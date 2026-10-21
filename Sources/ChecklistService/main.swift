@@ -56,17 +56,15 @@ final class StorageRecoveryServer: NSObject, NSXPCListenerDelegate {
     let state: StorageRecoveryReply
     let listener = NSXPCListener(machServiceName:ChecklistInstance.current.machServiceName)
     let lifetimeLease: StorageServiceLease?
-    let clientRequirement = ClientCodeIdentity.bundledRequirement()
+    let clientIdentity = ClientCodeIdentity.bundledAdmission()
     init(error: Error) {
         state = StorageRecoveryReply(error:error)
         lifetimeLease = try? StorageServiceLease(root:ChecklistPaths.root)
         super.init();listener.delegate = self
     }
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
-        guard connection.effectiveUserIdentifier == getuid(),ClientCodeIdentity.restrict(connection,requirement:clientRequirement) else {return false}
-        connection.exportedInterface = NSXPCInterface(with:ChecklistRPC.self)
-        connection.exportedObject = StorageRecoveryPeer(state:state)
-        connection.resume();return true
+        guard connection.effectiveUserIdentifier == getuid() else { return false }
+        return clientIdentity.accept(connection) { StorageRecoveryPeer(state: state) }
     }
 }
 final class StorageRecoveryPeer: NSObject, ChecklistRPC {
@@ -89,7 +87,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     let enrollmentFile = ChecklistPaths.root.appendingPathComponent("connections.json")
     let expectedOwnerPath: String
     let expectedOwnerHash: Data?
-    let clientRequirement = ClientCodeIdentity.bundledRequirement()
+    let clientIdentity = ClientCodeIdentity.bundledAdmission()
     init(router: CommandRouter) {
         self.router = router
         let gui=ChecklistPaths.serviceExecutable.deletingLastPathComponent().appendingPathComponent("ChecklistApp").resolvingSymlinksInPath()
@@ -121,12 +119,8 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     }
 
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
-        guard connection.effectiveUserIdentifier == getuid(),ClientCodeIdentity.restrict(connection,requirement:clientRequirement) else { return false }
-        let peer = Peer(coordinator: self, connection: connection)
-        connection.exportedInterface = NSXPCInterface(with: ChecklistRPC.self)
-        connection.exportedObject = peer
-        connection.resume()
-        return true
+        guard connection.effectiveUserIdentifier == getuid() else { return false }
+        return clientIdentity.accept(connection) { Peer(coordinator: self, connection: connection) }
     }
     func saveEnrollments() throws {
         let data = try JSONEncoder().encode(enrollments)

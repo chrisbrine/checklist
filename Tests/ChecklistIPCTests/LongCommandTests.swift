@@ -50,7 +50,7 @@ final class LongCommandTests: XCTestCase {
     }
 
     private func run(delay: TimeInterval, timeout: TimeInterval?, disconnect: Bool = false) throws {
-        let parent = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/ChecklistQualification/CL-149")
+        let parent = FileManager.default.temporaryDirectory
         let root = parent.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }

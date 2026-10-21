@@ -198,7 +198,7 @@ final class MediaListQueryTests: XCTestCase {
         XCTAssertTrue((adoptedTarget["record_references"] as! [JSON]).contains {$0["type"] as? String == "media_item_target" && $0["id"] as? String == example["target_id"] as? String})
         try f.router.dbQueue.read {db in try MediaRecordRegistry.validate(MediaRecordRegistry.envelopes(db,project:f.project))}
         for method in ["media_item_page","media_item_counts","media_approved_examples","media_material_reference_adopt","media_example_read_lease"] {
-            checks.checkError("UNSUPPORTED_METHOD") {try f.router.handle(method:method,params:["command_id":uuid(),"project_id":f.project],caller:f.owner)}
+            checks.checkError("FORBIDDEN") {try f.router.handle(method:method,params:["command_id":uuid(),"project_id":f.project],caller:f.worker)}
         }
         XCTAssertFalse(try jsonString(f.router.handle(method:"tool_catalog",params:[:],caller:f.worker)).contains("media_item_page"))
     }

@@ -235,6 +235,7 @@ if [ -n "$STAGE_ASSEMBLY" ]; then
 fi
 if [ "$MODE" = --stage ]; then echo "Staged $STAGE"; exit 0; fi
 DEST="/Applications/Checklist.app"
+INSTALL_STARTED="$(date +%s)"
 INSTALL_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 INCOMING="/Applications/.Checklist-incoming-$INSTALL_ID.app"
 PREVIOUS="/Applications/.Checklist-previous-$INSTALL_ID.app"
@@ -311,15 +312,17 @@ esac
 case "$MODE" in
   --verify|--install-stage)
   sleep 2
-  if ! python3 "$ROOT_DIR/script/verify_install.py" "$DEST"; then
+  if ! python3 "$ROOT_DIR/script/verify_install.py" "$DEST" --install-started "$INSTALL_STARTED"; then
+    echo "Installed verification failed." >&2
+    if ! python3 "$ROOT_DIR/script/verify_install.py" --failure-guidance --install-started "$INSTALL_STARTED" >&2; then
+      echo "The installed bundle and the store were kept. Check checklist service status and the service log. If the first start upgraded the store, a rollback is a restore of its protected pre-upgrade generation, not the previous bundle." >&2
+    fi
     if [ "$HAD_PREVIOUS" = 1 ]; then
-      echo "Installed verification failed; previous bundle retained at $PREVIOUS (bundle rollback only; no store restore)." >&2
-    else
-      echo "Installed verification failed; no previous bundle was available. The installed bundle and store were retained." >&2
+      echo "Previous bundle kept at $PREVIOUS; it does not restore the store." >&2
     fi
     exit 1
   fi
   ;;
 esac
 echo "Installed $DEST"
-if [ "$HAD_PREVIOUS" = 1 ]; then echo "Previous bundle retained at $PREVIOUS (bundle rollback only; no store restore)."; fi
+if [ "$HAD_PREVIOUS" = 1 ]; then echo "Previous bundle retained at $PREVIOUS; it does not restore the store."; fi

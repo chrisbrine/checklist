@@ -44,6 +44,7 @@ extension BridgeClient {
 }
 
 public struct BridgeEnvironment: Sendable {
+    public var shimUpdate: ShimUpdateEnvironment?
     public var makeClient: @Sendable (BridgeClientConfiguration) -> any BridgeClient
     public var discover: @Sendable (_ assistantRelay: Bool) -> NativeSessionDiscovery
     public var now: @Sendable () -> TimeInterval
@@ -51,6 +52,7 @@ public struct BridgeEnvironment: Sendable {
     public var stderr: @Sendable (String) -> Void
 
     public init(
+        shimUpdate: ShimUpdateEnvironment? = nil,
         makeClient: @escaping @Sendable (BridgeClientConfiguration) -> any BridgeClient = {
             ChecklistClient(installation: $0.installation, workspace: $0.workspace,
                             nativeContext: $0.nativeContext, usesStoredCredential: $0.usesStoredCredential)
@@ -65,6 +67,7 @@ public struct BridgeEnvironment: Sendable {
         sleep: @escaping @Sendable (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
         stderr: @escaping @Sendable (String) -> Void = { FileHandle.standardError.write(Data($0.utf8)) }
     ) {
+        self.shimUpdate = shimUpdate
         self.makeClient = makeClient; self.discover = discover; self.now = now
         self.sleep = sleep; self.stderr = stderr
     }

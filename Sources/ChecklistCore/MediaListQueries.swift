@@ -244,7 +244,7 @@ extension CommandRouter {
             "title":target["title"]!,"metadata":target["metadata"]!,"winner_id":winner,"slots":candidate["slots"]!,
             "review_basis_signature":basis,"historical_context_label":"Historical owner-accepted example — no current approval",
             "context_id":target["context_id"]!,"type_revision_id":target["type_revision_id"]!,"display_only":true,"grants_current_approval":false,
-            "original_references":references]
+            "original_references":references,"decision_created_at":decision["created_at"]!,"decision_origin":decision["origin"]!,"decision_author_session_id":decision["author_session_id"]!,"round_title":round["title"]!,"source_name":candidate["source_name"] ?? "Captured text"]
     }
     func mediaExampleQuery(_ db: Database,p: JSON,c: Caller,project: String) throws -> JSON {
         let round = try scoped(db,try text(p,"round_id"),project,type:"media_round"),schema = try mediaQuerySchema(db,round)

@@ -67,7 +67,7 @@ final class ChecklistStore: ObservableObject {
     @Published var busy = false
     @Published var hasPendingMutation = false
     var pendingCommandID: String? { pendingMutation?.params["command_id"] as? String }
-    private var pendingMutation: (method: String, params: [String: Any], success: String?, completion: (([String: Any]) -> Void)?)?
+    private var pendingMutation: (method: String, params: [String: Any], success: String?, completion: (([String: Any]) -> Void)?, failure: ((Error) -> Void)?)?
     @Published var notice: String? { didSet { if !informing { noticeIsWarning = false } } }
     private var informing = false
     /// True when the current notice reports an ignored action rather than a success.
@@ -85,6 +85,8 @@ final class ChecklistStore: ObservableObject {
         guard let reason = writeBlockReason else { return true }
         inform(reason); return false
     }
+    // CL-116: one window-local media presentation; service remains durable authority.
+    let mediaReview = MediaReviewModel()
     @Published var page: Page = .overview { didSet { prepareTicketWorkspace() } }
     @Published var projectID: String? = nil { didSet { prepareTicketWorkspace() } }
     @Published var detail: Detail? {
@@ -168,7 +170,7 @@ final class ChecklistStore: ObservableObject {
 
     init(draftJournal: LocalDraftJournal = LocalDraftJournal(), preferences: UserDefaults = .standard, restorePendingCommand: Bool = true, desktopAlerts: DesktopAlertCoordinator = .shared, requestTransport: ((String,[String:Any]) async throws -> [String:Any])? = nil, navigationMemory: DetailItemNavigationMemory = .shared, pendingCommandKey:String = "pending-command", pendingCommandPersistence:PendingCommandPersistence = .keychain) {
         self.draftJournal = draftJournal; self.preferences = preferences; self.desktopAlerts = desktopAlerts;self.requestTransport = requestTransport;self.navigationMemory = navigationMemory;self.pendingCommandKey=pendingCommandKey;self.pendingCommandPersistence=pendingCommandPersistence
-        if restorePendingCommand, let saved = pendingCommandPersistence.read(pendingCommandKey), let bytes = saved.data(using: .utf8), let record = (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any], let method = record["method"] as? String, let params = record["params"] as? [String: Any] { pendingMutation = (method, params, "Last change checked", nil); hasPendingMutation = true }
+        if restorePendingCommand, let saved = pendingCommandPersistence.read(pendingCommandKey), let bytes = saved.data(using: .utf8), let record = (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any], let method = record["method"] as? String, let params = record["params"] as? [String: Any] { pendingMutation = (method, params, "Last change checked", nil, nil); hasPendingMutation = true }
         if let bytes = preferences.data(forKey: "lastDetail") {
             if let savedDetail = try? JSONDecoder().decode(Detail.self, from: bytes) { detail = savedDetail }
             else { preferences.removeObject(forKey: "lastDetail") }
@@ -929,11 +931,11 @@ final class ChecklistStore: ObservableObject {
         }
     }
 
-    func run(_ method: String, _ params: [String: Any] = [:], success: String? = nil, completion: (([String: Any]) -> Void)? = nil) {
+    func run(_ method: String, _ params: [String: Any] = [:], success: String? = nil, failure: ((Error) -> Void)? = nil, completion: (([String: Any]) -> Void)? = nil) {
         guard allowWrite() else { return }
         var command = params
         if command["command_id"] == nil { command["command_id"] = UUID().uuidString }
-        pendingMutation = (method, command, success, completion)
+        pendingMutation = (method, command, success, completion, failure)
         do {
             let bytes = try JSONSerialization.data(withJSONObject: ["method": method, "params": command])
             try pendingCommandPersistence.save(String(data: bytes, encoding: .utf8)!,pendingCommandKey)
@@ -954,7 +956,7 @@ final class ChecklistStore: ObservableObject {
             do {
                 let reply = try await request(pending.method, pending.params)
                 pendingMutation = nil; hasPendingMutation = false; pendingCommandPersistence.remove(pendingCommandKey)
-                await refresh(quiet: true)
+                if !pending.method.hasPrefix("media_") {await refresh(quiet: true)}
                 if pending.method == "message_mentions_prepare" {
                     // Preparation's caller must inspect the refreshed selected
                     // context, rather than mistake a scheduled read for readiness.
@@ -967,6 +969,7 @@ final class ChecklistStore: ObservableObject {
                 busy = false
                 pending.completion?(reply)
             } catch {
+                pending.failure?(error)
                 if CommandReply.shouldRetainPending(after: error) {
                     hasPendingMutation = true
                     self.error = "The service may already have saved this change. Use Check the last change before you make another change."

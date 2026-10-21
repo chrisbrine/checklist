@@ -6,11 +6,12 @@ struct ProjectWorkspaceTabs: View {
         HStack(spacing: Spacing.tight) {
             tab("Tickets", page: .tasks)
             tab("Epics", page: .epics)
+            MediaProjectTab(model:store.mediaReview)
             Spacer()
         }.checklistActionScroll().padding(.horizontal, Spacing.page).padding(.top, Spacing.control).overlay(alignment: .bottom) { Divider() }
     }
     func tab(_ title: String, page: Page) -> some View {
-        let selected = page == .tasks ? store.page != .epics : store.page == .epics
+        let selected = page == .tasks ? [.tasks, .archived].contains(store.page) : store.page == page
         return Button {
             store.page = page
             store.windowPreferences.set(page.rawValue, forKey: "lastPage")

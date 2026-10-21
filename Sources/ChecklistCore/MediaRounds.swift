@@ -3,10 +3,10 @@ import CryptoKit
 import GRDB
 
 extension CommandRouter {
-    /// INTERNAL ONLY. Deliberately absent from dispatch, Catalog, CLI and native app.
+    /// Internal domain seam; CL-116 exposes only its explicit native-owner allowlist.
     /// Capture/holds are composed internally; public activation still needs the complete
     /// owner UI/rendering/query/rework slice and its native qualification.
-    func executeMediaCommand(method: String,params p: JSON,caller c: Caller) throws -> JSON {
+    func executeMediaCommand(method: String,params p: JSON,caller c: Caller,nativeOwnerProjection: Bool = false) throws -> JSON {
         let reads: Set<String> = ["media_type_get","media_round_get","media_intake_get","media_bulk_get","media_item_page","media_item_counts","media_approved_examples"]
         let allowed: [String:Set<String>] = [
             "media_item_page":["round_id","list","filter","limit","cursor"],
@@ -23,6 +23,9 @@ extension CommandRouter {
             "media_intake_revise":["intake_id","expected_revision","mapping","resolutions"],
             "media_intake_confirm":["intake_id","expected_revision","plan_id","plan_digest"],
             "media_intake_capture":["intake_id","expected_revision","plan_id","row_ids"],
+            "media_type_retire":["type_id","expected_revision"],
+            "media_round_cancel":["round_id","expected_revision","reason"],
+            "media_round_archive":["round_id","expected_revision"],
             "media_type_create":["title","schema","rubric"], "media_type_get":["type_id"],
             "media_type_revise":["type_id","expected_revision","schema","rubric","title"],
             "media_type_adopt":["type_id","expected_revision","type_revision_id","observed_type_token"],
@@ -58,7 +61,8 @@ extension CommandRouter {
         let command = try text(p,"command_id",max:100)
         guard UUID(uuidString:command) != nil else { throw CoreError("INVALID_INPUT","command_id must be a UUID.") }
         let digest = hash(Data((method + (try jsonString(p))).utf8))
-        let resources = try prepareMediaResources(method:method,params:p,caller:c)
+        var resources = try prepareMediaResources(method:method,params:p,caller:c)
+        resources.nativeOwnerProjection = nativeOwnerProjection
         let prepared = try prepareMediaCommand(method:method,params:p,caller:c,resources:resources)
         defer { try? prepared?.observer.close() }
         return try ArchiveStorageGate.withExclusive(root:root) { _ in
@@ -103,7 +107,8 @@ extension CommandRouter {
         guard input["schema"] == nil || input["schema"] is JSON else { throw CoreError("INVALID_INPUT","A schema must be an object.") }
         let previous = (type["draft_revision_id"] as? String).flatMap {try? scoped(db,$0,type["project_id"] as! String,type:"media_review_type_revision")}
         let name = input["title"] as? String ?? type["title"] as! String
-        let definition: JSON = input["schema"] as? JSON ?? previous?["schema"] as? JSON ?? ["schema_version":1,"id":type["id"]!,"name":name]
+        var definition: JSON = input["schema"] as? JSON ?? previous?["schema"] as? JSON ?? ["schema_version":1,"id":type["id"]!,"name":name]
+        if input["title"] != nil {definition["name"] = name}
         let schema = try MediaReviewSchema.parse(definition)
         guard schema.id.rawValue == type["id"] as? String else { throw CoreError("INVALID_INPUT","A type revision must keep its stable type ID.") }
         let rubric = input["rubric"] != nil ? try text(input,"rubric",max:16000,required:false) : previous?["rubric"] as? String ?? ""
@@ -237,6 +242,23 @@ extension CommandRouter {
         if method.hasPrefix("media_bulk_") { return try mediaBulkCommand(db,method:method,p:p,c:c,project:pid) }
         switch method {
         case "media_material_reference_adopt": return try mediaMaterialReferenceAdopt(db,p:p,c:c,project:pid)
+        case "media_type_retire":
+            try owner(c)
+            var type = try scoped(db,try text(p,"type_id"),pid,type:"media_review_type");try mediaRevision(p,type)
+            let live = try records(db,type:"media_round",project:pid).contains { EnvelopeStorageIdentity.equal($0["type_id"] as? String,type["id"] as? String) && ["draft","open"].contains($0["state"] as? String ?? "") }
+            guard !live else {throw CoreError("MEDIA_ROUNDS_REMAIN","Finish/archive or explicitly cancel every Draft and Open round before retiring this type.")}
+            type["enabled"] = false;type["state"] = "retired";type = revised(type);try mediaWrite(db,type,type:"media_review_type");return type
+        case "media_round_cancel", "media_round_archive":
+            try owner(c)
+            var round = try scoped(db,try text(p,"round_id"),pid,type:"media_round");try mediaRevision(p,round)
+            if method == "media_round_cancel" {
+                guard ["draft","open"].contains(round["state"] as? String ?? "") else {throw CoreError("MEDIA_ROUND_CLOSED","Only a Draft or Open round can be canceled.")}
+                round["cancellation_reason"] = try text(p,"reason",max:4000);round["state"] = "canceled"
+            } else {
+                guard ["closed","canceled"].contains(round["state"] as? String ?? "") else {throw CoreError("MEDIA_ROUNDS_REMAIN","Finish or explicitly cancel this round before archiving.")}
+                round["state"] = "archived"
+            }
+            round = revised(round);try mediaWrite(db,round,type:"media_round");return round
         case "media_type_create":
             let title = try text(p,"title",max:256)
             var type = mediaRecord(["title":title,"state":"draft","enabled":false],project:pid,caller:c)
@@ -255,6 +277,7 @@ extension CommandRouter {
         case "media_type_adopt":
             try owner(c)
             var type = try scoped(db,try text(p,"type_id"),pid,type:"media_review_type");try mediaRevision(p,type)
+            guard type["state"] as? String != "retired" else {throw CoreError("MEDIA_TYPE_RETIRED","A retired type is historical.")}
             guard p["observed_type_token"] as? String == (try mediaTypeToken(db,type:type,caller:c)),p["type_revision_id"] as? String == type["draft_revision_id"] as? String else { throw CoreError("MEDIA_CONTEXT_CHANGED","Inspect the exact proposed type and approved project context before adoption.") }
             let revision = try scoped(db,type["draft_revision_id"] as! String,pid,type:"media_review_type_revision")
             if !bool(type,"enabled"),try records(db,type:"media_review_type",project:pid).filter({bool($0,"enabled")}).count >= 8 { throw CoreError("CAPACITY_EXCEEDED","A project supports eight enabled media types.") }
@@ -287,12 +310,13 @@ extension CommandRouter {
             };return try mediaTypeView(db,type:type,caller:c)
         case "media_round_create":
             let type = try scoped(db,try text(p,"type_id"),pid,type:"media_review_type")
+            guard type["state"] as? String != "retired" else {throw CoreError("MEDIA_TYPE_RETIRED","Restore a review type before adding a round.")}
             let typeRevision = try scoped(db,type["adopted_revision_id"] as? String ?? type["draft_revision_id"] as! String,pid,type:"media_review_type_revision")
             var round = mediaRecord(["type_id":type["id"]!,"title":try text(p,"title",max:2000),"state":"draft","type_revision_id":typeRevision["id"]!,"attention_ids":[String]()],project:pid,caller:c,references:[mediaRef("media_review_type",type),mediaRef("media_review_type_revision",typeRevision)])
             let sources = try mediaCurrentSources(db,project:pid,type:type["id"] as! String,round:round["id"] as! String)
             let context = try mediaSnapshot(db,round:round,typeRevision:typeRevision,sources:sources,caller:c)
             round["context_id"] = context["id"];round["record_references"] = (round["record_references"] as! [JSON]) + [mediaRef("media_review_context",context)]
-            try mediaWrite(db,round,type:"media_round");return try mediaRoundView(db,round:round,caller:c)
+            try mediaWrite(db,round,type:"media_round");return try resources.nativeOwnerProjection ? mediaOwnerHeader(db,round,c) : mediaRoundView(db,round:round,caller:c)
         case "media_item_create","media_item_update":
             var item: JSON
             let round: JSON
@@ -359,7 +383,7 @@ extension CommandRouter {
                 item = revised(item);try mediaWrite(db,item,type:"media_item");targets[i] = (item,target)
             }
             _ = try mediaManifest(db,round:&round,targets:targets,typeRevision:type,context:context,caller:c)
-            round["state"] = "open";round = revised(round);try mediaWrite(db,round,type:"media_round");return try mediaRoundView(db,round:round,caller:c)
+            round["state"] = "open";round = revised(round);try mediaWrite(db,round,type:"media_round");return try resources.nativeOwnerProjection ? mediaOwnerHeader(db,round,c) : mediaRoundView(db,round:round,caller:c)
         case "media_context_reconcile": return try mediaReconcile(db,p,c,project:pid)
         case "media_decide","media_suggest","media_adopt_suggestion": return try mediaDecision(db,p,c,project:pid,method:method)
         case "media_round_finish":

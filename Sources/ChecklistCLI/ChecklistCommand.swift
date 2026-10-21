@@ -79,12 +79,15 @@ struct CLIError: LocalizedError {
 @main
 struct ChecklistCommand {
     static func main() async {
-        _ = ChecklistInstance.current
+        let instance = ChecklistInstance.current
         do {
+            try DelegateInstanceExpectation.verifyIfPresent(instance: instance)
+            let shimUpdate = ShimUpdateEnvironment.capture()
             let arguments = try Arguments(Array(CommandLine.arguments.dropFirst()))
             let bridge = Bridge(configuration: .init(installation: arguments.installation, workspace: arguments.workspace,
                 expectedSession: arguments.session, automatic: !arguments.installationExplicit,
-                assistantProject: arguments.assistant ? arguments.project : nil, command: arguments.command.first ?? ""))
+                assistantProject: arguments.assistant ? arguments.project : nil, command: arguments.command.first ?? ""),
+                environment: .init(shimUpdate: arguments.command.first == "mcp" ? shimUpdate : nil))
             switch arguments.command.first ?? "help" {
             case "connect":
                 guard arguments.command.count == 1 else { throw CLIError("Usage: checklist connect [--task KEY_OR_UUID] or checklist connect --assistant --project UUID_OR_EXACT_NAME") }
@@ -111,11 +114,10 @@ struct ChecklistCommand {
                 try printJSON(await bridge.serviceInfo())
             case "call":
                 guard arguments.command.count == 2 || arguments.command.count == 3 else { throw CLIError("Usage: checklist call METHOD '{JSON}' [--workspace PATH]") }
+                let data = try CallArgumentInput.read(arguments.command.count == 3 ? arguments.command[2] : "{}")
+                let value = try JSONDecoder().decode(Value.self, from: data)
                 _ = try await bridge.connect()
                 try await bridge.verifySession()
-                let data = Data((arguments.command.count == 3 ? arguments.command[2] : "{}").utf8)
-                guard data.count <= 1_048_576 else { throw CLIError("Input exceeds 1 MiB.") }
-                let value = try JSONDecoder().decode(Value.self, from: data)
                 try printJSON(await bridge.call(arguments.command[1], value))
             case "help", "--help", "-h": printHelp()
             case "version", "--version": print("Checklist 0.1.0 · MCP Swift SDK 0.12.1")
@@ -144,6 +146,7 @@ struct ChecklistCommand {
           checklist tools
           checklist service start|status
           checklist call METHOD '{"parameter":"value"}' [--workspace /absolute/project]
+          checklist call METHOD -    (read at most 1 MiB of JSON from stdin)
           checklist version
 
         Run connect from a Codex or Claude conversation in its project directory.

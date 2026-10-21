@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import ChecklistIPC
 
 struct CaptureAttachmentDestination: Codable, Equatable {
     let storeIncarnation: String
@@ -19,7 +20,7 @@ struct CaptureAttachment: Identifiable, Codable {
     init(destination: CaptureAttachmentDestination,url: URL,mode: String,ownedStaging: Bool = false) {
         id = UUID();self.destination = destination;self.url = url;self.mode = mode;self.ownedStaging = ownedStaging;commandID = UUID().uuidString
     }
-    static var staging: URL { FileManager.default.urls(for:.cachesDirectory,in:.userDomainMask)[0].appendingPathComponent("ChecklistAttachmentDrafts",isDirectory:true) }
+    static var staging: URL { ChecklistInstance.current.cachesRoot.appendingPathComponent("ChecklistAttachmentDrafts",isDirectory:true) }
     func removeOwnedStaging() {
         guard ownedStaging,url.deletingLastPathComponent().path == Self.staging.path,UUID(uuidString:url.deletingPathExtension().lastPathComponent) != nil else { return }
         try? FileManager.default.removeItem(at:url)

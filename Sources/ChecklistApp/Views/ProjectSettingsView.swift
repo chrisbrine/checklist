@@ -72,6 +72,7 @@ struct ProjectSettingsView: View {
                     }
                     Button("Add pinned decision") { pinnedDecisions.appendEmpty() }.checklistDisabled([(pinnedDecisions.count >= 25, "A project can pin at most 25 decisions.")])
                 }
+                MediaTypeSettings(projectID:project.id, model:store.mediaReview)
                 ArchiveStorageSettingsSection(project:project)
                 workflowSettings
                 ReviewRequirementsEditor(draft:$reviewRequirements)

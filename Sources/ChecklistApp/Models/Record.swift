@@ -15,13 +15,14 @@ struct Record: Identifiable {
 }
 
 enum Page: String, CaseIterable, Identifiable {
-    case overview, needsYou, tasks, epics, activity, archived
+    case overview, needsYou, tasks, epics, media, activity, archived
     var id: String { rawValue }
     var title: String {
         switch self {
         case .overview: return "Overview"
         case .needsYou: return "Needs You"
         case .tasks: return "Tickets"
+        case .media: return "Media review"
         case .epics: return "Epics"
         case .activity: return "Activity"
         case .archived: return "Archived"
@@ -32,6 +33,7 @@ enum Page: String, CaseIterable, Identifiable {
         case .overview: return "square.grid.2x2"
         case .needsYou: return "flag"
         case .tasks: return "checklist"
+        case .media: return "photo.on.rectangle"
         case .epics: return "folder"
         case .activity: return "clock.arrow.circlepath"
         case .archived: return "archivebox"

@@ -17,6 +17,7 @@ final class ChecklistMCPServerTests: XCTestCase {
         private var bootstraps: [(TimeInterval, TimeInterval?)] = []
         private var stderrLines: [String] = []
         var bootstrapHandler: ((TimeInterval?) throws -> Void)?
+        var callHandler: ((String) throws -> Void)?
 
         init(provider: String = "claude") throws {
             let session = "a85c9a24-fce8-49ba-a738-67594bb90a67"
@@ -61,8 +62,9 @@ final class ChecklistMCPServerTests: XCTestCase {
         }
 
         func call(_ name: String, client: Int) throws -> [String: Any] {
-            locked {
+            try locked {
                 requests.append((name, client))
+                try callHandler?(name)
                 if name == "tool_catalog" {
                     return ["data": ["tools": ["service_info", "task_list", "project_list"].map {
                         ["name": $0, "description": "Synthetic " + $0,
@@ -123,10 +125,12 @@ final class ChecklistMCPServerTests: XCTestCase {
         let notifications: Notifications
     }
 
-    private func start(_ fixture: Fixture) async throws -> Session {
+    private func start(_ fixture: Fixture, update: ShimUpdateEnvironment? = nil, configuration: BridgeConfiguration? = nil) async throws -> Session {
         let pair = await InMemoryTransport.createConnectedPair()
         let transport = ProtocolTransport(pair.server)
-        let bridge = Bridge(configuration: .init(workspace: fixture.context.workspacePath), environment: fixture.environment)
+        var environment = fixture.environment
+        environment.shimUpdate = update
+        let bridge = Bridge(configuration: configuration ?? .init(workspace: fixture.context.workspacePath), environment: environment)
         let server = try await ChecklistMCPServer.start(bridge: bridge, transport: transport)
         let client = Client(name: "CL-168 synthetic client", version: "1")
         let notifications = Notifications()
@@ -328,5 +332,284 @@ final class ChecklistMCPServerTests: XCTestCase {
         XCTAssertTrue(tools.tools[0].description?.contains("PROJECT_SETUP_REQUIRED") == true)
         XCTAssertEqual(unregistered.attempts.count, 1); XCTAssertEqual(unregistered.time, 0)
         XCTAssertTrue(unregistered.stderr[0].contains("add this folder as a project"))
+    }
+
+    private final class UpdateFixture: @unchecked Sendable {
+        private let lock = NSLock()
+        private var state = ShimLaunchState.current
+        private var runs: [[String]] = []
+        private var inputs: [Data?] = []
+        private var checks: [Bool] = []
+        var result = ShimChildResult(status: 0, stdout: Data("{\"data\":{\"delegate\":true}}".utf8))
+        var failure: Error?
+        let path = "/synthetic/Checklist Test 2.app/Contents/MacOS/checklist"
+
+        private func locked<T>(_ body: () throws -> T) rethrows -> T {
+            lock.lock(); defer { lock.unlock() }; return try body()
+        }
+        func set(_ value: ShimLaunchState) { locked { state = value } }
+        var calls: [[String]] { locked { runs } }
+        var payloads: [Data?] { locked { inputs } }
+        var forcedChecks: Int { locked { checks.filter { $0 }.count } }
+        var environment: ShimUpdateEnvironment {
+            .init(launchPath: path, check: { force in
+                self.locked { self.checks.append(force); return self.state }
+            }, run: { arguments, input in
+                try self.locked {
+                    self.runs.append(arguments); self.inputs.append(input)
+                    if let failure = self.failure { throw failure }
+                    if arguments.first == "tools" {
+                        return .init(status: 0, stdout: Data("{\"tools\":[{\"name\":\"project_list\",\"inputSchema\":{\"type\":\"object\"}}]}".utf8))
+                    }
+                    return self.result
+                }
+            })
+        }
+    }
+
+    private func noticeCount(_ session: Session) async throws -> Int {
+        try await session.client.ping()
+        return try await session.transport.frames().filter {
+            (try JSONSerialization.jsonObject(with: $0) as? [String: Any])?["method"] as? String == "notifications/tools/list_changed"
+        }.count
+    }
+
+    func testLaunchPathChangeDelegatesCurrentAndQueuedCallsAndNotifiesOnce() async throws {
+        let fixture = try Fixture(), update = UpdateFixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        let config = BridgeConfiguration(installation: "test-slot-binding", workspace: fixture.context.workspacePath,
+            expectedSession: fixture.context.nativeSessionID, automatic: false)
+        let session = try await start(fixture, update: update.environment, configuration: config)
+        let oldCalls = fixture.calls.count
+        update.set(.replaced)
+        let arguments: [String: Value] = ["command_id": .string("same-command-id"), "body": .string("quote \" and newline\nUnicode å")]
+        async let first = session.client.callTool(name: "task_edit", arguments: arguments)
+        async let second = session.client.callTool(name: "task_list")
+        for result in try await [first, second] {
+            XCTAssertEqual(result.isError, false)
+            XCTAssertEqual(try JSONDecoder().decode(Value.self, from: Data(text(result.content).utf8)), .object(["data": .object(["delegate": .bool(true)])]))
+        }
+        let third = try await session.client.callTool(name: "task_edit", arguments: arguments)
+        XCTAssertEqual(third.isError, false)
+        XCTAssertEqual(update.calls.count, 3)
+        XCTAssertEqual(fixture.calls.count, oldCalls)
+        XCTAssertTrue(fixture.attempts.isEmpty)
+        for (index, call) in update.calls.enumerated() {
+            XCTAssertEqual(Array(call.suffix(6)), ["--workspace", fixture.context.workspacePath, "--session", fixture.context.nativeSessionID, "--installation", "test-slot-binding"])
+            if call[1] == "task_edit" {
+                XCTAssertEqual(call[2], "-")
+                XCTAssertEqual(try JSONDecoder().decode(Value.self, from: XCTUnwrap(update.payloads[index])), .object(arguments))
+            }
+        }
+        let count = try await noticeCount(session)
+        XCTAssertEqual(count, 1)
+        try await assertProtocolOnly(session)
+    }
+
+    func testOutdatedReplyForCatalogOrCommandForcesCheckAndDelegatesOnce() async throws {
+        for refusal in ["tool_catalog", "task_list"] {
+            let fixture = try Fixture(), update = UpdateFixture()
+            fixture.setDiscoveries([.available(fixture.context)])
+            let session = try await start(fixture, update: update.environment)
+            fixture.callHandler = { name in if name == refusal { throw ClientUpdateRequired.error } }
+            let first = try await session.client.callTool(name: "task_list")
+            XCTAssertEqual(first.isError, false)
+            XCTAssertTrue(text(first.content).contains("delegate"))
+            let oldCalls = fixture.calls.count
+            _ = try await session.client.callTool(name: "task_list")
+            XCTAssertEqual(fixture.calls.count, oldCalls)
+            XCTAssertEqual(fixture.attempts.count, 1)
+            XCTAssertEqual(update.forcedChecks, 1)
+            XCTAssertEqual(update.calls.count, 2)
+            let count = try await noticeCount(session)
+            XCTAssertEqual(count, 1)
+        }
+    }
+
+    func testDelegateRoutesToolsAndResourcesThroughInstalledCLI() async throws {
+        let fixture = try Fixture(), update = UpdateFixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        let session = try await start(fixture, update: update.environment)
+        update.set(.replaced)
+        let catalog = try await session.client.listTools()
+        XCTAssertEqual(catalog.tools.map(\.name), ["project_list"])
+        let resources = try await session.client.listResources()
+        XCTAssertEqual(resources.resources.map(\.uri), ["checklist://service/status", "checklist://projects"])
+        for uri in resources.resources.map(\.uri) {
+            let result = try await session.client.readResource(uri: uri)
+            XCTAssertEqual(result.count, 1)
+        }
+        XCTAssertEqual(update.calls.map { Array($0.prefix(1)) }, [["tools"], ["tools"], ["call"], ["call"]])
+        XCTAssertEqual(update.calls[2][1], "service_info")
+        XCTAssertEqual(update.calls[3][1], "project_list")
+        XCTAssertTrue(update.calls.allSatisfy { !$0.contains("--installation") })
+        let count = try await noticeCount(session)
+        XCTAssertEqual(count, 1)
+    }
+
+    func testMissingOrInvalidLaunchPathReturnsClearErrorAndKeepsTransportAlive() async throws {
+        let fixture = try Fixture(), update = UpdateFixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        let session = try await start(fixture, update: update.environment)
+        let oldCalls = fixture.calls.count
+        update.set(.unavailable)
+        for _ in 0..<2 {
+            let reply = try await session.client.callTool(name: "task_edit")
+            XCTAssertEqual(reply.isError, true)
+            XCTAssertTrue(text(reply.content).contains("CLIENT_OUTDATED"))
+            XCTAssertTrue(text(reply.content).contains("no command ran"))
+            XCTAssertTrue(text(reply.content).contains("reconnect the checklist MCP server"))
+            XCTAssertFalse(text(reply.content).contains("OUTCOME_UNKNOWN"))
+            try await session.client.ping()
+        }
+        XCTAssertTrue(update.calls.isEmpty)
+        XCTAssertEqual(fixture.calls.count, oldCalls)
+        update.set(.replaced)
+        let recovered = try await session.client.callTool(name: "task_edit")
+        XCTAssertEqual(recovered.isError, false)
+        let count = try await noticeCount(session)
+        XCTAssertEqual(count, 1)
+    }
+
+    func testCurrentShimNeverDelegatesAndKeepsLazyBootstrap() async throws {
+        let fixture = try Fixture(), update = UpdateFixture()
+        let session = try await start(fixture, update: update.environment)
+        fixture.setDiscoveries([.available(fixture.context)])
+        _ = try await session.client.listTools()
+        _ = try await session.client.callTool(name: "task_list")
+        _ = try await session.client.readResource(uri: "checklist://service/status")
+        XCTAssertEqual(fixture.attempts.count, 1)
+        XCTAssertTrue(update.calls.isEmpty)
+        XCTAssertEqual(update.forcedChecks, 0)
+        let count = try await noticeCount(session)
+        XCTAssertEqual(count, 1) // The existing CL-168 connection notice only.
+    }
+
+    func testUpdateSkipsOldLazyBootstrapAndStartupOutdatedReplyCanRecover() async throws {
+        for startupRefusal in [false, true] {
+            let fixture = try Fixture(), update = UpdateFixture()
+            if startupRefusal {
+                fixture.setDiscoveries([.available(fixture.context)])
+                fixture.bootstrapHandler = { _ in throw ClientUpdateRequired.error }
+            }
+            let session = try await start(fixture, update: update.environment)
+            if !startupRefusal { update.set(.replaced); fixture.setDiscoveries([.available(fixture.context)]) }
+            let reply = try await session.client.callTool(name: "task_list")
+            XCTAssertEqual(reply.isError, false)
+            XCTAssertEqual(fixture.attempts.count, startupRefusal ? 1 : 0)
+            XCTAssertEqual(update.calls.count, 1)
+            let count = try await noticeCount(session)
+            XCTAssertEqual(count, 1)
+        }
+    }
+
+    func testDelegateChildErrorUsesStderrAndArgumentLimitPreventsLaunch() async throws {
+        let fixture = try Fixture(), update = UpdateFixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        let session = try await start(fixture, update: update.environment)
+        update.set(.replaced)
+        update.result = .init(status: 1, stdout: Data("not a result".utf8), stderr: "Checklist: connected after 3 attempts in 500 ms\nChecklist: EXACT_DELEGATE_ERROR: synthetic refusal\n")
+        let refused = try await session.client.callTool(name: "task_edit")
+        XCTAssertEqual(refused.isError, true)
+        XCTAssertEqual(text(refused.content), "EXACT_DELEGATE_ERROR: synthetic refusal")
+        update.result = .init(status: 9, stdout: Data())
+        let interruptedChild = try await session.client.callTool(name: "task_edit")
+        XCTAssertEqual(interruptedChild.isError, true)
+        XCTAssertTrue(text(interruptedChild.content).contains("OUTCOME_UNKNOWN"))
+        XCTAssertFalse(text(interruptedChild.content).contains("no command ran"))
+        update.failure = ShimChildLaunchError(underlying: CocoaError(.fileNoSuchFile))
+        let cannotLaunch = try await session.client.callTool(name: "task_edit")
+        XCTAssertEqual(cannotLaunch.isError, true)
+        XCTAssertTrue(text(cannotLaunch.content).contains("DELEGATE_LAUNCH_FAILED"))
+        XCTAssertFalse(text(cannotLaunch.content).contains("CLIENT_OUTDATED"))
+        let before = update.calls.count
+        let tooLarge = try await session.client.callTool(name: "task_edit", arguments: ["body": .string(String(repeating: "a", count: 1_048_577))])
+        XCTAssertEqual(tooLarge.isError, true)
+        XCTAssertTrue(text(tooLarge.content).contains("Input exceeds 1 MiB"))
+        XCTAssertEqual(update.calls.count, before)
+        try await session.client.ping()
+    }
+
+    func testUnverifiedDelegateResultsKeepUnknownOutcomeAndOriginalCommandID() async throws {
+        for commandID in [nil, "original-delegated-command"] as [String?] {
+            for result in [
+                ShimChildResult(status: 9, stdout: Data(), stderr: "Checklist: connected after 3 attempts in 500 ms\n", termination: .signalled),
+                ShimChildResult(status: 0, stdout: Data("{}".utf8), termination: .notAwaited),
+                ShimChildResult(status: 2, stdout: Data(), stderr: "Checklist: INVALID_INPUT: ignored status\n"),
+                ShimChildResult(status: 1, stdout: Data(), stderr: "Checklist: connected after 3 attempts in 500 ms\n"),
+                ShimChildResult(status: 1, stdout: Data(), stderr: "Checklist: INVALID_INPUT: not the final line\nChecklist: connected after 3 attempts in 500 ms\n"),
+                ShimChildResult(status: 0, stdout: Data("not JSON".utf8))
+            ] {
+                let fixture = try Fixture(), update = UpdateFixture()
+                fixture.setDiscoveries([.available(fixture.context)])
+                let session = try await start(fixture, update: update.environment)
+                update.set(.replaced); update.result = result
+                let arguments = commandID.map { ["command_id": Value.string($0)] } ?? [:]
+                let reply = try await session.client.callTool(name: "task_edit", arguments: arguments)
+                XCTAssertEqual(reply.isError, true)
+                let message = text(reply.content)
+                XCTAssertTrue(message.hasPrefix("OUTCOME_UNKNOWN:"), message)
+                XCTAssertFalse(message.contains("connected after"), message)
+                if let commandID { XCTAssertTrue(message.contains(commandID), message) }
+                let frames = try await session.transport.frames().map { try JSONSerialization.jsonObject(with: $0) as! [String: Any] }
+                let result = try XCTUnwrap(frames.last { $0["result"] is [String: Any] }?["result"] as? [String: Any])
+                let structured = try XCTUnwrap(result["structuredContent"] as? [String: Any])
+                let error = try XCTUnwrap(structured["error"] as? [String: Any])
+                let details = try XCTUnwrap(error["details"] as? [String: Any])
+                XCTAssertEqual(error["code"] as? String, "OUTCOME_UNKNOWN")
+                XCTAssertEqual(details["reason"] as? String, "delegate_ended")
+                XCTAssertEqual(details["command_id"] as? String, commandID)
+            }
+        }
+    }
+
+    func testDelegateSpawnAndWaitErrorsKeepDistinctOutcomes() async throws {
+        for commandID in [nil, "original-spawn-command"] as [String?] {
+            let fixture = try Fixture(), update = UpdateFixture()
+            fixture.setDiscoveries([.available(fixture.context)])
+            let session = try await start(fixture, update: update.environment)
+            update.set(.replaced)
+            let arguments = commandID.map { ["command_id": Value.string($0)] } ?? [:]
+            update.failure = ShimChildLaunchError(underlying: NSError(domain: NSPOSIXErrorDomain, code: Int(E2BIG)))
+            let spawn = try await session.client.callTool(name: "task_edit", arguments: arguments)
+            XCTAssertEqual(spawn.isError, true)
+            XCTAssertTrue(text(spawn.content).hasPrefix("DELEGATE_LAUNCH_FAILED:"))
+            XCTAssertTrue(text(spawn.content).contains("No command ran"))
+            XCTAssertFalse(text(spawn.content).contains("CLIENT_OUTDATED"))
+            if let commandID { XCTAssertTrue(text(spawn.content).contains(commandID)) }
+            update.failure = CocoaError(.fileReadUnknown)
+            let wait = try await session.client.callTool(name: "task_edit", arguments: arguments)
+            XCTAssertEqual(wait.isError, true)
+            XCTAssertTrue(text(wait.content).hasPrefix("OUTCOME_UNKNOWN:"))
+            if let commandID { XCTAssertTrue(text(wait.content).contains(commandID)) }
+        }
+    }
+
+    func testParentAndChildInstanceMismatchesKeepNotSentAndCommandID() async throws {
+        for commandID in [nil, "original-instance-command"] as [String?] {
+            for parentRefusal in [false, true] {
+                let fixture = try Fixture(), update = UpdateFixture()
+                fixture.setDiscoveries([.available(fixture.context)])
+                let session = try await start(fixture, update: update.environment)
+                update.set(.replaced)
+                if parentRefusal {
+                    update.failure = ShimChildInstanceMismatch(processID: 0, observedHash: nil, stdout: Data(), stderr: "")
+                } else {
+                    update.result = .init(status: 1, stdout: Data(), stderr: "Checklist: DELEGATE_INSTANCE_MISMATCH: no command ran; reconnect.\n")
+                }
+                let arguments = commandID.map { ["command_id": Value.string($0)] } ?? [:]
+                let reply = try await session.client.callTool(name: "task_edit", arguments: arguments)
+                XCTAssertEqual(reply.isError, true)
+                XCTAssertTrue(text(reply.content).hasPrefix("DELEGATE_INSTANCE_MISMATCH:"))
+                if let commandID { XCTAssertTrue(text(reply.content).contains(commandID)) }
+                let frames = try await session.transport.frames().map { try JSONSerialization.jsonObject(with: $0) as! [String: Any] }
+                let result = try XCTUnwrap(frames.last { $0["result"] is [String: Any] }?["result"] as? [String: Any])
+                let fields = try XCTUnwrap((result["structuredContent"] as? [String: Any])?["error"] as? [String: Any])
+                let details = try XCTUnwrap(fields["details"] as? [String: Any])
+                XCTAssertEqual(details["command_outcome"] as? String, "not_sent")
+                XCTAssertEqual(details["command_executed"] as? Bool, false)
+                XCTAssertEqual(details["command_id"] as? String, commandID)
+            }
+        }
     }
 }

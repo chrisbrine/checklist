@@ -3,6 +3,7 @@ import CryptoKit
 import Darwin
 import Combine
 import ChecklistCore
+import ChecklistIPC
 
 struct FilePreviewFailure: LocalizedError {
     let message: String
@@ -67,8 +68,9 @@ final class AuthorizedPreviewFile: @unchecked Sendable {
 
     /// External copies persist in the app cache, with a provenance sidecar. They
     /// are intentionally not imported back or used to satisfy an inspection.
+    static var defaultExternalWorkingCopyBase: URL { ChecklistInstance.current.cachesRoot }
     func externalWorkingCopy(baseDirectory: URL? = nil) throws -> URL {
-        let base = try baseDirectory ?? FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        let base = baseDirectory ?? Self.defaultExternalWorkingCopyBase
         let root = base.appendingPathComponent("Checklist/OpenCopies/" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         do {

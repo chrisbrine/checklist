@@ -23,6 +23,7 @@ import unicodedata
 import uuid
 
 from verify_stage import sha, signing_teams, verify as verify_stage
+from verify_install import failure_guidance
 
 REPO = Path(__file__).resolve().parent.parent
 BASE = Path.home() / 'Library/Application Support/Checklist Test Instances'
@@ -932,7 +933,11 @@ def promote(arguments, p):
         print('Missing live-backup qualification: run a same-build live-backup-seeded slot check.')
     if not all(gates.values()): raise ValueError('Promotion refused: all gates must pass, including a live-backup-seeded check of this build. ' + RELOCATION_REQUIRED)
     if not arguments.dry_run:
-        subprocess.run(command, check=True)
+        install_started = time.time()
+        try:
+            subprocess.run(command, check=True)
+        except subprocess.CalledProcessError as error:
+            raise ValueError('Promotion: install ran; installed verification failed.\n' + failure_guidance(install_started)) from error
         print('Promoted build ' + selected['build_id'] + '; installed app and service verification passed.')
 
 

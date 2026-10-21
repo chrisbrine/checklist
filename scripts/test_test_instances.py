@@ -931,15 +931,100 @@ class InstalledVerificationTests(unittest.TestCase):
     def status(self):
         return {'data': {'name': 'Checklist', 'version': '0.1.0', 'capabilities': ['durable_store']}}
 
-    def test_zero_exit_recovery_unavailable_error_and_malformed_status_are_failures(self):
+    class Clock:
+        def __init__(self): self.now = 0; self.sleeps = []
+        def monotonic(self): return self.now
+        def sleep(self, seconds): self.sleeps.append(seconds); self.now += seconds
+
+    def assert_safe_guidance(self, text):
+        self.assertIn('installed bundle and the store were kept', text)
+        self.assertIn('checklist service status', text)
+        self.assertIn('service log', text)
+        self.assertIn('restore of its protected pre-upgrade generation', text)
+        self.assertIn('not the previous bundle', text)
+        self.assertNotIn('bundle rollback only', text)
+
+    def test_zero_exit_recovery_error_and_malformed_status_are_immediate_failures(self):
         target = Path('/synthetic/Checklist.app');paths = [str(target / 'Contents/MacOS/ChecklistApp')]
         for payload in [dict(self.status(), error={}), {'data': dict(self.status()['data'], state='recovery_required')},
-                        {'data': dict(self.status()['data'], state='unavailable')}, {'data': {'error': 'failure'}}, {}, None]:
+                        dict(self.status(), state='recovery_required'),
+                        {'data': dict(self.status()['data'], state='failed')}, {'data': {'error': 'failure'}}, {}, None]:
             with self.subTest(payload=payload):
+                clock = self.Clock();calls = []
                 response = subprocess.CompletedProcess([], 0, stdout=json.dumps(payload))
-                with self.assertRaises(ValueError): verify_install.verify(target, paths, lambda *a, **k: response)
+                def runner(*args, **kwargs): calls.append(kwargs);return response
+                with self.assertRaises(ValueError):
+                    verify_install.verify(target, paths, runner, clock=clock.monotonic, sleep=clock.sleep)
+                self.assertEqual(len(calls), 1);self.assertEqual(clock.now, 0)
         for response in [subprocess.CompletedProcess([], 0, stdout='not json'), subprocess.CompletedProcess([], 1, stdout=json.dumps(self.status()))]:
             with self.assertRaises(ValueError): verify_install.verify(target, paths, lambda *a, **k: response)
+
+    def test_first_start_timeouts_and_unavailable_then_healthy(self):
+        target = Path('/synthetic/Checklist.app');clock = self.Clock();timeouts = [];progress = []
+        responses = iter(['timeout'] * 4 + [
+            {'data': {'state': 'unavailable'}}, {'error': {'code': 'SERVICE_UNAVAILABLE'}}, self.status()])
+        def runner(command, **kwargs):
+            self.assertEqual(command, [str(target / 'Contents/MacOS/checklist'), 'service', 'status'])
+            timeouts.append(kwargs['timeout']);response = next(responses)
+            if response == 'timeout':
+                clock.now += kwargs['timeout']
+                raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(response))
+        result = verify_install.verify(target, [str(target / 'Contents/MacOS/ChecklistApp')], runner,
+                                       clock=clock.monotonic, sleep=clock.sleep, progress=progress.append)
+        self.assertEqual(result['service_state'], 'healthy');self.assertEqual(len(timeouts), 7)
+        self.assertTrue(all(0 < value <= 30 for value in timeouts))
+        self.assertGreaterEqual(len(progress), 2);self.assertTrue(all('still starting' in line for line in progress))
+
+    def test_deadline_expires_with_safe_guidance_and_caps_last_call(self):
+        target = Path('/synthetic/Checklist.app');clock = self.Clock();timeouts = []
+        def runner(command, **kwargs):
+            timeouts.append(kwargs['timeout']);clock.now += kwargs['timeout']
+            raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+        with patch.dict(os.environ, {'CHECKLIST_VERIFY_DEADLINE_SECONDS': '61'}):
+            with self.assertRaises(ValueError) as error:
+                verify_install.verify(target, [str(target / 'Contents/MacOS/ChecklistApp')], runner,
+                                      clock=clock.monotonic, sleep=clock.sleep, progress=lambda line: None)
+        self.assertEqual(clock.now, 61);self.assertEqual(timeouts, [30, 26])
+        self.assertIn('61 seconds', str(error.exception));self.assert_safe_guidance(str(error.exception))
+
+    def test_unavailable_waits_to_minimum_deadline_and_default_is_45_minutes(self):
+        target = Path('/synthetic/Checklist.app');paths = [str(target / 'Contents/MacOS/ChecklistApp')]
+        for environment, expected in [({'CHECKLIST_VERIFY_DEADLINE_SECONDS': '1'}, 60), ({}, 2700)]:
+            with self.subTest(environment=environment), patch.dict(os.environ, environment, clear=True):
+                clock = self.Clock()
+                response = subprocess.CompletedProcess([], 1, stdout='', stderr='Checklist: SERVICE_UNAVAILABLE: not responding')
+                with self.assertRaises(ValueError):
+                    verify_install.verify(target, paths, lambda *a, **k: response,
+                                          clock=clock.monotonic, sleep=clock.sleep, progress=lambda line: None)
+                self.assertEqual(clock.now, expected)
+
+    def test_installed_process_disappearing_during_startup_fails_without_another_call(self):
+        target = Path('/synthetic/Checklist.app');clock = self.Clock()
+        with patch.object(verify_install, 'executable_paths', side_effect=[iter([str(target / 'Contents/MacOS/ChecklistApp')]), iter([])]), \
+             patch.object(verify_install.subprocess, 'run', side_effect=subprocess.TimeoutExpired('status', 30)) as runner:
+            with self.assertRaisesRegex(ValueError, 'exact installed Checklist app process'):
+                verify_install.verify(target, runner=runner, clock=clock.monotonic, sleep=clock.sleep)
+            self.assertEqual(runner.call_count, 1)
+
+    def test_guidance_names_only_newest_completed_snapshot_created_since_install(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory);snapshots = []
+            for name in ['old', 'middle', 'latest', 'incomplete']:
+                snapshot = data / 'backups' / ('snapshot-' + name);snapshot.mkdir(parents=True)
+                if name != 'incomplete': (snapshot / 'manifest.json').write_text('{}')
+                snapshots.append(snapshot)
+            started = snapshots[0].stat().st_birthtime + 0.000001
+            # Give the two completed new snapshots deterministic creation times.
+            original = Path.stat
+            def metadata(path, *args, **kwargs):
+                if path in snapshots:
+                    return SimpleNamespace(st_birthtime=[started - 10, started + 10, started + 20, started + 30][snapshots.index(path)])
+                return original(path, *args, **kwargs)
+            with patch.object(Path, 'stat', metadata):
+                guidance = verify_install.failure_guidance(started, data_root=data)
+            self.assert_safe_guidance(guidance);self.assertIn(str(snapshots[2]), guidance)
+            for snapshot in [snapshots[0], snapshots[1], snapshots[3]]: self.assertNotIn(str(snapshot), guidance)
 
     def test_exact_installed_process_and_healthy_service_are_both_required(self):
         target = Path('/Applications/Checklist.app')
@@ -968,13 +1053,14 @@ raise SystemExit(int(os.environ['VERIFY_EXIT']))
             for mode, code in [('--verify', 0), ('--install-stage', 0), ('--verify', 1), ('--install-stage', 1), ('--install', 1)]:
                 trace.write_text('')
                 environment = dict(os.environ, MODE=mode, ROOT_DIR=str(harness.REPO), DEST=str(base / 'installed.app'),
-                                   HAD_PREVIOUS='1', PREVIOUS=str(previous), VERIFY_TRACE=str(trace), VERIFY_EXIT=str(code), PATH=str(binary) + os.pathsep + os.environ['PATH'])
+                                   HAD_PREVIOUS='1', PREVIOUS=str(previous), INSTALL_STARTED='1234', VERIFY_TRACE=str(trace), VERIFY_EXIT=str(code), PATH=str(binary) + os.pathsep + os.environ['PATH'])
                 result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block], env=environment, text=True, capture_output=True)
                 self.assertTrue(previous.is_dir())
                 calls = trace.read_text().splitlines()
-                self.assertEqual(len(calls), 0 if mode == '--install' else 1)
+                self.assertEqual(len(calls), 0 if mode == '--install' else (2 if code else 1))
                 if mode != '--install' and code:
                     self.assertEqual(result.returncode, 1);self.assertIn(str(previous), result.stderr)
+                    self.assert_safe_guidance(result.stderr)
                     self.assertNotIn('Installed ' + str(base / 'installed.app'), result.stdout)
                 else: self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -986,11 +1072,12 @@ raise SystemExit(int(os.environ['VERIFY_EXIT']))
             for mode in ['--verify', '--install-stage']:
                 with self.subTest(mode=mode):
                     environment = dict(os.environ, MODE=mode, ROOT_DIR=str(harness.REPO), DEST=str(base / 'installed.app'),
-                                       HAD_PREVIOUS='1', PREVIOUS=str(previous))
+                                       HAD_PREVIOUS='1', PREVIOUS=str(previous), INSTALL_STARTED='1234')
                     code = 'set -euo pipefail\npython3() { return 70; }\nsleep() { :; }\n' + block
                     result = subprocess.run(['bash', '-c', code], env=environment, text=True, capture_output=True)
                     self.assertNotEqual(result.returncode, 0)
                     self.assertTrue(previous.is_dir());self.assertIn(str(previous), result.stderr)
+                    self.assert_safe_guidance(result.stderr)
                     self.assertNotIn('Installed ' + str(base / 'installed.app'), result.stdout)
 
     def test_promotion_never_reports_success_after_installed_verification_failure(self):
@@ -998,10 +1085,13 @@ raise SystemExit(int(os.environ['VERIFY_EXIT']))
         with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()), \
              patch.object(harness, 'load', return_value=selected), patch.object(harness, 'bundle_check'), \
              patch.object(harness, 'promotion_gates', return_value={'selected_build_check': True, 'live_snapshot_check_same_build': True}), \
-             patch.object(harness.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'stub installed verification')):
+             patch.object(harness.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'stub installed verification')), \
+             patch.object(harness, 'failure_guidance', return_value=verify_install.failure_guidance(None)):
             output = io.StringIO()
-            with redirect_stdout(output), self.assertRaises(subprocess.CalledProcessError):
+            with redirect_stdout(output), self.assertRaises(ValueError) as error:
                 harness.promote(SimpleNamespace(dry_run=False), harness.checked(1))
+            self.assertIn('install ran; installed verification failed', str(error.exception))
+            self.assert_safe_guidance(str(error.exception))
             self.assertNotIn('Promoted build', output.getvalue())
 
 

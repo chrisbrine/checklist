@@ -202,6 +202,18 @@ public final class CommandRouter: @unchecked Sendable {
         guard ["owner","worker","assistant"].contains(caller.role), !caller.installation.isEmpty else { throw CoreError("FORBIDDEN", "An authenticated connection is required.") }
         guard let encoded = try? JSONSerialization.data(withJSONObject:params), encoded.count <= 2_000_000 else { throw CoreError("INVALID_INPUT", "Command input is too large or invalid.") }
         try validateInput(method,params,caller)
+        // CL-116 native owner media boundary prepares outside the ordinary writer.
+        if Self.mediaOwnerMethods.contains(method) {
+            do {
+                let value = try executeMediaOwnerChannel(method:method,params:params,caller:caller)
+                var reply: JSON = ["data":value]
+                if !Self.mediaOwnerReads.contains(method) {reply["command_id"] = params["command_id"]}
+                return reply
+            } catch let error as DatabaseError {
+                if let command = params["command_id"] as? String {throw storageOutcomeFailure(error,command:command)}
+                throw error
+            }
+        }
         let operationLease = try storageAdmission.acquire()
         defer { operationLease.finish() }
         // CL-72: a pure read runs on a read-only connection, without the object gate or the
@@ -346,5 +358,5 @@ public final class CommandRouter: @unchecked Sendable {
         guard !captures.isEmpty else { return }
         try? dbQueue.read { db in _ = self.discardUncommittedSourceCaptures(db, captures) }
     }
-    static let readMethods: Set<String> = ["cleanup_job_get","cleanup_job_list","workspace_page","service_info","tool_catalog","snapshot","changes_wait","delivery_pending","storage_status","diagnostics_summary","project_list","project_resolve","project_settings_get","policy_get","taxonomy_get","task_get","task_list","task_context","session_list","session_inbox","assistant_inbox","assistant_projects","history_list","attachment_list","attachment_read","attachment_cleanup_preview","agent_resolve","triage_list","epic_list","development_status","policy_preview","relation_list","batch_get","batch_list","source_execution_get","review_prepare","review_context"]
+    static let readMethods: Set<String> = mediaOwnerReads.union(["cleanup_job_get","cleanup_job_list","workspace_page","service_info","tool_catalog","snapshot","changes_wait","delivery_pending","storage_status","diagnostics_summary","project_list","project_resolve","project_settings_get","policy_get","taxonomy_get","task_get","task_list","task_context","session_list","session_inbox","assistant_inbox","assistant_projects","history_list","attachment_list","attachment_read","attachment_cleanup_preview","agent_resolve","triage_list","epic_list","development_status","policy_preview","relation_list","batch_get","batch_list","source_execution_get","review_prepare","review_context"])
 }

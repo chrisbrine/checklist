@@ -10,6 +10,7 @@ struct PreparedMediaResources {
         let prepared: ManagedAttachmentPreparation
         let encodedReceipt: String
     }
+    var nativeOwnerProjection = false
     var preview: [JSON] = []
     var captures: [String:Capture] = [:]
     var errors: [String:String] = [:]

@@ -12,6 +12,10 @@ public struct ChecklistInstance {
     public let keychainService: String
     public let root: URL
     public let ownerDataRoot: URL
+    public var cachesRoot: URL {
+        guard slot != nil else { return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0] }
+        return root.deletingLastPathComponent().appendingPathComponent("caches", isDirectory: true)
+    }
     public var bundleFileName: String { displayName + ".app" }
     public var ownerPathSuffix: String { "/" + bundleFileName + "/Contents/MacOS/ChecklistApp" }
     public var ownerRequirement: String { "identifier \"\(bundleIdentifier)\"" }

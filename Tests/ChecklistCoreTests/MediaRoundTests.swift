@@ -262,7 +262,7 @@ final class MediaRoundTests: XCTestCase {
         // A type name such as Owner/Reviewer has no effect on this worker's authority.
         let named = try f.type(adopt:false,as:f.worker);XCTAssertEqual(named["origin"] as? String,"agent")
     }
-    func testTokensBindCallerRoundGrantAndIncarnationAndPublicDispatchStaysDisabled() throws {
+    func testTokensBindCallerRoundGrantAndIncarnationAndWorkerDispatchStaysDisabled() throws {
         let f = try Fixture(),t = try f.type(schema()),r = try f.round(t);_ = try f.item(r);let published = try f.publish(r)
         let workerView = try f.get(r,as:f.worker)
         var p = f.decisionParams(published);p["observed_context_token"] = workerView["observed_context_token"]
@@ -277,7 +277,7 @@ final class MediaRoundTests: XCTestCase {
         XCTAssertNotEqual((try f.get(r,as:f.worker))["observed_context_token"] as? String,workerView["observed_context_token"] as? String)
         let assistant = Caller(role:"assistant",installation:"assistant",projectIDs:[f.project],assistantGrants:[f.project:["read":true]])
         checkError("FORBIDDEN") {try f.get(r,as:assistant)}
-        checkError("UNSUPPORTED_METHOD") {try f.router.handle(method:"media_round_create",params:["command_id":uuid(),"project_id":f.project,"type_id":t["id"]!,"title":"Cannot dispatch"],caller:f.owner)}
+        checkError("FORBIDDEN") {try f.router.handle(method:"media_round_create",params:["command_id":uuid(),"project_id":f.project,"type_id":t["id"]!,"title":"Cannot dispatch"],caller:f.worker)}
         let catalog = try f.router.handle(method:"tool_catalog",params:[:],caller:f.worker)
         XCTAssertFalse(try jsonString(catalog).contains("media_round_create"));XCTAssertFalse(try jsonString(catalog).contains("media_decide"))
     }

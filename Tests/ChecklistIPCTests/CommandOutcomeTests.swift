@@ -8,7 +8,7 @@ final class CommandOutcomeTests: XCTestCase {
     var router: CommandRouter!
     let owner = Caller(role: "owner", installation: "disposable-outcome-test", projectIDs: [])
     override func setUpWithError() throws {
-        let parent=FileManager.default.urls(for:.cachesDirectory,in:.userDomainMask).first!.appendingPathComponent("ChecklistSyntheticTests")
+        let parent=FileManager.default.temporaryDirectory.appendingPathComponent("ChecklistSyntheticTests")
         try FileManager.default.createDirectory(at:parent,withIntermediateDirectories:true)
         root=parent.appendingPathComponent("command-outcome-"+UUID().uuidString);router=try CommandRouter(root:root)
     }

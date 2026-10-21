@@ -27,6 +27,10 @@ public actor Bridge {
     private let requestedWorkspace: String
     private let assistantProject: String?
     private let command: String
+    private let installation: String
+    private var delegating = false
+    private var launchState = ShimLaunchState.current
+    private var updateNoticePending = false
     private var bootstrapResponse: Value?
     private var registryStart = ClaudeRegistryStart()
     private(set) var setupNotice: String?
@@ -41,6 +45,7 @@ public actor Bridge {
         requestedWorkspace = configuration.workspace
         assistantProject = configuration.assistantProject
         command = configuration.command
+        installation = configuration.installation
     }
 
     public func reportStartupNotice() {
@@ -48,6 +53,8 @@ public actor Bridge {
     }
 
     public func connect(required: Bool = false) throws -> Value? {
+        checkInstalledBuild()
+        if delegating { return nil }
         if let bootstrapResponse { return bootstrapResponse }
         guard automatic else {
             if required { throw BridgeError("Automatic connection uses the current native conversation; omit --installation.") }
@@ -89,6 +96,10 @@ public actor Bridge {
         }
         let response: [String: Any]
         do { response = try client.bootstrap(nativeContext, timeBudget: timeBudget) }
+        catch let error as ChecklistError where error.code == ClientUpdateRequired.code && environment.shimUpdate != nil {
+            checkInstalledBuild(force: true, refused: true)
+            return nil
+        }
         catch let error as ChecklistError where UnregisteredWorkspaceStart.applies(errorCode: error.code, command: command, assistantRelay: assistantProject != nil) {
             // Nothing was enrolled. Stay unbound instead of borrowing a stored legacy credential.
             client = environment.makeClient(.init(workspace: context.workspacePath, usesStoredCredential: false))
@@ -112,10 +123,16 @@ public actor Bridge {
     }
 
     func retryConnection() -> Bool {
+        checkInstalledBuild()
+        if delegating { return false }
         var start = registryStart
-        let changed = start.retry(now: environment.now, discover: { self.discover() }, bootstrap: {
-            let response = try self.bootstrap($0, required: true)
-            try self.verifyBoundSession()
+        let changed = start.retry(now: environment.now, discover: { self.discover() }, bootstrap: { observed -> Value? in
+            let response = try self.bootstrap(observed, required: true)
+            do { try self.verifyBoundSession() }
+            catch let error as ChecklistError where error.code == ClientUpdateRequired.code && self.environment.shimUpdate != nil {
+                self.checkInstalledBuild(force: true, refused: true)
+                return nil
+            }
             return response
         })
         registryStart = start
@@ -129,7 +146,10 @@ public actor Bridge {
 
     public func verifySession() throws {
         guard registryStart.error == nil else { return }
-        try verifyBoundSession()
+        do { try verifyBoundSession() }
+        catch let error as ChecklistError where error.code == ClientUpdateRequired.code && environment.shimUpdate != nil {
+            checkInstalledBuild(force: true, refused: true)
+        }
         reportConnectionRecovery()
     }
 
@@ -140,7 +160,7 @@ public actor Bridge {
     }
 
     private func verifyBoundSession() throws {
-        guard let expectedSession else { return }
+        guard !delegating, let expectedSession else { return }
         let info = responseData(try client.call("service_info"))
         let caller = info["caller"] as? [String: Any]
         let boundSession = info["session_id"] as? String ?? caller?["session_id"] as? String
@@ -186,6 +206,10 @@ public actor Bridge {
     }
 
     func tools() throws -> [Tool] {
+        try forward(current: { try localTools() }, delegate: { try delegateTools() })
+    }
+
+    private func localTools() throws -> [Tool] {
         // No project tool is advertised before an actual enrollment exists.
         if let connectionNotice { return ClaudeRegistryStart.limitedToolNames.map { Self.limitedServiceInfo(connectionNotice, name: $0) } }
         if let setupNotice { return [Self.limitedServiceInfo("Read limited local service status. " + setupNotice)] }
@@ -207,9 +231,13 @@ public actor Bridge {
     }
 
     public func call(_ name: String, _ arguments: Value) throws -> Value {
+        try forward(current: { try localCall(name, arguments) }, delegate: { try delegateCall(name, arguments) })
+    }
+
+    private func localCall(_ name: String, _ arguments: Value) throws -> Value {
         if let error = registryStart.error, !ClaudeRegistryStart.limitedToolNames.contains(name) { throw error }
         // Discovery repeats for every call: cached schemas never preserve a revoked role.
-        let available = try tools()
+        let available = try localTools()
         guard available.contains(where: { $0.name == name }) else {
             throw BridgeError("METHOD_UNAVAILABLE: This tool is unavailable to the paired connection: \(name)")
         }
@@ -220,7 +248,8 @@ public actor Bridge {
     }
 
     public func serviceInfo() throws -> Value {
-        try mcpValue(withSetupNotice(client.call("service_info")))
+        try forward(current: { try mcpValue(withSetupNotice(client.call("service_info"))) },
+                    delegate: { try delegateCall("service_info", .object([:])) })
     }
 
     // The limited start can only reach service_info; its result says why no project is bound.
@@ -236,11 +265,105 @@ public actor Bridge {
     }
 
     func resources() throws -> [Resource] {
+        try forward(current: { try resourceCatalog(localTools()) }, delegate: { try resourceCatalog(delegateTools()) })
+    }
+
+    private func resourceCatalog(_ tools: [Tool]) -> [Resource] {
         var resources = [Resource(name: "Checklist service", uri: "checklist://service/status", description: "Limited local service and current paired capability status", mimeType: "application/json")]
-        if try tools().contains(where: { $0.name == "project_list" }) {
+        if tools.contains(where: { $0.name == "project_list" }) {
             resources.append(Resource(name: "Granted projects", uri: "checklist://projects", description: "Projects accessible to this enrolled connection", mimeType: "application/json"))
         }
         return resources
+    }
+
+
+    private func checkInstalledBuild(force: Bool = false, refused: Bool = false) {
+        guard let update = environment.shimUpdate else { return }
+        launchState = update.check(force)
+        if refused || launchState != .current {
+            if !delegating { delegating = true; updateNoticePending = true }
+        }
+    }
+
+    func takeUpdateNotice() -> Bool {
+        guard updateNoticePending else { return false }
+        updateNoticePending = false
+        return true
+    }
+
+    private func forward<T>(current: () throws -> T, delegate: () throws -> T) throws -> T {
+        if delegating { return try delegate() }
+        do { return try current() }
+        catch let error as ChecklistError where error.code == ClientUpdateRequired.code && environment.shimUpdate != nil {
+            checkInstalledBuild(force: true, refused: true)
+            return try delegate()
+        }
+    }
+
+    private func delegate(_ route: [String], input: Data? = nil, commandID: String? = nil) throws -> Data {
+        guard let update = environment.shimUpdate, launchState != .unavailable else { throw ClientUpdateRequired.error }
+        var arguments = route + ["--workspace", requestedWorkspace]
+        if let expectedSession { arguments += ["--session", expectedSession] }
+        if !automatic { arguments += ["--installation", installation] }
+        if let assistantProject { arguments += ["--assistant", "--project", assistantProject] }
+        let result: ShimChildResult
+        do { result = try update.run(arguments, input) }
+        catch is ShimInstanceRefusal { throw ClientUpdateRequired.error }
+        catch is ShimChildInstanceMismatch {
+            var details = DelegateInstanceExpectation.mismatch.details
+            if let commandID { details["command_id"] = commandID }
+            throw ChecklistError(DelegateInstanceExpectation.mismatch.code, DelegateInstanceExpectation.mismatch.message, details: details)
+        }
+        catch let error as ShimChildLaunchError {
+            var details: [String: Any] = ["command_outcome": "not_sent", "command_executed": false]
+            if let commandID { details["command_id"] = commandID }
+            throw ChecklistError("DELEGATE_LAUNCH_FAILED", "Cannot start the installed Checklist CLI: " + error.underlying.localizedDescription + " No command ran.", details: details)
+        }
+        catch { throw CommandReply.unknown(commandID: commandID, reason: "delegate_ended") }
+        guard result.termination == .exited else { throw CommandReply.unknown(commandID: commandID, reason: "delegate_ended") }
+        if result.status == 0,
+           (try? JSONSerialization.jsonObject(with: result.stdout, options: [.fragmentsAllowed])) != nil {
+            return result.stdout
+        }
+        if result.status == 1, let failure = Self.cliError(result.stderr) {
+            if failure.code == "DELEGATE_INSTANCE_MISMATCH" {
+                var details = DelegateInstanceExpectation.mismatch.details
+                if let commandID { details["command_id"] = commandID }
+                throw ChecklistError(failure.code, failure.message, details: details)
+            }
+            let bytes = try jsonData(["error": ["code": failure.code, "message": failure.message]])
+            _ = try CommandReply.decode(bytes, method: "", commandID: commandID)
+        }
+        throw CommandReply.unknown(commandID: commandID, reason: "delegate_ended")
+    }
+
+    /// Only the final CLI error line is a result. Earlier lines are diagnostics.
+    private static func cliError(_ stderr: String) -> (code: String, message: String)? {
+        guard let line = stderr.split(whereSeparator: \.isNewline).last,
+              line.hasPrefix("Checklist: ") else { return nil }
+        let body = line.dropFirst("Checklist: ".count)
+        guard let separator = body.range(of: ": ") else { return nil }
+        let code = String(body[..<separator.lowerBound]), message = String(body[separator.upperBound...])
+        guard let first = code.utf8.first, (65...90).contains(first), !message.isEmpty,
+              code.utf8.allSatisfy({ (65...90).contains($0) || (48...57).contains($0) || $0 == 95 }) else { return nil }
+        return (code, message)
+    }
+
+    private func delegateTools() throws -> [Tool] {
+        struct Catalog: Decodable { let tools: [Tool] }
+        return try JSONDecoder().decode(Catalog.self, from: delegate(["tools"])).tools
+    }
+
+    private func delegateCall(_ name: String, _ arguments: Value) throws -> Value {
+        guard case .object = arguments else { throw BridgeError("Tool arguments must be a JSON object.") }
+        let data = try JSONEncoder().encode(arguments)
+        guard data.count <= CallArgumentInput.limit else {
+            throw ChecklistError("TOO_LARGE", "Input exceeds 1 MiB; no command ran.", details: ["command_outcome": "not_sent", "command_executed": false])
+        }
+        let commandID: String?
+        if case .object(let values) = arguments, case .string(let id)? = values["command_id"] { commandID = id }
+        else { commandID = nil }
+        return try JSONDecoder().decode(Value.self, from: delegate(["call", name, "-"], input: data, commandID: commandID))
     }
 
     func readResource(_ uri: String) throws -> Value {

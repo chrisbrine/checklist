@@ -1,8 +1,21 @@
 import Foundation
 import MCP
 import ChecklistBridges
+import ChecklistIPC
 
 public enum ChecklistMCPServer {
+    private static func request<T>(server: Server, bridge: Bridge, body: () async throws -> T) async throws -> T {
+        if await bridge.retryConnection() { try await server.notify(ToolListChangedNotification.message()) }
+        do {
+            let result = try await body()
+            if await bridge.takeUpdateNotice() { try await server.notify(ToolListChangedNotification.message()) }
+            return result
+        } catch {
+            if await bridge.takeUpdateNotice() { try? await server.notify(ToolListChangedNotification.message()) }
+            throw error
+        }
+    }
+
     public static func start(bridge: Bridge, transport: any Transport = StdioTransport()) async throws -> Server {
         _ = try await bridge.connect()
         try await bridge.verifySession()
@@ -16,32 +29,41 @@ public enum ChecklistMCPServer {
             capabilities: .init(resources: .init(subscribe: false, listChanged: false), tools: .init(listChanged: true))
         )
         await server.withMethodHandler(ListTools.self) { parameters in
-            if await bridge.retryConnection() { try await server.notify(ToolListChangedNotification.message()) }
-            guard parameters.cursor == nil else { throw MCPError.invalidParams("This catalog is a single page; no cursor is accepted.") }
-            return .init(tools: try await bridge.tools())
+            try await request(server: server, bridge: bridge) {
+                guard parameters.cursor == nil else { throw MCPError.invalidParams("This catalog is a single page; no cursor is accepted.") }
+                return .init(tools: try await bridge.tools())
+            }
         }
         await server.withMethodHandler(CallTool.self) { parameters in
             do {
-                if await bridge.retryConnection() { try await server.notify(ToolListChangedNotification.message()) }
-                let result = try await bridge.call(parameters.name, .object(parameters.arguments ?? [:]))
+                let result = try await request(server: server, bridge: bridge) {
+                    try await bridge.call(parameters.name, .object(parameters.arguments ?? [:]))
+                }
                 let json = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
                 var content: [Tool.Content] = []
                 if let envelope = try jsonObject(result) as? [String:Any],let notice = HumanAnswerNoticePresentation.text(in:envelope) { content.append(.text(text:notice,annotations:nil,_meta:nil)) }
                 content.append(.text(text:json,annotations:nil,_meta:nil))
                 return CallTool.Result(content:content, structuredContent:.some(result), isError:false)
             } catch {
-                let errorResult: Value = .object(["error": .object(["message": .string(error.localizedDescription)])])
+                var fields: [String: Value] = ["message": .string(error.localizedDescription)]
+                if let failure = error as? ChecklistError {
+                    fields["code"] = .string(failure.code)
+                    fields["details"] = try? mcpValue(failure.details)
+                }
+                let errorResult: Value = .object(["error": .object(fields)])
                 return CallTool.Result(content: [.text(text: error.localizedDescription, annotations: nil, _meta: nil)], structuredContent: .some(errorResult), isError: true)
             }
         }
         await server.withMethodHandler(ListResources.self) { parameters in
-            if await bridge.retryConnection() { try await server.notify(ToolListChangedNotification.message()) }
-            guard parameters.cursor == nil else { throw MCPError.invalidParams("This resource catalog is a single page.") }
-            return .init(resources: try await bridge.resources())
+            try await request(server: server, bridge: bridge) {
+                guard parameters.cursor == nil else { throw MCPError.invalidParams("This resource catalog is a single page.") }
+                return .init(resources: try await bridge.resources())
+            }
         }
         await server.withMethodHandler(ReadResource.self) { parameters in
-            if await bridge.retryConnection() { try await server.notify(ToolListChangedNotification.message()) }
-            let value = try await bridge.readResource(parameters.uri)
+            let value = try await request(server: server, bridge: bridge) {
+                try await bridge.readResource(parameters.uri)
+            }
             let text = String(decoding: try JSONEncoder().encode(value), as: UTF8.self)
             return .init(contents: [.text(text, uri: parameters.uri, mimeType: "application/json")])
         }

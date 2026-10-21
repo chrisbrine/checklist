@@ -26,7 +26,7 @@ struct ContentView: View {
             GeometryReader { geometry in
                 ZStack(alignment: .trailing) {
                     VStack(spacing: Spacing.none) {
-                        if store.projectID != nil && [.tasks, .epics, .archived].contains(store.page) { ProjectWorkspaceTabs() }
+                        if store.projectID != nil && [.tasks, .epics, .media, .archived].contains(store.page) { ProjectWorkspaceTabs() }
                         mainContent.frame(maxWidth: .infinity, maxHeight: .infinity)
                     }.frame(maxWidth: .infinity, maxHeight: .infinity)
                     if let detail = store.detail {
@@ -97,6 +97,8 @@ struct ContentView: View {
             }
         }
         .task { await store.startLiveUpdates() }
+        .task(id: store.projectID) { await store.mediaReview.connect(store:store) }
+        .onChange(of: store.archivePreviewEpoch) { _, _ in Task { await store.mediaReview.refresh() } }
         .onAppear {
             QuickCaptureController.shared.openMainWindow = { [openWindow] in openWindow(id: "main") }
             DockBadge.apply(count: store.needsCount)
@@ -128,6 +130,7 @@ struct ContentView: View {
         case .tasks, .archived: VStack(spacing: Spacing.none) { ArchivedProjectNotice(); TaskWorkspaceView() }
         case .needsYou: NeedsYouView()
         case .epics: VStack(spacing: Spacing.none) { ArchivedProjectNotice(); EpicWorkspaceView() }
+        case .media: MediaReviewWorkspace(model:store.mediaReview)
         case .activity: ActivityView()
         }
     }
