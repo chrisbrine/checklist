@@ -1,0 +1,16 @@
+{
+  "project_id": "synthetic-project",
+  "command_id": "126d5f3d-e768-421a-8b59-7613142476dc",
+  "tasks": [
+    {
+      "task_id": "synthetic-ticket-one",
+      "expected_revision": 3
+    },
+    {
+      "task_id": "synthetic-ticket-two",
+      "expected_revision": 7
+    }
+  ],
+  "preview": true,
+  "original_command_id": "53c7c3d2-4066-4b75-8cc0-340e9aac0bb3"
+}

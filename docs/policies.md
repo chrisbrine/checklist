@@ -1,0 +1,69 @@
+# Project rules and assignment
+
+Checklist resolves a small project preset plus bounded task-kind exceptions. Policy is validated data, not a routing language. Agents apply it with `policy_apply` and a reason, recorded as agent changes; the owner can also apply it in the app. A project policy field `agent_rule_changes` (`allowed` by default, or `owner_only`) decides whether agents may change rules and settings, and only the owner can change that field. An agent that holds active work in the project can apply rule changes only to future attempts (`mode=future_attempts`), so it never revises the contract of its own active work. Provider preferences never launch a model, switch a running model, enroll a session or grant access. Personal-assistant integration remains deferred and absent from these work settings.
+
+## Presets and bounded exceptions
+
+| Preset | Default roles |
+|---|---|
+| Shared work (`shared`) | Codex or Claude can coordinate, implement and independently review. |
+| Claude coordinates / Codex works (`claude_coordinates`) | Claude coordinates; Codex implements; eligible independent Codex or Claude reviews. |
+| Codex-led (`codex_led`) | Codex coordinates and implements; eligible independent Codex or Claude reviews. |
+
+`allowed_providers` contains only implemented Codex/Claude work providers. Each role can further restrict its providers and record a preferred provider or model names. Every preferred provider must already be eligible. Preferences describe selection; the actual host still selects its model. Only actual enrolled worker sessions with current project grants can claim work. An optional `coordinator_session_id` selects an existing eligible enrolled worker for context copies; it grants no work authority or new enrollment.
+
+`task_kind_overrides` contains at most one entry for each Work, Bug, Asset, Playtest or Question kind. Its optional coordinator/implementer/reviewer rules replace that kind's corresponding base role rule. Its optional `required_gates` replaces the base gate list for that kind. Providers remain inside the participating project set. This allows a Codex-led project to select Claude for Assets without enabling another runtime. The [runtime schema](../contracts/project-policy.schema.json) and [synthetic example](../examples/project-policy.json) match the current service.
+
+A planned agent assignment must select an already eligible provider or actual enrolled session and include `assignment_reason`. The service records the actual actor, human/agent origin, time and policy revision; client-supplied prose cannot mint provenance. Human assignment stays separate from worker pickup. Assistant-only connections cannot become assignees, coordinators or reviewers.
+
+## Review handling shared by every project
+
+The shared coordinator default is at most 10 distinct implementation tickets in flight. A ticket occupies its slot through submission, independent review and failed-case rework until Done or an explicit deferral/release. Review finished implementations promptly and complete passing tickets independently before picking up replacements; a subtask, prepared patch or evidence packet is not a completed ticket. Finish an inherited cohort above the limit before new pickup. Explicit project workflow instructions can override this handling limit. It is coordinator guidance, not a new server-enforced claim limit or reviewer-subagent limit.
+
+The shared default is `review_batch_policy: complete_passing_independently`: review each ticket's exact submitted target, complete tickets whose own required gates pass, and continue implementation or repeat review only for failed or remaining tickets. One failed ticket does not reopen a different passing ticket. A new target, changed acceptance or explicit owner direction can still invalidate that ticket's own evidence.
+
+The same failed-only default applies to individual acceptance items and test/inspection cases. After repair, run only failed, inconclusive or materially affected cases and carry passing evidence whose relevant source, requirements, fixture/harness and environment inputs remain valid. A fixture-only repair does not require a fresh all-green suite run. Before broader checks, identify the named affected cases and invalidating inputs or the applicable explicit effective project workflow/context instruction; Triage/batch membership or a sibling failure is no override. Reports distinguish carried results with original producer, target and hash from new execution. Carried checks do not transfer old verdicts or approvals; every current target still needs its fresh required gates and assessment.
+
+A project can explicitly select `hold_passing_for_batch` when its production workflow needs a batch hold. The override changes handling, never review independence, exact-target validity or a ticket's required gates. Group Done remains an atomic command over all current members; individual passing tickets may be completed separately under the shared default. Any individual status action removes the ticket from all current Triages. Epics remain stable subprojects.
+
+This build supports `review` and exact-target `human_approval` gates. Other gates in the wider design require their own implemented evidence/qualification paths before policy can select them. A simple Question can use a recorded answer instead of a fictitious code artifact. Other human-assigned work needs explicit `allow_human_decision_evidence: true`, optionally bounded to a task kind; default technical work still requires a real source or artifact target. No preset creates a gate that silently does nothing.
+
+## Revisioned review requirements
+
+`review_requirements` stores complete `default` and `kind_overrides` rules separately from provider/gate overrides. A rule contains up to 20 ordered checks (`id`, `text`), a nonblank `reject_bar`, and zero to four `required_evidence_types`. IDs are opaque exact UTF-8 bytes, at most 256 bytes; check text is at most 2000 bytes and reject guidance at most 4000 bytes. Supported kinds are Work, Bug, Asset, Playtest and Question. A kind rule replaces the whole default rule; deleting it resets that kind to inheritance. An absent default uses generic acceptance/project checks and honest reject/block guidance, with no extra evidence classes. The invariant that a passing reviewer supplies its own managed evidence remains separate.
+
+Every new agent review claim, including an atomic batch member claim, records a separate applied requirement snapshot from the current policy revision. The snapshot includes the retained full policy hash, project/kind, canonical resolved requirement and deterministic requirement digest. The implementation manifest's gate policy remains pinned to its original round. Future settings edits do not change an active review's applied rubric or any recorded verdict. New reviews use the then-current requirement revision. A legacy active review without an applied snapshot must preserve evidence, release and acquire a fresh review; the service never reconstructs its requirement from today's policy. Existing historical verdicts remain unchanged. Trusted human approval is an existing separate gate, not a newly qualified rubric path.
+
+`review_context` exposes the applied snapshot and a selected-evidence preflight before a verdict. Pre-claim preparation is only a preview; refresh context after claiming. Classes are established from selected, scoped, available hash-verified bytes and service provenance:
+
+- `reviewer_report`: bounded UTF-8 report minted by `review_evidence_add` for this exact reviewer attempt and target.
+- `source_capture`: the exact immutable target capture, validated by the existing source-evidence path.
+- `image`: an actual decodable image, at most 16 MiB and 64 million pixels; names/extensions alone do not qualify.
+- `text_record`: valid UTF-8 bytes, at most 1 MiB.
+
+A report can also be a text record. A decision reference supplies none of these four classes. Unselected attachments do not fill a gap. Classes establish byte/provenance shape only; an image is not proof of native observation, a text record is not a successful test, and no class confers authority or approval. A pass is refused before storage when required selected classes are missing or ambiguous; reject/blocked outcomes can retain an honest gap report. All existing acceptance/project/captured-instruction assessments and exact-target/independence gates still apply.
+
+The initial service integration accepts rubric changes only with `future_attempts`. A rubric-changing `checkpoint_active` request fails with `REVIEW_REQUIREMENT_RECONCILIATION_UNSUPPORTED` before applying settings. Same-gate active rubric reconciliation needs a separate explicit implementation; unrelated existing checkpoint policy changes retain their existing path.
+
+## Preview, application and active work
+
+`policy_preview` reports affected queued tickets, current manifests, active attempts, before/after gates, current eligible implementers, revoked service authority and required acknowledgments. `policy_propose` retains that preview with an opaque proposal ID and digest. The owner, or an agent while `agent_rule_changes` is `allowed`, can apply its unchanged ID/digest; a changed project or affected work rejects the stale preview and preserves the draft. An agent-applied change keeps agent provenance and never becomes an owner decision. The trusted app can also submit a fully validated policy directly; the same preview and application checks run in its transaction.
+
+Two application modes preserve explicit completion contracts:
+
+- `future_attempts` applies selection and gates to new work rounds. Existing rounds retain their captured gate contract and immutable submitted evidence. A newly claimed review separately pins the current review requirements; an already active review retains its applied rubric.
+- `checkpoint_active` records a pending policy revision for current work and submitted rounds, queues a visible control note and blocks further submission, verdict or completion. The current handler saves a checkpoint and explicitly acknowledges the revised contract with a reason. A submitted round without a handler requires the owner to acknowledge its task revision. Existing manifests/verdicts remain historical facts; any newly required gate receives a new exact-target review request.
+
+Removing provider/role authority applies immediately in either mode. A denied attempt keeps its scope and warning until explicit recovery verifies the external process. Checklist cannot stop an external process by declaring it revoked. Checkpoints and release/recovery remain available to preserve evidence and report what actually happened. Re-enabling a preference does not resurrect an authority-revoked claim.
+
+Policy snapshots are immutable. Older stores recover original policies only from retained revisions or durable original command outcomes; they never guess an old contract from today's settings. A checkpoint reconciliation records an explicit current contract separately from its immutable manifest. Cosmetic status names, icons and accents do not alter review evidence.
+
+Project identity, capture hints, default view, alert override and production context use canonical [project settings](project-customization.md). Statuses/tags use canonical taxonomy revisions. Writable roots, native identity, session grants, trusted human authorship, atomic claims, immutable history and truthful delivery remain product invariants that policy cannot edit. Installation-specific build/install grants and the wider future integration gates remain separate from a project's workflow preset.
+
+## Involved-session coordination
+
+Routine coordination between actual enrolled sessions involved in the same authorized Checklist project, task or Triage has standing authorization and needs no per-message permission question. Use existing scope/grants and current handler/session identities; a message never enrolls a session, launches a model, changes an assignee or expands authority. This shared handling rule does not replace role or recipient-grant checks, and assistant integration remains deferred.
+
+Coordinators and workers record who is waiting on their work, including active tickets held by a temporary coordination dependency. Before concluding completion, handoff or a meaningful blocker change, they record the outcome on affected waiting tickets and notify their current handlers through the existing Checklist conversation/outbox. A source-ticket status change or final source-chat reply alone does not notify a waiter. One concise scoped note should serve both history and delivery; reuse matching receipts and avoid duplicate broadcasts or unchanged reminders. The notice records the source/result, relevant evidence and next permitted step; it grants no authority and does not automatically resume or complete dependent work. A queued notice is not acknowledged. See the [worker coordination procedure](../skills/checklist/references/coordinate.md).
+
+For `message_send`, omit `recipient` for current handlers/pickup or use exactly `recipient={"kind":"session","session_id":"<verified scoped session>"}`. An explicit malformed or unsupported route is rejected instead of falling back. Before reporting a notification, inspect returned `deliveries` for the intended exact `recipient_session_id`: `saved_for_pickup` without a delivery is history only, `queued` is an actual recipient delivery waiting, and only that recipient’s explicit acknowledgment proves it was read. A completion notice after Done needs an explicit eligible session when no current handler remains. Preserve original command/receipt IDs and do not send again merely because acknowledgment is pending. A retry error for a pre-upgrade malformed intent does not prove it never committed; preserve the original IDs and inspect existing receipt/history.

@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Checklist resolved project taxonomy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "statuses": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "key": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "category": {
+            "enum": [
+              "queued",
+              "implementation",
+              "review",
+              "changes_requested",
+              "waiting_human",
+              "blocked",
+              "deferred",
+              "done",
+              "cancelled",
+              "superseded"
+            ]
+          },
+          "section": {
+            "type": "string",
+            "minLength": 1
+          },
+          "color": {
+            "type": "string",
+            "minLength": 1
+          },
+          "order": {
+            "type": "integer"
+          },
+          "retired": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "key",
+          "name",
+          "category",
+          "section",
+          "color",
+          "order",
+          "retired"
+        ]
+      }
+    },
+    "transitions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "to": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "intent": {
+            "enum": [
+              "claim",
+              "submit",
+              "request_changes",
+              "review_gate",
+              "queue",
+              "defer",
+              "block",
+              "resolve",
+              "wait_human",
+              "complete",
+              "cancel",
+              "supersede",
+              "reopen"
+            ]
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "intent"
+        ]
+      },
+      "description": "Protected generated edges; no arbitrary owner-authored transition graph in v1."
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "color": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": {
+            "type": "string"
+          },
+          "retired": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "color",
+          "description",
+          "retired"
+        ]
+      }
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "queued": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "implementation": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "review": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "changes_requested": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "waiting_human": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "blocked": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "deferred": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "done": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "cancelled": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "superseded": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "queued",
+        "implementation",
+        "review",
+        "changes_requested",
+        "waiting_human",
+        "blocked",
+        "deferred",
+        "done",
+        "cancelled",
+        "superseded"
+      ],
+      "description": "Generated internal category destinations, not ten required owner setup choices."
+    },
+    "event_routes": {
+      "type": "object",
+      "description": "Validated lifecycle event or review-gate route; domain validation checks category/guard.",
+      "additionalProperties": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "propertyNames": {
+        "enum": [
+          "review.ready.integration",
+          "review.ready.asset_approval",
+          "review.ready.playtest",
+          "review.ready.installed_build_verified"
+        ]
+      }
+    },
+    "preset": {
+      "const": "games_and_apps"
+    }
+  },
+  "required": [
+    "schema_version",
+    "preset",
+    "revision",
+    "statuses",
+    "transitions",
+    "tags",
+    "defaults",
+    "event_routes"
+  ],
+  "description": "Resolved service snapshot. The app generates protected transitions and category defaults from the production preset; owner editing asks only name, behaves-like and color."
+}

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Evidence measures",
+  "description": "Optional upper-budget observations on submission evidence and reviewer reports. Numbers must also be finite at the command boundary; names are unique within a list.",
+  "type": "array",
+  "maxItems": 100,
+  "items": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "unit": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 80
+      },
+      "limit": {
+        "type": "number"
+      },
+      "before": {
+        "type": "number"
+      },
+      "after": {
+        "type": "number"
+      }
+    },
+    "required": [
+      "name",
+      "unit",
+      "limit",
+      "before",
+      "after"
+    ],
+    "additionalProperties": false
+  }
+}

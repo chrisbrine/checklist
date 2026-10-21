@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "commands": [
+    {
+      "method": "message_send",
+      "params": {
+        "project_id": "891a5d82-a052-477f-a479-70b5f71e83ce",
+        "task_id": "a0a1baaa-1022-43f0-a213-7e806ef25249",
+        "command_id": "7af42d89-2ada-4431-bcea-000000000000",
+        "kind": "correction",
+        "correction_of": "42bf077b-969f-4b92-a812-2a0432c7eacc",
+        "body": "Corrected scope: only update the synthetic fixture."
+      }
+    },
+    {
+      "method": "message_send",
+      "params": {
+        "project_id": "891a5d82-a052-477f-a479-70b5f71e83ce",
+        "task_id": "a0a1baaa-1022-43f0-a213-7e806ef25249",
+        "command_id": "7af42d89-2ada-4431-bcea-000000000001",
+        "kind": "retraction",
+        "correction_of": "42bf077b-969f-4b92-a812-2a0432c7eacc",
+        "body": "The earlier direction is withdrawn; prior work remains recorded."
+      }
+    },
+    {
+      "method": "task_transition",
+      "params": {
+        "project_id": "891a5d82-a052-477f-a479-70b5f71e83ce",
+        "task_id": "a0a1baaa-1022-43f0-a213-7e806ef25249",
+        "command_id": "7af42d89-2ada-4431-bcea-000000000002",
+        "expected_revision": 3,
+        "action": "cancel",
+        "reason": "Scope is no longer needed."
+      }
+    },
+    {
+      "method": "task_transition",
+      "params": {
+        "project_id": "891a5d82-a052-477f-a479-70b5f71e83ce",
+        "task_id": "a0a1baaa-1022-43f0-a213-7e806ef25249",
+        "command_id": "7af42d89-2ada-4431-bcea-000000000003",
+        "expected_revision": 4,
+        "action": "reopen",
+        "reason": "The requirement returned."
+      }
+    },
+    {
+      "method": "task_archive",
+      "params": {
+        "project_id": "891a5d82-a052-477f-a479-70b5f71e83ce",
+        "task_id": "a0a1baaa-1022-43f0-a213-7e806ef25249",
+        "command_id": "7af42d89-2ada-4431-bcea-000000000004",
+        "expected_revision": 5,
+        "action": "archive",
+        "cleanup": false
+      }
+    },
+    {
+      "method": "task_archive",
+      "params": {
+        "project_id": "891a5d82-a052-477f-a479-70b5f71e83ce",
+        "task_id": "a0a1baaa-1022-43f0-a213-7e806ef25249",
+        "command_id": "7af42d89-2ada-4431-bcea-000000000005",
+        "expected_revision": 6,
+        "action": "unarchive",
+        "undo": true
+      }
+    },
+    {
+      "method": "task_archive",
+      "params": {
+        "project_id": "891a5d82-a052-477f-a479-70b5f71e83ce",
+        "task_id": "a0a1baaa-1022-43f0-a213-7e806ef25249",
+        "command_id": "7af42d89-2ada-4431-bcea-000000000006",
+        "expected_revision": 7,
+        "action": "trash",
+        "reason": "Mistaken capture."
+      }
+    },
+    {
+      "method": "task_purge_preview",
+      "params": {
+        "project_id": "891a5d82-a052-477f-a479-70b5f71e83ce",
+        "task_id": "a0a1baaa-1022-43f0-a213-7e806ef25249",
+        "command_id": "7af42d89-2ada-4431-bcea-000000000007",
+        "expected_revision": 8
+      }
+    },
+    {
+      "method": "task_archive",
+      "params": {
+        "project_id": "891a5d82-a052-477f-a479-70b5f71e83ce",
+        "task_id": "a0a1baaa-1022-43f0-a213-7e806ef25249",
+        "command_id": "7af42d89-2ada-4431-bcea-000000000008",
+        "expected_revision": 8,
+        "action": "restore"
+      }
+    },
+    {
+      "method": "task_edit",
+      "params": {
+        "project_id": "891a5d82-a052-477f-a479-70b5f71e83ce",
+        "task_id": "a0a1baaa-1022-43f0-a213-7e806ef25249",
+        "command_id": "7af42d89-2ada-4431-bcea-000000000009",
+        "expected_revision": 9,
+        "patch": {
+          "planned_assignee": "unassigned",
+          "assignment_reason": "Return this ticket for pickup."
+        }
+      }
+    },
+    {
+      "method": "task_purge",
+      "params": {
+        "project_id": "891a5d82-a052-477f-a479-70b5f71e83ce",
+        "task_id": "a0a1baaa-1022-43f0-a213-7e806ef25249",
+        "command_id": "7af42d89-2ada-4431-bcea-000000000099",
+        "expected_revision": 8,
+        "preview_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    }
+  ]
+}

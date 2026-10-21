@@ -1,0 +1,16 @@
+[
+  {
+    "name": "Triangles",
+    "unit": "triangles",
+    "limit": 25000,
+    "before": 32000,
+    "after": 26000
+  },
+  {
+    "name": "Collider gap",
+    "unit": "mm",
+    "limit": 0.5,
+    "before": 1.2,
+    "after": 0.2
+  }
+]

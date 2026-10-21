@@ -1,0 +1,8 @@
+{
+  "name": "checklist",
+  "version": "0.1.0-dev.1",
+  "description": "Deferred Checklist personal-assistant MCP/skill package, retained for future development. No current assistant UI/setup or qualified Dot access; reactivation requires an explicit owner request.",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "requires_local_executor": true
+}

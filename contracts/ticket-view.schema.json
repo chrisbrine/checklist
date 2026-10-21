@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owner ticket list view",
+  "type": "object",
+  "required": ["surface", "status_filter", "tag_filter", "group_by", "order_by"],
+  "additionalProperties": false,
+  "properties": {
+    "surface": {"enum": ["tickets", "overview", "archived", "trash"]},
+    "status_filter": {"type": "string", "maxLength": 4000},
+    "tag_filter": {"type": "string", "maxLength": 4000},
+    "tag_ids": {"type": "array", "maxItems": 100, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 4000}},
+    "tag_mode": {"enum": ["any", "all", "none"]},
+    "planned_assignee": {"type": "string", "minLength": 1, "maxLength": 4000, "description": "all, unassigned, human, agent, or a worker session ID"},
+    "actual_assignee": {"type": "string", "minLength": 1, "maxLength": 4000, "description": "all, unassigned, human, agent, or the session ID of an active attempt"},
+    "epic_id": {"type": "string", "minLength": 1, "maxLength": 4000, "description": "all, none, or an Epic ID"},
+    "triage_id": {"type": "string", "minLength": 1, "maxLength": 4000, "description": "all, none, or a current Triage ID"},
+    "group_by": {"enum": ["status", "epic", "none"]},
+    "order_by": {"enum": ["manual", "priority", "updated_desc"]}
+  }
+}

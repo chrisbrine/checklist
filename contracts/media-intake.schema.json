@@ -1,0 +1,253 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://checklist.local/contracts/media-intake.schema.json",
+  "title": "Prepared media intake/list values (internal only)",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "type_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "intake": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input": {
+          "enum": [
+            "selected_files",
+            "tsv",
+            "explicit_metadata"
+          ]
+        },
+        "assignments": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "field_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "source": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "column"
+                      },
+                      "column_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "column_id"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "stem"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "source_index"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "stem_token"
+                      },
+                      "delimiter": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 32,
+                        "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+                      },
+                      "index": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 63
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "delimiter",
+                      "index"
+                    ]
+                  }
+                ]
+              }
+            },
+            "required": [
+              "field_id",
+              "source"
+            ]
+          }
+        },
+        "candidate_grouping": {
+          "const": "explicit_preview_only"
+        }
+      },
+      "required": [
+        "input"
+      ]
+    },
+    "list": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "visible_columns": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "maxItems": 8,
+          "uniqueItems": true
+        },
+        "group_by": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "maxItems": 2,
+          "uniqueItems": true
+        },
+        "sort": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "field_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "order": {
+                    "enum": [
+                      "ascending",
+                      "descending",
+                      "declared_choice_order"
+                    ]
+                  }
+                },
+                "required": [
+                  "field_id"
+                ]
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "key": {
+                    "enum": [
+                      "title",
+                      "order"
+                    ]
+                  },
+                  "order": {
+                    "enum": [
+                      "ascending",
+                      "descending"
+                    ]
+                  }
+                },
+                "required": [
+                  "key"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "required": []
+    },
+    "approved_examples": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "match_fields": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "maxItems": 3,
+          "uniqueItems": true
+        },
+        "target_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "maxItems": 8,
+          "uniqueItems": true
+        },
+        "page_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "not": {
+        "required": [
+          "match_fields",
+          "target_ids"
+        ]
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "type_id",
+    "intake",
+    "list",
+    "approved_examples"
+  ]
+}

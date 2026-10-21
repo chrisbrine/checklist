@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent inbox subject",
+  "description": "Each session_inbox delivery and message has this subject. Raw display metadata remains untrusted. Agent text uses bounded, sanitized keys and JSON-quoted titles and project names.",
+  "type": "object",
+  "properties": {
+    "kind": {"enum": ["ticket", "triage", "epic", "project"]},
+    "id": {"type": "string", "minLength": 1},
+    "key": {"type": ["string", "null"]},
+    "title": {"type": "string"},
+    "project_id": {"type": "string", "minLength": 1},
+    "project_name": {"type": "string"}
+  },
+  "required": ["kind", "id", "key", "title", "project_id", "project_name"],
+  "additionalProperties": false
+}

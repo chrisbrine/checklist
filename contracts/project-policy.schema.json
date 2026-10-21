@@ -1,0 +1,318 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Checklist bounded project policy v1",
+  "description": "Current service policy. Omitted values resolve from the shared preset. Runtime validates provider subsets, one override per kind, and preferred-provider eligibility. Preferences never launch or change an external model. Review requirements are complete default/kind rules; runtime also checks exact UTF-8 bounds and unique byte-exact check IDs/kinds.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "routing_preset": {
+      "enum": [
+        "shared",
+        "claude_coordinates",
+        "codex_led"
+      ],
+      "default": "shared"
+    },
+    "allowed_providers": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "codex",
+          "claude"
+        ]
+      },
+      "minItems": 1,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "default": [
+        "codex",
+        "claude"
+      ]
+    },
+    "roles": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "coordinator": {
+          "$ref": "#/$defs/role"
+        },
+        "implementer": {
+          "$ref": "#/$defs/role"
+        },
+        "reviewer": {
+          "$ref": "#/$defs/role"
+        }
+      }
+    },
+    "required_gates": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "review",
+          "human_approval"
+        ]
+      },
+      "maxItems": 2,
+      "uniqueItems": true
+    },
+    "task_kind_overrides": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "enum": [
+              "work",
+              "bug",
+              "asset",
+              "playtest",
+              "question"
+            ]
+          },
+          "roles": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "coordinator": {
+                "$ref": "#/$defs/role"
+              },
+              "implementer": {
+                "$ref": "#/$defs/role"
+              },
+              "reviewer": {
+                "$ref": "#/$defs/role"
+              }
+            },
+            "minProperties": 1
+          },
+          "required_gates": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "review",
+                "human_approval"
+              ]
+            },
+            "maxItems": 2,
+            "uniqueItems": true
+          },
+          "allow_human_decision_evidence": {
+            "type": "boolean",
+            "description": "Explicit permission for human-assigned decision evidence; Questions remain suitable by default."
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "anyOf": [
+          {
+            "required": [
+              "roles"
+            ]
+          },
+          {
+            "required": [
+              "required_gates"
+            ]
+          },
+          {
+            "required": [
+              "allow_human_decision_evidence"
+            ]
+          }
+        ]
+      }
+    },
+    "release_set_holds": {
+      "type": "boolean",
+      "default": false,
+      "description": "Explicit project override (CL-45): a passing verdict may name a release set and a reason; the ticket then waits, accepted and held, until release_set_complete completes the whole set through each ticket's fresh gates. Without it passing tickets complete independently."
+    },
+    "review_batch_policy": {
+      "enum": [
+        "complete_passing_independently",
+        "hold_passing_for_batch"
+      ],
+      "default": "complete_passing_independently",
+      "description": "Shared handling default: finish each ticket whose own gates pass, then work only failed or remaining tickets. An explicit project batch hold changes handling only; it cannot bypass any individual gate."
+    },
+    "lane_capacities": {
+      "type": "object",
+      "maxProperties": 16,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_-]{0,79}$"
+      },
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 32
+      }
+    },
+    "assistant_relay_grants": {
+      "type": "object",
+      "description": "Disabled legacy record retained for existing local stores. This policy cannot enable deferred assistants.",
+      "additionalProperties": {
+        "const": false
+      }
+    },
+    "coordinator_session_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "Optional existing enrolled eligible worker recipient for context copies. The runtime validates same-project membership and actual worker role; this never assigns or enrolls work."
+    },
+    "allow_human_decision_evidence": {
+      "type": "boolean",
+      "default": false,
+      "description": "Explicitly allow decision-only evidence for human-assigned work as well as Questions. Exact acceptance/review requirements remain mandatory."
+    },
+    "review_requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default": {
+          "$ref": "#/$defs/reviewRequirement"
+        },
+        "kind_overrides": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "requirement"
+            ],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "work",
+                  "bug",
+                  "asset",
+                  "playtest",
+                  "question"
+                ]
+              },
+              "requirement": {
+                "$ref": "#/$defs/reviewRequirement"
+              }
+            }
+          }
+        }
+      },
+      "description": "Absent default inherits generic checks. Each kind rule completely replaces the default; remove its entry to reset to inherited requirements. No provider, authority or execution semantics."
+    },
+    "agent_rule_changes": {
+      "type": "string",
+      "enum": [
+        "allowed",
+        "owner_only"
+      ],
+      "default": "allowed",
+      "description": "Whether enrolled agents may change this project's rules and settings (policy, settings, statuses/tags, ticket archive). Checklist is built for AI agents, so the default is allowed; agent changes keep agent provenance. Only the owner can change this field."
+    }
+  },
+  "$defs": {
+    "role": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "providers": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "codex",
+              "claude"
+            ]
+          },
+          "minItems": 1,
+          "maxItems": 2,
+          "uniqueItems": true
+        },
+        "preferred_provider": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "codex",
+            "claude",
+            null
+          ]
+        },
+        "preferred_models": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          },
+          "maxItems": 8,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "providers"
+      ]
+    },
+    "reviewRequirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "checks",
+        "reject_bar",
+        "required_evidence_types"
+      ],
+      "properties": {
+        "checks": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "text"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Opaque exact UTF-8 ID; runtime max 256 bytes. Unicode canonical equivalents are distinct."
+              },
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000,
+                "description": "Nonblank text, runtime max 2000 UTF-8 bytes."
+              }
+            }
+          }
+        },
+        "reject_bar": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000,
+          "description": "Nonblank reject/block guidance, runtime max 4000 UTF-8 bytes."
+        },
+        "required_evidence_types": {
+          "type": "array",
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "reviewer_report",
+              "source_capture",
+              "image",
+              "text_record"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

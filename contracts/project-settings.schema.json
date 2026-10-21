@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Checklist resolved project identity and presentation settings v1",
+  "description": "Portable project settings snapshot. Referenced policy, taxonomy and context remain canonical separate records. Local roots, bookmarks, provider/assistant grants, endpoints and credentials are excluded.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "project_id": { "type": "string", "format": "uuid" },
+    "revision": { "type": "integer", "minimum": 1 },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 120, "pattern": "\\S" },
+        "future_key_prefix": { "description": "Used for new ticket, Triage and Epic keys only; existing keys and all three independent counters remain unchanged.", "type": "string", "pattern": "^[A-Z][A-Z0-9]{0,7}$" },
+        "accent": { "enum": ["system", "blue", "teal", "green", "orange", "pink", "purple"] },
+        "icon": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "const": "symbol" },
+                "symbol": { "$ref": "#/$defs/symbol" },
+                "accessibility_label": { "$ref": "#/$defs/iconLabel" }
+              },
+              "required": ["kind", "symbol", "accessibility_label"]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "const": "managed_image" },
+                "asset_id": { "type": "string", "format": "uuid" },
+                "content_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+                "fallback_symbol": { "$ref": "#/$defs/symbol" },
+                "accessibility_label": { "$ref": "#/$defs/iconLabel" }
+              },
+              "required": ["kind", "asset_id", "content_sha256", "fallback_symbol", "accessibility_label"]
+            }
+          ]
+        }
+      },
+      "required": ["name", "future_key_prefix", "accent", "icon"]
+    },
+    "capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled_kinds": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/taskKind" },
+          "minItems": 1,
+          "maxItems": 5,
+          "uniqueItems": true,
+          "contains": { "const": "work" }
+        },
+        "default_kind": { "$ref": "#/$defs/taskKind" },
+        "starter_overrides": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "kind": { "$ref": "#/$defs/taskKind" },
+              "brief_hint": { "$ref": "#/$defs/hint" },
+              "outcome_hint": { "$ref": "#/$defs/hint" }
+            },
+            "required": ["kind"],
+            "anyOf": [{ "required": ["brief_hint"] }, { "required": ["outcome_hint"] }]
+          }
+        }
+      },
+      "required": ["enabled_kinds", "default_kind", "starter_overrides"]
+    },
+    "presentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default_list": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "group_by": { "enum": ["none", "status", "epic"] },
+            "order_by": { "enum": ["manual", "priority", "updated_desc"] }
+          },
+          "required": ["group_by", "order_by"]
+        },
+        "owner_desktop_alerts": { "enum": ["inherit", "needs_you", "quiet"] }
+      },
+      "required": ["default_list", "owner_desktop_alerts"]
+    },
+    "references": {
+      "type": "object",
+      "description": "Resolved read-only revision references in the enclosing project_id. Coherent exports include the matching canonical records; changing these values is not a settings mutation API.",
+      "additionalProperties": false,
+      "properties": {
+        "policy_revision": { "type": "integer", "minimum": 1 },
+        "taxonomy_revision": { "type": "integer", "minimum": 1 },
+        "context_revision": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["policy_revision", "taxonomy_revision", "context_revision"]
+    }
+  },
+  "required": ["schema_version", "project_id", "revision", "identity", "capture", "presentation", "references"],
+  "$defs": {
+    "symbol": { "enum": ["checklist", "gamecontroller", "app", "sparkles", "moon.stars", "film", "hammer", "leaf"] },
+    "iconLabel": { "type": "string", "minLength": 1, "maxLength": 120, "pattern": "\\S" },
+    "taskKind": { "enum": ["work", "bug", "asset", "playtest", "question"] },
+    "hint": { "type": "string", "minLength": 1, "maxLength": 400, "pattern": "\\S" }
+  }
+}

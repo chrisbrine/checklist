@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "type_id": "animation",
+  "intake": {
+    "input": "selected_files",
+    "candidate_grouping": "explicit_preview_only",
+    "assignments": [
+      {
+        "field_id": "character",
+        "source": {
+          "kind": "stem_token",
+          "delimiter": "__",
+          "index": 0
+        }
+      },
+      {
+        "field_id": "animation_label",
+        "source": {
+          "kind": "stem_token",
+          "delimiter": "__",
+          "index": 1
+        }
+      },
+      {
+        "field_id": "direction",
+        "source": {
+          "kind": "stem_token",
+          "delimiter": "__",
+          "index": 2
+        }
+      }
+    ]
+  },
+  "list": {
+    "visible_columns": [
+      "character",
+      "animation_label",
+      "direction"
+    ],
+    "group_by": [
+      "character",
+      "animation_label"
+    ],
+    "sort": [
+      {
+        "field_id": "direction",
+        "order": "declared_choice_order"
+      }
+    ]
+  },
+  "approved_examples": {
+    "enabled": true,
+    "match_fields": [
+      "character",
+      "animation_label",
+      "direction"
+    ],
+    "page_size": 8
+  }
+}

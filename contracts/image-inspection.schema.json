@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Exact target image inspection selections",
+  "type": "object",
+  "required": ["inspected_images"],
+  "properties": {
+    "inspected_images": {
+      "type": "array",
+      "maxItems": 1000,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": ["artifact_id", "sha256", "target_manifest_id"],
+        "properties": {
+          "artifact_id": {"type": "string", "minLength": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "target_manifest_id": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$comment": "Shape only. The service requires current exact target membership/hash, real reviewer authority, original availability and all image marks before pass/approval. A non-gate request uses request:<form_identity> for target_manifest_id. Displaying/opening never creates these selections or a verdict."
+}

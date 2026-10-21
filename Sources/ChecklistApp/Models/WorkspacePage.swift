@@ -1,0 +1,76 @@
+import Foundation
+import Observation
+
+struct WorkspacePageQuery: Equatable {
+    let surface: String
+    let project: String?
+    var text = ""
+    var record = ""
+    var archived = false
+    var limit = 50
+    var since = ""
+    static func == (a:Self,b:Self)->Bool {
+        a.limit == b.limit && a.since == b.since && a.surface == b.surface && a.project.map(RecordIdentity.init) == b.project.map(RecordIdentity.init) && RecordIdentity(a.text)==RecordIdentity(b.text) && RecordIdentity(a.record)==RecordIdentity(b.record) && a.archived==b.archived
+    }
+    func parameters(cursor:String? = nil)->[String:Any] {
+        var p:[String:Any] = ["surface":surface,"text":text,"record_id":record,"include_archived":archived,"limit":limit]
+        p["project_id"] = project;p["cursor"] = cursor
+        if !since.isEmpty {p["since"] = since}
+        return p
+    }
+}
+struct WorkspacePage {
+    let query: WorkspacePageQuery
+    let rows: [Record]
+    let total: Int
+    let next: String?
+    let previous: String?
+    let projects: [Record]
+    let service: Record
+    let contentCursor: String
+    init(_ response:[String:Any],query:WorkspacePageQuery)throws {
+        guard let version=response["workspace_version"] as? NSNumber,CFGetTypeID(version) != CFBooleanGetTypeID(),version.doubleValue==1,
+              response["surface"] as? String==query.surface,
+              let record=response["record_id"] as? String,RecordIdentity(record)==RecordIdentity(query.record),
+              let rows=response["rows"] as? [[String:Any]],rows.count<=100,
+              let total=response["total"] as? NSNumber,CFGetTypeID(total) != CFBooleanGetTypeID(),total.doubleValue.isFinite,total.doubleValue.rounded(.towardZero)==total.doubleValue,total.doubleValue>=Double(rows.count),total.doubleValue<Double(Int.max),
+              let projects=response["projects"] as? [[String:Any]],let service=response["service"] as? [String:Any],
+              let store=service["store_incarnation"] as? String,!store.isEmpty,
+              let cursor=response["content_cursor"] as? String,!cursor.isEmpty else {throw TicketPageError.invalid("workspace")}
+        let ids=Set(projects.compactMap{$0["id"] as? String}.map(RecordIdentity.init))
+        var seen=Set<RecordIdentity>()
+        for row in rows {
+            guard let id=row["id"] as? String,!id.isEmpty,seen.insert(RecordIdentity(id)).inserted,
+                  let pid=row["project_id"] as? String,ids.contains(RecordIdentity(pid)),query.project.map({RecordIdentity($0)==RecordIdentity(pid)}) ?? true else {throw TicketPageError.invalid("workspace.scope")}
+        }
+        func token(_ key:String)throws->String? {
+            if response[key] is NSNull{return nil}
+            guard let value=response[key] as? String,!value.isEmpty else {throw TicketPageError.invalid(key)}
+            return value
+        }
+        let next=try token("next_cursor"),previous=try token("previous_cursor")
+        guard response["has_more"] as? Bool==(next != nil) else {throw TicketPageError.invalid("workspace.cursor")}
+        self.query=query;self.rows=rows.map(Record.init);self.total=total.intValue;self.next=next;self.previous=previous
+        self.projects=projects.map(Record.init);self.service=Record(values:service);contentCursor=cursor
+    }
+}
+
+/// A single page per actual consumer. Starting another query retires its request;
+/// late replies cannot install, and older pages are replaced rather than appended.
+@MainActor @Observable final class WorkspacePageObservation {
+    var page: WorkspacePage?
+    var loading=false
+    var error:String?
+    private(set) var query:WorkspacePageQuery?
+    private var generation=UUID()
+    func begin(_ query:WorkspacePageQuery)->UUID {
+        if self.query != query {page=nil}
+        self.query=query;generation=UUID();loading=true;error=nil;return generation
+    }
+    @discardableResult func receive(_ response:[String:Any],query:WorkspacePageQuery,generation:UUID)throws->Bool {
+        guard self.generation==generation,self.query==query else{return false}
+        page=try WorkspacePage(response,query:query);loading=false;return true
+    }
+    func fail(_ generation:UUID) {guard self.generation==generation else{return};loading=false;error="Could not load this page. Refresh to load it again; drafts are kept."}
+    func cancel(clear:Bool=false) {generation=UUID();loading=false;if clear {page=nil;query=nil;error=nil}}
+}

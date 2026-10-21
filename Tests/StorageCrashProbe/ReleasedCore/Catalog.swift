@@ -1,0 +1,158 @@
+import Foundation
+import GRDB
+
+extension CommandRouter {
+    func toolCatalog(_ c: Caller) -> [JSON] {
+        let common = ["project_id","command_id","expected_revision"]
+        var fields: [String:[String]] = [
+            "service_info":[],"project_list":["include_archived"],"project_resolve":["workspace_path"],"project_settings_get":[],"policy_get":["revision","task_id"],"taxonomy_get":["revision"],
+            "session_attach_task":["task_id"],"session_register":["label","provider","workspace_path"],"session_update":["state","observation"],"session_list":["task_id","include_ended","cursor","limit"],"session_inbox":["cursor","attempt_id","limit"],"assistant_inbox":["task_id","cursor","limit"],"assistant_projects":[],
+            "task_create":["title","brief","acceptance","kind","planned_assignee","assignment_reason","tag_ids","epic_id","owner_request_ref"],"task_get":["task_id","key"],"task_list":["text","status_ids","archived","cursor","limit"],"task_context":["task_id","history_cursor","detail_level"],"task_edit":["task_id","patch"],"task_transition":["task_id","action","reason","target_status_id"],
+            "work_claim":["task_id","phase","policy_revision","file_scopes","lane_scopes","review_request_id","target_manifest_id","gate"],"work_checkpoint":["attempt_id","claim_token","progress","direction_cursor"],"work_release":["attempt_id","claim_token","reason","continuation","direction_cursor"],"work_submit":["attempt_id","claim_token","acceptance_revision","evidence_manifest","direction_cursor"],"review_record":["attempt_id","claim_token","review_request_id","target_manifest_id","gate","verdict","checks","review_assessment","findings","finding_resolutions","supersedes_verdict_id","direction_cursor"],"review_request":["task_id","target_manifest_id","gate","supersedes_request_id","reason"],"task_complete":["task_id","current_manifest_id","accepted_verdict_ids","direction_cursor","target_status_id"],
+            "message_send":["task_id","body","kind","recipient","reply_to","owner_request_ref"],"message_ack":["delivery_id","stage","response_ref","reaction"],"history_list":["task_id","triage_id","epic_id","conversation_id","cursor","limit"],"agent_resolve":["name","agent_profile_id","task_id"],"agent_message_send":["recipient_target","body","expects_reply","task_id","reply_to","owner_request_ref"],"human_request_create":["task_id","title","blocking","questions","file_requests","target_attachment_id","review_request_id","target_manifest_id"],"attachment_add":["task_id","source","path","name","expected_sha256","description","mode"],"attachment_list":["task_id","cursor","limit"],"attachment_read":["attachment_id","representation"],"attachment_cleanup_preview":["task_id"],"triage_list":[],"epic_list":[],"epic_create":["name","brief","description"],"triage_create":["name","purpose"],"triage_transition":["triage_id","group_id","target_status_id","action","reason","expected_member_revisions"],"epic_edit":["group_id","epic_id","name","brief","description"],"triage_edit":["group_id","triage_id","name","purpose"],"group_membership":["group_id","task_id","action","expected_task_revision","from_epic_id","from_epic_revision","handling_phase","exit_milestone"]]
+        let workflowFields: [String:[String]] = [
+            "work_scope_adjust":["attempt_id","claim_token","file_scopes","lane_scopes"],
+            "work_delegate":["attempt_id","claim_token","child_session_id","file_scopes","lane_scopes","brief"],
+            "work_child_accept":["delegation_id"],
+            "work_handoff_offer":["attempt_id","claim_token","target_session_id","summary"],
+            "work_handoff_accept":["offer_id"],
+            "source_review_execute":["attempt_id","claim_token","tool","args"],
+            "review_context":["task_id","review_request_id","target_manifest_id","gate","evidence_refs"],
+            "review_prepare":["task_id","review_request_id","target_manifest_id","gate","provider"],
+            "review_evidence_add":["attempt_id","claim_token","title","body"],
+            "policy_preview":["policy","mode"],"policy_propose":["policy","mode"],
+            "policy_acknowledge":["attempt_id","claim_token","task_id","reason"],
+            "task_link":["task_id","relation","target_task_id","action","relation_id","required"],
+            "relation_list":["task_id"],
+            "human_request_revise":["request_id","patch","reason"],"human_request_cancel":["request_id","reason"]
+        ]
+        let batchFields: [String:[String]] = [
+            "batch_prepare":["triage_id","phase","tasks","checks"],"batch_claim":["batch_id","policy_revision"],
+            "batch_get":["batch_id"],"batch_list":["triage_id"],
+            "batch_submit":["batch_id","members"],"batch_review_record":["batch_id","members"],
+            "batch_complete_passing":["batch_id"],"batch_retriage_remaining":["batch_id","name","purpose"]
+        ]
+        fields["triage_orchestrate"] = ["triage_id","action","progress","reason"]
+        fields["source_execution_get"] = ["execution_id"]
+        fields.merge(batchFields) { _,new in new }
+        fields["task_context"]! += ["context_revision_id"]
+        fields["work_checkpoint"]! += ["direction_ids"]
+        fields["message_send"]! += ["correction_of"]
+        fields["triage_transition"]! += ["expected_direction_cursors"]
+        fields["batch_complete_passing"]! += ["expected_direction_cursors"]
+        fields["triage_create"]! += ["phase"]
+        fields["triage_edit"]! += ["archived","phase"]
+        fields["epic_edit"]! += ["archived"]
+        fields.merge(workflowFields) { _,new in new }
+        fields["work_checkpoint"]! += ["file_scopes","lane_scopes"]
+        fields["work_claim"]! += ["direction_cursor"]
+        fields["human_request_create"]! += ["explanation","command"]
+        if c.isOwner { fields["task_get"]! += ["include_completion_eligibility"] }
+        let reader: Set<String> = ["service_info","project_list","project_resolve","project_settings_get","policy_get","taxonomy_get","session_list","task_create","task_get","task_list","task_context","message_send","message_ack","history_list","agent_resolve","agent_message_send","attachment_list","attachment_read","attachment_add"]
+        let assistants = reader.union(["assistant_projects","assistant_inbox"])
+        var allowed = c.role == "assistant" ? assistants : Set(fields.keys).subtracting(["assistant_inbox","assistant_projects"])
+        if c.role == "assistant" {
+            let readable = c.assistantGrants.filter { c.projectIDs.contains($0.key) && $0.value["read"] == true }
+            if readable.isEmpty { allowed = ["service_info","project_list","assistant_projects"] }
+            if !readable.contains(where: {$0.value["create_drafts_on_request"] == true}) { allowed.remove("task_create") }
+            if !readable.contains(where: {$0.value["post_notes_on_request"] == true}) { allowed.subtract(["message_send","agent_resolve","agent_message_send","attachment_add"]) }
+            if !readable.contains(where: {$0.value["receive_messages"] == true}) { allowed.subtract(["assistant_inbox","message_ack"]) }
+        }
+        return allowed.sorted().compactMap { name in
+            guard let extra = fields[name] else { return nil }
+            var properties: JSON = [:]
+            let keys = Set(extra + (name == "service_info" || name == "project_list" || name == "assistant_projects" ? [] : common))
+            for key in keys {
+                if ["limit","expected_revision","expected_task_revision","from_epic_revision","policy_revision","acceptance_revision","revision"].contains(key) { properties[key] = ["type":"integer","minimum":0] }
+                else if ["archived","blocking","expects_reply","include_archived","include_ended","required","include_completion_eligibility"].contains(key) { properties[key] = ["type":"boolean"] }
+                else if key == "evidence_refs" { properties[key] = ["type":"array","maxItems":100] }
+                else if ["questions","file_requests","checks","findings","finding_resolutions","file_scopes","lane_scopes","acceptance","accepted_verdict_ids","tag_ids","status_ids","args","tasks","submissions","verdicts","members","direction_ids","submission_receipt_ids"].contains(key) { properties[key] = ["type":"array","maxItems":200] }
+                else if key == "expected_direction_cursors" { properties[key] = ["type":"object","maxProperties":1000,"additionalProperties":["type":"string"]] }
+                else if key == "expected_member_revisions" { properties[key] = ["type":"object","maxProperties":1000,"additionalProperties":["type":"integer","minimum":1]] }
+                else if key == "reaction" { properties[key] = ["type":"string","enum":Self.noteReactions.sorted()] }
+                else if key == "recipient" { properties[key] = ["type":"object","properties":["kind":["type":"string","enum":["session"]],"session_id":["type":"string","minLength":1,"maxLength":4000,"pattern":"\\S"]],"required":["kind","session_id"],"additionalProperties":false] }
+                else if ["patch","source","evidence_manifest","owner_request_ref","planned_assignee","policy","command","response_ref","review_assessment"].contains(key) { properties[key] = ["type":"object"] }
+                else { properties[key] = ["type":"string","maxLength":key == "body" || key == "brief" ? 65536 : 4000] }
+            }
+            var required: [String] = []
+            if !Self.readMethods.contains(name) { required.append("command_id") }
+            if !["service_info","project_list","assistant_projects","assistant_inbox","project_resolve"].contains(name) { required.append("project_id") }
+            if name == "triage_transition" { required += ["expected_revision","expected_member_revisions"] }
+            var schema: JSON = ["type":"object","properties":properties,"required":required,"additionalProperties":false]
+            if name == "triage_transition" {
+                schema["allOf"] = [["oneOf":[["required":["triage_id"],"not":["required":["group_id"]]],["required":["group_id"],"not":["required":["triage_id"]]]]],["oneOf":[["required":["target_status_id"],"not":["required":["action"]]],["required":["action"],"not":["required":["target_status_id"]]]]]]
+            }
+            return ["name":name,"description":description(name),"inputSchema":schema,"annotations":["readOnlyHint":Self.readMethods.contains(name),"idempotentHint":true,"openWorldHint":false]]
+        }
+    }
+    func validateInput(_ method: String,_ p: JSON,_ c: Caller) throws {
+        if method == "task_get" { _ = try ownerCompletionEligibilityRequested(p,caller:c) }
+        if method == "message_send" { _ = try explicitMessageRecipient(p) }
+        if c.isOwner { return }
+        if method == "tool_catalog" { guard p.isEmpty else { throw CoreError("INVALID_INPUT","tool_catalog takes no arguments.") }; return }
+        guard let tool = toolCatalog(c).first(where: {$0["name"] as? String == method}),let schema = tool["inputSchema"] as? JSON,let properties = schema["properties"] as? JSON else { throw CoreError("FORBIDDEN","This command is not available to this connection role.") }
+        guard Set(p.keys).isSubset(of:Set(properties.keys)) else { throw CoreError("INVALID_INPUT","Unknown fields are not accepted by this command.") }
+        for key in strings(schema,"required") { guard p[key] != nil else { throw CoreError("INVALID_INPUT","\(key) is required.") } }
+        for (key,value) in p {
+            let spec = properties[key] as? JSON ?? [:]; let type = spec["type"] as? String ?? ""
+            let valid: Bool
+            switch type { case "string": valid = value is String; case "array":valid = value is [Any]; case "object":valid = value is JSON; case "boolean":valid = (value as? NSNumber).map { CFGetTypeID($0) == CFBooleanGetTypeID() } ?? false; case "integer":valid = (value as? NSNumber).map { CFGetTypeID($0) != CFBooleanGetTypeID() && $0.doubleValue.rounded() == $0.doubleValue } ?? false; default:valid = false }
+            guard valid else { throw CoreError("INVALID_INPUT","\(key) has the wrong type.") }
+            if let value = value as? String,value.utf8.count > int(spec,"maxLength",default:65536) { throw CoreError("INVALID_INPUT","\(key) exceeds its text limit.") }
+            if let values = value as? [Any],values.count > int(spec,"maxItems",default:200) { throw CoreError("INVALID_INPUT","\(key) contains too many entries.") }
+        }
+        if method == "task_edit",let patch = p["patch"] as? JSON {
+            guard Set(patch.keys).isSubset(of:["title","brief","acceptance","kind","readiness","priority","order","planned_assignee","assignment_reason","epic_id","tag_ids"]) else { throw CoreError("INVALID_INPUT","Task patches contain unsupported fields.") }
+        }
+    }
+    func description(_ method: String) -> String {
+        switch method {
+        case "service_info":return "Read this build's supported capabilities and current authenticated session. Native push is separately qualified."
+        case "agent_resolve":return "Resolve an exact named agent in the enrolled project; duplicate names require disambiguation."
+        case "agent_message_send":return "Save a message to a freshly resolved opaque recipient target. Stored pickup is not model acknowledgment."
+        case "message_ack":return "Record this exact recipient's explicit acknowledgment, optionally with one reaction: thumbs_up (seen, no reply needed), thumbs_down (no), done, looking or question. Reading an inbox is not acknowledgment; a reaction never addresses a direction or completes a ticket."
+        case "message_send":return "Save a scoped ticket/project coordination note with honest delivery receipts. Routine coordination between actual involved Checklist sessions has standing authorization; no per-message human permission is needed within their existing project/task/Triage grants. Omit recipient for current handlers/pickup, or use exactly recipient={\"kind\":\"session\",\"session_id\":\"<verified scoped session>\"}. Malformed explicit routes are rejected. Inspect returned deliveries for the intended recipient; saved/queued is not acknowledgment and grants no work role or new access."
+        case "task_create":return "Capture a Draft task in this project. Assistant captures never assign work."
+        case "task_transition":return "Individually mark a ticket's status, including its current status. This removes it from all current Triages; notes and metadata edits do not. Protected work/review/Done states require their real workflow commands."
+        case "triage_transition":return "Atomically apply one status to EVERY current Triage member using exact group and per-ticket revisions. Ordinary status changes retain memberships; Done uses each ticket's actual completion gates and removes it from all Triages. Any blocker rejects the entire action. Empty and already-uniform ordinary selections are truthful no-ops. There is no public retention override for individual ticket actions."
+        case "batch_claim":return "Atomically claim the complete prepared frozen set. Ordinary grouped claims retain current Triage membership; exact revisions, authority, reservations and review independence still apply. Use this instead of individual work_claim when work must remain grouped."
+        case "batch_submit","batch_review_record":return "Atomically continue the complete exact active frozen batch with each member's own claim and ordinary gates. Phase completion removes the handled tickets from their current Triages. Group context is internal; a batch ID cannot retain an individual status action."
+        case "work_claim":return "Atomically claim one Ready task or exact independent review request. Coordinator default: keep at most10 distinct implementation tickets in flight through review/rework until Done or explicit deferral/release; finish an inherited cohort before new pickup. Review finished implementations and complete passing tickets independently before replacements. Explicit project workflow may override this guidance; it is not a server-enforced claim or reviewer-subagent limit. A separate non-contributor reviewer subagent may share the native host/provider; the author and recorded prior/delegated contributor identities cannot review their own work. This individual status action removes the ticket from all current Triages. Inspect current Triage memberships BEFORE this call: an individual claim detaches every membership. Use a discovered atomic batch claim when the work must stay grouped; selecting a Triage does not provide group context."
+        case "work_release","work_submit","review_record","review_request":return method.replacingOccurrences(of:"_",with:" ").capitalized + " through the exact ticket workflow and guards. This individual status action removes the ticket from all current Triages."
+        case "review_prepare":return "Prepare a fresh independent reviewer composer or honest copy instruction for the exact current target. No model, native conversation, connection or claim is started."
+        case "review_context":return "Read the exact target, current acceptance and project review requirements for a fresh non-contributor review. Reviewer-chosen hashed artifacts support the assessment; no service test receipt is required. After rework, carry input-valid passing acceptance/check cases with original provenance and report them separately from new execution. Run only failed, inconclusive or materially affected cases; fixture-only repairs do not require an all-green suite. Before broader checks, name invalidating case inputs or cite an applicable explicit effective project workflow/context instruction; Triage membership or sibling failure is no override. Fresh target-bound gates and a current reviewer-owned assessment remain required."
+        case "source_review_execute":return "Unavailable: service execution of submitted code is disabled without a qualified sandbox. Reviewers choose checks in their own sessions and attach hashed evidence."
+        case "task_complete":return "Complete a ticket only after its current immutable target and all pinned gates pass. Done always removes the ticket from all current Triages."
+        case "triage_orchestrate":return "Start, checkpoint or finish this phase's actual coordinating Codex or Claude session. Identity comes from the authenticated caller, never a supplied name/session ID. Active orchestration contributes Active attention to its members while each ticket keeps its own work/review claims. No model is launched."
+        case "triage_create":return "Create one Implementation or Review handling pass. In-progress tickets can join an Implementation Triage; claim Ready/Queued work before grouping it or use an actual atomic batch claim. Submitted targets enter a separate Review Triage. Passes complete independently; only failures return for implementation. An actual Codex or Claude conversation may orchestrate the pass."
+        case "triage_list":return "Read each Triage's handling phase, actual orchestration, current members and derived member status. Active attention includes work in progress or membership in an actively orchestrated Triage."
+        case "group_membership":return "Explicitly add, update, remove or move project-scoped membership. In-progress tickets may join an Implementation Triage. Each Triage handles one phase and may bind an actual orchestrating Codex or Claude conversation. Epics persist as subprojects; Triages are temporary handling groups. Individual ticket status actions remove all Triage memberships; triage_transition retains ordinary group membership, and Done always removes it."
+        default:return method.replacingOccurrences(of:"_",with:" ").capitalized + " in the authenticated project scope."
+        }
+    }
+    func bridge(_ db: Database,_ p: JSON,_ c: Caller,_ method: String) throws -> JSON {
+        try owner(c); guard c.installation == "native-bridge" else { throw CoreError("FORBIDDEN","This command is reserved for the bundled delivery service.") }
+        if method == "delivery_pending" {
+            let deliveries = try records(db,type:"delivery").filter { bool(p,"include_acknowledged") || !["acknowledged","addressed"].contains($0["state"] as? String ?? "") }
+            let eligible = try deliveries.filter { d in if bool(p,"include_acknowledged") { return true }; let session = try record(db,d["recipient_session_id"] as! String,type:"session"); return canReceive(session,project:d["project_id"] as! String) && d["recipient_authorization_generation"] as? String == sessionGeneration(session) }
+            return ["deliveries":try eligible.map { d -> JSON in var d = d; d["message"] = try record(db,d["message_id"] as! String,type:"message"); d["session"] = try record(db,d["recipient_session_id"] as! String,type:"session"); return d }]
+        }
+        if method == "delivery_record" {
+            var d = try record(db,try text(p,"delivery_id"),type:"delivery")
+            let state = try text(p,"state"); if state == "uncertain",!(try deliveryCurrent(db,d)) { throw CoreError("RECIPIENT_CHANGED","The recipient authorization changed before native submission.") }; guard ["transport_written","held","failed","uncertain","provider_accepted","unavailable"].contains(state) else { throw CoreError("INVALID_INPUT","A bridge cannot fabricate recipient acknowledgment.") }
+            // Actual transport evidence is retained independently from recipient acknowledgment.
+            d["push_state"] = state; d["transport_receipt"] = p["receipt"] ?? [:]
+            if !["acknowledged","addressed"].contains(d["state"] as? String ?? "") { d["state"] = ["held":"held_for_approval","failed":"unavailable","uncertain":"delivery_uncertain","provider_accepted":"provider_accepted","unavailable":"unavailable"][state] ?? "queued" }
+            d = revised(d); try save(db,d,type:"delivery"); try event(db,caller:c,project:d["project_id"] as? String,entity:d["message_id"] as? String,kind:"delivery_recorded",data:["state":state]); return d
+        }
+        let pid = try text(p,"project_id"); var original = try scoped(db,try text(p,"reply_to"),pid,type:"message"); let sid = try text(p,"recipient_session_id"); let session = try scoped(db,sid,pid,type:"session")
+        guard try records(db,type:"delivery",project:pid).contains(where: {$0["message_id"] as? String == original["id"] as? String && $0["recipient_session_id"] as? String == sid && $0["recipient_authorization_generation"] as? String == sessionGeneration(session)}) else { throw CoreError("FORBIDDEN","The native reply does not match this recipient delivery.") }
+        guard original["reply_recipient_authorization_generation"] as? String == sessionGeneration(session),bool(original,"reply_allowed"),!bool(original,"reply_used"),original["reply_recipient_session_id"] as? String == sid,canReceive(session,project:pid) else { throw CoreError("FORBIDDEN","This exact native reply allowance is absent, used or revoked.") }
+        if session["role"] as? String == "assistant",(session["assistant_grants"] as? [String:[String:Bool]])?[pid]?["post_notes_on_request"] != true { throw CoreError("FORBIDDEN","This assistant's current grant does not permit requested replies.") }
+        original["reply_used"] = true; try save(db,revised(original),type:"message")
+        for var delivery in try records(db,type:"delivery",project:pid) where delivery["message_id"] as? String == original["id"] as? String && delivery["recipient_session_id"] as? String == sid { delivery["state"] = "acknowledged"; delivery["acknowledged_at"] = now(); delivery["acknowledgment_evidence"] = p["source_evidence"] ?? [:]; try save(db,revised(delivery),type:"delivery") }
+        var reply: JSON = ["id":uuid(),"project_id":pid,"body":try text(p,"body"),"origin":"agent","kind":"reply","author":"native:"+sid,"author_session_id":sid,"author_display":session["label"] ?? "Native agent","reply_to":original["id"]!,"source_evidence":p["source_evidence"] ?? [:],"verification_source":"same_user_native_peer","revision":1,"created_at":now()]
+        for key in ["task_id","conversation_id"] { if let value = original[key] { reply[key] = value } }
+        try save(db,reply,type:"message"); try event(db,caller:c,project:pid,entity:original["task_id"] as? String ?? original["conversation_id"] as? String,kind:"native_reply_received",data:["reply_id":reply["id"]!]); return reply
+    }
+}

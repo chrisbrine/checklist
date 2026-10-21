@@ -1,0 +1,55 @@
+# Local installation state and historical private planning evidence
+.local/
+.checklist/
+.env
+.env.*
+!.env.example
+# Private source-project audits, native conversation receipts and runnable historical probes
+docs/research/
+docs/reviews/evidence/
+docs/reviews/2026-10-16-deep-review.md
+docs/reviews/2026-10-16-production-revision.md
+docs/reviews/2026-10-16-storage-customization-*.md
+# Previous screenshots reference private projects. Only synthetic public concepts ship.
+docs/design/*.png
+!docs/design/public-*.png
+# Credentials, signing material and local stores never ship
+*.p12
+*.pem
+*.key
+*.cer
+*.mobileprovision
+*.provisionprofile
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+# Swift Package Manager, Xcode and local build/install products
+.build/
+build/
+.swiftpm/
+Packages/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xcuserdata/
+*.app/
+*.dSYM/
+*.dSYM.zip
+# Python tooling
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+# Agent hosts: local settings and worktrees stay per machine
+.claude/settings.local.json
+.claude/worktrees/
+# Editors, logs and macOS metadata
+.vscode/
+.idea/
+*.swp
+*~
+*.log
+.DS_Store
+._*

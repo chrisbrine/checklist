@@ -1,0 +1,59 @@
+{
+  "title": "Choose the pause-menu icon candidate",
+  "explanation": "Choose a candidate and optionally share reference files. This request records input; a separate exact-target human approval gate is needed for release approval.",
+  "questions": [
+    {
+      "id": "candidate",
+      "prompt": "Which candidate should we use?",
+      "type": "choice",
+      "required": true,
+      "multiple": false,
+      "allow_custom": true,
+      "options": [
+        {
+          "id": "a",
+          "label": "Candidate A"
+        },
+        {
+          "id": "b",
+          "label": "Candidate B"
+        }
+      ]
+    },
+    {
+      "id": "notes",
+      "prompt": "What should change?",
+      "type": "text",
+      "required": false
+    },
+    {
+      "id": "inspection",
+      "prompt": "Did the visual check pass?",
+      "type": "check",
+      "required": false
+    },
+    {
+      "id": "decision",
+      "prompt": "Do you approve the proposed direction?",
+      "type": "approval",
+      "required": false
+    }
+  ],
+  "file_requests": [
+    {
+      "id": "references",
+      "prompt": "Share a file or reference folder",
+      "kind": "either",
+      "multiple": true,
+      "required": false,
+      "optional_explanation": true
+    }
+  ],
+  "blocking": true,
+  "command": {
+    "text": "printf \"Review candidates A and B in the design folder\\n\"",
+    "working_directory": "/path/to/fictional-game",
+    "reason": "Compare the proposed pause-menu icons",
+    "expected_result": "Record your choice and any changes needed"
+  }
+}

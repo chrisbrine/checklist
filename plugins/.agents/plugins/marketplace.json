@@ -1,0 +1,20 @@
+{
+  "name": "checklist-local",
+  "interface": {
+    "displayName": "Checklist Local"
+  },
+  "plugins": [
+    {
+      "name": "checklist",
+      "source": {
+        "source": "local",
+        "path": "./checklist"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

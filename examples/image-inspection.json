@@ -1,0 +1,14 @@
+{
+  "inspected_images": [
+    {
+      "artifact_id": "synthetic-front-original",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "target_manifest_id": "synthetic-round-two-manifest"
+    },
+    {
+      "artifact_id": "synthetic-rear-original",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "target_manifest_id": "synthetic-round-two-manifest"
+    }
+  ]
+}

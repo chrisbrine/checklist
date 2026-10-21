@@ -1,0 +1,70 @@
+{
+  "routing_preset": "codex_led",
+  "allowed_providers": [
+    "codex",
+    "claude"
+  ],
+  "required_gates": [
+    "review"
+  ],
+  "task_kind_overrides": [
+    {
+      "kind": "asset",
+      "roles": {
+        "implementer": {
+          "providers": [
+            "claude"
+          ],
+          "preferred_provider": "claude",
+          "preferred_models": []
+        }
+      },
+      "required_gates": [
+        "human_approval"
+      ]
+    }
+  ],
+  "review_batch_policy": "complete_passing_independently",
+  "release_set_holds": false,
+  "lane_capacities": {
+    "build": 1,
+    "playtest": 1
+  },
+  "roles": {
+    "coordinator": {
+      "providers": [
+        "codex"
+      ],
+      "preferred_provider": "codex",
+      "preferred_models": []
+    },
+    "implementer": {
+      "providers": [
+        "codex"
+      ],
+      "preferred_provider": "codex",
+      "preferred_models": []
+    },
+    "reviewer": {
+      "providers": [
+        "codex",
+        "claude"
+      ],
+      "preferred_provider": "codex",
+      "preferred_models": []
+    }
+  },
+  "review_requirements": {
+    "default": {
+      "checks": [
+        {
+          "id": "applicable-requirements",
+          "text": "Assess every applicable acceptance and project requirement against the exact target."
+        }
+      ],
+      "reject_bar": "Reject unmet requirements; record blocked when necessary evidence cannot be obtained.",
+      "required_evidence_types": []
+    },
+    "kind_overrides": []
+  }
+}

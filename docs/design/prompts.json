@@ -1,0 +1,34 @@
+{
+  "generated_on": "2026-10-16",
+  "mode": "built-in image_gen",
+  "use_case": "ui-mockup",
+  "outputs": [
+    {
+      "path": "public-task-workspace.png",
+      "pixels": [
+        1536,
+        1024
+      ],
+      "sha256": "aedc747c5ac08c7d95bdac5d2e045c8f88ea0d1a2efc589121b61d0c9a872672",
+      "selected": true,
+      "prompt": "Use case: ui-mockup. Make a public, reusable fictional example from the supplied Checklist macOS production-task mockup. Preserve the full native light window, crisp readable typography, restrained teal palette, open sliding left sidebar, All filter selected, compact rows, floating RIGHT task overlay with shadow/back/ellipsis/close, brief/next action/evidence/acceptance, note composer and truthful per-recipient receipts. Use only the fictional projects Lantern Harbor, Orchard and Night Train, plus Checklist. Use fictional Lantern Harbor ticket keys LH-204/205/206/207 consistently in the breadcrumb, rows and composer. Toolbar and selected sidebar say Lantern Harbor. Composer destination 'Lantern Harbor · LH-204 → Worker 2 + Claude coordinator'. All tasks/images synthetic. Keep Codex and Claude as actual initial integration providers, not named personal agents. No personal/session/filepath identifiers. Show project symbols: Lantern Harbor a gamecontroller, Orchard a leaf, Night Train a train icon, Checklist checklist icon. Preserve every functional part of the corrected layout and its no-fixed-third-column overlay. This is one complete app concept screen for a public game/app production tool. No explanatory annotations, marketing text or extra windows.",
+      "prompt_is_sanitized": true,
+      "exact_prompt_sha256": "a89e161323b2996e146753f099d46b6fd1bdcabce1c1dad5ed7d111a2813b2ce",
+      "reference_role": "Private local prior concept used as edit target; excluded from public source"
+    },
+    {
+      "path": "public-human-request.png",
+      "pixels": [
+        1536,
+        1024
+      ],
+      "sha256": "0d6b322a04a5eafff3811a1000c9b2a64adf643520cdb22a1eea5f4eca0e558a",
+      "selected": true,
+      "prompt": "Use case: ui-mockup. Public fictional example revision of the attached Checklist Needs You macOS window. Preserve this accurate full native light UI, hidden LEFT SIDEBAR with persistent toggle, All projects/Search/+ Task toolbar, Requests3 / Your tasks2, list behind floating RIGHT slide-in overlay, exact fictional orchard image, Open original, immutable candidate label/hash, unselected approval choices, disabled Send answer, local draft saved and Finder option. Use only fictional project labels and keys: Orchard OR-84, Lantern Harbor LH-204, and Checklist CL-12. Orchard is a fictional game project. Keep Claude as the actual requester provider, Art review as its generic conversation example. Do not add any personal/session/path identifiers, marketing or explanatory labels. Make no functional layout changes. Return one complete readable public app concept.",
+      "prompt_is_sanitized": true,
+      "exact_prompt_sha256": "0667b3ab9b9b071575609d428d2f8846953946a613eaaf6589a035ec5ba89c71",
+      "reference_role": "Private local prior concept used as edit target; excluded from public source"
+    }
+  ],
+  "notes": "Public synthetic concepts. Returned rasters copied unchanged; no resizing, upscaling or code redraw. Public prompt text is sanitized; exact prompts and prior private edit references remain local."
+}

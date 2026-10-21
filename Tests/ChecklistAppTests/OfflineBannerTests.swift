@@ -1,0 +1,84 @@
+import XCTest
+import ChecklistIPC
+@testable import ChecklistApp
+@testable import ChecklistCore
+
+/// CL-60: a service outage shows one offline banner, the alert does not repeat, and reconnection clears it.
+@MainActor final class OfflineBannerTests: XCTestCase {
+    struct Down: LocalizedError { var errorDescription: String? { "Connection refused" } }
+
+    func testOutageShowsOneBannerAndNoRepeatedAlert() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("offline-" + UUID().uuidString)
+        let preferences = isolatedDefaults("Offline").preferences
+        defer { try? FileManager.default.removeItem(at: root) }
+        var online = false
+        let store = ChecklistStore(draftJournal: LocalDraftJournal(directory: root), preferences: preferences, restorePendingCommand: false,
+                                   desktopAlerts: DesktopAlertCoordinator(sink: OfflineAlertSink()),
+                                   requestTransport: { method, _ in
+                                       guard online else { throw Down() }
+                                       return method == "snapshot" ? ["data": ["service": ["store_incarnation": "offline-test"]], "event_cursor": "c1"] : [:]
+                                   })
+        XCTAssertFalse(store.showsOfflineBanner, "No banner before the first connection attempt")
+        for _ in 0..<3 {   // the live loop retries like this every few seconds
+            await store.refresh(quiet: true)
+            await store.ensureFullSnapshot()
+            XCTAssertNil(store.error, "An outage never raises the alert")
+        }
+        XCTAssertTrue(store.showsOfflineBanner)
+        XCTAssertEqual(store.lastServiceFailure, "Connection refused")
+        online = true
+        await store.ensureFullSnapshot()
+        XCTAssertTrue(store.connected)
+        XCTAssertFalse(store.showsOfflineBanner, "Reconnection clears the banner")
+        XCTAssertNil(store.error)
+    }
+
+    /// The production loop: the first read and its retry fail, then the service answers waits again with no
+    /// change. The next healthy wait reloads the visible page, which reconnects and removes the banner.
+    func testAHealthyUnchangedWaitAfterAnOutageReconnects() async throws {
+        let cache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!.appendingPathComponent("ChecklistSyntheticTests")
+        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+        let root = cache.appendingPathComponent("reconnect-" + UUID().uuidString)
+        let preferences = isolatedDefaults("Reconnect").preferences
+        defer { try? FileManager.default.removeItem(at: root) }
+        let router = try CommandRouter(root: root), owner = Caller(role: "owner", installation: "reconnect-fixture", projectIDs: [])
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("a"), withIntermediateDirectories: true)
+        let project = try router.handle(method: "project_create", params: ["command_id": UUID().uuidString, "name": "A", "key_prefix": "A",
+                                                                           "root_path": root.appendingPathComponent("a").path], caller: owner)["data"] as! [String: Any]
+        preferences.set(Page.epics.rawValue, forKey: "lastPage"); preferences.set(project["id"] as! String, forKey: "lastProject")
+        var waits = 0, healthyWaits = 0, reads = 0
+        let store = ChecklistStore(draftJournal: LocalDraftJournal(directory: root.appendingPathComponent("drafts")), preferences: preferences, restorePendingCommand: false,
+                                   desktopAlerts: DesktopAlertCoordinator(sink: OfflineAlertSink()),
+                                   requestTransport: { method, params in
+                                       if method == "changes_wait" {
+                                           waits += 1
+                                           if waits == 1 { throw Down() }
+                                           healthyWaits += 1
+                                           try await Task.sleep(nanoseconds: 5_000_000)
+                                           return ["data": ["changed": false], "event_cursor": "healthy"]
+                                       }
+                                       reads += 1
+                                       if reads <= 2 { throw Down() }   // the first read, and the retry after the failed wait
+                                       var params = params
+                                       if !CommandReply.readMethods.contains(method) && params["command_id"] == nil { params["command_id"] = UUID().uuidString }
+                                       return try router.handle(method: method, params: params, caller: owner)
+                                   })
+        store.liveWaitPause = 5_000_000; store.liveRetryPause = 5_000_000
+        let live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); store.stopWindowReads() }
+        let deadline = Date().addingTimeInterval(10)
+        while !(healthyWaits >= 3 && store.connected) && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertGreaterThanOrEqual(healthyWaits, 1)
+        XCTAssertGreaterThan(reads, 2, "A healthy wait after the outage reloads the visible data")
+        XCTAssertTrue(store.connected)
+        XCTAssertFalse(store.showsOfflineBanner, "The banner goes away without a changed event or a Retry click")
+        XCTAssertNil(store.error)
+    }
+}
+
+@MainActor private final class OfflineAlertSink: DesktopAlertSink {
+    func authorization() async -> DesktopAlertAuthorization { .denied }
+    func requestAuthorizationFromOwnerAction() async throws -> Bool { false }
+    func send(_ alert: DesktopAlert) async throws {}
+    func remove(_ identifiers: [String]) {}
+}

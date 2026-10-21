@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "project_id": "65b298d0-5a4f-4c4a-b190-df7ed3b4f281",
+  "revision": 1,
+  "identity": {
+    "name": "Lantern Harbor — synthetic game",
+    "future_key_prefix": "LH",
+    "accent": "teal",
+    "icon": {
+      "kind": "symbol",
+      "symbol": "gamecontroller",
+      "accessibility_label": "Lantern Harbor game project"
+    }
+  },
+  "capture": {
+    "enabled_kinds": ["work", "bug", "asset", "playtest", "question"],
+    "default_kind": "work",
+    "starter_overrides": [
+      {
+        "kind": "bug",
+        "brief_hint": "What happened, on which platform/build, and how can it be reproduced?",
+        "outcome_hint": "What should the player see or be able to do after the fix?"
+      },
+      {
+        "kind": "asset",
+        "brief_hint": "Link the intended scene and describe the candidate or output needed.",
+        "outcome_hint": "Which exact image or build will the owner review?"
+      }
+    ]
+  },
+  "presentation": {
+    "default_list": { "group_by": "status", "order_by": "manual" },
+    "owner_desktop_alerts": "needs_you"
+  },
+  "references": {
+    "policy_revision": 1,
+    "taxonomy_revision": 1,
+    "context_revision": 1
+  }
+}

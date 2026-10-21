@@ -1,0 +1,177 @@
+import Foundation
+import GRDB
+import Darwin
+import CryptoKit
+
+/// All supported routers take this gate before entering the SQL writer. Reader
+/// grants, links, backup holds and the final unlink therefore share one order.
+final class ArchiveStoragePermit {
+    fileprivate let files: StorageObjectFiles
+    fileprivate var active = true
+    fileprivate init(_ files: StorageObjectFiles) { self.files = files }
+    func requireRoot(_ root: URL) throws {
+        guard active,Data(files.root.path.utf8) == Data(root.standardizedFileURL.path.utf8) else { throw CoreError("STORAGE_GATE_REQUIRED", "Cleanup requires the current store's exclusive object gate.") }
+    }
+}
+enum ArchiveStorageGate {
+    static func withExclusive<T>(root: URL,_ body: (ArchiveStoragePermit) throws -> T) throws -> T {
+        let files = try StorageObjectFiles(root:root)
+        let fd = openat(files.descriptor,".archive-storage.lock",O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC,0o600)
+        guard fd >= 0 else { throw CoreError("STORAGE_GATE_UNAVAILABLE", "The managed object gate cannot be opened.") }
+        defer { Darwin.close(fd) }
+        var info = stat()
+        guard fstat(fd,&info) == 0,info.st_mode & S_IFMT == S_IFREG,info.st_nlink == 1 else { throw CoreError("STORAGE_GATE_UNAVAILABLE", "The managed object gate is not a private regular file.") }
+        while flock(fd,LOCK_EX) != 0 { if errno != EINTR { throw CoreError("STORAGE_GATE_UNAVAILABLE", "The managed object gate could not be acquired.") } }
+        let permit = ArchiveStoragePermit(files)
+        defer { permit.active = false;_ = flock(fd,LOCK_UN) }
+        return try body(permit)
+    }
+}
+
+extension ArchiveStoragePermit {
+    /// Only the exact managed original's directory entry is removed; never a
+    /// followed symlink, directory, source file or preview. Lengths are logical.
+    fileprivate func removeOriginal(relative: String,sha256: String,size: Int64) throws -> Bool {
+        guard relative.hasPrefix("objects/") else { throw CoreError("CLEANUP_PATH_REFUSED", "Cleanup only removes managed original objects.") }
+        let (directory,name) = try files.parent(relative);defer { Darwin.close(directory) }
+        let fd = openat(directory,name,O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        if fd < 0,errno == ENOENT { return false }
+        guard fd >= 0 else { throw CoreError("CLEANUP_OBJECT_UNAVAILABLE", "The original could not be opened safely.") }
+        defer { Darwin.close(fd) }
+        var before = stat();guard fstat(fd,&before) == 0,before.st_mode & S_IFMT == S_IFREG,before.st_size == size else { throw CoreError("CLEANUP_IDENTITY_CHANGED", "Original identity changed; bytes were retained.") }
+        var hasher = SHA256(),buffer = [UInt8](repeating:0,count:65_536),counted: Int64 = 0
+        while true {
+            let n = Darwin.read(fd,&buffer,buffer.count)
+            if n < 0,errno == EINTR { continue }
+            guard n >= 0 else { throw CoreError("CLEANUP_OBJECT_UNAVAILABLE", "Original verification failed; bytes were retained.") }
+            if n == 0 { break }
+            counted += Int64(n);guard counted <= size else { throw CoreError("CLEANUP_IDENTITY_CHANGED", "Original size changed; bytes were retained.") }
+            hasher.update(data:Data(buffer.prefix(n)))
+        }
+        let digest = hasher.finalize().map { String(format:"%02x",$0) }.joined()
+        var after = stat(),entry = stat()
+        guard counted == size,digest == sha256,fstat(fd,&after) == 0,fstatat(directory,name,&entry,AT_SYMLINK_NOFOLLOW) == 0,
+              before.st_dev == after.st_dev,before.st_ino == after.st_ino,before.st_size == after.st_size,
+              before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec,before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
+              entry.st_mode & S_IFMT == S_IFREG,entry.st_dev == after.st_dev,entry.st_ino == after.st_ino else { throw CoreError("CLEANUP_IDENTITY_CHANGED", "Original changed during verification; bytes were retained.") }
+        guard unlinkat(directory,name,0) == 0,fsync(directory) == 0 else { throw CoreError("CLEANUP_IO", "Cleanup needs reconciliation before its outcome can be confirmed.") }
+        return true
+    }
+}
+
+extension CommandRouter {
+    private func archiveCleanupCursorID(_ job: ArchiveCleanupJob) -> String { "archive-cleanup-cursor:" + job.id.text }
+    private func archiveCleanupIntentID(_ job: ArchiveCleanupJob,_ id: ArchiveAttachmentID) -> String { "archive-cleanup-delete:" + hash(Data((job.id.text + ":" + id.text).utf8)) }
+    private func archiveCleanupRelativePath(_ attachment: JSON) throws -> String {
+        guard attachment["mode"] as? String == "managed",let path = attachment["path"] as? String else { throw CoreError("CLEANUP_PATH_REFUSED", "External originals cannot be removed.") }
+        return try managedRelative(path,family:"objects")
+    }
+    /// Internal synchronous service pump: at most eight metadata admissions and
+    /// one exact original per call. The service schedules a one-shot continuation.
+    /// Persisted job, cursor and deletion intent survive router/process restart.
+    func processArchiveCleanupJobs(_ db: Database,permit: ArchiveStoragePermit,nowMS: Int64) throws {
+        try permit.requireRoot(root)
+        guard !db.isInsideTransaction else { throw CoreError("CLEANUP_TRANSACTION_REQUIRED", "Run cleanup after the semantic transaction commits.") }
+        let ids = try String.fetchAll(db,sql:"""
+            SELECT j.id FROM records j LEFT JOIN records c ON c.id=('archive-cleanup-cursor:' || j.id) AND c.type='storage_job'
+            WHERE j.type='cleanup_job' AND CASE WHEN json_valid(j.data) THEN COALESCE(json_extract(j.data,'$.not_before_ms') <= ?,1) ELSE 1 END AND CASE WHEN json_valid(j.data) THEN json_extract(j.data,'$.state') NOT IN ('completed','canceled','suspended') ELSE 1 END
+            ORDER BY CASE WHEN json_valid(c.data) THEN COALESCE(json_extract(c.data,'$.checked_at_ms'),0) ELSE 0 END,j.rowid LIMIT 8
+            """,arguments:[nowMS])
+        var admissions = 0
+        for id in ids {
+            var job = try cleanupJobDecode(record(db,id,type:"cleanup_job"))
+            guard nowMS >= job.notBeforeMS else { continue }
+            var cursor: JSON = (try archiveCleanupRecordIfPresent(db,archiveCleanupCursorID(job),type:"storage_job")) ?? ["id":archiveCleanupCursorID(job),"project_id":job.projectID.text,"task_id":job.taskID.text,"kind":"archive_cleanup_cursor","state":"idle","revision":0,"next_index":0]
+            guard cursor["kind"] as? String == "archive_cleanup_cursor",cleanupJobEqual(cursor["task_id"],job.taskID.text),cleanupJobEqual(cursor["project_id"],job.projectID.text) else { throw CoreError("CLEANUP_CURSOR_INVALID", "Cleanup cursor requires repair; originals retained.") }
+            let start = max(0,int(cursor,"next_index")) % job.items.count
+            for offset in 0..<job.items.count where admissions < ArchiveCleanupJob.admissionStepLimit {
+                let index = (start + offset) % job.items.count,item = job.items[index]
+                if item.terminal { continue }; admissions += 1
+                cursor["next_index"] = (index + 1) % job.items.count;cursor["checked_at_ms"] = nowMS
+                var precedingFailure: ArchiveCleanupJob.Failure?
+                var precedingFailureCount = 0
+                do {
+                    var eligible = false
+                    try withValidatedDomainTransaction(db) {
+                        let raw = try self.record(db,id,type:"cleanup_job");job = try self.cleanupJobDecode(raw)
+                        if let previous = job.items.first(where: {$0.original.id == item.original.id}) { precedingFailure = previous.failure;precedingFailureCount = previous.sameFailureCount }
+                        let task = try self.scoped(db,job.taskID.text,job.projectID.text,type:"task")
+                        if !bool(task,"archived") { _ = job.cancel();try self.save(db,job.record(revision:self.nextCleanupJobRevision(raw)),type:"cleanup_job");return .commit }
+                        let a = try self.scoped(db,item.original.id.text,job.projectID.text,type:"attachment")
+                        let graph = try self.archiveCleanupReferenceRows(db)
+                        var holds = try self.completeArchiveCleanupHolds(db,attachment:a,task:task,currentGraph:graph)
+                        let currentSize = try ArchiveCleanupJob.integer(a["size"]),currentRevision = try ArchiveCleanupJob.integer(a["revision"])
+                        if !self.cleanupJobEqual(a["task_id"],job.taskID.text) || a["sha256"] as? String != item.original.sha256 || currentSize != item.original.logicalBytes || currentRevision != item.original.attachmentRevision { holds.insert(.changedIdentity) }
+                        let project = try self.record(db,job.projectID.text,type:"project")
+                        let plan = try ArchiveRetentionPlanner.make(configuration:self.archiveRetentionConfiguration(project),facts:self.archiveRetentionFacts(db,task:task,currentGraph:graph))
+                        if !plan.selected.contains(where: {$0.id == item.original.id}) { holds.insert(.policyNoLongerSelects) }
+                        try job.observe([.init(projectID:job.projectID,taskID:job.taskID,original:item.original,referencesComplete:true,holds:holds)],nowMS:nowMS)
+                        if try jsonString(job.record(revision:ArchiveCleanupJob.integer(raw["revision"]))) != jsonString(raw) { try self.save(db,job.record(revision:self.nextCleanupJobRevision(raw)),type:"cleanup_job") }
+                        if holds.isEmpty {
+                            let relative = try self.archiveCleanupRelativePath(a),intentID = self.archiveCleanupIntentID(job,item.original.id)
+                            let prior = try self.archiveCleanupRecordIfPresent(db,intentID,type:"storage_job")
+                            let intent: JSON = ["id":intentID,"project_id":job.projectID.text,"task_id":job.taskID.text,"kind":"archive_cleanup_delete","state":"marked","revision":int(prior ?? [:],"revision") + 1,"cleanup_job_id":job.id.text,"attachment_id":item.original.id.text,"relative_path":relative,"sha256":item.original.sha256,"logical_bytes":item.original.logicalBytes]
+                            try self.save(db,intent,type:"storage_job");eligible = true
+                        }
+                        return .commit
+                    }
+                    if eligible {
+                        // Fresh complete graph inside an actual writer transaction,
+                        // after the durable intent and immediately before unlink.
+                        try withValidatedDomainTransaction(db) {
+                            let raw = try self.record(db,id,type:"cleanup_job");job = try self.cleanupJobDecode(raw)
+                            guard ![.canceled,.completed,.suspended].contains(job.state),nowMS >= job.notBeforeMS else { return .commit }
+                            let task = try self.scoped(db,job.taskID.text,job.projectID.text,type:"task")
+                            guard bool(task,"archived") else { return .commit }
+                            var a = try self.scoped(db,item.original.id.text,job.projectID.text,type:"attachment")
+                            guard try self.completeArchiveCleanupHolds(db,attachment:a,task:task).isEmpty,
+                                  a["sha256"] as? String == item.original.sha256,try ArchiveCleanupJob.integer(a["revision"]) == item.original.attachmentRevision else { return .commit }
+                            let relative = try self.archiveCleanupRelativePath(a)
+                            let removed = try permit.removeOriginal(relative:relative,sha256:item.original.sha256,size:item.original.logicalBytes)
+                            try job.recordDeletion(id:item.original.id,alreadyMissing:!removed)
+                            a["availability"] = removed ? "original_cleaned" : "original_missing";a["cleanup_state"] = "complete";a["cleaned_at"] = now();a["cleanup_job_id"] = id
+                            try self.save(db,self.revised(a),type:"attachment");try self.save(db,job.record(revision:self.nextCleanupJobRevision(raw)),type:"cleanup_job")
+                            var intent = try self.record(db,self.archiveCleanupIntentID(job,item.original.id),type:"storage_job");intent["state"] = removed ? "removed" : "already_missing";try self.save(db,self.revised(intent),type:"storage_job")
+                            try self.event(db,caller:Caller(role:"owner",installation:"storage",projectIDs:[]),project:job.projectID.text,entity:job.taskID.text,kind:removed ? "attachment_original_cleaned" : "attachment_original_missing",data:["attachment_id":item.original.id.text,"cleanup_job_id":id,"active_store_logical_bytes_removed":removed ? item.original.logicalBytes : 0,"physical_reclamation":"unmeasured","backup_retained_physical_bytes":NSNull()])
+                            return .commit
+                        }
+                        try withValidatedDomainTransaction(db) { try self.save(db,self.revised(cursor),type:"storage_job");return .commit }
+                        return
+                    }
+                } catch {
+                    // A failure after unlink may have rolled its SQL outcome back.
+                    // The durable marked intent is preserved; retry verifies absence.
+                    try withValidatedDomainTransaction(db) {
+                        let raw = try self.record(db,id,type:"cleanup_job");var current = try self.cleanupJobDecode(raw)
+                        let code: ArchiveCleanupJob.Failure = (error as? CoreError)?.code == "CLEANUP_IDENTITY_CHANGED" ? .identityChanged : (error is DatabaseError ? .metadataUnavailable : .admissionUnavailable)
+                        if ![.canceled,.completed,.suspended].contains(current.state) {
+                            // Admission's ready projection clears metadata failures;
+                            // preserve consecutive executor failure history explicitly.
+                            let target = min(2,(precedingFailure == code ? precedingFailureCount : 0) + 1)
+                            let present = current.items.first(where: {$0.original.id == item.original.id})
+                            let existing = present?.failure == code ? (present?.sameFailureCount ?? 0) : 0
+                            for _ in 0..<max(1,target - existing) { try current.recordFailure(id:item.original.id,code:code) }
+                            try self.save(db,current.record(revision:self.nextCleanupJobRevision(raw)),type:"cleanup_job")
+                        }
+                        return .commit
+                    }
+                }
+            }
+            try withValidatedDomainTransaction(db) { try self.save(db,self.revised(cursor),type:"storage_job");return .commit }
+            if admissions >= ArchiveCleanupJob.admissionStepLimit { break }
+        }
+    }
+    /// Service uses a one-shot deadline, never a polling/model timer. Held work
+    /// resumes on a relevant command or an expiring actual reader/backup lease.
+    public func nextArchiveCleanupDeadline() throws -> Date? {
+        guard storageMaintenanceFallbackFailures < 2 else { return nil }
+        return try dbQueue.read { db in
+            let nowMS = self.archiveCleanupNowMS()
+            let deadline = try Int64.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.not_before_ms') AS INTEGER)) FROM records WHERE type='cleanup_job' AND json_valid(data) AND json_extract(data,'$.state') IN ('queued','ready')")
+            let expiry = try Double.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.expires_at') AS REAL)) FROM records WHERE type='storage_hold' AND json_valid(data) AND json_extract(data,'$.state')='active' AND CAST(json_extract(data,'$.expires_at') AS REAL)>?",arguments:[Date().timeIntervalSince1970])
+            let more = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records j,json_each(j.data,'$.items') i WHERE j.type='cleanup_job' AND json_valid(j.data) AND json_extract(j.data,'$.state')='held' AND (json_extract(i.value,'$.state')='waiting' OR json_extract(i.value,'$.same_failure_count')=1))") ?? false
+            let next = [deadline.map { max($0,nowMS + 50) },expiry.map { Int64($0 * 1000) },more ? nowMS + 1000 : nil].compactMap {$0}.min()
+            return next.map { Date(timeIntervalSince1970:Double($0)/1000) }
+        }
+    }
+}

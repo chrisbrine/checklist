@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://checklist.local/contracts/media-record-reference.schema.json",
+  "title": "Internal exact media history dependency (capture prerequisite, no command)",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Must resolve to a registered canonical family in the same project at capture."
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807,
+      "description": "Required for immutable historical version families. Optional for a mutable identity such as an ownership reference; when present it must match exactly."
+    }
+  },
+  "required": [
+    "id",
+    "type"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "media_review_type_revision",
+              "media_round_manifest",
+              "media_review_context",
+              "media_context_reconciliation",
+              "media_item_target",
+              "media_candidate",
+              "media_owner_decision",
+              "media_suggestion",
+              "media_intake_plan",
+              "media_intake_chunk",
+              "media_bulk_operation",
+              "media_bulk_chunk"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "revision"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Checklist host-owned personal assistant identity snapshot v1",
+  "description": "Read-only snapshot of an existing personal assistant owned by its host, such as a Dot. Checklist creates no persona/profile catalog and does not copy or edit host personality/memory. This snapshot is not a credential, worker identity or live integration proof.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1},
+    "assistant_id": {"type": "string", "format": "uuid", "description": "Internal stable reference for the observed host assistant, not a caller-selected profile binding or credential."},
+    "adapter_registry_id": {
+      "type": "string", "minLength": 3, "maxLength": 120,
+      "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)+$",
+      "description": "Installed adapter reference; a valid registry string never enables an implementation."
+    },
+    "host_assistant_ref": {
+      "type": "string", "minLength": 1, "maxLength": 512,
+      "pattern": "^[^\\u0000-\\u001F\\u007F]+$",
+      "description": "Opaque non-secret host identity reference. A display name or host-exported session ID alone cannot establish a verified persistent assistant identity."
+    },
+    "identity_provenance": {"enum": ["host_reported", "host_verified"]},
+    "verification_receipt_id": {"type": "string", "format": "uuid", "description": "Receipt for actual host identity proof, not merely a signed executable or caller-supplied field. Runtime validates receipt scope/source."},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "display_name": {"type": "string", "minLength": 1, "maxLength": 120, "pattern": "\\S", "description": "Read-only host-provided display snapshot; never routing authority."},
+    "pronouns": {"type": "string", "minLength": 1, "maxLength": 80, "pattern": "\\S", "description": "Optional read-only host-provided display data."}
+  },
+  "required": ["schema_version", "assistant_id", "adapter_registry_id", "host_assistant_ref", "identity_provenance", "observed_at", "display_name"],
+  "if": {"properties": {"identity_provenance": {"const": "host_verified"}}, "required": ["identity_provenance"]},
+  "then": {"required": ["verification_receipt_id"]},
+  "else": {"not": {"required": ["verification_receipt_id"]}}
+}

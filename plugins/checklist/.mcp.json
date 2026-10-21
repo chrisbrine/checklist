@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "checklist": {
+      "type": "stdio",
+      "command": "/Applications/Checklist.app/Contents/MacOS/checklist",
+      "args": [
+        "mcp",
+        "--assistant",
+        "--project",
+        "@enabled"
+      ]
+    }
+  }
+}

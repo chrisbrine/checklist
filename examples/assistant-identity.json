@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "assistant_id": "69b1f3b0-32ab-489a-b69e-999232ff9460",
+  "adapter_registry_id": "codex.dot",
+  "host_assistant_ref": "synthetic-host-assistant-rowan",
+  "identity_provenance": "host_reported",
+  "observed_at": "2026-10-16T19:00:00Z",
+  "display_name": "Rowan",
+  "pronouns": "they/them"
+}

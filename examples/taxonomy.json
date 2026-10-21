@@ -1,0 +1,255 @@
+{
+  "schema_version": 1,
+  "preset": "games_and_apps",
+  "revision": 1,
+  "statuses": [
+    {
+      "id": "2a0b4fdd-5ddb-4d7b-84cc-000000000001",
+      "key": "queued",
+      "name": "Queued",
+      "category": "queued",
+      "section": "Ready",
+      "color": "#6A7588",
+      "order": 0,
+      "retired": false
+    },
+    {
+      "id": "2a0b4fdd-5ddb-4d7b-84cc-000000000002",
+      "key": "working",
+      "name": "Working",
+      "category": "implementation",
+      "section": "Working",
+      "color": "#00857D",
+      "order": 1,
+      "retired": false
+    },
+    {
+      "id": "2a0b4fdd-5ddb-4d7b-84cc-000000000003",
+      "key": "review",
+      "name": "Ready for review",
+      "category": "review",
+      "section": "Review",
+      "color": "#BA8500",
+      "order": 2,
+      "retired": false
+    },
+    {
+      "id": "2a0b4fdd-5ddb-4d7b-84cc-000000000004",
+      "key": "playtest",
+      "name": "Needs playtest",
+      "category": "review",
+      "section": "Review",
+      "color": "#9464B2",
+      "order": 3,
+      "retired": false
+    },
+    {
+      "id": "2a0b4fdd-5ddb-4d7b-84cc-000000000005",
+      "key": "changes",
+      "name": "Changes requested",
+      "category": "changes_requested",
+      "section": "Ready",
+      "color": "#BA6600",
+      "order": 4,
+      "retired": false
+    },
+    {
+      "id": "2a0b4fdd-5ddb-4d7b-84cc-000000000006",
+      "key": "human",
+      "name": "Waiting on you",
+      "category": "waiting_human",
+      "section": "Needs You",
+      "color": "#B07121",
+      "order": 5,
+      "retired": false
+    },
+    {
+      "id": "2a0b4fdd-5ddb-4d7b-84cc-000000000007",
+      "key": "blocked",
+      "name": "Blocked",
+      "category": "blocked",
+      "section": "Blocked",
+      "color": "#B85656",
+      "order": 6,
+      "retired": false
+    },
+    {
+      "id": "2a0b4fdd-5ddb-4d7b-84cc-000000000008",
+      "key": "parked-later",
+      "name": "Parked \u2014 Later",
+      "category": "deferred",
+      "section": "Parked",
+      "color": "#7A7F87",
+      "order": 7,
+      "retired": false
+    },
+    {
+      "id": "2a0b4fdd-5ddb-4d7b-84cc-000000000009",
+      "key": "parked-design",
+      "name": "Parked \u2014 Awaiting design",
+      "category": "deferred",
+      "section": "Parked",
+      "color": "#8E7D95",
+      "order": 8,
+      "retired": false
+    },
+    {
+      "id": "2a0b4fdd-5ddb-4d7b-84cc-000000000010",
+      "key": "done",
+      "name": "Done",
+      "category": "done",
+      "section": "Closed",
+      "color": "#4B8873",
+      "order": 9,
+      "retired": false
+    },
+    {
+      "id": "2a0b4fdd-5ddb-4d7b-84cc-000000000011",
+      "key": "cancelled",
+      "name": "Cancelled",
+      "category": "cancelled",
+      "section": "Closed",
+      "color": "#777777",
+      "order": 10,
+      "retired": false
+    },
+    {
+      "id": "2a0b4fdd-5ddb-4d7b-84cc-000000000012",
+      "key": "superseded",
+      "name": "Superseded",
+      "category": "superseded",
+      "section": "Closed",
+      "color": "#777777",
+      "order": 11,
+      "retired": false
+    }
+  ],
+  "transitions": [
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000001",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000002",
+      "intent": "claim"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000002",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000003",
+      "intent": "submit"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000003",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000004",
+      "intent": "review_gate"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000003",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000005",
+      "intent": "request_changes"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000004",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000005",
+      "intent": "request_changes"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000005",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000002",
+      "intent": "claim"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000003",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000010",
+      "intent": "complete"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000004",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000010",
+      "intent": "complete"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000001",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000008",
+      "intent": "defer"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000001",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000009",
+      "intent": "defer"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000008",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000001",
+      "intent": "queue"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000009",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000001",
+      "intent": "queue"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000001",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000006",
+      "intent": "wait_human"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000006",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000001",
+      "intent": "resolve"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000002",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000007",
+      "intent": "block"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000007",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000001",
+      "intent": "resolve"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000001",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000011",
+      "intent": "cancel"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000001",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000012",
+      "intent": "supersede"
+    },
+    {
+      "from": "2a0b4fdd-5ddb-4d7b-84cc-000000000010",
+      "to": "2a0b4fdd-5ddb-4d7b-84cc-000000000001",
+      "intent": "reopen"
+    }
+  ],
+  "tags": [
+    {
+      "id": "2a0b4fdd-5ddb-4d7b-84cc-000000000101",
+      "name": "accessibility",
+      "color": "#57899A",
+      "description": "Keyboard, focus and accessibility work",
+      "retired": false
+    },
+    {
+      "id": "2a0b4fdd-5ddb-4d7b-84cc-000000000102",
+      "name": "regression",
+      "color": "#AD715D",
+      "description": "Previously working behavior",
+      "retired": false
+    }
+  ],
+  "defaults": {
+    "queued": "2a0b4fdd-5ddb-4d7b-84cc-000000000001",
+    "implementation": "2a0b4fdd-5ddb-4d7b-84cc-000000000002",
+    "review": "2a0b4fdd-5ddb-4d7b-84cc-000000000003",
+    "changes_requested": "2a0b4fdd-5ddb-4d7b-84cc-000000000005",
+    "waiting_human": "2a0b4fdd-5ddb-4d7b-84cc-000000000006",
+    "blocked": "2a0b4fdd-5ddb-4d7b-84cc-000000000007",
+    "deferred": "2a0b4fdd-5ddb-4d7b-84cc-000000000008",
+    "done": "2a0b4fdd-5ddb-4d7b-84cc-000000000010",
+    "cancelled": "2a0b4fdd-5ddb-4d7b-84cc-000000000011",
+    "superseded": "2a0b4fdd-5ddb-4d7b-84cc-000000000012"
+  },
+  "event_routes": {
+    "review.ready.playtest": "2a0b4fdd-5ddb-4d7b-84cc-000000000004"
+  }
+}

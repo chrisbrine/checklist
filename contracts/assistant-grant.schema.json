@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Checklist assistant observer and messaging grant v1",
+  "description": "Owner-approved local grant snapshot for an existing host-owned personal assistant, not a credential or importable live binding. The host owns its name/personality; no Checklist-created persona, named worker profile, work role or trusted human authority is available. Host/bootstrap authorization remains separate from this snapshot.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1},
+    "assistant_id": {"type": "string", "format": "uuid"},
+    "adapter_registry_id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 120,
+      "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)+$",
+      "description": "References a separately installed and qualified namespaced registry entry; an arbitrary valid string does not enable an adapter."
+    },
+    "grant_revision": {"type": "integer", "minimum": 1, "description": "Current snapshot revision; authoritative grant edits must provide this as the expected revision and fail on conflict."},
+    "access_mode": {"const": "observer_messenger"},
+    "projects": {
+      "type": "array", "minItems": 1, "maxItems": 100, "uniqueItems": true,
+      "description": "The service additionally rejects repeated project_id values across otherwise different entries; keyed duplicates never union permissions or use first/last-write wins.",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "properties": {
+          "project_id": {"type": "string", "format": "uuid"},
+          "read": {"const": true},
+          "create_drafts_on_request": {"type": "boolean"},
+          "post_notes_on_request": {"type": "boolean", "description": "Allows owner-requested ticket notes/project messages and replies authorized by the original human request or trusted app grant for that exact conversation; inbound agent text alone is not consent. No unsolicited contact, assignment or work."},
+          "receive_messages": {"type": "boolean", "description": "Allows requested direct contacts and authorized correlated replies into this assistant's scoped inbox. Push separately requires qualified host setup/opt-in. This is independent of optional ticket-update subscriptions."},
+          "receive_notifications": {"type": "boolean", "description": "Permits explicitly subscribed ticket-update event delivery only. False does not drop an otherwise authorized requested direct reply or create a ticket subscription. A grant alone creates no subscription or reporting turn."}
+        },
+        "required": ["project_id", "read", "create_drafts_on_request", "post_notes_on_request", "receive_messages", "receive_notifications"]
+      }
+    }
+  },
+  "required": ["schema_version", "assistant_id", "adapter_registry_id", "grant_revision", "access_mode", "projects"]
+}

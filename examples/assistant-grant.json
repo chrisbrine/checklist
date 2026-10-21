@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "assistant_id": "69b1f3b0-32ab-489a-b69e-999232ff9460",
+  "adapter_registry_id": "codex.dot",
+  "grant_revision": 1,
+  "access_mode": "observer_messenger",
+  "projects": [
+    {
+      "project_id": "65b298d0-5a4f-4c4a-b190-df7ed3b4f281",
+      "read": true,
+      "create_drafts_on_request": true,
+      "post_notes_on_request": true,
+      "receive_messages": true,
+      "receive_notifications": true
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+# Custom statuses, tags and live updates
+
+These are first-release requirements for the owner's games/apps. Custom labels, several Parked types and real live data fit a simple task list; the owner should not configure a transition graph to get them.
+
+## Simple status editing
+
+The app ships a working production preset. Add a status with **Name → behaves like → color**, then optionally reorder it. Common behavior choices read Queued / Available, Working, Review, Waiting on you, Blocked, Parked and Closed; advanced internal distinctions are supplied by the preset. Several choices such as **Parked — Later**, **Parked — Awaiting design** and **Parked — External dependency** share protected deferred behavior and remain separately filterable.
+
+Each stored status has a stable project-local ID/key, editable name/color/order/section, internal category and retirement state. Names are case-fold unique within a project; other projects can reuse them. History records ID and label at the time. Behavior never comes from searching the name for “Parked”.
+
+The service's internal categories are `queued`, `implementation`, `review`, `changes_requested`, `waiting_human`, `blocked`, `deferred`, `done`, `cancelled`, `superseded`. A resolved taxonomy snapshot includes generated category defaults and protected transition rules so every domain command has a safe destination. Those fields are **not a setup checklist or an owner-facing graph editor**. The [example](../examples/taxonomy.json) is a resolved export; optional event/gate routes can present Needs playtest without a second workflow system.
+
+“Available” here names queued behavior, not a guarantee of pickup: Draft/Ready is separate readiness and grants/dependencies still apply. Title-only capture uses queued behavior with a Draft badge and cannot be picked up. Showing a ready review status does not imply a reviewer claimed it; row attention distinguishes Ready for review from Reviewer working using actual claims. A new custom status cannot grant write authority, release a claim, submit evidence or pass a gate.
+
+Task commands select a permitted explicit `target_status_id`, otherwise the generated event/gate route or category default. Claim/submission/verdict/completion guards remain authoritative; status plus semantic projection commits atomically. Adding another Parked type needs no storage migration. Cosmetic changes apply live without invalidating evidence.
+
+Triage group status derives from its current tickets: their common status, Mixed or Empty. Changing a group status transitions every current member under the same ordinary/custom guards, with expected group/member revisions and all-or-nothing commit; it never sets an independent group label. A Done target runs real completion gates for every ticket. Any blocker leaves all members unchanged. Any individual ticket status action removes it from every current Triage, including explicit same-status marking. Notes/attachments/metadata-only edits retain membership. Ordinary group transitions retain membership; group Done removes completed tickets from every current Triage. Preserve membership history, primary Epic and fixed batches; clients receive no keep-membership bypass flag.
+
+Retire an unused status to hide it from new choices while preserving history. An in-use retirement/category change shows affected tasks and explicit destination mapping. Never silently flatten Parked types, activate parked work, complete work or free claims. Changes to protected workflow behavior use policy impact/revision rules; ordinary setup and editing stay small.
+
+## Incomplete and closed ticket surfaces
+
+Ticket worklists default to **Incomplete**: Draft, Ready, Active, Review, Blocked and Parked work remain subject to the current project, search and filters. **Done / Archived** explicitly retrieves completed, canceled and archived tickets, with their actual state visibly labeled. Trashed work stays outside these worklists. An explicit saved closed-status filter selects the closed surface, including when custom status metadata arrives after startup. Project and all-project search apply to the selected surface; switching back returns to incomplete work.
+
+This is a presentation filter. Viewing closed work does not set archive flags, clean up files or mutate status, evidence, history or the primary Epic. Live completion removes a ticket from the incomplete worklist before held-row stabilization, and reopening returns it when the current filters match. Triage membership still follows its ordinary status-change rules. Epic historical progress aggregates and related/prerequisite references retain closed work as context.
+
+## Independent ticket tags and bulk changes
+
+Tags have project-scoped stable ID, editable name/color/description and retirement. Tasks can have several, such as regression, art, accessibility or save-system. Tags do not encode provider/ownership/status. Old source fields named Claude/Codex/Owner map to provenance/assignment during later migration, not these tags.
+
+Support type-to-find/create, rename, retire and merge tags; merge retains aliases/history and never merges tasks. Filters allow any/all/none. Saved filters use IDs so renames survive; retired/mapped values show an explicit warning/successor, not a silent empty list. Global views disambiguate identical project-local names and can filter protected behavior across projects.
+
+Multi-select supports tags, planned assignment, epic/triage links, allowed status actions and archive. Preview count/conflicts and use an atomic command by default. A competing claim or revision rejects the operation without partly applying it; the owner can explicitly retry the shown eligible subset as a fresh command. No batch-automation designer is needed. Undo uses a revision-checked compensating change with a clear reason when ownership/review has advanced. It cannot erase history, resurrect claims or recover cleaned attachment bytes.
+
+The development service exposes `task_bulk_edit` and `task_bulk_undo`; their [parameters, atomic preview/apply behavior and receipt limits](mcp-contract.md#saved-list-filters-and-bulk-changes) are explicit. Bulk status changes are individual ticket actions and remove current Triage memberships. Cancel and Reopen require a short, nonblank `changes.reason` (at most 4,000 UTF-8 bytes); a missing reason rejects the command before row checks, and each changed ticket retains the reason in its transition history. The bulk sheet asks for it and explains why Preview/Apply is unavailable while it is missing. Status Undo records a reason naming the original bulk command, plus optional caller `reason` (combined limit 4,000 UTF-8 bytes). Undo also follows ordinary status guards; restoring a protected status or a reopened duplicate's removed redirect is unavailable. Personal saved views keep filters/grouping/order locally, with [project-default precedence](interface.md#capture-and-lists), and never rewrite manual ticket positions.
+
+## Live data without interaction surprises
+
+The native app receives ordered authenticated local events for task projections, counts, taxonomies, groups, requests/answers, sessions and delivery receipts. Agent writes and all windows use the same source. A snapshot includes a high-water cursor; replay strictly after it and attach the live stream without a gap. Deduplicate by event/command ID, update changed projections and coalesce harmless rendering updates rather than reloading the database.
+
+Preserve selection, scroll anchors, filters, keyboard focus and per-item draft state. While the owner is clicking, dragging or navigating a row, defer disruptive row movement until a safe interaction boundary; indicate pending changes if needed. A completed/archive/filter change cannot move a different row beneath an in-progress click. Keep the open task anchored with **Moved to Review**, **No longer matches this view**, **Archived elsewhere** or **Trashed elsewhere**, plus the relevant action. Never replace it silently with its neighbor. Unavailable due to permissions/removal has a distinct explanation and closes only by the owner's action or unavoidable access protection.
+
+The right overlay retains a compact Back path, per-item scroll/drafts/focus and visible Close control. Live changes to a linked request/session do not discard that path. First Escape exits the focused editor/picker as appropriate; a subsequent Escape closes the overlay. Destructive/unsent input remains recoverable.
+
+Edits retain their starting revision. Competing updates show changed fields/conflict and never overwrite the draft. Required human answers validate exact form revision and image/build target; changed questions/target preserve draft for reconciliation. Notes/answers become Saved only after durable service receipt, and Delivered/Acknowledged remain separate. Unknown send outcome retains command ID until idempotent reconciliation.
+
+On disconnect, display Reconnecting/Service unavailable and last confirmed update time. Save drafts, not offline authority-changing mutations. Reconnect from durable cursor, or reconcile a new consistent snapshot when retention invalidates it. Preserve local state in either case. No offline claim/review synchronization or silent queued completion. After repeated identical transport failure, back off/suspend and expose repair; do not spin an unchanged poll loop.
+
+Acceptance target on an awake connected Mac: relevant committed changes visible in other open windows within one second at p95, measured on the release fixture. That target is not a measured result. Test row/filter movement, active click/keyboard selection, archived open detail, narrow overlay, changed-answer draft and multiple windows, alongside cursor gap/deduplication cases.
+
+Agents learn changes through qualified native messages, normal checkpoints/hooks or optional client-supported subscriptions. Durable inbox/context remains available even when push is unavailable. UI live data and MCP notifications do not prove an idle model woke or read anything. No recurring model polling is introduced to imitate live capability.
+
+
+### Bounded Tickets and selected-context composition
+
+The native Tickets/Overview/Archive list consumes a separate bounded owner page with explicit distinct counts, Triage member completeness, request preview counts and scoped continuation. Selected ticket conversation and event history load on demand; work/review records require an explicit current-record read. Late or failed reads preserve drafts and block stale actions. Full-index compatibility surfaces remain explicit; this composition does not claim that every worker context or Activity/Epics path is paged.
+
+Filter/draft/selected state uses separate observation owners; rendered ticket labels use an Equatable presentation while retaining real button/focus/navigation wrappers. Formatter/icon caches retain their independently recorded helper evidence. Installed latency, memory and native behavior require the current target's observations; static code and synthetic tests do not establish those results.

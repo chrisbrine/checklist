@@ -1,0 +1,315 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Checklist human request form fields",
+  "description": "Flat human_request_create fields, alongside project_id, task_id and command_id. No request_spec wrapper, schema_version, purpose, blocking_scope or target object. human_request_revise takes a non-empty subset in patch (see $defs/patch), alongside project_id, request_id, expected_revision, command_id and optional reason. The service derives authorship, state, revisions and target hash. Creation defaults title to Needs your input, questions/file_requests to empty and blocking to true; at least one question or file is required. Service text limits count UTF-8 bytes, not Unicode characters. Approval gate/target authorization is validated against current service records.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "title": {
+      "type": "string",
+      "maxLength": 4000,
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "explanation": {
+      "type": "string",
+      "maxLength": 4000
+    },
+    "questions": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "$ref": "#/$defs/question"
+      }
+    },
+    "file_requests": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "$ref": "#/$defs/fileRequest"
+      }
+    },
+    "blocking": {
+      "type": "boolean",
+      "default": true
+    },
+    "command": {
+      "$ref": "#/$defs/command"
+    },
+    "target_attachment_id": {
+      "type": "string",
+      "maxLength": 4000
+    },
+    "review_request_id": {
+      "type": "string",
+      "maxLength": 4000
+    },
+    "target_manifest_id": {
+      "type": "string",
+      "maxLength": 4000
+    }
+  },
+  "anyOf": [
+    {
+      "required": [
+        "questions"
+      ],
+      "properties": {
+        "questions": {
+          "minItems": 1
+        }
+      }
+    },
+    {
+      "required": [
+        "file_requests"
+      ],
+      "properties": {
+        "file_requests": {
+          "minItems": 1
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "command": {
+      "type": "object",
+      "description": "Shown as instructions only; Checklist does not execute this command. Text limits are UTF-8 bytes in the service. Extra nested fields are ignored.",
+      "properties": {
+        "text": {
+          "type": "string",
+          "maxLength": 16000,
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "working_directory": {
+          "type": "string",
+          "maxLength": 4000,
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "expected_result": {
+          "type": "string",
+          "maxLength": 4000,
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 4000
+        }
+      },
+      "required": [
+        "text",
+        "working_directory",
+        "expected_result"
+      ]
+    },
+    "question": {
+      "type": "object",
+      "description": "IDs are unique within questions. type defaults to text; required defaults true; multiple and allow_custom default false. Extra nested fields are ignored.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 100,
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "prompt": {
+          "type": "string",
+          "maxLength": 4000,
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "type": {
+          "enum": [
+            "text",
+            "choice",
+            "approval",
+            "check"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "multiple": {
+          "type": "boolean"
+        },
+        "allow_custom": {
+          "type": "boolean"
+        },
+        "command": {
+          "$ref": "#/$defs/command"
+        }
+      },
+      "required": [
+        "id",
+        "prompt"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "choice"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "options": {
+                "type": "array",
+                "maxItems": 100,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "maxLength": 100,
+                      "minLength": 1,
+                      "pattern": "\\S"
+                    },
+                    "label": {
+                      "type": "string",
+                      "maxLength": 4000,
+                      "minLength": 1,
+                      "pattern": "\\S"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "label"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "options"
+            ],
+            "anyOf": [
+              {
+                "properties": {
+                  "options": {
+                    "minItems": 1
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "allow_custom": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "allow_custom"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "fileRequest": {
+      "type": "object",
+      "description": "IDs are unique within file_requests. kind takes precedence over selection (an alias); omitted kind/selection means either. required defaults true; multiple and optional_explanation default false. Extra nested fields are ignored.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 100,
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "prompt": {
+          "type": "string",
+          "maxLength": 4000,
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "kind": {
+          "enum": [
+            "file",
+            "directory",
+            "either"
+          ]
+        },
+        "selection": {
+          "enum": [
+            "file",
+            "directory",
+            "either"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "multiple": {
+          "type": "boolean"
+        },
+        "optional_explanation": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "prompt"
+      ]
+    },
+    "patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "title": {
+          "type": "string",
+          "maxLength": 4000,
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "explanation": {
+          "type": "string",
+          "maxLength": 16000
+        },
+        "questions": {
+          "type": "array",
+          "maxItems": 30,
+          "items": {
+            "$ref": "#/$defs/question"
+          }
+        },
+        "file_requests": {
+          "type": "array",
+          "maxItems": 30,
+          "items": {
+            "$ref": "#/$defs/fileRequest"
+          }
+        },
+        "blocking": {
+          "type": "boolean",
+          "default": true
+        },
+        "command": {
+          "$ref": "#/$defs/command"
+        },
+        "target_attachment_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4000,
+          "description": "Null or an empty string clears the target; rebinding still validates any human approval gate."
+        },
+        "review_request_id": {
+          "type": "string",
+          "maxLength": 4000
+        },
+        "target_manifest_id": {
+          "type": "string",
+          "maxLength": 4000
+        }
+      }
+    }
+  }
+}

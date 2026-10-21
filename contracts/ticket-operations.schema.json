@@ -1,0 +1,347 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Checklist ticket correction and retirement command examples v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "commands": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "method": {
+                "const": "message_send"
+              },
+              "params": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "project_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "task_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "command_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "expected_revision": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "body": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 65536
+                  },
+                  "correction_of": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "kind": {
+                    "enum": [
+                      "correction",
+                      "retraction"
+                    ]
+                  }
+                },
+                "required": [
+                  "project_id",
+                  "task_id",
+                  "command_id",
+                  "body",
+                  "correction_of"
+                ]
+              }
+            },
+            "required": [
+              "method",
+              "params"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "method": {
+                "const": "task_transition"
+              },
+              "params": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "project_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "task_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "command_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "expected_revision": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "action": {
+                    "enum": [
+                      "cancel",
+                      "reopen"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4000
+                  }
+                },
+                "required": [
+                  "project_id",
+                  "task_id",
+                  "command_id",
+                  "expected_revision",
+                  "action",
+                  "reason"
+                ]
+              }
+            },
+            "required": [
+              "method",
+              "params"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "method": {
+                "const": "task_archive"
+              },
+              "params": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "project_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "task_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "command_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "expected_revision": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "action": {
+                    "enum": [
+                      "archive",
+                      "unarchive",
+                      "trash",
+                      "restore"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string",
+                    "maxLength": 4000
+                  },
+                  "cleanup": {
+                    "type": "boolean"
+                  },
+                  "cleanup_preview_id": {
+                    "type": "string"
+                  },
+                  "undo": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "project_id",
+                  "task_id",
+                  "command_id",
+                  "expected_revision",
+                  "action"
+                ]
+              }
+            },
+            "required": [
+              "method",
+              "params"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "method": {
+                "const": "task_purge_preview"
+              },
+              "params": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "project_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "task_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "command_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "expected_revision": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "project_id",
+                  "task_id",
+                  "command_id",
+                  "expected_revision"
+                ]
+              }
+            },
+            "required": [
+              "method",
+              "params"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "method": {
+                "const": "task_edit"
+              },
+              "params": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "project_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "task_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "command_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "expected_revision": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "patch": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "planned_assignee": {
+                        "enum": [
+                          "human",
+                          "unassigned"
+                        ]
+                      },
+                      "assignment_reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 4000
+                      }
+                    },
+                    "required": [
+                      "planned_assignee",
+                      "assignment_reason"
+                    ]
+                  }
+                },
+                "required": [
+                  "project_id",
+                  "task_id",
+                  "command_id",
+                  "expected_revision",
+                  "patch"
+                ]
+              }
+            },
+            "required": [
+              "method",
+              "params"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "method": {
+                "const": "task_purge"
+              },
+              "params": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "project_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "task_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "command_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "expected_revision": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "preview_digest": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  }
+                },
+                "required": [
+                  "project_id",
+                  "task_id",
+                  "command_id",
+                  "expected_revision",
+                  "preview_digest"
+                ]
+              }
+            },
+            "required": [
+              "method",
+              "params"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "commands"
+  ]
+}

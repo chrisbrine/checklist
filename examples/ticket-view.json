@@ -1,0 +1,13 @@
+{
+  "surface": "tickets",
+  "status_filter": "ready",
+  "tag_filter": "all",
+  "tag_ids": ["tag-regression", "tag-accessibility"],
+  "tag_mode": "any",
+  "planned_assignee": "agent",
+  "actual_assignee": "unassigned",
+  "epic_id": "none",
+  "triage_id": "all",
+  "group_by": "status",
+  "order_by": "priority"
+}

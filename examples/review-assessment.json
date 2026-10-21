@@ -1,0 +1,67 @@
+{
+  "contract_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "target_manifest_id": "4dfe4bfd-a4c9-42bb-a628-12790f4d3ac7",
+  "acceptance": [
+    {
+      "requirement_id": "acceptance:0",
+      "result": "pass",
+      "rationale": "Inspected the exact menu input path and observed the stated keyboard behavior in the reviewer’s chosen check.",
+      "evidence_refs": [
+        {
+          "artifact_id": "2e9fa8c1-d752-4ced-84ed-84329081b641",
+          "sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+        }
+      ]
+    }
+  ],
+  "project_requirements": [
+    {
+      "requirement_id": "project:brief",
+      "result": "pass",
+      "rationale": "The captured change preserves the project brief’s supported keyboard workflow.",
+      "evidence_refs": [
+        {
+          "artifact_id": "2e9fa8c1-d752-4ced-84ed-84329081b641",
+          "sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+        }
+      ]
+    }
+  ],
+  "evidence_refs": [
+    {
+      "artifact_id": "2e9fa8c1-d752-4ced-84ed-84329081b641",
+      "sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+    }
+  ],
+  "instruction_coverage": [
+    {
+      "source_capture_id": "a6f82363-afd9-4624-8bb1-56f8e1c68b84",
+      "source_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "path": "AGENTS.md",
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "resolved_path": "rules.md",
+      "link_chain": [
+        {
+          "path": "AGENTS.md",
+          "target": "rules.md",
+          "sha256": "54ea723241231828f6cea5e58275577fb2860c25d321b75dac6e01c75e5c831b"
+        }
+      ]
+    }
+  ],
+  "all_applicable_project_requirements_assessed": true,
+  "additional_requirements": [
+    {
+      "requirement": "Changed controls retain keyboard access.",
+      "source": "Captured AGENTS.md -> rules.md, interface requirements",
+      "result": "pass",
+      "rationale": "Reviewed the focus path and retained the observed result in the reviewer’s own report.",
+      "evidence_refs": [
+        {
+          "artifact_id": "2e9fa8c1-d752-4ced-84ed-84329081b641",
+          "sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+        }
+      ]
+    }
+  ]
+}

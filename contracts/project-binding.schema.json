@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Checklist project binding v1",
+  "description": "Workspace-to-project reference, not an enrollment form or credential. Provider-thread CLI/MCP bootstrap resolves the actual caller working directory and available host session identity automatically. A signed native executable does not attest a host-exported thread ID; runtime records the actual assurance separately. Worker bindings reject assistant/persona/profile identities.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "store_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "project_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "root_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "root_relative_to_binding": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "store_id",
+    "project_id",
+    "root_id",
+    "root_relative_to_binding"
+  ]
+}

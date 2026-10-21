@@ -1,0 +1,34 @@
+{
+  "directories": [
+    "Caf\u00e9/Checklist Test Instances/slot-1/data/child",
+    "Caf\u00e9/Checklist",
+    "Caf\u00e9/Checklist Test Instances2"
+  ],
+  "symlinks": [
+    {"path": "slot-alias", "target": "Caf\u00e9/Checklist Test Instances/slot-1/data"},
+    {"path": "dangling-alias", "target": "Caf\u00e9/Checklist Test Instances/slot-1/data/Future"}
+  ],
+  "vectors": [
+    {"id": "exact", "a": "Caf\u00e9/Checklist Test Instances/slot-1/data", "b": "Caf\u00e9/Checklist Test Instances/slot-1/data", "overlap": true},
+    {"id": "case-variant", "a": "Caf\u00e9/Checklist Test Instances/slot-1/data", "b": "caf\u00e9/checklist test instances/SLOT-1/DATA", "overlap": true},
+    {"id": "nfc-nfd-existing", "a": "Caf\u00e9/Checklist Test Instances/slot-1/data", "b": "Cafe\u0301/Checklist Test Instances/slot-1/data", "overlap": true},
+    {"id": "symlink", "a": "Caf\u00e9/Checklist Test Instances/slot-1/data", "b": "slot-alias", "overlap": true},
+    {"id": "dangling-link", "a": "Caf\u00e9/Checklist Test Instances/slot-1/data/Future", "b": "dangling-alias", "overlap": true},
+    {"id": "firmlink-existing", "a": "/Users", "b": "/System/Volumes/Data/Users", "overlap": true, "requires_firmlink": true},
+    {"id": "firmlink-ancestor", "a": "/Users", "b": "/System/Volumes/Data/Users/{missing}/Caf\u00e9", "overlap": true, "requires_firmlink": true},
+    {"id": "firmlink-missing-tail", "a": "/Users/{missing}/Caf\u00e9/Child", "b": "/System/Volumes/Data/Users/{missing}/CAFE\u0301/child", "overlap": true, "requires_firmlink": true},
+    {"id": "missing-case-nfd-tail", "a": "Caf\u00e9/Checklist Test Instances/slot-1/data/F\u00fbture/Child", "b": "Cafe\u0301/checklist test instances/slot-1/data/FU\u0302TURE/child", "overlap": true},
+    {"id": "missing-case-fold-expansion", "a": "Caf\u00e9/Stra\u00dfe/child", "b": "Cafe\u0301/STRASSE/CHILD", "overlap": true},
+    {"id": "ancestor", "a": "Caf\u00e9/Checklist Test Instances", "b": "Caf\u00e9/Checklist Test Instances/slot-1/data/child", "overlap": true},
+    {"id": "descendant", "a": "Caf\u00e9/Checklist Test Instances/slot-1/data/child", "b": "Caf\u00e9/Checklist Test Instances", "overlap": true},
+    {"id": "live-test-siblings", "a": "Caf\u00e9/Checklist", "b": "Caf\u00e9/Checklist Test Instances", "overlap": false},
+    {"id": "test-base-prefix-siblings", "a": "Caf\u00e9/Checklist Test Instances", "b": "Caf\u00e9/Checklist Test Instances2", "overlap": false},
+    {"id": "tmp-private-tmp-existing", "a": "/tmp", "b": "/private/tmp", "overlap": true},
+    {"id": "tmp-private-tmp-missing-tail", "a": "/tmp/{missing}/objects/Child", "b": "/private/tmp/{missing}/OBJECTS", "overlap": true},
+    {"id": "var-private-var-existing", "a": "/var", "b": "/private/var", "overlap": true},
+    {"id": "var-private-var-missing-tail", "a": "/var/{missing}/source-captures/Caf\u00e9", "b": "/private/var/{missing}/SOURCE-CAPTURES/Cafe\u0301/child", "overlap": true},
+    {"id": "managed-family-siblings", "a": "Caf\u00e9/Checklist/objects/{missing}", "b": "Caf\u00e9/Checklist/icons/{missing}", "overlap": false},
+    {"id": "capture-root-contains-entry", "a": "Caf\u00e9/Checklist/source-captures", "b": "Cafe\u0301/Checklist/source-captures/{missing}/source/file", "overlap": true},
+    {"id": "external-project-sibling", "a": "Caf\u00e9/project", "b": "Caf\u00e9/Checklist", "overlap": false}
+  ]
+}
