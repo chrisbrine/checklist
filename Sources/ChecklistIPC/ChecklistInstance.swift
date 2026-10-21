@@ -16,6 +16,12 @@ public struct ChecklistInstance {
         guard slot != nil else { return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0] }
         return root.deletingLastPathComponent().appendingPathComponent("caches", isDirectory: true)
     }
+    public var workspacePreferencesSuitePrefix: String {
+        slot.map { "Checklist.Test\($0).Workspace" } ?? "Checklist.Workspace"
+    }
+    public var humanClaimService: String {
+        slot.map { "Checklist.Test\($0).HumanClaim" } ?? "Checklist.HumanClaim"
+    }
     public var bundleFileName: String { displayName + ".app" }
     public var ownerPathSuffix: String { "/" + bundleFileName + "/Contents/MacOS/ChecklistApp" }
     public var ownerRequirement: String { "identifier \"\(bundleIdentifier)\"" }

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import plistlib
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+from urllib.parse import unquote, urlsplit
 import uuid
 
 from verify_stage import sha, signing_teams, verify as verify_stage
@@ -41,6 +43,7 @@ def live_root(environment=None):
 LIVE = live_root()
 BUILD = REPO / '.local/build'
 RELOCATION_REQUIRED = 'Seed path safety requires the instance-local managed-path contract; unsafe references and file URLs are refused.'
+KEYCHAIN_DELETE_LIMIT = 1024
 
 # A field name alone does not establish file authority. The inspector below
 # distinguishes canonical managed descriptors, project references, captured names
@@ -382,6 +385,11 @@ def require_local_paths(database, destination, immutable=True, source_root=None)
         try: contained(database.parent / relative, database.parent)
         except ValueError: refuse(location, 'a stored file path through a symlink')
 
+    def check_slot_absolute(value, location):
+        path = check_absolute(value, location)
+        if not path.is_relative_to(destination): refuse(location, 'a stored absolute path outside the destination slot root')
+        check_local(path.relative_to(destination), location)
+
     def check_managed(value, family, location):
         if not value.startswith('/'):
             try: relative = relative_path(value)
@@ -478,10 +486,29 @@ def require_local_paths(database, destination, immutable=True, source_root=None)
         elif isinstance(value, list):
             for child in value: inspect(child, location + '[]', record_kind, rule, inert)
         elif isinstance(value, str):
-            if re.search(r'\bfile:', value, re.IGNORECASE): refuse(location, 'a stored file URL')
             kind, family = rule
+            has_file_url = re.search(r'\bfile:', value, re.IGNORECASE) is not None
+            if has_file_url and kind is not None: refuse(location, 'a stored file URL')
+            if kind is None:
+                # Inspect serialized payloads at their leaves, not as quoted prose.
+                try: decoded = json.loads(value)
+                except (ValueError, TypeError): pass
+                else:
+                    if decoded != value:
+                        inspect(decoded, location, record_kind, inert=inert)
+                        return
+                if re.fullmatch(r'file:\S*', value.strip(), re.IGNORECASE):
+                    try:
+                        url = urlsplit(value.strip())
+                        if url.netloc.lower() not in {'', 'localhost'} or url.query or url.fragment or re.search(r'%(?![0-9a-fA-F]{2})', url.path):
+                            refuse(location, 'a malformed or nonlocal stored file URL')
+                        decoded_path = unquote(url.path, errors='strict')
+                    except (ValueError, UnicodeError):
+                        refuse(location, 'a malformed or nonlocal stored file URL')
+                    check_slot_absolute(decoded_path, location)
+                    return
             if inert:
-                if kind is not None or value.startswith('/'):
+                if kind is not None or value.startswith('/') or has_file_url:
                     counts['inert_metadata_path_occurrences' if inert == 'metadata' else 'inert_history_path_occurrences'] += 1
             elif kind == 'managed': check_managed(value, family, location)
             elif kind == 'lookup':
@@ -516,9 +543,9 @@ def require_local_paths(database, destination, immutable=True, source_root=None)
                 check_absolute(value, location)
                 counts['capture_git_provenance'] += 1
             elif kind == 'strict' or value.startswith('/'):
-                path = check_absolute(value, location)
-                if not path.is_relative_to(destination): refuse(location, 'a stored absolute path outside the destination slot root')
-                check_local(path.relative_to(destination), location)
+                check_slot_absolute(value, location)
+            elif has_file_url:
+                counts['inert_history_path_occurrences'] += 1
             try: decoded = json.loads(value)
             except (ValueError, TypeError): return
             if decoded != value: inspect(decoded, location, record_kind, inert=inert)
@@ -709,8 +736,8 @@ def stopped(p):
         raise ValueError('Slot must be stopped, including its CLI/MCP processes.')
 
 
-def trash(folder):
-    contained(folder, BASE)
+def trash(folder, root=None):
+    contained(folder, BASE if root is None else root)
     destination = Path.home() / '.Trash' / (folder.name + '-Checklist-' + uuid.uuid4().hex)
     contained(destination, Path.home() / '.Trash')
     destination.parent.mkdir(mode=0o700, exist_ok=True)
@@ -795,15 +822,61 @@ def bundle_check(p, metadata):
     return manifest
 
 
-def service_status(p):
-    result = run([p['bundle'] / 'Contents/MacOS/checklist', 'service', 'status'], timeout=360)
-    value = json.loads(result.stdout)
-    if value.get('data', value).get('state') == 'recovery_required':
-        raise ValueError('Service storage recovery required: ' + result.stdout)
+def start_deadline_seconds():
+    try: value = float(os.environ.get('CHECKLIST_START_DEADLINE_SECONDS', '2700'))
+    except ValueError as error:
+        raise ValueError('CHECKLIST_START_DEADLINE_SECONDS must be finite and at least 60 seconds.') from error
+    if not math.isfinite(value) or value < 60:
+        raise ValueError('CHECKLIST_START_DEADLINE_SECONDS must be finite and at least 60 seconds.')
     return value
 
 
+def service_status(p, *, bound=None):
+    """Wait for health while the slot's protected snapshot/migration keeps running."""
+    bound = start_deadline_seconds() if bound is None else bound
+    number = p['folder'].name.removeprefix('slot-')
+    started = time.monotonic();deadline = started + bound;next_progress = started + 60
+    command = [p['bundle'] / 'Contents/MacOS/checklist', 'service', 'status']
+    def expired():
+        raise ValueError(f'Slot {number} startup deadline expired after {bound:g} seconds; '
+                         'the slot service keeps running its protected startup. '
+                         f'Run start --slot {number} again to keep waiting, '
+                         f'or status --slot {number} to inspect it; '
+                         'destroying the slot during a protected snapshot discards that work.')
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0: expired()
+        try: result = run(command, timeout=min(30, remaining), check=False)
+        except subprocess.TimeoutExpired: pass
+        else:
+            try: payload = json.loads(result.stdout)
+            except (ValueError, TypeError):
+                if not (result.returncode and 'unavailable' in ((result.stderr or '') + (result.stdout or '')).lower()):
+                    raise ValueError('Slot service returned invalid status: ' + str(result.stdout))
+            else:
+                body = payload.get('data', payload) if isinstance(payload, dict) else None
+                if not isinstance(body, dict): raise ValueError('Slot service returned invalid status: ' + str(result.stdout))
+                states = [payload.get('state'), body.get('state')]
+                if any(state not in [None, 'ready', 'running', 'healthy', 'starting', 'unavailable'] for state in states):
+                    raise ValueError('Slot service reported an error state: ' + result.stdout)
+                errors = [value['error'] for value in [payload, body] if 'error' in value]
+                if any(not isinstance(error, dict) or error.get('code') not in ['SERVICE_UNAVAILABLE', 'UNAVAILABLE'] for error in errors):
+                    raise ValueError('Slot service returned an error status: ' + result.stdout)
+                if not errors and not any(state in ['starting', 'unavailable'] for state in states):
+                    if (result.returncode or body.get('name') != 'Checklist' or not isinstance(body.get('version'), str)
+                            or not body['version'] or not isinstance(body.get('capabilities'), list) or 'durable_store' not in body['capabilities']):
+                        raise ValueError('Slot service is not healthy: ' + result.stdout)
+                    return payload
+        now = time.monotonic()
+        if now >= deadline: expired()
+        if now >= next_progress:
+            print(f'slot {number}: still starting (protected startup), {(now - started) / 60:.0f} min', file=sys.stderr, flush=True)
+            next_progress = now + 60
+        time.sleep(min(5, deadline - now))
+
+
 def start(arguments, p):
+    bound = start_deadline_seconds()  # Reject invalid configuration before bootstrap.
     metadata = load(p)
     if metadata['seed']['kind'] not in ['empty', 'backup', 'slot'] or metadata['mode'] in ['incomplete', 'refused']:
         raise ValueError('Slot creation did not complete: ' + metadata['seed'].get('reason', 'incomplete seed'))
@@ -822,7 +895,7 @@ def start(arguments, p):
         plist.write_bytes(plistlib.dumps(contents))
         run(['launchctl', 'bootstrap', f'gui/{os.getuid()}', plist])
     metadata['mode'] = 'gui' if arguments.gui or processes(p)['app'] else 'headless'; save(p, metadata)
-    service_status(p)
+    service_status(p, bound=bound)
     if arguments.gui:
         print(f'Opening Checklist Test {arguments.slot}: synthetic/test data only.')
         run(['open', '-n', p['bundle']])
@@ -846,10 +919,13 @@ def check(p):
                     [p['bundle'] / 'Contents/MacOS/checklist', 'service', 'status'],
                     [sys.executable, REPO / 'scripts/mcp-smoke.py', '--binary', p['bundle'] / 'Contents/MacOS/checklist', '--service-only']]
         for command in commands:
-            result = run(command, timeout=360, check=False)
+            if command[1:3] == ['service', 'status']:
+                # A direct check can also encounter the slot's first startup.
+                payload = service_status(p)
+                result = subprocess.CompletedProcess(command, 0, json.dumps(payload) + '\n', '')
+            else:
+                result = run(command, timeout=360, check=False)
             item = {'command': list(map(str, command)), 'exit': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}
-            if command[1:3] == ['service', 'status'] and not result.returncode:
-                if json.loads(result.stdout).get('data', {}).get('state') == 'recovery_required': item['exit'] = 1
             results.append(item)
             print(result.stdout, end='')
             if item['exit']: print(result.stderr, file=sys.stderr)
@@ -892,16 +968,78 @@ def stop(p):
     print('Stopped ' + p['label'])
 
 
+def delete_slot_keychain(number, service):
+    number = slot_number(number)
+    if not re.fullmatch(fr'(?:org\.checklist\.test{number}\.enrollments|Checklist\.Test{number}\.HumanClaim)', service):
+        raise ValueError('Refusing non-slot Keychain service identity: ' + service)
+    for count in range(KEYCHAIN_DELETE_LIMIT):
+        result = run(['security', 'delete-generic-password', '-s', service], check=False)
+        if result.returncode == 44: return count
+        if result.returncode:
+            raise ValueError(f'Cannot delete slot Keychain service {service} after {count} removals: ' + result.stderr)
+    raise ValueError(f'Keychain deletion limit {KEYCHAIN_DELETE_LIMIT} reached for {service}; slot folder preserved.')
+
+
 def destroy(p):
+    match = re.fullmatch(r'slot-([1-4])', p['folder'].name)
+    if not match or p != paths(int(match[1])):
+        raise ValueError('Refusing mismatched slot cleanup identity.')
+    number = int(match[1])
     stop(p)
-    # Delete all accounts for this exact test-only service. A second lookup verifies absence.
-    while True:
-        found = run(['security', 'find-generic-password', '-s', p['keychain']], check=False)
-        if found.returncode == 44: break
-        if found.returncode: raise ValueError('Cannot inspect test keychain service: ' + found.stderr)
-        run(['security', 'delete-generic-password', '-s', p['keychain']])
-    if p['folder'].exists():
-        load(p); trash(p['folder'])
+    if p['folder'].exists(): load(p)
+
+    preferences = Path.home() / 'Library/Preferences'
+    contained(preferences, preferences)
+    window_uuid = r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
+    domain_rule = re.compile(fr'(?:org\.checklist\.app\.test{number}|Checklist\.Test{number}\.Workspace\.{window_uuid})')
+    domains = {p['identifier']}  # Also delete a cached standard domain with no plist yet.
+    if preferences.exists():
+        domains.update(file.stem for file in preferences.iterdir()
+                       if file.suffix == '.plist' and domain_rule.fullmatch(file.stem))
+    files = {}
+    for domain in sorted(domains):
+        if not domain_rule.fullmatch(domain): raise ValueError('Refusing non-slot preference domain: ' + domain)
+        file = contained(preferences / (domain + '.plist'), preferences)
+        if file.exists() and not file.is_file(): raise ValueError('Refusing non-file preference plist: ' + str(file))
+        files[domain] = file
+    saved_root = Path.home() / 'Library/Saved Application State'
+    saved = contained(saved_root / (p['identifier'] + '.savedState'), saved_root)
+    if not re.fullmatch(fr'org\.checklist\.app\.test{number}\.savedState', saved.name):
+        raise ValueError('Refusing non-slot saved-state identity.')
+    if saved.exists() and not saved.is_dir(): raise ValueError('Refusing non-directory saved state: ' + str(saved))
+
+    receipt = {'slot': number, 'keychain_items_removed': {}, 'preference_domains_removed': [],
+               'preference_domains_missing': [], 'trashed': []}
+    for service in [p['keychain'], f'Checklist.Test{number}.HumanClaim']:
+        receipt['keychain_items_removed'][service] = delete_slot_keychain(number, service)
+    for domain, file in files.items():
+        had_plist = file.exists()
+        result = run(['defaults', 'delete', domain], check=False)
+        missing = result.returncode == 1 and any(message in result.stdout + result.stderr for message in
+                                                [f'Domain ({domain}) not found.', f"Domain '{domain}' not found."])
+        if result.returncode and not missing:
+            raise ValueError(f'Cannot remove slot preference domain {domain}: ' + result.stderr)
+        contained(file, preferences)
+        if file.exists():
+            # cfprefsd can persist an empty dictionary after clearing the domain.
+            # Clear through defaults first, then remove only that verified empty plist.
+            try:
+                empty = plistlib.loads(file.read_bytes()) == {}
+            except (ValueError, OSError) as error:
+                raise ValueError(f'Cannot verify cleared preference plist {file}: {error}') from error
+            if not empty: raise ValueError('Refusing nonempty preference plist after defaults delete: ' + str(file))
+            file.unlink()
+        if file.exists() or file.is_symlink():
+            raise ValueError(f'Cannot remove slot preference domain {domain}; plist must be gone: ' + result.stderr)
+        receipt['preference_domains_missing' if missing and not had_plist else 'preference_domains_removed'].append(domain)
+    for folder, root in [(saved, saved_root), (p['folder'], BASE)]:
+        if folder.exists():
+            trash(folder, root)
+            receipt['trashed'].append(str(folder))
+    receipt['preference_domains_removed_count'] = len(receipt['preference_domains_removed'])
+    receipt['trashed_count'] = len(receipt['trashed'])
+    print('Destroy receipt: ' + json.dumps(receipt, sort_keys=True))
+    return receipt
 
 
 def promotion_gates(selected, slots):

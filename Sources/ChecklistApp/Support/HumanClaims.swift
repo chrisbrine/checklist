@@ -1,9 +1,10 @@
 import Foundation
 import Security
+import ChecklistIPC
 
 /// Claim credentials are local authority and never part of task exports or preferences.
 enum HumanClaims {
-    static let service = "Checklist.HumanClaim"
+    static var service: String { ChecklistInstance.current.humanClaimService }
     static func save(_ token: String, attempt: String) throws {
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: attempt]
         SecItemDelete(query as CFDictionary)

@@ -1,4 +1,5 @@
 import SwiftUI
+import ChecklistIPC
 
 /// Primary keeps the existing owner's journal and preferences. A restored
 /// WindowGroup value gives every additional window a stable, separate namespace.
@@ -29,8 +30,11 @@ struct WorkspaceWindowStorage {
     var workspacePreferences: ((UUID) -> UserDefaults)? = nil
 
     static var application: WorkspaceWindowStorage {
-        .init(journalBaseDirectory: LocalDraftJournal.defaultDirectory,
-              primaryPreferences: .standard, preferencesSuitePrefix: "Checklist.Workspace")
+        application(for: ChecklistInstance.current)
+    }
+    static func application(for instance: ChecklistInstance) -> WorkspaceWindowStorage {
+        .init(journalBaseDirectory: LocalDraftJournal.directory(for: instance),
+              primaryPreferences: .standard, preferencesSuitePrefix: instance.workspacePreferencesSuitePrefix)
     }
     func suiteName(for id: UUID) -> String { preferencesSuitePrefix + "." + id.uuidString.lowercased() }
     var lastWorkspaceID: UUID? {

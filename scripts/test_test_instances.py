@@ -1,7 +1,7 @@
 """Pure-logic checks for bounded test slots; no installed app or service is touched."""
 import importlib.util
 import io
-from contextlib import redirect_stdout, closing, ExitStack, contextmanager
+from contextlib import redirect_stdout, redirect_stderr, closing, ExitStack, contextmanager
 import itertools
 import os
 import sqlite3
@@ -275,6 +275,163 @@ class StopWaitTests(unittest.TestCase):
             self.assertEqual(json.loads((state.p['folder'] / 'slot.json').read_text())['mode'], 'headless')
 
 
+class DestroyCleanupTests(unittest.TestCase):
+    @contextmanager
+    def slot(self, number=4, populated=True):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            home = Path(directory).resolve()
+            stack.enter_context(patch.object(harness.Path, 'home', return_value=home))
+            stack.enter_context(patch.object(harness, 'BASE', home / 'slots'))
+            p = harness.paths(number)
+            p['folder'].mkdir(parents=True)
+            (p['folder'] / 'slot.json').write_text(json.dumps({'slot': number}))
+            preferences = home / 'Library/Preferences'; preferences.mkdir(parents=True)
+            workspace = f'Checklist.Test{number}.Workspace.00000000-0000-4000-8000-00000000000A'
+            domains = [p['identifier'], workspace]
+            other = number % 4 + 1
+            preserved = ['org.checklist.app', f'org.checklist.app.test{other}',
+                         'Checklist.Workspace.00000000-0000-4000-8000-000000000004',
+                         f'Checklist.Test{other}.Workspace.00000000-0000-4000-8000-000000000004',
+                         f'Checklist.Test{number}0.Workspace.00000000-0000-4000-8000-000000000004',
+                         f'Checklist.Test{number}.Workspace.not-a-uuid', workspace + '.extra']
+            for domain in preserved + (domains if populated else []):
+                (preferences / (domain + '.plist')).write_text('fixture')
+            saved_root = home / 'Library/Saved Application State'; saved_root.mkdir()
+            saved = saved_root / (p['identifier'] + '.savedState')
+            preserved_state = [saved_root / (domain + '.savedState') for domain in preserved[:2]]
+            for folder in preserved_state + ([saved] if populated else []): folder.mkdir()
+            claims = f'Checklist.Test{number}.HumanClaim'
+            counts = {p['keychain']: int(populated), claims: 2 if populated else 0}
+            calls = []
+            stopped = stack.enter_context(patch.object(harness, 'stop'))
+            def run(command, **kwargs):
+                self.assertEqual(stopped.call_count, 1, 'cleanup must follow stop')
+                command = [str(value) for value in command]; calls.append(command)
+                if command[:2] == ['security', 'find-generic-password']:
+                    # The old implementation sees no enrollment and misses claims.
+                    return SimpleNamespace(returncode=44, stdout='', stderr='')
+                if command[:2] == ['security', 'delete-generic-password']:
+                    self.assertEqual(command[2], '-s'); self.assertEqual(len(command), 4)
+                    self.assertIn(command[3], counts)
+                    code = 0 if counts[command[3]] else 44
+                    if not code: counts[command[3]] -= 1
+                    return SimpleNamespace(returncode=code, stdout='', stderr='')
+                self.assertEqual(command[:2], ['defaults', 'delete'])
+                self.assertEqual(len(command), 3); self.assertIn(command[2], domains)
+                file = preferences / (command[2] + '.plist')
+                code = 0 if file.exists() else 1
+                file.unlink(missing_ok=True)
+                return SimpleNamespace(returncode=code, stdout='',
+                                       stderr=f'Domain ({command[2]}) not found.' if code else '')
+            stack.enter_context(patch.object(harness, 'run', side_effect=run))
+            output = stack.enter_context(redirect_stdout(io.StringIO()))
+            yield SimpleNamespace(p=p, home=home, preferences=preferences, domains=domains,
+                                  preserved=preserved, saved=saved, preserved_state=preserved_state,
+                                  counts=counts, calls=calls, output=output, stopped=stopped)
+
+    def test_destroy_cleans_only_the_exact_slot_names_after_stop(self):
+        for number in range(1, 5):
+            with self.subTest(slot=number), self.slot(number) as state:
+                receipt = harness.destroy(state.p)
+                self.assertTrue(all(count == 0 for count in state.counts.values()))
+                self.assertTrue(all(not (state.preferences / (domain + '.plist')).exists()
+                                    for domain in state.domains))
+                self.assertTrue(all((state.preferences / (domain + '.plist')).read_text() == 'fixture'
+                                    for domain in state.preserved))
+                self.assertTrue(all(folder.is_dir() for folder in state.preserved_state))
+                self.assertFalse(state.saved.exists()); self.assertFalse(state.p['folder'].exists())
+                trashed = list((state.home / '.Trash').iterdir())
+                self.assertEqual(len(trashed), 2)
+                self.assertTrue(any(path.name.startswith(state.saved.name + '-Checklist-') for path in trashed))
+                self.assertEqual(receipt['keychain_items_removed'],
+                                 {state.p['keychain']: 1, f'Checklist.Test{number}.HumanClaim': 2})
+                self.assertEqual(receipt['preference_domains_removed'], sorted(state.domains))
+                self.assertEqual(receipt['preference_domains_removed_count'], 2)
+                self.assertEqual(receipt['trashed_count'], 2)
+                self.assertIn('Destroy receipt:', state.output.getvalue())
+                self.assertEqual([call for call in state.calls if call[0] == 'security'],
+                                 [['security', 'delete-generic-password', '-s', service]
+                                  for service, count in receipt['keychain_items_removed'].items()
+                                  for _ in range(count + 1)])
+
+    def test_missing_items_and_repeated_destroy_are_fine(self):
+        with self.slot(populated=False) as state:
+            first = harness.destroy(state.p)
+            state.stopped.reset_mock()
+            second = harness.destroy(state.p)
+            for receipt in [first, second]:
+                self.assertEqual(list(receipt['keychain_items_removed'].values()), [0, 0])
+                self.assertEqual(receipt['preference_domains_removed_count'], 0)
+                self.assertEqual(receipt['preference_domains_missing'], [state.p['identifier']])
+            self.assertEqual(first['trashed_count'], 1)
+            self.assertEqual(second['trashed_count'], 0)
+
+    def test_keychain_delete_loop_is_bounded_and_keeps_slot_on_failure(self):
+        for service in ['org.checklist.test4.enrollments', 'Checklist.Test4.HumanClaim']:
+            with self.subTest(service=service), self.slot() as state, patch.object(harness, 'KEYCHAIN_DELETE_LIMIT', 3):
+                def result(command, **kwargs):
+                    return SimpleNamespace(returncode=0 if command[-1] == service else 44, stdout='', stderr='')
+                with patch.object(harness, 'run', side_effect=result) as run:
+                    with self.assertRaisesRegex(ValueError, 'Keychain.*limit.*3'):
+                        harness.destroy(state.p)
+                self.assertEqual(sum(call.args[0][-1] == service for call in run.call_args_list), 3)
+                self.assertTrue(state.p['folder'].is_dir())
+
+    def test_other_keychain_error_keeps_slot(self):
+        with self.slot() as state, patch.object(harness, 'run', return_value=SimpleNamespace(
+                returncode=36, stdout='', stderr='Keychain unavailable')) as run:
+            with self.assertRaisesRegex(ValueError, 'Keychain unavailable'): harness.destroy(state.p)
+            self.assertEqual(run.call_count, 1)
+            self.assertTrue(state.p['folder'].is_dir())
+
+    def test_changed_identity_is_refused_before_stop_or_cleanup(self):
+        for key, value in [('keychain', 'Checklist.HumanClaim'), ('identifier', 'org.checklist.app'),
+                           ('keychain', 'org.checklist.test3.enrollments'), ('folder', Path('/outside/slot-4'))]:
+            with self.subTest(key=key, value=value), self.slot() as state, patch.object(harness, 'run') as run:
+                state.p[key] = value
+                with self.assertRaisesRegex(ValueError, 'identity'): harness.destroy(state.p)
+                state.stopped.assert_not_called(); run.assert_not_called()
+
+    def test_preference_symlink_is_refused_before_cleanup(self):
+        for kind in ['preference', 'saved-state']:
+            with self.subTest(kind=kind), self.slot() as state:
+                if kind == 'preference':
+                    file = state.preferences / (state.domains[1] + '.plist')
+                    file.unlink(); file.symlink_to(state.preferences / (state.preserved[0] + '.plist'))
+                else:
+                    state.saved.rmdir(); state.saved.symlink_to(state.preserved_state[0])
+                with self.assertRaisesRegex(ValueError, 'symlink'): harness.destroy(state.p)
+                self.assertEqual(state.calls, [])
+                self.assertTrue(state.p['folder'].is_dir())
+
+    def test_defaults_failure_or_remaining_plist_keeps_slot(self):
+        for code in [0, 1, 2]:
+            with self.subTest(code=code), self.slot() as state:
+                def run(command, **kwargs):
+                    return SimpleNamespace(returncode=44 if command[0] == 'security' else code,
+                                           stdout='', stderr='defaults failed')
+                with patch.object(harness, 'run', side_effect=run):
+                    with self.assertRaisesRegex(ValueError, 'preference'): harness.destroy(state.p)
+                self.assertTrue(state.p['folder'].is_dir())
+
+    def test_defaults_can_leave_an_empty_plist_that_destroy_removes(self):
+        for code in [0, 1]:
+            with self.subTest(defaults_exit=code), self.slot() as state:
+                def run(command, **kwargs):
+                    if command[0] == 'security':
+                        return SimpleNamespace(returncode=44, stdout='', stderr='')
+                    self.assertEqual(command[:2], ['defaults', 'delete'])
+                    self.assertIn(command[2], state.domains)
+                    (state.preferences / (command[2] + '.plist')).write_bytes(plistlib.dumps({}))
+                    return SimpleNamespace(returncode=code, stdout='', stderr=(
+                        f"Error: Domain '{command[2]}' not found.\nDefaults have not been changed.\n" if code else ''))
+                with patch.object(harness, 'run', side_effect=run):
+                    receipt = harness.destroy(state.p)
+                self.assertEqual(receipt['preference_domains_removed'], sorted(state.domains))
+                self.assertTrue(all(not (state.preferences / (domain + '.plist')).exists()
+                                    for domain in state.domains))
+
+
 class SnapshotLogicTests(unittest.TestCase):
     def fixture(self, base, schema=0, records=()):
         source = base / 'snapshot-fixture'; source.mkdir()
@@ -388,8 +545,8 @@ class SeedIsolationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'wrong family'):
                 self.inspect(Path(directory).resolve(), [('attachment', attachment('/owned/source/icons/file'))], '/owned/source')
 
-    def test_file_urls_are_refused_in_text_history_and_json_dictionary_keys(self):
-        for value in ['file:///outside/file', 'FILE:///outside/file', 'File:///outside/file', 'See FILE:///outside/file']:
+    def test_whole_external_file_urls_are_refused_in_text_history_and_json_dictionary_keys(self):
+        for value in ['file:///outside/file', 'FILE:///outside/file', 'FiLe:///outside/file', ' \tfile:///outside/file\n']:
             for table in ['records', 'commands', 'events']:
                 with self.subTest(value=value, table=table), tempfile.TemporaryDirectory() as directory:
                     base = Path(directory).resolve();database = base / 'fixture.sqlite'
@@ -399,9 +556,99 @@ class SeedIsolationTests(unittest.TestCase):
                             db.create_collation('checklist_storage_v2', lambda a, b: (a.encode() > b.encode()) - (a.encode() < b.encode()))
                             if table == 'commands': db.execute('INSERT INTO commands VALUES (?,?,?,?)', ('fixture', 'command', 'digest', json.dumps({value: 'text'})))
                             else: db.execute('INSERT INTO events(id,actor,kind,occurred_at,data) VALUES (?,?,?,?,?)', ('event', 'fixture', 'fixture', 'now', json.dumps({'text': value})))
-                    with self.assertRaisesRegex(ValueError, 'file URL'): harness.require_local_paths(database, base / 'data')
+                    with self.assertRaisesRegex(ValueError, 'absolute path outside'): harness.require_local_paths(database, base / 'data')
         with tempfile.TemporaryDirectory() as directory:
             self.inspect(Path(directory).resolve(), [('ticket', {'id': 'ticket', 'body': 'Explain ../ and ../../src; do not open them.', 'stage': 'acknowledged'})])
+
+    def test_file_urls_in_every_path_rule_still_refuse(self):
+        for scheme in ['file', 'FILE', 'FiLe']:
+            for value in [scheme + ':///outside/file', 'Error mentions ' + scheme + ':///outside/file']:
+                cases = [('fixture', {field: [value] if field in harness.PATH_LIST_FIELDS else value})
+                         for field in harness.PATH_FIELDS | harness.PATH_LIST_FIELDS]
+                cases += [('attachment', dict(attachment(value))),
+                          ('capture_bindings', {'stored': value}),
+                          ('fixture', {'objects': [{'representation': 'original', 'stage': value, 'final': 'objects/file'}]}),
+                          ('fixture', {'file_scopes': [{'path': value}]}),
+                          ('source_capture', {'source_root': '/project', 'additional_paths': [value]}),
+                          ('source_capture', {'files': [{'path': value}]}),
+                          ('source_capture', {'files': [{'kind': 'symlink', 'path': 'dir/link', 'target': value}]}),
+                          ('source_capture', {'git_path': value})]
+                for kind, record in cases:
+                    with self.subTest(kind=kind, record=record), tempfile.TemporaryDirectory() as directory:
+                        with self.assertRaisesRegex(ValueError, 'stored file URL'):
+                            self.inspect(Path(directory).resolve(), [(kind, dict(record, id='fixture'))])
+
+    def test_whole_local_file_urls_decode_and_keep_slot_containment(self):
+        for scheme in ['file', 'FILE', 'FiLe']:
+            with self.subTest(scheme=scheme), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve();destination = base / 'data'
+                url = (destination / 'objects/caf\u00e9 file').as_uri().replace('file:', scheme + ':', 1)
+                counts = self.inspect(base, [('message', {'id': 'note', 'body': ' \t' + url + '\n'})])
+                self.assertEqual(counts['inert_history_path_occurrences'], 0)
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve();destination = base / 'data';destination.mkdir()
+            # The inspected copy lives at database.parent, before publication at destination.
+            (base / 'alias').symlink_to(base / 'outside')
+            bad = [(destination / 'alias/file').as_uri(),
+                   destination.as_uri() + '/%2e%2e/outside', destination.as_uri() + '/objects%2f..%2ffile',
+                   destination.as_uri() + '/objects/file%00', 'file:objects/file', 'file://other-host' + str(destination / 'file'),
+                   destination.as_uri() + '/bad%xx', destination.as_uri() + '/bad%ff',
+                   destination.as_uri() + '/file?query', destination.as_uri() + '/file#fragment',
+                   (base / 'slot-3/data/file').as_uri(), (harness.LIVE / 'objects/file').as_uri()]
+            for number, value in enumerate(bad):
+                database = base / f'bad-{number}.sqlite';store_fixture(database, 3, [('fixture', {'id': 'fixture', 'unknown': value})])
+                with self.subTest(value=value), self.assertRaises(ValueError): harness.require_local_paths(database, destination)
+
+    def test_path_field_file_urls_still_refuse_in_inert_history(self):
+        for table in ['commands', 'events']:
+            with self.subTest(table=table), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve();database = base / 'fixture.sqlite';store_fixture(database, 3)
+                payload = json.dumps({'path': 'Error contains FiLe:///outside/file'})
+                with closing(sqlite3.connect(database)) as db, db:
+                    db.create_collation('checklist_storage_v2', lambda a, b: (a.encode() > b.encode()) - (a.encode() < b.encode()))
+                    if table == 'commands': db.execute('INSERT INTO commands VALUES (?,?,?,?)', ('fixture', 'command', 'digest', payload))
+                    else: db.execute('INSERT INTO events(id,actor,kind,occurred_at,data) VALUES (?,?,?,?,?)', ('event', 'fixture', 'fixture', 'now', payload))
+                with self.assertRaisesRegex(ValueError, 'stored file URL'): harness.require_local_paths(database, base / 'data')
+
+    def test_create_schema_three_snapshot_with_quoted_file_urls_counts_leaf_text(self):
+        # Message and review shapes from Communication.swift / Work.swift, in currentSQL tables.
+        lower = 'The operation failed: NSURL=file:///Volumes/x/project/file; no file was opened.'
+        upper = 'The review quotes FILE:///Volumes/x/project/file as error text.'
+        records = [('message', {'id': 'note', 'project_id': 'project', 'task_id': 'ticket', 'body': lower,
+                               'kind': 'note', 'origin': 'agent', 'author': 'agent:fixture', 'author_display': 'Fixture',
+                               'author_session_id': 'session', 'requires_action': False, 'addressed': False,
+                               'revision': 1, 'created_at': '2026-10-21T00:00:00Z'}),
+                   ('review', {'id': 'review', 'project_id': 'project', 'task_id': 'ticket', 'manifest_id': 'manifest',
+                               'review_request_id': 'request', 'gate': 'agent_review', 'verdict': 'pass',
+                               'checks': [{'label': 'Observed error', 'result': 'pass', 'notes': upper}],
+                               'findings': [], 'finding_resolutions': [], 'actor': 'agent:reviewer',
+                               'actor_display': 'Reviewer', 'revision': 1, 'created_at': '2026-10-21T00:00:00Z'}),
+                   ('task', {'id': 'ticket', 'project_id': 'project', 'title': 'Investigate FiLe:///Volumes/x/file error'})]
+        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve() / 'slots'):
+            base = Path(directory).resolve();source, _, manifest = self.fixture(base, 3, records)
+            with closing(sqlite3.connect(source / 'database.sqlite')) as db, db:
+                db.create_collation('checklist_storage_v2', lambda a, b: (a.encode() > b.encode()) - (a.encode() < b.encode()))
+                db.execute('INSERT INTO commands VALUES (?,?,?,?)', ('fixture', 'command', 'digest', json.dumps({'message': lower})))
+                db.execute('INSERT INTO events(id,actor,kind,occurred_at,data) VALUES (?,?,?,?,?)', ('event', 'fixture', 'fixture', 'now', json.dumps({'details': upper})))
+                db.execute('INSERT INTO metadata VALUES (?,?)', ('preupgrade_snapshot', json.dumps({'note': upper})))
+            manifest.update(databaseSHA256=harness.sha(source / 'database.sqlite'), databaseSize=(source / 'database.sqlite').stat().st_size)
+            (source / 'manifest.json').write_text(json.dumps(manifest))
+            stage = base / 'stage';info = stage / 'Checklist.app/Contents/Info.plist';info.parent.mkdir(parents=True)
+            info.write_bytes(plistlib.dumps({'CFBundleExecutable': 'ChecklistApp', 'CFBundleVersion': '101'}))
+            selected = {'build_id': 'fixture', 'source_fingerprint': 'fingerprint', 'signing_profile': 'ad-hoc'}
+            def run(command):
+                if command[0] == 'ditto': harness.shutil.copytree(command[1], command[2])
+                return subprocess.CompletedProcess(command, 0, '', '')
+            with patch.object(sys, 'argv', ['test_instances.py', 'create', '--slot', '4', '--stage', str(stage), '--seed', 'backup:' + str(source)]), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(stage, selected)), patch.object(harness, 'require_managed_path_support'), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'signing_teams'), patch.object(harness, 'run', side_effect=run):
+                harness.main()
+            p = harness.checked(4);created = harness.load(p)
+            self.assertEqual(created['mode'], 'stopped')
+            self.assertEqual(created['seed']['kind'], 'backup')
+            self.assertEqual(created['seed']['path_inspection']['inert_history_path_occurrences'], 5)
+            self.assertEqual(created['seed']['path_inspection']['inert_metadata_path_occurrences'], 1)
+            self.assertTrue(p['bundle'].is_dir())
+            self.assertEqual(harness.sha(p['data'] / 'checklist.sqlite'), manifest['databaseSHA256'])
+            self.assertEqual(harness.sha(source / 'database.sqlite'), manifest['databaseSHA256'])
 
     def test_schema_zero_two_and_three_seeds_preserve_database_bytes(self):
         for schema in [0, 2, 3]:
@@ -925,6 +1172,129 @@ class LiveRootTests(unittest.TestCase):
                 self.assertFalse(harness.is_live_snapshot(harness.DEFAULT_LIVE / 'backups/snapshot-old', str(harness.DEFAULT_LIVE)))
                 self.assertFalse(harness.is_live_snapshot(snapshot, str(harness.DEFAULT_LIVE)))
                 with self.assertRaisesRegex(ValueError, 'Only completed backups'): harness.snapshot_seed(custom / 'objects', Path('unused'))
+
+
+class SlotStartupTests(unittest.TestCase):
+    class Clock:
+        def __init__(self): self.now = 0; self.sleeps = []
+        def monotonic(self): return self.now
+        def sleep(self, seconds): self.sleeps.append(seconds);self.now += seconds
+
+    @staticmethod
+    def healthy():
+        return {'data': {'name': 'Checklist', 'version': '0.1.0', 'capabilities': ['durable_store']}}
+
+    @contextmanager
+    def fixture(self, responses, registered=False, environment=None):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            base = Path(directory).resolve();stack.enter_context(patch.object(harness, 'BASE', base / 'slots'))
+            p = harness.checked(4);p['data'].mkdir(parents=True)
+            metadata = {'slot': 4, 'stage_path': str(base), 'build_id': 'fixture', 'source_fingerprint': 'fingerprint',
+                        'seed': {'kind': 'backup', 'source_root': '/owned/source'}, 'mode': 'headless' if registered else 'stopped'}
+            clock = self.Clock();calls = [];commands = [];responses = iter(responses)
+            output = io.StringIO();progress = io.StringIO()
+            def run(command, **kwargs):
+                commands.append(list(map(str, command)))
+                if command[0] == 'launchctl': return subprocess.CompletedProcess(command, 0, '', '')
+                self.assertEqual(command, [p['bundle'] / 'Contents/MacOS/checklist', 'service', 'status'])
+                calls.append(kwargs)
+                response = next(responses)
+                if response == 'timeout':
+                    clock.now += kwargs['timeout'];raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+                if isinstance(response, subprocess.CompletedProcess): return response
+                return subprocess.CompletedProcess(command, 0, json.dumps(response), '')
+            for context in [patch.dict(os.environ, environment or {}, clear=True),
+                            patch.object(harness, 'load', return_value=metadata), patch.object(harness, 'bundle_check', return_value={}),
+                            patch.object(harness, 'require_managed_path_support'), patch.object(harness, 'require_local_paths'),
+                            patch.object(harness, 'launch_state', return_value={'registered': registered}),
+                            patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}),
+                            patch.object(harness, 'run', side_effect=run), patch.object(harness.time, 'monotonic', clock.monotonic),
+                            patch.object(harness.time, 'sleep', clock.sleep), redirect_stdout(output), redirect_stderr(progress)]:
+                stack.enter_context(context)
+            yield p, clock, calls, commands, output, progress
+
+    def test_start_timeouts_and_unavailable_then_healthy(self):
+        unavailable = subprocess.CompletedProcess([], 1, '', 'Checklist: SERVICE_UNAVAILABLE: not responding')
+        responses = ['timeout'] * 4 + [{'data': {'state': 'unavailable'}},
+                    {'error': {'code': 'SERVICE_UNAVAILABLE'}}, unavailable, self.healthy()]
+        with self.fixture(responses) as (p, clock, calls, commands, output, progress):
+            harness.start(SimpleNamespace(slot=4, gui=False), p)
+            self.assertEqual(len(calls), 8)
+            self.assertTrue(all(0 < call['timeout'] <= 30 and call['check'] is False for call in calls))
+            self.assertEqual(sum(command[0] == 'launchctl' for command in commands), 1)
+            self.assertIn('Slot 4 ready (headless)', output.getvalue())
+            self.assertGreaterEqual(len(progress.getvalue().splitlines()), 2)
+            self.assertTrue(all(line.startswith('slot 4: still starting (protected startup), ') and line.endswith(' min')
+                                for line in progress.getvalue().splitlines()))
+
+    def test_recovery_definite_errors_and_invalid_health_fail_immediately(self):
+        healthy = self.healthy()
+        for payload in [{'state': 'recovery_required'}, {'data': {'state': 'recovery_required'}},
+                        {'state': 'failed', 'data': {'state': 'unavailable'}}, {'data': {'state': 'failed'}},
+                        {'error': {'code': 'STORAGE_ERROR'}}, {'data': {'error': 'failure'}}, {}, None,
+                        subprocess.CompletedProcess([], 0, 'not json', ''),
+                        subprocess.CompletedProcess([], 1, json.dumps(healthy), '')]:
+            with self.subTest(payload=payload), self.fixture([payload]) as (p, clock, calls, commands, output, progress):
+                with self.assertRaises(ValueError): harness.start(SimpleNamespace(slot=4, gui=False), p)
+                self.assertEqual(len(calls), 1);self.assertEqual(clock.now, 0)
+                self.assertEqual(progress.getvalue(), '');self.assertNotIn('ready', output.getvalue())
+
+    def test_deadline_caps_last_call_and_preserves_protected_startup(self):
+        with self.fixture(['timeout'] * 3, environment={'CHECKLIST_START_DEADLINE_SECONDS': '61'}) as (p, clock, calls, commands, output, progress):
+            with self.assertRaises(ValueError) as error: harness.start(SimpleNamespace(slot=4, gui=False), p)
+            self.assertEqual(clock.now, 61);self.assertEqual([call['timeout'] for call in calls], [30, 26])
+            message = str(error.exception)
+            for text in ['61 seconds', 'slot service keeps running its protected startup', 'start --slot 4',
+                         'status --slot 4', 'destroying the slot during a protected snapshot discards that work']:
+                self.assertIn(text, message)
+            self.assertTrue(p['folder'].exists());self.assertTrue((p['folder'] / 'service.plist').exists())
+            self.assertEqual(sum(command[0] == 'launchctl' for command in commands), 1)
+
+    def test_invalid_start_deadline_refuses_before_bootstrap(self):
+        for value in ['', 'bad', 'nan', 'inf', '-inf', '0', '-1', '59']:
+            with self.subTest(value=value), self.fixture([], environment={'CHECKLIST_START_DEADLINE_SECONDS': value}) as (p, clock, calls, commands, output, progress):
+                with self.assertRaisesRegex(ValueError, 'CHECKLIST_START_DEADLINE_SECONDS'):
+                    harness.start(SimpleNamespace(slot=4, gui=False), p)
+                self.assertEqual(commands, []);self.assertEqual(clock.now, 0)
+                self.assertFalse((p['folder'] / 'service.plist').exists())
+
+    def test_start_deadline_default_and_valid_override(self):
+        for environment, expected in [({}, 2700), ({'CHECKLIST_START_DEADLINE_SECONDS': '60'}, 60),
+                                      ({'CHECKLIST_START_DEADLINE_SECONDS': '120.5'}, 120.5)]:
+            with self.subTest(environment=environment), patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(harness.start_deadline_seconds(), expected)
+
+    def test_already_started_slot_only_waits_for_health(self):
+        with self.fixture(['timeout', self.healthy()], registered=True) as (p, clock, calls, commands, output, progress):
+            harness.start(SimpleNamespace(slot=4, gui=False), p)
+            self.assertEqual(len(calls), 2)
+            self.assertFalse(any(command[0] in ['launchctl', 'open'] for command in commands))
+            self.assertFalse((p['folder'] / 'service.plist').exists())
+            self.assertIn('Slot 4 ready (headless)', output.getvalue())
+
+    def test_check_waits_before_smoke_and_keeps_other_command_bounds(self):
+        with self.fixture(['timeout'] * 3 + [self.healthy()]) as (p, clock, calls, commands, output, progress):
+            waiting_run = harness.run;other_calls = []
+            def run(command, **kwargs):
+                if command[1:3] == ['service', 'status']: return waiting_run(command, **kwargs)
+                other_calls.append((command, kwargs));return subprocess.CompletedProcess(command, 0, 'smoke passed\n', '')
+            with patch.object(harness, 'run', side_effect=run), patch.object(harness, 'database_observation', return_value={'quick_check': 'ok'}):
+                harness.check(p)
+            self.assertEqual(len(calls), 4);self.assertTrue(all(call['timeout'] <= 30 for call in calls))
+            self.assertEqual(len(other_calls), 2);self.assertTrue(all(kwargs['timeout'] == 360 for _, kwargs in other_calls))
+            saved = json.loads((p['folder'] / 'slot.json').read_text())
+            self.assertTrue(saved['checks']['passed']);self.assertEqual(len(saved['checks']['results']), 3)
+
+    def test_check_stops_before_mcp_on_definite_startup_failure(self):
+        with self.fixture([{'data': {'state': 'recovery_required'}}]) as (p, clock, calls, commands, output, progress):
+            waiting_run = harness.run;other_calls = []
+            def run(command, **kwargs):
+                if command[1:3] == ['service', 'status']: return waiting_run(command, **kwargs)
+                other_calls.append(command);return subprocess.CompletedProcess(command, 0, '', '')
+            with patch.object(harness, 'run', side_effect=run), self.assertRaisesRegex(ValueError, 'Slot checks failed'):
+                harness.check(p)
+            self.assertEqual(len(other_calls), 1);self.assertEqual(len(calls), 1);self.assertEqual(clock.now, 0)
+            self.assertFalse(json.loads((p['folder'] / 'slot.json').read_text())['checks']['passed'])
 
 
 class InstalledVerificationTests(unittest.TestCase):
