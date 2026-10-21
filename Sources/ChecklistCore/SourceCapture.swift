@@ -235,6 +235,9 @@ extension CommandRouter {
         let (captureParent,_) = try durable.parent(prepared.pending.directory + "/source/.check");Darwin.close(captureParent)
         consumedSourceCaptures.insert(prepared.pending.id)
         var capture = prepared.inventory;capture["id"] = prepared.pending.id;capture["project_id"] = pid;capture["task_id"] = task["id"];capture["attempt_id"] = attempt["id"];capture["source_root"] = path;capture["snapshot_path"] = prepared.pending.directory + "/source";capture["additional_paths"] = additional;capture["captured_at"] = now();capture["revision"] = 1
+        capture["relevance"] = sourceRelevance(root:path,attempt:attempt,additional:additional)
+        let relevance = capture["relevance"] as! JSON
+        capture["relevant_sha256"] = relevance["mode"] as? String == "scoped" ? try relevantSourceHash(capture,relevance:relevance) : capture["sha256"]
         try durable.writeNew(prepared.pending.directory + "/manifest.json",bytes:Data((try jsonString(capture)).utf8));try save(db,capture,type:"source_capture");return capture
     }
 
@@ -341,6 +344,37 @@ extension CommandRouter {
         }
         return result
     }
+    /// Reservations are canonical absolute paths. Freeze root-relative, case-insensitive
+    /// prefixes so future additions under a directory are relevant too.
+    func sourceRelevance(root: String,attempt: JSON,additional: [String]) -> JSON {
+        let files = attempt["file_scopes"] as? [JSON] ?? []
+        guard !files.isEmpty else { return ["mode":"whole"] }
+        let base = reservationKey(root).lowercased()
+        let scopes = files.compactMap { scope -> String? in
+            guard let path = scope["path"] as? String else { return nil }
+            let key = path.lowercased()
+            guard containsPath(base,key) else { return nil }
+            return key == base ? "." : String(key.dropFirst(base.count + 1))
+        }
+        return ["mode":"scoped","scopes":Set(scopes + additional.map {$0.lowercased()}).sorted(),"instruction_names":["AGENTS.md","CLAUDE.md"]]
+    }
+    func relevantSourceEntries(_ inventory: JSON,relevance: JSON) throws -> [String:String] {
+        let scopes = strings(relevance,"scopes"),instructions = Set(strings(relevance,"instruction_names").map {$0.lowercased()})
+        var entries: [String:String] = [:]
+        for file in inventory["files"] as? [JSON] ?? [] {
+            guard let path = file["path"] as? String else { continue }
+            let key = path.lowercased()
+            guard relevance["mode"] as? String != "scoped" || instructions.contains(key.split(separator:"/").last.map(String.init) ?? "") || scopes.contains(where: {$0 == "." || containsPath($0,key)}) else { continue }
+            // Size and Git bookkeeping are not freshness inputs. Case-folded paths match
+            // reservations; ambiguous case aliases refuse rather than hide a changed entry.
+            guard entries[key] == nil else { throw CoreError("EVIDENCE_STALE","Relevant source paths are ambiguous: \(path).") }
+            entries[key] = try jsonString(file.filter {["kind","sha256","executable","target"].contains($0.key)})
+        }
+        return entries
+    }
+    func relevantSourceHash(_ inventory: JSON,relevance: JSON) throws -> String {
+        hash(Data((try jsonString(relevantSourceEntries(inventory,relevance:relevance))).utf8))
+    }
     func validateSourceTarget(_ db: Database, evidence: JSON, task: JSON) throws -> JSON? {
         guard let ref = evidence["source_capture"] as? JSON else { return nil }
         let capture = try scoped(db,try text(ref,"id"),task["project_id"] as! String,type:"source_capture")
@@ -356,8 +390,18 @@ extension CommandRouter {
         } else if let id = capture["id"] as? String, preparation.failedCaptures.contains(id) {
             throw CoreError("EVIDENCE_STALE","Captured source bytes changed or disappeared.")
         } else { try validateCapturedFiles(capture) }
-        // An immutable target survives cosmetic metadata; relevant live source edits require a new submission.
-        guard let source = capture["source_root"] as? String,try sourceInventory(source,additional:strings(capture,"additional_paths"))["sha256"] as? String == capture["sha256"] as? String else { throw CoreError("EVIDENCE_STALE","Relevant source, index or base changed. Capture and review the new target.") }
+        guard let source = capture["source_root"] as? String else { throw CoreError("EVIDENCE_STALE","The source root is unavailable.") }
+        let live = try sourceInventory(source,additional:strings(capture,"additional_paths"))
+        if let relevance = capture["relevance"] as? JSON,relevance["mode"] as? String == "scoped" {
+            let before = try relevantSourceEntries(capture,relevance:relevance),after = try relevantSourceEntries(live,relevance:relevance)
+            let changed = Set(before.keys).union(after.keys).filter { before[$0] != after[$0] }.sorted()
+            let files = (live["files"] as? [JSON] ?? []) + (capture["files"] as? [JSON] ?? [])
+            let paths = changed.prefix(5).map { key in files.compactMap {$0["path"] as? String}.first {$0.lowercased() == key} ?? key }
+            guard changed.isEmpty else { throw CoreError("EVIDENCE_STALE","Relevant source changed: \(paths.joined(separator:", ")). Capture and review the new target.",details:["changed_paths":paths]) }
+        } else {
+            // Legacy and unscoped captures retain the complete inventory, HEAD and index check.
+            guard live["sha256"] as? String == capture["sha256"] as? String else { throw CoreError("EVIDENCE_STALE","Relevant source, index or base changed. Capture and review the new target.") }
+        }
         return capture
     }
     func sourceReviewExecute(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
@@ -453,9 +497,16 @@ extension CommandRouter {
             let pid = try self.scope(db, p, c, write: true)
             if let command = p["command_id"] as? String, try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM commands WHERE principal=? AND command_id=?)", arguments: [c.principal, command]) == true { return nil }
             var plan = Plan(); plan.pid = pid
-            var artifactIDs = Self.referencedValues(p, key: "artifact_id"), captureIDs = Self.referencedValues(p, key: "source_capture_id")
+            var artifactIDs = Self.referencedValues(p, key: "artifact_id").union(Self.referencedValues(p,key:"attachment_id")), captureIDs = Self.referencedValues(p, key: "source_capture_id")
             if Self.sourceCaptureMethods.contains(method) {
                 let root = try self.record(db, pid, type: "project")["root_path"] as? String ?? ""
+                // Validate every member before copying any source, including artifact-only
+                // members of a mixed batch. The write transaction repeats this gate.
+                for input in method == "batch_submit" ? (p["members"] as? [JSON] ?? []) : [p] {
+                    var claim = input;claim["project_id"] = pid
+                    guard let attempt = try? self.claimAttempt(db,claim,c,pid),let tid = attempt["task_id"] as? String,let task = try? self.scoped(db,tid,pid,type:"task"),int(input,"acceptance_revision") == int(task,"acceptance_revision",default:1),let evidence = input["evidence_manifest"] as? JSON else { continue }
+                    _ = try self.normalizedAcceptanceEvidence(db,params:input,evidence:evidence,task:task,attempt:attempt,caller:c)
+                }
                 for input in method == "batch_submit" ? (p["members"] as? [JSON] ?? []) : [p] {
                     guard !root.isEmpty, let attempt = input["attempt_id"] as? String, let evidence = input["evidence_manifest"] as? JSON else { continue }
                     let kind = evidence["kind"] as? String ?? (evidence["source_capture"] != nil ? "source" : "artifact")
@@ -471,7 +522,7 @@ extension CommandRouter {
                     guard let task = try? self.scoped(db, taskID, pid, type: "task"), let mid = task["current_manifest_id"] as? String,
                           let manifest = try? self.scoped(db, mid, pid, type: "manifest") else { continue }
                     let evidence = manifest["evidence"] as? JSON ?? [:]
-                    artifactIDs.formUnion((evidence["artifact_refs"] as? [JSON] ?? []).compactMap { $0["artifact_id"] as? String })
+                    artifactIDs.formUnion(((evidence["artifact_refs"] as? [JSON] ?? []) + self.acceptanceArtifactRefs(evidence)).compactMap { $0["artifact_id"] as? String })
                     if let ref = evidence["source_capture"] as? JSON, let cid = ref["id"] as? String { captureIDs.insert(cid) }
                 }
                 if method == "human_request_answer", let rid = p["request_id"] as? String, let request = try? self.scoped(db, rid, pid, type: "request"), let target = request["target_attachment_id"] as? String { artifactIDs.insert(target) }

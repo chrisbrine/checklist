@@ -95,7 +95,7 @@ final class HumanGateDirectionTests: XCTestCase {
         XCTAssertEqual(clarification["state"] as? String,"pending")
         XCTAssertEqual((try context(value)["task"] as! JSON)["active_verification_request_id"] as? String,value.request["id"] as? String)
         let plainTask = try call("task_create",["project_id":value.project["id"]!,"title":"Ordinary answer","brief":"Keep nongate answers possible"])
-        let plainRequest = try call("human_request_create",["project_id":value.project["id"]!,"task_id":plainTask["id"]!,"questions":[["id":"q","prompt":"Which detail?"]]])
+        let plainRequest = try call("human_request_create",["project_id":value.project["id"]!,"task_id":plainTask["id"]!,"title":"Ordinary detail question","questions":[["id":"q","prompt":"Which detail?"]]])
         _ = try call("message_send",["project_id":value.project["id"]!,"task_id":plainTask["id"]!,"body":"Another unresolved direction","requires_action":true])
         let plainAnswer = try call("human_request_answer",["project_id":value.project["id"]!,"request_id":plainRequest["id"]!,"expected_revision":1,"answers":[["question_id":"q","text":"Use the saved detail"]]])
         XCTAssertEqual(plainAnswer["state"] as? String,"answered")

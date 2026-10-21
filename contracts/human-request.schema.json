@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Checklist human request form fields",
-  "description": "Flat human_request_create fields, alongside project_id, task_id and command_id. No request_spec wrapper, schema_version, purpose, blocking_scope or target object. human_request_revise takes a non-empty subset in patch (see $defs/patch), alongside project_id, request_id, expected_revision, command_id and optional reason. The service derives authorship, state, revisions and target hash. Creation defaults title to Needs your input, questions/file_requests to empty and blocking to true; at least one question or file is required. Service text limits count UTF-8 bytes, not Unicode characters. Approval gate/target authorization is validated against current service records.",
+  "description": "Flat human_request_create fields, alongside project_id, task_id and command_id. No request_spec wrapper, schema_version, purpose, blocking_scope or target object. human_request_revise takes a non-empty subset in patch (see $defs/patch), alongside project_id, request_id, expected_revision, command_id and optional reason. The service derives authorship, state, revisions and target hash. Creation defaults title to Needs your input, questions/file_requests to empty and blocking to true; at least one question or file is required. Service text limits count UTF-8 bytes, not Unicode characters. Approval gate/target authorization is validated against current service records. Creation refuses covered earlier owner answers with COVERED_BY_EARLIER_ANSWER. Supersede fields are create-only, stored on the request and returned in reads; supply a matched answer ID (or request ID) and a nonblank reason explaining what changed.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -47,6 +47,20 @@
     "target_manifest_id": {
       "type": "string",
       "maxLength": 4000
+    },
+    "supersedes_answer_id": {
+      "type": "string",
+      "maxLength": 4000,
+      "minLength": 1,
+      "pattern": "\\S",
+      "description": "ID of a matching earlier answer, or its request ID."
+    },
+    "supersede_reason": {
+      "type": "string",
+      "maxLength": 4000,
+      "minLength": 1,
+      "pattern": "\\S",
+      "description": "What changed since the earlier owner answer."
     }
   },
   "anyOf": [
@@ -311,5 +325,13 @@
         }
       }
     }
+  },
+  "dependentRequired": {
+    "supersedes_answer_id": [
+      "supersede_reason"
+    ],
+    "supersede_reason": [
+      "supersedes_answer_id"
+    ]
   }
 }

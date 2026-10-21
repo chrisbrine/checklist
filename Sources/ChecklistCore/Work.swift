@@ -139,7 +139,7 @@ extension CommandRouter {
             try recordFinalReport(p,caller:c,attempt:&a); a.removeValue(forKey:"draft_verdict")
             if a["parent_attempt_id"] != nil { a["state"] = "released";a["reason"] = try text(p,"reason");a.removeValue(forKey:"token_hash");try save(db,revised(a),type:"attempt");a.removeValue(forKey:"incarnation");return a }
             if let rid = a["review_request_id"] as? String { var request = try scoped(db,rid,pid,type:"review_request"); request["state"] = "queued"; try save(db,revised(request),type:"review_request") }
-            a["state"] = "released"; a["reason"] = try text(p,"reason"); a.removeValue(forKey:"token_hash"); try save(db,revised(a),type:"attempt"); t.removeValue(forKey:"active_attempt_id"); t["status_id"] = try status(db,pid,"queued")["id"]; t = revised(t); try save(db,t,type:"task"); try recordTicketStatusAction(db,task:t,caller:c,operation:operation); try event(db,caller:c,project:pid,entity:t["id"] as? String,kind:"work_released"); return try taskProjection(db,t)
+            a["state"] = "released"; a["reason"] = try text(p,"reason"); a.removeValue(forKey:"token_hash"); try save(db,revised(a),type:"attempt"); t.removeValue(forKey:"active_attempt_id"); t["status_id"] = try status(db,pid,a["phase"] as? String == "review" ? "review" : "queued")["id"]; t = revised(t); try save(db,t,type:"task"); try recordTicketStatusAction(db,task:t,caller:c,operation:operation); try event(db,caller:c,project:pid,entity:t["id"] as? String,kind:"work_released",data:["reason":a["reason"]!]); return try taskProjection(db,t)
         }
         if method == "work_submit" {
             guard a["parent_attempt_id"] == nil else { throw CoreError("INVALID_TRANSITION","A contributor releases its bounded work; only the parent submits the ticket.") }
@@ -149,6 +149,8 @@ extension CommandRouter {
             guard int(p,"acceptance_revision") == int(t,"acceptance_revision",default:1) else { throw CoreError("EVIDENCE_STALE","Acceptance changed during this attempt.") }
             guard !(try hasPendingDirections(db,task:t)) else { throw CoreError("USER_DIRECTION_PENDING","Address the outstanding owner direction before submission.") }
             guard var evidence = p["evidence_manifest"] as? JSON else { throw CoreError("INVALID_INPUT","Submit target-appropriate immutable evidence.") }
+            evidence.removeValue(forKey:"acceptance_evidence")
+            if let map = try normalizedAcceptanceEvidence(db,params:p,evidence:evidence,task:t,attempt:a,caller:c) { evidence["acceptance_evidence"] = map }
             try normalizedEvidenceMeasures(&evidence)
             let kind = evidence["kind"] as? String ?? (evidence["source_capture"] != nil ? "source" : "artifact")
             guard ["source","artifact","decision"].contains(kind) else { throw CoreError("INVALID_INPUT","Evidence target must be source, artifact or decision.") }

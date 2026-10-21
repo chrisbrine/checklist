@@ -103,7 +103,7 @@ final class ImageInspectionTests: XCTestCase {
         let attempt = try fixture.call("work_claim", ["project_id": project["id"]!, "task_id": task["id"]!, "expected_revision": task["revision"]!])
         let refs = files.map { ["artifact_id": $0["id"]!, "sha256": $0["sha256"]!, "view_name": ImageViewName.resolve(filename: $0["name"] as! String)] }
         let next = try fixture.call("work_submit", ["project_id": project["id"]!, "attempt_id": attempt["id"]!, "claim_token": attempt["claim_token"]!, "acceptance_revision": 1, "evidence_manifest": ["artifact_refs": refs]])
-        let nextRequest = try fixture.call("human_request_create", ["project_id": project["id"]!, "task_id": task["id"]!, "target_attachment_id": files[0]["id"]!, "questions": [["id": "approve", "type": "approval", "prompt": "Inspect the next exact target"]]])
+        let nextRequest = try fixture.call("human_request_create", ["project_id": project["id"]!, "task_id": task["id"]!, "supersedes_answer_id": request["id"]!, "supersede_reason": "A new submitted manifest requires fresh image inspection after requested changes.", "target_attachment_id": files[0]["id"]!, "questions": [["id": "approve", "type": "approval", "prompt": "Inspect the next exact target"]]])
         let context = try fixture.router.dbQueue.read { db in try fixture.router.requestImageReviewContext(db, request: nextRequest, task: task, caller: fixture.owner) }
         XCTAssertEqual(context["previous_manifest_id"] as? String, first["manifest_id"] as? String)
         XCTAssertEqual((context["previous_images"] as! [JSON]).count, 2)

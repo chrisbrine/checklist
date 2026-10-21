@@ -48,15 +48,15 @@ final class HumanRequestTests: XCTestCase {
         let schema = try contractJSON("contracts/human-request.schema.json")
         let definitions = schema["$defs"] as! JSON
         let properties = schema["properties"] as! JSON
-        XCTAssertEqual(Set(properties.keys),Set(CommandRouter.requestFormKeys + ["review_request_id","target_manifest_id"]))
-        XCTAssertEqual(Set(((definitions["patch"] as! JSON)["properties"] as! JSON).keys),Set(properties.keys))
+        XCTAssertEqual(Set(properties.keys),Set(CommandRouter.requestFormKeys + ["review_request_id","target_manifest_id"] + CommandRouter.requestSupersedeKeys))
+        XCTAssertEqual(Set(((definitions["patch"] as! JSON)["properties"] as! JSON).keys),Set(properties.keys).subtracting(CommandRouter.requestSupersedeKeys))
         let (p,t) = try fixture(),worker = try requester(p,"schema-enums")
         let catalog = router.toolCatalog(worker)
         let create = try XCTUnwrap(catalog.first { $0["name"] as? String == "human_request_create" })
         XCTAssertEqual(Set(((create["inputSchema"] as! JSON)["properties"] as! JSON).keys),Set(properties.keys).union(["project_id","task_id","command_id","expected_revision"]))
         for name in ["human_request_create","human_request_revise"] {
             let description = catalog.first { $0["name"] as? String == name }!["description"] as! String
-            for field in properties.keys { XCTAssertTrue(description.contains(field),"\(name): \(field)") }
+            for field in properties.keys where name == "human_request_create" || !CommandRouter.requestSupersedeKeys.contains(field) { XCTAssertTrue(description.contains(field),"\(name): \(field)") }
         }
         let questionProps = (definitions["question"] as! JSON)["properties"] as! JSON
         for type in (questionProps["type"] as! JSON)["enum"] as! [String] {
@@ -181,7 +181,7 @@ final class HumanRequestTests: XCTestCase {
         let response = (answer["responses"] as! [JSON])[0]; XCTAssertNotNil(response["created_at"]); XCTAssertNotNil(response["form_identity"]); XCTAssertEqual(answer["continuation_delivery"] as? String,"queued_for_pickup")
         let session = try router.dbQueue.read { try router.record($0,original.sessionID!,type:"session") }
         _ = try call("session_update",["project_id":p["id"]!,"session_id":original.sessionID!,"expected_revision":session["revision"]!,"state":"ended"])
-        let next = try call("human_request_create",["project_id":p["id"]!,"task_id":t["id"]!,"questions":[["id":"q","prompt":"Another decision"]]],handler)
+        let next = try call("human_request_create",["project_id":p["id"]!,"task_id":t["id"]!,"title":"Another decision","questions":[["id":"q","prompt":"Another decision"]]],handler)
         let nextAnswer = try call("human_request_answer",["project_id":p["id"]!,"request_id":next["id"]!,"expected_revision":1,"answers":[["question_id":"q","text":"Still proceed"]]])
         XCTAssertEqual(((nextAnswer["message"] as! JSON)["deliveries"] as! [JSON]).count,1)
         XCTAssertEqual(try router.dbQueue.read { try router.record($0,original.sessionID!,type:"session")["state"] as? String },"ended")

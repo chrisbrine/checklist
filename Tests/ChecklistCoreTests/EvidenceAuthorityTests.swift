@@ -17,7 +17,10 @@ final class EvidenceAuthorityTests: XCTestCase {
     }
     override func tearDownWithError() throws { router = nil;try? FileManager.default.removeItem(at:directory) }
     @discardableResult func call(_ method: String,_ input: JSON,_ caller: Caller? = nil,command: String? = nil) throws -> JSON {
-        var p = input;if !CommandRouter.readMethods.contains(method) {p["command_id"] = command ?? UUID().uuidString}
+        var p = input
+        if method == "work_submit" { p = try fixtureAcceptanceEvidence(router,input:p) }
+        if method == "batch_submit",let members = p["members"] as? [JSON] { p["members"] = try members.map {try fixtureAcceptanceEvidence(router,input:$0)} }
+        if !CommandRouter.readMethods.contains(method) {p["command_id"] = command ?? UUID().uuidString}
         return try router.handle(method:method,params:p,caller:caller ?? owner)["data"] as! JSON
     }
     func project() throws -> JSON { try call("project_create",["name":"Evidence fixture","key_prefix":"E","root_path":workspace.path]) }

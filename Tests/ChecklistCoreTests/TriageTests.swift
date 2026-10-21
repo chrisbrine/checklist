@@ -112,7 +112,7 @@ extension CoreTests {
         assertCode("TRIAGE_TRANSITION_BLOCKED") { _ = try self.call("triage_transition",self.triageInput(p,group,["action":"complete"])) }
         let after = try call("snapshot");for key in ["tasks","groups","events"] { XCTAssertEqual(try jsonString(["rows":before[key]!]),try jsonString(["rows":after[key]!]),key) }
         let context = try call("task_context",["project_id":p["id"]!,"task_id":second["id"]!]);let artifact = (context["attachments"] as! [JSON])[0]
-        let secondRequest = try call("human_request_create",["project_id":p["id"]!,"task_id":second["id"]!,"target_attachment_id":artifact["id"]!,"questions":[["id":"approve","type":"approval","prompt":"Inspect this exact original","required":true]]])
+        let secondRequest = try call("human_request_create",["project_id":p["id"]!,"task_id":second["id"]!,"title":"Approve the other completion target","target_attachment_id":artifact["id"]!,"questions":[["id":"approve","type":"approval","prompt":"Inspect the exact original on the other completion target","required":true]]])
         _ = try call("human_request_answer",try observedGateAnswer(["project_id":p["id"]!,"request_id":secondRequest["id"]!,"expected_revision":secondRequest["revision"]!,"target_sha256":artifact["sha256"]!,"answers":[["question_id":"approve","value":"approved"]]], task:second))
         // The individual approval itself removes the second ticket; deliberately put it back in this new batch.
         try addTriage(p,group,second);try addTriage(p,other,second)

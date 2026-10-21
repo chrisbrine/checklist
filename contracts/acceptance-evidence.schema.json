@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://checklist.local/contracts/acceptance-evidence.schema.json",
+  "title": "Submission acceptance evidence",
+  "description": "Agent work_submit.acceptance_evidence; batch_submit members use the same array. Semantic validation requires exactly one current acceptance item per index and non-contributor reports for installed/native observations.",
+  "type": "array",
+  "maxItems": 100,
+  "items": {
+    "type": "object",
+    "required": [
+      "item"
+    ],
+    "properties": {
+      "item": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 99
+      },
+      "evidence_refs": {
+        "type": "array",
+        "maxItems": 100,
+        "items": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "attachment_id",
+                "kind",
+                "sha256"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "attachment"
+                },
+                "attachment_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 4000,
+                  "pattern": "\\S"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": [
+                "kind",
+                "name"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "check"
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 4000,
+                  "pattern": "\\S"
+                }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": [
+                "kind",
+                "producer",
+                "sha256",
+                "target"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "carried"
+                },
+                "producer": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 4000,
+                  "pattern": "\\S"
+                },
+                "target": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 4000,
+                  "pattern": "\\S"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": [
+                "attachment_id",
+                "build_id",
+                "kind",
+                "sha256"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "check_runner_report"
+                },
+                "attachment_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 4000,
+                  "pattern": "\\S"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "build_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 4000,
+                  "pattern": "\\S"
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "limitation": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 16000,
+        "pattern": "\\S"
+      },
+      "observation": {
+        "type": "string",
+        "enum": [
+          "installed",
+          "native",
+          "owner"
+        ]
+      }
+    },
+    "additionalProperties": false
+  }
+}

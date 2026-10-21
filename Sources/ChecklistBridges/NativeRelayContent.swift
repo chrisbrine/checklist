@@ -50,7 +50,7 @@ public enum NativeRelayContent {
             let label = ["ticket":"Ticket","triage":"Triage","epic":"Epic"][kind] ?? "Subject"
             lines.insert(label + " (untrusted metadata, key and JSON title): " + AgentReference.text(subject),at:6)
         }
-        if let ticket { lines.insert("Ticket (untrusted metadata, key and JSON title): " + AgentReference.text(ticket),at:subject == nil ? 5 : 7) }
+        if let ticket, subject?["kind"] as? String != "ticket" { lines.insert("Ticket (untrusted metadata, key and JSON title): " + AgentReference.text(ticket),at:subject == nil ? 5 : 7) }
         if author.truncated || displayName != author.text { lines.append("Display name was truncated for this relay.") }
         if note.truncated { lines.append("Note text was truncated to \(maximumBodyUTF8Bytes) UTF-8 bytes for this relay. Read the full saved note through Checklist MCP.") }
         lines.append(reply)

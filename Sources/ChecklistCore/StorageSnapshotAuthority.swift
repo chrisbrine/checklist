@@ -177,7 +177,12 @@ enum StorageSnapshotAuthority {
                 if value["attachment_owner_id"] is String {
                     // Media staging is not committed ownership. Preserve job/plan metadata,
                     // and retain already published finals only as uncommitted recovery bytes.
-                    if state != "committed", let raw = value["objects"] {
+                    // Successful reconciliation settles committed imports without a
+                    // reason. Canceled/abandoned settled jobs remain recovery-only.
+                    // Repair-required jobs also belong to canonical attachments,
+                    // whose availability is authoritative for backup.
+                    let captured = ["committed","repair_required"].contains(state) || state == "settled" && value["settled_reason"] == nil
+                    if !captured, let raw = value["objects"] {
                         guard let entries = raw as? [JSON] else { throw StorageSnapshotFailure.unsupportedAuthority }
                         for object in entries {
                             let final = try text(object,"final")

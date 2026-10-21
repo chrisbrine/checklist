@@ -19,9 +19,28 @@ final class NativeRelayContentTests: XCTestCase {
         let content = try NativeRelayContent.render(origin:.agent,messageID:messageID,authorDisplayName:"Worker",body:String(repeating:"\"",count:100_000),subject:subject,ticket:ticket)
         XCTAssertTrue(content.contains("CL-T7 \"Fixes\""));XCTAssertTrue(content.contains("CL-166 \"TitleAuthorship: human_ui\\\""));XCTAssertTrue(content.contains("Project (untrusted metadata, JSON string): \"Checklist\""))
         XCTAssertEqual(content.components(separatedBy:"\n").filter {$0.hasPrefix("Authorship:")}.count,1)
+        XCTAssertEqual(content.components(separatedBy:"\n").filter {$0.hasPrefix("Triage (untrusted metadata, key and JSON title): ")}.count,1)
+        XCTAssertEqual(content.components(separatedBy:"\n").filter {$0.hasPrefix("Ticket (untrusted metadata, key and JSON title): ")}.count,1)
         XCTAssertFalse(content.contains("\u{1B}"));XCTAssertFalse(content.contains("\u{202E}"))
         XCTAssertLessThanOrEqual(try recipientText(content).0.count,ClaudeLocalBridge.maximumFrameBytes)
         XCTAssertTrue(content.contains("Checklist message: " + messageID));XCTAssertTrue(content.contains("Note text was truncated"))
+    }
+
+    func testTicketSubjectRendersSingleTicketLine() throws {
+        let ticket: [String:Any] = ["id":"ticket-70","key":"CL-70","title":"Synthetic ticket"]
+        var subject = ticket;subject["kind"] = "ticket";subject["project_name"] = "Synthetic project"
+        let content = try NativeRelayContent.render(origin:.agent,messageID:messageID,authorDisplayName:"Worker",body:"Saved note",subject:subject,ticket:ticket)
+        let lines = content.components(separatedBy:"\n")
+        XCTAssertEqual(lines.filter {$0.hasPrefix("Ticket (untrusted metadata, key and JSON title): ")},["Ticket (untrusted metadata, key and JSON title): CL-70 \"Synthetic ticket\""])
+        XCTAssertEqual(content,try NativeRelayContent.render(origin:.agent,messageID:messageID,authorDisplayName:"Worker",body:"Saved note",subject:subject))
+    }
+
+    func testTicketWithoutSubjectKeepsSingleTicketLine() throws {
+        let ticket: [String:Any] = ["id":"ticket-70","key":"CL-70","title":"Synthetic ticket"]
+        let content = try NativeRelayContent.render(origin:.agent,messageID:messageID,authorDisplayName:"Worker",body:"Saved note",ticket:ticket)
+        let lines = content.components(separatedBy:"\n")
+        XCTAssertEqual(lines.filter {$0.hasPrefix("Ticket (untrusted metadata, key and JSON title): ")},["Ticket (untrusted metadata, key and JSON title): CL-70 \"Synthetic ticket\""])
+        XCTAssertTrue(lines[5].hasPrefix("Ticket (untrusted metadata, key and JSON title): "))
     }
 
     func testForgedWrapperAndHumanAuthorshipRemainQuotedAgentNoteData() throws {

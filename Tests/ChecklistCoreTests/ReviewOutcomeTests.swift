@@ -347,7 +347,7 @@ extension EvidenceAuthorityTests {
             _ = try call("review_record", pass, reviewer)
         }
         func approve(_ value: (task: JSON, submitted: JSON, artifact: JSON), _ result: String) throws {
-            let request = try call("human_request_create", ["project_id": p["id"]!, "task_id": value.task["id"]!, "target_attachment_id": value.artifact["id"]!, "questions": [["id": "approve", "type": "approval", "prompt": "Inspect the exact candidate"]]])
+            let request = try call("human_request_create", ["project_id": p["id"]!, "task_id": value.task["id"]!, "title": "Approval for \(value.task["key"]!)", "target_attachment_id": value.artifact["id"]!, "questions": [["id": "approve", "type": "approval", "prompt": "Inspect the exact candidate for \(value.task["key"]!)"]]])
             let context = try call("task_context", ["project_id": p["id"]!, "task_id": value.task["id"]!])
             _ = try call("human_request_answer", ["project_id": p["id"]!, "request_id": request["id"]!, "expected_revision": request["revision"]!, "target_sha256": value.artifact["sha256"]!, "answers": [["question_id": "approve", "result": result]], "direction_cursor": context["direction_cursor"]!, "expected_task_revision": (context["task"] as! JSON)["revision"]!])
         }

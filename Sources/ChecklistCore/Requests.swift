@@ -9,6 +9,7 @@ extension CommandRouter {
             var t = try task(db,p,pid)
             var r: JSON = ["id":uuid(),"project_id":pid,"task_id":t["id"]!,"title":"Needs your input","questions":[],"file_requests":[],"blocking":true,"state":"pending","requester":c.principal,"requester_session_id":c.sessionID ?? "human","requester_authorization_generation":try callerSessionGeneration(db,c,project:pid),"revision":1,"form_revision":1,"created_at":now(),"responses":[]]
             try applyRequestForm(db,request:&r,params:p)
+            try validateCoveredAnswers(db,request:&r,params:p)
             try ensureSingleBlockingRequest(db,request:r)
             try bindHumanGate(db,request:&r,task:&t,params:p)
             r["form_identity"] = try requestFormIdentity(r)
@@ -116,6 +117,45 @@ extension CommandRouter {
         try event(db,caller:c,project:pid,entity:r["task_id"] as? String,kind:"human_request_answered",data:["request_id":r["id"]!,"complete":complete,"response_id":response["id"]!,"form_revision":int(r,"form_revision",default:1)])
         try db.execute(sql:"DELETE FROM metadata WHERE key=?",arguments:[try pendingStorageCommandKey(principal:c.principal,command:p["command_id"] as! String)])
         r["message"] = message; return r
+    }
+
+    static let requestSupersedeKeys = ["supersedes_answer_id","supersede_reason"]
+    func normalizedRequestText(_ value: String) -> String {
+        value.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator:" ")
+    }
+    func validateCoveredAnswers(_ db: Database,request: inout JSON,params: JSON) throws {
+        let questions = request["questions"] as? [JSON] ?? []
+        let texts = Set(([request["title"] as? String ?? ""] + questions.compactMap {$0["prompt"] as? String}).map(normalizedRequestText).filter {!$0.isEmpty})
+        let approval = questions.contains {$0["type"] as? String == "approval"}
+        var matches: [JSON] = []
+        for earlier in try records(db,type:"request",project:request["project_id"] as? String) {
+            for response in earlier["responses"] as? [JSON] ?? [] where ["answered","send"].contains(response["action"] as? String ?? "") {
+                // A response stays tied to the form the owner actually answered.
+                let form = (earlier["form_history"] as? [JSON] ?? []).first { int($0,"form_revision",default:1) == int(response,"form_revision",default:1) } ?? earlier
+                let priorQuestions = form["questions"] as? [JSON] ?? []
+                let titleMatch = texts.contains(normalizedRequestText(form["title"] as? String ?? ""))
+                let matchingQuestions = priorQuestions.filter {
+                    texts.contains(normalizedRequestText($0["prompt"] as? String ?? "")) ||
+                    (approval && earlier["task_id"] as? String == request["task_id"] as? String && $0["type"] as? String == "approval")
+                }
+                guard titleMatch || !matchingQuestions.isEmpty else { continue }
+                let task = try scoped(db,earlier["task_id"] as! String,request["project_id"] as! String,type:"task")
+                let answers = response["answers"] as? [JSON] ?? []
+                let summary = String((try jsonString(["answers":answers,"files":response["files"] ?? [],"explanation":response["explanation"] ?? ""])).prefix(1000))
+                matches.append(["request_id":earlier["id"]!,"answer_id":response["id"] ?? NSNull(),"task_id":task["id"]!,"key":task["key"] ?? "","title":form["title"] ?? "",
+                    "matching_question_text":(titleMatch ? priorQuestions : matchingQuestions).compactMap {$0["prompt"] as? String}.joined(separator:"; "),"answers":answers,"answer_summary":summary,"answered_at":response["created_at"] ?? ""])
+            }
+        }
+        if params["supersedes_answer_id"] != nil || params["supersede_reason"] != nil {
+            let id = try text(params,"supersedes_answer_id",max:4000),reason = try text(params,"supersede_reason",max:4000)
+            guard matches.contains(where: {$0["answer_id"] as? String == id || $0["request_id"] as? String == id}) else { throw CoreError("INVALID_INPUT","supersedes_answer_id must name a matching earlier answer or its request.") }
+            request["supersedes_answer_id"] = id; request["supersede_reason"] = reason
+            return
+        }
+        guard matches.isEmpty else {
+            let descriptions = matches.map { "Request \($0["request_id"]!), answer \($0["answer_id"]!), ticket \($0["task_id"]!) \($0["key"]!) \"\($0["title"]!)\": \($0["matching_question_text"]!); answer \($0["answer_summary"]!); answered \($0["answered_at"]!)." }
+            throw CoreError("COVERED_BY_EARLIER_ANSWER","Earlier owner answers cover this request. " + descriptions.joined(separator:" ") + " Supply supersedes_answer_id and a non-empty supersede_reason explaining what changed.",details:["matches":matches])
+        }
     }
 
     static let requestFormKeys = ["title","explanation","questions","file_requests","command","blocking","target_attachment_id"]

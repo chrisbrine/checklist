@@ -15,7 +15,7 @@ extension CommandRouter {
         if evidence["kind"] as? String == "decision" {
             guard let text = decision?["text"] as? String,decision?["sha256"] as? String == hash(Data(text.utf8)),source == nil,refs.isEmpty else { throw CoreError("EVIDENCE_STALE","The exact recorded decision target changed.") }
         } else if source == nil && refs.isEmpty { throw CoreError("EVIDENCE_STALE","The target has no inspectable immutable evidence.") }
-        for ref in refs {
+        for ref in refs + acceptanceArtifactRefs(evidence) {
             let attachment = try scoped(db,try text(ref,"artifact_id"),pid,type:"attachment")
             guard attachment["task_id"] as? String == task["id"] as? String,attachment["sha256"] as? String == ref["sha256"] as? String,attachment["mode"] as? String == "managed",attachment["availability"] as? String == "available",let path = attachment["path"] as? String,objectBytesMatch(path,sha256:attachment["sha256"] as? String ?? "") else { throw CoreError("EVIDENCE_STALE","An immutable target original is missing, cleaned or changed. Re-capture it before verification.") }
         }

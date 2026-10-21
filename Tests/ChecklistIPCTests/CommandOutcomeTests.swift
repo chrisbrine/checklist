@@ -112,7 +112,7 @@ final class CommandOutcomeTests: XCTestCase {
         // These envelopes come from the actual Core endpoint, including all
         // unresolved actions and Not checked, rather than hand-built approximations.
         for action in ["answered", "send", "clarification", "clarify", "cannot_do", "not_checked"] {
-            let request = try call("human_request_create", ["project_id": pid, "task_id": tid, "blocking": false, "questions": [["id": "q", "type": "check", "prompt": "Run the selected check"]]])["data"] as! [String: Any]
+            let request = try call("human_request_create", ["project_id": pid, "task_id": tid, "title": "Selected check \(action)", "blocking": false, "questions": [["id": "q", "type": "check", "prompt": "Run the selected check for \(action)"]]])["data"] as! [String: Any]
             let commandID = UUID().uuidString
             let result = action == "not_checked" ? "not_checked" : "passed"
             let answers: [[String: Any]] = ["answered", "send", "not_checked"].contains(action) ? [["question_id": "q", "result": result]] : []

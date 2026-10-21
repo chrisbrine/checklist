@@ -232,12 +232,83 @@ extension CoreTests {
         try Data("rework changes the shared captured tree".utf8).write(to:workspace.appendingPathComponent("b.txt"))
         let changed = try call("batch_get",["project_id":p["id"]!,"batch_id":batch["id"]!])
         let completed = (changed["outcomes"] as! [JSON]).first {$0["task_id"] as? String == first["id"] as? String}!
-        XCTAssertEqual(completed["state"] as? String,"stale","Historical target freshness remains honest")
-        XCTAssertEqual(completed["accepted"] as? Bool,false)
-        XCTAssertEqual(completed["completed"] as? Bool,true,"A stale historical target must not reopen a completed ticket")
+        XCTAssertEqual(completed["state"] as? String,"completed","Unrelated sibling changes preserve scoped target freshness")
+        XCTAssertEqual(completed["accepted"] as? Bool,true)
+        XCTAssertEqual(completed["completed"] as? Bool,true,"A sibling’s rework must not reopen a completed ticket")
         let retry = try call("batch_retriage_remaining",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":1])
         XCTAssertEqual(strings(retry,"task_ids"),[second["id"] as! String]);XCTAssertEqual(strings(retry["triage"] as! JSON,"task_ids"),[second["id"] as! String])
         try assertEmptyTriage(p,group);try assertEmptyTriage(p,reviewGroup)
+    }
+
+    func testBatchNonFinalVerdictsRetainAllTriagesWhileIndividualVerdictsDepart() throws {
+        for verdict in ["blocked","not_run","evidence_missing"] {
+            for batched in [true,false] {
+                let value = try submittedArtifact(),p = value.project,group = try triage(p,phase:"review"),other = try triage(p,"Other review",phase:"review")
+                try addTriage(p,group,value.task);try addTriage(p,other,value.task)
+                let reviewer = Caller(role:"owner",installation:"non-final-"+verdict,projectIDs:[]),batch = try prepareReviewBatch(p,group,[value.task],reviewer)
+                let claim = (try claimFixedBatch(p,batch,reviewer)["claims"] as! [JSON])[0]
+                var input: JSON = ["attempt_id":claim["id"]!,"claim_token":claim["claim_token"]!,"review_request_id":claim["review_request_id"]!,"target_manifest_id":claim["manifest_id"]!,"gate":"review","verdict":verdict]
+                if verdict != "blocked" { input["reason"] = "The selected check needs its inputs" }
+                if verdict == "not_run" { input["check"] = "Inspect result" }
+                if batched { _ = try call("batch_review_record",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":1,"members":[input]],reviewer) }
+                else { input["project_id"] = p["id"];_ = try call("review_record",input,reviewer) }
+                for triage in [group,other] { XCTAssertEqual(strings(try currentTriage(p,triage),"task_ids"),batched ? [value.task["id"] as! String] : [],verdict) }
+                let request = try router.dbQueue.read {try router.record($0,claim["review_request_id"] as! String,type:"review_request")}
+                XCTAssertEqual(request["state"] as? String,verdict == "evidence_missing" ? "evidence_requested" : "queued")
+                XCTAssertNil(try call("task_get",["project_id":p["id"]!,"task_id":value.task["id"]!])["active_attempt_id"])
+            }
+        }
+    }
+    func testBatchPartialReleaseKeepsOtherClaimAndSubmitsOnlyLiveMembers() throws {
+        let p = try project(),first = try ready(p,task(p,"Release")),second = try ready(p,task(p,"Continue")),group = try triage(p),other = try triage(p,"Other handling")
+        try addTriage(p,group,first);try addTriage(p,group,second);try addTriage(p,other,first)
+        let batch = try prepareImplementationBatch(p,group,[first,second]),claims = try claimFixedBatch(p,batch)["claims"] as! [JSON]
+        let beforeOther = try call("task_get",["project_id":p["id"]!,"task_id":second["id"]!]),beforeClaim = try router.dbQueue.read {try router.record($0,claims[1]["id"] as! String,type:"attempt")}
+        let result = try call("batch_release",["project_id":p["id"]!,"batch_id":batch["id"]!,"members":[["attempt_id":claims[0]["id"]!,"claim_token":claims[0]["claim_token"]!]],"reason":"Continue in a later pass"])
+        XCTAssertEqual(strings(result,"released_task_ids"),[first["id"] as! String]);XCTAssertEqual(int(result["triage_effect"] as! JSON,"removed_count"),0)
+        XCTAssertEqual(try jsonString(beforeOther),try jsonString(call("task_get",["project_id":p["id"]!,"task_id":second["id"]!])))
+        XCTAssertEqual(try jsonString(beforeClaim),try router.dbQueue.read {try jsonString(router.record($0,claims[1]["id"] as! String,type:"attempt"))})
+        let released = try router.dbQueue.read {try router.record($0,claims[0]["id"] as! String,type:"attempt")}
+        XCTAssertEqual(released["state"] as? String,"released");XCTAssertEqual(released["reason"] as? String,"Continue in a later pass")
+        XCTAssertEqual(try call("task_get",["project_id":p["id"]!,"task_id":first["id"]!])["status_category"] as? String,"queued")
+        XCTAssertEqual(strings(try currentTriage(p,group),"task_ids").count,2);XCTAssertEqual(strings(try currentTriage(p,other),"task_ids"),[first["id"] as! String])
+        let events = try call("snapshot")["events"] as! [JSON]
+        XCTAssertTrue(events.contains {$0["kind"] as? String == "batch_released" && ($0["data"] as? JSON)?["reason"] as? String == "Continue in a later pass"})
+        XCTAssertTrue(events.contains {$0["kind"] as? String == "work_released" && $0["entity_id"] as? String == first["id"] as? String && ($0["data"] as? JSON)?["reason"] as? String == "Continue in a later pass"})
+        let input = try batchArtifactInput(p,claims[1])
+        assertCode("REVISION_CONFLICT") { _ = try self.call("batch_submit",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":1,"members":[input,input]]) }
+        _ = try call("batch_submit",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":1,"members":[input]])
+        XCTAssertEqual(strings(try currentTriage(p,group),"task_ids"),[first["id"] as! String])
+    }
+    func testBatchFullReleaseAndInvalidSelectionsAreAtomic() throws {
+        let p = try project(),tasks = try [ready(p,task(p)),ready(p,task(p))],group = try triage(p)
+        for task in tasks { try addTriage(p,group,task) }
+        let batch = try prepareImplementationBatch(p,group,tasks),claims = try claimFixedBatch(p,batch)["claims"] as! [JSON]
+        let foreignTask = try ready(p,task(p)),foreignGroup = try triage(p,"Other batch");try addTriage(p,foreignGroup,foreignTask)
+        let foreignBatch = try prepareImplementationBatch(p,foreignGroup,[foreignTask]),foreign = (try claimFixedBatch(p,foreignBatch)["claims"] as! [JSON])[0]
+        let inputs: [JSON] = claims.map {["attempt_id":$0["id"]!,"claim_token":$0["claim_token"]!]}
+        let before = try call("snapshot")
+        assertCode("INVALID_INPUT") { _ = try self.call("batch_release",["project_id":p["id"]!,"batch_id":batch["id"]!,"members":inputs,"reason":"  "]) }
+        assertCode("STALE_CLAIM") { _ = try self.call("batch_release",["project_id":p["id"]!,"batch_id":batch["id"]!,"members":[inputs[0],["attempt_id":foreign["id"]!,"claim_token":foreign["claim_token"]!]],"reason":"Wrong batch"]) }
+        assertCode("INVALID_INPUT") { _ = try self.call("batch_release",["project_id":p["id"]!,"batch_id":batch["id"]!,"members":[inputs[0],inputs[0]],"reason":"Duplicate"]) }
+        let after = try call("snapshot");for key in ["tasks","attempts","groups","events"] {XCTAssertEqual(try jsonString(before[key]!),try jsonString(after[key]!))}
+        _ = try call("batch_release",["project_id":p["id"]!,"batch_id":batch["id"]!,"members":inputs,"reason":"Release full pass"])
+        XCTAssertEqual(strings(try currentTriage(p,group),"task_ids").count,2)
+        for task in tasks { let current = try call("task_get",["project_id":p["id"]!,"task_id":task["id"]!]);XCTAssertNil(current["active_attempt_id"]);XCTAssertEqual(current["status_category"] as? String,"queued") }
+    }
+    func testReviewBatchReleaseKeepsReviewAndRecordsOnlyRemainingLiveVerdict() throws {
+        let p = try project(),tasks = try [ready(p,task(p)),ready(p,task(p))],implementation = try triage(p)
+        for task in tasks {try addTriage(p,implementation,task)}
+        let batch = try prepareImplementationBatch(p,implementation,tasks),claims = try claimFixedBatch(p,batch)["claims"] as! [JSON]
+        _ = try call("batch_submit",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":1,"members":try claims.map {try batchArtifactInput(p,$0)}])
+        let group = try triage(p,phase:"review");for task in tasks {try addTriage(p,group,task)}
+        let reviewer = Caller(role:"owner",installation:"partial-review-release",projectIDs:[]),reviewBatch = try prepareReviewBatch(p,group,tasks,reviewer),reviews = try claimFixedBatch(p,reviewBatch,reviewer)["claims"] as! [JSON]
+        _ = try call("batch_release",["project_id":p["id"]!,"batch_id":reviewBatch["id"]!,"members":[["attempt_id":reviews[0]["id"]!,"claim_token":reviews[0]["claim_token"]!]],"reason":"Another reviewer can continue"],reviewer)
+        XCTAssertEqual(try call("task_get",["project_id":p["id"]!,"task_id":tasks[0]["id"]!])["status_category"] as? String,"review")
+        let request = try router.dbQueue.read {try router.record($0,reviews[0]["review_request_id"] as! String,type:"review_request")};XCTAssertEqual(request["state"] as? String,"queued")
+        let claim = reviews[1],input: JSON = ["attempt_id":claim["id"]!,"claim_token":claim["claim_token"]!,"review_request_id":claim["review_request_id"]!,"target_manifest_id":claim["manifest_id"]!,"gate":"review","verdict":"blocked"]
+        _ = try call("batch_review_record",["project_id":p["id"]!,"batch_id":reviewBatch["id"]!,"expected_revision":1,"members":[input]],reviewer)
+        XCTAssertEqual(strings(try currentTriage(p,group),"task_ids").count,2)
     }
 
 }

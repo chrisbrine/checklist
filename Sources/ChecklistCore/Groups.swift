@@ -141,13 +141,15 @@ extension CommandRouter {
     }
     func groupList(_ db: Database,_ p: JSON,_ c: Caller,_ method: String) throws -> JSON {
         let pid = try scope(db,p,c), kind = method == "epic_list" ? "epic" : "triage"
-        var groups = try records(db,type:"group",project:pid).filter {$0["kind"] as? String == kind}
+        let fields = method == "triage_list" ? try listFields(db,p,projects:[pid],type:"group",kind:"triage",known:Self.triageListFields) : []
+        let selected = method == "triage_list" ? try listGroup(db,p,key:"triage_id",projects:[pid],kind:"triage") : nil
+        var groups = try records(db,type:"group",project:pid).filter {$0["kind"] as? String == kind && (selected == nil || $0["id"] as? String == selected?["id"] as? String)}
         if p["key"] != nil {
             let key = try text(p,"key")
             groups = groups.filter {($0["key"] as? String ?? "").caseInsensitiveCompare(key) == .orderedSame}
             guard groups.count <= 1 else { throw CoreError("AMBIGUOUS_GROUP","More than one \(kind) uses display key \(AgentReference.quoted(key)). Select its stable internal ID.",details:["matches":groups.map {["id":$0["id"]!,"key":$0["key"]!,"title":$0["name"] ?? ""]}]) }
         }
-        return ["groups":try groups.map {try groupProjection(db,$0)}]
+        return ["groups":listProjection(try groups.map {try groupProjection(db,$0)},fields:fields)]
     }
     func groupWrite(_ db: Database,_ p: JSON,_ c: Caller,_ method: String) throws -> JSON {
         try worker(c);let pid = try scope(db,p,c,write:true)

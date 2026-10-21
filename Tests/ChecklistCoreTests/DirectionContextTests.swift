@@ -13,7 +13,7 @@ final class DirectionContextTests: XCTestCase {
     }
     override func tearDownWithError() throws { router = nil; try? FileManager.default.removeItem(at:directory) }
     @discardableResult func call(_ method: String,_ params: JSON,_ caller: Caller? = nil) throws -> JSON {
-        var input = params
+        var input = method == "work_submit" ? try fixtureAcceptanceEvidence(router,input:params) : params
         if !CommandRouter.readMethods.contains(method) { input["command_id"] = UUID().uuidString }
         return try router.handle(method:method,params:input,caller:caller ?? owner)["data"] as! JSON
     }

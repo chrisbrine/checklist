@@ -19,6 +19,8 @@ final class CoreTests: XCTestCase {
     override func tearDownWithError() throws { router = nil; try? FileManager.default.removeItem(at:directory) }
     @discardableResult func call(_ method: String,_ p: JSON = [:],_ caller: Caller? = nil,_ command: String? = nil) throws -> JSON {
         var p = p
+        if method == "work_submit" { p = try fixtureAcceptanceEvidence(router,input:p) }
+        if method == "batch_submit",let members = p["members"] as? [JSON] { p["members"] = try members.map {try fixtureAcceptanceEvidence(router,input:$0)} }
         // Supply explicit synthetic review evidence for legacy fixtures exercising other guards.
         // Assessment-negative tests use their own raw router calls instead of this convenience.
         if method == "review_record" {p = try addingSyntheticReviewEvidence(p,actor:caller ?? owner)}

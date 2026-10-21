@@ -10,13 +10,21 @@ func fixtureReviewAssessment(_ router: CommandRouter, task: JSON, manifest: JSON
     return ["contract_sha256":contract["sha256"]!,"target_manifest_id":manifest["id"]!,"acceptance":rows("acceptance"),"project_requirements":rows("project_requirements"),"evidence_refs":[ref],"instruction_coverage":instructions,"all_applicable_project_requirements_assessed":true,"additional_requirements":instructions.map {["requirement":"Synthetic captured instruction coverage","source":$0["path"]!,"result":"pass","rationale":"Synthetic fixture exercised exact instruction references.","evidence_refs":[ref]]}]
 }
 
+/// Existing fixtures exercise review rules; their submission limitations claim no observation.
+func fixtureAcceptanceEvidence(_ router: CommandRouter,input: JSON) throws -> JSON {
+    var p = input
+    guard p["acceptance_evidence"] == nil,let aid = p["attempt_id"] as? String,let attempt = try? router.dbQueue.read({try router.record($0,aid,type:"attempt")}),let tid = attempt["task_id"] as? String,let task = try? router.dbQueue.read({try router.record($0,tid,type:"task")}) else { return p }
+    p["acceptance_evidence"] = strings(task,"acceptance").indices.map {["item":$0,"limitation":"Synthetic fixture for another command guard; no installed or native observation is claimed."] as JSON}
+    return p
+}
+
 final class AgentReviewAssessmentTests: XCTestCase {
     var directory: URL!,workspace: URL!,router: CommandRouter!
     let owner = Caller(role:"owner",installation:"review-fixture-owner",projectIDs:[])
     let critic = Caller(role:"owner",installation:"review-fixture-critic",projectIDs:[])
     override func setUpWithError() throws {directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString);workspace = directory.appendingPathComponent("workspace");try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true);router = try CommandRouter(root:directory.appendingPathComponent("store"))}
     override func tearDownWithError() throws {router = nil;try? FileManager.default.removeItem(at:directory)}
-    @discardableResult func call(_ method: String,_ input: JSON,_ actor: Caller? = nil) throws -> JSON {var p = input;if !CommandRouter.readMethods.contains(method) {p["command_id"] = UUID().uuidString};return try router.handle(method:method,params:p,caller:actor ?? owner)["data"] as! JSON}
+    @discardableResult func call(_ method: String,_ input: JSON,_ actor: Caller? = nil) throws -> JSON {var p = method == "work_submit" ? try fixtureAcceptanceEvidence(router,input:input) : input;if !CommandRouter.readMethods.contains(method) {p["command_id"] = UUID().uuidString};return try router.handle(method:method,params:p,caller:actor ?? owner)["data"] as! JSON}
     func assertCode(_ code: String,_ body: () throws -> Void,file: StaticString = #filePath,line: UInt = #line) {XCTAssertThrowsError(try body(),file:file,line:line) {XCTAssertEqual(($0 as? CoreError)?.code,code,file:file,line:line)}}
     func fixture(source: Bool = false,instructionSymlink: Bool = false) throws -> (JSON,JSON,JSON,JSON) {
         let p = try call("project_create",["name":"Agent review fixture","key_prefix":"AR","root_path":workspace.path])

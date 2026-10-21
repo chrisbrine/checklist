@@ -18,6 +18,9 @@ extension CommandRouter {
             left == right ? .orderedSame : (left < right ? .orderedAscending : .orderedDescending)
         })
         db.add(collation: DatabaseCollation("checklist_human_order") { left, right in left.localizedStandardCompare(right) })
+        db.add(function: DatabaseFunction("checklist_key_fold", argumentCount: 1) { values in
+            (String.fromDatabaseValue(values[0]) ?? "").folding(options:.caseInsensitive,locale:Locale(identifier:"en_US_POSIX"))
+        })
         db.add(function: DatabaseFunction("checklist_contains", argumentCount: 2) { values in
             guard let haystack = String.fromDatabaseValue(values[0]), let needle = String.fromDatabaseValue(values[1]) else { return false }
             return haystack.localizedCaseInsensitiveContains(needle)
@@ -54,6 +57,14 @@ extension CommandRouter {
             projectIDs = [try scope(db,p,c)]
         }
         let projectJSON = try jsonStringArray(projectIDs)
+        let triage = try listGroup(db,p,key:"triage_id",projects:projectIDs,kind:"triage")
+        let epic = try listGroup(db,p,key:"epic_id",projects:projectIDs,kind:"epic")
+        var keys: [String] = []
+        if let raw = p["keys"] {
+            guard let values = raw as? [String],values.count <= 200,values.allSatisfy({!$0.isEmpty && $0.utf8.count <= 4000}) else { throw CoreError("INVALID_INPUT","keys must be an array of at most 200 non-empty ticket keys.") }
+            keys = Array(Set(values.map {$0.folding(options:.caseInsensitive,locale:Locale(identifier:"en_US_POSIX"))})).sorted()
+        }
+        let fields = try listFields(db,p,projects:projectIDs,type:"task",known:Self.taskListFields)
         let query = view == nil ? p["text"] as? String ?? "" : (p["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard query.utf8.count <= 4000 else { throw CoreError("INVALID_INPUT", "Search text is too long.") }
         let limit = min(max(int(p,"limit",default:200),1),200)
@@ -69,6 +80,7 @@ extension CommandRouter {
         let generations = try projectIDs.map { try callerSessionGeneration(db,c,project:$0) }
         let identity: JSON = ["projects":projectIDs,"view":view ?? NSNull(),"text":query,
             "archived":bool(p,"archived"),"status_ids":strings(p,"status_ids"),"limit":limit,
+            "triage_id":triage?["id"] ?? NSNull(),"epic_id":epic?["id"] ?? NSNull(),"keys":p["keys"] == nil ? NSNull() : keys,"fields":fields.sorted(),
             "locale":Locale.current.identifier,"authorization":try authorizationScope(db,c),"generations":generations]
         let queryKey = hash(Data(try jsonString(identity).utf8))
         // Sequence stores the private offset, never a public event sequence.
@@ -81,6 +93,7 @@ extension CommandRouter {
             "archived":bool(p,"archived") ? 1 : 0,"statuses":try jsonStringArray(strings(p,"status_ids")),
             "status":view?["status_filter"] as? String ?? "all","tag":view?["tag_filter"] as? String ?? "all"]
         arguments += try ticketFacetArguments(view)
+        arguments += ["listTriage":triage == nil ? 0 : 1,"listMembers":try jsonStringArray(triage.map {triageMemberIDs($0)} ?? []),"listEpic":epic?["id"] as? String ?? "","listHasKeys":p["keys"] == nil ? 0 : 1,"listKeys":try jsonStringArray(keys)]
         let ordering = ticketRowOrder(view: view)
         let sql = ticketSelectionSQL(ownerView:view != nil,includeTriages:!["overview","trash"].contains(view?["surface"] as? String ?? ""),rowOrdering:ordering)
         arguments += ["limit":limit + 1,"offset":offset]
@@ -101,7 +114,7 @@ extension CommandRouter {
             guard let id = row["id"] as String? else { return false }
             return seenIDs.insert(SnapshotRecordIdentity(id)).inserted
         }
-        let taskRows = try projectTicketPage(db,rows:selectedTasks,projectJSON:projectJSON,ownerView:view != nil)
+        let taskRows = listProjection(try projectTicketPage(db,rows:selectedTasks,projectJSON:projectJSON,ownerView:view != nil),fields:fields)
         let hasMore = fetched.count > limit
         let next: Any = hasMore ? try cursor(db,caller:c,scope:cursorScope,sequence:offset + limit) : NSNull()
         let previous: Any = offset > 0 ? try cursor(db,caller:c,scope:cursorScope,sequence:max(0,offset-limit)) : NSNull()
@@ -252,6 +265,9 @@ extension CommandRouter {
           JOIN records p ON p.id=t.project_id AND p.type='project'
           LEFT JOIN records s ON s.id=json_extract(t.data,'$.status_id') AND s.project_id=t.project_id AND s.type='status'
           WHERE t.type='task' AND COALESCE(json_extract(t.data,'$.purged'),0)=0 AND COALESCE(json_extract(t.data,'$.trashed'),0)=:trashed
+            AND (:listTriage=0 OR t.id IN (SELECT value FROM json_each(:listMembers)))
+            AND (:listEpic='' OR json_extract(t.data,'$.epic_id')=:listEpic COLLATE BINARY)
+            AND (:listHasKeys=0 OR checklist_key_fold(json_extract(t.data,'$.key')) IN (SELECT value FROM json_each(:listKeys)))
         ), surface AS MATERIALIZED (SELECT * FROM base WHERE \(surface)), facets AS (SELECT * FROM surface WHERE \(facets)),
         matching AS MATERIALIZED (SELECT f.* FROM facets f \(ownerView ? "LEFT JOIN notes n ON n.project_id=f.project_id AND n.tid=f.id" : "")
           WHERE :query='' OR checklist_contains(\(textExpression),:query) \(groupMatch))

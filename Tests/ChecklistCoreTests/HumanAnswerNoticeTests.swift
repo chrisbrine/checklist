@@ -29,8 +29,8 @@ final class HumanAnswerNoticeTests: XCTestCase {
         _ = try call("work_claim",["project_id":project["id"]!,"task_id":task["id"]!,"expected_revision":task["revision"]!],handler)
         return (project,task,requester,handler,other)
     }
-    func request(_ f: (project:JSON,task:JSON,requester:Caller,handler:Caller,other:Caller)) throws -> JSON {
-        try call("human_request_create",["project_id":f.project["id"]!,"task_id":f.task["id"]!,"title":"PRIVATE_TITLE","questions":[["id":"q","prompt":"PRIVATE_PROMPT"]]],f.requester)
+    func request(_ f: (project:JSON,task:JSON,requester:Caller,handler:Caller,other:Caller),_ suffix: String = "") throws -> JSON {
+        try call("human_request_create",["project_id":f.project["id"]!,"task_id":f.task["id"]!,"title":"PRIVATE_TITLE\(suffix)","questions":[["id":"q","prompt":"PRIVATE_PROMPT\(suffix)"]]],f.requester)
     }
     func answer(_ f: (project:JSON,task:JSON,requester:Caller,handler:Caller,other:Caller),_ request: JSON,command: String? = nil) throws -> JSON {
         try call("human_request_answer",["project_id":f.project["id"]!,"request_id":request["id"]!,"expected_revision":request["revision"]!,"answers":[["question_id":"q","text":"PRIVATE_ANSWER /Users/private/source"]],"explanation":"PRIVATE_EXPLANATION"],command:command)
@@ -85,7 +85,7 @@ final class HumanAnswerNoticeTests: XCTestCase {
         XCTAssertNotNil(notice(try envelope("service_info",[:],f.requester)))
         _ = try call("session_register",["project_id":f.project["id"]!,"session_id":f.requester.sessionID!,"provider":"codex","role":"worker","installation":"requester","workspace":f.requester.workspace!])
         XCTAssertNil(notice(try envelope("service_info",[:],f.requester)),"A new generation cannot consume the old generation's queued answer.")
-        let next = try request(f);_ = try answer(f,next)
+        let next = try request(f," next question");_ = try answer(f,next)
         XCTAssertNotNil(notice(try envelope("service_info",[:],f.requester)))
         let session = try router.dbQueue.read {try router.record($0,f.requester.sessionID!,type:"session")}
         _ = try call("session_update",["project_id":f.project["id"]!,"session_id":f.requester.sessionID!,"expected_revision":session["revision"]!,"state":"ended"])
@@ -96,7 +96,7 @@ final class HumanAnswerNoticeTests: XCTestCase {
         let f = try fixture()
         _ = try call("message_send",["project_id":f.project["id"]!,"task_id":f.task["id"]!,"body":"Ordinary owner note","recipient":["kind":"session","session_id":f.requester.sessionID!]])
         XCTAssertNil(notice(try envelope("service_info",[:],f.requester)))
-        for _ in 0..<10 {let r = try request(f);_ = try answer(f,r)}
+        for index in 0..<10 {let r = try request(f," question \(index)");_ = try answer(f,r)}
         let output = try envelope("service_info",[:],f.requester),metadata = try XCTUnwrap(notice(output))
         XCTAssertEqual((metadata["items"] as! [JSON]).count,8);XCTAssertEqual(metadata["has_more"] as? Bool,true)
         XCTAssertLessThan(try jsonString(metadata).utf8.count,16*1024)

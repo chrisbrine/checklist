@@ -137,14 +137,17 @@ extension CommandRouter {
                     ["source_index":index,"name":"Pasted line \(index + 1)","stem":String(line.prefix(200)),"text":line,"sha256":hash(Data(line.utf8)),"size":line.utf8.count,"media_kind":"text","status":"valid","columns":JSON()]
                 }
             } else if let tsv = p["tsv"] as? String {
-                let count = tsv.components(separatedBy:"\n").count - (tsv.hasSuffix("\n") ? 2 : 1)
+                // CRLF is one Swift Character, so hasSuffix("\n") does not
+                // detect it. Count with the same literal splitting as the parser.
+                let lines = tsv.components(separatedBy:"\n")
+                let count = lines.count - (lines.last == "" ? 2 : 1)
                 guard (1...1000).contains(count) else { throw CoreError("INVALID_INPUT","Paste 1 to 1,000 TSV entries.") }
                 let parsed = try MediaIntakeSourceRow.tsv(tsv,rowIDs:(0..<count).map {try MediaReviewID("row-\($0)")})
                 resources.preview = try parsed.map { row in
                     guard Set(row.columns.map(\.id)).count == row.columns.count else { throw CoreError("INVALID_INPUT","TSV column names must be unambiguous for durable capture.") }
                     let columns = Dictionary(row.columns.map {($0.id.rawValue,$0.value)},uniquingKeysWith:{a,_ in a})
                     for key in ["title","slot","group"] where (columns[key] as? String)?.isEmpty == false { _ = try text(columns,key,max:key == "title" ? 2000 : 256) }
-                    guard let text = columns["text"] as? String else { throw CoreError("INVALID_INPUT","TSV needs a literal text column.") }
+                    guard let text = columns["text"] as? String,!text.isEmpty else { throw CoreError("INVALID_INPUT","TSV row \(row.sourceIndex + 1) needs nonempty literal text in the text column.") }
                     return ["source_index":row.sourceIndex,"name":"TSV row \(row.sourceIndex + 1)","stem":columns["title"] ?? String(text.prefix(200)),"text":text,"sha256":hash(Data(text.utf8)),"size":text.utf8.count,"media_kind":"text","status":"valid","columns":columns]
                 }
             } else { throw CoreError("INVALID_INPUT","Invalid selected source input.") }
@@ -322,6 +325,17 @@ extension CommandRouter {
             }
             let mapping = p["mapping"] as? JSON ?? ["input":p["sources"] != nil ? "selected_files" : p["tsv"] != nil ? "tsv" : "explicit_metadata"]
             rows = try mediaApplyMapping(rows,mapping:mapping,schema:schema,resolutions:[])
+            if p["tsv"] != nil || p["text"] != nil,
+               let row = rows.first(where:{!($0["mapping_errors"] as? [JSON] ?? []).isEmpty}),
+               let error = (row["mapping_errors"] as? [JSON])?.first {
+                let reason: String
+                switch error["reason"] as? String {
+                case "missingValue": reason = "a value is missing"
+                case "ambiguousColumn": reason = "the source column is ambiguous"
+                default: reason = "the value is invalid for this field"
+                }
+                throw CoreError("INVALID_INPUT","Pasted row \(int(row,"source_index") + 1), field \(error["field_id"] as? String ?? "metadata"): \(reason). Correct the pasted data or mapping before previewing.")
+            }
             intake["row_ids"] = rows.map {$0["id"]!};try mediaSavePlan(db,intake:&intake,rows:rows,mapping:mapping,caller:c)
             return try mediaIntakeView(db,intake:intake)
         }

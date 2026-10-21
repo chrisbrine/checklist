@@ -248,8 +248,9 @@ extension CommandRouter {
         // separate workers. Review independence concerns the actual contributors,
         // including prior/delegated identities, rather than every worker in that host.
         let author: JSON = ["principal":manifest["author_principal"] ?? NSNull(),"installation":manifest["author_installation"] ?? NSNull(),"session_id":manifest["author_session_id"] ?? NSNull()]
-        for contributor in [author] + (manifest["contributors"] as? [JSON] ?? []) {
-            if contributor["principal"] as? String == caller.principal || contributor["installation"] as? String == caller.installation || (caller.sessionID != nil && contributor["session_id"] as? String == caller.sessionID) { throw CoreError("REVIEW_INDEPENDENCE","A registered implementation contributor cannot independently review this target.") }
-        }
+        if implementationContributor([author] + (manifest["contributors"] as? [JSON] ?? []),principal:caller.principal,installation:caller.installation,sessionID:caller.sessionID) { throw CoreError("REVIEW_INDEPENDENCE","A registered implementation contributor cannot independently review this target.") }
+    }
+    func implementationContributor(_ contributors: [JSON],principal: String,installation: String?,sessionID: String?) -> Bool {
+        contributors.contains { $0["principal"] as? String == principal || (installation != nil && $0["installation"] as? String == installation) || (sessionID != nil && $0["session_id"] as? String == sessionID) }
     }
 }

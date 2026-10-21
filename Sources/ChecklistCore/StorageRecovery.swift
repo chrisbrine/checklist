@@ -56,6 +56,32 @@ extension CommandRouter {
     /// Called under the real outer admission/object gate on the serialized
     /// writer queue, outside a SQL transaction. No metadata-only backup success.
     func executeStorageBackup(_ db: Database, params: JSON, caller: Caller, permit: ArchiveStoragePermit) throws -> JSON {
+        let budget = StorageSnapshotBudget.production()
+        do {
+            return try createStorageBackup(db,params:params,caller:caller,permit:permit,budget:budget)
+        } catch {
+            let reported = budget.reporting(error)
+            guard let failure = reported as? StorageSnapshotFailure else {throw reported}
+            let code: String, message: String
+            switch failure {
+            case .invalidFixture, .unsupportedAuthority:
+                code = "BACKUP_INVALID_INVENTORY"; message = "Backup could not validate the complete managed-file inventory. Keep the store and existing backups and report this failure."
+            case .sourceChanged:
+                code = "BACKUP_SOURCE_CHANGED"; message = "Required backup data changed or did not match its recorded checksum. Check original availability before retrying."
+            case .incomplete:
+                code = "BACKUP_INCOMPLETE"; message = "Backup is incomplete. A required file or completed snapshot is unavailable. Keep the store and existing backups."
+            case .io:
+                code = "BACKUP_IO_ERROR"; message = "Backup could not read or copy every required file, or write its destination. Check original availability and destination access before retrying."
+            case .canceled:
+                code = "BACKUP_CANCELED"; message = "Backup was canceled before completion. Existing data and backups are retained."
+            case .publicationUncertain:
+                throw CoreError("OUTCOME_UNKNOWN","Backup publication could not be confirmed. Check the last change using the original command before retrying.",details:["command_id":params["command_id"] ?? "","command_outcome":"unknown","reason":"backup_publication_uncertain"])
+            case .limit, .deadline: throw reported // Converted by the shared budget above.
+            }
+            throw CoreError(code,message,details:["command_outcome":"rejected"])
+        }
+    }
+    private func createStorageBackup(_ db: Database,params: JSON,caller: Caller,permit: ArchiveStoragePermit,budget: StorageSnapshotBudget) throws -> JSON {
         try owner(caller);try permit.requireRoot(root)
         guard !db.isInsideTransaction else { throw StoreRecovery.required("backup_inside_semantic_transaction") }
         let command = try text(params,"command_id",max:100)
@@ -90,7 +116,6 @@ extension CommandRouter {
               !destination.path.hasPrefix(root.standardizedFileURL.path + "/objects/"),
               !destination.path.hasPrefix(root.standardizedFileURL.path + "/source-captures/") else { throw CoreError("INVALID_INPUT","Choose a separate backup destination.") }
         let parent = destination.deletingLastPathComponent(), name = destination.lastPathComponent
-        let budget = StorageSnapshotBudget.production()
         let receipt: StorageSnapshotReceipt
         do {
             // A previously published generation after lost SQL receipt is

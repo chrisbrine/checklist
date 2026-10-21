@@ -64,6 +64,9 @@ extension CommandRouter {
         let (task,request,manifest) = try exactAgentReview(db,p,c)
         var context = try compactTaskContext(db,task:task,caller:c)
         context["review_request"] = request;context["target_manifest"] = manifest;context["review_contract"] = try reviewContract(db,task:task,manifest:manifest)
+        let capture = (manifest["evidence"] as? JSON)?["source_capture"] as? JSON
+        context["source_relevance"] = capture?["relevance"] ?? ["mode":"whole"]
+        context["acceptance_evidence"] = (manifest["evidence"] as? JSON)?["acceptance_evidence"] ?? []
         context["review_evidence_requirements"] = try reviewRequirementPreflight(db,params:p,task:task,manifest:manifest,caller:c)
         context["review_instruction"] = "Use a fresh non-contributor conversation. Assess every acceptance item and current project requirement, including applicable captured AGENTS.md and linked rules. Choose meaningful inspection/checks in your own session. After rework, carry input-valid passing acceptance/check cases with their original producer, target and hashes; distinguish them from new execution in your current reviewer-owned report. Run only failed, inconclusive or materially affected cases; a fixture-only repair does not require an all-green suite. Before broader checks, identify named cases and invalidating inputs or cite the applicable explicit effective project workflow/context instruction; Triage membership or sibling failure is no override. Carrying checks does not transfer an old verdict or approval; fresh target-bound gates remain required. Attach your own report/log/screenshots as managed hashed evidence. No service-run test or validation script is required. Claim the exact request before reviewing; preparation alone grants no authority. Refresh review_context after claim for the applied rubric contract. Its evidence_refs selection preflight validates real scoped bytes; classes never prove native or execution success."
         return context
@@ -103,7 +106,7 @@ extension CommandRouter {
         var response = artifact;if !c.isOwner {response.removeValue(forKey:"path")};return response
     }
     func validateReviewEvidence(_ db: Database, refs: [JSON], task: JSON, manifest: JSON, caller: Caller) throws -> (refs:[JSON],owned:Bool) {
-        let pid = task["project_id"] as! String,evidence = manifest["evidence"] as? JSON ?? [:],targetArtifacts = evidence["artifact_refs"] as? [JSON] ?? []
+        let pid = task["project_id"] as! String,evidence = manifest["evidence"] as? JSON ?? [:],targetArtifacts = (evidence["artifact_refs"] as? [JSON] ?? []) + acceptanceArtifactRefs(evidence)
         var validated: [JSON] = [],owned = false
         guard !refs.isEmpty,refs.count <= 100 else {throw CoreError("REVIEW_ASSESSMENT_INCOMPLETE","Assessments need reviewer-chosen evidence references.")}
         // CL-41: evidence added after an evidence_missing verdict, recorded on a review request of

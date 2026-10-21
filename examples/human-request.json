@@ -1,6 +1,6 @@
 {
-  "title": "Choose the pause-menu icon candidate",
-  "explanation": "Choose a candidate and optionally share reference files. This request records input; a separate exact-target human approval gate is needed for release approval.",
+  "title": "Choose the new pause-menu icon candidate",
+  "explanation": "Choose a candidate for the new pause menu and optionally share reference files. This request records input; a separate exact-target human approval gate is needed for release approval.",
   "questions": [
     {
       "id": "candidate",

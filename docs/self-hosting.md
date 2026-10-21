@@ -32,6 +32,8 @@ No self-update may strand the task that initiated it. The durable build/install 
 
 An interrupted install can recover the last known-good bundle through its receipt. Store migrations first run against a copy, and production migrations keep a consistent pre-upgrade backup. Rolling back binaries is allowed only when the old version can read the current schema; after new production writes, do not restore an old database and lose those writes to make a rollback appear successful. Use a recovery/repair-forward mode when schema compatibility prevents safe downgrade.
 
+Each install runs `script/retire_old_bundles.py` to move older unused app copies to the Trash while keeping the immediate previous bundle, later concurrent installs, incoming bundles and bundles used by running processes. After the installed checks pass, run `python3 script/retire_old_bundles.py --retire-previous` to move the previous bundle to the Trash unless a running process still uses it.
+
 Show the task's Built → Installed → Verified sequence and its next action first. Current/staged versions, last successful build, service compatibility, logs and rollback details are expandable. Attach large build logs/artifacts under its attachment policy; archiving completed development tasks can clean large managed copies while retaining result metadata. Keep originals still needed by pending installed-build verification or another active task.
 
 ## Gate before enabling automatic install

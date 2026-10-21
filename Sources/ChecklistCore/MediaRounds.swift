@@ -7,6 +7,15 @@ extension CommandRouter {
     /// Capture/holds are composed internally; public activation still needs the complete
     /// owner UI/rendering/query/rework slice and its native qualification.
     func executeMediaCommand(method: String,params p: JSON,caller c: Caller,nativeOwnerProjection: Bool = false) throws -> JSON {
+        do {
+            return try executeValidatedMediaCommand(method:method,params:p,caller:c,nativeOwnerProjection:nativeOwnerProjection)
+        } catch let error as MediaSchemaError {
+            // Portable schema helpers have no transport error codes. Translate at
+            // the command boundary, including resource and canonical preparation.
+            throw CoreError("INVALID_INPUT","Invalid media input: " + error.description)
+        }
+    }
+    private func executeValidatedMediaCommand(method: String,params p: JSON,caller c: Caller,nativeOwnerProjection: Bool) throws -> JSON {
         let reads: Set<String> = ["media_type_get","media_round_get","media_intake_get","media_bulk_get","media_item_page","media_item_counts","media_approved_examples"]
         let allowed: [String:Set<String>] = [
             "media_item_page":["round_id","list","filter","limit","cursor"],

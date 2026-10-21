@@ -35,10 +35,11 @@ extension CommandRouter {
         try db.inSavepoint {
             for member in selected {
                 let base: Set<String> = ["task_id","expected_revision","file_scopes","lane_scopes"]
-                let allowed = phase == "review" ? base.union(["review_request_id","target_manifest_id","gate"]) : base
+                let allowed = phase == "review" ? base.union(["review_request_id","target_manifest_id","gate","key","contributor_session_ids"]) : base
                 guard Set(member.keys).isSubset(of:allowed) else { throw CoreError("INVALID_INPUT","Batch members contain unsupported fields or review selectors in an implementation batch.") }
                 guard let expected = member["expected_revision"] as? NSNumber,CFGetTypeID(expected) != CFBooleanGetTypeID(),expected.doubleValue.rounded() == expected.doubleValue,expected.intValue >= 1,(member["file_scopes"] == nil || member["file_scopes"] is [JSON]),(member["lane_scopes"] == nil || member["lane_scopes"] is [JSON]) else { throw CoreError("INVALID_INPUT","Each selected member needs a positive task revision and structured file/lane scopes.") }
                 let task = try scoped(db,try text(member,"task_id"),pid,type:"task");try revision(member,task)
+                if member["key"] != nil,member["key"] as? String != task["key"] as? String { throw CoreError("INVALID_INPUT","The supplied ticket key must match its current key.") }
                 var snapshot: JSON = ["task_id":task["id"]!,"key":task["key"] ?? "","title":task["title"] ?? "","task_revision":task["revision"]!,"acceptance_revision":task["acceptance_revision"] ?? 1,"membership":(group["members"] as? [JSON] ?? []).first {$0["task_id"] as? String == task["id"] as? String} ?? [:]]
                 if phase == "review" {
                     let request = try scoped(db,try text(member,"review_request_id"),pid,type:"review_request")
@@ -96,7 +97,7 @@ extension CommandRouter {
         let action = method == "batch_submit" ? "work_submit" : "review_record"
         let requiredPhase = method == "batch_submit" ? "implementation" : "review"
         guard batch["phase"] as? String == requiredPhase,let inputs = p["members"] as? [JSON],!inputs.isEmpty,inputs.count <= 200 else { throw CoreError("INVALID_TRANSITION","Supply every active member of the matching frozen batch phase.") }
-        let expectedIDs = Set((batch["members"] as? [JSON] ?? []).compactMap {$0["task_id"] as? String})
+        let expectedIDs = Set(try records(db,type:"attempt",project:pid).filter {$0["state"] as? String == "active" && $0["batch_id"] as? String == batch["id"] as? String && $0["batch_digest"] as? String == batch["digest"] as? String && $0["phase"] as? String == requiredPhase}.compactMap {$0["task_id"] as? String})
         var attempts: [JSON] = []
         for input in inputs {
             let attempt = try claimAttempt(db,input,c,pid)
@@ -105,16 +106,45 @@ extension CommandRouter {
         }
         let actualIDs = attempts.compactMap {$0["task_id"] as? String}
         guard Set(actualIDs) == expectedIDs,actualIDs.count == expectedIDs.count else { throw CoreError("REVISION_CONFLICT","The group workflow requires the complete exact active batch set once each. No member changed.") }
+        if method == "batch_submit" {
+            for (input,attempt) in zip(inputs,attempts) {
+                let task = try scoped(db,attempt["task_id"] as! String,pid,type:"task")
+                _ = try normalizedAcceptanceEvidence(db,params:input,evidence:input["evidence_manifest"] as? JSON ?? [:],task:task,attempt:attempt,caller:c)
+            }
+        }
         var results: [JSON] = []
         for input in inputs {
             var memberInput = input;memberInput["project_id"] = pid
-            // Finishing a phase always departs its current handling groups, including legacy manual milestones.
-            var result = try work(db,memberInput,c,action)
+            // Non-final batch verdicts keep all current handling memberships; terminal outcomes depart.
+            let operation: TicketStatusOperation = method == "batch_review_record" && ["blocked","not_run","evidence_missing"].contains(input["verdict"] as? String ?? "") ? .triage : .individual
+            var result = try work(db,memberInput,c,action,operation:operation)
             let task = try scoped(db,attempts[results.count]["task_id"] as! String,pid,type:"task")
             result["task_id"] = task["id"];result["key"] = task["key"];result["title"] = task["title"];results.append(result)
         }
         try event(db,caller:c,project:pid,entity:batch["triage_id"] as? String,kind:method == "batch_submit" ? "batch_submitted" : "batch_reviewed",data:["batch_id":batch["id"]!,"task_ids":actualIDs,"phase_completed":requiredPhase])
         return ["triage_id":batch["triage_id"] ?? NSNull(),"triage_key":batchTriageKey(db,batch) as Any? ?? NSNull(),"triage_name":batch["triage_name"] ?? "","batch_id":batch["id"]!,"results":results,"phase_completed":requiredPhase]
+    }
+
+    /// Release a selected live subset atomically without ending its Triage handling membership.
+    func batchRelease(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
+        try worker(c);let pid = try scope(db,p,c,write:true),batch = try scoped(db,try text(p,"batch_id"),pid,type:"batch")
+        let reason = try text(p,"reason")
+        guard let inputs = p["members"] as? [JSON],!inputs.isEmpty,inputs.count <= 200 else { throw CoreError("INVALID_INPUT","Select between 1 and 200 live batch claims to release.") }
+        var attempts: [JSON] = []
+        for input in inputs {
+            let attempt = try claimAttempt(db,input,c,pid)
+            guard attempt["batch_id"] as? String == batch["id"] as? String,attempt["batch_digest"] as? String == batch["digest"] as? String,attempt["phase"] as? String == batch["phase"] as? String else { throw CoreError("STALE_CLAIM","A member attempt is not a live claim of this exact frozen batch and phase.") }
+            attempts.append(attempt)
+        }
+        let taskIDs = attempts.compactMap {$0["task_id"] as? String}
+        guard Set(taskIDs).count == inputs.count else { throw CoreError("INVALID_INPUT","Select each live batch claim once.") }
+        var results: [JSON] = []
+        for input in inputs {
+            var memberInput = input;memberInput["project_id"] = pid;memberInput["reason"] = reason;memberInput["final_report"] = p["final_report"]
+            results.append(try work(db,memberInput,c,"work_release",operation:.triage))
+        }
+        try event(db,caller:c,project:pid,entity:batch["triage_id"] as? String,kind:"batch_released",data:["batch_id":batch["id"]!,"task_ids":taskIDs,"reason":reason])
+        return ["triage_id":batch["triage_id"] ?? NSNull(),"triage_key":batchTriageKey(db,batch) as Any? ?? NSNull(),"triage_name":batch["triage_name"] ?? "","batch_id":batch["id"]!,"released_task_ids":taskIDs,"results":results]
     }
 
     func redactBatchClaims(_ data: JSON) -> JSON {

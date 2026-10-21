@@ -304,8 +304,7 @@ record['verification']=json.loads((Path(sys.argv[5])/'build-verification.json').
 (build/'last-install.json').write_text(json.dumps(record,indent=2)+'\n')
 PY
 case "$MODE" in
-  --debug) lldb -- "$DEST/Contents/MacOS/ChecklistApp" ;;
-  --logs|--telemetry) open -n "$DEST"; /usr/bin/log stream --info --style compact --predicate 'process == "ChecklistApp" OR process == "ChecklistService"' ;;
+  --debug|--logs|--telemetry) ;;
   *) open -n "$DEST" ;;
 esac
 # Installed verification is mandatory for both verified installation routes.
@@ -326,3 +325,13 @@ case "$MODE" in
 esac
 echo "Installed $DEST"
 if [ "$HAD_PREVIOUS" = 1 ]; then echo "Previous bundle retained at $PREVIOUS; it does not restore the store."; fi
+if [ "$HAD_PREVIOUS" != 1 ]; then PREVIOUS=""; fi
+if ! python3 "$ROOT_DIR/script/retire_old_bundles.py" --after-install --keep "$PREVIOUS"; then
+  echo "Warning: old Checklist bundles could not all move to the Trash; see the retirement output." >&2
+fi
+echo "After the installed checks pass, retire the previous bundle: python3 \"$ROOT_DIR/script/retire_old_bundles.py\" --retire-previous"
+# Interactive modes can wait indefinitely; retire older bundles before entering them.
+case "$MODE" in
+  --debug) lldb -- "$DEST/Contents/MacOS/ChecklistApp" ;;
+  --logs|--telemetry) open -n "$DEST"; /usr/bin/log stream --info --style compact --predicate 'process == "ChecklistApp" OR process == "ChecklistService"' ;;
+esac

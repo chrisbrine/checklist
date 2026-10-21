@@ -1,0 +1,42 @@
+[
+  {
+    "item": 0,
+    "evidence_refs": [
+      {
+        "kind": "check",
+        "name": "Synthetic parser fixture"
+      }
+    ]
+  },
+  {
+    "item": 1,
+    "limitation": "Synthetic component evidence only; no native observation is claimed."
+  },
+  {
+    "item": 2,
+    "observation": "installed",
+    "evidence_refs": [
+      {
+        "kind": "check_runner_report",
+        "attachment_id": "synthetic-runner-report",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "build_id": "synthetic-build-1"
+      }
+    ]
+  },
+  {
+    "item": 3,
+    "evidence_refs": [
+      {
+        "kind": "carried",
+        "producer": "synthetic-original-runner",
+        "target": "synthetic-original-target",
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    ]
+  },
+  {
+    "item": 4,
+    "observation": "owner"
+  }
+]
