@@ -21,6 +21,8 @@ Slot attachment drafts and Open in… working copies use the sibling `caches/` f
 
 Secondary workspace windows keep slot preferences in the instance-specific suite `Checklist.Test<N>.Workspace.<window-uuid>`; live windows keep `Checklist.Workspace.<window-uuid>`. The standard preference domain follows the bundle ID (`org.checklist.app.testN`, live `org.checklist.app`); these files live separately in `~/Library/Preferences`. Human claims and pending commands use the Keychain service `Checklist.Test<N>.HumanClaim` (live `Checklist.HumanClaim`). `destroy` removes the slot's Keychain claims, preference domains and Saved Application State.
 
+The app never prompts for the Keychain; foreign or unreadable items are ignored, and pending-command recovery uses the new `pending-command-v2` / `pending-command-v2-window-<uuid>` accounts without reading or deleting legacy accounts. To remove the stale legacy item, the owner can run `security delete-generic-password -s Checklist.HumanClaim -a pending-command`.
+
 ## Seeds
 
 - `empty` is the default: the service initializes an empty store. Test startup does not create the development project automatically.

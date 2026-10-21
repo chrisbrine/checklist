@@ -29,6 +29,28 @@ public struct ChecklistError: LocalizedError {
     public init(_ code: String, _ message: String, details: [String: Any] = [:]) { self.code = code; self.message = message; self.details = details }
 }
 
+/// Both the file-based login keychain and Data Protection keychain must fail
+/// without UI. The legacy interaction flag is process-wide, so serialize every
+/// Checklist keychain operation and restore the caller's setting afterwards.
+public enum KeychainWithoutUI {
+    private static let lock = NSLock()
+
+    @discardableResult
+    public static func perform(_ attributes: [String: Any], operation: (CFDictionary) -> OSStatus) -> OSStatus {
+        lock.lock()
+        defer { lock.unlock() }
+        var wasAllowed: DarwinBoolean = false
+        let status = SecKeychainGetUserInteractionAllowed(&wasAllowed)
+        guard status == errSecSuccess else { return status }
+        let disabled = SecKeychainSetUserInteractionAllowed(false)
+        guard disabled == errSecSuccess else { return disabled }
+        defer { SecKeychainSetUserInteractionAllowed(wasAllowed.boolValue) }
+        var query = attributes
+        query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
+        return operation(query as CFDictionary)
+    }
+}
+
 public enum ChecklistKeychain {
     private static var service: String { ChecklistInstance.current.keychainService }
     public static func read(_ account: String) throws -> String? {
@@ -36,7 +58,7 @@ public enum ChecklistKeychain {
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        let status = KeychainWithoutUI.perform(query) { SecItemCopyMatching($0, &result) }
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess, let data = result as? Data, let value = String(data: data, encoding: .utf8) else {
             throw ChecklistError("KEYCHAIN_UNAVAILABLE", "Cannot read the paired installation (\(status)).")
@@ -46,7 +68,7 @@ public enum ChecklistKeychain {
     public static func write(_ account: String, _ value: String) throws {
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
         let values: [String: Any] = [kSecValueData as String: Data(value.utf8)]
-        var status = SecItemUpdate(query as CFDictionary, values as CFDictionary)
+        var status = KeychainWithoutUI.perform(query) { SecItemUpdate($0, values as CFDictionary) }
         if status == errSecItemNotFound {
             var add = query.merging(values) { _, new in new }
             add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
@@ -61,7 +83,7 @@ public enum ChecklistKeychain {
                 var access: SecAccess?
                 if SecAccessCreate("Checklist paired local executables" as CFString, trusted as CFArray, &access) == errSecSuccess, let access { add[kSecAttrAccess as String] = access }
             }
-            status = SecItemAdd(add as CFDictionary, nil)
+            status = KeychainWithoutUI.perform(add) { SecItemAdd($0, nil) }
         }
         guard status == errSecSuccess else { throw ChecklistError("KEYCHAIN_UNAVAILABLE", "Cannot save pairing (\(status)).") }
     }
@@ -69,7 +91,8 @@ public enum ChecklistKeychain {
         guard status == errSecSuccess || status == errSecItemNotFound else { throw ChecklistError("KEYCHAIN_UNAVAILABLE", "Cannot restore the previous paired credential (\(status)).") }
     }
     public static func removeChecked(_ account: String) throws {
-        try checkRemovalStatus(SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account] as CFDictionary))
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
+        try checkRemovalStatus(KeychainWithoutUI.perform(query) { SecItemDelete($0) })
     }
     public static func remove(_ account: String) { try? removeChecked(account) }
 }

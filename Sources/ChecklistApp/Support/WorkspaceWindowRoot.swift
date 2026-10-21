@@ -15,8 +15,8 @@ enum WorkspaceWindowIdentity: Hashable, Codable {
     }
     var pendingCommandKey: String {
         switch self {
-        case .primary: return "pending-command"
-        case .workspace(let id): return "pending-command-window-" + id.uuidString.lowercased()
+        case .primary: return "pending-command-v2"
+        case .workspace(let id): return "pending-command-v2-window-" + id.uuidString.lowercased()
         }
     }
 }
