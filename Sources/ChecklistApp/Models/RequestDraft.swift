@@ -37,12 +37,29 @@ enum RequestDraftIdentity {
         return draft
     }
     static func isComplete(_ draft: AnswerDraft, questions: [Record], fileRequests: [Record]) -> Bool {
-        if questions.contains(where: { ["approval", "check"].contains($0.string("type")) && draft.values[$0.id] == "not_checked" }) { return false }
-        let answersComplete = questions.filter { ($0.values["required"] as? Bool ?? true) }.allSatisfy { question in
-            !(draft.values[question.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (question.bool("allow_custom") && !(draft.customValues[question.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        incompleteItems(draft, questions: questions, fileRequests: fileRequests).isEmpty
+    }
+    /// Keep the visible explanation and Send's accessibility help tied to the same validation.
+    static func incompleteMessage(_ draft: AnswerDraft, questions: [Record], fileRequests: [Record]) -> String? {
+        let items = incompleteItems(draft, questions: questions, fileRequests: fileRequests)
+        guard !items.isEmpty else { return nil }
+        var names = items.prefix(3).map { "“\($0.string("prompt", fallback: $0.string("label", fallback: "Required item")))”" }
+        if items.count > 3 { names.append("\(items.count - 3) more") }
+        let list = names.count == 1 ? names[0] : names.dropLast().joined(separator: ", ") + " and " + names.last!
+        let hasFiles = items.contains { item in fileRequests.contains { $0.id == item.id } }
+        let action = hasFiles ? "Complete" : "Answer"
+        let guidance = items.contains { ["approval", "check"].contains($0.string("type")) }
+            ? " Choose No to decline; use Other response for Not checked." : ""
+        return "\(action) \(list)." + guidance
+    }
+    private static func incompleteItems(_ draft: AnswerDraft, questions: [Record], fileRequests: [Record]) -> [Record] {
+        let answers = questions.filter { question in
+            if ["approval", "check"].contains(question.string("type")) && draft.values[question.id] == "not_checked" { return true }
+            guard question.values["required"] as? Bool ?? true else { return false }
+            return (draft.values[question.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !(question.bool("allow_custom") && !(draft.customValues[question.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
-        let filesComplete = fileRequests.filter { ($0.values["required"] as? Bool ?? true) }.allSatisfy { !(draft.paths[$0.id] ?? []).isEmpty }
-        return answersComplete && filesComplete
+        let files = fileRequests.filter { ($0.values["required"] as? Bool ?? true) && (draft.paths[$0.id] ?? []).isEmpty }
+        return answers + files
     }
     static func fileProblems(_ draft: inout AnswerDraft, fileRequests: [Record]) -> [String: String] {
         let paths = fileRequests.flatMap { draft.paths[$0.id] ?? [] }

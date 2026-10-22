@@ -75,6 +75,7 @@ final class QuickCaptureModel: ObservableObject {
     @Published private(set) var state: State = .editing
     @Published private(set) var projectsAvailable = false
     @Published var problem: String?
+    private var draftSaveFailed = false
     private let journal: LocalDraftJournal
     private let preferences: UserDefaults
     private let transport: Transport
@@ -247,8 +248,19 @@ final class QuickCaptureModel: ObservableObject {
               UUID(uuidString: url.deletingPathExtension().lastPathComponent) != nil else { return }
         try? FileManager.default.removeItem(at: url)
     }
+    func captureTerminationCheck() -> CaptureTerminationCheck {
+        let snapshot = draft, journal = journal, failed = draftSaveFailed
+        return CaptureTerminationCheck(verify: {
+            guard !failed else { throw CocoaError(.fileWriteUnknown) }
+            if !snapshot.isEmpty || snapshot.pendingCreate != nil || snapshot.createdTaskID != nil {
+                try journal.checkSaved(snapshot, kind: Self.journalKind, key: "draft")
+            }
+        }, isCurrent: { [weak self] in self?.draft == snapshot })
+    }
     private func persist() {
-        do { try journal.save(draft, kind: Self.journalKind, key: "draft") }
-        catch { problem = "This draft could not be saved on this Mac: \(error.localizedDescription)" }
+        do { try journal.save(draft, kind: Self.journalKind, key: "draft"); draftSaveFailed = false }
+        catch { draftSaveFailed = true; problem = "This draft could not be saved on this Mac: \(error.localizedDescription)" }
     }
 }
+
+extension QuickCaptureModel: CaptureTerminationParticipant {}

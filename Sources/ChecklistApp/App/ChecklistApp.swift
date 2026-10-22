@@ -3,6 +3,24 @@ import SwiftUI
 import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let termination: CaptureTerminationCoordinator
+    private var terminationReply: ((Bool) -> Void)?
+    private var terminationFailure: ((String) -> Void)?
+    override init() { termination = MainActor.assumeIsolated { .shared }; super.init() }
+    init(termination: CaptureTerminationCoordinator, reply: @escaping (Bool) -> Void, failure: @escaping (String) -> Void) {
+        self.termination = termination; terminationReply = reply; terminationFailure = failure; super.init()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        termination.request(reply: terminationReply ?? { sender.reply(toApplicationShouldTerminate: $0) }, failure: terminationFailure ?? { message in
+            // The pending termination has already been canceled before showing UI.
+            DispatchQueue.main.async {
+                sender.presentError(NSError(domain: "Checklist.Capture", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Checklist could not quit safely", NSLocalizedRecoverySuggestionErrorKey: message]))
+            }
+        })
+    }
+
     /// The notification delegate must exist before launch ends, so that a click that launched the app opens its item (CL-59).
     func applicationWillFinishLaunching(_ notification: Notification) {
         MainActor.assumeIsolated { _ = DesktopAlertCoordinator.shared }

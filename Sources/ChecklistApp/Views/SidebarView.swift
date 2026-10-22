@@ -45,7 +45,7 @@ struct SidebarView: View {
                             Text("Archived projects (\(store.archivedProjects.count))").checklistFont(.body).foregroundStyle(Color.checklistSecondaryText)
                         }.accessibilityIdentifier("archivedProjects")
                     }
-                } header: { Text("Projects").checklistFont(.captionEmphasis) }
+                } header: { Text("Projects").checklistFont(.captionEmphasis).foregroundStyle(Color.checklistSecondaryText) }
                 Section {
                     navigation(.activity)
                 }

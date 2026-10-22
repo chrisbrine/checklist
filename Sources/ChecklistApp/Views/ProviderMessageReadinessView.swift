@@ -13,18 +13,18 @@ struct ProviderMessageReadinessView: View {
                 ForEach(store.projects) { project in Text(project.string("name")).tag(project.id) }
             }
             if let context {
-                Text(context.recipientLabel).checklistFont(.micro).foregroundStyle(.secondary)
+                Text(context.recipientLabel).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 if let observation = model.observation(for: context) {
                     claudeCard(observation)
                     codexCard(observation)
-                    Text("Observed \(observation.observedAt.formatted(date: .abbreviated, time: .standard)). Refresh after changing provider settings.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("Observed \(observation.observedAt.formatted(date: .abbreviated, time: .standard)). Refresh after changing provider settings.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 } else {
                     Text(model.context == context && model.loading ? "Reading bounded local settings…" : "No current observation. Refresh for this project and recipient.").checklistFont(.callout)
                 }
                 Button("Refresh message readiness") { Task { await model.refresh(context) } }
                     .checklistDisabled([(model.context == context && model.loading, "A message readiness read is already in progress.")])
             }
-            Text("Settings readiness, note transport, host hold/refusal and recipient acknowledgment are separate. A readiness observation never means that a note was sent or read.").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("Settings readiness, note transport, host hold/refusal and recipient acknowledgment are separate. A readiness observation never means that a note was sent or read.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
         }.onChange(of: context, initial: true) { _, value in model.invalidate(for: value) }
             .onDisappear { model.invalidate(for: nil) }
     }
@@ -33,7 +33,7 @@ struct ProviderMessageReadinessView: View {
         VStack(alignment: .leading, spacing: Spacing.small) {
             Text("Claude · version unknown").checklistFont(.calloutStrong)
             Text(observation.claude.title).checklistFont(.callout)
-            Text(ProviderReadinessObservation.versionLimitation).checklistFont(.micro).foregroundStyle(.secondary)
+            Text(ProviderReadinessObservation.versionLimitation).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             if let decision = observation.claude.observedDecision {
                 Text("Known-source result: \(decision.rawValue) · \(observation.claude.decidingSource)").checklistFont(.micro).textSelection(.enabled)
             }
@@ -58,8 +58,8 @@ struct ProviderMessageReadinessView: View {
             Text("Codex · version unknown").checklistFont(.calloutStrong)
             Text(ProviderReadinessObservation.codexTitle).checklistFont(.callout)
             Text("Source: this Checklist build's MCP pickup capability; no live recipient engine version observed.").checklistFont(.micro)
-            Text(ProviderReadinessObservation.codexExplanation).checklistFont(.micro).foregroundStyle(.secondary)
-            Text("No automatic send or success receipt is created by this card. An actual MCP acknowledgment keeps its existing exact-recipient meaning.").checklistFont(.micro).foregroundStyle(.secondary)
+            Text(ProviderReadinessObservation.codexExplanation).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+            Text("No automatic send or success receipt is created by this card. An actual MCP acknowledgment keeps its existing exact-recipient meaning.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
         }.frame(maxWidth: .infinity, alignment: .leading).checklistCard(padding: Card.padding)
     }
 }

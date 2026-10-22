@@ -26,7 +26,7 @@ struct CaptureTaskView: View {
             Picker("Project", selection: Binding(get: { projectID }, set: { switchProject($0) })) { Text("Choose a project").tag(""); ForEach(store.activeProjects) { Text($0.string("name")).tag($0.id) } }.checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)])
             if let createdTaskID {Text("Ticket captured · "+String(createdTaskID.prefix(8))+". Finish its selected files before starting another ticket.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)}
             if !projectID.isEmpty {
-                Picker("Epic", selection: $epicID) {
+                Picker("Epic", selection: Binding(get: { epicID }, set: { epicID = $0; persistCapture() })) {
                     Text("No Epic").tag("")
                     if !epicID.isEmpty,!availableEpics.contains(where:{RecordIdentity($0.id)==RecordIdentity(epicID)}) {Text("Saved Epic · "+String(epicID.prefix(8))).tag(epicID)}
                     ForEach(availableEpics) {Text($0.string("name")).tag($0.id)}
@@ -34,14 +34,14 @@ struct CaptureTaskView: View {
                 AccessibleHStack {if epicLoading {ProgressView().controlSize(.small)};if let token=epicPrevious {Button("Previous Epics") {Task {await loadEpics(cursor:token)}}};if let token=epicNext {Button("More Epics") {Task {await loadEpics(cursor:token)}}}}.checklistFont(.micro).checklistDisabled([(epicLoading, "Epics are still loading.")])
                 if let epicError {Text(epicError).checklistFont(.micro).foregroundStyle(.orange)}
             }
-            TextField("What needs doing?", text: $title).checklistFont(.subheading).textFieldStyle(.roundedBorder).focused($titleFocused).accessibilityIdentifier("captureTitle").checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)])
-            AccessibleHStack { Picker("Starter", selection: $kind) { ForEach(enabledKinds, id: \.self) { Text($0.capitalized).tag($0) } }.frame(maxWidth: .infinity, alignment: .leading).checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)]); Spacer(); Text("Saves as Draft").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+            TextField("What needs doing?", text: Binding(get: { title }, set: { title = $0; persistCapture() })).checklistFont(.subheading).textFieldStyle(.roundedBorder).focused($titleFocused).accessibilityIdentifier("captureTitle").checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)])
+            AccessibleHStack { Picker("Starter", selection: Binding(get: { kind }, set: { kind = $0; persistCapture() })) { ForEach(enabledKinds, id: \.self) { Text($0.capitalized).tag($0) } }.frame(maxWidth: .infinity, alignment: .leading).checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)]); Spacer(); Text("Saves as Draft").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             if !starterHint.isEmpty { Text(starterHint).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             if !StarterFields.fields(for: kind).isEmpty {
-                StarterFieldsEditor(kind: kind, values: $starterFields)
+                StarterFieldsEditor(kind: kind, values: Binding(get: { starterFields }, set: { starterFields = $0; persistCapture() }))
                     .checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)])
             }
-            TextEditor(text: $brief).checklistFont(.body).frame(height: 110).padding(Spacing.compact).overlay(RoundedRectangle(cornerRadius: Radius.medium).stroke(.quaternary)).accessibilityLabel("Optional brief").checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)])
+            TextEditor(text: Binding(get: { brief }, set: { brief = $0; persistCapture() })).checklistFont(.body).frame(height: 110).padding(Spacing.compact).overlay(RoundedRectangle(cornerRadius: Radius.medium).stroke(.quaternary)).accessibilityLabel("Optional brief").checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)])
             AttachmentCaptureSection(pending:$pendingAttachments,destination:Binding(get:{CaptureAttachmentDestination(storeIncarnation:store.storeIncarnation,projectID:projectID,taskID:nil)},set:{_ in}),disabled:store.busy || captureNeedsReconciliation)
             Text("A title is enough to capture it. Add the outcome and make it ready when you're set.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             if !title.isEmpty || !brief.isEmpty {
@@ -57,15 +57,12 @@ struct CaptureTaskView: View {
                 Button(createdTaskID != nil ? "Finish attachments" : createCommandID != nil ? "Finish creating this ticket" : "Create Draft") { createDraft() }.buttonStyle(.checklistProminent).keyboardShortcut(.return, modifiers: .command)
                     .checklistDisabled([(projectID.isEmpty, "Choose a project first."), (title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Enter a title first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline), (captureNeedsReconciliation, "This draft belongs to an earlier store. Confirm its destination first."), (createCommandID == nil && epicLoading, "Epics are still loading.")])
             }
-        }.padding(Spacing.page).checklistSheet(width: 510).onAppear {
+        }.padding(Spacing.page).checklistSheet(width: 510).modifier(CaptureAllowsQuit()).onAppear {
             if let epic = store.groups.first(where: { $0.id == store.captureEpicID && $0.string("kind") == "epic" }) { switchProject(epic.string("project_id")); epicID = epic.id }
-            else { switchProject(store.projectID ?? (store.activeProjects.count == 1 ? store.activeProjects.first?.id ?? "" : "")) }
+            else { switchProject(store.captureInitialProjectID) }
             titleFocused = true
-        }.task(id:projectID) {await loadEpics()}.onChange(of: title) { _, _ in persistCapture() }
-            .onChange(of: brief) { _, _ in persistCapture() }
-            .onChange(of: kind) { _, _ in persistCapture() }
-            .onChange(of: epicID) { _, _ in persistCapture() }
-            .onChange(of: starterFields) { _, _ in persistCapture() }
+        }.task(id:projectID) {await loadEpics()}
+            // Editable bindings save before returning, including the final edit before Quit.
             .onDisappear {epicRead=UUID();persistCapture(); store.captureEpicID = nil }
     }
     var captureDefaults: [String: Any] { store.project(projectID)?.object("capture_defaults") ?? [:] }

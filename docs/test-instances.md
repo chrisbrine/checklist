@@ -75,7 +75,7 @@ defaults write org.checklist.app.test1 checklistQualificationFaults -dict select
 defaults write org.checklist.app.test1 checklistQualificationFaults -dict selected_records -string fresh_context_fail remaining -int 2
 ```
 
-The slot strip shows **TEST FAULT · N remaining** while armed (external preference changes appear within about one second). Each injected fault writes a unified-log notice in category `QualificationFaults` with slot domain, read boundary, error code and remaining count:
+The slot strip shows **TEST FAULT · N remaining** while armed (external preference changes appear within about one second). Each observed arm writes one unified-log notice in category `QualificationFaults` with slot domain, fault kind and budget: a key already set at startup, an external arm while running, or a changed kind/budget on refresh (including re-arming after countdown). Unchanged timer polls and the app’s own countdown do not add arm notices. Each injected fault still writes its own notice with slot domain, read boundary, error code and remaining count. Live apps write neither kind of notice:
 
 ```sh
 log show --last 5m --style compact --predicate 'category == "QualificationFaults"'

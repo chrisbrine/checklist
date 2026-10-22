@@ -33,7 +33,7 @@ struct TaskEditDraft: Codable {
     var scope: DraftScope
 }
 
-struct CaptureDraft: Codable {
+struct CaptureDraft: Codable, Equatable {
     var projectID: String
     var title: String
     var brief: String
@@ -82,6 +82,14 @@ final class LocalDraftJournal {
         guard descriptor >= 0 else { throw POSIXError(.EIO) }
         defer { close(descriptor) }
         guard fsync(descriptor) == 0, try Data(contentsOf: target) == bytes else { throw POSIXError(.EIO) }
+    }
+
+    /// A read-only quit check of the snapshot already synchronized by save().
+    func checkSaved<Value: Codable & Equatable>(_ value: Value, kind: String, key: String) throws {
+        let envelope = try JSONDecoder().decode(Envelope<Value>.self, from: Data(contentsOf: file(kind: kind, key: key)))
+        guard envelope.schemaVersion == 1, envelope.kind == kind, envelope.key == key, envelope.value == value else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
     }
 
     func load<Value: Codable>(_ type: Value.Type, kind: String) throws -> [String: Value] {

@@ -893,6 +893,20 @@ final class ChecklistStore: ObservableObject {
         draft.createdTaskID=id;saveCapture(draft)
         return draftSaveError("capture",projectID)==nil ? id : nil
     }
+    /// A saved blank-project draft takes priority over ordinary capture defaults.
+    var captureInitialProjectID: String {
+        if let blank = captureDrafts[""], !blank.title.isEmpty || !blank.brief.isEmpty { return "" }
+        return projectID ?? (activeProjects.count == 1 ? activeProjects.first?.id ?? "" : "")
+    }
+    func captureTerminationCheck() -> CaptureTerminationCheck {
+        let drafts = captureDrafts, journal = draftJournal
+        let failed = draftSaveFailures.keys.contains { $0.hasPrefix("capture:") }
+        return CaptureTerminationCheck(verify: {
+            guard !failed else { throw CocoaError(.fileWriteUnknown) }
+            for (key, draft) in drafts { try journal.checkSaved(draft, kind: "capture", key: key) }
+        }, isCurrent: { [weak self] in self?.captureDrafts == drafts })
+    }
+
     func draftSaveError(_ kind: String, _ id: String) -> String? { draftSaveFailures[kind + ":" + id] }
     func retryDraftSave(_ kind: String, _ id: String) {
         switch kind {
@@ -1377,3 +1391,5 @@ extension ChecklistStore {
     var ticketFilterEpics: [Record] { ticketPages.page?.epics ?? [] }
     var ticketFilterTriages: [Record] { ticketPages.page?.filterTriages ?? [] }
 }
+
+extension ChecklistStore: CaptureTerminationParticipant {}

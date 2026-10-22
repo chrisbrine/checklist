@@ -69,6 +69,7 @@ final class WorkspaceWindowState: ObservableObject {
         store = storeFactory?(journal, preferences, navigationMemory)
             ?? ChecklistStore(draftJournal: journal, preferences: preferences,
                               navigationMemory: navigationMemory, pendingCommandKey: identity.pendingCommandKey)
+        CaptureTerminationCoordinator.shared.register(store)
     }
 }
 

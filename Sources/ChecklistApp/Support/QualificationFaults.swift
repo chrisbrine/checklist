@@ -18,15 +18,21 @@ final class QualificationFaults: ObservableObject {
     private let read: (String) -> Any?
     private let write: (String, [String:Any]) -> Void
     private let log: (String) -> Void
+    private let logArm: (String) -> Void
+    private var armedKind: Kind?
 
     init(instance: ChecklistInstance, read: @escaping (String) -> Any? = QualificationFaults.readPreference,
          write: @escaping (String, [String:Any]) -> Void = QualificationFaults.writePreference,
-         log: @escaping (String) -> Void = { Logger(subsystem:"org.checklist.app",category:"QualificationFaults").notice("\($0,privacy:.public)") }) {
+         logArm: @escaping (String) -> Void = QualificationFaults.logNotice,
+         log: @escaping (String) -> Void = QualificationFaults.logNotice) {
         domain = instance.slot == nil ? nil : instance.bundleIdentifier
-        self.read = read; self.write = write; self.log = log
+        self.read = read; self.write = write; self.log = log; self.logArm = logArm
         refresh()
     }
 
+    nonisolated private static func logNotice(_ message: String) {
+        Logger(subsystem:"org.checklist.app",category:"QualificationFaults").notice("\(message,privacy:.public)")
+    }
     nonisolated private static func readPreference(_ domain: String) -> Any? {
         CFPreferencesSynchronize(domain as CFString,kCFPreferencesCurrentUser,kCFPreferencesAnyHost)
         return CFPreferencesCopyValue(key as CFString,domain as CFString,kCFPreferencesCurrentUser,kCFPreferencesAnyHost)
@@ -44,13 +50,22 @@ final class QualificationFaults: ObservableObject {
               number == NSNumber(value:number.intValue) else { return nil }
         return (kind,number.intValue)
     }
-    func refresh() { remaining = configuration()?.1 ?? 0 }
+    func refresh() {
+        guard let (kind,count) = configuration(), let domain else {
+            armedKind = nil; remaining = 0; return
+        }
+        // Our own countdown updates remaining below; unchanged timer polls stay silent.
+        let changed = armedKind != kind || remaining != count
+        armedKind = kind; remaining = count
+        if changed { logArm("TEST FAULT armed slot-domain=\(domain) selected_records=\(kind.rawValue) remaining=\(count)") }
+    }
 
     func inject(_ boundary: Read) throws {
-        guard let (kind,count) = configuration(), let domain else { remaining = 0; return }
-        remaining = count
+        refresh()
+        guard let kind = armedKind, let domain else { return }
         if boundary == .freshContext && kind != .freshContext { return }
-        remaining = count - 1
+        remaining -= 1
+        if remaining == 0 { armedKind = nil }
         write(domain,["selected_records":kind.rawValue,"remaining":remaining])
         let code = boundary == .freshContext ? "QUALIFICATION_FRESH_CONTEXT_FAILED" : "CURSOR_RESET"
         log("TEST FAULT slot-domain=\(domain) read=\(boundary.rawValue) code=\(code) remaining=\(remaining)")

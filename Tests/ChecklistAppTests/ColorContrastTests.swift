@@ -63,6 +63,37 @@ final class ColorContrastTests: XCTestCase {
         }
     }
 
+    func testInformativeViewTextUsesSecondaryToken() throws {
+        let views = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/ChecklistApp/Views")
+        // Guard the missed captions and the List header, whose system style is inherited.
+        let captions: [String: [String]] = [
+            "ProviderMessageReadinessView.swift": [
+                "Text(context.recipientLabel)", "Text(\"Observed ",
+                "Text(\"Settings readiness,", "Text(ProviderReadinessObservation.versionLimitation)",
+                "Text(ProviderReadinessObservation.codexExplanation)", "Text(\"No automatic send"
+            ],
+            "TaskSessionsView.swift": [
+                "Text(NativeCommunicationRoutes.summary)", "Text(route.reason)",
+                "Text(\"Native wake unavailable"
+            ],
+            "ProjectSettingsView.swift": ["Text(\"Pausing retains requests."],
+            "SidebarView.swift": ["header: { Text(\"Projects\")"]
+        ]
+        for (file, fragments) in captions {
+            let source = try String(contentsOf: views.appendingPathComponent(file), encoding: .utf8)
+            XCTAssertNil(source.range(of: #"\.(secondary|tertiary)\b"#, options: .regularExpression),
+                         "Informative text in \(file) must use the shared token")
+            for fragment in fragments {
+                let line = try XCTUnwrap(source.split(separator: "\n").first { $0.contains(fragment) },
+                                         "Missing caption in \(file): \(fragment)")
+                XCTAssertTrue(line.contains(".foregroundStyle(Color.checklistSecondaryText)"),
+                              "Caption in \(file) must explicitly use the shared token: \(fragment)")
+            }
+        }
+    }
+
     func testEveryStatusPillMeetsAAOnItsCompositedFill() {
         inAppearances { appearance, backgrounds in
             for category in categories {

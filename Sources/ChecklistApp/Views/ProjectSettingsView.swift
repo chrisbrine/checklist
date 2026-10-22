@@ -84,7 +84,7 @@ struct ProjectSettingsView: View {
                     Toggle("Check active work", isOn: $healthEnabled).toggleStyle(.checkbox)
                     Stepper("Ask after \(healthInactivity) minutes without progress", value: $healthInactivity, in: 1...10080)
                     Stepper("Response grace: \(healthGrace) minutes", value: $healthGrace, in: 1...10080)
-                    Text("Pausing retains requests. Resuming gives a fresh interval or response grace. Health checks never release claims or launch an agent. Native wake is unavailable; requests wait for MCP pickup.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("Pausing retains requests. Resuming gives a fresh interval or response grace. Health checks never release claims or launch an agent. Native wake is unavailable; requests wait for MCP pickup.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
                 Button("Save project settings") { saveSettings() }.buttonStyle(.checklistProminent).checklistDisabled([(name.isEmpty, "Enter a name first."), (prefix.isEmpty, "Enter a key prefix first."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving), ((workflowNeedsPreview && (!matchingWorkflowPreview || !reviewRequirements.canPreview)), "Preview the workflow change first.")])
                 Text(workflowNeedsPreview ? "Preview workflow changes before saving. A conflict preserves this draft." : "Project details and defaults save directly. A conflict preserves this draft.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)

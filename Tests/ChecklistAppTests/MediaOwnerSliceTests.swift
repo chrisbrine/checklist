@@ -204,7 +204,7 @@ import CryptoKit
     }
     func testComparisonAndWinnerLabelsUseTitleOriginTimeAndSlotWithoutTechnicalIdentity() throws {
         let candidateID="6167d5d8-31b1-48ab-8499-639a494c60f4",slotID="6e0c4dd3-efe7-4e96-b40b-454af7c475eb"
-        let hash=String(repeating:"abc123ef",count:8),author="auto-codex/01a1616c-278b-7c61-9ace-d82ba99e2625"
+        let hash=String(repeating:"abc123ef",count:8),author="auto-codex/00000000-0000-0000-0000-000000000001"
         let slot=Record(values:["slot_id":slotID,"media_kind":"image","sha256":hash])
         let definitions=[Record(values:["id":slotID,"label":"Walk north","kind":"image"])]
         let candidate:MediaValues=["id":candidateID,"source_name":"hero-walk.png","origin":"agent","author_session_id":author,"created_at":"2026-10-21T12:00:00Z","slots":[slot.values],"content_signature":hash]

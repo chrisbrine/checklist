@@ -13,7 +13,7 @@ final class ArchivePreviewStoreCopyTests: XCTestCase {
         let router = try CommandRouter(root:root,serviceLease:StorageServiceLease(root:root))
         defer { try? router.closeStore() }
         let owner = Caller(role:"owner",installation:"cl150-store-copy",projectIDs:[])
-        let params: JSON = ["project_id":"a3854aea-b62c-4fbc-b86b-40ce4a4f0cd6","task_id":"b6240dd9-0d41-4058-a758-55822b97502d"]
+        let params: JSON = ["project_id":"00000000-0000-0000-0000-000000000001","task_id":"00000000-0000-0000-0000-000000000002"]
         // Time the actual command, including read-to-writer retry when a preview is first stored.
         var times: [Double] = [], previews: [String] = []
         for _ in 0..<5 {

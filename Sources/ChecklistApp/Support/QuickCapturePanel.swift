@@ -125,6 +125,7 @@ final class QuickCaptureController: NSObject, NSWindowDelegate, NSMenuDelegate {
         self.model = model ?? QuickCaptureModel()
         self.pasteboard = pasteboard
         super.init()
+        CaptureTerminationCoordinator.shared.register(self.model)
     }
 
     /// AppKit owns the menu bar item independently of SwiftUI's app scene graph.

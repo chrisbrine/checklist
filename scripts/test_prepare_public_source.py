@@ -58,6 +58,55 @@ class PublicSourceTests(unittest.TestCase):
                 prepare.read_source(self.root, 'README.md', {})
             self.assertNotIn(value, str(error.exception))
 
+    def test_uuid_provider_identities_and_live_project_refused(self):
+        # Assemble private-shaped inputs so this test source remains exportable.
+        v4 = 'c0ffee00-1234-4567-89ab-0123456789ab'
+        values = ['auto-codex/' + v4,
+                  'auto-claude-' + 'a1b2c3/workspace:' + v4,
+                  'auto-claude-' + 'f' * 40 + '/' + v4.upper() + ':' + v4.upper(),
+                  'a3854aea-' + 'b62c-4fbc-b86b-' + '40ce4a4f0cd6']
+        # UUIDv7 detection must not depend on a particular timestamp prefix.
+        for prefix in ['01a1616c', '019abcde', '12345678', 'ffffffff']:
+            for variant in '89ab':
+                thread = prefix + '-1234-7abc-' + variant + 'def-0123456789ab'
+                values.extend([thread, thread.upper(), 'auto-codex/' + thread,
+                               'rollout-2026-10-21-' + thread + '.jsonl',
+                               'thread_' + thread])
+        for value in values:
+            (self.root / 'README.md').write_text('Heading\n' + value)
+            with self.subTest(value=value), self.assertRaises(ValueError) as error:
+                prepare.read_source(self.root, 'README.md', {})
+            self.assertIn('README.md:2', str(error.exception))
+            self.assertNotIn(value, str(error.exception))
+
+    def test_synthetic_uuid_namespace_and_content_hashes_allowed(self):
+        for suffix in ['000', '001', '00a', 'fff']:
+            synthetic = '00000000-0000-0000-0000-000000000' + suffix
+            values = [synthetic, 'auto-codex/' + synthetic,
+                      'auto-claude-' + 'abc123/' + synthetic + ':' + synthetic]
+            for value in values:
+                (self.root / 'README.md').write_text(value)
+                with self.subTest(value=value):
+                    self.assertEqual(prepare.read_source(self.root, 'README.md', {})[0], value.encode())
+        values = ['abc123ef' * 8, '01a1616c' + '7abc89ab' * 4,
+                  'c0ffee00-1234-4567-89ab-0123456789ab',  # Ordinary example UUIDv4.
+                  '12345678-1234-' + '7abc-0def-0123456789ab',  # Not RFC UUIDv7 variant.
+                  '12345678-1234-' + '6abc-8def-0123456789ab']
+        for value in values:
+            (self.root / 'README.md').write_text(value)
+            with self.subTest(value=value):
+                self.assertEqual(prepare.read_source(self.root, 'README.md', {})[0], value.encode())
+
+    def test_synthetic_actor_allowance_is_narrow_and_checks_workspace_uuid(self):
+        synthetic = '00000000-0000-0000-0000-000000000001'
+        values = ['auto-codex/' + '00000000-0000-0000-0000-000000001000',
+                  'auto-codex/' + '00000001-0000-0000-0000-000000000001',
+                  'auto-claude-' + 'abc/00000000-0000-0000-0001-000000000001:' + synthetic]
+        for value in values:
+            (self.root / 'README.md').write_text(value)
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                prepare.read_source(self.root, 'README.md', {})
+
     def test_synthetic_exception_is_hash_bound(self):
         (self.root / 'Tests').mkdir()
         path = self.root / 'Tests/Fixture.swift'
@@ -86,6 +135,31 @@ class PublicSourceTests(unittest.TestCase):
                 prepare.prepare(self.root, self.target)
         self.assertFalse(self.target.exists())
         self.assertEqual(list(self.target.parent.glob('.checklist-public-*')), [])
+
+    def test_planning_validator_applies_shared_uuid_privacy_rules(self):
+        prepare.prepare(prepare.ROOT, self.target)
+        readme = self.target / 'README.md'
+        original = readme.read_text()
+        values = ['auto-codex/' + 'c0ffee00-1234-4567-89ab-0123456789ab',
+                  'auto-claude-' + 'ab/workspace:c0ffee00-1234-4567-89ab-0123456789ab',
+                  '12345678-1234-' + '7abc-8def-0123456789ab',
+                  'a3854aea-' + 'b62c-4fbc-b86b-' + '40ce4a4f0cd6']
+        for value in values:
+            readme.write_text(original + '\n' + value + '\n')
+            result = prepare.subprocess.run([prepare.sys.executable, 'scripts/validate-plan.py'],
+                                            cwd=self.target, text=True, capture_output=True)
+            with self.subTest(value=value):
+                self.assertEqual(result.returncode, 1, result.stderr)
+                errors = json.loads(result.stdout)['errors']
+                self.assertTrue(any('Concrete private identifier' in error and 'README.md:' in error
+                                    for error in errors))
+                self.assertNotIn(value, result.stdout + result.stderr)
+        readme.write_text(original + '\n' + 'abc123ef' * 8 + '\n' +
+                          'auto-codex/' + '00000000-0000-0000-0000-000000000001' + '\n')
+        result = prepare.subprocess.run([prepare.sys.executable, 'scripts/validate-plan.py'],
+                                        cwd=self.target, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['errors'], [])
 
     def test_actual_export_is_complete_reproducible_and_validated(self):
         report = prepare.prepare(prepare.ROOT, self.target)

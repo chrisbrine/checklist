@@ -3,6 +3,7 @@ import SwiftUI
 struct TriageDetailView: View {
     @EnvironmentObject var store: ChecklistStore
     let triage: Record
+    @StateObject private var batchHistory = TriageBatchHistory()
     @State private var editingPurpose = false
     @State private var name = ""
     @State private var purpose = ""
@@ -69,20 +70,9 @@ struct TriageDetailView: View {
                     Button("Add to this Triage") { store.run("group_membership", ["project_id": projectID, "group_id": triage.id, "task_id": selectedTicket, "action": "add", "expected_revision": triage.integer("revision")], success: "Ticket added to this Triage; Epic unchanged") { _ in selectedTicket = "" } }.buttonStyle(.checklistBordered).checklistDisabled([(triage.bool("archived"), "This Triage is archived. Restore it first."), (selectedTicket.isEmpty, "Choose a ticket first."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
                     Text("Membership changes apply to the current members. A dispatched batch, claim or review is not rewritten.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
-                if !triage.records("batches").isEmpty {
-                    Divider()
-                    DetailSection(title:"Fixed batches") {
-                        ForEach(triage.records("batches")) { batch in
-                            VStack(alignment:.leading,spacing: Spacing.tight) {
-                                Text("\(batch.string("phase").capitalized) · \(batch.integer("member_count",fallback:0)) tickets").checklistFont(.callout)
-                                let lifecycle = BatchLifecycleDisplay(batch)
-                                Text(lifecycle.date.isEmpty ? lifecycle.label : "\(lifecycle.label) \(relativeTime(lifecycle.date))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-                                if !lifecycle.reason.isEmpty { Text(lifecycle.reason).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
-                                TechnicalDetails([("Batch", batch.id), ("Triage revision", "\(batch.integer("triage_revision"))"), ("Created at", batch.string("created_at"))])
-                            }
-                        }
-                        Text("Later membership edits affect future batches. Passing tickets complete independently; the next pass contains only failed or remaining work unless this project's rules hold passing tickets.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-                    }
+                Divider()
+                TriageFixedBatchesSection(history: batchHistory) {
+                    Task { await loadBatches() }
                 }
                 Divider()
                 Button(triage.bool("archived") ? "Restore Triage" : "Archive Triage…") {
@@ -92,7 +82,13 @@ struct TriageDetailView: View {
                 }.checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
             }.padding(Spacing.page)
         }.onAppear { selectedPhase = triage.string("phase",fallback:"implementation");store.loadGroupTasks(triage,closed:false);store.loadGroupCandidates(triage,closed:false) }
+        .task(id: store.archivePreviewEpoch) { await loadBatches() }
         .checklistConfirmation($confirmation)
+    }
+    private func loadBatches() async {
+        await batchHistory.load(projectID: projectID, triageID: triage.id) { method, params in
+            try await store.request(method, params)
+        }
     }
     var draftKey: String { "triageHandlingDraft-" + triage.id }
     func beginEdit() {
@@ -120,4 +116,65 @@ private struct TriageMemberRow: View {
         }.checklistCard(padding: Card.padding)
     }
 
+}
+
+/// Detail-local history: workspace group summaries intentionally omit fixed batches.
+@MainActor final class TriageBatchHistory: ObservableObject {
+    @Published private(set) var batches: [Record] = []
+    @Published private(set) var loading = true
+    @Published private(set) var error: String?
+    private var generation = UUID()
+
+    func load(projectID: String, triageID: String,
+              request: (String, [String: Any]) async throws -> [String: Any]) async {
+        let read = UUID(); generation = read
+        batches = []; error = nil; loading = true
+        defer { if generation == read { loading = false } }
+        do {
+            let result = try await request("triage_list", ["project_id": projectID, "triage_id": triageID, "fields": ["project_id", "batches"]])
+            guard generation == read, !Task.isCancelled else { return }
+            guard let groups = result["groups"] as? [[String: Any]], groups.count == 1,
+                  let group = groups.first,
+                  RecordIdentity(group["id"] as? String ?? "") == RecordIdentity(triageID),
+                  RecordIdentity(group["project_id"] as? String ?? "") == RecordIdentity(projectID),
+                  let rows = group["batches"] as? [[String: Any]],
+                  rows.allSatisfy({ !($0["id"] as? String ?? "").isEmpty }),
+                  Set(rows.compactMap { $0["id"] as? String }).count == rows.count else {
+                error = "Fixed batches could not be read. Try again."
+                return
+            }
+            batches = rows.map(Record.init)
+        } catch {
+            guard generation == read, !Task.isCancelled else { return }
+            self.error = "Fixed batches could not be loaded. " + PlainError.text(error)
+        }
+    }
+}
+
+struct TriageFixedBatchesSection: View {
+    @ObservedObject var history: TriageBatchHistory
+    let retry: () -> Void
+    var body: some View {
+        DetailSection(title: "Fixed batches") {
+            if history.loading {
+                Text("Loading fixed batches…").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+            } else if let error = history.error {
+                Text(error).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                Button("Retry fixed batches", action: retry).checklistFont(.micro)
+            } else if history.batches.isEmpty {
+                Text("No fixed batches for this Triage.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+            } else {
+                ForEach(history.batches) { batch in
+                    VStack(alignment: .leading, spacing: Spacing.tight) {
+                        Text("\(batch.string("phase").capitalized) · \(batch.integer("member_count", fallback: 0)) tickets").checklistFont(.callout)
+                        let lifecycle = BatchLifecycleDisplay(batch)
+                        Text(lifecycle.date.isEmpty ? lifecycle.label : "\(lifecycle.label) \(relativeTime(lifecycle.date))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                        if !lifecycle.reason.isEmpty { Text(lifecycle.reason).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+                        TechnicalDetails([("Batch", batch.id), ("Triage revision", "\(batch.integer("triage_revision"))"), ("Created at", batch.string("created_at")), ("Lifecycle date", lifecycle.date)])
+                    }
+                }
+                Text("Later membership edits affect future batches. Passing tickets complete independently; the next pass contains only failed or remaining work unless this project's rules hold passing tickets.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+            }
+        }
+    }
 }

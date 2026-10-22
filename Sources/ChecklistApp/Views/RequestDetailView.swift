@@ -45,6 +45,7 @@ struct RequestDetailView: View {
     func questionPrompt(_ id: String) -> String { questions.first { $0.string("id") == id }.map { $0.string("prompt", fallback: $0.string("label", fallback: "Question")) } ?? "Question" }
     func filePrompt(_ id: String) -> String { fileRequests.first { $0.string("id") == id }.map { $0.string("prompt", fallback: $0.string("label", fallback: "File")) } ?? "File" }
     var answered: Bool { ["answered", "resolved", "canceled", "superseded"].contains(Canceled.normalized(request.string("state"))) }
+    var incompleteMessage: String? { answered ? nil : RequestDraftIdentity.incompleteMessage(draft, questions: questions, fileRequests: fileRequests) }
     var complete: Bool { RequestDraftIdentity.isComplete(draft, questions: questions, fileRequests: fileRequests) && !staleDraft && fileProblems.isEmpty && fileInspector.ready(for: fileInspectionScope) && imageApprovalReady }
     var fileInspectionScope: RequestFileInspectionScope {
         RequestFileInspectionScope(request: request, draft: draft, fileRequests: fileRequests, storeIncarnation: store.storeIncarnation)
@@ -144,6 +145,7 @@ struct RequestDetailView: View {
             if let progress = fileInspector.progress {
                 ProgressView(value: progress.fraction) { Text("Checking selected files…").checklistFont(.micro) }
             }
+            if let incompleteMessage { Text(incompleteMessage).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             AccessibleHStack {
                 Menu("Other response") {
                     Button("Need clarification") { send("clarification") }.checklistDisabled([(!store.connected, DisabledReasons.offline), (draft.explanation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write an explanation first."), (staleDraft, "This request changed. Review the current version first."), (fileInspector.isChecking, "The selected files are still being checked.")])
@@ -153,7 +155,7 @@ struct RequestDetailView: View {
                     Button("Cancel request…", role: .destructive) { confirmation = Confirmations.cancelRequest { store.run("human_request_cancel", ["project_id": request.string("project_id"), "request_id": request.id, "expected_revision": request.integer("revision"), "reason": draft.explanation], success: "Request canceled") } }
                 }.checklistDisabled([(answered, "This request is already answered."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
                 Spacer()
-                Button("Send answer") { send("answered") }.buttonStyle(.checklistProminent).keyboardShortcut(.return, modifiers: .command).checklistDisabled([(!complete, "Complete every required item. Choose No to decline; use Other response for Not checked."), (answered, "This request is already answered."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
+                Button("Send answer") { send("answered") }.buttonStyle(.checklistProminent).keyboardShortcut(.return, modifiers: .command).checklistDisabled([(!complete, incompleteMessage ?? "Complete every required item. Choose No to decline; use Other response for Not checked."), (answered, "This request is already answered."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
             }
         }.padding(Spacing.group).background(.bar)
     }

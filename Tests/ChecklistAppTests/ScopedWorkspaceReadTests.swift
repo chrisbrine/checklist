@@ -79,12 +79,12 @@ import ChecklistIPC
     private func changes(_ pid:String,families:[String],task:String?=nil)->[String:Any] {
         ["event_cursor":"observed-interval","coverage":["schema_version":2,"complete":true,"reset":false,"changes":[["project_id":pid,"families":families,"task_ids":task.map{[$0]} ?? [],"all_tasks":task==nil]]]]
     }
-    func testAnswerAndDeclineImmediatelyRemoveNeedsYouRowsAndCountsBeforeRefresh() async throws {
+    func testAnswerDeclineAndApprovalImmediatelyRemoveNeedsYouRowsAndDockCountsBeforeRefresh() async throws {
         for page in [Page.needsYou,.overview] {
-            for result in ["passed","declined"] {
+            for (type, result) in [("text", "Answer"), ("check", "passed"), ("check", "declined"), ("approval", "approved")] {
                 let f = try Fixture(defaults:isolatedDefaults("ImmediateHumanAnswer")); defer { f.cleanup() }
                 f.preferences.set(page.rawValue,forKey:"lastPage")
-                let input: [String:Any] = ["project_id":f.a,"task_id":f.task,"title":"Answer this check","questions":[["id":"q","prompt":"Keyboard navigation is on","type":"check"]]]
+                let input: [String:Any] = ["project_id":f.a,"task_id":f.task,"title":"Answer this check","questions":[["id":"q","prompt":"Keyboard navigation is on","type":type]]]
                 let request = Record(values:try f.command("human_request_create",input)["data"] as! [String:Any])
                 let initial = result == "passed" ? 1 : 2
                 if initial == 2 {
@@ -97,17 +97,20 @@ import ChecklistIPC
                 store.open(.request(request.id))
                 try await until { store.selectedOther?.id == request.id && !store.otherDetailLoading }
                 XCTAssertEqual(store.needsCount,initial)
+                XCTAssertEqual(DockBadge.label(count:store.needsCount,enabled:true),String(initial))
                 var draft = AnswerDraft(revision:request.integer("revision"))
                 draft.targetIdentity = RequestDraftIdentity.form(request); draft.formRevision = request.integer("form_revision")
                 draft.values = ["q":result]
                 XCTAssertTrue(RequestDraftIdentity.isComplete(draft,questions:request.records("questions"),fileRequests:[]))
-                draft.values["q"] = "not_checked"
-                XCTAssertFalse(RequestDraftIdentity.isComplete(draft,questions:request.records("questions"),fileRequests:[]))
+                if type != "text" {
+                    draft.values["q"] = "not_checked"
+                    XCTAssertFalse(RequestDraftIdentity.isComplete(draft,questions:request.records("questions"),fileRequests:[]))
+                }
                 draft.values["q"] = result
                 let submission = RequestAnswerSubmission(request:request,action:"answered")
                 f.holdSurface = page == .needsYou ? "requests" : "overview"
                 var completion: RequestAnswerCompletion?
-                let params: [String:Any] = ["project_id":f.a,"request_id":request.id,"expected_revision":request.integer("revision"),"form_identity":draft.targetIdentity,"response":"answered","answers":[["question_id":"q","result":result]]]
+                let params: [String:Any] = ["project_id":f.a,"request_id":request.id,"expected_revision":request.integer("revision"),"form_identity":draft.targetIdentity,"response":"answered","answers":[["question_id":"q",type == "text" ? "text" : "result":result]]]
                 store.run("human_request_answer",params) { reply in
                     completion = submission.reconcile(Record(values:reply),currentRequest:store.requests.first { $0.id == request.id },currentDetail:store.detail,draft:draft)
                 }

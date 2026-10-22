@@ -14,6 +14,8 @@ from urllib.parse import unquote
 from jsonschema import Draft202012Validator, FormatChecker
 import yaml
 
+from public_source_privacy import private_identifiers
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -186,16 +188,14 @@ def check() -> dict:
         errors.append('Unexpected planned app executable')
 
     links = 0
-    private_patterns = [r'/(?:Users|home)/[A-Za-z0-9_.-]+',
-                        r'/tmp/cc-socks(?:-\d+)?/\d+\.sock',
-                        r'(?<![A-Za-z_])session_[A-Za-z0-9]{15,}']
     for path in sorted(selected):
         if not path.exists(): errors.append(f'Missing public file: {path.relative_to(ROOT)}'); continue
         if path.suffix in {'.png', '.icns'}: continue
         if path.suffix == '.json': json.loads(path.read_text())
         body = path.read_text()
-        for pattern in private_patterns:
-            if re.search(pattern, body): errors.append(f'Concrete private identifier: {path.relative_to(ROOT)}')
+        for label, match in private_identifiers(body):
+            line = body.count('\n', 0, match.start()) + 1
+            errors.append(f'Concrete private identifier ({label}): {path.relative_to(ROOT)}:{line}')
         if path.suffix != '.md': continue
         if re.search(r'^(<<<<<<<|=======|>>>>>>>)', body, re.M): errors.append(f'Conflict marker: {path.relative_to(ROOT)}')
         if any(line.rstrip() != line for line in body.splitlines()): errors.append(f'Trailing whitespace: {path.relative_to(ROOT)}')

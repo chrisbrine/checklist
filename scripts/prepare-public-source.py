@@ -7,21 +7,15 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
-import re
 import stat
 import subprocess
 import sys
 import tempfile
 
+from public_source_privacy import PATTERNS, private_identifiers
+
 ROOT = Path(__file__).resolve().parents[1]
 INVENTORY = 'scripts/public-source-files.json'
-PATTERNS = {
-    'home_path': r'/(?:Users|home)/[A-Za-z0-9_.-]+',
-    'native_socket': r'/tmp/cc-socks(?:-\d+)?/\d+\.sock',
-    'native_session': r'(?<![A-Za-z_])session_[A-Za-z0-9]{15,}',
-    'private_scratch': r'/private/tmp/claude-\d+',
-    'credential': r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----',
-}
 
 
 def inventory(root: Path) -> tuple[list[str], dict]:
@@ -66,9 +60,10 @@ def read_source(root: Path, name: str, exceptions: dict) -> tuple[bytes, int]:
               'docs/design/public-human-request.png', 'docs/design/public-task-workspace.png'}
     if name not in images:
         body = data.decode('utf-8')
-        for label, pattern in PATTERNS.items():
-            if re.search(pattern, body) and not (exception and label in exception['patterns']):
-                raise ValueError('Private identifier (' + label + '): ' + name)
+        for label, match in private_identifiers(body):
+            if not (exception and label in exception['patterns']):
+                line = body.count('\n', 0, match.start()) + 1
+                raise ValueError(f'Private identifier ({label}): {name}:{line}')
     return data, 0o755 if path.stat().st_mode & 0o111 else 0o644
 
 
