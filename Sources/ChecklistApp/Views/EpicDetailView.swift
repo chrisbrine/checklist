@@ -107,6 +107,7 @@ private struct EpicTicketRow: View {
             VStack(alignment: .leading, spacing: Spacing.compact) {
                 Text(task.string("title")).checklistFont(.bodyEmphasis).frame(maxWidth: .infinity, alignment: .leading)
                 AccessibleHStack { Text(task.string("key")).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText); Spacer(); TicketStatusPills(task: task); if task.bool("archived") { Image(systemName: "archivebox").foregroundStyle(Color.checklistSecondaryText) } }
+                TicketStatusReasonLine(task:task)
             }.checklistCard(padding: Card.padding)
         }.buttonStyle(.checklistRow).contextMenu {
             Button("Open ticket") { store.open(.task(task.id)) }

@@ -3,6 +3,18 @@ import Combine
 
 /// Preparing and opening a draft never supplies a session identity or work authority.
 @MainActor final class TaskHandoffModel: ObservableObject {
+    struct Scope: Hashable {
+        let projectID: String
+        let taskID: String
+        let providerID: String
+
+        init(task: Record, provider: HandoffProvider) {
+            projectID = task.string("project_id")
+            taskID = task.id
+            providerID = provider.id
+        }
+    }
+
     typealias Transport = (String, [String: Any]) async throws -> [String: Any]
     typealias Opener = (URL, URL) async throws -> Void
     @Published private(set) var loading = true
@@ -14,18 +26,26 @@ import Combine
     @Published private(set) var opening = false
     @Published private(set) var openedComposer = false
     private let commandID = UUID().uuidString
+    private var preparationID: UUID?
+    private var preparationScope: Scope?
+    private var preparedScope: Scope?
 
     func prepare(task: Record, provider: HandoffProvider, transport: Transport) async {
-        guard !opening else { return }
+        guard !opening, !Task.isCancelled else { return }
+        let scope = Scope(task: task, provider: provider), requestID = UUID()
+        preparationID = requestID; preparationScope = scope; preparedScope = nil
         loading = true; instruction = ""; limitation = ""; preparationFailure = ""; openingFailure = ""; composeURL = nil; openedComposer = false
-        defer { loading = false }
+        // A retired request must not clear a newer request's loading state either.
+        defer { if preparationID == requestID { loading = false } }
         if let reason = provider.unavailabilityReason { preparationFailure = reason; return }
         do {
             let response = try await transport("task_handoff_prepare", ["command_id": commandID, "project_id": task.string("project_id"), "task_id": task.id, "provider": provider.id])
+            guard preparationID == requestID, preparationScope == scope, !Task.isCancelled else { return }
             guard let returned = response["instruction"] as? String, !returned.isEmpty else {
                 preparationFailure = "The service did not return a ticket instruction. No chat was opened."
                 return
             }
+            preparedScope = scope
             instruction = returned
             limitation = response["limitation"] as? String ?? ""
             if let raw = response["compose_url"] as? String {
@@ -35,14 +55,26 @@ import Combine
                 }
                 composeURL = validated
             }
-        } catch { preparationFailure = PlainError.text(error) }
+        } catch {
+            guard preparationID == requestID, preparationScope == scope, !Task.isCancelled, !(error is CancellationError) else { return }
+            preparationFailure = PlainError.text(error)
+        }
     }
 
-    func openPreparedChat(applicationURL: URL?, opener: Opener) async {
-        guard !loading, !opening, let composeURL else { return }
+    func validatedComposeURL(task: Record, provider: HandoffProvider) -> URL? {
+        guard !loading, preparedScope == Scope(task: task, provider: provider), let composeURL else { return nil }
+        return provider.validatedComposeURL(composeURL.absoluteString)
+    }
+
+    func openPreparedChat(task: Record, provider: HandoffProvider, applicationURL: URL?, opener: Opener) async {
+        guard !loading, !opening, !Task.isCancelled, composeURL != nil else { return }
         openedComposer = false; openingFailure = ""
+        guard let composeURL = validatedComposeURL(task: task, provider: provider) else {
+            openingFailure = "The prepared chat does not match this ticket or available provider. Prepare it again."
+            return
+        }
         guard let applicationURL else {
-            openingFailure = "Codex could not be located. The instruction is available to copy."
+            openingFailure = "\(provider.name) could not be located. The instruction is available to copy."
             return
         }
         opening = true

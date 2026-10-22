@@ -11,6 +11,7 @@ struct TaskRowPresentation: Equatable {
     let projectName: String?
     let human: Bool
     let closed: Bool
+    let statusReason: TicketStatusReasonPresentation?
     let statusName: String
     let waiting: String
     let draft: Bool
@@ -22,6 +23,7 @@ struct TaskRowPresentation: Equatable {
         title = task.string("title");key = task.string("key");kind = task.string("kind",fallback:"Work")
         self.projectName = projectName
         human = task.string("planned_assignee") == "human" || task.object("planned_assignee")["kind"] as? String == "human"
+        statusReason = TicketStatusReasonPresentation(task:task)
         closed = TicketVisibility.isClosed(task);statusName = TicketVisibility.statusLabel(task);waiting = TicketVisibility.waitingLabel(task)
         draft = task.string("readiness") == "draft"
         statusCategory = task.string("status_category");self.age = age

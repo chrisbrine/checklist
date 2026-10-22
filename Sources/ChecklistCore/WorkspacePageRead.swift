@@ -113,7 +113,8 @@ extension CommandRouter {
         // scoped to one project. Keep that catalog separate from the SQL row
         // scope above; only the trusted owner may use this command.
         let catalogs = try projects(db,c)
-        return ["workspace_version":1,"surface":surface,"record_id":recordID,"rows":rows,"total":total,"has_more":fetched.count>limit,
+        let needs = try ownerNeedsYouCounts(db)
+        return ["workspace_version":1,"surface":surface,"record_id":recordID,"rows":rows,"total":total,"needs_you_count":needs.requests + needs.tasks,"has_more":fetched.count>limit,
                 "next_cursor":fetched.count>limit ? try cursor(db,caller:c,scope:cursorScope,sequence:offset+limit) : NSNull(),
                 "previous_cursor":offset>0 ? try cursor(db,caller:c,scope:cursorScope,sequence:max(0,offset-limit)) : NSNull(),
                 "projects":catalogs,"service":try dispatch(db,method:"service_info",p:[:],c:c),"content_cursor":try cursor(db,caller:c,scope:authorizationScope(db,c),sequence:latest)]
@@ -182,7 +183,7 @@ extension CommandRouter {
         }
         return ["workspace_version":1,"surface":"overview","record_id":"","groups":groups,"rows":[JSON](),"total":0,"has_more":false,
                 "next_cursor":NSNull(),"previous_cursor":NSNull(),"projects":last["projects"] ?? [JSON](),"service":last["service"] ?? [:],
-                "content_cursor":last["content_cursor"] ?? NSNull()]
+                "content_cursor":last["content_cursor"] ?? NSNull(),"needs_you_count":last["needs_you_count"] ?? 0]
     }
 
     /// The active attempt of a listed ticket: who works, in which phase, and how recent its checkpoint is.

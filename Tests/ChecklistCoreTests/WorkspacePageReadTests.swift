@@ -28,6 +28,30 @@ extension CoreTests {
         let after=try router.dbQueue.read {try Int.fetchOne($0,sql:"SELECT COUNT(*) FROM cursors")}
         XCTAssertEqual(before,after)
     }
+    func testWorkspaceNeedsYouCountIsGlobalUnfilteredAndExcludesEveryClosedState() throws {
+        let p = try project("Count scope"), foreign = try project("Foreign count"), t = try task(p), owned = try task(foreign)
+        let pid = p["id"] as! String
+        try router.dbQueue.writeWithoutTransaction { db in try router.withValidatedDomainTransaction(db) {
+            for (id, project, state, snoozed) in [("visible",pid,"pending",false),("hidden",pid,"pending",true),("foreign",foreign["id"] as! String,"pending",false),
+                                                  ("answered",pid,"answered",false),("canceled",pid,"canceled",false),("superseded",pid,"superseded",false),("resolved",pid,"resolved",false)] {
+                try router.save(db,["id":id,"project_id":project,"task_id":t["id"]!,"title":id,"state":state,"owner_snoozed":snoozed,"revision":1],type:"request")
+            }
+            var task = owned; task["planned_assignee"] = "human"
+            try router.save(db,task,type:"task")
+            return .commit
+        }}
+        for surface in ["requests","human_tasks","epics","overview"] {
+            let page = try call("workspace_page",["project_id":pid,"surface":surface,"text":"no matching row","limit":1])
+            XCTAssertEqual(page["needs_you_count"] as? Int,4,surface)
+            if let groups = page["groups"] as? [String:JSON] {
+                for (name,group) in groups { XCTAssertEqual(group["needs_you_count"] as? Int,4,name) }
+            } else { XCTAssertEqual(page["total"] as? Int,0) }
+        }
+        _ = try call("human_request_cancel",["project_id":pid,"request_id":"visible","expected_revision":1])
+        let refreshed = try call("workspace_page",["project_id":pid,"surface":"requests"])
+        XCTAssertEqual(refreshed["total"] as? Int,0)
+        XCTAssertEqual(refreshed["needs_you_count"] as? Int,3)
+    }
     func testWorkspaceActivityAndSelectedRecordNeverInstallForeignCorpus()throws {
         let p=try project("Activity scope"),foreign=try project("Other activity"),t=try task(p)
         let pid=p["id"] as! String,tid=t["id"] as! String

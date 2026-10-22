@@ -59,6 +59,8 @@ Optional Work, Bug, Asset, Playtest and Question templates add useful prompts, n
 
 ## Separate state dimensions
 
+A ticket’s optional `status_reason` is the explanation from its latest status action: `text`, authenticated `actor`, `actor_display` and `at`. It remains visible while the ticket stays in that status, through notes and metadata edits. A later status action without a reason clears the current explanation; all original reasons remain in history. Explicit transitions and implementation/review releases (including batch releases) share this rule. Reads derive this value from the latest status event in the ticket’s indexed history, without a storage migration. Older events without a captured display name use the current scoped session label when available, otherwise You for the owner or Agent; the exact actor and timestamp remain available. The ticket header displays the full explanation under its status; list rows show one line with the complete text on hover.
+
 - **Disposition:** `open`, `deferred`, `done`, `cancelled`, `superseded`; archive/trash visibility is separate. Superseded means duplicate/successor history, not done.
 - **Open phase:** `queued`, `implementation`, `review`, `changes_requested`, `waiting_human`, `blocked`. Blocking human requests retain the previous continuation. Nonblocking questions need not move the primary phase.
 - **Attempt status:** `claimed`, `running`, `submitted`, `completed`, `blocked`, `released`, `interrupted`, `recovery_required`, `cancelled`. Implementation submission ends its write claim; review requires a separate claim.

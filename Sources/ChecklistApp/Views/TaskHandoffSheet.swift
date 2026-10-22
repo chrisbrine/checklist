@@ -9,7 +9,7 @@ struct TaskHandoffSheet: View {
     @StateObject private var model = TaskHandoffModel()
     @State private var copied = false
     var applicationURL: URL? { provider.bundleID.flatMap { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) } }
-    var canCompose: Bool { model.composeURL != nil && applicationURL != nil }
+    var canCompose: Bool { model.validatedComposeURL(task: task, provider: provider) != nil && applicationURL != nil }
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.section) {
             AccessibleHStack { Text("Use in \(provider.name)").checklistFont(.sheetTitle); Spacer(); Button { dismiss() } label: { Image(systemName: "xmark") }.buttonStyle(.checklistIcon).accessibilityLabel("Close handoff").help("Close handoff") }
@@ -55,14 +55,14 @@ struct TaskHandoffSheet: View {
                     }.checklistDisabled([(model.loading, "Still loading."), (model.instruction.isEmpty, "The ticket instruction is not ready yet."), (model.opening, "Waiting for the provider to open.")])
                 }
             }
-        }.padding(Spacing.page).checklistSheet(width: 600).task { await prepare() }
+        }.padding(Spacing.page).checklistSheet(width: 600).task(id: TaskHandoffModel.Scope(task: task, provider: provider)) { await prepare() }
     }
     func prepare() async {
         copied = false
         await model.prepare(task: task, provider: provider, transport: store.request)
     }
     func openPreparedChat() async {
-        await model.openPreparedChat(applicationURL: applicationURL) { url, app in
+        await model.openPreparedChat(task: task, provider: provider, applicationURL: applicationURL) { url, app in
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 NSWorkspace.shared.open([url], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration()) { _, error in
                     if let error { continuation.resume(throwing: error) } else { continuation.resume() }

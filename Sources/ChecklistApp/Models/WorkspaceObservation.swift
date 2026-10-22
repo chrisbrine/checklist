@@ -31,10 +31,11 @@ import Observation
         let count = page.outstandingRequestCount + page.humanTaskCount
         if needsCount != count { needsCount = count }
     }
-    /// Overview pages (CL-53) carry the owned project catalog and service identity, not statuses or tags.
+    /// Workspace totals are global owner counts, independent of row scope, filters and pagination.
     func install(workspace page: WorkspacePage) {
         if !same(projects,page.projects) { projects = page.projects }
         if !same(service.map {[$0]},[page.service]) { service = page.service }
+        if let count = page.needsCount, needsCount != count { needsCount = count }
     }
     func clear() { projects = nil;statuses = nil;tags = nil;service = nil;needsCount = nil }
     private func same(_ lhs: [Record]?,_ rhs: [Record]) -> Bool {

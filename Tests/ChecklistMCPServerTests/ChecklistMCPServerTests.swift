@@ -18,6 +18,7 @@ final class ChecklistMCPServerTests: XCTestCase {
         private var stderrLines: [String] = []
         var bootstrapHandler: ((TimeInterval?) throws -> Void)?
         var responseText: String?
+        var responseData: [String:Any]?
         var callHandler: ((String) throws -> Void)?
         var unregisteredWorkspace = false
         var projectCreationEnabled = false
@@ -83,6 +84,7 @@ final class ChecklistMCPServerTests: XCTestCase {
                          "inputSchema": ["type": "object", "properties": [:], "additionalProperties": false]] as [String: Any]
                     }]]
                 }
+                if let responseData { return ["data":responseData] }
                 if let responseText { return ["data": ["text": responseText, responseText: responseText]] }
                 if name == "service_info" { return ["data": ["service": "synthetic", "session_id": context.nativeSessionID]] }
                 if name == "project_list" { return ["data": ["projects": [["id": "synthetic-project"]]]] }
@@ -180,6 +182,24 @@ final class ChecklistMCPServerTests: XCTestCase {
             XCTAssertEqual(object["jsonrpc"] as? String, "2.0", file: file, line: line)
             XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("connected after"), file: file, line: line)
             XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("Startup wait ended after"), file: file, line: line)
+        }
+    }
+
+    func testStatusReasonShapeSurvivesMCPToolAndResourceAndClears() async throws {
+        let fixture = try Fixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        let session = try await start(fixture)
+        for reason: [String:Any]? in [["text":"Waiting for the build.\nFull reason", "actor":"verified:worker", "actor_display":"Reviewer", "at":"2026-10-22T21:00:00Z"], nil] {
+            var ticket: [String:Any] = ["id":"ticket", "status_category":reason == nil ? "queued":"blocked"]
+            ticket["status_reason"] = reason
+            fixture.responseData = ["tasks":[ticket]]
+            let tool = try await session.client.callTool(name:"task_list")
+            let resource = try await session.client.readResource(uri:"checklist://service/status")
+            for json in [text(tool.content), try XCTUnwrap(resource.first?.text)] {
+                let envelope = try JSONSerialization.jsonObject(with:Data(json.utf8)) as! [String:Any]
+                let received = ((envelope["data"] as! [String:Any])["tasks"] as! [[String:Any]])[0]
+                XCTAssertEqual((received["status_reason"] as? NSDictionary),reason.map { $0 as NSDictionary })
+            }
         }
     }
 

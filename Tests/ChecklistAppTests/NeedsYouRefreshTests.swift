@@ -33,7 +33,7 @@ import Observation
             let values = Array(all.dropFirst(offset).prefix(limit))
             let next = offset + values.count < all.count ? String(offset + values.count) : nil
             return ["workspace_version":1,"surface":surface,"record_id":params["record_id"] ?? "",
-                    "rows":values,"total":all.count,"has_more":next != nil,"next_cursor":next as Any? ?? NSNull(),"previous_cursor":offset > 0 ? String(max(0,offset - limit)) : NSNull(),
+                    "rows":values,"total":all.count,"needs_you_count":rows.count,"has_more":next != nil,"next_cursor":next as Any? ?? NSNull(),"previous_cursor":offset > 0 ? String(max(0,offset - limit)) : NSNull(),
                     "projects":[["id":"p","name":"Synthetic project"]],"service":["store_incarnation":"synthetic"],"content_cursor":"content"]
         }
         func transport(_ method: String, _ params: [String:Any]) async throws -> [String:Any] {

@@ -142,7 +142,7 @@ extension CommandRouter {
             pp[i]["tags"] = (projection.collections["tag"] ?? []).filter { row in guard let pid = row["project_id"] as? String else { return false }; return SnapshotRecordIdentity(pid) == SnapshotRecordIdentity(id) }
         }
         result["projects"] = pp
-        result["tasks"] = try taskRows.map {try projection.project(self,task:$0)}
+        result["tasks"] = try taskRows.map {try projection.project(self,database:db,task:$0)}
         for (name,type) in [("statuses","status"),("tags","tag"),("profiles","profile"),("sessions","session"),("requests","request"),("groups","group"),("attachments","attachment"),("attempts","attempt"),("reviews","review"),("findings","finding"),("finding_resolutions","finding_resolution"),("review_requests","review_request"),("manifests","manifest"),("relations","relation"),("task_aliases","task_alias"),("source_executions","source_execution"),("batches","batch")] { result[name] = try (projection.collections[type] ?? records(db,type:type)).map { row -> JSON in var row = row; row.removeValue(forKey:"token_hash"); row.removeValue(forKey:"incarnation"); return row } }
         result["task_sessions"] = try records(db,type:"task_session").map {try taskSessionProjection(db,$0)}
         result["connections"] = result["sessions"]
@@ -158,7 +158,7 @@ extension CommandRouter {
         let tags = try records(db,type:"tag",project:task["project_id"] as? String).filter {strings(task,"tag_ids").contains($0["id"] as? String ?? "")}
         var value = assembledTaskProjection(task,status:status,activeAttention:try taskActiveAttention(db,task),tags:tags,relation:try relationTaskProjection(db,task:task))
         value["work_health"] = try workHealthView(db,task:task)
-        return value
+        return try withStatusReason(db,task:value)
     }
     func assembledTaskProjection(_ task: JSON, status: JSON?, activeAttention: Bool, tags: [JSON], relation: JSON) -> JSON {
         var t = task

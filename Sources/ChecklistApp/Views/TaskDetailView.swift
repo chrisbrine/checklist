@@ -154,7 +154,7 @@ struct TaskDetailView: View {
             .onChange(of: task.string("status_id")) { _, _ in movedFromStatus = task.string("status_name") }
             .sheet(item:$reasonStatus) { status in TicketReasonSheet(task:task,status:status,onTransition:{result in ticketUndo = TicketUndo.transition(result,previous:task)}).environmentObject(store) }
             .sheet(isPresented:$showingAssignmentReason) {TicketReasonSheet(task:task,assignment:assignmentTarget).environmentObject(store)}
-            .sheet(item: $handoffProvider) { provider in TaskHandoffSheet(task: task, provider: provider).environmentObject(store) }
+            .sheet(item: $handoffProvider) { provider in TaskHandoffSheet(task: task, provider: provider).id(TaskHandoffModel.Scope(task: task, provider: provider)).environmentObject(store) }
             .sheet(isPresented: $showWorkerAssignment) { TaskAssignmentSheet(task: task).environmentObject(store) }
             .task(id: ArchiveConfirmationState.LoadKey(scope: archiveScope, presented: archiveConfirmation.presented, retry: archiveRetry)) {
                 guard archiveConfirmation.presented else { return }
@@ -223,6 +223,7 @@ struct TaskDetailView: View {
                 Text(handler).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 Spacer()
             }
+            TicketStatusReasonDetail(task:task)
             if !movedFromStatus.isEmpty { Label("Moved to \(movedFromStatus). This ticket stays open.", systemImage: "arrow.turn.down.right").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             if noLongerMatchesView { Text("No longer matches this view. This ticket stays open by its identity.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             if task.bool("archived") { Label("Archived elsewhere · this ticket stays open", systemImage: "archivebox").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }

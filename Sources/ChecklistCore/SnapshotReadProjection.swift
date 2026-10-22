@@ -76,7 +76,7 @@ struct SnapshotReadProjection {
         attentionByTask = attention
     }
 
-    func project(_ router: CommandRouter, task: JSON) throws -> JSON {
+    func project(_ router: CommandRouter, database: Database, task: JSON) throws -> JSON {
         let project = task["project_id"] as! String, key = TaskKey(project: project, task: task["id"] as! String)
         let prerequisites = router.projectedPrerequisites(task: task, relations: prerequisitesByTask[key] ?? [],
             taskLookup: { try Self.scoped(tasksByID, id: $0, project: project) },
@@ -94,7 +94,7 @@ struct SnapshotReadProjection {
         var result = router.assembledTaskProjection(task, status: status, activeAttention: attention, tags: tags, relation: relation)
         // Only an explicit selected task_get may carry current completion authority.
         result.removeValue(forKey: "completion_eligibility")
-        return result
+        return try router.withStatusReason(database,task:result)
     }
 
     private static func firstByID(_ rows: [JSON]) -> [SnapshotRecordIdentity: JSON] {

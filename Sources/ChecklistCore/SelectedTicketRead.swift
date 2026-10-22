@@ -36,7 +36,7 @@ extension CommandRouter {
         }
         var result = assembledTaskProjection(task,status:status,activeAttention:attention,tags:tags,relation:relation)
         result["cleaned_original_count"] = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type='attachment' AND project_id=? AND json_extract(data,'$.task_id')=? AND json_extract(data,'$.availability')='original_cleaned'",arguments:[pid,tid]) ?? 0
-        return result
+        return try withStatusReason(db,task:result)
     }
     /// Authoritative selected-ticket display data, separate from global snapshot
     /// and complete review authority. Only bounded selected rows are decoded.

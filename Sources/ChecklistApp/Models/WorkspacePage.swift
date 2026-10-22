@@ -23,6 +23,7 @@ struct WorkspacePage {
     let query: WorkspacePageQuery
     var rows: [Record]
     var total: Int
+    let needsCount: Int?
     let next: String?
     let previous: String?
     let projects: [Record]
@@ -37,6 +38,12 @@ struct WorkspacePage {
               let projects=response["projects"] as? [[String:Any]],let service=response["service"] as? [String:Any],
               let store=service["store_incarnation"] as? String,!store.isEmpty,
               let cursor=response["content_cursor"] as? String,!cursor.isEmpty else {throw TicketPageError.invalid("workspace")}
+        // Selected ticket history shares this row model but is not a badge-count source.
+        if query.surface == "record_history", response["needs_you_count"] == nil { needsCount = nil }
+        else {
+            guard let needs=response["needs_you_count"] as? NSNumber,CFGetTypeID(needs) != CFBooleanGetTypeID(),needs.doubleValue.isFinite,needs.doubleValue.rounded(.towardZero)==needs.doubleValue,needs.doubleValue>=0,needs.doubleValue<Double(Int.max) else {throw TicketPageError.invalid("workspace.needs_you_count")}
+            needsCount = needs.intValue
+        }
         let ids=Set(projects.compactMap{$0["id"] as? String}.map(RecordIdentity.init))
         var seen=Set<RecordIdentity>()
         for row in rows {

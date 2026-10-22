@@ -124,6 +124,10 @@ public final class CommandRouter: @unchecked Sendable {
     func event(_ db: Database, caller: Caller, project: String?, entity: String?, kind: String, data: JSON = [:]) throws {
         try requireWriter(db)
         var data = data
+        if Self.ticketStatusEventKinds.contains(kind), let entity, let task = try? record(db,entity,type:"task") {
+            data["to_status_id"] = task["status_id"]
+            data["actor_display"] = author(db,caller)
+        }
         if let entity, let named = try? record(db,entity), named["title"] != nil || named["kind"] as? String == "triage" || named["kind"] as? String == "epic" {
             data["subject"] = ["id":entity,"key":named["key"] ?? NSNull(),"title":named["title"] ?? named["name"] ?? ""]
         }

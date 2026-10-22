@@ -30,7 +30,7 @@ import ChecklistIPC
         XCTAssertEqual(SourceState.of([loading, failed], offline: false), .failed, "A failure is shown even while another source loads")
         // Recheck finding 310a34a7 / 8d749ea9: a refresh that fails over an earlier page is stale, not current.
         let cached = WorkspacePageObservation(), query = WorkspacePageQuery(surface: "recent_reviews", project: nil)
-        let reply: [String: Any] = ["workspace_version": 1, "surface": "recent_reviews", "record_id": "", "rows": [[String: Any]](), "total": 0, "has_more": false,
+        let reply: [String: Any] = ["workspace_version": 1, "needs_you_count": 0, "surface": "recent_reviews", "record_id": "", "rows": [[String: Any]](), "total": 0, "has_more": false,
                                     "next_cursor": NSNull(), "previous_cursor": NSNull(), "projects": [[String: Any]](), "service": ["store_incarnation": "s"], "content_cursor": "c"]
         XCTAssertTrue(try cached.receive(reply, query: query, generation: cached.begin(query)))
         XCTAssertEqual(SourceState.of([cached], offline: false), .loaded)

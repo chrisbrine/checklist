@@ -661,8 +661,6 @@ final class ChecklistStore: ObservableObject {
                 do { if try observation.receive(group, query: query, generation: generation), let installed = observation.page { ticketCatalog.install(workspace: installed); accepted = true } }
                 catch { observation.fail(generation) }
             }
-            if let requests = overviewObservations["requests"]?.page, let owned = overviewObservations["human_tasks"]?.page,
-               ticketCatalog.needsCount != requests.total + owned.total { ticketCatalog.needsCount = requests.total + owned.total }
             if accepted {
                 acceptServiceRead()
                 if eventCursor == nil { eventCursor = response["event_cursor"] as? String ?? (response["content_cursor"] as? String) }
@@ -688,8 +686,6 @@ final class ChecklistStore: ObservableObject {
             guard overviewQuery(surface) == query else { observation.cancel(generation); scheduleOverviewNeeds(only: surface, force: true); return false }
             if try observation.receive(response, query: query, generation: generation), let installed = observation.page {
                 ticketCatalog.install(workspace: installed)
-                if let requests = overviewObservations["requests"]?.page, let owned = overviewObservations["human_tasks"]?.page,
-                   ticketCatalog.needsCount != requests.total + owned.total { ticketCatalog.needsCount = requests.total + owned.total }
                 acceptServiceRead()
                 if eventCursor == nil { eventCursor = response["event_cursor"] as? String ?? installed.contentCursor }
             }
@@ -728,6 +724,7 @@ final class ChecklistStore: ObservableObject {
             }
             guard current() else {return false}
             if try workspaceObservation.receive(response,query:query,generation:id) {
+                if let installed = workspaceObservation.page { ticketCatalog.install(workspace:installed) }
                 workspacePageIndex = index
                 acceptServiceRead();if eventCursor == nil {eventCursor=response["event_cursor"] as? String ?? workspaceObservation.page?.contentCursor}
             }
@@ -1184,7 +1181,8 @@ final class ChecklistStore: ObservableObject {
               response.string("origin") == "human_ui" else { return }
         if let current = requests.first(where: { RecordIdentity($0.id) == RecordIdentity(record.id) }),
            current.integer("revision") > record.integer("revision") { return }
-        if workspaceQuery.surface == "requests" { workspaceRead?.cancel(); workspaceObservation.cancel() }
+        // Every workspace page now carries the global count; fence any older reply.
+        workspaceRead?.cancel(); workspaceObservation.cancel()
         if page == .overview {
             overviewRead?.cancel(); for observation in overviewObservations.values { observation.cancel() }
         }
@@ -1272,12 +1270,13 @@ final class ChecklistStore: ObservableObject {
             row["all_tasks"] as? Bool != false || task == nil || (row["task_ids"] as? [String] ?? []).contains {RecordIdentity($0)==RecordIdentity(task!)}
         }
         // Catalog metadata is visible in the Sidebar across all owned projects.
-        // Task/work events remain confined to the selected project, while an
-        // unknown or project-policy/catalog event conservatively reloads catalog.
+        // The owner count also spans all projects: request/task changes can alter
+        // the badge even when the selected project's rows are unchanged.
         let catalogAffected=reset || rows.contains {families($0).contains("all")}
+        let needsAffected=reset || rows.contains {!families($0).isDisjoint(with:["all","requests","tasks"])}
         let visible=rows.filter {inProject($0,projectID)}
-        let ticketAffected=catalogAffected || visible.contains {row in let f=families(row);return !f.isDisjoint(with:["all","tasks","groups"]) || !search.isEmpty && f.contains("messages")}
-        let workspaceAffected=catalogAffected || visible.contains {row in
+        let ticketAffected=catalogAffected || needsAffected || visible.contains {row in let f=families(row);return !f.isDisjoint(with:["all","tasks","groups"]) || !search.isEmpty && f.contains("messages")}
+        let workspaceAffected=catalogAffected || needsAffected || visible.contains {row in
             let f=families(row)
             if page == .activity || page == .overview {return true}
             if page == .epics {return !f.isDisjoint(with:["all","tasks","groups"])}

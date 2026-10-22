@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 @testable import ChecklistApp
 @testable import ChecklistCore
 import ChecklistIPC
@@ -64,6 +65,13 @@ import ChecklistIPC
             return reply
         }
         func release() {if let held {self.held=nil;held.resume(returning:heldReply!);heldReply=nil}}
+        func supersede(_ request:Record) throws {
+            try router.dbQueue.writeWithoutTransaction { db in try router.withValidatedDomainTransaction(db) {
+                var changed = request.values; changed["state"] = "superseded"
+                try router.save(db,router.revised(changed),type:"request")
+                return .commit
+            }}
+        }
         func store(restore:Bool=false)->ChecklistStore {
             ChecklistStore(draftJournal:LocalDraftJournal(directory:root.appendingPathComponent("drafts")),preferences:preferences,restorePendingCommand:restore,
                            desktopAlerts:DesktopAlertCoordinator(sink:ScopedReadAlertSink()),requestTransport:{[self] method,params in try await transport(method,params)},
@@ -128,6 +136,108 @@ import ChecklistIPC
             }
         }
     }
+    func testCanceledRequestWhileNeedsYouIsShownRefreshesCachedCountAndDockValue() async throws {
+        let f = try Fixture(defaults:isolatedDefaults("CanceledNeedsCount")); defer { f.cleanup() }
+        f.preferences.set(Page.tasks.rawValue,forKey:"lastPage")
+        let request = Record(values:try f.command("human_request_create",["project_id":f.a,"task_id":f.task,"questions":[["id":"q","prompt":"Synthetic question"]]])["data"] as! [String:Any])
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); store.stopWindowReads() }
+        try await until { store.connected && !store.ticketPageLoading }
+        XCTAssertEqual(store.needsCount,1,"Prime the nonnil Tickets count before opening Needs You")
+        store.select(.needsYou,project:f.a)
+        try await until { !store.workspaceLoading && store.workspaceRows.contains { $0.id == request.id } }
+        assertDockCount(store,1,defaults:f.preferences)
+        _ = try f.command("human_request_cancel",["project_id":f.a,"request_id":request.id,"expected_revision":request.integer("revision")])
+        // The existing event subscription calls this same path; no manual refresh or timer.
+        await store.applyChangeCoverage(changes(f.a,families:["requests","work","tasks"],task:f.task))
+        XCTAssertTrue(store.workspaceRows.isEmpty)
+        assertDockCount(store,0,defaults:f.preferences)
+    }
+    func testSupersededRequestRefreshRemovesRowAndLowersGlobalCount() async throws {
+        let f = try Fixture(defaults:isolatedDefaults("SupersededNeedsCount")); defer { f.cleanup() }
+        f.preferences.set(Page.needsYou.rawValue,forKey:"lastPage")
+        let request = Record(values:try f.command("human_request_create",["project_id":f.a,"task_id":f.task,"questions":[["id":"q","prompt":"Synthetic old target"]]])["data"] as! [String:Any])
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); store.stopWindowReads() }
+        try await until { store.connected && store.needsCount == 1 }
+        // Fixture-only supersession models a target replacement committed by another session.
+        // The app must trust the new service count rather than a closure-specific local decrement.
+        try f.supersede(request)
+        await store.applyChangeCoverage(changes(f.a,families:["requests","tasks","work"],task:f.task))
+        XCTAssertTrue(store.workspaceRows.isEmpty)
+        assertDockCount(store,0,defaults:f.preferences)
+    }
+    func testManualNeedsYouRefreshCorrectsStaleCachedCount() async throws {
+        let f = try Fixture(defaults:isolatedDefaults("ManualNeedsCount")); defer { f.cleanup() }
+        f.preferences.set(Page.tasks.rawValue,forKey:"lastPage")
+        let request = Record(values:try f.command("human_request_create",["project_id":f.a,"task_id":f.task,"questions":[["id":"q","prompt":"Synthetic question"]]])["data"] as! [String:Any])
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); store.stopWindowReads() }
+        try await until { store.connected && !store.ticketPageLoading }
+        store.select(.needsYou,project:f.a)
+        try await until { !store.workspaceLoading && store.workspaceRows.count == 1 }
+        _ = try f.command("human_request_cancel",["project_id":f.a,"request_id":request.id,"expected_revision":request.integer("revision")])
+        assertDockCount(store,1,defaults:f.preferences)
+        await store.refresh()
+        XCTAssertTrue(store.workspaceRows.isEmpty)
+        assertDockCount(store,0,defaults:f.preferences)
+    }
+    func testForeignRequestAndHumanTaskChangesRefreshGlobalCountAcrossNeedSurfaces() async throws {
+        for page in [Page.needsYou,.overview,.tasks] {
+            let f = try Fixture(defaults:isolatedDefaults("ForeignNeedsCount")); defer { f.cleanup() }
+            f.preferences.set(page.rawValue,forKey:"lastPage")
+            let foreign = Record(values:try f.command("task_create",["project_id":f.b,"title":"Foreign owner task","planned_assignee":"human"])["data"] as! [String:Any])
+            let request = Record(values:try f.command("human_request_create",["project_id":f.b,"task_id":foreign.id,"questions":[["id":"q","prompt":"Foreign question"]]])["data"] as! [String:Any])
+            let store = f.store(), live = Task { await store.startLiveUpdates() }
+            defer { live.cancel(); store.stopWindowReads() }
+            try await until { store.connected && store.needsCount == 2 }
+            assertDockCount(store,2,defaults:f.preferences)
+            _ = try f.command("human_request_cancel",["project_id":f.b,"request_id":request.id,"expected_revision":request.integer("revision")])
+            await store.applyChangeCoverage(changes(f.b,families:["requests","tasks","work"],task:foreign.id))
+            assertDockCount(store,1,defaults:f.preferences)
+            if page == .needsYou {
+                XCTAssertTrue(store.workspaceRows.isEmpty,"Global count is independent of selected project rows")
+                store.configureWorkspace(surface:"human_tasks")
+                try await until { !store.workspaceLoading && f.calls.last?.1["surface"] as? String == "human_tasks" }
+            } else if page == .overview {
+                XCTAssertEqual(store.overviewObservations["requests"]?.page?.total,0)
+                store.overviewFocus = "needs_pickup"
+                try await until { store.overviewObservations["needs_pickup"]?.loading == false && f.calls.last?.1["surface"] as? String == "needs_pickup" }
+                assertDockCount(store,1,defaults:f.preferences)
+            }
+            _ = try f.command("task_edit",["project_id":f.b,"task_id":foreign.id,"expected_revision":foreign.integer("revision"),"patch":["planned_assignee":"unassigned","assignment_reason":"Synthetic owner work no longer required"]])
+            await store.applyChangeCoverage(changes(f.b,families:["tasks"],task:foreign.id))
+            assertDockCount(store,0,defaults:f.preferences)
+        }
+    }
+    func testAnswerReceiptFencesOlderCountFromOtherWorkspaceSurfaces() async throws {
+        for surface in ["human_tasks","epics"] {
+            let f = try Fixture(defaults:isolatedDefaults("AnswerCountFence")); defer { f.cleanup() }
+            f.preferences.set(Page.needsYou.rawValue,forKey:"lastPage")
+            let request = Record(values:try f.command("human_request_create",["project_id":f.a,"task_id":f.task,"questions":[["id":"q","prompt":"Question"]]])["data"] as! [String:Any])
+            let store = f.store(), live = Task { await store.startLiveUpdates() }
+            defer { live.cancel(); f.release(); store.stopWindowReads() }
+            try await until { store.connected && store.needsCount == 1 }
+            if surface == "epics" { store.select(.epics,project:f.a) }
+            else { store.configureWorkspace(surface:surface) }
+            try await until { !store.workspaceLoading }
+            f.holdSurface = surface
+            let older = Task { await store.refresh() }
+            try await until { f.held != nil }
+            store.run("human_request_answer",["project_id":f.a,"request_id":request.id,"expected_revision":request.integer("revision"),"answers":[["question_id":"q","text":"Done"]]])
+            try await until { !store.busy && store.needsCount == 0 }
+            f.release(); await older.value
+            assertDockCount(store,0,defaults:f.preferences)
+        }
+    }
+    private func assertDockCount(_ store:ChecklistStore,_ expected:Int,defaults:UserDefaults,file:StaticString=#filePath,line:UInt=#line) {
+        XCTAssertEqual(store.needsCount,expected,file:file,line:line)
+        // Exercise the same sink ContentView observes, without claiming native Dock drawing.
+        let app = NSApplication.shared, previous = app.dockTile.badgeLabel
+        defer { app.dockTile.badgeLabel = previous }
+        DockBadge.apply(count:store.needsCount,defaults:defaults)
+        XCTAssertEqual(app.dockTile.badgeLabel,expected == 0 ? nil : String(expected),file:file,line:line)
+    }
     func testReadDeadlinesEndLoadingAndLaterTicketAndRecordReadsRecover()async throws {
         let f=try Fixture(defaults:isolatedDefaults("ScopedAppReadFailure"));defer {f.cleanup()}
         f.preferences.set(Page.tasks.rawValue,forKey:"lastPage")
@@ -152,7 +262,7 @@ import ChecklistIPC
         XCTAssertFalse(store.ticketPageLoading)
         XCTAssertNil(store.ticketPageError)
     }
-    func testForeignCatalogRefreshesVisibleSidebarButForeignTaskDoesNot()async throws {
+    func testForeignChangesRefreshGlobalSidebarCountWithoutChangingVisibleRows()async throws {
         let f=try Fixture(defaults: isolatedDefaults("ScopedAppTests"));defer {f.cleanup()}
         f.preferences.set(Page.tasks.rawValue,forKey:"lastPage")
         let store=f.store(),live=Task {await store.startLiveUpdates()}
@@ -163,13 +273,14 @@ import ChecklistIPC
         store.select(.epics,project:f.a)
         try await until {!store.workspaceLoading && f.calls.last?.1["surface"] as? String=="epics"}
         XCTAssertEqual(store.projects.first{$0.id==f.b}?.string("name"),"B")
-        let before=f.calls.count
+        let before=f.calls.count, originalRows=store.workspaceRows.map(\.id)
         await store.applyChangeCoverage(changes(f.b,families:["tasks","work"],task:"foreign-task"))
-        XCTAssertEqual(f.calls.count,before,"A foreign task does not refresh the selected project")
+        XCTAssertEqual(f.calls.count,before+1,"A foreign task can change the global owner count")
+        XCTAssertEqual(store.workspaceRows.map(\.id),originalRows)
         let current=try f.command("project_settings_get",["project_id":f.b])["data"] as! [String:Any]
         _=try f.command("project_edit",["project_id":f.b,"expected_revision":current["revision"]!,"name":"B renamed"])
         await store.applyChangeCoverage(changes(f.b,families:["all"]))
-        XCTAssertEqual(f.calls.count,before+1)
+        XCTAssertEqual(f.calls.count,before+2)
         XCTAssertEqual(f.calls.last?.0,"workspace_page")
         XCTAssertEqual(store.projects.first{$0.id==f.b}?.string("name"),"B renamed")
     }
@@ -322,7 +433,13 @@ import ChecklistIPC
         let query=WorkspacePageQuery(surface:"epics",project:f.a)
         let reply=try f.command("workspace_page",query.parameters())["data"] as! [String:Any]
         XCTAssertNoThrow(try WorkspacePage(reply,query:query))
-        for (field,value) in [("workspace_version",1.5),("total",0.5)] {
+        var missing=reply;missing.removeValue(forKey:"needs_you_count")
+        XCTAssertThrowsError(try WorkspacePage(missing,query:query))
+        for invalid in [true, NSNull(), "1"] as [Any] {
+            var malformed=reply;malformed["needs_you_count"]=invalid
+            XCTAssertThrowsError(try WorkspacePage(malformed,query:query))
+        }
+        for (field,value) in [("workspace_version",1.5),("total",0.5),("needs_you_count",0.5),("needs_you_count",-1)] {
             var malformed=reply;malformed[field]=value
             XCTAssertThrowsError(try WorkspacePage(malformed,query:query))
         }

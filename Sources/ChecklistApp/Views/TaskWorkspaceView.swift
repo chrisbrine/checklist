@@ -341,6 +341,7 @@ private struct TaskRowLabel: View, Equatable {
             Image(systemName: presentation.kind == "bug" ? "ladybug" : "circle").checklistFont(.body).foregroundStyle(presentation.selected ? Color.checklistAccentText : Color.checklistSecondaryText).padding(.top, Spacing.tight)
             VStack(alignment: .leading, spacing: Spacing.compact) {
                 Text(presentation.title).checklistFont(.bodyStrong).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+                TicketStatusReasonLine(reason:presentation.statusReason)
                 HStack(spacing: Spacing.compact) {
                     Text(presentation.key)
                     if let project = presentation.projectName { Text("·");Text(project) }

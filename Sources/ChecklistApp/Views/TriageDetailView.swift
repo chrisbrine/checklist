@@ -109,6 +109,7 @@ private struct TriageMemberRow: View {
             Button { store.open(.task(task.id)) } label: { VStack(alignment: .leading, spacing: Spacing.compact) {
                 Text(task.string("title")).checklistFont(.bodyStrong).frame(maxWidth: .infinity, alignment: .leading)
                 AccessibleHStack { Text(task.string("key")).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText); Spacer(); TicketStatusPills(task: task) }
+                TicketStatusReasonLine(task:task)
             } }.buttonStyle(.checklistRow)
             if let epic = store.groups.first(where: { $0.id == task.string("epic_id") }) { Button { store.open(.group(epic.id)) } label: { Label("Epic: " + ProductionGroups.label(epic), systemImage: "folder") }.buttonStyle(.link).checklistFont(.micro) }
             else { Text("No Epic").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }

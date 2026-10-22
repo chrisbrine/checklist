@@ -354,7 +354,7 @@ extension CommandRouter {
             // Shared semantics retain active-attempt/status short circuits and
             // the original order of deferred Triage failures.
             let attention = ownerView ? (row["attention"] as Bool) : (try projectedTaskAttention(task,statusLookup:{try lookup($0,pid,"status")},groupAttention:{try groupAttention(task,project:pid)}))
-            return assembledTaskProjection(task,status:status.isEmpty ? nil : status,activeAttention:attention,tags:selectedTags,relation:relation)
+            return try withStatusReason(db,task:assembledTaskProjection(task,status:status.isEmpty ? nil : status,activeAttention:attention,tags:selectedTags,relation:relation))
         }
     }
 

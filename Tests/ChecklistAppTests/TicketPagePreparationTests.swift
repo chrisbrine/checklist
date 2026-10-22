@@ -30,7 +30,7 @@ import XCTest
 
     func testWorkspaceGenerationCancellationPreservesAcceptedRowsAndNewerState() throws {
         let observation = WorkspacePageObservation(), query = WorkspacePageQuery(surface: "epics", project: nil)
-        let response: [String: Any] = ["workspace_version": 1, "surface": "epics", "record_id": "", "rows": [["id": "e", "project_id": "p"]], "total": 1,
+        let response: [String: Any] = ["workspace_version": 1, "needs_you_count": 0, "surface": "epics", "record_id": "", "rows": [["id": "e", "project_id": "p"]], "total": 1,
             "has_more": false, "next_cursor": NSNull(), "previous_cursor": NSNull(), "projects": [["id": "p"]], "service": ["store_incarnation": "s"], "content_cursor": "c"]
         XCTAssertTrue(try observation.receive(response, query: query, generation: observation.begin(query)))
         let old = observation.begin(query), newer = observation.begin(query)
