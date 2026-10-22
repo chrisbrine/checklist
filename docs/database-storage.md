@@ -25,7 +25,7 @@ Managed imports reserve the authenticated principal plus original command UUID b
 
 Disk-full/commit errors return an explicit unknown outcome with the original command ID for reconciliation. Existing database/WAL/objects are preserved; content-free recovery metadata is best effort because a failed volume can refuse that write too. If authoritative startup refuses, the existing local service route answers a content-free recovery state and rejects data access; it does not enroll connections, dispatch messages, run cleanup or open a replacement store. Process-kill checks qualify their actual boundaries, not abrupt power-loss durability. Installed target evidence and independent review remain separate from source implementation.
 
-**Deferred extension:** assistant identity/grant/subscription storage below is future design. It neither exposes active assistant controls nor qualifies a Dot connection; current release checks do not depend on assistant setup.
+**Cancelled extension:** assistant identity/grant/subscription storage below is historical design from the scope cancelled on 22 October 2026 (CL-3 and CL-22), not planned release work. It neither exposes active assistant controls nor qualifies a Dot connection. See the [cancellation decision](assistant-plugin.md#cancellation-decision).
 
 **Full storage target, 16 October 2026.** The local development service already uses SQLite and managed files; [implementation status](implementation-status.md) identifies remaining restore/failure qualification. Checklist keeps the owner's game and app projects in one local store on this Mac. Tickets, notes, answers, review history and delivery receipts remain available together; images and larger files live beside the database. A project does not need its own database, cloud account or storage setup.
 
@@ -35,7 +35,7 @@ This document complements [architecture](architecture.md), [domain semantics](do
 
 ## Store ownership and layout
 
-Ship SQLite inside the native app's storage layer, using the pinned Swift wrapper selected during the packaging spike. Only `ChecklistService` opens the authoritative database for mutation. UI windows, MCP shims, the diagnostic executable and future assistant plugins use authenticated service commands. They never coordinate by editing a shared JSON or Markdown file.
+Ship SQLite inside the native app's storage layer, using the pinned Swift wrapper selected during the packaging spike. Only `ChecklistService` opens the authoritative database for mutation. UI windows, MCP shims, the diagnostic executable and retained assistant components use authenticated service commands. They never coordinate by editing a shared JSON or Markdown file.
 
 ```text
 ~/Library/Application Support/Checklist/
@@ -111,7 +111,7 @@ Stable named assistant identities and their project grants belong in this store 
 
 Persist granted project memberships, ticket subscriptions/event filters, subscription expiration, causal/reply IDs, inbox cursors, exact host-session binding and delivery receipts independently of work attempts. The preferred MCP Events notification route uses host-supplied authenticated subscriptions and outbound signed HTTPS webhooks; it creates no inbound public listener. Store callback destinations as private routing metadata excluded from exports/diagnostics, and signing secrets in Keychain. Commit event-to-subscription deliveries atomically with the relevant event/outbox work so a reconnect can deduplicate using delivery/event IDs. A webhook `2xx` is only transport acceptance, not proof that assistant read it or the owner saw it. Expired/revoked subscriptions stop future dispatch and retain receipt history; resume requires a currently valid subscription and cursor reconciliation. No polling, streaming or model runtime substitutes for an unavailable host event route. Keep source receipts but coalesce obsolete same-ticket/cause notifications into one bounded reconnect/catch-up report, retaining unresolved owner requests. Do not emit a failure event through its own failing route; report connection health locally or through another explicitly selected route with causal deduplication.
 
-The storage layer grants no authority because of a display name, personality or imported assistant reference. Route availability, host capabilities and consent are defined in the integration contract and need real local-Dot qualification; a saved subscription does not prove the host can wake an agent or route a subagent.
+The storage layer grants no authority because of a display name, personality or imported assistant reference. Route availability, host capabilities and consent are defined in the integration contract and would require real local-Dot qualification under a new separately authorized proposal; a saved subscription does not prove the host can wake an agent or route a subagent.
 
 ## Settings, project icons and drafts
 

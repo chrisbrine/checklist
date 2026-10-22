@@ -2,6 +2,8 @@
 
 **16 October 2026.** This revises the complete planning baseline for a reusable macOS game/app production tool. The app/service are unbuilt. No source was published, license selected, provider installed/enrolled, message sent or event subscription created by this revision.
 
+**Subsequent status, 22 October 2026:** the owner cancelled personal-assistant/Dot integration (CL-3 and CL-22). The [cancellation decision](../assistant-plugin.md#cancellation-decision) supersedes this report's assistant roadmap and qualification gates. The original review below describes the 16 October baseline.
+
 ## Product and package changes
 
 The assistant skill is **checklist-assistant**, with generic plugin/installation terminology. A chosen agent name is data, not a role, namespace or product integration. Named profiles hold optional avatar/pronouns/short descriptive personality hints, separate from provider/model/adapter, native session, authenticated principal and grants. The host owns actual persona/memory. Historical attribution keeps name/avatar/provider snapshots plus stable IDs.

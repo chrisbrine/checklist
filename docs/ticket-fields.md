@@ -40,7 +40,7 @@ The relation context contains the same derived eligibility. The existing related
 
 Reconciliation is a bounded service operation requested for this Checklist board, not a migration facility or an automatic prose parser. Inspect the latest source text, exact project-scoped identifiers, existing relation IDs, target states and affected current handlers before mutating. Add only explicitly listed prerequisite IDs, skip existing identical links, and let normal revision/cycle/scope guards reject conflicts. Keep the original brief/note intact and append a ticket note identifying the source text and resulting relation IDs. Statuses are not changed merely because a new link exposes a blocker.
 
-Historical completed tickets and owner-deferred assistant tickets retain their original planning context without retroactively introducing new work gates. If such text is obsolete, record the discrepancy for owner review rather than reinterpret it. Conversion receipts and the installation's exact identifiers are private verification material; they are not product defaults.
+Historical completed tickets and owner-cancelled assistant tickets retain their original planning context without retroactively introducing new work gates. If such text is obsolete, record the discrepancy for owner review rather than reinterpret it. Conversion receipts and the installation's exact identifiers are private verification material; they are not product defaults.
 
 ## Deliberately deferred fields
 

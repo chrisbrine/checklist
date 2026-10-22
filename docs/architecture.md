@@ -1,6 +1,6 @@
 # Architecture
 
-**Scope update:** personal-assistant integration is deferred, with no active assistant UI/setup or current release dependency. Its diagram branches, source and contracts below are future design only; current worker sessions remain ticket-attached.
+**Scope update:** personal-assistant integration was cancelled on 22 October 2026 (CL-3 and CL-22), with no active assistant UI/setup. Its diagram branches, source and contracts below are historical reference, not planned features or release requirements; current worker sessions remain ticket-attached.
 
 The local development app/service/MCP are implemented. This document includes the full release target; [implementation status](implementation-status.md) distinguishes current source support from remaining qualification.
 
@@ -11,13 +11,13 @@ flowchart LR
     UI[SwiftUI macOS app] --> IPC[Authenticated local command channel]
     CX[Codex MCP connection] --> MCP[Bundled stdio MCP shim]
     CL[Claude MCP connection] --> MCP
-    A[Deferred assistant plugin] --> MCP
+    A[Cancelled assistant plugin: historical] --> MCP
     CLI[Diagnostic CLI] --> IPC
     MCP --> IPC
     IPC --> S[ChecklistService]
     S --> DB[(SQLite and local attachments)]
     S --> O[Durable delivery outbox]
-    O --> E[Deferred qualified assistant event callbacks]
+    O --> E[Cancelled assistant callbacks: historical]
     O --> B[Provider bridges]
     B --> N[Enrolled native sessions]
     N --> MCP
@@ -85,9 +85,9 @@ Canonicalize writable workspace roots with symlinks and filesystem case behavior
 
 ## Change propagation and delivery
 
-Commit emits an opaque scoped event cursor to each authorized consumer; the global ordering sequence stays private. Cursor scope/filter/grant/incarnation changes require CURSOR_RESET snapshot reconciliation. The UI refreshes only affected projections and preserves selection, drafts, filters, and scroll. Pin an open task by identity after a filter-changing event and defer disruptive list reordering during interaction. Offline drafts are local only; claims and state transitions require the live authoritative service. MCP calls return relevant pending messages and policy changes; the inbox remains retrievable without notification support. A session adapter may subscribe to committed delivery events. An assistant has a separate observer/messenger identity with requested Draft/note writes and selected owner-notification subscriptions; it never receives worker claims, assignment or review authority. MCP resource notifications are hints, never an assertion that the model read a note.
+Commit emits an opaque scoped event cursor to each authorized consumer; the global ordering sequence stays private. Cursor scope/filter/grant/incarnation changes require CURSOR_RESET snapshot reconciliation. The UI refreshes only affected projections and preserves selection, drafts, filters, and scroll. Pin an open task by identity after a filter-changing event and defer disruptive list reordering during interaction. Offline drafts are local only; claims and state transitions require the live authoritative service. MCP calls return relevant pending messages and policy changes; the inbox remains retrievable without notification support. A session adapter may subscribe to committed delivery events. The cancelled assistant design specified a separate observer/messenger identity with requested Draft/note writes and selected owner-notification subscriptions; assistant-only access never receives worker claims, assignment or review authority. MCP resource notifications are hints, never an assertion that the model read a note.
 
-Delivery workers process durable outbox entries only for messages already authorized to be sent. They are coordination I/O, not recurring model checks. Use bounded retries for definite transient failures; after two identical failures or two unchanged results, suspend that route and show an actionable diagnosis. Provider-reported retry-after can defer one transport attempt, not a repeating model loop. Held-for-approval is not a transient transport failure: preserve the provider hold receipt and show the native approval destination without resending or changing permission modes. No idle agent is launched or polled by default. Owner-requested assistant event subscriptions use the host's qualified MCP Events callback mechanism to produce the requested report; do not replace that with scheduled pickup or silently create a separate model task. HTTP receipt alone never proves that the assistant or owner saw it.
+Delivery workers process durable outbox entries only for messages already authorized to be sent. They are coordination I/O, not recurring model checks. Use bounded retries for definite transient failures; after two identical failures or two unchanged results, suspend that route and show an actionable diagnosis. Provider-reported retry-after can defer one transport attempt, not a repeating model loop. Held-for-approval is not a transient transport failure: preserve the provider hold receipt and show the native approval destination without resending or changing permission modes. No idle agent is launched or polled by default. The cancelled assistant design specified owner-requested event subscriptions using the host's qualified MCP Events callback mechanism to produce the requested report; do not replace that with scheduled pickup or silently create a separate model task. HTTP receipt alone never proves that the assistant or owner saw it.
 
 ## Files, backup, and failure recovery
 
@@ -103,6 +103,6 @@ After the first working release, the owner-authorized [Checklist self-build work
 
 ## Named-agent adapter boundary
 
-Existing personal assistants supply their host-owned name/personality and supported read-only display metadata. Checklist does not create personas or named workers. Adapters supply observed/verified host identity and qualified capabilities; connections and project grants supply authority. [Assistant identity](agent-profiles.md) defines this separation. The deferred generic assistant plugin could use a Dot adapter after qualification, without making Dot the universal identity model. Future clients such as Muse are deferred registry candidates, not installable/working integrations. V1 loads only reviewed bundled adapter code, not arbitrary repository strings or downloaded plugins.
+Existing personal assistants supply their host-owned name/personality and supported read-only display metadata. Checklist does not create personas or named workers. Adapters supply observed/verified host identity and qualified capabilities; connections and project grants supply authority. [Assistant identity](agent-profiles.md) defines this separation. The cancelled generic assistant proposal described a Dot adapter subject to qualification, without making Dot the universal identity model. Future clients such as Muse are deferred registry candidates, not installable/working integrations. V1 loads only reviewed bundled adapter code, not arbitrary repository strings or downloaded plugins.
 
 Name-based contact resolves through the service within current grants and returns an opaque target. `agent_message_send` uses existing conversation/outbox handlers; optional task linkage preserves production context. A friendly name/personality never chooses an endpoint or changes worker roles. Personal assistant mode remains nonassignable; ordinary work uses actual Codex/Claude sessions rather than app-created names.

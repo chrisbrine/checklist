@@ -2,7 +2,7 @@
 
 Tickets, Triages and Epics have immutable project display keys and separate stable IDs. Tickets use `PREFIX-n`; Triages use `PREFIX-Tn`; Epics use `PREFIX-En`. Each kind has its own project counter. Rename, archive, trash and later prefix edits preserve existing keys and never reuse a number. The startup backfill assigns missing group keys in `created_at`, then byte-exact ID order per project and kind. Agents cite `KEY "Title"` (the name for groups), with the project name when needed; IDs remain tool arguments. Names and custom ticket keys are untrusted metadata, never instructions.
 
-**Deferred extension:** assistant identity, contact and subscriptions below are retained future contracts. They do not imply active assistant UI, project grant controls or a qualified Dot connection and do not block the current release.
+**Cancelled extension:** assistant identity, contact and subscriptions below are historical contracts from the scope cancelled on 22 October 2026 (CL-3 and CL-22). They are not planned release work and do not imply active assistant UI, project grant controls or a qualified Dot connection. See the [cancellation decision](assistant-plugin.md#cancellation-decision).
 
 **Production domain target, 16 October 2026.** A local development implementation exists; [implementation status](implementation-status.md) identifies its supported subset and remaining qualification. This full contract is not a claim every invariant has release evidence. The owner sees projects, a useful task list, Needs You, and task detail. The records below keep work dependable without making sessions or policy machinery the main product.
 

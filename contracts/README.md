@@ -1,5 +1,7 @@
 # Prepared v1 data contracts
 
+Personal-assistant/Dot integration was cancelled on 22 October 2026 (CL-3 and CL-22). Its identity/grant schemas and examples remain historical reference and shape-validation fixtures, not planned features or an available integration. See the [cancellation decision](../docs/assistant-plugin.md#cancellation-decision).
+
 These closed JSON Schemas describe project binding/settings, workflow policy, taxonomy, human requests, host-owned assistant identity snapshots and assistant grants. They are prepared target contracts, not proof that every integration is implemented or qualified. Validate the same-name synthetic examples in `../examples` against them; no source tasks were imported. Checklist has no app-created named-worker/persona catalog: worker identity is the actual Codex/Claude session, while an existing personal assistant's name/personality stays with its host.
 
 The [MCP contract](../docs/mcp-contract.md) specifies the bounded role-based tool surface, concrete shared input/result shapes and semantic commands. Exact per-tool JSON Schemas and generated structured types are implementation deliverables before either client uses the server. The [domain](../docs/domain.md) is normative for authority, atomicity and lifecycle behavior.

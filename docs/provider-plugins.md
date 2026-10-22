@@ -34,7 +34,7 @@ The build-106 provider/model audit covered every `codex`, `claude`, `provider`, 
 | Lifecycle process/registry closure and resumption | Qualified `registry_closure`, exact process start and secure registry identity. Codex lacks a per-thread closure registry and cannot inherit Claude resumption |
 | `dispatchNative`, endpoint naming, Claude framing/status and reply translation | Qualified reviewed `NativeProviderTransport` adapter; actual kernel peer, socket identity, message correlation and native host identity checks stay in place |
 | `prepareHandoff`, `prepareAgentReview`, `CodexComposeLink`, app menus/settings | Selected plugin's composer/validator/application metadata; Claude/unknown providers cannot acquire a Codex link by fallback |
-| Deferred `codex.dot` verified-assistant identity and `native_codex_helper_not_dot_identity` provenance | Retained historical/future identity contracts, not generic provider selection; no assistant UI or grants are enabled |
+| Cancelled `codex.dot` verified-assistant identity and `native_codex_helper_not_dot_identity` provenance | Retained historical identity contracts, not generic provider selection; no assistant UI or grants are enabled |
 | CLI/MCP connection text, documentation and existing diagnostics | Informational labels and stable protocol fields, not runtime model/provider selectors; bounded existing CLI/MCP upgrade delegation remains unchanged |
 
 Provider adapters may implement provider-specific wire types inside Bridges. Those types do not become domain state or a second integration engine. Unknown native frames/status words, ambiguous kernel recipients, mismatched message IDs or changed generations are left uncorrelated; they never mint acknowledgment or consume a reply allowance.
@@ -43,7 +43,7 @@ Provider adapters may implement provider-specific wire types inside Bridges. Tho
 
 | Bundled plugin | Advertised implementation contract | Explicitly unavailable |
 |---|---|---|
-| `org.checklist.codex` 1.0.0 | Actual host-exported thread context, authenticated MCP pickup/ack/reply, human-answer pickup notice, prepared draft composer; retained deferred helper source | Native idle/child wake, per-thread process/registry closure, automatic app Send/create, model selection, schedules |
+| `org.checklist.codex` 1.0.0 | Actual host-exported thread context, authenticated MCP pickup/ack/reply, human-answer pickup notice, prepared draft composer; retained cancelled assistant-helper source | Native idle/child wake, per-thread process/registry closure, automatic app Send/create, model selection, schedules |
 | `org.checklist.claude` 1.0.0 | Actual process/session registry bootstrap, authenticated MCP pickup/ack/reply, bounded same-user native peer transport/host hold notices, exact registry closure | Native composer/automatic creation, model selection, schedules; permission-mode holds remain holds |
 
 `service_info.provider_plugins` reports versioned manifests and distinct declared/qualified capability lists. An enabled capability means that the reviewed bundled implementation is eligible for its existing bounded operation, subject to all current identity/route/grant checks. It does not assert a live endpoint, universal host-version compatibility, a newly observed installed pass, or a model response. `native_push=false` and the existing unsupported list remain unchanged. The retained assistant-helper capability describes dormant source support, not qualified Dot access or permission to enable it.

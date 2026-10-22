@@ -123,7 +123,7 @@ App Storage shows database/managed originals/previews and backup-held usage sepa
 
 Actual Codex/Claude workers appear only on the ticket they handle: current/prior attempt, checkpoint/progress, continuation/recovery and supported session actions. The internal worker registry is not a global Connections catalog. Connection is automatic from the provider thread using bundled CLI/MCP, without a manual Settings pairing flow.
 
-Personal-assistant/Dot integration is **deferred**. The current UI has no Agents sidebar, assistant details/connection settings, project assistant grants or ticket-update subscription controls. The [future assistant design](assistant-plugin.md) is retained separately; it is not part of current navigation or release acceptance.
+Personal-assistant/Dot integration was **cancelled on 22 October 2026** (CL-3 and CL-22). The current UI has no Agents sidebar, assistant details/connection settings, project assistant grants or ticket-update subscription controls. The [cancelled assistant design](assistant-plugin.md) is retained as historical reference; it is not part of current navigation or release acceptance.
 
 ## Native checks
 
