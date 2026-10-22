@@ -27,6 +27,7 @@ GRAPH = {'targets': [
     target('ChecklistProducts', ['ChecklistApp', 'ChecklistService', 'ChecklistCLI']),
     target('StorageCrashProbe', ['ChecklistCore', 'StorageReleasedCoreFixture'], path='Tests/StorageCrashProbe'),
     target('StorageReleasedCoreFixture', path='Tests/StorageCrashProbe/ReleasedCore'),
+    target('ChecklistCLIInputProbe', ['ChecklistIPC'], kind='executable', path='Tests/ChecklistCLIInputProbe'),
 ] + [target(name + 'Tests', dependencies, 'test') for name, dependencies in [
     ('ChecklistApp', ['ChecklistApp', 'ChecklistCore']), ('ChecklistCore', ['ChecklistCore']),
     ('ChecklistIPC', ['ChecklistIPC', 'ChecklistCore']), ('ChecklistBridges', ['ChecklistBridges']),
@@ -61,7 +62,13 @@ class SelectionTests(unittest.TestCase):
                           'ChecklistCoreTests', 'ChecklistIPCTests', 'ChecklistMCPServerTests'])
 
     def test_test_target_does_not_select_its_dependencies(self):
-        self.assertEqual(self.plan('Tests/ChecklistCoreTests/NewTests.swift')['test_targets'], ['ChecklistCoreTests'])
+        self.assertEqual(self.plan('Tests/ChecklistBridgesTests/NewTests.swift')['test_targets'], ['ChecklistBridgesTests'])
+
+    def test_source_inspection_consumers_are_selected(self):
+        for path in ['Sources/ChecklistService/main.swift', 'Sources/ChecklistCLI/main.swift',
+                     'Sources/ChecklistBridges/Bridge.swift', 'Tests/ChecklistCoreTests/NewTests.swift']:
+            with self.subTest(path=path):
+                self.assertIn('ChecklistAppTests', self.plan(path)['test_targets'])
 
     def test_nested_custom_target_uses_longest_path(self):
         plan = self.plan('Tests/StorageCrashProbe/ReleasedCore/Fixture.swift')
@@ -100,7 +107,7 @@ class SelectionTests(unittest.TestCase):
                 self.assertEqual(plan['fallback_paths'], [path])
 
     def test_heavy_skip_matches_real_swift_test_identifiers(self):
-        command = self.plan('Sources/ChecklistCore/Domain.swift')['swift_commands'][0]
+        command = self.plan('Sources/ChecklistApp/ContentView.swift')['swift_commands'][0]
         patterns = [command[i + 1] for i, arg in enumerate(command) if arg == '--skip']
         identifiers = [selector.HEAVY_TESTS[0], selector.HEAVY_TESTS[1] + '/testFrozen',
                        selector.HEAVY_TESTS[2] + '/testDecision']
@@ -118,6 +125,44 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.plan(path)['skip'], [])
         self.assertEqual(self.plan('Tests/ChecklistCoreTests/MediaDecisionTests.swift')['skip'], list(selector.HEAVY_TESTS))
+
+    def test_shared_and_indirect_heavy_dependencies_enable_heavy_cases(self):
+        for path in ['Sources/ChecklistCore/Models.swift', 'Sources/ChecklistCore/Models/New.swift',
+                     'Sources/ChecklistCore/ManagedAttachmentImport.swift', 'Sources/ChecklistCore/Attachments.swift',
+                     'Sources/ChecklistCore/NewSharedHelper.swift', 'Sources/ChecklistProviders/Registry.swift']:
+            with self.subTest(path=path):
+                plan = self.plan(path)
+                self.assertIn('ChecklistCoreTests', plan['test_targets'])
+                self.assertEqual(plan['skip'], [])
+                self.assertNotIn('--skip', plan['swift_commands'][0])
+
+    def test_unknown_impact_never_skips_heavy_cases(self):
+        for path in ['Package.swift', 'Package.resolved', 'mystery.txt', 'docs/new-fixture.bin',
+                     'Resources/new.json', 'unowned/guide.md', 'Sources/ChecklistCore/unmapped.json']:
+            with self.subTest(path=path):
+                self.assertEqual(self.plan(path)['skip'], [])
+                self.assertEqual(self.plan(path)['fallback_paths'], [path])
+
+    def test_runtime_file_inputs_select_consumers(self):
+        for path, consumers in selector.FILE_TEST_CONSUMERS.items():
+            with self.subTest(path=path):
+                plan = self.plan(path)
+                self.assertEqual(plan['test_targets'], list(consumers))
+                self.assertEqual(plan['fallback_paths'], [])
+                self.assertEqual(plan['commands'][-1], selector.VALIDATE)
+
+    def test_cli_input_probe_selects_mcp_runtime_consumers(self):
+        plan = self.plan('Tests/ChecklistCLIInputProbe/main.swift')
+        self.assertEqual(plan['test_targets'], ['ChecklistMCPServerTests'])
+        self.assertIn('^ChecklistMCPServerTests\\.', plan['swift_commands'][0])
+
+    def test_package_resources_follow_target_consumers(self):
+        # SwiftPM resources live under their target path, including custom paths.
+        graph = {'targets': [target('Assets', path='fixtures/assets'),
+                             target('AssetsTests', ['Assets'], 'test')]}
+        graph['targets'][0]['resources'] = [{'path': 'fixtures/assets/catalog.json', 'rule': 'copy'}]
+        plan = selector.select(self.root, graph, ['fixtures/assets/catalog.json'], self.root / '.build')
+        self.assertEqual(plan['test_targets'], ['AssetsTests'])
 
     def test_full_has_no_filters_or_skips(self):
         plan = self.plan('Sources/ChecklistApp/ContentView.swift', full=True)
@@ -173,6 +218,133 @@ class SelectionTests(unittest.TestCase):
                  contextlib.redirect_stdout(output):
                 selector.main(['--root', str(self.root), '--json', *args])
             self.assertEqual(json.loads(output.getvalue())['test_targets'], ['ChecklistAppTests'])
+
+
+# These tests create a different script in an owned workspace, or reject the
+# requested execution before a read. Neither reads our repository's validator.
+SYNTHETIC_FILE_REFERENCES = {
+    ('Tests/ChecklistCoreTests/EvidenceAuthorityTests.swift', 'scripts/validate-plan.py'),
+    ('Tests/ChecklistCoreTests/AgentReviewAssessmentTests.swift', 'scripts/validate-plan.py'),
+}
+# ChecklistInstanceTests passes these names to its URL parser, not to exec.
+SYNTHETIC_EXECUTABLE_REFERENCES = {
+    ('Tests/ChecklistIPCTests/ChecklistInstanceTests.swift', 'ChecklistApp'),
+    ('Tests/ChecklistIPCTests/ChecklistInstanceTests.swift', 'ChecklistService'),
+}
+
+
+def repository_references(root):
+    """Audit path literals, including directory enumerations, in Swift inputs.
+
+    This deliberately over-approximates reads: a repository path in a string
+    must have an owner even if it is only used on one conditional test route.
+    Generated store/workspace fixtures and installed-bundle resources aren't
+    repository inputs. Split/dynamic paths need an explicit audit when added.
+    """
+    directories = {p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith('.')}
+    references = []
+    for tree in ('Tests', 'Sources'):
+        for source in sorted((root / tree).rglob('*.swift')):
+            for literal in re.findall(r'"((?:\\.|[^"\\])*)"', source.read_text()):
+                path = Path(literal)
+                if (source.relative_to(root).as_posix(), literal) in SYNTHETIC_FILE_REFERENCES:
+                    continue
+                if '/' not in literal or not path.parts or path.parts[0] not in directories or '\\' in literal:
+                    continue
+                candidate = root / path
+                inputs = sorted(candidate.rglob('*')) if candidate.is_dir() else [candidate]
+                for item in inputs:
+                    if item.is_file():
+                        references.append((source.relative_to(root).as_posix(), item.relative_to(root).as_posix()))
+    return references
+
+
+class RepositoryDependencyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.root = Path(__file__).resolve().parents[1]
+        # Reuse the assigned persistent slot when present. This describes the
+        # actual package; it never builds Swift or runs the application.
+        cls.scratch = cls.root.parent / '.build'
+        if not cls.scratch.is_dir():
+            cls.scratch = cls.root / '.build'
+        cls.graph = selector.package_graph(cls.root, cls.scratch)
+        cls.targets = sorted(cls.graph['targets'], key=lambda t: len(t['path']), reverse=True)
+
+    def owner(self, path):
+        return next(t for t in self.targets if path.startswith(t['path'] + '/'))
+
+    def test_repository_input_map_covers_swift_literals(self):
+        found = {}
+        for source, path in repository_references(self.root):
+            if path.endswith('.swift'):
+                continue
+            owner = self.owner(source)
+            consumers = ([owner['name']] if owner['type'] == 'test' else
+                         selector.select(self.root, self.graph, [source], self.scratch)['test_targets'])
+            found.setdefault(path, set()).update(consumers)
+        self.assertEqual(found, {path: set(consumers) for path, consumers in selector.FILE_TEST_CONSUMERS.items()},
+                         'Update FILE_TEST_CONSUMERS for added, moved or removed repository input reads')
+        for path, consumers in found.items():
+            plan = selector.select(self.root, self.graph, [path], self.scratch)
+            self.assertTrue(consumers.issubset(plan['test_targets']), (path, plan))
+
+    def test_source_reads_select_the_reading_test_target(self):
+        for source, path in repository_references(self.root):
+            owner = self.owner(source)
+            if owner['type'] == 'test' and path.endswith('.swift'):
+                with self.subTest(reader=source, input=path):
+                    plan = selector.select(self.root, self.graph, [path], self.scratch)
+                    self.assertIn(owner['name'], plan['test_targets'])
+
+    def test_input_audit_finds_new_docs_skills_and_resource_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path in ['docs/new.md', 'skills/new/input.json', 'examples/new.json',
+                         'contracts/new.json', 'Resources/catalog.json']:
+                file = root / path
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.touch()
+            source = root / 'Tests/NewTests/InputTests.swift'
+            source.parent.mkdir(parents=True)
+            source.write_text('let inputs = ["docs/new.md", "skills/new/input.json", "examples/new.json", '
+                              '"contracts/new.json", "Resources/catalog.json"]')
+            self.assertEqual({path for _, path in repository_references(root)},
+                             {'docs/new.md', 'skills/new/input.json', 'examples/new.json',
+                              'contracts/new.json', 'Resources/catalog.json'})
+
+    def test_actual_package_resources_select_consumers(self):
+        for target in self.targets:
+            expected = selector.select(self.root, self.graph,
+                                       [target['path'] + '/ResourceInput.swift'], self.scratch)['test_targets']
+            for resource in target.get('resources', []):
+                path = Path(resource['path'])
+                if path.is_absolute():
+                    path = path.relative_to(self.root)
+                plan = selector.select(self.root, self.graph, [path.as_posix()], self.scratch)
+                self.assertTrue(set(expected).issubset(plan['test_targets']), (target['name'], resource))
+
+    def test_runtime_executable_map_covers_actual_package_references(self):
+        executables = {t['name'] for t in self.targets if t['type'] == 'executable'}
+        references = {}
+        for source in (self.root / 'Tests').rglob('*.swift'):
+            relative = source.relative_to(self.root).as_posix()
+            owner = next((t for t in self.targets if relative.startswith(t['path'] + '/')), None)
+            if owner is None or owner['type'] != 'test':
+                continue
+            text = source.read_text()
+            for name in executables:
+                if (relative, name) in SYNTHETIC_EXECUTABLE_REFERENCES:
+                    continue
+                # Canonical built binary names, not synthetic app/shim filenames.
+                if '"' + name + '"' in text or (name == 'StorageCrashProbe' and '"CHECKLIST_STORAGE_PROBE"' in text):
+                    references.setdefault(name, set()).add(owner['name'])
+        self.assertEqual(references, {name: set(consumers) for name, consumers in selector.RUNTIME_TEST_CONSUMERS.items()},
+                         'Update RUNTIME_TEST_CONSUMERS for executable runtime dependencies')
+        for name, consumers in references.items():
+            target = next(t for t in self.targets if t['name'] == name)
+            plan = selector.select(self.root, self.graph, [target['path'] + '/main.swift'], self.scratch)
+            self.assertTrue(consumers.issubset(plan['test_targets']), (name, plan))
 
 
 if __name__ == '__main__':
