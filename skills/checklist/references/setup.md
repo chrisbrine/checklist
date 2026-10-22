@@ -1,6 +1,6 @@
 # Setup and connection
 
-If discovery lists only `service_info` and its `connection.state` is `project_setup_required`, this conversation's folder is not an active Checklist project. Tell the user to add the folder as a project in the Checklist app and restart the MCP connection. Do not select another project.
+If `service_info.data.connection.state` is `project_setup_required`, this conversation's folder is not an active Checklist project. A verified native Codex/Claude conversation also discovers `project_create` for that actual folder. When the user asked to set it up, follow [new-project setup](work.md): creation enrolls/grants this worker atomically, then the same MCP connection exposes its full tools without restart. Do not select another project or invent a workspace. If native verification is unavailable, report its concrete limitation.
 
 A resumed Claude conversation (new process, same conversation) reconnects through the same bootstrap after Checklist verified that its earlier process closed. Its earlier claims returned for pickup: read `task_context` and claim the tickets again. `NATIVE_CLOSURE_PENDING` means the earlier process's work still stops; `NATIVE_SESSION_MISMATCH` means the earlier process still runs. `CONNECTION_REVOKED` after an owner disconnect is final; do not work around it. Restart the MCP connection after a refusal clears.
 

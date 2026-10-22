@@ -170,7 +170,12 @@ extension CommandRouter {
     }
 
     func projectCreate(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
-        try owner(c)
+        guard c.isOwner else { throw CoreError("FORBIDDEN","Native workers create projects through the service's verified workspace transaction.") }
+        return try insertProject(db,p,c)
+    }
+    // Creation authority is checked by the owner route or the verified native
+    // workspace transaction, never by caller-supplied project/role parameters.
+    func insertProject(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         let name = try text(p,"name",max:200); let prefix = (p["key_prefix"] as? String ?? "TASK").uppercased()
         guard prefix.range(of:"^[A-Z][A-Z0-9]{0,11}$",options:.regularExpression) != nil else { throw CoreError("INVALID_INPUT","Use a short letter/number ticket prefix.") }
         let path = (p["root_path"] as? String).map(canonical) ?? ""
@@ -184,7 +189,7 @@ extension CommandRouter {
         for (index,item) in [("Queued","queued","gray"),("In progress","active","blue"),("Review","review","purple"),("Blocked","blocked","orange"),("Parked","parked","gray"),("Done","done","green"),("Canceled","canceled","gray")].enumerated() {
             try save(db,["id":uuid(),"project_id":id,"name":item.0,"category":item.1,"color":item.2,"sort_order":index,"revision":1,"retired":false],type:"status")
         }
-        try event(db,caller:c,project:id,entity:id,kind:"project_created",data:["name":name]); return value
+        try event(db,caller:c,project:id,entity:id,kind:"project_created",data:["name":name,"origin":c.isOwner ? "human_ui":"agent"]); return value
     }
     func projectEdit(_ db: Database,_ p: JSON,_ c: Caller,_ method: String) throws -> JSON {
         // Restoring must reach an archived project; owner edits keep their original non-write scope.

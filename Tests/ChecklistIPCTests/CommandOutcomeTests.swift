@@ -98,6 +98,23 @@ final class CommandOutcomeTests: XCTestCase {
         XCTAssertEqual(try jsonString(CommandReply.decode(bytes(handshake), method: "connection_bootstrap", commandID: nil)), try jsonString(handshake))
     }
 
+    func testVerifiedUnregisteredBootstrapAndMalformedVariants() throws {
+        let limited: [String:Any] = ["connected":false,"state":"project_setup_required","native_context_verified":true,
+                                    "workspace":"/tmp/new-project","provider":"codex","session_id":UUID().uuidString]
+        let envelope: [String:Any] = ["data":limited]
+        XCTAssertEqual(try jsonString(CommandReply.decode(bytes(envelope),method:"connection_bootstrap",commandID:nil)),try jsonString(envelope))
+        let badValues:[String:Any] = ["connected":true,"state":"other","native_context_verified":false,"workspace":"relative","provider":"unknown","session_id":"not-a-session"]
+        for key in limited.keys {
+            var missing=limited;missing.removeValue(forKey:key)
+            var invalid=limited;invalid[key]=badValues[key]
+            for data in [missing,invalid] {
+                XCTAssertThrowsError(try CommandReply.decode(bytes(["data":data]),method:"connection_bootstrap",commandID:nil),key) { error in
+                    XCTAssertEqual((error as? ChecklistError)?.code,"INVALID_RESPONSE")
+                }
+            }
+        }
+    }
+
     func testR2HumanAnswerRequiresActualRequestResponseAndPreservesUnresolvedResults() throws {
         let id = UUID().uuidString
         let malformed: [[String: Any]] = [["id": NSNull()], ["complete": true], ["triage_effect": ["kind": "none"]]]

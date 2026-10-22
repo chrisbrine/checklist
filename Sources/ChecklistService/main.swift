@@ -217,9 +217,12 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         if request["method"] as? String == "connection_bootstrap" {
             return .done(try bootstrap(request["params"] as? [String:Any] ?? [:], connection:connection))
         }
-        let caller = try caller(request, connection: connection)
         let method = request["method"] as? String ?? ""
         let params = request["params"] as? [String: Any] ?? [:]
+        if method == "project_create", request["owner_channel"] as? Bool != true {
+            return .done(try createWorkspaceProject(params,request:request,connection:connection))
+        }
+        let caller = try caller(request, connection: connection)
         if method == "connection_list" {
             guard caller.role == "owner" else { throw ChecklistError("FORBIDDEN", "Connection setup is owner-only.") }
             return .done(["data": ["connections": enrollments.values.sorted { $0.name < $1.name }.map { e -> [String:Any] in

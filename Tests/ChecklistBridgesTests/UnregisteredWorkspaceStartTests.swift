@@ -45,4 +45,27 @@ final class UnregisteredWorkspaceStartTests: XCTestCase {
         XCTAssertTrue(notice.contains("add this folder as a project in the Checklist app"))
         XCTAssertFalse(notice.contains("\n"))
     }
+    func testVerifiedNativeCreationIsAvailableToMCPToolsAndCallOnly() {
+        for command in ["mcp","tools","call"] {
+            XCTAssertTrue(UnregisteredWorkspaceStart.allowsCreation(command:command,assistantRelay:false))
+            XCTAssertFalse(UnregisteredWorkspaceStart.allowsCreation(command:command,assistantRelay:true))
+        }
+        for command in ["connect","service","help",""] {
+            XCTAssertFalse(UnregisteredWorkspaceStart.allowsCreation(command:command,assistantRelay:false))
+        }
+        let notice=UnregisteredWorkspaceStart.creationNotice(workspace:"/tmp/new-project")
+        XCTAssertTrue(notice.contains("project_create"));XCTAssertTrue(notice.contains("/tmp/new-project"))
+    }
+
+    func testCreationIdentityStaysStableForReplayAndIsolatesNativeContexts() {
+        let first=NativeWorkspaceCreation.installation(provider:"codex",session:"session",workspace:"/tmp/project")
+        XCTAssertEqual(first,NativeWorkspaceCreation.installation(provider:"codex",session:"session",workspace:"/tmp/project"))
+        XCTAssertNotEqual(first,NativeWorkspaceCreation.installation(provider:"claude",session:"session",workspace:"/tmp/project"))
+        XCTAssertNotEqual(first,NativeWorkspaceCreation.installation(provider:"codex",session:"other",workspace:"/tmp/project"))
+        XCTAssertNotEqual(first,NativeWorkspaceCreation.installation(provider:"codex",session:"session",workspace:"/tmp/other"))
+        let generation=NativeWorkspaceCreation.generation(provider:"codex",session:"session",workspace:"/tmp/project",executionDomain:"process-1")
+        XCTAssertEqual(generation,NativeWorkspaceCreation.generation(provider:"codex",session:"session",workspace:"/tmp/project",executionDomain:"process-1"))
+        XCTAssertNotEqual(generation,NativeWorkspaceCreation.generation(provider:"codex",session:"session",workspace:"/tmp/project",executionDomain:"process-2"))
+    }
+
 }

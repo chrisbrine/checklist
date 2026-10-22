@@ -113,12 +113,7 @@ struct ChecklistCommand {
                 // IPC cold-starts the same bundled singleton. There is no model/runtime launch.
                 try printJSON(await bridge.serviceInfo())
             case "call":
-                guard arguments.command.count == 2 || arguments.command.count == 3 else { throw CLIError("Usage: checklist call METHOD '{JSON}' [--workspace PATH]") }
-                let data = try CallArgumentInput.read(arguments.command.count == 3 ? arguments.command[2] : "{}")
-                let value = try JSONDecoder().decode(Value.self, from: data)
-                _ = try await bridge.connect()
-                try await bridge.verifySession()
-                try printJSON(await bridge.call(arguments.command[1], value))
+                try printJSON(await call(arguments:arguments,bridge:bridge))
             case "help", "--help", "-h": printHelp()
             case "version", "--version": print("Checklist 0.1.0 · MCP Swift SDK 0.12.1")
             default: throw CLIError("Unknown command. Run checklist help.")
@@ -127,6 +122,15 @@ struct ChecklistCommand {
             FileHandle.standardError.write(Data("Checklist: \(error.localizedDescription)\n".utf8))
             exit(1)
         }
+    }
+
+    static func call(arguments: Arguments, bridge: Bridge) async throws -> Value {
+        guard arguments.command.count == 2 || arguments.command.count == 3 else { throw CLIError("Usage: checklist call METHOD '{JSON}' [--workspace PATH]") }
+        let data = try CallArgumentInput.read(arguments.command.count == 3 ? arguments.command[2] : "{}")
+        let value = try JSONDecoder().decode(Value.self, from: data)
+        _ = try await bridge.connect()
+        try await bridge.verifySession()
+        return try await bridge.call(arguments.command[1], value)
     }
 
     static func printJSON(_ value: Value, to output: FileHandle = .standardOutput) throws {
@@ -155,6 +159,7 @@ struct ChecklistCommand {
         This requires owner-enabled assistant grants for that project; it never grants worker access.
         The helper remains a local assistant relay, without claiming the cloud Dot's identity or delivery.
         MCP and call connect automatically when native context is available; no IDs or Settings form.
+        In an unregistered folder, call project_create to create this conversation's own project and connect.
         Explicit --installation selects a previously configured nonautomatic integration.
         The MCP shim uses the official Swift MCP SDK over stdio; stdout contains only protocol frames.
         Existing checklists are never imported automatically. No model is launched.

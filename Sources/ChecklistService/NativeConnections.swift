@@ -11,14 +11,9 @@ import ChecklistBridges
 // host-exported context, not a cryptographically attested thread identity.
 extension Coordinator {
     func bootstrap(_ context:[String:Any], connection:NSXPCConnection) throws -> [String:Any] {
-        guard bundledCLI(connection.processIdentifier) else { throw ChecklistError("NATIVE_CLIENT_REQUIRED","Connect through the installed Checklist executable inside a Codex or Claude thread.") }
-        guard let provider=context["provider"] as? String,let plugin=ProviderPluginRegistry.bundled.plugin(provider, requiring: .workSession),
-              let sid=context["native_session_id"] as? String,UUID(uuidString:sid) != nil else { throw ChecklistError("NATIVE_SESSION_REQUIRED","This process does not expose a supported native thread identity.") }
-        let process = try nativeProcess(connection.processIdentifier, provider:provider)
-        let executionDomain=try processDomain(process,provider:provider)
-        let workspace = try currentDirectory(connection.processIdentifier)
-        if let supplied=context["workspace_path"] as? String,canonical(supplied) != workspace { throw ChecklistError("WORKSPACE_MISMATCH","The supplied workspace differs from this process's actual working directory.") }
-        try verifyProviderRegistry(plugin,process:process,session:sid,workspace:workspace,endpoint:context["native_endpoint"] as? String)
+        let native = try verifiedNativeWorkspace(context, connection: connection)
+        let (provider, sid, process, executionDomain, workspace) = (native.provider, native.session, native.process, native.executionDomain, native.workspace)
+        let plugin = ProviderPluginRegistry.bundled.plugin(provider, requiring: .workSession)!
         let owner=Caller(role:"owner",installation:"native-thread-bootstrap",projectIDs:[])
         let relay=context["mode"] as? String == "assistant_relay"
         guard context["mode"] == nil || relay else { throw ChecklistError("INVALID_CONNECTION_MODE","Use worker or personal-assistant relay access.") }
@@ -31,6 +26,10 @@ extension Coordinator {
             if reference == "@enabled" { projects=projects.filter { $0["archived"] as? Bool != true && ((($0["policy"] as? [String:Any])?["assistant_relay_grants"] as? [String:Bool])?["read"] == true) } }
             else { projects=projects.filter { ($0["id"] as? String) == reference || ($0["name"] as? String)?.localizedCaseInsensitiveCompare(reference) == .orderedSame };guard projects.count <= 1 else { throw ChecklistError("AMBIGUOUS_PROJECT","Use the stable ID for one of these identically named projects.") } }
             projects.sort { ($0["id"] as? String ?? "") < ($1["id"] as? String ?? "") }
+        }
+        if !relay && projects.isEmpty {
+            return ["data": ["connected": false, "state": "project_setup_required", "native_context_verified": true,
+                              "workspace": workspace, "provider": provider, "session_id": sid]]
         }
         guard (relay ? !projects.isEmpty:projects.count == 1),let project=projects.first,
               project["archived"] as? Bool != true,let pid=project["id"] as? String else { throw ChecklistError("PROJECT_SETUP_REQUIRED","Add this workspace as a project in Checklist first. Existing checklists are never imported automatically.") }
@@ -45,7 +44,11 @@ extension Coordinator {
         let binding=relay ? nil:canonical(projectRoot)
         let identity=relay ? "\(provider)|\(sid)|\(selector)|assistant_relay":"\(provider)|\(sid)|\(pid)"
         let digest=SHA256.hash(data:Data(identity.utf8)).map{String(format:"%02x",$0)}.joined()
-        let installation="auto-\(provider)-\(digest.prefix(40))"
+        let defaultInstallation="auto-\(provider)-\(digest.prefix(40))"
+        // Project creation had to choose an identity before its project ID existed.
+        // Reuse that enrollment; an ordinary reconnect must preserve its receipt principal.
+        let creationInstallation=NativeWorkspaceCreation.installation(provider:provider,session:sid,workspace:binding ?? workspace)
+        let installation = !relay && enrollments[creationInstallation]?.sessionID == sid ? creationInstallation : defaultInstallation
         guard !enrollments.values.contains(where:{$0.sessionID == boundSessionID && $0.installation != installation}) else { throw ChecklistError("BINDING_CHANGED","This reported session is already bound to another connection. Use a thread created for this project.") }
         if var existing=enrollments[installation] {
             if existing.revoked == true || existing.nativeExecutionDomain != executionDomain {
@@ -96,6 +99,90 @@ extension Coordinator {
             rollback: { try ConnectionCommit.restore(enrollment: { enrollments.removeValue(forKey: installation); try saveEnrollments() }, credential: { try ChecklistKeychain.removeChecked(installation) }) })
         try requireCommittedRegistration(enrollment, project: pid, caller: owner)
         return connectionResult(enrollment,project:pid)
+    }
+
+    private struct VerifiedNativeWorkspace {
+        let provider: String
+        let session: String
+        let process: pid_t
+        let executionDomain: String
+        let workspace: String
+    }
+
+    /// Shared by bootstrap and workspace creation; never derive a folder from service cwd.
+    private func verifiedNativeWorkspace(_ context: [String: Any], connection: NSXPCConnection) throws -> VerifiedNativeWorkspace {
+        guard bundledCLI(connection.processIdentifier) else { throw ChecklistError("NATIVE_CLIENT_REQUIRED","Connect through the installed Checklist executable inside a Codex or Claude thread.") }
+        guard let provider=context["provider"] as? String,let plugin=ProviderPluginRegistry.bundled.plugin(provider, requiring: .workSession),
+              let sid=context["native_session_id"] as? String,UUID(uuidString:sid) != nil else { throw ChecklistError("NATIVE_SESSION_REQUIRED","This process does not expose a supported native thread identity.") }
+        let process = try nativeProcess(connection.processIdentifier, provider:provider)
+        let executionDomain=try processDomain(process,provider:provider)
+        let workspace = try currentDirectory(connection.processIdentifier)
+        if let supplied=context["workspace_path"] as? String,canonical(supplied) != workspace { throw ChecklistError("WORKSPACE_MISMATCH","The supplied workspace differs from this process's actual working directory.") }
+        try verifyProviderRegistry(plugin,process:process,session:sid,workspace:workspace,endpoint:context["native_endpoint"] as? String)
+        return VerifiedNativeWorkspace(provider:provider,session:sid,process:process,executionDomain:executionDomain,workspace:workspace)
+    }
+
+    func createWorkspaceProject(_ intent: [String: Any], request: [String: Any], connection: NSXPCConnection) throws -> [String: Any] {
+        guard let context=request["native_context"] as? [String:Any], context["mode"] == nil else {
+            throw ChecklistError("NATIVE_SESSION_REQUIRED","Project creation requires a verified native worker conversation in its actual workspace.")
+        }
+        let native=try verifiedNativeWorkspace(context,connection:connection)
+        guard let supplied=request["workspace"] as? String,canonical(supplied) == native.workspace else {
+            throw ChecklistError("WORKSPACE_MISMATCH","Use this conversation's actual workspace folder.")
+        }
+        let installation=NativeWorkspaceCreation.installation(provider:native.provider,session:native.session,workspace:native.workspace)
+        let priorEnrollment=enrollments.values.first(where:{$0.sessionID == native.session})
+        if let priorEnrollment {
+            guard priorEnrollment.automatic == true,priorEnrollment.role == "worker",priorEnrollment.assistantRelay != true,
+                  priorEnrollment.provider == native.provider,priorEnrollment.revoked != true else {
+                throw ChecklistError("CONNECTION_REVOKED","This native conversation cannot replace its existing connection.")
+            }
+            guard let binding=priorEnrollment.workspace,contains(binding,native.workspace) else {
+                throw ChecklistError("BINDING_CHANGED","This conversation is already bound to another workspace.")
+            }
+            guard priorEnrollment.nativeExecutionDomain == native.executionDomain else {
+                throw ChecklistError("NATIVE_SESSION_MISMATCH","This connection belongs to another native host process.")
+            }
+        }
+        let generation=priorEnrollment?.generation ?? NativeWorkspaceCreation.generation(provider:native.provider,session:native.session,workspace:native.workspace,executionDomain:native.executionDomain)
+        let boundInstallation=priorEnrollment?.installation ?? installation
+        let owner=Caller(role:"owner",installation:"native-thread-bootstrap",projectIDs:[])
+        var projects=priorEnrollment?.projectIDs ?? []
+        if let priorEnrollment,let pid=projects.first {
+            let catalog=try router.handle(method:"project_list",params:[:],caller:owner)
+            let records=(catalog["data"] as? [String:Any])?["projects"] as? [[String:Any]] ?? []
+            if records.contains(where:{$0["id"] as? String == pid}) {
+                try requireCommittedRegistration(priorEnrollment,project:pid,caller:owner)
+            } else {
+                // An interrupted precommit preparation has no grant. Retry the same
+                // native creation identity; Core still refuses any existing session.
+                guard boundInstallation == installation else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED","This connection's project is unavailable.") }
+                projects=[]
+            }
+        }
+        let caller=Caller(role:"worker",installation:boundInstallation+"/"+generation,projectIDs:projects,sessionID:native.session,workspace:native.workspace,executionDomain:native.executionDomain)
+        var priorCredential:String?,snapshotTaken=false
+        return try router.commitWorkspaceProjectCreation(intent:intent,caller:caller,provider:native.provider,preparePersistence:{ pid in
+            priorCredential=try ChecklistKeychain.read(boundInstallation);snapshotTaken=true
+            var bytes=[UInt8](repeating:0,count:32)
+            guard SecRandomCopyBytes(kSecRandomDefault,bytes.count,&bytes) == errSecSuccess else { throw ChecklistError("RANDOM_FAILURE","Could not create the thread connection.") }
+            let token=Data(bytes).base64EncodedString()
+            let plugin=ProviderPluginRegistry.bundled.plugin(native.provider,requiring:.workSession)!
+            var enrollment=Enrollment(installation:boundInstallation,name:"\(plugin.manifest.displayName) thread \(native.session.prefix(8))",provider:native.provider,role:"worker",projectIDs:[pid],sessionID:native.session,workspace:native.workspace,profileID:nil,tokenDigest:SHA256.hash(data:Data(token.utf8)).map{String(format:"%02x",$0)}.joined(),generation:generation)
+            enrollment.nativeSessionID=native.session;enrollment.automatic=true;enrollment.revoked=false
+            enrollment.nativeExecutionDomain=native.executionDomain;enrollment.identityVerification=plugin.nativeHost?.identityVerification
+            enrollment.assistantRelay=false
+            if ProviderPluginRegistry.bundled.plugin(native.provider,requiring:.nativePeer) != nil,let endpoint=context["native_endpoint"] as? String { try bindProviderEndpoint(&enrollment,endpoint:endpoint,process:native.process) }
+            try ChecklistKeychain.write(boundInstallation,token)
+            enrollments[boundInstallation]=enrollment;try saveEnrollments()
+            return ["project_id":pid,"project_ids":[pid],"session_id":native.session,"installation":caller.installation,"provider":native.provider,"role":"worker","workspace":native.workspace,"name":enrollment.name,"execution_domain":native.executionDomain]
+        },rollback:{
+            guard snapshotTaken else { return }
+            try ConnectionCommit.restore(enrollment:{ enrollments[boundInstallation]=priorEnrollment;try saveEnrollments() },credential:{
+                if let priorCredential { try ChecklistKeychain.write(boundInstallation,priorCredential) }
+                else { try ChecklistKeychain.removeChecked(boundInstallation) }
+            })
+        })
     }
 
     func requireCommittedRegistration(_ enrollment: Enrollment, project: String, caller: Caller) throws {

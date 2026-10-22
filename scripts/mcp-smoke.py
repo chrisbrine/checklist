@@ -4,7 +4,8 @@
 Read checks are the default. --exercise-project explicitly permits a synthetic
 Draft and an idempotent retry inside that already-enrolled project.
 --expect-unregistered checks the limited start of a native conversation whose
-folder is not a Checklist project: only service_info, with setup guidance.
+folder is not a Checklist project: service_info and own-workspace project_create,
+with setup guidance. This read-only check never calls project_create.
 """
 from __future__ import annotations
 
@@ -17,6 +18,22 @@ import subprocess
 import tempfile
 import time
 import uuid
+
+
+def validate_discovery(tools: list[dict], *, service_only: bool, expect_unregistered: bool) -> set[str]:
+    names = {tool["name"] for tool in tools}
+    assert "service_info" in names
+    for tool in tools:
+        assert tool["inputSchema"].get("type") == "object", tool["name"]
+        assert tool["inputSchema"].get("additionalProperties") is False, tool["name"]
+    assert not names.intersection({"human_request_answer", "connection_pair"}), names
+    if service_only:
+        assert names == {"service_info"}, names
+    elif expect_unregistered:
+        assert names == {"service_info", "project_create"}, names
+    else:
+        assert {"project_create", "policy_apply", "project_settings_save", "status_create", "task_archive", "work_takeover"} <= names, names
+    return names
 
 
 class MCPProbe:
@@ -117,17 +134,7 @@ def main():
         listed = probe.request("tools/list")
         assert "error" not in listed, listed
         tools = listed["result"]["tools"]
-        names = {tool["name"] for tool in tools}
-        assert "service_info" in names
-        for tool in tools:
-            assert tool["inputSchema"].get("type") == "object", tool["name"]
-            assert tool["inputSchema"].get("additionalProperties") is False, tool["name"]
-        assert not names.intersection({"human_request_answer", "connection_pair", "project_create"}), names
-        # Checklist is AI-first: workers change project rules and settings (owner decision 2026-10-18).
-        if arguments.service_only:
-            assert names == {"service_info"}, names
-        elif not arguments.expect_unregistered:
-            assert {"policy_apply", "project_settings_save", "status_create", "task_archive", "work_takeover"} <= names, names
+        names = validate_discovery(tools, service_only=arguments.service_only, expect_unregistered=arguments.expect_unregistered)
         report["tool_count"] = len(names)
         report["checks"].append("role-limited discovery and closed schemas")
         info = probe.tool("service_info")
@@ -135,11 +142,10 @@ def main():
         report["checks"].append("structured service_info")
         if arguments.expect_unregistered:
             connection = info.get("data", info).get("connection", {})
-            assert names == {"service_info"}, names
             assert connection.get("state") == "project_setup_required" and connection.get("connected") is False, info
             probe.stderr.seek(0)
             assert b"PROJECT_SETUP_REQUIRED" in probe.stderr.read(), "Setup guidance missing from stderr"
-            report["checks"].append("unregistered folder: limited start with setup guidance, no enrollment")
+            report["checks"].append("unregistered folder: own-workspace creation discovered with setup guidance, no enrollment or mutation")
         unknown = probe.request("tools/call", {"name": "connection_pair", "arguments": {}})
         assert "error" in unknown or unknown.get("result", {}).get("isError") is True
         report["checks"].append("owner tool denied")

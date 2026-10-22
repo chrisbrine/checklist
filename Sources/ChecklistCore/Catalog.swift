@@ -37,6 +37,7 @@ extension CommandRouter {
             "tag_create":["name","color","sort_order"],"tag_edit":["tag_id","name","color","sort_order"],"tag_retire":["tag_id"],
             "task_archive":["task_id","action","reason","cleanup","cleanup_preview_id","undo"]
         ]
+        if c.role != "assistant" { fields["project_create"] = ["name","key_prefix","root_path","icon","accent"] }
         fields["work_recover"] = ["task_id","attempt_id","action","reason","observation_refs","file_state_refs","source_execution_ids","expected_source_execution_revisions"]
         fields["finding_waive"] = ["finding_id","reason"]
         fields["direction_waive"] = ["message_id","reason"]
@@ -106,7 +107,7 @@ extension CommandRouter {
         return allowed.sorted().compactMap { name in
             guard let extra = fields[name] else { return nil }
             var properties: JSON = [:]
-            let keys = Set(extra + (name == "service_info" || name == "project_list" || name == "assistant_projects" ? [] : common))
+            let keys = Set(extra + (name == "project_create" ? ["command_id"] : (name == "service_info" || name == "project_list" || name == "assistant_projects" ? [] : common)))
             for key in keys {
                 if ["limit","expected_revision","expected_task_revision","from_epic_revision","policy_revision","acceptance_revision","revision","settings_revision","sort_order"].contains(key) { properties[key] = ["type":"integer","minimum":0] }
                 else if ["archived","blocking","expects_reply","include_archived","include_ended","required","include_completion_eligibility","cleanup","preview","undo","retain_cited_files","snoozed"].contains(key) { properties[key] = ["type":"boolean"] }
@@ -140,7 +141,8 @@ extension CommandRouter {
             var required: [String] = []
             if !Self.readMethods.contains(name) { required.append("command_id") }
             if name == "policy_apply" && !c.isOwner { required.append("reason") }
-            if !["service_info","project_list","assistant_projects","assistant_inbox","project_resolve"].contains(name) && !(c.isOwner && ["task_list","task_context"].contains(name)) { required.append("project_id") }
+            if name == "project_create" { required.append("name") }
+            if !["service_info","project_list","assistant_projects","assistant_inbox","project_resolve","project_create"].contains(name) && !(c.isOwner && ["task_list","task_context"].contains(name)) { required.append("project_id") }
             if name == "batch_claim" { required.append("policy_revision");properties["policy_revision"] = ["type":"integer","minimum":1,"maximum":Int.max,"description":"Required positive policy_revision returned by batch_prepare."] }
             if name == "batch_discard" { required += ["batch_id","expected_revision","reason"] }
             if name == "triage_transition" { required += ["expected_revision","expected_member_revisions"] }
@@ -180,6 +182,7 @@ extension CommandRouter {
     }
     func description(_ method: String) -> String {
         switch method {
+        case "project_create":return "Create a project for this verified native conversation's actual unregistered workspace only. Omit root_path or use that same canonical folder. Commits worker enrollment/grant with the project; retry identical input with the same command_id to recover its receipt. Assistants cannot create projects."
         case "work_recover":return "Revoke a stopped attempt with explicit observation_refs and file_state_refs, action=confirm_stopped_revoke and reason. Name every unresolved source execution and its expected revision. Agent recovery is labeled as agent action; timeouts never prove a stop. Requires allowed agent_rule_changes."
         case "finding_waive","direction_waive":return "Record a reasoned waiver with caller provenance. Agent callers create agent waivers, never owner approvals. Requires allowed agent_rule_changes."
         case "project_icon_import":return "Import a PNG, JPEG or WebP up to 5 MiB from inside the caller's enrolled workspace. Requires current project revision and allowed agent_rule_changes."

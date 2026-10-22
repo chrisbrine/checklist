@@ -109,10 +109,18 @@ extension CoreTests {
         try cl135Lock(p,true)
         assertCode("HUMAN_CHANNEL_REQUIRED") {_ = try self.call("diagnostics_summary",["project_id":p["id"]!],agent)}
     }
-    func testCL135CatalogKeepsGrantCreationAndPathBasedExportClosed() throws {
+    func testCL135CatalogOpensOwnWorkspaceCreationAndKeepsPathBasedExportClosed() throws {
         let (p,agent) = try agentChangeFixture(),names = Set(router.toolCatalog(agent).compactMap {$0["name"] as? String})
         for method in ["work_recover","finding_waive","direction_waive","project_icon_import","project_icon_clear","archive_storage_settings","cleanup_job_list","cleanup_job_get","cleanup_job_cancel","cleanup_job_retry","attachment_update","attachment_read_release","relation_import","human_request_snooze","diagnostics_summary"] {XCTAssertTrue(names.contains(method),method)}
-        for method in ["project_create","export_project","human_request_answer"] {XCTAssertFalse(names.contains(method));assertCode("FORBIDDEN") {_ = try self.call(method,["project_id":p["id"]!],agent)}}
+        XCTAssertTrue(names.contains("project_create"))
+        let schema = router.toolCatalog(agent).first {$0["name"] as? String == "project_create"}!["inputSchema"] as! JSON
+        XCTAssertNil((schema["properties"] as! JSON)["project_id"])
+        XCTAssertFalse(strings(schema,"required").contains("project_id"))
+        // The service's verified native transaction grants creation authority;
+        // an ordinary router payload cannot authenticate that boundary.
+        assertCode("FORBIDDEN") {_ = try self.call("project_create",["name":"Requires verified native workspace"],agent)}
+        XCTAssertFalse(router.toolCatalog(Caller(role:"assistant",installation:"assistant",projectIDs:[])).contains {$0["name"] as? String == "project_create"})
+        for method in ["export_project","human_request_answer"] {XCTAssertFalse(names.contains(method));assertCode("FORBIDDEN") {_ = try self.call(method,["project_id":p["id"]!],agent)}}
     }
 }
 

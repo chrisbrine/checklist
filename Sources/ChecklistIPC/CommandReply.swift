@@ -54,7 +54,13 @@ public enum CommandReply {
                 guard isHumanAnswerResult(data) else { throw ambiguous("missing_human_answer_result") }
             }
         } else if method == "connection_bootstrap" {
-            guard data["connected"] as? Bool == true, data["installation"] is String, data["session_id"] is String else { throw ambiguous("missing_bootstrap_result") }
+            let connected = data["connected"] as? Bool == true && data["installation"] is String && data["session_id"] is String
+            let verifiedWorkspace = data["connected"] as? Bool == false
+                && data["state"] as? String == "project_setup_required" && data["native_context_verified"] as? Bool == true
+                && (data["workspace"] as? String)?.hasPrefix("/") == true
+                && ["codex","claude"].contains(data["provider"] as? String ?? "")
+                && (data["session_id"] as? String).flatMap(UUID.init(uuidString:)) != nil
+            guard connected || verifiedWorkspace else { throw ambiguous("missing_bootstrap_result") }
         }
         return object
     }

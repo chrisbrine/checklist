@@ -32,6 +32,9 @@ public actor Bridge {
     private var launchState = ShimLaunchState.current
     private var updateNoticePending = false
     private var bootstrapResponse: Value?
+    private var setupContext: NativeSessionContext?
+    private var creationNoticePending = false
+    private var setupCompletionPending = false
     private var registryStart = ClaudeRegistryStart()
     private(set) var setupNotice: String?
     var connectionNotice: String? { registryStart.notice }
@@ -107,11 +110,23 @@ public actor Bridge {
             return nil
         }
         let data = responseData(response)
+        if data["state"] as? String == "project_setup_required", data["native_context_verified"] as? Bool == true {
+            guard UnregisteredWorkspaceStart.allowsCreation(command:command,assistantRelay:assistantProject != nil) else {
+                throw ChecklistError("PROJECT_SETUP_REQUIRED","Create this workspace's project with checklist call project_create or checklist mcp first.")
+            }
+            // This context has passed the service's ordinary native bootstrap checks.
+            // Creation verifies it again; no stored credential is consulted here.
+            client = environment.makeClient(.init(workspace:context.workspacePath,nativeContext:nativeContext,usesStoredCredential:false))
+            setupContext=context
+            setupNotice=UnregisteredWorkspaceStart.creationNotice(workspace:context.workspacePath)
+            return nil
+        }
         guard let installation = data["installation"] as? String, !installation.isEmpty else {
             throw BridgeError("INVALID_RESPONSE: Automatic connection returned no installation binding.")
         }
         client = environment.makeClient(.init(installation: installation, workspace: context.workspacePath, nativeContext: nativeContext))
         let value = try mcpValue(response)
+        setupContext=nil;setupNotice=nil;setupCompletionPending=false
         bootstrapResponse = value
         return value
     }
@@ -125,7 +140,14 @@ public actor Bridge {
     func retryConnection() -> Bool {
         checkInstalledBuild()
         if delegating { return false }
+        if setupCompletionPending,let context=setupContext {
+            do {
+                _ = try bootstrap(context,required:true)
+                if setupContext == nil { return true }
+            } catch { environment.stderr("Checklist: Project connection is still pending: \(error.localizedDescription)\n") }
+        }
         var start = registryStart
+        let hadSetupContext = setupContext != nil
         let changed = start.retry(now: environment.now, discover: { self.discover() }, bootstrap: { observed -> Value? in
             let response = try self.bootstrap(observed, required: true)
             do { try self.verifyBoundSession() }
@@ -141,7 +163,9 @@ public actor Bridge {
             client = environment.makeClient(.init(workspace: requestedWorkspace, usesStoredCredential: false))
         }
         if changed { reportConnectionRecovery() }
-        return changed
+        // Native verification can recover into an unregistered workspace. Its
+        // creation tool is a catalog change even before a project is enrolled.
+        return changed || (!hadSetupContext && setupContext != nil)
     }
 
     public func verifySession() throws {
@@ -205,14 +229,27 @@ public actor Bridge {
         Tool(name: name, description: description, inputSchema: .object(["type": .string("object"), "properties": .object([:]), "additionalProperties": .bool(false)]), annotations: .init(readOnlyHint: true, openWorldHint: false))
     }
 
+    private static let workspaceProjectCreate = Tool(name:"project_create",description:"Create a Checklist project for this verified native conversation's own folder and connect this worker atomically. root_path, if supplied, must equal that folder. Continue setup through the full tool set after success.",inputSchema:.object([
+        "type":.string("object"),"properties":.object([
+            "command_id":.object(["type":.string("string"),"format":.string("uuid"),"maxLength":.int(100)]),
+            "name":.object(["type":.string("string"),"maxLength":.int(200)]),"key_prefix":.object(["type":.string("string"),"maxLength":.int(12)]),
+            "root_path":.object(["type":.string("string"),"maxLength":.int(4000)]),"icon":.object(["type":.string("string"),"maxLength":.int(4000)]),
+            "accent":.object(["type":.string("string"),"maxLength":.int(4000)])
+        ]),"required":.array([.string("command_id"),.string("name")]),"additionalProperties":.bool(false)
+    ]),annotations:.init(readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false))
+
     func tools() throws -> [Tool] {
         try forward(current: { try localTools() }, delegate: { try delegateTools() })
     }
 
     private func localTools() throws -> [Tool] {
-        // No project tool is advertised before an actual enrollment exists.
+        // Creation is the only project tool before an actual enrollment exists.
         if let connectionNotice { return ClaudeRegistryStart.limitedToolNames.map { Self.limitedServiceInfo(connectionNotice, name: $0) } }
-        if let setupNotice { return [Self.limitedServiceInfo("Read limited local service status. " + setupNotice)] }
+        if let setupNotice {
+            var tools=[Self.limitedServiceInfo("Read limited local service status. " + setupNotice)]
+            if setupContext != nil { tools.append(Self.workspaceProjectCreate) }
+            return tools
+        }
         let catalog: [String: Any]
         do { catalog = responseData(try client.call("tool_catalog")) }
         catch let error as ChecklistError where error.code == "SETUP_REQUIRED" {
@@ -244,7 +281,20 @@ public actor Bridge {
         guard let parameters = try jsonObject(arguments) as? [String: Any] else {
             throw BridgeError("Tool arguments must be a JSON object.")
         }
-        return try mcpValue(withSetupNotice(client.call(name, parameters)))
+        let response=try client.call(name,parameters)
+        if name == "project_create",let context=setupContext {
+            // A connection failure after commit must preserve the successful
+            // receipt. A later request can finish the same bootstrap safely.
+            setupCompletionPending=true
+            do {
+                _ = try bootstrap(context,required:true)
+                if setupContext == nil { creationNoticePending=true }
+            } catch {
+                setupNotice="The project was created, but completing this conversation's connection is pending. Retry the original project_create command_id or make another request. "+error.localizedDescription
+                environment.stderr("Checklist: \(setupNotice!)\n")
+            }
+        }
+        return try mcpValue(withSetupNotice(response))
     }
 
     public func serviceInfo() throws -> Value {
@@ -252,11 +302,11 @@ public actor Bridge {
                     delegate: { try delegateCall("service_info", .object([:])) })
     }
 
-    // The limited start can only reach service_info; its result says why no project is bound.
+    // Limited service status explains why the verified workspace has no project yet.
     private func withSetupNotice(_ response: [String: Any]) -> [String: Any] {
         let connection: [String: Any]
         if let pending = registryStart.connection { connection = pending }
-        else if let setupNotice { connection = ["connected": false, "state": "project_setup_required", "message": setupNotice] }
+        else if let setupNotice { connection = ["connected":false,"state":setupCompletionPending ? "project_connection_pending":"project_setup_required","message":setupNotice] }
         else { return response }
         var response = response
         if var data = response["data"] as? [String: Any] { data["connection"] = connection; response["data"] = data }
@@ -286,8 +336,8 @@ public actor Bridge {
     }
 
     func takeUpdateNotice() -> Bool {
-        guard updateNoticePending else { return false }
-        updateNoticePending = false
+        guard updateNoticePending || creationNoticePending else { return false }
+        updateNoticePending = false;creationNoticePending = false
         return true
     }
 
@@ -378,4 +428,3 @@ public actor Bridge {
         }
     }
 }
-

@@ -19,6 +19,8 @@ final class ChecklistMCPServerTests: XCTestCase {
         var bootstrapHandler: ((TimeInterval?) throws -> Void)?
         var responseText: String?
         var callHandler: ((String) throws -> Void)?
+        var unregisteredWorkspace = false
+        var projectCreationEnabled = false
 
         init(provider: String = "claude") throws {
             let session = "a85c9a24-fce8-49ba-a738-67594bb90a67"
@@ -57,6 +59,10 @@ final class ChecklistMCPServerTests: XCTestCase {
             try locked {
                 bootstraps.append((elapsed, budget))
                 try bootstrapHandler?(budget)
+                if unregisteredWorkspace {
+                    return ["data":["connected":false,"state":"project_setup_required","native_context_verified":true,
+                                    "workspace":context.workspacePath,"provider":context.provider,"session_id":context.nativeSessionID]]
+                }
                 return ["data": ["installation": "synthetic-thread", "project_id": "synthetic-project",
                                  "session_id": context.nativeSessionID, "connected": true]]
             }
@@ -66,8 +72,13 @@ final class ChecklistMCPServerTests: XCTestCase {
             try locked {
                 requests.append((name, client))
                 try callHandler?(name)
+                if name == "project_create",projectCreationEnabled {
+                    unregisteredWorkspace=false
+                    return ["data":["id":"synthetic-project","root_path":context.workspacePath]]
+                }
                 if name == "tool_catalog" {
-                    return ["data": ["tools": ["service_info", "task_list", "project_list"].map {
+                    let names=["service_info","task_list","project_list"] + (projectCreationEnabled ? ["project_create"] : [])
+                    return ["data": ["tools": names.map {
                         ["name": $0, "description": "Synthetic " + $0,
                          "inputSchema": ["type": "object", "properties": [:], "additionalProperties": false]] as [String: Any]
                     }]]
@@ -378,6 +389,94 @@ final class ChecklistMCPServerTests: XCTestCase {
         XCTAssertTrue(tools.tools[0].description?.contains("PROJECT_SETUP_REQUIRED") == true)
         XCTAssertEqual(unregistered.attempts.count, 1); XCTAssertEqual(unregistered.time, 0)
         XCTAssertTrue(unregistered.stderr[0].contains("add this folder as a project"))
+    }
+
+    func testVerifiedUnregisteredWorkspaceCreatesAndRefreshesSameMCPConnectionOnce() async throws {
+        for provider in ["codex","claude"] {
+            let fixture=try Fixture(provider:provider)
+            fixture.setDiscoveries([.available(fixture.context)])
+            fixture.unregisteredWorkspace=true;fixture.projectCreationEnabled=true
+            let session=try await start(fixture)
+            let limited=try await session.client.listTools()
+            XCTAssertEqual(limited.tools.map(\.name),["service_info","project_create"])
+            XCTAssertTrue(limited.tools[1].description?.contains("own folder") == true)
+            let unavailable=try await session.client.callTool(name:"task_list")
+            XCTAssertEqual(unavailable.isError,true)
+            XCTAssertFalse(fixture.calls.contains{$0.0 == "tool_catalog"})
+            let created=try await session.client.callTool(name:"project_create",arguments:[
+                "command_id":.string(UUID().uuidString),"name":.string("Synthetic"),"key_prefix":.string("SYN")])
+            XCTAssertEqual(created.isError,false)
+            XCTAssertTrue(text(created.content).contains("synthetic-project"))
+            XCTAssertEqual(fixture.attempts.count,2)
+            let createClient=try XCTUnwrap(fixture.calls.first{$0.0 == "project_create"}?.1)
+            XCTAssertFalse(createClient.usesStoredCredential)
+            XCTAssertEqual(createClient.nativeContext?["native_session_id"] as? String,fixture.context.nativeSessionID)
+            XCTAssertEqual(createClient.workspace,fixture.context.workspacePath)
+            let full=try await session.client.listTools()
+            XCTAssertTrue(full.tools.contains{$0.name == "task_list"})
+            let task=try await session.client.callTool(name:"task_list")
+            XCTAssertEqual(task.isError,false)
+            let taskClient=try XCTUnwrap(fixture.calls.last{$0.0 == "task_list"}?.1)
+            XCTAssertTrue(taskClient.usesStoredCredential)
+            XCTAssertEqual(taskClient.installation,"synthetic-thread")
+            let frames=try await session.transport.frames().map{try JSONSerialization.jsonObject(with:$0) as! [String:Any]}
+            XCTAssertEqual(frames.filter{$0["method"] as? String == "notifications/tools/list_changed"}.count,1)
+        }
+    }
+
+    func testClaudeRegistryRecoveryInUnregisteredWorkspaceAdvertisesCreationOnce() async throws {
+        let fixture=try Fixture(provider:"claude")
+        fixture.unregisteredWorkspace=true;fixture.projectCreationEnabled=true
+        let session=try await start(fixture)
+        let initial=try await session.client.listTools()
+        XCTAssertEqual(initial.tools.map(\.name),["service_info"])
+        fixture.setDiscoveries([.available(fixture.context)])
+        // Recover through a status call so a cached client receives notification
+        // without first asking for another catalog.
+        let status=try await session.client.callTool(name:"service_info")
+        XCTAssertEqual(status.isError,false)
+        XCTAssertTrue(text(status.content).contains("project_setup_required"))
+        let tools=try await session.client.listTools()
+        XCTAssertEqual(tools.tools.map(\.name),["service_info","project_create"])
+        _ = try await session.client.listTools()
+        XCTAssertEqual(fixture.attempts.count,1)
+        XCTAssertFalse(fixture.calls.contains {$0.0 == "project_create" || $0.0 == "tool_catalog"})
+        let frames=try await session.transport.frames().map {try JSONSerialization.jsonObject(with:$0) as! [String:Any]}
+        XCTAssertEqual(frames.filter {$0["method"] as? String == "notifications/tools/list_changed"}.count,1)
+    }
+
+    func testFailedWorkspaceCreationKeepsLimitedCatalogWithoutNotification() async throws {
+        let fixture=try Fixture(provider:"codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        fixture.unregisteredWorkspace=true;fixture.projectCreationEnabled=true
+        fixture.callHandler={ name in if name == "project_create" {throw ChecklistError("ROOT_MISMATCH","Use the actual folder")} }
+        let session=try await start(fixture)
+        let result=try await session.client.callTool(name:"project_create",arguments:["command_id":.string(UUID().uuidString),"name":.string("Synthetic"),"key_prefix":.string("SYN"),"root_path":.string("/other")])
+        XCTAssertEqual(result.isError,true)
+        XCTAssertEqual(fixture.attempts.count,1)
+        let tools=try await session.client.listTools()
+        XCTAssertEqual(tools.tools.map(\.name),["service_info","project_create"])
+        let frames=try await session.transport.frames().map{try JSONSerialization.jsonObject(with:$0) as! [String:Any]}
+        XCTAssertEqual(frames.filter{$0["method"] as? String == "notifications/tools/list_changed"}.count,0)
+    }
+
+    func testCommittedCreationRetainsReceiptAndCompletesBootstrapOnNextRequest() async throws {
+        let fixture=try Fixture(provider:"codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        fixture.unregisteredWorkspace=true;fixture.projectCreationEnabled=true
+        fixture.bootstrapHandler={ _ in if fixture.attempts.count == 2 { throw ChecklistError("SERVICE_UNAVAILABLE","synthetic postcommit connection failure") } }
+        let session=try await start(fixture)
+        let created=try await session.client.callTool(name:"project_create",arguments:["command_id":.string(UUID().uuidString),"name":.string("Synthetic")])
+        XCTAssertEqual(created.isError,false)
+        XCTAssertTrue(text(created.content).contains("synthetic-project"))
+        XCTAssertTrue(text(created.content).contains("project_connection_pending"))
+        let full=try await session.client.listTools()
+        XCTAssertTrue(full.tools.contains{$0.name == "task_list"})
+        _ = try await session.client.listTools()
+        XCTAssertEqual(fixture.attempts.count,3)
+        XCTAssertEqual(fixture.calls.filter{$0.0 == "project_create"}.count,1)
+        let frames=try await session.transport.frames().map{try JSONSerialization.jsonObject(with:$0) as! [String:Any]}
+        XCTAssertEqual(frames.filter{$0["method"] as? String == "notifications/tools/list_changed"}.count,1)
     }
 
     private final class UpdateFixture: @unchecked Sendable {
