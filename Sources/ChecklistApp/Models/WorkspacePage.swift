@@ -59,17 +59,36 @@ struct WorkspacePage {
 /// late replies cannot install, and older pages are replaced rather than appended.
 @MainActor @Observable final class WorkspacePageObservation {
     var page: WorkspacePage?
+    private(set) var rows: [Record] = []
+    private(set) var retainedRequest: Record?
     var loading=false
     var error:String?
     private(set) var query:WorkspacePageQuery?
     private var generation=UUID()
     func begin(_ query:WorkspacePageQuery)->UUID {
-        if self.query != query {page=nil}
+        if self.query != query {page=nil;rows=[];retainedRequest=nil}
         self.query=query;generation=UUID();loading=true;error=nil;return generation
     }
     @discardableResult func receive(_ response:[String:Any],query:WorkspacePageQuery,generation:UUID)throws->Bool {
         guard self.generation==generation,self.query==query else{return false}
-        page=try WorkspacePage(response,query:query);loading=false;return true
+        var incoming = try WorkspacePage(response,query:query)
+        // Keep unchanged row values and publish rows only when their contents or order change.
+        // SwiftUI reconciles changed/inserted/removed rows using their stable record identities.
+        let existing = Dictionary(uniqueKeysWithValues: rows.map { (RecordIdentity($0.id), $0) })
+        incoming.rows = incoming.rows.map { row in
+            guard let old = existing[RecordIdentity(row.id)], Self.same([old], [row]) else { return row }
+            return old
+        }
+        if !Self.same(rows, incoming.rows) { rows = incoming.rows }
+        if query.surface == "record", let request = incoming.rows.first, request.string("record_type") == "request" {
+            retainedRequest = request
+        }
+        page=incoming;loading=false;return true
+    }
+    private static func same(_ lhs: [Record], _ rhs: [Record]) -> Bool {
+        guard let a = try? JSONSerialization.data(withJSONObject: lhs.map(\.values), options: .sortedKeys),
+              let b = try? JSONSerialization.data(withJSONObject: rhs.map(\.values), options: .sortedKeys) else { return false }
+        return a == b
     }
     func applyAnsweredRequest(_ record: Record) {
         guard var current = page, let index = current.rows.firstIndex(where: {
@@ -81,10 +100,17 @@ struct WorkspacePage {
         } else if current.query.surface == "record" {
             current.rows[index] = Record(values:current.rows[index].values.merging(record.values) { _,new in new })
         }
+        if !Self.same(rows, current.rows) { rows = current.rows }
+        if current.query.surface == "record" { retainedRequest = current.rows.first }
         page = current
     }
     func isCurrent(_ generation:UUID)->Bool {self.generation==generation}
     func fail(_ generation:UUID,message:String = "Could not load this page. Refresh to load it again; drafts are kept.") {guard self.generation==generation else{return};loading=false;error=message}
     func cancel(_ generation:UUID) {guard self.generation==generation else{return};cancel()}
-    func cancel(clear:Bool=false) {generation=UUID();loading=false;if clear {page=nil;query=nil;error=nil}}
+    func cancel(clear:Bool=false) {generation=UUID();loading=false;if clear {page=nil;rows=[];retainedRequest=nil;query=nil;error=nil}}
+}
+
+// Opaque record IDs are byte-exact; refreshed arrays must not define row identity.
+extension Record {
+    var workspaceIdentity: RecordIdentity { RecordIdentity(id) }
 }

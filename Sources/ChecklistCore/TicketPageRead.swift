@@ -221,15 +221,15 @@ extension CommandRouter {
           ) note_rows GROUP BY project_id,note_rows.tid
         )
         """
+        // Compatibility attention feeds health/context only; Active facets use category.
         let attention = ownerView ? "(json_extract(t.data,'$.active_attempt_id') IS NOT NULL OR json_extract(s.data,'$.category')='active' OR EXISTS (SELECT 1 FROM memberships m JOIN triages g ON g.id=m.gid AND g.project_id=m.project_id WHERE m.tid=t.id AND m.project_id=t.project_id AND COALESCE(json_extract(g.data,'$.archived'),0)=0 AND g.active))" : "0"
         let surface = ownerView ? "(:trashed=1 OR closed=:closed)" : "COALESCE(json_extract(data,'$.archived'),0)=:archived"
         let facets = ownerView ? """
-        (:status='all' OR status_id=:status COLLATE BINARY OR category=:status COLLATE BINARY
+        (:status='all' OR (:status<>'active' AND status_id=:status COLLATE BINARY) OR category=:status COLLATE BINARY
           OR (:status='archived' AND COALESCE(json_extract(data,'$.archived'),0)=1)
           OR (:status='done' AND category IN ('done','completed')) OR (:status='canceled' AND category IN ('canceled','\(LegacyStoredValue.canceled)'))
           OR (:status='draft' AND json_extract(data,'$.readiness')='draft' AND NOT closed)
-          OR (:status='ready' AND json_extract(data,'$.readiness')='ready' AND category='queued')
-          OR (:status='active' AND attention))
+          OR (:status='ready' AND json_extract(data,'$.readiness')='ready' AND category='queued'))
         AND (:tag='all' OR EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.tag_ids')) WHERE value=:tag COLLATE BINARY))
         AND \(ticketFacetSQL)
         """ : "(json_array_length(:statuses)=0 OR status_id IN (SELECT value FROM json_each(:statuses)))"
@@ -413,6 +413,12 @@ extension CommandRouter {
                 "page_member_ids":members,"members_complete":false,"active_attention":row["summary_active"] as Bool,
                 "status_state":uniform ? "uniform" : "mixed","status_id":status?["id"] ?? NSNull(),"status_name":status?["name"] ?? "Mixed","status_category":status?["category"] ?? "mixed"]
             for key in ["key","name","purpose","phase","archived"] { result[key] = source[key] ?? (key=="archived" ? false : "") }
+            // Display only: a bounded coordinator identity, never member work authority.
+            if let orchestration = source["orchestration"] as? JSON {
+                var display: JSON = [:]
+                for key in ["state", "actor_display", "session_id"] { display[key] = orchestration[key] as? String ?? "" }
+                result["orchestration"] = display
+            }
             byID[SnapshotRecordIdentity(gid)] = result
         }
         return groupIDs.compactMap { byID[SnapshotRecordIdentity($0)] }

@@ -162,6 +162,7 @@ extension CommandRouter {
     func assembledTaskProjection(_ task: JSON, status: JSON?, activeAttention: Bool, tags: [JSON], relation: JSON) -> JSON {
         var t = task
         if let status {t["status_name"] = status["name"];t["status_category"] = status["category"];t["status"] = status["name"]}
+        // Advisory handling context, not an Active membership/count flag (CL-215).
         t["active_attention"] = activeAttention;t["body"] = t["brief"];t["assignee"] = t["planned_assignee"];t["tags"] = tags
         for (key,value) in relation {t[key] = value}
         return t

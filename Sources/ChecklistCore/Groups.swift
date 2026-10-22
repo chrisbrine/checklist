@@ -14,6 +14,8 @@ extension CommandRouter {
             guard category == "review",task["current_manifest_id"] != nil else { throw CoreError("TRIAGE_PHASE_CONFLICT","A review Triage accepts only tickets currently in review with a submitted exact target. Create a separate implementation Triage for further fixes.") }
         } else { guard !["review","done","canceled"].contains(category) else { throw CoreError("TRIAGE_PHASE_CONFLICT","An implementation Triage accepts implementation work, including In Progress tickets. Submitted targets go into a separate review Triage; completed tickets remain outside active handling.") } }
     }
+    /// Legacy advisory handling signal: orchestration and member attempts count here.
+    /// It is not the Active section predicate; that uses each ticket's status category.
     func triageActiveAttention(_ db: Database,_ group: JSON) throws -> Bool {
         let pid = group["project_id"] as! String
         return try projectedTriageAttention(group,taskLookup:{try self.scoped(db,$0,pid,type:"task")},statusLookup:{try self.scoped(db,$0,pid,type:"status")})
@@ -27,6 +29,7 @@ extension CommandRouter {
         }
         return false
     }
+    /// Kept for agent compatibility and work health, including unclaimed Triage members.
     func taskActiveAttention(_ db: Database,_ task: JSON) throws -> Bool {
         let pid = task["project_id"] as! String
         return try projectedTaskAttention(task,statusLookup:{try self.scoped(db,$0,pid,type:"status")}) {

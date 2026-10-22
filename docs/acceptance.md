@@ -175,7 +175,7 @@ These are preserved future checks, not current release prerequisites or runnable
 ## Directed Triage passes
 
 - An already In Progress ticket can join an Implementation Triage without losing its actual claim or Epic. An actual authenticated Codex/Claude coordinator can start, checkpoint and finish orchestration without claiming member work on anyone's behalf.
-- Active attention includes both the ticket's own work and participation in actively orchestrated handling. Ended or unknown orchestration remains recovery-required; timeout never invents completion.
+- Owner decision, 22 October 2026 (CL-215): Active sections, counts and filters in the app and agent reads use only the ticket's own active status category (In progress). An orchestrated Triage with Queued, Review and In progress members shows only the In progress member under Active; Queued, Draft, Review, Blocked, Parked and Done never enter Active through membership. Verify the same counts without orchestration and the sidebar counts. Triage rows and detail still show orchestration and its actual coordinator. Advisory `active_attention` remains separate for work health. Ended or unknown orchestration remains recovery-required; timeout never invents completion.
 - Implementation and Review Triages remain separate. Submission leaves the implementation pass; review outcomes leave the review pass. Current exact target/gate guards apply to each ticket.
 - In a mixed review result, complete passing tickets independently under the default and retriage only failed or remaining work. An explicit project override may hold passes but never reimplements them or weakens their gates.
 

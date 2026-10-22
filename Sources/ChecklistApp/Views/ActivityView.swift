@@ -18,7 +18,7 @@ struct WorkspacePagingControls: View {
     @EnvironmentObject var store: ChecklistStore
     var body: some View {
         VStack(alignment:.leading,spacing: Spacing.compact) {
-            if store.workspaceLoading {ProgressView("Loading page…")}
+            if store.workspaceShowsLoading {ProgressView("Loading page…")}
             if let error=store.workspaceError {Text(error).checklistFont(.micro).foregroundStyle(.orange);Button("Refresh page") {store.retryWorkspacePage()}}
             AccessibleHStack {Text("\(store.workspaceRows.count) shown · \(store.workspaceTotal) matching").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText);Spacer();if let token=store.workspacePrevious {Button("Previous") {store.moveWorkspacePage(token)}};if let token=store.workspaceNext {Button("Next") {store.moveWorkspacePage(token)}}}.checklistDisabled([(store.workspaceLoading, "The page is still loading.")])
         }

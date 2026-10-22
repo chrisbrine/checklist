@@ -19,8 +19,9 @@ enum TicketVisibility {
     static func matchesStatus(_ task: Record, filter: String, activeTriageMembers: Set<String>) -> Bool {
         matchesStatus(task, filter: filter, activeTriageMember: activeTriageMembers.contains(task.id))
     }
-    static func matchesStatus(_ task: Record, filter: String, activeTriageMember: Bool) -> Bool {
-        if RecordIdentity(task.string("status_id")) == RecordIdentity(filter) { return true }
+    // Retain the legacy membership arguments for callers; attention never selects Active.
+    static func matchesStatus(_ task: Record, filter: String, activeTriageMember: Bool = false) -> Bool {
+        if filter != "active", RecordIdentity(task.string("status_id")) == RecordIdentity(filter) { return true }
         switch filter {
         case "all": return true
         case "archived": return task.bool("archived")
@@ -28,7 +29,7 @@ enum TicketVisibility {
         case "canceled": return Canceled.matches(task.string("status_category"))
         case "draft": return task.string("readiness") == "draft" && !isClosed(task)
         case "ready": return task.string("readiness") == "ready" && task.string("status_category") == "queued"
-        case "active": return task.string("status_category") == "active" || task.bool("active_attention") || activeTriageMember
+        case "active": return task.string("status_category") == "active"
         default: return task.string("status_category") == filter
         }
     }

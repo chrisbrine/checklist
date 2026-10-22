@@ -138,6 +138,7 @@ extension CommandRouter {
             value["deliveries"] = deliveries
             value["delivery_state"] = deliveries.first?["state"] ?? "saved_for_pickup"
         }
+        // Health deliberately includes orchestrated/unclaimed members, beyond Active status.
         if !bool(selected,"active_attention") {
             value["state"] = "inactive"; value["attention"] = false; value.removeValue(forKey:"next_check_at")
         }
@@ -227,7 +228,7 @@ extension CommandRouter {
                 var inspected = 0, changed = 0
                 for row in rows {
                     let task = try GRDBRecordEnvelopeAdapter.decode(row).object
-                    // Exact selected projection includes active member-derived Triage attention.
+                    // Advisory attention retains orchestration/sibling handling; it is not the Active filter.
                     if try bool(selectedTaskProjectionWithoutHealth(db, task: task), "active_attention") {
                         if try checkWorkHealth(db, task: task, at: date) { changed += 1 }; inspected += 1
                     }

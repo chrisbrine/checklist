@@ -4,6 +4,8 @@ struct NeedsYouView: View {
     @EnvironmentObject var store: ChecklistStore
     @State private var selected = 0
     @State private var showSnoozed = false
+    @State private var requestScrollID: RecordIdentity?
+    @State private var taskScrollID: RecordIdentity?
     var requests: [Record] {selected == 0 ? store.workspaceRows : []}
     var yourTasks: [Record] {selected == 1 ? store.workspaceRows : []}
     var body: some View {
@@ -18,7 +20,7 @@ struct NeedsYouView: View {
                 else {
                     ScrollView {
                         LazyVStack(spacing: Spacing.small) {
-                            ForEach(requests) { request in
+                            ForEach(requests, id: \.workspaceIdentity) { request in
                                 Button { store.open(.request(request.id)) } label: {
                                     AccessibleHStack(alignment: .top, spacing: Spacing.control) {
                                         Image(systemName: "bubble.left.and.bubble.right").checklistFont(.subheading).foregroundStyle(.orange).padding(.top, Spacing.tight)
@@ -44,13 +46,13 @@ struct NeedsYouView: View {
                                     }.checklistCard(padding: Spacing.group)
                                 }.buttonStyle(.checklistRow)
                             }
-                        }
-                    }
+                        }.scrollTargetLayout()
+                    }.scrollPosition(id: $requestScrollID, anchor: .top)
                 }
             } else {
                 WorkspacePagingControls()
                 if yourTasks.isEmpty { WorkspaceListState(symbol: "person.crop.circle.badge.checkmark", emptyTitle: "No tickets assigned to you", emptyDetail: "Tickets assigned to you stay separate from questions agents need answered.") }
-                else { ScrollView { LazyVStack { ForEach(yourTasks) { TaskRow(task: $0) } } } }
+                else { ScrollView { LazyVStack { ForEach(yourTasks, id: \.workspaceIdentity) { TaskRow(task: $0) } }.scrollTargetLayout() }.scrollPosition(id: $taskScrollID, anchor: .top) }
             }
         }.padding(Spacing.page)
         .focusedSceneValue(\.checklistTicketOrder, selected == 1 ? yourTasks.map(\.id) : [])

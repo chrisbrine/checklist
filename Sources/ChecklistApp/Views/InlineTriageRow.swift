@@ -29,7 +29,7 @@ struct InlineTriageRow: View {
                                 Text(section.triage.string("phase",fallback:"Choose phase").capitalized)
                                 Text("·")
                                 Text(section.visibleMembers.count == section.totalCount ? "\(section.totalCount) tickets" : "\(section.visibleMembers.count) of \(section.totalCount) tickets shown")
-                                if section.triage.bool("active_attention") { Text("· In progress") }
+                                if let label = section.orchestrationLabel { Text("· " + label) }
                             }.checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                         }
                     }.padding(.leading, Spacing.small).padding(.vertical, Spacing.small)

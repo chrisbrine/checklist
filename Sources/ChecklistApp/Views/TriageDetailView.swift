@@ -21,7 +21,7 @@ struct TriageDetailView: View {
                     Text(ProductionGroups.label(triage)).checklistFont(.title)
                     Text("\(store.projectName(projectID)) · \(triage.string("phase",fallback:"Choose phase").capitalized) · \(members.count) current tickets").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     Text("Tickets leave when this phase finishes. Implementation submission moves to Review; create a separate review Triage for those targets. Complete passing tickets and return only failed tickets to implementation.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-                    if triage.bool("active_attention") { Text("In progress · Active includes these tickets while this Triage or its actual coordinator is working.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+                    Text("Active includes only tickets whose own status is In progress. Triage orchestration does not change ticket status.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     if triage.bool("archived") { Text("Archived Triage · tickets and dispatched batches are preserved").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                 }
                 if triage.bool("phase_requires_selection") || members.isEmpty {

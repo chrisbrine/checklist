@@ -158,7 +158,7 @@ extension CommandRouter {
         switch surface {
         case "needs_review": return unarchived + " AND " + category + "='review' AND COALESCE(json_extract(r.data,'$.pending_policy_revision'),0)=0 AND " + free + " AND " + queuedReview
         case "needs_pickup": return unarchived + " AND json_extract(r.data,'$.readiness')='ready' AND " + category + "='queued' AND NOT " + ownerAssigned + " AND " + free
-        case "needs_active": return unarchived + " AND " + working + " AND COALESCE(" + category + ",'')<>'blocked' AND NOT " + lostSession + " AND NOT " + quiet
+        case "needs_active": return unarchived + " AND " + category + "='active' AND " + working + " AND NOT " + lostSession + " AND NOT " + quiet
         case "needs_quiet": return unarchived + " AND ((COALESCE(json_extract(r.data,'$.work_health.attention'),0)=1 AND NOT (" + working + ") AND " + unclaimedHealthActive + ") OR (" + working + " AND COALESCE(" + category + ",'')<>'blocked' AND NOT " + lostSession + " AND " + quiet + "))"
         case "needs_recovery": return unarchived + " AND (" + category + "='blocked' OR (" + working + " AND " + lostSession + "))"
         default: return open + " AND " + category + " IN ('done','completed') AND checklist_timestamp(json_extract(r.data,'$.completed_at'))>=:todayStart"

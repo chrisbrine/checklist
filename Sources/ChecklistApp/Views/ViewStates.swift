@@ -12,7 +12,7 @@ struct WorkspaceListState: View {
             EmptyView()
         } else if !store.workspacePageLoaded && store.showsOfflineBanner {
             EmptyState(symbol: "bolt.horizontal.circle", title: "Checklist is offline", detail: "This list loads when Checklist reconnects. Your drafts stay on this Mac.")
-        } else if store.workspaceLoading || !store.workspacePageLoaded {
+        } else if !store.workspacePageLoaded {
             ProgressView("Loading…").frame(maxWidth: .infinity).padding(.vertical, Spacing.group)
         } else {
             EmptyState(symbol: symbol, title: emptyTitle, detail: emptyDetail)

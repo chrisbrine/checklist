@@ -144,7 +144,7 @@ struct TicketPage {
             let summary = triage.values
             try Self.keys(summary, required: ["id", "project_id", "revision", "name", "purpose", "kind", "phase",
                 "archived", "active_attention", "status_state", "status_id", "status_name", "status_category",
-                "member_count", "matching_count", "page_member_ids", "members_complete"], optional:["key"], path: "triages.summary")
+                "member_count", "matching_count", "page_member_ids", "members_complete"], optional:["key", "orchestration"], path: "triages.summary")
             for field in ["name", "purpose", "phase", "status_state", "status_id", "status_name", "status_category"] {
                 _ = try Self.string(summary[field], path: "triages.\(field)")
             }
@@ -155,6 +155,13 @@ struct TicketPage {
             }
             _ = try Self.boolean(summary["archived"], path: "triages.archived")
             _ = try Self.boolean(summary["active_attention"], path: "triages.active_attention")
+            if let raw = summary["orchestration"] {
+                guard let orchestration = raw as? [String: Any] else { throw TicketPageError.invalid("triages.orchestration") }
+                try Self.keys(orchestration, required: ["state", "actor_display", "session_id"], path: "triages.orchestration")
+                for field in ["state", "actor_display", "session_id"] {
+                    _ = try Self.string(orchestration[field], path: "triages.orchestration.\(field)")
+                }
+            }
             let memberCount = try Self.integer(summary["member_count"], path: "triages.member_count")
             let matchingCount = try Self.integer(summary["matching_count"], path: "triages.matching_count")
             let ids = try Self.ids(summary["page_member_ids"], path: "triages.page_member_ids")

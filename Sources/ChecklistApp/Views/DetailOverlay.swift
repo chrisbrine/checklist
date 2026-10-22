@@ -20,11 +20,30 @@ struct DetailOverlay: View {
                     else if store.showsOfflineBanner || store.selectedTicketMissing {DetailUnavailable(symbol: "doc.text", title: "Ticket unavailable")}
                     else if let failure = store.selectedTicketError {VStack(spacing: Spacing.control) {Text(failure);Button("Retry ticket") {store.retrySelectedTicket()}}.padding(Spacing.group)}
                     else {ProgressView("Loading selected ticket…")}
+                } else if case .request(let id) = detail {
+                    // The form stays at the same structural identity while its record refreshes.
+                    VStack(spacing: Spacing.none) {
+                        if let error = store.otherDetailError {
+                            HStack { Text(error); Button("Retry detail") { store.retryOtherDetail() } }
+                                .checklistFont(.micro).foregroundStyle(.orange).padding(Spacing.control)
+                        }
+                        if store.otherDetailMissing {
+                            Text("This request is no longer available. Your unsent draft is kept.")
+                                .checklistFont(.callout).padding(Spacing.control)
+                        } else if store.requestNoLongerListed(id) {
+                            Text("This request is no longer in this Needs You view. Your draft is kept.")
+                                .checklistFont(.callout).padding(Spacing.control)
+                        }
+                        if let request = store.requestDetail(id) {
+                            RequestDetailView(request: request).id(id).checklistDisabled([(store.otherDetailMissing, "This request is no longer available. Your draft is kept.")])
+                        } else if store.otherDetailLoading { ProgressView("Loading current detail…") }
+                        else { DetailUnavailable(symbol: "bubble.left", title: "Request unavailable") }
+                    }
                 } else if store.otherDetailLoading {ProgressView("Loading current detail…")}
                 else if let error=store.otherDetailError {VStack(spacing: Spacing.control) {Text(error).multilineTextAlignment(.center);Button("Retry detail") {store.retryOtherDetail()}}.padding(Spacing.group)}
                 else {switch detail {
                 case .task: EmptyView()
-                case .request(let id): if let request = store.requests.first(where: { $0.id == id }) { RequestDetailView(request: request).id(id) } else { DetailUnavailable(symbol: "bubble.left", title: "Request unavailable") }
+                case .request: EmptyView()
                 case .project(let id): if let project = store.project(id) { ProjectSettingsView(project: project).id(id) } else { DetailUnavailable(symbol: "gearshape", title: "Project settings unavailable") }
                 case .group(let id): if let group = store.groups.first(where: { $0.id == id }) { if group.string("kind") == "epic" { EpicDetailView(epic: group).id(id) } else { TriageDetailView(triage: group).id(id) } } else { DetailUnavailable(symbol: "folder", title: "Epic or Triage unavailable") }
                 }}

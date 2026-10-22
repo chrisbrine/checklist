@@ -6,6 +6,13 @@ struct InlineTriageSection: Identifiable {
     let visibleMembers: [Record]
     let matchesGroupSearch: Bool
     var id: String { triage.id }
+    var orchestrationLabel: String? {
+        let orchestration = Record(values: triage.object("orchestration"))
+        guard orchestration.string("state") == "active" else { return nil }
+        let display = orchestration.string("actor_display")
+        let actor = display.isEmpty ? orchestration.string("session_id") : display
+        return actor.isEmpty ? "Being orchestrated" : "Orchestrated by " + actor
+    }
     var totalCount: Int { triage.values["members_complete"] as? Bool == false ? triage.integer("member_count", fallback: 0) : RecordIdentitySet(triage.strings("task_ids")).count }
 }
 
@@ -29,11 +36,10 @@ struct TicketListProjection {
         let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
         let hasFacets = statusFilter != "all" || tagFilter != "all"
         let notesByTask = query.isEmpty ? [:] : Dictionary(grouping: messages, by: { ScopedRecordIdentity(projectID: $0.string("project_id"), id: $0.string("task_id")) })
-        let activeTriageMembers = Set(groups.filter { $0.string("kind") == "triage" && !$0.bool("archived") && $0.bool("active_attention") }.flatMap { group in group.strings("task_ids").map { ScopedRecordIdentity(projectID: group.string("project_id"), id: $0) } })
         // The legacy archived parameter selects the explicit Done / Archived surface.
         let scope = tasks.filter { TicketVisibility.includes($0, showingClosed: archived) && inProject($0) }
         let facets = scope.filter { task in
-            let statusMatches = TicketVisibility.matchesStatus(task, filter: statusFilter, activeTriageMember: activeTriageMembers.contains(key(task)))
+            let statusMatches = TicketVisibility.matchesStatus(task, filter: statusFilter)
             return statusMatches && (tagFilter == "all" || task.strings("tag_ids").contains { RecordIdentity($0) == RecordIdentity(tagFilter) })
         }
         func matches(_ task: Record) -> Bool {

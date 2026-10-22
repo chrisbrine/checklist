@@ -154,17 +154,28 @@ final class ChecklistStore: ObservableObject {
     private var groupCandidatesRead: Task<Void,Never>?
     private var needsSurface = "requests"
     private var workspaceArchived = false
-    var workspaceRows: [Record] {workspaceObservation.page?.rows ?? []}
+    private var workspacePageIndex = 0
+    var workspaceRows: [Record] {workspaceObservation.rows}
     var workspaceTotal: Int {workspaceObservation.page?.total ?? 0}
     var workspaceLoading: Bool {workspaceObservation.loading}
     /// A page for the current workspace query has arrived; before that an empty list is not yet known to be empty.
     var workspacePageLoaded: Bool {workspaceObservation.page != nil}
+    var workspaceShowsLoading: Bool {workspaceLoading && !workspacePageLoaded}
     var workspaceError: String? {workspaceObservation.error}
     var workspaceNext: String? {workspaceObservation.page?.next}
     var workspacePrevious: String? {workspaceObservation.page?.previous}
     var otherDetailLoading: Bool {otherDetailObservation.loading}
     var otherDetailError: String? {otherDetailObservation.error}
-    var selectedOther: Record? {otherDetailObservation.page?.rows.first}
+    var selectedOther: Record? {otherDetailObservation.page?.rows.first ?? otherDetailObservation.retainedRequest}
+    var otherDetailMissing: Bool {otherDetailObservation.page?.rows.isEmpty == true && otherDetailObservation.retainedRequest != nil}
+    func requestDetail(_ id: String) -> Record? {
+        if let request = selectedOther, request.string("record_type") == "request", RecordIdentity(request.id) == RecordIdentity(id) { return request }
+        return startedLiveUpdates ? nil : records("requests").first { RecordIdentity($0.id) == RecordIdentity(id) }
+    }
+    func requestNoLongerListed(_ id: String) -> Bool {
+        page == .needsYou && needsSurface == "requests" && workspacePageLoaded &&
+            !workspaceRows.contains { RecordIdentity($0.id) == RecordIdentity(id) }
+    }
     var groupTaskRows: [Record] {groupTasksObservation.page?.rows ?? []}
     var groupTaskTotal: Int {groupTasksObservation.page?.total ?? 0}
     var groupTaskNext: String? {groupTasksObservation.page?.next}
@@ -229,7 +240,7 @@ final class ChecklistStore: ObservableObject {
     var tasks: [Record] { records("tasks") }
     var workSessions: [Record] { sessions.filter { $0.string("role") == "worker" } }
     var sessions: [Record] { records("sessions") }
-    var requests: [Record] { if startedLiveUpdates {return (selectedOther.map { $0.string("record_type")=="request" ? [$0] : [] } ?? []) + workspaceRows.filter {$0.string("record_type")=="request" && RecordIdentity($0.id) != selectedOther.map {RecordIdentity($0.id)}}};return records("requests") }
+    var requests: [Record] { if startedLiveUpdates {return (selectedOther.map { $0.string("record_type")=="request" && !otherDetailMissing ? [$0] : [] } ?? []) + workspaceRows.filter {$0.string("record_type")=="request" && RecordIdentity($0.id) != selectedOther.map {RecordIdentity($0.id)}}};return records("requests") }
     var groups: [Record] { if startedLiveUpdates {return (selectedOther.map {$0.string("record_type")=="group" ? [$0] : []} ?? []) + workspaceRows.filter {$0.string("record_type")=="group" && RecordIdentity($0.id) != selectedOther.map {RecordIdentity($0.id)}}};return records("groups") }
     var currentProject: Record? { projectID.flatMap { project($0) } }
     var outstandingRequests: [Record] { requests.filter { !["answered", "canceled", "superseded", "resolved"].contains(Canceled.normalized($0.string("state"))) } }
@@ -547,7 +558,10 @@ final class ChecklistStore: ObservableObject {
         if let surface {needsSurface=surface};if let archived {workspaceArchived=archived}
         scheduleWorkspacePage(force:true)
     }
-    func moveWorkspacePage(_ cursor:String) {scheduleWorkspacePage(cursor:cursor,force:true)}
+    func moveWorkspacePage(_ cursor:String) {
+        let index = cursor == workspaceNext ? workspacePageIndex + 1 : max(0,workspacePageIndex - 1)
+        scheduleWorkspacePage(cursor:cursor,force:true,pageIndex:index)
+    }
 
     // CL-53: Overview groups by what needs the owner. Each group is one small page with its exact
     // total from existing records; "Show all" pages one group. "human_tasks" only keeps the Needs You count.
@@ -683,19 +697,38 @@ final class ChecklistStore: ObservableObject {
         return !Task.isCancelled
     }
     func retryWorkspacePage() {scheduleWorkspacePage(force:true)}
-    private func scheduleWorkspacePage(cursor:String? = nil,force:Bool=false) {
+    private func scheduleWorkspacePage(cursor:String? = nil,force:Bool=false,pageIndex:Int? = nil) {
         guard startedLiveUpdates,!restoringPreferences,!usesTicketPages else{return}
         if page == .overview {scheduleOverviewNeeds(force:force);return}
         guard force || workspaceObservation.query != workspaceQuery || workspaceObservation.page == nil && !workspaceObservation.loading else{return}
         workspaceRead?.cancel()
-        workspaceRead=Task {[weak self] in _ = await self?.readWorkspacePage(cursor:cursor)}
+        workspaceRead=Task {[weak self] in _ = await self?.readWorkspacePage(cursor:cursor,pageIndex:pageIndex)}
     }
-    @discardableResult private func readWorkspacePage(cursor:String?) async -> Bool {
-        let query=workspaceQuery,id=workspaceObservation.begin(workspaceQuery)
+    @discardableResult private func readWorkspacePage(cursor:String?,pageIndex:Int? = nil) async -> Bool {
+        let query=workspaceQuery
+        let targetIndex = pageIndex ?? (workspaceObservation.query == query && workspaceObservation.page != nil ? workspacePageIndex : 0)
+        let id=workspaceObservation.begin(query)
+        func current() -> Bool { !Task.isCancelled && !usesTicketPages && workspaceQuery == query && workspaceObservation.isCurrent(id) }
         do {
-            let response=try await request("workspace_page",query.parameters(cursor:cursor))
-            guard !Task.isCancelled,!usesTicketPages,workspaceQuery==query else{return false}
+            var response: [String:Any]
+            var index = cursor == nil ? 0 : targetIndex
+            do { response = try await request("workspace_page",query.parameters(cursor:cursor)) }
+            catch {
+                guard current(), cursor != nil, (error as? ChecklistError)?.code == "CURSOR_RESET" else { throw error }
+                index = 0
+                response = try await request("workspace_page",query.parameters())
+            }
+            // Workspace cursors include event coverage and expire after a change. Re-seek the
+            // current page with fresh tokens, keeping all intermediate pages off screen.
+            while current(), index < targetIndex {
+                let page = try WorkspacePage(response,query:query)
+                guard let next = page.next else { break }
+                response = try await request("workspace_page",query.parameters(cursor:next))
+                index += 1
+            }
+            guard current() else {return false}
             if try workspaceObservation.receive(response,query:query,generation:id) {
+                workspacePageIndex = index
                 acceptServiceRead();if eventCursor == nil {eventCursor=response["event_cursor"] as? String ?? workspaceObservation.page?.contentCursor}
             }
         } catch {if isReadCancellation(error) {workspaceObservation.cancel(id);return false} else {connectionAttempted = true;workspaceObservation.fail(id)}}
@@ -1344,8 +1377,8 @@ final class ChecklistStore: ObservableObject {
                     // new interval; ordinary reads never skip unseen events.
                     eventCursor=nil
                     invalidateSelectedTicketFreshness()
-                    workspaceRead?.cancel();workspaceObservation.cancel(clear:true)
-                    otherDetailRead?.cancel();otherDetailObservation.cancel(clear:true)
+                    workspaceRead?.cancel();workspaceObservation.cancel()
+                    otherDetailRead?.cancel();otherDetailObservation.cancel()
                     groupTasksRead?.cancel();groupTasksObservation.cancel(clear:true)
                     groupCandidatesRead?.cancel();groupCandidatesObservation.cancel(clear:true)
                     recordHistoryRead?.cancel();recordHistoryObservation.cancel(clear:true)
