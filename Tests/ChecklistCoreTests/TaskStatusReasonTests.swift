@@ -122,3 +122,95 @@ extension CoreTests {
         XCTAssertEqual(Set(cleared.keys),["id","key","revision"])
     }
 }
+
+
+extension CoreTests {
+    func testStatusReasonRecoverySetsAttributedReasonInEveryProjectionAndHistory() throws {
+        let p = try project(), initial = try ready(p,task(p))
+        let scope: JSON = ["project_id":p["id"]!,"task_id":initial["id"]!]
+        let claim = try call("work_claim",scope.merging(["expected_revision":initial["revision"]!,"phase":"implementation"]) {_,new in new})
+        let text = "Waiting for owner to inspect recovered output"
+        let recovered = try call("work_recover",scope.merging([
+            "expected_revision":(claim["task"] as! JSON)["revision"]!,"attempt_id":claim["id"]!,
+            "action":"confirm_stopped_revoke","reason":text,
+            "observation_refs":["Synthetic fixture: no native writer launched"],
+            "file_state_refs":["Synthetic fixture: no source output"]
+        ]) {_,new in new})
+        XCTAssertEqual(recovered["status_category"] as? String,"blocked")
+        let reason = try XCTUnwrap(recovered["status_reason"] as? JSON)
+        XCTAssertEqual(reason["text"] as? String,text)
+        XCTAssertEqual(reason["actor"] as? String,owner.principal)
+        XCTAssertEqual(reason["actor_display"] as? String,"You")
+        let sources: [JSON] = [
+            try call("task_get",scope),
+            try call("task_context",scope)["task"] as! JSON,
+            try call("task_context",scope.merging(["detail_level":"ui"]) {_,new in new})["task"] as! JSON,
+            (try call("task_list",["project_id":p["id"]!])["tasks"] as! [JSON]).first!
+        ]
+        for task in sources { XCTAssertEqual(try jsonString(task["status_reason"] as! JSON),try jsonString(reason)) }
+        let history = try call("history_list",scope)["events"] as! [JSON]
+        let event = try XCTUnwrap(history.first {$0["kind"] as? String == "claim_revoked"})
+        XCTAssertEqual((event["data"] as? JSON)?["reason"] as? String,text)
+        XCTAssertEqual(reason["at"] as? String,event["occurred_at"] as? String)
+        _ = try call("task_transition",scope.merging(["expected_revision":recovered["revision"]!,"action":"queue"]) {_,new in new})
+        XCTAssertNil(try call("task_get",scope)["status_reason"])
+        XCTAssertTrue((try call("history_list",scope)["events"] as! [JSON]).contains {($0["data"] as? JSON)?["reason"] as? String == text})
+    }
+
+    func testStatusReasonRetireRemapClearsLegacyReleaseInSameCategory() throws {
+        let p = try project(), t = try ready(p,task(p)), pid = p["id"] as! String, tid = t["id"] as! String
+        let scope: JSON = ["project_id":pid,"task_id":tid]
+        try router.dbQueue.write {db in
+            // Old-format history exists only in this owned temporary test store.
+            try db.execute(sql:"INSERT INTO events(id,project_id,entity_id,actor,kind,occurred_at,data) VALUES (?,?,?,?,?,?,?)",arguments:[UUID().uuidString,pid,tid,"legacy:worker","work_released","2026-10-22T20:00:00Z","{\"reason\":\"Old release must clear after remap\"}"])
+        }
+        XCTAssertEqual((try call("task_get",scope)["status_reason"] as? JSON)?["text"] as? String,"Old release must clear after remap")
+        let statuses = try call("taxonomy_get",["project_id":pid])["statuses"] as! [JSON]
+        let old = try XCTUnwrap(statuses.first {$0["id"] as? String == t["status_id"] as? String})
+        let target = try call("status_create",["project_id":pid,"name":"Another queue","category":"queued","sort_order":20])
+        _ = try call("status_retire",["project_id":pid,"status_id":old["id"]!,"expected_revision":old["revision"]!,"remap_target_status_id":target["id"]!,"expected_task_revisions":[tid:t["revision"]!]])
+        let remapped = try call("task_get",scope)
+        XCTAssertEqual(remapped["status_id"] as? String,target["id"] as? String)
+        XCTAssertEqual(remapped["status_category"] as? String,"queued")
+        XCTAssertNil(remapped["status_reason"])
+        XCTAssertNil((try call("task_context",scope)["task"] as! JSON)["status_reason"])
+        let history = try call("history_list",scope)["events"] as! [JSON]
+        XCTAssertTrue(history.contains {$0["kind"] as? String == "status_remapped" && ($0["data"] as? JSON)?["reason"] == nil})
+        XCTAssertTrue(history.contains {($0["data"] as? JSON)?["reason"] as? String == "Old release must clear after remap"})
+    }
+
+    func testStatusReasonEveryStatusEventSetsOrClearsWithoutRevivingEarlierReason() throws {
+        // Independent inventory from the status writers, including legacy status_changed.
+        // Batch/Triage use work_* / task_transitioned / task_completed per member;
+        // passing agent and human verdicts that change status also emit task_completed.
+        let kinds = ["task_transitioned","status_changed","status_remapped","work_claimed",
+                     "work_released","work_submitted","claim_revoked","work_released_native_closure",
+                     "review_requested","review_reject","human_approval_reject","task_completed"]
+        XCTAssertEqual(Set(CommandRouter.ticketStatusEventKinds),Set(kinds))
+        let p = try project(), t = try ready(p,task(p)), pid = p["id"] as! String, tid = t["id"] as! String
+        try router.dbQueue.write {db in
+            for kind in kinds {
+                for reason in [nil, "", " \n\t", "Current reason from " + kind] as [String?] {
+                    try router.event(db,caller:owner,project:pid,entity:tid,kind:"work_released",data:["reason":"Earlier reason"])
+                    var data: JSON = [:];data["reason"] = reason
+                    try router.event(db,caller:owner,project:pid,entity:tid,kind:kind,data:data)
+                    let current = try router.currentStatusReason(db,task:t)
+                    if let reason, !reason.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty {
+                        XCTAssertEqual(current?["text"] as? String,reason,kind)
+                        XCTAssertEqual(current?["actor"] as? String,owner.principal,kind)
+                        XCTAssertEqual(current?["actor_display"] as? String,"You",kind)
+                        XCTAssertNotNil(current?["at"],kind)
+                    } else { XCTAssertNil(current,kind) }
+                }
+            }
+            // These change visibility, ownership or review records, not ticket status.
+            // A pass that really completes is covered by task_completed above.
+            for kind in ["task_archive","task_unarchive","task_trash","task_restore","work_taken_over",
+                         "review_pass","human_approval_pass","review_blocked","review_evidence_missing","review_not_run"] {
+                try router.event(db,caller:owner,project:pid,entity:tid,kind:"work_released",data:["reason":"Keep current status reason"])
+                try router.event(db,caller:owner,project:pid,entity:tid,kind:kind,data:["reason":"Other action reason"])
+                XCTAssertEqual(try router.currentStatusReason(db,task:t)?["text"] as? String,"Keep current status reason",kind)
+            }
+        }
+    }
+}

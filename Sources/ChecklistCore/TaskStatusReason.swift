@@ -2,9 +2,15 @@ import Foundation
 import GRDB
 
 extension CommandRouter {
-    // Status boundaries, including transitions without reasons, prevent an older
-    // explanation from resurfacing after claim, submit, recovery or completion.
-    static let ticketStatusEventKinds = ["task_transitioned", "status_changed", "work_released", "work_claimed", "work_submitted", "task_completed", "claim_revoked", "work_released_native_closure", "review_requested", "review_reject", "human_approval_reject"]
+    // Every ticket status boundary uses the same rule: its nonblank reason is
+    // current, or no reason clears the previous explanation. Batch and Triage
+    // handlers emit these per-ticket events too; group events are not boundaries.
+    static let ticketStatusEventKinds = [
+        "task_transitioned", "status_changed", "status_remapped",
+        "work_claimed", "work_released", "work_submitted", "claim_revoked",
+        "work_released_native_closure", "review_requested", "review_reject",
+        "human_approval_reject", "task_completed"
+    ]
 
     func currentStatusReason(_ db: Database, task: JSON) throws -> JSON? {
         guard let pid = task["project_id"] as? String, let tid = task["id"] as? String else { return nil }
@@ -14,8 +20,7 @@ extension CommandRouter {
         let arguments: [DatabaseValueConvertible] = [Data(pid.utf8), Data(tid.utf8)] + Self.ticketStatusEventKinds
         guard let row = try Row.fetchOne(db, sql: "SELECT actor,kind,occurred_at,data FROM events WHERE project_id=CAST(? AS TEXT) AND entity_id=CAST(? AS TEXT) AND kind IN (" + kinds + ") ORDER BY seq DESC LIMIT 1", arguments: StatementArguments(arguments)) else { return nil }
         let data = jsonObject(row["data"]), kind: String = row["kind"]
-        guard ["task_transitioned", "status_changed", "work_released"].contains(kind),
-              let reason = data["reason"] as? String, !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        guard let reason = data["reason"] as? String, !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         if let target = data["to_status_id"] as? String {
             guard EnvelopeStorageIdentity.equal(target, task["status_id"] as? String ?? "") else { return nil }
         } else if kind == "work_released" {
