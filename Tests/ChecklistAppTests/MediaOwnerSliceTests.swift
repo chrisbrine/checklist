@@ -10,6 +10,7 @@ import CryptoKit
         var types:[MediaValues]=[]
         var rows:[MediaValues]=[]
         var secondPage:[MediaValues]=[]
+        var roundRecords:[MediaValues]=[]
         var token="context-1",basis="basis-1",target="target-1"
         var reject=false
         var pending:[String:String]=[:]
@@ -20,6 +21,14 @@ import CryptoKit
             let value:MediaValues
             switch method {
             case "media_navigation":value=["types":types]
+            case "media_round_create":
+                let round:MediaValues=["id":"round-c","title":params["title"]!,"state":"draft","revision":1]
+                roundRecords.append(round);value=round
+            case "media_round_page" where !roundRecords.isEmpty:
+                let matches=roundRecords.filter {$0["state"] as? String == params["state"] as? String}
+                value=["rows":Array(matches.dropFirst(params["offset"] as? Int ?? 0).prefix(100)),"has_more":false]
+            case "media_round_header" where !roundRecords.isEmpty:
+                value=roundRecords.first {$0["id"] as? String == params["round_id"] as? String} ?? [:]
             case "media_round_page":value=["rows":[["id":"round","title":"Synthetic round","state":"open"]],"has_more":false]
             case "media_round_header":value=["id":"round","title":"Synthetic round","state":"open","revision":1,"observed_context_token":token,"manifest":["id":"manifest","digest":"digest"],"type_revision":["schema":schema],"attention":[],"attention_ids":[]]
             case "media_publication_preview":
@@ -66,6 +75,27 @@ import CryptoKit
         XCTAssertEqual(model.enabledTypes.map(\.id),["animation","story"])
         XCTAssertEqual(model.typeID,"animation");XCTAssertEqual(store.page,.tasks)
         XCTAssertEqual(Page.tasks.title,"Tickets");XCTAssertEqual(Page.epics.title,"Epics")
+    }
+    func testCreatingDraftRoundFromOpenFilterSelectsDraftAndPickerChoice() async throws {
+        let (peer,store,_,_)=fixture();let model=await setup(peer,store)
+        peer.roundRecords=[["id":"round-b","title":"Round B","state":"open","revision":1]]
+        model.roundState="open";model.roundID="round-b";await model.refresh()
+        XCTAssertEqual(model.rounds.first?.string("title"),"Round B")
+        model.roundOffset=100
+        store.connected=true;peer.calls=[]
+        var title="Round C"
+        model.createRound(title:title) {title=""}
+        try await settle {model.header.id=="round-c" && !model.loading && !store.busy}
+        XCTAssertEqual(title,"")
+        XCTAssertEqual(model.roundState,"draft")
+        XCTAssertEqual(model.roundOffset,0)
+        XCTAssertEqual(model.roundID,"round-c")
+        XCTAssertEqual(model.header.string("state"),"draft")
+        XCTAssertEqual(model.rounds.first {$0.id==model.roundID}?.string("title"),"Round C", "The selected ID must have the new title in the picker options")
+        let creates=peer.calls.filter {$0.0=="media_round_create"}
+        XCTAssertEqual(creates.count,1)
+        XCTAssertEqual(creates.first?.1["title"] as? String,"Round C")
+        XCTAssertEqual(creates.first?.1["type_id"] as? String,"animation")
     }
     func row(_ id:String,_ direction:String) -> MediaValues {
         ["id":id,"title":"Hero walk "+direction,"disposition":"pending","metadata":["direction":direction],"group_path":[["field_id":"character","value":"Hero","item_count":2],["field_id":"animation_label","value":"walk","item_count":2]]]
@@ -157,8 +187,8 @@ import CryptoKit
         XCTAssertTrue(pending!.effect.contains("originals"))
         XCTAssertTrue(pending!.effect.contains("history"))
         XCTAssertTrue(peer.calls.isEmpty, "Opening the dialog must not send the command")
-        pending!.respond(confirmed:false)
-        pending=nil // The native dialog dismisses on Cancel or Escape.
+        PendingConfirmation.resolve(Binding(get:{pending},set:{pending=$0}),confirmed:false)
+        XCTAssertNil(pending, "The shared Escape/Keep path dismisses the confirmation")
         await Task.yield()
         XCTAssertTrue(peer.calls.isEmpty, "Cancel must send nothing")
         XCTAssertFalse(store.busy)
@@ -251,7 +281,8 @@ import CryptoKit
         XCTAssertTrue(workspace.contains("TechnicalDetails(raw: [(\"Round\",model.header.values)"))
         for technical in [" · Revision ","intake.id.prefix(","row.string(\"target_id\")"] {XCTAssertFalse(workspace.contains(technical),technical)}
         let dialogs=try String(contentsOf:root.appendingPathComponent("Support/Confirmations.swift"),encoding:.utf8)
-        XCTAssertTrue(dialogs.contains("role: .cancel) { item.respond(confirmed: false) }.keyboardShortcut(.defaultAction)"))
+        XCTAssertTrue(dialogs.contains(".onExitCommand { PendingConfirmation.resolve(pending, confirmed: false) }"))
+        XCTAssertTrue(workspace.contains("model.createRound(title:roundTitle)"))
         let details=try String(contentsOf:root.appendingPathComponent("Support/TechnicalDetails.swift"),encoding:.utf8)
         XCTAssertTrue(details.contains("DisclosureGroup(\"Technical details\")"))
         XCTAssertFalse(details.contains("isExpanded:"),"Shared technical details start collapsed")

@@ -13,6 +13,12 @@ struct PendingConfirmation: Identifiable {
     var cancelIsDefault = false
 
     func respond(confirmed: Bool) { if confirmed { perform() } }
+
+    static func resolve(_ pending: Binding<PendingConfirmation?>, confirmed: Bool) {
+        let item = pending.wrappedValue
+        pending.wrappedValue = nil
+        item?.respond(confirmed: confirmed)
+    }
 }
 
 /// The same action has the same confirmation wherever it appears.
@@ -85,14 +91,28 @@ enum Confirmations {
 
 extension View {
     func checklistConfirmation(_ pending: Binding<PendingConfirmation?>) -> some View {
-        confirmationDialog(pending.wrappedValue?.title ?? "", isPresented: Binding(get: { pending.wrappedValue != nil }, set: { if !$0 { pending.wrappedValue = nil } }),
-                           titleVisibility: .visible, presenting: pending.wrappedValue) { item in
+        let dialog = Binding<PendingConfirmation?>(get: { pending.wrappedValue?.cancelIsDefault == false ? pending.wrappedValue : nil },
+                                                   set: { pending.wrappedValue = $0 })
+        let safeDefault = Binding<PendingConfirmation?>(get: { pending.wrappedValue?.cancelIsDefault == true ? pending.wrappedValue : nil },
+                                                        set: { pending.wrappedValue = $0 })
+        return confirmationDialog(dialog.wrappedValue?.title ?? "", isPresented: Binding(get: { dialog.wrappedValue != nil }, set: { if !$0 { dialog.wrappedValue = nil } }),
+                                  titleVisibility: .visible, presenting: dialog.wrappedValue) { item in
             Button(item.confirmLabel, role: .destructive) { item.respond(confirmed: true) }
-            if item.cancelIsDefault {
-                Button(item.keepLabel, role: .cancel) { item.respond(confirmed: false) }.keyboardShortcut(.defaultAction)
-            } else {
-                Button(item.keepLabel, role: .cancel) { item.respond(confirmed: false) }
-            }
+            Button(item.keepLabel, role: .cancel) { item.respond(confirmed: false) }
         } message: { item in Text(item.effect) }
+        .sheet(item: safeDefault) { item in
+            VStack(alignment: .leading, spacing: Spacing.group) {
+                Text(item.title).checklistFont(.sheetTitle)
+                Text(item.effect).checklistFont(.callout)
+                AccessibleHStack {
+                    Button(item.keepLabel) { PendingConfirmation.resolve(pending, confirmed: false) }.keyboardShortcut(.defaultAction)
+                    Spacer()
+                    Button(item.confirmLabel, role: .destructive) { PendingConfirmation.resolve(pending, confirmed: true) }
+                }.buttonStyle(.checklistBordered)
+            }.padding(Spacing.page).checklistSheet(width: 520)
+            // A native dialog button can have only one shortcut. Keep Return safe
+            // and handle Escape separately, through the same cancellation path.
+            .onExitCommand { PendingConfirmation.resolve(pending, confirmed: false) }
+        }
     }
 }

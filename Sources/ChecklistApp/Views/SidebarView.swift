@@ -21,7 +21,7 @@ struct SidebarView: View {
                     ForEach(store.activeProjects) { project in
                         Button { store.select(.tasks, project: project.id) } label: {
                             HStack(spacing: Spacing.row) {
-                                ProjectIcon(project: project)
+                                ProjectIcon(project: project, size: 20)
                                 Text(project.string("name")).lineLimit(1)
                                 Spacer(minLength: 0)
                             }.checklistFont(.body).padding(.vertical, Spacing.compact).padding(.horizontal, Spacing.tight)
@@ -72,7 +72,7 @@ struct SidebarView: View {
         AccessibleHStack(spacing: Spacing.row) {
             Button { store.select(.tasks, project: project.id) } label: {
                 HStack(spacing: Spacing.row) {
-                    ProjectIcon(project: project).opacity(0.6)
+                    ProjectIcon(project: project, size: 20).opacity(0.6)
                     Text(project.string("name")).lineLimit(1).foregroundStyle(Color.checklistSecondaryText)
                     Spacer(minLength: 0)
                 }.checklistFont(.body).padding(.vertical, Spacing.compact).padding(.horizontal, Spacing.tight)

@@ -109,7 +109,7 @@ struct MediaReviewWorkspace: View {
                 }
                 if !model.historyOnly {HStack {
                     TextField("New round title",text:$roundTitle)
-                    Button("Add Draft round") {model.mutate("media_round_create",["type_id":model.typeID,"title":roundTitle]) {result in roundTitle="";model.chooseRound(result["id"] as! String)}}.checklistDisabled([(roundTitle.isEmpty,"Enter a round title."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
+                    Button("Add Draft round") {model.createRound(title:roundTitle) {roundTitle=""}}.checklistDisabled([(roundTitle.isEmpty,"Enter a round title."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
                 }}
                 if let error=model.error {Text(error).foregroundStyle(.orange).textSelection(.enabled)}
                 if model.loading {ProgressView("Refreshing media review")}

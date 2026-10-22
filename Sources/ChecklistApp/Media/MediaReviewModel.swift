@@ -124,6 +124,14 @@ typealias MediaValues = [String: Any]
             error=nil
         } catch {if epoch==token {self.error=PlainError.text(error)}}
     }
+    func createRound(title: String, then: @escaping () -> Void = {}) {
+        mutate("media_round_create", ["type_id":typeID,"title":title]) { [weak self] result in
+            guard let self else { return }
+            then()
+            self.roundState="draft";self.roundOffset=0
+            self.chooseRound(result["id"] as! String)
+        }
+    }
     func chooseType(_ id: String) {saveDraft();roundOffset=0;typeID=id;list=[:];roundID="";selectedID="";rows=[];header=Record(values:[:]);item=Record(values:[:]);intake=Record(values:[:]);publication=[];Task {await refresh()}}
     func chooseRound(_ id: String) {saveDraft();roundID=id;selectedID="";rows=[];item=Record(values:[:]);publication=[];intake=Record(values:[:]);contextConflict=false;Task {await refresh()}}
     private func loadRound(token: UUID) async throws {

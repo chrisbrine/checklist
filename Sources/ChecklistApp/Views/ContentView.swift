@@ -58,7 +58,11 @@ struct ContentView: View {
             ToolbarItem(placement: .navigation) {
                 Menu {
                     Button("All projects") { store.select(.tasks) }
-                    ForEach(store.activeProjects) { project in Button(project.string("name")) { store.select(.tasks, project: project.id) } }
+                    ForEach(store.activeProjects) { project in
+                        Button { store.select(.tasks, project: project.id) } label: {
+                            Label { Text(project.string("name")) } icon: { ProjectIcon(project: project, size: 18) }
+                        }
+                    }
                     Divider()
                     Button("New Project…") { store.showNewProject = true }
                     if let id = store.projectID { Button("Project Settings…") { store.open(.project(id)) } }
