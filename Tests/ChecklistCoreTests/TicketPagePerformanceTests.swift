@@ -2,7 +2,7 @@ import XCTest
 import GRDB
 @testable import ChecklistCore
 
-/// Four new affected controls for the measured page correction; not executed.
+/// Synthetic controls for the measured owner and worker page projections.
 final class TicketPagePerformanceTests: XCTestCase {
     private var directory: URL!
     private var router: CommandRouter!
@@ -22,7 +22,15 @@ final class TicketPagePerformanceTests: XCTestCase {
         if !CommandRouter.readMethods.contains(method) { p["command_id"] = UUID().uuidString }
         return try router.handle(method:method,params:p,caller:caller ?? owner)["data"] as! JSON
     }
-    private func save(_ row: JSON,_ type: String) throws { try router.dbQueue.write {try router.save($0,row,type:type)} }
+    private func save(_ row: JSON,_ type: String) throws {
+        // Status/task/group fixtures use the same complete domain boundary as commands.
+        try router.dbQueue.writeWithoutTransaction { db in
+            try router.withValidatedDomainTransaction(db) {
+                try router.save(db,row,type:type)
+                return .commit
+            }
+        }
+    }
     private func task(_ id: String, status: String = "q", activeAttempt: Bool = false) throws {
         var row: JSON = ["id":id,"project_id":pid,"title":id,"key":id,"brief":"Synthetic brief","status_id":status,"revision":1,"readiness":"ready","order":1,"archived":false,"trashed":false,"tag_ids":[String](),"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"]
         if activeAttempt { row["active_attempt_id"] = "synthetic-attempt" }
@@ -35,10 +43,13 @@ final class TicketPagePerformanceTests: XCTestCase {
     }
     private func trace(_ body: () throws -> JSON) throws -> (JSON,[String]) {
         var statements: [String] = []
-        router.dbQueue.writeWithoutTransaction { db in
+        // CL-72 moved task_list to the read-only pool. This sequential fixture
+        // has one reader; tracing the writer observes none of the page queries.
+        let readers = try XCTUnwrap(router.readers)
+        try readers.read { db in
             db.trace(options:[.statement]) { if case .statement(let statement) = $0 { statements.append(statement.sql) } }
         }
-        defer { router.dbQueue.writeWithoutTransaction {$0.trace(nil)} }
+        defer { try? readers.read {$0.trace(nil)} }
         return (try body(),statements)
     }
 
@@ -110,8 +121,11 @@ final class TicketPagePerformanceTests: XCTestCase {
         XCTAssertTrue(tasks.allSatisfy {$0["active_attention"] as? Bool == true})
         XCTAssertEqual(tasks[0]["prerequisites_satisfied"] as? Bool,true)
         XCTAssertEqual(tasks[1]["prerequisites_satisfied"] as? Bool,false)
-        XCTAssertEqual(sql.filter {$0=="SELECT type,data FROM records WHERE id=?"}.count <= 20,true,"Point reads must not grow with member-by-task projection")
-        XCTAssertEqual(sql.filter {$0=="SELECT data FROM records WHERE type=? AND project_id=? ORDER BY rowid"}.count,1,"Group corpus loads once per request")
+        // Canonical reads include envelope witnesses and byte-exact CAST bindings.
+        let pointReads = sql.filter {$0.contains(" FROM records WHERE id = CAST(? AS TEXT)")}
+        XCTAssertLessThanOrEqual(pointReads.count,20,"Point reads must not grow with member-by-task projection")
+        let groupRead = "SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE type = CAST(? AS TEXT) AND project_id = CAST(? AS TEXT) ORDER BY rowid"
+        XCTAssertEqual(sql.filter {$0 == groupRead}.count,1,"Group corpus loads once per request")
         XCTAssertTrue(tasks.allSatisfy {$0["completion_eligibility"] == nil})
     }
 

@@ -42,7 +42,8 @@ extension CoreTests {
         XCTAssertFalse(bool(queued,"pickup_eligible"))
         let done = try completeRelationFixture(p,prerequisite)
         let unblocked = try currentRelationTask(p,source);XCTAssertTrue(bool(unblocked,"pickup_eligible"))
-        _ = try call("task_transition",["project_id":p["id"]!,"task_id":done["id"]!,"expected_revision":done["revision"]!,"action":"reopen"])
+        // docs/operations.md: reopen creates a new round with a reason; earlier evidence remains.
+        _ = try call("task_transition",["project_id":p["id"]!,"task_id":done["id"]!,"expected_revision":done["revision"]!,"action":"reopen","reason":"Recheck pickup when the prerequisite needs another round"])
         let reopened = try currentRelationTask(p,source)
         XCTAssertTrue(bool(reopened,"queue_eligible"));XCTAssertFalse(bool(reopened,"pickup_eligible"))
         XCTAssertEqual(reopened["status_id"] as? String,queued["status_id"] as? String)
@@ -70,7 +71,8 @@ extension CoreTests {
         // A prerequisite that reopens after batch_prepare makes batch_claim refuse with no claims.
         let done = try completeRelationFixture(p,prerequisite)
         let batch = try prepareImplementationBatch(p,group,[try currentRelationTask(p,waiting),try currentRelationTask(p,free)])
-        _ = try call("task_transition",["project_id":p["id"]!,"task_id":done["id"]!,"expected_revision":done["revision"]!,"action":"reopen"])
+        // docs/operations.md: reopen creates a new round with a reason; earlier evidence remains.
+        _ = try call("task_transition",["project_id":p["id"]!,"task_id":done["id"]!,"expected_revision":done["revision"]!,"action":"reopen","reason":"Recheck pickup when the prerequisite needs another round"])
         assertCode("DEPENDENCY_UNSATISFIED") { _ = try self.claimFixedBatch(p,batch) }
         XCTAssertNil(try currentRelationTask(p,waiting)["active_attempt_id"]);XCTAssertNil(try currentRelationTask(p,free)["active_attempt_id"])
         XCTAssertFalse(bool(try currentRelationTask(p,waiting),"pickup_eligible"))

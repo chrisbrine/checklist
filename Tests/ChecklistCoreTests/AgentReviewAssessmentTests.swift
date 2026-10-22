@@ -3,7 +3,12 @@ import XCTest
 
 /// Synthetic test evidence only. This helper does not record a live product review.
 func fixtureReviewAssessment(_ router: CommandRouter, task: JSON, manifest: JSON, artifact: JSON) throws -> JSON {
-    let contract = try router.dbQueue.read {try router.reviewContract($0,task:task,manifest:manifest)}
+    // Review claims pin an applied rubric; a submission/pre-claim task still
+    // describes the preview contract (docs/policies.md, Revisioned review requirements).
+    let contract = try router.dbQueue.read { db in
+        let current = try router.record(db,task["id"] as! String,type:"task")
+        return try router.reviewContract(db,task:current,manifest:manifest)
+    }
     let ref: JSON = ["artifact_id":artifact["id"]!,"sha256":artifact["sha256"]!]
     func rows(_ section: String) -> [JSON] {(contract[section] as? [JSON] ?? []).map {["requirement_id":$0["id"]!,"result":"pass","rationale":"Synthetic fixture observed the requirement for this test scenario.","evidence_refs":[ref]]}}
     let instructions = contract["project_instruction_refs"] as? [JSON] ?? []
@@ -84,13 +89,19 @@ final class AgentReviewAssessmentTests: XCTestCase {
         let settings = try call("project_settings_get",["project_id":p["id"]!])
         _ = try call("project_settings_save",["project_id":p["id"]!,"expected_revision":settings["revision"]!,"brief":"Preserve the project’s stated review outcome.","pinned_decisions":[["body":"Inspect keyboard access on changed controls."]]])
         let context = try call("review_context",selectors,critic),contract = context["review_contract"] as! JSON
-        XCTAssertNotEqual(contract["sha256"] as? String,oldHash);XCTAssertEqual((contract["project_requirements"] as! [JSON]).count,2)
+        XCTAssertNotEqual(contract["sha256"] as? String,oldHash)
+        let requirements = contract["project_requirements"] as! [JSON]
+        // Generic review check/reject guidance now accompanies brief and pinned decisions.
+        XCTAssertEqual(requirements.compactMap {$0["kind"] as? String},["project_brief","approved_project_decision","review_check","review_reject_bar"])
         let a = try call("work_claim",selectors,critic),report = try ownReport(p,t,critic),manifest = try router.dbQueue.read {try router.record($0,s["manifest_id"] as! String,type:"manifest")}
         var assessment = try fixtureReviewAssessment(router,task:t,manifest:manifest,artifact:report),input = verdict(p,a)
         assessment["contract_sha256"] = oldHash;input["review_assessment"] = assessment
         assertCode("REVIEW_ASSESSMENT_REQUIRED") {_ = try self.router.dbQueue.read {try self.router.validateReviewAssessment($0,params:input,task:t,attempt:a,verdict:"pass",caller:self.critic)}}
-        assessment["contract_sha256"] = contract["sha256"]!;assessment["project_requirements"] = [];input["review_assessment"] = assessment
-        assertCode("REVIEW_ASSESSMENT_INCOMPLETE") {_ = try self.router.dbQueue.read {try self.router.validateReviewAssessment($0,params:input,task:t,attempt:a,verdict:"pass",caller:self.critic)}}
+        let applied = try call("review_context",selectors,critic),currentTask = applied["task"] as! JSON
+        assessment["contract_sha256"] = (applied["review_contract"] as! JSON)["sha256"]!
+        assessment["project_requirements"] = (assessment["project_requirements"] as! [JSON]).filter {$0["requirement_id"] as? String != "project:brief"}
+        input["review_assessment"] = assessment
+        assertCode("REVIEW_ASSESSMENT_INCOMPLETE") {_ = try self.router.dbQueue.read {try self.router.validateReviewAssessment($0,params:input,task:currentTask,attempt:a,verdict:"pass",caller:self.critic)}}
     }
     func testManagedReviewerReportBindsExactAttemptAndCleansBytesOnRollback() throws {
         let (p,t,_,selectors) = try fixture(source:true),a = try call("work_claim",selectors,critic)
@@ -98,7 +109,9 @@ final class AgentReviewAssessmentTests: XCTestCase {
         var rolledBackPath = "",rolledBackID = ""
         try router.dbQueue.writeWithoutTransaction { db in
             try db.inTransaction {
-                let artifact = try router.addAgentReviewEvidence(db,input,critic);rolledBackPath = artifact["path"] as! String;rolledBackID = artifact["id"] as! String;return .rollback
+                let artifact = try router.addAgentReviewEvidence(db,input,critic);rolledBackPath = try XCTUnwrap(ManagedPaths.resolve(artifact["path"] as! String,family:"objects",root:router.root)).path
+                XCTAssertTrue(FileManager.default.fileExists(atPath:rolledBackPath))
+                rolledBackID = artifact["id"] as! String;return .rollback
             }
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath:rolledBackPath))
@@ -117,6 +130,8 @@ final class AgentReviewAssessmentTests: XCTestCase {
     }
     func testCapturedInstructionSymlinkRequiresExactLinkAndResolvedContentCoverage() throws {
         let (p,t,_,selectors) = try fixture(source:true,instructionSymlink:true)
+        let attempt = try call("work_claim",selectors,critic)
+        // A pre-claim context is a preview; use the applied contract for every guard below.
         let context = try call("review_context",selectors,critic),contract = context["review_contract"] as! JSON,refs = contract["project_instruction_refs"] as! [JSON]
         XCTAssertEqual(refs.count,1)
         let instruction = try XCTUnwrap(refs.first),capture = ((context["target_manifest"] as! JSON)["evidence"] as! JSON)["source_capture"] as! JSON
@@ -124,8 +139,8 @@ final class AgentReviewAssessmentTests: XCTestCase {
         XCTAssertEqual(instruction["source_capture_id"] as? String,capture["id"] as? String);XCTAssertEqual(instruction["source_sha256"] as? String,capture["sha256"] as? String)
         XCTAssertEqual(instruction["path"] as? String,"AGENTS.md");XCTAssertEqual(instruction["resolved_path"] as? String,"rules.md");XCTAssertEqual(instruction["sha256"] as? String,contentHash)
         XCTAssertEqual(try jsonString(instruction["link_chain"]!),try jsonString([["path":"AGENTS.md","target":"rules.md","sha256":linkHash]]))
-        let attempt = try call("work_claim",selectors,critic),report = try ownReport(p,t,critic),reportRef: JSON = ["artifact_id":report["id"]!,"sha256":report["sha256"]!]
-        var assessment: JSON = ["contract_sha256":contract["sha256"]!,"target_manifest_id":selectors["target_manifest_id"]!,"acceptance":(contract["acceptance"] as! [JSON]).map {["requirement_id":$0["id"]!,"result":"pass","rationale":"Inspected the exact synthetic acceptance outcome.","evidence_refs":[reportRef]]},"project_requirements":[],"evidence_refs":[reportRef],"instruction_coverage":[],"all_applicable_project_requirements_assessed":true,"additional_requirements":[]]
+        let report = try ownReport(p,t,critic),reportRef: JSON = ["artifact_id":report["id"]!,"sha256":report["sha256"]!]
+        var assessment: JSON = ["contract_sha256":contract["sha256"]!,"target_manifest_id":selectors["target_manifest_id"]!,"acceptance":(contract["acceptance"] as! [JSON]).map {["requirement_id":$0["id"]!,"result":"pass","rationale":"Inspected the exact synthetic acceptance outcome.","evidence_refs":[reportRef]]},"project_requirements":(contract["project_requirements"] as! [JSON]).map {["requirement_id":$0["id"]!,"result":"pass","rationale":"Inspected the synthetic generic review requirement.","evidence_refs":[reportRef]]},"evidence_refs":[reportRef],"instruction_coverage":[],"all_applicable_project_requirements_assessed":true,"additional_requirements":[]]
         var input = verdict(p,attempt);input["review_assessment"] = assessment
         assertCode("REVIEW_ASSESSMENT_INCOMPLETE") {_ = try self.call("review_record",input,self.critic)}
         assessment["instruction_coverage"] = refs;input["review_assessment"] = assessment

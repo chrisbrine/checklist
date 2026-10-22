@@ -38,7 +38,8 @@ extension CoreTests {
         let handler = Caller(role:"worker",installation:"handler",projectIDs:[pid],sessionID:handlerID,workspace:workspace.path)
         _ = try call("work_claim",["project_id":pid,"task_id":task["id"]!,"expected_revision":task["revision"]!],handler)
         let note = try call("message_send",["project_id":pid,"task_id":task["id"]!,"body":"Which logo size did you pick?","expects_reply":true])
-        XCTAssertEqual(Set((note["deliveries"] as! [JSON]).compactMap {$0["recipient_session_id"] as? String}),Set([handlerID,coordinatorID]))
+        // docs/domain.md, Scoped ordinary comment mentions: current attempts/children only.
+        XCTAssertEqual(Set((note["deliveries"] as! [JSON]).compactMap {$0["recipient_session_id"] as? String}),Set([handlerID]))
         XCTAssertEqual(note["reply_recipient_session_id"] as? String,handlerID)
         let bridge = Caller(role:"owner",installation:"native-bridge",projectIDs:[])
         assertCode("FORBIDDEN") { _ = try self.call("native_reply_record",["project_id":pid,"reply_to":note["id"]!,"recipient_session_id":coordinatorID,"body":"Coordinator answer","source_evidence":[:]],bridge) }

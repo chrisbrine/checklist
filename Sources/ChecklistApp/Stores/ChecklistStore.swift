@@ -37,6 +37,11 @@ final class ChecklistStore: ObservableObject {
     private var selectedTicketRead: Task<Void,Never>?
     private var selectedWorkRead:Task<Void,Never>?
     private var selectedTicketReadID = UUID()
+    // This selection/lifetime fence survives a record-context rebase. The shared
+    // read fetches only; each waiting consumer must still own its installation.
+    private var selectedRecordLifetimeID = UUID()
+    private var selectedRecordRecovery: (id: UUID, context: String, read: Task<SelectedTicketDisplay,Error>)?
+    @Published private(set) var recordHistoryNotice: String?
     private var ticketPages: TicketPagePreparation { get {ticketObservation.pages} set {ticketObservation.pages = newValue} }
     private var pagedTicketWorkspace: PreparedTicketWorkspace? { get {ticketObservation.workspace} set {ticketObservation.workspace = newValue} }
     @Published private(set) var fullSnapshotAvailable = false
@@ -194,6 +199,9 @@ final class ChecklistStore: ObservableObject {
         }
         projectSelectionObservation = $projectID.removeDuplicates().dropFirst().sink { [weak self] _ in
             guard let self else { return }
+            self.cancelSelectedRecordRecovery()
+            self.selectedWorkRead?.cancel();self.selectedRecordsReadID = UUID();self.selectedRecordsLoading = false
+            self.recordHistoryRead?.cancel();self.recordHistoryObservation.cancel(clear:true)
             self.scheduleSelectedEligibility(for: self.detail)
         }
     }
@@ -258,17 +266,89 @@ final class ChecklistStore: ObservableObject {
         scheduleSelectedTicket(for:.task(id),cursor:cursor)
     }
     func retrySelectedTicket() {scheduleSelectedTicket(for:detail)}
+    private func cancelSelectedRecordRecovery() {
+        selectedRecordLifetimeID = UUID()
+        selectedRecordRecovery?.read.cancel();selectedRecordRecovery = nil
+        recordHistoryNotice = nil
+    }
+    private func selectedRecordScopeCurrent(_ display: SelectedTicketDisplay, lifetime: UUID, project: String?) -> Bool {
+        selectedRecordLifetimeID == lifetime && isSelectedTicket(display.task.id) &&
+        project.map(RecordIdentity.init) == projectID.map(RecordIdentity.init) &&
+        RecordIdentity(storeIncarnation) == RecordIdentity(display.service.string("store_incarnation"))
+    }
+    private func refreshSelectedRecordContext(_ displayed: SelectedTicketDisplay, isCurrent: @MainActor () -> Bool) async throws -> SelectedTicketDisplay {
+        guard !Task.isCancelled,isCurrent() else {throw CancellationError()}
+        if let current = selectedTicketDisplay,current.contextCursor != displayed.contextCursor {return current}
+        let recovery: (id: UUID, context: String, read: Task<SelectedTicketDisplay,Error>)
+        if let pending = selectedRecordRecovery,pending.context == displayed.contextCursor {recovery = pending}
+        else {
+            recovery = (UUID(),displayed.contextCursor,Task {
+                let response = try await self.request("task_context",["task_id":displayed.task.id,"detail_level":"ui"])
+                try Task.checkCancellation()
+                let value = try SelectedTicketDisplay(response:response)
+                guard RecordIdentity(value.task.id) == RecordIdentity(displayed.task.id),
+                      RecordIdentity(value.project.id) == RecordIdentity(displayed.project.id),
+                      RecordIdentity(value.service.string("store_incarnation")) == RecordIdentity(displayed.service.string("store_incarnation")),
+                      value.task.integer("revision") >= displayed.task.integer("revision") else {throw TicketPageError.invalid("selected_ticket.identity")}
+                return value
+            })
+            selectedRecordRecovery = recovery
+        }
+        defer {if selectedRecordRecovery?.id == recovery.id {selectedRecordRecovery = nil}}
+        let value = try await recovery.read.value
+        guard !Task.isCancelled,isCurrent() else {throw CancellationError()}
+        if let current = selectedTicketDisplay,current.contextCursor != displayed.contextCursor {return current}
+        // Do not run the ordinary expanded-record reload hook: that would cancel
+        // this consumer and grant a fresh retry budget. Old authority is retired.
+        fullSelectedRecordID = nil;selectedRecordCollections = [:]
+        invalidateSelectedEligibility()
+        selectedTicketDisplay = value;acceptServiceRead()
+        scheduleSelectedEligibility(for:detail)
+        return value
+    }
+    private func selectedRecordResponse(_ displayed: SelectedTicketDisplay, level: String, family: String? = nil, cursor: String? = nil, isCurrent: @MainActor () -> Bool) async throws -> (response: [String:Any], context: String, restarted: Bool) {
+        func parameters(_ display: SelectedTicketDisplay, cursor: String?) -> [String:Any] {
+            var p: [String:Any] = ["task_id":display.task.id,"detail_level":level,"selected_context_cursor":display.contextCursor]
+            p["records_family"] = family;p["cursor"] = cursor
+            return p
+        }
+        do {
+            let response = try await request("task_context",parameters(displayed,cursor:cursor))
+            return (response,displayed.contextCursor,false)
+        } catch let failure as ChecklistError where failure.code == "CURSOR_RESET" {
+            guard !isReadCancellation(failure),isCurrent() else {throw CancellationError()}
+            // A delayed reset for the old cursor must not retire authority
+            // already accepted by a concurrent consumer on the fresh context.
+            if selectedTicketDisplay?.contextCursor == displayed.contextCursor {
+                fullSelectedRecordID = nil;selectedRecordCollections = [:]
+                invalidateSelectedEligibility()
+            }
+            let fresh = try await refreshSelectedRecordContext(displayed,isCurrent:isCurrent)
+            guard !Task.isCancelled,isCurrent() else {throw CancellationError()}
+            // One retry only. History's offset belongs to the rejected context.
+            let response = try await request("task_context",parameters(fresh,cursor:nil))
+            return (response,fresh.contextCursor,level == "ui_history")
+        }
+    }
+    private func selectedRecordFailure(_ error: Error, operation: String) -> String {
+        if (error as? ChecklistError)?.code == "CURSOR_RESET" {
+            return "This ticket's context changed again while loading. Use Refresh selected ticket, then load these records again. Your draft is kept."
+        }
+        return "Could not load \(operation). \(PlainError.text(error)) Your draft is kept."
+    }
     func loadFullSelectedRecord(_ id: String) {
         selectedRecordsError = nil;selectedRecordsLoading = true
         let readID = UUID();selectedRecordsReadID = readID
-        let contextID = selectedTicketReadID
+        let lifetime = selectedRecordLifetimeID,project = projectID
         guard let displayed = selectedTicketDisplay,RecordIdentity(displayed.task.id) == RecordIdentity(id) else {selectedRecordsLoading = false;return}
         selectedWorkRead?.cancel()
         selectedWorkRead=Task {
+            @MainActor func current() -> Bool {selectedRecordsReadID == readID && selectedRecordScopeCurrent(displayed,lifetime:lifetime,project:project)}
             do {
-                let response = try await request("task_context",["task_id":id,"detail_level":"ui_records","selected_context_cursor":displayed.contextCursor])
-                guard !Task.isCancelled,selectedRecordsReadID == readID,selectedTicketReadID == contextID,isSelectedTicket(id),let current = selectedTicketDisplay,
-                      RecordIdentity(current.task.id)==RecordIdentity(id),
+                let result = try await selectedRecordResponse(displayed,level:"ui_records",isCurrent:current)
+                guard !Task.isCancelled,current(),let current = selectedTicketDisplay,current.contextCursor == result.context else {throw CancellationError()}
+                let response = result.response
+                guard RecordIdentity(current.task.id)==RecordIdentity(id),
                       response["ui_records_version"] as? Int == 1,
                       response["task_revision"] as? Int == current.task.integer("revision"),
                       let returnedID = response["task_id"] as? String,RecordIdentity(returnedID)==RecordIdentity(id),
@@ -284,16 +364,17 @@ final class ChecklistStore: ObservableObject {
                     guard collections[key] is [[String:Any]] else {throw TicketPageError.invalid("selected_records."+key)}
                 }
                 selectedRecordCollections = collections;fullSelectedRecordID = RecordIdentity(id);selectedRecordsLoading = false
-                scheduleSelectedEligibility(for:detail)
+                acceptServiceRead();scheduleSelectedEligibility(for:detail)
             } catch {
-                guard selectedRecordsReadID == readID,selectedTicketReadID == contextID,isSelectedTicket(id) else {return}
+                guard selectedRecordsReadID == readID,selectedRecordLifetimeID == lifetime else {return}
                 selectedRecordsLoading = false
-                if isReadCancellation(error) { return }
-                selectedRecordsError = "Could not load work/review records for this observed ticket context. Refresh the selected ticket before retrying; your draft is preserved."
+                if isReadCancellation(error) || !current() {return}
+                selectedRecordsError = selectedRecordFailure(error,operation:"work and review records")
             }
         }
     }
     private func scheduleSelectedTicket(for selection: Detail?, cursor: String? = nil) {
+        cancelSelectedRecordRecovery()
         selectedTicketRead?.cancel(); selectedTicketReadID = UUID();selectedRecordsReadID = UUID()
         recordHistoryRead?.cancel();recordHistoryObservation.cancel(clear:true)
         selectedWorkRead?.cancel()
@@ -346,6 +427,7 @@ final class ChecklistStore: ObservableObject {
     }
 
     private func invalidateSelectedTicketFreshness() {
+        cancelSelectedRecordRecovery()
         guard case .task = detail else {return}
         selectedTicketRead?.cancel();selectedTicketReadID = UUID();selectedRecordsReadID = UUID()
         selectedTicketLoading = true;selectedTicketError = nil;selectedTicketMissing = false
@@ -429,18 +511,24 @@ final class ChecklistStore: ObservableObject {
     }
     func readRecordHistory(_ task:Record,family:String,cursor:String? = nil) {
         guard let display=selectedTicketDisplay,RecordIdentity(display.task.id)==RecordIdentity(task.id),selectedTicketCurrent(task.id) else{return}
-        recordHistoryRead?.cancel()
-        let query=WorkspacePageQuery(surface:"record_history",project:task.string("project_id"),record:task.id)
-        let generation=recordHistoryObservation.begin(query),contextID=selectedTicketReadID
+        recordHistoryRead?.cancel();recordHistoryNotice = nil
+        let query=WorkspacePageQuery(surface:"record_history",project:task.string("project_id"),text:family,record:task.id)
+        let generation=recordHistoryObservation.begin(query),lifetime=selectedRecordLifetimeID,project=projectID
         recordHistoryRead=Task {[weak self] in
             guard let self else{return}
+            @MainActor func current() -> Bool {self.recordHistoryObservation.isCurrent(generation) && self.selectedRecordScopeCurrent(display,lifetime:lifetime,project:project)}
             do {
-                var p:[String:Any] = ["task_id":task.id,"detail_level":"ui_history","selected_context_cursor":display.contextCursor,"records_family":family]
-                p["cursor"]=cursor
-                let response=try await self.request("task_context",p)
-                guard !Task.isCancelled,self.selectedTicketReadID==contextID,self.isSelectedTicket(task.id) else{return}
-                _=try self.recordHistoryObservation.receive(response,query:query,generation:generation)
-            } catch {if self.isReadCancellation(error) {self.recordHistoryObservation.cancel(generation)} else {self.recordHistoryObservation.fail(generation)}}
+                let result = try await self.selectedRecordResponse(display,level:"ui_history",family:family,cursor:cursor,isCurrent:current)
+                guard !Task.isCancelled,current(),self.selectedTicketDisplay?.contextCursor == result.context else {throw CancellationError()}
+                guard let service=result.response["service"] as? [String:Any],service["store_incarnation"] as? String == display.service.string("store_incarnation") else {throw TicketPageError.invalid("selected_history.identity")}
+                if try self.recordHistoryObservation.receive(result.response,query:query,generation:generation) {
+                    if result.restarted {self.recordHistoryNotice = "This ticket changed. History restarted at the latest records."}
+                    self.acceptServiceRead()
+                }
+            } catch {
+                if self.isReadCancellation(error) || !current() {self.recordHistoryObservation.cancel(generation)}
+                else {self.recordHistoryObservation.fail(generation,message:self.selectedRecordFailure(error,operation:"ticket history"))}
+            }
         }
     }
     private var workspaceQuery: WorkspacePageQuery {
@@ -1053,6 +1141,7 @@ final class ChecklistStore: ObservableObject {
     }
 
     func stopWindowReads() {
+        cancelSelectedRecordRecovery()
         ticketPageRead?.cancel();ticketPageReadID=UUID();ticketPages.invalidate()
         workspaceRead?.cancel();workspaceObservation.cancel()
         otherDetailRead?.cancel();otherDetailObservation.cancel()
@@ -1061,6 +1150,7 @@ final class ChecklistStore: ObservableObject {
         overviewRead?.cancel(); overviewPending = []; for observation in overviewObservations.values { observation.cancel() }
         selectedTicketRead?.cancel();selectedTicketReadID=UUID();selectedRecordsReadID=UUID();selectedWorkRead?.cancel()
         recordHistoryRead?.cancel();recordHistoryObservation.cancel();invalidateSelectedEligibility()
+        selectedTicketLoading=false;selectedRecordsLoading=false
         scopedReadGeneration=UUID()
     }
 
@@ -1068,9 +1158,27 @@ final class ChecklistStore: ObservableObject {
     var liveWaitPause: UInt64 = 500_000_000
     var liveRetryPause: UInt64 = 3_000_000_000
 
+    /// A replaced store can leave a persisted project ID that no longer exists.
+    /// Prove absence with the global catalog; a failed scoped read alone is not enough.
+    private func recoverMissingRestoredProject() async -> Bool {
+        guard !connected, let selected = projectID else { return false }
+        do {
+            let catalog = try await request("project_list", ["include_archived": true])
+            guard !Task.isCancelled, projectID.map(RecordIdentity.init) == RecordIdentity(selected),
+                  let projects = catalog["projects"] as? [[String: Any]] else { return false }
+            let ids = projects.compactMap { $0["id"] as? String }
+            guard ids.count == projects.count, ids.allSatisfy({ !$0.isEmpty }),
+                  !ids.contains(where: { RecordIdentity($0) == RecordIdentity(selected) }) else { return false }
+            // Media review requires a project. Keep drafts, but reopen the ordinary worklist.
+            select(page == .media ? .tasks : page, project: nil)
+            return true
+        } catch { return false } // No catalog authority: preserve the saved scope for recovery.
+    }
+
     func startLiveUpdates() async {
         startedLiveUpdates = true
         await refresh()
+        if await recoverMissingRestoredProject() { await refresh() }
         // Event invalidation only: this never polls or launches an agent/model.
         while !Task.isCancelled {
             do {

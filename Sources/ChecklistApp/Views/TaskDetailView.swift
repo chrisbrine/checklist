@@ -84,14 +84,14 @@ struct TaskDetailView: View {
                         DetailSection(title: "Triages") { ForEach(handlingTriages) { triage in Button { store.open(.group(triage.id)) } label: { Label(ProductionGroups.label(triage), systemImage: "tray.2") }.buttonStyle(.link) } }
                     }
                     if store.fullSelectedRecordLoaded(task.id) {
-                        if let failure = store.selectedRecordsError {Text(failure).checklistFont(.micro).foregroundStyle(.orange);Button("Refresh work & review records") {store.loadFullSelectedRecord(task.id)}}
+                        if let failure = store.selectedRecordsError {Text(failure).checklistFont(.micro).foregroundStyle(.orange);Button("Refresh work & review records") {store.loadFullSelectedRecord(task.id)};Button("Refresh selected ticket") {store.retrySelectedTicket()}}
                         RelatedTicketsView(task: task).checklistDisabled([(!store.selectedRecordsCurrent, "Work and review records are still loading.")])
                         ReviewDetailView(task: task).checklistDisabled([(!store.selectedRecordsCurrent, "Work and review records are still loading.")])
                         HumanWorkActions(task: task).checklistDisabled([(!store.selectedRecordsCurrent, "Work and review records are still loading.")])
                     } else {
                         DetailSection(title:"Work, related tickets & review") {
                             Text("The selected ticket is loaded. Its complete review and work records have a separate loading boundary.").checklistFont(.micro).foregroundStyle(.secondary)
-                            if let failure = store.selectedRecordsError {Text(failure).checklistFont(.micro).foregroundStyle(.orange)}
+                            if let failure = store.selectedRecordsError {Text(failure).checklistFont(.micro).foregroundStyle(.orange);Button("Refresh selected ticket") {store.retrySelectedTicket()}}
                             Button("Load current work & review records") {store.loadFullSelectedRecord(task.id)}.checklistDisabled([(!store.connected, DisabledReasons.offline), (store.loading, "Checklist is still loading."), (store.selectedRecordsLoading, "Work and review records are still loading."), (!store.selectedTicketCurrent(task.id), DisabledReasons.ticketLoading)])
                         }
                     }
@@ -261,7 +261,8 @@ struct TaskDetailView: View {
                 }.onChange(of:recordHistoryFamily) {_,value in store.readRecordHistory(task,family:value)}
                 AccessibleHStack {Button("Read history") {store.readRecordHistory(task,family:recordHistoryFamily)};if let c=store.recordHistoryPrevious {Button("Newer") {store.readRecordHistory(task,family:recordHistoryFamily,cursor:c)}};if let c=store.recordHistoryNext {Button("Older") {store.readRecordHistory(task,family:recordHistoryFamily,cursor:c)}}}.checklistDisabled([(store.recordHistoryLoading, "History is still loading."), (!store.selectedTicketCurrent(task.id), DisabledReasons.ticketLoading)])
                 if store.recordHistoryLoading {ProgressView("Loading history page…")}
-                if let error=store.recordHistoryError {Text(error).checklistFont(.micro).foregroundStyle(.orange)}
+                if let notice=store.recordHistoryNotice {Text(notice).checklistFont(.micro).foregroundStyle(.secondary)}
+                if let error=store.recordHistoryError {Text(error).checklistFont(.micro).foregroundStyle(.orange);Button("Refresh selected ticket") {store.retrySelectedTicket()}}
                 Text("\(store.recordHistoryRows.count) shown · \(store.recordHistoryTotal) records").checklistFont(.micro).foregroundStyle(.secondary)
                 ForEach(store.recordHistoryRows) {record in
                     if record.string("record_type")=="attachment" {AttachmentRow(file:record)}

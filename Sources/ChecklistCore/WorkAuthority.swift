@@ -17,6 +17,11 @@ extension CommandRouter {
         let sensitive = (try? URL(fileURLWithPath:existing).resourceValues(forKeys:[.volumeSupportsCaseSensitiveNamesKey]).volumeSupportsCaseSensitiveNames) ?? true
         return sensitive ? resolved : resolved.lowercased()
     }
+    // Use physical parent coordinates for aliases, retaining the final declared link.
+    func declaredScopePath(_ path: String,root: String) -> String {
+        let url = URL(fileURLWithPath:path.hasPrefix("/") ? path : URL(fileURLWithPath:root).appendingPathComponent(path).path).standardizedFileURL
+        return URL(fileURLWithPath:reservationKey(url.deletingLastPathComponent().path)).appendingPathComponent(url.lastPathComponent).path.precomposedStringWithCanonicalMapping
+    }
     func normalizedWorkScopes(_ db: Database, project: JSON, fileScopes: [JSON], laneScopes: [JSON]) throws -> (files:[JSON],lanes:[JSON]) {
         guard fileScopes.count <= 200,laneScopes.count <= 32 else { throw CoreError("INVALID_INPUT","Too many work scopes.") }
         let root = project["root_path"] as? String ?? ""
@@ -28,7 +33,7 @@ extension CommandRouter {
             guard containsPath(reservationKey(root),key) else { throw CoreError("ROOT_MISMATCH","Work scopes must remain inside this project’s canonical root.") }
             guard !files.contains(where: {$0["canonical_key"] as? String == key}) else { throw CoreError("INVALID_INPUT","Duplicate canonical file scope.") }
             let alias = input["declared_path"] as? String ?? raw
-            let declared = URL(fileURLWithPath:alias.hasPrefix("/") ? alias : URL(fileURLWithPath:root).appendingPathComponent(alias).path).standardizedFileURL.path
+            let declared = declaredScopePath(alias,root:root)
             files.append(["path":key,"canonical_key":key,"declared_path":declared,"access":access])
         }
         for input in laneScopes {

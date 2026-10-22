@@ -71,7 +71,8 @@ struct WorkspacePage {
         guard self.generation==generation,self.query==query else{return false}
         page=try WorkspacePage(response,query:query);loading=false;return true
     }
-    func fail(_ generation:UUID) {guard self.generation==generation else{return};loading=false;error="Could not load this page. Refresh to load it again; drafts are kept."}
+    func isCurrent(_ generation:UUID)->Bool {self.generation==generation}
+    func fail(_ generation:UUID,message:String = "Could not load this page. Refresh to load it again; drafts are kept.") {guard self.generation==generation else{return};loading=false;error=message}
     func cancel(_ generation:UUID) {guard self.generation==generation else{return};cancel()}
     func cancel(clear:Bool=false) {generation=UUID();loading=false;if clear {page=nil;query=nil;error=nil}}
 }

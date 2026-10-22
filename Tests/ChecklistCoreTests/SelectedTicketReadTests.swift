@@ -2,7 +2,7 @@ import XCTest
 import GRDB
 @testable import ChecklistCore
 
-/// New selected-context controls; source preparation only, not executed.
+/// Selected-context scope and bounded history controls.
 final class SelectedTicketReadTests: XCTestCase {
     private var root: URL!
     private var router: CommandRouter!
@@ -107,6 +107,33 @@ final class SelectedTicketReadTests: XCTestCase {
         XCTAssertEqual(incomplete["complete"] as? Bool,true,"Historical rows are read separately from current gate authority")
         XCTAssertEqual(((incomplete["collections"] as! JSON)["attachments"] as! [JSON]).count,0)
         XCTAssertEqual((incomplete["history_counts"] as! JSON)["attachments"] as? Int,201)
+    }
+    func testUnrelatedMutationResetsCurrentAndHistoryForArchivedAndUnarchivedTickets() throws {
+        for archived in [false,true] {
+            try write {db in
+                var task = try router.record(db,tid,type:"task");task["archived"] = archived;try router.save(db,task,type:"task")
+                if !archived {for i in 0..<51 {try router.save(db,["id":"history-\(i)","project_id":pid,"task_id":tid,"revision":1,"evidence":[:]],type:"manifest")}}
+            }
+            let initial = try selected(),context = initial["context_cursor"]!
+            XCTAssertEqual((initial["task"] as? JSON)?["archived"] as? Bool,archived)
+            let history = try call("task_context",["task_id":tid,"detail_level":"ui_history","records_family":"manifest","selected_context_cursor":context])
+            let revision = try call("task_get",["project_id":pid,"task_id":"e\u{301}"])["revision"]!
+            _ = try call("task_edit",["project_id":pid,"task_id":"e\u{301}","expected_revision":revision,"patch":["title":"Unrelated change","brief":"Synthetic outcome"]])
+            for level in ["ui_records","ui_history"] {
+                XCTAssertThrowsError(try call("task_context",["task_id":tid,"detail_level":level,"records_family":"manifest","selected_context_cursor":context])) {
+                    XCTAssertEqual(($0 as? CoreError)?.code,"CURSOR_RESET")
+                }
+            }
+            let fresh = try selected()
+            XCTAssertEqual((fresh["task"] as? JSON)?["revision"] as? Int,(initial["task"] as? JSON)?["revision"] as? Int)
+            XCTAssertNotEqual(fresh["context_cursor"] as? String,context as? String)
+            XCTAssertEqual(try call("task_context",["task_id":tid,"detail_level":"ui_records","selected_context_cursor":fresh["context_cursor"]!])["complete"] as? Bool,true)
+            XCTAssertThrowsError(try call("task_context",["task_id":tid,"detail_level":"ui_history","records_family":"manifest","selected_context_cursor":fresh["context_cursor"]!,"cursor":history["next_cursor"]!])) {
+                XCTAssertEqual(($0 as? CoreError)?.code,"CURSOR_RESET")
+            }
+            let restarted = try call("task_context",["task_id":tid,"detail_level":"ui_history","records_family":"manifest","selected_context_cursor":fresh["context_cursor"]!])
+            XCTAssertEqual((restarted["rows"] as? [JSON])?.count,50);XCTAssertTrue(restarted["previous_cursor"] is NSNull)
+        }
     }
     func testReviewTargetHistoryIncludesPreviousImagesWithIdenticalHashesAndMeasuresWithoutActionAuthority() throws {
         let hash = String(repeating:"a",count:64)

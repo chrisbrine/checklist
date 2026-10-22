@@ -74,7 +74,12 @@ extension CoreTests {
         let p = try project();let first = try task(p,"Safe to park"),second = try ready(p,task(p,"Claimed by work session"));let claim = try call("work_claim",["project_id":p["id"]!,"task_id":second["id"]!,"expected_revision":second["revision"]!]);let group = try triage(p)
         try addTriage(p,group,first);try addTriage(p,group,second)
         let before = try call("snapshot");let input = try triageInput(p,group)
-        XCTAssertThrowsError(try call("triage_transition",input)) { error in let e = error as! CoreError;XCTAssertEqual(e.code,"TRIAGE_TRANSITION_BLOCKED");XCTAssertTrue(e.message.contains(second["key"] as! String));XCTAssertTrue(e.message.contains("Release or recover")) }
+        // TicketRetirement.requireRetirementSafe: holder release, reasoned takeover or verified-stop recovery.
+        XCTAssertThrowsError(try call("triage_transition",input)) { error in
+            let e = error as! CoreError;XCTAssertEqual(e.code,"TRIAGE_TRANSITION_BLOCKED");XCTAssertTrue(e.message.contains(second["key"] as! String))
+            let blocker = (e.details["blockers"] as? [JSON])?.first { $0["task_id"] as? String == second["id"] as? String };XCTAssertEqual(blocker?["code"] as? String,"CLAIM_CONFLICT")
+            for guidance in ["work_release","work_takeover with a reason","recovery after a verified stop"] { XCTAssertTrue(e.message.contains(guidance),guidance) }
+        }
         let after = try call("snapshot");for key in ["tasks","groups","events"] { XCTAssertEqual(try jsonString(["rows":before[key]!]),try jsonString(["rows":after[key]!]),key) }
         let context = try call("task_context",["project_id":p["id"]!,"task_id":second["id"]!]);XCTAssertEqual((context["task"] as! JSON)["active_attempt_id"] as? String,claim["id"] as? String)
     }

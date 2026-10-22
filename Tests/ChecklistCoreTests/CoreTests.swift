@@ -1,4 +1,5 @@
 import XCTest
+import GRDB
 import AppKit
 import ImageIO
 import UniformTypeIdentifiers
@@ -146,10 +147,23 @@ final class CoreTests: XCTestCase {
         let p = try project();let t = try task(p);let source = directory.appendingPathComponent("large.bin")
         try Data(repeating:7,count:21*1024*1024).write(to:source)
         let managed = try call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":source.path]);let external = try call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":source.path,"mode":"external_reference"])
-        let preview = try call("attachment_cleanup_preview",["project_id":p["id"]!,"task_id":t["id"]!]);XCTAssertEqual(preview["clean_bytes"] as? Int,21*1024*1024)
+        let preview = try call("attachment_cleanup_preview",["project_id":p["id"]!,"task_id":t["id"]!]);XCTAssertEqual(preview["clean_bytes"] as? Int64,Int64(21*1024*1024))
         _ = try call("task_archive",["project_id":p["id"]!,"task_id":t["id"]!,"expected_revision":t["revision"]!,"action":"archive","cleanup":true,"cleanup_preview_id":preview["cleanup_preview_id"]!])
+        // docs/archive-cleanup.md: archive commits a durable job with a 30-second Undo window.
+        let job = try router.dbQueue.read { try XCTUnwrap(router.records($0,type:"cleanup_job",project:p["id"] as? String).first) }
+        XCTAssertEqual(try ArchiveCleanupJob.integer(job["not_before_ms"]) - ArchiveCleanupJob.integer(job["enqueued_at_ms"]),30_000)
+        try router.runStorageMaintenance()
+        XCTAssertTrue(FileManager.default.fileExists(atPath:managed["path"] as! String))
+        try makeCleanupJobDueForFixture(job)
+        try router.runStorageMaintenance()
         XCTAssertTrue(FileManager.default.fileExists(atPath:source.path));XCTAssertFalse(FileManager.default.fileExists(atPath:managed["path"] as! String))
         let metadata = try call("attachment_read",["project_id":p["id"]!,"attachment_id":managed["id"]!,"representation":"metadata"]);XCTAssertEqual(metadata["availability"] as? String,"original_cleaned")
+        for key in ["id","artifact_id","name","sha256","mode","author","origin","created_at"] { XCTAssertEqual(metadata[key] as? String,managed[key] as? String,key) }
+        XCTAssertEqual(try ArchiveCleanupJob.integer(metadata["size"]),try ArchiveCleanupJob.integer(managed["size"]))
+        // ManagedPathConsumers.ownerManagedPathProjection omits paths whose bytes are unavailable.
+        XCTAssertNil(metadata["path"]);XCTAssertNotNil(metadata["path_unavailable_reason"])
+        let stored = try router.dbQueue.read { try router.record($0,managed["id"] as! String,type:"attachment") }
+        XCTAssertEqual(stored["path"] as? String,try router.managedRelative(managed["path"] as! String,family:"objects"))
         let reference = try call("attachment_read",["project_id":p["id"]!,"attachment_id":external["id"]!,"representation":"metadata"]);XCTAssertEqual(reference["availability"] as? String,"available")
     }
     func testCleanupDoesNotDeleteNewlyEligibleUnpreviewedFile() throws {
@@ -415,30 +429,65 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual((try call("session_inbox",["project_id":pid],worker)["deliveries"] as! [JSON]).count,1)
     }
 
-    func markCommittedCleanupForCrashFixture(taskID: String,attachmentID: String,archived: Bool = true) throws {
-        // Disposable-store crash fixture: the archive transaction committed, but deletion has not run yet.
-        try router.dbQueue.write { db in
-            var task = try router.record(db,taskID,type:"task");task["archived"] = archived;try router.save(db,task,type:"task")
-            var attachment = try router.record(db,attachmentID,type:"attachment");attachment["cleanup_state"] = "pending";try router.save(db,attachment,type:"attachment")
+    func fixtureDomainTransaction(_ body: (Database) throws -> Void) throws {
+        // TaskReferenceValidation.swift: the domain boundary owns the outer commit.
+        try router.dbQueue.writeWithoutTransaction { db in
+            try router.withValidatedDomainTransaction(db) { try body(db);return .commit }
         }
+    }
+    func makeCleanupJobDueForFixture(_ job: JSON) throws {
+        // Advance only this disposable store's persisted clock, as in ArchiveCleanupExecutionTests.
+        try fixtureDomainTransaction { db in
+            var current = try router.record(db,job["id"] as! String,type:"cleanup_job")
+            current["enqueued_at_ms"] = Int64(1);current["not_before_ms"] = Int64(30_001)
+            current["revision"] = try router.nextCleanupJobRevision(current)
+            _ = try ArchiveCleanupJob(record:current)
+            try router.save(db,current,type:"cleanup_job")
+        }
+    }
+    @discardableResult func markCommittedCleanupForCrashFixture(taskID: String,attachmentID: String,archived: Bool = true) throws -> JSON {
+        // Synthetic pre-hold selection, like ArchiveCleanupJobsIntegrationTests.fixture/enqueue.
+        // Model an archive commit whose maintenance has not run; current holds are NOT deletion authority.
+        // docs/archive-cleanup.md: durable cleanup_job, complete fresh admission after restart.
+        var result: JSON?
+        try fixtureDomainTransaction { db in
+            var task = try router.record(db,taskID,type:"task")
+            let project = try router.record(db,task["project_id"] as! String,type:"project")
+            let attachment = try router.scoped(db,attachmentID,project["id"] as! String,type:"attachment")
+            let fact = try ArchiveAttachmentFact(id:attachmentID,logicalOriginalBytes:ArchiveCleanupJob.integer(attachment["size"]))
+            let plan = try ArchiveRetentionPlanner.make(configuration:router.archiveRetentionConfiguration(project),facts:[fact])
+            XCTAssertEqual(plan.selected.map { $0.id.text },[attachmentID])
+            let previewID = UUID().uuidString
+            let basis: JSON = ["project_id":project["id"]!,"task_id":taskID,"task_revision":task["revision"]!,"settings_revision":project["settings_revision"]!,"preview_id":previewID,"originals":[["attachment_id":attachmentID,"sha256":attachment["sha256"]!,"logical_bytes":attachment["size"]!,"attachment_revision":attachment["revision"]!]]]
+            try router.save(db,["id":UUID().uuidString,"project_id":project["id"]!,"task_id":taskID,"record_type":"cleanup_preview","revision":1,"cleanup_preview_id":previewID,"task_revision":task["revision"]!,"settings_revision":project["settings_revision"]!,"cleanup_job_plan_sha256":ChecklistCore.hash(Data(try jsonString(basis).utf8))],type:"cleanup_preview")
+            result = try XCTUnwrap(router.enqueueArchiveCleanupJob(db,task:task,settingsRevision:ArchiveCleanupJob.integer(project["settings_revision"]),previewID:previewID,plan:plan,nowMS:1,notBeforeMS:30_001,caller:owner))
+            task["archived"] = archived;try router.save(db,task,type:"task")
+        }
+        return try XCTUnwrap(result)
+    }
+    func assertCleanupJobHeld(_ job: JSON,attachmentID: String,reason: ArchiveCleanupJob.Hold) throws {
+        let current = try router.dbQueue.read { try ArchiveCleanupJob(record:router.record($0,job["id"] as! String,type:"cleanup_job")) }
+        XCTAssertEqual(current.state,.held)
+        let item = try XCTUnwrap(current.items.first { $0.original.id.text == attachmentID })
+        XCTAssertEqual(item.state,.held);XCTAssertTrue(item.holds.contains(reason))
     }
     func testCleanupRestartRechecksActualReaderLeaseAndRestoredTask() throws {
         let p = try project();let t = try task(p);let path = directory.appendingPathComponent("reader-held.bin");try Data(repeating:3,count:21*1024*1024).write(to:path)
         let a = try call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":path.path]);let read = try call("attachment_read",["project_id":p["id"]!,"attachment_id":a["id"]!,"representation":"original"])
         XCTAssertNotNil(read["read_hold_id"])
-        try markCommittedCleanupForCrashFixture(taskID:t["id"] as! String,attachmentID:a["id"] as! String)
+        let job = try markCommittedCleanupForCrashFixture(taskID:t["id"] as! String,attachmentID:a["id"] as! String)
         router = nil;router = try CommandRouter(root:directory)
         XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
-        let held = try call("attachment_read",["project_id":p["id"]!,"attachment_id":a["id"]!,"representation":"metadata"]);XCTAssertEqual(held["cleanup_state"] as? String,"held");XCTAssertTrue((held["cleanup_hold_reasons"] as! [String]).contains("Active reader"))
+        let held = try call("attachment_read",["project_id":p["id"]!,"attachment_id":a["id"]!,"representation":"metadata"]);XCTAssertEqual(held["availability"] as? String,"available");try assertCleanupJobHeld(job,attachmentID:a["id"] as! String,reason:.activeReader)
         _ = try call("attachment_read_release",["project_id":p["id"]!,"read_hold_id":read["read_hold_id"]!]);XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
-        let t2 = try task(p);let a2 = try call("attachment_add",["project_id":p["id"]!,"task_id":t2["id"]!,"path":path.path]);try markCommittedCleanupForCrashFixture(taskID:t2["id"] as! String,attachmentID:a2["id"] as! String,archived:false)
-        router = nil;router = try CommandRouter(root:directory);XCTAssertTrue(FileManager.default.fileExists(atPath:a2["path"] as! String));XCTAssertEqual(try call("attachment_read",["project_id":p["id"]!,"attachment_id":a2["id"]!])["cleanup_state"] as? String,"canceled")
+        let t2 = try task(p);let a2 = try call("attachment_add",["project_id":p["id"]!,"task_id":t2["id"]!,"path":path.path]);let restoredJob = try markCommittedCleanupForCrashFixture(taskID:t2["id"] as! String,attachmentID:a2["id"] as! String,archived:false)
+        router = nil;router = try CommandRouter(root:directory);XCTAssertTrue(FileManager.default.fileExists(atPath:a2["path"] as! String));XCTAssertEqual(try call("cleanup_job_get",["project_id":p["id"]!,"cleanup_job_id":restoredJob["id"]!])["state"] as? String,"canceled");XCTAssertEqual(try call("attachment_read",["project_id":p["id"]!,"attachment_id":a2["id"]!])["availability"] as? String,"available")
     }
     func testCleanupRestartRechecksPendingHumanInspection() throws {
         let p = try project();let t = try task(p);let path = directory.appendingPathComponent("inspection-held.bin");try Data(repeating:5,count:21*1024*1024).write(to:path)
         let a = try call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":path.path]);let request = try call("human_request_create",["project_id":p["id"]!,"task_id":t["id"]!,"target_attachment_id":a["id"]!,"questions":[["id":"inspect","type":"approval","prompt":"Inspect the original"]]])
-        try markCommittedCleanupForCrashFixture(taskID:t["id"] as! String,attachmentID:a["id"] as! String);router = nil;router = try CommandRouter(root:directory)
-        XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String));let metadata = try call("attachment_read",["project_id":p["id"]!,"attachment_id":a["id"]!]);XCTAssertTrue((metadata["cleanup_hold_reasons"] as! [String]).contains("Pending human inspection"))
+        let job = try markCommittedCleanupForCrashFixture(taskID:t["id"] as! String,attachmentID:a["id"] as! String);router = nil;router = try CommandRouter(root:directory)
+        XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String));let metadata = try call("attachment_read",["project_id":p["id"]!,"attachment_id":a["id"]!]);XCTAssertEqual(metadata["availability"] as? String,"available");try assertCleanupJobHeld(job,attachmentID:a["id"] as! String,reason:.pendingHumanInspection)
         _ = try call("human_request_cancel",["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":1]);XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
     }
     func testPolicyChangesApplyToFutureAttemptsWithoutRelaxingActiveTarget() throws {
@@ -521,10 +570,10 @@ final class CoreTests: XCTestCase {
 
     func testCleanupRestartProtectsCurrentQueuedReviewOriginal() throws {
         let value = try submittedArtifact(data:Data(repeating:8,count:21*1024*1024))
-        try markCommittedCleanupForCrashFixture(taskID:value.task["id"] as! String,attachmentID:value.artifact["id"] as! String)
+        let job = try markCommittedCleanupForCrashFixture(taskID:value.task["id"] as! String,attachmentID:value.artifact["id"] as! String)
         router = nil;router = try CommandRouter(root:directory)
         XCTAssertTrue(FileManager.default.fileExists(atPath:value.artifact["path"] as! String))
-        let metadata = try call("attachment_read",["project_id":value.project["id"]!,"attachment_id":value.artifact["id"]!]);XCTAssertEqual(metadata["cleanup_state"] as? String,"held");XCTAssertTrue((metadata["cleanup_hold_reasons"] as! [String]).contains("Current review target"))
+        let metadata = try call("attachment_read",["project_id":value.project["id"]!,"attachment_id":value.artifact["id"]!]);XCTAssertEqual(metadata["availability"] as? String,"available");try assertCleanupJobHeld(job,attachmentID:value.artifact["id"] as! String,reason:.currentReview)
     }
 
     func testIdenticalMessageTimestampsPreserveCreationOrderInsteadOfUUIDOrder() {

@@ -381,7 +381,11 @@ extension CommandRouter {
         let files = attempt["file_scopes"] as? [JSON] ?? []
         guard !files.isEmpty else { return ["mode":"whole"] }
         let base = reservationKey(root).lowercased()
-        let scopes = files.flatMap {[$0["declared_path"] as? String,$0["path"] as? String].compactMap {$0}}.compactMap { path -> String? in
+        let paths = files.flatMap { scope -> [String] in
+            let aliases = (scope["declared_path"] as? String).map {[declaredScopePath($0,root:root)]} ?? []
+            return aliases + ((scope["path"] as? String).map {[$0]} ?? [])
+        }
+        let scopes = paths.compactMap { path -> String? in
             let key = path.lowercased()
             guard containsPath(base,key) else { return nil }
             return key == base ? "." : String(key.dropFirst(base.count + 1))

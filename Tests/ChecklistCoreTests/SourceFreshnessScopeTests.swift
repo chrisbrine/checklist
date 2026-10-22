@@ -5,8 +5,11 @@ import XCTest
 final class SubmissionEvidenceFixture {
     let storage: ReadPerformanceFixture, workspace: URL, project: JSON
     var router: CommandRouter { storage.router }
-    init(_ ticket: String) throws {
-        storage = try ReadPerformanceFixture(ticket);workspace = storage.directory.appendingPathComponent("workspace")
+    init(_ ticket: String,symlinkedParent: Bool = false) throws {
+        storage = try ReadPerformanceFixture(ticket)
+        let parent = storage.directory.appendingPathComponent("root-alias")
+        if symlinkedParent { try FileManager.default.createSymbolicLink(atPath:parent.path,withDestinationPath:storage.directory.path) }
+        workspace = (symlinkedParent ? parent : storage.directory).appendingPathComponent("workspace")
         try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
         project = try storage.call("project_create",["name":"Synthetic submission evidence","key_prefix":"SE","root_path":workspace.path])
     }
@@ -144,11 +147,13 @@ final class SourceFreshnessScopeTests: XCTestCase {
         }
     }
     func testReadScopeSymlinkRetargetMustStaleScopedReview() throws {
-        let f = try SubmissionEvidenceFixture("Reviewer-T-CL141")
+        let f = try SubmissionEvidenceFixture("Reviewer-T-CL141",symlinkedParent:true)
         try f.write("src/file.swift");try f.write("one.txt","first");try f.write("two.txt","second")
         let link = f.workspace.appendingPathComponent("dependency.txt")
         try FileManager.default.createSymbolicLink(atPath:link.path,withDestinationPath:"one.txt")
-        let author = try f.worker("author"),task = try f.ready(),attempt = try f.claim(task,author,scopes:[["path":"src","access":"write"],["path":"dependency.txt","access":"read"]])
+        let author = try f.worker("author"),task = try f.ready(),attempt = try f.claim(task,author,scopes:[["path":"src","access":"write"],["path":link.path,"access":"read"]])
+        let declared = URL(fileURLWithPath:f.router.reservationKey(link.deletingLastPathComponent().path)).appendingPathComponent(link.lastPathComponent).path
+        XCTAssertEqual((attempt["file_scopes"] as? [JSON])?.first {$0["access"] as? String == "read"}?["declared_path"] as? String,declared)
         let submitted = try f.call("work_submit",f.submissionInput(attempt,author),author),reviewer = try f.worker("reviewer")
         _ = try f.call("review_context",f.selectors(submitted),reviewer)
         try FileManager.default.removeItem(at:link);try FileManager.default.createSymbolicLink(atPath:link.path,withDestinationPath:"two.txt")
@@ -162,7 +167,7 @@ final class SourceFreshnessScopeTests: XCTestCase {
     func testScopedSymlinkChainsRetainResolvedIdentityAndAliasDiagnostics() throws {
         let inputs: [(String,String?)] = [("AGENTS.md",nil),("nested/CLAUDE.md",nil),("dependency.txt","read"),("write-dependency.txt","write"),("src/dependency.txt",nil)]
         for (alias,access) in inputs {
-            let f = try SubmissionEvidenceFixture("CL-141")
+            let f = try SubmissionEvidenceFixture("CL-141",symlinkedParent:true)
             try f.write("src/file.swift");try f.write("one.txt","same bytes");try f.write("two.txt","same bytes");try f.write("links/unrelated.txt")
             let middle = f.workspace.appendingPathComponent("links/middle.txt"),link = f.workspace.appendingPathComponent(alias)
             try FileManager.default.createDirectory(at:link.deletingLastPathComponent(),withIntermediateDirectories:true)
@@ -170,7 +175,7 @@ final class SourceFreshnessScopeTests: XCTestCase {
             let target = alias.contains("/") ? "../links/middle.txt" : "links/middle.txt"
             try FileManager.default.createSymbolicLink(atPath:link.path,withDestinationPath:target)
             var scopes: [JSON] = [["path":"src","access":"write"]]
-            if let access {scopes.append(["path":alias,"access":access])}
+            if let access {scopes.append(["path":link.path,"access":access])}
             let author = try f.worker("author"),task = try f.ready(),claimed = try f.claim(task,author,scopes:scopes)
             // A lane-only scope adjustment must also retain the declared file aliases.
             _ = try f.call("work_scope_adjust",["attempt_id":claimed["id"]!,"claim_token":claimed["claim_token"]!,"lane_scopes":[]],author)
@@ -192,8 +197,8 @@ final class SourceFreshnessScopeTests: XCTestCase {
         }
     }
     func testBatchClaimKeepsDeclaredSymlinkScopeAlias() throws {
-        let f = try SubmissionEvidenceFixture("CL-141")
-        try f.write("src/file.swift");try f.write("other/file.swift");try f.write("one.txt")
+        let f = try SubmissionEvidenceFixture("CL-141",symlinkedParent:true)
+        try f.write("src/file.swift");try f.write("other/file.swift");try f.write("one.txt");try f.write("two.txt")
         let alias = f.workspace.appendingPathComponent("dependency.txt")
         try FileManager.default.createSymbolicLink(atPath:alias.path,withDestinationPath:"one.txt")
         let tasks = try [f.ready(),f.ready()],author = try f.worker("author")
@@ -204,15 +209,83 @@ final class SourceFreshnessScopeTests: XCTestCase {
         }
         let members: [JSON] = try tasks.enumerated().map {index,task in
             let current = try f.record(task["id"]!,"task")
-            let scopes: [JSON] = index == 0 ? [["path":"src","access":"write"],["path":"dependency.txt","access":"read"]] : [["path":"other","access":"write"]]
+            let scopes: [JSON] = index == 0 ? [["path":"src","access":"write"],["path":alias.path,"access":"read"]] : [["path":"other","access":"write"]]
             return ["task_id":current["id"]!,"expected_revision":current["revision"]!,"file_scopes":scopes]
         }
         let batch = try f.call("batch_prepare",["triage_id":group["id"]!,"expected_revision":group["revision"]!,"phase":"implementation","tasks":members],author)
+        let declared = URL(fileURLWithPath:f.router.reservationKey(alias.deletingLastPathComponent().path)).appendingPathComponent(alias.lastPathComponent).path
+        let frozen = try XCTUnwrap((batch["members"] as? [JSON])?.first {$0["task_id"] as? String == tasks[0]["id"] as? String})
+        XCTAssertEqual((frozen["file_scopes"] as? [JSON])?.first {$0["access"] as? String == "read"}?["declared_path"] as? String,declared)
         let result = try f.call("batch_claim",["batch_id":batch["id"]!,"expected_revision":batch["revision"]!,"policy_revision":batch["policy_revision"]!],author)
         let attempt = try XCTUnwrap((result["claims"] as? [JSON])?.first {$0["task_id"] as? String == tasks[0]["id"] as? String})
         let scope = try XCTUnwrap((attempt["file_scopes"] as? [JSON])?.first {$0["access"] as? String == "read"})
-        XCTAssertEqual(scope["declared_path"] as? String,alias.path)
+        XCTAssertEqual(scope["declared_path"] as? String,declared)
         XCTAssertEqual(scope["canonical_key"] as? String,f.router.reservationKey(f.workspace.appendingPathComponent("one.txt").path))
         XCTAssertEqual(strings(f.router.sourceRelevance(root:f.workspace.path,attempt:attempt,additional:[]),"scopes"),["dependency.txt","one.txt","src"])
+        let claims = result["claims"] as! [JSON]
+        let submitted = try f.call("batch_submit",["batch_id":batch["id"]!,"expected_revision":batch["revision"]!,"members":try claims.map {try f.submissionInput($0,author)}],author)["results"] as! [JSON]
+        let reviewer = try f.worker("reviewer")
+        var reviewGroup = try f.call("triage_create",["name":"Synthetic alias review","phase":"review"])
+        for task in tasks {
+            _ = try f.call("group_membership",["group_id":reviewGroup["id"]!,"expected_revision":reviewGroup["revision"]!,"task_id":task["id"]!,"action":"add"])
+            reviewGroup = try f.record(reviewGroup["id"]!,"group")
+        }
+        let reviewMembers: [JSON] = try submitted.map {target in
+            var member = f.selectors(target).filter {$0.key != "phase"}
+            member["expected_revision"] = try f.record(member["task_id"]!,"task")["revision"]
+            return member
+        }
+        let prepare: JSON = ["triage_id":reviewGroup["id"]!,"expected_revision":reviewGroup["revision"]!,"phase":"review","tasks":reviewMembers]
+        let reviewBatch = try f.call("batch_prepare",prepare,reviewer)
+        try FileManager.default.removeItem(at:alias);try FileManager.default.createSymbolicLink(atPath:alias.path,withDestinationPath:"two.txt")
+        let target = try XCTUnwrap(submitted.first {($0["task"] as? JSON)?["id"] as? String == tasks[0]["id"] as? String})
+        stale({_ = try f.call("review_context",f.selectors(target),reviewer)},path:"dependency.txt")
+        stale({_ = try f.call("work_claim",f.selectors(target),reviewer)},path:"dependency.txt")
+        stale({_ = try f.call("batch_claim",["batch_id":reviewBatch["id"]!,"expected_revision":reviewBatch["revision"]!,"policy_revision":reviewBatch["policy_revision"]!],reviewer)},path:"dependency.txt")
+        stale({_ = try f.call("batch_prepare",prepare,reviewer)},path:"dependency.txt")
+        for task in tasks { XCTAssertNil(try f.record(task["id"]!,"task")["active_attempt_id"],"A stale batch must not claim any member") }
+    }
+
+    func testScopeAdjustmentKeepsReadSymlinkUnderAliasedParent() throws { try adjustedAliasRetarget("work_scope_adjust") }
+    func testCheckpointScopeChangeKeepsReadSymlinkUnderAliasedParent() throws { try adjustedAliasRetarget("work_checkpoint") }
+    func adjustedAliasRetarget(_ method: String) throws {
+        let f = try SubmissionEvidenceFixture("CL-141",symlinkedParent:true)
+        try f.write("src/file.swift");try f.write("one.txt");try f.write("two.txt")
+        let alias = f.workspace.appendingPathComponent("dependency.txt")
+        try FileManager.default.createSymbolicLink(atPath:alias.path,withDestinationPath:"one.txt")
+        let author = try f.worker("author"),task = try f.ready(),attempt = try f.claim(task,author,scopes:[["path":"src","access":"write"]])
+        var input: JSON = ["attempt_id":attempt["id"]!,"claim_token":attempt["claim_token"]!,"file_scopes":[["path":"src","access":"write"],["path":alias.path,"access":"read"]]]
+        if method == "work_checkpoint" { input["progress"] = "Declare the aliased read dependency" }
+        let adjusted = try f.call(method,input,author)
+        let declared = URL(fileURLWithPath:f.router.reservationKey(alias.deletingLastPathComponent().path)).appendingPathComponent(alias.lastPathComponent).path
+        XCTAssertEqual((adjusted["file_scopes"] as? [JSON])?.first {$0["access"] as? String == "read"}?["declared_path"] as? String,declared)
+        let physical = f.router.reservationKey(f.workspace.path)
+        XCTAssertNotEqual(f.workspace.path.lowercased(),physical.lowercased(),"The fixture must exercise a symlinked parent without TMPDIR")
+        XCTAssertEqual(strings(f.router.sourceRelevance(root:f.workspace.path,attempt:adjusted,additional:[]),"scopes"),["dependency.txt","one.txt","src"])
+        XCTAssertEqual(try jsonString(f.router.sourceRelevance(root:f.workspace.path,attempt:adjusted,additional:[])),try jsonString(f.router.sourceRelevance(root:physical,attempt:adjusted,additional:[])))
+        let s = try f.call("work_submit",f.submissionInput(attempt,author),author),r = try f.worker("reviewer")
+        _ = try f.call("review_context",f.selectors(s),r)
+        try FileManager.default.removeItem(at:alias);try FileManager.default.createSymbolicLink(atPath:alias.path,withDestinationPath:"two.txt")
+        stale({_ = try f.call("review_context",f.selectors(s),r)},path:"dependency.txt")
+        stale({_ = try f.call("work_claim",f.selectors(s),r)},path:"dependency.txt")
+    }
+
+    func testStoredDeclaredAliasesUsePhysicalRootCoordinates() throws {
+        let f = try SubmissionEvidenceFixture("CL-141",symlinkedParent:true)
+        try f.write("one.txt")
+        let alias = f.workspace.appendingPathComponent("dependency.txt")
+        try FileManager.default.createSymbolicLink(atPath:alias.path,withDestinationPath:"one.txt")
+        // Existing attempts/batches can still contain a lexical declared_path. Reading
+        // relevance normalizes its parent, without resolving dependency.txt itself.
+        let attempt: JSON = ["file_scopes":[["path":f.router.reservationKey(alias.path),"declared_path":alias.path,"access":"read"]]]
+        var roots = [f.workspace.path,f.workspace.resolvingSymlinksInPath().path]
+        var links: [URL] = []
+        defer {for link in links {try? FileManager.default.removeItem(at:link)}}
+        for base in ["/private/tmp","/private/var/tmp"] {
+            let physical = URL(fileURLWithPath:base).appendingPathComponent("cl141-"+UUID().uuidString)
+            try FileManager.default.createSymbolicLink(atPath:physical.path,withDestinationPath:f.workspace.resolvingSymlinksInPath().path);links.append(physical)
+            roots += [physical.path,String(physical.path.dropFirst("/private".count))]
+        }
+        for root in roots { XCTAssertEqual(strings(f.router.sourceRelevance(root:root,attempt:attempt,additional:[]),"scopes"),["dependency.txt","one.txt"]) }
     }
 }

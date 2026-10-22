@@ -26,7 +26,8 @@ extension CoreTests {
     }
     func testLegacyTriagePhaseSelectionNeverSilentlyDeletesMemberships() throws {
         let p = try project(),first = try task(p),second = try task(p),group = try triage(p);try addTriage(p,group,first);try addTriage(p,group,second)
-        try router.dbQueue.write { db in
+        // TaskReferenceValidation.swift: validate the complete synthetic legacy group at commit.
+        try fixtureDomainTransaction { db in
             var legacy = try router.scoped(db,group["id"] as! String,p["id"] as! String,type:"group");legacy.removeValue(forKey:"phase")
             var members = legacy["members"] as! [JSON];members[0]["handling_phase"] = "implementation";members[1]["handling_phase"] = "review";legacy["members"] = members;try router.save(db,legacy,type:"group")
         }
