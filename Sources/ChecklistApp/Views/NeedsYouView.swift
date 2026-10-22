@@ -27,10 +27,10 @@ struct NeedsYouView: View {
                                             AccessibleHStack(spacing: Spacing.small) {
                                                 Text(store.projectName(request.string("project_id")))
                                                 Text(RequestRowPresentation.ticketLabel(request,task:store.task(request.string("task_id"))))
-                                                    .foregroundStyle(request.bool("blocking") ? .orange : .secondary)
+                                                    .foregroundStyle(request.bool("blocking") ? .orange : Color.checklistSecondaryText)
                                                 Spacer(minLength:0)
                                                 RequestAgeLabel(request:request)
-                                            }.checklistFont(.micro).foregroundStyle(.secondary)
+                                            }.checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                                             AccessibleHStack(spacing: Spacing.compact) {
                                                 ForEach(RequestRowPresentation.capabilities(request)) { capability in
                                                     Label(capability.rawValue,systemImage:capability.symbol)
@@ -38,9 +38,9 @@ struct NeedsYouView: View {
                                                         .background(.primary.opacity(0.05),in:Capsule())
                                                 }
                                             }
-                                            Text("Requested by \(requesterLabel(request))").checklistFont(.micro).foregroundStyle(.secondary)
+                                            Text("Requested by \(requesterLabel(request))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                                         }
-                                        Image(systemName: "chevron.right").checklistFont(.micro).foregroundStyle(.tertiary)
+                                        Image(systemName: "chevron.right").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                                     }.checklistCard(padding: Spacing.group)
                                 }.buttonStyle(.checklistRow)
                             }

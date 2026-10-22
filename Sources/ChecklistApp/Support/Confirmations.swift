@@ -2,7 +2,7 @@ import SwiftUI
 
 /// One confirmation pattern for actions that remove, cancel, retire or release something (CL-57).
 /// The title names the action and its object, the message names the effect, and the confirm button
-/// repeats the action. It is a native dialog: Return confirms, Escape cancels, VoiceOver reads all parts.
+/// repeats the action. It is a native dialog: Return uses the configured default, Escape cancels, VoiceOver reads all parts.
 struct PendingConfirmation: Identifiable {
     let id = UUID()
     let title: String
@@ -10,6 +10,9 @@ struct PendingConfirmation: Identifiable {
     let confirmLabel: String
     var keepLabel = "Cancel"
     let perform: () -> Void
+    var cancelIsDefault = false
+
+    func respond(confirmed: Bool) { if confirmed { perform() } }
 }
 
 /// The same action has the same confirmation wherever it appears.
@@ -33,6 +36,21 @@ enum Confirmations {
     static func retireTag(_ name: String, perform: @escaping () -> Void) -> PendingConfirmation {
         PendingConfirmation(title: "Retire the tag \(name)?", effect: "Tickets keep this tag in their history, but nobody can add it to a ticket again.",
                             confirmLabel: "Retire tag", perform: perform)
+    }
+    static func retireMediaType(_ name: String, perform: @escaping () -> Void) -> PendingConfirmation {
+        PendingConfirmation(title: "Retire the review type \(name)?",
+                            effect: "This permanently disables the type. It cannot be enabled again or receive new rounds. Existing rounds, originals and history stay. Draft and Open rounds must be finished or canceled first.",
+                            confirmLabel: "Retire type", perform: perform, cancelIsDefault: true)
+    }
+    static func cancelMediaRound(_ name: String, perform: @escaping () -> Void) -> PendingConfirmation {
+        PendingConfirmation(title: "Cancel the round \(name)?",
+                            effect: "This ends review without completing the round. The cancellation reason, originals and history stay.",
+                            confirmLabel: "Cancel round", keepLabel: "Keep round", perform: perform, cancelIsDefault: true)
+    }
+    static func archiveMediaRound(_ name: String, perform: @escaping () -> Void) -> PendingConfirmation {
+        PendingConfirmation(title: "Archive the round \(name)?",
+                            effect: "The round moves to Archived rounds. Its originals and history stay; no files are deleted.",
+                            confirmLabel: "Archive round", perform: perform, cancelIsDefault: true)
     }
     static func removeDecision(perform: @escaping () -> Void) -> PendingConfirmation {
         PendingConfirmation(title: "Remove this decision?", effect: "Agents no longer get this decision in their project context after you save the settings. Earlier notes that quote it stay.",
@@ -69,8 +87,12 @@ extension View {
     func checklistConfirmation(_ pending: Binding<PendingConfirmation?>) -> some View {
         confirmationDialog(pending.wrappedValue?.title ?? "", isPresented: Binding(get: { pending.wrappedValue != nil }, set: { if !$0 { pending.wrappedValue = nil } }),
                            titleVisibility: .visible, presenting: pending.wrappedValue) { item in
-            Button(item.confirmLabel, role: .destructive) { item.perform() }
-            Button(item.keepLabel, role: .cancel) {}
+            Button(item.confirmLabel, role: .destructive) { item.respond(confirmed: true) }
+            if item.cancelIsDefault {
+                Button(item.keepLabel, role: .cancel) { item.respond(confirmed: false) }.keyboardShortcut(.defaultAction)
+            } else {
+                Button(item.keepLabel, role: .cancel) { item.respond(confirmed: false) }
+            }
         } message: { item in Text(item.effect) }
     }
 }

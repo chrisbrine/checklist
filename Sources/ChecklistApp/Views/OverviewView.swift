@@ -10,7 +10,7 @@ struct OverviewView: View {
             VStack(alignment: .leading, spacing: Spacing.page) {
                 VStack(alignment: .leading, spacing: Spacing.tight) {
                     Text("Overview").checklistFont(.pageTitle)
-                    Text(store.projectID.map { store.projectName($0) } ?? "All projects").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text(store.projectID.map { store.projectName($0) } ?? "All projects").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
                 if let focus = store.overviewFocus {
                     Button { store.overviewFocus = nil } label: { Label("Overview", systemImage: "chevron.left") }.buttonStyle(.link)
@@ -58,10 +58,10 @@ struct OverviewGroupSection: View {
                 Text(error).checklistFont(.micro).foregroundStyle(.orange)
                 Button("Retry") { store.scheduleOverviewNeeds(only: surface, force: true) }.checklistFont(.micro)
             } else if page == nil {
-                if store.showsOfflineBanner { Text("This group loads when Checklist reconnects.").checklistFont(.micro).foregroundStyle(.secondary) }
+                if store.showsOfflineBanner { Text("This group loads when Checklist reconnects.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                 else { ProgressView().controlSize(.small) }
             } else if let page, page.rows.isEmpty {
-                Text(OverviewText.empty(surface)).checklistFont(.micro).foregroundStyle(.secondary)
+                Text(OverviewText.empty(surface)).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             } else if let page {
                 ForEach(page.rows) { row in
                     if surface == "requests" { OverviewRequestRow(request: row) }
@@ -69,7 +69,7 @@ struct OverviewGroupSection: View {
                         VStack(alignment: .leading, spacing: Spacing.none) {
                             TaskRow(task: row)
                             if let work = OverviewText.work(row) {
-                                Text(work.text).checklistFont(.micro).foregroundStyle(work.needsRecovery ? Color.orange : Color.secondary).padding(.leading, Spacing.control)
+                                Text(work.text).checklistFont(.micro).foregroundStyle(work.needsRecovery ? Color.orange : Color.checklistSecondaryText).padding(.leading, Spacing.control)
                             }
                         }
                     }
@@ -118,14 +118,14 @@ struct WorkingNowStrip: View {
                 switch state {
                 case .loading: ProgressView().controlSize(.small)
                 case .failed, .stale: SourceFailure(text: "Could not load who is working now.") { store.scheduleOverviewNeeds(force: true) }
-                case .offline: Text("Working now loads when Checklist reconnects.").checklistFont(.micro).foregroundStyle(.secondary)
-                case .loaded: Text("No agent is working on a ticket now.").checklistFont(.micro).foregroundStyle(.secondary)
+                case .offline: Text("Working now loads when Checklist reconnects.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                case .loaded: Text("No agent is working on a ticket now.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
             } else {
                 // Entries can come from some sources while another failed, loads or waits (review finding 310a34a7).
                 if let text = Self.partialNotice(state) {
                     if state == .stale || state == .failed { SourceFailure(text: text) { store.scheduleOverviewNeeds(force: true) } }
-                    else { Text(text).checklistFont(.micro).foregroundStyle(.secondary) }
+                    else { Text(text).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                 }
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: Spacing.small) {
@@ -134,7 +134,7 @@ struct WorkingNowStrip: View {
                             Button { store.open(.task(row.id)) } label: {
                                 VStack(alignment: .leading, spacing: Spacing.tight) {
                                     Text(row.string("key")).checklistFont(.captionStrong)
-                                    Text(work?.text ?? "").checklistFont(.micro).foregroundStyle(work?.needsRecovery == true ? Color.orange : Color.secondary).lineLimit(2)
+                                    Text(work?.text ?? "").checklistFont(.micro).foregroundStyle(work?.needsRecovery == true ? Color.orange : Color.checklistSecondaryText).lineLimit(2)
                                 }.padding(Spacing.small).frame(width: 190, alignment: .leading)
                             }.buttonStyle(.checklistPlain).checklistCard()
                                 .accessibilityLabel("\(row.string("key")), \(work?.text ?? "")").help(row.string("title"))
@@ -171,21 +171,21 @@ struct LatestReviewResults: View {
                 switch state {
                 case .loading: ProgressView().controlSize(.small)
                 case .failed, .stale: SourceFailure(text: "Could not load the latest review results.") { store.scheduleOverviewNeeds(only: focused ? "recent_reviews" : nil, force: true) }
-                case .offline: Text("Review results load when Checklist reconnects.").checklistFont(.micro).foregroundStyle(.secondary)
-                case .loaded: Text("No review results yet.").checklistFont(.micro).foregroundStyle(.secondary)
+                case .offline: Text("Review results load when Checklist reconnects.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                case .loaded: Text("No review results yet.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
             } else if state == .stale {
                 StaleNotice { store.scheduleOverviewNeeds(only: focused ? "recent_reviews" : nil, force: true) }
             }
             ForEach(OverviewText.byProject(rows), id: \.0) { project, verdicts in
-                if store.projectID == nil { Text(store.projectName(project)).checklistFont(.microEmphasis).foregroundStyle(.secondary) }
+                if store.projectID == nil { Text(store.projectName(project)).checklistFont(.microEmphasis).foregroundStyle(Color.checklistSecondaryText) }
                 ForEach(verdicts.prefix(3)) { review in
                     Button { store.open(.task(review.string("task_id"))) } label: {
                         HStack(spacing: Spacing.small) {
                             StatusPill(name: OverviewText.verdict(review.string("verdict")), category: review.string("verdict") == "pass" ? "done" : "blocked")
                             Text("\(review.string("task_key")) · \(review.string("task_title"))").checklistFont(.callout).lineLimit(1)
                             Spacer()
-                            Text("\(review.string("reviewer", fallback: "Reviewer")) · \(relativeTime(review.string("created_at")))").checklistFont(.micro).foregroundStyle(.secondary).lineLimit(1)
+                            Text("\(review.string("reviewer", fallback: "Reviewer")) · \(relativeTime(review.string("created_at")))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).lineLimit(1)
                         }.padding(.vertical, Spacing.tight).contentShape(Rectangle())
                     }.buttonStyle(.checklistPlain).checklistDisabled([(review.string("task_id").isEmpty, "This verdict has no ticket.")])
                 }
@@ -222,13 +222,13 @@ struct CompletionDigest: View {
                 switch SourceState.of([store.overviewObservations["completed_since"]], offline: store.showsOfflineBanner) {
                 case .loading, .loaded: ProgressView().controlSize(.small)
                 case .failed, .stale: SourceFailure(text: "Could not load the completed tickets.") { store.scheduleOverviewNeeds(only: "completed_since", force: true) }
-                case .offline: Text("The digest loads when Checklist reconnects.").checklistFont(.micro).foregroundStyle(.secondary)
+                case .offline: Text("The digest loads when Checklist reconnects.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
             } else if store.overviewObservations["completed_since"]?.error != nil {
                 StaleNotice { store.scheduleOverviewNeeds(only: "completed_since", force: true) }
             }
             if let page, page.rows.isEmpty, store.overviewObservations["completed_since"]?.error == nil {
-                Text(since.isEmpty ? "Nothing completed since your last visit." : "Nothing completed since your last visit (\(since)).").checklistFont(.micro).foregroundStyle(.secondary)
+                Text(since.isEmpty ? "Nothing completed since your last visit." : "Nothing completed since your last visit (\(since)).").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
             ForEach(page?.rows ?? []) { task in
                 Button { store.open(.task(task.id)) } label: {
@@ -236,7 +236,7 @@ struct CompletionDigest: View {
                         Image(systemName: "checkmark.circle").foregroundStyle(.green).accessibilityHidden(true)
                         Text("\(task.string("key")) · \(task.string("title"))").checklistFont(.callout).lineLimit(1)
                         Spacer()
-                        Text(relativeTime(task.string("completed_at"))).checklistFont(.micro).foregroundStyle(.secondary)
+                        Text(relativeTime(task.string("completed_at"))).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     }.padding(.vertical, Spacing.tight).contentShape(Rectangle())
                 }.buttonStyle(.checklistPlain)
             }
@@ -254,10 +254,10 @@ struct OverviewRequestRow: View {
                 VStack(alignment: .leading, spacing: Spacing.tight) {
                     Text(request.string("title")).checklistFont(.bodyEmphasis).lineLimit(2)
                     Text([store.projectID == nil ? store.projectName(request.string("project_id")) : "", request.string("task_key"), request.bool("blocking") ? "Blocks work" : ""]
-                        .filter { !$0.isEmpty }.joined(separator: " · ")).checklistFont(.micro).foregroundStyle(.secondary)
+                        .filter { !$0.isEmpty }.joined(separator: " · ")).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
                 Spacer()
-                Text(relativeTime(request.string("created_at"))).checklistFont(.micro).foregroundStyle(.secondary)
+                Text(relativeTime(request.string("created_at"))).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }.padding(.vertical, Spacing.small).contentShape(Rectangle())
         }.buttonStyle(.checklistPlain)
     }

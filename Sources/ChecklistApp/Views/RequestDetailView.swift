@@ -61,7 +61,7 @@ struct RequestDetailView: View {
                 VStack(alignment: .leading, spacing: Spacing.page) {
                     Text(request.string("title")).checklistFont(.pageTitle)
                     AccessibleHStack { StatusPill(name: Self.stateName(request), category: answered ? "done" : "blocked"); Spacer() }
-                    Text("Requested by \(requesterLabel)").checklistFont(.micro).foregroundStyle(.secondary).textSelection(.enabled)
+                    Text("Requested by \(requesterLabel)").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).textSelection(.enabled)
                     TechnicalDetails([("Request", request.id), ("Form revision", "\(request.integer("form_revision"))"), ("Candidate", exactTarget.id), ("Candidate SHA-256", exactTarget.string("sha256"))])
                     if !spec.string("explanation").isEmpty { Text(spec.string("explanation")).checklistFont(.callout).textSelection(.enabled) }
                     if !request.string("task_id").isEmpty, let task = store.task(request.string("task_id")) { Button { store.open(.task(task.id)) } label: { Label("\(task.string("key")) · \(task.string("title"))", systemImage: "arrow.turn.up.left") }.buttonStyle(.link) }
@@ -75,11 +75,11 @@ struct RequestDetailView: View {
                     if !target.id.isEmpty {
                         DetailSection(title: "Exact candidate") {
                             Text(target.string("label")).checklistFont(.bodyStrong)
-                            Text("\(target.string("version_label")) · \(target.string("platform_label"))").checklistFont(.micro).foregroundStyle(.secondary)
+                            Text("\(target.string("version_label")) · \(target.string("platform_label"))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                             if let attachment = request.records("detail_attachments").first(where: { $0.id == target.id }) { AttachmentRow(file: attachment, targetManifestID: request.string("target_manifest_id")) }
                             if !imageCandidates.isEmpty {
                                 Button("Inspect and compare images…") { showingImageReview = true }
-                                Text("Inspected \(imageCandidates.filter { inspectedSelection.wrappedValue.contains($0.identity) }.count) of \(imageCandidates.count) originals").checklistFont(.micro).foregroundStyle(.secondary)
+                                Text("Inspected \(imageCandidates.filter { inspectedSelection.wrappedValue.contains($0.identity) }.count) of \(imageCandidates.count) originals").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                                 if !imageApprovalReady { Text("Inspect and explicitly mark every available original before approving. Missing or cleaned originals cannot be approved.").checklistFont(.micro).foregroundStyle(.orange) }
                             }
                             if !imageContext.string("problem").isEmpty { Text(imageContext.string("problem")).checklistFont(.micro).foregroundStyle(.orange) }
@@ -109,15 +109,15 @@ struct RequestDetailView: View {
                         DetailSection(title: "Saved responses") {
                             ForEach(request.records("responses")) { response in
                                 VStack(alignment: .leading, spacing: Spacing.tight) {
-                                    Text("You · \(relativeTime(response.string("created_at")))").checklistFont(.micro).foregroundStyle(.secondary)
+                                    Text("You · \(relativeTime(response.string("created_at")))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                                     Text(response.bool("complete") ? "Answer saved" : "Response saved; dependency remains unresolved").checklistFont(.micro)
                                     if !response.records("inspected_images").isEmpty { Text("Inspected originals: \(response.records("inspected_images").count)").checklistFont(.micro) }
                                     if !response.string("explanation").isEmpty { Text(response.string("explanation")).checklistFont(.callout).textSelection(.enabled) }
                                     let continuation = RequestAnswerDeliveryProjection.make(request: request, response: response, messages: request.records("detail_messages"), sessions: request.records("detail_sessions"), snapshotCurrent: store.connected)
                                     ForEach(continuation.recipients) { recipient in
-                                        Text("\(recipient.label) · \(recipient.receipt)").checklistFont(.micro).foregroundStyle(.secondary)
+                                        Text("\(recipient.label) · \(recipient.receipt)").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                                     }
-                                    Text(continuation.summary).checklistFont(.micro).foregroundStyle(.secondary)
+                                    Text(continuation.summary).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                                     TechnicalDetails([("Response", response.id), ("Saved at", response.string("created_at")), ("Form revision", "\(response.integer("form_revision"))"),
                                                       ("Source", response.string("origin")), ("Authorization generation", response.string("source_authorization_generation")), ("Form identity", response.string("form_identity"))])
                                 }
@@ -138,9 +138,9 @@ struct RequestDetailView: View {
     }
     var responseActions: some View {
         VStack(alignment: .leading, spacing: Spacing.row) {
-            if answered { Text(Self.footerText(request)).checklistFont(.micro).foregroundStyle(.secondary) }
-            else { DraftSaveStatusView(kind: "answer", draftID: request.id); Text("Sending records only the results you explicitly select.").checklistFont(.micro).foregroundStyle(.secondary) }
-            if draft.explanation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !answered { Text("Add an explanation to request clarification or say you cannot do this.").checklistFont(.micro).foregroundStyle(.tertiary) }
+            if answered { Text(Self.footerText(request)).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+            else { DraftSaveStatusView(kind: "answer", draftID: request.id); Text("Sending records only the results you explicitly select.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+            if draft.explanation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !answered { Text("Add an explanation to request clarification or say you cannot do this.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             if let progress = fileInspector.progress {
                 ProgressView(value: progress.fraction) { Text("Checking selected files…").checklistFont(.micro) }
             }
@@ -153,7 +153,7 @@ struct RequestDetailView: View {
                     Button("Cancel request…", role: .destructive) { confirmation = Confirmations.cancelRequest { store.run("human_request_cancel", ["project_id": request.string("project_id"), "request_id": request.id, "expected_revision": request.integer("revision"), "reason": draft.explanation], success: "Request canceled") } }
                 }.checklistDisabled([(answered, "This request is already answered."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
                 Spacer()
-                Button("Send answer") { send("answered") }.buttonStyle(.checklistProminent).keyboardShortcut(.return, modifiers: .command).checklistDisabled([(!complete, "Answer every required question first."), (answered, "This request is already answered."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
+                Button("Send answer") { send("answered") }.buttonStyle(.checklistProminent).keyboardShortcut(.return, modifiers: .command).checklistDisabled([(!complete, "Complete every required item. Choose No to decline; use Other response for Not checked."), (answered, "This request is already answered."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
             }
         }.padding(Spacing.group).background(.bar)
     }
@@ -162,7 +162,7 @@ struct RequestDetailView: View {
             Text(command.string("reason")).checklistFont(.callout)
             ScrollView(.horizontal) { Text(command.string("text")).checklistFont(.codeCaption).textSelection(.enabled).padding(Spacing.row) }.background(.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: Radius.medium))
             Text("In: \(command.string("working_directory"))").checklistFont(.micro).textSelection(.enabled)
-            Text("Expected: \(command.string("expected_result"))").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("Expected: \(command.string("expected_result"))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             Button("Copy command") { clipboard(command.string("text")) }
         }
     }
@@ -171,7 +171,7 @@ struct RequestDetailView: View {
             let type = question.string("type")
             if !question.object("command").isEmpty { commandView(Record(values: question.object("command"))) }
             if ["single_choice", "multiple_choice", "choice", "approval", "check"].contains(type) {
-                let options: [Record] = type == "approval" ? [Record(values: ["id": "approved", "label": "Approve"]), Record(values: ["id": "changes_requested", "label": "Needs changes"]), Record(values: ["id": "not_checked", "label": "Not checked"])] : type == "check" ? [Record(values: ["id": "passed", "label": "I ran it · Passed"]), Record(values: ["id": "failed", "label": "I ran it · Failed"]), Record(values: ["id": "not_checked", "label": "Not checked"])] : question.records("options")
+                let options: [Record] = type == "approval" ? [Record(values: ["id": "approved", "label": "Approve"]), Record(values: ["id": "changes_requested", "label": "Needs changes"]), Record(values: ["id": "declined", "label": "No · I decline"]), Record(values: ["id": "not_checked", "label": "Not checked"])] : type == "check" ? [Record(values: ["id": "passed", "label": "I ran it · Passed"]), Record(values: ["id": "failed", "label": "I ran it · Failed"]), Record(values: ["id": "declined", "label": "No · I decline"]), Record(values: ["id": "not_checked", "label": "Not checked"])] : question.records("options")
                 VStack(alignment: .leading, spacing: Spacing.small) {
                     ForEach(options) { option in
                         Button {
@@ -205,7 +205,7 @@ struct RequestDetailView: View {
                 VStack(alignment: .leading, spacing: Spacing.tight) {
                     AccessibleHStack {
                         Image(systemName: "link"); Text(URL(fileURLWithPath: path).lastPathComponent).checklistFont(.micro).lineLimit(1)
-                        Text(draft.fileModes[file.id] == "managed" ? "Managed copy on send" : "Reference").checklistFont(.micro).foregroundStyle(.secondary)
+                        Text(draft.fileModes[file.id] == "managed" ? "Managed copy on send" : "Reference").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                         Spacer()
                         Button { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) } label: { Image(systemName: "folder") }.buttonStyle(.checklistIcon).help("Reveal original").accessibilityLabel("Reveal original")
                         Button("Relink") { choose(file, replacing: path) }.checklistFont(.micro).checklistDisabled([(answered, "This request is already answered."), (staleDraft, "This request changed. Review the current version first.")])

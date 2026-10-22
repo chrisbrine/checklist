@@ -8,6 +8,14 @@ extension CommandRouter {
 
     /// Settings are project data. Personal views, alert permissions and delivery state stay separate.
     func validateProjectSettingsPatch(_ p: JSON, project: inout JSON) throws {
+        if let raw = p["work_health_settings"] {
+            let value = try validateWorkHealthSettings(raw)
+            if try jsonString(value) != jsonString(workHealthSettings(project)) {
+                project["work_health_generation"] = uuid()
+                project["work_health_changed_at"] = now()
+            }
+            project["work_health_settings"] = value
+        }
         if p["name"] != nil { project["name"] = try text(p,"name",max:200) }
         if let raw = p["key_prefix"] {
             guard let prefix = raw as? String, prefix.range(of:"^[A-Z][A-Z0-9]{0,11}$",options:.regularExpression) != nil else { throw CoreError("INVALID_INPUT","Use a short uppercase letter/number ticket prefix.") }
@@ -46,7 +54,7 @@ extension CommandRouter {
             if let policy = p["policy"] { params["policy"] = policy }
             if let proposal = p["policy_proposal_id"] { params["proposal_id"] = proposal; params["digest"] = p["policy_digest"] }
             updated = try policyCommand(db,params,c,"policy_apply")
-            for key in ["name","key_prefix","icon","accent","brief","pinned_decisions","context_revision","brief_revision","decisions_revision","previous_context_revision_id","context_approved_by","default_view","alert_override","capture_defaults"] { if let value = draft[key] { updated[key] = value } }
+            for key in ["name","key_prefix","icon","accent","brief","pinned_decisions","context_revision","brief_revision","decisions_revision","previous_context_revision_id","context_approved_by","default_view","alert_override","capture_defaults","work_health_settings","work_health_generation","work_health_changed_at"] { if let value = draft[key] { updated[key] = value } }
         } else { updated = revised(draft) }
         updated["settings_revision"] = int(current,"settings_revision",default:1) + 1
         try save(db,updated,type:"project"); try propagateProjectContextChange(db,old:current,updated:updated,caller:c)

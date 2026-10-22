@@ -59,6 +59,40 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
     }
     func exists(_ file: JSON) -> Bool { FileManager.default.fileExists(atPath:file["path"] as! String) }
 
+    func testBackupCaptureDefersCleanupWithoutFailuresAndProtectsManagedUnlinks() throws {
+        let f = try fixture(),job = try archive(f)
+        try makeDue(job)
+        let before = try record(job["id"] as! String,"cleanup_job")
+        var observed = false,budget = StorageSnapshotBudget.production()
+        budget.observe = {event in
+            guard event == "copying_objects" else {return}
+            observed = true
+            try self.router.runStorageMaintenance()
+            XCTAssertNil(try self.router.nextArchiveCleanupDeadline())
+            XCTAssertEqual(try jsonString(self.record(job["id"] as! String,"cleanup_job")),try jsonString(before))
+            try ArchiveStorageGate.withExclusive(root:self.router.root) { _ in
+                let files = try StorageObjectFiles(root:self.router.root)
+                XCTAssertThrowsError(try self.router.removeManagedFile(files,relative:self.router.managedRelative(f.files[0]["path"] as! String,family:"objects"))) {
+                    XCTAssertEqual(($0 as? CoreError)?.code,"BACKUP_CAPTURE_ACTIVE")
+                }
+                let capture = "source-captures/fixture/capture"
+                try files.writeNew(capture + "/source/a",bytes:Data("protected".utf8))
+                XCTAssertThrowsError(try self.router.removeManagedTree(files,relative:capture)) {
+                    XCTAssertEqual(($0 as? CoreError)?.code,"BACKUP_CAPTURE_ACTIVE")
+                }
+            }
+            let holds = try self.router.dbQueue.read {db in
+                try self.router.completeArchiveCleanupHolds(db,attachment:f.files[0],task:self.router.record(db,f.task["id"] as! String,type:"task"))
+            }
+            XCTAssertTrue(holds.contains(.backupCapture))
+            XCTAssertTrue(self.exists(f.files[0]))
+        }
+        _ = try router.executeStorageBackup(params:["command_id":UUID().uuidString,"path":directory.appendingPathComponent("protected-backup").path],caller:owner,budget:budget)
+        XCTAssertTrue(observed)
+        try router.runStorageMaintenance()
+        XCTAssertFalse(exists(f.files[0]))
+    }
+
     func testCanonicalSettingsAggregateSelectionGraceCancelAndUnarchiveKeepBytes() throws {
         let f = try fixture(count:3,size:10,threshold:100,budget:15),pid = f.project["id"]!,tid = f.task["id"]!
         let preview = try call("attachment_cleanup_preview",["project_id":pid,"task_id":tid])

@@ -10,7 +10,7 @@ struct TicketRetirementControls: View {
         HStack {
             if task.bool("trashed") {
                 Button("Restore from Trash") { archiveAction("restore") }
-                Text("Notes and connections are retained.").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("Notes and connections are retained.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             } else {
                 Button("Move to Trash…") { reasonAction = .trash }
                 if ["done","completed","canceled"].contains(task.string("status_category")) {

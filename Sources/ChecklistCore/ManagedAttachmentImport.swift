@@ -427,6 +427,7 @@ extension CommandRouter {
         let absolute = root.appendingPathComponent(path).path
         guard try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type='attachment' AND CASE WHEN json_valid(data) THEN json_extract(data,'$.path')=CAST(? AS TEXT) COLLATE BINARY OR json_extract(data,'$.preview_path')=CAST(? AS TEXT) COLLATE BINARY OR json_extract(data,'$.path')=CAST(? AS TEXT) COLLATE BINARY OR json_extract(data,'$.preview_path')=CAST(? AS TEXT) COLLATE BINARY ELSE 1 END",arguments:[Data(absolute.utf8),Data(absolute.utf8),Data(path.utf8),Data(path.utf8)]) == 0 else { throw managedImportFailure("staging_reference_retained") }
         guard try managedImportExists(files,path) else { return }
+        try StorageSnapshotRetention.requireNoCapture(root:files.root)
         let (directory,name) = try files.parent(path); defer { Darwin.close(directory) }
         guard unlinkat(directory,name,0) == 0, fsync(directory) == 0 else { throw managedImportFailure("stage_cleanup_pending") }
     }

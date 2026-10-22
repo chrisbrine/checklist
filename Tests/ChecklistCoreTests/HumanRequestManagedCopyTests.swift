@@ -311,12 +311,13 @@ final class HumanRequestManagedCopyTests: XCTestCase {
     func testIncompleteAnswerImportsNothingAndRemainsPending() throws {
         let selected = try file("pending.txt","pending"), request = try request(questions:[["id":"check","type":"check","prompt":"Did you run it?"]])
         var input = try answer(request,[selected]); input["answers"] = [["question_id":"check","result":"not_checked"]]
-        let result = try call("human_request_answer",input)
-        XCTAssertEqual(result["state"] as? String,"pending")
-        XCTAssertEqual(((result["responses"] as! [JSON])[0])["complete"] as? Bool,false)
+        XCTAssertThrowsError(try call("human_request_answer",input)) { XCTAssertEqual(($0 as? CoreError)?.code,"ANSWER_INCOMPLETE") }
+        let stored = try records("request").first!
+        XCTAssertEqual(stored["state"] as? String,"pending")
+        XCTAssertTrue((stored["responses"] as! [JSON]).isEmpty)
+        XCTAssertTrue(try records("message").isEmpty)
         XCTAssertTrue(try records("attachment").isEmpty)
         XCTAssertTrue(try records("storage_job").isEmpty)
-        XCTAssertNil((((result["responses"] as! [JSON])[0])["files"] as! [JSON])[0]["artifact_refs"])
     }
 
     func testReferenceAnswerRecordsOriginalWithoutManagedImport() throws {

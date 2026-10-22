@@ -53,7 +53,7 @@ extension CommandRouter {
         guard task["active_verification_request_id"] as? String == request["id"] as? String,gate["state"] as? String == "human_pending",gate["human_request_id"] as? String == request["id"] as? String,let mid = request["target_manifest_id"] as? String,gate["manifest_id"] as? String == mid,gate["gate"] as? String == "human_approval" else { throw CoreError("REQUEST_CHANGED","This human verification no longer owns the exact gate.") }
         _ = try validateManifestTarget(db,task:task,manifestID:mid)
         try validateHumanGateDirection(db,request:request,params:params,caller:caller)
-        guard let answer = answers.first(where: {$0["question_id"] as? String == request["approval_question_id"] as? String}),let result = answer["result"] as? String ?? answer["value"] as? String,["approved","changes_requested"].contains(result) else { throw CoreError("ANSWER_INCOMPLETE","Choose Approve or Needs changes for the exact inspected target.") }
+        guard let answer = answers.first(where: {$0["question_id"] as? String == request["approval_question_id"] as? String}),let result = answer["result"] as? String ?? answer["value"] as? String,["approved","changes_requested","declined"].contains(result) else { throw CoreError("ANSWER_INCOMPLETE","Choose Approve or Needs changes for the exact inspected target.") }
         let verdict = result == "approved" ? "pass" : "reject"
         let review: JSON = ["id":uuid(),"project_id":pid,"task_id":task["id"]!,"manifest_id":mid,"review_request_id":rid,"human_request_id":request["id"]!,"human_response_id":responseID,"target_attachment_id":request["target_attachment_id"]!,"target_sha256":request["target_sha256"]!,"gate":"human_approval","verdict":verdict,"actor":caller.principal,"actor_display":"You","origin":"human_ui","checks":[["label":"Owner inspected exact original","result":result,"target_attachment_id":request["target_attachment_id"]!,"sha256":request["target_sha256"]!]],"findings":[],"revision":1,"created_at":now()]
         try save(db,review,type:"review"); gate["state"] = verdict; gate["latest_verdict_id"] = review["id"]; try save(db,revised(gate),type:"review_request")
@@ -106,7 +106,7 @@ extension CommandRouter {
         for input in dispositions {
             let id = try text(input,"finding_id"); var finding = try scoped(db,id,pid,type:"finding")
             guard finding["task_id"] as? String == tid,finding["gate"] as? String == gate,finding["state"] as? String == "open" else { throw CoreError("FINDINGS_UNRESOLVED","This finding is not an open finding for this task and gate.") }
-            let disposition = try text(input,"disposition"); guard ["resolved","rejected"].contains(disposition) else { throw CoreError("HUMAN_CHANNEL_REQUIRED","An owner waiver is a separate explicitly labeled action.") }
+            let disposition = try text(input,"disposition"); guard ["resolved","rejected"].contains(disposition) else { throw CoreError("HUMAN_CHANNEL_REQUIRED","Use finding_waive for a separate explicitly attributed waiver.") }
             let reason = try text(input,"reason",max:8000); let refs = input["evidence_refs"] as? [Any] ?? []
             try findingEvidence(db,refs:refs,task:task,manifestID:mid)
             let resolution: JSON = ["id":uuid(),"project_id":pid,"task_id":tid,"finding_id":id,"review_id":reviewID,"manifest_id":mid,"disposition":disposition,"reason":reason,"evidence_refs":refs,"actor":caller.principal,"actor_display":author(db,caller),"created_at":now(),"revision":1]
@@ -135,8 +135,12 @@ extension CommandRouter {
         let mid = try text(p,"target_manifest_id"),gate = try text(p,"gate"); _ = try validateManifestTarget(db,task:task,manifestID:mid)
         let manifest = try scoped(db,mid,pid,type:"manifest"); guard try manifestGates(db,manifest).contains(gate) else { throw CoreError("POLICY_DENIED","This gate is not required by the submitted target’s pinned policy.") }
         let existing = try records(db,type:"review_request",project:pid).last { $0["task_id"] as? String == task["id"] as? String && $0["manifest_id"] as? String == mid && $0["gate"] as? String == gate }
+        // A request for the same target/gate continues the current Review phase.
+        // New targets and actual phase changes still use the individual status departure.
+        let category = try taskProjection(db,task)["status_category"] as? String
+        let continuesReview = existing != nil && category == "review"
         if p["supplemental_evidence_refs"] != nil,existing?["state"] as? String != "evidence_requested" { throw CoreError("INVALID_INPUT","Supplemental evidence answers an evidence_missing verdict on this target and gate.") }
-        if let existing = existing,existing["state"] as? String == "queued" { try recordTicketStatusAction(db,task:task,caller:c); var result = existing;result["key"] = task["key"];result["title"] = task["title"];return result }
+        if let existing = existing,existing["state"] as? String == "queued" { if !continuesReview { try recordTicketStatusAction(db,task:task,caller:c) }; var result = existing;result["key"] = task["key"];result["title"] = task["title"];return result }
         if let existing = existing { guard p["supersedes_request_id"] as? String == existing["id"] as? String else { throw CoreError("REVIEW_TARGET_MISMATCH","Name the current request when explicitly starting another review round.") }; _ = try text(p,"reason",max:8000) }
         var request: JSON = ["id":uuid(),"project_id":pid,"task_id":task["id"]!,"manifest_id":mid,"gate":gate,"state":"queued","revision":1,"created_at":now()]
         if let existing = existing { request["supersedes_request_id"] = existing["id"] }
@@ -151,13 +155,13 @@ extension CommandRouter {
                 return ["artifact_id":attachment["id"]!,"sha256":attachment["sha256"]!,"name":attachment["name"] ?? ""]
             }
         } else if p["supplemental_evidence_refs"] != nil { throw CoreError("INVALID_INPUT","supplemental_evidence_refs is a list of attachment references.") }
-        try save(db,request,type:"review_request"); task["status_id"] = try status(db,pid,"review")["id"]; try save(db,revised(task),type:"task"); try recordTicketStatusAction(db,task:task,caller:c)
+        try save(db,request,type:"review_request"); if !continuesReview { task["status_id"] = try status(db,pid,"review")["id"] }; try save(db,revised(task),type:"task"); if !continuesReview { try recordTicketStatusAction(db,task:task,caller:c) }
         try event(db,caller:c,project:pid,entity:task["id"] as? String,kind:"review_requested",data:["review_request_id":request["id"]!,"manifest_id":mid,"gate":gate]); request["key"] = task["key"];request["title"] = task["title"];return request
     }
     func findingWaive(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
-        try owner(c); let pid = try scope(db,p,c,write:true); var finding = try scoped(db,try text(p,"finding_id"),pid,type:"finding"); try revision(p,finding)
+        let pid = try scope(db,p,c,write:true); try requireAgentEditAuthority(db,project:try record(db,pid,type:"project"),caller:c); var finding = try scoped(db,try text(p,"finding_id"),pid,type:"finding"); try revision(p,finding)
         guard finding["state"] as? String == "open" else { throw CoreError("FINDINGS_UNRESOLVED","Only an open finding can be waived.") }
-        let resolution: JSON = ["id":uuid(),"project_id":pid,"task_id":finding["task_id"]!,"finding_id":finding["id"]!,"disposition":"waived","reason":try text(p,"reason",max:8000),"actor":c.principal,"actor_display":"You","origin":"human_ui","revision":1,"created_at":now()]
+        let resolution: JSON = ["id":uuid(),"project_id":pid,"task_id":finding["task_id"]!,"finding_id":finding["id"]!,"disposition":"waived","reason":try text(p,"reason",max:8000),"actor":c.principal,"actor_display":c.isOwner ? "You" : "Agent","origin":c.isOwner ? "human_ui" : "agent","waiver_kind":c.isOwner ? "owner_waiver" : "agent_waiver","session_id":c.sessionID ?? "human","revision":1,"created_at":now()]
         try save(db,resolution,type:"finding_resolution"); finding["state"] = "waived"; finding["latest_resolution_id"] = resolution["id"]; finding = revised(finding); try save(db,finding,type:"finding"); try event(db,caller:c,project:pid,entity:finding["task_id"] as? String,kind:"finding_waived",data:["finding_id":finding["id"]!,"resolution_id":resolution["id"]!]); return finding
     }
 }

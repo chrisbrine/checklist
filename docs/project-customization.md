@@ -22,6 +22,8 @@ No project setting changes protected ownership, human authorship, evidence or de
 
 Changing a key prefix affects **new tickets, Triages and Epics only**. Existing keys, aliases, links and external references keep their original values. Separate project-wide monotonic counters for tickets, Triages and Epics never reset on a prefix change, and retired keys are not reused. Prefixes can match across projects because all resolution remains scoped by stable project UUID. Renaming a project or replacing its icon never creates a new project or changes its root binding.
 
+Enrolled workers may import/clear project icons and change archive storage settings while `agent_rule_changes=allowed`. Icon sources must stay inside the actual workspace and enrolled project; the service reads through a checked descriptor. Root moves and the switch itself remain owner actions.
+
 ## Icons that remain readable and portable
 
 Choose a built-in symbol from the supported picker or import a local PNG, JPEG or WebP using Finder, paste or drop. The initial design limit is **5 MiB and 4,096 pixels per edge**, with bounded decoding and a useful rejection message. Normalize a successful import into a metadata-free 256-pixel PNG thumbnail in the managed blob store; retain that thumbnail rather than the large source image. Never modify or remove the Finder original. Animated, vector and active-content formats are outside the first release.
@@ -76,3 +78,7 @@ Project Settings keeps review requirements beside workflow controls. The project
 An untouched generic default does not create a workflow change. Project details still save directly when workflow is unchanged; changing requirements needs a matching workflow preview. Editing requirements or application mode after preview makes the old preview inapplicable. Validation errors and conflicts keep the visible draft. Changed review requirements use future review claims; same-gate active requirement reconciliation remains unavailable and is rejected by the service.
 
 New agent reviews pin the then-current requirement revision separately from their submitted target's gate policy. Active and recorded requirements remain read-only in review details. A preparation preview starts no claim; the actual reviewer refreshes service context after claiming. Historical verdicts show their own stored requirements and never substitute today's project rules. Evidence classes describe selected bytes/provenance, not successful tests, native observations or approval.
+
+## Active work health settings
+
+The native form and agent settings commands expose `work_health_settings`: `enabled` (default true), `inactivity_minutes` and `response_grace_minutes` (both default 20; whole minutes 1–10080). Pause retains requests; resume grants a new observation window. Unchanged saves do not postpone checks. Settings remain subject to project revision/agent-rule authority. [Work health](work-health.md) describes progress, liveness, waits, pickup limits and late-response reconciliation.

@@ -202,7 +202,7 @@ final class CoreTests: XCTestCase {
         let value = try submittedArtifact(gates:["human_approval","review"]);let p = value.project;var request = try humanApproval(value)
         XCTAssertEqual(request["gate"] as? String,"human_approval");XCTAssertEqual(request["target_manifest_id"] as? String,value.submission["manifest_id"] as? String)
         assertCode("TARGET_CHANGED") { _ = try self.call("human_request_answer",try self.observedGateAnswer(["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":1,"target_sha256":"wrong","answers":[["question_id":"approve","value":"approved"]]], task:value.task)) }
-        request = try call("human_request_answer",try observedGateAnswer(["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":1,"target_sha256":value.artifact["sha256"]!,"answers":[["question_id":"approve","value":"not_checked"]]], task:value.task))
+        request = try call("human_request_answer",try observedGateAnswer(["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":1,"target_sha256":value.artifact["sha256"]!,"response":"clarification","explanation":"I have not checked this target","answers":[["question_id":"approve","value":"not_checked"]]], task:value.task))
         XCTAssertEqual(request["state"] as? String,"pending");XCTAssertNil(request["gate_verdict_id"])
         request = try call("human_request_answer",["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":request["revision"]!,"response":"clarification","explanation":"Need a different angle","answers":[]])
         XCTAssertEqual(request["state"] as? String,"pending")

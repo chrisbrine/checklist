@@ -44,15 +44,15 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertEqual(Set(summary.keys), ["schema_version", "observed_at", "service", "record_counts"])
     }
 
-    func testDiagnosticsIsReadOnlyAndUnavailableToWorkerOrAssistant() throws {
+    func testDiagnosticsIsReadOnlyAndRequiresScopedWorkerOrOwner() throws {
         let before = try router.dbQueue.read { db in try router.records(db, type: "task").count }
         _ = try call("diagnostics_summary")
         let after = try router.dbQueue.read { db in try router.records(db, type: "task").count }
         XCTAssertEqual(before, after)
         for role in ["worker", "assistant"] {
             let caller = Caller(role: role, installation: "untrusted-diagnostics", projectIDs: [], sessionID: "private-session")
-            XCTAssertFalse(router.toolCatalog(caller).contains { $0["name"] as? String == "diagnostics_summary" })
-            XCTAssertThrowsError(try call("diagnostics_summary", caller: caller)) { XCTAssertEqual(($0 as? CoreError)?.code, "FORBIDDEN") }
+            XCTAssertEqual(router.toolCatalog(caller).contains { $0["name"] as? String == "diagnostics_summary" },role == "worker")
+            XCTAssertThrowsError(try call("diagnostics_summary", ["project_id":"outside-grant"], caller: caller)) { XCTAssertEqual(($0 as? CoreError)?.code, "FORBIDDEN") }
         }
     }
 }

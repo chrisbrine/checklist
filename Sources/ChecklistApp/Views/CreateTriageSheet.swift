@@ -11,7 +11,7 @@ struct CreateTriageSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.section) {
             Text("New Triage").checklistFont(.sheetTitle)
-            Text("Group one phase of work. Implementation submission leaves its Triage; put submitted tickets into a separate review Triage. Only failed tickets need another implementation pass.").checklistFont(.callout).foregroundStyle(.secondary)
+            Text("Group one phase of work. Implementation submission leaves its Triage; put submitted tickets into a separate review Triage. Only failed tickets need another implementation pass.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
             Picker("Project", selection: $projectID) { Text("Choose project").tag(""); ForEach(store.activeProjects) { Text($0.string("name")).tag($0.id) } }
             TextField("Name of this Triage", text: $name).textFieldStyle(.roundedBorder)
             Picker("Phase",selection:$phase) { Text("Implementation").tag("implementation");Text("Review").tag("review") }.pickerStyle(.segmented).tint(.checklistAccent)

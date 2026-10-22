@@ -4,7 +4,7 @@ Checklist is designed for independent game/app developers. Public product terms,
 
 ## Public and private material
 
-Public source contains README/AGENTS, the LICENSE, active docs, contracts and synthetic examples, generic skills/plugin package, project instruction templates, the planning validator, and the selected `public-*.png` concepts with sanitized provenance. Only the current public-overhaul report is included from reviews. Public examples use fictional projects and agent names; stable example UUIDs are synthetic identities, never live grants.
+Public source contains the Swift package and dependency lockfile, app/service/MCP source, portable tests, build helpers, README/AGENTS, the LICENSE, active docs, contracts and synthetic examples, generic skills/plugin package, project instruction templates, preparation checks, and the selected `public-*.png` concepts with sanitized provenance. Only the current public-overhaul report is included from reviews. Public examples use fictional projects and agent names; stable example UUIDs are synthetic identities, never live grants.
 
 The generated app icon, native `.icns` representations and [retained prompt/source notes](../Resources/AppIcon/README.md) are generic product assets. Inspect their artwork before publication; this does not make private runtime screenshots public.
 
@@ -23,6 +23,21 @@ uv run --no-project --with jsonschema --with pyyaml python scripts/validate-plan
 The validator selects an explicit generic public source set, checks schema/example pairs, positive/negative contract shapes and cross-references, both skill packages, plugin path wiring, public local links/anchors and PNG metadata/provenance. It reports prospective source files and fails on private-directory references, real home paths or concrete native inbox/session identifiers. Public screenshots also require human visual inspection; a string scan cannot prove their contents.
 
 The script is read-only and does not execute bundled tools, historical probes, model CLIs, service startup or the bundled MCP command. JSON/manifest validation is not plugin host compatibility. Product tests and actual provider qualification remain separate.
+
+## Prepare an unpublished source directory
+
+The reviewed [source inventory](../scripts/public-source-files.json) lists exact relative paths. New files never enter the set implicitly. Review an inventory change before preparing a later set; the inventory is a selection boundary, not proof that arbitrary future edits are public. The installation-specific opt-in `ArchivePreviewStoreCopyTests.swift` is omitted because it names records from an actual owned store copy. The remaining tests use synthetic data. Five test files contain deliberate fictional home paths or socket-number fixtures; exceptions bind to their exact SHA-256 and require renewed review if those bytes change. These are test inputs, never runtime installation defaults.
+
+With an existing parent directory outside this checkout, run:
+
+```sh
+uv run --no-project --with jsonschema --with pyyaml python scripts/test_prepare_public_source.py
+uv run --no-project --with jsonschema --with pyyaml python scripts/prepare-public-source.py ../Checklist-public-source
+```
+
+The destination must not exist. Preparation copies only inventoried regular files, refuses symlinks (including parent components), scans UTF-8 inputs for concrete home/native identifiers and private keys, and runs the planning validator **inside the copied tree** before exposing the directory. It copies no Git history, local audit, store, receipt, credential or installation grant. It preserves executable modes and emits `public-source-manifest.json` with relative paths, modes, exact byte hashes and the exported-tree validation result; repeated runs over unchanged inputs produce the same manifest. Failure removes the temporary set and leaves an existing destination alone. No app, provider, MCP or historical probe is executed.
+
+The planning validator still checks only its planning subset; the exporter additionally scans the complete selected product source. Neither scanner can identify every possible secret or infer whether an arbitrary UUID is real. Review the exact inventory and content changes, and visually inspect the two concepts and icon before any later publication. The local export is a prepared source set, not an installed build, native qualification, public repository or release. It does not alter the owner-selected license. A future Git publication must start from reviewed exported bytes or separately audit every included historical commit.
 
 ## Distribution and authority
 

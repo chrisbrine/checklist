@@ -40,7 +40,7 @@ struct StorageSnapshotReceipt {
     // No live protected-generation status, SQL completion row or drain attestation.
 }
 
-/// Runs only under the current root's object permit. Native bootstrap must own
+/// Capture runs under the current root's object permit. Native bootstrap must own
 /// the supported service singleton before applying a schema change; the SQLite
 /// lease alone cannot drain a previous process's filesystem continuation.
 enum StorageSnapshot {
@@ -56,12 +56,29 @@ enum StorageSnapshot {
 
     static func build(_ fixture: StorageSnapshotSource, operation: UUID,
                       budget: StorageSnapshotBudget) throws -> StorageSnapshotReceipt {
-        do { return try buildGeneration(fixture, operation: operation, budget: budget) }
+        do { return try prepareGeneration(fixture, operation: operation, budget: budget)() }
         catch { throw budget.reporting(error) }
     }
 
-    private static func buildGeneration(_ fixture: StorageSnapshotSource, operation: UUID,
-                                        budget: StorageSnapshotBudget) throws -> StorageSnapshotReceipt {
+    /// Owner backup holds the crash-released retention barrier across capture,
+    /// copying and publication. Only capture occupies the ordinary object gate.
+    static func buildOnline(source: URL, parent: URL, storeID: String, publicationName: String,
+                            operation: UUID, budget: StorageSnapshotBudget, retention: StorageSnapshotRetention) throws -> StorageSnapshotReceipt {
+        try retention.requireRoot(source)
+        do {
+            let finish = try ArchiveStorageGate.withExclusive(root: source) { permit in
+                try prepareGeneration(StorageSnapshotSource(source: source, parent: parent, storeID: storeID,
+                    publicationName: publicationName, permit: permit), operation: operation, budget: budget)
+            }
+            try budget.observe("capture_released")
+            return try finish()
+        } catch { throw budget.reporting(error) }
+    }
+
+    /// The returned continuation touches only immutable source objects and its
+    /// owned stage. Callers retain either the exclusive gate or a retention lease.
+    private static func prepareGeneration(_ fixture: StorageSnapshotSource, operation: UUID,
+                                          budget: StorageSnapshotBudget) throws -> () throws -> StorageSnapshotReceipt {
         try fixture.permit.requireRoot(fixture.source)
         try budget.check()
         guard budget.pagesPerStep > 0, budget.maximumBytes > 0, budget.maximumObjectBytes > 0,
@@ -77,7 +94,7 @@ enum StorageSnapshot {
         writerConfiguration.prepareDatabase { db in try SchemaMigrations.installStorageCollation(db); try db.execute(sql: "PRAGMA foreign_keys=ON; PRAGMA busy_timeout=50") }
         let writer = try DatabaseQueue(path: StorageBootstrap.writableURI(fixture.source.appendingPathComponent("checklist.sqlite")), configuration: writerConfiguration)
         defer { try? writer.close() }
-        try writer.writeWithoutTransaction { lease in
+        let (inventory, schema) = try writer.writeWithoutTransaction { lease -> (StorageSnapshotInventory, Int) in
             try lease.beginTransaction(.immediate)
             defer { try? lease.rollback() }
             try budget.observe("writer_lease_acquired")
@@ -131,6 +148,11 @@ enum StorageSnapshot {
                 }
                 try copy.close()
             } catch { try? copy.close(); throw error }
+            return (inventory, schema)
+        }
+        // Close the SQLite lease and all live/copy read connections before the
+        // continuation, so ordinary writes and WAL checkpointing can proceed.
+        return {
             // Measure the complete closed inventory before expensive durable copies.
             // Lengths are descriptor-relative/no-follow; copy still rehashes and
             // checks identity, expected size and digest independently afterwards.
@@ -157,6 +179,7 @@ enum StorageSnapshot {
             let database = try stage.digest("database.sqlite", budget: budget)
             var total = try budget.adding(database.1, to: intentSize)
             var materialized: [StorageSnapshotMaterializedObject] = []
+            try budget.observe("copying_objects")
             for descriptor in inventory.objects where descriptor.kind == "file" {
                 try budget.check()
                 var remainingBudget = budget
@@ -165,6 +188,7 @@ enum StorageSnapshot {
                 guard descriptor.expectedSize == nil || descriptor.expectedSize == value.1 else { throw StorageSnapshotFailure.sourceChanged }
                 total = try budget.adding(value.1, to: total)
                 materialized.append(.init(descriptor: descriptor, sha256: value.0, size: value.1))
+                try budget.observe("object_copied")
             }
             for descriptor in inventory.objects where descriptor.kind == "symlink" {
                 try budget.check()
@@ -192,8 +216,8 @@ enum StorageSnapshot {
             try budget.observe("before_publish")
             try budget.check()
             try parent.publish(names.staging, as: names.published) { try budget.observe("published_before_parent_flush") }
+            return try reconcile(parent: fixture.parent, operation: operation, publicationName: fixture.publicationName, budget: budget)
         }
-        return try reconcile(parent: fixture.parent, operation: operation, publicationName: fixture.publicationName, budget: budget)
     }
 
     static func reconcile(parent: URL, operation: UUID, publicationName: String? = nil, budget: StorageSnapshotBudget) throws -> StorageSnapshotReceipt {

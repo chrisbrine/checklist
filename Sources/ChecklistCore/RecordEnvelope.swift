@@ -53,7 +53,7 @@ struct EnvelopeFailure: Error, Equatable {
         case jsonObject, duplicateEnvelopeField, jsonIdentity, jsonProject, jsonRevision
         case identityMismatch, projectMismatch, revisionMismatch, expectedTypeMismatch
         case unsupportedFamily, unsupportedPreviousFamily, ownershipShape
-        case immutableType, immutableTaskProject, immutableMediaRevision, revisionRegression
+        case immutableType, immutableTaskProject, immutableMediaRevision, immutableBatchDisposition, revisionRegression
     }
     let reason: Reason
     init(_ reason: Reason) { self.reason = reason }
@@ -72,7 +72,7 @@ struct EnvelopeFamily {
     // project-owned managed-import job. These
     // are not task/state enums, workflow policy or a grant from a record name.
     static let catalog: [String: EnvelopeFamily] = {
-        let projectOwned = ["attachment", "attempt", "batch", "batch_claim", "checkpoint", "cleanup_preview", "cleanup_job",
+        let projectOwned = ["attachment", "attempt", "batch", "batch_claim", "batch_disposition", "checkpoint", "cleanup_preview", "cleanup_job",
             "conversation", "delegation", "delivery", "direction_disposition", "finding", "finding_resolution",
             "group", "handoff", "manifest", "native_closure", "message", "ordinary_mention_plan", "policy_proposal", "policy_revision",
             "project_context_revision", "recipient_target", "relation", "request", "review", "review_request",
@@ -182,10 +182,10 @@ enum CanonicalEnvelope {
         guard EnvelopeStorageIdentity.equal(prior.id, next.id) else { throw EnvelopeFailure(.identityMismatch) }
         guard EnvelopeStorageIdentity.equal(prior.type, next.type) else { throw EnvelopeFailure(.immutableType) }
         if next.type == "task", !EnvelopeStorageIdentity.equal(prior.projectID, next.projectID) { throw EnvelopeFailure(.immutableTaskProject) }
-        if MediaRecordRegistry.immutableFamilies.contains(next.type) {
+        if next.type == "batch_disposition" || MediaRecordRegistry.immutableFamilies.contains(next.type) {
             guard let before = try? JSONSerialization.data(withJSONObject:prior.object,options:[.sortedKeys]),
                   let after = try? JSONSerialization.data(withJSONObject:next.object,options:[.sortedKeys]),before == after else {
-                throw EnvelopeFailure(.immutableMediaRevision)
+                throw EnvelopeFailure(next.type == "batch_disposition" ? .immutableBatchDisposition : .immutableMediaRevision)
             }
         }
         guard next.revision >= prior.revision else { throw EnvelopeFailure(.revisionRegression) }

@@ -9,12 +9,13 @@ extension CommandRouter {
         let pid = try scope(db,p,c,write:true)
         try assistantPermission(c,pid,"post_notes_on_request")
         if method == "attachment_update" {
+            try requireAgentEditAuthority(db,project:try record(db,pid,type:"project"),caller:c)
             var a = try scoped(db,try text(p,"attachment_id"),pid,type:"attachment"); try revision(p,a)
             guard a["task_id"] is String else { throw CoreError("MEDIA_STORAGE_UNAVAILABLE","Taskless media commands are not enabled.") }
             switch p["action"] as? String ?? "describe" {
             case "describe": a["description"] = try text(p,"description",required:false)
             case "keep_original": a["keep_original"] = true
-            case "release_own_hold": try owner(c); a["keep_original"] = false
+            case "release_own_hold": a["keep_original"] = false; a["hold_released_by"] = c.principal; a["hold_release_origin"] = c.isOwner ? "human_ui" : "agent"
             case "unlink": a["unlinked"] = true
             case "restore_link": a["unlinked"] = false
             default: throw CoreError("INVALID_INPUT","Unsupported attachment operation.")
@@ -146,9 +147,10 @@ extension CommandRouter {
         return Array(Set(reasons)).sorted()
     }
     func releaseAttachmentRead(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
-        try owner(c);let pid = try scope(db,p,c);var hold = try scoped(db,try text(p,"read_hold_id"),pid,type:"storage_hold")
+        let pid = try scope(db,p,c); try requireAgentEditAuthority(db,project:try record(db,pid,type:"project"),caller:c);var hold = try scoped(db,try text(p,"read_hold_id"),pid,type:"storage_hold")
         guard hold["kind"] as? String == "reader" else { throw CoreError("FORBIDDEN","This is not a reader lease.") }
-        hold["state"] = "released";hold = revised(hold);try save(db,hold,type:"storage_hold");return hold
+        guard c.isOwner || hold["author"] as? String == c.principal else { throw CoreError("FORBIDDEN","Only the reader that acquired this lease can release it.") }
+        hold["released_by"] = c.principal;hold["release_origin"] = c.isOwner ? "human_ui" : "agent";hold["state"] = "released";hold = revised(hold);try save(db,hold,type:"storage_hold");return hold
     }
     func exportProject(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         throw CoreError("STORAGE_BOUNDARY_REQUIRED","Project export requires a protected capture outside the command transaction.")
@@ -270,7 +272,7 @@ extension CommandRouter {
         try? FileManager.default.removeItem(at:item)
         return lstat(item.path,&info) != 0 && errno == ENOENT
     }
-    static let projectExportTypes = ["policy_revision","task","relation","task_alias","status","tag","message","conversation","delivery","request","group","attachment","review","review_request","finding","finding_resolution","manifest","attempt","session","task_session","source_capture","source_execution","batch","batch_claim","triage_membership_interval","triage_membership_exit","project_context_revision","direction_disposition","checkpoint","policy_proposal","taxonomy_revision","storage_job","storage_hold"] + MediaRecordRegistry.families.sorted()
+    static let projectExportTypes = ["policy_revision","task","relation","task_alias","status","tag","message","conversation","delivery","request","group","attachment","review","review_request","finding","finding_resolution","manifest","attempt","session","task_session","source_capture","source_execution","batch","batch_claim","batch_disposition","triage_membership_interval","triage_membership_exit","project_context_revision","direction_disposition","checkpoint","policy_proposal","taxonomy_revision","storage_job","storage_hold"] + MediaRecordRegistry.families.sorted()
 
     func projectExportRecords(_ db: Database,pid: String) throws -> JSON {
         // Validate ALL project envelopes before applying the portable projection. An

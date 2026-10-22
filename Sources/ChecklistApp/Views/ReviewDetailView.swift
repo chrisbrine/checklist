@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ChecklistProviders
 
 struct ReviewDetailView: View {
     @EnvironmentObject var store: ChecklistStore
@@ -41,7 +42,7 @@ struct ReviewDetailView: View {
                 VStack(alignment: .leading, spacing: Spacing.tight) {
                     Label("Accepted and held for release set \(hold.string("release_set"))", systemImage: "shippingbox").checklistFont(.captionStrong)
                     Text(hold.string("reason")).checklistFont(.micro).textSelection(.enabled)
-                    Text("It completes when its release set is completed. It is not reopened or reviewed again.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("It completes when its release set is completed. It is not reopened or reviewed again.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
             }
             ForEach(projection.repeatedCauses, id: \.first?.id) { group in
@@ -53,7 +54,7 @@ struct ReviewDetailView: View {
                         ForEach(StableListRows.acceptance(task.strings("acceptance"), task: task)) { row in
                             Text("\(row.number). \(row.value)").checklistFont(.callout).textSelection(.enabled)
                         }
-                        Text("Criteria describe the expected outcome. Only recorded evidence and gate verdicts establish completion.").checklistFont(.micro).foregroundStyle(.secondary)
+                        Text("Criteria describe the expected outcome. Only recorded evidence and gate verdicts establish completion.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     }.padding(.top, Spacing.small)
                 }.checklistFont(.micro)
             }
@@ -69,12 +70,12 @@ struct ReviewDetailView: View {
                     ForEach(projection.gates(for: selected), id: \.self) { gate in
                         ReviewGateCard(gate: gate, manifest: selected, projection: projection)
                     }
-                    if projection.gates(for: selected).isEmpty { Text("This target's captured policy requires no review gates.").checklistFont(.micro).foregroundStyle(.secondary) }
+                    if projection.gates(for: selected).isEmpty { Text("This target's captured policy requires no review gates.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                 } else if !selectedManifestID.isEmpty {
                     Label("The selected target is unavailable. Your selection and note draft are retained.", systemImage: "exclamationmark.circle").checklistFont(.micro).foregroundStyle(.orange)
                 }
             } else {
-                Text("No implementation target has been submitted. Required gates: \(projection.requiredGates.map(ReviewProjection.gateName).joined(separator: ", ").isEmpty ? "none" : projection.requiredGates.map(ReviewProjection.gateName).joined(separator: ", ")).").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("No implementation target has been submitted. Required gates: \(projection.requiredGates.map(ReviewProjection.gateName).joined(separator: ", ").isEmpty ? "none" : projection.requiredGates.map(ReviewProjection.gateName).joined(separator: ", ")).").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
             TestResultEvidenceView(task: task, manifest: selected, projection: projection)
             let targetHistory = store.selectedReviewData(task)["review_target_history"] as? [String: Any] ?? [:]
@@ -102,7 +103,7 @@ struct ReviewDetailView: View {
                 NextActionLead(task: task, step: lead) { sheet = .recover($0) }
             } else if task.integer("pending_policy_revision", fallback: 0) > 0 && projection.activeAttempt == nil {
                 Text("The review rules for this project changed").checklistFont(.captionStrong)
-                Text("Check what changed. Earlier evidence and verdicts stay with their submissions; the new checks must pass before completion.").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("Check what changed. Earlier evidence and verdicts stay with their submissions; the new checks must pass before completion.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 TechnicalDetails([("Policy revision", "\(task.integer("pending_policy_revision"))")], raw: [("Revised completion rules", task.object("pending_policy_snapshot"))])
                 TextField("Why this ticket can use the new rules", text: $policyReason).textFieldStyle(.roundedBorder)
                 Button("Use the new rules") {
@@ -116,16 +117,16 @@ struct ReviewDetailView: View {
                     Label("Reviewer working · \(providerLabel(active))", systemImage: "magnifyingglass").checklistFont(.captionStrong)
                     if active.string("session_id") == "human" {
                         Button("Release prior owner review claim") { sheet = .releaseOwner(active) }.buttonStyle(.checklistProminent).checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
-                    } else { Text("The current reviewer must finish or release this review before another review can start.").checklistFont(.micro).foregroundStyle(.secondary) }
+                    } else { Text("The current reviewer must finish or release this review before another review can start.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                 } else {
                     Text("Implementation working · \(providerLabel(active))").checklistFont(.captionStrong)
-                    Text("Next: submit the finished work for review.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("Next: submit the finished work for review.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
             } else if projection.canComplete {
                 Button("Complete ticket") {
                     store.runTaskCommand("task_complete", ["project_id": task.string("project_id"), "task_id": task.id, "expected_revision": task.integer("revision"), "current_manifest_id": task.string("current_manifest_id")], taskID: task.id, success: "Ticket completed after validating the current target and gates")
                 }.buttonStyle(.checklistProminent).checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
-                Text("Checklist checks the submitted work and every required review again before it completes the ticket.").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("Checklist checks the submitted work and every required review again before it completes the ticket.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             } else if let request = projection.eligibleReviewRequest {
                 Label("Ready for reviewer · Unassigned", systemImage: "person.crop.circle.badge.questionmark").checklistFont(.captionStrong)
                 Button("Start independent review") { startReview(request) }.buttonStyle(.checklistProminent).checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
@@ -135,13 +136,13 @@ struct ReviewDetailView: View {
                 Button("Request another review") { sheet = .retry(blocked) }.buttonStyle(.checklistProminent).checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
             } else if projection.current == nil && canStartImplementation {
                 Button(projection.openFindings.isEmpty ? "Start my work" : "Start fixing findings") { startImplementation() }.buttonStyle(.checklistProminent).checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
-                Text("Starts your work on this ticket. Submit it for review when it is ready.").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("Starts your work on this ticket. Submit it for review when it is ready.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             } else {
-                Text(projection.current == nil ? (projection.openFindings.isEmpty ? "Next: start the work and submit it for review." : "Next: fix the open findings and submit the work again.") : "Completion is waiting for the requirements below.").checklistFont(.micro).foregroundStyle(.secondary)
+                Text(projection.current == nil ? (projection.openFindings.isEmpty ? "Next: start the work and submit it for review." : "Next: fix the open findings and submit the work again.") : "Completion is waiting for the requirements below.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
             if task.string("status_category") != "done" && !projection.completionBlockers.isEmpty {
                 DisclosureGroup("Remaining requirements · \(projection.completionBlockers.count)") {
-                    VStack(alignment: .leading, spacing: Spacing.compact) { ForEach(projection.completionBlockers, id: \.self) { Text("• \($0)").checklistFont(.micro).foregroundStyle(.secondary) } }.padding(.top, Spacing.compact)
+                    VStack(alignment: .leading, spacing: Spacing.compact) { ForEach(projection.completionBlockers, id: \.self) { Text("• \($0)").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) } }.padding(.top, Spacing.compact)
                 }.checklistFont(.micro)
             }
         }.frame(maxWidth: .infinity, alignment: .leading)
@@ -154,7 +155,7 @@ struct ReviewDetailView: View {
             }
             Text(submissionLabel(manifest)).checklistFont(.microEmphasis)
             if task.string("completion_policy_manifest_id") == manifest.id {
-                Text("Uses the updated review rules").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("Uses the updated review rules").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
             ForEach(StableListRows.artifacts(projection.artifactRefs(for: manifest), manifest: manifest)) { row in
                 let ref = row.value
@@ -223,43 +224,43 @@ private struct ReviewGateCard: View {
         VStack(alignment: .leading, spacing: Spacing.small) {
             AccessibleHStack { Text(ReviewProjection.gateName(gate)).checklistFont(.captionStrong); Spacer(); Text(stateLabel).checklistFont(.micro).foregroundStyle(stateColor) }
             let failed = projection.failedRounds(for: gate)
-            if failed > 0 { Text("Failed rounds: \(failed)").checklistFont(.micro).foregroundStyle(failed >= 2 ? .orange : .secondary) }
+            if failed > 0 { Text("Failed rounds: \(failed)").checklistFont(.micro).foregroundStyle(failed >= 2 ? .orange : Color.checklistSecondaryText) }
             if let request {
                 let evidence = Record(values: request.object("evidence_request"))
                 if request.string("state") == "evidence_requested", !evidence.values.isEmpty {
                     Text("More evidence requested: \(evidence.string("reason"))").checklistFont(.micro).textSelection(.enabled)
-                    Text("Add the evidence to this ticket and request the review again. The submission stays the same.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("Add the evidence to this ticket and request the review again. The submission stays the same.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
                 ForEach(request.records("not_run_checks"), id: \.values.description) { check in
-                    Text("Not run: \(check.string("check")) · \(check.string("reason"))").checklistFont(.micro).foregroundStyle(.secondary).textSelection(.enabled)
+                    Text("Not run: \(check.string("check")) · \(check.string("reason"))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).textSelection(.enabled)
                 }
                 if !request.records("supplemental_evidence_refs").isEmpty {
-                    Text("Added evidence: " + request.records("supplemental_evidence_refs").map { $0.string("name", fallback: "Attachment") }.joined(separator: ", ")).checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("Added evidence: " + request.records("supplemental_evidence_refs").map { $0.string("name", fallback: "Attachment") }.joined(separator: ", ")).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
                 if let reviewer = projection.reviewer(for: request) {
                     let session = store.detailRecords("sessions",task:projection.task).first { $0.id == reviewer.string("session_id") }
-                    Text("Reviewer working · \(reviewer.string("session_id") == "human" ? "You" : session?.string("provider", fallback: "Agent").capitalized ?? "Agent")").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("Reviewer working · \(reviewer.string("session_id") == "human" ? "You" : session?.string("provider", fallback: "Agent").capitalized ?? "Agent")").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     if !reviewer.string("progress").isEmpty { Text(reviewer.string("progress")).checklistFont(.micro).textSelection(.enabled) }
                     let draft = Record(values: reviewer.object("draft_verdict"))
-                    if !draft.values.isEmpty { Text("Draft verdict saved · \(ReviewProjection.verdictLabel(draft.string("verdict"))) · \(relativeTime(draft.string("saved_at")))").checklistFont(.micro).foregroundStyle(.secondary) }
+                    if !draft.values.isEmpty { Text("Draft verdict saved · \(ReviewProjection.verdictLabel(draft.string("verdict"))) · \(relativeTime(draft.string("saved_at")))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                     if gate == "review" {
                         ReviewRequirementsSummaryView(title:"Applied review requirements",snapshot:reviewer.object("review_requirement_snapshot"),projectID:projection.task.string("project_id"),taskKind:projection.task.string("kind"))
                     }
-                } else if request.string("state") == "queued" { Text(gate == "human_approval" ? "Waiting for exact-target owner approval request" : "Ready for reviewer · Unassigned").checklistFont(.micro).foregroundStyle(.secondary) }
+                } else if request.string("state") == "queued" { Text(gate == "human_approval" ? "Waiting for exact-target owner approval request" : "Ready for reviewer · Unassigned").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                 if let review = projection.verdict(for: request) {
-                    Text("\(ReviewProjection.verdictLabel(review.string("verdict"))) · \(review.string("actor_display", fallback: "Reviewer")) · \(relativeTime(review.string("created_at")))").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("\(ReviewProjection.verdictLabel(review.string("verdict"))) · \(review.string("actor_display", fallback: "Reviewer")) · \(relativeTime(review.string("created_at")))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     if !review.records("inspected_images").isEmpty {
                         Text("Inspected originals: \(review.records("inspected_images").count)").checklistFont(.micro)
                     }
                     let submitter = Record(values: review.object("submitted_by"))
-                    if !submitter.values.isEmpty { Text("Draft by this reviewer, submitted by \(submitter.string("actor_display", fallback: "the coordinator"))").checklistFont(.micro).foregroundStyle(.secondary) }
+                    if !submitter.values.isEmpty { Text("Draft by this reviewer, submitted by \(submitter.string("actor_display", fallback: "the coordinator"))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                     if !review.string("reason").isEmpty { Text((review.string("check").isEmpty ? "" : review.string("check") + ": ") + review.string("reason")).checklistFont(.micro).textSelection(.enabled) }
                     ForEach(StableListRows.checks(review.records("checks"), review: review)) { row in
                         let check = row.value
                         VStack(alignment: .leading, spacing: Spacing.tight) {
                             Text("\(check.string("label", fallback: check.string("name", fallback: "Recorded check"))) · \(check.string("result", fallback: check.string("status", fallback: "Recorded")))").checklistFont(.microEmphasis)
                             if !check.string("notes", fallback: check.string("detail")).isEmpty { Text(check.string("notes", fallback: check.string("detail"))).checklistFont(.micro).textSelection(.enabled) }
-                            if let cause = ReviewProjection.failureCauseLabel(check) { Text(cause).checklistFont(.micro).foregroundStyle(.secondary) }
+                            if let cause = ReviewProjection.failureCauseLabel(check) { Text(cause).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                         }
                     }
                     let assessment = Record(values:review.object("review_assessment"))
@@ -303,8 +304,8 @@ private struct ReviewGateCard: View {
         }
     }
     var stateColor: Color {
-        guard manifest.id == projection.task.string("current_manifest_id"), projection.targetWarnings(manifest).isEmpty else { return .secondary }
-        switch request?.string("state") { case "pass": return .green; case "reject", "blocked", "evidence_requested": return .orange; default: return .secondary }
+        guard manifest.id == projection.task.string("current_manifest_id"), projection.targetWarnings(manifest).isEmpty else { return Color.checklistSecondaryText }
+        switch request?.string("state") { case "pass": return .green; case "reject", "blocked", "evidence_requested": return .orange; default: return Color.checklistSecondaryText }
     }
 }
 
@@ -317,19 +318,19 @@ private struct ReviewFindingCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.small) {
             let advice = finding.string("severity") == "advice"
-            AccessibleHStack { Text("\(advice ? "Advice · does not block completion" : GlossaryText.title(finding.string("severity", fallback: "blocking"))) · \(GlossaryText.title(finding.string("state")))").checklistFont(.microStrong).foregroundStyle(finding.string("state") == "open" && !advice ? .orange : .secondary) }
-            if let change = finding.records("severity_history").last { Text("Severity changed to \(change.string("to")) by \(change.string("actor_display", fallback: "Reviewer")): \(change.string("reason"))").checklistFont(.micro).foregroundStyle(.secondary).textSelection(.enabled) }
+            AccessibleHStack { Text("\(advice ? "Advice · does not block completion" : GlossaryText.title(finding.string("severity", fallback: "blocking"))) · \(GlossaryText.title(finding.string("state")))").checklistFont(.microStrong).foregroundStyle(finding.string("state") == "open" && !advice ? .orange : Color.checklistSecondaryText) }
+            if let change = finding.records("severity_history").last { Text("Severity changed to \(change.string("to")) by \(change.string("actor_display", fallback: "Reviewer")): \(change.string("reason"))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).textSelection(.enabled) }
             Text(finding.string("description")).checklistFont(.callout).textSelection(.enabled)
-            Text("\(ReviewProjection.gateName(finding.string("gate"))) · \(finding.string("author_display", fallback: "Reviewer"))").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("\(ReviewProjection.gateName(finding.string("gate"))) · \(finding.string("author_display", fallback: "Reviewer"))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             AccessibleHStack {
                 Button("Show the reviewed submission", action: inspect)
                 if finding.string("state") == "open" { Button("Waive finding…", action: waive).checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)]) }
             }.checklistFont(.micro)
             ForEach(RecordOrdering.newestFirst(resolutions)) { resolution in
                 VStack(alignment: .leading, spacing: Spacing.tight) {
-                    Text(resolution.string("disposition") == "waived" ? "Explicit owner waiver · not a passing check" : resolution.string("disposition").capitalized).checklistFont(.microEmphasis)
+                    Text(ReviewProjection.findingDispositionLabel(resolution)).checklistFont(.microEmphasis)
                     Text(resolution.string("reason")).checklistFont(.micro).textSelection(.enabled)
-                    Text("\(resolution.string("actor_display", fallback: "Reviewer")) · \(relativeTime(resolution.string("created_at")))").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("\(resolution.string("actor_display", fallback: "Reviewer")) · \(relativeTime(resolution.string("created_at")))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
             }
             TechnicalDetails([("Finding", finding.id)], raw: [("Finding history and evidence", ["finding": finding.values, "dispositions": resolutions.map(\.values)])])
@@ -346,7 +347,7 @@ private struct FindingWaiverSheet: View {
         VStack(alignment: .leading, spacing: Spacing.group) {
             Text("Explicitly waive this finding").checklistFont(.sheetTitle)
             Text(finding.string("description")).checklistFont(.callout).textSelection(.enabled)
-            Text("A waiver records your reason and identity. It does not turn a failed check into a pass or waive other gates.").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("A waiver records your reason and identity. It does not turn a failed check into a pass or waive other gates.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             TextField("Reason for accepting this unresolved issue", text: $reason).textFieldStyle(.roundedBorder)
             AccessibleHStack { Button("Cancel") { dismiss() }; Spacer(); Button("Record owner waiver") { store.run("finding_waive", ["project_id": finding.string("project_id"), "finding_id": finding.id, "expected_revision": finding.integer("revision"), "reason": reason], success: "Explicit owner waiver recorded") { _ in dismiss() } }.buttonStyle(.checklistProminent).checklistDisabled([(reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write a reason first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline)]) }
         }.padding(Spacing.page).checklistSheet(width: 520)
@@ -362,7 +363,7 @@ private struct ReviewRetrySheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.group) {
             Text("Request another review").checklistFont(.sheetTitle)
-            Text("The blocked verdict and stable findings remain in history. A new request names the same exact current target.").checklistFont(.callout).foregroundStyle(.secondary)
+            Text("The blocked verdict and stable findings remain in history. A new request names the same exact current target.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
             TextField("What changed so this review can continue?", text: $reason).textFieldStyle(.roundedBorder)
             AccessibleHStack { Button("Cancel") { dismiss() }; Spacer(); Button("Request review") { store.run("review_request", ["project_id": task.string("project_id"), "task_id": task.id, "expected_revision": task.integer("revision"), "target_manifest_id": request.string("manifest_id"), "gate": request.string("gate"), "supersedes_request_id": request.id, "reason": reason], success: "Another exact-target review requested") { _ in dismiss() } }.buttonStyle(.checklistProminent).checklistDisabled([(reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write a reason first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline)]) }
         }.padding(Spacing.page).checklistSheet(width: 520)
@@ -374,41 +375,42 @@ private struct AgentReviewPreparationSheet: View {
     @Environment(\.dismiss) var dismiss
     let task: Record
     let request: Record
-    @State private var provider = "codex"
+    @State private var provider = ProviderPolicyDefaults.defaultReviewProvider
     @State private var preparation: [String:Any] = [:]
     @State private var loading = true
     @State private var failure = ""
     @State private var opened = false
     @State private var copied = false
+    @State private var preparationID = UUID()
     var providers: [String] {
         let policy = store.project(task.string("project_id"))?.object("policy") ?? [:]
-        let roles = policy["roles"] as? [String:Any] ?? [:],reviewer = roles["reviewer"] as? [String:Any] ?? [:]
-        return (reviewer["providers"] as? [String] ?? ["codex","claude"]).filter { ["codex","claude"].contains($0) && (policy["allowed_providers"] as? [String] ?? ["codex","claude"]).contains($0) }
+        return HandoffProvider.eligibleIDs(role: "reviewer", policy: policy, taskKind: task.string("kind"))
     }
+    var selectedProvider: HandoffProvider { HandoffProvider(id: provider) }
     var instruction: String { preparation["instruction"] as? String ?? "" }
-    var applicationURL: URL? { NSWorkspace.shared.urlForApplication(withBundleIdentifier:provider == "codex" ? "com.openai.codex" : "com.anthropic.claudefordesktop") }
-    var composeURL: URL? { guard provider == "codex",let raw = preparation["compose_url"] as? String else {return nil};return CodexComposeLink.validated(raw) }
+    var applicationURL: URL? { selectedProvider.bundleID.flatMap { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) } }
+    var composeURL: URL? { guard let raw = preparation["compose_url"] as? String else {return nil};return selectedProvider.validatedComposeURL(raw) }
     var body: some View {
         VStack(alignment:.leading,spacing: Spacing.group) {
             Text("Prepare independent agent review").checklistFont(.sheetTitle)
             Text("A fresh non-contributor reviews this exact target against its acceptance and the project's requirements. The reviewer chooses its own checks and attaches its own evidence.").checklistFont(.callout)
             // The prepared instruction names IDs and raw records; it is copied or opened, not read in the main flow.
             TechnicalDetails([("Review request", request.id), ("Submission", request.string("manifest_id"))], blocks: [("Reviewer instruction", instruction)])
-            Picker("Reviewer provider",selection:$provider) { ForEach(providers,id:\.self) { Text($0.capitalized).tag($0) } }.pickerStyle(.segmented).tint(.checklistAccent)
+            Picker("Reviewer provider",selection:$provider) { ForEach(providers,id:\.self) { Text(HandoffProvider(id: $0).name).tag($0) } }.pickerStyle(.segmented).tint(.checklistAccent)
             if loading {ProgressView("Preparing exact review context…")}
             if !failure.isEmpty {Text(failure).foregroundStyle(.orange);Button("Retry preparation") {Task {await prepare()}}}
             if !instruction.isEmpty {
                 let contract = Record(values:preparation["review_contract"] as? [String:Any] ?? [:])
                 ReviewRequirementsSummaryView(title:"Review requirement preview",snapshot:contract.object("review_requirements"),projectID:task.string("project_id"),taskKind:task.string("kind"),preflight:preparation["review_evidence_requirements"] as? [String:Any] ?? [:],previewOnly:true)
-                Text(preparation["limitation"] as? String ?? "").checklistFont(.micro).foregroundStyle(.secondary)
-                Text("No review turn, connection or claim has started. Send the prepared prompt in a fresh conversation; its actual session must connect and claim this request.").checklistFont(.micro).foregroundStyle(.secondary)
-                if opened {Label("Prepared composer opened. Press Send there to start the reviewer.",systemImage:"arrow.up.right.square").checklistFont(.micro)}
+                Text(preparation["limitation"] as? String ?? "").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                Text("No review turn, connection or claim has started. Send the prepared prompt in a fresh conversation; its actual session must connect and claim this request.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                if opened {Label("Prepared \(selectedProvider.name) composer opened. Press Send there to start the reviewer.",systemImage:"arrow.up.right.square").checklistFont(.micro)}
             }
             AccessibleHStack {
                 Button("Close") {dismiss()};Spacer()
                 Button(copied ? "Copied" : "Copy reviewer instruction") {clipboard(instruction);copied = true}.checklistDisabled([(loading, "Still loading."), (instruction.isEmpty, "The ticket instruction is not ready yet.")])
                 if let url = composeURL,let app = applicationURL {
-                    Button("Open prepared Codex review") {
+                    Button("Open prepared \(selectedProvider.name) review") {
                         NSWorkspace.shared.open([url],withApplicationAt:app,configuration:NSWorkspace.OpenConfiguration()) {_,error in Task {@MainActor in if let error {failure = PlainError.text(error)}else{opened = true}}}
                     }.buttonStyle(.checklistProminent).checklistDisabled([(loading, "Still loading."), (!failure.isEmpty, "Loading failed. Read the message above.")])
                 }
@@ -418,10 +420,20 @@ private struct AgentReviewPreparationSheet: View {
             .onChange(of:provider) {_ in Task {await prepare()}}
     }
     func prepare() async {
+        let generation = UUID(), selected = selectedProvider
+        preparationID = generation
         loading = true;failure = "";preparation = [:];opened = false;copied = false
-        defer {loading = false}
-        do {preparation = try await store.request("review_prepare",["project_id":task.string("project_id"),"task_id":task.id,"review_request_id":request.id,"target_manifest_id":request.string("manifest_id"),"gate":request.string("gate"),"provider":provider])}
-        catch {failure = PlainError.text(error)}
+        defer {if preparationID == generation {loading = false}}
+        guard providers.contains(selected.id) else {failure = "No enabled, qualified provider is eligible for this review.";return}
+        do {
+            let response = try await store.request("review_prepare",["project_id":task.string("project_id"),"task_id":task.id,"review_request_id":request.id,"target_manifest_id":request.string("manifest_id"),"gate":request.string("gate"),"provider":selected.id])
+            guard preparationID == generation, provider == selected.id else {return}
+            if let raw = response["compose_url"] as? String, selected.validatedComposeURL(raw) == nil {
+                throw NSError(domain:"Checklist",code:2,userInfo:[NSLocalizedDescriptionKey:"The service returned an unsupported compose link for \(selected.name). No chat was opened."])
+            }
+            preparation = response
+        }
+        catch {if preparationID == generation {failure = PlainError.text(error)}}
     }
 }
 

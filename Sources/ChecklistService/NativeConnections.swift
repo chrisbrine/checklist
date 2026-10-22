@@ -4,23 +4,25 @@ import CryptoKit
 import Darwin
 import ChecklistCore
 import ChecklistIPC
+import ChecklistProviders
+import ChecklistBridges
 
 // Automatic worker connections have a native process boundary. A thread ID is
 // host-exported context, not a cryptographically attested thread identity.
 extension Coordinator {
     func bootstrap(_ context:[String:Any], connection:NSXPCConnection) throws -> [String:Any] {
         guard bundledCLI(connection.processIdentifier) else { throw ChecklistError("NATIVE_CLIENT_REQUIRED","Connect through the installed Checklist executable inside a Codex or Claude thread.") }
-        guard let provider=context["provider"] as? String,["codex","claude"].contains(provider),
+        guard let provider=context["provider"] as? String,let plugin=ProviderPluginRegistry.bundled.plugin(provider, requiring: .workSession),
               let sid=context["native_session_id"] as? String,UUID(uuidString:sid) != nil else { throw ChecklistError("NATIVE_SESSION_REQUIRED","This process does not expose a supported native thread identity.") }
         let process = try nativeProcess(connection.processIdentifier, provider:provider)
         let executionDomain=try processDomain(process,provider:provider)
         let workspace = try currentDirectory(connection.processIdentifier)
         if let supplied=context["workspace_path"] as? String,canonical(supplied) != workspace { throw ChecklistError("WORKSPACE_MISMATCH","The supplied workspace differs from this process's actual working directory.") }
-        if provider == "claude" { try verifyClaudeRegistry(process,session:sid,workspace:workspace,endpoint:context["native_endpoint"] as? String) }
+        try verifyProviderRegistry(plugin,process:process,session:sid,workspace:workspace,endpoint:context["native_endpoint"] as? String)
         let owner=Caller(role:"owner",installation:"native-thread-bootstrap",projectIDs:[])
         let relay=context["mode"] as? String == "assistant_relay"
         guard context["mode"] == nil || relay else { throw ChecklistError("INVALID_CONNECTION_MODE","Use worker or personal-assistant relay access.") }
-        if relay && provider != "codex" { throw ChecklistError("ADAPTER_UNAVAILABLE","The personal-assistant helper currently uses native Codex.") }
+        if relay && ProviderPluginRegistry.bundled.plugin(provider, requiring: .assistantRelay) == nil { throw ChecklistError("ADAPTER_UNAVAILABLE","The personal-assistant helper currently uses native Codex.") }
         let resolved=try router.handle(method:relay ? "project_list":"project_resolve",params:relay ? [:]:["workspace_path":workspace],caller:owner)
         let body=resolved["data"] as? [String:Any] ?? resolved
         var projects=body["projects"] as? [[String:Any]] ?? []
@@ -78,14 +80,14 @@ extension Coordinator {
         var bytes=[UInt8](repeating:0,count:32)
         guard SecRandomCopyBytes(kSecRandomDefault,bytes.count,&bytes)==errSecSuccess else { throw ChecklistError("RANDOM_FAILURE","Could not create the thread connection.") }
         let token=Data(bytes).base64EncodedString()
-        let label=relay ? "Personal assistant helper · \(sid.prefix(8))":"\(provider == "codex" ? "Codex":"Claude") thread \(sid.prefix(8))"
+        let label=relay ? "Personal assistant helper · \(sid.prefix(8))":"\(plugin.manifest.displayName) thread \(sid.prefix(8))"
         var enrollment=Enrollment(installation:installation,name:label,provider:provider,role:relay ? "assistant":"worker",projectIDs:projectIDs,sessionID:boundSessionID,workspace:binding,profileID:nil,tokenDigest:SHA256.hash(data:Data(token.utf8)).map{String(format:"%02x",$0)}.joined(),generation:UUID().uuidString)
         enrollment.nativeSessionID=sid
-        enrollment.automatic=true;enrollment.revoked=false;enrollment.identityVerification=provider == "codex" ? "native_process_verified_thread_observed":"native_process_and_session_registry_verified"
+        enrollment.automatic=true;enrollment.revoked=false;enrollment.identityVerification=plugin.nativeHost?.identityVerification
         enrollment.nativeExecutionDomain=executionDomain
         enrollment.assistantRelay=relay
         if relay { enrollment.assistantGrants=grantMap;enrollment.relayPolicyRevisions=grantRevisions;enrollment.relaySelector=selector;enrollment.identityVerification="native_codex_helper_not_dot_identity" }
-        if provider == "claude",let endpoint=context["native_endpoint"] as? String { try bindClaudeEndpoint(&enrollment,endpoint:endpoint,process:process) }
+        if ProviderPluginRegistry.bundled.plugin(provider, requiring: .nativePeer) != nil,let endpoint=context["native_endpoint"] as? String { try bindProviderEndpoint(&enrollment,endpoint:endpoint,process:process) }
         // Save no caller-supplied role, projects, profile, title or human provenance.
         _ = try ConnectionCommit.perform(
             saveCredential: { try ChecklistKeychain.write(installation, token) },
@@ -110,8 +112,8 @@ extension Coordinator {
         }
     }
 
-    private func bindClaudeEndpoint(_ enrollment:inout Enrollment,endpoint:String,process:pid_t) throws {
-        let expected="/tmp/cc-socks/\(process).sock"
+    private func bindProviderEndpoint(_ enrollment:inout Enrollment,endpoint:String,process:pid_t) throws {
+        let expected=NativeProviderTransport.expectedEndpoint(provider:enrollment.provider,processID:process)
         var attrs=stat()
         guard endpoint == expected,lstat(endpoint,&attrs)==0,attrs.st_mode & S_IFMT == S_IFSOCK,attrs.st_uid == getuid(),attrs.st_mode & 0o077 == 0 else { throw ChecklistError("NATIVE_ROUTE_MISMATCH","Claude's local route does not belong to this native process.") }
         enrollment.nativeEndpoint=endpoint;enrollment.nativeDevice=UInt64(attrs.st_dev);enrollment.nativeInode=UInt64(attrs.st_ino)
@@ -125,8 +127,8 @@ extension Coordinator {
     private func resumeAfterVerifiedClosure(_ existing:Enrollment,project:String,executionDomain:String,binding:String?,process:pid_t,endpoint:String?,owner:Caller) throws -> Enrollment {
         let ownerDisconnected=ChecklistError("CONNECTION_REVOKED","The owner disconnected this thread in Checklist. It cannot reconnect automatically.")
         // Verified closure applies only to these enrollments; any other revocation is the owner's.
-        guard existing.automatic == true,existing.role == "worker",existing.assistantRelay != true,existing.provider == "claude",
-              existing.identityVerification == "native_process_and_session_registry_verified",let oldDomain=existing.nativeExecutionDomain else {
+        guard existing.automatic == true,existing.role == "worker",existing.assistantRelay != true,let plugin=ProviderPluginRegistry.bundled.plugin(existing.provider, requiring: .registryClosure),
+              existing.identityVerification == plugin.nativeHost?.identityVerification,let oldDomain=existing.nativeExecutionDomain else {
             if existing.revoked == true { throw ownerDisconnected }
             throw ChecklistError("NATIVE_SESSION_MISMATCH","This reported thread was connected by a different native host process. Its claims and messages cannot be borrowed.")
         }
@@ -149,7 +151,7 @@ extension Coordinator {
         resumed.generation=UUID().uuidString;resumed.nativeExecutionDomain=executionDomain;resumed.revoked=false
         resumed.tokenDigest=SHA256.hash(data:Data(token.utf8)).map{String(format:"%02x",$0)}.joined()
         resumed.nativeEndpoint=nil;resumed.nativeDevice=nil;resumed.nativeInode=nil
-        if let endpoint { try bindClaudeEndpoint(&resumed,endpoint:endpoint,process:process) }
+        if ProviderPluginRegistry.bundled.plugin(existing.provider, requiring: .nativePeer) != nil,let endpoint { try bindProviderEndpoint(&resumed,endpoint:endpoint,process:process) }
         let resumption=NativeSessionResumption(projectID:project,sessionID:existing.sessionID,provider:existing.provider,
             oldInstallation:existing.installation+"/"+existing.generation,oldExecutionDomain:oldDomain,
             newInstallation:resumed.installation+"/"+resumed.generation,newExecutionDomain:executionDomain)
@@ -185,18 +187,23 @@ extension Coordinator {
         } else {
             guard context["mode"] == nil,let bound=e.workspace,contains(bound,workspace) else { throw ChecklistError("WORKSPACE_MISMATCH","This process is outside the connection's bound workspace.") }
         }
-        if e.provider == "claude" { try verifyClaudeRegistry(native,session:e.sessionID,workspace:workspace,endpoint:context["native_endpoint"] as? String) }
+        guard let plugin=ProviderPluginRegistry.bundled.plugin(e.provider, requiring: .workSession) else { throw ChecklistError("ADAPTER_UNAVAILABLE","This provider plugin is disabled, incompatible or unqualified.") }
+        try verifyProviderRegistry(plugin,process:native,session:e.sessionID,workspace:workspace,endpoint:context["native_endpoint"] as? String)
         return workspace
     }
 
-    private func verifyClaudeRegistry(_ process:pid_t,session:String,workspace:String,endpoint:String?) throws {
-        let file=FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/sessions/\(process).json")
+    private func verifyProviderRegistry(_ plugin:any ChecklistProviderPlugin,process:pid_t,session:String,workspace:String,endpoint:String?) throws {
+        guard let path=plugin.nativeHost?.registryPath(processID:process) else { return }
+        let file=URL(fileURLWithPath:path)
         var attrs=stat()
-        guard lstat(file.path,&attrs)==0,attrs.st_mode & S_IFMT == S_IFREG,attrs.st_uid == getuid(),attrs.st_mode & 0o022 == 0,attrs.st_size <= 65_536,
+        guard lstat(path,&attrs)==0,attrs.st_mode & S_IFMT == S_IFREG,attrs.st_uid == getuid(),attrs.st_mode & 0o022 == 0,attrs.st_size <= 65_536,
               let bytes=try? Data(contentsOf:file),let record=(try? JSONSerialization.jsonObject(with:bytes)) as? [String:Any],
-              (record["pid"] as? NSNumber)?.int32Value == process,record["sessionId"] as? String == session,
-              let root=record["cwd"] as? String,contains(canonical(root),workspace) else { throw ChecklistError("NATIVE_SESSION_MISMATCH","Claude's current session registry does not match this native process and workspace.") }
-        if let endpoint { guard record["messagingSocketPath"] as? String == endpoint else { throw ChecklistError("NATIVE_ROUTE_MISMATCH","Claude's route differs from its current session registry.") } }
+              plugin.registryMatches(record,processID:process,sessionID:session,workspace:workspace,endpoint:nil) else {
+            throw ChecklistError("NATIVE_SESSION_MISMATCH",plugin.registryMismatchMessage)
+        }
+        if let endpoint, !plugin.registryMatches(record,processID:process,sessionID:session,workspace:workspace,endpoint:endpoint) {
+            throw ChecklistError("NATIVE_ROUTE_MISMATCH","The native route differs from the provider's current session registry.")
+        }
     }
 
     func connectionResult(_ enrollment:Enrollment,project:String)->[String:Any] {
@@ -211,7 +218,7 @@ extension Coordinator {
     }
 
     func prepareHandoff(_ p:[String:Any],caller:Caller) throws -> [String:Any] {
-        guard caller.role == "owner",let provider=p["provider"] as? String,["codex","claude"].contains(provider),let pid=p["project_id"] as? String,let tid=p["task_id"] as? String else { throw ChecklistError("INVALID_HANDOFF","Choose a task and Codex or Claude from the native app.") }
+        guard caller.role == "owner",let provider=p["provider"] as? String,let plugin=ProviderPluginRegistry.bundled.plugin(provider, requiring: .workSession),let pid=p["project_id"] as? String,let tid=p["task_id"] as? String else { throw ChecklistError("INVALID_HANDOFF","Choose a task and Codex or Claude from the native app.") }
         let result=try router.handle(method:"task_get",params:["project_id":pid,"task_id":tid],caller:caller)
         let task=result["data"] as? [String:Any] ?? result
         let projectResult=try router.handle(method:"project_settings_get",params:["project_id":pid],caller:caller)
@@ -220,10 +227,9 @@ extension Coordinator {
         let key=task["key"] as? String ?? tid
         let instruction=try ChecklistHandoff.instruction(key:key,title:task["title"] as? String ?? "task",root:root,projectID:pid,taskID:tid,cliCommand:ChecklistInstance.current.cliCommand)
         var response:[String:Any]=["provider":provider,"task_key":key,"title":task["title"] as? String ?? "","instruction":instruction,"connection_mode":"automatic_on_use","launch_available":false,"limitation":"Checklist cannot start a native desktop turn directly. A native Codex agent can create a thread with this context; the new thread then attaches itself to the ticket."]
-        var directory:ObjCBool=false
-        if provider == "codex",root.hasPrefix("/"),FileManager.default.fileExists(atPath:root,isDirectory:&directory),directory.boolValue {
-            var components=URLComponents();components.scheme="codex";components.host="threads";components.path="/new";components.queryItems=[URLQueryItem(name:"prompt",value:instruction),URLQueryItem(name:"path",value:root)]
-            if let url=components.url { response["compose_url"]=url.absoluteString;response["limitation"]="The prepared Codex chat opens with the ticket context filled in. Press Send there to start; the new thread connects and attaches itself automatically. Opening a composer alone does not create or connect a session." }
+        if let url=ProviderPluginRegistry.bundled.plugin(provider, requiring: .composer)?.composeURL(instruction:instruction,workspace:root) {
+            response["compose_url"]=url.absoluteString
+            response["limitation"]="The prepared \(plugin.manifest.displayName) chat opens with the ticket context filled in. Press Send there to start; the new thread connects and attaches itself automatically. Opening a composer alone does not create or connect a session."
         }
         return ["data":response]
     }
@@ -260,12 +266,11 @@ extension Coordinator {
             var bsd=proc_bsdinfo()
             guard proc_pidinfo(current,PROC_PIDTBSDINFO,0,&bsd,Int32(MemoryLayout.size(ofValue:bsd))) == MemoryLayout.size(ofValue:bsd),bsd.pbi_uid == getuid() else { break }
             if let info=signingInfo(current),let identifier=info[kSecCodeInfoIdentifier as String] as? String,let team=info[kSecCodeInfoTeamIdentifier as String] as? String {
-                if provider == "codex",identifier == "codex",team == "2DC432GLL2" { return current }
-                if provider == "claude",identifier == "com.anthropic.claude-code",team == "Q6L2SF6YDW" { return current }
+                if let host=ProviderPluginRegistry.bundled.plugin(provider, requiring: .workSession)?.nativeHost,identifier == host.signingIdentifier,team == host.signingTeam { return current }
             }
             let parent=pid_t(bsd.pbi_ppid);if parent <= 1 || parent == current { break };current=parent
         }
-        throw ChecklistError("NATIVE_HOST_REQUIRED","This command must run inside a signed native \(provider == "codex" ? "Codex":"Claude") work session.")
+        throw ChecklistError("NATIVE_HOST_REQUIRED","This command must run inside a signed native \(ProviderPluginRegistry.bundled.plugin(provider, requiring: .workSession)?.manifest.displayName ?? provider) work session.")
     }
 
     private func currentDirectory(_ pid:pid_t) throws -> String {

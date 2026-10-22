@@ -1,4 +1,5 @@
 import Foundation
+import ChecklistProviders
 import GRDB
 
 extension CommandRouter {
@@ -12,7 +13,7 @@ extension CommandRouter {
     func attachSessionToTask(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         guard c.role == "worker",let sid = c.sessionID else { throw CoreError("FORBIDDEN","Only a bound worker connection can attach its own task context.") }
         let pid = try scope(db,p,c,write:true),task = try self.task(db,p,pid),generation = try callerSessionGeneration(db,c,project:pid)
-        let session = try scoped(db,sid,pid,type:"session");guard session["role"] as? String == "worker",["codex","claude"].contains((session["provider"] as? String ?? "").lowercased()) else { throw CoreError("FORBIDDEN","Personal assistants never become work connections.") }
+        let session = try scoped(db,sid,pid,type:"session");guard session["role"] as? String == "worker",providerPlugins.plugin((session["provider"] as? String ?? "").lowercased(), requiring: .workSession) != nil else { throw CoreError("FORBIDDEN","Personal assistants never become work connections.") }
         let digest = hash(Data((pid+":"+(task["id"] as! String)+":"+sid+":"+generation).utf8));let chars = Array(digest.prefix(32))
         let id = String(chars[0..<8])+"-"+String(chars[8..<12])+"-"+String(chars[12..<16])+"-"+String(chars[16..<20])+"-"+String(chars[20..<32])
         if let existing = try? scoped(db,id,pid,type:"task_session") { return try taskSessionProjection(db,existing) }

@@ -24,7 +24,7 @@ struct MentionComposerPanel: View {
                                     Image(systemName: token.selected == candidate.target ? "checkmark.circle.fill" : "circle")
                                     VStack(alignment: .leading, spacing: Spacing.hairline) {
                                         Text(candidate.title).checklistFont(.micro)
-                                        Text(candidate.detail).checklistFont(.micro).foregroundStyle(.secondary)
+                                        Text(candidate.detail).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                                     }
                                     Spacer(minLength: 0)
                                 }.frame(maxWidth: .infinity, alignment: .leading).padding(Spacing.compact)

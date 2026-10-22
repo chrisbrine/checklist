@@ -22,6 +22,7 @@ struct MediaTypeSettings: View {
     @State private var title=""
     @State private var starter="generic"
     @State private var renames:[String:String]=[:]
+    @State private var confirmation: PendingConfirmation?
     @State private var historyType:Record?
     var body: some View {
         DetailSection(title:"Media review") {
@@ -45,7 +46,7 @@ struct MediaTypeSettings: View {
                     }}.checklistDisabled([((renames[type.id] ?? type.string("title")).isEmpty,"Enter a type name.")])
                     Spacer()
                     if type.bool("enabled") {
-                        Button("Retire type") {model.mutate("media_type_retire",["type_id":type.id,"expected_revision":type.integer("revision")])}
+                        Button("Retire type…") {confirmation = model.retireTypeConfirmation(type)}
                     } else {
                         Button("Enable type") {Task {
                             do {let current=try await model.read("media_type_get",["type_id":type.id]);model.mutate("media_type_adopt",["type_id":type.id,"expected_revision":current["revision"]!,"type_revision_id":current["draft_revision_id"]!,"observed_type_token":current["observed_type_token"]!])} catch {model.error=PlainError.text(error)}
@@ -56,9 +57,10 @@ struct MediaTypeSettings: View {
             ForEach(model.types.filter {$0.string("state") == "retired"}) {type in
                 Button("View retained rounds: "+type.string("title")) {historyType=type}
             }
-            Text("Optional. Types appear only after you add one. Finish or cancel Draft and Open rounds before retiring their type. Originals and history are retained.").font(.caption).foregroundStyle(.secondary)
+            Text("Optional. Types appear only after you add one. Finish or cancel Draft and Open rounds before retiring their type. Originals and history are retained.").font(.caption).foregroundStyle(Color.checklistSecondaryText)
             if let error=model.error {Text(error).foregroundStyle(.orange)}
         }.task {if store.projectID == projectID {await model.connect(store:store)}}
+        .checklistConfirmation($confirmation)
         .sheet(item:$historyType) {type in MediaRetainedHistory(type:type)}
     }
     static func schema(title:String,starter:String) -> MediaValues {
@@ -81,6 +83,7 @@ struct MediaReviewWorkspace: View {
     @State private var showPaste=false
     @State private var showList=false
     @State private var cancelReason=""
+    @State private var confirmation: PendingConfirmation?
     var body: some View {
         VStack(alignment:.leading,spacing:8) {
             if model.hasMedia || model.historyOnly {
@@ -116,7 +119,7 @@ struct MediaReviewWorkspace: View {
                         itemList.frame(minWidth:175,idealWidth:220)
                         ScrollView {MediaOwnerComparison(model:model).frame(maxWidth:.infinity,alignment:.leading).padding(8)}.frame(minWidth:280)
                     }.frame(minHeight:150).layoutPriority(1)
-                } else {Text("Choose a round, or capture a title-only Draft round.").foregroundStyle(.secondary);Spacer()}
+                } else {Text("Choose a round, or capture a title-only Draft round.").foregroundStyle(Color.checklistSecondaryText);Spacer()}
             } else {Spacer()} // No onboarding imposed on a project without enabled types.
         }.padding(12)
         .sheet(isPresented:$showPaste) {
@@ -132,10 +135,11 @@ struct MediaReviewWorkspace: View {
             }.padding(20)
         }
         .sheet(isPresented:$showList) {MediaListSettings(model:model)}
+        .checklistConfirmation($confirmation)
     }
     var roundControls: some View {
         VStack(alignment:.leading,spacing:6) {
-            Text(model.header.string("title")+" · "+GlossaryText.title(model.header.string("state"))+" · Revision "+String(model.header.integer("revision"))).font(.headline)
+            Text(model.header.string("title")+" · "+GlossaryText.title(model.header.string("state"))).font(.headline)
             Text(model.counts.keys.sorted().map { $0.replacingOccurrences(of:"_",with:" ")+": "+String(model.counts[$0]!) }.joined(separator:" · ")).font(.caption)
             if model.writable {
                 HStack {
@@ -148,8 +152,8 @@ struct MediaReviewWorkspace: View {
                     Button("Preview publication") {Task {await model.previewPublication()}}
                     Button("List settings") {showList=true}
                 }.checklistDisabled([(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])}.fixedSize(horizontal:false,vertical:true)
-                ForEach(model.header.records("intakes")) {intake in
-                    if model.intake.id != intake.id {Button("Resume intake · "+intake.string("state")+" · "+String(intake.id.prefix(8))) {Task {await model.resumeIntake(intake.id)}}}
+                ForEach(Array(model.header.records("intakes").enumerated()),id:\.element.id) {index,intake in
+                    if model.intake.id != intake.id {Button("Resume intake "+String(index+1)+" · "+GlossaryText.title(intake.string("state"))) {Task {await model.resumeIntake(intake.id)}}}
                 }
                 if model.fields.contains(where:{$0.id=="character"}) {Toggle("Map character__animation_label__direction filename tokens",isOn:$model.mapsAnimationNames).font(.caption)}
                 if let project=store.currentProject {Button("Approve current project context for media review") {model.mutate("media_context_approve",["kind":"project","expected_project_revision":project.integer("revision")])}.checklistDisabled([(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])}
@@ -159,7 +163,7 @@ struct MediaReviewWorkspace: View {
                     DisclosureGroup("Publication items") {
                         ScrollView {LazyVStack(alignment:.leading) {
                             ForEach(model.publication,id:\.publicationItemID) {row in
-                                Text(row.string("title")+" · "+(row.bool("publication_ready") ? "Ready" : "Incomplete")+" · "+row.string("target_id")).font(.caption).textSelection(.enabled)
+                                Text(row.string("title")+" · "+(row.bool("publication_ready") ? "Ready" : "Incomplete")).font(.caption).textSelection(.enabled)
                             }
                         }}.frame(maxHeight:120)
                     }
@@ -167,11 +171,12 @@ struct MediaReviewWorkspace: View {
                 }
                 DisclosureGroup("Cancel this round") {
                     TextField("Cancellation reason",text:$cancelReason)
-                    Button("Cancel round and retain originals") {model.mutate("media_round_cancel",["round_id":model.roundID,"expected_revision":model.header.integer("revision"),"reason":cancelReason])}.checklistDisabled([(cancelReason.isEmpty,"Enter a cancellation reason."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
+                    Button("Cancel round and retain originals…") {confirmation = model.cancelRoundConfirmation(reason:cancelReason)}.checklistDisabled([(cancelReason.isEmpty,"Enter a cancellation reason."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
                 }
             } else if !model.historyOnly && ["closed","canceled"].contains(model.header.string("state")) {
-                Button("Archive round and retain originals") {model.mutate("media_round_archive",["round_id":model.roundID,"expected_revision":model.header.integer("revision")])}.checklistDisabled([(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
+                Button("Archive round and retain originals…") {confirmation = model.archiveRoundConfirmation()}.checklistDisabled([(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
             }
+            TechnicalDetails(raw: [("Round",model.header.values),("Publication preview",model.publication.map(\.values)),("Frozen intake",model.intake.values)]).id(model.roundID)
         }
     }
     var itemList: some View {
@@ -247,6 +252,16 @@ struct MediaFrozenIntakeView: View {
     @EnvironmentObject var store: ChecklistStore
     @ObservedObject var model: MediaReviewModel
     @State private var groups:[String:String]=[:]
+    static func editableGroup(_ row: Record, rows: [Record]) -> String {
+        let group=row.string("group_id")
+        return rows.contains {$0.id==group} ? "" : group
+    }
+    static func groupLabel(_ row: Record, rows: [Record]) -> String {
+        let name=editableGroup(row,rows:rows)
+        if !name.isEmpty {return "Candidate group: "+name}
+        let first=rows.firstIndex {$0.string("group_id")==row.string("group_id")}
+        return first.map {"Candidate group \($0+1)"} ?? "Separate candidate"
+    }
     var body: some View {
         DisclosureGroup("Frozen intake · \(model.intake.strings("committed_row_ids").count) captured · \(model.intake.strings("remaining_row_ids").count) remaining") {
             Text("Preview only until confirmation. Included, skipped and unresolved rows are explicit; duplicates stay separate unless you supply an explicit group in TSV. Capture never changes Finder originals.").font(.caption)
@@ -254,21 +269,21 @@ struct MediaFrozenIntakeView: View {
                 ForEach(model.intake.records("rows")) {row in
                     VStack(alignment:.leading) {
                         Text(row.string("title")+" · "+row.string("status")+" · "+row.string("disposition")+" · "+row.string("capture_state"))
-                        Text("Source: "+row.string("name")+" · Slot: "+row.string("slot_id")+" · Group: "+row.string("group_id")).font(.caption)
+                        Text("Source: "+row.string("name")+" · "+MediaComparisonLabels.slot(row,definitions:model.slots)+" · "+Self.groupLabel(row,rows:model.intake.records("rows"))).font(.caption)
                         if row.string("capture_state") != "committed" {
                             HStack {
-                                TextField("Explicit candidate group",text:Binding(get:{groups[row.id] ?? row.string("group_id")},set:{groups[row.id]=$0})).accessibilityLabel("Candidate group for "+row.string("title"))
-                                Button("Apply group") {model.resolveIntake(row,disposition:"include",slotID:row.string("slot_id").isEmpty ? nil : row.string("slot_id"),groupID:groups[row.id] ?? row.string("group_id"))}
-                                    .checklistDisabled([((groups[row.id] ?? row.string("group_id")).isEmpty,"Enter an explicit candidate group.")])
+                                TextField("Explicit candidate group",text:Binding(get:{groups[row.id] ?? Self.editableGroup(row,rows:model.intake.records("rows"))},set:{groups[row.id]=$0})).accessibilityLabel("Candidate group for "+row.string("title"))
+                                Button("Apply group") {model.resolveIntake(row,disposition:"include",slotID:row.string("slot_id").isEmpty ? nil : row.string("slot_id"),groupID:groups[row.id] ?? Self.editableGroup(row,rows:model.intake.records("rows")))}
+                                    .checklistDisabled([((groups[row.id] ?? Self.editableGroup(row,rows:model.intake.records("rows"))).isEmpty,"Enter an explicit candidate group.")])
                             }
                             HStack {
                                 Button("Skip") {model.resolveIntake(row,disposition:"skip")}
                                 ForEach(model.slots.filter {$0.string("kind")==row.string("media_kind")}) {slot in
-                                    Button("Include as "+slot.id) {model.resolveIntake(row,disposition:"include",slotID:slot.id)}
+                                    Button("Include as "+MediaComparisonLabels.slot(Record(values:["slot_id":slot.id,"media_kind":slot.string("kind")]),definitions:model.slots)) {model.resolveIntake(row,disposition:"include",slotID:slot.id)}
                                 }
                             }
                         }
-                        if !row.object("capture_error").isEmpty {Text(String(describing:row.object("capture_error"))).font(.caption).foregroundStyle(.orange)}
+                        if !row.object("capture_error").isEmpty {Text(Record(values:row.object("capture_error")).string("message",fallback:"Capture did not finish. See Technical details for the recorded error.")).font(.caption).foregroundStyle(.orange)}
                     }.padding(4).accessibilityElement(children:.contain)
                 }
             }}.frame(maxHeight:140)

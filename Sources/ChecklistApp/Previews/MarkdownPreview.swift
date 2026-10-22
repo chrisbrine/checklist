@@ -88,7 +88,7 @@ struct RenderedMarkdownPreview: View {
         case .list(let marker, let value): HStack(alignment: .firstTextBaseline) { Text(marker).frame(minWidth: 20, alignment: .trailing); inline(value).textSelection(.enabled) }
         case .code(let language, let value):
             VStack(alignment: .leading, spacing: 4) {
-                if !language.isEmpty { Text(verbatim: language).font(.caption).foregroundStyle(.secondary) }
+                if !language.isEmpty { Text(verbatim: language).font(.caption).foregroundStyle(Color.checklistSecondaryText) }
                 ScrollView(.horizontal) { Text(verbatim: value).font(.system(.body, design: .monospaced)).textSelection(.enabled) }
             }.padding(10).background(.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
         case .table(let rows):
@@ -106,7 +106,7 @@ struct RenderedMarkdownPreview: View {
                 MarkdownAttachedImage(file: file, label: label)
             } else {
                 Label(label.isEmpty ? "Image" : label, systemImage: "photo").font(.callout)
-                Text(imageReason(destination, index: index)).font(.caption).foregroundStyle(.secondary)
+                Text(imageReason(destination, index: index)).font(.caption).foregroundStyle(Color.checklistSecondaryText)
                 if case .attachment(let id) = MarkdownResource.resolve(destination, image: true, attachments: resourceMap), let file = permittedFiles.first(where: { $0.id == id }) {
                     Button("Open attached image…") { linkedAttachment = file }
                 }
@@ -149,13 +149,13 @@ private struct MarkdownAttachedImage: View {
     var body: some View {
         VStack(alignment: .leading) {
             if !bounded {
-                Text("This image exceeds the 25 MiB embedded-preview limit.").font(.caption).foregroundStyle(.secondary)
+                Text("This image exceeds the 25 MiB embedded-preview limit.").font(.caption).foregroundStyle(Color.checklistSecondaryText)
                 Button("Preview attached image…") { showing = true }
             } else if let verified = loader.file { NativeImagePreview(url: verified.url).frame(height: 280).accessibilityLabel(label.isEmpty ? file.string("name") : label) }
             else if loader.loading { ProgressView("Loading attached image…") }
             else { Text(loader.problem).font(.caption).foregroundStyle(.orange) }
             if loader.file != nil, !loader.problem.isEmpty { Text(loader.problem).font(.caption).foregroundStyle(.orange) }
-            Text(label.isEmpty ? file.string("name") : label).font(.caption).foregroundStyle(.secondary)
+            Text(label.isEmpty ? file.string("name") : label).font(.caption).foregroundStyle(Color.checklistSecondaryText)
         }.task(id: file.id) { if bounded { await loader.load(file, store: store) } }.onDisappear { loader.cancel() }
             .sheet(isPresented: $showing) { FilePreviewSheet(attachment: file) }
     }

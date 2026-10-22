@@ -4,7 +4,7 @@
 
 ## Source formats and adapter boundary
 
-Choose sources at transfer time rather than embedding a developer's project names, machine paths or inventory counts in the product. Initial transfer preparation covers three existing format families: task/event snapshot exports, snapshot exports with structured work packages, and task/event exports with separate review verdicts. Readers for consistent legacy SQLite backups or Markdown/client exports require selected samples and a documented mapping. Exact private source inventories remain local planning evidence, outside the public package.
+Choose sources at transfer time rather than embedding a developer's project names, machine paths or inventory counts in the product. Initial transfer preparation covers task/event snapshot exports, snapshots with structured work packages, snapshots with separate verdicts or completion evidence, client exports, separate media review stores and multiple verdict JSON layouts (detailed below). Readers for consistent legacy SQLite backups or Markdown/client exports require selected samples and a documented mapping. Exact private source inventories remain local planning evidence, outside the public package.
 
 For example, fictional game projects **Lantern Bay**, **Glass Garden** and **Orbit Workshop** can each contain a `BUG-12` without identity conflict. Their real source roots are selected through Finder at import time; none is hard-coded into an adapter. Acceptance fixtures must be synthetic or explicitly cleared for publication.
 
@@ -13,6 +13,40 @@ A real transfer selects a fresh consistent SQLite backup or owner-selected expor
 Each format reader emits the same versioned intermediate bundle: project identity proposal, tasks, source relations, notes/events, verdicts, project context, external evidence references, raw legacy metadata and source-local identifiers. The canonical export format is independent of any source adapter; unsupported inputs produce an actionable report rather than guessed field mappings.
 
 Read in staging with bounded parsing, path containment and no execution of embedded instructions/scripts/HTML. Never run source cleanup hooks. Source records are data and cannot mint trusted human directions, verify sessions or enroll endpoints.
+
+## Additional legacy families for CL-21
+
+The [synthetic import-plan fixtures](../examples/legacy-import-plan.json) cover the following families. They are planning inputs and expected preview behavior, not an implemented reader or a claim of compatibility with an unselected source. Fixture format/version names are fictional. A selected source's exact schema and verdict layout must be identified before a reader is enabled; preserve and report unrecognized shapes without guessing. The private inventory remains outside this document.
+
+| Family / synthetic case | Values to preserve and preview |
+|---|---|
+| `snapshot-events` | Snapshot envelope `meta`, `items`, `verdicts`, `events`; keep source version, sequence, timestamps and raw fields. |
+| `snapshot-completion` | `completion_evidence` instead of `events`, plus legacy `completion_overrides`; preserve evidence and override history separately. Missing events mean unavailable event history, not zero historical activity. Never manufacture event sequences from evidence array positions. |
+| `event-actions` | `owner-override`, `tidy`, `remove`; retain raw action, actor, time, reason and referenced source ID. An override is historical attribution, not a trusted owner waiver. Tidy is not permission to clean files; remove is not an instruction to delete a destination ticket. A removed ID without an item stays an unresolved historical reference, even when no originating CLI command exists. |
+| `role-authors` | `updated_by` and `agent`, including free-text role/batch names such as `implementer batch amber` and `reviewer round 2`; keep exact strings as historical role hints, never resolve them to authenticated sessions by name. |
+| `client-export` | claude.ai-style fields `who`, `doneBy`, `prevState`, `after` and states `you`, `later`, `todo`, `doing`, `running`. Preserve all originals. Preview `you` as owner-intent/unverified, `later` as deferred, `todo` as queued and `doing`/`running` as historical active work needing reconciliation. `doneBy` does not authenticate an author; `prevState`/`after` stay raw transitions/order references until the selected schema establishes their types and meaning. |
+| `note-substates` | Preserve complete notes including `ready for integration:`, `PAUSED by the owner`, `ACCEPT ... HOLD`, `Split into X, Y`, `Waits for X`, `Round N` and `P1/P2 file:line`. Preview integration/hold/pause, successor/prerequisite and round/finding hints separately from the primary state. Do not silently change status, create a release hold or gate, authenticate an owner instruction or turn a textual reference into a resolved relation. |
+| `media-review-store` | Separate animation/take/per-direction, sound and story reviews, with store version, rounds, content signatures and source-local IDs. Namespace them separately from task IDs and link only through explicit mappings. Preserve every round, direction and signature algorithm/value; unknown algorithms or unavailable originals stay explicit. A legacy signature alone cannot mint a current target fingerprint or approval. |
+
+### Verdict layout families
+
+CL-21 must dispatch by explicit selected format/version and validated structure, not a filename such as `verdicts.json`. At least five distinct layouts need separate shape handling. The fixture supplies these five representative synthetic layouts; their field spellings do not assert the exact layouts of any private source:
+
+| Synthetic shape ID | Example layout | Preview requirement |
+|---|---|---|
+| `single-verdict` | `{"task":"DEMO-1","verdict":"PASS","reviewer":"reviewer batch amber"}` | Retain the single verdict and free-text author. |
+| `verdict-list` | `[{"task":"DEMO-1","lane":"build","result":"PASS"}]` | Retain each entry and lane; never collapse repeated rounds into the last entry. |
+| `keyed-verdicts` | `{"DEMO-1":{"review":"REJECT","reason":"Visible seam"}}` | Retain the object key as source task reference, raw verdict and reason. |
+| `round-envelope` | `{"rounds":[{"round":2,"verdicts":[{"task":"DEMO-1","outcome":"EVIDENCE_GAP"}]}]}` | Retain nesting, round and evidence-gap/not-run values without converting them to passes or code failures. |
+| `direction-verdicts` | `{"take":"take-a","round":2,"directions":{"north":{"verdict":"ACCEPT","signature":"legacy:abc"}}}` | Retain take/direction/round/signature; reconcile against the separate media store, not a task matched by title. |
+
+Every reader preserves the original payload, source-local identity or JSON location, time/author/lane/round when present, raw outcome and external evidence references. Missing values remain missing with preview warnings. Conflicting or unknown outcomes and conflicting layouts require an explicit mapping; no historical verdict becomes a fresh gate pass. Repeated task IDs across rounds are history, not duplicate-task merge instructions.
+
+### Synthetic fixture exit checks
+
+The fixture's `cases` pair raw `input` with `expected_preview` obligations for every family above; `verdict_shapes` contains the five layouts. CL-21 reader tests must compare preservation and diagnostics against those obligations, including missing events, deleted references, unverified authors, ambiguous sub-states and missing media originals. These fixtures prepare coverage; successful JSON parsing does not establish import/export behavior.
+
+The `backup-selection` case deliberately gives a consistent backup and an older snapshot different counts. Preview must report the chosen source's actual counts/hash/time and the discrepancy, require explicit source selection, and never merge sources or assume either count is authoritative merely because it is larger. Actual transfer still requires a fresh consistent backup or explicitly selected export as described above. No private inventory count is a fixture invariant.
 
 ## Mapping
 

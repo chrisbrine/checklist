@@ -1,4 +1,5 @@
 import Foundation
+import ChecklistProviders
 import GRDB
 
 extension CommandRouter {
@@ -9,7 +10,7 @@ extension CommandRouter {
             throw CoreError("TICKET_PURGED","This ticket was permanently removed. Its remaining reference cannot be edited or restored.")
         }
         switch method {
-        case "service_info": return ["session_id":c.sessionID ?? "","caller":["session_id":c.sessionID ?? "","role":c.role,"installation":c.installation],"name":"Checklist","version":"0.1.0","store_incarnation":incarnation,"role":c.role,"project_ids":c.projectIDs,"capabilities":["durable_store","project_isolation","pickup_inbox","named_contacts","human_requests","managed_attachments","scope_reservations","captured_source_review","triage_batches","phase_triages","triage_orchestration","typed_relations","policy_reconciliation","request_revisions"],"native_push":false,"native_push_status":"Pickup via authenticated MCP is available. Native idle-client push is not qualified.","unsupported":["automatic_model_launch","native_idle_push","restore","MCP_events"]]
+        case "service_info": return ["session_id":c.sessionID ?? "","caller":["session_id":c.sessionID ?? "","role":c.role,"installation":c.installation],"name":"Checklist","version":"0.1.0","store_incarnation":incarnation,"role":c.role,"project_ids":c.projectIDs,"capabilities":["durable_store","project_isolation","pickup_inbox","named_contacts","human_requests","managed_attachments","scope_reservations","captured_source_review","triage_batches","phase_triages","triage_orchestration","typed_relations","policy_reconciliation","request_revisions"],"provider_plugins":providerPlugins.summaries,"native_push":false,"native_push_status":NativeCommunicationRoutes.summary,"native_routes":NativeCommunicationRoutes.serviceInfo,"unsupported":["automatic_model_launch","native_idle_push","restore","MCP_events"]]
         case "tool_catalog": return ["tools":toolCatalog(c)]
         case "changes_wait":
             let scope = try authorizationScope(db,c)
@@ -24,7 +25,7 @@ extension CommandRouter {
         case "delivery_pending", "delivery_record", "native_reply_record": return try bridge(db,p,c,method)
         case "delivery_host_status": return try deliveryHostStatus(db,p,c)
         case "snapshot": try owner(c); return try snapshot(db,c:c)
-        case "diagnostics_summary": return try diagnosticsSummary(db,c)
+        case "diagnostics_summary": return try diagnosticsSummary(db,p,c)
         case "storage_status": try owner(c); return ["database_path":root.appendingPathComponent("checklist.sqlite").path,"managed_bytes":try records(db,type:"attachment").filter {$0["mode"] as? String == "managed" && $0["availability"] as? String == "available"}.reduce(0) {$0+int($1,"size")},"cleanup_enabled":true,"restore_supported":false]
         // An archived project leaves the ordinary project list; include_archived lists it for a restore.
         case "project_list", "assistant_projects": return ["projects":try projects(db,c).filter { bool(p,"include_archived") || !bool($0,"archived") }]
@@ -81,6 +82,7 @@ extension CommandRouter {
         case "review_batch_inputs": return try reviewBatchInputs(db,p,c)
         case "batch_prepare": return try batchPrepare(db,p,c)
         case "batch_claim": return try batchClaim(db,p,c)
+        case "batch_discard": return try batchDiscard(db,p,c)
         case "batch_release": return try batchRelease(db,p,c)
         case "batch_get", "batch_list": return try batchRead(db,p,c,method)
         case "batch_submit", "batch_review_record": return try batchWork(db,p,c,method)
@@ -105,6 +107,7 @@ extension CommandRouter {
         case "task_link": return try taskLink(db,p,c)
         case "relation_list": return try relationRead(db,p,c)
         case "relation_import": return try relationImport(db,p,c)
+        case "work_health_get", "work_health_respond": return try workHealthCommand(db,p,c,method)
         case "work_claim", "work_checkpoint", "work_release", "work_submit", "review_record", "task_complete", "work_recover": return try work(db,p,c,method)
         case "direction_waive": return try directionWaive(db,p,c)
         case "message_mentions_prepare": return try ordinaryMentionPrepareCommand(db,p,c)
@@ -152,7 +155,9 @@ extension CommandRouter {
     func taskProjection(_ db: Database,_ task: JSON) throws -> JSON {
         let status = try? record(db,task["status_id"] as? String ?? "",type:"status")
         let tags = try records(db,type:"tag",project:task["project_id"] as? String).filter {strings(task,"tag_ids").contains($0["id"] as? String ?? "")}
-        return assembledTaskProjection(task,status:status,activeAttention:try taskActiveAttention(db,task),tags:tags,relation:try relationTaskProjection(db,task:task))
+        var value = assembledTaskProjection(task,status:status,activeAttention:try taskActiveAttention(db,task),tags:tags,relation:try relationTaskProjection(db,task:task))
+        value["work_health"] = try workHealthView(db,task:task)
+        return value
     }
     func assembledTaskProjection(_ task: JSON, status: JSON?, activeAttention: Bool, tags: [JSON], relation: JSON) -> JSON {
         var t = task

@@ -1,0 +1,17 @@
+{
+  "description": "Synthetic enrolled-worker command shapes. Read current IDs/revisions and discover the installed catalog first. Never execute these fixture UUIDs.",
+  "project_id": "00000000-0000-4000-8000-000000000001",
+  "agent_rule_changes": "allowed",
+  "commands": [
+    {"method":"work_recover","params":{"project_id":"00000000-0000-4000-8000-000000000001","command_id":"00000000-0000-4000-8000-000000000002","task_id":"00000000-0000-4000-8000-000000000003","expected_revision":4,"action":"confirm_stopped_revoke","reason":"Synthetic stopped-process and inspected-file receipts","observation_refs":["fixture:process-stopped"],"file_state_refs":["fixture:files-inspected"],"source_execution_ids":["00000000-0000-4000-8000-000000000004"],"expected_source_execution_revisions":{"00000000-0000-4000-8000-000000000004":1}}},
+    {"method":"finding_waive","params":{"project_id":"00000000-0000-4000-8000-000000000001","command_id":"00000000-0000-4000-8000-000000000005","finding_id":"00000000-0000-4000-8000-000000000006","expected_revision":1,"reason":"Synthetic agent waiver; this does not record owner approval"}},
+    {"method":"archive_storage_settings","params":{"project_id":"00000000-0000-4000-8000-000000000001","command_id":"00000000-0000-4000-8000-000000000007","expected_revision":2,"settings_revision":1,"archive_storage":{"preset":"clean_large_managed_on_archive","large_original_bytes":20971520,"retained_budget_bytes":52428800}}},
+    {"method":"diagnostics_summary","params":{"project_id":"00000000-0000-4000-8000-000000000001"}}
+  ],
+  "remaining_owner_only": {
+    "project_create": "Requires atomic native enrollment and matching session grant, outside current router authority.",
+    "project_edit.root_path": "Defines the filesystem authority boundary; explicit owner decision required.",
+    "export_project": "Path-based destination publication and crash reconciliation need descriptor-relative confinement together.",
+    "diagnostics_file_export": "Native app presentation exporter; workers can save their scoped summary using workspace tools."
+  }
+}

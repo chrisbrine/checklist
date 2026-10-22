@@ -91,15 +91,15 @@ struct EvidenceMeasuresView: View {
                     }
                     DisclosureGroup("Measures · \(snapshot.title)") {
                         VStack(alignment:.leading,spacing:Spacing.control) {
-                            Text("Upper limits are advisory. Observations do not establish a review verdict.").checklistFont(.micro).foregroundStyle(.secondary)
+                            Text("Upper limits are advisory. Observations do not establish a review verdict.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                             ForEach(snapshot.measures) { measure in
                                 VStack(alignment:.leading,spacing:Spacing.tight) {
                                     Text(verbatim:measure.name).checklistFont(.microEmphasis)
                                     Text("\(number(measure.before)) → \(number(measure.after)) \(measure.unit) · limit \(number(measure.limit)) \(measure.unit)").checklistFont(.micro).monospacedDigit()
                                     if measure.overLimit { Text("After value exceeds the limit by \(number(measure.after - measure.limit)) \(measure.unit).").checklistFont(.micro).foregroundStyle(.orange) }
                                     if let prior = values.previousMeasure(measure,in:snapshot) {
-                                        Text("Previous round: \(number(prior.before)) → \(number(prior.after)) \(prior.unit), limit \(number(prior.limit)). After change: \(signed(measure.after - prior.after)) \(measure.unit).\(prior.limit == measure.limit ? "" : " The limit changed.")").checklistFont(.micro).foregroundStyle(.secondary)
-                                    } else { Text("No unambiguous matching name and unit in the previous loaded round.").checklistFont(.micro).foregroundStyle(.secondary) }
+                                        Text("Previous round: \(number(prior.before)) → \(number(prior.after)) \(prior.unit), limit \(number(prior.limit)). After change: \(signed(measure.after - prior.after)) \(measure.unit).\(prior.limit == measure.limit ? "" : " The limit changed.")").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                                    } else { Text("No unambiguous matching name and unit in the previous loaded round.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                                 }
                             }
                             TechnicalDetails([("Source",snapshot.id),("Target",snapshot.manifestID),("Author",snapshot.author),("SHA-256",snapshot.sha256)] + (values.previous(for:snapshot).map { [("Previous source",$0.id),("Previous target",$0.manifestID),("Previous SHA-256",$0.sha256)] } ?? []))

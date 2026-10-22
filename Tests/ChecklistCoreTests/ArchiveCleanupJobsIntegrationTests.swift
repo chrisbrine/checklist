@@ -3,7 +3,7 @@ import GRDB
 @testable import ChecklistCore
 
 /// Prepared only. Requires the exact frozen CL19 validated-transaction producer,
-/// explicit cleanup_job family and the two narrow owner dispatch/catalog fragments.
+/// explicit cleanup_job family and project-authorized dispatch/catalog fragments.
 /// Internal preview setup is synthetic, not a native preview or archive receipt claim.
 final class ArchiveCleanupJobsIntegrationTests: XCTestCase {
     var directory: URL!
@@ -61,8 +61,8 @@ final class ArchiveCleanupJobsIntegrationTests: XCTestCase {
     func testWorkerWrongProjectAndNonIntegralRevisionCannotCancelJob() throws {
         let f = try fixture(),job = try enqueue(f),pid = f.project["id"] as! String,jid = job["id"] as! String
         let worker = Caller(role:"worker",installation:"fixture-worker",projectIDs:[pid])
-        XCTAssertFalse(router.toolCatalog(worker).contains {$0["name"] as? String == "cleanup_job_cancel"})
-        XCTAssertThrowsError(try transaction {db in try router.archiveCleanupJobCommand(db,["project_id":pid,"cleanup_job_id":jid,"expected_revision":1],worker,"cleanup_job_cancel")}) {XCTAssertEqual(($0 as? CoreError)?.code,"HUMAN_CHANNEL_REQUIRED")}
+        XCTAssertTrue(router.toolCatalog(worker).contains {$0["name"] as? String == "cleanup_job_cancel"})
+        XCTAssertThrowsError(try transaction {db in try router.archiveCleanupJobCommand(db,["project_id":pid,"cleanup_job_id":jid,"expected_revision":1],worker,"cleanup_job_cancel")}) {XCTAssertEqual(($0 as? CoreError)?.code,"ROOT_MISMATCH")}
         let other = try call("project_create",["name":"Other","key_prefix":"OTHER"])
         XCTAssertThrowsError(try call("cleanup_job_get",["project_id":other["id"]!,"cleanup_job_id":jid]))
         for bad in [true,1.5] as [Any] {XCTAssertThrowsError(try call("cleanup_job_cancel",["project_id":pid,"cleanup_job_id":jid,"expected_revision":bad]))}

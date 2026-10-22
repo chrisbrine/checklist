@@ -24,7 +24,7 @@ struct CaptureTaskView: View {
         VStack(alignment: .leading, spacing: Spacing.section) {
             AccessibleHStack { Text("New ticket").checklistFont(.sheetTitle); Spacer(); Button { dismiss() } label: { Image(systemName: "xmark") }.buttonStyle(.checklistIcon).accessibilityLabel("Close ticket capture").help("Close ticket capture") }
             Picker("Project", selection: Binding(get: { projectID }, set: { switchProject($0) })) { Text("Choose a project").tag(""); ForEach(store.activeProjects) { Text($0.string("name")).tag($0.id) } }.checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)])
-            if let createdTaskID {Text("Ticket captured · "+String(createdTaskID.prefix(8))+". Finish its selected files before starting another ticket.").checklistFont(.micro).foregroundStyle(.secondary)}
+            if let createdTaskID {Text("Ticket captured · "+String(createdTaskID.prefix(8))+". Finish its selected files before starting another ticket.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)}
             if !projectID.isEmpty {
                 Picker("Epic", selection: $epicID) {
                     Text("No Epic").tag("")
@@ -35,15 +35,15 @@ struct CaptureTaskView: View {
                 if let epicError {Text(epicError).checklistFont(.micro).foregroundStyle(.orange)}
             }
             TextField("What needs doing?", text: $title).checklistFont(.subheading).textFieldStyle(.roundedBorder).focused($titleFocused).accessibilityIdentifier("captureTitle").checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)])
-            AccessibleHStack { Picker("Starter", selection: $kind) { ForEach(enabledKinds, id: \.self) { Text($0.capitalized).tag($0) } }.frame(maxWidth: .infinity, alignment: .leading).checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)]); Spacer(); Text("Saves as Draft").checklistFont(.micro).foregroundStyle(.secondary) }
-            if !starterHint.isEmpty { Text(starterHint).checklistFont(.micro).foregroundStyle(.secondary) }
+            AccessibleHStack { Picker("Starter", selection: $kind) { ForEach(enabledKinds, id: \.self) { Text($0.capitalized).tag($0) } }.frame(maxWidth: .infinity, alignment: .leading).checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)]); Spacer(); Text("Saves as Draft").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+            if !starterHint.isEmpty { Text(starterHint).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             if !StarterFields.fields(for: kind).isEmpty {
                 StarterFieldsEditor(kind: kind, values: $starterFields)
                     .checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)])
             }
             TextEditor(text: $brief).checklistFont(.body).frame(height: 110).padding(Spacing.compact).overlay(RoundedRectangle(cornerRadius: Radius.medium).stroke(.quaternary)).accessibilityLabel("Optional brief").checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)])
             AttachmentCaptureSection(pending:$pendingAttachments,destination:Binding(get:{CaptureAttachmentDestination(storeIncarnation:store.storeIncarnation,projectID:projectID,taskID:nil)},set:{_ in}),disabled:store.busy || captureNeedsReconciliation)
-            Text("A title is enough to capture it. Add the outcome and make it ready when you're set.").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("A title is enough to capture it. Add the outcome and make it ready when you're set.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             if !title.isEmpty || !brief.isEmpty {
                 DraftSaveStatusView(kind: "capture", draftID: projectID)
                 if captureNeedsReconciliation {
@@ -139,8 +139,8 @@ struct NewProjectView: View {
             Text("New project").checklistFont(.sheetTitle)
             TextField("Project name", text: $name).textFieldStyle(.roundedBorder)
             AccessibleHStack { TextField("Key prefix (e.g. GAME)", text: $prefix).textFieldStyle(.roundedBorder); Picker("Icon", selection: $symbol) { ForEach(["folder", "gamecontroller", "app", "leaf", "tram", "checklist", "sparkles", "hammer"], id: \.self) { Label($0, systemImage: $0).tag($0) } }.labelsHidden() }
-            AccessibleHStack { Text(root.isEmpty ? "No workspace selected" : root).checklistFont(.micro).foregroundStyle(.secondary).lineLimit(2); Spacer(); Button("Choose folder…") { if let path = chooseFiles(directories: true, files: false, multiple: false).first { root = path.path } } }
-            Text("Workspace binding lets agents resolve this project safely. You can add it later. No existing checklists are imported.").checklistFont(.micro).foregroundStyle(.secondary)
+            AccessibleHStack { Text(root.isEmpty ? "No workspace selected" : root).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).lineLimit(2); Spacer(); Button("Choose folder…") { if let path = chooseFiles(directories: true, files: false, multiple: false).first { root = path.path } } }
+            Text("Workspace binding lets agents resolve this project safely. You can add it later. No existing checklists are imported.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             AccessibleHStack { Text("Accent"); Picker("Accent", selection: $accent) { ForEach(["teal", "blue", "purple", "orange", "green", "pink"], id: \.self) { Text($0.capitalized).tag($0) } }.labelsHidden(); Spacer() }
             AccessibleHStack { Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction); Spacer(); Button("Create project") { var params: [String: Any] = ["name": name, "key_prefix": prefix.uppercased(), "icon": symbol, "accent": accent]; if !root.isEmpty { params["root_path"] = root }; store.run("project_create", params, success: "Project created") { result in if let project = result["project"] as? [String: Any], let id = project["id"] as? String { store.select(.tasks, project: id) } else if let id = result["id"] as? String { store.select(.tasks, project: id) }; dismiss() } }.buttonStyle(.checklistProminent).checklistDisabled([(name.isEmpty, "Enter a name first."), (prefix.isEmpty, "Enter a key prefix first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline)]) }
         }.padding(Spacing.page).checklistSheet(width: 500)
@@ -154,7 +154,7 @@ struct StarterFieldsEditor: View {
     @Binding var values: [String: String]
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.small) {
-            Text(kind == "bug" ? "Bug details (optional)" : "Playtest details (optional)").checklistFont(.captionEmphasis).foregroundStyle(.secondary)
+            Text(kind == "bug" ? "Bug details (optional)" : "Playtest details (optional)").checklistFont(.captionEmphasis).foregroundStyle(Color.checklistSecondaryText)
             ForEach(StarterFields.fields(for: kind)) { field in
                 let text = Binding(get: { values[field.key] ?? "" }, set: { values[field.key] = $0.isEmpty ? nil : $0 })
                 if field.multiline {
@@ -182,7 +182,7 @@ struct StarterFieldsSection: View {
             DetailSection(title: task.string("kind") == "playtest" ? "Playtest details" : task.string("kind") == "bug" ? "Bug details" : "Details") {
                 ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
                     VStack(alignment: .leading, spacing: Spacing.hairline) {
-                        Text(row.label).checklistFont(.captionEmphasis).foregroundStyle(.secondary)
+                        Text(row.label).checklistFont(.captionEmphasis).foregroundStyle(Color.checklistSecondaryText)
                         Text(row.value).checklistFont(.body).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }

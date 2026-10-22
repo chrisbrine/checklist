@@ -41,7 +41,7 @@ import CryptoKit
         func store(_ defaults:UserDefaults,_ directory:URL) -> ChecklistStore {
             let store=ChecklistStore(draftJournal:LocalDraftJournal(directory:directory),preferences:defaults,restorePendingCommand:false,
                 desktopAlerts:DesktopAlertCoordinator(sink:MediaNoAlerts()),requestTransport:{[self] in try await request($0,$1)},navigationMemory:DetailItemNavigationMemory(),pendingCommandPersistence:PendingCommandPersistence(read:{[self] in pending[$0]},save:{[self] in pending[$1]=$0},remove:{[self] in pending.removeValue(forKey:$0)}))
-            store.connected=true;store.projectID=project;return store
+            store.data=["service":["store_incarnation":"synthetic-media-store"]];store.connected=true;store.projectID=project;return store
         }
     }
     func fixture() -> (Peer,ChecklistStore,IsolatedDefaults,URL) {
@@ -148,6 +148,113 @@ import CryptoKit
         XCTAssertFalse(model.imageIsActive("current-1",historical:false));XCTAssertTrue(model.imageIsActive("current-2",historical:false))
         model.endImage();model.endImage();XCTAssertEqual(model.imageLoads,0)
         await model.showExamples(false);XCTAssertFalse(model.imageIsActive("historical-1",historical:true))
+    }
+    func assertConfirmation(_ make: () -> PendingConfirmation, method: String, object: String, peer: Peer, store: ChecklistStore) async throws -> MediaValues {
+        peer.calls=[]
+        var pending: PendingConfirmation?=make()
+        XCTAssertTrue(pending!.title.contains(object))
+        XCTAssertTrue(pending!.cancelIsDefault, "Cancel must be the default native dialog action")
+        XCTAssertTrue(pending!.effect.contains("originals"))
+        XCTAssertTrue(pending!.effect.contains("history"))
+        XCTAssertTrue(peer.calls.isEmpty, "Opening the dialog must not send the command")
+        pending!.respond(confirmed:false)
+        pending=nil // The native dialog dismisses on Cancel or Escape.
+        await Task.yield()
+        XCTAssertTrue(peer.calls.isEmpty, "Cancel must send nothing")
+        XCTAssertFalse(store.busy)
+        pending=make()
+        XCTAssertTrue(peer.calls.isEmpty)
+        pending!.respond(confirmed:true)
+        try await settle {peer.calls.contains {$0.0==method} && !store.busy}
+        let calls=peer.calls.filter {$0.0==method}
+        XCTAssertEqual(calls.count,1)
+        return try XCTUnwrap(calls.first?.1)
+    }
+    func testRetireTypeWaitsForNativeConfirmationAndCancelSendsNothing() async throws {
+        let (peer,store,_,_)=fixture();let model=await setup(peer,store)
+        let type=Record(values:["id":"exact-type","title":"Hero animation","revision":7])
+        let sent=try await assertConfirmation({model.retireTypeConfirmation(type)},method:"media_type_retire",object:"Hero animation",peer:peer,store:store)
+        XCTAssertEqual(sent["type_id"] as? String,"exact-type")
+        XCTAssertEqual(sent["expected_revision"] as? Int,7)
+    }
+    func testCancelRoundWaitsForNativeConfirmationAndCancelSendsNothing() async throws {
+        let (peer,store,_,_)=fixture();let model=await setup(peer,store)
+        let sent=try await assertConfirmation({model.cancelRoundConfirmation(reason:"Superseded by the new direction")},method:"media_round_cancel",object:"Synthetic round",peer:peer,store:store)
+        XCTAssertEqual(sent["round_id"] as? String,"round")
+        XCTAssertEqual(sent["reason"] as? String,"Superseded by the new direction")
+        XCTAssertEqual(sent["expected_revision"] as? Int,1)
+    }
+    func testArchiveRoundWaitsForNativeConfirmationAndCancelSendsNothing() async throws {
+        let (peer,store,_,_)=fixture();let model=await setup(peer,store)
+        model.header=Record(values:["id":"round","title":"Finished round","state":"closed","revision":9])
+        let sent=try await assertConfirmation({model.archiveRoundConfirmation()},method:"media_round_archive",object:"Finished round",peer:peer,store:store)
+        XCTAssertEqual(sent["round_id"] as? String,"round")
+        XCTAssertEqual(sent["expected_revision"] as? Int,9)
+    }
+    func testRoundConfirmationKeepsDisplayedObjectAndRevisionAcrossRefresh() async throws {
+        let (peer,store,_,_)=fixture();let model=await setup(peer,store)
+        let pending=model.cancelRoundConfirmation(reason:"Original reason")
+        model.roundID="another-round";model.header=Record(values:["id":"another-round","title":"Another round","revision":99])
+        store.connected=true;peer.calls=[];pending.respond(confirmed:true)
+        try await settle {peer.calls.contains {$0.0=="media_round_cancel"}}
+        let sent=try XCTUnwrap(peer.calls.first {$0.0=="media_round_cancel"}?.1)
+        XCTAssertEqual(sent["round_id"] as? String,"round")
+        XCTAssertEqual(sent["expected_revision"] as? Int,1)
+        XCTAssertEqual(sent["reason"] as? String,"Original reason")
+    }
+    func testComparisonAndWinnerLabelsUseTitleOriginTimeAndSlotWithoutTechnicalIdentity() throws {
+        let candidateID="6167d5d8-31b1-48ab-8499-639a494c60f4",slotID="6e0c4dd3-efe7-4e96-b40b-454af7c475eb"
+        let hash=String(repeating:"abc123ef",count:8),author="auto-codex/01a1616c-278b-7c61-9ace-d82ba99e2625"
+        let slot=Record(values:["slot_id":slotID,"media_kind":"image","sha256":hash])
+        let definitions=[Record(values:["id":slotID,"label":"Walk north","kind":"image"])]
+        let candidate:MediaValues=["id":candidateID,"source_name":"hero-walk.png","origin":"agent","author_session_id":author,"created_at":"2026-10-21T12:00:00Z","slots":[slot.values],"content_signature":hash]
+        let item=Record(values:["id":UUID().uuidString,"title":"Hero walk","candidates":[candidate,candidate.merging(["id":UUID().uuidString]) {_,new in new}],"target":["id":UUID().uuidString,"review_basis_signature":hash]])
+        let choices=MediaComparisonLabels.choices(item:item,definitions:definitions)
+        XCTAssertEqual(choices.count,2)
+        XCTAssertEqual(choices[0].id,candidateID,"Exact winner binding is retained")
+        XCTAssertNotEqual(choices[0].label,choices[1].label,"Capture order disambiguates identical sources and times")
+        for (index,choice) in choices.enumerated() {
+            for label in ["Candidate \(index+1)","Hero walk","hero-walk.png","Agent capture",MediaComparisonLabels.time("2026-10-21T12:00:00Z"),"Walk north"] {XCTAssertTrue(choice.label.contains(label),label)}
+            for technical in [candidateID,slotID,hash,author] {XCTAssertFalse(choice.label.contains(technical),technical)}
+        }
+        let imageLabel=MediaComparisonLabels.imageAccessibilityLabel(slot,definitions:definitions)
+        XCTAssertEqual(imageLabel,"Verified original image, Walk north")
+        XCTAssertFalse(imageLabel.contains(slotID));XCTAssertFalse(imageLabel.contains(hash))
+        XCTAssertEqual(MediaComparisonLabels.slot(Record(values:["slot_id":slotID,"text":"literal"]),definitions:[]),"Text slot")
+        XCTAssertEqual(MediaComparisonLabels.origin("human_ui"),"Owner")
+        XCTAssertEqual(MediaComparisonLabels.slot(slot,definitions:[Record(values:["id":slotID,"label":slotID,"kind":"image"])]),"Image slot 1")
+        let context=Record(values:["approved_context":["brief":"Use the green palette","brief_revision":8,"pinned_decisions":[["id":candidateID,"title":"Style","body":"Keep the silhouette","sha256":hash]]]])
+        XCTAssertEqual(MediaComparisonLabels.context(context),"Use the green palette\n\nStyle: Keep the silhouette")
+        let intakeRow=Record(values:["id":candidateID,"group_id":candidateID])
+        XCTAssertEqual(MediaFrozenIntakeView.groupLabel(intakeRow,rows:[intakeRow]),"Candidate group 1")
+        XCTAssertEqual(MediaFrozenIntakeView.editableGroup(intakeRow,rows:[intakeRow]),"")
+        let explicitGroup=Record(values:["id":candidateID,"group_id":"Hero walk"])
+        XCTAssertEqual(MediaFrozenIntakeView.groupLabel(explicitGroup,rows:[explicitGroup]),"Candidate group: Hero walk")
+        XCTAssertEqual(MediaFrozenIntakeView.editableGroup(explicitGroup,rows:[explicitGroup]),"Hero walk")
+        let details=TechnicalDetails(raw:[("Selected media and candidates",item.values)])
+        let raw=ReviewProjection.readableJSON(details.raw[0].value)
+        XCTAssertTrue(raw.contains(candidateID));XCTAssertTrue(raw.contains(hash))
+        let rendered=Record(values:try XCTUnwrap(JSONSerialization.jsonObject(with:Data(raw.utf8)) as? MediaValues))
+        XCTAssertEqual(rendered.records("candidates").first?.string("author_session_id"),author)
+    }
+    func testMediaViewsWireSharedDialogsAndKeepTechnicalMetadataCollapsed() throws {
+        let root=URL(fileURLWithPath:#filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Sources/ChecklistApp")
+        let workspace=try String(contentsOf:root.appendingPathComponent("Media/MediaReviewWorkspace.swift"),encoding:.utf8)
+        for action in ["confirmation = model.retireTypeConfirmation(type)","confirmation = model.cancelRoundConfirmation(reason:cancelReason)","confirmation = model.archiveRoundConfirmation()"] {XCTAssertTrue(workspace.contains(action),action)}
+        XCTAssertEqual(workspace.components(separatedBy:".checklistConfirmation($confirmation)").count-1,2)
+        for command in ["media_type_retire","media_round_cancel","media_round_archive"] {XCTAssertFalse(workspace.contains("model.mutate(\""+command+"\""),command)}
+        let comparison=try String(contentsOf:root.appendingPathComponent("Media/MediaOwnerComparison.swift"),encoding:.utf8)
+        for technical in ["Text(\"Target:","Text(\"Basis:","Text(\"Round:","Text(\"Attention:","SHA-256: ",".id.prefix(","string(\"author_session_id\")","string(\"decision_author_session_id\")"] {XCTAssertFalse(comparison.contains(technical),technical)}
+        XCTAssertTrue(comparison.contains("Text(choice.label).tag(choice.id).accessibilityLabel(choice.label)"))
+        XCTAssertTrue(comparison.contains("Text(choice.label).font(.headline).accessibilityLabel(choice.label)"))
+        XCTAssertEqual(comparison.components(separatedBy:"TechnicalDetails(raw:").count-1,1)
+        XCTAssertTrue(workspace.contains("TechnicalDetails(raw: [(\"Round\",model.header.values)"))
+        for technical in [" · Revision ","intake.id.prefix(","row.string(\"target_id\")"] {XCTAssertFalse(workspace.contains(technical),technical)}
+        let dialogs=try String(contentsOf:root.appendingPathComponent("Support/Confirmations.swift"),encoding:.utf8)
+        XCTAssertTrue(dialogs.contains("role: .cancel) { item.respond(confirmed: false) }.keyboardShortcut(.defaultAction)"))
+        let details=try String(contentsOf:root.appendingPathComponent("Support/TechnicalDetails.swift"),encoding:.utf8)
+        XCTAssertTrue(details.contains("DisclosureGroup(\"Technical details\")"))
+        XCTAssertFalse(details.contains("isExpanded:"),"Shared technical details start collapsed")
     }
     func testImageDecoderRequiresExactDigestAndDecodesActualBoundedOriginal() async throws {
         let bytes=Data(base64Encoded:"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")!

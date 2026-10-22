@@ -12,7 +12,7 @@ struct ArchivedProjectNotice: View {
     var body: some View {
         if let id = store.projectID, let project = store.archivedProjects.first(where: { RecordIdentity($0.id) == RecordIdentity(id) }) {
             AccessibleHStack(spacing: Spacing.small) {
-                Image(systemName: "archivebox").foregroundStyle(.secondary).accessibilityHidden(true)
+                Image(systemName: "archivebox").foregroundStyle(Color.checklistSecondaryText).accessibilityHidden(true)
                 Text(ProjectArchiveText.archivedNotice).checklistFont(.callout).fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: Spacing.small)
                 Button("Restore project") { store.setProjectArchived(project, archived: false) }

@@ -15,7 +15,7 @@ struct ArchiveStorageSettingsSection: View {
                 TextField("Retained ticket budget",text:$draft.budget).textFieldStyle(.roundedBorder)
                 Picker("Size unit",selection:$draft.unit) { Text("MiB").tag(Int64(1_048_576));Text("Bytes").tag(Int64(1)) }.frame(maxWidth: .infinity, alignment: .leading)
             }
-            Text("The total budget can select smaller files too. Keep-original, shared evidence, active work, review, readers and backup captures remain protected. Cleanup has a 30-second cancellation window.").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("The total budget can select smaller files too. Keep-original, shared evidence, active work, review, readers and backup captures remain protected. Cleanup has a 30-second cancellation window.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             if baseRevision != project.integer("revision") || settingsRevision != project.integer("settings_revision") { Text("Project settings changed. Reload before saving; your edits are preserved.").checklistFont(.micro).foregroundStyle(.orange) }
             AccessibleHStack {
                 Button("Save storage settings") { save() }.checklistDisabled([(draft.value == nil, "There are no changes to save."), (draft == baseline, "There are no changes to save."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline), (baseRevision != project.integer("revision"), "The project changed. Reload the settings first."), (settingsRevision != project.integer("settings_revision"), "The project settings changed. Reload them first.")])
@@ -45,26 +45,26 @@ struct ArchiveCleanupSection: View {
     private var current: Bool { store.connected && store.selectedTicketCurrent(task.id) }
     var body: some View {
         DetailSection(title:"Archive cleanup") {
-            AccessibleHStack { Text("Observed job state").checklistFont(.micro).foregroundStyle(.secondary);Spacer();Button("Refresh cleanup") { Task { await load() } }.buttonStyle(.link).checklistDisabled([(loading, "Still loading."), (!current, "The cleanup state changed. Refresh first.")]) }
+            AccessibleHStack { Text("Observed job state").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText);Spacer();Button("Refresh cleanup") { Task { await load() } }.buttonStyle(.link).checklistDisabled([(loading, "Still loading."), (!current, "The cleanup state changed. Refresh first.")]) }
             if loading { ProgressView().controlSize(.small) }
             if let failure { Text(failure).checklistFont(.micro).foregroundStyle(.orange) }
-            if jobs.isEmpty && !loading { Text("No cleanup job recorded for this ticket.").checklistFont(.micro).foregroundStyle(.secondary) }
+            if jobs.isEmpty && !loading { Text("No cleanup job recorded for this ticket.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             ForEach(jobs.prefix(4)) { job in
                 VStack(alignment:.leading,spacing: Spacing.compact) {
                     Text(GlossaryText.title(job.string("state"))).checklistFont(.calloutEmphasis)
                     Text("Selected \(bytes(job,"selected_logical_original_bytes")) · removed from active store \(bytes(job,"removed_logical_original_bytes")) · already absent \(bytes(job,"already_missing_logical_original_bytes"))").checklistFont(.micro)
-                    Text("Known at backup: \(job.values["known_backup_retained_logical_original_bytes"] is NSNumber ? bytes(job,"known_backup_retained_logical_original_bytes") : "unavailable"). Current external backup presence, physical disk savings and backup-retained allocation are unverified. Logical lengths are not physical reclamation.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("Known at backup: \(job.values["known_backup_retained_logical_original_bytes"] is NSNumber ? bytes(job,"known_backup_retained_logical_original_bytes") : "unavailable"). Current external backup presence, physical disk savings and backup-retained allocation are unverified. Logical lengths are not physical reclamation.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     let reasons = Array(Set(job.records("items").flatMap {$0.strings("holds")})).sorted()
-                    if !reasons.isEmpty { Text("Retained: " + reasons.map(ArchiveStorageDraft.holdLabel).joined(separator:", ")).checklistFont(.micro).foregroundStyle(.secondary) }
+                    if !reasons.isEmpty { Text("Retained: " + reasons.map(ArchiveStorageDraft.holdLabel).joined(separator:", ")).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                     AccessibleHStack {
                         if job.bool("can_cancel_remaining") { Button("Cancel remaining cleanup") { change(job,"cleanup_job_cancel") }.checklistDisabled([(!store.connected, DisabledReasons.offline), (!current, "The cleanup state changed. Refresh first."), (store.busy, DisabledReasons.saving), (store.hasPendingMutation, DisabledReasons.uncheckedChange)]) }
                         if job.string("state") == "suspended" { Button("Retry with a new Undo window") { change(job,"cleanup_job_retry") }.checklistDisabled([(!store.connected, DisabledReasons.offline), (!current, "The cleanup state changed. Refresh first."), (store.busy, DisabledReasons.saving), (store.hasPendingMutation, DisabledReasons.uncheckedChange)]) }
                         if task.bool("archived") { Button("Undo archive") { store.run("task_archive",["project_id":task.string("project_id"),"task_id":task.id,"expected_revision":task.integer("revision"),"action":"unarchive","cleanup":false],success:"Unarchived; any deleted originals remain unavailable") { _ in Task { await load() } } }.checklistDisabled([(!store.connected, DisabledReasons.offline), (!current, "The cleanup state changed. Refresh first."), (store.busy, DisabledReasons.saving), (store.hasPendingMutation, DisabledReasons.uncheckedChange)]) }
                     }
-                    Text("Cancel affects only remaining originals. Unarchiving restores the ticket and retained previews, never deleted bytes.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("Cancel affects only remaining originals. Unarchiving restores the ticket and retained previews, never deleted bytes.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }.padding(.vertical,Spacing.compact)
             }
-            if jobs.count > 4 { Text("Showing the four latest jobs. Refresh or use the service for the complete bounded history.").checklistFont(.micro).foregroundStyle(.secondary) }
+            if jobs.count > 4 { Text("Showing the four latest jobs. Refresh or use the service for the complete bounded history.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
         }.task(id:task.id + ":" + String(task.bool("archived"))) { await load() }
             .onDisappear { readID = UUID() }
     }

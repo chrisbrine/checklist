@@ -84,7 +84,9 @@ final class QuickCaptureModel: ObservableObject {
         self.journal = journal; self.preferences = preferences; self.transport = transport
         draft = (try? journal.load(QuickCaptureDraft.self, kind: Self.journalKind))?["draft"] ?? QuickCaptureDraft()
         projects = (preferences.data(forKey: Self.projectsKey)).flatMap { try? JSONDecoder().decode([QuickCaptureProject].self, from: $0) } ?? []
-        if draft.projectID.isEmpty, draft.pendingCreate == nil { draft.projectID = preferences.string(forKey: Self.lastProjectKey) ?? "" }
+        if draft.projectID.isEmpty, draft.pendingCreate == nil, draft.createdTaskID == nil, draft.isEmpty {
+            draft.projectID = preferences.string(forKey: Self.lastProjectKey) ?? ""
+        }
         if draft.createdTaskID != nil { state = .filesPending(Self.savedTicketFiles) }
         else if draft.pendingCreate != nil { state = .uncertain(Self.uncertainCreate) }
     }
@@ -109,7 +111,10 @@ final class QuickCaptureModel: ObservableObject {
             }
             projects = list; projectsAvailable = true
             preferences.set(try? JSONEncoder().encode(list), forKey: Self.projectsKey)
-            if draft.pendingCreate == nil, draft.createdTaskID == nil, !list.contains(where: { $0.id == draft.projectID }) { draft.projectID = list.count == 1 ? list[0].id : "" }
+            if draft.pendingCreate == nil, draft.createdTaskID == nil, !list.contains(where: { $0.id == draft.projectID }) {
+                // A missing destination requires a fresh choice for saved content.
+                draft.projectID = draft.isEmpty && list.count == 1 ? list[0].id : ""
+            }
             if case .notSent = state { state = .editing }
         } catch {
             projectsAvailable = false

@@ -1,0 +1,401 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Planned conversation content v1",
+  "description": "Optional presentation companion to an existing plain string. Not a command, permission, executable document, or evidence verdict. Service validation additionally enforces exact fallback join against the adjacent string, UTF-8 byte and total-payload limits, keyed block/column uniqueness, row widths, aggregate chart/table/HTML limits, HTML/CSS parser allowlists, finite canonical numbers, and exact authorized attachment identity. Unknown historic versions remain opaque with their external plain fallback.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "blocks": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "block_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+              },
+              "type": {
+                "const": "markdown"
+              },
+              "fallback": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 65536
+              }
+            },
+            "required": [
+              "block_id",
+              "type",
+              "fallback"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "block_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+              },
+              "type": {
+                "const": "table"
+              },
+              "fallback": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 65536
+              },
+              "columns": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/column"
+                },
+                "minItems": 1,
+                "maxItems": 20
+              },
+              "rows": {
+                "type": "array",
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 0,
+                    "maxLength": 2000
+                  },
+                  "minItems": 1,
+                  "maxItems": 20
+                },
+                "minItems": 0,
+                "maxItems": 200
+              },
+              "caption": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 4000
+              }
+            },
+            "required": [
+              "block_id",
+              "type",
+              "fallback",
+              "columns",
+              "rows"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "block_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+              },
+              "type": {
+                "const": "chart"
+              },
+              "fallback": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 65536
+              },
+              "chart_kind": {
+                "enum": [
+                  "bar",
+                  "line",
+                  "scatter"
+                ]
+              },
+              "x_label": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 2000
+              },
+              "y_label": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 2000
+              },
+              "series": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/series"
+                },
+                "minItems": 1,
+                "maxItems": 20
+              },
+              "x_unit": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 200
+              },
+              "y_unit": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 200
+              },
+              "caption": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 4000
+              }
+            },
+            "required": [
+              "block_id",
+              "type",
+              "fallback",
+              "chart_kind",
+              "x_label",
+              "y_label",
+              "series"
+            ],
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "chart_kind": {
+                      "const": "bar"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "series": {
+                      "items": {
+                        "properties": {
+                          "points": {
+                            "items": {
+                              "properties": {
+                                "x": {
+                                  "type": "string"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "else": {
+                  "properties": {
+                    "series": {
+                      "items": {
+                        "properties": {
+                          "points": {
+                            "items": {
+                              "properties": {
+                                "x": {
+                                  "type": "number"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "block_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+              },
+              "type": {
+                "const": "html"
+              },
+              "fallback": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 65536
+              },
+              "html": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 65536
+              },
+              "css": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 16384
+              }
+            },
+            "required": [
+              "block_id",
+              "type",
+              "fallback",
+              "html",
+              "css"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "block_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+              },
+              "type": {
+                "const": "media"
+              },
+              "fallback": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 65536
+              },
+              "attachment_ref": {
+                "$ref": "#/$defs/attachmentRef"
+              },
+              "media_kind": {
+                "enum": [
+                  "image",
+                  "video",
+                  "audio",
+                  "pdf",
+                  "text",
+                  "file"
+                ]
+              },
+              "caption": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 4000
+              }
+            },
+            "required": [
+              "block_id",
+              "type",
+              "fallback",
+              "attachment_ref",
+              "media_kind"
+            ]
+          }
+        ]
+      },
+      "minItems": 1,
+      "maxItems": 32
+    }
+  },
+  "required": [
+    "schema_version",
+    "blocks"
+  ],
+  "$defs": {
+    "column": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2000
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ]
+    },
+    "point": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "x": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 2000
+            },
+            {
+              "type": "number"
+            }
+          ]
+        },
+        "y": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y"
+      ]
+    },
+    "series": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2000
+        },
+        "points": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/point"
+          },
+          "minItems": 1,
+          "maxItems": 1000
+        }
+      },
+      "required": [
+        "label",
+        "points"
+      ]
+    },
+    "attachmentRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "attachment_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "representation": {
+          "enum": [
+            "original",
+            "preview"
+          ]
+        }
+      },
+      "required": [
+        "attachment_id",
+        "sha256",
+        "representation"
+      ]
+    }
+  }
+}

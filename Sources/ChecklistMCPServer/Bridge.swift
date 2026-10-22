@@ -292,11 +292,15 @@ public actor Bridge {
     }
 
     private func forward<T>(current: () throws -> T, delegate: () throws -> T) throws -> T {
-        if delegating { return try delegate() }
-        do { return try current() }
-        catch let error as ChecklistError where error.code == ClientUpdateRequired.code && environment.shimUpdate != nil {
-            checkInstalledBuild(force: true, refused: true)
-            return try delegate()
+        do {
+            if delegating { return try delegate() }
+            do { return try current() }
+            catch let error as ChecklistError where error.code == ClientUpdateRequired.code && environment.shimUpdate != nil {
+                checkInstalledBuild(force: true, refused: true)
+                return try delegate()
+            }
+        } catch let error as ChecklistError where error.code == "NATIVE_SESSION_REQUIRED" {
+            throw ChecklistError(error.code, "Restart the Checklist MCP connection: stop its running `checklist mcp` process and start `\(ChecklistInstance.current.cliCommand) mcp` from this same native conversation and project directory. Keep the original command_id when retrying a mutation. An installation label cannot authenticate a native session.", details:error.details)
         }
     }
 

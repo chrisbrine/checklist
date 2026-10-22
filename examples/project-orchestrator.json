@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "project_id": "65b298d0-5a4f-4c4a-b190-df7ed3b4f281",
+  "registration": {
+    "schema_version": 1,
+    "orchestrator_id": "20000000-0000-4000-8000-000000000010",
+    "project_id": "65b298d0-5a4f-4c4a-b190-df7ed3b4f281",
+    "revision": 2,
+    "kind": "group",
+    "label": "Rendering coordination",
+    "responsibility": {
+      "kind": "focused",
+      "task_ids": [
+        "20000000-0000-4000-8000-000000000003",
+        "20000000-0000-4000-8000-000000000004"
+      ]
+    },
+    "state": "active",
+    "created_at": "2026-10-21T12:00:00Z",
+    "created_by": "synthetic-native-principal"
+  },
+  "participants": [
+    {
+      "schema_version": 1,
+      "participant_id": "20000000-0000-4000-8000-000000000030",
+      "orchestrator_id": "20000000-0000-4000-8000-000000000010",
+      "project_id": "65b298d0-5a4f-4c4a-b190-df7ed3b4f281",
+      "revision": 1,
+      "provider_session_ref": {
+        "session_id": "20000000-0000-4000-8000-000000000040",
+        "authorization_generation": "synthetic-codex-authorization-1",
+        "provider": "codex",
+        "installation_id": "21000000-0000-4000-8000-000000000040",
+        "native_session_id": "synthetic-codex-conversation",
+        "native_generation": "synthetic-native-generation-1"
+      },
+      "participation": "active",
+      "joined_at": "2026-10-21T12:00:00Z",
+      "checkpoint": "Synthetic planning example. No live conversation is enrolled."
+    },
+    {
+      "schema_version": 1,
+      "participant_id": "20000000-0000-4000-8000-000000000031",
+      "orchestrator_id": "20000000-0000-4000-8000-000000000010",
+      "project_id": "65b298d0-5a4f-4c4a-b190-df7ed3b4f281",
+      "revision": 1,
+      "provider_session_ref": {
+        "session_id": "20000000-0000-4000-8000-000000000041",
+        "authorization_generation": "synthetic-claude-authorization-1",
+        "provider": "claude",
+        "installation_id": "21000000-0000-4000-8000-000000000041",
+        "native_session_id": "synthetic-claude-conversation",
+        "native_generation": "synthetic-native-generation-1"
+      },
+      "participation": "active",
+      "joined_at": "2026-10-21T12:00:00Z",
+      "checkpoint": "Synthetic planning example. No live conversation is enrolled."
+    }
+  ],
+  "conversation": {
+    "schema_version": 1,
+    "conversation_id": "20000000-0000-4000-8000-000000000020",
+    "project_id": "65b298d0-5a4f-4c4a-b190-df7ed3b4f281",
+    "orchestrator_id": "20000000-0000-4000-8000-000000000010",
+    "revision": 1,
+    "participant_ids": [
+      "20000000-0000-4000-8000-000000000030",
+      "20000000-0000-4000-8000-000000000031"
+    ]
+  },
+  "requests": [
+    {
+      "schema_version": 1,
+      "request_id": "20000000-0000-4000-8000-000000000050",
+      "project_id": "65b298d0-5a4f-4c4a-b190-df7ed3b4f281",
+      "conversation_id": "20000000-0000-4000-8000-000000000020",
+      "message_id": "20000000-0000-4000-8000-000000000051",
+      "revision": 1,
+      "state": "inbox_pending",
+      "context_refs": [
+        {
+          "kind": "task",
+          "id": "20000000-0000-4000-8000-000000000003",
+          "revision": 4
+        }
+      ],
+      "shared_inbox_orchestrator_id": "20000000-0000-4000-8000-000000000010"
+    }
+  ]
+}

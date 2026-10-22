@@ -4,10 +4,10 @@ import Combine
 import ChecklistIPC
 
 struct PendingCommandPersistence {
-    let read: (String)->String?
+    let read: (String)throws->String?
     let save: (String,String)throws->Void
     let remove: (String)->Void
-    static var keychain: Self {Self(read:HumanClaims.read,save:{try HumanClaims.save($0,attempt:$1)},remove:HumanClaims.remove)}
+    static var keychain: Self {Self(read:HumanClaims.readRecovery,save:{try HumanClaims.save($0,attempt:$1)},remove:HumanClaims.remove)}
 }
 
 @MainActor
@@ -71,8 +71,9 @@ final class ChecklistStore: ObservableObject {
     @Published var error: String? { didSet { DiagnosticsRecorder.shared.record(error) } }
     @Published var busy = false
     @Published var hasPendingMutation = false
-    var pendingCommandID: String? { pendingMutation?.params["command_id"] as? String }
-    private var pendingMutation: (method: String, params: [String: Any], success: String?, completion: (([String: Any]) -> Void)?, failure: ((Error) -> Void)?)?
+    var pendingCommandID: String? { pendingMutation?.command.params["command_id"] as? String }
+    private var pendingMutation: (command: PendingCommandRecovery, success: String?, completion: (([String: Any]) -> Void)?, failure: ((Error) -> Void)?)?
+    private var recoveredCommand: (command: PendingCommandRecovery, marker: String)?
     @Published var notice: String? { didSet { if !informing { noticeIsWarning = false } } }
     private var informing = false
     /// True when the current notice reports an ignored action rather than a success.
@@ -81,6 +82,7 @@ final class ChecklistStore: ObservableObject {
     var writeBlockReason: String? {
         if !connected { return DisabledReasons.offline }
         if hasPendingMutation { return DisabledReasons.uncheckedChange }
+        if recoveredCommand != nil { return "Checklist is checking which saved change belongs to this store." }
         if busy { return DisabledReasons.saving }
         return nil
     }
@@ -125,11 +127,14 @@ final class ChecklistStore: ObservableObject {
     var windowPreferences:UserDefaults {preferences}
     private let pendingCommandKey:String
     private let pendingCommandPersistence:PendingCommandPersistence
+    private let pendingCommandServiceIdentity: String
+    private var ignoredRecoveryPreferenceKey: String { "ignored-recovery-" + pendingCommandKey }
     private var restoringPreferences = true
     private var refreshing = false
     private var eventCursor: String?
     private let desktopAlerts: DesktopAlertCoordinator
     let navigationMemory: DetailItemNavigationMemory
+    private let qualificationFaults: QualificationFaults
     private let requestTransport: ((String,[String:Any]) async throws -> [String:Any])?
     private let workspaceObservation = WorkspacePageObservation()
     private let otherDetailObservation = WorkspacePageObservation()
@@ -173,9 +178,10 @@ final class ChecklistStore: ObservableObject {
     var groupTaskLoading: Bool {groupTasksObservation.loading}
     var groupTaskError: String? {groupTasksObservation.error}
 
-    init(draftJournal: LocalDraftJournal = LocalDraftJournal(), preferences: UserDefaults = .standard, restorePendingCommand: Bool = true, desktopAlerts: DesktopAlertCoordinator = .shared, requestTransport: ((String,[String:Any]) async throws -> [String:Any])? = nil, navigationMemory: DetailItemNavigationMemory = .shared, pendingCommandKey:String = WorkspaceWindowIdentity.primary.pendingCommandKey, pendingCommandPersistence:PendingCommandPersistence = .keychain) {
-        self.draftJournal = draftJournal; self.preferences = preferences; self.desktopAlerts = desktopAlerts;self.requestTransport = requestTransport;self.navigationMemory = navigationMemory;self.pendingCommandKey=pendingCommandKey;self.pendingCommandPersistence=pendingCommandPersistence
-        if restorePendingCommand, let saved = pendingCommandPersistence.read(pendingCommandKey), let bytes = saved.data(using: .utf8), let record = (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any], let method = record["method"] as? String, let params = record["params"] as? [String: Any] { pendingMutation = (method, params, "Last change checked", nil, nil); hasPendingMutation = true }
+    init(draftJournal: LocalDraftJournal = LocalDraftJournal(), preferences: UserDefaults = .standard, restorePendingCommand: Bool = true, desktopAlerts: DesktopAlertCoordinator = .shared, requestTransport: ((String,[String:Any]) async throws -> [String:Any])? = nil, navigationMemory: DetailItemNavigationMemory = .shared, pendingCommandKey:String = WorkspaceWindowIdentity.primary.pendingCommandKey, pendingCommandPersistence:PendingCommandPersistence = .keychain, pendingCommandServiceIdentity: String = ChecklistInstance.current.machServiceName, qualificationFaults: QualificationFaults? = nil) {
+        self.qualificationFaults = qualificationFaults ?? .shared
+        self.draftJournal = draftJournal; self.preferences = preferences; self.desktopAlerts = desktopAlerts;self.requestTransport = requestTransport;self.navigationMemory = navigationMemory;self.pendingCommandKey=pendingCommandKey;self.pendingCommandPersistence=pendingCommandPersistence;self.pendingCommandServiceIdentity=pendingCommandServiceIdentity
+        if restorePendingCommand { restoreSavedCommand() }
         if let bytes = preferences.data(forKey: "lastDetail") {
             if let savedDetail = try? JSONDecoder().decode(Detail.self, from: bytes) { detail = savedDetail }
             else { preferences.removeObject(forKey: "lastDetail") }
@@ -283,6 +289,7 @@ final class ChecklistStore: ObservableObject {
         if let pending = selectedRecordRecovery,pending.context == displayed.contextCursor {recovery = pending}
         else {
             recovery = (UUID(),displayed.contextCursor,Task {
+                try self.qualificationFaults.inject(.freshContext)
                 let response = try await self.request("task_context",["task_id":displayed.task.id,"detail_level":"ui"])
                 try Task.checkCancellation()
                 let value = try SelectedTicketDisplay(response:response)
@@ -313,6 +320,7 @@ final class ChecklistStore: ObservableObject {
             return p
         }
         do {
+            try qualificationFaults.inject(level == "ui_history" ? .history : .records)
             let response = try await request("task_context",parameters(displayed,cursor:cursor))
             return (response,displayed.contextCursor,false)
         } catch let failure as ChecklistError where failure.code == "CURSOR_RESET" {
@@ -326,6 +334,7 @@ final class ChecklistStore: ObservableObject {
             let fresh = try await refreshSelectedRecordContext(displayed,isCurrent:isCurrent)
             guard !Task.isCancelled,isCurrent() else {throw CancellationError()}
             // One retry only. History's offset belongs to the rejected context.
+            try qualificationFaults.inject(level == "ui_history" ? .history : .records)
             let response = try await request("task_context",parameters(fresh,cursor:nil))
             return (response,fresh.contextCursor,level == "ui_history")
         }
@@ -960,6 +969,7 @@ final class ChecklistStore: ObservableObject {
     }
     private func acceptServiceRead() {
         connected = true; connectionAttempted = true; lastServiceFailure = nil
+        reconcileRecoveredCommand()
     }
     private func recordServiceOutage(_ error: Error) {
         connected = false; connectionAttempted = true; lastServiceFailure = error.localizedDescription
@@ -1049,14 +1059,64 @@ final class ChecklistStore: ObservableObject {
         }
     }
 
+    private static let foreignRecoveryNotice = "Checklist ignored a saved change from a different store or installation. It will not be sent to this store."
+    private static let unreadableRecoveryNotice = "Checklist ignored a saved change it could not read safely. It will not be sent."
+
+    private func restoreSavedCommand() {
+        do {
+            guard let saved = try pendingCommandPersistence.read(pendingCommandKey) else {
+                preferences.removeObject(forKey: ignoredRecoveryPreferenceKey)
+                return
+            }
+            if preferences.string(forKey: ignoredRecoveryPreferenceKey) == "unreadable" {
+                preferences.removeObject(forKey: ignoredRecoveryPreferenceKey)
+            }
+            let marker = PendingCommandRecovery.marker(saved)
+            guard let command = PendingCommandRecovery(saved: saved) else {
+                ignoreSavedCommand(marker: marker, message: Self.unreadableRecoveryNotice)
+                return
+            }
+            recoveredCommand = (command, marker)
+        } catch {
+            // The bytes are inaccessible, so remember this unreadable interval
+            // until an absent/readable item or a new saved command is observed.
+            ignoreSavedCommand(marker: "unreadable", message: Self.unreadableRecoveryNotice)
+        }
+    }
+
+    private func reconcileRecoveredCommand() {
+        guard !storeIncarnation.isEmpty else { return }
+        if let recovered = recoveredCommand {
+            recoveredCommand = nil
+            guard recovered.command.matches(storeIncarnation: storeIncarnation, serviceIdentity: pendingCommandServiceIdentity) else {
+                ignoreSavedCommand(marker: recovered.marker, message: Self.foreignRecoveryNotice)
+                return
+            }
+            pendingMutation = (recovered.command, "Last change checked", nil, nil)
+            hasPendingMutation = true
+        } else if let pending = pendingMutation,
+                  !pending.command.matches(storeIncarnation: storeIncarnation, serviceIdentity: pendingCommandServiceIdentity) {
+            ignoreSavedCommand(marker: pending.command.marker, message: Self.foreignRecoveryNotice)
+        }
+    }
+
+    private func ignoreSavedCommand(marker: String, message: String) {
+        recoveredCommand = nil; pendingMutation = nil; hasPendingMutation = false
+        guard preferences.string(forKey: ignoredRecoveryPreferenceKey) != marker else { return }
+        preferences.set(marker, forKey: ignoredRecoveryPreferenceKey)
+        inform(message)
+    }
+
     func run(_ method: String, _ params: [String: Any] = [:], success: String? = nil, failure: ((Error) -> Void)? = nil, completion: (([String: Any]) -> Void)? = nil) {
         guard allowWrite() else { return }
+        guard !storeIncarnation.isEmpty else { inform("Refresh Checklist before making a change so it can be recovered safely."); return }
         var command = params
         if command["command_id"] == nil { command["command_id"] = UUID().uuidString }
-        pendingMutation = (method, command, success, completion, failure)
+        let recovery = PendingCommandRecovery(method: method, params: command, storeIncarnation: storeIncarnation, serviceIdentity: pendingCommandServiceIdentity)
+        pendingMutation = (recovery, success, completion, failure)
         do {
-            let bytes = try JSONSerialization.data(withJSONObject: ["method": method, "params": command])
-            try pendingCommandPersistence.save(String(data: bytes, encoding: .utf8)!,pendingCommandKey)
+            try pendingCommandPersistence.save(recovery.encoded(),pendingCommandKey)
+            preferences.removeObject(forKey: ignoredRecoveryPreferenceKey)
         } catch { pendingMutation = nil; self.error = "Cannot preserve the command for safe recovery: \(error.localizedDescription)"; return }
         performPendingMutation()
     }
@@ -1064,18 +1124,69 @@ final class ChecklistStore: ObservableObject {
     func retryPendingMutation() {
         guard pendingMutation != nil else { return }
         guard connected, !busy else { inform(connected ? DisabledReasons.saving : DisabledReasons.offline); return }
-        error = nil; performPendingMutation()
+        error = nil; performPendingMutation(checkIdentity: true)
     }
-    private func performPendingMutation() {
+    /// Apply the committed answer before any refresh can wait or fail. Counts come
+    /// from the same transaction as the answer, including any human-gate task change.
+    private func applyHumanAnswerReceipt(_ reply: [String:Any], params: [String:Any]) {
+        let record = Record(values:reply)
+        guard record.id == params["request_id"] as? String,
+              record.string("project_id") == params["project_id"] as? String,
+              record.string("state") == "answered",
+              let response = record.records("responses").last, response.bool("complete"),
+              response.string("origin") == "human_ui" else { return }
+        if let current = requests.first(where: { RecordIdentity($0.id) == RecordIdentity(record.id) }),
+           current.integer("revision") > record.integer("revision") { return }
+        if workspaceQuery.surface == "requests" { workspaceRead?.cancel(); workspaceObservation.cancel() }
+        if page == .overview {
+            overviewRead?.cancel(); for observation in overviewObservations.values { observation.cancel() }
+        }
+        if detail == .request(record.id) { otherDetailRead?.cancel(); otherDetailObservation.cancel() }
+        ticketPageRead?.cancel(); ticketPageReadID = UUID()
+        workspaceObservation.applyAnsweredRequest(record)
+        overviewObservations["requests"]?.applyAnsweredRequest(record)
+        otherDetailObservation.applyAnsweredRequest(record)
+        if let count = reply["needs_you_count"] as? Int, count >= 0 { ticketCatalog.needsCount = count }
+    }
+    private func performPendingMutation(checkIdentity: Bool = false) {
         guard let pending = pendingMutation else { return }
         busy = true
         Task {
             defer { busy = false }
+            // A retry checks the actual endpoint again: its store may have been
+            // replaced since the page that offered this command was accepted.
+            if checkIdentity {
+                do {
+                    let service = try await request("service_info")
+                    guard let incarnation = service["store_incarnation"] as? String, !incarnation.isEmpty else {
+                        throw ChecklistError("INVALID_RESPONSE", "Checklist could not identify the store. Reconnect before checking the last change.")
+                    }
+                    guard pending.command.matches(storeIncarnation: incarnation, serviceIdentity: pendingCommandServiceIdentity) else {
+                        ignoreSavedCommand(marker: pending.command.marker, message: Self.foreignRecoveryNotice)
+                        return
+                    }
+                } catch {
+                    guard pendingMutation != nil else { return }
+                    // A failed identity read says nothing about the original write.
+                    hasPendingMutation = true
+                    self.error = "Checklist could not check the saved change's store. Reconnect and try Check the last change again."
+                    return
+                }
+            }
+            // A concurrent accepted read can fence this command while its
+            // identity check is suspended. Never revive or send that old item.
+            guard pendingMutation != nil else { return }
             do {
-                let reply = try await request(pending.method, pending.params)
+                let reply = try await request(pending.command.method, pending.command.params)
+                guard pendingMutation != nil else { return }
                 pendingMutation = nil; hasPendingMutation = false; pendingCommandPersistence.remove(pendingCommandKey)
-                if !pending.method.hasPrefix("media_") {await refresh(quiet: true)}
-                if pending.method == "message_mentions_prepare" {
+                let answered = pending.command.method == "human_request_answer"
+                if answered {
+                    applyHumanAnswerReceipt(reply,params:pending.command.params)
+                    pending.completion?(reply)
+                }
+                if !pending.command.method.hasPrefix("media_") {await refresh(quiet: true)}
+                if pending.command.method == "message_mentions_prepare" {
                     // Preparation's caller must inspect the refreshed selected
                     // context, rather than mistake a scheduled read for readiness.
                     // Capture this read only: a later selection/invalidating read
@@ -1085,8 +1196,9 @@ final class ChecklistStore: ObservableObject {
                 }
                 noticeIsWarning = false; notice = pending.success
                 busy = false
-                pending.completion?(reply)
+                if !answered { pending.completion?(reply) }
             } catch {
+                guard pendingMutation != nil else { return }
                 pending.failure?(error)
                 if CommandReply.shouldRetainPending(after: error) {
                     hasPendingMutation = true
@@ -1162,9 +1274,14 @@ final class ChecklistStore: ObservableObject {
     /// Prove absence with the global catalog; a failed scoped read alone is not enough.
     private func recoverMissingRestoredProject() async -> Bool {
         guard !connected, let selected = projectID else { return false }
+        let restoredPage = page, observedGeneration = scopedReadGeneration
+        func isCurrent() -> Bool {
+            !connected && page == restoredPage && scopedReadGeneration == observedGeneration &&
+                projectID.map(RecordIdentity.init) == RecordIdentity(selected)
+        }
         do {
             let catalog = try await request("project_list", ["include_archived": true])
-            guard !Task.isCancelled, projectID.map(RecordIdentity.init) == RecordIdentity(selected),
+            guard !Task.isCancelled, isCurrent(),
                   let projects = catalog["projects"] as? [[String: Any]] else { return false }
             let ids = projects.compactMap { $0["id"] as? String }
             guard ids.count == projects.count, ids.allSatisfy({ !$0.isEmpty }),
@@ -1172,7 +1289,11 @@ final class ChecklistStore: ObservableObject {
             // Media review requires a project. Keep drafts, but reopen the ordinary worklist.
             select(page == .media ? .tasks : page, project: nil)
             return true
-        } catch { return false } // No catalog authority: preserve the saved scope for recovery.
+        } catch {
+            guard !isReadCancellation(error), isCurrent() else { return false }
+            recordServiceOutage(error)
+            return false // No catalog authority: preserve the saved scope for recovery.
+        }
     }
 
     func startLiveUpdates() async {

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Checklist bounded project policy v1",
-  "description": "Current service policy. Omitted values resolve from the shared preset. Runtime validates provider subsets, one override per kind, and preferred-provider eligibility. Preferences never launch or change an external model. Review requirements are complete default/kind rules; runtime also checks exact UTF-8 bounds and unique byte-exact check IDs/kinds.",
+  "description": "Current service policy. Omitted values resolve from the shared preset. Runtime validates provider subsets, one override per kind, and preferred-provider eligibility. Preferences never launch or change an external model. Review requirements are complete default/kind rules; runtime also checks exact UTF-8 bounds and unique byte-exact check IDs/kinds. Provider IDs are shape-only; the runtime requires an enabled, compatible, qualified plugin and current project role eligibility.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -16,13 +16,13 @@
     "allowed_providers": {
       "type": "array",
       "items": {
-        "enum": [
-          "codex",
-          "claude"
-        ]
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 160,
+        "pattern": "^[a-z][a-z0-9.-]*$"
       },
       "minItems": 1,
-      "maxItems": 2,
+      "maxItems": 128,
       "uniqueItems": true,
       "default": [
         "codex",
@@ -222,24 +222,20 @@
         "providers": {
           "type": "array",
           "items": {
-            "enum": [
-              "codex",
-              "claude"
-            ]
+            "$ref": "#/$defs/provider"
           },
           "minItems": 1,
-          "maxItems": 2,
+          "maxItems": 128,
           "uniqueItems": true
         },
         "preferred_provider": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "enum": [
-            "codex",
-            "claude",
-            null
+          "anyOf": [
+            {
+              "$ref": "#/$defs/provider"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "preferred_models": {
@@ -313,6 +309,12 @@
           }
         }
       }
+    },
+    "provider": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[a-z][a-z0-9.-]*$"
     }
   }
 }

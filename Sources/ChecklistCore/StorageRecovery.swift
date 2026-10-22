@@ -53,12 +53,14 @@ extension CommandRouter {
         }
     }
 
-    /// Called under the real outer admission/object gate on the serialized
-    /// writer queue, outside a SQL transaction. No metadata-only backup success.
-    func executeStorageBackup(_ db: Database, params: JSON, caller: Caller, permit: ArchiveStoragePermit) throws -> JSON {
-        let budget = StorageSnapshotBudget.production()
+    /// Admitted by handle, but never occupies its serial writer during copying.
+    /// An explicit budget is an internal fixture seam, not a service callback.
+    func executeStorageBackup(params: JSON, caller: Caller, budget: StorageSnapshotBudget = .production()) throws -> JSON {
         do {
-            return try createStorageBackup(db,params:params,caller:caller,permit:permit,budget:budget)
+            try owner(caller)
+            return try StorageSnapshotRetention.withCapture(root:root) { retention in
+                try createStorageBackup(params:params,caller:caller,budget:budget,retention:retention)
+            }
         } catch {
             let reported = budget.reporting(error)
             guard let failure = reported as? StorageSnapshotFailure else {throw reported}
@@ -81,34 +83,37 @@ extension CommandRouter {
             throw CoreError(code,message,details:["command_outcome":"rejected"])
         }
     }
-    private func createStorageBackup(_ db: Database,params: JSON,caller: Caller,permit: ArchiveStoragePermit,budget: StorageSnapshotBudget) throws -> JSON {
-        try owner(caller);try permit.requireRoot(root)
-        guard !db.isInsideTransaction else { throw StoreRecovery.required("backup_inside_semantic_transaction") }
+    private func createStorageBackup(params: JSON,caller: Caller,budget: StorageSnapshotBudget,retention: StorageSnapshotRetention) throws -> JSON {
         let command = try text(params,"command_id",max:100)
         guard UUID(uuidString:command) != nil else { throw CoreError("INVALID_INPUT","command_id must be a UUID.") }
         let digest = hash(Data(("backup_create" + (try jsonString(params))).utf8))
         let key = try pendingStorageCommandKey(principal:caller.principal,command:command)
-        guard let identityRaw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='store_identity'") else {throw StoreRecovery.required("missing_migration_identity")}
-        let identity = try StoreIdentityReceipt.decode(Data(identityRaw.utf8))
-        // Parent ownership remains principal+UUID in this store; physical stage
-        // names additionally bind store incarnation/root, avoiding collisions
-        // between independently owned stores using the same owner command UUID.
-        let physical = try jsonString(["parent":key,"store_id":identity.logical_store_id,"incarnation":identity.incarnation,"source_root":root.path])
-        let seed = hash(Data(physical.utf8)), chars = Array(seed.prefix(32))
-        let operationText = String(chars[0..<8]) + "-" + String(chars[8..<12]) + "-" + String(chars[12..<16]) + "-" + String(chars[16..<20]) + "-" + String(chars[20..<32])
-        let operation = UUID(uuidString:operationText)!
-        var replay: JSON?
-        try withValidatedDomainTransaction(db) {
-            try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
-            if let row = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[caller.principal,command]) {
-                guard row["digest"] as String == digest else { throw CoreError("IDEMPOTENCY_CONFLICT","This command ID already belongs to another original intent.") }
-                replay = jsonObject(row["result"])
-                if Self.isPrunedResult(replay ?? [:]) { throw Self.expiredCommandError(command) }
-                return .commit
+        let (identity, operation, replay) = try ArchiveStorageGate.withExclusive(root:root) { _ in
+            try dbQueue.writeWithoutTransaction { db in
+                guard let identityRaw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='store_identity'") else {throw StoreRecovery.required("missing_migration_identity")}
+                let identity = try StoreIdentityReceipt.decode(Data(identityRaw.utf8))
+                // Parent ownership remains principal+UUID in this store; physical stage
+                // names additionally bind store incarnation/root, avoiding collisions
+                // between independently owned stores using the same owner command UUID.
+                let physical = try jsonString(["parent":key,"store_id":identity.logical_store_id,"incarnation":identity.incarnation,"source_root":root.path])
+                let seed = hash(Data(physical.utf8)), chars = Array(seed.prefix(32))
+                let operationText = String(chars[0..<8]) + "-" + String(chars[8..<12]) + "-" + String(chars[12..<16]) + "-" + String(chars[16..<20]) + "-" + String(chars[20..<32])
+                let operation = UUID(uuidString:operationText)!
+                var replay: JSON?
+                try withValidatedDomainTransaction(db) {
+                    try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
+                    if let row = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[caller.principal,command]) {
+                        guard row["digest"] as String == digest else { throw CoreError("IDEMPOTENCY_CONFLICT","This command ID already belongs to another original intent.") }
+                        replay = jsonObject(row["result"])
+                        if Self.isPrunedResult(replay ?? [:]) { throw Self.expiredCommandError(command) }
+                        return .commit
+                    }
+                    let pending: JSON = ["kind":"backup_create","intent_digest":digest,"operation_id":operation.uuidString.lowercased(),"state":"pending"]
+                    try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[key,try jsonString(pending)])
+                    return .commit
+                }
+                return (identity, operation, replay)
             }
-            let pending: JSON = ["kind":"backup_create","intent_digest":digest,"operation_id":operation.uuidString.lowercased(),"state":"pending"]
-            try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[key,try jsonString(pending)])
-            return .commit
         }
         if var replay { replay["replayed"] = true;return replay }
         let destination = URL(fileURLWithPath:try text(params,"path"),isDirectory:true).standardizedFileURL
@@ -116,6 +121,14 @@ extension CommandRouter {
               !destination.path.hasPrefix(root.standardizedFileURL.path + "/objects/"),
               !destination.path.hasPrefix(root.standardizedFileURL.path + "/source-captures/") else { throw CoreError("INVALID_INPUT","Choose a separate backup destination.") }
         let parent = destination.deletingLastPathComponent(), name = destination.lastPathComponent
+        func commitBackup(_ receipt: StorageSnapshotReceipt) throws -> JSON {
+            let generation = try prepareStorageBackupReceipt(destination:destination,receipt:receipt,identity:identity)
+            return try ArchiveStorageGate.withExclusive(root:root) { permit in
+                try dbQueue.writeWithoutTransaction { db in
+                    try self.commitStorageBackupReceipt(db,params:params,caller:caller,permit:permit,command:command,digest:digest,key:key,destination:destination,receipt:receipt,identity:identity,generation:generation)
+                }
+            }
+        }
         let receipt: StorageSnapshotReceipt
         do {
             // A previously published generation after lost SQL receipt is
@@ -136,21 +149,25 @@ extension CommandRouter {
                     }
                     if let recovered = try StorageSnapshot.resumeStaging(parent:parent,operation:operation,publicationName:name,budget:budget) {
                         receipt = recovered
-                        return try self.commitStorageBackupReceipt(db,params:params,caller:caller,permit:permit,command:command,digest:digest,key:key,destination:destination,receipt:receipt)
+                        return try commitBackup(receipt)
                     }
                 }
-                let source = try StorageSnapshotSource(source:root,parent:parent,storeID:identity.logical_store_id,publicationName:name,permit:permit)
-                receipt = try StorageSnapshot.build(source,operation:operation,budget:budget)
+                receipt = try StorageSnapshot.buildOnline(source:root,parent:parent,storeID:identity.logical_store_id,
+                    publicationName:name,operation:operation,budget:budget,retention:retention)
             }
         } catch {
             // Best effort error metadata cannot turn an unsuccessful copy into
             // success, and may itself fail on a full or inaccessible volume.
-            try? withValidatedDomainTransaction(db) {
-                try db.execute(sql:"UPDATE metadata SET value=? WHERE key=?",arguments:[try jsonString(["kind":"backup_create","intent_digest":digest,"operation_id":operation.uuidString.lowercased(),"state":"incomplete","error_code":"BACKUP_INCOMPLETE"]),key]);return .commit
+            try? ArchiveStorageGate.withExclusive(root:root) { _ in
+                try dbQueue.writeWithoutTransaction { db in
+                    try self.withValidatedDomainTransaction(db) {
+                        try db.execute(sql:"UPDATE metadata SET value=? WHERE key=?",arguments:[try jsonString(["kind":"backup_create","intent_digest":digest,"operation_id":operation.uuidString.lowercased(),"state":"incomplete","error_code":"BACKUP_INCOMPLETE"]),key]);return .commit
+                    }
+                }
             }
             throw budget.reporting(error)
         }
-        return try commitStorageBackupReceipt(db,params:params,caller:caller,permit:permit,command:command,digest:digest,key:key,destination:destination,receipt:receipt)
+        return try commitBackup(receipt)
     }
     private func currentBackupManifest(_ directory: URL,identity: StoreIdentityReceipt) throws -> StorageSnapshotManifest {
         let bytes = try StorageObjectFiles(root:directory).read("manifest.json",maximum:StorageSnapshotBudget.manifestByteLimit)
@@ -158,11 +175,9 @@ extension CommandRouter {
         guard manifest.storeID.utf8.elementsEqual(identity.logical_store_id.utf8),manifest.sourceRoot.utf8.elementsEqual(root.path.utf8) else {throw CoreError("BACKUP_TARGET_MISMATCH","This backup belongs to another logical store or source root.")}
         return manifest
     }
-    private func commitStorageBackupReceipt(_ db: Database,params: JSON,caller: Caller,permit: ArchiveStoragePermit,command: String,digest: String,key: String,destination: URL,receipt: StorageSnapshotReceipt) throws -> JSON {
+    private func prepareStorageBackupReceipt(destination: URL,receipt: StorageSnapshotReceipt,identity: StoreIdentityReceipt) throws -> String {
         let manifestBytes = try StorageObjectFiles(root:destination).read("manifest.json",maximum:StorageSnapshotBudget.manifestByteLimit)
         guard hash(manifestBytes) == receipt.manifestSHA256 else {throw StorageSnapshotFailure.sourceChanged}
-        guard let identityRaw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='store_identity'") else {throw StoreRecovery.required("missing_migration_identity")}
-        let identity = try StoreIdentityReceipt.decode(Data(identityRaw.utf8))
         let manifest = try currentBackupManifest(destination,identity:identity)
         var config = Configuration();config.readonly = true;config.prepareDatabase {try SchemaMigrations.installStorageCollation($0)}
         let copy = try DatabaseQueue(path:destination.appendingPathComponent("database.sqlite").path,configuration:config)
@@ -178,13 +193,19 @@ extension CommandRouter {
             ["path":$0.descriptor.relativePath,"sha256":$0.sha256,"size":$0.size]
         }
         let generation: JSON = ["format":1,"state":"complete","operation_id":receipt.operationID.uuidString.lowercased(),"manifest_sha256":receipt.manifestSHA256,"known_at":now(),"current_physical_verified":false,"objects":indexedObjects]
+        return try jsonString(generation)
+    }
+    private func commitStorageBackupReceipt(_ db: Database,params: JSON,caller: Caller,permit: ArchiveStoragePermit,command: String,digest: String,key: String,destination: URL,receipt: StorageSnapshotReceipt,identity: StoreIdentityReceipt,generation: String) throws -> JSON {
+        try permit.requireRoot(root)
+        guard let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='store_identity'"),
+              try StoreIdentityReceipt.decode(Data(raw.utf8)) == identity else {throw CoreError("BACKUP_TARGET_MISMATCH","The store generation changed during backup.")}
         var output: JSON = [:]
         try withValidatedDomainTransaction(db) {
             try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
             let data: JSON = ["path":destination.path,"format":"checklist-store-snapshot","manifest_sha256":receipt.manifestSHA256,"operation_id":receipt.operationID.uuidString.lowercased(),"restore_supported":false,"status":"complete"]
             output = ["data":data,"command_id":command,"event_cursor":try self.cursor(db,caller:caller,scope:self.authorizationScope(db,caller))]
             try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[caller.principal,command,digest,try jsonString(output)])
-            try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["backup-generation:" + receipt.operationID.uuidString.lowercased(),try jsonString(generation)])
+            try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["backup-generation:" + receipt.operationID.uuidString.lowercased(),generation])
             try db.execute(sql:"DELETE FROM metadata WHERE key=?",arguments:[key]);return .commit
         }
         let warning = performStorageMaintenance(db,permit:permit)

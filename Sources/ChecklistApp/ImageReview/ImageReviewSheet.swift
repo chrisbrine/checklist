@@ -16,7 +16,7 @@ struct ImageReviewSection: View {
         if !current.isEmpty {
             VStack(alignment: .leading, spacing: Spacing.small) {
                 Button("Compare candidate images…") { showing = true }.checklistFont(.micro)
-                Text("\(current.count) exact candidate images. Inspection selections do not approve a review.").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("\(current.count) exact candidate images. Inspection selections do not approve a review.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }.sheet(isPresented: $showing) { ImageReviewSheet(current: current, previous: previous, selection: $selection, editable: false) }
                 .onChange(of: manifest?.id) { _, _ in selection = [] }
         }
@@ -46,7 +46,7 @@ struct ImageReviewSheet: View {
                 if editable { Text("Inspected \(current.filter { selection.contains($0.identity) }.count) of \(current.count)").font(.callout) }
                 Button("Close") { dismiss() }.keyboardShortcut(.cancelAction)
             }
-            Text(editable ? "Mark each original after inspecting it. Choose and send an approval separately." : "View the exact submitted originals. Owner inspection selections are recorded in the associated approval request.").font(.caption).foregroundStyle(.secondary)
+            Text(editable ? "Mark each original after inspecting it. Choose and send an approval separately." : "View the exact submitted originals. Owner inspection selections are recorded in the associated approval request.").font(.caption).foregroundStyle(Color.checklistSecondaryText)
             Picker("View", selection: Binding(get: { group?.id ?? Data() }, set: { selectedView = $0; selectedCurrent = ""; selectedPrevious = "" })) {
                 ForEach(groups) { group in Text("\(group.viewName) · \(group.current.count) current").tag(group.id) }
             }.onChange(of: selectedView) { _, _ in selectedCurrent = ""; selectedPrevious = "" }

@@ -9,9 +9,9 @@ struct DetailOverlay: View {
         VStack(spacing: Spacing.none) {
             HStack(spacing: Spacing.row) {
                 OverlayNavigationButton(symbol: "chevron.left", label: "Back", identifier: "detailBackButton", help: "Back (⌘[)") { store.goBack() }.checklistDisabled([(store.detailBackStack.isEmpty, "There is no earlier detail.")])
-                Text(breadcrumb).checklistFont(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(breadcrumb).checklistFont(.caption).foregroundStyle(Color.checklistSecondaryText).lineLimit(1)
                 Spacer()
-                OverlayNavigationButton(symbol: "xmark", label: "Close details", identifier: "detailCloseButton", help: "Close details (Esc)", initialFocus: true) { store.closeDetail() }.foregroundStyle(.secondary)
+                OverlayNavigationButton(symbol: "xmark", label: "Close details", identifier: "detailCloseButton", help: "Close details (Esc)", initialFocus: true) { store.closeDetail() }.foregroundStyle(Color.checklistSecondaryText)
             }.padding(.horizontal, Spacing.page).padding(.vertical, Spacing.group)
             Divider()
             Group {

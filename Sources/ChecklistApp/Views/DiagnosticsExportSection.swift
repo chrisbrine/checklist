@@ -10,7 +10,7 @@ struct DiagnosticsExportSection: View {
     var body: some View {
         Section("Diagnostics") {
             Button("Save diagnostics…") { save() }.checklistDisabled([(exporting, "Diagnostics are being saved.")])
-            Text("Save versions, build ID, service state, record counts and recent error codes. Notes, file contents, paths and connection secrets are excluded. Nothing is uploaded.").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("Save versions, build ID, service state, record counts and recent error codes. Notes, file contents, paths and connection secrets are excluded. Nothing is uploaded.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             if !result.isEmpty { Text(result).checklistFont(.micro).accessibilityIdentifier("diagnosticsExportResult") }
         }
     }

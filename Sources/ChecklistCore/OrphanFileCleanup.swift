@@ -151,6 +151,7 @@ extension CommandRouter {
     // MARK: Store-relative removal that never follows a symlink
 
     func removeManagedFile(_ files: StorageObjectFiles, relative: String) throws -> Bool {
+        try StorageSnapshotRetention.requireNoCapture(root:files.root)
         let (directory, name) = try files.parent(relative); defer { Darwin.close(directory) }
         var info = stat()
         if fstatat(directory, name, &info, AT_SYMLINK_NOFOLLOW) != 0 { if errno == ENOENT { return false }; throw CoreError("CLEANUP_IO", "A pending file could not be inspected.") }
@@ -159,6 +160,7 @@ extension CommandRouter {
     }
 
     func removeManagedTree(_ files: StorageObjectFiles, relative: String) throws -> Bool {
+        try StorageSnapshotRetention.requireNoCapture(root:files.root)
         let parentFD: Int32, name: String
         do { (parentFD, name) = try files.parent(relative) } catch { if errno == ENOENT { return false }; throw error }
         defer { Darwin.close(parentFD) }

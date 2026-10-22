@@ -28,7 +28,7 @@ struct TaskAssignmentSheet: View {
         VStack(alignment: .leading, spacing: Spacing.group) {
             Text("Assign an existing worker").checklistFont(.sheetTitle)
             Text("\(store.projectName(project)) · \(task.string("key")) · \(task.string("title"))").checklistFont(.bodyStrong).lineLimit(3)
-            Text("Choose an actual enrolled session allowed by this ticket's current implementation policy. Assignment plans who handles the ticket; it does not launch an agent or acquire a claim.").checklistFont(.callout).foregroundStyle(.secondary)
+            Text("Choose an actual enrolled session allowed by this ticket's current implementation policy. Assignment plans who handles the ticket; it does not launch an agent or acquire a claim.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
             if loading { ProgressView("Checking current worker eligibility…") }
             if !failure.isEmpty {
                 Text(failure).checklistFont(.micro).foregroundStyle(.orange)
@@ -40,15 +40,15 @@ struct TaskAssignmentSheet: View {
                 ForEach(eligibleSessions) { session in Text("\(session.string("provider").capitalized) · \(session.string("native_conversation_title", fallback: session.string("label", fallback: String(session.id.prefix(8))))) · \(String(session.id.prefix(8)))").tag(session.id) }
             }.checklistDisabled([(loading, "Still loading."), (!failure.isEmpty, "Loading failed. Read the message above.")])
             AccessibleHStack {if let cursor=previousWorkers {Button("Previous workers") {Task {await loadPolicy(cursor:cursor)}}};if let cursor=nextWorkers {Button("More workers") {Task {await loadPolicy(cursor:cursor)}}}}.checklistFont(.micro).checklistDisabled([(loading, "Still loading.")])
-            if !loading && failure.isEmpty && eligibleSessions.isEmpty { Text("No currently enrolled worker is eligible for this ticket. Connect a supported provider session through its normal Checklist integration.").checklistFont(.micro).foregroundStyle(.secondary) }
+            if !loading && failure.isEmpty && eligibleSessions.isEmpty { Text("No currently enrolled worker is eligible for this ticket. Connect a supported provider session through its normal Checklist integration.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             if let session = selectedSession { Text("Provider: \(session.string("provider").capitalized)").checklistFont(.micro); TechnicalDetails([("Session", session.id), ("Policy revision", "\(policyRevision)")]) }
             TextField("Why should this worker handle this ticket?", text: $reason, axis: .vertical).textFieldStyle(.roundedBorder).lineLimit(2...5)
             if contextChanged && !loading {
                 Label("This ticket or its policy changed. Review its current state before assigning. Your draft is retained.", systemImage: "exclamationmark.circle").checklistFont(.micro).foregroundStyle(.orange)
                 Button("Review current assignment and eligibility") { expectedRevision = currentTask.integer("revision"); Task { await loadPolicy() } }
-                Text("Current assignment: \(currentAssignment)").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("Current assignment: \(currentAssignment)").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
-            Text("Draft saved on this Mac. Your reason is recorded with the actual assignment.").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("Draft saved on this Mac. Your reason is recorded with the actual assignment.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             AccessibleHStack {
                 Button("Close; keep draft") { saveDraft(); dismiss() }.keyboardShortcut(.cancelAction)
                 Spacer()

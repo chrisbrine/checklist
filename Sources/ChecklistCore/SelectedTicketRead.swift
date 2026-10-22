@@ -15,6 +15,11 @@ extension CommandRouter {
     /// Reuse projection semantics while decoding only this task's dependency
     /// sources/tags and the actual triages containing it, not project corpora.
     func selectedTaskProjection(_ db: Database, task: JSON) throws -> JSON {
+        var value = try selectedTaskProjectionWithoutHealth(db, task: task)
+        value["work_health"] = try workHealthView(db, task: task)
+        return value
+    }
+    func selectedTaskProjectionWithoutHealth(_ db: Database, task: JSON) throws -> JSON {
         let pid = task["project_id"] as! String,tid = task["id"] as! String
         let status = try? scoped(db,task["status_id"] as? String ?? "",pid,type:"status")
         let edges = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='relation' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.source_task_id')=CAST(? AS TEXT) COLLATE BINARY AND COALESCE(json_extract(data,'$.state'),'')<>'removed' ORDER BY rowid",arguments:[Data(pid.utf8),Data(tid.utf8)]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}

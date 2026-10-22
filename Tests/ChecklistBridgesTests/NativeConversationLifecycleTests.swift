@@ -1,5 +1,6 @@
 import XCTest
 import Darwin
+import ChecklistProviders
 @testable import ChecklistBridges
 
 final class NativeConversationLifecycleTests: XCTestCase {
@@ -24,6 +25,71 @@ final class NativeConversationLifecycleTests: XCTestCase {
         let data = try JSONSerialization.data(withJSONObject: ["pid": getpid(), "sessionId": session ?? self.session, "cwd": directory.path])
         try data.write(to: registry)
         try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: registry.path)
+    }
+    // An owned non-host process exercises the real kernel observation. These
+    // private registry fixtures do not qualify Claude/Codex conversation closure.
+    private func withOwnedProcess(_ body: (Process, NativeLifecycleRegistration) throws -> Void) throws {
+        let process = Process(), input = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/cat")
+        process.standardInput = input; process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        defer {
+            if process.isRunning { process.terminate() }
+            process.waitUntilExit()
+            try? input.fileHandleForWriting.close()
+        }
+        var info = proc_bsdinfo()
+        let count = proc_pidinfo(process.processIdentifier, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout.size(ofValue: info)))
+        XCTAssertEqual(count, Int32(MemoryLayout.size(ofValue: info)))
+        let registration = try XCTUnwrap(NativeLifecycleRegistration(provider: "claude", sessionID: session,
+            executionDomain: "claude:\(process.processIdentifier):\(info.pbi_start_tvsec):\(info.pbi_start_tvusec)",
+            registryPath: registry.path))
+        try body(process, registration)
+    }
+    private func writeOwnedRegistry(_ registration: NativeLifecycleRegistration, session: String? = nil) throws {
+        let data = try JSONSerialization.data(withJSONObject: ["pid": registration.processID,
+            "sessionId": session ?? self.session, "cwd": directory.path])
+        try data.write(to: registry)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: registry.path)
+    }
+    func testActualOwnedProcessExitRequiresRegistryClosureToo() throws {
+        try withOwnedProcess { process, registration in
+            try writeOwnedRegistry(registration)
+            let live = NativeLifecycleInspector.inspect(registration)
+            XCTAssertEqual(live.process, .running); XCTAssertEqual(live.registry, .matching)
+            XCTAssertFalse(live.provesClosure)
+            process.terminate(); process.waitUntilExit()
+            let staleRegistry = NativeLifecycleInspector.inspect(registration)
+            XCTAssertEqual(staleRegistry.process, .gone); XCTAssertEqual(staleRegistry.registry, .matching)
+            XCTAssertFalse(staleRegistry.provesClosure)
+            try FileManager.default.removeItem(at: registry)
+            let closed = NativeLifecycleInspector.inspect(registration)
+            XCTAssertEqual(closed.process, .gone); XCTAssertEqual(closed.registry, .absent)
+            XCTAssertTrue(closed.provesClosure)
+        }
+    }
+    func testActualOwnedProcessExitStillRejectsUnverifiableReplacement() throws {
+        try withOwnedProcess { process, registration in
+            process.terminate(); process.waitUntilExit()
+            try writeOwnedRegistry(registration, session: UUID().uuidString)
+            let replaced = NativeLifecycleInspector.inspect(registration)
+            XCTAssertEqual(replaced.process, .gone); XCTAssertEqual(replaced.registry, .replaced)
+            XCTAssertNotNil(replaced.registryDigest); XCTAssertTrue(replaced.provesClosure)
+            try Data("{}".utf8).write(to: registry)
+            let malformed = NativeLifecycleInspector.inspect(registration)
+            XCTAssertEqual(malformed.process, .gone); XCTAssertEqual(malformed.registry, .unknown)
+            XCTAssertFalse(malformed.provesClosure)
+            try writeOwnedRegistry(registration, session: UUID().uuidString)
+            try FileManager.default.setAttributes([.posixPermissions: 0o666], ofItemAtPath: registry.path)
+            XCTAssertFalse(NativeLifecycleInspector.inspect(registration).provesClosure)
+            try FileManager.default.removeItem(at: registry)
+            try FileManager.default.removeItem(at: directory)
+            let missingDirectory = NativeLifecycleInspector.inspect(registration)
+            XCTAssertEqual(missingDirectory.registry, .unknown); XCTAssertFalse(missingDirectory.provesClosure)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                   attributes: [.posixPermissions: 0o700])
+        }
     }
     func testOnlyPositiveProcessAndRegistryPairProvesClosure() {
         for process in [NativeLifecycleObservation.ProcessState.running, .gone, .replaced, .unknown] {
@@ -72,6 +138,33 @@ final class NativeConversationLifecycleTests: XCTestCase {
         let result = NativeLifecycleInspector.inspect(try registration(provider: "codex"))
         XCTAssertEqual(result.registry, .unsupported); XCTAssertFalse(result.provesClosure)
     }
+    func testRegistrationUsesQualifiedWorkProviderInsteadOfFixedProviderNames() throws {
+        let plugin = BridgeFixtureProviderPlugin()
+        let enabled = try ProviderPluginRegistry([.init(plugin: plugin, enabled: true, qualifiedCapabilities: plugin.manifest.capabilities)])
+        XCTAssertNotNil(NativeLifecycleRegistration(provider: "fixture", sessionID: session, executionDomain: "fixture:24680:5:0",
+            registryPath: nil, providerRegistry: enabled))
+        XCTAssertNil(NativeLifecycleRegistration(provider: "fixture", sessionID: session, executionDomain: "fixture:24680:5:0", registryPath: nil))
+        for entry in [ProviderPluginRegistration(plugin: plugin, enabled: false, qualifiedCapabilities: plugin.manifest.capabilities),
+                      ProviderPluginRegistration(plugin: plugin, enabled: true)] {
+            XCTAssertNil(NativeLifecycleRegistration(provider: "fixture", sessionID: session, executionDomain: "fixture:24680:5:0",
+                registryPath: nil, providerRegistry: try ProviderPluginRegistry([entry])))
+        }
+    }
+    func testRegistryIdentityInspectionRemainsAvailableWithoutAutomaticClosureCapability() throws {
+        try writeRegistry()
+        let plugin = ClaudeProviderPlugin()
+        let workOnly: Set<ProviderCapability> = [.workSession, .pickup, .correlatedReply]
+        let registry = try ProviderPluginRegistry([.init(plugin: plugin, enabled: true, qualifiedCapabilities: workOnly)])
+        let result = NativeLifecycleInspector.inspect(try registration(), providerRegistry: registry)
+        XCTAssertEqual(result.process, .running)
+        XCTAssertEqual(result.registry, .matching)
+        XCTAssertFalse(result.provesClosure)
+        let fixture = BridgeFixtureProviderPlugin(capabilities: [.workSession, .pickup, .correlatedReply, .registryClosure])
+        let fixtureRegistry = try ProviderPluginRegistry([.init(plugin: fixture, enabled: true, qualifiedCapabilities: fixture.manifest.capabilities)])
+        let fixtureRegistration = try XCTUnwrap(NativeLifecycleRegistration(provider: "fixture", sessionID: session,
+            executionDomain: "fixture:24680:5:0", registryPath: self.registry.path, providerRegistry: fixtureRegistry))
+        XCTAssertEqual(NativeLifecycleInspector.inspect(fixtureRegistration, providerRegistry: fixtureRegistry).registry, .unsupported)
+    }
     func testFIFORegistryWithoutWriterPromptlyStaysUnknown() throws {
         XCTAssertEqual(mkfifo(registry.path, 0o600), 0)
         let registration = try registration()
@@ -118,6 +211,13 @@ final class NativeConversationLifecycleTests: XCTestCase {
         }
         try writeRegistry()
         let original = try registration()
+        let peerOnly = try ProviderPluginRegistry([.init(plugin:ClaudeProviderPlugin(),enabled:true,
+            qualifiedCapabilities:[.workSession,.pickup,.correlatedReply,.nativePeer])])
+        _ = try NativeProviderTransport.send(provider:"claude",content:"Synthetic peer identity with closure disabled",messageID:"cl128-peer",
+            replyAddress:"uds:/tmp/cl128-reply.sock",displayName:"Component fixture",endpoint:endpoint,
+            expectedPeerPID:getpid(),expectedRegistration:original,timeout:1,registry:peerOnly)
+        XCTAssertGreaterThan(receivedByteCount(),0)
+
         let replacedStart = try XCTUnwrap(NativeLifecycleRegistration(provider: "claude", sessionID: session,
             executionDomain: "claude:\(getpid()):\(original.startSeconds + 1):\(original.startMicroseconds)", registryPath: registry.path))
         XCTAssertThrowsError(try send(replacedStart)); XCTAssertEqual(receivedByteCount(), 0)

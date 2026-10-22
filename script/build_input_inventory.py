@@ -9,7 +9,7 @@ import subprocess
 INPUT_ROOTS = [
     'Package.swift', 'Package.resolved', 'Sources', 'Tests', 'Resources',
     'Packages', 'skills', 'plugins', 'templates', 'script/build_and_run.sh',
-    'script/build_input_inventory.py', 'script/verify_stage.py', 'script/verify_install.py',
+    'script/build_input_inventory.py', 'script/build_support.py', 'script/verify_stage.py', 'script/verify_install.py',
 ]
 # Exact tooling/private metadata names, not generic names such as cache or build.
 PACKAGE_METADATA = {'.build', '.swiftpm', '.local', '__pycache__'}

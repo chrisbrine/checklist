@@ -9,8 +9,8 @@ final class GlossaryTests: XCTestCase {
         XCTAssertEqual(Canceled.normalized("answered"), "answered")
         XCTAssertTrue(Canceled.matches("canceled"))
         XCTAssertTrue(Canceled.matches("cancelled"))
-        XCTAssertEqual(StatusPill(name: "Canceled", category: "canceled").color, .secondary)
-        XCTAssertEqual(StatusPill(name: "Canceled", category: "cancelled").color, .secondary)
+        XCTAssertEqual(StatusPill(name: "Canceled", category: "canceled").color, .checklistSecondaryText)
+        XCTAssertEqual(StatusPill(name: "Canceled", category: "cancelled").color, .checklistSecondaryText)
     }
 
     /// Core and service code also use one spelling; only the legacy stored-value constants name the old one.

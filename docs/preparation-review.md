@@ -10,6 +10,8 @@ Run the reproducible [planning validator](../scripts/validate-plan.py) using the
 
 Independent review identified scoped-cursor disclosure, in-flight revocation ambiguity, notification recursion/backlog, historical identity attribution, conflicting duplicate grants and future-adapter trust boundaries. Each fix is incorporated in the corresponding contract and an observable acceptance scenario. Named personal-assistant contact is deferred and not a current release prerequisite; if resumed, it needs real installed-client qualification; no message or subscription was created during this revision.
 
+The [unpublished source preparation](public-source.md#prepare-an-unpublished-source-directory) additionally exports the exact reviewed product-source inventory, excludes the installation-specific store-copy test, checks privacy boundaries and validates the copied planning subset. Its generated manifest records the exact bytes and modes without local paths or runtime receipts. Export regression tests cover selection, symlink/privacy refusal, hash-bound synthetic fixtures, failed preparation and deterministic complete exports. This adds no native or installed qualification.
+
 ## Evidence boundaries
 
 A limited local existing-Claude-session round trip was observed earlier after correcting missing sender permission metadata. Its sanitized result and limits are in [integrations](integrations.md). Private raw identifiers/probes are not public fixtures or a generic passing test. Future public release evidence must use deliberately enrolled synthetic sessions, redacted receipts and actual supported versions.

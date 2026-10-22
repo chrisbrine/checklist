@@ -16,6 +16,8 @@ Personal-assistant integration, including Dot access and notifications, is **def
 
 Current work providers are Codex and Claude, using actual sessions attached to tickets. **Use in Codex** prepares a native composer; the user presses Send. A separate explicit native Codex thread-creation test also returned a real thread that automatically connected to its ticket; that association alone assigns no work and acquires no claim. Claude automatic creation remains unqualified. Future personal assistants and clients such as Muse require their own supported, qualified adapters; names and personalities confer no access.
 
+The versioned [bundled provider-plugin boundary](docs/provider-plugins.md) separates Codex/Claude metadata and supported native behavior from ticket/review policy. Optional [project orchestrators](docs/project-orchestrators.md) and [conversation content](docs/conversation-content.md) are defined as planned contracts; there is no Orchestrators tab or rich-message command in the current build.
+
 ## Start here
 
 1. [Product brief](docs/brief.md)

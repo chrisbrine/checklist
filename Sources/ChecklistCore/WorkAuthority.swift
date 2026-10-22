@@ -1,4 +1,5 @@
 import Foundation
+import ChecklistProviders
 import GRDB
 import Darwin
 
@@ -55,7 +56,7 @@ extension CommandRouter {
     func requireNoWritableChildren(_ db: Database, attempt: JSON) throws {
         guard !(try activeDescendants(db,attempt:attempt)).contains(where: { !(($0["file_scopes"] as? [JSON] ?? []).filter {$0["access"] as? String == "write"}).isEmpty || !(($0["lane_scopes"] as? [JSON]) ?? []).isEmpty }) else { throw CoreError("CHILD_WRITERS_ACTIVE","Every writable descendant must release or have explicit verified recovery before this operation.") }
     }
-    func validateWorkReservations(_ db: Database, candidate: JSON, excluding: Set<String> = []) throws {
+    func validateWorkReservations(_ db: Database, candidate: JSON, excluding: Set<String> = [],batchContext: BatchClaimContext? = nil) throws {
         let pid = candidate["project_id"] as! String,project = try record(db,pid,type:"project")
         let files = candidate["file_scopes"] as? [JSON] ?? [],lanes = candidate["lane_scopes"] as? [JSON] ?? []
         let others = try records(db,type:"attempt").filter {$0["state"] as? String == "active" && !excluding.contains($0["id"] as? String ?? "") && $0["id"] as? String != candidate["id"] as? String}
@@ -64,7 +65,10 @@ extension CommandRouter {
             for other in others {
                 for reserved in other["file_scopes"] as? [JSON] ?? [] where reserved["access"] as? String == "write" {
                     let old = reserved["canonical_key"] as? String ?? reservationKey(reserved["path"] as! String)
-                    if containsPath(path,old) || containsPath(old,path) { throw CoreError("SCOPE_CONFLICT","A live attempt reserves an overlapping canonical writable path.",details:["attempt_id":other["id"]!,"path":scope["path"]!]) }
+                    if containsPath(path,old) || containsPath(old,path) {
+                        if try sharesFrozenBatchWrite(db,candidate,other,path:path,reserved:old,context:batchContext) { continue }
+                        throw CoreError("SCOPE_CONFLICT","Canonical write scope \(path) conflicts between \(try reservationTicketLabel(db,candidate)) and \(candidate["project_id"] as? String == other["project_id"] as? String ? try reservationTicketLabel(db,other) : "another project ticket").",details:try reservationConflictDetails(db,candidate,other,path:path,reserved:old))
+                    }
                 }
             }
         }
@@ -121,7 +125,7 @@ extension CommandRouter {
     }
     func eligibleWorkSession(_ db: Database, id: String, project: String) throws -> JSON {
         let session = try scoped(db,id,project,type:"session")
-        guard session["role"] as? String == "worker",canReceive(session,project:project),["codex","claude"].contains((session["provider"] as? String ?? "").lowercased()),let domain = session["execution_domain"] as? String,!domain.isEmpty,let installation = session["installation"] as? String,!installation.isEmpty else { throw CoreError("UNVERIFIED_SESSION","Select an existing native host-bound worker session.") }
+        guard session["role"] as? String == "worker",canReceive(session,project:project),providerPlugins.plugin((session["provider"] as? String ?? "").lowercased(), requiring: .workSession) != nil,let domain = session["execution_domain"] as? String,!domain.isEmpty,let installation = session["installation"] as? String,!installation.isEmpty else { throw CoreError("UNVERIFIED_SESSION","Select an existing native host-bound worker session.") }
         return session
     }
     func workAuthority(_ db: Database,_ p: JSON,_ c: Caller,_ method: String) throws -> JSON {
@@ -199,7 +203,7 @@ extension CommandRouter {
         let phase = old["phase"] as? String ?? "implementation", project = try record(db,pid,type:"project")
         if let pr = p["policy_revision"],(pr as? NSNumber)?.intValue != int(project,"policy_revision",default:1) { throw CoreError("POLICY_CHANGED","Refresh the current workflow rules before taking over.") }
         let session = try scoped(db,sid,pid,type:"session")
-        guard session["role"] as? String == "worker",!["revoked","ended"].contains(session["state"] as? String ?? ""),["codex","claude"].contains((session["provider"] as? String ?? "").lowercased()) else { throw CoreError("POLICY_DENIED","This enrolled provider is not enabled for work in this build.") }
+        guard session["role"] as? String == "worker",!["revoked","ended"].contains(session["state"] as? String ?? ""),providerPlugins.plugin((session["provider"] as? String ?? "").lowercased(), requiring: .workSession) != nil else { throw CoreError("POLICY_DENIED","This enrolled provider is not enabled for work in this build.") }
         let assignee = t["planned_assignee"] as? String ?? (t["planned_assignee"] as? JSON)?["kind"] as? String
         if phase == "implementation",assignee == "human" { throw CoreError("POLICY_DENIED","This task is assigned to the owner.") }
         let policy = effectivePolicy(project["policy"] as? JSON ?? [:],kind:t["kind"] as? String ?? "work")

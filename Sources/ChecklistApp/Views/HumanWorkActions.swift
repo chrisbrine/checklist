@@ -19,7 +19,7 @@ struct HumanWorkActions: View {
         if ownTask || yourAttempt != nil {
             DetailSection(title: "Your work") {
                 if let attempt = yourAttempt {
-                    Text(permitsDecision ? "Record your decision and submit it when ready." : "Save a checkpoint or submit the actual managed evidence when ready.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text(permitsDecision ? "Record your decision and submit it when ready." : "Save a checkpoint or submit the actual managed evidence when ready.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     TextField("Progress / next step", text: $progress).textFieldStyle(.roundedBorder)
                     AccessibleHStack {
                         Button("Save checkpoint") { command("work_checkpoint", attempt, extras: ["progress": progress]) }.checklistDisabled([(!store.connected, DisabledReasons.offline), (progress.isEmpty, "Write your progress first.")])
@@ -28,7 +28,7 @@ struct HumanWorkActions: View {
                     }
                     if attempt.values["pending_policy_revision"] != nil {
                         Text("The review rules changed. Save your progress, read the new required reviews below, then confirm them with a reason.").checklistFont(.micro).foregroundStyle(.orange)
-                        Text("Required reviews: \((attempt.object("pending_policy_snapshot")["required_gates"] as? [String] ?? []).map(ReviewProjection.gateName).joined(separator: ", "))").checklistFont(.micro).foregroundStyle(.secondary)
+                        Text("Required reviews: \((attempt.object("pending_policy_snapshot")["required_gates"] as? [String] ?? []).map(ReviewProjection.gateName).joined(separator: ", "))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                         Button("Confirm the new rules") { command("policy_acknowledge", attempt, extras: ["reason": progress]) }
                             .checklistDisabled([(store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline), (attempt.string("last_checkpoint").isEmpty, "Save a checkpoint first."), (progress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write a reason first.")])
                     }
@@ -37,13 +37,13 @@ struct HumanWorkActions: View {
                         Button("Submit recorded decision") {
                             command("work_submit", attempt, extras: ["acceptance_revision": task.integer("acceptance_revision"), "evidence_manifest": ["kind": "decision", "decision": ["text": decision]]])
                         }.buttonStyle(.checklistProminent).checklistDisabled([(store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline), (decision.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write your decision first.")])
-                        Text("Your recorded decision is the evidence. Checklist still checks the applicable project gates.").checklistFont(.micro).foregroundStyle(.secondary)
+                        Text("Your recorded decision is the evidence. Checklist still checks the applicable project gates.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     }
                     Button("Submit current evidence") {
                         let artifacts: [[String: Any]] = store.detailRecords("attachments",task:task).filter { $0.string("task_id") == task.id && $0.string("mode") == "managed" && $0.string("availability") == "available" }.map { ["artifact_id": $0.id, "sha256": $0.string("sha256")] }
                         command("work_submit", attempt, extras: ["acceptance_revision": task.integer("acceptance_revision"), "evidence_manifest": ["artifact_refs": artifacts]])
                     }.buttonStyle(.checklistBordered).checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
-                    if !permitsDecision { Text("Add a file or image as evidence first. Technical work follows this project's evidence and review rules.").checklistFont(.micro).foregroundStyle(.secondary) }
+                    if !permitsDecision { Text("Add a file or image as evidence first. Technical work follows this project's evidence and review rules.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                 } else if task.string("readiness") == "ready" && task.string("active_attempt_id").isEmpty && ["queued", "blocked"].contains(task.string("status_category")) {
                     Button("Start my work") {
                         store.run("work_claim", ["project_id": project, "task_id": task.id, "expected_revision": task.integer("revision"), "phase": "implementation"], success: "Your work started") { result in
@@ -51,7 +51,7 @@ struct HumanWorkActions: View {
                         }
                     }.buttonStyle(.checklistProminent).checklistDisabled([(store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline), (!WorkActionProjection.canStartHumanWork(task), "This ticket cannot start now. Check its requirements.")])
                     if !WorkActionProjection.canStartHumanWork(task) {
-                        Text(WorkActionProjection.humanPickupBlocker(task)).checklistFont(.micro).foregroundStyle(.secondary)
+                        Text(WorkActionProjection.humanPickupBlocker(task)).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     }
                 }
 

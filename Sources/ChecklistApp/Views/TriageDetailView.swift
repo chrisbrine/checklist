@@ -16,12 +16,12 @@ struct TriageDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Spacing.page) {
                 VStack(alignment: .leading, spacing: Spacing.small) {
-                    Text("Edit Triage").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("Edit Triage").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     Text(ProductionGroups.label(triage)).checklistFont(.title)
-                    Text("\(store.projectName(projectID)) · \(triage.string("phase",fallback:"Choose phase").capitalized) · \(members.count) current tickets").checklistFont(.micro).foregroundStyle(.secondary)
-                    Text("Tickets leave when this phase finishes. Implementation submission moves to Review; create a separate review Triage for those targets. Complete passing tickets and return only failed tickets to implementation.").checklistFont(.micro).foregroundStyle(.secondary)
-                    if triage.bool("active_attention") { Text("In progress · Active includes these tickets while this Triage or its actual coordinator is working.").checklistFont(.micro).foregroundStyle(.secondary) }
-                    if triage.bool("archived") { Text("Archived Triage · tickets and dispatched batches are preserved").checklistFont(.micro).foregroundStyle(.secondary) }
+                    Text("\(store.projectName(projectID)) · \(triage.string("phase",fallback:"Choose phase").capitalized) · \(members.count) current tickets").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                    Text("Tickets leave when this phase finishes. Implementation submission moves to Review; create a separate review Triage for those targets. Complete passing tickets and return only failed tickets to implementation.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                    if triage.bool("active_attention") { Text("In progress · Active includes these tickets while this Triage or its actual coordinator is working.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+                    if triage.bool("archived") { Text("Archived Triage · tickets and dispatched batches are preserved").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                 }
                 if triage.bool("phase_requires_selection") || members.isEmpty {
                     DetailSection(title:"Phase") {
@@ -33,9 +33,9 @@ struct TriageDetailView: View {
                     let orchestration = Record(values:triage.object("orchestration"))
                     DetailSection(title:"Actual coordination") {
                         Text(orchestration.string("actor_display") + " · " + orchestration.string("provider").capitalized).checklistFont(.callout)
-                        Text(GlossaryText.title(orchestration.string("state"))).checklistFont(.micro).foregroundStyle(.secondary)
+                        Text(GlossaryText.title(orchestration.string("state"))).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                         if !orchestration.string("progress").isEmpty { Text(orchestration.string("progress")).checklistFont(.micro).textSelection(.enabled) }
-                        if triage.string("orchestration_connection") == "recovery_required" { Text("The recorded session needs recovery or an explicit finish. Its ending does not complete these tickets.").checklistFont(.micro).foregroundStyle(.secondary) }
+                        if triage.string("orchestration_connection") == "recovery_required" { Text("The recorded session needs recovery or an explicit finish. Its ending does not complete these tickets.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                     }
                 }
                 if editingPurpose {
@@ -46,7 +46,7 @@ struct TriageDetailView: View {
                     }
                 } else {
                     DetailSection(title: "Triage purpose") {
-                        Text(triage.string("purpose").isEmpty ? "Describe the fix or review pass these tickets should share." : triage.string("purpose")).checklistFont(.callout).foregroundStyle(triage.string("purpose").isEmpty ? .secondary : .primary).textSelection(.enabled)
+                        Text(triage.string("purpose").isEmpty ? "Describe the fix or review pass these tickets should share." : triage.string("purpose")).checklistFont(.callout).foregroundStyle(triage.string("purpose").isEmpty ? Color.checklistSecondaryText : .primary).textSelection(.enabled)
                         Button("Edit Triage brief…") { beginEdit() }.checklistFont(.micro)
                     }
                 }
@@ -54,7 +54,7 @@ struct TriageDetailView: View {
                 DetailSection(title: "Current members") {
                     GroupTaskPagingControls(group:triage,closed:false)
                     if members.isEmpty && !store.groupTaskLoading && store.groupTaskError == nil {
-                        Text("This Triage is empty. Add more work for another pass, or leave it as a record of this Triage.").checklistFont(.callout).foregroundStyle(.secondary)
+                        Text("This Triage is empty. Add more work for another pass, or leave it as a record of this Triage.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
                     }
                     ForEach(members) { task in TriageMemberRow(task: task, triage: triage) }
                 }
@@ -64,10 +64,10 @@ struct TriageDetailView: View {
                     Picker("Ticket", selection: $selectedTicket) { Text("Choose ticket from this project").tag(""); ForEach(available) { task in Text("\(task.string("key")) · \(task.string("title"))").tag(task.id) } }.labelsHidden()
                     if let task = available.first(where: { $0.id == selectedTicket }) {
                         let epic = store.groups.first { $0.id == task.string("epic_id") }
-                        Text(epic.map { "Stays in Epic: " + ProductionGroups.label($0) } ?? "No Epic. Adding it to this Triage does not change its Epic.").checklistFont(.micro).foregroundStyle(.secondary)
+                        Text(epic.map { "Stays in Epic: " + ProductionGroups.label($0) } ?? "No Epic. Adding it to this Triage does not change its Epic.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     }
                     Button("Add to this Triage") { store.run("group_membership", ["project_id": projectID, "group_id": triage.id, "task_id": selectedTicket, "action": "add", "expected_revision": triage.integer("revision")], success: "Ticket added to this Triage; Epic unchanged") { _ in selectedTicket = "" } }.buttonStyle(.checklistBordered).checklistDisabled([(triage.bool("archived"), "This Triage is archived. Restore it first."), (selectedTicket.isEmpty, "Choose a ticket first."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
-                    Text("Membership changes apply to the current members. A dispatched batch, claim or review is not rewritten.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("Membership changes apply to the current members. A dispatched batch, claim or review is not rewritten.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
                 if !triage.records("batches").isEmpty {
                     Divider()
@@ -75,11 +75,13 @@ struct TriageDetailView: View {
                         ForEach(triage.records("batches")) { batch in
                             VStack(alignment:.leading,spacing: Spacing.tight) {
                                 Text("\(batch.string("phase").capitalized) · \(batch.integer("member_count",fallback:0)) tickets").checklistFont(.callout)
-                                Text("Started \(relativeTime(batch.string("created_at")))").checklistFont(.micro).foregroundStyle(.secondary)
+                                let lifecycle = BatchLifecycleDisplay(batch)
+                                Text(lifecycle.date.isEmpty ? lifecycle.label : "\(lifecycle.label) \(relativeTime(lifecycle.date))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                                if !lifecycle.reason.isEmpty { Text(lifecycle.reason).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                                 TechnicalDetails([("Batch", batch.id), ("Triage revision", "\(batch.integer("triage_revision"))"), ("Created at", batch.string("created_at"))])
                             }
                         }
-                        Text("Later membership edits affect future batches. Passing tickets complete independently; the next pass contains only failed or remaining work unless this project's rules hold passing tickets.").checklistFont(.micro).foregroundStyle(.secondary)
+                        Text("Later membership edits affect future batches. Passing tickets complete independently; the next pass contains only failed or remaining work unless this project's rules hold passing tickets.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     }
                 }
                 Divider()
@@ -110,11 +112,11 @@ private struct TriageMemberRow: View {
         VStack(alignment: .leading, spacing: Spacing.row) {
             Button { store.open(.task(task.id)) } label: { VStack(alignment: .leading, spacing: Spacing.compact) {
                 Text(task.string("title")).checklistFont(.bodyStrong).frame(maxWidth: .infinity, alignment: .leading)
-                AccessibleHStack { Text(task.string("key")).checklistFont(.micro).foregroundStyle(.secondary); Spacer(); TicketStatusPills(task: task) }
+                AccessibleHStack { Text(task.string("key")).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText); Spacer(); TicketStatusPills(task: task) }
             } }.buttonStyle(.checklistRow)
             if let epic = store.groups.first(where: { $0.id == task.string("epic_id") }) { Button { store.open(.group(epic.id)) } label: { Label("Epic: " + ProductionGroups.label(epic), systemImage: "folder") }.buttonStyle(.link).checklistFont(.micro) }
-            else { Text("No Epic").checklistFont(.micro).foregroundStyle(.secondary) }
-            AccessibleHStack { Text("Ticket stays in its Epic").checklistFont(.micro).foregroundStyle(.secondary); Spacer(); Button("Remove from Triage…") { confirmation = Confirmations.removeFromTriage(task.string("key")) { store.run("group_membership", ["project_id": triage.string("project_id"), "group_id": triage.id, "task_id": task.id, "action": "remove", "expected_revision": triage.integer("revision")], success: "Removed from this Triage; Epic unchanged") } }.checklistFont(.micro).checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)]) }
+            else { Text("No Epic").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+            AccessibleHStack { Text("Ticket stays in its Epic").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText); Spacer(); Button("Remove from Triage…") { confirmation = Confirmations.removeFromTriage(task.string("key")) { store.run("group_membership", ["project_id": triage.string("project_id"), "group_id": triage.id, "task_id": task.id, "action": "remove", "expected_revision": triage.integer("revision")], success: "Removed from this Triage; Epic unchanged") } }.checklistFont(.micro).checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)]) }
         }.checklistCard(padding: Card.padding)
     }
 

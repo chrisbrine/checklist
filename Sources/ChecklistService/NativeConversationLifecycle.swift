@@ -2,6 +2,7 @@ import Foundation
 import Darwin
 import ChecklistCore
 import ChecklistBridges
+import ChecklistProviders
 
 /// Kernel/file events trigger a bounded observation. No timer, model or polling
 /// loop is created; a lost MCP/XPC connection is not an event source for closure.
@@ -36,14 +37,14 @@ extension Coordinator {
     func observeNativeConversationLifecycles() {
         for enrollment in Array(enrollments.values) {
             guard enrollment.automatic == true, enrollment.role == "worker", enrollment.assistantRelay != true,
-                  enrollment.provider == "claude",
-                  enrollment.identityVerification == "native_process_and_session_registry_verified",
+                  let plugin=ProviderPluginRegistry.bundled.plugin(enrollment.provider, requiring: .registryClosure),
+                  enrollment.identityVerification == plugin.nativeHost?.identityVerification,
                   let domain = enrollment.nativeExecutionDomain else { continue }
             let key = enrollment.installation + "/" + enrollment.generation
             guard !nativeLifecycle.reconciled.contains(key),
                   let parsed = NativeLifecycleRegistration(provider: enrollment.provider,
                     sessionID: enrollment.nativeSessionID ?? enrollment.sessionID, executionDomain: domain, registryPath: nil) else { continue }
-            let path = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/sessions/\(parsed.processID).json").path
+            guard let path = plugin.nativeHost?.registryPath(processID:parsed.processID) else { continue }
             guard let registration = NativeLifecycleRegistration(provider: enrollment.provider,
                 sessionID: enrollment.nativeSessionID ?? enrollment.sessionID, executionDomain: domain, registryPath: path) else { continue }
             if nativeLifecycle.watches[key] == nil {

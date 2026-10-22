@@ -21,11 +21,11 @@ extension CommandRouter {
         try revision(p,r)
         guard r["state"] as? String == "pending" else { throw CoreError("REQUEST_CHANGED","This request is no longer pending.") }
         if method == "human_request_snooze" {
-            try owner(c)
+            try requireAgentEditAuthority(db,project:try record(db,pid,type:"project"),caller:c)
             // A personal inbox preference, with no due time, task transition or scheduled pickup.
             r["owner_snoozed"] = bool(p,"snoozed",default:true)
             r = revised(r); try save(db,r,type:"request")
-            try event(db,caller:c,project:pid,entity:r["task_id"] as? String,kind:"human_request_visibility_changed",data:["request_id":r["id"]!,"snoozed":r["owner_snoozed"]!])
+            try event(db,caller:c,project:pid,entity:r["task_id"] as? String,kind:"human_request_visibility_changed",data:["request_id":r["id"]!,"snoozed":r["owner_snoozed"]!,"origin":c.isOwner ? "human_ui" : "agent"])
             return r
         }
         if method == "human_request_cancel" || method == "human_request_revise" {
@@ -72,7 +72,7 @@ extension CommandRouter {
         if !isAnswer { _ = try text(p,"explanation",max:16000) }
         let answers = try validatedRequestAnswers(r,params:p,requireComplete:isAnswer)
         let files = try preparedHumanRequestFiles(r,params:p)
-        let complete = isAnswer && !answers.contains { ($0["result"] as? String ?? $0["value"] as? String) == "not_checked" }
+        let complete = isAnswer
         if complete,let target = r["target_attachment_id"] as? String {
             if let mid = r["target_manifest_id"] as? String {
                 let currentTask = try scoped(db,r["task_id"] as! String,pid,type:"task")
@@ -116,7 +116,10 @@ extension CommandRouter {
         try save(db,r,type:"request")
         try event(db,caller:c,project:pid,entity:r["task_id"] as? String,kind:"human_request_answered",data:["request_id":r["id"]!,"complete":complete,"response_id":response["id"]!,"form_revision":int(r,"form_revision",default:1)])
         try db.execute(sql:"DELETE FROM metadata WHERE key=?",arguments:[try pendingStorageCommandKey(principal:c.principal,command:p["command_id"] as! String)])
-        r["message"] = message; return r
+        r["message"] = message
+        let counts = try ownerNeedsYouCounts(db)
+        r["needs_you_count"] = counts.requests + counts.tasks
+        return r
     }
 
     static let requestSupersedeKeys = ["supersedes_answer_id","supersede_reason"]
@@ -139,8 +142,8 @@ extension CommandRouter {
                     switch question["type"] as? String ?? "text" {
                     case "text": return !(answer["text"] as? String ?? "").trimmingCharacters(in:.whitespacesAndNewlines).isEmpty
                     case "choice": return !strings(answer,"option_ids").isEmpty || !(answer["custom_text"] as? String ?? "").trimmingCharacters(in:.whitespacesAndNewlines).isEmpty
-                    case "approval": return ["approved","changes_requested"].contains(answer["result"] as? String ?? "")
-                    case "check": return ["passed","failed"].contains(answer["result"] as? String ?? "")
+                    case "approval": return ["approved","changes_requested","declined"].contains(answer["result"] as? String ?? "")
+                    case "check": return ["passed","failed","declined"].contains(answer["result"] as? String ?? "")
                     default: return false
                     }
                 }
@@ -245,7 +248,7 @@ extension CommandRouter {
         var normalized: [JSON] = []
         for q in questions {
             guard var answer = answers.first(where: {$0["question_id"] as? String == q["id"] as? String}) else {
-                if requireComplete && bool(q,"required",default:true) { throw CoreError("ANSWER_INCOMPLETE","Answer every required question before sending.") }; continue
+                if requireComplete && bool(q,"required",default:true) { throw incompleteRequestItem(q) }; continue
             }
             let type = q["type"] as? String ?? "text"
             if let claimedType = answer["type"] { guard claimedType as? String == type else { throw CoreError("INVALID_INPUT","An answer has the wrong question type.") } }
@@ -253,7 +256,7 @@ extension CommandRouter {
             guard Set(answer.keys).isSubset(of:fields) else { throw CoreError("INVALID_INPUT","This answer contains fields for a different question type.") }
             if type == "text" {
                 let value = try requestAnswerString(answer,keys:["text","value"],max:16000)
-                guard !value.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else { throw CoreError("ANSWER_INCOMPLETE","A selected text answer is empty.") }
+                guard !value.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else { throw incompleteRequestItem(q) }
                 answer = ["question_id":q["id"]!,"text":value]
             } else if type == "choice" {
                 if answer["option_ids"] != nil && !(answer["option_ids"] is [String]) { throw CoreError("INVALID_INPUT","Selected options must be a list of IDs.") }
@@ -262,16 +265,20 @@ extension CommandRouter {
                 let custom = try requestAnswerString(answer,keys:["custom_text"],max:16000)
                 let customPresent = !custom.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty
                 let options = Set((q["options"] as? [JSON] ?? []).compactMap {$0["id"] as? String})
-                guard Set(ids).isSubset(of:options),Set(ids).count == ids.count,ids.count + (customPresent ? 1 : 0) <= (bool(q,"multiple") ? 100 : 1),!ids.isEmpty || customPresent,custom.isEmpty || (bool(q,"allow_custom") && customPresent) else { throw CoreError("ANSWER_INCOMPLETE","Choose valid options or a permitted custom answer.") }
+                guard Set(ids).isSubset(of:options),Set(ids).count == ids.count,ids.count + (customPresent ? 1 : 0) <= (bool(q,"multiple") ? 100 : 1),!ids.isEmpty || customPresent,custom.isEmpty || (bool(q,"allow_custom") && customPresent) else { throw incompleteRequestItem(q) }
                 answer = ["question_id":q["id"]!,"option_ids":ids,"custom_text":custom]
             } else {
                 let result = try requestAnswerString(answer,keys:["result","value"],max:100)
-                guard (type == "approval" ? ["approved","changes_requested","not_checked"] : ["passed","failed","not_checked"]).contains(result) else { throw CoreError("ANSWER_INCOMPLETE","Choose an explicit approval or check result.") }
+                guard (type == "approval" ? ["approved","changes_requested","declined","not_checked"] : ["passed","failed","declined","not_checked"]).contains(result) else { throw incompleteRequestItem(q) }
+                if requireComplete && result == "not_checked" { throw incompleteRequestItem(q) }
                 answer = ["question_id":q["id"]!,"result":result]
             }
             normalized.append(answer)
         }
         return normalized
+    }
+    func incompleteRequestItem(_ item: JSON) -> CoreError {
+        CoreError("ANSWER_INCOMPLETE","Complete “\(item["prompt"] as? String ?? item["id"] as? String ?? "Required item")” before sending.")
     }
     func requestAnswerString(_ input: JSON,keys: [String],max: Int) throws -> String {
         for key in keys where input[key] != nil { guard let value = input[key] as? String,value.utf8.count <= max else { throw CoreError("INVALID_INPUT","\(key) must be text within its size limit.") }; return value }
@@ -285,9 +292,9 @@ extension CommandRouter {
         var result: [JSON] = []
         for spec in specs {
             let file = files.first {$0["file_request_id"] as? String == spec["id"] as? String}
-            guard let file else { if requireComplete && bool(spec,"required",default:true) { throw CoreError("ANSWER_INCOMPLETE","Choose every required file or directory.") }; continue }
+            guard let file else { if requireComplete && bool(spec,"required",default:true) { throw incompleteRequestItem(spec) }; continue }
             guard let paths = file["paths"] as? [String],Set(paths).count == paths.count,paths.count <= (bool(spec,"multiple") ? 100 : 1) else { throw CoreError("INVALID_INPUT","File selections must be a unique list within the selection limit.") }
-            if paths.isEmpty { if requireComplete && bool(spec,"required",default:true) { throw CoreError("ANSWER_INCOMPLETE","Choose every required file or directory.") }; continue }
+            if paths.isEmpty { if requireComplete && bool(spec,"required",default:true) { throw incompleteRequestItem(spec) }; continue }
             let mode = file["mode"] as? String ?? "reference"
             guard (file["mode"] == nil || file["mode"] is String),["reference","managed"].contains(mode) else { throw CoreError("INVALID_INPUT","Choose Reference or Managed copy.") }
             if file["path_sha256"] != nil && !(file["path_sha256"] is [String:String]) { throw CoreError("INVALID_INPUT","File identities must map paths to checksums.") }

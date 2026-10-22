@@ -39,7 +39,7 @@ struct NativePreviewUnavailable: View {
         VStack(spacing: 12) {
             Image(systemName: "doc").font(.largeTitle).accessibilityHidden(true)
             Text(title).font(.headline)
-            Text(reason).foregroundStyle(.secondary).multilineTextAlignment(.center).textSelection(.enabled)
+            Text(reason).foregroundStyle(Color.checklistSecondaryText).multilineTextAlignment(.center).textSelection(.enabled)
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
             .accessibilityElement(children: .contain)
             .accessibilityLabel(title)
@@ -96,7 +96,7 @@ struct NativeImagePreview: View {
                 Toggle("Nearest neighbor", isOn: $nearest).toggleStyle(.button)
                 if actualPixels { Slider(value: $zoom, in: 1...8, step: 1).frame(maxWidth: 150).accessibilityLabel("Pixel zoom"); Text("\(Int(zoom * 100))%") }
                 Spacer()
-                if dimensions != .zero { Text("\(Int(dimensions.width)) × \(Int(dimensions.height)) px").font(.caption).foregroundStyle(.secondary) }
+                if dimensions != .zero { Text("\(Int(dimensions.width)) × \(Int(dimensions.height)) px").font(.caption).foregroundStyle(Color.checklistSecondaryText) }
             }
             if loading { ProgressView("Decoding image…").frame(maxWidth: .infinity, maxHeight: .infinity) }
             else if !problem.isEmpty { Text(problem).foregroundStyle(.orange).frame(maxWidth: .infinity, maxHeight: .infinity) }
@@ -147,7 +147,7 @@ struct NativePlaybackPreview: View {
                     }
             } else if problem.isEmpty { ProgressView(audio ? "Checking audio preview…" : "Checking video preview…").frame(minHeight: audio ? 120 : 300) }
             if !problem.isEmpty { Text(problem).foregroundStyle(.orange) }
-            Text("Press Play to start. Native controls provide pause, seeking and volume.").font(.caption).foregroundStyle(.secondary)
+            Text("Press Play to start. Native controls provide pause, seeking and volume.").font(.caption).foregroundStyle(Color.checklistSecondaryText)
         }.task(id: url) {
             player?.pause(); player = nil; problem = ""
             do {

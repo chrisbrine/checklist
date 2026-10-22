@@ -1,4 +1,5 @@
 import Foundation
+import ChecklistProviders
 import GRDB
 
 extension CommandRouter {
@@ -64,7 +65,7 @@ extension CommandRouter {
             if let acceptedVerdictIDs,!acceptedVerdictIDs.contains(verdictID) { throw CoreError("EVIDENCE_STALE","The accepted verdict list omits a current required gate.") }
         }
     }
-    func work(_ db: Database,_ p: JSON,_ c: Caller,_ method: String,operation: TicketStatusOperation = .individual) throws -> JSON {
+    func work(_ db: Database,_ p: JSON,_ c: Caller,_ method: String,operation: TicketStatusOperation = .individual,batchContext: BatchClaimContext? = nil) throws -> JSON {
         try worker(c); let pid = try scope(db,p,c,write:true)
         if method == "task_complete" {
             var t = try task(db,p,pid); try revision(p,t)
@@ -77,7 +78,7 @@ extension CommandRouter {
             t["status_id"] = target["id"]; t["completed_at"] = now(); t = revised(t); try save(db,t,type:"task"); try recordTicketStatusAction(db,task:t,caller:c,operation:operation); try event(db,caller:c,project:pid,entity:t["id"] as? String,kind:"task_completed"); return try taskProjection(db,t)
         }
         if method == "work_recover" {
-            try owner(c); var t = try task(db,p,pid); try revision(p,t); guard let aid = p["attempt_id"] as? String ?? t["active_attempt_id"] as? String else { return try taskProjection(db,t) }
+            try requireAgentEditAuthority(db,project:try record(db,pid,type:"project"),caller:c); var t = try task(db,p,pid); try revision(p,t); guard let aid = p["attempt_id"] as? String ?? t["active_attempt_id"] as? String else { return try taskProjection(db,t) }
             var a = try scoped(db,aid,pid,type:"attempt")
             guard a["state"] as? String == "active" else { throw CoreError("STALE_CLAIM","Only live attempts need verified recovery.") }
             guard a["task_id"] as? String == t["id"] as? String else { throw CoreError("NOT_FOUND","This attempt belongs to another task.") }
@@ -85,7 +86,7 @@ extension CommandRouter {
             guard p["action"] as? String == "confirm_stopped_revoke", !(try text(p,"reason")).isEmpty, !strings(p,"observation_refs").isEmpty, !strings(p,"file_state_refs").isEmpty else { throw CoreError("RECOVERY_REQUIRED","Record explicit stop verification and file-state observation references. A timeout is insufficient.") }
             try recoverSourceExecutions(db,attempt:a,params:p,caller:c)
             if let rid = a["review_request_id"] as? String { var request = try scoped(db,rid,pid,type:"review_request");request["state"] = t["current_manifest_id"] as? String == request["manifest_id"] as? String ? "queued" : "superseded";try save(db,revised(request),type:"review_request") }
-            a["state"] = "revoked"; a["recovery_reason"] = p["reason"];a["stop_observation_refs"] = p["observation_refs"];a["file_state_refs"] = p["file_state_refs"];a.removeValue(forKey:"token_hash"); try save(db,revised(a),type:"attempt"); if a["parent_attempt_id"] != nil { return ["attempt_id":a["id"]!,"state":"revoked"] };t.removeValue(forKey:"active_attempt_id"); t["status_id"] = try status(db,pid,"blocked")["id"]; t = revised(t); try save(db,t,type:"task"); try recordTicketStatusAction(db,task:t,caller:c,operation:operation); try event(db,caller:c,project:pid,entity:t["id"] as? String,kind:"claim_revoked"); return try taskProjection(db,t)
+            a["state"] = "revoked"; a["recovery_reason"] = p["reason"];a["recovery_origin"] = c.isOwner ? "human_ui" : "agent";a["recovered_by"] = c.principal;a["recovery_session_id"] = c.sessionID ?? "human";a["stop_observation_refs"] = p["observation_refs"];a["file_state_refs"] = p["file_state_refs"];a.removeValue(forKey:"token_hash"); try save(db,revised(a),type:"attempt"); if a["parent_attempt_id"] != nil { return ["attempt_id":a["id"]!,"state":"revoked"] };t.removeValue(forKey:"active_attempt_id"); t["status_id"] = try status(db,pid,"blocked")["id"]; t = revised(t); try save(db,t,type:"task"); try recordTicketStatusAction(db,task:t,caller:c,operation:operation); try event(db,caller:c,project:pid,entity:t["id"] as? String,kind:"claim_revoked"); return try taskProjection(db,t)
         }
         if method == "work_claim" {
             var t = try task(db,p,pid); try revision(p,t)
@@ -101,14 +102,16 @@ extension CommandRouter {
             if !c.isOwner {
                 guard let sid = c.sessionID else { throw CoreError("FORBIDDEN","A paired work session is required.") }
                 let session = try scoped(db,sid,pid,type:"session"); let provider = (session["provider"] as? String ?? "").lowercased()
-                guard session["role"] as? String == "worker",session["state"] as? String != "revoked",["codex","claude"].contains(provider) else { throw CoreError("POLICY_DENIED","This enrolled provider is not enabled for work in this build.") }
+                guard session["role"] as? String == "worker",session["state"] as? String != "revoked",providerPlugins.plugin(provider, requiring: .workSession) != nil else { throw CoreError("POLICY_DENIED","This enrolled provider is not enabled for work in this build.") }
             }
             let policy = effectivePolicy(project["policy"] as? JSON ?? [:],kind:t["kind"] as? String ?? "work")
             try validatePolicySelection(db,project:project,task:t,caller:c,phase:phase,policy:policy)
             try validateScopeInputs(p)
             let scopes = try normalizedWorkScopes(db,project:project,fileScopes:p["file_scopes"] as? [JSON] ?? [],laneScopes:p["lane_scopes"] as? [JSON] ?? [])
             var a: JSON = ["id":uuid(),"project_id":pid,"task_id":t["id"]!,"phase":phase,"principal":c.principal,"installation":c.installation,"actor_display":author(db,c),"session_id":c.sessionID ?? "human","session_authorization_generation":try callerSessionGeneration(db,c,project:pid),"state":"active","incarnation":incarnation,"revision":1,"started_at":now(),"policy_revision":project["policy_revision"] ?? 1,"policy_snapshot":policy,"file_scopes":scopes.files,"lane_scopes":scopes.lanes]
-            try validateWorkReservations(db,candidate:a)
+            if let domain = c.executionDomain { a["execution_domain"] = domain }
+            if let context = batchContext { try installBatchContext(context,attempt:&a) }
+            try validateWorkReservations(db,candidate:a,batchContext:batchContext)
             if phase == "review" {
                 let rid = try text(p,"review_request_id"); var request = try scoped(db,rid,pid,type:"review_request")
                 guard request["task_id"] as? String == t["id"] as? String,request["manifest_id"] as? String == p["target_manifest_id"] as? String,request["gate"] as? String == p["gate"] as? String,request["state"] as? String == "queued" else { throw CoreError("REVIEW_TARGET_MISMATCH","Claim the exact queued review request, gate and manifest.") }
@@ -121,7 +124,6 @@ extension CommandRouter {
                 let cat = try taskProjection(db,t)["status_category"] as? String ?? "queued"
                 guard ["queued","blocked"].contains(cat) else { throw CoreError("INVALID_TRANSITION","Queue a Parked task before pickup.") }
             }
-            if let domain = c.executionDomain { a["execution_domain"] = domain }
             let token = uuid()+uuid(); a["token_hash"] = hash(Data(token.utf8)); try save(db,a,type:"attempt")
             // A new implementation round ends any release-set hold of an earlier pass (CL-45).
             if phase != "review" { t.removeValue(forKey:"release_hold") }
@@ -131,7 +133,7 @@ extension CommandRouter {
         try verifyPolicyAuthority(db,attempt:a,caller:c,requireAcknowledgment: !["work_checkpoint","work_release"].contains(method))
         if method == "work_checkpoint" {
             if p["file_scopes"] != nil || p["lane_scopes"] != nil { try verifyPolicyAuthority(db,attempt:a,caller:c);try adjustWorkScopes(db,params:p,attempt:&a) }
-            a["progress"] = try text(p,"progress"); a["last_checkpoint"] = now(); try recordResourceWait(p,attempt:&a); a = revised(a); try save(db,a,type:"attempt"); try event(db,caller:c,project:pid,entity:t["id"] as? String,kind:"work_checkpoint",data:["progress":a["progress"]!]); let checkpoint = try recordDirectionCheckpoint(db,params:p,attempt:a,progress:a["progress"] as! String,caller:c);a["checkpoint_id"] = checkpoint["id"];a["context"] = try compactTaskContext(db,task:t,caller:c);a["direction_cursor"] = (a["context"] as? JSON)?["direction_cursor"];a.removeValue(forKey:"token_hash");return a
+            let progress = try text(p,"progress"); recordHealthProgress(&a,progress:progress); a["progress"] = progress; a["last_checkpoint"] = now(); try recordResourceWait(p,attempt:&a); a = revised(a); try save(db,a,type:"attempt"); try event(db,caller:c,project:pid,entity:t["id"] as? String,kind:"work_checkpoint",data:["progress":a["progress"]!]); let checkpoint = try recordDirectionCheckpoint(db,params:p,attempt:a,progress:a["progress"] as! String,caller:c);a["checkpoint_id"] = checkpoint["id"];a["context"] = try compactTaskContext(db,task:t,caller:c);a["direction_cursor"] = (a["context"] as? JSON)?["direction_cursor"];a.removeValue(forKey:"token_hash");return a
         }
         if method == "work_release" {
             try requireNoSourceExecutions(db,attempt:a)

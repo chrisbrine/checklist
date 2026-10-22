@@ -10,7 +10,7 @@ struct DesktopAlertPreferencesView: View {
         VStack(alignment:.leading,spacing: Spacing.small) {
             Toggle("Enable desktop alerts on this Mac",isOn:$enabled).toggleStyle(.checkbox)
             Picker("App default on this Mac",selection:$defaultMode) { Text("Actionable Needs You").tag("needs_you"); Text("Needs You and delivery issues").tag("all") }
-            Text(status).checklistFont(.micro).foregroundStyle(.secondary)
+            Text(status).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             if authorization == .notRequested {
                 Button("Allow desktop alerts in macOS…") {
                     Task {
@@ -19,7 +19,7 @@ struct DesktopAlertPreferencesView: View {
                     }
                 }
             }
-            Text("Only new items while Checklist is open produce alerts. Project Quiet suppresses them; Needs You and delivery receipts stay in the app.").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("Only new items while Checklist is open produce alerts. Project Quiet suppresses them; Needs You and delivery receipts stay in the app.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             if let failure = alerts.lastFailure { Text(failure).checklistFont(.micro).foregroundStyle(.orange) }
             if !setupError.isEmpty { Text(setupError).checklistFont(.micro).foregroundStyle(.orange) }
         }

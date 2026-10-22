@@ -96,10 +96,10 @@ extension CommandRouter {
     }
 
     func directionWaive(_ db: Database,_ params: JSON,_ caller: Caller) throws -> JSON {
-        try owner(caller); let pid = try scope(db,params,caller,write:true)
+        let pid = try scope(db,params,caller,write:true); try requireAgentEditAuthority(db,project:try record(db,pid,type:"project"),caller:caller)
         var message = try scoped(db,try text(params,"message_id"),pid,type:"message"); try revision(params,message)
         guard message["origin"] as? String == "human_ui",bool(message,"requires_action") else { throw CoreError("INVALID_INPUT","Select a trusted owner direction.") }
-        let disposition: JSON = ["id":uuid(),"project_id":pid,"task_id":message["task_id"]!,"message_id":message["id"]!,"actor":caller.principal,"origin":"human_ui","state":"waived","reason":try text(params,"reason",max:4000),"revision":1,"created_at":now()]
+        let disposition: JSON = ["id":uuid(),"project_id":pid,"task_id":message["task_id"]!,"message_id":message["id"]!,"actor":caller.principal,"origin":caller.isOwner ? "human_ui" : "agent","waiver_kind":caller.isOwner ? "owner_waiver" : "agent_waiver","session_id":caller.sessionID ?? "human","state":"waived","reason":try text(params,"reason",max:4000),"revision":1,"created_at":now()]
         try save(db,disposition,type:"direction_disposition"); message["addressed"] = true; message["disposition_id"] = disposition["id"]; message["disposition_state"] = "waived"; try save(db,revised(message),type:"message")
         try event(db,caller:caller,project:pid,entity:message["task_id"] as? String,kind:"direction_waived",data:["message_id":message["id"]!,"disposition_id":disposition["id"]!]); return disposition
     }

@@ -45,11 +45,11 @@ struct TicketListFilterControls: View {
                 } label: { Text("Saved views") }
             }.menuStyle(.borderlessButton).fixedSize(horizontal:false, vertical:true)
             HStack(alignment:.top) {
-                Text(summary).checklistFont(.micro).foregroundStyle(.secondary).textSelection(.enabled)
+                Text(summary).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).textSelection(.enabled)
                 Spacer()
                 if store.listHasFilters { Button("Reset") { store.resetTicketFilters() }.buttonStyle(.link) }
             }
-            if let workerError { Text(workerError).checklistFont(.micro).foregroundStyle(.secondary) }
+            if let workerError { Text(workerError).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
         }.padding(.horizontal, Spacing.page).padding(.bottom, Spacing.control)
             .sheet(isPresented:$savingView) {
                 VStack(alignment:.leading, spacing:Spacing.control) {

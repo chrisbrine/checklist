@@ -13,7 +13,7 @@ struct TrashTicketsView: View {
     var body: some View {
         VStack(alignment:.leading,spacing:Spacing.group) {
             HStack {Text("Trash").checklistFont(.sheetTitle);Spacer();Button("Close") {dismiss()}}
-            Text("Trashed tickets keep their notes and connections. Restore returns them to their earlier status and archive visibility.").checklistFont(.callout).foregroundStyle(.secondary)
+            Text("Trashed tickets keep their notes and connections. Restore returns them to their earlier status and archive visibility.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
             if loading {ProgressView("Loading Trash…")}
             if let failure {Text(failure).foregroundStyle(.orange)}
             HStack {Button("Refresh") {load()};if let cursor = page?.previousCursor {Button("Previous page") {load(cursor)}};if let cursor = page?.nextCursor {Button("Next page") {load(cursor)}}}.checklistDisabled([(loading,"Trash is still loading.")])

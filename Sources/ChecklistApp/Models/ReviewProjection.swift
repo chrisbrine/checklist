@@ -21,6 +21,12 @@ enum WorkActionProjection {
 /// Presentation of the exact submitted target. A passing historical verdict is never
 /// treated as authority for a replacement manifest or changed acceptance criteria.
 struct ReviewProjection {
+    static func findingDispositionLabel(_ resolution: Record) -> String {
+        guard resolution.string("disposition") == "waived" else {return resolution.string("disposition").capitalized}
+        let actor = resolution.string("origin") == "agent" ? "agent" : "owner"
+        return "Explicit " + actor + " waiver · not a passing check"
+    }
+
     let task: Record
     let project: Record?
     let manifests: [Record]
@@ -137,7 +143,7 @@ struct ReviewProjection {
         if messages.contains(where: { $0.bool("requires_action") && !$0.bool("addressed") }) { result.append("Address the outstanding owner direction.") }
         guard let current else { result.append("Submit the work for review."); return result }
         result.append(contentsOf: targetWarnings(current))
-        if !openBlockingFindings.isEmpty { result.append("\(openBlockingFindings.count) open finding\(openBlockingFindings.count == 1 ? " needs" : "s need") a fix or an owner waiver.") }
+        if !openBlockingFindings.isEmpty { result.append("\(openBlockingFindings.count) open finding\(openBlockingFindings.count == 1 ? " needs" : "s need") a fix or an explicit waiver.") }
         let hold = task.object("release_hold")
         if !hold.isEmpty { result.append("Accepted and held for release set \(hold["release_set"] as? String ?? ""). It completes with that set.") }
         for gate in gates(for: current) {

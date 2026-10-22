@@ -38,10 +38,10 @@ extension CommandRouter {
     /// Called inside the same validated semantic transaction as archive+its durable command receipt.
     /// No cleanup/delete/maintenance is performed here. The caller supplies a real future Undo deadline.
     func enqueueArchiveCleanupJob(_ db: Database,task: JSON,settingsRevision: Int64,previewID: String,plan: ArchiveRetentionPlan,nowMS: Int64,notBeforeMS: Int64,caller: Caller) throws -> JSON? {
-        try owner(caller)
         guard db.isInsideTransaction,let pid = task["project_id"] as? String,let tid = task["id"] as? String else {throw CoreError("CLEANUP_TRANSACTION_REQUIRED","Enqueue cleanup with the guarded archive transaction.")}
         _ = try scope(db,["project_id":pid],caller,write:true)
         let current = try scoped(db,tid,pid,type:"task"),project = try record(db,pid,type:"project")
+        try requireAgentEditAuthority(db,project:project,caller:caller)
         guard cleanupJobEqual(current["id"],tid),cleanupJobEqual(current["project_id"],pid),try ArchiveCleanupJob.integer(current["revision"]) == ArchiveCleanupJob.integer(task["revision"]),try ArchiveCleanupJob.integer(project["settings_revision"]) == settingsRevision,current["active_attempt_id"] == nil,current["active_verification_request_id"] == nil else {throw CoreError("CLEANUP_PREVIEW_STALE","Refresh archive cleanup after the task or settings change.")}
         guard !plan.selected.isEmpty else {return nil}
         guard plan.selected.count <= ArchiveCleanupJob.maximumItems else {throw CoreError("CLEANUP_JOB_TOO_LARGE","This cleanup job exceeds its bounded object limit. No cleanup was queued.")}
@@ -63,11 +63,11 @@ extension CommandRouter {
         try event(db,caller:caller,project:pid,entity:tid,kind:"archive_cleanup_queued",data:["cleanup_job_id":job.id.text,"selected_logical_original_bytes":try job.logicalTotals().selected])
         return try cleanupJobProjection(job,revision:1)
     }
-    /// Owner-only metadata/cancel/retry. Router dispatch/catalog additions remain explicit merge fragments.
+    /// Project-authorized metadata/cancel/retry. Router dispatch/catalog additions remain explicit merge fragments.
     /// handle owns the semantic transaction, command digest/receipt/replay and post-commit104+maintenance tail.
     func archiveCleanupJobCommand(_ db: Database,_ p: JSON,_ c: Caller,_ method: String,retryDeadline: (nowMS: Int64,notBeforeMS: Int64)? = nil) throws -> JSON {
         // Protective cancellation remains possible when the project itself is archived.
-        try owner(c);let pid = try scope(db,p,c,write:method == "cleanup_job_retry")
+        let pid = try scope(db,p,c,write:method == "cleanup_job_retry"); try requireAgentEditAuthority(db,project:try record(db,pid,type:"project"),caller:c)
         // Historical byte accounting grants no deletion authority. Its failure
         // must never prevent protective cancellation or invent a zero total.
         let accounting: (StorageBackupRetentionIndex,[Data:JSON])? = try? {

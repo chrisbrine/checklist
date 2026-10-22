@@ -103,6 +103,36 @@ final class AgentReviewAssessmentTests: XCTestCase {
         input["review_assessment"] = assessment
         assertCode("REVIEW_ASSESSMENT_INCOMPLETE") {_ = try self.router.dbQueue.read {try self.router.validateReviewAssessment($0,params:input,task:currentTask,attempt:a,verdict:"pass",caller:self.critic)}}
     }
+    func testNewReviewerReportRollbackDuringBackupCleansOnlyItsOwnFile() throws {
+        let (p,_,_,selectors) = try fixture(source:true),a = try call("work_claim",selectors,critic)
+        let input: JSON = ["project_id":p["id"]!,"attempt_id":a["id"]!,"claim_token":a["claim_token"]!,"title":"Synthetic report during backup","body":"Synthetic rollback evidence"]
+        let destination = directory.appendingPathComponent("report-backup")
+        var budget = StorageSnapshotBudget.production(),observed = false,committed: JSON = [:]
+        budget.observe = {event in
+            guard event == "copying_objects" else {return};observed = true
+            var rolledBackPath = ""
+            try ArchiveStorageGate.withExclusive(root:self.router.root) { _ in
+                try self.router.dbQueue.writeWithoutTransaction {db in
+                    try db.inTransaction {
+                        let artifact = try self.router.addAgentReviewEvidence(db,input,self.critic)
+                        rolledBackPath = try self.router.managedURL(artifact["path"] as! String,family:"objects").path
+                        XCTAssertTrue(FileManager.default.fileExists(atPath:rolledBackPath))
+                        return .rollback
+                    }
+                }
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath:rolledBackPath))
+            committed = try self.call("review_evidence_add",input,self.critic)
+            XCTAssertTrue(FileManager.default.fileExists(atPath:try self.router.managedURL(committed["path"] as! String,family:"objects").path))
+        }
+        _ = try router.executeStorageBackup(params:["command_id":UUID().uuidString,"path":destination.path],caller:owner,budget:budget)
+        XCTAssertTrue(observed)
+        XCTAssertTrue(FileManager.default.fileExists(atPath:try router.managedURL(committed["path"] as! String,family:"objects").path))
+        let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self,from:Data(contentsOf:destination.appendingPathComponent("manifest.json")))
+        XCTAssertFalse(manifest.objects.contains {$0.descriptor.authorities.contains("attachment:" + (committed["id"] as! String) + ":original")})
+        _ = try StorageSnapshot.reconcile(parent:directory,operation:UUID(uuidString:manifest.operationID)!,publicationName:destination.lastPathComponent,budget:.production())
+    }
+
     func testManagedReviewerReportBindsExactAttemptAndCleansBytesOnRollback() throws {
         let (p,t,_,selectors) = try fixture(source:true),a = try call("work_claim",selectors,critic)
         let input: JSON = ["project_id":p["id"]!,"attempt_id":a["id"]!,"claim_token":a["claim_token"]!,"title":"Independent review report","body":"Actual synthetic fixture report body; source files stay unchanged."]

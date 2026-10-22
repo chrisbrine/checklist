@@ -21,7 +21,9 @@ Slot attachment drafts and Open in… working copies use the sibling `caches/` f
 
 Secondary workspace windows keep slot preferences in the instance-specific suite `Checklist.Test<N>.Workspace.<window-uuid>`; live windows keep `Checklist.Workspace.<window-uuid>`. The standard preference domain follows the bundle ID (`org.checklist.app.testN`, live `org.checklist.app`); these files live separately in `~/Library/Preferences`. Human claims and pending commands use the Keychain service `Checklist.Test<N>.HumanClaim` (live `Checklist.HumanClaim`). `destroy` removes the slot's Keychain claims, preference domains and Saved Application State.
 
-The app never prompts for the Keychain; foreign or unreadable items are ignored, and pending-command recovery uses the new `pending-command-v2` / `pending-command-v2-window-<uuid>` accounts without reading or deleting legacy accounts. To remove the stale legacy item, the owner can run `security delete-generic-password -s Checklist.HumanClaim -a pending-command`.
+The app never prompts for the Keychain. Pending-command recovery uses `pending-command-v2` / `pending-command-v2-window-<uuid>` without reading or deleting legacy accounts. Each saved command records the connected store incarnation and the bundle-derived Mach service name. A recovery offer appears only after both match an accepted service read; **Check the last change** rechecks the incarnation before sending the original command UUID. A live command is refused by a test slot and a test command by live, even if a seed retained the same incarnation. An older incarnation, foreign service, malformed/unbound record or unreadable item is never sent and produces one plain-language in-app warning. Notice memory is local to the window account and survives relaunch; unreadable bytes share one warning interval until a readable/absent item or a new save is observed. No command is sent automatically. See [uncertain-command recovery](database-storage.md#uncertain-command-recovery-on-this-mac-cl-196).
+
+Ignored items remain in Keychain until replaced by a later save or explicitly removed. To remove one, quit the matching app and delete only its recovery item in Keychain Access, or run `security delete-generic-password -s Checklist.Test1.HumanClaim -a pending-command-v2` for slot 1; replace the slot number and use `pending-command-v2-window-<lowercase-window-uuid>` for a secondary window. Live uses service `Checklist.HumanClaim`. The owner can remove the stale pre-hotfix live item with `security delete-generic-password -s Checklist.HumanClaim -a pending-command`. Deleting an item does not undo a command that may already have committed.
 
 ## Seeds
 
@@ -58,6 +60,31 @@ The first start of a real-backup seed runs the protected pre-upgrade snapshot an
 The GUI window title identifies `Checklist Test N` and a persistent strip says **TEST INSTANCE N · synthetic/test data**. Headless operation covers the service, CLI and MCP. Human answers/approvals, `agent_rule_changes` and `backup_create` still require the actual signed GUI owner channel. A headless process gains no owner authority. Live owner drafts and the Finder data action keep their former fixed Library paths even under `CHECKLIST_DATA_ROOT`; test slots use their own derived root. Both ordinary and review handoff prompts retain the exact former live CLI literal for no slot, and use the test bundle’s shell-quoted CLI path for a test slot.
 
 `check` runs the 18 CLI argument guards, service status and the official-SDK MCP smoke's `--service-only` mode using that slot's CLI. The MCP probe uses an explicit unenrolled binding, reads service information and checks the limited catalog, schema rejection and resources without bootstrapping a native conversation. The receipt also records a read-only observation of the running store’s schema, quick check and record counts, including committed WAL data. These are bounded smoke checks; acceptance cases for a particular change still need their own evidence.
+
+## Selected-record qualification faults (CL-205)
+
+Only a GUI app with a valid `ChecklistInstanceSlot` reads `checklistQualificationFaults`, and it reads exactly its own preference domain (`org.checklist.app.testN`). Live apps never read this key. Global defaults, command-line defaults and secondary-window suites cannot arm it. This is an app-client fault; the service, SQLite store, CLI and MCP are unaffected.
+
+The value is a dictionary with `selected_records` equal to `cursor_reset_twice` or `fresh_context_fail`, and `remaining` a positive integer. Each injected client read decrements `remaining` in that same slot domain; zero disables it. Invalid values are inactive. `cursor_reset_twice` injects `CURSOR_RESET` at `ui_records` / `ui_history` reads, including the bounded retry. `fresh_context_fail` injects `CURSOR_RESET` at those reads and `QUALIFICATION_FRESH_CONTEXT_FAILED` at the shared CL-174 fresh-context recovery read. Ordinary selected-ticket `ui` reads are unaffected. The budget is shared across windows and record/history reads, so use one window and one action for a deterministic observation.
+
+For a selected synthetic ticket in slot 1, arm **two** read faults before loading current work/review records or opening a record-history page:
+
+```sh
+defaults write org.checklist.app.test1 checklistQualificationFaults -dict selected_records -string cursor_reset_twice remaining -int 2
+# Alternatively, fail the fresh context after the first injected reset:
+defaults write org.checklist.app.test1 checklistQualificationFaults -dict selected_records -string fresh_context_fail remaining -int 2
+```
+
+The slot strip shows **TEST FAULT · N remaining** while armed (external preference changes appear within about one second). Each injected fault writes a unified-log notice in category `QualificationFaults` with slot domain, read boundary, error code and remaining count:
+
+```sh
+log show --last 5m --style compact --predicate 'category == "QualificationFaults"'
+defaults read org.checklist.app.test1 checklistQualificationFaults
+# Disarm explicitly if the check ends before the budget is used:
+defaults delete org.checklist.app.test1 checklistQualificationFaults
+```
+
+With `cursor_reset_twice` and `remaining=2`, the first record read resets, the existing recovery fetches fresh context, and the one retry resets again. Observe the selected ticket's “context changed again” explanation and **Refresh selected ticket** action. With `fresh_context_fail` and `remaining=2`, observe the concrete “TEST FAULT: selected-ticket fresh context read failed” cause and the same refresh action. In both cases confirm the unsent draft is kept, the stored count is zero, the marker disappears and a subsequent refresh/read works. A budget of one injects only the initial reset; use two for the terminal-state check. These instructions prepare an observation; they do not establish an installed pass. The non-contributor runner must record the exact installed build and native result, then close the qualification slot app and restore the real Checklist window.
 
 ## Promotion and cleanup
 

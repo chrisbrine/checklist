@@ -88,7 +88,7 @@ final class HumanGateDirectionTests: XCTestCase {
     func testPendingDirectionStillAllowsNonGateAnswerAndNonVerdictApprovalResponses() throws {
         let value = try fixture()
         _ = try call("message_send",["project_id":value.project["id"]!,"task_id":value.task["id"]!,"body":"New direction remains pending","requires_action":true])
-        var answer = try approval(value);answer["answers"] = [["question_id":"approve","result":"not_checked"]]
+        var answer = try approval(value);answer["response"] = "clarification";answer["explanation"] = "I have not checked this target";answer["answers"] = [["question_id":"approve","result":"not_checked"]]
         let unchecked = try call("human_request_answer",answer)
         XCTAssertEqual(unchecked["state"] as? String,"pending");XCTAssertNil(unchecked["gate_verdict_id"])
         let clarification = try call("human_request_answer",["project_id":value.project["id"]!,"request_id":value.request["id"]!,"expected_revision":unchecked["revision"]!,"response":"clarification","explanation":"Need a closer view"])

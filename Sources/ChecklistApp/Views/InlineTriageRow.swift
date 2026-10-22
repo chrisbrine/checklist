@@ -20,7 +20,7 @@ struct InlineTriageRow: View {
                 Button { expanded.toggle() } label: {
                     HStack(alignment: .center, spacing: Spacing.row) {
                         // The disclosure glyph fits its fixed twelve-point column independently of text scale.
-                        Image(systemName: expanded ? "chevron.down" : "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary).frame(width: 12)
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(Color.checklistSecondaryText).frame(width: 12)
                         Image(systemName: "tray.2").foregroundStyle(Color.checklistAccentText)
                         VStack(alignment: .leading, spacing: Spacing.tight) {
                             Text(ProductionGroups.label(section.triage)).checklistFont(.bodyStrong).frame(maxWidth: .infinity, alignment: .leading)
@@ -30,7 +30,7 @@ struct InlineTriageRow: View {
                                 Text("·")
                                 Text(section.visibleMembers.count == section.totalCount ? "\(section.totalCount) tickets" : "\(section.visibleMembers.count) of \(section.totalCount) tickets shown")
                                 if section.triage.bool("active_attention") { Text("· In progress") }
-                            }.checklistFont(.micro).foregroundStyle(.secondary)
+                            }.checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                         }
                     }.padding(.leading, Spacing.small).padding(.vertical, Spacing.small)
                 }.buttonStyle(.checklistRow).accessibilityIdentifier("triageRow-\(section.id)").accessibilityLabel("\(ProductionGroups.label(section.triage)), \(expanded ? "expanded" : "collapsed") Triage")
@@ -43,7 +43,7 @@ struct InlineTriageRow: View {
                     }
                 } label: {
                     // The disclosure glyph stays small beside the status pill.
-                    HStack(spacing: Spacing.tight) { StatusPill(name: statusName, category: section.totalCount == 0 ? "draft" : section.triage.values["members_complete"] as? Bool == false ? section.triage.string("status_category", fallback: "mixed") : uniformStatus?.string("status_category") ?? "mixed"); Image(systemName: "chevron.down").font(.system(size: 8)).foregroundStyle(.secondary) }.accessibilityElement(children: .ignore)
+                    HStack(spacing: Spacing.tight) { StatusPill(name: statusName, category: section.totalCount == 0 ? "draft" : section.triage.values["members_complete"] as? Bool == false ? section.triage.string("status_category", fallback: "mixed") : uniformStatus?.string("status_category") ?? "mixed"); Image(systemName: "chevron.down").font(.system(size: 8)).foregroundStyle(Color.checklistSecondaryText) }.accessibilityElement(children: .ignore)
                 }.menuStyle(.button).buttonStyle(.checklistPlain).menuIndicator(.hidden).fixedSize().checklistDisabled([(preparingStatus, "The status change is being prepared."), (section.totalCount == 0, "This Triage has no tickets."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)]).help("Change the status of every current ticket in this Triage").accessibilityLabel("Triage status: \(statusName)")
                 Menu {
                     Button("Edit Triage / add or remove tickets…") { store.open(.group(section.id)) }
@@ -121,7 +121,7 @@ struct InlineTriageMemberRow: View {
             TaskRow(task: task)
             HStack(spacing: Spacing.small) {
                 if task.string("readiness") != "draft" && !TicketVisibility.isClosed(task) { TicketStatusPills(task: task) }
-                if let epic = store.groups.first(where: { $0.id == task.string("epic_id") && $0.string("kind") == "epic" }) { Text(ProductionGroups.label(epic)).checklistFont(.micro).foregroundStyle(.secondary) }
+                if let epic = store.groups.first(where: { $0.id == task.string("epic_id") && $0.string("kind") == "epic" }) { Text(ProductionGroups.label(epic)).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             }.padding(.leading, 39).padding(.bottom, Spacing.small) // Align metadata with the title after its icon.
         }.padding(.leading, 19).triageMemberRule() // Indent members under the disclosure control.
     }

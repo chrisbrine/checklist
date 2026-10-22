@@ -79,6 +79,52 @@ import ChecklistIPC
     private func changes(_ pid:String,families:[String],task:String?=nil)->[String:Any] {
         ["event_cursor":"observed-interval","coverage":["schema_version":2,"complete":true,"reset":false,"changes":[["project_id":pid,"families":families,"task_ids":task.map{[$0]} ?? [],"all_tasks":task==nil]]]]
     }
+    func testAnswerAndDeclineImmediatelyRemoveNeedsYouRowsAndCountsBeforeRefresh() async throws {
+        for page in [Page.needsYou,.overview] {
+            for result in ["passed","declined"] {
+                let f = try Fixture(defaults:isolatedDefaults("ImmediateHumanAnswer")); defer { f.cleanup() }
+                f.preferences.set(page.rawValue,forKey:"lastPage")
+                let input: [String:Any] = ["project_id":f.a,"task_id":f.task,"title":"Answer this check","questions":[["id":"q","prompt":"Keyboard navigation is on","type":"check"]]]
+                let request = Record(values:try f.command("human_request_create",input)["data"] as! [String:Any])
+                let initial = result == "passed" ? 1 : 2
+                if initial == 2 {
+                    let other = try f.command("task_create",["project_id":f.a,"title":"Unrelated question target"])["data"] as! [String:Any]
+                    _ = try f.command("human_request_create",["project_id":f.a,"task_id":other["id"]!,"title":"Keep this request","questions":[["id":"q","prompt":"Keep pending"]]])
+                }
+                let store = f.store(), live = Task { await store.startLiveUpdates() }
+                defer { live.cancel(); f.release(); store.stopWindowReads() }
+                try await until { store.connected && (page == .needsYou ? store.workspaceTotal == initial : store.overviewObservations["requests"]?.page?.total == initial) }
+                store.open(.request(request.id))
+                try await until { store.selectedOther?.id == request.id && !store.otherDetailLoading }
+                XCTAssertEqual(store.needsCount,initial)
+                var draft = AnswerDraft(revision:request.integer("revision"))
+                draft.targetIdentity = RequestDraftIdentity.form(request); draft.formRevision = request.integer("form_revision")
+                draft.values = ["q":result]
+                XCTAssertTrue(RequestDraftIdentity.isComplete(draft,questions:request.records("questions"),fileRequests:[]))
+                draft.values["q"] = "not_checked"
+                XCTAssertFalse(RequestDraftIdentity.isComplete(draft,questions:request.records("questions"),fileRequests:[]))
+                draft.values["q"] = result
+                let submission = RequestAnswerSubmission(request:request,action:"answered")
+                f.holdSurface = page == .needsYou ? "requests" : "overview"
+                var completion: RequestAnswerCompletion?
+                let params: [String:Any] = ["project_id":f.a,"request_id":request.id,"expected_revision":request.integer("revision"),"form_identity":draft.targetIdentity,"response":"answered","answers":[["question_id":"q","result":result]]]
+                store.run("human_request_answer",params) { reply in
+                    completion = submission.reconcile(Record(values:reply),currentRequest:store.requests.first { $0.id == request.id },currentDetail:store.detail,draft:draft)
+                }
+                try await until { f.held != nil }
+                XCTAssertTrue(store.busy,"The refresh is still waiting")
+                XCTAssertEqual(completion?.shouldDismiss,true,"The confirmed send reconciles before waiting for refresh")
+                XCTAssertEqual(store.selectedOther?.string("state"),"answered")
+                let rows = page == .needsYou ? store.workspaceRows : store.overviewObservations["requests"]?.page?.rows ?? []
+                XCTAssertFalse(rows.contains { $0.id == request.id })
+                XCTAssertEqual(rows.count,initial - 1)
+                XCTAssertEqual(store.needsCount,initial - 1,"The sidebar count changes from the committed receipt")
+                XCTAssertEqual(DockBadge.label(count:store.needsCount,enabled:true),initial == 1 ? nil : "1","The Dock consumes the same updated count")
+                f.release(); try await until { !store.busy }
+                XCTAssertEqual(store.needsCount,initial - 1,"The later refresh cannot subtract the same request twice")
+            }
+        }
+    }
     func testReadDeadlinesEndLoadingAndLaterTicketAndRecordReadsRecover()async throws {
         let f=try Fixture(defaults:isolatedDefaults("ScopedAppReadFailure"));defer {f.cleanup()}
         f.preferences.set(Page.tasks.rawValue,forKey:"lastPage")

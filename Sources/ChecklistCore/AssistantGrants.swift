@@ -1,4 +1,5 @@
 import Foundation
+import ChecklistProviders
 import GRDB
 
 extension CommandRouter {
@@ -20,7 +21,7 @@ extension CommandRouter {
     }
     func canReceive(_ session: JSON,project: String) -> Bool {
         guard !["revoked","ended"].contains(session["state"] as? String ?? ""),(strings(session,"project_ids").contains(project) || session["project_id"] as? String == project) else { return false }
-        guard session["role"] as? String == "assistant" else { return session["role"] as? String == "worker" }
+        guard session["role"] as? String == "assistant" else { return session["role"] as? String == "worker" && providerPlugins.plugin(session["provider"] as? String ?? "", requiring: .pickup) != nil }
         let grants = session["assistant_grants"] as? [String:[String:Bool]] ?? [:]
         return grants[project]?["read"] == true && grants[project]?["receive_messages"] == true
     }

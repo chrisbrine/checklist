@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "blocks": [
+    {
+      "block_id": "report",
+      "type": "markdown",
+      "fallback": "## Synthetic frame-time report\n\nReported measurements only; exact-build evidence remains separate."
+    },
+    {
+      "block_id": "measurements",
+      "type": "table",
+      "fallback": "| Build | Frame time (ms) |\n| --- | --- |\n| Before | 24 |\n| After | 16 |",
+      "columns": [
+        {
+          "id": "build",
+          "label": "Build"
+        },
+        {
+          "id": "frame-time",
+          "label": "Frame time (ms)"
+        }
+      ],
+      "rows": [
+        [
+          "Before",
+          "24"
+        ],
+        [
+          "After",
+          "16"
+        ]
+      ]
+    },
+    {
+      "block_id": "chart",
+      "type": "chart",
+      "fallback": "Frame time (ms): before 24; after 16. Target: at most 20 ms.",
+      "chart_kind": "bar",
+      "x_label": "Build",
+      "y_label": "Frame time",
+      "y_unit": "ms",
+      "series": [
+        {
+          "label": "Measured",
+          "points": [
+            {
+              "x": "before",
+              "y": 24
+            },
+            {
+              "x": "after",
+              "y": 16
+            }
+          ]
+        }
+      ],
+      "caption": "Target: at most 20 ms."
+    },
+    {
+      "block_id": "comparison",
+      "type": "html",
+      "fallback": "Comparison: before 24 ms; after 16 ms. These are reported values.",
+      "html": "<section class=\"comparison\" aria-label=\"Frame time comparison\"><p>Before: <strong>24 ms</strong></p><p>After: <strong>16 ms</strong></p></section>",
+      "css": ".comparison { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 1rem; }"
+    },
+    {
+      "block_id": "capture",
+      "type": "media",
+      "fallback": "Synthetic comparison screenshot attachment. Original availability must be checked before viewing.",
+      "attachment_ref": {
+        "attachment_id": "30000000-0000-4000-8000-000000000001",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "representation": "original"
+      },
+      "media_kind": "image",
+      "caption": "Synthetic planning reference, not installed verification."
+    }
+  ]
+}

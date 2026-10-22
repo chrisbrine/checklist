@@ -31,13 +31,13 @@ struct AttachmentCaptureSection: View {
                 }.menuStyle(.button).buttonStyle(.checklistBordered).menuIndicator(.hidden)
                     .accessibilityLabel("Import as").accessibilityValue(mode == "managed" ? "Managed copy" : "External reference")
             }.checklistDisabled([(!canSelect, "Choose a project before adding files.")])
-            if destination.projectID.isEmpty { Text("Choose a project before selecting files.").checklistFont(.micro).foregroundStyle(.secondary) }
-            Text("Drop images or files here. Managed copies keep the Finder original; references keep using its external location.").checklistFont(.micro).foregroundStyle(.secondary)
+            if destination.projectID.isEmpty { Text("Choose a project before selecting files.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+            Text("Drop images or files here. Managed copies keep the Finder original; references keep using its external location.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             if !selected.isEmpty {
                 ScrollView {
                     VStack(alignment:.leading,spacing: Spacing.compact) {
                         ForEach(selected) { item in
-                            AccessibleHStack { Label(item.url.lastPathComponent,systemImage:item.mode == "reference" ? "link" : "doc").lineLimit(1);Text(item.mode == "reference" ? "Reference" : "Managed copy").checklistFont(.micro).foregroundStyle(.secondary);Spacer();Button("Remove") { pending.removeAll {$0.id == item.id};item.removeOwnedStaging() }.buttonStyle(.link).checklistDisabled([(disabled, "Files cannot change while the ticket is being created.")]) }
+                            AccessibleHStack { Label(item.url.lastPathComponent,systemImage:item.mode == "reference" ? "link" : "doc").lineLimit(1);Text(item.mode == "reference" ? "Reference" : "Managed copy").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText);Spacer();Button("Remove") { pending.removeAll {$0.id == item.id};item.removeOwnedStaging() }.buttonStyle(.link).checklistDisabled([(disabled, "Files cannot change while the ticket is being created.")]) }
                         }
                     }
                 }.frame(height:min(280, CGFloat(selected.count * 26) * textScale * textScale))

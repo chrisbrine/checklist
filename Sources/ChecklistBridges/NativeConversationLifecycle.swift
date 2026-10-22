@@ -1,7 +1,7 @@
 import Foundation
-import CoreFoundation
 import CryptoKit
 import Darwin
+import ChecklistProviders
 
 /// Service-owned registration, derived from an authenticated automatic bootstrap.
 /// An MCP/CLI shim PID must never be substituted for this native host identity.
@@ -13,9 +13,10 @@ public struct NativeLifecycleRegistration: Sendable {
     public let startMicroseconds: UInt64
     public let registryPath: String?
 
-    public init?(provider: String, sessionID: String, executionDomain: String, registryPath: String?) {
+    public init?(provider: String, sessionID: String, executionDomain: String, registryPath: String?,
+                 providerRegistry: ProviderPluginRegistry = .bundled) {
         let parts = executionDomain.split(separator: ":", omittingEmptySubsequences: false)
-        guard ["codex", "claude"].contains(provider), parts.count == 4,
+        guard providerRegistry.plugin(provider, requiring: .workSession) != nil, parts.count == 4,
               parts[0] == provider, UUID(uuidString: sessionID) != nil,
               let pid = Int32(parts[1]), pid > 1,
               let seconds = UInt64(parts[2]), seconds > 0,
@@ -42,9 +43,10 @@ public struct NativeLifecycleObservation: Sendable {
 }
 
 public enum NativeLifecycleInspector {
-    public static func inspect(_ registration: NativeLifecycleRegistration) -> NativeLifecycleObservation {
+    public static func inspect(_ registration: NativeLifecycleRegistration,
+                               providerRegistry: ProviderPluginRegistry = .bundled) -> NativeLifecycleObservation {
         let process = processState(registration)
-        let registry = registryState(registration)
+        let registry = registryState(registration, providerRegistry: providerRegistry)
         return .init(process: process, registry: registry.state, detail: registry.detail, registryDigest: registry.digest)
     }
 
@@ -60,10 +62,15 @@ public enum NativeLifecycleInspector {
         return kill(registration.processID, 0) == -1 && errno == ESRCH ? .gone : .unknown
     }
 
-    private static func registryState(_ registration: NativeLifecycleRegistration) -> (state: NativeLifecycleObservation.RegistryState, detail: String, digest: String?) {
-        // Current Codex bootstrap has no qualified per-thread registry. Host
-        // death, stdio EOF, a completed turn or thread unload cannot invent one.
-        guard registration.provider == "claude", let path = registration.registryPath else {
+    private static func registryState(_ registration: NativeLifecycleRegistration,
+                                      providerRegistry: ProviderPluginRegistry) -> (state: NativeLifecycleObservation.RegistryState, detail: String, digest: String?) {
+        // Capabilities require both reviewed plugin qualification and its native
+        // schema adapter. Host death, stdio EOF or thread unload cannot invent one.
+        // Inspecting current peer identity is also needed by native transport.
+        // Automatic closure/release is separately gated by the service monitor.
+        guard let plugin = providerRegistry.plugin(registration.provider, requiring: .workSession),
+              let identityReader = plugin as? NativeRegistryIdentityReader,
+              let path = registration.registryPath else {
             return (.unsupported, "No qualified native conversation registry is available.", nil)
         }
         let url = URL(fileURLWithPath: path)
@@ -99,14 +106,11 @@ public enum NativeLifecycleInspector {
         }
         let data = Data(bytes.prefix(count))
         guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let pid = object["pid"] as? NSNumber, CFGetTypeID(pid) != CFBooleanGetTypeID(),
-              pid.doubleValue == Double(registration.processID),
-              let session = object["sessionId"] as? String, UUID(uuidString: session) != nil,
-              let cwd = object["cwd"] as? String, cwd.hasPrefix("/") else {
+              let identity = identityReader.registryIdentity(object), identity.processID == registration.processID else {
             return (.unknown, "The native registry has no valid process/session/workspace identity.", nil)
         }
         let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        return session.utf8.elementsEqual(registration.sessionID.utf8)
+        return identity.sessionID.utf8.elementsEqual(registration.sessionID.utf8)
             ? (.matching, "The registry still identifies this conversation.", digest)
             : (.replaced, "A valid registry at this address identifies a different conversation.", digest)
     }

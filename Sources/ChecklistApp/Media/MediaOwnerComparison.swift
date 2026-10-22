@@ -12,53 +12,51 @@ struct MediaOwnerComparison: View {
             if !model.item.id.isEmpty {
                 Text(model.item.string("title")).font(.title3).accessibilityAddTraits(.isHeader)
                 Text(model.item.string("disposition").replacingOccurrences(of:"_",with:" ").capitalized).font(.headline)
-                Text("Target: "+(model.item.object("target")["id"] as? String ?? "")+" · Context: "+(model.item.object("target")["context_id"] as? String ?? "")).font(.caption).textSelection(.enabled)
                 if !model.item.object("decision").isEmpty {
                     let decision=Record(values:model.item.object("decision"))
-                    Text("Last owner action: "+decision.string("disposition")+" · "+decision.string("created_at")+" · "+decision.string("origin")+" · "+decision.string("author_session_id")).font(.caption).textSelection(.enabled)
+                    Text("Last owner action: "+GlossaryText.title(decision.string("disposition"))+" · "+MediaComparisonLabels.time(decision.string("created_at"))+" · "+MediaComparisonLabels.origin(decision.string("origin"))).font(.caption).textSelection(.enabled)
                     Text(decision.string("note")).textSelection(.enabled)
                 }
-                ForEach(model.item.records("candidates")) {candidate in
+                ForEach(candidateChoices) {choice in
+                    let candidate=choice.candidate
                     VStack(alignment:.leading,spacing:6) {
-                        Text("Candidate "+String(candidate.id.prefix(8))).font(.headline)
-                        Text("Source: "+candidate.string("source_name",fallback:"Inline text")+" · Captured by "+candidate.string("author_session_id")+" · "+candidate.string("origin")+" · "+candidate.string("created_at")).font(.caption)
+                        Text(choice.label).font(.headline).accessibilityLabel(choice.label)
                         ForEach(candidate.records("slots"),id:\.stringID) {slot in
                             MediaSlotView(model:model,slot:slot,example:nil)
                         }
                     }.padding(8).background(.quaternary.opacity(0.3),in:RoundedRectangle(cornerRadius:6))
                 }
-                if model.item.records("candidates").isEmpty {Text("No captured original. Title-only Draft; publication and owner decisions require captured material.").foregroundStyle(.secondary)}
-                if !model.item.object("target").isEmpty {
-                    Text("Basis: "+(model.item.object("target")["review_basis_signature"] as? String ?? "")).font(.caption2).textSelection(.enabled)
-                }
+                if model.item.records("candidates").isEmpty {Text("No captured original. Title-only Draft; publication and owner decisions require captured material.").foregroundStyle(Color.checklistSecondaryText)}
                 Button(model.examplesShown ? "Hide past approved examples" : "Show past approved examples") {Task {await model.showExamples(!model.examplesShown)}}
                     .accessibilityIdentifier("mediaExamplesToggle")
                 if model.examplesShown {
                     Text("Historical owner-accepted examples — no current approval. Availability and current acceptance are rechecked when shown.").font(.caption)
-                    if model.examples.isEmpty {Text("No matching available approved examples.").foregroundStyle(.secondary)}
+                    if model.examples.isEmpty {Text("No matching available approved examples.").foregroundStyle(Color.checklistSecondaryText)}
                     ForEach(model.examples) {example in
                         VStack(alignment:.leading) {
                             Text(example.string("title")).font(.headline)
                             Text(example.string("historical_context_label")).font(.caption)
-                            Text(example.string("round_title")+" · "+example.string("source_name")+" · "+example.string("decision_created_at")+" · "+example.string("decision_origin")+" · "+example.string("decision_author_session_id")).font(.caption)
-                            Text("Round: "+example.string("round_id")+" · Context: "+example.string("context_id")+" · Decision: "+example.string("decision_id")).font(.caption2).textSelection(.enabled)
+                            Text(example.string("round_title")+" · "+example.string("source_name")+" · "+MediaComparisonLabels.time(example.string("decision_created_at"))+" · "+MediaComparisonLabels.origin(example.string("decision_origin"))).font(.caption)
                             ForEach(example.records("slots"),id:\.stringID) {slot in MediaSlotView(model:model,slot:slot,example:example)}
                         }.padding(8).background(.quaternary.opacity(0.3),in:RoundedRectangle(cornerRadius:6))
                     }
                     if model.examplesNext != nil {Button("More approved examples") {Task {await model.showExamples(true,more:true)}}}
                 }
                 if model.writable {ownerActions}
-            } else {Text("Select a media item to inspect its exact original and history.").foregroundStyle(.secondary)}
+                TechnicalDetails(raw: [("Selected media and candidates",model.item.values),("Historical examples",model.examples.map(\.values)),("Review attention",model.header.records("attention").map(\.values)),("Review context sources",model.header.records("context_sources").map(\.values)),("Proposed context sources",model.header.records("attention_sources").map(\.values))]).id(model.item.id)
+            } else {Text("Select a media item to inspect its exact original and history.").foregroundStyle(Color.checklistSecondaryText)}
         }.accessibilityElement(children:.contain).accessibilityIdentifier("mediaComparison")
+    }
+    var candidateChoices: [MediaCandidateChoice] {
+        MediaComparisonLabels.choices(item:model.item,definitions:model.slots)
     }
     var ownerActions: some View {
         VStack(alignment:.leading,spacing:8) {
             if !model.header.records("attention").isEmpty {
                 Text("Approved context changed. Your input is saved. Inspect the current attention before keeping or migrating.").foregroundStyle(.orange)
                 ForEach(model.header.records("attention_sources")) {source in
-                    Text(source.string("body",fallback:source.string("rubric",fallback:String(describing:source.object("approved_context"))))).font(.caption).textSelection(.enabled)
+                    Text(MediaComparisonLabels.context(source)).font(.caption).textSelection(.enabled)
                 }
-                ForEach(model.header.records("attention")) {attention in Text("Attention: "+attention.id+" · Source: "+attention.string("source_id")).font(.caption).textSelection(.enabled)}
                 TextField("Reason for keeping or migrating context",text:$model.draft.reconciliationReason)
                 HStack {
                     Button("Keep pinned context") {model.reconcile("keep")}
@@ -66,7 +64,7 @@ struct MediaOwnerComparison: View {
                 }.checklistDisabled([(model.draft.reconciliationReason.isEmpty,"Enter a reason for keeping or migrating context."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
             }
             DisclosureGroup("Approved review context") {
-                ForEach(model.header.records("context_sources")) {source in Text(source.string("body",fallback:String(describing:source.object("approved_context")))).textSelection(.enabled)}
+                ForEach(model.header.records("context_sources")) {source in Text(MediaComparisonLabels.context(source)).textSelection(.enabled)}
                 TextField("Requires-action direction for this round",text:$direction)
                 Button("Approve direction for this round") {model.mutate("media_context_approve",["kind":"direction","body":direction,"round_id":model.roundID]) {_ in direction=""}}
                     .checklistDisabled([(direction.isEmpty,"Enter the direction to approve."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
@@ -77,7 +75,7 @@ struct MediaOwnerComparison: View {
             }
             Picker("Winning candidate",selection:$model.draft.winnerID) {
                 Text("Choose a winner").tag("")
-                ForEach(model.item.records("candidates")) {Text(String($0.id.prefix(12))).tag($0.id)}
+                ForEach(candidateChoices) {choice in Text(choice.label).tag(choice.id).accessibilityLabel(choice.label)}
             }
             Text("Owner note · saved on this Mac, not sent").font(.caption)
             TextEditor(text:$model.draft.note).frame(minHeight:80).overlay(RoundedRectangle(cornerRadius:4).stroke(.separator)).accessibilityLabel("Media owner decision note")
@@ -86,7 +84,7 @@ struct MediaOwnerComparison: View {
                 HStack {decisionButtons}
                 VStack(alignment:.leading) {decisionButtons}
             }.checklistDisabled([(!model.decisionEnabled,"Publish the selected item and choose whether to keep or update its review context before deciding."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
-            Text("Unanswered stays Pending. Show/Hide never records a decision. Changes requested creates no ticket here; rework and review closure are a later slice.").font(.caption).foregroundStyle(.secondary)
+            Text("Unanswered stays Pending. Show/Hide never records a decision. Changes requested creates no ticket here; rework and review closure are a later slice.").font(.caption).foregroundStyle(Color.checklistSecondaryText)
         }
     }
     @ViewBuilder var decisionButtons: some View {
@@ -97,6 +95,57 @@ struct MediaOwnerComparison: View {
     }
 }
 private extension Record {var stringID:String {string("slot_id")}}
+
+/// Human labels share the exact candidate ordering in cards and winner choices.
+/// IDs remain selection values; full provenance and hashes belong to TechnicalDetails.
+struct MediaCandidateChoice: Identifiable {
+    let candidate: Record
+    let label: String
+    var id: String { candidate.id }
+}
+enum MediaComparisonLabels {
+    static func context(_ source: Record) -> String {
+        if !source.string("body").isEmpty {return source.string("body")}
+        if !source.string("rubric").isEmpty {return source.string("rubric")}
+        let approved=Record(values:source.object("approved_context"))
+        let text=([approved.string("brief")]+approved.records("pinned_decisions").map {
+            [$0.string("title"),$0.string("body")].filter {!$0.isEmpty}.joined(separator:": ")
+        }).filter {!$0.isEmpty}.joined(separator:"\n\n")
+        return text.isEmpty ? "No written review context." : text
+    }
+    static func origin(_ value: String) -> String {
+        switch value {
+        case "human_ui": return "Owner"
+        case "agent": return "Agent capture"
+        default: return "Recorded capture"
+        }
+    }
+    static func time(_ value: String) -> String {
+        let parser=ISO8601DateFormatter()
+        parser.formatOptions=[.withInternetDateTime,.withFractionalSeconds]
+        let date=parser.date(from:value) ?? ISO8601DateFormatter().date(from:value)
+        return date?.formatted(date:.abbreviated,time:.shortened) ?? "Time unavailable"
+    }
+    static func slot(_ slot: Record, definitions: [Record]) -> String {
+        let index=definitions.firstIndex {$0.id==slot.string("slot_id")}
+        let definition=index.map {definitions[$0]}
+        let label=definition?.string("label") ?? ""
+        if !label.isEmpty, label != definition?.id {return label}
+        let kind=definition?.string("kind") ?? (slot.values["text"] is String ? "text" : slot.string("media_kind"))
+        let name=["text","image","audio","video"].contains(kind) ? kind.capitalized : "Media"
+        return name+" slot"+(index.map {" \($0+1)"} ?? "")
+    }
+    static func imageAccessibilityLabel(_ slot: Record, definitions: [Record]) -> String {
+        "Verified original image, "+self.slot(slot,definitions:definitions)
+    }
+    static func choices(item: Record, definitions: [Record]) -> [MediaCandidateChoice] {
+        item.records("candidates").enumerated().map {index,candidate in
+            let slots=candidate.records("slots").map {slot($0,definitions:definitions)}.joined(separator:", ")
+            let label=["Candidate \(index+1)",item.string("title"),candidate.string("source_name",fallback:"Inline text"),origin(candidate.string("origin")),time(candidate.string("created_at")),slots].filter {!$0.isEmpty}.joined(separator:" · ")
+            return MediaCandidateChoice(candidate:candidate,label:label)
+        }
+    }
+}
 
 enum MediaComparisonAvailability: Equatable {
     case text(String),image,unavailable(String),unsupported(String)
@@ -125,12 +174,12 @@ struct MediaSlotView: View {
     var active:Bool {model.imageIsActive(imageKey,historical:example != nil)}
     var body: some View {
         VStack(alignment:.leading,spacing:4) {
-            Text("Slot: "+slot.string("slot_id")+" · SHA-256: "+slot.string("sha256")).font(.caption2).textSelection(.enabled)
+            Text(MediaComparisonLabels.slot(slot,definitions:model.slots)).font(.caption)
             switch MediaComparisonAvailability.resolve(slot:slot,original:original) {
             case .text(let value): Text(value).textSelection(.enabled).frame(maxWidth:.infinity,alignment:.leading).accessibilityLabel("Exact captured text: "+value)
-            case .unavailable(let reason),.unsupported(let reason):Text(reason).foregroundStyle(.secondary)
+            case .unavailable(let reason),.unsupported(let reason):Text(reason).foregroundStyle(Color.checklistSecondaryText)
             case .image:
-                if active,let image {Image(nsImage:image).resizable().scaledToFit().frame(maxWidth:460,maxHeight:300).accessibilityLabel("Verified original image, slot "+slot.string("slot_id")+", SHA-256 "+slot.string("sha256"))}
+                if active,let image {Image(nsImage:image).resizable().scaledToFit().frame(maxWidth:460,maxHeight:300).accessibilityLabel(MediaComparisonLabels.imageAccessibilityLabel(slot,definitions:model.slots))}
                 else {Text(active ? status : "Image not loaded");Button("Load exact image") {Task {await load()}}.checklistDisabled([(model.imageLoads>=2,"Two original images are loading. Wait for one to finish.")])}
             }
         }

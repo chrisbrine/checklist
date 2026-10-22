@@ -83,6 +83,29 @@ typealias MediaValues = [String: Any]
             Task {await self.refresh()}
         }
     }
+    // Capture the displayed object/revision/reason before the native dialog opens.
+    // Live refresh must not retarget a later confirmation to a different object.
+    func retireTypeConfirmation(_ type: Record) -> PendingConfirmation {
+        let project = projectID
+        return Confirmations.retireMediaType(type.string("title")) { [weak self] in
+            guard let self, self.projectID == project else { return }
+            self.mutate("media_type_retire", ["type_id":type.id,"expected_revision":type.integer("revision")])
+        }
+    }
+    func cancelRoundConfirmation(reason: String) -> PendingConfirmation {
+        let project = projectID, round = header, id = roundID
+        return Confirmations.cancelMediaRound(round.string("title")) { [weak self] in
+            guard let self, self.projectID == project else { return }
+            self.mutate("media_round_cancel", ["round_id":id,"expected_revision":round.integer("revision"),"reason":reason])
+        }
+    }
+    func archiveRoundConfirmation() -> PendingConfirmation {
+        let project = projectID, round = header, id = roundID
+        return Confirmations.archiveMediaRound(round.string("title")) { [weak self] in
+            guard let self, self.projectID == project else { return }
+            self.mutate("media_round_archive", ["round_id":id,"expected_revision":round.integer("revision")])
+        }
+    }
     func refresh() async {
         guard !projectID.isEmpty else {return}
         let token=UUID();epoch=token;loading=true

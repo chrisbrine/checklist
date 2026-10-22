@@ -37,7 +37,7 @@ struct RequestAnswerSubmission {
         let complete = response.bool("complete")
         guard complete ? action == "answered" && recorded.string("state") == "answered" : recorded.string("state") == "pending" else { return nil }
         let notChecked = response.records("answers").contains { $0.string("result", fallback: $0.string("value")) == "not_checked" }
-        guard !(complete && notChecked), action != "answered" || complete || notChecked else { return nil }
+        guard !(complete && notChecked), action != "answered" || complete else { return nil }
         var updated = draft
         updated.revision = max(draft.revision, recorded.integer("revision"))
         return RequestAnswerCompletion(draft: updated, shouldDismiss: action == "answered")

@@ -93,16 +93,16 @@ extension CoreTests {
         claim = try call("work_claim",["project_id":p["id"]!,"task_id":task["id"]!,"expected_revision":current["revision"]!]);try addTriage(p,group,task)
         let submission = try submitTriageArtifact(p,task,claim);try assertEmptyTriage(p,group)
         let submitted = submission["task"] as! JSON;let rid = strings(submission,"review_request_ids")[0];let reviewGroup = try triage(p,"Review phase",phase:"review");try addTriage(p,reviewGroup,task)
-        _ = try call("review_request",["project_id":p["id"]!,"task_id":task["id"]!,"expected_revision":submitted["revision"]!,"target_manifest_id":submission["manifest_id"]!,"gate":"review"]);try assertEmptyTriage(p,reviewGroup)
+        _ = try call("review_request",["project_id":p["id"]!,"task_id":task["id"]!,"expected_revision":submitted["revision"]!,"target_manifest_id":submission["manifest_id"]!,"gate":"review"]);XCTAssertEqual(strings(try currentTriage(p,reviewGroup),"task_ids"),[task["id"] as! String])
         let reviewer = Caller(role:"owner",installation:"independent-review",projectIDs:[])
-        let review = try call("work_claim",["project_id":p["id"]!,"task_id":task["id"]!,"expected_revision":submitted["revision"]!,"phase":"review","review_request_id":rid,"target_manifest_id":submission["manifest_id"]!,"gate":"review"],reviewer)
+        let review = try call("work_claim",["project_id":p["id"]!,"task_id":task["id"]!,"expected_revision":submitted["revision"]!,"phase":"review","review_request_id":rid,"target_manifest_id":submission["manifest_id"]!,"gate":"review"],reviewer);try assertEmptyTriage(p,reviewGroup)
         try addTriage(p,reviewGroup,task);_ = try call("review_record",["project_id":p["id"]!,"attempt_id":review["id"]!,"claim_token":review["claim_token"]!,"review_request_id":rid,"target_manifest_id":submission["manifest_id"]!,"gate":"review","verdict":"pass"],reviewer);try assertEmptyTriage(p,reviewGroup)
     }
     func testHumanApprovalVerdictLeavesTriagesButUnfinishedAnswerRetainsThem() throws {
-        for verdict in ["approved","changes_requested"] {
+        for verdict in ["approved","changes_requested","declined"] {
             let value = try submittedArtifact(gates:["human_approval"]);let p = value.project;let group = try triage(p,phase:"review");try addTriage(p,group,value.task)
             var request = try humanApproval(value)
-            request = try call("human_request_answer",try observedGateAnswer(["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":request["revision"]!,"target_sha256":value.artifact["sha256"]!,"answers":[["question_id":"approve","value":"not_checked"]]], task:value.task))
+            request = try call("human_request_answer",try observedGateAnswer(["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":request["revision"]!,"target_sha256":value.artifact["sha256"]!,"response":"clarification","explanation":"I have not checked this target","answers":[["question_id":"approve","value":"not_checked"]]], task:value.task))
             XCTAssertEqual(strings(try currentTriage(p,group),"task_ids"),[value.task["id"] as! String])
             _ = try call("human_request_answer",try observedGateAnswer(["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":request["revision"]!,"target_sha256":value.artifact["sha256"]!,"answers":[["question_id":"approve","value":verdict]]], task:value.task));try assertEmptyTriage(p,group)
         }

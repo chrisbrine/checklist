@@ -49,6 +49,7 @@ extension CommandRouter {
     func completeArchiveCleanupHolds(_ db: Database,attachment a: JSON,task: JSON,considerArchiving: Bool = false,currentGraph: [JSON]? = nil, currentIndex: ArchiveCleanupReferenceIndex? = nil) throws -> Set<ArchiveCleanupJob.Hold> {
         let aid = a["id"] as! String,tid = task["id"] as! String
         var holds = Set<ArchiveCleanupJob.Hold>()
+        if try StorageSnapshotRetention.isActive(root:root) {holds.insert(.backupCapture)}
         if a["mode"] as? String != "managed" { holds.insert(.externalOriginal) }
         if bool(a,"keep_original") { holds.insert(.keepOriginal) }
         if task["active_attempt_id"] != nil { holds.insert(.activeWork) }

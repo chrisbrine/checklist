@@ -88,7 +88,7 @@ struct TicketBulkEditSheet: View {
                 VStack(alignment: .leading, spacing: Spacing.group) {
                     if isUndo {
                         Text(draft.undo?.summary ?? "Ticket changes").checklistFont(.bodyStrong)
-                        Text("Undo checks the original change against each ticket now. Later edits stay. Work that has advanced or has an active claim is left alone. Notes and history stay, and cleaned files are not restored.").checklistFont(.callout).foregroundStyle(.secondary)
+                        Text("Undo checks the original change against each ticket now. Later edits stay. Work that has advanced or has an active claim is left alone. Notes and history stay, and cleaned files are not restored.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
                     } else { editControls }
                     if loading || checking { ProgressView(loading ? "Loading choices…" : "Checking tickets…") }
                     if let failure {
@@ -134,20 +134,20 @@ struct TicketBulkEditSheet: View {
             if statusRequiresReason {
                 TextField("Short reason for canceling or reopening these tickets", text: $reason, axis: .vertical).textFieldStyle(.roundedBorder)
             }
-            Text("Each status action removes that ticket from its current Triages. Work and review still use their normal claim and completion checks.").checklistFont(.callout).foregroundStyle(.secondary)
+            Text("Each status action removes that ticket from its current Triages. Work and review still use their normal claim and completion checks.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
         case "tags":
             Picker("Tags", selection: $tagAction) { Text("Add").tag("add"); Text("Remove").tag("remove") }.pickerStyle(.segmented)
             ForEach(store.tags(project)) { tag in
                 Toggle(tag.string("name"), isOn: Binding(get: { selectedTags.contains(tag.id) }, set: { if $0 { selectedTags.insert(tag.id) } else { selectedTags.remove(tag.id) } }))
             }
-            if store.tags(project).isEmpty { Text("This project has no available tags.").checklistFont(.callout).foregroundStyle(.secondary) }
+            if store.tags(project).isEmpty { Text("This project has no available tags.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText) }
         case "assignee":
             Picker("Planned assignee", selection: $assignment) {
                 Text("Unassigned").tag("unassigned"); Text("You · Your tickets").tag("human")
                 ForEach(workerOptions) { worker in Text(worker.string("provider").capitalized + " · " + worker.string("native_conversation_title", fallback: worker.string("label", fallback: "Existing worker"))).tag(worker.id) }
             }
             optionPages
-            Text("Only actual workers allowed by every selected ticket's policy are listed. Assigning a ticket to you puts it in Your tickets.").checklistFont(.callout).foregroundStyle(.secondary)
+            Text("Only actual workers allowed by every selected ticket's policy are listed. Assigning a ticket to you puts it in Your tickets.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
             if !["unassigned", "human"].contains(assignment) {
                 TextField("Why should this worker handle these tickets?", text: $reason, axis: .vertical).textFieldStyle(.roundedBorder)
                 if let worker = workerOptions.first(where: { RecordIdentity($0.id) == RecordIdentity(assignment) }) { TechnicalDetails([("Session", worker.id)]) }
@@ -159,10 +159,10 @@ struct TicketBulkEditSheet: View {
                 ForEach(options) { group in Text(ProductionGroups.label(group)).tag(group.id) }
             }
             optionPages
-            if draft.kind == "triage" { Text("The service checks each ticket against the Triage's phase and current membership.").checklistFont(.callout).foregroundStyle(.secondary) }
+            if draft.kind == "triage" { Text("The service checks each ticket against the Triage's phase and current membership.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText) }
         default:
             Picker("Archive change", selection: $archiveAction) { Text("Archive").tag("archive"); Text("Unarchive").tag("unarchive") }.pickerStyle(.segmented)
-            Text("Tickets with active work cannot be archived. Unarchive cannot restore files that were already cleaned.").checklistFont(.callout).foregroundStyle(.secondary)
+            Text("Tickets with active work cannot be archived. Unarchive cannot restore files that were already cleaned.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
         }
     }
     private var optionPages: some View {
@@ -174,7 +174,7 @@ struct TicketBulkEditSheet: View {
     private func previewContent(_ preview: TicketBulkPreview) -> some View {
         VStack(alignment: .leading, spacing: Spacing.small) {
             Text("\(preview.affectedCount) tickets would change").checklistFont(.bodyStrong)
-            if preview.blocked.isEmpty { Text("All selected tickets passed this check. Apply checks them again together.").checklistFont(.callout).foregroundStyle(.secondary) }
+            if preview.blocked.isEmpty { Text("All selected tickets passed this check. Apply checks them again together.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText) }
             else {
                 Text("Nothing has changed. \(preview.blocked.count) tickets cannot be included:").checklistFont(.callout)
                 ForEach(Array(preview.blocked.enumerated()), id: \.offset) { _, row in
@@ -187,7 +187,7 @@ struct TicketBulkEditSheet: View {
                 if preview.affectedCount > 0 {
                     Button("Apply to the \(preview.affectedCount) eligible tickets") { apply(preview.eligibleTickets(from: tickets)) }
                         .checklistDisabled(validationDisabledReasons + [(store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline), (checking || loading, "Wait for the current check.")])
-                    Text("This sends a new change for only the eligible tickets. The blocked tickets stay as they are.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("This sends a new change for only the eligible tickets. The blocked tickets stay as they are.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
             }
         }

@@ -37,6 +37,7 @@ enum RequestDraftIdentity {
         return draft
     }
     static func isComplete(_ draft: AnswerDraft, questions: [Record], fileRequests: [Record]) -> Bool {
+        if questions.contains(where: { ["approval", "check"].contains($0.string("type")) && draft.values[$0.id] == "not_checked" }) { return false }
         let answersComplete = questions.filter { ($0.values["required"] as? Bool ?? true) }.allSatisfy { question in
             !(draft.values[question.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (question.bool("allow_custom") && !(draft.customValues[question.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }

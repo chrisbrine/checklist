@@ -8,6 +8,10 @@ The shipping product dependency graph is acyclic:
 graph LR
   App[ChecklistApp] --> IPC[ChecklistIPC]
   App --> Core[ChecklistCore]
+  App --> Providers[ChecklistProviders]
+  Core --> Providers
+  Bridges --> Providers
+  Service --> Providers
   Service[ChecklistService] --> Core[ChecklistCore]
   Service --> IPC
   Service --> Bridges[ChecklistBridges]
@@ -24,9 +28,9 @@ graph LR
 
 Both external dependencies use exact root-manifest versions. The committed root `Package.resolved` pins their transitive revisions. Do not regenerate the lock as a side effect of moving a module. Native file previews now import the portable public preview/inspection values from the existing Core target; the app never opens the service database. This adds the App → Core build edge (and its GRDB link dependency), without a schema migration or a second persistence runtime. A future shared-package extraction can move those Foundation-only values behind the compatibility facade. Core tests also declare their existing ChecklistBridges import as a test dependency.
 
-Bridges imports Core’s shared agent-reference formatter; Core has no reverse dependency on Bridges.
+Bridges imports Core’s shared agent-reference formatter; Core has no reverse dependency on Bridges. `ChecklistProviders` is the Foundation-only versioned provider-plugin contract/bundled metadata and interpretation target consumed by Core, App, Bridges and Service. Native transport stays in Bridges and authentication stays in Service. See [provider plugins](provider-plugins.md).
 
-Both direct dependencies use exact root-manifest versions. The committed root `Package.resolved` pins their transitive revisions. Do not regenerate the lock as a side effect of moving a module. This workspace preparation changes neither manifest, dependency, target nor runtime/data schema.
+Both direct dependencies use exact root-manifest versions. The committed root `Package.resolved` pins their transitive revisions. Do not regenerate the lock as a side effect of moving a module. CL-128 adds the internal provider target and its explicit build edges; CL-173 adds the build aggregation target. External dependency pins, executable identities and runtime/data schema stay unchanged.
 
 ## Root commands
 
@@ -34,9 +38,7 @@ Use the installed Swift/Xcode macOS toolchain. From a clean repository checkout,
 
 ```sh
 swift package --force-resolved-versions resolve
-for product in ChecklistApp ChecklistService checklist; do
-  swift build --force-resolved-versions --product "$product"
-done
+swift build --force-resolved-versions --target ChecklistProducts
 swift test --force-resolved-versions
 python3 scripts/validate-plan.py
 ```
@@ -60,6 +62,18 @@ python3 -m unittest discover -s scripts -p test_test_instances.py
 ```
 
 See [test instances](test-instances.md) for the four isolated identities, backup-seeding limits and mandatory same-build backup check before promotion. `./script/build_and_run.sh --install-stage CAPTURE_DIR` verifies and installs an existing original stage through the ordinary install path; it does not compile again. Like `--verify`, it requires the exact installed app process and healthy parsed service status before success, retaining the prior bundle on failure. The live defaults below remain unchanged; test bundles derive separate values from their own Info.plist.
+
+## Captured build lane and timing
+
+`ChecklistProducts` is a build aggregation target. It depends on `ChecklistApp`, `ChecklistService` and `ChecklistCLI`. One `swift build --target ChecklistProducts` builds and links all three shipping executables. The helper reads `--show-bin-path` once before compilation. It removes only final shipping executables and resource bundles from that output directory, retaining objects and module caches. This prevents a changed manifest or group from reusing a stale final product. It does not build the storage crash or CLI input probes for a shipping stage. SwiftPM's normal build-manifest cache stays enabled. Release remains the default configuration.
+
+The immutable capture remains the build authority. Under `.local/build`, each toolchain/configuration/signing profile has a stable `lane-<toolchain-id>/source` path and a separate `swiftpm-<toolchain-id>` scratch path. `script/build_support.py` copies only the verified capture into that lane. It preserves unchanged file bytes and timestamps and removes stale inputs. It checks the complete lane membership, bytes and executable modes against the capture before and after compilation. Extra inputs, symlinks and changed files fail the build. Later checkout edits are reported as provenance and never enter the lane.
+
+The existing `.local/build/.build-lock` covers capture, lane synchronization, compilation, staging, signing, verification and installation. A second invocation in the same checkout fails before touching the lane or scratch directory. The helper does not queue builds. Different checkouts have separate build roots. A stale lock requires reconciliation; do not remove a live build's lock or share its lane manually.
+
+`<fingerprint>/build-verification.json` records signed executable hashes and `timing`. The timing record contains total seconds, UTC start, start/end load averages and `phases`. The phases are `capture`, `compile`, `stage`, `sign`, `verify` and `install`. Each phase records seconds and a completed or skipped status. Executed phases also record their start/end load averages. Compile includes lane synchronization, compilation, the binary-path query and the post-build lane check. Verify covers staged signing, icon and captured-source checks. Install covers the existing bundle copy, quiescence, replacement and signature check. Native launch and installed-service qualification follow that installation receipt.
+
+A stage-only run records installation as skipped. Reusing an existing verified stage records compile, stage and sign as skipped. `build-timings.jsonl` retains timing snapshots for repeated uses of a capture. Install modes also copy the timing record into `.local/build/last-install.json`. These records measure elapsed time under the reported host load; they do not control contention from other projects. CL-173 has no completed application timing comparison yet. Native fixture checks establish aggregation, resource regeneration and capture isolation; they do not establish the requested application speedup.
 
 ## Complete local package inputs
 

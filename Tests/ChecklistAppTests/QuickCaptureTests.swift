@@ -22,6 +22,120 @@ import ChecklistIPC
         QuickCaptureModel(journal: LocalDraftJournal(directory: root), preferences: preferences!, transport: transport)
     }
 
+    func testBlankNonemptyDraftStaysBlankThroughRestoreAndProjectRefresh() async throws {
+        preferences.set("p1", forKey: QuickCaptureModel.lastProjectKey)
+        let file = root.appendingPathComponent("capture.txt")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("Unsent file".utf8).write(to: file)
+        let drafts = [
+            QuickCaptureDraft(title: "Unsent title"),
+            QuickCaptureDraft(note: "Unsent note"),
+            QuickCaptureDraft(files: [.init(path: file.path, ownedStaging: false, commandID: "file-command")])
+        ]
+        for saved in drafts {
+            for count in 0...2 {
+                for offline in [false, true] {
+                    let journal = LocalDraftJournal(directory: root.appendingPathComponent(UUID().uuidString))
+                    try journal.save(saved, kind: QuickCaptureModel.journalKind, key: "draft")
+                    let restored = QuickCaptureModel(journal: journal, preferences: preferences!) { _, _ in
+                        if offline { throw ChecklistError("SERVICE_UNAVAILABLE", "offline") }
+                        return ["projects": (1...2).prefix(count).map { ["id": "p\($0)", "name": "Project \($0)"] }]
+                    }
+                    XCTAssertEqual(restored.draft, saved)
+                    XCTAssertFalse(restored.canSend)
+                    XCTAssertEqual(restored.sendTitle, "Create Draft")
+                    await restored.loadProjects()
+                    XCTAssertEqual(restored.draft, saved, "Refresh must preserve blank content, including files")
+                    XCTAssertFalse(restored.canSend)
+                    XCTAssertEqual(restored.projectsAvailable, !offline)
+                    if offline { XCTAssertEqual(restored.state, .notSent(QuickCaptureModel.notSentOffline)) }
+                    XCTAssertEqual(try Data(contentsOf: file), Data("Unsent file".utf8))
+                    if !saved.title.isEmpty {
+                        restored.draft.projectID = "p1"
+                        XCTAssertTrue(restored.canSend, "Choosing a project enables a titled draft")
+                    }
+                }
+            }
+        }
+    }
+
+    func testEmptyDraftDefaultsAndValidExplicitChoiceSurviveRefresh() async throws {
+        let cases: [(QuickCaptureDraft, String, [String], String, String)] = [
+            (.init(), "p2", ["p1", "p2"], "p2", "p2"),
+            (.init(title: "  \n"), "p1", ["p1"], "p1", "p1"),
+            (.init(), "", ["p1"], "", "p1"),
+            (.init(), "missing", ["p1"], "missing", "p1"),
+            (.init(), "missing", ["p1", "p2"], "missing", ""),
+            (.init(), "missing", [], "missing", ""),
+            (.init(projectID: "p2", title: "Explicit content"), "p1", ["p1", "p2"], "p2", "p2")
+        ]
+        for (saved, last, ids, initial, refreshed) in cases {
+            preferences.set(last, forKey: QuickCaptureModel.lastProjectKey)
+            let journal = LocalDraftJournal(directory: root.appendingPathComponent(UUID().uuidString))
+            try journal.save(saved, kind: QuickCaptureModel.journalKind, key: "draft")
+            let restored = QuickCaptureModel(journal: journal, preferences: preferences!) { _, _ in
+                ["projects": ids.map { ["id": $0, "name": $0] }]
+            }
+            XCTAssertEqual(restored.draft.projectID, initial)
+            await restored.loadProjects()
+            XCTAssertEqual(restored.draft.projectID, refreshed)
+            XCTAssertEqual(restored.draft.title, saved.title)
+        }
+    }
+
+    func testUnavailableProjectRequiresFreshChoiceAndOfflineKeepsExistingChoice() async throws {
+        preferences.set("p2", forKey: QuickCaptureModel.lastProjectKey)
+        for archived in [false, true] {
+            var offline = true
+            let journal = LocalDraftJournal(directory: root.appendingPathComponent(UUID().uuidString))
+            let saved = QuickCaptureDraft(projectID: "p1", title: "Do not reroute", note: "Keep this note")
+            try journal.save(saved, kind: QuickCaptureModel.journalKind, key: "draft")
+            let restored = QuickCaptureModel(journal: journal, preferences: preferences!) { _, _ in
+                if offline { throw ChecklistError("SERVICE_UNAVAILABLE", "offline") }
+                var rows: [[String: Any]] = [["id": "p2", "name": "Remaining"]]
+                if archived { rows.append(["id": "p1", "name": "Archived", "archived": true]) }
+                return ["projects": rows]
+            }
+            await restored.loadProjects()
+            XCTAssertEqual(restored.draft, saved)
+            XCTAssertFalse(restored.projectsAvailable)
+            XCTAssertEqual(restored.state, .notSent(QuickCaptureModel.notSentOffline))
+            offline = false
+            await restored.loadProjects()
+            XCTAssertEqual(restored.draft.projectID, "")
+            XCTAssertEqual(restored.draft.title, saved.title)
+            XCTAssertEqual(restored.draft.note, saved.note)
+            XCTAssertEqual(restored.projects.map(\.id), ["p2"])
+            XCTAssertEqual(restored.state, .editing)
+            XCTAssertFalse(restored.canSend)
+            await restored.loadProjects()
+            XCTAssertEqual(restored.draft.projectID, "", "A second refresh cannot reroute the content either")
+            XCTAssertEqual(QuickCaptureModel(journal: journal, preferences: preferences!, transport: { _, _ in [:] }).draft.projectID, "")
+        }
+    }
+
+    func testRecoveryDestinationsNeverAdoptDefaultsOrRefreshChoices() async throws {
+        preferences.set("p2", forKey: QuickCaptureModel.lastProjectKey)
+        for pending in [false, true] {
+            for choice in ["", "unavailable"] {
+                let saved = QuickCaptureDraft(
+                    pendingCreate: pending ? .init(commandID: "original-command", projectID: "original-project", title: "Original", brief: "Original note") : nil,
+                    projectID: choice, createdTaskID: pending ? nil : "saved-ticket")
+                let journal = LocalDraftJournal(directory: root.appendingPathComponent(UUID().uuidString))
+                try journal.save(saved, kind: QuickCaptureModel.journalKind, key: "draft")
+                let restored = QuickCaptureModel(journal: journal, preferences: preferences!) { _, _ in
+                    ["projects": [["id": "p2", "name": "Only project"]]]
+                }
+                XCTAssertEqual(restored.draft, saved, "Even empty recovery content cannot receive last-used")
+                let state = restored.state
+                await restored.loadProjects()
+                XCTAssertEqual(restored.draft, saved, "Recovery is frozen even when its destination is unavailable")
+                XCTAssertEqual(restored.state, state)
+                XCTAssertTrue(restored.canSend)
+            }
+        }
+    }
+
     func testOfflineDraftIsKeptAndSaysNotSentThenSendsWithTheSameCommands() async throws {
         var online = false
         var calls: [(String, [String: Any])] = []
@@ -161,6 +275,13 @@ import ChecklistIPC
         XCTAssertEqual(quick.draft.note, "Newer brief")
         XCTAssertEqual(quick.draft.projectID, "", "Even an unfinished newer edit stays intact")
         XCTAssertNil(quick.draft.createCommandID, "The next draft must get a new command ID")
+        XCTAssertEqual(preferences.string(forKey: QuickCaptureModel.lastProjectKey), fixture.projectID)
+        let restarted = model(fixture.transport)
+        XCTAssertEqual(restarted.draft, quick.draft, "Confirmation must not default the newer blank draft on restart")
+        await restarted.loadProjects()
+        XCTAssertEqual(restarted.draft, quick.draft)
+        XCTAssertFalse(restarted.canSend)
+        XCTAssertEqual(fixture.creates.count, 2, "Restoring and refreshing cannot create another ticket")
     }
 
     func testRestartReplaysOriginalCreateDespiteSavedNewerTitle() async throws {
@@ -254,6 +375,9 @@ import ChecklistIPC
         quick.draft.projectID = ""; quick.draft.note = "Newer note"
         let restored = model(fixture.transport)
         XCTAssertEqual(restored.state, .filesPending(QuickCaptureModel.savedTicketFiles))
+        await restored.loadProjects()
+        XCTAssertEqual(restored.draft.projectID, "")
+        XCTAssertEqual(restored.draft.pendingCreate?.projectID, fixture.projectID)
         XCTAssertTrue(restored.canSend)
         await restored.send()
         XCTAssertEqual(fixture.creates.count, 1, "A known ticket never needs another create")

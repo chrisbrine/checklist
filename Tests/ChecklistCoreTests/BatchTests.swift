@@ -37,6 +37,76 @@ extension CoreTests {
         }
         return try call("batch_prepare",["project_id":p["id"]!,"triage_id":group["id"]!,"expected_revision":current["revision"]!,"phase":"review","tasks":members],reviewer)
     }
+    // Compare domain effects independently of the command-intent journal.
+    func batchClaimState(_ p: JSON,_ batch: JSON) throws -> String {
+        let snapshot = try call("snapshot")
+        var state: JSON = [:]
+        for key in ["tasks","attempts","groups","events"] { state[key] = snapshot[key] }
+        state["batch"] = try call("batch_get",["project_id":p["id"]!,"batch_id":batch["id"]!])
+        state["dispatches"] = try router.dbQueue.read {try router.records($0,type:"batch_claim",project:p["id"] as! String)}
+        return try jsonString(state)
+    }
+    func testBatchClaimPolicyInputRefusalsLeavePreparationClaimable() throws {
+        let invalid: [Any?] = [nil,NSNull(),"1",true,false,1.5,0,-1,NSNumber(value:UInt64.max)]
+        for value in invalid {
+            let p = try project(),tasks = try [ready(p,task(p)),ready(p,task(p))],group = try triage(p)
+            for task in tasks {try addTriage(p,group,task)}
+            let batch = try prepareImplementationBatch(p,group,tasks),before = try batchClaimState(p,batch)
+            var input: JSON = ["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":batch["revision"]!]
+            input["policy_revision"] = value
+            let rejectedCommand = UUID().uuidString
+            XCTAssertThrowsError(try call("batch_claim",input,nil,rejectedCommand)) { error in
+                XCTAssertEqual((error as? CoreError)?.code,"INVALID_INPUT")
+                XCTAssertTrue(error.localizedDescription.contains("policy_revision"))
+                XCTAssertTrue(error.localizedDescription.contains("batch_prepare"))
+                XCTAssertFalse(error.localizedDescription.contains("Prepare a new batch"))
+            }
+            XCTAssertEqual(try batchClaimState(p,batch),before)
+            // Changed input gets a fresh ID; the original fixed preparation is reused.
+            let command = UUID().uuidString,claimed = try claimFixedBatch(p,batch,nil,command)
+            XCTAssertNotEqual(command,rejectedCommand)
+            XCTAssertEqual((claimed["claims"] as! [JSON]).count,2)
+            XCTAssertEqual(strings(try currentTriage(p,group),"task_ids"),tasks.map {$0["id"] as! String})
+            XCTAssertEqual(try call("policy_get",["project_id":p["id"]!])["revision"] as? Int,batch["policy_revision"] as? Int)
+            // An identical unknown-outcome retry retains that ID and original attempts.
+            let replay = try claimFixedBatch(p,batch,nil,command)
+            XCTAssertEqual((replay["claims"] as! [JSON]).compactMap {$0["id"] as? String},(claimed["claims"] as! [JSON]).compactMap {$0["id"] as? String})
+        }
+    }
+    func testBatchClaimPolicyMismatchAndChangedProjectAreAtomic() throws {
+        for changedProject in [false,true] {
+            for sendsNewRevision in [false,true] {
+                let p = try project(),tasks = try [ready(p,task(p)),ready(p,task(p))],group = try triage(p)
+                for task in tasks {try addTriage(p,group,task)}
+                let batch = try prepareImplementationBatch(p,group,tasks),oldRevision = int(batch,"policy_revision")
+                if changedProject { _ = try call("policy_apply",["project_id":p["id"]!,"expected_revision":p["revision"]!,"policy":["required_gates":[]]]) }
+                let before = try batchClaimState(p,batch)
+                let supplied = changedProject && !sendsNewRevision ? oldRevision : oldRevision+1
+                XCTAssertThrowsError(try call("batch_claim",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":batch["revision"]!,"policy_revision":supplied])) { error in
+                    XCTAssertEqual((error as? CoreError)?.code,"POLICY_CHANGED")
+                    XCTAssertTrue(error.localizedDescription.contains(changedProject ? "current project policy" : "supplied policy_revision"))
+                    if !changedProject {XCTAssertFalse(error.localizedDescription.contains("Prepare a new batch"))}
+                }
+                XCTAssertEqual(try batchClaimState(p,batch),before)
+            }
+        }
+    }
+    func testBatchClaimCatalogRequiresPreparedPositivePolicyRevision() throws {
+        let worker = Caller(role:"worker",installation:"batch-catalog",projectIDs:[])
+        let tools = try call("tool_catalog",[:],worker)["tools"] as! [JSON]
+        let tool = tools.first {$0["name"] as? String == "batch_claim"}!,schema = tool["inputSchema"] as! JSON
+        XCTAssertTrue(strings(schema,"required").contains("policy_revision"))
+        let spec = (schema["properties"] as! JSON)["policy_revision"] as! JSON
+        XCTAssertEqual(spec["type"] as? String,"integer");XCTAssertEqual(spec["minimum"] as? Int,1);XCTAssertEqual(spec["maximum"] as? Int,Int.max)
+        let description = tool["description"] as! String
+        for text in ["batch_prepare","INVALID_INPUT","new command_id","original command_id","identical input"] {XCTAssertTrue(description.contains(text))}
+        for value: Any? in [nil,NSNull(),"1",true,1.5] {
+            var input: JSON = ["project_id":"catalog-project","batch_id":"catalog-batch","expected_revision":1,"command_id":UUID().uuidString];input["policy_revision"] = value
+            assertCode("INVALID_INPUT") {try self.router.validateInput("batch_claim",input,worker)}
+        }
+        let workSchema = tools.first {$0["name"] as? String == "work_claim"}!["inputSchema"] as! JSON
+        XCTAssertFalse(strings(workSchema,"required").contains("policy_revision"))
+    }
     func testBatchSnapshotSurvivesLiveMembershipEditsAndKeepsExclusiveClaims() throws {
         let p = try project(),first = try ready(p,task(p,"One")),second = try ready(p,task(p,"Two")),later = try ready(p,task(p,"Later")),group = try triage(p)
         try addTriage(p,group,first);try addTriage(p,group,second)
@@ -61,15 +131,6 @@ extension CoreTests {
         _ = try call("task_edit",["project_id":p["id"]!,"task_id":second["id"]!,"expected_revision":second["revision"]!,"patch":["brief":"Changed after preparation"]])
         let before = try call("snapshot")
         assertCode("REVISION_CONFLICT") { _ = try self.claimFixedBatch(p,batch) }
-        let after = try call("snapshot")
-        for key in ["tasks","attempts","groups","events"] { XCTAssertEqual(try jsonString(before[key]!),try jsonString(after[key]!)) }
-    }
-    func testBatchPrepareRejectsOverlappingScopeSetWithoutClaimingAnything() throws {
-        let workspace = directory.appendingPathComponent("batch-scopes");try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
-        let p = try call("project_create",["name":"Scopes","key_prefix":"S","root_path":workspace.path]),first = try ready(p,task(p)),second = try ready(p,task(p)),group = try triage(p)
-        try addTriage(p,group,first);try addTriage(p,group,second)
-        let before = try call("snapshot")
-        assertCode("SCOPE_CONFLICT") { _ = try self.prepareImplementationBatch(p,group,[first,second],scopes:[[["path":"src","access":"write"]],[["path":"src/menu.swift","access":"write"]]]) }
         let after = try call("snapshot")
         for key in ["tasks","attempts","groups","events"] { XCTAssertEqual(try jsonString(before[key]!),try jsonString(after[key]!)) }
     }

@@ -21,8 +21,8 @@ struct WorkspacePageQuery: Equatable {
 }
 struct WorkspacePage {
     let query: WorkspacePageQuery
-    let rows: [Record]
-    let total: Int
+    var rows: [Record]
+    var total: Int
     let next: String?
     let previous: String?
     let projects: [Record]
@@ -70,6 +70,18 @@ struct WorkspacePage {
     @discardableResult func receive(_ response:[String:Any],query:WorkspacePageQuery,generation:UUID)throws->Bool {
         guard self.generation==generation,self.query==query else{return false}
         page=try WorkspacePage(response,query:query);loading=false;return true
+    }
+    func applyAnsweredRequest(_ record: Record) {
+        guard var current = page, let index = current.rows.firstIndex(where: {
+            RecordIdentity($0.id) == RecordIdentity(record.id) && RecordIdentity($0.string("project_id")) == RecordIdentity(record.string("project_id"))
+        }) else { return }
+        cancel()
+        if current.query.surface == "requests" {
+            current.rows.remove(at:index); current.total = max(0,current.total - 1)
+        } else if current.query.surface == "record" {
+            current.rows[index] = Record(values:current.rows[index].values.merging(record.values) { _,new in new })
+        }
+        page = current
     }
     func isCurrent(_ generation:UUID)->Bool {self.generation==generation}
     func fail(_ generation:UUID,message:String = "Could not load this page. Refresh to load it again; drafts are kept.") {guard self.generation==generation else{return};loading=false;error=message}

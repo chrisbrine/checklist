@@ -41,35 +41,103 @@ extension CommandRouter {
         if let sid = task["status_id"] as? String,try statusLookup(sid)["category"] as? String == "active" { return true }
         return try groupAttention()
     }
+    func eligibleTriageCoordinator(_ db: Database,_ c: Caller,_ pid: String) throws -> JSON {
+        guard let sid = c.sessionID,let domain = c.executionDomain else { throw CoreError("ACTUAL_SESSION_REQUIRED","Use the actual connected Codex or Claude session; a name or manually chosen identity is insufficient.") }
+        let session = try eligibleWorkSession(db,id:sid,project:pid)
+        guard session["execution_domain"] as? String == domain,session["installation"] as? String == c.installation else { throw CoreError("FORBIDDEN","The orchestration session must match this authenticated host connection.") }
+        let project = try record(db,pid,type:"project"),policy = effectivePolicy(project["policy"] as? JSON ?? [:],kind:"")
+        let rule = (policy["roles"] as? JSON)?["coordinator"] as? JSON ?? [:]
+        guard strings(rule,"providers").contains(session["provider"] as? String ?? "") else { throw CoreError("POLICY_DENIED","This actual provider is not eligible to coordinate the project's Triages.") }
+        return session
+    }
+    // CL-139: only a service-verified resumption of this exact native conversation
+    // can close its old generation. It never revives checkpoint/work authority.
+    func resumedTriageClosure(_ db: Database,_ orchestration: JSON,_ session: JSON,_ pid: String) throws -> String? {
+        guard orchestration["session_id"] as? String == session["id"] as? String else { return nil }
+        for id in strings(session,"prior_native_closure_refs") {
+            let closure = try scoped(db,id,pid,type:"native_closure")
+            guard closure["state"] as? String == "released",
+                  closure["session_id"] as? String == orchestration["session_id"] as? String,
+                  closure["provider"] as? String == orchestration["provider"] as? String,
+                  closure["execution_domain"] as? String == orchestration["execution_domain"] as? String,
+                  closure["old_authorization_generation"] as? String == orchestration["session_authorization_generation"] as? String,
+                  let installation = closure["installation"] as? String,
+                  orchestration["principal"] as? String == installation + ":" + (session["id"] as! String) else { continue }
+            return id
+        }
+        return nil
+    }
+    // A Triage notice is independent of member tickets (including an empty Triage).
+    // Retain history when the earlier session cannot receive; never reroute to members.
+    func triageTakeoverNotice(_ db: Database,group: JSON,old: JSON,new: JSON,reason: String,caller: Caller) throws -> JSON {
+        let pid = group["project_id"] as! String,gid = group["id"] as! String
+        let sid = old["session_id"] as? String ?? ""
+        let target = try? scoped(db,sid,pid,type:"session")
+        let recipients: [JSON] = target.map {canReceive($0,project:pid) ? [["session_id":sid,"recipient_role":"prior_orchestrator"]] : []} ?? []
+        let message: JSON = ["id":uuid(),"project_id":pid,"triage_id":gid,"kind":"note","origin":"agent",
+            "author":caller.principal,"author_display":author(db,caller),"author_session_id":caller.sessionID!,
+            "requires_action":false,"addressed":false,"revision":1,"created_at":now(),
+            "from_orchestration_id":old["id"]!,"to_orchestration_id":new["id"]!,
+            "prior_orchestrator_session_id":sid,"orchestrator_session_id":caller.sessionID!,
+            "body":"Triage metadata: \(try agentReference(db,group)). \(AgentReference.quoted(author(db,caller))) (session \(caller.sessionID!)) took over orchestration. Reason: \(reason)\nYour orchestration record ended. Member ticket claims and Triage memberships are unchanged."]
+        try save(db,message,type:"message")
+        let deliveries = try queueDirectionDeliveries(db,message:message,recipients:recipients)
+        try event(db,caller:caller,project:pid,entity:gid,kind:"message_saved",data:["message_id":message["id"]!,"origin":"agent"])
+        return ["message_id":message["id"]!,"recipient_session_id":sid,"deliveries":deliveries,"delivery_status":recipients.isEmpty ? "saved_for_pickup" : "queued","native_push":false]
+    }
     func triageOrchestrate(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         try worker(c);let pid = try scope(db,p,c,write:true),gid = try text(p,"triage_id")
         var group = try scoped(db,gid,pid,type:"group");try revision(p,group)
         guard group["kind"] as? String == "triage",!bool(group,"archived"),triagePhase(group) != nil else { throw CoreError("TRIAGE_PHASE_REQUIRED","Use an active Triage with an established implementation or review phase.") }
         let action = try text(p,"action");var orchestration = group["orchestration"] as? JSON ?? [:]
-        guard ["start","checkpoint","finish"].contains(action) else { throw CoreError("INVALID_INPUT","Use start, checkpoint or finish for the actual orchestration session.") }
-        if action == "start" {
-            guard let sid = c.sessionID,let domain = c.executionDomain else { throw CoreError("ACTUAL_SESSION_REQUIRED","Start orchestration from the actual connected Codex or Claude session; a name or manually chosen identity is insufficient.") }
-            let session = try eligibleWorkSession(db,id:sid,project:pid)
-            guard session["execution_domain"] as? String == domain else { throw CoreError("FORBIDDEN","The orchestration session must match this authenticated host execution domain.") }
-            let project = try record(db,pid,type:"project"),policy = effectivePolicy(project["policy"] as? JSON ?? [:],kind:"")
-            let rule = (policy["roles"] as? JSON)?["coordinator"] as? JSON ?? [:]
-            guard strings(rule,"providers").contains(session["provider"] as? String ?? "") else { throw CoreError("POLICY_DENIED","This actual provider is not eligible to coordinate the project's Triages.") }
-            if orchestration["state"] as? String == "active" { throw CoreError("CLAIM_CONFLICT","This Triage already records an active orchestration. Checkpoint or explicitly finish that recorded coordination first.") }
-            orchestration = ["id":uuid(),"session_id":sid,"principal":c.principal,"session_authorization_generation":sessionGeneration(session),"execution_domain":domain,"provider":session["provider"]!,"actor_display":author(db,c),"state":"active","started_at":now(),"revision":1]
+        guard ["start","checkpoint","finish","takeover"].contains(action) else { throw CoreError("INVALID_INPUT","Use start, checkpoint, finish or takeover for the actual orchestration session.") }
+        var notice: JSON?
+        if action == "start" || action == "takeover" {
+            let session = try eligibleTriageCoordinator(db,c,pid)
+            let previous = orchestration
+            var reason: String?
+            if action == "takeover" {
+                reason = try text(p,"reason",max:4000)
+                guard previous["state"] as? String == "active" else { throw CoreError("INVALID_TRANSITION","This Triage has no active orchestration to take over. Use start.") }
+                guard previous["session_id"] as? String != c.sessionID else { throw CoreError("INVALID_INPUT","This conversation already records the orchestration. Finish it before starting again; a verified resumed conversation can finish with a reason.") }
+            } else if previous["state"] as? String == "active" { throw CoreError("CLAIM_CONFLICT","This Triage already records an active orchestration. Checkpoint, explicitly finish or take over that recorded coordination with a reason.") }
+            orchestration = ["id":uuid(),"session_id":c.sessionID!,"principal":c.principal,"session_authorization_generation":sessionGeneration(session),"execution_domain":c.executionDomain!,"provider":session["provider"]!,"actor_display":author(db,c),"state":"active","started_at":now(),"revision":1]
+            if let previousID = previous["id"] { orchestration["previous_orchestration_id"] = previousID }
+            if let reason {
+                var ended = revised(previous);ended["state"] = "taken_over";ended["finished_at"] = now()
+                ended["takeover_reason"] = reason;ended["taken_over_by_orchestration_id"] = orchestration["id"]
+                ended["taken_over_by_session_id"] = c.sessionID!
+                orchestration["takeover_from_orchestration_id"] = previous["id"]!;orchestration["takeover_reason"] = reason
+                if let progress = previous["progress"] { orchestration["takeover_context"] = progress }
+                try event(db,caller:c,project:pid,entity:gid,kind:"triage_orchestration_taken_over",data:["orchestration":ended,"member_claims_unchanged":true,"memberships_unchanged":true])
+                notice = try triageTakeoverNotice(db,group:group,old:ended,new:orchestration,reason:reason,caller:c)
+                orchestration["takeover_notice"] = notice!
+            }
         } else {
             guard orchestration["state"] as? String == "active" else { throw CoreError("INVALID_TRANSITION","This Triage has no recorded active orchestration.") }
             if c.isOwner,action == "finish" { orchestration["owner_finish_reason"] = try text(p,"reason") }
             else {
-                guard orchestration["principal"] as? String == c.principal,orchestration["session_id"] as? String == c.sessionID,orchestration["execution_domain"] as? String == c.executionDomain,orchestration["session_authorization_generation"] as? String == (try callerSessionGeneration(db,c,project:pid)) else { throw CoreError("FORBIDDEN","Only the actual recorded session can checkpoint or finish its coordination. An owner can explicitly finish a stale coordination with a reason.") }
+                guard let sid = c.sessionID else { throw CoreError("FORBIDDEN","Only the recorded actual session can checkpoint or finish.") }
+                let session = try eligibleWorkSession(db,id:sid,project:pid)
+                guard session["installation"] as? String == c.installation,session["execution_domain"] as? String == c.executionDomain else { throw CoreError("FORBIDDEN","Use the authenticated current session connection.") }
+                let current = orchestration["principal"] as? String == c.principal && orchestration["session_id"] as? String == c.sessionID && orchestration["execution_domain"] as? String == c.executionDomain && orchestration["session_authorization_generation"] as? String == sessionGeneration(session)
+                if !current {
+                    guard action == "finish",let closure = try resumedTriageClosure(db,orchestration,session,pid) else { throw CoreError("FORBIDDEN","Only the recorded current session can checkpoint or finish. A verified resumed conversation can finish its earlier record with a reason; an eligible different coordinator can explicitly take over.") }
+                    orchestration["recovery_finish_reason"] = try text(p,"reason",max:4000)
+                    orchestration["native_closure_ref"] = closure;orchestration["finished_by_principal"] = c.principal
+                    orchestration["finished_by_authorization_generation"] = sessionGeneration(session)
+                }
             }
             orchestration = revised(orchestration)
         }
-        if p["progress"] != nil { orchestration["progress"] = try text(p,"progress") }
+        if p["progress"] != nil { let progress = try text(p,"progress"); recordHealthProgress(&orchestration,progress:progress); orchestration["progress"] = progress }
         orchestration["last_checkpoint"] = now()
         if action == "finish" { orchestration["state"] = "finished";orchestration["finished_at"] = now() }
         group["orchestration"] = orchestration;group = revised(group);try save(db,group,type:"group")
-        try event(db,caller:c,project:pid,entity:gid,kind:"triage_orchestration_"+action,data:["orchestration":orchestration,"member_claims_unchanged":true])
-        return try groupProjection(db,group)
+        try event(db,caller:c,project:pid,entity:gid,kind:"triage_orchestration_"+action,data:["orchestration":orchestration,"member_claims_unchanged":true,"memberships_unchanged":true])
+        var result = try groupProjection(db,group)
+        if let notice { result["takeover_notice"] = notice }
+        return result
     }
     func taskEpicContext(_ db: Database,_ task: JSON) throws -> Any {
         guard let id = task["epic_id"] as? String,let source = try? scoped(db,id,task["project_id"] as! String,type:"group"),source["kind"] as? String == "epic" else { return NSNull() }
@@ -106,7 +174,8 @@ extension CommandRouter {
                 var interval = interval;interval["exit"] = exits.first {$0["membership_id"] as? String == interval["id"] as? String} ?? NSNull();return interval
             }
             group["batches"] = try records(db,type:"batch",project:source["project_id"] as? String).filter {$0["triage_id"] as? String == source["id"] as? String}.map { batch -> JSON in
-                ["id":batch["id"]!,"phase":batch["phase"]!,"created_at":batch["created_at"]!,"triage_revision":batch["triage_revision"]!,"member_count":(batch["members"] as? [JSON] ?? []).count,"digest":batch["digest"]!]
+                var summary: JSON = ["id":batch["id"]!,"phase":batch["phase"]!,"created_at":batch["created_at"]!,"triage_revision":batch["triage_revision"]!,"member_count":(batch["members"] as? [JSON] ?? []).count,"digest":batch["digest"]!]
+                summary.merge(try batchLifecycle(db,batch)) { _,new in new };return summary
             }
             return group
         }

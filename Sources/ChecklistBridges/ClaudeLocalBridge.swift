@@ -1,4 +1,5 @@
 import Foundation
+import ChecklistProviders
 import Darwin
 
 public enum NativeBridgeError: LocalizedError {
@@ -81,7 +82,7 @@ public enum ClaudeLocalBridge {
     public static func send(content: String, messageID: String, sender: ClaudePeerSender,
                             endpoint: String, expectedPeerPID: Int32? = nil,
                             expectedRegistration: NativeLifecycleRegistration? = nil,
-                            timeout: TimeInterval = 5) throws -> NativeWriteReceipt {
+                            timeout: TimeInterval = 5, providerRegistry: ProviderPluginRegistry = .bundled) throws -> NativeWriteReceipt {
         let frame = try envelope(content: content, messageID: messageID, sender: sender)
         let before = try checkedSocket(endpoint)
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -111,7 +112,7 @@ public enum ClaudeLocalBridge {
         let after = try checkedSocket(endpoint)
         guard before.st_dev == after.st_dev, before.st_ino == after.st_ino else { throw NativeBridgeError.invalid("RECIPIENT_CHANGED: enrolled socket changed during connection.") }
         if let expectedRegistration {
-            let current = NativeLifecycleInspector.inspect(expectedRegistration)
+            let current = NativeLifecycleInspector.inspect(expectedRegistration, providerRegistry:providerRegistry)
             guard connectedPID == expectedRegistration.processID,
                   current.process == .running, current.registry == .matching else {
                 throw NativeBridgeError.invalid("RECIPIENT_CHANGED: connected peer no longer matches the exact native process and conversation registry.")

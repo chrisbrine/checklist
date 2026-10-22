@@ -11,6 +11,7 @@ import ChecklistIPC
         var scopedFailures: [String] = []
         var enteredWait = false
         var failInitialPage = false
+        var snapshotError: Error?
         var catalogError: Error?
         var catalogReply: [String: Any]?
         var holdCatalog = false
@@ -44,6 +45,7 @@ import ChecklistIPC
                         try await Task.sleep(nanoseconds: 30_000_000_000); throw CancellationError()
                     }
                     if method == "workspace_page", failInitialPage { failInitialPage = false; throw OfflineBannerTests.Down() }
+                    if method == "snapshot", let snapshotError { throw snapshotError }
                     if method == "project_list" {
                         if let catalogError { throw catalogError }
                         if holdCatalog { return try await withCheckedThrowingContinuation { heldCatalog = $0 } }
@@ -120,6 +122,108 @@ import ChecklistIPC
             await live.value; store.stopWindowReads()
             XCTAssertEqual(store.projectID, cancel ? id : nil)
             XCTAssertEqual(store.page, cancel ? .media : .overview)
+        }
+    }
+    func testReviewerRealCatalogFailureRecordsItsConcreteCause() async throws {
+        let f = try Fixture(isolatedDefaults("W4-catalog-cause").preferences); defer { f.cleanup() }
+        f.catalogError = ChecklistError("SERVICE_UNAVAILABLE", "Catalog connection refused for reviewer check")
+        let id = UUID().uuidString, store = f.store(page: .epics, project: id)
+        store.saveNote("old-ticket", text: "Keep café\nexact draft")
+        let live = Task { await store.startLiveUpdates() }
+        try await until { f.enteredWait }
+        live.cancel(); await live.value; store.stopWindowReads()
+        XCTAssertTrue(f.scopedFailures.contains("NOT_FOUND"))
+        XCTAssertFalse(store.connected); XCTAssertTrue(store.connectionAttempted); XCTAssertTrue(store.showsOfflineBanner)
+        XCTAssertNil(store.error, "An outage uses the banner, never a repeated alert")
+        XCTAssertEqual(store.projectID, id); XCTAssertEqual(f.preferences.string(forKey: "lastProject"), id)
+        XCTAssertEqual(store.noteDrafts["old-ticket"], "Keep café\nexact draft")
+        XCTAssertTrue(store.lastServiceFailure?.contains("Catalog connection refused for reviewer check") == true,
+                      "Acceptance 1 requires a truthful last error when the catalog failure is real; actual=\(String(describing:store.lastServiceFailure))")
+    }
+    func testCatalogErrorsRecordOutageAndHealthyRefreshClearsIt() async throws {
+        for kind in ["transport", "service", "reply"] {
+            let f = try Fixture(isolatedDefaults("RestoredProjectCatalogError").preferences); defer { f.cleanup() }
+            let failure = ChecklistError("SERVICE_UNAVAILABLE", "Catalog service unavailable")
+            if kind == "reply" { f.catalogReply = ["error": ["code": failure.code, "message": failure.message]] }
+            else { f.catalogError = kind == "transport" ? OfflineBannerTests.Down() : failure }
+            let expected = kind == "transport" ? "Connection refused" : failure.localizedDescription
+            let id = UUID().uuidString, store = f.store(page: .media, project: id)
+            store.saveNote("old-ticket", text: "Keep café\nexact draft")
+            let live = Task { await store.startLiveUpdates() }
+            try await until { f.enteredWait }
+            live.cancel(); await live.value
+            XCTAssertEqual(store.lastServiceFailure, expected)
+            XCTAssertFalse(store.connected); XCTAssertTrue(store.connectionAttempted); XCTAssertTrue(store.showsOfflineBanner)
+            XCTAssertNotNil(store.writeBlockReason); XCTAssertNil(store.error)
+            XCTAssertEqual(store.projectID, id); XCTAssertEqual(f.preferences.string(forKey: "lastProject"), id)
+            XCTAssertEqual(store.page, .media); XCTAssertEqual(store.noteDrafts["old-ticket"], "Keep café\nexact draft")
+            store.select(.epics)
+            await store.refresh()
+            XCTAssertTrue(store.connected); XCTAssertFalse(store.showsOfflineBanner); XCTAssertNil(store.lastServiceFailure)
+            store.stopWindowReads()
+        }
+    }
+
+    func testCatalogCancellationLeavesExistingHealthUntouched() async throws {
+        for priorOutage in [false, true] {
+            for result in ["cancellation", "lateError", "lateSuccess"] {
+                let cancelTask = result != "cancellation"
+                let f = try Fixture(isolatedDefaults("RestoredProjectCatalogCancellation").preferences); defer { f.cleanup() }
+                let id = UUID().uuidString, store = f.store(page: .media, project: id)
+                store.saveNote("old-ticket", text: "Keep café\nexact draft")
+                if priorOutage {
+                    f.snapshotError = OfflineBannerTests.Down()
+                    await store.ensureFullSnapshot()
+                }
+                f.holdCatalog = true
+                let live = Task { await store.startLiveUpdates() }
+                try await until { f.heldCatalog != nil }
+                let connected = store.connected, attempted = store.connectionAttempted, banner = store.showsOfflineBanner, failure = store.lastServiceFailure
+                if cancelTask { live.cancel() }
+                // Even a real transport error after caller cancellation is lifecycle evidence only.
+                if result == "lateSuccess" { f.heldCatalog?.resume(returning: ["data": ["projects": [[String: Any]]()]]) }
+                else { f.heldCatalog?.resume(throwing: cancelTask ? OfflineBannerTests.Down() : CancellationError()) }
+                f.heldCatalog = nil
+                if !cancelTask { try await until { f.enteredWait }; live.cancel() }
+                await live.value; store.stopWindowReads()
+                XCTAssertEqual(store.connected, connected); XCTAssertEqual(store.connectionAttempted, attempted)
+                XCTAssertEqual(store.showsOfflineBanner, banner); XCTAssertEqual(store.lastServiceFailure, failure)
+                XCTAssertEqual(store.projectID, id); XCTAssertEqual(f.preferences.string(forKey: "lastProject"), id)
+                XCTAssertEqual(store.page, .media); XCTAssertEqual(store.noteDrafts["old-ticket"], "Keep café\nexact draft")
+                XCTAssertNil(store.error)
+            }
+        }
+    }
+
+    func testSupersededCatalogResultLeavesHealthAndSelectionUntouched() async throws {
+        for replacement in ["project", "page", "window", "healthyRead"] {
+            for fails in [false, true] {
+                let f = try Fixture(isolatedDefaults("RestoredProjectCatalogSuperseded").preferences); defer { f.cleanup() }
+                let id = try f.existingProject(archived: false)
+                f.failInitialPage = true; f.holdCatalog = true
+                let store = f.store(page: .epics, project: id)
+                store.saveNote("old-ticket", text: "Keep café\nexact draft")
+                let live = Task { await store.startLiveUpdates() }
+                try await until { f.heldCatalog != nil }
+                switch replacement {
+                case "project": store.select(.epics); await store.refresh()
+                case "page": store.select(.activity, project: id); await store.refresh()
+                case "window": store.stopWindowReads()
+                default: await store.refresh()
+                }
+                let connected = store.connected, attempted = store.connectionAttempted, banner = store.showsOfflineBanner, failure = store.lastServiceFailure
+                let project = store.projectID, page = store.page
+                if fails { f.heldCatalog?.resume(throwing: ChecklistError("SERVICE_UNAVAILABLE", "Obsolete catalog failure")) }
+                else { f.heldCatalog?.resume(returning: ["data": ["projects": [[String: Any]]()]]) }
+                f.heldCatalog = nil
+                try await until { f.enteredWait }
+                live.cancel(); await live.value; store.stopWindowReads()
+                XCTAssertEqual(store.connected, connected, replacement); XCTAssertEqual(store.connectionAttempted, attempted, replacement)
+                XCTAssertEqual(store.showsOfflineBanner, banner, replacement); XCTAssertEqual(store.lastServiceFailure, failure, replacement)
+                XCTAssertEqual(store.projectID, project, replacement); XCTAssertEqual(f.preferences.string(forKey: "lastProject"), project, replacement)
+                XCTAssertEqual(store.page, page, replacement); XCTAssertEqual(store.noteDrafts["old-ticket"], "Keep café\nexact draft")
+                XCTAssertNil(store.error)
+            }
         }
     }
 }

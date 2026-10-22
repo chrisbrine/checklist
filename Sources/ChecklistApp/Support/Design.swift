@@ -240,6 +240,13 @@ extension View {
 }
 
 extension Color {
+    /// Informative metadata and hints need normal-text contrast, even at caption sizes.
+    /// Opaque shades avoid the extra attenuation of the system secondary/tertiary styles.
+    static let checklistSecondaryText = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(white: 0.75, alpha: 1)
+            : NSColor(white: 0.34, alpha: 1)
+    })
     /// The fill and tint accent (prominent buttons draw white titles on it).
     static let checklistAccent = Color(red: 0.03, green: 0.49, blue: 0.52)
     /// The accent for text, icons and thin marks, also the window tint for menu and pop-up titles.
@@ -274,10 +281,38 @@ struct StatusPill: View {
             Text(name).checklistFont(.captionEmphasis)
         }
         .padding(.horizontal, Spacing.small).padding(.vertical, Spacing.tight)
-        .background(color.opacity(0.11), in: Capsule())
+        .background(StatusPillColors.tint(category: category).opacity(StatusPillColors.fillOpacity), in: Capsule())
         .foregroundStyle(color)
     }
-    var color: Color {
+    var color: Color { StatusPillColors.foreground(category: category) }
+}
+
+/// Preserve the status hues while separating readable text from the decorative fill tint.
+enum StatusPillColors {
+    static let fillOpacity = 0.11
+
+    static func foreground(category: String) -> Color {
+        let light: (CGFloat, CGFloat, CGFloat), dark: (CGFloat, CGFloat, CGFloat)
+        switch Canceled.normalized(category) {
+        case "active", "in_progress", "working":
+            light = (0.02, 0.34, 0.37); dark = (0.40, 0.80, 0.82)
+        case "review", "in_review":
+            light = (0.43, 0.20, 0.62); dark = (0.79, 0.65, 0.95)
+        case "done", "completed":
+            light = (0.12, 0.37, 0.18); dark = (0.49, 0.82, 0.53)
+        case "parked", "blocked":
+            light = (0.51, 0.29, 0.02); dark = (0.98, 0.74, 0.38)
+        case "draft", "canceled": return Color.checklistSecondaryText
+        default:
+            light = (0.12, 0.32, 0.64); dark = (0.55, 0.76, 1.00)
+        }
+        return Color(nsColor: NSColor(name: nil) { appearance in
+            let rgb = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
+            return NSColor(srgbRed: rgb.0, green: rgb.1, blue: rgb.2, alpha: 1)
+        })
+    }
+
+    static func tint(category: String) -> Color {
         switch Canceled.normalized(category) {
         case "active", "in_progress", "working": return .checklistAccent
         case "review", "in_review": return .purple
@@ -306,7 +341,7 @@ struct SectionCaption: View {
     var body: some View {
         HStack(spacing: Spacing.small) {
             Text(title).checklistFont(.bodyStrong)
-            if let count { Text("\(count)").checklistFont(.captionEmphasis).foregroundStyle(.secondary).padding(.horizontal, Spacing.compact).padding(.vertical, Spacing.hairline).background(.quaternary, in: Capsule()) }
+            if let count { Text("\(count)").checklistFont(.captionEmphasis).foregroundStyle(Color.checklistSecondaryText).padding(.horizontal, Spacing.compact).padding(.vertical, Spacing.hairline).background(.quaternary, in: Capsule()) }
             Spacer()
         }.padding(.top, Spacing.small).padding(.bottom, Spacing.tight)
     }
@@ -321,7 +356,7 @@ struct EmptyState: View {
             // Decorative empty-state artwork keeps its size independently of text scaling.
             Image(systemName: symbol).font(.system(size: 34, weight: .light)).foregroundStyle(.tertiary)
             Text(title).checklistFont(.subheadingEmphasis)
-            Text(detail).checklistFont(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 380)
+            Text(detail).checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText).multilineTextAlignment(.center).frame(maxWidth: 380)
         }.frame(maxWidth: .infinity, maxHeight: .infinity).padding(Spacing.empty)
     }
 }

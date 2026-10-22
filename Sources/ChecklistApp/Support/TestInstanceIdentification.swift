@@ -1,18 +1,34 @@
 import SwiftUI
+import Combine
 import ChecklistIPC
 
 extension View {
     @ViewBuilder func checklistTestIdentification() -> some View {
         if let slot = ChecklistInstance.current.slot {
             self.safeAreaInset(edge:.top,spacing:0) {
-                Text("TEST INSTANCE \(slot) · synthetic/test data")
-                    .font(.caption).fontWeight(.semibold)
-                    .frame(maxWidth:.infinity).padding(.vertical,4)
-                    .background(.orange.opacity(0.18))
+                TestInstanceStrip(slot:slot)
             }
             .navigationTitle(ChecklistInstance.current.displayName)
             .background(TestInstanceWindowTitle())
         } else { self }
+    }
+}
+
+/// Refresh only while a slot strip is visible, so an external `defaults write`
+/// appears without a relaunch. The shared controller also updates on each read.
+private struct TestInstanceStrip: View {
+    let slot: Int
+    @ObservedObject private var faults = QualificationFaults.shared
+    private let refresh = Timer.publish(every:1,on:.main,in:.common).autoconnect()
+    var body: some View {
+        HStack {
+            Text("TEST INSTANCE \(slot) · synthetic/test data")
+            if faults.isArmed { Text("TEST FAULT · \(faults.remaining) remaining").bold() }
+        }
+        .font(.caption).fontWeight(.semibold)
+        .frame(maxWidth:.infinity).padding(.vertical,4)
+        .background(.orange.opacity(faults.isArmed ? 0.4 : 0.18))
+        .onReceive(refresh) { _ in faults.refresh() }
     }
 }
 

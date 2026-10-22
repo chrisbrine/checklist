@@ -39,7 +39,7 @@ struct QuickCaptureView: View {
             ForEach(model.projects) { Text($0.name).tag($0.id) }
         }.checklistDisabled([(locked, QuickCaptureView.lockedReason)]).accessibilityIdentifier("quickCaptureProject")
         VStack(alignment: .leading, spacing: Spacing.tight) {
-            Text("Note (optional)").checklistFont(.caption).foregroundStyle(.secondary)
+            Text("Note (optional)").checklistFont(.caption).foregroundStyle(Color.checklistSecondaryText)
             TextEditor(text: $model.draft.note).checklistFont(.body).frame(minHeight: 70).padding(Spacing.tight)
                 .overlay(RoundedRectangle(cornerRadius: Radius.medium).stroke(.quaternary)).accessibilityLabel("Note").checklistDisabled([(locked, QuickCaptureView.lockedReason)])
         }
@@ -59,16 +59,16 @@ struct QuickCaptureView: View {
                 }
             }.checklistFont(.callout)
         }
-        Text("Drop files here or on the Checklist Dock icon. Files are attached as managed copies; the originals stay where they are.").checklistFont(.micro).foregroundStyle(.secondary)
+        Text("Drop files here or on the Checklist Dock icon. Files are attached as managed copies; the originals stay where they are.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
         if model.draft.pendingCreate != nil {
-            Text(QuickCaptureModel.newerEdits).checklistFont(.micro).foregroundStyle(.secondary)
+            Text(QuickCaptureModel.newerEdits).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
         }
         if case .uncertain(let reason) = model.state {
             Text(reason).checklistFont(.callout).foregroundStyle(.orange).accessibilityIdentifier("quickCaptureUncertain")
         } else if case .filesPending(let reason) = model.state {
             Text(reason).checklistFont(.callout).foregroundStyle(.orange).accessibilityIdentifier("quickCaptureFilesPending")
         } else if case .notSent(let reason) = model.state { Text(reason).checklistFont(.callout).foregroundStyle(.orange).accessibilityIdentifier("quickCaptureNotSent") }
-        else if !model.projectsAvailable && model.projects.isEmpty { Text("Checklist's service is not available, so no projects are listed. Your draft is saved on this Mac.").checklistFont(.micro).foregroundStyle(.secondary) }
+        else if !model.projectsAvailable && model.projects.isEmpty { Text("Checklist's service is not available, so no projects are listed. Your draft is saved on this Mac.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
         if let problem = model.problem { Text(problem).checklistFont(.micro).foregroundStyle(.orange) }
         Spacer(minLength: 0)
         AccessibleHStack {
@@ -86,9 +86,9 @@ struct QuickCaptureView: View {
     @ViewBuilder func captured(key: String, taskID: String) -> some View {
         Label(key.isEmpty ? "Ticket captured as a Draft." : "\(key) captured as a Draft.", systemImage: "checkmark.circle.fill")
             .checklistFont(.subheading).accessibilityIdentifier("quickCaptureDone")
-        Text("Add its outcome and make it ready in Checklist when you are set.").checklistFont(.callout).foregroundStyle(.secondary)
+        Text("Add its outcome and make it ready in Checklist when you are set.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
         if !model.draft.isEmpty {
-            Text("Your newer edits are saved as the next draft.").checklistFont(.callout).foregroundStyle(.secondary)
+            Text("Your newer edits are saved as the next draft.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
         }
         Spacer(minLength: 0)
         AccessibleHStack {
@@ -135,7 +135,7 @@ struct QuickCaptureSettingsSection: View {
                 }
             }
             if let problem { Text(problem).checklistFont(.micro).foregroundStyle(.orange) }
-            Text(QuickCaptureSettings.help).checklistFont(.micro).foregroundStyle(.secondary)
+            Text(QuickCaptureSettings.help).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
         }.onDisappear { stop() }
     }
     private func record() {

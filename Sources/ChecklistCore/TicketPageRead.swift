@@ -4,6 +4,12 @@ import GRDB
 /// Request-local SQL selection. Only LIMITed canonical task rows cross the JSON
 /// decoding boundary; count/search predicates stay inside the authorized query.
 extension CommandRouter {
+    func ownerNeedsYouCounts(_ db: Database) throws -> (requests: Int, tasks: Int) {
+        let requests = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type='request' AND COALESCE(json_extract(data,'$.state'),'') NOT IN ('answered','canceled','\(LegacyStoredValue.canceled)','superseded','resolved')") ?? 0
+        let tasks = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records t LEFT JOIN records s ON s.id=json_extract(t.data,'$.status_id') AND s.project_id=t.project_id AND s.type='status' WHERE t.type='task' AND COALESCE(json_extract(t.data,'$.archived'),0)=0 AND COALESCE(json_extract(t.data,'$.trashed'),0)=0 AND COALESCE(json_extract(s.data,'$.category'),'') NOT IN ('done','completed','canceled','\(LegacyStoredValue.canceled)') AND (json_extract(t.data,'$.planned_assignee')='human' OR json_extract(t.data,'$.planned_assignee.kind')='human' OR json_extract(t.data,'$.assignee')='human')") ?? 0
+        return (requests,tasks)
+    }
+
     static func installTicketSearchFunctions(_ db: Database) {
         // Registered by prepareDatabase on every connection, never persisted DDL.
         let fractional = ISO8601DateFormatter()
@@ -134,8 +140,9 @@ extension CommandRouter {
         page["epics"] = try Row.fetchAll(db,sql:"SELECT id,project_id,json_extract(data,'$.name') name,json_extract(data,'$.key') key FROM records WHERE type='group' AND json_extract(data,'$.kind')='epic' AND project_id IN (SELECT value FROM json_each(?)) ORDER BY rowid",arguments:[projectJSON]).map {["id":$0["id"] as String,"project_id":$0["project_id"] as String,"key":$0["key"] as String? ?? "","name":$0["name"] as String? ?? ""]}
         page["filter_triages"] = try Row.fetchAll(db,sql:"SELECT id,project_id,json_extract(data,'$.name') name,json_extract(data,'$.key') key FROM records WHERE type='group' AND json_extract(data,'$.kind')='triage' AND project_id IN (SELECT value FROM json_each(?)) ORDER BY rowid",arguments:[projectJSON]).map {["id":$0["id"] as String,"project_id":$0["project_id"] as String,"key":$0["key"] as String? ?? "","name":$0["name"] as String? ?? ""]}
         // Global sidebar badges do not force the full requests/tasks corpus into memory.
-        page["outstanding_request_count"] = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type='request' AND COALESCE(json_extract(data,'$.state'),'') NOT IN ('answered','canceled','\(LegacyStoredValue.canceled)','superseded','resolved')") ?? 0
-        page["human_task_count"] = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records t LEFT JOIN records s ON s.id=json_extract(t.data,'$.status_id') AND s.project_id=t.project_id AND s.type='status' WHERE t.type='task' AND COALESCE(json_extract(t.data,'$.archived'),0)=0 AND COALESCE(json_extract(t.data,'$.trashed'),0)=0 AND COALESCE(json_extract(s.data,'$.category'),'') NOT IN ('done','completed','canceled','\(LegacyStoredValue.canceled)') AND (json_extract(t.data,'$.planned_assignee')='human' OR json_extract(t.data,'$.planned_assignee.kind')='human' OR json_extract(t.data,'$.assignee')='human')") ?? 0
+        let needs = try ownerNeedsYouCounts(db)
+        page["outstanding_request_count"] = needs.requests
+        page["human_task_count"] = needs.tasks
         let preview = try overviewRequestPreview(db,projectJSON:projectJSON,query:query,surface:view?["surface"] as? String ?? "tickets")
         page["overview_requests"] = preview["requests"]
         page["overview_request_count"] = preview["count"]

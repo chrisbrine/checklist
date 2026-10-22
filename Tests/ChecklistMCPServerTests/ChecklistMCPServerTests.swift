@@ -93,6 +93,23 @@ final class ChecklistMCPServerTests: XCTestCase {
         }
     }
 
+    func testNativeSessionRequiredNamesExactReconnectAndDoesNotReplay() async throws {
+        let fixture = try Fixture(provider:"codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        let bridge = Bridge(configuration:.init(workspace:fixture.context.workspacePath),environment:fixture.environment)
+        _ = try await bridge.connect(required:true)
+        fixture.callHandler = { name in if name == "task_list" {throw ChecklistError("NATIVE_SESSION_REQUIRED","old native binding")} }
+        do {
+            _ = try await bridge.call("task_list",.object(["project_id":.string("synthetic-project")]))
+            XCTFail("Expected reconnect guidance")
+        } catch let error as ChecklistError {
+            XCTAssertEqual(error.code,"NATIVE_SESSION_REQUIRED")
+            XCTAssertTrue(error.message.contains("/Applications/Checklist.app/Contents/MacOS/checklist mcp"))
+            XCTAssertTrue(error.message.contains("original command_id"))
+        }
+        XCTAssertEqual(fixture.calls.filter {$0.0 == "task_list"}.count,1)
+    }
+
     private actor ProtocolTransport: Transport {
         nonisolated let logger: Logger
         let base: InMemoryTransport
@@ -394,6 +411,23 @@ final class ChecklistMCPServerTests: XCTestCase {
                 }
             })
         }
+    }
+
+    func testReplacedShimNativeRefusalAlsoNamesReconnectWithoutReplay() async throws {
+        let fixture = try Fixture(provider:"codex"),update = UpdateFixture()
+        update.set(.replaced)
+        update.result = .init(status:1,stdout:Data(),stderr:"Checklist: NATIVE_SESSION_REQUIRED: old native binding\n")
+        var environment = fixture.environment;environment.shimUpdate = update.environment
+        let bridge = Bridge(configuration:.init(workspace:fixture.context.workspacePath),environment:environment)
+        _ = try await bridge.connect(required:true)
+        do {
+            _ = try await bridge.serviceInfo()
+            XCTFail("Expected native reconnect guidance")
+        } catch let error as ChecklistError {
+            XCTAssertEqual(error.code,"NATIVE_SESSION_REQUIRED")
+            XCTAssertTrue(error.message.contains(ChecklistInstance.current.cliCommand + " mcp"))
+        }
+        XCTAssertEqual(update.calls.count,1)
     }
 
     private func noticeCount(_ session: Session) async throws -> Int {

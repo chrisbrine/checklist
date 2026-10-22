@@ -207,7 +207,7 @@ extension CommandRouter {
 
     // Data-only relation import into already mapped tickets. No source access, identity guessing or work authority transfer.
     func relationImport(_ db: Database, _ p: JSON, _ c: Caller) throws -> JSON {
-        try owner(c); let pid = try scope(db, p, c, write: true), project = try record(db, pid, type: "project"); try revision(p, project)
+        let pid = try scope(db, p, c, write: true), project = try record(db, pid, type: "project"); try requireAgentEditAuthority(db,project:project,caller:c); try revision(p, project)
         guard (p["relations"] == nil || p["relations"] is [JSON]), (p["aliases"] == nil || p["aliases"] is [JSON]) else { throw CoreError("INVALID_INPUT", "Relation import needs arrays of relation and alias records.") }
         let edges = p["relations"] as? [JSON] ?? [], aliases = p["aliases"] as? [JSON] ?? []
         guard edges.count <= 1000, aliases.count <= 1000 else { throw CoreError("INVALID_INPUT", "Import at most 1000 relations and aliases per command.") }
@@ -232,6 +232,8 @@ extension CommandRouter {
                 var source = try scoped(db, try text(edge, "source_task_id"), pid, type: "task")
                 try markDuplicate(db, task: &source, edge: edge, caller: c, createAlias: false); try save(db, revised(source), type: "task")
             }
+            edge["imported_by"] = c.principal; edge["import_origin"] = c.isOwner ? "human_ui" : "agent"
+            if !c.isOwner { edge["origin"] = "agent"; edge["author"] = c.principal }
             try save(db, edge, type: "relation"); imported.append(edge)
         }
         for raw in aliases {
@@ -242,6 +244,8 @@ extension CommandRouter {
             guard !(try records(db, type: "task_alias", project: pid).contains { $0["namespace"] as? String == namespace && $0["alias"] as? String == value && $0["task_id"] as? String != alias["task_id"] as? String }) else { throw CoreError("ALIAS_CONFLICT", "This source alias already identifies another ticket. Resolve it explicitly.") }
             if let target = alias["target_task_id"] as? String { _ = try scoped(db, target, pid, type: "task") }
             alias["project_id"] = pid; alias["revision"] = max(int(alias, "revision", default: 1), 1); alias["created_at"] = alias["created_at"] ?? now()
+            alias["imported_by"] = c.principal; alias["import_origin"] = c.isOwner ? "human_ui" : "agent"
+            if !c.isOwner { alias["origin"] = "agent"; alias["author"] = c.principal }
             try save(db, alias, type: "task_alias"); importedAliases.append(alias)
         }
         try save(db, revised(project), type: "project")

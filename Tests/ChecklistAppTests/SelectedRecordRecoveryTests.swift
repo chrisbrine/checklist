@@ -64,10 +64,10 @@ import ChecklistIPC
             if let error = error ?? heldError {held.resume(throwing:error)} else {held.resume(returning:heldReply!)}
             heldReply = nil;heldError = nil
         }
-        func store() -> ChecklistStore {
+        func store(qualificationFaults: QualificationFaults? = nil) -> ChecklistStore {
             ChecklistStore(draftJournal:LocalDraftJournal(directory:root.appendingPathComponent("drafts")),preferences:preferences,restorePendingCommand:false,
                            desktopAlerts:DesktopAlertCoordinator(sink:RecoveryAlertSink()),requestTransport:{[self] in try await transport($0,$1)},navigationMemory:DetailItemNavigationMemory(),
-                           pendingCommandPersistence:PendingCommandPersistence(read:{_ in nil},save:{_,_ in},remove:{_ in}))
+                           pendingCommandPersistence:PendingCommandPersistence(read:{_ in nil},save:{_,_ in},remove:{_ in}),qualificationFaults:qualificationFaults)
         }
         func reads(_ level: String) -> [[String:Any]] {calls.filter {$0.0 == "task_context" && $0.1["detail_level"] as? String == level}.map(\.1)}
         func draftBytes() throws -> [String:Data] {
@@ -159,6 +159,39 @@ import ChecklistIPC
             XCTAssertTrue(error?.contains(freshFailure ? "Fresh context permission refused" : "context changed again") == true)
             XCTAssertEqual(f.reads("ui").count,1);XCTAssertEqual(f.reads(level).count,freshFailure ? 1 : 2)
             XCTAssertFalse(store.selectedRecordsCurrent)
+        }}
+    }
+    func testSlotPreferenceFaultsReachTerminalRecoveryOnBothRoutesThenDisarm() async throws {
+        for history in [false,true] {for kind in ["cursor_reset_twice","fresh_context_fail"] {
+            let f = try Fixture(isolatedDefaults("CL205-client-boundary"));defer {f.cleanup()}
+            var preference: [String:Any] = [:], logs: [String] = []
+            let faults = QualificationFaults(instance:try ChecklistInstance(slotValue:1),read:{ domain in
+                XCTAssertEqual(domain,"org.checklist.app.test1");return preference
+            },write:{ _,value in preference = value },log:{logs.append($0)})
+            let store = f.store(qualificationFaults:faults),live = Task {await store.startLiveUpdates()}
+            defer {live.cancel();store.stopWindowReads()}
+            try await select(store,f)
+            store.saveNote(f.task,text:"CL205 unsent draft");let bytes = try f.draftBytes()
+            preference = ["selected_records":kind,"remaining":2];faults.refresh()
+            XCTAssertTrue(faults.isArmed)
+            let task = try XCTUnwrap(store.selectedTask(f.task))
+            if history {store.readRecordHistory(task,family:"manifest")} else {store.loadFullSelectedRecord(f.task)}
+            try await until {history ? !store.recordHistoryLoading : !store.selectedRecordsLoading}
+            let error = history ? store.recordHistoryError : store.selectedRecordsError
+            XCTAssertTrue(error?.contains(kind == "fresh_context_fail" ? "TEST FAULT: selected-ticket fresh context read failed" : "context changed again") == true)
+            XCTAssertTrue(error?.contains("Your draft is kept") == true)
+            XCTAssertFalse(store.selectedRecordsCurrent);XCTAssertTrue(store.connected)
+            XCTAssertEqual(try f.draftBytes(),bytes)
+            XCTAssertEqual(logs.count,2);XCTAssertTrue(logs[0].contains("remaining=1"));XCTAssertTrue(logs[1].contains("remaining=0"))
+            XCTAssertEqual(preference["remaining"] as? Int,0);XCTAssertFalse(faults.isArmed)
+            XCTAssertEqual(f.reads("ui_records").count,0);XCTAssertEqual(f.reads("ui_history").count,0)
+            XCTAssertEqual(f.reads("ui").count,kind == "fresh_context_fail" ? 0 : 1)
+            f.calls = []
+            if history {store.readRecordHistory(task,family:"manifest")} else {store.loadFullSelectedRecord(f.task)}
+            try await until {history ? !store.recordHistoryLoading : !store.selectedRecordsLoading}
+            XCTAssertNil(history ? store.recordHistoryError : store.selectedRecordsError)
+            XCTAssertEqual(f.reads(history ? "ui_history" : "ui_records").count,1)
+            XCTAssertEqual(logs.count,2)
         }}
     }
     func testOtherFailuresNeverRebaseAndRemainSpecific() async throws {

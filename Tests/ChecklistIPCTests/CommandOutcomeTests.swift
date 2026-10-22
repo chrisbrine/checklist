@@ -27,7 +27,7 @@ final class CommandOutcomeTests: XCTestCase {
 
     func testScopedWorkspaceAndCleanupReadsKeepReadEnvelopesAndCoreClassification() throws {
         XCTAssertEqual(CommandReply.readMethods.subtracting(["connection_list","task_handoff_prepare"]),CommandRouter.readMethods)
-        for method in ["workspace_page","cleanup_job_get","cleanup_job_list"] {
+        for method in ["workspace_page","cleanup_job_get","cleanup_job_list","work_health_get"] {
             XCTAssertFalse(CommandReply.expectsMutation(method))
             let reply:[String:Any] = ["data":["rows":[],"_checklist":["schema_version":1]]]
             let decoded=try CommandReply.decode(bytes(reply),method:method,commandID:nil)
@@ -110,19 +110,19 @@ final class CommandOutcomeTests: XCTestCase {
         }
         let (pid, tid) = try fixture()
         // These envelopes come from the actual Core endpoint, including all
-        // unresolved actions and Not checked, rather than hand-built approximations.
-        for action in ["answered", "send", "clarification", "clarify", "cannot_do", "not_checked"] {
+        // unresolved actions and explicit check decline, rather than hand-built approximations.
+        for action in ["answered", "send", "clarification", "clarify", "cannot_do", "declined"] {
             let request = try call("human_request_create", ["project_id": pid, "task_id": tid, "title": "Selected check \(action)", "blocking": false, "questions": [["id": "q", "type": "check", "prompt": "Run the selected check for \(action)"]]])["data"] as! [String: Any]
             let commandID = UUID().uuidString
-            let result = action == "not_checked" ? "not_checked" : "passed"
-            let answers: [[String: Any]] = ["answered", "send", "not_checked"].contains(action) ? [["question_id": "q", "result": result]] : []
-            var envelope = try call("human_request_answer", ["project_id": pid, "request_id": request["id"]!, "expected_revision": request["revision"]!, "form_identity": request["form_identity"]!, "response": action == "not_checked" ? "answered" : action, "answers": answers, "explanation": "Actual disposable endpoint control", "command_id": commandID])
+            let result = action == "declined" ? "declined" : "passed"
+            let answers: [[String: Any]] = ["answered", "send", "declined"].contains(action) ? [["question_id": "q", "result": result]] : []
+            var envelope = try call("human_request_answer", ["project_id": pid, "request_id": request["id"]!, "expected_revision": request["revision"]!, "form_identity": request["form_identity"]!, "response": action == "declined" ? "answered" : action, "answers": answers, "explanation": "Actual disposable endpoint control", "command_id": commandID])
             var data = envelope["data"] as! [String: Any]
             data["_checklist"] = ["pending_human_answers": ["schema_version": 1, "status": "pending_pickup", "items": []]]
             envelope["data"] = data
             let decoded = try CommandReply.decode(bytes(envelope), method: "human_request_answer", commandID: commandID)
             XCTAssertEqual(try jsonString(decoded), try jsonString(envelope), action)
-            XCTAssertEqual(data["state"] as? String, ["answered", "send"].contains(action) ? "answered" : "pending")
+            XCTAssertEqual(data["state"] as? String, ["answered", "send", "declined"].contains(action) ? "answered" : "pending")
         }
         let read: [String: Any] = ["data": ["requests": []]]
         XCTAssertEqual(try jsonString(CommandReply.decode(bytes(read), method: "snapshot", commandID: id)), try jsonString(read))

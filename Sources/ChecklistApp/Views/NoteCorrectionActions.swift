@@ -14,15 +14,15 @@ struct NoteCorrectionActions: View {
     var body: some View {
         VStack(alignment:.leading,spacing:Spacing.small) {
             let state = message.string("note_revision_state")
-            if ["corrected","retracted"].contains(state) {Text(state == "corrected" ? "Corrected · original retained" : "Retracted · original retained").checklistFont(.microEmphasis).foregroundStyle(.secondary)}
+            if ["corrected","retracted"].contains(state) {Text(state == "corrected" ? "Corrected · original retained" : "Retracted · original retained").checklistFont(.microEmphasis).foregroundStyle(Color.checklistSecondaryText)}
             ForEach(message.records("note_revisions")) {revision in
                 VStack(alignment:.leading,spacing:Spacing.tight) {
                     Text(revision.string("kind") == "retraction" ? "Retraction" : "Correction").checklistFont(.microEmphasis)
                     Text(revision.string("body")).checklistFont(.callout).textSelection(.enabled)
-                    if revision.bool("direction_already_addressed") || revision.bool("direction_already_acknowledged") {Text("Recorded after the earlier direction was acknowledged or addressed. Earlier work is still recorded.").checklistFont(.micro).foregroundStyle(.secondary)}
+                    if revision.bool("direction_already_addressed") || revision.bool("direction_already_acknowledged") {Text("Recorded after the earlier direction was acknowledged or addressed. Earlier work is still recorded.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)}
                 }
             }
-            if message.bool("note_revisions_truncated") {Text("More corrections are kept in ticket history.").checklistFont(.micro).foregroundStyle(.secondary)}
+            if message.bool("note_revisions_truncated") {Text("More corrections are kept in ticket history.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)}
             if ownNote {
                 HStack {
                     Button("Correct…") {text = message.string("body");retracting = false;correcting = true}
@@ -35,7 +35,7 @@ struct NoteCorrectionActions: View {
                 Text(retracting ? "Retract note" : "Correct note").checklistFont(.sheetTitle)
                 Text("The original note, its author and delivery receipts stay in history. The current handler receives a linked note. Earlier work is still recorded.").checklistFont(.callout)
                 TextEditor(text:$text).frame(minHeight:110).overlay(RoundedRectangle(cornerRadius:Radius.medium).stroke(.quaternary))
-                Text(retracting ? "Give a short reason for retracting this note." : "Write the corrected note. A direction stays pending until addressed or retracted.").checklistFont(.micro).foregroundStyle(.secondary)
+                Text(retracting ? "Give a short reason for retracting this note." : "Write the corrected note. A direction stays pending until addressed or retracted.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 HStack {Button("Cancel") {correcting = false};Spacer();Button(retracting ? "Retract…" : "Save correction") {if retracting {confirmRetraction = true} else {save()}}.buttonStyle(.checklistProminent).checklistDisabled([(text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty,"Write the corrected note or a retraction reason first."),(store.busy,DisabledReasons.saving),(!store.connected,DisabledReasons.offline)])}
             }.padding(Spacing.page).checklistSheet(width:510)
                 .confirmationDialog("Retract this note?",isPresented:$confirmRetraction,titleVisibility:.visible) {Button("Retract note",role:.destructive) {save()};Button("Cancel",role:.cancel) {}} message: {Text("Future action on this direction is withdrawn. Acknowledgment and earlier work remain in history.")}

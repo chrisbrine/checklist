@@ -57,7 +57,7 @@ struct PlaytestBundleView: View {
             DisclosureGroup("Playtest bundle · \(build.string("build_id"))") {
                 VStack(alignment:.leading,spacing:Spacing.small) {
                     Text("Build \(build.string("build_id")) · \(build.string("version")) · \(build.string("platform"))").checklistFont(.microEmphasis)
-                    Text(manifest.id == projection.task.string("current_manifest_id") ? "Bound to this exact submission and build. A different build requires a new bundle." : "Earlier bundle. Its results do not verify a replacement build.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text(manifest.id == projection.task.string("current_manifest_id") ? "Bound to this exact submission and build. A different build requires a new bundle." : "Earlier bundle. Its results do not verify a replacement build.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     ForEach(value.files) { row in
                         VStack(alignment:.leading,spacing:Spacing.tight) {
                             Text(row.role).checklistFont(.microEmphasis)
@@ -66,7 +66,7 @@ struct PlaytestBundleView: View {
                             } else {
                                 Text(row.file?.string("name",fallback:"File") ?? "Missing file").checklistFont(.microEmphasis).lineLimit(2)
                             }
-                            Text("\(row.available ? "Available managed original" : "Original unavailable or changed")\(row.cited ? " · Cited in a verdict" : " · Not cited in a recorded verdict")\(row.file?.bool("keep_original") == true ? " · Keep original" : "")").checklistFont(.micro).foregroundStyle(row.available ? Color.secondary : .orange)
+                            Text("\(row.available ? "Available managed original" : "Original unavailable or changed")\(row.cited ? " · Cited in a verdict" : " · Not cited in a recorded verdict")\(row.file?.bool("keep_original") == true ? " · Keep original" : "")").checklistFont(.micro).foregroundStyle(row.available ? Color.checklistSecondaryText : .orange)
                             TechnicalDetails([("Attachment",row.ref.string("artifact_id")),("SHA-256",row.ref.string("sha256"))])
                         }.padding(Spacing.small).frame(maxWidth:.infinity,alignment:.leading).background(.primary.opacity(0.025),in:RoundedRectangle(cornerRadius:Radius.small))
                     }
@@ -82,7 +82,7 @@ struct PlaytestBundleView: View {
                             }
                         }
                     }
-                    Text("Reviewers can request Keep original for cited bundle files with their verdict. Other files follow the project’s archive policy and existing holds. Preview the normal cleanup before archiving.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("Reviewers can request Keep original for cited bundle files with their verdict. Other files follow the project’s archive policy and existing holds. Preview the normal cleanup before archiving.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     Button("Preview archive cleanup") { preview() }.checklistDisabled([(reading,"The cleanup preview is loading."),(!store.connected,DisabledReasons.offline),(!store.selectedTicketCurrent(projection.task.id),"Refresh the ticket before previewing cleanup.")])
                     if let cleanup {
                         Text("Eligible originals: \(cleanup.strings("attachment_ids").count) · selected \(ByteCountFormatter.string(fromByteCount:(cleanup.values["clean_bytes"] as? NSNumber)?.int64Value ?? 0,countStyle:.file)) · kept \(ByteCountFormatter.string(fromByteCount:(cleanup.values["retained_bytes"] as? NSNumber)?.int64Value ?? 0,countStyle:.file)). No files have been removed by this preview.").checklistFont(.micro)

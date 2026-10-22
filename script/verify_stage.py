@@ -59,6 +59,10 @@ def verify(capture):
     receipt = json.loads((capture / 'build-verification.json').read_text())
     if receipt.get('captured_source_verified') is not True or receipt.get('source_fingerprint') != fingerprint or receipt.get('build_id') != manifest['build_id']:
         raise ValueError('No matching completed build verification receipt.')
+    if 'binary_sha256' in receipt:
+        actual = {name: sha(bundle / 'Contents/MacOS' / name) for name in ['ChecklistApp', 'ChecklistService', 'checklist']}
+        if receipt['binary_sha256'] != actual:
+            raise ValueError('Staged binaries differ from the completed build receipt.')
     subprocess.run(['codesign', '--verify', '--deep', '--strict', str(bundle)], check=True)
     signing_teams(bundle, manifest['signing_profile'])
     return capture, manifest

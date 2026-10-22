@@ -29,7 +29,7 @@ struct FilePreviewSheet: View {
                     Button("Close") { dismiss() }
                 } else { Button("Close") { dismiss() }.keyboardShortcut(.cancelAction) }
             }
-            Text("Viewing does not approve this candidate. External apps receive a separate working copy.").font(.caption).foregroundStyle(.secondary)
+            Text("Viewing does not approve this candidate. External apps receive a separate working copy.").font(.caption).foregroundStyle(Color.checklistSecondaryText)
             if loader.loading {
                 VStack(spacing: Spacing.row) {
                     if loader.copying {
@@ -112,7 +112,7 @@ struct OpenInApplicationsSheet: View {
                 List(apps, selection: $selection) { app in
                     VStack(alignment: .leading) {
                         Text(app.name + (app.isDefault ? " (default)" : ""))
-                        Text(app.url.path).font(.caption).foregroundStyle(.secondary)
+                        Text(app.url.path).font(.caption).foregroundStyle(Color.checklistSecondaryText)
                     }.tag(app.id)
                 }.frame(minHeight: 170)
             }

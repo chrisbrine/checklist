@@ -471,16 +471,16 @@ extension CommandRouter {
         try records(db,type:"source_execution").filter { (["queued","running","interrupted"].contains($0["state"] as? String ?? "") || bool($0,"process_stop_unverified")) && (attemptID == nil || $0["attempt_id"] as? String == attemptID) && (taskID == nil || $0["task_id"] as? String == taskID) }
     }
     func requireNoSourceExecutions(_ db: Database, attempt: JSON) throws {
-        guard try unresolvedSourceExecutions(db,attemptID:attempt["id"] as? String).isEmpty else { throw CoreError("SOURCE_EXECUTION_ACTIVE","A queued, running or interrupted source process retains its attempt reservations. Await actual completion, or record explicit owner stop verification before recovery.") }
+        guard try unresolvedSourceExecutions(db,attemptID:attempt["id"] as? String).isEmpty else { throw CoreError("SOURCE_EXECUTION_ACTIVE","A queued, running or interrupted source process retains its attempt reservations. Await actual completion, or record explicit stop verification before recovery.") }
     }
     func recoverSourceExecutions(_ db: Database, attempt: JSON, params: JSON, caller: Caller) throws {
-        try owner(caller)
+        try requireAgentEditAuthority(db,project:try record(db,attempt["project_id"] as! String,type:"project"),caller:caller)
         let runs = try unresolvedSourceExecutions(db,attemptID:attempt["id"] as? String)
         guard !runs.isEmpty else {return}
         guard Set(strings(params,"source_execution_ids")) == Set(runs.compactMap {$0["id"] as? String}) else { throw CoreError("RECOVERY_REQUIRED","Explicitly name every source execution whose external process stop was verified.",details:["source_execution_ids":runs.compactMap {$0["id"] as? String}]) }
         let expected = params["expected_source_execution_revisions"] as? JSON ?? [:]
         guard Set(expected.keys) == Set(runs.compactMap {$0["id"] as? String}),runs.allSatisfy({int(expected,$0["id"] as! String,default:-1) == int($0,"revision")}) else { throw CoreError("REVISION_CONFLICT","Source process state changed after the stop observation. Inspect the current launch/stop receipt before recovery.",details:["source_execution_revisions":Dictionary(uniqueKeysWithValues:runs.map {($0["id"] as! String,int($0,"revision"))})]) }
-        for var run in runs { run["state"] = "stopped";run["process_stop_unverified"] = false;run["stop_verified_by"] = caller.principal;run["stop_observation_refs"] = params["observation_refs"];run["file_state_refs"] = params["file_state_refs"];run["stop_reason"] = params["reason"];run["finished_at"] = now();try save(db,revised(run),type:"source_execution") }
+        for var run in runs { run["state"] = "stopped";run["process_stop_unverified"] = false;run["stop_verified_by"] = caller.principal;run["stop_verification_origin"] = caller.isOwner ? "human_ui" : "agent";run["stop_verification_session_id"] = caller.sessionID ?? "human";run["stop_observation_refs"] = params["observation_refs"];run["file_state_refs"] = params["file_state_refs"];run["stop_reason"] = params["reason"];run["finished_at"] = now();try save(db,revised(run),type:"source_execution") }
     }
 }
 
@@ -520,7 +520,7 @@ extension CommandRouter {
     /// Methods that the service may run off its serial queue: their large file work runs
     /// before the writer, and pure reads use the read-only connections (CL-71, CL-72).
     public static func runsOutsideSerialQueue(_ method: String) -> Bool {
-        sourceCaptureMethods.contains(method) || sourceTargetMethods.contains(method) || method == "attachment_add" || pureReadMethods.contains(method)
+        sourceCaptureMethods.contains(method) || sourceTargetMethods.contains(method) || method == "attachment_add" || method == "backup_create" || pureReadMethods.contains(method)
     }
 
     func inventoryKey(_ path: String, _ additional: [String]) -> String {

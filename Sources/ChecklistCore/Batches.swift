@@ -31,29 +31,37 @@ extension CommandRouter {
         guard ids.count == selected.count,Set(ids).count == ids.count,Set(ids).isSubset(of:Set(triageMemberIDs(group))) else { throw CoreError("REVISION_CONFLICT","Select unique current members of this Triage before preparing a batch.") }
         let project = try record(db,pid,type:"project")
         var frozen: [JSON] = []
-        // Evaluate the complete selected set together, including mutual scope conflicts, then discard every provisional mutation.
+        for member in selected {
+            let base: Set<String> = ["task_id","expected_revision","file_scopes","lane_scopes"]
+            let allowed = phase == "review" ? base.union(["review_request_id","target_manifest_id","gate","key","contributor_session_ids"]) : base
+            guard Set(member.keys).isSubset(of:allowed) else { throw CoreError("INVALID_INPUT","Batch members contain unsupported fields or review selectors in an implementation batch.") }
+            guard let expected = member["expected_revision"] as? NSNumber,CFGetTypeID(expected) != CFBooleanGetTypeID(),expected.doubleValue.rounded() == expected.doubleValue,expected.intValue >= 1,(member["file_scopes"] == nil || member["file_scopes"] is [JSON]),(member["lane_scopes"] == nil || member["lane_scopes"] is [JSON]) else { throw CoreError("INVALID_INPUT","Each selected member needs a positive task revision and structured file/lane scopes.") }
+            let task = try scoped(db,try text(member,"task_id"),pid,type:"task");try revision(member,task)
+            if member["key"] != nil,member["key"] as? String != task["key"] as? String { throw CoreError("INVALID_INPUT","The supplied ticket key must match its current key.") }
+            var snapshot: JSON = ["task_id":task["id"]!,"key":task["key"] ?? "","title":task["title"] ?? "","task_revision":task["revision"]!,"acceptance_revision":task["acceptance_revision"] ?? 1,"membership":(group["members"] as? [JSON] ?? []).first {$0["task_id"] as? String == task["id"] as? String} ?? [:]]
+            if phase == "review" {
+                let request = try scoped(db,try text(member,"review_request_id"),pid,type:"review_request")
+                let manifest = try scoped(db,try text(member,"target_manifest_id"),pid,type:"manifest")
+                snapshot["review_request_id"] = request["id"];snapshot["review_request_revision"] = request["revision"];snapshot["target_manifest_id"] = manifest["id"];snapshot["manifest_revision"] = manifest["revision"];snapshot["manifest_digest"] = hash(Data(try jsonString(manifest).utf8));snapshot["gate"] = try text(member,"gate")
+            }
+            let scopes = try normalizedWorkScopes(db,project:project,fileScopes:member["file_scopes"] as? [JSON] ?? [],laneScopes:member["lane_scopes"] as? [JSON] ?? [])
+            snapshot["file_scopes"] = scopes.files;snapshot["lane_scopes"] = scopes.lanes
+            frozen.append(snapshot)
+        }
+        var batch: JSON = ["id":uuid(),"project_id":pid,"triage_id":group["id"]!,"triage_revision":group["revision"]!,"triage_key":group["key"] ?? "","triage_name":group["name"] ?? "","phase":phase,"members":frozen,"checks":p["checks"] ?? [],"policy_revision":project["policy_revision"] ?? 1,"policy_snapshot":project["policy"] ?? [:],"revision":1,"prepared_by":c.principal,"created_at":now()]
+        batch["digest"] = try batchDigest(batch)
+        let cohort = BatchClaimContext(batch:batch)
+        // Normalize the entire selection first. Ephemeral attempts use the same cohort
+        // predicate as dispatch; rollback removes every provisional authority/effect.
         try db.inSavepoint {
-            for member in selected {
-                let base: Set<String> = ["task_id","expected_revision","file_scopes","lane_scopes"]
-                let allowed = phase == "review" ? base.union(["review_request_id","target_manifest_id","gate","key","contributor_session_ids"]) : base
-                guard Set(member.keys).isSubset(of:allowed) else { throw CoreError("INVALID_INPUT","Batch members contain unsupported fields or review selectors in an implementation batch.") }
-                guard let expected = member["expected_revision"] as? NSNumber,CFGetTypeID(expected) != CFBooleanGetTypeID(),expected.doubleValue.rounded() == expected.doubleValue,expected.intValue >= 1,(member["file_scopes"] == nil || member["file_scopes"] is [JSON]),(member["lane_scopes"] == nil || member["lane_scopes"] is [JSON]) else { throw CoreError("INVALID_INPUT","Each selected member needs a positive task revision and structured file/lane scopes.") }
-                let task = try scoped(db,try text(member,"task_id"),pid,type:"task");try revision(member,task)
-                if member["key"] != nil,member["key"] as? String != task["key"] as? String { throw CoreError("INVALID_INPUT","The supplied ticket key must match its current key.") }
-                var snapshot: JSON = ["task_id":task["id"]!,"key":task["key"] ?? "","title":task["title"] ?? "","task_revision":task["revision"]!,"acceptance_revision":task["acceptance_revision"] ?? 1,"membership":(group["members"] as? [JSON] ?? []).first {$0["task_id"] as? String == task["id"] as? String} ?? [:]]
-                if phase == "review" {
-                    let request = try scoped(db,try text(member,"review_request_id"),pid,type:"review_request")
-                    let manifest = try scoped(db,try text(member,"target_manifest_id"),pid,type:"manifest")
-                    snapshot["review_request_id"] = request["id"];snapshot["review_request_revision"] = request["revision"];snapshot["target_manifest_id"] = manifest["id"];snapshot["manifest_revision"] = manifest["revision"];snapshot["manifest_digest"] = hash(Data(try jsonString(manifest).utf8));snapshot["gate"] = try text(member,"gate")
-                }
+            for (index,member) in selected.enumerated() {
                 var input = member;input["project_id"] = pid;input["phase"] = phase;input["policy_revision"] = project["policy_revision"] ?? 1
-                let provisional = try work(db,input,c,"work_claim",operation:.triage)
-                snapshot["file_scopes"] = provisional["file_scopes"] ?? [];snapshot["lane_scopes"] = provisional["lane_scopes"] ?? [];snapshot["policy_revision"] = provisional["policy_revision"] ?? 1;snapshot["policy_snapshot"] = provisional["policy_snapshot"] ?? [:]
-                frozen.append(snapshot)
+                let provisional = try work(db,input,c,"work_claim",operation:.triage,batchContext:cohort)
+                frozen[index]["policy_revision"] = provisional["policy_revision"] ?? 1;frozen[index]["policy_snapshot"] = provisional["policy_snapshot"] ?? [:]
             }
             return .rollback
         }
-        var batch: JSON = ["id":uuid(),"project_id":pid,"triage_id":group["id"]!,"triage_revision":group["revision"]!,"triage_key":group["key"] ?? "","triage_name":group["name"] ?? "","phase":phase,"members":frozen,"checks":p["checks"] ?? [],"policy_revision":project["policy_revision"] ?? 1,"policy_snapshot":project["policy"] ?? [:],"revision":1,"prepared_by":c.principal,"created_at":now()]
+        batch["members"] = frozen
         batch["digest"] = try batchDigest(batch);try save(db,batch,type:"batch")
         try event(db,caller:c,project:pid,entity:group["id"] as? String,kind:"batch_prepared",data:["batch_id":batch["id"]!,"digest":batch["digest"]!,"triage_revision":group["revision"]!,"task_ids":ids])
         return try batchProjection(db,batch)
@@ -62,10 +70,13 @@ extension CommandRouter {
     func batchClaim(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         try worker(c);let pid = try scope(db,p,c,write:true)
         let batch = try scoped(db,try text(p,"batch_id"),pid,type:"batch");try revision(p,batch)
+        try requireBatchNotDiscarded(db,batch)
         guard batch["digest"] as? String == (try batchDigest(batch)) else { throw CoreError("EVIDENCE_STALE","The prepared batch snapshot failed its integrity check.") }
         guard !(try records(db,type:"batch_claim",project:pid).contains {$0["batch_id"] as? String == batch["id"] as? String}) else { throw CoreError("CLAIM_CONFLICT","This fixed batch was already dispatched. Prepare a new batch for further work.") }
         let project = try record(db,pid,type:"project")
-        guard p["policy_revision"] != nil,int(p,"policy_revision") == int(batch,"policy_revision"),int(project,"policy_revision",default:1) == int(batch,"policy_revision") else { throw CoreError("POLICY_CHANGED","Policy changed after preparation. Prepare a new batch; no claims started.") }
+        guard let policyRevision = p["policy_revision"] as? NSNumber,CFGetTypeID(policyRevision) != CFBooleanGetTypeID(),policyRevision.doubleValue.isFinite,policyRevision.decimalValue >= 1,policyRevision.decimalValue <= Decimal(Int.max),policyRevision.compare(NSNumber(value:policyRevision.intValue)) == .orderedSame else { throw CoreError("INVALID_INPUT","policy_revision must be a positive integer in the supported range. Use policy_revision returned by batch_prepare; no claims started.") }
+        guard int(project,"policy_revision",default:1) == int(batch,"policy_revision") else { throw CoreError("POLICY_CHANGED","The current project policy differs from the prepared batch policy. Prepare a new batch; no claims started.") }
+        guard policyRevision.intValue == int(batch,"policy_revision") else { throw CoreError("POLICY_CHANGED","The supplied policy_revision differs from the prepared batch policy_revision. Read the existing batch and current policy before retrying; no claims started.") }
         let members = batch["members"] as? [JSON] ?? []
         // Check all frozen targets before taking any member authority. Live Triage edits intentionally are irrelevant.
         for member in members {
@@ -78,12 +89,12 @@ extension CommandRouter {
                 guard int(manifest,"revision") == int(member,"manifest_revision"),hash(Data(try jsonString(manifest).utf8)) == member["manifest_digest"] as? String else { throw CoreError("REVIEW_TARGET_MISMATCH","An exact prepared target changed; no claims started.") }
             }
         }
+        let cohort = BatchClaimContext(batch:batch)
         var claims: [JSON] = []
         for member in members {
             var input: JSON = ["project_id":pid,"task_id":member["task_id"]!,"expected_revision":member["task_revision"]!,"phase":batch["phase"]!,"policy_revision":batch["policy_revision"]!,"file_scopes":(member["file_scopes"] as? [JSON] ?? []).map {$0.filter {["path","access","declared_path"].contains($0.key)}},"lane_scopes":member["lane_scopes"] ?? []]
             for key in ["review_request_id","target_manifest_id","gate"] { if let value = member[key] { input[key] = value } }
-            var claim = try work(db,input,c,"work_claim",operation:.triage)
-            var stored = try scoped(db,claim["id"] as! String,pid,type:"attempt");stored["batch_id"] = batch["id"];stored["batch_digest"] = batch["digest"];try save(db,stored,type:"attempt")
+            var claim = try work(db,input,c,"work_claim",operation:.triage,batchContext:cohort)
             claim["batch_id"] = batch["id"];claim["key"] = member["key"] ?? (claim["task"] as? JSON)?["key"] ?? "";claim["title"] = member["title"] ?? (claim["task"] as? JSON)?["title"] ?? "";claims.append(claim)
         }
         let receipt: JSON = ["id":uuid(),"project_id":pid,"batch_id":batch["id"]!,"batch_digest":batch["digest"]!,"attempt_ids":claims.compactMap {$0["id"] as? String},"principal":c.principal,"revision":1,"created_at":now()]
@@ -158,7 +169,7 @@ extension CommandRouter {
         var result = data
         result["claims"] = try (data["claims"] as? [JSON] ?? []).map {claim -> JSON in
             var claim = claim;claim.removeValue(forKey:"claim_token")
-            guard let id = claim["id"] as? String,var attempt = try? record(db,id,type:"attempt"),attempt["state"] as? String == "active",attempt["principal"] as? String == c.principal,attempt["incarnation"] as? String == incarnation,attempt["session_authorization_generation"] as? String == (try callerSessionGeneration(db,c,project:attempt["project_id"] as! String)) else { return claim }
+            guard let id = claim["id"] as? String,var attempt = try? record(db,id,type:"attempt"),attempt["state"] as? String == "active",attempt["principal"] as? String == c.principal,attempt["session_id"] as? String == (c.sessionID ?? "human"),attempt["execution_domain"] as? String == c.executionDomain,attempt["incarnation"] as? String == incarnation,attempt["session_authorization_generation"] as? String == (try callerSessionGeneration(db,c,project:attempt["project_id"] as! String)) else { return claim }
             let token = uuid()+uuid();attempt["token_hash"] = hash(Data(token.utf8));try save(db,attempt,type:"attempt");claim["claim_token"] = token;return claim
         }
         return result
@@ -208,13 +219,14 @@ extension CommandRouter {
             return member
         }
         result["outcomes"] = try (batch["members"] as? [JSON] ?? []).map {try batchMemberOutcome(db,batch,$0)}
-        result["dispatch"] = try records(db,type:"batch_claim",project:batch["project_id"] as? String).first {$0["batch_id"] as? String == batch["id"] as? String} ?? NSNull()
+        result.merge(try batchLifecycle(db,batch)) { _,new in new }
         return result
     }
 
     /// Independent completion is explicitly distinct from the all-or-nothing current-membership status command.
     func batchCompletePassing(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         try worker(c);let pid = try scope(db,p,c,write:true),batch = try scoped(db,try text(p,"batch_id"),pid,type:"batch");try revision(p,batch)
+        try requireBatchNotDiscarded(db,batch)
         let members = batch["members"] as? [JSON] ?? [],outcomes = try members.map {try batchMemberOutcome(db,batch,$0)}
         let policy = effectiveReviewBatchPolicy(batch["policy_snapshot"] as? JSON ?? [:])
         if policy == "hold_passing_for_batch",outcomes.contains(where: {!bool($0,"accepted") && !bool($0,"completed")}) { return ["triage_id":batch["triage_id"] ?? NSNull(),"triage_key":batchTriageKey(db,batch) as Any? ?? NSNull(),"triage_name":batch["triage_name"] ?? "","batch_id":batch["id"]!,"policy":policy,"completed_task_ids":[],"held_task_ids":outcomes.filter {bool($0,"accepted")}.compactMap {$0["task_id"] as? String},"reason":"project_override_holds_passing"] }
@@ -237,6 +249,7 @@ extension CommandRouter {
 
     func batchRetriageRemaining(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         try worker(c);let pid = try scope(db,p,c,write:true),batch = try scoped(db,try text(p,"batch_id"),pid,type:"batch");try revision(p,batch)
+        try requireBatchNotDiscarded(db,batch)
         let outcomes = try (batch["members"] as? [JSON] ?? []).map {try batchMemberOutcome(db,batch,$0)}
         // Passing tickets never receive implementation work just because another ticket failed, including under a hold override.
         let remaining = outcomes.filter {!bool($0,"accepted") && !bool($0,"completed")}

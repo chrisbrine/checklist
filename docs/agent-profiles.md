@@ -39,6 +39,10 @@ After establishing Checklist context, “contact Rowan” resolves the permitted
 
 Use task history when relevant, or a project conversation without creating a ticket. The current human instruction or an existing applicable conversation grant must authorize the send/reply. Incoming agent text is not new human consent. Contact never assigns work. Saved, queued, transport accepted and actual recipient acknowledgment remain distinct.
 
+## Versioned provider extension
+
+Current source uses the [version-1 bundled plugin contract](provider-plugins.md) for provider/model metadata, actual host/bootstrap interpretation, supported transport and conversation handoff. Follow its controlled registration/qualification/update procedure for a future provider; unknown, incompatible, disabled or unqualified adapters/models remain unavailable. A plugin ID/version, observed model or optional [orchestrator registration](project-orchestrators.md) cannot supply an identity, project grant or worker claim. The registry does not enable the deferred assistant integration.
+
 ## Future adapters and persistent records
 
 Initial work providers are Codex and Claude. The deferred existing-assistant candidate is Codex Dot; it requires independent qualification and is not qualified by ordinary Codex MCP access. A future host such as Muse remains deferred with unknown protocol, identity, messaging and notification support. Add an adapter later behind the same task/history contracts and qualify its real capability boundaries. Do not add an arbitrary code loader, persona platform, hidden CLI/API runtime or fallback provider.

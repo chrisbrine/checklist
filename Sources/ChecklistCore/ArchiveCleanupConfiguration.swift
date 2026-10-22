@@ -11,7 +11,7 @@ extension CommandRouter {
     /// A separate canonical settings edit uses the same project/settings revisions.
     /// It cannot apply workflow policy or overwrite another settings field.
     func archiveStorageSettingsCommand(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
-        try owner(c); let pid = try scope(db,p,c,write:true)
+        let pid = try scope(db,p,c,write:true); try requireAgentEditAuthority(db,project:try record(db,pid,type:"project"),caller:c)
         var project = try record(db,pid,type:"project"); try revision(p,project)
         guard try ArchiveCleanupJob.integer(p["settings_revision"]) == ArchiveCleanupJob.integer(project["settings_revision"]) else {
             throw CoreError("REVISION_CONFLICT", "Project settings changed. Reload before saving archive storage.")
@@ -24,8 +24,8 @@ extension CommandRouter {
         guard !overflow else { throw CoreError("INVALID_INPUT", "Settings revision is exhausted.") }
         project["settings_revision"] = next; project = revised(project)
         try save(db,project,type:"project")
-        try event(db,caller:c,project:pid,entity:pid,kind:"archive_storage_settings_changed")
-        return project
+        try event(db,caller:c,project:pid,entity:pid,kind:"archive_storage_settings_changed",data:["origin":c.isOwner ? "human_ui" : "agent"])
+        return projectProjection(project,caller:c)
     }
 
     func archiveRetentionFacts(_ db: Database,task: JSON,considerArchiving: Bool = false,currentGraph: [JSON]? = nil) throws -> [ArchiveAttachmentFact] {

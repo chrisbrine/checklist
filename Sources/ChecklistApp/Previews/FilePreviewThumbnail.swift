@@ -12,7 +12,7 @@ struct AttachmentThumbnail: View {
     var body: some View {
         Group {
             if let thumbnail { Image(nsImage: thumbnail).resizable().scaledToFit().clipShape(RoundedRectangle(cornerRadius: Radius.small)) }
-            else { Image(systemName: problem.isEmpty ? (["reference", "external_reference"].contains(file.string("mode")) ? "link" : "doc") : "exclamationmark.triangle").checklistFont(.sheetHeading).foregroundStyle(.secondary) }
+            else { Image(systemName: problem.isEmpty ? (["reference", "external_reference"].contains(file.string("mode")) ? "link" : "doc") : "exclamationmark.triangle").checklistFont(.sheetHeading).foregroundStyle(Color.checklistSecondaryText) }
         }.overlay(alignment: .topTrailing) {
             if thumbnail != nil, !problem.isEmpty { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
         }.help(problem.isEmpty ? "Thumbnail for context; use Preview to inspect the exact original." : problem)

@@ -1,5 +1,34 @@
 import Foundation
+import ChecklistProviders
 import GRDB
+import Darwin
+
+/// Only this fresh O_EXCL report can be discarded on its creating transaction's
+/// rollback. Production dispatch retains the object gate until rollback ends,
+/// so no backup can have inventoried it. This is not a general capture bypass.
+private final class UncommittedReviewReport {
+    private let directory: Int32
+    private let name: String
+    private let identity: stat
+    init(root: URL, relative: String, bytes: Data) throws {
+        let files = try StorageObjectFiles(root:root)
+        try files.writeNew(relative,bytes:bytes)
+        let (directory,name) = try files.parent(relative)
+        var identity = stat()
+        guard fstatat(directory,name,&identity,AT_SYMLINK_NOFOLLOW) == 0,identity.st_mode & S_IFMT == S_IFREG else {
+            Darwin.close(directory);throw StorageSnapshotFailure.io
+        }
+        self.directory = directory;self.name = name;self.identity = identity
+    }
+    deinit {Darwin.close(directory)}
+    func rollback() {
+        var current = stat()
+        guard fstatat(directory,name,&current,AT_SYMLINK_NOFOLLOW) == 0,current.st_mode & S_IFMT == S_IFREG,
+              current.st_dev == identity.st_dev,current.st_ino == identity.st_ino,current.st_size == identity.st_size,
+              current.st_mtimespec.tv_sec == identity.st_mtimespec.tv_sec,current.st_mtimespec.tv_nsec == identity.st_mtimespec.tv_nsec else {return}
+        if unlinkat(directory,name,0) == 0 {_ = fsync(directory)}
+    }
+}
 
 extension CommandRouter {
     func capturedReviewInstructions(_ capture: JSON) throws -> [JSON] {
@@ -52,22 +81,21 @@ extension CommandRouter {
     func prepareAgentReview(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         let (task,request,manifest) = try exactAgentReview(db,p,c),pid = task["project_id"] as! String,project = try record(db,pid,type:"project")
         guard request["state"] as? String == "queued",task["active_attempt_id"] == nil,task["active_verification_request_id"] == nil else { throw CoreError("REVIEW_ALREADY_ACTIVE","Release the existing review before preparing another fresh reviewer.") }
-        let provider = p["provider"] as? String ?? "codex",policy = effectivePolicy(project["policy"] as? JSON ?? [:],kind:task["kind"] as? String ?? "work"),reviewers = strings((policy["roles"] as? JSON)?["reviewer"] as? JSON ?? [:],"providers")
-        guard ["codex","claude"].contains(provider),strings(policy,"allowed_providers").contains(provider),reviewers.contains(provider) else { throw CoreError("POLICY_DENIED","The selected provider is not currently eligible for this project's review role.") }
+        let provider = p["provider"] as? String ?? ProviderPolicyDefaults.defaultReviewProvider,policy = effectivePolicy(project["policy"] as? JSON ?? [:],kind:task["kind"] as? String ?? "work"),reviewers = strings((policy["roles"] as? JSON)?["reviewer"] as? JSON ?? [:],"providers")
+        guard providerPlugins.plugin(provider, requiring: .workSession) != nil,strings(policy,"allowed_providers").contains(provider),reviewers.contains(provider) else { throw CoreError("POLICY_DENIED","The selected provider is not currently eligible for this project's review role.") }
         let selectors: JSON = ["project_id":pid,"task_id":task["id"]!,"review_request_id":request["id"]!,"target_manifest_id":manifest["id"]!,"gate":request["gate"]!]
         let root = project["root_path"] as? String ?? "",json = try jsonString(selectors)
         let instruction = agentReviewInstruction(provider:provider,task:task,root:root,json:json,reference:try agentReference(db,task))
         var response: JSON = ["task_id":task["id"]!,"key":task["key"] ?? "","title":task["title"] ?? "","project_name":project["name"] ?? "","provider":provider,"instruction":instruction,"review_request_id":request["id"]!,"target_manifest_id":manifest["id"]!,"review_contract":try reviewContract(db,task:task,manifest:manifest),"launch_available":false,"session_connected":false,"claim_acquired":false,"state":"prepared_copy","limitation":"Open a fresh conversation and paste this instruction. Native creation/connection/claim has not occurred."]
-        var directory: ObjCBool = false
-        if provider == "codex",root.hasPrefix("/"),FileManager.default.fileExists(atPath:root,isDirectory:&directory),directory.boolValue {
-            var parts = URLComponents();parts.scheme = "codex";parts.host = "threads";parts.path = "/new";parts.queryItems = [URLQueryItem(name:"prompt",value:instruction),URLQueryItem(name:"path",value:root)]
-            if let url = parts.url {response["compose_url"] = url.absoluteString;response["state"] = "prepared_composer";response["limitation"] = "Open the prepared fresh Codex composer and press Send. A draft is not a created/connected reviewer or a review claim."}
+        if let url = providerPlugins.plugin(provider, requiring: .composer)?.composeURL(instruction:instruction,workspace:root) {
+            response["compose_url"] = url.absoluteString;response["state"] = "prepared_composer"
+            response["limitation"] = "Open the prepared fresh composer and press Send. A draft is not a created/connected reviewer or a review claim."
         }
         response["review_evidence_requirements"] = try reviewRequirementPreflight(db,params:[:],task:task,manifest:manifest,caller:c)
         return response
     }
     func agentReviewInstruction(provider: String,task: JSON,root: String,json: String,reference: String) -> String {
-        return "Start a fresh independent \(provider == "codex" ? "Codex" : "Claude") reviewer conversation for ticket metadata \(reference). Do not reuse an implementation contributor or its delegated/prior identity. Work in \(root). Run \(cliCommand) connect --task \(task["id"]!) from that workspace. Discover checklist tools, then call review_context with this exact JSON: \(json). Read the complete brief, acceptance, findings, immutable target and current review_contract; fetch captured AGENTS.md and its linked project rules. Claim this exact request with phase review, current task revision, gate and manifest before review. Refresh review_context after claiming to obtain the applied requirement revision and contract SHA; pre-claim preparation is a preview. Assess every acceptance and project requirement critically; choose meaningful checks in your own session, attach your own hashed report/log/screenshots with attachment_add, and record review_assessment against the fresh contract SHA-256. No swift_test or validate-plan receipt is required. On rework, follow the case-level failed-only guidance in review_context: carry input-valid passes with original provenance, run only failed/inconclusive/materially affected checks, explain broader selection by named changed inputs or an applicable explicit effective project workflow/context instruction, and report carried versus newly executed evidence. A fixture-only repair needs no all-green rerun; no prior verdict or approval transfers and all fresh gates remain required. Report pass, changes or blocked honestly, preserving stable finding IDs. Preparing this prompt starts no turn and acquires no claim."
+        return "Start a fresh independent \(providerPlugins.plugin(provider, requiring: .workSession)?.manifest.displayName ?? provider) reviewer conversation for ticket metadata \(reference). Do not reuse an implementation contributor or its delegated/prior identity. Work in \(root). Run \(cliCommand) connect --task \(task["id"]!) from that workspace. Discover checklist tools, then call review_context with this exact JSON: \(json). Read the complete brief, acceptance, findings, immutable target and current review_contract; fetch captured AGENTS.md and its linked project rules. Claim this exact request with phase review, current task revision, gate and manifest before review. Refresh review_context after claiming to obtain the applied requirement revision and contract SHA; pre-claim preparation is a preview. Assess every acceptance and project requirement critically; choose meaningful checks in your own session, attach your own hashed report/log/screenshots with attachment_add, and record review_assessment against the fresh contract SHA-256. No swift_test or validate-plan receipt is required. On rework, follow the case-level failed-only guidance in review_context: carry input-valid passes with original provenance, run only failed/inconclusive/materially affected checks, explain broader selection by named changed inputs or an applicable explicit effective project workflow/context instruction, and report carried versus newly executed evidence. A fixture-only repair needs no all-green rerun; no prior verdict or approval transfers and all fresh gates remain required. Report pass, changes or blocked honestly, preserving stable finding IDs. Preparing this prompt starts no turn and acquires no claim."
     }
     func addAgentReviewEvidence(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         try worker(c);let pid = try scope(db,p,c,write:true),attempt = try claimAttempt(db,p,c,pid)
@@ -76,8 +104,8 @@ extension CommandRouter {
         let task = try scoped(db,attempt["task_id"] as! String,pid,type:"task");_ = try validateManifestTarget(db,task:task,manifestID:mid)
         let measures = try EvidenceMeasure.parse(p["measures"])
         let title = try text(p,"title",max:1000),body = try measuredReportBody(text(p,"body",max:65536),measures:measures),bytes = Data(body.utf8),id = uuid(),relative = "objects/" + pid + "/" + id + ".md"
-        try StorageObjectFiles(root:root).writeNew(relative,bytes:bytes)
-        db.afterNextTransaction(onCommit:{_ in},onRollback:{_ in if let files = try? StorageObjectFiles(root:self.root) { _ = try? self.removeManagedFile(files,relative:relative) }})
+        let report = try UncommittedReviewReport(root:root,relative:relative,bytes:bytes)
+        db.afterNextTransaction(onCommit:{_ in},onRollback:{_ in report.rollback()})
         var artifact: JSON = ["id":id,"artifact_id":id,"project_id":pid,"task_id":task["id"]!,"name":title,"description":"Reviewer-authored evidence for exact target "+mid,"mode":"managed","path":relative,"sha256":hash(bytes),"size":bytes.count,"availability":"available","keep_original":false,"unlinked":false,"author":c.principal,"origin":c.isOwner ? "human_ui" : c.role,"review_attempt_id":attempt["id"]!,"target_manifest_id":mid,"revision":1,"created_at":now()]
         if p["measures"] != nil { artifact["measures"] = measures.map(\.json) }
         try save(db,artifact,type:"attachment");try event(db,caller:c,project:pid,entity:task["id"] as? String,kind:"review_evidence_added",data:["artifact_id":id,"manifest_id":mid,"attempt_id":attempt["id"]!])

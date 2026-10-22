@@ -1,4 +1,5 @@
 import Foundation
+import ChecklistProviders
 import GRDB
 import CryptoKit
 
@@ -9,10 +10,12 @@ public final class CommandRouter: @unchecked Sendable {
     let readers: DatabasePool?
     let cursorKey: SymmetricKey
     var lastRoutinePrune: Date?
+    var workHealthScanPosition: Int64 = 0
     private let preparationLock = NSLock()
     let root: URL
     let managedCapturePaths: [Data:String]
     let incarnation: String
+    let providerPlugins: ProviderPluginRegistry
     let cliCommand: String
     let serviceLease: StorageServiceLease?
     let storageAdmission = StorageAdmission()
@@ -31,11 +34,12 @@ public final class CommandRouter: @unchecked Sendable {
     var inlineSourceCaptures: [PendingSourceCapture] = []
     var consumedSourceCaptures: Set<String> = []
     var exportPublications: [ExportPublication] = []
-    public init(root: URL, serviceLease: StorageServiceLease? = nil, cliCommand: String = "/Applications/Checklist.app/Contents/MacOS/checklist") throws {
+    public init(root: URL, serviceLease: StorageServiceLease? = nil, cliCommand: String = "/Applications/Checklist.app/Contents/MacOS/checklist", providerPlugins: ProviderPluginRegistry = .bundled) throws {
         let root = StoreDirectory.anchoredRoot(root)
         self.root = root
         self.serviceLease = serviceLease
         self.cliCommand = cliCommand
+        self.providerPlugins = providerPlugins
         let opened: StorageBootstrap.Opened
         do { opened = try StorageBootstrap.open(root:root,serviceLease:serviceLease,prepareDatabase:Self.installTicketSearchFunctions) }
         catch { StoreRecovery.recordFailure(root:root,error:error);throw error }
@@ -230,6 +234,13 @@ public final class CommandRouter: @unchecked Sendable {
                 try requirePendingExportIntent(command:command,digest:hash(Data((method + (try jsonString(params))).utf8)),caller:caller)
             }
         }
+        if method == "backup_create" {
+            do { return try executeStorageBackup(params:params,caller:caller) }
+            catch let error as DatabaseError {
+                guard let command = params["command_id"] as? String else {throw error}
+                throw storageOutcomeFailure(error,command:command)
+            }
+        }
         // CL-71: large file and git work runs before the object gate and the SQL writer.
         var preparation = try prepareCommandFiles(method:method,params:params,caller:caller)
         if method == "human_request_answer" { preparation.humanRequestFiles = try prepareHumanRequestAnswerFiles(params:params,caller:caller) }
@@ -250,13 +261,6 @@ public final class CommandRouter: @unchecked Sendable {
                 do { return try self.executeProjectExport(db,params,caller,permit:permit) }
                 catch let error as DatabaseError {
                     guard let command = params["command_id"] as? String else { throw error }
-                    throw self.storageOutcomeFailure(error,command:command)
-                }
-            }
-            if method == "backup_create" {
-                do { return try self.executeStorageBackup(db,params:params,caller:caller,permit:permit) }
-                catch let error as DatabaseError {
-                    guard let command = params["command_id"] as? String else {throw error}
                     throw self.storageOutcomeFailure(error,command:command)
                 }
             }
@@ -360,5 +364,5 @@ public final class CommandRouter: @unchecked Sendable {
         guard !captures.isEmpty else { return }
         try? dbQueue.read { db in _ = self.discardUncommittedSourceCaptures(db, captures) }
     }
-    static let readMethods: Set<String> = mediaOwnerReads.union(["cleanup_job_get","cleanup_job_list","workspace_page","service_info","tool_catalog","snapshot","changes_wait","delivery_pending","storage_status","diagnostics_summary","project_list","project_resolve","project_settings_get","policy_get","taxonomy_get","task_get","task_list","task_context","session_list","session_inbox","assistant_inbox","assistant_projects","history_list","attachment_list","attachment_read","attachment_cleanup_preview","agent_resolve","triage_list","epic_list","development_status","policy_preview","relation_list","review_batch_inputs","batch_get","batch_list","source_execution_get","review_prepare","review_context"])
+    static let readMethods: Set<String> = mediaOwnerReads.union(["work_health_get","cleanup_job_get","cleanup_job_list","workspace_page","service_info","tool_catalog","snapshot","changes_wait","delivery_pending","storage_status","diagnostics_summary","project_list","project_resolve","project_settings_get","policy_get","taxonomy_get","task_get","task_list","task_context","session_list","session_inbox","assistant_inbox","assistant_projects","history_list","attachment_list","attachment_read","attachment_cleanup_preview","agent_resolve","triage_list","epic_list","development_status","policy_preview","relation_list","review_batch_inputs","batch_get","batch_list","source_execution_get","review_prepare","review_context"])
 }

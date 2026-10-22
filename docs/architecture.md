@@ -60,6 +60,8 @@ This is cooperative isolation between local clients, not a security boundary aga
 
 Keep providers behind a capability interface: identify session, inspect presence, enqueue message, report transport receipt, open supported deep link, and optionally stop/steer where verified and authorized. A missing capability has an explicit unavailable result. Provider identifiers/capabilities and verified existing assistant display snapshots are separate data, not switch statements in task logic; the UI needs no model catalog or profile designer.
 
+The implemented [provider-plugin boundary](provider-plugins.md) adds `ChecklistProviders`, a Foundation-only root target holding versioned contracts and reviewed bundled implementations. Core, Bridges, Service and App consume its validated registry; provider-specific native I/O remains in Bridges, with service-owned kernel/signature/grant checks. The acyclic [workspace graph](monorepo-workspace.md) records these edges. There is no arbitrary code loader, second persistence engine or automatic model runtime. The [orchestrator](project-orchestrators.md) and [optional content](conversation-content.md) proposals reuse these boundaries and remain planned.
+
 ## Storage and consistency
 
 The detailed [database and storage specification](database-storage.md) defines table groups, composite keys/indexes, staging/commit/cleanup, consistent filesystem-inclusive backup, WAL/migration/restore and failure behavior. [Project settings](project-customization.md) and [assistant integration](assistant-plugin.md) share this same store. No plugin-specific database or per-project fake data location.

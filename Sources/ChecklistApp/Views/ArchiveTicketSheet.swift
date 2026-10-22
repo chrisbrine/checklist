@@ -22,7 +22,7 @@ struct ArchiveTicketSheet: View {
                 Button("Retry file retention", action: refresh)
             } else {
                 ProgressView("Checking this ticket’s file retention…").controlSize(.small)
-                Text("Archive actions become available when retention is known.").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("Archive actions become available when retention is known.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
             if let preview, (preview["clean_bytes"] as? NSNumber)?.int64Value ?? 0 > 0 {
                 Button("Archive and clean eligible large copies", role: .destructive) { perform(true, preview) }

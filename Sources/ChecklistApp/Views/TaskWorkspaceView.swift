@@ -72,13 +72,13 @@ struct TaskWorkspaceView: View {
             }
             HStack {
                 if store.ticketPageLoading { ProgressView().controlSize(.small) }
-                Text("Showing \(store.ticketPageShownCount) of \(store.ticketPageMatchedCount) matching tickets").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("Showing \(store.ticketPageShownCount) of \(store.ticketPageMatchedCount) matching tickets").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 Spacer()
                 Button("Previous page") { if let cursor = store.ticketPagePreviousCursor { stability.reset(); store.moveTicketPage(cursor) } }.checklistDisabled([(store.ticketPageLoading, "The page is still loading."), (store.ticketPagePreviousCursor == nil, "This is the first page.")])
                 Button("Next page") { if let cursor = store.ticketPageNextCursor { stability.reset(); store.moveTicketPage(cursor) } }.checklistDisabled([(store.ticketPageLoading, "The page is still loading."), (store.ticketPageNextCursor == nil, "This is the last page.")])
             }.padding(.horizontal, Spacing.page).padding(.bottom, Spacing.row).checklistActionScroll()
             if stability.pending(freshRows) {
-                HStack { Text("List updates are waiting while you interact.").checklistFont(.micro).foregroundStyle(.secondary); Spacer(); Button("Apply updates") { stability.apply(freshRows) }.buttonStyle(.link) }.padding(.horizontal, Spacing.page).padding(.bottom, Spacing.small).checklistActionScroll()
+                HStack { Text("List updates are waiting while you interact.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText); Spacer(); Button("Apply updates") { stability.apply(freshRows) }.buttonStyle(.link) }.padding(.horizontal, Spacing.page).padding(.bottom, Spacing.small).checklistActionScroll()
             }
             if !store.connected {
                 Label("Showing saved state. Drafts stay on this Mac until the service reconnects.", systemImage: "wifi.slash").checklistFont(.callout).foregroundStyle(.orange).padding(.horizontal, Spacing.page).padding(.bottom, Spacing.row)
@@ -125,7 +125,7 @@ struct TaskWorkspaceView: View {
                 }
             }
             if bulkSelection.selecting {
-                Text(bulkSelection.count > 200 ? "Choose at most 200 tickets for one bulk change." : (bulkSelection.count > 0 && bulkSelection.project == nil ? "Choose tickets from one project to make a bulk change." : "Command-click to select tickets. Shift-click selects a range. Selection keeps the version you selected.")).checklistFont(.micro).foregroundStyle(.secondary)
+                Text(bulkSelection.count > 200 ? "Choose at most 200 tickets for one bulk change." : (bulkSelection.count > 0 && bulkSelection.project == nil ? "Choose tickets from one project to make a bulk change." : "Command-click to select tickets. Shift-click selects a range. Selection keeps the version you selected.")).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
             if let bulkReceipt {
                 HStack {
@@ -143,7 +143,7 @@ struct TaskWorkspaceView: View {
     func header(_ list: TicketListProjection) -> some View {
         HStack(alignment: .firstTextBaseline) {
             if store.page != .tasks || store.projectID == nil { Text(store.page == .archived ? "Done / Archived" : store.page.title).checklistFont(.pageTitle) }
-            Text(hasFilters ? "\(list.visibleTicketCount) of \(list.scopedTicketCount) tickets" : "\(list.visibleTicketCount) tickets").checklistFont(.callout).foregroundStyle(.secondary)
+            Text(hasFilters ? "\(list.visibleTicketCount) of \(list.scopedTicketCount) tickets" : "\(list.visibleTicketCount) tickets").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
             Spacer()
             if store.page == .tasks {
                 Button { showCreateTriage = true } label: { Label("New Triage",systemImage:"plus") }.buttonStyle(.checklistBordered).controlSize(.small).checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
@@ -257,12 +257,12 @@ struct TaskWorkspaceView: View {
         switch row.content {
         case .requestHeading(let count): SectionCaption(title: store.overviewRequestTotal > count ? "Needs your answer · showing \(count) of \(store.overviewRequestTotal)" : "Needs your answer", count: count)
         case .request(let request):
-            Button { store.open(.request(request.id)) } label: { HStack(spacing: Spacing.row) { Image(systemName: "bubble.left.and.bubble.right").foregroundStyle(.orange); Text(request.string("title")).checklistFont(.bodyEmphasis); Spacer(); Image(systemName: "chevron.right").checklistFont(.micro).foregroundStyle(.tertiary) }.padding(Spacing.control).background(.orange.opacity(0.07), in: RoundedRectangle(cornerRadius: Radius.medium)) }.buttonStyle(.checklistRow)
+            Button { store.open(.request(request.id)) } label: { HStack(spacing: Spacing.row) { Image(systemName: "bubble.left.and.bubble.right").foregroundStyle(.orange); Text(request.string("title")).checklistFont(.bodyEmphasis); Spacer(); Image(systemName: "chevron.right").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }.padding(Spacing.control).background(.orange.opacity(0.07), in: RoundedRectangle(cornerRadius: Radius.medium)) }.buttonStyle(.checklistRow)
         case .triage(let section): InlineTriageRow(section: section, expanded: expansion(section), filtered: hasFilters)
         // Align purpose text with the Triage title after its disclosure control.
-        case .triagePurpose(let text): Text(text).checklistFont(.micro).foregroundStyle(.secondary).padding(.leading, 33).padding(.trailing, Spacing.control).padding(.top, Spacing.small).textSelection(.enabled).triageMemberRule()
+        case .triagePurpose(let text): Text(text).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).padding(.leading, 33).padding(.trailing, Spacing.control).padding(.top, Spacing.small).textSelection(.enabled).triageMemberRule()
         // Align the empty message with the nested member content.
-        case .triageEmpty(let text): Text(text).checklistFont(.callout).foregroundStyle(.secondary).padding(.leading, 34).padding(.vertical, Spacing.group).triageMemberRule()
+        case .triageEmpty(let text): Text(text).checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText).padding(.leading, 34).padding(.vertical, Spacing.group).triageMemberRule()
         case .triageMember(let task): InlineTriageMemberRow(task: task)
         case .heading(let title, let count): SectionCaption(title: title, count: count)
         case .ticket(let task): TaskRow(task: task)
@@ -338,7 +338,7 @@ private struct TaskRowLabel: View, Equatable {
     var body: some View {
         let _ = NativeRenderMetrics.body(.ticketLabel)
         HStack(alignment: .top, spacing: Spacing.control) {
-            Image(systemName: presentation.kind == "bug" ? "ladybug" : "circle").checklistFont(.body).foregroundStyle(presentation.selected ? Color.checklistAccentText : .secondary).padding(.top, Spacing.tight)
+            Image(systemName: presentation.kind == "bug" ? "ladybug" : "circle").checklistFont(.body).foregroundStyle(presentation.selected ? Color.checklistAccentText : Color.checklistSecondaryText).padding(.top, Spacing.tight)
             VStack(alignment: .leading, spacing: Spacing.compact) {
                 Text(presentation.title).checklistFont(.bodyStrong).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
                 HStack(spacing: Spacing.compact) {
@@ -347,10 +347,10 @@ private struct TaskRowLabel: View, Equatable {
                     Text("·");Text(presentation.kind.capitalized)
                     if presentation.human {Text("· You")}
                     if !presentation.waiting.isEmpty {Text("· " + presentation.waiting).foregroundStyle(.orange)}
-                }.checklistFont(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }.checklistFont(.caption).foregroundStyle(Color.checklistSecondaryText).lineLimit(1)
             }
             if presentation.showsStatus { TicketStatusPills(name: presentation.statusName, category: presentation.statusCategory, draft: presentation.draft) }
-            Text(presentation.age).checklistFont(.micro).foregroundStyle(.tertiary).padding(.top, Spacing.tight)
+            Text(presentation.age).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).padding(.top, Spacing.tight)
         }.padding(.horizontal, Spacing.control).padding(.vertical, Spacing.control).background(presentation.selected ? Color.checklistAccent.opacity(0.1) : .clear, in: RoundedRectangle(cornerRadius: Radius.medium)).contentShape(Rectangle())
     }
 }

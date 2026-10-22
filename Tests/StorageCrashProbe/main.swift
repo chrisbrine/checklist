@@ -22,6 +22,13 @@ guard base.lastPathComponent == "CL19-storage-" + markerID.uuidString.lowercased
       marker == ["fixture_id":markerID.uuidString.lowercased(),"purpose":"CL19-storage-failure"] else { fail(65) }
 let mode = args[3], root = base.appendingPathComponent("store",isDirectory:true)
 do {
+    if mode == "backup-retention-held" {
+        try StorageSnapshotRetention.withCapture(root:root) { _ in
+            try Data(mode.utf8).write(to:base.appendingPathComponent("ready"))
+            while true {pause()}
+        }
+        fail(3)
+    }
     if mode == "recovery-refusal" {
         do {
             let lease = try StorageServiceLease(root:root)

@@ -34,6 +34,7 @@ extension ArchiveStoragePermit {
     /// No directory, followed link, external original or workspace is admitted.
     fileprivate func removeOriginal(relative: String,sha256: String,size: Int64,capturedSource: Bool = false,linkTarget: String? = nil) throws -> Bool {
         try requireRoot(files.root)
+        try StorageSnapshotRetention.requireNoCapture(root:files.root)
         let parts = try StorageObjectFiles.parts(relative)
         let source = capturedSource && parts.count >= 4 && parts[0] == "source-captures" && (parts[3] == "source" && parts.count >= 5 || parts.count == 4 && parts[3] == "manifest.json")
         guard size >= 0,sha256.range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil,
@@ -91,6 +92,7 @@ extension CommandRouter {
     func processArchiveCleanupJobs(_ db: Database,permit: ArchiveStoragePermit,nowMS: Int64) throws {
         try permit.requireRoot(root)
         guard !db.isInsideTransaction else { throw CoreError("CLEANUP_TRANSACTION_REQUIRED", "Run cleanup after the semantic transaction commits.") }
+        guard try !StorageSnapshotRetention.isActive(root:root) else {return}
         let ids = try String.fetchAll(db,sql:"""
             SELECT j.id FROM records j LEFT JOIN records c ON c.id=('archive-cleanup-cursor:' || j.id) AND c.type='storage_job'
             WHERE j.type='cleanup_job' AND CASE WHEN json_valid(j.data) THEN COALESCE(json_extract(j.data,'$.not_before_ms') <= ?,1) ELSE 1 END AND CASE WHEN json_valid(j.data) THEN json_extract(j.data,'$.state') NOT IN ('completed','canceled','suspended') ELSE 1 END
@@ -183,6 +185,7 @@ extension CommandRouter {
     /// Service uses a one-shot deadline, never a polling/model timer. Held work
     /// resumes on a relevant command or an expiring actual reader/backup lease.
     public func nextArchiveCleanupDeadline() throws -> Date? {
+        if try StorageSnapshotRetention.isActive(root:root) {return nil}
         guard storageMaintenanceFallbackFailures < 2 else { return nil }
         return try dbQueue.read { db in
             let nowMS = self.archiveCleanupNowMS()
@@ -203,6 +206,7 @@ extension CommandRouter {
     func processTicketObjectDeletionIntents(_ db: Database,permit: ArchiveStoragePermit) throws {
         try permit.requireRoot(root)
         guard !db.isInsideTransaction else {throw CoreError("CLEANUP_TRANSACTION_REQUIRED","Run object deletion after the semantic transaction commits.")}
+        guard try !StorageSnapshotRetention.isActive(root:root) else {return}
         guard let raw = try Row.fetchOne(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND json_valid(data) AND json_extract(data,'$.kind')='ticket_object_delete' AND json_extract(data,'$.state')='pending' ORDER BY rowid LIMIT 1") else {return}
         let receipt = try GRDBRecordEnvelopeAdapter.decode(raw).object
         guard var objects = receipt["objects"] as? [JSON],objects.count <= 100000,var index = objects.firstIndex(where: {$0["state"] as? String == "pending"}) else {throw CoreError("CLEANUP_INTENT_INVALID","The deletion intent requires repair; bytes retained.")}

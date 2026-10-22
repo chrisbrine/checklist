@@ -24,7 +24,7 @@ struct GeneralSettingsView: View {
             Section("Checklist") {
                 LabeledContent("Installed build", value: store.buildLabel)
                 LabeledContent("Service", value: store.connected ? "Connected" : "Disconnected")
-                Text("Local macOS production checklist. Existing checklists have not been migrated.").checklistFont(.callout).foregroundStyle(.secondary)
+                Text("Local macOS production checklist. Existing checklists have not been migrated.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
             }
             DiagnosticsExportSection()
             Section("Workspace") {
@@ -36,7 +36,7 @@ struct GeneralSettingsView: View {
                     }
                     .task { badgeAllowed = await DockBadge.macOSAllowsBadge() }
                 if showDockBadge && badgeAllowed == false {
-                    Text("macOS does not show Checklist's badge now. You can allow it in System Settings > Notifications > Checklist.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("macOS does not show Checklist's badge now. You can allow it in System Settings > Notifications > Checklist.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     Button("Open Notifications settings") { NSWorkspace.shared.open(DockBadge.notificationSettingsURL) }
                 }
                 Picker("Text size", selection: Binding(get: { TextScale.normalized(textScale) }, set: { textScale = $0 })) {
@@ -46,9 +46,10 @@ struct GeneralSettingsView: View {
             }
             QuickCaptureSettingsSection()
             Section("Agent sessions") {
-                Text("The bundled MCP bridge can start the local service with the app closed. Use a ticket in Codex or Claude; the actual thread connects itself when it uses Checklist.").checklistFont(.callout).foregroundStyle(.secondary)
-                Text("No hidden model runtime or scheduled ticket pickup is enabled.").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("The bundled MCP bridge can start the local service with the app closed. Use a ticket in Codex or Claude; the actual thread connects itself when it uses Checklist.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
+                Text("No hidden model runtime or scheduled ticket pickup is enabled.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
+            ProviderMessageReadinessView()
         }.formStyle(.grouped).padding(.top, Spacing.small)
     }
 }
@@ -57,16 +58,21 @@ struct StorageSettingsView: View {
     @EnvironmentObject var store: ChecklistStore
     @State private var info: [String: Any] = [:]
     @State private var result = ""
+    @State private var backingUp = false
     var body: some View {
         Form {
             Section("Local store") {
-                Text("Checklist keeps one local database and managed attachment storage. External references stay in their original location.").checklistFont(.callout).foregroundStyle(.secondary)
+                Text("Checklist keeps one local database and managed attachment storage. External references stay in their original location.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
                 ForEach(info.keys.sorted(), id: \.self) { key in if let text = info[key] as? String { LabeledContent(GlossaryText.humanize(key).capitalized, value: text) } else if let number = info[key] as? NSNumber { LabeledContent(GlossaryText.humanize(key).capitalized, value: number.stringValue) } }
                 Button("Show app data in Finder") { NSWorkspace.shared.open(ChecklistInstance.current.ownerDataRoot) }
             }
             Section("Export & backup") {
-                Button("Back up all projects…") { backup() }
-                Text("Backups include records and managed objects. Restore is not available in this build. Credentials are never portable authority.").checklistFont(.micro).foregroundStyle(.secondary)
+                Button("Back up all projects…") { backup() }.checklistDisabled([(backingUp, "Wait for this backup to finish.")])
+                if backingUp {
+                    ProgressView("Copying and verifying backup…").controlSize(.small)
+                }
+                Text("Large stores can take about 10 minutes; Checklist allows up to 30 minutes. You can keep adding notes and editing tickets while files copy. Cleanup waits until backup finishes.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                Text("Backups include records and managed objects. Restore is not available in this build. Credentials are never portable authority.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 if !result.isEmpty { Text(result).checklistFont(.micro).textSelection(.enabled) }
             }
         }.formStyle(.grouped).task { do { info = try await store.request("storage_status") } catch { result = PlainError.text(error) } }
@@ -74,7 +80,14 @@ struct StorageSettingsView: View {
     func backup() {
         let panel = NSSavePanel(); panel.nameFieldStringValue = "Checklist-backup"; panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        Task { do { let reply = try await store.request("backup_create", ["command_id": UUID().uuidString, "path": url.path]); result = "Backup saved to \(reply["path"] as? String ?? url.path). Restore is not yet available." } catch { result = PlainError.text(error) } }
+        backingUp = true; result = ""
+        Task {
+            defer {backingUp = false}
+            do {
+                let reply = try await store.request("backup_create", ["command_id": UUID().uuidString, "path": url.path])
+                result = "Backup saved to \(reply["path"] as? String ?? url.path). Restore is not yet available."
+            } catch { result = PlainError.text(error) }
+        }
     }
 }
 

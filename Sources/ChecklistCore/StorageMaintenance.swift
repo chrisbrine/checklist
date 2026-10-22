@@ -4,10 +4,12 @@ import GRDB
 enum StorageMaintenanceWarning: Equatable {
     case retryPending
     case suspended
+    case backupCapture
 
     var metadata: JSON {
         ["schema_version": 1, "code": "STORAGE_MAINTENANCE_DEFERRED",
-         "status": self == .suspended ? "suspended" : "retry_pending"]
+         "status": self == .backupCapture ? "held" : (self == .suspended ? "suspended" : "retry_pending"),
+         "reason": self == .backupCapture ? "backup_capture" : "maintenance_retry"]
     }
 }
 
@@ -18,8 +20,9 @@ extension CommandRouter {
     /// provides a fresh recovery opportunity; no durable latch exists without an
     /// owner-authorized resume boundary. Never automatically restart or poll it.
     func performStorageMaintenance(_ db: Database, permit: ArchiveStoragePermit) -> StorageMaintenanceWarning? {
-        guard storageMaintenanceFallbackFailures < 2 else { return .suspended }
         do {
+            if try StorageSnapshotRetention.isActive(root:root) {return .backupCapture}
+            guard storageMaintenanceFallbackFailures < 2 else { return .suspended }
             let importWarning = try reconcileManagedAttachmentImports(db)
             try processTicketObjectDeletionIntents(db,permit:permit)
             try processArchiveCleanupJobs(db, permit: permit, nowMS: Int64(Date().timeIntervalSince1970 * 1000))

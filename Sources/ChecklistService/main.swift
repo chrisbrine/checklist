@@ -5,6 +5,7 @@ import Darwin
 import ChecklistCore
 import ChecklistIPC
 import ChecklistBridges
+import ChecklistProviders
 
 struct Enrollment: Codable {
     var installation: String
@@ -47,7 +48,7 @@ struct NativeInFlight {
     let routeGeneration: String
     let startedAt: Date
     var writeRecorded = false
-    var pendingStatus: (status: ClaudePeerMessageStatus, correlation: String)?
+    var pendingStatus: (status: NativeProviderHostStatus, correlation: String)?
 }
 
 /// Storage failure stays observable over the existing local XPC route. This
@@ -84,6 +85,8 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     var storageWake: DispatchWorkItem?
     var attemptedDeliveries = Set<String>()
     var nativeInFlight: [String: NativeInFlight] = [:]
+    var workHealthWake: DispatchWorkItem?
+    var workHealthFailures = 0
     let enrollmentFile = ChecklistPaths.root.appendingPathComponent("connections.json")
     let expectedOwnerPath: String
     let expectedOwnerHash: Data?
@@ -101,8 +104,29 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         super.init()
         if let data = try? Data(contentsOf: enrollmentFile), let records = try? JSONDecoder().decode([String: Enrollment].self, from: data) { enrollments = records }
         listener.delegate = self
-        queue.async { [weak self] in self?.observeNativeConversationLifecycles();self?.armStorageWake() }
+        queue.async { [weak self] in self?.observeNativeConversationLifecycles();self?.armStorageWake();self?.runWorkHealth() }
     }
+    /// Advisory database supervision only; never launches or polls a model.
+    /// One bounded page per wake; persisted deadlines survive sleep/restart.
+    func runWorkHealth() {
+        workHealthWake?.cancel(); workHealthWake = nil
+        do {
+            let result = try router.runWorkHealthChecks()
+            workHealthFailures = 0
+            if (result["changed"] as? Int ?? 0) > 0 { changed() }
+            guard result["enabled"] as? Bool == true else { return }
+            let work = DispatchWorkItem { [weak self] in self?.runWorkHealth() }
+            workHealthWake = work
+            queue.asyncAfter(deadline: .now() + ((result["has_more"] as? Bool == true) ? 0.1 : 30), execute: work)
+        } catch {
+            workHealthFailures += 1
+            fputs("Work health check deferred; durable requests and claims retained: \(error.localizedDescription)\n", stderr)
+            guard workHealthFailures < 2 else { return }
+            let work = DispatchWorkItem { [weak self] in self?.runWorkHealth() }
+            workHealthWake = work; queue.asyncAfter(deadline: .now() + 30, execute: work)
+        }
+    }
+
     /// One-shot durable cleanup deadline. Held work waits for a relevant
     /// command or an actual lease deadline; this is not a model/pickup loop.
     func armStorageWake() {
@@ -159,6 +183,9 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
             throw ChecklistError("SETUP_REQUIRED", "Use Checklist from a Codex or Claude thread in this project's workspace to connect automatically.")
         }
         guard enrollment.revoked != true else { throw ChecklistError("CONNECTION_REVOKED", enrollment.ownerRevoked == true ? "This connection was disconnected by the owner." : "This connection ended. Connect again from its conversation; an owner disconnect stays final.") }
+        guard ProviderPluginRegistry.bundled.plugin(enrollment.provider, requiring: .pickup) != nil else {
+            throw ChecklistError("ADAPTER_UNAVAILABLE", "This provider plugin is disabled, incompatible or unqualified. Existing grants and pending messages are retained for recovery.")
+        }
         var callerWorkspace=enrollment.workspace
         if enrollment.automatic == true { callerWorkspace = try verifyAutomatic(enrollment, request:request, connection:connection) }
         else if let bound = enrollment.workspace {
@@ -196,7 +223,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         if method == "connection_list" {
             guard caller.role == "owner" else { throw ChecklistError("FORBIDDEN", "Connection setup is owner-only.") }
             return .done(["data": ["connections": enrollments.values.sorted { $0.name < $1.name }.map { e -> [String:Any] in
-                ["installation":e.installation,"name":e.name,"provider":e.provider,"role":e.role,"project_ids":e.projectIDs,"session_id":e.sessionID,"workspace":e.workspace ?? "","profile_id":e.profileID ?? "","generation":e.generation,"native_endpoint":e.nativeEndpoint ?? "","native_push":e.nativeEndpoint != nil && e.revoked != true,"assistant_grants":e.assistantGrants ?? [:],"automatic":e.automatic ?? false,"revoked":e.revoked ?? false,"identity_verification":e.identityVerification ?? "owner_enrolled"]
+                ["installation":e.installation,"name":e.name,"provider":e.provider,"role":e.role,"project_ids":e.projectIDs,"session_id":e.sessionID,"workspace":e.workspace ?? "","profile_id":e.profileID ?? "","generation":e.generation,"native_endpoint":e.nativeEndpoint ?? "","native_push":e.nativeEndpoint != nil && e.revoked != true && ProviderPluginRegistry.bundled.plugin(e.provider, requiring: .nativePeer) != nil,"assistant_grants":e.assistantGrants ?? [:],"automatic":e.automatic ?? false,"revoked":e.revoked ?? false,"identity_verification":e.identityVerification ?? "owner_enrolled"]
             }]])
         }
         if method == "task_handoff_prepare" { return .done(try prepareHandoff(params, caller:caller)) }
@@ -221,8 +248,8 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
                 guard SecRandomCopyBytes(kSecRandomDefault, random.count, &random) == errSecSuccess else { throw ChecklistError("RANDOM_FAILURE", "Could not generate a pairing credential.") }
                 let token = Data(random).base64EncodedString()
                 let suppliedSession = originalIntent["session_id"] as? String
-                var enrollment = Enrollment(installation: installation, name: originalIntent["name"] as? String ?? installation, provider: originalIntent["provider"] as? String ?? "codex", role: role, projectIDs: projects, sessionID: suppliedSession.flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString.lowercased(), workspace: workspace, profileID: originalIntent["profile_id"] as? String, tokenDigest: SHA256.hash(data: Data(token.utf8)).map { String(format: "%02x", $0) }.joined(), generation: UUID().uuidString)
-                guard ["codex", "claude"].contains(enrollment.provider) else { throw ChecklistError("ADAPTER_UNAVAILABLE", "This build includes Codex and Claude adapters only.") }
+                var enrollment = Enrollment(installation: installation, name: originalIntent["name"] as? String ?? installation, provider: originalIntent["provider"] as? String ?? ProviderPolicyDefaults.defaultReviewProvider, role: role, projectIDs: projects, sessionID: suppliedSession.flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString.lowercased(), workspace: workspace, profileID: originalIntent["profile_id"] as? String, tokenDigest: SHA256.hash(data: Data(token.utf8)).map { String(format: "%02x", $0) }.joined(), generation: UUID().uuidString)
+                guard ProviderPluginRegistry.bundled.plugin(enrollment.provider, requiring: .pickup) != nil else { throw ChecklistError("ADAPTER_UNAVAILABLE", "This provider plugin is disabled, incompatible or unqualified.") }
                 if role == "assistant" {
                     guard let profile=enrollment.profileID,!profile.isEmpty else { throw ChecklistError("PROFILE_REQUIRED","Choose a named profile for this assistant connection.") }
                     let supplied=originalIntent["assistant_grants"] as? [String:[String:Bool]] ?? [:]
@@ -234,7 +261,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
                     })
                 }
                 if let endpoint=originalIntent["native_endpoint"] as? String,!endpoint.isEmpty {
-                    guard enrollment.provider == "claude", endpoint.hasPrefix("/tmp/cc-socks/"), endpoint.hasSuffix(".sock") else { throw ChecklistError("UNSUPPORTED_ROUTE","Only an explicitly selected current Claude local socket is supported. Codex uses MCP pickup.") }
+                    guard NativeProviderTransport.validatesEndpoint(provider:enrollment.provider,endpoint:endpoint) else { throw ChecklistError("UNSUPPORTED_ROUTE","Only an explicitly selected current Claude local socket is supported. Codex uses MCP pickup.") }
                     var attributes=stat()
                     guard lstat(endpoint,&attributes)==0, attributes.st_mode & S_IFMT == S_IFSOCK, attributes.st_uid==getuid(), attributes.st_mode & 0o077==0 else { throw ChecklistError("RECIPIENT_UNAVAILABLE","Select a current same-user private native Claude socket.") }
                     enrollment.nativeEndpoint=endpoint;enrollment.nativeDevice=UInt64(attributes.st_dev);enrollment.nativeInode=UInt64(attributes.st_ino)
@@ -312,7 +339,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
             let replyPermitted=message["reply_allowed"] as? Bool == true && message["reply_used"] as? Bool != true
                 && message["reply_recipient_session_id"] as? String == sid
                 && message["reply_recipient_authorization_generation"] as? String == delivery["recipient_authorization_generation"] as? String
-            let peerPID=NativeReplyRouting.endpointPID(endpoint) ?? 0
+            let peerPID=NativeProviderTransport.endpointPID(provider:enrollment.provider,endpoint:endpoint) ?? 0
             // Registered before I/O: Claude can report a hold before this write's outcome is recorded.
             nativeInFlight[id]=NativeInFlight(deliveryID:id,messageID:mid,peerPID:peerPID,routeGeneration:enrollment.generation,startedAt:Date())
             DispatchQueue.global(qos:.utility).async { [self] in
@@ -326,15 +353,16 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
                     }
                     guard stillAuthorized else { throw ChecklistError("RECIPIENT_REVOKED","Native send canceled before I/O because the route was revoked.") }
                     guard enrollment.automatic == true,
-                          enrollment.identityVerification == "native_process_and_session_registry_verified",
+                          let plugin=ProviderPluginRegistry.bundled.plugin(enrollment.provider, requiring: .nativePeer),
+                          enrollment.identityVerification == plugin.nativeHost?.identityVerification,
                           peerPID > 1,let domain = enrollment.nativeExecutionDomain,
                           let registration = NativeLifecycleRegistration(provider:enrollment.provider,
                             sessionID:enrollment.nativeSessionID ?? enrollment.sessionID,executionDomain:domain,
-                            registryPath:FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/sessions/\(peerPID).json").path) else {
+                            registryPath:plugin.nativeHost?.registryPath(processID:peerPID)) else {
                         throw ChecklistError("NATIVE_REGISTRATION_UNPROVEN","Native push requires the current verified native registration; this note remains available through Checklist pickup.")
                     }
                     let content=try NativeRelayContent.render(origin:origin,messageID:mid,authorDisplayName:message["author_display"] as? String ?? "unknown session",body:body,subject:delivery["subject"] as? [String:Any],ticket:delivery["ticket"] as? [String:Any],permittedReply:replyPermitted ? NativeRelayReply(address:listener.address):nil)
-                    let sent=try ClaudeLocalBridge.send(content:content,messageID:mid,sender:ClaudePeerSender(replyAddress:listener.address,displayName:"Checklist",permissionClass:.prompting),endpoint:endpoint,expectedPeerPID:peerPID,expectedRegistration:registration)
+                    let sent=try NativeProviderTransport.send(provider:enrollment.provider,content:content,messageID:mid,replyAddress:listener.address,displayName:"Checklist",endpoint:endpoint,expectedPeerPID:peerPID,expectedRegistration:registration)
                     state="transport_written";receipt=["bytes":sent.byteCount,"socket_device":sent.socketDevice,"socket_inode":sent.socketInode,"route_generation":enrollment.generation]
                 } catch {
                     state=(error as? NativeBridgeError)?.deliveryMayHaveOccurred == true ? "uncertain":"failed"
@@ -359,9 +387,16 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     }
     func recordNativeReply(_ frame:NativeReplyFrame) {
         guard let object=(try? JSONSerialization.jsonObject(with:frame.data)) as? [String:Any] else { return }
-        if let status=ClaudePeerMessageStatus.parse(object) { recordHostStatus(status,peerPID:frame.peerPID);return }
-        guard object["type"] as? String == "user",let message=object["message"] as? [String:Any],let content=message["content"] as? String,
-              let (mid,body)=NativeReplyRouting.reply(in:content) else { return }
+        // Kernel peer identity selects one current qualified adapter before any
+        // provider frame is decoded. Disabling native I/O leaves MCP pickup intact.
+        let providers=Set(enrollments.values.compactMap { enrollment -> String? in
+            guard enrollment.revoked != true,let endpoint=enrollment.nativeEndpoint,
+                  NativeProviderTransport.endpointPID(provider:enrollment.provider,endpoint:endpoint) == frame.peerPID else { return nil }
+            return enrollment.provider
+        })
+        guard providers.count == 1,let provider=providers.first else { return }
+        if let status=NativeProviderTransport.parseHostStatus(provider:provider,object:object) { recordHostStatus(status,peerPID:frame.peerPID);return }
+        guard let (mid,body)=NativeProviderTransport.parseReply(provider:provider,object:object) else { return }
         let bridge=Caller(role:"owner",installation:"native-bridge",projectIDs:[])
         let pending:[String:Any]
         do { pending=try router.handle(method:"delivery_pending",params:["include_acknowledged":true],caller:bridge) }
@@ -371,10 +406,11 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         // the core then accepts the reply only from the exact allowance holder.
         let forMessage=deliveries.filter { $0["message_id"] as? String == mid }
         let routes=forMessage.compactMap { d -> (sessionID:String,endpoint:String)? in
-            guard let sid=d["recipient_session_id"] as? String,let endpoint=enrollments.values.first(where:{$0.sessionID==sid})?.nativeEndpoint else { return nil }
+            guard let sid=d["recipient_session_id"] as? String,let enrollment=enrollments.values.first(where:{$0.sessionID==sid && $0.provider==provider && $0.revoked != true}),let endpoint=enrollment.nativeEndpoint,NativeProviderTransport.endpointPID(provider:provider,endpoint:endpoint) == frame.peerPID else { return nil }
             return (sid,endpoint)
         }
-        guard let sid=NativeReplyRouting.recipient(peerPID:frame.peerPID,routes:routes),
+        let sessions=Set(routes.map(\.sessionID))
+        guard sessions.count == 1,let sid=sessions.first,
               let d=forMessage.first(where:{$0["recipient_session_id"] as? String == sid}),let pid=d["project_id"] as? String,
               let enrolled=enrollments.values.first(where:{$0.sessionID==sid}),let deliveryID=d["id"] as? String else {
             fputs("ChecklistService: native reply to message \(mid) matches no delivery for its kernel peer; it was not recorded.\n",stderr);return
@@ -385,7 +421,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     /// Claude sends `peer_message_status` to the relay's `from` socket on a new connection.
     /// Correlate it only with an in-flight write whose recipient is the kernel-reported notifier
     /// and whose message ID Claude echoed exactly. Anything else stays uncorrelated.
-    func recordHostStatus(_ status:ClaudePeerMessageStatus,peerPID:Int32) {
+    func recordHostStatus(_ status:NativeProviderHostStatus,peerPID:Int32) {
         let cutoff=Date().addingTimeInterval(-300)
         nativeInFlight=nativeInFlight.filter { $0.value.startedAt > cutoff }
         let matches=nativeInFlight.values.filter { status.refers(to:$0.messageID,recipientPID:$0.peerPID,notifierPID:peerPID) }
@@ -395,7 +431,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         guard entry.writeRecorded else { nativeInFlight[entry.deliveryID]?.pendingStatus=(status,"orig_msg_id");return }
         applyHostStatus(entry,status,correlation:"orig_msg_id")
     }
-    func applyHostStatus(_ entry:NativeInFlight,_ status:ClaudePeerMessageStatus,correlation:String) {
+    func applyHostStatus(_ entry:NativeInFlight,_ status:NativeProviderHostStatus,correlation:String) {
         nativeInFlight[entry.deliveryID]?.pendingStatus=nil
         var receipt:[String:Any]=["host_status":status.status,"native_peer_pid":entry.peerPID,"correlation":correlation,"route_generation":entry.routeGeneration]
         if let id=status.originalMessageID { receipt["orig_msg_id"]=id }
@@ -471,7 +507,15 @@ final class Peer: NSObject, ChecklistRPC {
         afterCommand(result)
     }
     func afterCommand(_ result:[String:Any]) {
-        if result["error"] == nil { coordinator.changed();coordinator.dispatchNative();coordinator.armStorageWake() }
+        if result["error"] == nil {
+            coordinator.changed();coordinator.dispatchNative()
+            coordinator.armStorageWake()
+            if coordinator.workHealthWake == nil && coordinator.workHealthFailures < 2 { coordinator.runWorkHealth() }
+        } else {
+            // A failed/canceled backup also releases its retention barrier. Resume
+            // deferred cleanup after either outcome, without waking during capture.
+            coordinator.armStorageWake()
+        }
     }
     static func errorBytes(_ error:Error)->Data {
         (try? JSONSerialization.data(withJSONObject:["error":publicError(error)])) ?? Data("{}".utf8)

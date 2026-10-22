@@ -34,10 +34,10 @@ struct RelatedTicketsView: View {
                     let requiredCount = prerequisites.filter {$0.bool("required")}.count
                     let blockers = prerequisites.filter {$0.bool("required") && !$0.bool("satisfied")}.count
                     Text("Prerequisites · \(requiredCount) required · \(blockers) blocking").checklistFont(.microEmphasis)
-                    Text("Required prerequisites must be Done before pickup, claim or completion. They never block Ready or queueing. Optional links keep context without blocking work.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("Required prerequisites must be Done before pickup, claim or completion. They never block Ready or queueing. Optional links keep context without blocking work.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
                 if task.string("disposition") == "superseded", let canonical = store.selectedRelatedTask(task.string("canonical_task_id"),task:task), canonical.id != task.id {
-                    Text("Preserved duplicate. Its notes, findings and history remain on this ticket.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("Preserved duplicate. Its notes, findings and history remain on this ticket.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     Button("Open canonical ticket · \(canonical.string("key"))") { store.open(.task(canonical.id)) }.buttonStyle(.link)
                     Button("Reopen this ticket") {
                         store.run("task_transition", ["project_id": task.string("project_id"), "task_id": task.id, "expected_revision": task.integer("revision"), "action": "reopen"], success: "Ticket reopened; duplicate history retained")
@@ -45,9 +45,9 @@ struct RelatedTicketsView: View {
                 }
                 ForEach(links) { edge in relationRow(edge) }
                 ForEach(aliases) { alias in
-                    Text("Source alias: \(alias.string("namespace")) · \(alias.string("alias"))").checklistFont(.micro).foregroundStyle(.secondary).textSelection(.enabled)
+                    Text("Source alias: \(alias.string("namespace")) · \(alias.string("alias"))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).textSelection(.enabled)
                 }
-                if links.isEmpty && aliases.isEmpty { Text("Link prerequisites, duplicates or follow-up work.").checklistFont(.micro).foregroundStyle(.secondary) }
+                if links.isEmpty && aliases.isEmpty { Text("Link prerequisites, duplicates or follow-up work.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                 Button(adding ? "Cancel adding link" : "Add related ticket…") { adding.toggle() }.buttonStyle(.link)
                     .checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
                 if adding { addForm }
@@ -62,7 +62,7 @@ struct RelatedTicketsView: View {
         return AccessibleHStack(alignment: .top, spacing: Spacing.small) {
             VStack(alignment: .leading, spacing: Spacing.tight) {
                 Text(label(edge.string("relation"), outgoing: outgoing) + (edge.string("relation") == "depends_on" && edge.values["required"] as? Bool == false ? " · optional" : ""))
-                    .checklistFont(.micro).foregroundStyle(.secondary)
+                    .checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 if let other {
                     Button("\(other.string("key")) · \(other.string("title"))") { store.open(.task(other.id)) }
                         .buttonStyle(.link).multilineTextAlignment(.leading)
@@ -72,12 +72,12 @@ struct RelatedTicketsView: View {
                 }
                 if outgoing,edge.string("relation") == "depends_on",let prerequisite = prerequisites.first(where: {$0.string("relation_id") == edge.id}) {
                     Text(prerequisite.bool("satisfied") ? "Satisfied · \(prerequisite.string("status_name",fallback:"Done"))" : prerequisite.string("reason",fallback:"Prerequisite remains unresolved"))
-                        .checklistFont(.micro).foregroundStyle(prerequisite.bool("satisfied") || !prerequisite.bool("required") ? Color.secondary : Color.orange)
+                        .checklistFont(.micro).foregroundStyle(prerequisite.bool("satisfied") || !prerequisite.bool("required") ? Color.checklistSecondaryText : Color.orange)
                 }
             }
             Spacer(minLength: 4)
             Button { confirmation = Confirmations.removeLink { remove(edge) } } label: { Image(systemName: "xmark.circle") }
-                .buttonStyle(.checklistIcon).foregroundStyle(.secondary).help("Remove this relation; preserve its history").accessibilityLabel("Remove ticket relation")
+                .buttonStyle(.checklistIcon).foregroundStyle(Color.checklistSecondaryText).help("Remove this relation; preserve its history").accessibilityLabel("Remove ticket relation")
                 .checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving), (store.selectedRelatedTask(edge.string("source_task_id"),task:task) == nil, "The linked ticket is not loaded.")])
         }
     }
@@ -87,7 +87,7 @@ struct RelatedTicketsView: View {
             TextField("Search project ticket title, brief or key",text:$candidateSearch).textFieldStyle(.roundedBorder)
             if candidateLoading {ProgressView("Finding tickets…")}
             if let candidateError {Text(candidateError).checklistFont(.micro).foregroundStyle(.orange)}
-            Text("Showing \(candidateRows.count) of \(candidateCount) matching project tickets. Refine the search to find another ticket.").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("Showing \(candidateRows.count) of \(candidateCount) matching project tickets. Refine the search to find another ticket.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             Picker("Relation", selection: $relation) {
                 Text("Depends on").tag("depends_on")
                 Text("Related to").tag("related_to")
@@ -103,7 +103,7 @@ struct RelatedTicketsView: View {
                 Toggle("Required before pickup, claim and completion", isOn: $required).toggleStyle(.checkbox).checklistFont(.micro)
             }
             if relation == "duplicate_of" {
-                Text("This preserves this ticket as a duplicate. Active work must be released first. Reopen explicitly to resume it.").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("This preserves this ticket as a duplicate. Active work must be released first. Reopen explicitly to resume it.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
             Button("Add link") {
                 store.run("task_link", ["project_id": task.string("project_id"), "task_id": task.id, "expected_revision": task.integer("revision"), "relation": relation, "target_task_id": targetID, "action": "add", "required": required], success: "Ticket linked") { _ in adding = false; targetID = "" }

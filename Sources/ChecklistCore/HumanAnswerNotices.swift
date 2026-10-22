@@ -1,4 +1,5 @@
 import Foundation
+import ChecklistProviders
 import GRDB
 
 extension CommandRouter {
@@ -15,7 +16,7 @@ extension CommandRouter {
             do { _ = try scope(db,["project_id":pid],caller) }
             catch let error as CoreError where ["FORBIDDEN","ROOT_MISMATCH","NOT_FOUND"].contains(error.code) { continue }
             guard let session = try noticeRecord(db,sid,pid,type:"session"),
-                  session["provider"] as? String == "codex",session["role"] as? String == "worker",
+                  providerPlugins.plugin(session["provider"] as? String ?? "", requiring: .answerNotice) != nil,session["role"] as? String == "worker",
                   canReceive(session,project:pid) else { continue }
             let generation = sessionGeneration(session)
             let rows = try Row.fetchAll(db,sql:"""

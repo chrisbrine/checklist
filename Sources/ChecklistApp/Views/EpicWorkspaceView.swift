@@ -9,7 +9,7 @@ struct EpicWorkspaceView: View {
         let _ = NativeRenderMetrics.body(.epics)
         VStack(alignment: .leading, spacing: Spacing.section) {
             AccessibleHStack { Text("Epics").checklistFont(.pageTitle); Spacer(); Button { showCreate = true } label: { Label("Epic", systemImage: "plus") }.buttonStyle(.checklistProminent).checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)]) }
-            Text("Epics group related production work. Each Epic keeps its own brief and tickets as implementation and review move forward.").checklistFont(.callout).foregroundStyle(.secondary)
+            Text("Epics group related production work. Each Epic keeps its own brief and tickets as implementation and review move forward.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
             Toggle("Include archived Epics", isOn: $showArchived).toggleStyle(.checkbox).checklistFont(.micro)
             WorkspacePagingControls()
             if epics.isEmpty {
@@ -33,15 +33,15 @@ private struct EpicOverviewRow: View {
                     Image(systemName: "folder").checklistFont(.subheading).foregroundStyle(Color.checklistAccentText)
                     VStack(alignment: .leading, spacing: Spacing.compact) {
                         Text(ProductionGroups.label(epic)).checklistFont(.sectionTitle)
-                        Text(store.projectName(epic.string("project_id")) + (epic.bool("archived") ? " · Archived Epic" : " · Epic")).checklistFont(.micro).foregroundStyle(.secondary)
+                        Text(store.projectName(epic.string("project_id")) + (epic.bool("archived") ? " · Archived Epic" : " · Epic")).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     }
                     Spacer()
-                    Image(systemName: "chevron.right").checklistFont(.micro).foregroundStyle(.tertiary)
+                    Image(systemName: "chevron.right").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
                 let brief = epic.string("brief", fallback: epic.string("purpose"))
-                if !brief.isEmpty { Text(brief).checklistFont(.callout).foregroundStyle(.secondary).lineLimit(2) }
-                AccessibleHStack { ProgressView(value: Double(completed), total: Double(max(ticketCount, 1))).tint(.checklistAccentText); Text("\(completed) / \(ticketCount) done").checklistFont(.micro).foregroundStyle(.secondary).fixedSize() }
-                Text(ticketCount == 0 ? "No tickets yet" : "Tickets by type").checklistFont(.micro).foregroundStyle(.secondary)
+                if !brief.isEmpty { Text(brief).checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText).lineLimit(2) }
+                AccessibleHStack { ProgressView(value: Double(completed), total: Double(max(ticketCount, 1))).tint(.checklistAccentText); Text("\(completed) / \(ticketCount) done").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).fixedSize() }
+                Text(ticketCount == 0 ? "No tickets yet" : "Tickets by type").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }.padding(Spacing.group).frame(maxWidth: .infinity, alignment: .leading).checklistCard()
         }.buttonStyle(.checklistRow)
     }
@@ -56,7 +56,7 @@ private struct CreateEpicSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.section) {
             Text("New Epic").checklistFont(.sheetTitle)
-            Text("An Epic is a lasting part of a project, with a brief and related tickets grouped by their type.").checklistFont(.callout).foregroundStyle(.secondary)
+            Text("An Epic is a lasting part of a project, with a brief and related tickets grouped by their type.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
             Picker("Project", selection: $projectID) { Text("Choose project").tag(""); ForEach(store.activeProjects) { Text($0.string("name")).tag($0.id) } }
             TextField("Epic name", text: $name).textFieldStyle(.roundedBorder)
             Text("Brief / intended outcome").checklistFont(.bodyStrong)

@@ -5,7 +5,7 @@ struct NextActionBar<Content: View>: View {
     @ViewBuilder let content: () -> Content
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.small) {
-            Text("Next").checklistFont(.microEmphasis).foregroundStyle(.secondary)
+            Text("Next").checklistFont(.microEmphasis).foregroundStyle(Color.checklistSecondaryText)
             content()
         }
         .padding(Spacing.control).frame(maxWidth: .infinity, alignment: .leading).checklistCard()
@@ -39,7 +39,7 @@ struct TicketNextActionBar: View {
                     Button("Show start, review and completion actions") { store.loadFullSelectedRecord(task.id) }
                         .buttonStyle(.checklistBordered)
                         .checklistDisabled([(!store.connected, DisabledReasons.offline), (store.selectedRecordsLoading, "The work records are loading.")])
-                    Text("These actions need this ticket's current work and review records.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("These actions need this ticket's current work and review records.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
             }
             .sheet(item: $recoveryAttempt) { attempt in TaskRecoverySheet(task: task, attempt: attempt).environmentObject(store) }
@@ -58,23 +58,23 @@ struct NextActionLead: View {
         switch step {
         case .completed:
             Label("Completed", systemImage: "checkmark.circle").checklistFont(.captionStrong)
-            Text("The submitted work and its review history stay available below.").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("The submitted work and its review history stay available below.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
         case .answer(let id):
             let title = store.detailRecords("requests", task: task).first { $0.id == id }?.string("title") ?? ""
             Button(title.isEmpty ? "Answer the blocking request" : "Answer: \(title)") { store.open(.request(id)) }.buttonStyle(.checklistProminent)
-            Text("This request blocks the ticket. Work continues after your answer.").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("This request blocks the ticket. Work continues after your answer.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
         case .recover(let id):
             let attempt = store.detailRecords("attempts", task: task).first { $0.id == id }
             Label("The session that works on this ticket has ended or is unknown.", systemImage: "exclamationmark.triangle").checklistFont(.captionStrong).foregroundStyle(.orange)
             Button("Recover stopped work…") { if let attempt { recover(attempt) } }.buttonStyle(.checklistProminent)
                 .checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving), (attempt == nil, "The work records are still loading.")])
-            Text("Recover only after checking that the work stopped. A timeout does not prove it.").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("Recover only after checking that the work stopped. A timeout does not prove it.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
         case .makeReady:
             Button("Make ready") {
                 store.run("task_edit", ["project_id": task.string("project_id"), "task_id": task.id, "readiness": "ready", "expected_revision": task.integer("revision")], success: "Ticket is Ready")
             }.buttonStyle(.checklistProminent)
                 .checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving), (!store.selectedTicketCurrent(task.id), DisabledReasons.ticketLoading)])
-            Text("This ticket is a Draft. Make it Ready when its brief and expected outcome are useful.").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("This ticket is a Draft. Make it Ready when its brief and expected outcome are useful.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
         }
     }
 }

@@ -45,7 +45,7 @@ extension CommandRouter {
 
     func validateDirectionCursor(_ db: Database, params: JSON, task: JSON, caller: Caller, attempt: JSON? = nil) throws {
         let directions = try ownerDirections(db,task:task)
-        guard !directions.contains(where: {!bool($0,"addressed")}) else { throw CoreError("USER_DIRECTION_PENDING","An owner direction still needs a permitted response, checkpoint, evidence or explicit owner waiver.") }
+        guard !directions.contains(where: {!bool($0,"addressed")}) else { throw CoreError("USER_DIRECTION_PENDING","An owner direction still needs a permitted response, checkpoint, evidence or explicit attributed waiver.") }
         let project = try record(db,task["project_id"] as! String,type:"project")
         let hasContext = !(project["brief"] as? String ?? "").isEmpty || !applicableDecisions(project,task:task).isEmpty || !directions.isEmpty
         guard let supplied = params["direction_cursor"] as? String else {
@@ -64,7 +64,8 @@ extension CommandRouter {
         let reviews = try scopedTaskRows(db,type:"review_request",task:task,predicate:"json_extract(data,'$.state') IN ('queued','active','blocked','evidence_requested')",limit:26)
         let attempts = try scopedTaskRows(db,type:"attempt",task:task,limit:26,descending:true).reversed().map {$0}
         let active = try (task["active_attempt_id"] as? String).map {try scoped(db,$0,pid,type:"attempt")}
-        let messages = chronologicalMessages(try scopedTaskRows(db,type:"message",task:task,limit:11,descending:true))
+        // Restore creation order within the bounded newest-note window before timestamp sorting.
+        let messages = chronologicalMessages(try scopedTaskRows(db,type:"message",task:task,limit:11,descending:true).reversed().map {$0})
         let directionIDs = try jsonString(directions.compactMap {$0["id"] as? String})
         let deliveries = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='delivery' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.message_id') IN (SELECT value FROM json_each(?)) ORDER BY rowid DESC LIMIT 51",arguments:[Data(pid.utf8),directionIDs]).reversed().map {try GRDBRecordEnvelopeAdapter.decode($0).object}
         let next: String

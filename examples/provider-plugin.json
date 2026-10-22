@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "interface_version": 1,
+  "plugin_id": "example.synthetic",
+  "version": "1.0.0",
+  "provider_id": "synthetic",
+  "display_name": "Synthetic component fixture",
+  "capabilities": [
+    "work_session",
+    "pickup",
+    "correlated_reply"
+  ],
+  "models": []
+}

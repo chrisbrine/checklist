@@ -1,0 +1,597 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Planned project orchestrator snapshot v1",
+  "description": "Prepared CL-124 shapes for one project registration, bounded participant projection, conversation, and request projection. This is not a command, enrollment, complete history, or authority. Cross-record scope/ID equality, keyed uniqueness, actual native verification, current grants, generation fences, enabled-registration limits, and UTF-8 byte limits require service validation. Historical participant/request pages are separate.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "project_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "registration": {
+      "$ref": "#/$defs/registration"
+    },
+    "participants": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/participant"
+      },
+      "minItems": 1,
+      "maxItems": 16
+    },
+    "conversation": {
+      "$ref": "#/$defs/conversation"
+    },
+    "requests": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/request"
+      },
+      "minItems": 0,
+      "maxItems": 100
+    }
+  },
+  "required": [
+    "schema_version",
+    "project_id",
+    "registration",
+    "participants",
+    "conversation",
+    "requests"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "registration": {
+            "properties": {
+              "kind": {
+                "const": "single"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "participants": {
+            "maxItems": 1
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "responsibility": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "general"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "focused"
+            },
+            "task_ids": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "minItems": 0,
+              "maxItems": 200,
+              "uniqueItems": true
+            },
+            "epic_ids": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "minItems": 0,
+              "maxItems": 200,
+              "uniqueItems": true
+            },
+            "triage_ids": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "minItems": 0,
+              "maxItems": 200,
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "anyOf": [
+            {
+              "required": [
+                "task_ids"
+              ],
+              "properties": {
+                "task_ids": {
+                  "minItems": 1
+                }
+              }
+            },
+            {
+              "required": [
+                "epic_ids"
+              ],
+              "properties": {
+                "epic_ids": {
+                  "minItems": 1
+                }
+              }
+            },
+            {
+              "required": [
+                "triage_ids"
+              ],
+              "properties": {
+                "triage_ids": {
+                  "minItems": 1
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "providerSessionRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "authorization_generation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9._-]*$"
+        },
+        "installation_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "native_session_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "native_generation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "subagent_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "parent_session_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "session_id",
+        "authorization_generation",
+        "provider",
+        "installation_id",
+        "native_session_id",
+        "native_generation"
+      ]
+    },
+    "registration": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "orchestrator_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "kind": {
+          "enum": [
+            "single",
+            "group"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "responsibility": {
+          "$ref": "#/$defs/responsibility"
+        },
+        "state": {
+          "enum": [
+            "active",
+            "paused",
+            "ended"
+          ]
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "created_by": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "required": [
+        "schema_version",
+        "orchestrator_id",
+        "project_id",
+        "revision",
+        "kind",
+        "label",
+        "responsibility",
+        "state",
+        "created_at",
+        "created_by"
+      ]
+    },
+    "participant": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "participant_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "orchestrator_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "provider_session_ref": {
+          "$ref": "#/$defs/providerSessionRef"
+        },
+        "participation": {
+          "enum": [
+            "active",
+            "paused",
+            "left"
+          ]
+        },
+        "joined_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "checkpoint": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 4000
+        }
+      },
+      "required": [
+        "schema_version",
+        "participant_id",
+        "orchestrator_id",
+        "project_id",
+        "revision",
+        "provider_session_ref",
+        "participation",
+        "joined_at"
+      ]
+    },
+    "conversation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "conversation_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "orchestrator_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "participant_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "schema_version",
+        "conversation_id",
+        "project_id",
+        "orchestrator_id",
+        "revision",
+        "participant_ids"
+      ]
+    },
+    "contextRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "task",
+            "epic",
+            "triage",
+            "human_request",
+            "attachment"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "kind",
+        "id"
+      ]
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "conversation_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "message_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "state": {
+          "enum": [
+            "inbox_pending",
+            "assigned",
+            "handoff_offered",
+            "responded",
+            "closed"
+          ]
+        },
+        "context_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/contextRef"
+          },
+          "minItems": 0,
+          "maxItems": 50
+        },
+        "responsible_participant_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "recipient_session_generation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "shared_inbox_orchestrator_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "handoff_to_participant_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "response_message_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "close_reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        }
+      },
+      "required": [
+        "schema_version",
+        "request_id",
+        "project_id",
+        "conversation_id",
+        "message_id",
+        "revision",
+        "state",
+        "context_refs"
+      ],
+      "oneOf": [
+        {
+          "required": [
+            "responsible_participant_id",
+            "recipient_session_generation"
+          ],
+          "not": {
+            "required": [
+              "shared_inbox_orchestrator_id"
+            ]
+          }
+        },
+        {
+          "required": [
+            "shared_inbox_orchestrator_id"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "responsible_participant_id"
+                ]
+              },
+              {
+                "required": [
+                  "recipient_session_generation"
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "inbox_pending"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "shared_inbox_orchestrator_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "assigned",
+                  "handoff_offered",
+                  "responded"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "responsible_participant_id",
+              "recipient_session_generation"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "handoff_offered"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "handoff_to_participant_id"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "handoff_to_participant_id"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "responded"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "response_message_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "closed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "close_reason"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

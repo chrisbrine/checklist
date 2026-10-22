@@ -134,7 +134,20 @@ extension CommandRouter {
         // Ended, revoked or unknown sessions need recovery; the owner's own work has no agent session.
         let lostSession = "(" + session + "<>'human' AND COALESCE((SELECT json_extract(x.data,'$.state') FROM records x WHERE x.id=" + session + " AND x.type='session'),'unknown') IN ('ended','revoked','unknown'))"
         // Quiet: no checkpoint for 30 minutes (ReviewOutcomes.quietCheckpointSeconds); a resource wait is never quiet.
-        let quiet = "(" + session + "<>'human' AND json_extract(" + attempt + ",'$.waiting_for_resource') IS NULL AND checklist_timestamp(COALESCE(json_extract(" + attempt + ",'$.last_checkpoint'),json_extract(" + attempt + ",'$.started_at')))<=:quietBefore)"
+        let quiet = "(COALESCE(json_extract(r.data,'$.work_health.attention'),0)=1 OR (" + session + "<>'human' AND json_extract(" + attempt + ",'$.waiting_for_resource') IS NULL AND checklist_timestamp(COALESCE(json_extract(" + attempt + ",'$.last_checkpoint'),json_extract(" + attempt + ",'$.started_at')))<=:quietBefore))"
+        // Unclaimed historical health does not remain actionable after release.
+        // A member still handled by an active phase or sibling remains Active attention.
+        let unclaimedHealthActive = """
+            (\(category)='active' OR EXISTS (
+              SELECT 1 FROM records g WHERE g.type='group' AND g.project_id=r.project_id
+              AND json_extract(g.data,'$.kind')='triage' AND COALESCE(json_extract(g.data,'$.archived'),0)=0
+              AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_array_length(json_extract(g.data,'$.members'))>0 THEN json_extract(g.data,'$.members') ELSE json_extract(g.data,'$.task_ids') END) m WHERE (CASE WHEN m.type='object' THEN json_extract(m.value,'$.task_id') ELSE m.value END)=r.id)
+              AND (json_extract(g.data,'$.orchestration.state')='active' OR EXISTS (
+                SELECT 1 FROM json_each(CASE WHEN json_array_length(json_extract(g.data,'$.members'))>0 THEN json_extract(g.data,'$.members') ELSE json_extract(g.data,'$.task_ids') END) m
+                JOIN records t ON t.id=(CASE WHEN m.type='object' THEN json_extract(m.value,'$.task_id') ELSE m.value END) AND t.type='task' AND t.project_id=g.project_id
+                LEFT JOIN records s ON s.id=json_extract(t.data,'$.status_id') AND s.type='status' AND s.project_id=t.project_id
+                WHERE json_extract(t.data,'$.active_attempt_id') IS NOT NULL OR json_extract(s.data,'$.category')='active'))))
+            """
         let ownerAssigned = "(COALESCE(json_extract(r.data,'$.planned_assignee'),'')='human' OR COALESCE(json_extract(r.data,'$.planned_assignee.kind'),'')='human' OR COALESCE(json_extract(r.data,'$.assignee'),'')='human')"
         let openPrerequisite = "EXISTS (SELECT 1 FROM records e WHERE e.project_id=r.project_id AND e.type='relation' AND json_extract(e.data,'$.source_task_id')=r.id AND json_extract(e.data,'$.relation')='depends_on' AND COALESCE(json_extract(e.data,'$.required'),1)=1 AND (COALESCE(json_extract(e.data,'$.state'),'active')='unresolved' OR NOT EXISTS (SELECT 1 FROM records pt JOIN records ps ON ps.id=json_extract(pt.data,'$.status_id') AND ps.type='status' AND ps.project_id=pt.project_id WHERE pt.id=json_extract(e.data,'$.target_task_id') AND pt.type='task' AND pt.project_id=r.project_id AND json_extract(ps.data,'$.category')='done' AND COALESCE(json_extract(pt.data,'$.trashed'),0)=0 AND COALESCE(json_extract(pt.data,'$.disposition'),'')<>'superseded')))"
         // A pending blocking owner request stops pickup, review and completion (Work.swift); such a ticket waits in Owner requests.
@@ -146,7 +159,7 @@ extension CommandRouter {
         case "needs_review": return unarchived + " AND " + category + "='review' AND COALESCE(json_extract(r.data,'$.pending_policy_revision'),0)=0 AND " + free + " AND " + queuedReview
         case "needs_pickup": return unarchived + " AND json_extract(r.data,'$.readiness')='ready' AND " + category + "='queued' AND NOT " + ownerAssigned + " AND " + free
         case "needs_active": return unarchived + " AND " + working + " AND COALESCE(" + category + ",'')<>'blocked' AND NOT " + lostSession + " AND NOT " + quiet
-        case "needs_quiet": return unarchived + " AND " + working + " AND COALESCE(" + category + ",'')<>'blocked' AND NOT " + lostSession + " AND " + quiet
+        case "needs_quiet": return unarchived + " AND ((COALESCE(json_extract(r.data,'$.work_health.attention'),0)=1 AND NOT (" + working + ") AND " + unclaimedHealthActive + ") OR (" + working + " AND COALESCE(" + category + ",'')<>'blocked' AND NOT " + lostSession + " AND " + quiet + "))"
         case "needs_recovery": return unarchived + " AND (" + category + "='blocked' OR (" + working + " AND " + lostSession + "))"
         default: return open + " AND " + category + " IN ('done','completed') AND checklist_timestamp(json_extract(r.data,'$.completed_at'))>=:todayStart"
         }

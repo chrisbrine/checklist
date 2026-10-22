@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ChecklistCore
 
 struct TaskSessionsView: View {
     @EnvironmentObject var store: ChecklistStore
@@ -26,12 +27,25 @@ struct TaskSessionsView: View {
         return RecordOrdering.newestFirst(links.filter { !$0.bool("binding_current") }, timestamp: "updated_at").filter { !known.contains($0.string("session_id")) && seen.insert($0.string("session_id")).inserted }
     }
     var body: some View {
-        if !attempts.isEmpty || !links.isEmpty {
+        if !attempts.isEmpty || !links.isEmpty || task.bool("active_attention") {
             DetailSection(title: "Work on this ticket") {
+                WorkHealthSummary(health:task.object("work_health"))
+                DisclosureGroup("Communication availability") {
+                    VStack(alignment: .leading, spacing: Spacing.control) {
+                        Text(NativeCommunicationRoutes.summary).checklistFont(.micro).foregroundStyle(.secondary)
+                        ForEach(NativeCommunicationRoutes.all) { route in
+                            VStack(alignment: .leading, spacing: Spacing.hairline) {
+                                Text("\(route.title) · \(route.statusLabel)").checklistFont(.microEmphasis)
+                                Text(route.reason).checklistFont(.micro).foregroundStyle(.secondary)
+                            }
+                        }
+                    }.padding(.top, Spacing.row)
+                }.checklistFont(.micro)
+
                 if let current {
                     attemptRow(current)
                     Button("Recover stopped work…") { recoveryAttempt = current }.checklistFont(.micro).checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
-                    Text("Only recover after checking that the handler has stopped. A timeout does not prove it.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("Only recover after checking that the handler has stopped. A timeout does not prove it.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
                 ForEach(activeContributors) { contributor in
                     attemptRow(contributor)
@@ -56,8 +70,8 @@ struct TaskSessionsView: View {
         let session = store.detailRecords("sessions",task:task).first { $0.id == link.string("session_id") }
         VStack(alignment: .leading, spacing: Spacing.small) {
             Text(sessionLabel(link, session)).checklistFont(.calloutStrong)
-            Text(historical ? "Historical context link · no current access implied" : "Connected for context · no work claim").checklistFont(.micro).foregroundStyle(.secondary)
-            Text("\(session?.string("provider").capitalized ?? "Agent") · Linked \(relativeTime(link.string("created_at")))").checklistFont(.micro).foregroundStyle(.secondary)
+            Text(historical ? "Historical context link · no current access implied" : "Connected for context · no work claim").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+            Text("\(session?.string("provider").capitalized ?? "Agent") · Linked \(relativeTime(link.string("created_at")))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             let earlier = attempts.filter { $0.string("session_id") == link.string("session_id") }
             if !earlier.isEmpty {
                 DisclosureGroup("Work history on this ticket") { VStack(spacing: Spacing.small) { ForEach(earlier) { attempt in attemptRow(attempt) } }.padding(.top, Spacing.small) }.checklistFont(.micro)
@@ -72,16 +86,16 @@ struct TaskSessionsView: View {
             AccessibleHStack {
                 Text(sessionLabel(attempt, session)).checklistFont(.calloutStrong)
                 Spacer()
-                Text(attempt.id == task.string("active_attempt_id") ? "Current handler" : attempt.string("state") == "active" ? "Current contributor" : GlossaryText.humanize(attempt.string("state")).capitalized).checklistFont(.micro).foregroundStyle(.secondary)
+                Text(attempt.id == task.string("active_attempt_id") ? "Current handler" : attempt.string("state") == "active" ? "Current contributor" : GlossaryText.humanize(attempt.string("state")).capitalized).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
-            Text("\(session?.string("provider").capitalized ?? (attempt.string("session_id") == "human" ? "You" : "Agent")) · \(attempt.string("phase", fallback: "implementation").capitalized)").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("\(session?.string("provider").capitalized ?? (attempt.string("session_id") == "human" ? "You" : "Agent")) · \(attempt.string("phase", fallback: "implementation").capitalized)").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             if attempt.string("state") == "active", !attempt.string("waiting_for_resource").isEmpty {
                 // CL-47: a resource wait is shown instead of a quiet claim.
-                Label("Waiting for \(attempt.string("waiting_for_resource")) since \(relativeTime(attempt.string("waiting_since")))", systemImage: "hourglass").checklistFont(.micro).foregroundStyle(.secondary)
+                Label("Waiting for \(attempt.string("waiting_for_resource")) since \(relativeTime(attempt.string("waiting_since")))", systemImage: "hourglass").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             } else if !attempt.string("last_checkpoint").isEmpty {
-                Text("Last checkpoint \(relativeTime(attempt.string("last_checkpoint")))").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("Last checkpoint \(relativeTime(attempt.string("last_checkpoint")))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             } else {
-                Text("Started \(relativeTime(attempt.string("started_at"))) · No checkpoint yet").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("Started \(relativeTime(attempt.string("started_at"))) · No checkpoint yet").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
             if !attempt.string("progress").isEmpty { Text(attempt.string("progress")).checklistFont(.callout).textSelection(.enabled) }
             if !attempt.string("final_report").isEmpty {
@@ -94,26 +108,30 @@ struct TaskSessionsView: View {
                 VStack(alignment: .leading, spacing: Spacing.tight) { Text("Continuation").checklistFont(.microEmphasis); Text(attempt.string("continuation")).checklistFont(.callout).textSelection(.enabled) }
             }
             if !attempt.string("reason", fallback: attempt.string("recovery_reason")).isEmpty { Text("Disposition: \(attempt.string("reason", fallback: attempt.string("recovery_reason")))").checklistFont(.micro).textSelection(.enabled) }
-            if let session { Text("Session: \(GlossaryText.humanize(session.string("state", fallback: "Unknown")))").checklistFont(.micro).foregroundStyle(.secondary) }
+            if let session { Text("Session: \(GlossaryText.humanize(session.string("state", fallback: "Unknown")))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             sessionActions(session)
             if session?.string("state") == "revoked" { Label("Session access revoked; work still needs a recorded disposition", systemImage: "exclamationmark.circle").checklistFont(.micro).foregroundStyle(.orange) }
             technicalIdentity(attempt, session: session, isAttempt: true)
         }.frame(maxWidth: .infinity, alignment: .leading).checklistCard(padding: Card.padding)
     }
     @ViewBuilder func sessionActions(_ session: Record?) -> some View {
-        if let session, ["codex", "claude"].contains(session.string("provider").lowercased()) {
+        if let session {
             let provider = HandoffProvider(id: session.string("provider").lowercased())
-            AccessibleHStack {
-                if let application = NSWorkspace.shared.urlForApplication(withBundleIdentifier: provider.bundleID) {
-                    Button("Open \(provider.name) app") {
-                        NSWorkspace.shared.openApplication(at: application, configuration: NSWorkspace.OpenConfiguration()) { _, error in
-                            if let error { Task { @MainActor in store.error = PlainError.text(error) } }
+            if provider.isAvailable {
+                AccessibleHStack {
+                    if let bundleID = provider.bundleID, let application = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+                        Button("Open \(provider.name) app") {
+                            NSWorkspace.shared.openApplication(at: application, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+                                if let error { Task { @MainActor in store.error = PlainError.text(error) } }
+                            }
                         }
                     }
-                }
-                Button("Prepare continuation…") { handoffProvider = provider }.checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
-            }.checklistFont(.micro)
-            Text("An exact conversation link is unavailable. Open the provider app to find this session, or prepare this ticket for a new thread.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Button("Prepare continuation…") { handoffProvider = provider }.checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
+                }.checklistFont(.micro)
+                Text("An exact conversation link is unavailable. Open the provider app to find this session, or prepare this ticket for a new thread.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+            } else if let reason = provider.unavailabilityReason {
+                Text(reason).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+            }
         }
     }
     func technicalIdentity(_ record: Record, session: Record?, isAttempt: Bool) -> some View {
@@ -152,14 +170,14 @@ struct TaskRecoverySheet: View {
         VStack(alignment: .leading, spacing: Spacing.group) {
             Text("Recover stopped work").checklistFont(.sheetTitle)
             Text("\(task.string("key")) · \(task.string("title"))").checklistFont(.bodyStrong).lineLimit(2)
-            Text(attempt.string("parent_attempt_id").isEmpty ? "Check the actual handler and reserved files first. Checklist will revoke this claim and mark the ticket blocked so its next step can be decided. It will not stop a running agent or infer completion." : "Check this exact contributor and its reserved files first. Checklist will revoke its stopped claim; the parent handler must still check the work. This action does not stop a running agent or infer completion.").checklistFont(.callout).foregroundStyle(.secondary)
+            Text(attempt.string("parent_attempt_id").isEmpty ? "Check the actual handler and reserved files first. Checklist will revoke this claim and mark the ticket blocked so its next step can be decided. It will not stop a running agent or infer completion." : "Check this exact contributor and its reserved files first. Checklist will revoke its stopped claim; the parent handler must still check the work. This action does not stop a running agent or infer completion.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
             TextField("Why does this work need recovery?", text: $reason).textFieldStyle(.roundedBorder)
             TextField("How did you verify that this exact handler stopped?", text: $observation).textFieldStyle(.roundedBorder)
             TextField("Where did you inspect the reserved files, and what state remains?", text: $fileState).textFieldStyle(.roundedBorder)
             Toggle("I verified this handler is stopped", isOn: $verifiedStopped).toggleStyle(.checkbox)
             if !unfinishedSourceExecutions.isEmpty {
                 Text("Source checks retain this attempt's reservations").checklistFont(.captionStrong)
-                Text("Verify each exact external process and its files before confirming it stopped. A failed or stale result can still have an unverified process stop. Recovery records your observations and does not terminate a process.").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("Verify each exact external process and its files before confirming it stopped. A failed or stale result can still have an unverified process stop. Recovery records your observations and does not terminate a process.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 if unfinishedSourceExecutions.contains(where: { confirmedSourceExecutions[$0.id] != nil && !isSourceExecutionConfirmed($0) }) {
                     Text("A source check changed after your earlier observation. Confirm its current state again.").checklistFont(.micro).foregroundStyle(.orange)
                 }
@@ -183,5 +201,26 @@ struct TaskRecoverySheet: View {
                 }.buttonStyle(.checklistProminent).checklistDisabled([(!verifiedStopped, "Confirm that the work stopped first."), (!allSourceExecutionsConfirmed, "Confirm that every source check stopped first."), (reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write a reason first."), (observation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write what you observed first."), (fileState.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Describe the state of the reserved files first."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
             }
         }.padding(Spacing.page).checklistSheet(width: 550)
+    }
+}
+
+/// The same service projection is shown for claimed work and unclaimed Triage members.
+struct WorkHealthSummary: View {
+    let health: [String: Any]
+    var body: some View {
+        let state = health["state"] as? String ?? "pending_check"
+        let target = health["current_target"] as? [String:Any] ?? [:]
+        VStack(alignment:.leading, spacing:Spacing.small) {
+            Label("Work health · " + GlossaryText.humanize(state), systemImage: health["attention"] as? Bool == true ? "exclamationmark.circle" : "heart.text.square").checklistFont(.microEmphasis)
+            if state != "inactive", target["kind"] as? String != "attempt" { Text("Missing ticket handler · " + (target["kind"] as? String == "orchestration" ? "Checking the actual phase orchestrator" : (target["reason"] as? String ?? "No actual phase orchestrator"))).checklistFont(.micro) }
+            if let progress = health["last_progress_at"] as? String { Text("Last substantive progress: " + relativeTime(progress)).checklistFont(.micro) }
+            if let next = health["next_check_at"] as? String, state != "paused" { Text("Next check: " + next).checklistFont(.micro) }
+            Text("Session: " + (health["session_state"] as? String ?? "unknown") + " · Last seen: " + (health["last_seen"] as? String ?? "unknown")).checklistFont(.micro)
+            ForEach(Array((health["known_waits"] as? [[String:Any]] ?? []).enumerated()), id: \.offset) { _, wait in Text("Known wait · " + (wait["kind"] as? String ?? "") + ": " + (wait["reason"] as? String ?? "Open prerequisite")).checklistFont(.micro) }
+            if let jobs = health["running_jobs"] as? [[String:Any]], !jobs.isEmpty { Text("Running source checks: \(jobs.count) · A running job does not prove substantive progress").checklistFont(.micro) }
+            if let delivery = health["delivery_state"] as? String { Text("Health request: " + GlossaryText.humanize(delivery) + " · A queued or acknowledged note is not a response").checklistFont(.micro) }
+            if health["response_without_new_progress"] as? Bool == true { Text("Handler replied; substantive progress is still overdue").checklistFont(.micro).foregroundStyle(.orange) }
+            Text("Native wake unavailable · MCP pickup only").checklistFont(.micro).foregroundStyle(.secondary)
+        }.frame(maxWidth:.infinity, alignment:.leading)
     }
 }

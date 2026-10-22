@@ -37,9 +37,9 @@ final class CoveredAnswerTests: XCTestCase {
     }
     func testSameTicketApprovalListsEarlierAnswerIncludingNeedsChanges() throws {
         let (p,t,w) = try fixture()
-        for outcome in ["approved","changes_requested"] {
+        for outcome in ["approved","changes_requested","declined"] {
             var original = input(p,t,title:"Earlier \(outcome)",prompt:"Approve \(outcome)?",type:"approval")
-            if outcome == "changes_requested" {
+            if outcome != "approved" {
                 let prior = try call("task_context",["project_id":p["id"]!,"task_id":t["id"]!])["requests"] as! [JSON]
                 original["supersedes_answer_id"] = prior[0]["id"]!; original["supersede_reason"] = "Candidate changed"
             }
@@ -101,7 +101,7 @@ extension CoveredAnswerTests {
     func testReviewerNotCheckedThenCanceledDoesNotCoverApproval() throws {
         let (p,t,w) = try fixture()
         let original = try call("human_request_create",input(p,t,title:"Old candidate",prompt:"Approve old candidate?",type:"approval"),w)
-        let unchecked = try answer(original,value:"not_checked",type:"approval")
+        let unchecked = try call("human_request_answer",["project_id":p["id"]!,"request_id":original["id"]!,"expected_revision":original["revision"]!,"response":"clarification","explanation":"Not checked","answers":[["question_id":"q","result":"not_checked"]]])
         XCTAssertEqual(unchecked["state"] as? String,"pending")
         XCTAssertEqual((unchecked["responses"] as! [JSON])[0]["complete"] as? Bool,false)
         _ = try call("human_request_cancel",["project_id":p["id"]!,"request_id":unchecked["id"]!,"expected_revision":unchecked["revision"]!],w)

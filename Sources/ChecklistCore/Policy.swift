@@ -1,4 +1,5 @@
 import Foundation
+import ChecklistProviders
 import GRDB
 
 extension CommandRouter {
@@ -17,14 +18,10 @@ extension CommandRouter {
     func effectivePolicy(_ raw: JSON, kind: String) -> JSON {
         var policy = raw
         let preset = raw["routing_preset"] as? String ?? "shared"
-        let allowed = raw["allowed_providers"] as? [String] ?? ["codex", "claude"]
+        let allowed = raw["allowed_providers"] as? [String] ?? providerPlugins.workProviders
         var roles: JSON = [:]
         for role in Self.policyRoles {
-            let selected: [String]
-            if role == "implementer", preset != "shared" { selected = allowed.filter { $0 == "codex" } }
-            else if role == "coordinator", preset == "claude_coordinates" { selected = allowed.filter { $0 == "claude" } }
-            else if role == "coordinator", preset == "codex_led" { selected = allowed.filter { $0 == "codex" } }
-            else { selected = allowed }
+            let selected = ProviderPolicyDefaults.providers(role:role,preset:preset,allowed:allowed)
             roles[role] = ["providers":selected, "preferred_provider":selected.first.map { $0 as Any } ?? NSNull(), "preferred_models":[]] as JSON
         }
         for (key, value) in raw["roles"] as? JSON ?? [:] { roles[key] = value }
@@ -49,7 +46,7 @@ extension CommandRouter {
         let keys: Set<String> = ["routing_preset", "allowed_providers", "roles", "required_gates", "task_kind_overrides", "review_batch_policy", "lane_capacities", "assistant_relay_grants", "coordinator_session_id", "allow_human_decision_evidence", "review_requirements", "agent_rule_changes", "release_set_holds"]
         guard Set(input.keys).isSubset(of: keys) else { throw CoreError("INVALID_INPUT", "Policy contains unsupported settings.") }
         if let mode = input["agent_rule_changes"] { guard let mode = mode as? String, Self.ruleChangeModes.contains(mode) else { throw CoreError("INVALID_INPUT", "agent_rule_changes is allowed or owner_only.") } }
-        if let preset = input["routing_preset"] { guard let preset = preset as? String, ["shared", "claude_coordinates", "codex_led"].contains(preset) else { throw CoreError("INVALID_INPUT", "Choose a supported routing preset.") } }
+        if let preset = input["routing_preset"] { guard let preset = preset as? String, ProviderPolicyDefaults.presets.contains(preset) else { throw CoreError("INVALID_INPUT", "Choose a supported routing preset.") } }
         if let batch = input["review_batch_policy"] { guard let batch = batch as? String, [Self.passingReviewDefault, "hold_passing_for_batch"].contains(batch) else { throw CoreError("INVALID_INPUT", "Choose independent completion or an explicit batch hold.") } }
         if let raw = input["release_set_holds"] { guard let number = raw as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else { throw CoreError("INVALID_INPUT", "release_set_holds must be explicitly enabled with a boolean.") } }
         if input["coordinator_session_id"] != nil { _ = try text(input,"coordinator_session_id",max:200) }
@@ -57,7 +54,7 @@ extension CommandRouter {
         var result = effectivePolicy(input, kind: "")
         result["review_requirements"] = try canonicalReviewRequirements(input["review_requirements"])
         let allowed = strings(result,"allowed_providers")
-        guard !allowed.isEmpty, allowed.count <= 2, Set(allowed).count == allowed.count, Set(allowed).isSubset(of: ["codex", "claude"]) else { throw CoreError("INVALID_INPUT", "Only existing Codex and Claude work providers can participate.") }
+        guard !allowed.isEmpty, allowed.count <= 128, Set(allowed).count == allowed.count, Set(allowed).isSubset(of: Set(providerPlugins.workProviders)) else { throw CoreError("INVALID_INPUT", "Only enabled, compatible and qualified work-provider plugins can participate.") }
         if input["allowed_providers"] != nil, input["allowed_providers"] as? [String] == nil { throw CoreError("INVALID_INPUT", "allowed_providers must be an array.") }
         func gates(_ value: Any?) throws -> [String] {
             guard let values = value as? [String], values.count <= Self.policyGates.count, Set(values).count == values.count, Set(values).isSubset(of: Set(Self.policyGates)) else { throw CoreError("INVALID_INPUT", "This build supports review and human_approval gates.") }
@@ -114,7 +111,7 @@ extension CommandRouter {
         let current = effectivePolicy(project["policy"] as? JSON ?? [:],kind:task["kind"] as? String ?? "work")
         let role = phase == "review" ? "reviewer" : "implementer"
         let rule = (current["roles"] as? JSON)?[role] as? JSON ?? [:]
-        guard session["role"] as? String == "worker", !["revoked", "ended"].contains(session["state"] as? String ?? ""), strings(current,"allowed_providers").contains(provider), strings(rule,"providers").contains(provider) else { throw CoreError("POLICY_DENIED", "The current project policy does not grant this provider the requested role.",details:["policy_revision":project["policy_revision"] ?? 1,"role":role,"eligible_providers":strings(rule,"providers"),"external_process_stopped":false]) }
+        guard session["role"] as? String == "worker", !["revoked", "ended"].contains(session["state"] as? String ?? ""), providerPlugins.plugin(provider, requiring: .workSession) != nil, strings(current,"allowed_providers").contains(provider), strings(rule,"providers").contains(provider) else { throw CoreError("POLICY_DENIED", "The current project policy does not grant this provider the requested role.",details:["policy_revision":project["policy_revision"] ?? 1,"role":role,"eligible_providers":strings(rule,"providers"),"external_process_stopped":false]) }
         // An agent planned assignee is a preference, not a lock: any eligible AI may claim an
         // unclaimed ticket (owner decision, 19 October 2026). Owner-assigned tickets stay
         // with the owner in work_claim, and review keeps contributor independence.
@@ -134,7 +131,7 @@ extension CommandRouter {
             if let requested = provider, requested != session["provider"] as? String { throw CoreError("POLICY_DENIED", "Assignment provider does not match its actual session.") }
             provider = session["provider"] as? String
         }
-        guard let provider, eligible.contains(provider) else { throw CoreError("POLICY_DENIED", "A task exception cannot expand project or task-kind role eligibility.",details:["eligible_providers":eligible]) }
+        guard let provider, providerPlugins.plugin(provider, requiring: .workSession) != nil, eligible.contains(provider) else { throw CoreError("POLICY_DENIED", "A task exception cannot expand project or task-kind role eligibility.",details:["eligible_providers":eligible]) }
         guard input["planned_assignee"] != nil else { return }
         let reason = try text(input,"assignment_reason",max:2000)
         task["assignment_reason"] = reason

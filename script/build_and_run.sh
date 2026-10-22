@@ -12,12 +12,19 @@ if ! mkdir "$BUILD_ROOT/.build-lock" 2>/dev/null; then
 fi
 INCOMING=""
 STAGE_ASSEMBLY=""
+BUILD_SOURCE=""
 cleanup() {
   if [ -n "$STAGE_ASSEMBLY" ] && [ -d "$STAGE_ASSEMBLY" ]; then rm -rf "$STAGE_ASSEMBLY"; fi
+  if [ -n "${TIMING_FILE:-}" ]; then rm -f "$TIMING_FILE"; fi
   rmdir "$BUILD_ROOT/.build-lock" 2>/dev/null || true
   if [ -n "$INCOMING" ] && [ -d "$INCOMING" ]; then echo "A verified install stage remains for reconciliation: $INCOMING" >&2; fi
 }
 trap cleanup EXIT
+TIMING_FILE="$(mktemp "$BUILD_ROOT/timing.XXXXXX")"
+BUILD_HELPER="$ROOT_DIR/script/build_support.py"
+phase() { python3 "$BUILD_HELPER" timing "$TIMING_FILE" "$@"; }
+phase init
+phase start capture
 CONFIGURATION="${CHECKLIST_BUILD_CONFIGURATION:-release}"
 case "$CONFIGURATION" in debug|release) ;; *) echo "CHECKLIST_BUILD_CONFIGURATION must be debug or release." >&2; exit 2;; esac
 if [ "${CHECKLIST_SIGN_IDENTITY+x}" = x ]; then
@@ -117,14 +124,23 @@ SOURCE="$CAPTURE_DIR/source"
 SCRATCH="$BUILD_ROOT/swiftpm-$TOOLCHAIN_ID"
 STAGE_FINAL="$CAPTURE_DIR/Checklist.app"
 STAGE="$STAGE_FINAL"
+BUILD_HELPER="$SOURCE/script/build_support.py"
+phase stop capture
 if [ ! -d "$STAGE_FINAL" ]; then
   # A failed copy/build/sign never publishes a directory reusable as a full stage.
   STAGE_ASSEMBLY="$(mktemp -d "$CAPTURE_DIR/stage-XXXXXX")"
   STAGE="$STAGE_ASSEMBLY/Checklist.app"
-  for product in ChecklistApp ChecklistService checklist; do
-    swift build --package-path "$SOURCE" --scratch-path "$SCRATCH" --configuration "$CONFIGURATION" --disable-build-manifest-caching --force-resolved-versions --product "$product"
-  done
-  BIN_DIR="$(swift build --package-path "$SOURCE" --scratch-path "$SCRATCH" --configuration "$CONFIGURATION" --disable-build-manifest-caching --show-bin-path)"
+  # One serialized lane per toolchain/profile keeps SwiftPM's package path
+  # stable. Only verified capture bytes enter it; checkout edits cannot enter.
+  BUILD_SOURCE="$BUILD_ROOT/lane-$TOOLCHAIN_ID/source"
+  phase start compile
+  python3 "$BUILD_HELPER" sync "$CAPTURE_DIR" "$BUILD_SOURCE"
+  BIN_DIR="$(swift build --package-path "$BUILD_SOURCE" --scratch-path "$SCRATCH" --configuration "$CONFIGURATION" --force-resolved-versions --show-bin-path)"
+  python3 "$BUILD_HELPER" clean-products "$BIN_DIR" "$SCRATCH"
+  swift build --package-path "$BUILD_SOURCE" --scratch-path "$SCRATCH" --configuration "$CONFIGURATION" --force-resolved-versions --target ChecklistProducts
+  python3 "$BUILD_HELPER" verify "$CAPTURE_DIR" "$BUILD_SOURCE"
+  phase stop compile
+  phase start stage
   mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
   for executable in ChecklistApp ChecklistService checklist; do
     cp "$BIN_DIR/$executable" "$STAGE/Contents/MacOS/$executable"
@@ -177,10 +193,15 @@ PY
     chmod 644 "$STAGE/Contents/Library/LaunchAgents/$agent_plist"
     plutil -lint "$STAGE/Contents/Library/LaunchAgents/$agent_plist"
   done
+  phase stop stage
+  phase start sign
   for executable in ChecklistService checklist; do codesign --force --sign "$SIGN_IDENTITY" --timestamp=none --identifier "org.checklist.$executable" "$STAGE/Contents/MacOS/$executable"; done
   codesign --force --sign "$SIGN_IDENTITY" --timestamp=none --identifier org.checklist.app "$STAGE"
+  phase stop sign
 fi
 fi
+if [ "$MODE" = --install-stage ]; then phase stop capture; fi
+phase start verify
 codesign --verify --deep --strict "$STAGE"
 python3 - "$STAGE" "$CAPTURE_DIR" <<'PY'
 import hashlib,json,plistlib,re,subprocess,sys
@@ -201,10 +222,10 @@ print('Verified one signing team across the app and both helpers ('+manifest['si
 PY
 # The captured tree is the build authority. The writer barrier ended after
 # capture, so later checkout edits are provenance, not a reason to reject it.
-python3 - "$CAPTURE_DIR" "$ROOT_DIR" <<'PY'
+python3 - "$CAPTURE_DIR" "$ROOT_DIR" "$STAGE" "${BUILD_SOURCE:-}" <<'PY'
 import datetime,hashlib,json,stat,sys
 from pathlib import Path
-capture,root=map(Path,sys.argv[1:]);manifest=json.loads((capture/'capture-manifest.json').read_text())
+capture,root,stage=map(Path,sys.argv[1:4]);manifest=json.loads((capture/'capture-manifest.json').read_text())
 inventory_path=capture/'source'/'script'/'build_input_inventory.py'
 inventory_entry=next((entry for entry in manifest['inputs'] if entry['path']=='script/build_input_inventory.py'),None)
 if not inventory_entry or inventory_path.is_symlink() or not inventory_path.is_file():raise SystemExit('Captured inventory helper changed; the installed app is untouched.')
@@ -215,6 +236,12 @@ exec(compile(inventory_source,str(inventory_path),'exec'),inventory_namespace)
 inventory=inventory_namespace['inventory']
 if inventory(capture/'source')!=manifest['inputs']:raise SystemExit('Immutable source capture changed during build; the installed app is untouched.')
 receipt={'schema_version':1,'build_id':manifest['build_id'],'source_fingerprint':manifest['source_fingerprint'],'captured_source_verified':True,'verified_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+receipt['binary_sha256']={name:hashlib.sha256((stage/'Contents/MacOS'/name).read_bytes()).hexdigest() for name in ['ChecklistApp','ChecklistService','checklist']}
+prior_path=capture/'build-verification.json'
+prior=json.loads(prior_path.read_text()) if not sys.argv[4] and prior_path.exists() else {}
+if prior.get('binary_sha256') is not None and prior['binary_sha256']!=receipt['binary_sha256']:raise SystemExit('Staged binaries differ from the completed build receipt; the installed app is untouched.')
+receipt['stable_source_verified']=bool(sys.argv[4]) or prior.get('stable_source_verified',False)
+if sys.argv[4] or prior.get('build_source'):receipt['build_source']=sys.argv[4] or prior['build_source']
 try:
  current=inventory(root);receipt['checkout_changed_after_capture']=current!=manifest['inputs']
  receipt['checkout_inventory_sha256']=hashlib.sha256(json.dumps(current,sort_keys=True,separators=(',',':')).encode()).hexdigest()
@@ -233,7 +260,21 @@ if [ -n "$STAGE_ASSEMBLY" ]; then
   STAGE_ASSEMBLY=""
   STAGE="$STAGE_FINAL"
 fi
+phase stop verify
+phase finish
+save_timing() {
+  python3 - "$CAPTURE_DIR" "$TIMING_FILE" <<'PYTIMING'
+import json,sys
+from pathlib import Path
+capture,timing=map(Path,sys.argv[1:]);path=capture/'build-verification.json'
+receipt=json.loads(path.read_text());receipt['timing']=json.loads(timing.read_text())
+path.write_text(json.dumps(receipt,indent=2)+'\n')
+with (capture/'build-timings.jsonl').open('a') as output:output.write(json.dumps(receipt['timing'])+'\n')
+PYTIMING
+}
+save_timing
 if [ "$MODE" = --stage ]; then echo "Staged $STAGE"; exit 0; fi
+phase start install
 DEST="/Applications/Checklist.app"
 INSTALL_STARTED="$(date +%s)"
 INSTALL_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -296,11 +337,15 @@ if ! codesign --verify --deep --strict "$DEST"; then
   echo "Installed signature failed; previous bundle restored. Data was retained." >&2
   exit 1
 fi
+phase stop install
+phase finish
+save_timing
 python3 - "$BUILD_ROOT" "$DEST" "$PREVIOUS" "$HAD_PREVIOUS" "$CAPTURE_DIR" <<'PY'
 import json,sys
 from pathlib import Path
 build,dest,previous=map(Path,sys.argv[1:4]);record={'installed':str(dest),'previous_bundle':str(previous) if sys.argv[4]=='1' else None,'build':json.loads((dest/'Contents/Resources/build-info.json').read_text()),'database_backup_created_by_script':False}
 record['verification']=json.loads((Path(sys.argv[5])/'build-verification.json').read_text())
+record['timing']=record['verification']['timing']
 (build/'last-install.json').write_text(json.dumps(record,indent=2)+'\n')
 PY
 case "$MODE" in

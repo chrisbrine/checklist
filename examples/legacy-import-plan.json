@@ -1,0 +1,435 @@
+{
+  "fixture_version": 1,
+  "scope": "Synthetic CL-21 planning fixtures only; no source reader or import compatibility is implemented.",
+  "cases": [
+    {
+      "id": "snapshot-events",
+      "input": {
+        "format": "synthetic-board/1",
+        "meta": {
+          "exported_at": "2026-01-02T12:00:00Z"
+        },
+        "items": [
+          {
+            "id": "DEMO-1",
+            "state": "review",
+            "note": "Review round 2"
+          }
+        ],
+        "verdicts": [
+          {
+            "task": "DEMO-1",
+            "lane": "review",
+            "verdict": "PASS"
+          }
+        ],
+        "events": [
+          {
+            "event_seq": 8,
+            "task": "DEMO-1",
+            "action": "review",
+            "agent": "reviewer batch amber",
+            "at": "2026-01-02T11:00:00Z"
+          }
+        ]
+      },
+      "expected_preview": [
+        "Preserve envelope version, metadata, task, verdict, event sequence, time and actor.",
+        "Historical PASS grants no fresh gate pass."
+      ]
+    },
+    {
+      "id": "snapshot-completion",
+      "input": {
+        "format": "synthetic-board/1",
+        "meta": {
+          "exported_at": "2026-01-02T12:00:00Z"
+        },
+        "items": [
+          {
+            "id": "DEMO-1",
+            "state": "done"
+          }
+        ],
+        "verdicts": [],
+        "completion_evidence": [
+          {
+            "task": "DEMO-1",
+            "evidence": "evidence/build.txt",
+            "result": "PASS"
+          }
+        ],
+        "completion_overrides": [
+          {
+            "task": "DEMO-1",
+            "by": "Owner",
+            "reason": "Historical exception"
+          }
+        ]
+      },
+      "expected_preview": [
+        "Preserve completion_evidence and completion_overrides separately.",
+        "Warn that event history is unavailable; do not synthesize events or a trusted owner waiver."
+      ]
+    },
+    {
+      "id": "event-actions",
+      "input": {
+        "items": [
+          {
+            "id": "DEMO-1"
+          }
+        ],
+        "events": [
+          {
+            "event_seq": 9,
+            "task": "DEMO-1",
+            "action": "owner-override",
+            "agent": "Owner",
+            "at": "2026-01-02T11:10:00Z",
+            "reason": "Historical exception"
+          },
+          {
+            "event_seq": 10,
+            "task": "DEMO-1",
+            "action": "tidy",
+            "agent": "maintainer batch amber",
+            "at": "2026-01-02T11:11:00Z",
+            "reason": "Reordered source rows"
+          },
+          {
+            "event_seq": 11,
+            "task": "DEMO-9",
+            "action": "remove",
+            "agent": "maintainer batch amber",
+            "at": "2026-01-02T11:12:00Z",
+            "reason": "Historical hard delete",
+            "command": null
+          }
+        ]
+      },
+      "expected_preview": [
+        "Preserve all three raw actions with actor, time, reason and source ID.",
+        "DEMO-9 is an unresolved deleted reference, not a destination deletion.",
+        "Do not execute tidy, remove or owner override."
+      ]
+    },
+    {
+      "id": "role-authors",
+      "input": {
+        "items": [
+          {
+            "id": "DEMO-1",
+            "updated_by": "implementer batch amber"
+          }
+        ],
+        "events": [
+          {
+            "task": "DEMO-1",
+            "agent": "reviewer round 2"
+          }
+        ]
+      },
+      "expected_preview": [
+        "Preserve exact updated_by and agent strings as unverified role hints.",
+        "Do not match a session or principal by author text."
+      ]
+    },
+    {
+      "id": "client-export",
+      "input": {
+        "format": "synthetic-client/1",
+        "items": [
+          {
+            "id": "DEMO-1",
+            "state": "you",
+            "who": "implementer batch amber",
+            "doneBy": null,
+            "prevState": "todo",
+            "after": null
+          },
+          {
+            "id": "DEMO-2",
+            "state": "later",
+            "who": "implementer batch amber",
+            "doneBy": null,
+            "prevState": "todo",
+            "after": "DEMO-1"
+          },
+          {
+            "id": "DEMO-3",
+            "state": "todo",
+            "who": "implementer batch amber",
+            "doneBy": null,
+            "prevState": "todo",
+            "after": "DEMO-2"
+          },
+          {
+            "id": "DEMO-4",
+            "state": "doing",
+            "who": "implementer batch amber",
+            "doneBy": null,
+            "prevState": "todo",
+            "after": "DEMO-3"
+          },
+          {
+            "id": "DEMO-5",
+            "state": "running",
+            "who": "implementer batch amber",
+            "doneBy": "reviewer round 2",
+            "prevState": "todo",
+            "after": "DEMO-4"
+          }
+        ]
+      },
+      "expected_preview": [
+        "Keep who, doneBy, prevState and after with original types and values.",
+        "Propose owner-intent/unverified, deferred, queued, historical active, historical active respectively.",
+        "Reconcile active rows; create no live session, claim or automatic relation from after."
+      ]
+    },
+    {
+      "id": "note-substates",
+      "input": {
+        "items": [
+          {
+            "id": "DEMO-1",
+            "state": "review",
+            "note": "ready for integration: evidence/build.txt"
+          },
+          {
+            "id": "DEMO-2",
+            "state": "review",
+            "note": "PAUSED by the owner: awaiting sample"
+          },
+          {
+            "id": "DEMO-3",
+            "state": "review",
+            "note": "ACCEPT ... HOLD until release"
+          },
+          {
+            "id": "DEMO-4",
+            "state": "review",
+            "note": "Split into DEMO-8, DEMO-9"
+          },
+          {
+            "id": "DEMO-5",
+            "state": "review",
+            "note": "Waits for DEMO-8"
+          },
+          {
+            "id": "DEMO-6",
+            "state": "review",
+            "note": "Round 3: evidence missing"
+          },
+          {
+            "id": "DEMO-7",
+            "state": "review",
+            "note": "P1/P2 src/example.txt:12 visible seam"
+          }
+        ]
+      },
+      "expected_preview": [
+        "Preserve each full note and primary review state.",
+        "Show integration, pause, hold, split, wait, round and finding hints without executing workflow changes.",
+        "Keep unresolved DEMO-8 and DEMO-9 references; no title matching."
+      ]
+    },
+    {
+      "id": "media-review-store",
+      "input": {
+        "format": "synthetic-media/5",
+        "takes": [
+          {
+            "id": "take-a",
+            "task_ref": "DEMO-1",
+            "rounds": [
+              {
+                "round": 1,
+                "directions": {
+                  "north": {
+                    "verdict": "REJECT",
+                    "content_signature": {
+                      "algorithm": "legacy-opaque",
+                      "value": "sig-a"
+                    }
+                  }
+                }
+              },
+              {
+                "round": 2,
+                "directions": {
+                  "north": {
+                    "verdict": "ACCEPT",
+                    "content_signature": {
+                      "algorithm": "legacy-opaque",
+                      "value": "sig-b"
+                    },
+                    "original": "media/take-a-north.png"
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "sound_reviews": [
+          {
+            "id": "sound-a",
+            "round": 1,
+            "verdict": "NOT_RUN",
+            "content_signature": {
+              "algorithm": "legacy-opaque",
+              "value": "sig-s"
+            }
+          }
+        ],
+        "story_reviews": [
+          {
+            "id": "story-a",
+            "round": 2,
+            "verdict": "EVIDENCE_GAP",
+            "content_signature": null
+          }
+        ]
+      },
+      "expected_preview": [
+        "Namespace take/sound/story IDs independently from tasks and preserve rounds/directions.",
+        "Report unknown signature algorithm, absent signature and unavailable original; never invent a current approval.",
+        "Resolve task_ref only through explicit project-scoped source-ID mapping."
+      ]
+    },
+    {
+      "id": "backup-selection",
+      "input": {
+        "sources": [
+          {
+            "id": "backup-a",
+            "kind": "consistent-backup",
+            "captured_at": "2026-01-02T12:00:00Z",
+            "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "items": [
+              {
+                "id": "DEMO-1"
+              },
+              {
+                "id": "DEMO-2"
+              }
+            ]
+          },
+          {
+            "id": "snapshot-a",
+            "kind": "snapshot-export",
+            "captured_at": "2026-01-01T12:00:00Z",
+            "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "items": [
+              {
+                "id": "DEMO-1"
+              },
+              {
+                "id": "DEMO-2"
+              },
+              {
+                "id": "DEMO-3"
+              }
+            ]
+          }
+        ],
+        "selected_source": null
+      },
+      "expected_preview": [
+        "Report backup count 2 versus older snapshot count 3 with source hashes/times.",
+        "Require explicit source selection; do not merge or trust the larger count.",
+        "Hashes are synthetic labels, not checksums of real backup bytes."
+      ]
+    }
+  ],
+  "verdict_shapes": [
+    {
+      "id": "single-verdict",
+      "input": {
+        "task": "DEMO-1",
+        "verdict": "PASS",
+        "reviewer": "reviewer batch amber"
+      },
+      "expected_preview": [
+        "One historical verdict; reviewer text is unverified."
+      ]
+    },
+    {
+      "id": "verdict-list",
+      "input": [
+        {
+          "task": "DEMO-1",
+          "lane": "build",
+          "round": 1,
+          "result": "REJECT"
+        },
+        {
+          "task": "DEMO-1",
+          "lane": "build",
+          "round": 2,
+          "result": "PASS"
+        }
+      ],
+      "expected_preview": [
+        "Keep both round/lane entries and raw outcomes; no last-entry overwrite."
+      ]
+    },
+    {
+      "id": "keyed-verdicts",
+      "input": {
+        "DEMO-1": {
+          "review": "REJECT",
+          "reason": "Visible seam"
+        }
+      },
+      "expected_preview": [
+        "Keep DEMO-1 as source reference and preserve reason."
+      ]
+    },
+    {
+      "id": "round-envelope",
+      "input": {
+        "rounds": [
+          {
+            "round": 2,
+            "verdicts": [
+              {
+                "task": "DEMO-1",
+                "outcome": "EVIDENCE_GAP"
+              },
+              {
+                "task": "DEMO-2",
+                "outcome": "NOT_RUN"
+              }
+            ]
+          }
+        ]
+      },
+      "expected_preview": [
+        "Keep nested round and both raw outcomes distinct; neither grants a pass."
+      ]
+    },
+    {
+      "id": "direction-verdicts",
+      "input": {
+        "take": "take-a",
+        "round": 2,
+        "directions": {
+          "north": {
+            "verdict": "ACCEPT",
+            "signature": "legacy:abc"
+          },
+          "south": {
+            "verdict": "HOLD",
+            "signature": null
+          }
+        }
+      },
+      "expected_preview": [
+        "Keep both directions, round, signatures and raw outcomes.",
+        "Missing signature warns; ACCEPT is historical, HOLD is not a current release hold."
+      ]
+    }
+  ]
+}

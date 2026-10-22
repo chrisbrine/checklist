@@ -68,9 +68,9 @@ struct ContentView: View {
             }
             ToolbarItem(placement: .principal) {
                 HStack(spacing: Spacing.small) {
-                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    Image(systemName: "magnifyingglass").foregroundStyle(Color.checklistSecondaryText)
                     TextField("Search tickets, notes or keys…", text: $store.search).textFieldStyle(.plain).focused($isSearchFocused)
-                    if !store.search.isEmpty { Button { store.search = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary) }.buttonStyle(.checklistIcon).accessibilityLabel("Clear search").help("Clear search") }
+                    if !store.search.isEmpty { Button { store.search = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(Color.checklistSecondaryText) }.buttonStyle(.checklistIcon).accessibilityLabel("Clear search").help("Clear search") }
                 }.padding(.horizontal, Spacing.control).padding(.vertical, Spacing.small).frame(minWidth: 210, idealWidth: 330, maxWidth: 430).background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: Radius.medium))
                     .accessibilityIdentifier("globalSearch")
             }

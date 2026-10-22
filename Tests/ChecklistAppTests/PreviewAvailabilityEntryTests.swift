@@ -23,7 +23,10 @@ extension PreviewAvailabilityTests {
                 let host = PreviewAXHost(FilePreviewSheet(attachment: source, inspected: { inspections += 1 }, openExternally: external)
                     .accessibilityLabel("Selected attachment preview").environmentObject(store))
                 defer { host.close() }
-                try await host.settle()
+                try await host.settle("unavailable preview with reason: \(reason)") {
+                    let text = host.text()
+                    return text.contains("Original unavailable") && text.contains(reason) && text.contains("Close")
+                }
                 for _ in 0..<3 {
                     let text = host.text()
                     XCTAssertTrue(text.contains("Original unavailable"), text)
@@ -55,11 +58,16 @@ extension PreviewAvailabilityTests {
             let source = unavailableEntryFile(availability: availability)
             let host = PreviewAXHost(AttachmentRow(file: source).accessibilityIdentifier("detailOverlay").environmentObject(store))
             defer { host.close() }
-            try await host.settle()
+            try await host.settle("attachment row preview actions") {
+                ["Preview", "Open in…"].allSatisfy { action in host.nodes().contains { previewAXString($0, "accessibilityLabel") == action } }
+            }
             for action in ["Preview", "Open in…"] {
                 try host.press(action)
                 let sheet = try await host.sheet()
-                try await host.settle()
+                try await host.settle("missing original sheet", root: sheet) {
+                    let text = host.text(sheet)
+                    return text.contains("Original unavailable") && text.contains("missing or unavailable") && text.contains("Close")
+                }
                 for _ in 0..<3 {
                     let text = host.text(sheet)
                     XCTAssertTrue(text.contains("Original unavailable"), text)
@@ -67,7 +75,7 @@ extension PreviewAvailabilityTests {
                     XCTAssertFalse(text.contains("Open working copy"), text)
                 }
                 try host.press("Close", root: sheet)
-                for _ in 0..<100 where host.window.attachedSheet != nil { try await Task.sleep(nanoseconds: 10_000_000) }
+                try await host.settle("closed preview sheet") { host.window.attachedSheet == nil }
                 XCTAssertNil(host.window.attachedSheet)
             }
             XCTAssertTrue(calls.isEmpty)
@@ -88,7 +96,14 @@ extension PreviewAvailabilityTests {
             do {
                 let host = PreviewAXHost(ImageReviewSheet(current: [candidate], previous: [candidate], selection: Binding(get: { selection }, set: { selection = $0 })).environmentObject(store))
                 defer { host.close() }
-                try await host.settle()
+                let reason = availability == "available" ? "The managed original could not be read." : "Original unavailable or cleaned"
+                try await host.settle("both image review originals unavailable: \(availability)") {
+                    let text = host.text()
+                    let unavailablePanes = host.nodes().filter {
+                        previewAXString($0, "accessibilityLabel").contains(reason) || previewAXString($0, "accessibilityValue").contains(reason)
+                    }
+                    return unavailablePanes.count >= 2 && !text.contains("Loading exact original")
+                }
                 for _ in 0..<3 {
                     let text = host.text()
                     XCTAssertTrue(text.contains(availability == "available" ? "The managed original could not be read." : "Original unavailable or cleaned"), text)
@@ -116,14 +131,23 @@ extension PreviewAvailabilityTests {
             do {
                 let host = PreviewAXHost(PlaytestBundleView(manifest: manifest, projection: review).environmentObject(store))
                 defer { host.close() }
-                try await host.settle()
+                try await host.settle("playtest bundle disclosure") {
+                    host.nodes().contains { previewAXString($0, "accessibilityLabel").contains("Playtest bundle") }
+                }
                 let disclosure = try XCTUnwrap(host.nodes().first { previewAXString($0, "accessibilityLabel").contains("Playtest bundle") })
                 try host.press(disclosure)
-                try await host.settle()
+                try await host.settle("expanded playtest bundle: \(availability)") {
+                    availability == "available"
+                        ? host.nodes().contains { previewAXString($0, "accessibilityLabel") == "Preview" }
+                        : host.text().contains("Original unavailable or changed")
+                }
                 if availability == "available" {
                     try host.press("Preview")
                     let sheet = try await host.sheet()
-                    try await host.settle()
+                    try await host.settle("refused playtest original", root: sheet) {
+                        let text = host.text(sheet)
+                        return text.contains("The managed original could not be read.") && text.contains("Close")
+                    }
                     let text = host.text(sheet)
                     XCTAssertTrue(text.contains("The managed original could not be read."), text)
                     XCTAssertFalse(text.contains("Open working copy"), text)
@@ -166,24 +190,19 @@ extension PreviewAvailabilityTests {
         let host = PreviewAXHost(FilePreviewSheet(attachment: source, inspected: { inspections += 1 }).environmentObject(store))
         defer { host.close() }
         var activeBytes: Int64 = 0
-        for _ in 0..<300 {
-            if let progress = host.nodes().first(where: { previewAXString($0, "accessibilityIdentifier") == "filePreviewCopyProgress" }) {
-                let words = previewAXString(progress, "accessibilityValue").split(separator: " ")
-                if words.count >= 3, let count = Int64(words[0]), let total = Int64(words[2]), count > 0, count < total {
-                    activeBytes = count
-                    try host.press("Cancel preview")
-                    break
-                }
-            }
-            try await Task.sleep(nanoseconds: 10_000_000)
+        try await host.settle("observed partial preview copy") {
+            guard let progress = host.nodes().first(where: { previewAXString($0, "accessibilityIdentifier") == "filePreviewCopyProgress" }) else { return false }
+            let words = previewAXString(progress, "accessibilityValue").split(separator: " ")
+            guard words.count >= 3, let count = Int64(words[0]), let total = Int64(words[2]), count > 0, count < total else { return false }
+            activeBytes = count
+            return true
         }
+        try host.press("Cancel preview")
         XCTAssertGreaterThan(activeBytes, 0, "This case requires an observed partial copy")
-        var outcome = ""
-        for _ in 0..<200 {
-            outcome = host.text()
-            if outcome.contains("Preview canceled"), calls.contains("attachment_read_release") { break }
-            try await Task.sleep(nanoseconds: 10_000_000)
+        try await host.settle("canceled preview and released read hold") {
+            host.text().contains("Preview canceled") && calls.contains("attachment_read_release")
         }
+        let outcome = host.text()
         XCTAssertTrue(outcome.contains("Preview canceled"), outcome)
         XCTAssertFalse(outcome.contains("Mark this original as inspected"), outcome)
         XCTAssertFalse(outcome.contains("Press Play"), outcome)
@@ -258,7 +277,20 @@ private func previewAXEnabled(_ object: NSObject) -> Bool {
         window.contentView = nil; window.close()
         NSApplication.shared.accessibilitySetValue(wasEnhanced, forAttribute: enhanced)
     }
-    func settle() async throws { try await Task.sleep(nanoseconds: 100_000_000); view.layoutSubtreeIfNeeded() }
+    func settle(_ state: String, root: NSObject? = nil, file: StaticString = #filePath, line: UInt = #line,
+                until predicate: () -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while true {
+            view.layoutSubtreeIfNeeded()
+            (root as? NSView)?.layoutSubtreeIfNeeded()
+            if predicate() { return }
+            if ContinuousClock.now >= deadline {
+                _ = try XCTUnwrap(nil as Bool?, "Timed out after 5 seconds waiting for \(state). Observed AX: \(text(root))", file: file, line: line)
+                return
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
     func nodes(_ root: NSObject? = nil) -> [NSObject] {
         var result: [NSObject] = []
         func visit(_ node: NSObject, depth: Int = 0) {
@@ -281,7 +313,7 @@ private func previewAXEnabled(_ object: NSObject) -> Bool {
         XCTAssertTrue(unsafeBitCast(object.method(for: selector), to: (@convention(c) (NSObject, Selector) -> Bool).self)(object, selector))
     }
     func sheet() async throws -> NSView {
-        for _ in 0..<100 where window.attachedSheet == nil { try await Task.sleep(nanoseconds: 10_000_000) }
+        try await settle("attached preview sheet") { window.attachedSheet?.contentView != nil }
         return try XCTUnwrap(window.attachedSheet?.contentView)
     }
 }

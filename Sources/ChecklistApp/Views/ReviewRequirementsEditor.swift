@@ -4,7 +4,7 @@ struct ReviewRequirementsEditor: View {
     @Binding var draft: ReviewRequirementsDraft
     var body: some View {
         DetailSection(title:"Review requirements") {
-            Text("A new review uses the requirements as they are when it starts. Changes keep the requirements of active reviews and the recorded verdicts.").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("A new review uses the requirements as they are when it starts. Changes keep the requirements of active reviews and the recorded verdicts.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             if let issue = draft.loadIssue {Text(issue).checklistFont(.micro).foregroundStyle(.orange)}
             Group {
                 Toggle("Customize project default",isOn:Binding(get:{draft.customDefault},set:{draft.setCustomDefault($0)})).toggleStyle(.checkbox)
@@ -12,7 +12,7 @@ struct ReviewRequirementsEditor: View {
                     ReviewRuleEditor(rule:$draft.defaultRule)
                     Button("Reset project default to generic requirements") {draft.setCustomDefault(false)}.checklistFont(.micro)
                 } else {
-                    Text("Generic: assess applicable acceptance and project requirements; reject unmet requirements or record blocked when evidence is unavailable. No additional evidence types.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("Generic: assess applicable acceptance and project requirements; reject unmet requirements or record blocked when evidence is unavailable. No additional evidence types.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
                 DisclosureGroup("Ticket-kind overrides") {
                     ForEach($draft.kindRules) { $kind in
@@ -22,14 +22,14 @@ struct ReviewRequirementsEditor: View {
                             if kind.custom {
                                 ReviewRuleEditor(rule:$kind.rule)
                                 Button("Reset to project default") {draft.setCustomKind(kind.kind,false)}.checklistFont(.micro)
-                            } else {Text("Inherits the project default.").checklistFont(.micro).foregroundStyle(.secondary)}
+                            } else {Text("Inherits the project default.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)}
                         }.padding(.vertical,Spacing.small)
                     }
                 }
             }.checklistDisabled([(draft.loadIssue != nil, "The review requirements could not be loaded.")])
             ForEach(Array(draft.issues.enumerated()),id:\.offset) { _,issue in Text(issue).checklistFont(.micro).foregroundStyle(.orange) }
-            Text("Changed requirements apply to future work rounds; active reviews keep their requirements.").checklistFont(.micro).foregroundStyle(.secondary)
-            Text("Evidence types describe selected file format or report provenance. They do not establish a successful check, native observation or approval.").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("Changed requirements apply to future work rounds; active reviews keep their requirements.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+            Text("Evidence types describe selected file format or report provenance. They do not establish a successful check, native observation or approval.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
         }
     }
 }

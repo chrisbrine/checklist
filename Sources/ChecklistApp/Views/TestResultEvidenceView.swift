@@ -15,11 +15,11 @@ struct TestResultEvidenceView: View {
         if !rows.isEmpty {
             DisclosureGroup("Attached test results · \(rows.count)") {
                 VStack(alignment: .leading, spacing: Spacing.control) {
-                    Text("Read NUnit XML, TRX or plain Swift XCTest logs. Counts describe the attachment; they do not establish a gate verdict.").checklistFont(.micro).foregroundStyle(.secondary)
+                    Text("Read NUnit XML, TRX or plain Swift XCTest logs. Counts describe the attachment; they do not establish a gate verdict.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     ForEach(Array(rows.prefix(20))) { artifact in
                         TestResultArtifactView(current: artifact, previous: results.previous(for: artifact)).environmentObject(store)
                     }
-                    if rows.count > 20 { Text("Showing the first 20 result attachments for this target.").checklistFont(.micro).foregroundStyle(.secondary) }
+                    if rows.count > 20 { Text("Showing the first 20 result attachments for this target.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                 }.padding(.top, Spacing.small)
             }.checklistFont(.micro)
         }
@@ -54,7 +54,7 @@ private struct TestResultArtifactView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.compact) {
             Text(verbatim: current.file.string("name")).checklistFont(.calloutEmphasis).lineLimit(2)
-            Text("\(current.manifestID.map { "Bound to target \($0.prefix(8))" } ?? "Attached; not bound to a submitted target") · \(current.file.string("origin", fallback: "Recorded uploader")) · \(relativeTime(current.file.string("created_at")))").checklistFont(.micro).foregroundStyle(.secondary)
+            Text("\(current.manifestID.map { "Bound to target \($0.prefix(8))" } ?? "Attached; not bound to a submitted target") · \(current.file.string("origin", fallback: "Recorded uploader")) · \(relativeTime(current.file.string("created_at")))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             if let unavailable = current.unavailable { Text(verbatim: unavailable).checklistFont(.micro).foregroundStyle(.orange) }
             else {
                 Button(result == nil ? "Read test results" : "Read again") { beginRead() }.checklistDisabled([(reading, "The result is being read."), (!store.connected, DisabledReasons.offline)])
@@ -67,14 +67,14 @@ private struct TestResultArtifactView: View {
                 if !result.failingNames.isEmpty {
                     DisclosureGroup("Failing tests · \(result.failingNames.count)") {
                         ForEach(Array(result.failingNames.prefix(100).enumerated()), id: \.offset) { _, name in Text(verbatim: name).checklistFont(.code).textSelection(.enabled) }
-                        if result.failingNames.count > 100 { Text("First 100 names shown. The original contains the complete list.").checklistFont(.micro).foregroundStyle(.secondary) }
+                        if result.failingNames.count > 100 { Text("First 100 names shown. The original contains the complete list.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                     }
                 }
                 if let prior, prior.format == result.format {
                     Text("Since previous target (parsed cases): total \(delta(result.total - prior.total)), passed \(delta(result.passed - prior.passed)), failed \(delta(result.failed - prior.failed)), skipped \(delta(result.skipped - prior.skipped)), other \(delta(result.other - prior.other)).").checklistFont(.micro)
                     ForEach(Array(prior.warnings.enumerated()), id: \.offset) { _, warning in Text(verbatim: "Previous report: " + warning).checklistFont(.micro).foregroundStyle(.orange) }
                 } else if !reading {
-                    Text(verbatim: priorProblem.isEmpty ? "No unambiguous same-name result from the previous target is available for comparison." : priorProblem).checklistFont(.micro).foregroundStyle(.secondary)
+                    Text(verbatim: priorProblem.isEmpty ? "No unambiguous same-name result from the previous target is available for comparison." : priorProblem).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
             }
             TechnicalDetails(provenance.split(separator: "\n").map { line in let parts = line.split(separator: ":", maxSplits: 1); return (String(parts[0]), parts.count > 1 ? String(parts[1]).trimmingCharacters(in: .whitespaces) : "") })

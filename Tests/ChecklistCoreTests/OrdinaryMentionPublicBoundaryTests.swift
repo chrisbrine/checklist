@@ -1,4 +1,4 @@
-// NEW public-boundary source cases only. Not compiled or executed.
+// Disposable public-command fixtures; native delivery qualification is separate.
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -93,6 +93,29 @@ final class OrdinaryMentionPublicBoundaryTests: XCTestCase {
         XCTAssertEqual(recipients(message), [f.handler.sessionID!, f.tagged.sessionID!])
         XCTAssertEqual((message["mentions"] as? [JSON])?.count, 2)
         XCTAssertTrue((message["deliveries"] as! [JSON]).allSatisfy { $0["state"] as? String == "queued" && $0["acknowledged_at"] == nil })
+    }
+
+    func testReplyRoutingNeverSubscribesEarlierAuthorsOrTaggedRecipients() throws {
+        let f = try fixture()
+        let original = try call("message_send", note(f, "Original from a non-handler"), f.writer)
+        XCTAssertEqual(recipients(original), [f.handler.sessionID!])
+        let body = "Please check @\(f.tagged.sessionID!)"
+        let topPlan = try prepare(f, body)
+        let top = try call("message_send", note(f, body, plan: topPlan), f.writer)
+        XCTAssertEqual(recipients(top), [f.handler.sessionID!, f.tagged.sessionID!])
+
+        // A tag on an earlier comment does not subscribe its recipient to replies.
+        let untagged = try call("message_send", note(f, "Later reply", reply: top["id"] as? String), f.writer)
+        XCTAssertEqual(recipients(untagged), [f.handler.sessionID!])
+        // A tagged reply reaches only its tags, even when a different handler exists.
+        let replyPlan = try prepare(f, body, reply: original["id"] as? String)
+        let tagged = try call("message_send", note(f, body, plan: replyPlan, reply: original["id"] as? String), f.writer)
+        XCTAssertEqual(recipients(tagged), [f.tagged.sessionID!])
+        // Replying to a non-handler's comment never implicitly notifies its author.
+        let handlerReply = try call("message_send", note(f, "Handler reply", reply: original["id"] as? String), f.handler)
+        XCTAssertEqual(recipients(handlerReply), []) // Current handler is also the sender.
+        let otherReply = try call("message_send", note(f, "Other ticket's handler reply", reply: original["id"] as? String), f.tagged)
+        XCTAssertEqual(recipients(otherReply), [f.handler.sessionID!])
     }
 
     func testCrossNamespaceAndDuplicateLabelAmbiguityRequireExplicitFreshSelection() throws {

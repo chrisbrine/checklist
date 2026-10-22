@@ -36,6 +36,8 @@ final class ScopedTaskRecordsTests:XCTestCase {
         let summary=try call("task_context",["project_id":pid,"task_id":tid],worker)
         XCTAssertEqual((summary["counts"] as? JSON)?["messages"] as? Int,81)
         XCTAssertEqual((summary["recent_messages"] as? [JSON])?.count,10)
+        XCTAssertEqual((summary["recent_messages"] as? [JSON])?.compactMap {$0["id"] as? String},(71..<81).map {"selected-note-\($0)"})
+        XCTAssertEqual(summary["truncated"] as? Bool,true)
         XCTAssertFalse(try jsonString(summary).contains("corrupt-unrelated"))
         let first=try call("task_context",["project_id":pid,"task_id":tid,"detail_level":"full"],worker)
         let next=try call("task_context",["project_id":pid,"task_id":tid,"history_cursor":first["next_history_cursor"]!],worker)

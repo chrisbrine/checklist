@@ -41,7 +41,7 @@ struct TaskDetailView: View {
             VStack(alignment:.leading,spacing:Spacing.group) {
                 Text("Purged ticket").checklistFont(.sheetTitle)
                 Text(task.string("key")).checklistFont(.bodyStrong)
-                Text("This ticket was permanently removed. Its reference and history positions remain. Shared records, managed file bytes, backups and exports may remain.").checklistFont(.callout).foregroundStyle(.secondary)
+                Text("This ticket was permanently removed. Its reference and history positions remain. Shared records, managed file bytes, backups and exports may remain.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
             }.padding(Spacing.page).frame(maxWidth:.infinity,maxHeight:.infinity,alignment:.topLeading)
         } else {
         VStack(spacing: Spacing.none) {
@@ -72,7 +72,7 @@ struct TaskDetailView: View {
                     } else {
                         DetailSection(title: "Brief") {
                             Text(task.string("brief").isEmpty ? "Add a brief and expected outcome so the next handler has useful context." : task.string("brief"))
-                                .checklistFont(.body).foregroundStyle(task.string("brief").isEmpty ? .secondary : .primary).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                                .checklistFont(.body).foregroundStyle(task.string("brief").isEmpty ? Color.checklistSecondaryText : .primary).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
                     StarterFieldsSection(task: task)
@@ -90,7 +90,7 @@ struct TaskDetailView: View {
                         HumanWorkActions(task: task).checklistDisabled([(!store.selectedRecordsCurrent, "Work and review records are still loading.")])
                     } else {
                         DetailSection(title:"Work, related tickets & review") {
-                            Text("The selected ticket is loaded. Its complete review and work records have a separate loading boundary.").checklistFont(.micro).foregroundStyle(.secondary)
+                            Text("The selected ticket is loaded. Its complete review and work records have a separate loading boundary.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                             if let failure = store.selectedRecordsError {Text(failure).checklistFont(.micro).foregroundStyle(.orange);Button("Refresh selected ticket") {store.retrySelectedTicket()}}
                             Button("Load current work & review records") {store.loadFullSelectedRecord(task.id)}.checklistDisabled([(!store.connected, DisabledReasons.offline), (store.loading, "Checklist is still loading."), (store.selectedRecordsLoading, "Work and review records are still loading."), (!store.selectedTicketCurrent(task.id), DisabledReasons.ticketLoading)])
                         }
@@ -118,7 +118,7 @@ struct TaskDetailView: View {
                             Button("Newer messages") {if let cursor = store.selectedMessagePreviousCursor {store.moveSelectedMessages(cursor)}}.checklistDisabled([(store.selectedTicketLoading, "The ticket is still loading."), (store.selectedMessagePreviousCursor == nil, "There are no newer messages.")])
                             Button("Older messages") {if let cursor = store.selectedMessageNextCursor {store.moveSelectedMessages(cursor)}}.checklistDisabled([(store.selectedTicketLoading, "The ticket is still loading."), (store.selectedMessageNextCursor == nil, "There are no older messages.")])
                         }
-                        if messages.isEmpty { Text("Notes and agent messages build the context for this ticket.").checklistFont(.callout).foregroundStyle(.secondary) }
+                        if messages.isEmpty { Text("Notes and agent messages build the context for this ticket.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText) }
                         ForEach(messages) { message in MessageRow(message: message, task: task) }
                     }
                     let currentHistory = eventHistory.records(in:store.storeIncarnation)
@@ -132,7 +132,7 @@ struct TaskDetailView: View {
                             ForEach(history) {event in
                                 VStack(alignment:.leading,spacing: Spacing.hairline) {
                                     Text(event.string("type",fallback:event.string("kind"))).checklistFont(.microEmphasis)
-                                    Text(relativeTime(event.string("occurred_at",fallback:event.string("created_at")))).checklistFont(.micro).foregroundStyle(.secondary)
+                                    Text(relativeTime(event.string("occurred_at",fallback:event.string("created_at")))).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                                 }.frame(maxWidth:.infinity,alignment:.leading)
                             }
                         }.padding(.top,Spacing.small)
@@ -220,19 +220,20 @@ struct TaskDetailView: View {
             }
             AccessibleHStack {
                 TicketStatusPills(task: task)
-                Text(handler).checklistFont(.micro).foregroundStyle(.secondary)
+                Text(handler).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 Spacer()
             }
-            if !movedFromStatus.isEmpty { Label("Moved to \(movedFromStatus). This ticket stays open.", systemImage: "arrow.turn.down.right").checklistFont(.micro).foregroundStyle(.secondary) }
-            if noLongerMatchesView { Text("No longer matches this view. This ticket stays open by its identity.").checklistFont(.micro).foregroundStyle(.secondary) }
-            if task.bool("archived") { Label("Archived elsewhere · this ticket stays open", systemImage: "archivebox").checklistFont(.micro).foregroundStyle(.secondary) }
+            if !movedFromStatus.isEmpty { Label("Moved to \(movedFromStatus). This ticket stays open.", systemImage: "arrow.turn.down.right").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+            if noLongerMatchesView { Text("No longer matches this view. This ticket stays open by its identity.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+            if task.bool("archived") { Label("Archived elsewhere · this ticket stays open", systemImage: "archivebox").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             if task.bool("trashed") { Label("Trashed elsewhere · this ticket stays open", systemImage: "trash").checklistFont(.micro).foregroundStyle(.orange) }
             if store.detailRecords("groups",task:task).contains(where: { $0.string("kind") == "triage" && ($0.bool("selected_task_member") || $0.strings("task_ids").contains(task.id)) }) {
-                Text("Changing this ticket's status takes it out of every Triage.").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("Changing this ticket's status takes it out of every Triage.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
             AccessibleHStack(spacing: Spacing.small) {
-                Button("Use in Codex") { handoffProvider = HandoffProvider(id: "codex") }
-                Button("Use in Claude") { handoffProvider = HandoffProvider(id: "claude") }
+                ForEach(HandoffProvider.workProviders()) { provider in
+                    Button("Use in \(provider.name)") { handoffProvider = provider }
+                }
             }.buttonStyle(.checklistBordered).controlSize(.small).checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving), (!store.selectedTicketCurrent(task.id), DisabledReasons.ticketLoading)])
             if !task.string("blocked_reason").isEmpty { Label(task.string("blocked_reason"), systemImage: "exclamationmark.circle").checklistFont(.callout).foregroundStyle(.orange) }
         }
@@ -255,15 +256,15 @@ struct TaskDetailView: View {
     var recordHistorySection:some View {
         DisclosureGroup("Work, review & file history") {
             VStack(alignment:.leading,spacing: Spacing.row) {
-                Text("One page is retained. Current action gates are checked separately above.").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("One page is retained. Current action gates are checked separately above.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 Picker("History",selection:$recordHistoryFamily) {
                     Text("Files").tag("attachment");Text("Work attempts").tag("attempt");Text("Targets").tag("manifest");Text("Gate requests").tag("review_request");Text("Verdicts").tag("review");Text("Findings").tag("finding");Text("Finding responses").tag("finding_resolution");Text("Human requests").tag("request");Text("Source executions").tag("source_execution");Text("Ticket connections").tag("task_session");Text("Aliases").tag("task_alias")
                 }.onChange(of:recordHistoryFamily) {_,value in store.readRecordHistory(task,family:value)}
                 AccessibleHStack {Button("Read history") {store.readRecordHistory(task,family:recordHistoryFamily)};if let c=store.recordHistoryPrevious {Button("Newer") {store.readRecordHistory(task,family:recordHistoryFamily,cursor:c)}};if let c=store.recordHistoryNext {Button("Older") {store.readRecordHistory(task,family:recordHistoryFamily,cursor:c)}}}.checklistDisabled([(store.recordHistoryLoading, "History is still loading."), (!store.selectedTicketCurrent(task.id), DisabledReasons.ticketLoading)])
                 if store.recordHistoryLoading {ProgressView("Loading history page…")}
-                if let notice=store.recordHistoryNotice {Text(notice).checklistFont(.micro).foregroundStyle(.secondary)}
+                if let notice=store.recordHistoryNotice {Text(notice).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)}
                 if let error=store.recordHistoryError {Text(error).checklistFont(.micro).foregroundStyle(.orange);Button("Refresh selected ticket") {store.retrySelectedTicket()}}
-                Text("\(store.recordHistoryRows.count) shown · \(store.recordHistoryTotal) records").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("\(store.recordHistoryRows.count) shown · \(store.recordHistoryTotal) records").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 ForEach(store.recordHistoryRows) {record in
                     if record.string("record_type")=="attachment" {AttachmentRow(file:record)}
                     else {VStack(alignment:.leading,spacing:Spacing.tight) {Text(record.string("title",fallback:GlossaryText.humanize(record.string("record_type")).capitalized)+" · "+relativeTime(record.string("updated_at",fallback:record.string("created_at")))).checklistFont(.micro); TechnicalDetails([("Record", record.id)], raw: [("Record", record.values)])}}
@@ -286,7 +287,7 @@ struct TaskDetailView: View {
                 Image(systemName: "arrow.right")
                 Text(destinationLabel)
                 Spacer()
-            }.checklistFont(.micro).foregroundStyle(.secondary)
+            }.checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             if recipientChanged && !(store.noteDrafts[task.id] ?? "").isEmpty {
                 AccessibleHStack { Text("The handler changed. Confirm the current destination before sending.").checklistFont(.micro).foregroundStyle(.orange); Spacer(); Button("Update recipients") { store.refreshNoteDestination(task.id) }.checklistFont(.micro) }
             }
@@ -435,7 +436,7 @@ struct DraftSaveStatusView: View {
             if let failure = store.draftSaveError(kind, draftID) {
                 Text("Not saved · \(failure). Your text remains in this app; copy it before quitting.").foregroundStyle(.orange).textSelection(.enabled)
                 Button("Retry draft save") { store.retryDraftSave(kind, draftID) }.buttonStyle(.link)
-            } else { Text("Saved on this Mac, not sent").foregroundStyle(.secondary) }
+            } else { Text("Saved on this Mac, not sent").foregroundStyle(Color.checklistSecondaryText) }
             if let recovery = store.draftRecoveryError { Text(recovery).foregroundStyle(.orange).textSelection(.enabled) }
         }.checklistFont(.micro)
     }
@@ -467,10 +468,10 @@ struct MessageRow: View {
         let _ = NativeRenderMetrics.body(.messageRow)
         VStack(alignment: .leading, spacing: Spacing.small) {
             AccessibleHStack {
-                Image(systemName: ["human", "human_ui"].contains(message.string("origin")) ? "person.crop.circle.fill" : "bubble.left.fill").foregroundStyle(["human", "human_ui"].contains(message.string("origin")) ? Color.checklistAccentText : .secondary)
+                Image(systemName: ["human", "human_ui"].contains(message.string("origin")) ? "person.crop.circle.fill" : "bubble.left.fill").foregroundStyle(["human", "human_ui"].contains(message.string("origin")) ? Color.checklistAccentText : Color.checklistSecondaryText)
                 Text(message.string("author_display", fallback: ["human", "human_ui"].contains(message.string("origin")) ? "You" : "Agent")).checklistFont(.captionStrong)
                 Spacer()
-                Text(relativeTime(message.string("created_at"))).checklistFont(.micro).foregroundStyle(.tertiary)
+                Text(relativeTime(message.string("created_at"))).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
             Text(message.string("body")).checklistFont(.callout).textSelection(.enabled)
             NoteCorrectionActions(message:message,task:task)
@@ -483,13 +484,13 @@ struct MessageRow: View {
             ForEach(message.records("deliveries")) { delivery in
                 VStack(alignment: .leading, spacing: Spacing.hairline) {
                     AccessibleHStack(spacing: Spacing.tight) {
-                        Text("\(recipientLabel(delivery)): \(receiptLabel(delivery.string("state")))").checklistFont(.micro).foregroundStyle(.secondary)
+                        Text("\(recipientLabel(delivery)): \(receiptLabel(delivery.string("state")))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                         if let reaction = reactionLabel(delivery.string("reaction")) {
                             Text(reaction.symbol).checklistFont(.caption).help(reaction.meaning).accessibilityLabel("Agent reaction: \(reaction.meaning)")
                         }
                     }
                     if ["queued", "pending", "saved", "saved_for_pickup"].contains(delivery.string("state")), delivery.string("push_state") == "unavailable" {
-                        Text("Saved for the agent’s next Checklist check.").checklistFont(.micro).foregroundStyle(.secondary)
+                        Text("Saved for the agent’s next Checklist check.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     } else if !delivery.string("reason", fallback: delivery.string("push_reason")).isEmpty && !delivery.string("reason", fallback: delivery.string("push_reason")).contains("Native push is unqualified") {
                         Text(delivery.string("reason", fallback: delivery.string("push_reason"))).checklistFont(.micro).foregroundStyle(.orange)
                     }
@@ -541,7 +542,7 @@ struct AttachmentRow: View {
             AttachmentThumbnail(file: file).frame(width: 75, height: 50)
             VStack(alignment: .leading, spacing: Spacing.tight) {
                 Text(file.string("name")).checklistFont(.calloutEmphasis).lineLimit(2)
-                Text("\(GlossaryText.humanize(file.string("mode", fallback: "Managed copy"))) · \(ByteCountFormatter.string(fromByteCount: Int64(file.integer("size", fallback: 0)), countStyle: .file)) · \(availabilityLabel)").checklistFont(.micro).foregroundStyle(.secondary)
+                Text("\(GlossaryText.humanize(file.string("mode", fallback: "Managed copy"))) · \(ByteCountFormatter.string(fromByteCount: Int64(file.integer("size", fallback: 0)), countStyle: .file)) · \(availabilityLabel)").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
             Spacer()
             Button("Preview") { openExternally = false; showingPreview = true }.checklistFont(.micro)
@@ -557,4 +558,3 @@ struct AttachmentRow: View {
         }
     }
 }
-
