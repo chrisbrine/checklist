@@ -16,7 +16,7 @@ Submit ready targets into a separate Review Triage, review the shared evidence a
 
 Use this sequence for each authorized combined round. Use the [reviewer and check-runner briefs](driven-sessions.md#reviewer-brief-template) for the independent sessions.
 
-1. The review coordinator names one integrator per round. That decision holds even when another note crosses it; note order never decides. If the review coordinator names nobody, it integrates the round itself.
+1. The implementation orchestrator integrates each round or names one integrator. That decision holds even when another note crosses it; note order never decides.
    Before anyone writes the shared checkout, every other participant that could build replies exactly: "agreed, I do not build".
    Only the integrator writes the shared checkout, and only in its announced write window.
 2. Each hand-in contains `tree/`, `base/`, `files.json`, `base.txt` and `notes.md`.
@@ -28,13 +28,13 @@ Use this sequence for each authorized combined round. Use the [reviewer and chec
 4. While a submitted ticket waits for a verdict, nobody writes in its review target. Keep the captured source immutable.
    With scoped freshness installed, protect every read/write file scope of its attempt, its `additional_paths`, and every `AGENTS.md` and `CLAUDE.md` at any depth, including new instruction files.
    Before that rule is installed, protect the whole inventory, including scripts, docs and Git. Legacy captures and unscoped attempts keep whole-inventory freshness; see [source freshness](../../../docs/source-evidence.md#source-freshness-during-parallel-work).
-5. Immediately after the install release note, before any ticket owner submits, the integrator opens the commit and push slot.
+5. Immediately after the install release note, before any ticket owner submits, the implementation orchestrator opens the commit and push slot.
    Check the diff for private material, commit and push, record the receipts, then close the slot. Checkout writes in this slot affect only `.git`.
-6. Run installed checks in isolated test slots, up to four in parallel, seeded empty or from a verified backup. Assign non-contributor Codex check runners; keep the live app window available to the owner.
+6. Run installed checks in isolated test slots, up to four in parallel, seeded empty or from a verified backup. The implementation orchestrator assigns non-contributor Codex check runners; keep the live app window available to the owner.
    Each acceptance item needing an installed/native observation has the runner's report attached with `attachment_add` before submission. Its description names the exact build ID.
    Supply `acceptance_evidence` on `work_submit` (or each `batch_submit` member), with `check_runner_report` references and matching `evidence_manifest.installed_build_id`; a limitation alone cannot cover an installed/native observation.
-7. Start a fresh non-contributor Codex thread per review batch. It uses `review_batch_inputs`, `batch_prepare`, `batch_claim` and `batch_review_record` as the reviewer brief specifies.
-   The review coordinator thread owns rework: it handles a failed ticket itself or gives it to a session that it started for that Triage, and the reworked ticket comes back for a failed-only recheck. Recheck only failed, inconclusive or materially affected cases; preserve valid passes and their original producer, target and hash.
+7. The review orchestrator starts a fresh non-contributor Codex thread on `gpt-6.1-sol` per review batch. The review orchestrator owns independent reviews and verdict routing only. The reviewer uses `review_batch_inputs`, `batch_prepare`, `batch_claim` and `batch_review_record` as the reviewer brief specifies.
+   Failed tickets go to the implementation orchestrator. It reworks each failed ticket itself or gives it to a session that it started for that Triage. The reworked ticket returns to the review orchestrator for a failed-only independent recheck. Recheck only failed, inconclusive or materially affected cases; preserve valid passes and their original producer, target and hash.
 8. Agents decide engineering, process and repository questions themselves. Read earlier owner answers; ask the owner only for an uncovered decision that an agent cannot undo.
    Never ask a covered question twice. On `COVERED_BY_EARLIER_ANSWER`, use the cited answer instead of repeating the request.
 9. Keep finished work moving through sequencing questions: choose the reversible option, record the decision and proceed within the authorized scope.
