@@ -113,6 +113,7 @@ extension CommandRouter {
         case "message_mentions_prepare": return try ordinaryMentionPrepareCommand(db,p,c)
         case "message_send", "agent_message_send", "message_ack": return try messageWrite(db,p,c,method)
         case "session_inbox", "assistant_inbox": return try inbox(db,p,c)
+        case "message_delivery_list": return try messageDeliveryList(db,p,c)
         case "history_list": return try history(db,p,c)
         case "profile_create", "profile_edit", "profile_archive": return try profileWrite(db,p,c,method)
         case "agent_resolve": return try resolve(db,p,c)

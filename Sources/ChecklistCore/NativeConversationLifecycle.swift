@@ -199,6 +199,19 @@ extension CommandRouter {
                 observation["state"] = nextState; observation["released_attempt_ids"] = allReleased; observation["pending_attempt_ids"] = pending
                 try save(db, revised(observation), type: "native_closure")
             }
+            if firstObservation {
+                let deliveries = try Row.fetchAll(db, sql: "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='delivery' AND project_id=? AND json_extract(data,'$.recipient_session_id')=? COLLATE BINARY AND json_extract(data,'$.recipient_authorization_generation')=? COLLATE BINARY", arguments: [proof.projectID, proof.sessionID, originalGeneration])
+                for row in deliveries {
+                    let delivery = try GRDBRecordEnvelopeAdapter.decode(row, expectedType: "delivery").object
+                    guard !["acknowledged", "addressed"].contains(delivery["state"] as? String ?? "") else { continue }
+                    let message = try scoped(db, delivery["message_id"] as! String, proof.projectID, type: "message")
+                    try event(db, caller: caller, project: proof.projectID,
+                              entity: message["task_id"] as? String ?? message["conversation_id"] as? String ?? message["id"] as? String,
+                              kind: "message_delivery_fenced", data: ["delivery_id": delivery["id"]!, "message_id": message["id"]!,
+                                  "recipient_session_id": proof.sessionID, "recipient_authorization_generation": originalGeneration,
+                                  "native_closure_ref": observationID])
+                }
+            }
             result = ["session_id": proof.sessionID, "state": "ended", "observation_ref": observationID,
                     "released_attempt_ids": released, "pending_attempt_ids": pending]
             return .commit

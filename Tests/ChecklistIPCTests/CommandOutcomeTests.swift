@@ -27,7 +27,7 @@ final class CommandOutcomeTests: XCTestCase {
 
     func testScopedWorkspaceAndCleanupReadsKeepReadEnvelopesAndCoreClassification() throws {
         XCTAssertEqual(CommandReply.readMethods.subtracting(["connection_list","task_handoff_prepare"]),CommandRouter.readMethods)
-        for method in ["workspace_page","cleanup_job_get","cleanup_job_list","work_health_get"] {
+        for method in ["workspace_page","cleanup_job_get","cleanup_job_list","work_health_get","message_delivery_list"] {
             XCTAssertFalse(CommandReply.expectsMutation(method))
             let reply:[String:Any] = ["data":["rows":[],"_checklist":["schema_version":1]]]
             let decoded=try CommandReply.decode(bytes(reply),method:method,commandID:nil)

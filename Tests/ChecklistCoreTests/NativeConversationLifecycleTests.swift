@@ -13,6 +13,100 @@ extension EvidenceAuthorityTests {
             authorizationGeneration: generation,
             processState: process, registryState: registry, registryDigest: nil)
     }
+    func testMessageDeliveryReadBySenderHandlerAndProjectReader() throws {
+        let p = try project(), t = try ready(p)
+        let sender = try native(p, "receipt-sender", domain: "codex:201:1:0")
+        let handler = try native(p, "receipt-handler", domain: "codex:202:1:0")
+        let reader = try native(p, "receipt-reader", domain: "codex:203:1:0")
+        _ = try claim(p, t, caller: handler)
+        let note = try call("message_send", ["project_id": p["id"]!, "task_id": t["id"]!, "body": "Private body must not appear in receipt metadata"], sender)
+        let delivery = try XCTUnwrap((note["deliveries"] as? [JSON])?.first)
+        try router.dbQueue.write { db in
+            var stored = try router.record(db, delivery["id"] as! String, type: "delivery")
+            stored["transport_receipt"] = ["credential": "secret-transport-token"]
+            stored["response_ref"] = ["body": "private recipient response"]
+            try router.save(db, stored, type: "delivery")
+        }
+        let input: JSON = ["project_id": p["id"]!, "task_id": t["id"]!, "message_id": note["id"]!]
+        // Read-only assistants need neither receive_messages nor note-writing permission.
+        let assistant = Caller(role: "assistant", installation: "read-only", projectIDs: [p["id"] as! String], assistantGrants: [p["id"] as! String: ["read": true]])
+        for caller in [sender, handler, reader, assistant] {
+            let read = try call("message_delivery_list", input, caller)
+            let receipts = try XCTUnwrap(read["deliveries"] as? [JSON])
+            XCTAssertEqual(receipts.count, 1)
+            let receipt = receipts[0]
+            XCTAssertEqual(receipt["id"] as? String, delivery["id"] as? String)
+            XCTAssertEqual(receipt["message_id"] as? String, note["id"] as? String)
+            XCTAssertEqual(receipt["recipient_session_id"] as? String, handler.sessionID)
+            XCTAssertEqual(receipt["recipient_authorization_generation"] as? String, delivery["recipient_authorization_generation"] as? String)
+            XCTAssertEqual(receipt["state"] as? String, "queued")
+            XCTAssertEqual(receipt["push_state"] as? String, "unavailable"); XCTAssertNotNil(receipt["created_at"])
+            let encoded = String(decoding: try JSONSerialization.data(withJSONObject: read), as: UTF8.self)
+            for secret in ["Private body", "secret-transport-token", "private recipient response", "transport_receipt", "response_ref"] { XCTAssertFalse(encoded.contains(secret)) }
+        }
+        // A retained delivered receipt is readable; public message_ack cannot mint this stage.
+        try router.dbQueue.write { db in
+            var stored = try router.record(db, delivery["id"] as! String, type: "delivery")
+            stored["state"] = "delivered"; stored["delivered_at"] = "2026-10-22T16:00:00Z"
+            try router.save(db, stored, type: "delivery")
+        }
+        var receipt = (try call("message_delivery_list", input, sender)["deliveries"] as! [JSON])[0]
+        XCTAssertEqual(receipt["state"] as? String, "delivered"); XCTAssertNotNil(receipt["delivered_at"])
+        _ = try call("message_ack", ["project_id": p["id"]!, "delivery_id": delivery["id"]!, "stage": "acknowledged"], handler)
+        receipt = (try call("message_delivery_list", input, sender)["deliveries"] as! [JSON])[0]
+        XCTAssertEqual(receipt["state"] as? String, "acknowledged"); XCTAssertNotNil(receipt["acknowledged_at"])
+        let tool = try XCTUnwrap(router.toolCatalog(assistant).first { $0["name"] as? String == "message_delivery_list" })
+        XCTAssertEqual((tool["annotations"] as? JSON)?["readOnlyHint"] as? Bool, true)
+        XCTAssertEqual(Set((tool["inputSchema"] as! JSON)["required"] as! [String]), ["project_id", "task_id", "message_id"])
+    }
+    func testMessageDeliveryReadRefusesOutsideScopeAndOtherTicketOrPrivateConversation() throws {
+        let p = try project(), t = try ready(p), other = try ready(p)
+        let sender = try native(p, "receipt-scoped-sender", domain: "codex:204:1:0")
+        let note = try call("message_send", ["project_id": p["id"]!, "task_id": t["id"]!, "body": "Scoped note"], sender)
+        let input: JSON = ["project_id": p["id"]!, "task_id": t["id"]!, "message_id": note["id"]!]
+        let outsider = Caller(role: "worker", installation: "outsider", projectIDs: [], workspace: workspace.path)
+        assertCode("FORBIDDEN") { _ = try self.call("message_delivery_list", input, outsider) }
+        let revokedSender = Caller(role: "worker", installation: sender.installation, projectIDs: [], sessionID: sender.sessionID, workspace: workspace.path, executionDomain: sender.executionDomain)
+        assertCode("FORBIDDEN") { _ = try self.call("message_delivery_list", input, revokedSender) }
+        let noRead = Caller(role: "assistant", installation: "no-read", projectIDs: [p["id"] as! String], assistantGrants: [p["id"] as! String: ["read": false]])
+        assertCode("FORBIDDEN") { _ = try self.call("message_delivery_list", input, noRead) }
+        var wrong = input; wrong["task_id"] = other["id"]!
+        assertCode("NOT_FOUND") { _ = try self.call("message_delivery_list", wrong, sender) }
+        let privateID = UUID().uuidString
+        try router.dbQueue.write { db in
+            try router.save(db, ["id": privateID, "project_id": p["id"]!, "body": "Other participants only", "revision": 1], type: "message")
+        }
+        wrong = input; wrong["message_id"] = privateID
+        assertCode("NOT_FOUND") { _ = try self.call("message_delivery_list", wrong, sender) }
+        let otherRoot = directory.appendingPathComponent("other-project")
+        try FileManager.default.createDirectory(at: otherRoot, withIntermediateDirectories: true)
+        let otherProject = try call("project_create", ["name": "Other project", "key_prefix": "O", "root_path": otherRoot.path])
+        let otherTask = try ready(otherProject)
+        let otherNote = try call("message_send", ["project_id": otherProject["id"]!, "task_id": otherTask["id"]!, "body": "Another project"])
+        wrong = input; wrong["message_id"] = otherNote["id"]!
+        assertCode("NOT_FOUND") { _ = try self.call("message_delivery_list", wrong, sender) }
+    }
+    func testMessageDeliveryReadSavedForPickupDoesNotCreateDelivery() throws {
+        let p = try project(), t = try ready(p), sender = try native(p, "saved-sender", domain: "codex:205:1:0")
+        let note = try call("message_send", ["project_id": p["id"]!, "task_id": t["id"]!, "body": "For future pickup"], sender)
+        let read = try call("message_delivery_list", ["project_id": p["id"]!, "task_id": t["id"]!, "message_id": note["id"]!], sender)
+        XCTAssertEqual(read["delivery_status"] as? String, "saved_for_pickup")
+        XCTAssertEqual((read["deliveries"] as? [JSON])?.count, 0)
+        XCTAssertEqual(read["created_at"] as? String, note["created_at"] as? String)
+        XCTAssertTrue(try router.dbQueue.read { try router.records($0, type: "delivery", project: (p["id"] as! String)).isEmpty })
+    }
+    func testMessageDeliveryReadPreservesAcknowledgmentAfterNativeClosure() throws {
+        let p = try project(), t = try ready(p), worker = try native(p, "acked-closure", domain: "claude:206:1:0", provider: "claude")
+        _ = try claim(p, t, caller: worker)
+        let note = try call("message_send", ["project_id": p["id"]!, "task_id": t["id"]!, "body": "Acknowledged before closure"])
+        let delivery = try XCTUnwrap((note["deliveries"] as? [JSON])?.first)
+        _ = try call("message_ack", ["project_id": p["id"]!, "delivery_id": delivery["id"]!, "stage": "acknowledged"], worker)
+        _ = try router.reconcileVerifiedNativeClosure(closure(p, worker), caller: lifecycleOwner)
+        let receipt = (try call("message_delivery_list", ["project_id": p["id"]!, "task_id": t["id"]!, "message_id": note["id"]!])["deliveries"] as! [JSON])[0]
+        XCTAssertEqual(receipt["state"] as? String, "acknowledged"); XCTAssertNil(receipt["native_closure_ref"])
+        let events = try call("history_list", ["project_id": p["id"]!, "task_id": t["id"]!])["events"] as! [JSON]
+        XCTAssertFalse(events.contains { $0["kind"] as? String == "message_delivery_fenced" })
+    }
     func testNativeClosureRejectsUnprovenOrDifferentRegistrationWithoutMutation() throws {
         let p = try project(), t = try ready(p), worker = try native(p, "closure", domain: "claude:123:5:0", provider: "claude")
         let a = try claim(p, t, caller: worker)
@@ -42,6 +136,18 @@ extension EvidenceAuthorityTests {
             XCTAssertEqual(task["status_id"] as? String, try router.status(db, p["id"] as! String, "queued")["id"] as? String)
             XCTAssertEqual(storedDelivery["state"] as? String, "queued"); XCTAssertFalse(try router.deliveryCurrent(db, storedDelivery))
         }
+        let receipt = (try call("message_delivery_list", ["project_id": p["id"]!, "task_id": t["id"]!, "message_id": note["id"]!])["deliveries"] as! [JSON])[0]
+        XCTAssertEqual(receipt["state"] as? String, "fenced")
+        XCTAssertEqual(receipt["native_closure_ref"] as? String, result["observation_ref"] as? String)
+        XCTAssertNotNil(receipt["fenced_at"]); XCTAssertNil(receipt["acknowledged_at"])
+        _ = try router.reconcileVerifiedNativeClosure(closure(p, worker), caller: lifecycleOwner)
+        let events = try call("history_list", ["project_id": p["id"]!, "task_id": t["id"]!])["events"] as! [JSON]
+        let fences = events.filter { $0["kind"] as? String == "message_delivery_fenced" }
+        XCTAssertEqual(fences.count, 1)
+        let fence = try XCTUnwrap(fences.first?["data"] as? JSON)
+        XCTAssertEqual(fence["delivery_id"] as? String, delivery["id"] as? String)
+        XCTAssertEqual(fence["message_id"] as? String, note["id"] as? String)
+        XCTAssertEqual(fence["native_closure_ref"] as? String, result["observation_ref"] as? String)
         var checkpoint = auth(p, a); checkpoint["progress"] = "stale fixture"
         assertCode("STALE_CLAIM") { _ = try self.call("work_checkpoint", checkpoint, worker) }
     }
@@ -120,6 +226,9 @@ extension EvidenceAuthorityTests {
         assertCode("STALE_CLAIM") { _ = try self.call("work_checkpoint", checkpoint, resumed) }
         let inbox = try call("session_inbox", ["project_id": p["id"]!], resumed)["deliveries"] as! [JSON]
         XCTAssertFalse(inbox.contains { $0["message_id"] as? String == note["id"] as? String })
+        let oldReceipt = (try call("message_delivery_list", ["project_id": p["id"]!, "task_id": t["id"]!, "message_id": note["id"]!], resumed)["deliveries"] as! [JSON])[0]
+        XCTAssertEqual(oldReceipt["state"] as? String, "fenced")
+        XCTAssertEqual(oldReceipt["native_closure_ref"] as? String, closed["observation_ref"] as? String)
         // The resumed thread picks the returned ticket up again with an ordinary claim.
         let returned = try router.dbQueue.read { try router.record($0, t["id"] as! String, type: "task") }
         let again = try claim(p, returned, caller: resumed)

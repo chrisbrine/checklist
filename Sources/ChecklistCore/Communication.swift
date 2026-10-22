@@ -185,6 +185,41 @@ extension CommandRouter {
         try event(db,caller:c,project:pid,entity:taskID ?? conversationID,kind:"message_saved",data:["message_id":mid,"origin":origin])
         m["subject"] = try subject(db,message:m);m["deliveries"] = deliveries; m["delivery_status"] = recipients.isEmpty ? "saved_for_pickup" : "queued"; m["native_push"] = false; return m
     }
+    /// Ticket-scoped receipt metadata only: this is never a recipient inbox read.
+    func messageDeliveryList(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
+        let pid = try scope(db,p,c), tid = try text(p,"task_id"), mid = try text(p,"message_id")
+        _ = try scoped(db,tid,pid,type:"task")
+        let message = try scoped(db,mid,pid,type:"message")
+        guard message["task_id"] as? String == tid else { throw CoreError("NOT_FOUND","This note is not available on this ticket.") }
+        let rows = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='delivery' AND project_id=? AND json_extract(data,'$.message_id')=? COLLATE BINARY ORDER BY rowid",arguments:[pid,mid])
+        let deliveries = try rows.map { row -> JSON in
+            let delivery = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"delivery").object
+            // Keep transport receipts, reply allowances, note bodies and credentials private.
+            let fields = ["id","message_id","recipient_session_id","recipient_authorization_generation","push_state","host_status","created_at","updated_at","delivered_at","acknowledged_at","addressed_at","host_status_at"]
+            var result = delivery.filter { fields.contains($0.key) }
+            let state = delivery["state"] as? String ?? "queued"
+            result["state"] = ["acknowledged","addressed"].contains(state) ? "acknowledged" : (state == "delivered" ? "delivered" : "queued")
+            if let closure = try deliveryNativeClosure(db,delivery) {
+                result["state"] = "fenced"; result["native_closure_ref"] = closure["id"]
+                result["fenced_at"] = closure["observed_at"]
+            }
+            return result
+        }
+        var result: JSON = ["message_id":mid,"task_id":tid,"deliveries":deliveries]
+        // No recipient exists yet; do not invent a delivery ID or generation.
+        if deliveries.isEmpty { result["delivery_status"] = "saved_for_pickup"; result["created_at"] = message["created_at"] }
+        return result
+    }
+
+    /// Includes historical closures after the conversation has resumed with a new generation.
+    func deliveryNativeClosure(_ db: Database,_ delivery: JSON) throws -> JSON? {
+        guard !["acknowledged","addressed"].contains(delivery["state"] as? String ?? ""),
+              let pid = delivery["project_id"] as? String, let sid = delivery["recipient_session_id"] as? String,
+              let generation = delivery["recipient_authorization_generation"] as? String else { return nil }
+        let row = try Row.fetchOne(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='native_closure' AND project_id=? AND json_extract(data,'$.session_id')=? COLLATE BINARY AND json_extract(data,'$.old_authorization_generation')=? COLLATE BINARY LIMIT 1",arguments:[pid,sid,generation])
+        return try row.map { try GRDBRecordEnvelopeAdapter.decode($0,expectedType:"native_closure").object }
+    }
+
     func inbox(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         guard let sid = c.sessionID else { throw CoreError("FORBIDDEN","This connection has no bound recipient.") }
         let pids: [String]
