@@ -96,6 +96,10 @@ Installed release build `dc7dab099bb99b3e` (41) served 80 role-scoped tools to t
 
 Claude Code resumes a conversation in a new process with the same session ID. Before this change, the verified closure of the earlier process fenced the connection for good, and `checklist connect` said the owner disconnected the thread. A resumed conversation now reconnects after that closure returned its work for pickup: the service verifies the new process and gives the session a new credential and authorization generation. The old claims and queued deliveries stay with the ended generation. An owner disconnect stays final, also after its process closes. Core tests cover the new generation, the refusals and a fresh claim; the service glue in `NativeConnections.swift` is checked only by a live reconnect.
 
+### CL-234 owner disconnect
+
+Build 113 exposes no owner Disconnect action. Core’s `NativeConversationLifecycleTests.testResumeRefusesOwnerDisconnectAndUnfinishedRelease` qualifies the refusal control in [closure step 5](integrations.md#native-conversation-closure-qualification-cl-38--cl-83); CL-234 requires the app action and its installed disconnect/resume observation. The same-session resume control was observed live on builds 112/113 (CL-38 observer D).
+
 ### Claim, review and takeover rules (19 October 2026)
 
 Owner decision (CL-137): any eligible AI claims an unclaimed ticket; an agent planned assignee no longer locks a ticket to one provider or session, and owner-assigned tickets stay with the owner. Every verdict ends the review claim; a reject returns the ticket to Queued, and a pass on the last open required gate (agent review or human approval) now marks the ticket Done when the `task_complete` checks hold, unless the project override `hold_passing_for_batch` holds passes. `work_takeover` lets any eligible agent replace a live holder with a reason and no permission; the earlier claim and its delegated children end, contributors stay recorded, and each earlier holder receives a note. Core tests cover each rule; batch and Triage tests now expect the automatic Done, and the Triage completion test sets the hold override.
