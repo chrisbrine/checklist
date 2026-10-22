@@ -30,7 +30,7 @@ VALIDATION_ONLY_GLOBS = (
     'examples/*.json', 'docs/design/prompts.json',
 )
 # Repository files read at runtime, not represented by SwiftPM dependencies.
-# test_repository_input_map_covers_swift_literals checks Tests/ and Sources/.
+# RepositoryDependencyTests audits Swift and Python repository input reads.
 FILE_TEST_CONSUMERS = {
     'docs/integrations.md': ('ChecklistCoreTests',),
     'examples/human-request.json': ('ChecklistCoreTests',),
@@ -38,6 +38,10 @@ FILE_TEST_CONSUMERS = {
     'contracts/ticket-bulk-edit.schema.json': ('ChecklistCoreTests',),
     'examples/media-intake.json': ('ChecklistCoreTests',),
     'Tests/Fixtures/path-overlap-vectors.json': ('ChecklistIPCTests',),
+}
+# Keep Python readers separate from Swift target names; select both for shared inputs.
+FILE_PYTHON_TEST_CONSUMERS = {
+    'Tests/Fixtures/path-overlap-vectors.json': ('scripts/test_test_instances.py',),
 }
 # Source-inspection tests read these trees as text, independently of imports.
 # GlossaryTests scans the Core test sources too.
@@ -133,8 +137,19 @@ def select(root, graph, paths, scratch, full=False):
             unknown.append(path)
         elif path == 'Package.swift' or path == 'Package.resolved' or path.startswith(BUILD_SCRIPTS):
             unknown.append(path)
-        elif path in FILE_TEST_CONSUMERS:
-            affected.update(name for name in FILE_TEST_CONSUMERS[path] if name in targets)
+        elif path in FILE_TEST_CONSUMERS or path in FILE_PYTHON_TEST_CONSUMERS:
+            consumers = FILE_TEST_CONSUMERS.get(path, ())
+            python_consumers = FILE_PYTHON_TEST_CONSUMERS.get(path, ())
+            if any(name not in all_tests for name in consumers) or any(
+                    not (root / name).is_file() for name in python_consumers):
+                unknown.append(path)
+            affected.update(name for name in consumers if name in all_tests)
+            python.update(name for name in python_consumers if (root / name).is_file())
+            # Explicit readers supplement the package graph, including resources.
+            owner = next((target for target in owners if path.startswith(target['path'] + '/')), None)
+            if owner and is_target_resource(root, owner, path):
+                affected.add(owner['name'])
+                changed_targets.add(owner['name'])
         elif path.startswith(('Sources/', 'Tests/')) or any(
                 path.startswith(target['path'] + '/') for target in owners):
             owner = next((target for target in owners if path.startswith(target['path'] + '/')), None)

@@ -1,4 +1,5 @@
 """Affected-test planning without Swift builds or live application access."""
+import ast
 import importlib.util
 import json
 from pathlib import Path
@@ -151,6 +152,48 @@ class SelectionTests(unittest.TestCase):
                 self.assertEqual(plan['fallback_paths'], [])
                 self.assertEqual(plan['commands'][-1], selector.VALIDATE)
 
+    def test_shared_fixture_selects_swift_and_python_consumers(self):
+        plan = self.plan('Tests/Fixtures/path-overlap-vectors.json')
+        self.assertEqual(plan['test_targets'], ['ChecklistIPCTests'])
+        self.assertEqual(plan['python_tests'], ['scripts/test_test_instances.py'])
+        self.assertEqual(plan['fallback_paths'], [])
+        self.assertIn(['uv', 'run', '--no-project', '--with', 'jsonschema', '--with', 'pyyaml',
+                       'python', 'scripts/test_test_instances.py'], plan['commands'])
+
+    def test_unavailable_mapped_consumer_falls_back(self):
+        (self.root / 'scripts/test_test_instances.py').unlink()
+        plan = self.plan('Tests/Fixtures/path-overlap-vectors.json')
+        self.assertEqual(plan['fallback_paths'], ['Tests/Fixtures/path-overlap-vectors.json'])
+        self.assertNotIn('scripts/test_test_instances.py', plan['python_tests'])
+        self.assertEqual(len(plan['test_targets']), 7)
+        self.assertEqual(plan['skip'], [])
+
+    def test_unavailable_swift_consumer_falls_back(self):
+        with patch.dict(selector.FILE_TEST_CONSUMERS, {'docs/integrations.md': ('MissingTests',)}):
+            plan = self.plan('docs/integrations.md')
+        self.assertEqual(plan['fallback_paths'], ['docs/integrations.md'])
+        self.assertEqual(len(plan['test_targets']), 7)
+        self.assertEqual(len(plan['python_tests']), 3)
+        self.assertEqual(plan['skip'], [])
+
+    def test_python_resource_reader_precedes_validation_only(self):
+        with patch.dict(selector.FILE_PYTHON_TEST_CONSUMERS,
+                        {'docs/python-input.md': ('scripts/test_test_instances.py',)}):
+            plan = self.plan('docs/python-input.md')
+        self.assertEqual(plan['test_targets'], [])
+        self.assertEqual(plan['python_tests'], ['scripts/test_test_instances.py'])
+        self.assertEqual(plan['fallback_paths'], [])
+
+    def test_mapped_readers_supplement_package_resource_consumers(self):
+        graph = {'targets': [target('Assets', path='Tests/Fixtures'),
+                             target('AssetsTests', ['Assets'], 'test'),
+                             target('ChecklistIPC'), target('ChecklistIPCTests', ['ChecklistIPC'], 'test')]}
+        graph['targets'][0]['resources'] = [{'path': 'Tests/Fixtures/path-overlap-vectors.json'}]
+        plan = selector.select(self.root, graph, ['Tests/Fixtures/path-overlap-vectors.json'], self.root / '.build')
+        self.assertEqual(plan['test_targets'], ['AssetsTests', 'ChecklistIPCTests'])
+        self.assertEqual(plan['python_tests'], ['scripts/test_test_instances.py'])
+        self.assertEqual(plan['fallback_paths'], [])
+
     def test_cli_input_probe_selects_mcp_runtime_consumers(self):
         plan = self.plan('Tests/ChecklistCLIInputProbe/main.swift')
         self.assertEqual(plan['test_targets'], ['ChecklistMCPServerTests'])
@@ -259,6 +302,43 @@ def repository_references(root):
     return references
 
 
+def python_repository_references(root):
+    """Audit literal repository paths passed to Python file reads.
+
+    Like the Swift audit, this is conservative, not an interpreter. Paths split
+    across variables or computed dynamically require an explicit map and audit.
+    """
+    directories = {p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith('.')}
+    references = set()
+    for source in sorted((root / 'scripts').glob('test_*.py')):
+        for node in ast.walk(ast.parse(source.read_text())):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Attribute) and node.func.attr in ('read_text', 'read_bytes', 'open'):
+                expression = node.func.value
+            elif isinstance(node.func, ast.Name) and node.func.id == 'open' and node.args:
+                expression = node.args[0]
+            else:
+                continue
+            # Path / 'directory' / 'file' and Path / 'directory/file'.
+            def literals(expression):
+                if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
+                    return [expression.value]
+                if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Div):
+                    return literals(expression.left) + literals(expression.right)
+                return []
+            literal = '/'.join(literals(expression))
+            path = Path(literal)
+            if '/' not in literal or not path.parts or path.parts[0] not in directories:
+                continue
+            candidate = root / path
+            inputs = sorted(candidate.rglob('*')) if candidate.is_dir() else [candidate]
+            for item in inputs:
+                if item.is_file():
+                    references.add((source.relative_to(root).as_posix(), item.relative_to(root).as_posix()))
+    return sorted(references)
+
+
 class RepositoryDependencyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -288,6 +368,29 @@ class RepositoryDependencyTests(unittest.TestCase):
         for path, consumers in found.items():
             plan = selector.select(self.root, self.graph, [path], self.scratch)
             self.assertTrue(consumers.issubset(plan['test_targets']), (path, plan))
+
+    def test_repository_input_selection_covers_python_reads(self):
+        references = python_repository_references(self.root)
+        self.assertIn(('scripts/test_test_instances.py', 'Tests/Fixtures/path-overlap-vectors.json'), references)
+        for source, path in references:
+            with self.subTest(reader=source, input=path):
+                plan = selector.select(self.root, self.graph, [path], self.scratch)
+                self.assertIn(source, plan['python_tests'],
+                              'Add every Python reader to FILE_PYTHON_TEST_CONSUMERS or fall back to the full suite')
+
+    def test_python_input_audit_finds_docs_and_split_fixture_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path in ['docs/new.md', 'Tests/Fixtures/shared.json', 'scripts/test_new.py']:
+                file = root / path
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.touch()
+            (root / 'scripts/test_new.py').write_text(
+                "(REPO / 'docs/new.md').read_text()\n"
+                "with open(REPO / 'Tests' / 'Fixtures' / 'shared.json') as f: pass\n")
+            self.assertEqual(python_repository_references(root), [
+                ('scripts/test_new.py', 'Tests/Fixtures/shared.json'),
+                ('scripts/test_new.py', 'docs/new.md')])
 
     def test_source_reads_select_the_reading_test_target(self):
         for source, path in repository_references(self.root):
