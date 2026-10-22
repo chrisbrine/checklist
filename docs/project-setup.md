@@ -13,6 +13,12 @@ The executable is `/Applications/Checklist.app/Contents/MacOS/checklist`; its `m
 
 The current app exposes no assistant connection/settings UI. Actual Codex/Claude worker status, current/prior attempts, checkpoint/progress, recovery and supported actions stay on the ticket being handled; the internal worker registry is not a global user catalog. The user should not need a Pair connection form, socket address, session ID or invented profile before a normal provider thread can use a ticket. One-time integration registration or an actual host permission prompt may still be necessary; explain the real requirement instead of presenting manual pairing as the solution to every missing route.
 
+## Reinstalling Checklist during a conversation
+
+Reinstalling replaces the bundled CLI while an existing Codex or Claude conversation may keep its earlier MCP shim running. The service admits commands only from the installed build. Fixed shims safely delegate to the signed replacement at their original launch path and keep the MCP connection; this is the chosen recovery route rather than restarting the transport automatically.
+
+If that route is unavailable or the replacement is also refused, `CLIENT_OUTDATED` says no command ran and carries `details.recovery_action: "restart_mcp_server"`. Use the Codex or Claude host's MCP controls to restart or reconnect this conversation's **checklist** MCP server, then retry the same request with its original `command_id`. Reinstalling or reopening the Checklist GUI alone does not restart a host's MCP process. A shim from before CL-171 cannot gain this behavior retroactively: reconnect it manually after installation. A genuine `OUTCOME_UNKNOWN` still requires reconciliation of the original command; it does not prove noncommit. See [install recovery](integrations.md#installs-and-running-mcp-shims).
+
 ## Add a project
 
 Choose **Add Project → Choose Folder**, confirm name/key prefix and optional symbol/image/accent, then choose participating work providers and a simple preset: **Claude coordinates / Codex works**, **Shared work**, or **Codex-led**. Defaults provide statuses, review/storage behavior and an empty task list. Title/project capture is immediately usable; no routing graph or named-agent catalog is required. Manual/coordinator-directed pickup does not launch another model.

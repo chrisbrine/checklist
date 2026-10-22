@@ -1,7 +1,6 @@
-// Component regression only: actual retention helper plus Record.swift, no Store,
-// service, native event synthesis or visible UI activation. Compile from repo root:
-// xcrun swiftc -swift-version 5 -parse-as-library -O Sources/ChecklistApp/Models/Record.swift Sources/ChecklistApp/Support/DetailItemStateRetention.swift scripts/check-item-navigation-ownership.swift -o /tmp/check-item-navigation-ownership
-// /tmp/check-item-navigation-ownership
+// Compile: bash scripts/compile-component.sh --scratch-path "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}" check-item-navigation-ownership
+// Run: "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}/check-item-navigation-ownership"
+// Component regression only: actual retention helper, no Store, service or visible UI activation.
 // Actual installed pointer Back focus remains an independent acceptance check.
 import AppKit
 import SwiftUI

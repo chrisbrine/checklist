@@ -1,11 +1,14 @@
-// Compile: xcrun swiftc -swift-version 5 -parse-as-library Sources/ChecklistApp/Models/Record.swift Sources/ChecklistApp/Support/DetailItemStateRetention.swift scripts/check-recreated-swiftui-focus.swift -o /tmp/checklist-recreated-swiftui-focus
+// Compile: bash scripts/compile-component.sh --scratch-path "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}" check-recreated-swiftui-focus
+// Run: "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}/check-recreated-swiftui-focus"
 // Isolated offscreen native clicks recreate actual SwiftUI detail fields. No
 // Checklist service, draft journal, preferences or user windows are changed.
 import AppKit
 import SwiftUI
 
 @MainActor final class BackFocusModel: ObservableObject {
-    @Published var detail = "request"
+    @Published var detail = "request" {
+        willSet { DetailItemNavigationMemory.shared.prepareNavigation(to: newValue) }
+    }
     @Published var answer = "Unsent answer selected before opening ticket"
 }
 struct BackFocusRoot: View {
@@ -40,6 +43,7 @@ struct BackFocusRoot: View {
 @main struct RecreatedSwiftUIFocusChecks {
     @MainActor static func main() async {
         let app = NSApplication.shared; app.setActivationPolicy(.accessory)
+        DetailItemNavigationMemory.shared.prepareNavigation(to: "request")
         let model = BackFocusModel()
         let window = BackFocusWindow(contentRect: NSRect(x: -5000, y: 0, width: 1200, height: 600), styleMask: [.titled], backing: .buffered, defer: false)
         let hosting = NSHostingView(rootView: BackFocusRoot(model: model)); window.contentView = hosting; window.orderFront(nil); window.layoutIfNeeded()

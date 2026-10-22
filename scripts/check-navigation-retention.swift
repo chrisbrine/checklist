@@ -1,4 +1,5 @@
-// Compile: xcrun swiftc -swift-version 5 -parse-as-library Sources/ChecklistApp/Models/Record.swift Sources/ChecklistApp/Models/TicketListProjection.swift Sources/ChecklistApp/Models/TicketListRows.swift Sources/ChecklistApp/Support/RecordOrdering.swift Sources/ChecklistApp/Support/TicketListStability.swift Sources/ChecklistApp/Support/DetailItemStateRetention.swift scripts/check-navigation-retention.swift -o /tmp/checklist-navigation-retention
+// Compile: bash scripts/compile-component.sh --scratch-path "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}" check-navigation-retention
+// Run: "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}/check-navigation-retention"
 // Isolated offscreen fixture; no Checklist service or user window/preferences.
 import AppKit
 import SwiftUI
@@ -17,14 +18,17 @@ struct NavigationRetentionChecks {
         let editor = NSTextField(frame: NSRect(x: 530, y: 35, width: 300, height: 30)); editor.identifier = .init("per-item-editor"); content.addSubview(editor)
         let outside = NSTextField(frame: NSRect(x: 50, y: 35, width: 200, height: 30)); content.addSubview(outside)
         window.orderFront(nil)
+        DetailItemNavigationMemory.shared.prepareNavigation(to: "task:first")
         let first = DetailItemStateRetention.Coordinator(key: "task:first"); first.anchor = anchor; first.restore()
         scroll.contentView.scroll(to: NSPoint(x: 0, y: 450)); window.makeFirstResponder(editor); first.capture()
         let saved = DetailItemNavigationMemory.shared.entries["task:first"]!
         check(saved.scrollOffsets.first?.y == 450 && saved.focus != nil, "An item must capture its scroll and actual editable focus")
+        DetailItemNavigationMemory.shared.prepareNavigation(to: "task:second")
         scroll.contentView.scroll(to: NSPoint(x: 0, y: 20)); window.makeFirstResponder(outside)
         let second = DetailItemStateRetention.Coordinator(key: "task:second"); second.anchor = anchor; second.restore(); second.capture()
         check(DetailItemNavigationMemory.shared.entries["task:second"]?.scrollOffsets.first?.y == 20, "Different item IDs must retain separate scroll positions")
-        first.restore()
+        DetailItemNavigationMemory.shared.prepareNavigation(to: "task:first")
+        first.update(key: "task:first"); first.restore()
         check(scroll.contentView.bounds.origin.y == 450, "Back must restore the earlier item's scroll offset")
         check((window.firstResponder as? NSTextView)?.delegate as? NSTextField === outside, "Per-item restoration must not steal focus from an outside clicked control")
         window.makeFirstResponder(window); first.restore()

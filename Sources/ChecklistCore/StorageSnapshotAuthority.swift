@@ -26,27 +26,34 @@ enum StorageSnapshotAuthority {
     static func validateCapturedLinks(_ objects: [StorageSnapshotObject]) throws {
         let entries = Dictionary(uniqueKeysWithValues: objects.map { ($0.relativePath, $0) })
         for link in objects where link.kind == "symlink" {
-            let initial = try StorageObjectFiles.parts(link.relativePath)
-            guard initial.count >= 5, initial[0] == "source-captures", initial[3] == "source" else { throw StorageSnapshotFailure.unsupportedAuthority }
-            let capturePrefix = Array(initial.prefix(4))
-            var path = link.relativePath, visited: Set<String> = [], hops = 0
-            while true {
-                guard visited.insert(path).inserted, let entry = entries[path] else { throw StorageSnapshotFailure.unsupportedAuthority }
-                if entry.kind == "file" { break }
-                guard entry.kind == "symlink", hops < 32, let target = entry.linkTarget,
-                      !target.isEmpty, !target.hasPrefix("/"), !target.contains("\0"),
-                      StorageObjectFiles.sha(Data(target.utf8)) == entry.expectedSHA256 else { throw StorageSnapshotFailure.unsupportedAuthority }
-                var components = try StorageObjectFiles.parts(path); components.removeLast()
-                for component in target.split(separator: "/") {
-                    if component == "." { continue }
-                    if component == ".." {
-                        guard components.count > capturePrefix.count else { throw StorageSnapshotFailure.unsupportedAuthority }
-                        components.removeLast()
-                    } else { components.append(String(component)) }
-                }
-                guard components.count > capturePrefix.count, Array(components.prefix(4)) == capturePrefix else { throw StorageSnapshotFailure.unsupportedAuthority }
-                path = components.joined(separator: "/"); hops += 1
+            _ = try capturedLinkClosure(link.relativePath,entries:entries)
+        }
+    }
+
+    /// Shared by snapshot validation and deletion. Include every captured hop
+    /// and the final file without following live filesystem links.
+    static func capturedLinkClosure(_ initialPath: String,entries: [String:StorageSnapshotObject]) throws -> [String] {
+        let initial = try StorageObjectFiles.parts(initialPath)
+        guard initial.count >= 5, initial[0] == "source-captures", initial[3] == "source" else { throw StorageSnapshotFailure.unsupportedAuthority }
+        let capturePrefix = Array(initial.prefix(4))
+        var path = initialPath, visited: Set<String> = [], hops = 0, closure: [String] = []
+        while true {
+            guard visited.insert(path).inserted, let entry = entries[path] else { throw StorageSnapshotFailure.unsupportedAuthority }
+            closure.append(path)
+            if entry.kind == "file" { return closure }
+            guard entry.kind == "symlink", hops < 32, let target = entry.linkTarget,
+                  !target.isEmpty, !target.hasPrefix("/"), !target.contains("\0"),
+                  StorageObjectFiles.sha(Data(target.utf8)) == entry.expectedSHA256 else { throw StorageSnapshotFailure.unsupportedAuthority }
+            var components = try StorageObjectFiles.parts(path); components.removeLast()
+            for component in target.split(separator: "/") {
+                if component == "." { continue }
+                if component == ".." {
+                    guard components.count > capturePrefix.count else { throw StorageSnapshotFailure.unsupportedAuthority }
+                    components.removeLast()
+                } else { components.append(String(component)) }
             }
+            guard components.count > capturePrefix.count, Array(components.prefix(4)) == capturePrefix else { throw StorageSnapshotFailure.unsupportedAuthority }
+            path = components.joined(separator: "/"); hops += 1
         }
     }
 

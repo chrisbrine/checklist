@@ -24,6 +24,7 @@ let package = Package(
         .executableTarget(name: "StorageCrashProbe", dependencies: ["ChecklistCore", "StorageReleasedCoreFixture", .product(name: "GRDB", package: "GRDB.swift")], path: "Tests/StorageCrashProbe", exclude: ["ReleasedCore"]),
         .executableTarget(name: "ChecklistCLIInputProbe", dependencies: ["ChecklistIPC"], path: "Tests/ChecklistCLIInputProbe"),
         .testTarget(name: "ChecklistCoreTests", dependencies: ["ChecklistCore", "ChecklistBridges", .product(name: "GRDB", package: "GRDB.swift")]),
+        .testTarget(name: "ChecklistCLITests", dependencies: ["ChecklistCLI", .product(name: "MCP", package: "swift-sdk")]),
         .testTarget(name: "ChecklistAppTests", dependencies: ["ChecklistApp", "ChecklistCore", "ChecklistIPC"]),
         .testTarget(name: "ChecklistIPCTests", dependencies: ["ChecklistIPC", "ChecklistCore", .product(name: "GRDB", package: "GRDB.swift")]),
         .testTarget(name: "ChecklistBridgesTests", dependencies: ["ChecklistBridges", "ChecklistIPC"]),

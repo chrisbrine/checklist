@@ -119,3 +119,7 @@ Permanent removal is available only through **Trash → Delete permanently** in 
 Purge replaces the ticket with an immutable **Purged ticket** reference retaining its id, project and key, purge time and actor. It removes exclusive notes, work/review/request/file records and indirect delivery records, removes grouping entries, clears affected history-event content without deleting sequence rows, and expires earlier cached command results containing removed content. Incoming relations and records shared with other tickets remain. It cannot be undone. Other tickets' quoted content is not granularly redacted.
 
 This version retains all managed-file and captured-source bytes; original-size totals are not reclaimed disk space. External originals and workspace files are never deleted. Known backup counts and recorded times come from existing metadata; unrecorded backups/exports may also contain the ticket. **Checklist does not change existing backups or exports; delete those copies yourself if needed.** No backup indexing, timed purge, secure erasure or conversation-redaction system is added.
+
+## CLI JSON results
+
+Every successful `checklist call` result is one RFC 8259 JSON value followed by a newline. Literal U+0000–U+001F inside string keys or values are escaped at the CLI output boundary; existing escapes and formatting whitespace outside strings are preserved. Standard strict JSON parsers can consume the output. MCP tool/resource JSON and SDK protocol frames have separate control-character regression coverage.

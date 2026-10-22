@@ -1,14 +1,14 @@
+// Compile: bash scripts/compile-component.sh --scratch-path "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}" check-ticket-layout-replay
+// Run: "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}/check-ticket-layout-replay"
+// Optional replay modes: --animated-width / --scroll-stress / --projection-only.
 // Isolated macOS layout replay; no Checklist service or persistent app preferences.
-// Compile from the repository root:
-// xcrun swiftc -swift-version 5 -parse-as-library Sources/ChecklistApp/Models/{Record,TicketListProjection,TicketListRows}.swift Sources/ChecklistApp/Support/{RecordOrdering,Design}.swift Sources/ChecklistApp/Views/{InlineTriageRow,TaskWorkspaceView}.swift scripts/check-ticket-layout-replay.swift -o /tmp/checklist-ticket-layout-check
-// Run /tmp/checklist-ticket-layout-check (idle live snapshots) or add --animated-width / --scroll-stress.
 import SwiftUI
 import AppKit
 import Foundation
 import Darwin
 
 @MainActor final class ChecklistStore: ObservableObject {
-    @Published var data: [String: Any] = [:]
+    @Published var data: [String: Any] = [:] { didSet { prepareWorkspace() } }
     @Published var page: Page = .tasks
     @Published var projectID: String? = "synthetic-project"
     @Published var search = ""
@@ -23,6 +23,37 @@ import Darwin
     @Published var error: String?
     @Published var showCapture = false
     @Published var sidebarVisible = true
+    // Only the ticket list is replayed. Sheets and their write paths stay inert.
+    let windowPreferences = ReplayPreferences()
+    var listFilters = TicketListFilters()
+    var storeIncarnation = "synthetic-store"
+    var ticketStatuses: [Record] { statuses(projectID ?? "") }
+    var listHasFilters: Bool { statusFilter != "all" || tagFilter != "all" || !search.isEmpty || listFilters.isActive }
+    var showsOfflineBanner: Bool { false }
+    var ticketPageError: String? { nil }
+    var ticketPageLoading: Bool { false }
+    var ticketPageShownCount: Int { tasks.count }
+    var ticketPageMatchedCount: Int { tasks.count }
+    var ticketPagePreviousCursor: String? { nil }
+    var ticketPageNextCursor: String? { nil }
+    var overviewRequestTotal: Int { 0 }
+    @Published var preparedTicketWorkspace: PreparedTicketWorkspace?
+    private var preparation = TicketWorkspacePreparation()
+    private var epoch: UInt64 = 0
+    private var expansion = TicketWorkspaceExpansion()
+    func prepareWorkspace() {
+        epoch += 1
+        preparation.prepare(snapshot: SnapshotRecordIndex(snapshot: data), request: TicketWorkspaceRequest(
+            snapshotEpoch: epoch,
+            query: TicketWorkspaceQuery(surface: .tickets, projectID: projectID, rawSearch: search, statusFilter: statusFilter, tagFilter: tagFilter),
+            ordering: TicketWorkspaceOrdering(groupBy: viewGroupBy, orderBy: viewOrderBy), expansion: expansion))
+        preparedTicketWorkspace = preparation.prepared
+    }
+    func updateTicketWorkspaceExpansion(_ value: TicketWorkspaceExpansion) { expansion = value; prepareWorkspace() }
+    func retryTicketPage() {}
+    func moveTicketPage(_ cursor: String) {}
+    func withTicketViewUpdate(_ update: () -> Void) { update(); prepareWorkspace() }
+    func resetTicketFilters() { search = ""; statusFilter = "all"; tagFilter = "all"; listFilters = TicketListFilters(); prepareWorkspace() }
     func records(_ key: String) -> [Record] { (data[key] as? [[String: Any]] ?? []).map(Record.init) }
     var tasks: [Record] { records("tasks") }
     var groups: [Record] { records("groups") }
@@ -41,6 +72,25 @@ import Darwin
 }
 struct CreateTriageSheet: View {
     let onCreated: (String) -> Void
+    var body: some View { EmptyView() }
+}
+// In-memory preferences avoid TaskWorkspaceView.onAppear writing to a real domain.
+final class ReplayPreferences {
+    private var values: [String: Any] = [:]
+    func stringArray(forKey key: String) -> [String]? { values[key] as? [String] }
+    func set(_ value: Any?, forKey key: String) { values[key] = value }
+}
+struct TrashTicketsView: View { var body: some View { EmptyView() } }
+struct TicketListFilterControls: View { var body: some View { EmptyView() } }
+struct TicketBulkDraft: Identifiable {
+    let id = UUID()
+    let kind: String
+    let tickets: [Record]
+    var undo: TicketBulkReceipt? = nil
+}
+struct TicketBulkEditSheet: View {
+    let draft: TicketBulkDraft
+    let completed: (TicketBulkReceipt?) -> Void
     var body: some View { EmptyView() }
 }
 struct ReplayRoot: View {
@@ -131,8 +181,9 @@ final class Heartbeat: @unchecked Sendable {
         if let fixture = CommandLine.arguments.dropFirst().first(where: { !$0.hasPrefix("--") }) { exactFixture = try! JSONSerialization.jsonObject(with:Data(contentsOf:URL(fileURLWithPath:fixture))) as? [String: Any] }
         validateRowIdentity()
         if CommandLine.arguments.contains("--projection-only") { return }
-        UserDefaults.standard.setVolatileDomain(["expandedTriages":[exactFixture?["group_id"] as? String ?? "synthetic-triage"]], forName: UserDefaults.argumentDomain)
-        let store = ChecklistStore(); store.data = syntheticSnapshot(0)
+        let store = ChecklistStore()
+        store.windowPreferences.set([exactFixture?["group_id"] as? String ?? "synthetic-triage"], forKey: "expandedTriages")
+        store.data = syntheticSnapshot(0)
         if let project = exactFixture?["project_id"] as? String { store.projectID = project }
         let host = NSHostingView(rootView: ReplayRoot().environmentObject(store))
         let window = NSWindow(contentRect: NSRect(x: -5000,y: 100,width:1240,height:820), styleMask:[.titled,.resizable], backing:.buffered, defer:false)

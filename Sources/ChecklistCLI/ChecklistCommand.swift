@@ -129,11 +129,11 @@ struct ChecklistCommand {
         }
     }
 
-    private static func printJSON(_ value: Value) throws {
+    static func printJSON(_ value: Value, to output: FileHandle = .standardOutput) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        FileHandle.standardOutput.write(try encoder.encode(value))
-        FileHandle.standardOutput.write(Data("\n".utf8))
+        output.write(JSONOutput.escapingStringControls(try encoder.encode(value)))
+        output.write(Data("\n".utf8))
     }
 
     private static func printHelp() {

@@ -205,13 +205,25 @@ extension CommandRouter {
         guard !db.isInsideTransaction else {throw CoreError("CLEANUP_TRANSACTION_REQUIRED","Run object deletion after the semantic transaction commits.")}
         guard let raw = try Row.fetchOne(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND json_valid(data) AND json_extract(data,'$.kind')='ticket_object_delete' AND json_extract(data,'$.state')='pending' ORDER BY rowid LIMIT 1") else {return}
         let receipt = try GRDBRecordEnvelopeAdapter.decode(raw).object
-        guard let objects = receipt["objects"] as? [JSON],objects.count <= 100000,let index = objects.firstIndex(where: {$0["state"] as? String == "pending"}) else {throw CoreError("CLEANUP_INTENT_INVALID","The deletion intent requires repair; bytes retained.")}
-        let object = objects[index]
+        guard var objects = receipt["objects"] as? [JSON],objects.count <= 100000,var index = objects.firstIndex(where: {$0["state"] as? String == "pending"}) else {throw CoreError("CLEANUP_INTENT_INVALID","The deletion intent requires repair; bytes retained.")}
+        var object = objects[index]
         do {
             try withValidatedDomainTransaction(db) {
                 let references = try TicketObjectDeletionReferenceIndex(self.archiveCleanupReferenceRows(db))
                 let mediaAuthorityComplete = (try? MediaRecordRegistry.validate(MediaRecordRegistry.envelopes(db))) != nil
-                let holds = try self.ticketObjectDeletionHolds(db,object:object,references:references,backup:try? self.storageBackupRetentionIndex(db),mediaAuthorityComplete:mediaAuthorityComplete)
+                let backup = try? self.storageBackupRetentionIndex(db)
+                // A newly held link anywhere in the intent wins before any target
+                // unlink, even if an older intent stored the opposite link order.
+                for i in objects.indices where objects[i]["state"] as? String == "pending" && objects[i]["kind"] as? String == "symlink" {
+                    let holds = try self.ticketObjectDeletionHolds(db,object:objects[i],references:references,backup:backup,mediaAuthorityComplete:mediaAuthorityComplete)
+                    if !holds.isEmpty {objects[i]["state"] = "retained";objects[i]["reasons"] = holds.sorted()}
+                }
+                let pendingTargets = Self.retainTicketObjectDeletionLinkTargets(&objects)
+                guard let next = objects.firstIndex(where: {$0["state"] as? String == "pending" && !pendingTargets.contains($0["relative_path"] as? String ?? "")}) else {
+                    try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects);return .commit
+                }
+                index = next;object = objects[index]
+                let holds = try self.ticketObjectDeletionHolds(db,object:object,references:references,backup:backup,mediaAuthorityComplete:mediaAuthorityComplete)
                 var result = object
                 if !holds.isEmpty {result["state"] = "retained";result["reasons"] = holds.sorted()}
                 else {
@@ -220,7 +232,9 @@ extension CommandRouter {
                     let removed = try permit.removeOriginal(relative:relative,sha256:sha,size:size,capturedSource:relative.hasPrefix("source-captures/"),linkTarget:object["link_target"] as? String)
                     result["state"] = removed ? "removed" : "already_missing"
                 }
-                try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,index:index,result:result)
+                objects[index] = result
+                _ = Self.retainTicketObjectDeletionLinkTargets(&objects)
+                try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects)
                 return .commit
             }
         } catch {
@@ -232,15 +246,16 @@ extension CommandRouter {
                 result["failures"] = failures
                 result["last_failure"] = (error as? CoreError)?.code ?? "CLEANUP_UNAVAILABLE"
                 if failures >= 2 {result["state"] = "retained";result["reasons"] = [result["last_failure"]!]}
-                try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,index:index,result:result)
+                objects[index] = result
+                _ = Self.retainTicketObjectDeletionLinkTargets(&objects)
+                try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects)
                 return .commit
             }
         }
     }
 
-    private func saveTicketObjectDeletionOutcome(_ db: Database,receipt: JSON,index: Int,result: JSON) throws {
-        var receipt = receipt,objects = receipt["objects"] as! [JSON]
-        objects[index] = result;receipt["objects"] = objects
+    private func saveTicketObjectDeletionOutcome(_ db: Database,receipt: JSON,objects: [JSON]) throws {
+        var receipt = receipt;receipt["objects"] = objects
         receipt["summary"] = Self.ticketObjectDeletionSummary(objects)
         receipt["state"] = objects.contains {$0["state"] as? String == "pending"} ? "pending" : "completed"
         receipt["checked_at"] = now()

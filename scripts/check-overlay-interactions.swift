@@ -1,4 +1,5 @@
-// Compile: xcrun swiftc -swift-version 5 -parse-as-library Sources/ChecklistApp/Support/DetailOverlayInteraction.swift Sources/ChecklistApp/Support/DetailOverlayOpeningControl.swift scripts/check-overlay-interactions.swift -o /tmp/checklist-overlay-interactions
+// Compile: bash scripts/compile-component.sh --scratch-path "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}" check-overlay-interactions
+// Run: "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}/check-overlay-interactions"
 // Runs an isolated offscreen AppKit fixture. No Checklist service, settings or user window changes.
 import AppKit
 import SwiftUI

@@ -17,6 +17,7 @@ final class ChecklistMCPServerTests: XCTestCase {
         private var bootstraps: [(TimeInterval, TimeInterval?)] = []
         private var stderrLines: [String] = []
         var bootstrapHandler: ((TimeInterval?) throws -> Void)?
+        var responseText: String?
         var callHandler: ((String) throws -> Void)?
 
         init(provider: String = "claude") throws {
@@ -71,6 +72,7 @@ final class ChecklistMCPServerTests: XCTestCase {
                          "inputSchema": ["type": "object", "properties": [:], "additionalProperties": false]] as [String: Any]
                     }]]
                 }
+                if let responseText { return ["data": ["text": responseText, responseText: responseText]] }
                 if name == "service_info" { return ["data": ["service": "synthetic", "session_id": context.nativeSessionID]] }
                 if name == "project_list" { return ["data": ["projects": [["id": "synthetic-project"]]]] }
                 return ["data": ["tasks": [], "executed": name]]
@@ -151,6 +153,33 @@ final class ChecklistMCPServerTests: XCTestCase {
             XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("connected after"), file: file, line: line)
             XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("Startup wait ended after"), file: file, line: line)
         }
+    }
+
+    func testControlCharactersRemainStrictJSONInToolResourceAndProtocolOutput() async throws {
+        let fixture = try Fixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        let session = try await start(fixture)
+        let controls = String(String.UnicodeScalarView((0...31).map { UnicodeScalar($0)! }))
+        fixture.responseText = controls + "quote \" slash / backslash \\ é🧪"
+        let tool = try await session.client.callTool(name: "task_list")
+        XCTAssertEqual(tool.isError, false)
+        let toolJSON = text(tool.content)
+        let resource = try await session.client.readResource(uri: "checklist://service/status")
+        let resourceJSON = try XCTUnwrap(resource.first?.text)
+        for json in [toolJSON, resourceJSON] {
+            let result = try JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+            XCTAssertEqual((result["data"] as? [String: String])?["text"], fixture.responseText)
+        }
+        let frames = await session.transport.frames().map { String(decoding: $0, as: UTF8.self) }
+        let process = Process(), input = Pipe(), errors = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = ["-c", "import json,sys; [json.loads(frame) for frame in json.load(sys.stdin)]"]
+        process.standardInput = input; process.standardError = errors
+        try process.run()
+        input.fileHandleForWriting.write(try JSONSerialization.data(withJSONObject: frames + [toolJSON, resourceJSON]))
+        try input.fileHandleForWriting.close()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0, String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
     }
 
     func testRegistryRaceStartsRealServerWithFullCatalogAndProtocolOnlyOutput() async throws {
@@ -458,7 +487,7 @@ final class ChecklistMCPServerTests: XCTestCase {
             XCTAssertEqual(reply.isError, true)
             XCTAssertTrue(text(reply.content).contains("CLIENT_OUTDATED"))
             XCTAssertTrue(text(reply.content).contains("no command ran"))
-            XCTAssertTrue(text(reply.content).contains("reconnect the checklist MCP server"))
+            XCTAssertTrue(text(reply.content).contains("restart or reconnect the checklist MCP server"))
             XCTAssertFalse(text(reply.content).contains("OUTCOME_UNKNOWN"))
             try await session.client.ping()
         }
@@ -469,6 +498,33 @@ final class ChecklistMCPServerTests: XCTestCase {
         XCTAssertEqual(recovered.isError, false)
         let count = try await noticeCount(session)
         XCTAssertEqual(count, 1)
+    }
+
+    func testOutdatedInstalledDelegateGivesHostRestartSignalWithoutUnknownOutcome() async throws {
+        let fixture = try Fixture(), update = UpdateFixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        let session = try await start(fixture, update: update.environment)
+        update.set(.replaced)
+        update.result = .init(status: 1, stdout: Data(), stderr: "Checklist: " + ClientUpdateRequired.error.localizedDescription + "\n")
+        let id = UUID().uuidString
+        let reply = try await session.client.callTool(name: "task_edit", arguments: ["command_id": .string(id)])
+        XCTAssertEqual(reply.isError, true)
+        let message = text(reply.content)
+        XCTAssertTrue(message.contains("CLIENT_OUTDATED"))
+        XCTAssertTrue(message.contains("Codex or Claude host's MCP controls"))
+        XCTAssertTrue(message.contains("restart or reconnect the checklist MCP server"))
+        XCTAssertFalse(message.contains("OUTCOME_UNKNOWN"))
+        let frames = try await session.transport.frames().map { try JSONSerialization.jsonObject(with: $0) as! [String: Any] }
+        let result = try XCTUnwrap(frames.last?["result"] as? [String: Any])
+        let structured = try XCTUnwrap(result["structuredContent"] as? [String: Any])
+        let error = try XCTUnwrap(structured["error"] as? [String: Any])
+        let details = try XCTUnwrap(error["details"] as? [String: Any])
+        XCTAssertEqual(error["code"] as? String, "CLIENT_OUTDATED")
+        XCTAssertEqual(details["recovery_action"] as? String, "restart_mcp_server")
+        XCTAssertEqual(details["command_executed"] as? Bool, false)
+        XCTAssertEqual(details["command_id"] as? String, id)
+        try await session.client.ping()
+        XCTAssertEqual(update.calls.count, 1)
     }
 
     func testCurrentShimNeverDelegatesAndKeepsLazyBootstrap() async throws {

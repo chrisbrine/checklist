@@ -1,4 +1,5 @@
-// Compile: xcrun swiftc -swift-version 5 -parse-as-library Sources/ChecklistApp/Support/DetailOverlayInteraction.swift scripts/check-native-frame-lifecycle.swift -o /tmp/checklist-native-frame-lifecycle
+// Compile: bash scripts/compile-component.sh --scratch-path "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}" check-native-frame-lifecycle
+// Run: export CL17_FRAME_KEY="$(uuidgen)" CL17_FRAME_PROBE_OUTPUT="${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}/frame-lifecycle.jsonl"; "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}/check-native-frame-lifecycle" --seed && "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}/check-native-frame-lifecycle" --relaunch
 // Run twice as separate processes: --seed then --relaunch. The standalone test
 // executable has its own preferences domain. Set CL17_FRAME_KEY to a fresh UUID
 // and CL17_FRAME_PROBE_OUTPUT to a private absolute JSONL path for both runs.

@@ -1,4 +1,5 @@
-// Compile: xcrun swiftc -swift-version 5 -parse-as-library Sources/ChecklistApp/Support/DetailOverlayInteraction.swift scripts/check-frame-observer-lifetime.swift -o /tmp/checklist-frame-observer-lifetime
+// Compile: bash scripts/compile-component.sh --scratch-path "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}" check-frame-observer-lifetime
+// Run: "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}/check-frame-observer-lifetime"
 // Isolated hidden native windows and a persistence spy; no user preferences.
 import AppKit
 import SwiftUI

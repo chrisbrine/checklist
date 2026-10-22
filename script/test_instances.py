@@ -752,7 +752,7 @@ def create(arguments, p):
         load(p)  # Do not replace unrelated directories.
     capture, manifest = stage_selection(arguments)
     identity = sign_identity(manifest)
-    if p['folder'].exists(): trash(p['folder'])
+    if p['folder'].exists(): destroy(p)
     p['folder'].mkdir(mode=0o700)
     metadata = {'slot': arguments.slot, 'build_id': manifest['build_id'], 'source_fingerprint': manifest['source_fingerprint'],
                 'stage_path': str(capture), 'seed': {'kind': 'incomplete'}, 'created_at': now(), 'mode': 'incomplete', 'checks': None}

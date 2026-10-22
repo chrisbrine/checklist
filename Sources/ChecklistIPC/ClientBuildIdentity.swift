@@ -45,9 +45,10 @@ public enum ClientBuildAdmission: Equatable {
 
 public enum ClientUpdateRequired {
     public static let code = "CLIENT_OUTDATED"
-    public static let message = "Checklist was updated. This connection runs an earlier Checklist build; no command ran. The MCP server switches to the installed build by itself; if this error repeats, reconnect the checklist MCP server."
+    public static let recoveryAction = "restart_mcp_server"
+    public static let message = "Checklist was updated. This connection runs an earlier Checklist build; no command ran. The MCP server tries the installed build automatically. If this error repeats, restart or reconnect the checklist MCP server using your Codex or Claude host's MCP controls, then retry the same request with its original command_id."
     public static var error: ChecklistError {
-        ChecklistError(code, message, details: ["command_outcome": "rejected", "command_executed": false])
+        ChecklistError(code, message, details: ["command_outcome": "rejected", "command_executed": false, "recovery_action": recoveryAction])
     }
 }
 
@@ -59,6 +60,6 @@ public final class OutdatedClientPeer: NSObject, ChecklistRPC {
 
     private static let response = try! JSONSerialization.data(withJSONObject: ["error": [
         "code": ClientUpdateRequired.code, "message": ClientUpdateRequired.message,
-        "details": ["command_outcome": "rejected", "command_executed": false]
+        "details": ClientUpdateRequired.error.details
     ]])
 }

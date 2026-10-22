@@ -57,6 +57,48 @@ extension CommandRouter {
         return totals
     }
 
+    /// Retention is transitive through captured links, whatever caused the hold.
+    /// Pending links also block unlink of their targets until the links are gone.
+    /// Rebuild this graph at each unlink boundary, including resumed old intents.
+    static func retainTicketObjectDeletionLinkTargets(_ objects: inout [JSON]) -> Set<String> {
+        var entries: [String:StorageSnapshotObject] = [:],closures: [Int:[String]] = [:]
+        var uncertainCaptures = Set<String>(),uncertainAll = false
+        func capturePrefix(_ path: String) -> String? {
+            guard let parts = try? StorageObjectFiles.parts(path),parts.count >= 5,parts[0] == "source-captures",parts[3] == "source" else {return nil}
+            return parts.prefix(4).joined(separator:"/")
+        }
+        for object in objects {
+            guard let path = object["relative_path"] as? String else {continue}
+            entries[path] = .init(relativePath:path,kind:object["kind"] as? String ?? "",expectedSHA256:object["sha256"] as? String,expectedSize:(object["size"] as? NSNumber)?.int64Value,executable:object["executable"] as? Bool == true,linkTarget:object["link_target"] as? String,authorities:[])
+        }
+        for index in objects.indices where objects[index]["kind"] as? String == "symlink" && ["pending","retained"].contains(objects[index]["state"] as? String ?? "") {
+            guard let path = objects[index]["relative_path"] as? String else {uncertainAll = true;continue}
+            do {
+                // An ambiguous or changed link may have a different live target.
+                // Its recorded chain alone cannot authorize deleting its capture.
+                guard !(objects[index]["reasons"] as? [String] ?? []).contains("ambiguous_identity"),objects[index]["last_failure"] as? String != "CLEANUP_IDENTITY_CHANGED" else {throw StorageSnapshotFailure.unsupportedAuthority}
+                closures[index] = try StorageSnapshotAuthority.capturedLinkClosure(path,entries:entries)
+            } catch {
+                if let capture = capturePrefix(path) {uncertainCaptures.insert(capture)} else {uncertainAll = true}
+            }
+        }
+        for index in objects.indices where objects[index]["state"] as? String == "pending" {
+            let capture = (objects[index]["relative_path"] as? String).flatMap(capturePrefix)
+            if uncertainAll || capture.map({uncertainCaptures.contains($0)}) == true {
+                objects[index]["state"] = "retained";objects[index]["reasons"] = ["link_closure_unavailable"]
+            }
+        }
+        var retainedTargets = Set<String>(),pendingTargets = Set<String>()
+        for (index,closure) in closures where objects[index]["state"] as? String == "retained" {retainedTargets.formUnion(closure.dropFirst())}
+        for index in objects.indices where objects[index]["state"] as? String == "pending" {
+            if let path = objects[index]["relative_path"] as? String,retainedTargets.contains(path) {
+                objects[index]["state"] = "retained";objects[index]["reasons"] = ["retained_link_target"]
+            }
+        }
+        for (index,closure) in closures where objects[index]["state"] as? String == "pending" {pendingTargets.formUnion(closure.dropFirst())}
+        return pendingTargets
+    }
+
     func ticketObjectDeletionPlan(_ db: Database, owned: [(String,JSON)], remaining: [JSON]) throws -> TicketObjectDeletionPlan {
         let files = try StorageObjectFiles(root:root)
         var objects: [String:JSON] = [:]
@@ -130,8 +172,9 @@ extension CommandRouter {
             }
             result.append(item)
         }
-        // Remove captured links before targets so a crash never leaves an owned
-        // dangling link in the remaining backup authority inventory.
+        _ = Self.retainTicketObjectDeletionLinkTargets(&result)
+        // The executor also checks pending dependencies before choosing an unlink;
+        // lexical link order alone cannot protect chains or retained links.
         result.sort {let a = $0["kind"] as? String == "symlink",b = $1["kind"] as? String == "symlink";return a != b ? a : ($0["stored_path"] as? String ?? "") < ($1["stored_path"] as? String ?? "")}
         return .init(objects:result)
     }

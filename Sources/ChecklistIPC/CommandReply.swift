@@ -32,6 +32,7 @@ public enum CommandReply {
             if code == ClientUpdateRequired.code {
                 details["command_outcome"] = "rejected"
                 details["command_executed"] = false
+                details["recovery_action"] = ClientUpdateRequired.recoveryAction
             }
             let uncertain = details["command_outcome"] as? String == "unknown" || ["OUTCOME_UNKNOWN", "INVALID_RESPONSE", "SERVICE_UNAVAILABLE", "COMMAND_FAILED"].contains(code)
             details["command_outcome"] = uncertain ? "unknown" : "rejected"

@@ -1,4 +1,5 @@
-// Compile: xcrun swiftc -swift-version 5 -parse-as-library Sources/ChecklistApp/Support/DetailOverlayInteraction.swift scripts/check-native-escape-routing.swift -o /tmp/checklist-native-escape-routing
+// Compile: bash scripts/compile-component.sh --scratch-path "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}" check-native-escape-routing
+// Run: "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}/check-native-escape-routing"
 // Isolated offscreen SwiftUI/native-event fixture; no Checklist service, drafts, preferences or user windows are changed.
 import AppKit
 import SwiftUI

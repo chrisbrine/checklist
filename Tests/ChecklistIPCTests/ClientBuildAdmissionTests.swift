@@ -38,6 +38,9 @@ final class ClientBuildAdmissionTests: XCTestCase {
                     let error = failure as? ChecklistError
                     XCTAssertEqual(error?.code, "CLIENT_OUTDATED")
                     XCTAssertEqual(error?.message, ClientUpdateRequired.message)
+                    XCTAssertTrue(error?.message.contains("Codex or Claude") == true)
+                    XCTAssertTrue(error?.message.contains("restart or reconnect the checklist MCP server") == true)
+                    XCTAssertEqual(error?.details["recovery_action"] as? String, "restart_mcp_server")
                     XCTAssertEqual(error?.details["command_executed"] as? Bool, false)
                     XCTAssertEqual(error?.details["command_outcome"] as? String, "rejected")
                     XCTAssertEqual(error?.details["command_id"] as? String, id)

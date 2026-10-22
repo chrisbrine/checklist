@@ -1,5 +1,5 @@
-// Compile alongside SettingsModalPresentation.swift, DetailOverlayInteraction.swift, DetailOverlayOpeningControl.swift and
-// Design.swift with its support files (TextScale.swift, DisplayCaches.swift, Canceled.swift, DisabledReason.swift).
+// Compile: bash scripts/compile-component.sh --scratch-path "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}" check-settings-modal
+// Run: "${CHECKLIST_COMPONENT_BUILD:-/tmp/checklist-components}/check-settings-modal"
 // Hidden native AppKit lifecycle fixture: never activates, orders, or attaches a real sheet.
 // Installed menu, visual layout, accessibility traversal, and file-dialog checks remain independent review work.
 import AppKit

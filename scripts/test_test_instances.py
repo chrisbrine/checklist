@@ -354,6 +354,65 @@ class DestroyCleanupTests(unittest.TestCase):
                                   for service, count in receipt['keychain_items_removed'].items()
                                   for _ in range(count + 1)])
 
+    def test_replace_cleans_exact_slot_names_before_copying_stage(self):
+        for number in range(1, 5):
+            with self.subTest(slot=number), self.slot(number) as state:
+                capture = state.home / 'stage'
+                manifest = {'build_id': 'replacement', 'source_fingerprint': 'replacement-inputs',
+                            'signing_profile': {}}
+                cleanup_run = harness.run
+                def run(command, **kwargs):
+                    if command[0] in ['security', 'defaults']:
+                        return cleanup_run(command, **kwargs)
+                    if command[0] == 'ditto':
+                        self.assertTrue(all(count == 0 for count in state.counts.values()))
+                        self.assertTrue(all(not (state.preferences / (domain + '.plist')).exists()
+                                            for domain in state.domains))
+                        self.assertFalse(state.saved.exists())
+                        self.assertTrue(all((state.preferences / (domain + '.plist')).read_text() == 'fixture'
+                                            for domain in state.preserved))
+                        self.assertTrue(all(folder.is_dir() for folder in state.preserved_state))
+                        receipt = json.loads(state.output.getvalue().split('Destroy receipt: ')[1].splitlines()[0])
+                        self.assertEqual(receipt, {
+                            'slot': number, 'keychain_items_removed': {
+                                state.p['keychain']: 1, f'Checklist.Test{number}.HumanClaim': 2},
+                            'preference_domains_removed': sorted(state.domains),
+                            'preference_domains_missing': [], 'preference_domains_removed_count': 2,
+                            'trashed': [str(state.saved), str(state.p['folder'])], 'trashed_count': 2})
+                        info = state.p['bundle'] / 'Contents/Info.plist'
+                        info.parent.mkdir(parents=True)
+                        info.write_bytes(plistlib.dumps({'CFBundleIdentifier': 'org.checklist.app'}))
+                    else:
+                        self.assertEqual(command[0], 'codesign')
+                    return SimpleNamespace(returncode=0, stdout='', stderr='')
+                with patch.object(harness, 'stopped'), \
+                     patch.object(harness, 'stage_selection', return_value=(capture, manifest)), \
+                     patch.object(harness, 'sign_identity', return_value='-'), \
+                     patch.object(harness, 'signing_teams'), patch.object(harness, 'run', side_effect=run):
+                    harness.create(SimpleNamespace(slot=number, replace=True, seed='empty'), state.p)
+                self.assertEqual(harness.load(state.p)['build_id'], 'replacement')
+                self.assertEqual(len(list((state.home / '.Trash').iterdir())), 2)
+
+    def test_replace_cleanup_failure_preserves_slot_and_never_copies_stage(self):
+        with self.slot() as state, patch.object(harness, 'stopped'), \
+             patch.object(harness, 'stage_selection', return_value=(state.home / 'stage', {})), \
+             patch.object(harness, 'sign_identity', return_value='-'), \
+             patch.object(harness, 'run', return_value=SimpleNamespace(
+                 returncode=36, stdout='', stderr='Keychain unavailable')) as run:
+            with self.assertRaisesRegex(ValueError, 'Keychain unavailable'):
+                harness.create(SimpleNamespace(slot=4, replace=True, seed='empty'), state.p)
+            self.assertTrue(state.p['folder'].is_dir())
+            self.assertEqual(harness.load(state.p), {'slot': 4})
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0][0], 'security')
+
+    def test_existing_slot_without_replace_never_cleans_names(self):
+        with self.slot() as state, patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection') as stage:
+            with self.assertRaisesRegex(ValueError, 'Slot exists'):
+                harness.create(SimpleNamespace(slot=4, replace=False, seed='empty'), state.p)
+            self.assertEqual(state.calls, [])
+            stage.assert_not_called(); state.stopped.assert_not_called()
+
     def test_missing_items_and_repeated_destroy_are_fine(self):
         with self.slot(populated=False) as state:
             first = harness.destroy(state.p)
