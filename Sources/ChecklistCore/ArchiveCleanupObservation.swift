@@ -66,7 +66,7 @@ extension CommandRouter {
                 UNION SELECT CAST(value AS BLOB) FROM json_each(?,'$.tokens')
             )
             SELECT CAST(r.id AS BLOB) source,CAST(ref.atom AS BLOB) target,
-                   CASE WHEN r.type='storage_job' AND json_extract(r.data,'$.kind') IN ('attachment_import','archive_cleanup_delete','archive_cleanup_cursor') THEN 0 ELSE 1 END transitive
+                   CASE WHEN r.type='storage_job' AND json_extract(r.data,'$.kind') IN ('attachment_import','archive_cleanup_delete','archive_cleanup_cursor','ticket_object_delete') THEN 0 ELSE 1 END transitive
             FROM records r,json_tree(r.data) ref
             WHERE r.type NOT IN (\(excluded)) AND ref.type='text'
                 AND CAST(ref.atom AS BLOB) IN (SELECT token FROM tokens)

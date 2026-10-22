@@ -80,7 +80,7 @@ extension CommandRouter {
         }
         var claims: [JSON] = []
         for member in members {
-            var input: JSON = ["project_id":pid,"task_id":member["task_id"]!,"expected_revision":member["task_revision"]!,"phase":batch["phase"]!,"policy_revision":batch["policy_revision"]!,"file_scopes":(member["file_scopes"] as? [JSON] ?? []).map {$0.filter {["path","access"].contains($0.key)}},"lane_scopes":member["lane_scopes"] ?? []]
+            var input: JSON = ["project_id":pid,"task_id":member["task_id"]!,"expected_revision":member["task_revision"]!,"phase":batch["phase"]!,"policy_revision":batch["policy_revision"]!,"file_scopes":(member["file_scopes"] as? [JSON] ?? []).map {$0.filter {["path","access","declared_path"].contains($0.key)}},"lane_scopes":member["lane_scopes"] ?? []]
             for key in ["review_request_id","target_manifest_id","gate"] { if let value = member[key] { input[key] = value } }
             var claim = try work(db,input,c,"work_claim",operation:.triage)
             var stored = try scoped(db,claim["id"] as! String,pid,type:"attempt");stored["batch_id"] = batch["id"];stored["batch_digest"] = batch["digest"];try save(db,stored,type:"attempt")

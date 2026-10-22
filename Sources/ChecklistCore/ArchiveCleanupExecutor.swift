@@ -29,15 +29,33 @@ enum ArchiveStorageGate {
 }
 
 extension ArchiveStoragePermit {
-    /// Only the exact managed original's directory entry is removed; never a
-    /// followed symlink, directory, source file or preview. Lengths are logical.
-    fileprivate func removeOriginal(relative: String,sha256: String,size: Int64) throws -> Bool {
-        guard relative.hasPrefix("objects/") else { throw CoreError("CLEANUP_PATH_REFUSED", "Cleanup only removes managed original objects.") }
-        let (directory,name) = try files.parent(relative);defer { Darwin.close(directory) }
+    /// The sole unlink path. Archive callers admit originals only; durable ticket
+    /// intents also admit exact previews, capture files, sidecars and link text.
+    /// No directory, followed link, external original or workspace is admitted.
+    fileprivate func removeOriginal(relative: String,sha256: String,size: Int64,capturedSource: Bool = false,linkTarget: String? = nil) throws -> Bool {
+        try requireRoot(files.root)
+        let parts = try StorageObjectFiles.parts(relative)
+        let source = capturedSource && parts.count >= 4 && parts[0] == "source-captures" && (parts[3] == "source" && parts.count >= 5 || parts.count == 4 && parts[3] == "manifest.json")
+        guard size >= 0,sha256.range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil,
+              relative.hasPrefix("objects/") && linkTarget == nil || source else { throw CoreError("CLEANUP_PATH_REFUSED", "Cleanup requires an exact managed object descriptor.") }
+        let directory: Int32,name: String
+        do {(directory,name) = try files.parent(relative)} catch {if errno == ENOENT {return false};throw error}
+        defer { Darwin.close(directory) }
+        var originalFD: Int32 = -1
+        defer {if originalFD >= 0 {Darwin.close(originalFD)}}
+        if let linkTarget {
+            var before = stat(),after = stat()
+            if fstatat(directory,name,&before,AT_SYMLINK_NOFOLLOW) != 0,errno == ENOENT {return false}
+            guard before.st_mode & S_IFMT == S_IFLNK,Int64(linkTarget.utf8.count) == size,StorageObjectFiles.sha(Data(linkTarget.utf8)) == sha256 else {throw CoreError("CLEANUP_IDENTITY_CHANGED","Captured link identity changed; bytes were retained.")}
+            var buffer = [UInt8](repeating:0,count:65536)
+            let count = readlinkat(directory,name,&buffer,buffer.count)
+            guard count >= 0,Data(buffer.prefix(count)) == Data(linkTarget.utf8),fstatat(directory,name,&after,AT_SYMLINK_NOFOLLOW) == 0,
+                  before.st_dev == after.st_dev,before.st_ino == after.st_ino,before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec,before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec else {throw CoreError("CLEANUP_IDENTITY_CHANGED","Captured link changed during verification; bytes were retained.")}
+        } else {
         let fd = openat(directory,name,O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         if fd < 0,errno == ENOENT { return false }
         guard fd >= 0 else { throw CoreError("CLEANUP_OBJECT_UNAVAILABLE", "The original could not be opened safely.") }
-        defer { Darwin.close(fd) }
+        originalFD = fd
         var before = stat();guard fstat(fd,&before) == 0,before.st_mode & S_IFMT == S_IFREG,before.st_size == size else { throw CoreError("CLEANUP_IDENTITY_CHANGED", "Original identity changed; bytes were retained.") }
         var hasher = SHA256(),buffer = [UInt8](repeating:0,count:65_536),counted: Int64 = 0
         while true {
@@ -54,6 +72,7 @@ extension ArchiveStoragePermit {
               before.st_dev == after.st_dev,before.st_ino == after.st_ino,before.st_size == after.st_size,
               before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec,before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
               entry.st_mode & S_IFMT == S_IFREG,entry.st_dev == after.st_dev,entry.st_ino == after.st_ino else { throw CoreError("CLEANUP_IDENTITY_CHANGED", "Original changed during verification; bytes were retained.") }
+        }
         guard unlinkat(directory,name,0) == 0,fsync(directory) == 0 else { throw CoreError("CLEANUP_IO", "Cleanup needs reconciliation before its outcome can be confirmed.") }
         return true
     }
@@ -170,8 +189,61 @@ extension CommandRouter {
             let deadline = try Int64.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.not_before_ms') AS INTEGER)) FROM records WHERE type='cleanup_job' AND json_valid(data) AND json_extract(data,'$.state') IN ('queued','ready')")
             let expiry = try Double.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.expires_at') AS REAL)) FROM records WHERE type='storage_hold' AND json_valid(data) AND json_extract(data,'$.state')='active' AND CAST(json_extract(data,'$.expires_at') AS REAL)>?",arguments:[Date().timeIntervalSince1970])
             let more = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records j,json_each(j.data,'$.items') i WHERE j.type='cleanup_job' AND json_valid(j.data) AND json_extract(j.data,'$.state')='held' AND (json_extract(i.value,'$.state')='waiting' OR json_extract(i.value,'$.same_failure_count')=1))") ?? false
-            let next = [deadline.map { max($0,nowMS + 50) },expiry.map { Int64($0 * 1000) },more ? nowMS + 1000 : nil].compactMap {$0}.min()
+            let deletionPending = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE type='storage_job' AND json_valid(data) AND json_extract(data,'$.kind')='ticket_object_delete' AND json_extract(data,'$.state')='pending')") ?? false
+            let next = [deletionPending ? nowMS + 50 : nil,deadline.map { max($0,nowMS + 50) },expiry.map { Int64($0 * 1000) },more ? nowMS + 1000 : nil].compactMap {$0}.min()
             return next.map { Date(timeIntervalSince1970:Double($0)/1000) }
         }
+    }
+}
+
+
+extension CommandRouter {
+    /// Shares archive cleanup's object gate, durable admission, final writer
+    /// checks and sole verified unlink. At most one object per continuation.
+    func processTicketObjectDeletionIntents(_ db: Database,permit: ArchiveStoragePermit) throws {
+        try permit.requireRoot(root)
+        guard !db.isInsideTransaction else {throw CoreError("CLEANUP_TRANSACTION_REQUIRED","Run object deletion after the semantic transaction commits.")}
+        guard let raw = try Row.fetchOne(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND json_valid(data) AND json_extract(data,'$.kind')='ticket_object_delete' AND json_extract(data,'$.state')='pending' ORDER BY rowid LIMIT 1") else {return}
+        let receipt = try GRDBRecordEnvelopeAdapter.decode(raw).object
+        guard let objects = receipt["objects"] as? [JSON],objects.count <= 100000,let index = objects.firstIndex(where: {$0["state"] as? String == "pending"}) else {throw CoreError("CLEANUP_INTENT_INVALID","The deletion intent requires repair; bytes retained.")}
+        let object = objects[index]
+        do {
+            try withValidatedDomainTransaction(db) {
+                let references = try TicketObjectDeletionReferenceIndex(self.archiveCleanupReferenceRows(db))
+                let mediaAuthorityComplete = (try? MediaRecordRegistry.validate(MediaRecordRegistry.envelopes(db))) != nil
+                let holds = try self.ticketObjectDeletionHolds(db,object:object,references:references,backup:try? self.storageBackupRetentionIndex(db),mediaAuthorityComplete:mediaAuthorityComplete)
+                var result = object
+                if !holds.isEmpty {result["state"] = "retained";result["reasons"] = holds.sorted()}
+                else {
+                    guard let relative = object["relative_path"] as? String,let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value,
+                          object["kind"] as? String == "file" || object["kind"] as? String == "symlink" else {throw CoreError("CLEANUP_INTENT_INVALID","The deletion descriptor requires repair; bytes retained.")}
+                    let removed = try permit.removeOriginal(relative:relative,sha256:sha,size:size,capturedSource:relative.hasPrefix("source-captures/"),linkTarget:object["link_target"] as? String)
+                    result["state"] = removed ? "removed" : "already_missing"
+                }
+                try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,index:index,result:result)
+                return .commit
+            }
+        } catch {
+            // SQL may roll back after unlink. Keep the admitted descriptor and
+            // retry absence; never claim that an already absent file was deleted.
+            try withValidatedDomainTransaction(db) {
+                var result = object
+                let failures = int(object,"failures") + 1
+                result["failures"] = failures
+                result["last_failure"] = (error as? CoreError)?.code ?? "CLEANUP_UNAVAILABLE"
+                if failures >= 2 {result["state"] = "retained";result["reasons"] = [result["last_failure"]!]}
+                try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,index:index,result:result)
+                return .commit
+            }
+        }
+    }
+
+    private func saveTicketObjectDeletionOutcome(_ db: Database,receipt: JSON,index: Int,result: JSON) throws {
+        var receipt = receipt,objects = receipt["objects"] as! [JSON]
+        objects[index] = result;receipt["objects"] = objects
+        receipt["summary"] = Self.ticketObjectDeletionSummary(objects)
+        receipt["state"] = objects.contains {$0["state"] as? String == "pending"} ? "pending" : "completed"
+        receipt["checked_at"] = now()
+        try save(db,revised(receipt),type:"storage_job")
     }
 }

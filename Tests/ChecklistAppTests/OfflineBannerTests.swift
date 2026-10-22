@@ -31,6 +31,7 @@ import ChecklistIPC
         XCTAssertTrue(store.connected)
         XCTAssertFalse(store.showsOfflineBanner, "Reconnection clears the banner")
         XCTAssertNil(store.error)
+        XCTAssertNil(store.lastServiceFailure, "Accepted reads clear the technical outage")
     }
 
     /// The production loop: the first read and its retry fail, then the service answers waits again with no
@@ -73,6 +74,7 @@ import ChecklistIPC
         XCTAssertTrue(store.connected)
         XCTAssertFalse(store.showsOfflineBanner, "The banner goes away without a changed event or a Retry click")
         XCTAssertNil(store.error)
+        XCTAssertNil(store.lastServiceFailure, "Accepted reads clear the technical outage")
     }
 }
 

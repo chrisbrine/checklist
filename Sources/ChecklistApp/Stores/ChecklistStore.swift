@@ -287,7 +287,9 @@ final class ChecklistStore: ObservableObject {
                 scheduleSelectedEligibility(for:detail)
             } catch {
                 guard selectedRecordsReadID == readID,selectedTicketReadID == contextID,isSelectedTicket(id) else {return}
-                selectedRecordsLoading = false;selectedRecordsError = "Could not load work/review records for this observed ticket context. Refresh the selected ticket before retrying; your draft is preserved."
+                selectedRecordsLoading = false
+                if isReadCancellation(error) { return }
+                selectedRecordsError = "Could not load work/review records for this observed ticket context. Refresh the selected ticket before retrying; your draft is preserved."
             }
         }
     }
@@ -299,7 +301,7 @@ final class ChecklistStore: ObservableObject {
         guard case .task(let id) = selection else {selectedTicketDisplay = nil;fullSelectedRecordID = nil;selectedRecordCollections = [:];selectedRecordsLoading = false;selectedRecordsError = nil;selectedTicketLoading = false;return}
         if selectedTicketDisplay.map({RecordIdentity($0.task.id) != RecordIdentity(id)}) ?? true {selectedTicketDisplay = nil;fullSelectedRecordID = nil;selectedRecordCollections = [:];selectedRecordsLoading = false;selectedRecordsError = nil}
         guard startedLiveUpdates else {return}
-        let readID = selectedTicketReadID
+        let readID = selectedTicketReadID, recordsReadID = selectedRecordsReadID
         selectedTicketLoading = true;selectedTicketError = nil;selectedTicketMissing = false
         selectedTicketRead = Task { [weak self] in
             guard let self else {return}
@@ -325,13 +327,18 @@ final class ChecklistStore: ObservableObject {
                     self.invalidateSelectedEligibility()
                 }
                 self.scopedReadGeneration = UUID()
-                self.selectedTicketDisplay = value;self.selectedTicketLoading = false;self.connected = true
+                self.selectedTicketDisplay = value;self.selectedTicketLoading = false;self.acceptServiceRead()
                 if changedStore {self.scheduleTicketPage(force:true)}
                 if self.fullSelectedRecordLoaded(id) {self.loadFullSelectedRecord(id)}
                 self.scheduleSelectedEligibility(for:self.detail)
             } catch {
-                guard !Task.isCancelled,self.selectedTicketReadID == readID else {return}
-                self.selectedTicketLoading = false;self.selectedTicketError = "Could not load the selected ticket. Your draft is preserved."
+                guard self.selectedTicketReadID == readID else {return}
+                self.selectedTicketLoading = false
+                if self.isReadCancellation(error) {
+                    if self.selectedRecordsReadID == recordsReadID {self.selectedRecordsLoading = false}
+                    return
+                }
+                self.selectedTicketError = "Could not load the selected ticket. Your draft is preserved."
                 // A removed ticket (for example from an old desktop alert) shows the unavailable state (CL-59).
                 self.selectedTicketMissing = (error as? ChecklistError)?.code == "NOT_FOUND"
             }
@@ -388,15 +395,15 @@ final class ChecklistStore: ObservableObject {
         let query = ticketPageQuery
         guard force || ticketPages.query != query || (ticketPages.page == nil && !ticketPages.loading) else { return }
         ticketPageRead?.cancel()
-        ticketPageRead = Task { [weak self] in await self?.readTicketPage(query: query, cursor: cursor) }
+        ticketPageRead = Task { [weak self] in _ = await self?.readTicketPage(query: query, cursor: cursor) }
     }
-    private func readTicketPage(query: TicketPageQuery, cursor: String?) async {
+    @discardableResult private func readTicketPage(query: TicketPageQuery, cursor: String?) async -> Bool {
         let observed = ticketPages.begin(query: query, cursor: cursor)
         let readID = UUID(); ticketPageReadID = readID
         pagedTicketWorkspace = ticketPages.prepared(expansion: ticketExpansion)
         do {
             let result = try await request("task_list", query.parameters(cursor: cursor))
-            guard !Task.isCancelled, ticketPageReadID == readID, usesTicketPages, ticketPageQuery == query else { return }
+            guard !Task.isCancelled, ticketPageReadID == readID, usesTicketPages, ticketPageQuery == query else { return false }
             let page = try TicketPage(response: result)
             let oldIncarnation = storeIncarnation
             let changedStore = !oldIncarnation.isEmpty && oldIncarnation != page.service.string("store_incarnation")
@@ -405,17 +412,20 @@ final class ChecklistStore: ObservableObject {
                 invalidateSelectedTicketFreshness()
                 invalidateSelectedEligibility()
             }
-            guard ticketPages.receive(page, for: observed) else { return }
+            guard ticketPages.receive(page, for: observed) else { return false }
             ticketCatalog.install(page)
             scopedReadGeneration = UUID()
             pagedTicketWorkspace = ticketPages.prepared(expansion: ticketExpansion)
-            if !connected {connected = true}
+            acceptServiceRead()
             if eventCursor == nil {eventCursor = result["event_cursor"] as? String ?? page.contentCursor}
             if changedStore {scheduleSelectedTicket(for:detail)}
         } catch {
-            guard !Task.isCancelled, ticketPageReadID == readID else { return }
+            if isReadCancellation(error) { ticketPages.cancel(observed); return false }
+            guard ticketPageReadID == readID else { return false }
+            connectionAttempted = true
             ticketPages.fail(observed)
         }
+        return !Task.isCancelled
     }
     func readRecordHistory(_ task:Record,family:String,cursor:String? = nil) {
         guard let display=selectedTicketDisplay,RecordIdentity(display.task.id)==RecordIdentity(task.id),selectedTicketCurrent(task.id) else{return}
@@ -430,7 +440,7 @@ final class ChecklistStore: ObservableObject {
                 let response=try await self.request("task_context",p)
                 guard !Task.isCancelled,self.selectedTicketReadID==contextID,self.isSelectedTicket(task.id) else{return}
                 _=try self.recordHistoryObservation.receive(response,query:query,generation:generation)
-            } catch {if !Task.isCancelled {self.recordHistoryObservation.fail(generation)}}
+            } catch {if self.isReadCancellation(error) {self.recordHistoryObservation.cancel(generation)} else {self.recordHistoryObservation.fail(generation)}}
         }
     }
     private var workspaceQuery: WorkspacePageQuery {
@@ -490,7 +500,7 @@ final class ChecklistStore: ObservableObject {
             }
             guard due else { return }
             overviewRead?.cancel(); overviewPending = []
-            overviewRead = Task { [weak self] in await self?.readOverviewGroups() }
+            overviewRead = Task { [weak self] in _ = await self?.readOverviewGroups() }
             return
         }
         let due = shownOverviewSurfaces.filter { surface in
@@ -516,12 +526,13 @@ final class ChecklistStore: ObservableObject {
         overviewObservations.keys.sorted().filter { overviewFocus == nil || overviewFocus == $0 || $0 == "human_tasks" }
     }
     func moveOverviewPage(_ surface: String, cursor: String) { scheduleOverviewNeeds(cursor: cursor, only: surface, force: true) }
-    private func readOverviewNeeds() async {
+    @discardableResult private func readOverviewNeeds() async -> Bool {
         overviewRead?.cancel(); overviewPending = []
-        if overviewFocus == nil { await readOverviewGroups(); return }
-        for surface in shownOverviewSurfaces { await readOverviewNeed(surface, cursor: nil) }
+        if overviewFocus == nil { return await readOverviewGroups() }
+        for surface in shownOverviewSurfaces { guard await readOverviewNeed(surface, cursor: nil) else { return false } }
+        return !Task.isCancelled
     }
-    private func readOverviewGroups() async {
+    @discardableResult private func readOverviewGroups() async -> Bool {
         let surfaces = shownOverviewSurfaces
         var started: [String: (query: WorkspacePageQuery, generation: UUID)] = [:]
         for surface in surfaces { let query = overviewQuery(surface); started[surface] = (query, overviewObservations[surface]!.begin(query)) }
@@ -529,42 +540,50 @@ final class ChecklistStore: ObservableObject {
         params["project_id"] = projectID
         do {
             let response = try await request("workspace_page", params)
-            guard !Task.isCancelled, page == .overview else { return }
+            guard !Task.isCancelled, page == .overview else { return false }
             let groups = response["groups"] as? [String: [String: Any]] ?? [:]
-            var stale = false
+            var stale = false, accepted = false
             for surface in surfaces {
                 guard let (query, generation) = started[surface], let observation = overviewObservations[surface] else { continue }
-                guard overviewQuery(surface) == query else { observation.cancel(); stale = true; continue }
+                guard overviewQuery(surface) == query else { observation.cancel(generation); stale = true; continue }
                 guard let group = groups[surface] else { observation.fail(generation); continue }
-                do { if try observation.receive(group, query: query, generation: generation), let installed = observation.page { ticketCatalog.install(workspace: installed) } }
+                do { if try observation.receive(group, query: query, generation: generation), let installed = observation.page { ticketCatalog.install(workspace: installed); accepted = true } }
                 catch { observation.fail(generation) }
             }
             if let requests = overviewObservations["requests"]?.page, let owned = overviewObservations["human_tasks"]?.page,
                ticketCatalog.needsCount != requests.total + owned.total { ticketCatalog.needsCount = requests.total + owned.total }
-            connected = true
-            if eventCursor == nil { eventCursor = response["event_cursor"] as? String ?? (response["content_cursor"] as? String) }
+            if accepted {
+                acceptServiceRead()
+                if eventCursor == nil { eventCursor = response["event_cursor"] as? String ?? (response["content_cursor"] as? String) }
+            }
             // The window's scope changed while the read ran: read again instead of leaving groups loading.
             if stale { scheduleOverviewNeeds(force: true) }
         } catch {
-            guard !Task.isCancelled else { return }
+            if isReadCancellation(error) {
+                for (surface, value) in started { overviewObservations[surface]?.cancel(value.generation) }
+                return false
+            }
+            connectionAttempted = true
             for (surface, value) in started { overviewObservations[surface]?.fail(value.generation) }
         }
+        return !Task.isCancelled
     }
-    private func readOverviewNeed(_ surface: String, cursor: String?) async {
+    @discardableResult private func readOverviewNeed(_ surface: String, cursor: String?) async -> Bool {
         let query = overviewQuery(surface), observation = overviewObservations[surface]!, generation = observation.begin(query)
         do {
             let response = try await request("workspace_page", query.parameters(cursor: cursor))
-            guard !Task.isCancelled, page == .overview else { return }
+            guard !Task.isCancelled, page == .overview else { return false }
             // The window's scope changed while this read ran: read the group again instead of leaving it loading.
-            guard overviewQuery(surface) == query else { observation.cancel(); scheduleOverviewNeeds(only: surface, force: true); return }
+            guard overviewQuery(surface) == query else { observation.cancel(generation); scheduleOverviewNeeds(only: surface, force: true); return false }
             if try observation.receive(response, query: query, generation: generation), let installed = observation.page {
                 ticketCatalog.install(workspace: installed)
                 if let requests = overviewObservations["requests"]?.page, let owned = overviewObservations["human_tasks"]?.page,
                    ticketCatalog.needsCount != requests.total + owned.total { ticketCatalog.needsCount = requests.total + owned.total }
-                connected = true
+                acceptServiceRead()
                 if eventCursor == nil { eventCursor = response["event_cursor"] as? String ?? installed.contentCursor }
             }
-        } catch { if !Task.isCancelled { observation.fail(generation) } }
+        } catch { if isReadCancellation(error) { observation.cancel(generation); return false } else { connectionAttempted = true; observation.fail(generation) } }
+        return !Task.isCancelled
     }
     func retryWorkspacePage() {scheduleWorkspacePage(force:true)}
     private func scheduleWorkspacePage(cursor:String? = nil,force:Bool=false) {
@@ -572,26 +591,28 @@ final class ChecklistStore: ObservableObject {
         if page == .overview {scheduleOverviewNeeds(force:force);return}
         guard force || workspaceObservation.query != workspaceQuery || workspaceObservation.page == nil && !workspaceObservation.loading else{return}
         workspaceRead?.cancel()
-        workspaceRead=Task {[weak self] in await self?.readWorkspacePage(cursor:cursor)}
+        workspaceRead=Task {[weak self] in _ = await self?.readWorkspacePage(cursor:cursor)}
     }
-    private func readWorkspacePage(cursor:String?) async {
+    @discardableResult private func readWorkspacePage(cursor:String?) async -> Bool {
         let query=workspaceQuery,id=workspaceObservation.begin(workspaceQuery)
         do {
             let response=try await request("workspace_page",query.parameters(cursor:cursor))
-            guard !Task.isCancelled,!usesTicketPages,workspaceQuery==query else{return}
+            guard !Task.isCancelled,!usesTicketPages,workspaceQuery==query else{return false}
             if try workspaceObservation.receive(response,query:query,generation:id) {
-                connected=true;if eventCursor == nil {eventCursor=response["event_cursor"] as? String ?? workspaceObservation.page?.contentCursor}
+                acceptServiceRead();if eventCursor == nil {eventCursor=response["event_cursor"] as? String ?? workspaceObservation.page?.contentCursor}
             }
-        } catch {if !Task.isCancelled {workspaceObservation.fail(id)}}
+        } catch {if isReadCancellation(error) {workspaceObservation.cancel(id);return false} else {connectionAttempted = true;workspaceObservation.fail(id)}}
+        return !Task.isCancelled
     }
     private func scheduleOtherDetail(for detail:Detail?) {
         let taskQuery=groupTasksObservation.query,candidateQuery=groupCandidatesObservation.query
-        otherDetailRead?.cancel();otherDetailObservation.cancel(clear:true)
-        groupTasksRead?.cancel();groupTasksObservation.cancel(clear:true)
-        groupCandidatesRead?.cancel();groupCandidatesObservation.cancel(clear:true)
-        guard startedLiveUpdates,let detail else{return}
-        let id:String
-        switch detail {case .request(let value),.group(let value),.project(let value):id=value;case .task:return}
+        let id:String?
+        switch detail {case .request(let value),.group(let value),.project(let value):id=value;default:id=nil}
+        let sameRecord=id.map {RecordIdentity($0)==otherDetailObservation.query.map {RecordIdentity($0.record)}} ?? false
+        otherDetailRead?.cancel();otherDetailObservation.cancel(clear:!sameRecord)
+        groupTasksRead?.cancel();groupTasksObservation.cancel(clear:!sameRecord)
+        groupCandidatesRead?.cancel();groupCandidatesObservation.cancel(clear:!sameRecord)
+        guard startedLiveUpdates,let detail,let id else{return}
         let query=WorkspacePageQuery(surface:"record",project:nil,record:id)
         let generation=otherDetailObservation.begin(query)
         otherDetailRead=Task {[weak self] in
@@ -603,7 +624,7 @@ final class ChecklistStore: ObservableObject {
                     if let taskQuery,RecordIdentity(taskQuery.record)==RecordIdentity(group.id) {self.loadGroupTasks(group,closed:taskQuery.archived)}
                     if let candidateQuery,RecordIdentity(candidateQuery.record)==RecordIdentity(group.id) {self.loadGroupCandidates(group,closed:candidateQuery.archived)}
                 }
-            } catch {if !Task.isCancelled {self.otherDetailObservation.fail(generation)}}
+            } catch {if self.isReadCancellation(error) {self.otherDetailObservation.cancel(generation)} else {self.otherDetailObservation.fail(generation)}}
         }
     }
     func retryOtherDetail() {scheduleOtherDetail(for:detail)}
@@ -614,7 +635,7 @@ final class ChecklistStore: ObservableObject {
         groupTasksRead=Task {[weak self] in
             guard let self else{return}
             do {let value=try await self.request("workspace_page",query.parameters(cursor:cursor));guard !Task.isCancelled,self.detail == .group(group.id) else{return};_=try self.groupTasksObservation.receive(value,query:query,generation:generation)}
-            catch {if !Task.isCancelled {self.groupTasksObservation.fail(generation)}}
+            catch {if self.isReadCancellation(error) {self.groupTasksObservation.cancel(generation)} else {self.groupTasksObservation.fail(generation)}}
         }
     }
     func loadGroupCandidates(_ group:Record,closed:Bool,cursor:String? = nil) {
@@ -624,7 +645,7 @@ final class ChecklistStore: ObservableObject {
         groupCandidatesRead=Task {[weak self] in
             guard let self else{return}
             do {let value=try await self.request("workspace_page",query.parameters(cursor:cursor));guard !Task.isCancelled,self.detail == .group(group.id) else{return};_=try self.groupCandidatesObservation.receive(value,query:query,generation:generation)}
-            catch {if !Task.isCancelled {self.groupCandidatesObservation.fail(generation)}}
+            catch {if self.isReadCancellation(error) {self.groupCandidatesObservation.cancel(generation)} else {self.groupCandidatesObservation.fail(generation)}}
         }
     }
 
@@ -845,17 +866,27 @@ final class ChecklistStore: ObservableObject {
         return reply
     }
 
+    /// Cancellation is a caller/read lifecycle event, never service health evidence.
+    private func isReadCancellation(_ error: Error) -> Bool {
+        error is CancellationError || Task.isCancelled
+    }
+    private func acceptServiceRead() {
+        connected = true; connectionAttempted = true; lastServiceFailure = nil
+    }
+    private func recordServiceOutage(_ error: Error) {
+        connected = false; connectionAttempted = true; lastServiceFailure = error.localizedDescription
+    }
+
     func refresh(quiet: Bool = false) async {
         archivePreviewEpoch = UUID()
-        defer { connectionAttempted = true }
         if usesTicketPages {
             ticketPageRead?.cancel()
-            await readTicketPage(query: ticketPageQuery, cursor: nil)
+            guard await readTicketPage(query: ticketPageQuery, cursor: nil) else { return }
             if case .task(let id) = detail {
                 scheduleSelectedTicket(for:detail)
             } else if detail != nil {scheduleOtherDetail(for:detail)}
         } else {
-            if page == .overview { await readOverviewNeeds() } else { await readWorkspacePage(cursor:nil) }
+            if page == .overview { guard await readOverviewNeeds() else { return } } else { guard await readWorkspacePage(cursor:nil) else { return } }
             if case .task = detail {scheduleSelectedTicket(for:detail)} else {scheduleOtherDetail(for:detail)}
         }
     }
@@ -868,10 +899,11 @@ final class ChecklistStore: ObservableObject {
         invalidateSelectedEligibility()
         guard !refreshing else { return }
         refreshing = true
+        var canceledRead = false
         if !quiet { loading = true }
         defer {
             refreshing = false; loading = false
-            if connected && !Task.isCancelled { scheduleSelectedEligibility(for: detail) }
+            if connected && !canceledRead && !Task.isCancelled { scheduleSelectedEligibility(for: detail) }
         }
         repeat {
             refreshRequested = false
@@ -895,12 +927,10 @@ final class ChecklistStore: ObservableObject {
                 loadTaskView()
                 eventCursor = snapshot["event_cursor"] as? String ?? snapshot["cursor"] as? String ?? (data["cursor"] as? String) ?? eventCursor
                 if let projectID, !projects.contains(where: { $0.id == projectID }) { self.projectID = nil }
-                connected = true
+                acceptServiceRead()
             } catch {
-                connected = false
-                // The offline banner reports the outage once; retries never raise the alert again.
-                lastServiceFailure = error.localizedDescription
-                connectionAttempted = true
+                guard !isReadCancellation(error) else { canceledRead = true; return }
+                recordServiceOutage(error)
                 return
             }
         } while refreshRequested && !Task.isCancelled
@@ -1012,10 +1042,11 @@ final class ChecklistStore: ObservableObject {
         let otherTask=selectedOther?.object("selected_task")["id"] as? String
         let otherAffected=selectedOther != nil && (reset || rows.contains {inProject($0,selectedOther?.string("project_id")) && (selectedOther?.string("record_type")=="group" ? !families($0).isDisjoint(with:["all","groups","tasks"]) : touches($0,task:otherTask))})
         if selectedAffected {invalidateSelectedTicketFreshness();invalidateSelectedEligibility()}
-        if usesTicketPages && ticketAffected {ticketPageRead?.cancel();await readTicketPage(query:ticketPageQuery,cursor:nil)}
+        if usesTicketPages && ticketAffected {ticketPageRead?.cancel();guard await readTicketPage(query:ticketPageQuery,cursor:nil) else {return}}
         else if !usesTicketPages && workspaceAffected {
-            if page == .overview {await readOverviewNeeds()} else {workspaceRead?.cancel();await readWorkspacePage(cursor:nil)}
+            if page == .overview {guard await readOverviewNeeds() else {return}} else {workspaceRead?.cancel();guard await readWorkspacePage(cursor:nil) else {return}}
         }
+        guard !Task.isCancelled else { return }
         if selectedAffected {scheduleSelectedTicket(for:detail)}
         if otherAffected {scheduleOtherDetail(for:detail)}
         if let cursor=changes["event_cursor"] as? String {eventCursor=cursor}
@@ -1050,14 +1081,19 @@ final class ChecklistStore: ObservableObject {
                 // installs sets connected, which removes the offline banner and allows writes again,
                 // even when no event changed (CL-60).
                 if !connected { await refresh(quiet: true) }
+                try Task.checkCancellation()
                 if changes["changed"] as? Bool == true {
                     NativeRenderMetrics.changeObserved()
                     await applyChangeCoverage(changes)
                 }
                 try await Task.sleep(nanoseconds: liveWaitPause)
             } catch {
-                connected = false
-                lastServiceFailure = error.localizedDescription
+                if isReadCancellation(error) {
+                    guard !Task.isCancelled else { return }
+                    do { try await Task.sleep(nanoseconds: liveWaitPause) } catch { return }
+                    continue
+                }
+                recordServiceOutage(error)
                 fullSnapshotDirty = true
                 if (error as? ChecklistError)?.code == "CURSOR_RESET" {
                     // The old coverage interval no longer exists. Only this

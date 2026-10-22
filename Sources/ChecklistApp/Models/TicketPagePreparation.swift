@@ -67,6 +67,14 @@ struct TicketPagePreparation {
         error = "Could not load the ticket page. Refresh the list."
     }
 
+    /// Retire only this read, preserving the accepted page and its preparation.
+    mutating func cancel(_ request: Request) {
+        guard activeRequest == request else { return }
+        activeRequest = nil
+        loading = false
+        error = nil
+    }
+
     mutating func invalidate() {
         activeRequest = nil
         page = nil

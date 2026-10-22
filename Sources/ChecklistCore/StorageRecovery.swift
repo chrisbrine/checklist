@@ -33,7 +33,7 @@ extension CommandRouter {
             for entry in entries {
                 guard let path = entry["path"] as? String,let sha = entry["sha256"] as? String,let size = entry["size"] as? NSNumber,size.int64Value >= 0 else {throw StoreRecovery.required("backup_receipt_index_invalid")}
                 // Historical presence is metadata, not permission to open a backup or origin path.
-                if let relative = try? ManagedPaths.relative(path,family:"objects",root:root) {
+                if let relative = try? ManagedPaths.relative(path,family:path.contains("source-captures/") ? "source-captures" : "objects",root:root) {
                     originals.insert(StorageBackupRetentionIndex.key(path:relative,sha:sha,size:size.int64Value))
                 }
             }
@@ -174,7 +174,7 @@ extension CommandRouter {
             }
             try copy.close()
         } catch {try? copy.close();throw error}
-        let indexedObjects: [JSON] = manifest.objects.filter {$0.descriptor.kind == "file"}.map {
+        let indexedObjects: [JSON] = manifest.objects.map {
             ["path":$0.descriptor.relativePath,"sha256":$0.sha256,"size":$0.size]
         }
         let generation: JSON = ["format":1,"state":"complete","operation_id":receipt.operationID.uuidString.lowercased(),"manifest_sha256":receipt.manifestSHA256,"known_at":now(),"current_physical_verified":false,"objects":indexedObjects]

@@ -22,7 +22,7 @@ struct ArchiveCleanupReferenceIndex {
         for (index,value) in graph.enumerated() {
             let type = value["record_type"] as? String ?? ""
             if bookkeeping.contains(type) { continue }
-            if type == "storage_job",["attachment_import","archive_cleanup_delete","archive_cleanup_cursor"].contains(value["kind"] as? String ?? "") { continue }
+            if type == "storage_job",["attachment_import","archive_cleanup_delete","archive_cleanup_cursor","ticket_object_delete"].contains(value["kind"] as? String ?? "") { continue }
             try indexStrings(value,row:index)
         }
         self.reverse = reverse
@@ -103,7 +103,7 @@ extension CommandRouter {
                 continue
             }
             if type == "storage_job",value["kind"] as? String == "media_attachment_owner" { continue }
-            if type == "storage_job",value["kind"] as? String == "archive_cleanup_delete" || value["kind"] as? String == "archive_cleanup_cursor" { continue }
+            if type == "storage_job",["archive_cleanup_delete","archive_cleanup_cursor","ticket_object_delete"].contains(value["kind"] as? String ?? "") { continue }
             if type == "storage_hold" {
                 guard value["state"] as? String == "active",mentions(value) else { continue }
                 if let expiry = value["expires_at"] as? NSNumber,CFGetTypeID(expiry) != CFBooleanGetTypeID(),expiry.doubleValue.isFinite,expiry.doubleValue <= Date().timeIntervalSince1970 { continue }

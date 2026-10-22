@@ -11,32 +11,10 @@ extension CommandRouter {
             guard let path = file["path"] as? String,entries[path] == nil else {throw CoreError("EVIDENCE_STALE","Captured project instruction paths are ambiguous.")}
             entries[path] = file
         }
-        func linkedPath(from path: String,target: String) throws -> String {
-            guard !target.isEmpty,!target.hasPrefix("/"),!target.contains("\0") else {throw CoreError("EVIDENCE_STALE","Captured project instruction links must remain inside the immutable capture.")}
-            var components = path.split(separator:"/").dropLast().map(String.init)
-            for component in target.split(separator:"/") {
-                if component == "." {continue}
-                if component == ".." {
-                    guard !components.isEmpty else {throw CoreError("EVIDENCE_STALE","Captured project instruction links must remain inside the immutable capture.")}
-                    components.removeLast()
-                } else {components.append(String(component))}
-            }
-            guard !components.isEmpty else {throw CoreError("EVIDENCE_STALE","Captured project instruction links must resolve to an included regular file.")}
-            return components.joined(separator:"/")
-        }
         return try files.filter {($0["path"] as? String ?? "").split(separator:"/").last == "AGENTS.md" && ["file","symlink"].contains($0["kind"] as? String ?? "")}.map { instruction in
-            let alias = instruction["path"] as! String
-            var path = alias,visited = Set<String>(),links: [JSON] = []
-            while true {
-                guard visited.insert(path).inserted,let entry = entries[path] else {throw CoreError("EVIDENCE_STALE","Captured project instructions contain a cyclic or missing link target.")}
-                if entry["kind"] as? String == "file",let contentHash = entry["sha256"] as? String {
-                    var ref: JSON = ["source_capture_id":captureID,"source_sha256":sourceHash,"path":alias,"sha256":contentHash]
-                    if !links.isEmpty {ref["resolved_path"] = path;ref["link_chain"] = links}
-                    return ref
-                }
-                guard entry["kind"] as? String == "symlink",links.count < 32,let target = entry["target"] as? String,let linkHash = entry["sha256"] as? String,hash(Data(target.utf8)) == linkHash else {throw CoreError("EVIDENCE_STALE","Captured project instructions must resolve through at most 32 hash-verified internal links to a regular file.")}
-                links.append(["path":path,"target":target,"sha256":linkHash]);path = try linkedPath(from:path,target:target)
-            }
+            var ref = try capturedSourceInput(instruction["path"] as! String,entries:entries)
+            ref["source_capture_id"] = captureID;ref["source_sha256"] = sourceHash
+            return ref
         }
     }
     func reviewContract(_ db: Database, task: JSON, manifest: JSON) throws -> JSON {

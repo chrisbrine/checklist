@@ -27,7 +27,9 @@ extension CommandRouter {
             let path = canonical(raw.hasPrefix("/") ? raw : URL(fileURLWithPath:root).appendingPathComponent(raw).path),key = reservationKey(path)
             guard containsPath(reservationKey(root),key) else { throw CoreError("ROOT_MISMATCH","Work scopes must remain inside this project’s canonical root.") }
             guard !files.contains(where: {$0["canonical_key"] as? String == key}) else { throw CoreError("INVALID_INPUT","Duplicate canonical file scope.") }
-            files.append(["path":key,"canonical_key":key,"access":access])
+            let alias = input["declared_path"] as? String ?? raw
+            let declared = URL(fileURLWithPath:alias.hasPrefix("/") ? alias : URL(fileURLWithPath:root).appendingPathComponent(alias).path).standardizedFileURL.path
+            files.append(["path":key,"canonical_key":key,"declared_path":declared,"access":access])
         }
         for input in laneScopes {
             let name = try text(input,"lane_id",max:100),units = int(input,"units",default:1)

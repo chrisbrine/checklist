@@ -45,7 +45,7 @@ struct TrashTicketsView: View {
                     Text(value.ticket.string("key") + " · " + value.ticket.string("title")).checklistFont(.bodyStrong)
                     Text("Removes the ticket's private content and \(value.removed) exclusively owned records, including notes, work attempts, requests, review and file records. Clears content from \(value.events) history entries while keeping their place.").checklistFont(.callout)
                     Text("Keeps a minimal Purged ticket reference, incoming connections, other tickets and \(value.shared) shared records. This cannot be undone.").checklistFont(.callout)
-                    Text("All managed file bytes remain in this version. The preview includes \(value.managed) managed attachments with \(ByteCountFormatter.string(fromByteCount:value.originalBytes,countStyle:.file)) of original file sizes. External originals and workspace files are never deleted. This does not securely erase file contents.").checklistFont(.callout)
+                    Text("After the ticket is removed, verified deletion queues \(ByteCountFormatter.string(fromByteCount:value.deletionBytes,countStyle:.file)) of exclusively owned managed files, previews and captured source. Shared, held or backup-referenced files retain \(ByteCountFormatter.string(fromByteCount:value.retainedBytes,countStyle:.file)). These logical sizes do not measure disk savings. External originals and workspace files are never deleted. This does not securely erase file contents.").checklistFont(.callout)
                     Text("Checklist knows of \(value.backups) earlier backup generations. Backups and exports made before this purge may contain this ticket. Checklist does not change them; delete those copies yourself if needed.").checklistFont(.callout)
                     if !value.creationTimes.isEmpty {Text("Recorded backup creation times: " + value.creationTimes.joined(separator:", ")).checklistFont(.micro)}
                     if !value.observedTimes.isEmpty {Text("Recorded backup observation times: " + value.observedTimes.joined(separator:", ")).checklistFont(.micro)}
@@ -54,7 +54,7 @@ struct TrashTicketsView: View {
                     .confirmationDialog("Delete this ticket permanently?",isPresented:$confirmPurge,titleVisibility:.visible) {
                         Button("Delete permanently",role:.destructive) {purge(value)}
                         Button("Cancel",role:.cancel) {}
-                    } message: {Text("The ticket's private records will be removed. Managed file bytes, shared records, backups and exports remain. This cannot be undone.")}
+                    } message: {Text("The ticket's private records will be removed. Exclusive managed bytes will be deleted after commit. Shared and held files, shared records, backups and exports remain. This cannot be undone.")}
             }
     }
     func load(_ cursor: String? = nil) {
@@ -77,6 +77,6 @@ struct TrashTicketsView: View {
     }
     func purge(_ value: TicketPurgePreview) {
         guard value.incarnation == store.storeIncarnation else {store.error = "The store changed. Read a new preview.";return}
-        store.run("task_purge",value.parameters,success:"Ticket permanently removed; managed file bytes, shared records, backups and exports retained") {_ in preview = nil;load()}
+        store.run("task_purge",value.parameters,success:"Ticket permanently removed; byte receipt recorded; shared records, backups and exports retained") {_ in preview = nil;load()}
     }
 }

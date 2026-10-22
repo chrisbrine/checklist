@@ -96,3 +96,28 @@ final class CoveredAnswerTests: XCTestCase {
         XCTAssertEqual(try call("human_request_create",input(p,t),w)["state"] as? String,"pending")
     }
 }
+
+extension CoveredAnswerTests {
+    func testReviewerNotCheckedThenCanceledDoesNotCoverApproval() throws {
+        let (p,t,w) = try fixture()
+        let original = try call("human_request_create",input(p,t,title:"Old candidate",prompt:"Approve old candidate?",type:"approval"),w)
+        let unchecked = try answer(original,value:"not_checked",type:"approval")
+        XCTAssertEqual(unchecked["state"] as? String,"pending")
+        XCTAssertEqual((unchecked["responses"] as! [JSON])[0]["complete"] as? Bool,false)
+        _ = try call("human_request_cancel",["project_id":p["id"]!,"request_id":unchecked["id"]!,"expected_revision":unchecked["revision"]!],w)
+        let next = try call("human_request_create",input(p,t,title:"New candidate",prompt:"Approve new candidate?",type:"approval"),w)
+        XCTAssertEqual(next["state"] as? String,"pending")
+    }
+    func testReviewerUnansweredOptionalApprovalDoesNotCoverApproval() throws {
+        let (p,t,w) = try fixture()
+        var params = input(p,t,title:"Earlier text decision",prompt:"Tell us the theme")
+        params["questions"] = [["id":"q","prompt":"Tell us the theme","type":"text"],["id":"optional","prompt":"Optional old approval?","type":"approval","required":false]]
+        let original = try call("human_request_create",params,w)
+        let answered = try answer(original)
+        XCTAssertEqual(answered["state"] as? String,"answered")
+        XCTAssertEqual((answered["responses"] as! [JSON])[0]["answers"] as? [JSON] != nil,true)
+        XCTAssertEqual(((answered["responses"] as! [JSON])[0]["answers"] as! [JSON]).count,1)
+        let next = try call("human_request_create",input(p,t,title:"New approval decision",prompt:"Approve this candidate?",type:"approval"),w)
+        XCTAssertEqual(next["state"] as? String,"pending")
+    }
+}

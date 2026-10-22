@@ -128,4 +128,91 @@ final class SourceFreshnessScopeTests: XCTestCase {
             stale({_ = try f.call("review_context",f.selectors(s),r)},path:"source")
         }
     }
+    func testInstructionSymlinkTargetEditMustStaleScopedReview() throws {
+        let f = try SubmissionEvidenceFixture("Reviewer-T-CL141")
+        try f.write("src/file.swift");try f.write("rules.md","Original project instructions")
+        try FileManager.default.createSymbolicLink(atPath:f.workspace.appendingPathComponent("AGENTS.md").path,withDestinationPath:"rules.md")
+        let author = try f.worker("author"),task = try f.ready(),attempt = try f.claim(task,author,scopes:[["path":"src","access":"write"]])
+        let submitted = try f.call("work_submit",f.submissionInput(attempt,author),author),reviewer = try f.worker("reviewer")
+        _ = try f.call("review_context",f.selectors(submitted),reviewer)
+        try f.write("rules.md","Changed project instructions")
+        XCTAssertThrowsError(try f.call("review_context",f.selectors(submitted),reviewer),"Changed resolved AGENTS.md content must stale the target") {
+            XCTAssertEqual(($0 as? CoreError)?.code,"EVIDENCE_STALE")
+        }
+        XCTAssertThrowsError(try f.call("work_claim",f.selectors(submitted),reviewer),"A stale target must refuse a review claim") {
+            XCTAssertEqual(($0 as? CoreError)?.code,"EVIDENCE_STALE")
+        }
+    }
+    func testReadScopeSymlinkRetargetMustStaleScopedReview() throws {
+        let f = try SubmissionEvidenceFixture("Reviewer-T-CL141")
+        try f.write("src/file.swift");try f.write("one.txt","first");try f.write("two.txt","second")
+        let link = f.workspace.appendingPathComponent("dependency.txt")
+        try FileManager.default.createSymbolicLink(atPath:link.path,withDestinationPath:"one.txt")
+        let author = try f.worker("author"),task = try f.ready(),attempt = try f.claim(task,author,scopes:[["path":"src","access":"write"],["path":"dependency.txt","access":"read"]])
+        let submitted = try f.call("work_submit",f.submissionInput(attempt,author),author),reviewer = try f.worker("reviewer")
+        _ = try f.call("review_context",f.selectors(submitted),reviewer)
+        try FileManager.default.removeItem(at:link);try FileManager.default.createSymbolicLink(atPath:link.path,withDestinationPath:"two.txt")
+        XCTAssertThrowsError(try f.call("review_context",f.selectors(submitted),reviewer),"Changed declared read dependency link must stale the target") {
+            XCTAssertEqual(($0 as? CoreError)?.code,"EVIDENCE_STALE")
+        }
+        XCTAssertThrowsError(try f.call("work_claim",f.selectors(submitted),reviewer),"A stale target must refuse a review claim") {
+            XCTAssertEqual(($0 as? CoreError)?.code,"EVIDENCE_STALE")
+        }
+    }
+    func testScopedSymlinkChainsRetainResolvedIdentityAndAliasDiagnostics() throws {
+        let inputs: [(String,String?)] = [("AGENTS.md",nil),("nested/CLAUDE.md",nil),("dependency.txt","read"),("write-dependency.txt","write"),("src/dependency.txt",nil)]
+        for (alias,access) in inputs {
+            let f = try SubmissionEvidenceFixture("CL-141")
+            try f.write("src/file.swift");try f.write("one.txt","same bytes");try f.write("two.txt","same bytes");try f.write("links/unrelated.txt")
+            let middle = f.workspace.appendingPathComponent("links/middle.txt"),link = f.workspace.appendingPathComponent(alias)
+            try FileManager.default.createDirectory(at:link.deletingLastPathComponent(),withIntermediateDirectories:true)
+            try FileManager.default.createSymbolicLink(atPath:middle.path,withDestinationPath:"../one.txt")
+            let target = alias.contains("/") ? "../links/middle.txt" : "links/middle.txt"
+            try FileManager.default.createSymbolicLink(atPath:link.path,withDestinationPath:target)
+            var scopes: [JSON] = [["path":"src","access":"write"]]
+            if let access {scopes.append(["path":alias,"access":access])}
+            let author = try f.worker("author"),task = try f.ready(),claimed = try f.claim(task,author,scopes:scopes)
+            // A lane-only scope adjustment must also retain the declared file aliases.
+            _ = try f.call("work_scope_adjust",["attempt_id":claimed["id"]!,"claim_token":claimed["claim_token"]!,"lane_scopes":[]],author)
+            let s = try f.call("work_submit",f.submissionInput(claimed,author),author),r = try f.worker("reviewer")
+            let context = try f.call("review_context",f.selectors(s),r),relevance = try XCTUnwrap(context["source_relevance"] as? JSON)
+            let input = try XCTUnwrap((relevance["symlink_inputs"] as? [JSON])?.first {$0["path"] as? String == alias})
+            XCTAssertEqual(input["resolved_path"] as? String,"one.txt");XCTAssertEqual(input["sha256"] as? String,ChecklistCore.hash(Data("same bytes".utf8)))
+            XCTAssertEqual(try jsonString(input["link_chain"]!),try jsonString([["path":alias,"target":target,"sha256":ChecklistCore.hash(Data(target.utf8))],["path":"links/middle.txt","target":"../one.txt","sha256":ChecklistCore.hash(Data("../one.txt".utf8))]]))
+            try f.write("links/unrelated.txt","unrelated edit");_ = try f.call("review_context",f.selectors(s),r)
+            try f.write("one.txt","changed resolved bytes")
+            stale({_ = try f.call("review_context",f.selectors(s),r)},path:alias)
+            stale({_ = try f.call("work_claim",f.selectors(s),r)},path:alias)
+            try f.write("one.txt","same bytes")
+            for destination in ["../two.txt",".././one.txt"] {
+                try FileManager.default.removeItem(at:middle);try FileManager.default.createSymbolicLink(atPath:middle.path,withDestinationPath:destination)
+                stale({_ = try f.call("review_context",f.selectors(s),r)},path:alias)
+                stale({_ = try f.call("work_claim",f.selectors(s),r)},path:alias)
+            }
+        }
+    }
+    func testBatchClaimKeepsDeclaredSymlinkScopeAlias() throws {
+        let f = try SubmissionEvidenceFixture("CL-141")
+        try f.write("src/file.swift");try f.write("other/file.swift");try f.write("one.txt")
+        let alias = f.workspace.appendingPathComponent("dependency.txt")
+        try FileManager.default.createSymbolicLink(atPath:alias.path,withDestinationPath:"one.txt")
+        let tasks = try [f.ready(),f.ready()],author = try f.worker("author")
+        var group = try f.call("triage_create",["name":"Synthetic alias batch","phase":"implementation"])
+        for task in tasks {
+            _ = try f.call("group_membership",["group_id":group["id"]!,"expected_revision":group["revision"]!,"task_id":task["id"]!,"action":"add"])
+            group = try f.record(group["id"]!,"group")
+        }
+        let members: [JSON] = try tasks.enumerated().map {index,task in
+            let current = try f.record(task["id"]!,"task")
+            let scopes: [JSON] = index == 0 ? [["path":"src","access":"write"],["path":"dependency.txt","access":"read"]] : [["path":"other","access":"write"]]
+            return ["task_id":current["id"]!,"expected_revision":current["revision"]!,"file_scopes":scopes]
+        }
+        let batch = try f.call("batch_prepare",["triage_id":group["id"]!,"expected_revision":group["revision"]!,"phase":"implementation","tasks":members],author)
+        let result = try f.call("batch_claim",["batch_id":batch["id"]!,"expected_revision":batch["revision"]!,"policy_revision":batch["policy_revision"]!],author)
+        let attempt = try XCTUnwrap((result["claims"] as? [JSON])?.first {$0["task_id"] as? String == tasks[0]["id"] as? String})
+        let scope = try XCTUnwrap((attempt["file_scopes"] as? [JSON])?.first {$0["access"] as? String == "read"})
+        XCTAssertEqual(scope["declared_path"] as? String,alias.path)
+        XCTAssertEqual(scope["canonical_key"] as? String,f.router.reservationKey(f.workspace.appendingPathComponent("one.txt").path))
+        XCTAssertEqual(strings(f.router.sourceRelevance(root:f.workspace.path,attempt:attempt,additional:[]),"scopes"),["dependency.txt","one.txt","src"])
+    }
 }

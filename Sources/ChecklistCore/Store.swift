@@ -312,8 +312,10 @@ public final class CommandRouter: @unchecked Sendable {
                 }
                 throw error
             }
-            let maintenanceWarning = self.performStorageMaintenance(db, permit: permit)
+            var maintenanceWarning = self.performStorageMaintenance(db, permit: permit)
             _ = self.pruneRoutineRecordsIfDue(db)
+            do {output = try self.addingTicketObjectDeletionReceipt(db,output:output)}
+            catch {maintenanceWarning = maintenanceWarning ?? .retryPending}
             // Dynamic recipient notices are not part of the durable command outcome.
             // Replayed commands observe current pending deliveries without replaying an answer.
             do { output = try self.addingHumanAnswerNotices(db,output:output,params:params,caller:caller) }

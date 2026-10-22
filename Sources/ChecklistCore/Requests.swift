@@ -131,19 +131,33 @@ extension CommandRouter {
         for earlier in try records(db,type:"request",project:request["project_id"] as? String) {
             for response in earlier["responses"] as? [JSON] ?? [] where ["answered","send"].contains(response["action"] as? String ?? "") {
                 // A response stays tied to the form the owner actually answered.
-                let form = (earlier["form_history"] as? [JSON] ?? []).first { int($0,"form_revision",default:1) == int(response,"form_revision",default:1) } ?? earlier
+                guard let form = ((earlier["form_history"] as? [JSON] ?? []) + [earlier]).first(where: { int($0,"form_revision",default:1) == int(response,"form_revision",default:1) }) else { continue }
                 let priorQuestions = form["questions"] as? [JSON] ?? []
+                let responseAnswers = response["answers"] as? [JSON] ?? []
+                let answeredQuestions = priorQuestions.filter { question in
+                    guard let answer = responseAnswers.first(where: {$0["question_id"] as? String == question["id"] as? String}) else { return false }
+                    switch question["type"] as? String ?? "text" {
+                    case "text": return !(answer["text"] as? String ?? "").trimmingCharacters(in:.whitespacesAndNewlines).isEmpty
+                    case "choice": return !strings(answer,"option_ids").isEmpty || !(answer["custom_text"] as? String ?? "").trimmingCharacters(in:.whitespacesAndNewlines).isEmpty
+                    case "approval": return ["approved","changes_requested"].contains(answer["result"] as? String ?? "")
+                    case "check": return ["passed","failed"].contains(answer["result"] as? String ?? "")
+                    default: return false
+                    }
+                }
+                guard !answeredQuestions.isEmpty else { continue }
                 let titleMatch = texts.contains(normalizedRequestText(form["title"] as? String ?? ""))
-                let matchingQuestions = priorQuestions.filter {
+                let matchingQuestions = answeredQuestions.filter {
                     texts.contains(normalizedRequestText($0["prompt"] as? String ?? "")) ||
                     (approval && earlier["task_id"] as? String == request["task_id"] as? String && $0["type"] as? String == "approval")
                 }
                 guard titleMatch || !matchingQuestions.isEmpty else { continue }
                 let task = try scoped(db,earlier["task_id"] as! String,request["project_id"] as! String,type:"task")
-                let answers = response["answers"] as? [JSON] ?? []
+                let coveredQuestions = titleMatch ? answeredQuestions : matchingQuestions
+                let coveredIDs = Set(coveredQuestions.compactMap {$0["id"] as? String})
+                let answers = responseAnswers.filter { coveredIDs.contains($0["question_id"] as? String ?? "") }
                 let summary = String((try jsonString(["answers":answers,"files":response["files"] ?? [],"explanation":response["explanation"] ?? ""])).prefix(1000))
                 matches.append(["request_id":earlier["id"]!,"answer_id":response["id"] ?? NSNull(),"task_id":task["id"]!,"key":task["key"] ?? "","title":form["title"] ?? "",
-                    "matching_question_text":(titleMatch ? priorQuestions : matchingQuestions).compactMap {$0["prompt"] as? String}.joined(separator:"; "),"answers":answers,"answer_summary":summary,"answered_at":response["created_at"] ?? ""])
+                    "matching_question_text":coveredQuestions.compactMap {$0["prompt"] as? String}.joined(separator:"; "),"answers":answers,"answer_summary":summary,"answered_at":response["created_at"] ?? ""])
             }
         }
         if params["supersedes_answer_id"] != nil || params["supersede_reason"] != nil {

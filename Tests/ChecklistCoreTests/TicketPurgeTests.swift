@@ -41,7 +41,7 @@ extension TicketRetirementTests {
         let preview = try call("task_purge_preview",params(p,t))
         XCTAssertGreaterThanOrEqual((preview["impact"] as! JSON)["shared_record_count"] as? Int ?? 0,1)
         let result = try purge(p,t,preview)
-        XCTAssertEqual(result["managed_bytes_action"] as? String,"retained")
+        XCTAssertEqual(result["managed_bytes_action"] as? String,"completed")
         let tombstone = try router.dbQueue.read {try router.record($0,tid,type:"task")}
         XCTAssertEqual(Set(tombstone.keys),["id","project_id","key","title","revision","purged","purged_at","purged_by","archived","trashed"])
         XCTAssertEqual(tombstone["title"] as? String,"Purged ticket")

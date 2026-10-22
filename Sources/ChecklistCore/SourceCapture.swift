@@ -235,9 +235,13 @@ extension CommandRouter {
         let (captureParent,_) = try durable.parent(prepared.pending.directory + "/source/.check");Darwin.close(captureParent)
         consumedSourceCaptures.insert(prepared.pending.id)
         var capture = prepared.inventory;capture["id"] = prepared.pending.id;capture["project_id"] = pid;capture["task_id"] = task["id"];capture["attempt_id"] = attempt["id"];capture["source_root"] = path;capture["snapshot_path"] = prepared.pending.directory + "/source";capture["additional_paths"] = additional;capture["captured_at"] = now();capture["revision"] = 1
-        capture["relevance"] = sourceRelevance(root:path,attempt:attempt,additional:additional)
-        let relevance = capture["relevance"] as! JSON
-        capture["relevant_sha256"] = relevance["mode"] as? String == "scoped" ? try relevantSourceHash(capture,relevance:relevance) : capture["sha256"]
+        var relevance = sourceRelevance(root:path,attempt:attempt,additional:additional)
+        if relevance["mode"] as? String == "scoped" {
+            let entries = try relevantSourceEntries(capture,relevance:relevance)
+            relevance["symlink_inputs"] = entries.keys.sorted().compactMap {entries[$0]?["resolved_input"] as? JSON}
+            capture["relevant_sha256"] = hash(Data((try jsonString(entries)).utf8))
+        } else {capture["relevant_sha256"] = capture["sha256"]}
+        capture["relevance"] = relevance
         try durable.writeNew(prepared.pending.directory + "/manifest.json",bytes:Data((try jsonString(capture)).utf8));try save(db,capture,type:"source_capture");return capture
     }
 
@@ -344,36 +348,70 @@ extension CommandRouter {
         }
         return result
     }
-    /// Reservations are canonical absolute paths. Freeze root-relative, case-insensitive
-    /// prefixes so future additions under a directory are relevant too.
+    /// Resolve only immutable inventory entries, shared by instruction coverage and scoped freshness.
+    func capturedSourceInput(_ alias: String,entries: [String:JSON]) throws -> JSON {
+        func linkedPath(from path: String,target: String) throws -> String {
+            guard !target.isEmpty,!target.hasPrefix("/"),!target.contains("\0") else {throw CoreError("EVIDENCE_STALE","Captured project instruction links must remain inside the immutable capture.")}
+            var components = path.split(separator:"/").dropLast().map(String.init)
+            for component in target.split(separator:"/") {
+                if component == "." {continue}
+                if component == ".." {
+                    guard !components.isEmpty else {throw CoreError("EVIDENCE_STALE","Captured project instruction links must remain inside the immutable capture.")}
+                    components.removeLast()
+                } else {components.append(String(component))}
+            }
+            guard !components.isEmpty else {throw CoreError("EVIDENCE_STALE","Captured project instruction links must resolve to an included regular file.")}
+            return components.joined(separator:"/")
+        }
+        var path = alias,visited = Set<String>(),links: [JSON] = []
+        while true {
+            guard visited.insert(path).inserted,let entry = entries[path] else {throw CoreError("EVIDENCE_STALE","Captured project instructions contain a cyclic or missing link target.")}
+            if entry["kind"] as? String == "file",let contentHash = entry["sha256"] as? String {
+                var ref: JSON = ["path":alias,"sha256":contentHash]
+                if !links.isEmpty {ref["resolved_path"] = path;ref["link_chain"] = links}
+                return ref
+            }
+            guard entry["kind"] as? String == "symlink",links.count < 32,let target = entry["target"] as? String,let linkHash = entry["sha256"] as? String,hash(Data(target.utf8)) == linkHash else {throw CoreError("EVIDENCE_STALE","Captured project instructions must resolve through at most 32 hash-verified internal links to a regular file.")}
+            links.append(["path":path,"target":target,"sha256":linkHash]);path = try linkedPath(from:path,target:target)
+        }
+    }
+    /// Keep declared aliases alongside canonical reservations. Freeze root-relative,
+    /// case-insensitive prefixes so future additions under a directory are relevant too.
     func sourceRelevance(root: String,attempt: JSON,additional: [String]) -> JSON {
         let files = attempt["file_scopes"] as? [JSON] ?? []
         guard !files.isEmpty else { return ["mode":"whole"] }
         let base = reservationKey(root).lowercased()
-        let scopes = files.compactMap { scope -> String? in
-            guard let path = scope["path"] as? String else { return nil }
+        let scopes = files.flatMap {[$0["declared_path"] as? String,$0["path"] as? String].compactMap {$0}}.compactMap { path -> String? in
             let key = path.lowercased()
             guard containsPath(base,key) else { return nil }
             return key == base ? "." : String(key.dropFirst(base.count + 1))
         }
         return ["mode":"scoped","scopes":Set(scopes + additional.map {$0.lowercased()}).sorted(),"instruction_names":["AGENTS.md","CLAUDE.md"]]
     }
-    func relevantSourceEntries(_ inventory: JSON,relevance: JSON) throws -> [String:String] {
+    func relevantSourceEntries(_ inventory: JSON,relevance: JSON) throws -> [String:JSON] {
         let scopes = strings(relevance,"scopes"),instructions = Set(strings(relevance,"instruction_names").map {$0.lowercased()})
-        var entries: [String:String] = [:]
-        for file in inventory["files"] as? [JSON] ?? [] {
+        let files = inventory["files"] as? [JSON] ?? []
+        var captured: [String:JSON] = [:],entries: [String:JSON] = [:]
+        for file in files {
+            guard let path = file["path"] as? String,captured[path] == nil else {throw CoreError("EVIDENCE_STALE","Relevant source paths are ambiguous.")}
+            captured[path] = file
+        }
+        for file in files {
             guard let path = file["path"] as? String else { continue }
             let key = path.lowercased()
             guard relevance["mode"] as? String != "scoped" || instructions.contains(key.split(separator:"/").last.map(String.init) ?? "") || scopes.contains(where: {$0 == "." || containsPath($0,key)}) else { continue }
             // Size and Git bookkeeping are not freshness inputs. Case-folded paths match
             // reservations; ambiguous case aliases refuse rather than hide a changed entry.
             guard entries[key] == nil else { throw CoreError("EVIDENCE_STALE","Relevant source paths are ambiguous: \(path).") }
-            entries[key] = try jsonString(file.filter {["kind","sha256","executable","target"].contains($0.key)})
+            var identity = file.filter {["kind","sha256","executable","target"].contains($0.key)}
+            if file["kind"] as? String == "symlink" {
+                var resolved = try capturedSourceInput(path,entries:captured)
+                resolved["executable"] = captured[resolved["resolved_path"] as! String]?["executable"]
+                identity["resolved_input"] = resolved
+            }
+            entries[key] = identity
         }
         return entries
-    }
-    func relevantSourceHash(_ inventory: JSON,relevance: JSON) throws -> String {
-        hash(Data((try jsonString(relevantSourceEntries(inventory,relevance:relevance))).utf8))
     }
     func validateSourceTarget(_ db: Database, evidence: JSON, task: JSON) throws -> JSON? {
         guard let ref = evidence["source_capture"] as? JSON else { return nil }
@@ -394,7 +432,7 @@ extension CommandRouter {
         let live = try sourceInventory(source,additional:strings(capture,"additional_paths"))
         if let relevance = capture["relevance"] as? JSON,relevance["mode"] as? String == "scoped" {
             let before = try relevantSourceEntries(capture,relevance:relevance),after = try relevantSourceEntries(live,relevance:relevance)
-            let changed = Set(before.keys).union(after.keys).filter { before[$0] != after[$0] }.sorted()
+            let changed = try Set(before.keys).union(after.keys).filter {try jsonString(before[$0] ?? [:]) != jsonString(after[$0] ?? [:])}.sorted()
             let files = (live["files"] as? [JSON] ?? []) + (capture["files"] as? [JSON] ?? [])
             let paths = changed.prefix(5).map { key in files.compactMap {$0["path"] as? String}.first {$0.lowercased() == key} ?? key }
             guard changed.isEmpty else { throw CoreError("EVIDENCE_STALE","Relevant source changed: \(paths.joined(separator:", ")). Capture and review the new target.",details:["changed_paths":paths]) }

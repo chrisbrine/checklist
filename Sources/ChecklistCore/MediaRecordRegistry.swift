@@ -59,7 +59,7 @@ enum MediaRecordRegistry {
             }
             if envelope.type == "storage_job" {
                 guard let kind = value["kind"] as? String,
-                      ["attachment_import","archive_cleanup_delete","archive_cleanup_cursor","media_attachment_owner"].contains(kind) else {
+                      ["attachment_import","archive_cleanup_delete","archive_cleanup_cursor","ticket_object_delete","media_attachment_owner"].contains(kind) else {
                     throw CoreError("MEDIA_CAPTURE_INCOMPLETE", "The required storage job kind is unregistered.")
                 }
                 if kind == "attachment_import",let ownerID = value["attachment_owner_id"] as? String {
