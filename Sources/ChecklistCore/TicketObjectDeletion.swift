@@ -9,7 +9,7 @@ struct TicketObjectDeletionReferenceIndex {
     let graph: [JSON]
     let reverse: [Data:Set<Int>]
     let projects: Set<Int>
-    init(_ graph: [JSON]) throws {
+    init(_ graph: [JSON], tokens: [Data:Set<Data>]? = nil) throws {
         self.graph = graph
         var reverse: [Data:Set<Int>] = [:],projects = Set<Int>(),edges = 0
         func visit(_ value: Any,row: Int,depth: Int = 0) throws {
@@ -22,7 +22,9 @@ struct TicketObjectDeletionReferenceIndex {
         for (index,value) in graph.enumerated() {
             if value["record_type"] as? String == "project" {projects.insert(index)}
             if value["record_type"] as? String == "storage_job",["ticket_object_delete","archive_cleanup_delete","archive_cleanup_cursor"].contains(value["kind"] as? String ?? "") {continue}
-            try visit(value,row:index)
+            if let tokens,let id = value["id"] as? String {
+                for token in tokens[Data(id.utf8)] ?? [] {reverse[token,default:[]].insert(index)}
+            } else {try visit(value,row:index)}
         }
         self.reverse = reverse;self.projects = projects
     }
@@ -99,13 +101,13 @@ extension CommandRouter {
         return pendingTargets
     }
 
-    func ticketObjectDeletionPlan(_ db: Database, owned: [(String,JSON)], remaining: [JSON]) throws -> TicketObjectDeletionPlan {
+    func ticketObjectDeletionPlan(_ db: Database, owned: [(String,JSON)], remaining: [JSON], referenceTokens: [Data:Set<Data>]? = nil) throws -> TicketObjectDeletionPlan {
         let files = try StorageObjectFiles(root:root)
         var objects: [String:JSON] = [:]
         func add(path: String?, family: String, owner: String, representation: String, sha: String? = nil, size: Int64? = nil, link: String? = nil, capture: String? = nil, executable: Bool = false, reason: String? = nil) throws {
             guard objects.count < 100000 else { throw CoreError("PURGE_LIMIT","The managed object inventory exceeds the safe purge limit.") }
             var item: JSON = ["owner_ids":[owner],"representation":representation,"kind":link == nil ? "file" : "symlink","executable":executable,"state":"pending","size":max(0,size ?? 0)]
-            if let path {item["stored_path"] = path}
+            if let path {item["stored_path"] = path;item["name"] = URL(fileURLWithPath:path).lastPathComponent}
             var reasons = reason.map {[$0]} ?? []
             if let path,let relative = try? managedRelative(path,family:family) {
                 item["relative_path"] = relative
@@ -162,7 +164,7 @@ extension CommandRouter {
             } else if type == "source_capture" {try capture(value,owner:id)}
             else if type == "manifest",let evidence = value["evidence"] as? JSON,let source = evidence["source_capture"] as? JSON {try capture(source,owner:id)}
         }
-        let backup = try? storageBackupRetentionIndex(db),references = try TicketObjectDeletionReferenceIndex(remaining)
+        let backup = try? storageBackupRetentionIndex(db),references = try TicketObjectDeletionReferenceIndex(remaining,tokens:referenceTokens)
         let mediaAuthorityComplete = (try? MediaRecordRegistry.validate(MediaRecordRegistry.envelopes(db))) != nil
         var result: [JSON] = []
         for var item in objects.values {

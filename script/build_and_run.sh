@@ -387,6 +387,20 @@ if ! python3 "$ROOT_DIR/script/retire_old_bundles.py" --after-install --keep "$P
   echo "Warning: old Checklist bundles could not all move to the Trash; see the retirement output." >&2
 fi
 echo "After the installed checks pass, retire the previous bundle: python3 \"$ROOT_DIR/script/retire_old_bundles.py\" --retire-previous"
+# Keep retirement outside capture/compile/stage/sign and after installed checks.
+post_install_cleanup() {
+  if ! python3 - "$ROOT_DIR" "$CAPTURE_DIR" "$$" <<'PYCLEAN'
+import sys
+from pathlib import Path
+sys.path.insert(0,str(Path(sys.argv[1])/'script'))
+from clean_builds import post_install
+sys.exit(post_install(*sys.argv[1:]))
+PYCLEAN
+  then
+    echo "Warning: build cleanup retained unresolved items; run script/clean_builds.py --preview." >&2
+  fi
+}
+post_install_cleanup
 # Interactive modes can wait indefinitely; retire older bundles before entering them.
 case "$MODE" in
   --debug) lldb -- "$DEST/Contents/MacOS/ChecklistApp" ;;

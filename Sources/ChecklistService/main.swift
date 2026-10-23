@@ -83,6 +83,8 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     var nativeListener: NativeReplyListener?
     var nativeLifecycle = NativeLifecycleMonitor()
     var storageWake: DispatchWorkItem?
+    let storageQueue = DispatchQueue(label:"org.checklist.storage-maintenance",qos:.utility)
+    var storageRunning = false
     var attemptedDeliveries = Set<String>()
     var nativeInFlight: [String: NativeInFlight] = [:]
     var workHealthWake: DispatchWorkItem?
@@ -131,12 +133,16 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     /// command or an actual lease deadline; this is not a model/pickup loop.
     func armStorageWake() {
         storageWake?.cancel();storageWake = nil
+        guard !storageRunning else {return}
         guard let deadline = try? router.nextArchiveCleanupDeadline() else { return }
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return };self.storageWake = nil
-            do { try self.router.runStorageMaintenance() }
-            catch { fputs("Storage maintenance deferred; its durable state was retained.\n",stderr) }
-            self.armStorageWake()
+            self.storageRunning = true
+            self.storageQueue.async {
+                do { try self.router.runStorageMaintenance() }
+                catch { fputs("Storage maintenance deferred; its durable state was retained.\n",stderr) }
+                self.queue.async {self.storageRunning = false;self.armStorageWake()}
+            }
         }
         storageWake = work
         queue.asyncAfter(deadline:.now() + max(0.05,deadline.timeIntervalSinceNow),execute:work)

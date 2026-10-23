@@ -520,7 +520,7 @@ extension CommandRouter {
     /// Methods that the service may run off its serial queue: their large file work runs
     /// before the writer, and pure reads use the read-only connections (CL-71, CL-72).
     public static func runsOutsideSerialQueue(_ method: String) -> Bool {
-        sourceCaptureMethods.contains(method) || sourceTargetMethods.contains(method) || method == "attachment_add" || method == "backup_create" || pureReadMethods.contains(method)
+        sourceCaptureMethods.contains(method) || sourceTargetMethods.contains(method) || method == "attachment_add" || method == "backup_create" || method == "epic_delete" || pureReadMethods.contains(method)
     }
 
     func inventoryKey(_ path: String, _ additional: [String]) -> String {

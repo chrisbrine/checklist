@@ -21,18 +21,17 @@ class CleanScratchTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
+        caller = patch.dict(os.environ, {'CODEX_THREAD_ID': 'session', 'CLAUDE_SESSION_ID': ''})
+        caller.start();self.addCleanup(caller.stop)
         self.repo = self.root / 'retained';self.repo.mkdir()
-        self.git('init', '-q')
         self.package = b'let package = Package(name: "Checklist")\n'
         (self.repo / 'Package.swift').write_bytes(self.package)
         (self.repo / 'source.py').write_bytes(b'old source\n')
-        self.git('add', '.')
-        self.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture')
-        # Historical source counts even when it differs from today's HEAD.
+        historical = cleanup.blob_id(self.repo / 'source.py')
         (self.repo / 'source.py').write_bytes(b'new source\n')
-        self.git('add', '.')
-        self.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'new fixture')
-        self.objects = cleanup.git_objects(self.repo)
+        # Inject retained object identities: these fixtures never invoke Git.
+        self.objects = {historical, cleanup.blob_id(self.repo / 'source.py'),
+                        cleanup.blob_id(self.repo / 'Package.swift')}
         self.sessions = self.root / 'sessions';self.sessions.mkdir()
         self.qualification = self.root / 'qualification';self.qualification.mkdir()
         self.installed = self.root / 'installed.json'
@@ -41,13 +40,15 @@ class CleanScratchTests(unittest.TestCase):
         self.now = time.time() + 7200  # Age fixture ctimes without changing the machine clock.
         self.trash = self.root / 'trash';self.trash.mkdir()
 
-    def git(self, *arguments):
-        return subprocess.check_output(['git', '-C', str(self.repo), *arguments], stderr=subprocess.STDOUT)
-
-    def item(self, name='copy', host='-Users-Checklist', qualification=False):
-        path = self.qualification / name if qualification else self.sessions / host / 'session' / 'scratchpad' / name
+    def item(self, name='copy', host='-Users-Checklist', qualification=False, session='session'):
+        path = self.qualification / name if qualification else self.sessions / host / session / 'scratchpad' / name
         path.mkdir(parents=True)
         return path
+
+    def mark(self, root, session='session', release=False):
+        if release and cleanup.read_marker(root) is None:
+            cleanup.write_marker(root, session, 'fixture persistent workspace')
+        return cleanup.write_marker(root, session, 'fixture persistent workspace', release)
 
     def write(self, root, path, contents=b'generated'):
         target = root / path;target.parent.mkdir(parents=True, exist_ok=True);target.write_bytes(contents)
@@ -61,10 +62,11 @@ class CleanScratchTests(unittest.TestCase):
     def run_cleanup(self, apply=False, **kwargs):
         output = io.StringIO()
         # Inject temporary Trash; native Trash is never called by any test.
-        with redirect_stdout(output), patch.dict(os.environ, CHECKLIST_TRASH_DIR=str(self.trash)):
+        with redirect_stdout(output), patch.dict(os.environ, CHECKLIST_TRASH_DIR=str(self.trash)), \
+             patch.object(cleanup, 'git_objects', return_value=self.objects):
             result = cleanup.clean(self.sessions, self.qualification, self.repo, self.installed,
                                    apply=apply, process_reader=kwargs.pop('process_reader', lambda: []),
-                                   clock=lambda: self.now, **kwargs)
+                                   clock=lambda: self.now, session_id=kwargs.pop('session_id', 'session'), **kwargs)
         return result, [json.loads(line) for line in output.getvalue().splitlines()]
 
     def test_preview_counts_history_build_unknown_and_git_metadata_without_mutation(self):
@@ -161,7 +163,7 @@ class CleanScratchTests(unittest.TestCase):
         (item.parent.parent.parent / 'linked-session').symlink_to(item.parent.parent, target_is_directory=True)
         other = self.sessions / 'Other';(other / 'session').mkdir(parents=True)
         (other / 'session/scratchpad').symlink_to(item.parent, target_is_directory=True)
-        found = list(cleanup.candidates(self.sessions, self.qualification))
+        found = list(cleanup.candidates(self.sessions, self.qualification, 'session'))
         self.assertEqual({p.name for p, _ in found}, {'copy', 'linked-item'})
         self.assertIn('symbolic link', self.plan(item.parent / 'linked-item')['reason'])
 
@@ -179,8 +181,8 @@ class CleanScratchTests(unittest.TestCase):
             self.assertIn('no retained Checklist package', next(r['reason'] for r in records if r.get('path') == str(path)))
 
     def test_qualification_runs_are_scanned_and_latest_fingerprint_kept(self):
-        old = self.item('old', qualification=True);self.write(old, '.build/object')
-        latest = self.item('latest', qualification=True);self.write(latest, '.build/object')
+        old = self.item('old', qualification=True);self.mark(old, release=True);self.write(old, '.build/object')
+        latest = self.item('latest', qualification=True);self.mark(latest, release=True);self.write(latest, '.build/object')
         self.write(latest, 'capture-manifest.json', json.dumps({'source_fingerprint': self.fingerprint}).encode())
         result, records = self.run_cleanup(apply=True)
         self.assertEqual(result, 0);self.assertFalse((old / '.build').exists())
@@ -219,7 +221,7 @@ class CleanScratchTests(unittest.TestCase):
             with self.subTest(name=name):
                 item = self.item(name);self.write(item, 'src/Package.swift', self.package)
                 self.write(item, '.build/object')
-                self.assertIn('persistent build slot', self.plan(item)['reason'])
+                self.assertIn('unmarked legacy persistent workspace', self.plan(item)['reason'])
                 self.assertEqual(self.plan(item)['moves'], [])
         ordinary = self.item('review-copy');self.write(ordinary, 'src/Package.swift', self.package)
         self.write(ordinary, '.build/object')
@@ -229,8 +231,186 @@ class CleanScratchTests(unittest.TestCase):
         item = self.item('round')
         self.write(item, 'slots/ws1/src/Package.swift', self.package)
         self.write(item, 'slots/ws1/.build/object')
-        self.assertIn('persistent build slot', self.plan(item)['reason'])
+        self.assertIn('unmarked legacy persistent workspace', self.plan(item)['reason'])
         self.assertEqual(self.plan(item)['moves'], [])
+
+    def test_marked_workspaces_of_any_name_direct_or_nested_keep_source_and_warm_build(self):
+        for prefix in ['', 'slots/']:
+            for name in ['rv1', 'rv2', 'rv3', 'rw-current', 'arbitrary-name']:
+                with self.subTest(prefix=prefix, name=name):
+                    item = self.item(('direct-' if not prefix else 'nested-') + name)
+                    workspace = item / prefix / name if prefix else item
+                    self.write(workspace, 'src/source.py', b'old source\n')
+                    self.write(workspace, '.build/object')
+                    self.mark(workspace)
+                    before = cleanup.inventory(item)
+                    result, records = self.run_cleanup(apply=True)
+                    self.assertEqual(result, 0)
+                    record = next(r for r in records if r.get('path') == str(item))
+                    self.assertIn('persistent workspace marker', record['reason'])
+                    self.assertEqual(record['eligible_paths'], [])
+                    self.assertEqual(record['kept_bytes'], record['total_bytes'])
+                    self.assertEqual(cleanup.inventory(item), before)
+
+    def test_other_session_unmarked_idle_item_never_selected_even_with_released_scan(self):
+        foreign = self.item('idle', session='other-session')
+        self.write(foreign, 'src/source.py', b'old source\n');self.write(foreign, '.build/object')
+        own = self.item('own');self.write(own, '.build/object')
+        for include in [False, True]:
+            with self.subTest(include_released=include):
+                found = list(cleanup.candidates(self.sessions, self.qualification, 'session', include))
+                self.assertEqual(found, [(own, 'session')])
+                with patch.object(cleanup, 'inventory', wraps=cleanup.inventory) as inspected:
+                    self.assertEqual(self.run_cleanup(include_released=include)[0], 0)
+                self.assertNotIn(foreign, [c.args[0] for c in inspected.call_args_list])
+        self.assertEqual(self.run_cleanup(apply=True, include_released=True)[0], 0)
+        self.assertTrue((foreign / '.build/object').exists())
+
+    def test_released_marker_allows_cleanup_but_does_not_bypass_quiet_or_process_rules(self):
+        item = self.item('rv1');self.write(item, 'src/source.py', b'old source\n')
+        self.write(item, '.build/object');self.mark(item)
+        self.assertEqual(self.plan(item)['moves'], [])
+        self.mark(item, release=True)
+        self.assertTrue(self.plan(item)['moves'])
+        self.assertIn('last 45 minutes', self.plan(item, now=time.time())['reason'])
+        self.assertIn('running process', self.plan(item, processes=[item])['reason'])
+        self.assertEqual(self.run_cleanup(apply=True)[0], 0)
+        self.assertFalse((item / '.build/object').exists())
+        self.assertFalse((item / 'src/source.py').exists())
+        self.assertTrue((item / cleanup.WORKSPACE_MARKER).exists())
+
+    def test_foreign_root_requires_owning_sessions_release_and_explicit_scan(self):
+        foreign = self.item('rv1', session='other-session')
+        self.write(foreign, '.build/object');self.mark(foreign, session='other-session')
+        self.assertEqual(list(cleanup.candidates(self.sessions, self.qualification, 'session', True)), [])
+        self.mark(foreign, session='other-session', release=True)
+        self.assertEqual(list(cleanup.candidates(self.sessions, self.qualification, 'session')), [])
+        self.assertEqual(list(cleanup.candidates(self.sessions, self.qualification, 'session', True)), [(foreign, 'session')])
+        self.assertEqual(self.run_cleanup(apply=True, include_released=True)[0], 0)
+        self.assertFalse((foreign / '.build/object').exists())
+        # A purported release by an unrelated session is not the folder owner's release.
+        self.write(foreign, cleanup.WORKSPACE_MARKER, json.dumps({'version': 1, 'session_id': 'intruder',
+                   'purpose': 'wrong owner', 'released': True}).encode())
+        self.assertEqual(list(cleanup.candidates(self.sessions, self.qualification, 'session', True)), [])
+
+    def test_nested_or_ancestor_marker_protects_even_under_released_root(self):
+        item = self.item('round');self.mark(item, release=True)
+        self.write(item, 'slots/rv1/.build/object');self.mark(item / 'slots/rv1')
+        self.assertEqual(self.plan(item)['moves'], [])
+        # Direct plan calls on a descendant must also respect its workspace root.
+        self.assertEqual(self.plan(item / 'slots/rv1/.build')['moves'], [])
+
+    def test_invalid_linked_and_unreadable_markers_fail_closed(self):
+        item = self.item();self.write(item, '.build/object')
+        marker = item / cleanup.WORKSPACE_MARKER
+        for value in ['{', '[]', '{"released": true}',
+                      '{"version": 1, "session_id": "session", "purpose": "build", "released": "true"}']:
+            with self.subTest(value=value):
+                marker.write_text(value)
+                self.assertEqual(self.plan(item)['moves'], [])
+                self.assertIn('invalid/unreadable workspace marker', self.plan(item)['reason'])
+        marker.unlink();marker.symlink_to(self.installed)
+        self.assertEqual(self.plan(item)['moves'], [])
+        with self.assertRaisesRegex(ValueError, 'invalid workspace marker'):
+            self.mark(item, release=True)
+
+    def test_mark_and_release_commands_keep_owner_and_require_purpose(self):
+        item = self.item('rv2')
+        argv = ['clean_scratch.py', '--session-id', 'session']
+        for mode in [['--mark', str(item), '--purpose', 'review slot'], ['--release', str(item)]]:
+            with patch.object(sys, 'argv', argv + mode), redirect_stdout(io.StringIO()), \
+                 patch.object(cleanup, 'git_objects', side_effect=AssertionError('marker command used Git')):
+                self.assertEqual(cleanup.main(), 0)
+        value = cleanup.read_marker(item)
+        self.assertEqual(value, {'version': 1, 'session_id': 'session', 'purpose': 'review slot', 'released': True})
+        with self.assertRaisesRegex(ValueError, 'another scratch session'):
+            cleanup.write_marker(item, 'foreign', release=True)
+        with self.assertRaisesRegex(ValueError, 'nonblank'):
+            cleanup.write_marker(item, 'session', ' ')
+        unmarked = self.item('unmarked')
+        with self.assertRaisesRegex(ValueError, 'before releasing'):
+            cleanup.write_marker(unmarked, 'session', release=True)
+        self.mark(item)  # Reusing a released slot protects it again.
+        self.assertFalse(cleanup.read_marker(item)['released'])
+
+    def test_legacy_ws_migration_is_reported_and_release_is_explicit(self):
+        for name in ['ws1', 'wsp2', 'wsreview3']:
+            item = self.item(name);self.write(item, 'src/source.py', b'old source\n')
+            self.write(item, '.build/object')
+            result, records = self.run_cleanup()
+            self.assertEqual(result, 0)
+            self.assertIn('unmarked legacy persistent workspace', next(r['reason'] for r in records if r['path'] == str(item)))
+            self.mark(item);self.assertEqual(self.plan(item)['moves'], [])
+            self.mark(item, release=True);self.assertTrue(self.plan(item)['moves'])
+
+    def test_qualification_requires_marker_ownership_or_explicit_released_scan(self):
+        unknown = self.item('unknown', qualification=True);self.write(unknown, '.build/object')
+        foreign = self.item('foreign', qualification=True);self.write(foreign, '.build/object')
+        self.mark(foreign, session='other-session', release=True)
+        own = self.item('own', qualification=True);self.mark(own, release=True)
+        self.assertEqual(list(cleanup.candidates(self.sessions, self.qualification, 'session')), [(own, 'qualification')])
+        found = list(cleanup.candidates(self.sessions, self.qualification, 'session', True))
+        self.assertEqual({p for p, _ in found}, {own, foreign})
+        with self.assertRaisesRegex(ValueError, 'owning session'):
+            cleanup.write_marker(foreign, 'session', release=True)
+
+    def test_foreign_release_revoked_before_apply_stops_cleanup(self):
+        item = self.item('rv3', session='other-session');self.write(item, '.build/object')
+        self.mark(item, session='other-session', release=True)
+        calls = 0
+        def reader():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.mark(item, session='other-session')
+            return []
+        result, records = self.run_cleanup(apply=True, include_released=True, process_reader=reader)
+        self.assertEqual(result, 1)
+        self.assertTrue((item / '.build/object').exists())
+        self.assertIn('ownership/release changed', records[0]['reason'])
+
+    def test_unknown_caller_refuses_cleanup_without_git_or_inventory(self):
+        with patch.object(cleanup, 'git_objects', side_effect=AssertionError('Git before caller validation')):
+            with self.assertRaisesRegex(ValueError, 'caller session unknown'):
+                cleanup.clean(self.sessions, self.qualification, self.repo, self.installed)
+
+    def test_retained_git_object_query_uses_reachable_history_only(self):
+        result = (b'a' * 40 + b' path\n' + b'b' * 40 + b'\n')
+        with patch.object(cleanup.subprocess, 'check_output', return_value=result) as reader:
+            self.assertEqual(cleanup.git_objects(self.repo), {'a' * 40, 'b' * 40})
+        self.assertEqual(reader.call_args.args[0], ['git', '-C', str(self.repo), 'rev-list', '--objects', '--all'])
+
+    def test_legacy_ws_without_src_is_still_kept_for_migration(self):
+        item = self.item('wsp7');self.write(item, '.build/object')
+        self.assertIn('unmarked legacy persistent workspace', self.plan(item)['reason'])
+        self.assertEqual(self.plan(item)['moves'], [])
+
+    def test_session_symlinks_are_never_followed_even_with_released_scan(self):
+        item = self.item('released');self.mark(item, release=True);self.write(item, '.build/object')
+        alias = item.parent.parent.parent / 'alias'
+        alias.symlink_to(item.parent.parent, target_is_directory=True)
+        with patch.object(cleanup, 'in_scope', wraps=cleanup.in_scope) as scope:
+            self.assertEqual(list(cleanup.candidates(self.sessions, self.qualification, 'session', True)), [(item, 'session')])
+        self.assertFalse(any('alias' in c.args[0].parts for c in scope.call_args_list))
+
+    def test_empty_scope_invokes_neither_git_nor_process_inspection(self):
+        self.item('foreign', session='other-session')
+        with patch.object(cleanup, 'git_objects', side_effect=AssertionError('Git outside scope')):
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(cleanup.clean(self.sessions, self.qualification, self.repo, self.installed,
+                                 session_id='session', process_reader=lambda: self.fail('process inspection outside scope')), 0)
+
+    def test_cli_cannot_select_another_sessions_identity(self):
+        with patch.object(sys, 'argv', ['clean_scratch.py', '--preview', '--session-id', 'other-session']), \
+             patch('sys.stderr', io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                cleanup.main()
+            self.assertEqual(error.exception.code, 2)
+        with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': ''}), \
+             patch.object(sys, 'argv', ['clean_scratch.py', '--preview']), patch('sys.stderr', io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                cleanup.main()
+            self.assertEqual(error.exception.code, 2)
 
     def test_changed_inventory_and_new_process_before_apply_refuse_move(self):
         item = self.item();file = self.write(item, '.build/object')
@@ -312,13 +492,14 @@ class CleanScratchTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as error:
                     cleanup.main()
                 self.assertEqual(error.exception.code, 2)
-        arguments = ['clean_scratch.py', '--preview', '--sessions-root', str(self.sessions),
+        arguments = ['clean_scratch.py', '--preview', '--session-id', 'session', '--sessions-root', str(self.sessions),
                      '--qualification-root', str(self.qualification), '--repo', str(self.repo),
                      '--installed-info', str(self.installed), '--keep-qualified', str(self.root / 'keep')]
         with patch.object(sys, 'argv', arguments), patch.object(cleanup, 'clean', return_value=0) as runner:
             self.assertEqual(cleanup.main(), 0)
         self.assertEqual(runner.call_args.args[:4], (self.sessions, self.qualification, self.repo, self.installed))
         self.assertEqual(runner.call_args.args[4:], ([self.root / 'keep'], False))
+        self.assertEqual(runner.call_args.kwargs, {'session_id': 'session', 'include_released': False})
 
 
 def stat_mode_fifo(path):

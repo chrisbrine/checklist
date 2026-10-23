@@ -1,14 +1,14 @@
 import Foundation
 import GRDB
 
-private struct PurgeRow {
+struct PurgeRow {
     let id: String
     let type: String
     let project: String?
     let value: JSON
     var key: Data {Data(id.utf8)}
 }
-private struct TicketPurgePlan {
+struct TicketPurgePlan {
     let removed: [PurgeRow]
     let shared: [PurgeRow]
     let groups: [PurgeRow]
@@ -19,22 +19,22 @@ private struct TicketPurgePlan {
 }
 
 extension CommandRouter {
-    private func requirePurgeSafe(_ db: Database, task: JSON) throws {
+    func requirePurgeSafe(_ db: Database, task: JSON, automatic: Bool = false) throws {
         guard !bool(task,"purged") else {throw CoreError("TICKET_PURGED","This ticket was already permanently removed.")}
         guard let key = task["key"] as? String,!key.isEmpty else {throw CoreError("PURGE_REFERENCE_REQUIRED","A stable ticket key is required before permanent removal.")}
         try requireRetirementSafe(db,task:task)
-        guard bool(task,"trashed") else {throw CoreError("TRASH_REQUIRED","Move this ticket to Trash before permanently removing it.")}
+        guard automatic || bool(task,"trashed") else {throw CoreError("TRASH_REQUIRED","Move this ticket to Trash before permanently removing it.")}
         let pending = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE type='request' AND project_id=? AND json_extract(data,'$.task_id')=? AND json_extract(data,'$.state')='pending')",arguments:[task["project_id"] as! String,task["id"] as! String]) ?? false
         guard !pending else {throw CoreError("OWNER_REQUEST_PENDING","Answer or cancel this ticket's pending owner request before permanently removing it.")}
     }
 
     /// One bounded reference inventory per command, never a full-table scan per row.
     /// Unknown references conservatively retain a shared record; they never grant unlink authority.
-    private func ticketPurgePlan(_ db: Database, task: JSON) throws -> TicketPurgePlan {
+    func ticketPurgePlan(_ db: Database, task: JSON, inventory: TicketCleanupInventory? = nil) throws -> TicketPurgePlan {
         let pid = task["project_id"] as! String,tid = task["id"] as! String,taskKey = Data(tid.utf8)
-        let rows = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records ORDER BY rowid LIMIT 100001")
+        let rows = try inventory == nil ? Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records ORDER BY rowid LIMIT 100001") : []
         guard rows.count <= 100000 else {throw CoreError("PURGE_LIMIT","The reference inventory exceeds the safe purge limit. No content was removed.")}
-        let all = try rows.map {row -> PurgeRow in let e = try GRDBRecordEnvelopeAdapter.decode(row);return PurgeRow(id:e.id,type:e.type,project:e.projectID,value:e.object)}
+        let all = try inventory?.rows ?? rows.map {row -> PurgeRow in let e = try GRDBRecordEnvelopeAdapter.decode(row);return PurgeRow(id:e.id,type:e.type,project:e.projectID,value:e.object)}
         func equals(_ value: Any?, _ id: String) -> Bool {(value as? String).map {Data($0.utf8) == Data(id.utf8)} ?? false}
         let containers: Set<String> = ["project","session","profile","status","tag","policy_revision","project_context_revision","taxonomy_revision","group","batch","batch_claim","relation","task"]
         var owned = Set(all.filter {$0.project == pid && !containers.contains($0.type) && $0.type != "storage_hold" && !($0.type == "storage_job" && $0.value["kind"] as? String == Self.ticketObjectDeletionKind) && equals($0.value["task_id"],tid)}.map(\.key))
@@ -80,7 +80,8 @@ extension CommandRouter {
         let groupValues = Dictionary(uniqueKeysWithValues:groups.map {($0.key,$0.value)})
         var references: [Data:Set<Data>] = [:],relevant = Set<Data>()
         for row in all {
-            let refs = try tokens(groupValues[row.key] ?? row.value)
+            let bookkeeping = row.type == "storage_job" && row.value["kind"] as? String == Self.ticketObjectDeletionKind
+            let refs = try bookkeeping ? Set<Data>() : (groupValues[row.key] != nil ? tokens(groupValues[row.key]!) : inventory?.tokens[row.key] ?? tokens(row.value))
             references[row.key] = refs
             if refs.contains(taskKey) || !refs.isDisjoint(with:owned) {relevant.insert(row.key)}
         }
@@ -108,7 +109,7 @@ extension CommandRouter {
         let backups = try Row.fetchAll(db,sql:"SELECT value FROM metadata WHERE key LIKE 'backup-generation:%' ORDER BY key").map {jsonObject($0["value"])}
         let relationCount = all.filter {$0.project == pid && $0.type == "relation" && equals($0.value["target_task_id"],tid) && !equals($0.value["source_task_id"],tid)}.count
         let remaining = all.filter {!removedKeys.contains($0.key) && $0.key != taskKey}.map {row -> JSON in var value = groupValues[row.key] ?? row.value;value["record_type"] = row.type;return value}
-        let byteDeletion = try ticketObjectDeletionPlan(db,owned:all.filter {owned.contains($0.key)}.map {($0.type,$0.value)},remaining:remaining)
+        let byteDeletion = try ticketObjectDeletionPlan(db,owned:all.filter {owned.contains($0.key)}.map {($0.type,$0.value)},remaining:remaining,referenceTokens:inventory.map {_ in references})
         let impact: JSON = ["task_id":tid,"project_id":pid,"expected_revision":task["revision"]!,"record_counts":counts,"removed_record_count":removed.count,"shared_record_count":shared.count,"history_events":events.count,"preserved_relation_count":relationCount,
             "managed_attachment_count":managed.count,"managed_attachment_logical_bytes":managed.reduce(0){$0+int($1.value,"size")},"managed_bytes_deleted":0,"managed_bytes_action":"post_commit_deletion","byte_deletion":byteDeletion.summary,"byte_deletion_objects":byteDeletion.objects,
             "known_backup_count":backups.count,"known_backup_observed_times":backups.compactMap {$0["known_at"] as? String},"known_backup_creation_times":backups.compactMap {$0["created_at"] as? String}]
@@ -128,15 +129,8 @@ extension CommandRouter {
             "backup_warning":"Backups and exports made before this purge may contain this ticket. Checklist does not change existing backups or exports; delete those copies yourself if needed. Recorded backup observation times are not guaranteed creation times."]
     }
 
-    func taskPurge(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
-        try owner(c);let pid = try scope(db,p,c,write:true),task = try self.task(db,p,pid)
-        try revision(p,task);try requirePurgeSafe(db,task:task)
-        let plan = try ticketPurgePlan(db,task:task)
-        guard try text(p,"preview_digest") == plan.digest else {throw CoreError("PURGE_PREVIEW_STALE","This ticket or its references changed. Read a new permanent-removal preview before confirming.")}
-        let tid = task["id"] as! String
-        let removedIDs = Set(plan.removed.map(\.key)).union([Data(tid.utf8)])
-        // Expiring receipts keeps idempotency ownership/digests but prevents a
-        // retry of an earlier create/note/read-modify command returning purged text.
+    func ticketPurgeExpiringCommands(_ db: Database,task: JSON,plan: TicketPurgePlan) throws -> [Row] {
+        let removedIDs = Set(plan.removed.map(\.key)).union([Data((task["id"] as! String).utf8)])
         let receipts = try Row.fetchAll(db,sql:"SELECT principal,command_id,result FROM commands LIMIT 100001")
         guard receipts.count <= 100000 else {throw CoreError("PURGE_LIMIT","The command history exceeds the safe purge limit. No content was removed.")}
         func containsRemoved(_ value: Any) -> Bool {
@@ -145,17 +139,30 @@ extension CommandRouter {
             if let d = value as? JSON {return d.contains {removedIDs.contains(Data($0.key.utf8)) || containsRemoved($0.value)}}
             return false
         }
-        var expired = 0
-        for receipt in receipts where containsRemoved(jsonObject(receipt["result"])) {
-            try db.execute(sql:"UPDATE commands SET result=? WHERE principal=? AND command_id=?",arguments:[Self.prunedResult,receipt["principal"] as String,receipt["command_id"] as String]);expired += 1
+        return receipts.filter {containsRemoved(jsonObject($0["result"]))}
+    }
+
+    func taskPurge(_ db: Database,_ p: JSON,_ c: Caller, automatic: Bool = false, prepared: TicketPurgePlan? = nil, expiredCommands: [Row]? = nil) throws -> JSON {
+        try owner(c);let pid = try scope(db,p,c,write:!automatic),task = try self.task(db,p,pid)
+        try revision(p,task);try requirePurgeSafe(db,task:task,automatic:automatic)
+        let plan = try prepared ?? ticketPurgePlan(db,task:task)
+        guard try text(p,"preview_digest") == plan.digest else {throw CoreError("PURGE_PREVIEW_STALE","This ticket or its references changed. Read a new permanent-removal preview before confirming.")}
+        let tid = task["id"] as! String
+        // Expiring receipts keeps idempotency ownership/digests but prevents a
+        // retry of an earlier create/note/read-modify command returning purged text.
+        let receipts = try expiredCommands ?? ticketPurgeExpiringCommands(db,task:task,plan:plan)
+        for receipt in receipts {
+            try db.execute(sql:"UPDATE commands SET result=? WHERE principal=? AND command_id=?",arguments:[Self.prunedResult,receipt["principal"] as String,receipt["command_id"] as String])
         }
+        let expired = receipts.count
         let deletion = try enqueueTicketObjectDeletion(db,project:pid,task:tid,cause:"task_purge",plan:plan.byteDeletion)
         for row in plan.removed {try db.execute(sql:"DELETE FROM records WHERE id=? AND project_id=? AND type=?",arguments:[row.id,pid,row.type])}
         for group in plan.groups {try save(db,revised(group.value),type:group.type)}
-        let tombstone: JSON = ["id":tid,"project_id":pid,"key":task["key"]!,"title":"Purged ticket","revision":int(task,"revision")+1,"purged":true,"purged_at":now(),"purged_by":c.principal,"trashed":true,"archived":true]
+        let tombstone: JSON = ["id":tid,"project_id":pid,"key":task["key"]!,"title":"Purged ticket","revision":int(task,"revision")+1,"purged":true,"purged_at":now(),"purged_by":automatic ? "system:ticket_cleanup" : c.principal,"trashed":true,"archived":true]
         try save(db,tombstone,type:"task")
         for row in plan.events {try db.execute(sql:"UPDATE events SET data='{}' WHERE seq=? AND project_id=?",arguments:[row["seq"] as Int64,pid])}
-        let counts: JSON = ["removed_records":plan.removed.count,"retained_shared_records":plan.shared.count,"scrubbed_history_events":plan.events.count,"expired_command_results":expired,"managed_bytes_deleted":0]
+        var counts: JSON = ["removed_records":plan.removed.count,"retained_shared_records":plan.shared.count,"scrubbed_history_events":plan.events.count,"expired_command_results":expired,"managed_bytes_deleted":0]
+        if automatic {counts["origin"] = "automatic_cleanup"}
         try event(db,caller:c,project:pid,entity:tid,kind:"task_purged",data:counts)
         return ["task":tombstone,"counts":counts,"byte_deletion_receipt_id":deletion["id"]!,"byte_deletion":deletion,"managed_bytes_action":"pending","warning":"Exclusive managed bytes are deleted after commit through the durable byte receipt. Shared, held and backup-referenced bytes, existing backups and exports remain. External originals and workspace files are never deleted."]
     }

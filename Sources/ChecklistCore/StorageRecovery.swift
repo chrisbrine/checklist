@@ -218,6 +218,24 @@ extension CommandRouter {
     /// actual job deadline; this creates no model runtime or polling loop.
     public func runStorageMaintenance() throws {
         let lease = try storageAdmission.acquire();defer { lease.finish() }
+        ticketCleanupMaintenanceLock.lock();defer {ticketCleanupMaintenanceLock.unlock()}
+        guard try dbQueue.read({_ in self.storageMaintenanceFallbackFailures < 2}) else {return}
+        do {
+            // Drain an admitted byte job before planning another ticket. Never run
+            // expensive reference traversal on the command tail or service queue.
+            var deletionPrepared = false
+            try withTicketCleanupPreparation({db -> TicketCleanupPreparedDeletion? in
+                let result = try self.prepareTicketObjectDeletion(db);deletionPrepared = result != nil;return result
+            }) {db,permit,prepared in try self.processTicketObjectDeletionIntents(db,permit:permit,prepared:prepared)}
+            if !deletionPrepared {
+                try withTicketCleanupPreparation({try self.prepareTicketLifecycleCleanup($0)}) {db,_,prepared in
+                    try self.commitTicketLifecycleCleanup(db,prepared:prepared,at:Date())
+                }
+            }
+        } catch {
+            try dbQueue.writeWithoutTransaction {_ in self.storageMaintenanceFallbackFailures = min(self.storageMaintenanceFallbackFailures + 1,2)}
+            throw error
+        }
         try ArchiveStorageGate.withExclusive(root:root) { permit in
             try dbQueue.writeWithoutTransaction { _ = self.performStorageMaintenance($0,permit:permit) }
         }

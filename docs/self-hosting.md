@@ -44,15 +44,39 @@ Prove a successful and a failed staged build, simultaneous complete-fingerprint 
 
 `VERSION` is the single repository source of the production series, initially `0.0.1`.
 Ordinary development builds never edit it. `script/version.py` allocates the next
-four-part version (`0.0.1.N`) under the build lock, continuing the installed and local
-build history. The fourth component counts development builds within the production
-series: no recorded same-series version starts at `.1`, then `.2`, and so on. The
-installed same-series version and local allocation state supply the highest fourth
-component; historical ordinals do not seed it. A new production series starts at `.1`.
-Both counters are reserved together before the legacy ordinal file is updated, so
-an interrupted allocation can skip numbers but never reuse a reserved version.
-The separate global `build_number` never resets and stays above the installed ordinal,
-including when changing series or returning to an older source version.
+four-part version (`0.0.1.N`) from one allocator shared by every checkout on this
+Mac, under `~/Library/Application Support/Checklist Build/`, outside checkouts and
+the live store. `allocator.lock` uses an OS advisory exclusive lock held only for
+reservation; process exit releases it. Keep this lock file in place: replacing or
+removing it could split the lock authority. Compilation keeps its checkout-local
+build lock and separate lanes.
+
+`version-state.json` in that shared directory retains the global ordinal and the
+highest fourth component for every production series. Under the shared lock,
+allocation takes the maximum of shared history, the calling checkout's legacy
+`.local/build/version-state.json` and `build-ordinal`, and the installed bundle.
+Legacy files are read only, and each checkout contributes its history when it next
+allocates. Reconcile any other pre-migration checkout histories before the first
+production allocation with this helper; unobserved legacy reservations cannot be
+inferred from the installed bundle. Do not delete, reset or restore an older shared
+state, including after a failed build, an abandoned stage or uninstalling the app.
+Preserve this build history separately from the app's store.
+
+Both counters are written together to a temporary file, flushed with `fsync`, then
+atomically replaced and the containing directory flushed before returning. Missing
+directories and their parent entries are flushed when created. A crash can leave
+unused numbers, but a completed reservation is never rolled back or reused. Invalid
+history refuses allocation rather than resetting counters. No new checkout-local
+allocation state is written.
+
+The fourth component starts at `.1` for each new production series; historical
+ordinals do not seed it. Returning to a previously built series continues its
+retained counter. The separate global `build_number` never resets. Both version
+and ordinal exceed the installed values; a source series older than the installed
+series refuses allocation. Tests use `CHECKLIST_BUILD_ALLOCATOR_DIR` or the helper's
+`allocator` parameter to select a temporary directory. All concurrently tested
+checkouts must share that temporary directory. Production checkouts must use the
+default shared location consistently; a checkout-local override loses the guarantee.
 
 The capture and bundled `source-manifest.json` and `build-info.json` record `version`,
 `production_version`, `build_number` and `build_id`. Apple plist fields retain the

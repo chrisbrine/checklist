@@ -122,6 +122,7 @@ extension CommandRouter {
         case "epic_delete": return try epicDelete(db,p,c)
         case "epic_list", "triage_list": return try groupList(db,p,c,method)
         case "archive_storage_settings": return try archiveStorageSettingsCommand(db,p,c)
+        case "ticket_cleanup_receipts": return try ticketCleanupRead(db,p,c,method)
         case "cleanup_job_list","cleanup_job_get","cleanup_job_cancel","cleanup_job_retry": return try archiveCleanupJobCommand(db,p,c,method)
         case "attachment_read_release": return try releaseAttachmentRead(db,p,c)
         case "attachment_add", "attachment_update": return try attachmentWrite(db,p,c,method)

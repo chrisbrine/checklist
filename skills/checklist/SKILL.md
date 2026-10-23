@@ -52,6 +52,10 @@ A Triage is the coordinated pass run by an actual Claude or Codex conversation o
 
 An Epic is a container for actual tickets. Never pre-create Epics or Triages as assumptions during project setup or at any other time. Create an Epic only when real tickets exist to go into it. Delete a mistakenly created empty Epic with `epic_delete` (CL-245), rather than archiving it. Use the command only when discovered; if unavailable, report the missing command and leave deletion pending. During setup, configure the project first, then capture actual tickets before organizing them into Epics or phase Triages.
 
+## Orchestration setups
+
+For one combined coordinator, split implementation/review threads or several disjoint implementation Triages, use [run implementation and review orchestrators](references/orchestration.md). It covers tool choice, role division, communication and current server limits.
+
 ## Select the relevant procedure
 
 - New/unregistered project or connection problems: [setup](references/setup.md).

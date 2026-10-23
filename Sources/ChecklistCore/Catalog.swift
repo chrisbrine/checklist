@@ -91,6 +91,8 @@ extension CommandRouter {
         if c.isOwner {
             fields["workspace_page"] = ["surface","record_id","text","cursor","limit","include_archived"]
         }
+        fields["project_settings_save"]! += ["ticket_cleanup"]
+        fields["ticket_cleanup_receipts"] = ["receipt_id"]
         fields["archive_storage_settings"] = ["settings_revision","archive_storage"]
         fields["cleanup_job_list"] = ["task_id"]
         for command in ["cleanup_job_get","cleanup_job_cancel","cleanup_job_retry"] {fields[command] = ["cleanup_job_id"]}
@@ -111,6 +113,7 @@ extension CommandRouter {
             for key in keys {
                 if ["limit","expected_revision","expected_task_revision","from_epic_revision","policy_revision","acceptance_revision","revision","settings_revision","sort_order"].contains(key) { properties[key] = ["type":"integer","minimum":0] }
                 else if ["archived","blocking","expects_reply","include_archived","include_ended","required","include_completion_eligibility","cleanup","preview","undo","retain_cited_files","snoozed"].contains(key) { properties[key] = ["type":"boolean"] }
+                else if key == "ticket_cleanup" { properties[key] = Self.ticketCleanupSchema }
                 else if key == "command_id" { properties[key] = ["type":"string","format":"uuid","maxLength":4000,"description":"A new random UUID for each distinct command. Reuse the same UUID only to retry the same command with the same input."] }
                 else if ["keys","fields"].contains(key) { properties[key] = ["type":"array","items":["type":"string"],"maxItems":200] }
                 else if key == "pinned_decisions" { properties[key] = ["type":"array","maxItems":25] }
@@ -188,6 +191,7 @@ extension CommandRouter {
         case "finding_waive","direction_waive":return "Record a reasoned waiver with caller provenance. Agent callers create agent waivers, never owner approvals. Requires allowed agent_rule_changes."
         case "project_icon_import":return "Import a PNG, JPEG or WebP up to 5 MiB from inside the caller's enrolled workspace. Requires current project revision and allowed agent_rule_changes."
         case "diagnostics_summary":return "Read aggregate diagnostics for the selected project only. Contains no file destination or record content. Agent callers require allowed agent_rule_changes."
+        case "ticket_cleanup_receipts":return "Read project-scoped durable automatic cleanup pass receipts and their current owned-byte outcomes. Removed pathname bytes are not measured physical disk savings."
         case "work_health_get":return "Read advisory work health, exact handler or actual phase orchestrator, substantive progress, separate liveness, known waits, correlated request/deadline, delivery and next check. Timeout changes no workflow authority."
         case "work_health_respond":return "Answer this exact request_id with current progress or a known wait and current task expected_revision. Rechecks session generation, current attempt/phase and material revisions. Late replies retain newer ownership and require ordinary fresh claim/handoff when authority changed. A reply is not substantive progress or a new claim."
         case "human_request_create":return "Create an owner input request with flat task_id, title, explanation, questions, file_requests, blocking (Boolean), command, target_attachment_id, review_request_id and target_manifest_id fields. No request_spec wrapper. Questions require id and prompt; type=text|choice|approval|check (default text), required (default true), multiple, allow_custom, options=[{id,label}] for choice, optional command. Files require id and prompt; kind (or selection)=file|directory|either. At least one question or file, at most 30 each. command={text,working_directory,expected_result,reason?} describes instructions, never executes them. Exact human gate binding requires one approval question and its managed attachment target. Earlier answered approvals on this ticket or normalized title/question matches in this project refuse with COVERED_BY_EARLIER_ANSWER and matching answers. Continue only with supersedes_answer_id naming a matched answer/request and supersede_reason explaining what changed."

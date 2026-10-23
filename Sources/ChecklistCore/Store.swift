@@ -4,6 +4,7 @@ import GRDB
 import CryptoKit
 
 public final class CommandRouter: @unchecked Sendable {
+    let epicReferenceIndex = EpicReferenceIndex()
     let dbQueue: DatabaseQueue
     /// Read-only connections for pure reads (CL-72). Nil when the store cannot open them;
     /// reads then use the writer path.
@@ -24,6 +25,8 @@ public final class CommandRouter: @unchecked Sendable {
     var managedImportRecoveryFailures: [Data:Int] = [:]
     var managedImportMaintenanceAfterRow: Int64 = 0
     var storageMaintenanceFallbackFailures = 0
+    let ticketCleanupMaintenanceLock = NSLock()
+    let ticketCleanupReferenceCache = TicketCleanupReferenceCache()
     // One command's prepared files (CL-71) and the captures it created (CL-70). Set and
     // cleared inside the serialized writer; preparation itself never reads them.
     private var preparationStorage = CommandPreparation()
@@ -79,6 +82,7 @@ public final class CommandRouter: @unchecked Sendable {
         } catch {
             storageMaintenanceFallbackFailures = 2
         }
+        try dbQueue.writeWithoutTransaction { try epicReferenceIndex.install($0) }
     }
     static let canonicalRecordColumns = "id,project_id,type,revision,data,CAST(id AS BLOB) AS _envelope_id_bytes,CAST(project_id AS BLOB) AS _envelope_project_id_bytes,CAST(type AS BLOB) AS _envelope_type_bytes,CAST(data AS BLOB) AS _envelope_data_bytes"
     // CASE guards every JSON operation. A foreign malformed payload is never
@@ -120,6 +124,13 @@ public final class CommandRouter: @unchecked Sendable {
         let referenceWrite = try prepareTaskReferenceWrite(db,previous:previous,next:envelope)
         try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),?,CAST(? AS TEXT)) ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,type=excluded.type,revision=excluded.revision,data=excluded.data",arguments:[Data(envelope.id.utf8),envelope.projectID.map { Data($0.utf8) },Data(envelope.type.utf8),envelope.revision,Data(raw.utf8)])
         recordTaskReferenceWrite(referenceWrite)
+        if type == "task",let pid = envelope.projectID,let statusID = value["status_id"] as? String,
+           let prior = previous.map({ jsonObject($0["data"]) }),prior["status_id"] as? String != statusID,
+           (try? record(db,statusID,type:"status"))?["category"] as? String == "done" {
+            // Commit a recovery wake with the Done transition. Startup or the
+            // background pump admits the usual durable byte job; no unlink here.
+            try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?, '0'), (?, '0')",arguments:["ticket-cleanup-cursor:" + pid,"ticket-cleanup-next:" + pid])
+        }
     }
     func event(_ db: Database, caller: Caller, project: String?, entity: String?, kind: String, data: JSON = [:]) throws {
         try requireWriter(db)
@@ -341,6 +352,7 @@ public final class CommandRouter: @unchecked Sendable {
     /// Closes the read-only connections before the writer, so the writer's close can
     /// checkpoint the WAL as the store's last connection.
     public func closeStore() throws {
+        epicReferenceIndex.stop()
         try readers?.close()
         try dbQueue.close()
     }
@@ -374,5 +386,5 @@ public final class CommandRouter: @unchecked Sendable {
         guard !captures.isEmpty else { return }
         try? dbQueue.read { db in _ = self.discardUncommittedSourceCaptures(db, captures) }
     }
-    static let readMethods: Set<String> = mediaOwnerReads.union(["work_health_get","cleanup_job_get","cleanup_job_list","workspace_page","service_info","tool_catalog","snapshot","changes_wait","delivery_pending","storage_status","diagnostics_summary","project_list","project_resolve","project_settings_get","policy_get","taxonomy_get","task_get","task_list","task_context","session_list","session_inbox","assistant_inbox","assistant_projects","message_delivery_list","history_list","attachment_list","attachment_read","attachment_cleanup_preview","agent_resolve","triage_list","epic_list","development_status","policy_preview","relation_list","review_batch_inputs","batch_get","batch_list","source_execution_get","review_prepare","review_context"])
+    static let readMethods: Set<String> = mediaOwnerReads.union(["ticket_cleanup_receipts","work_health_get","cleanup_job_get","cleanup_job_list","workspace_page","service_info","tool_catalog","snapshot","changes_wait","delivery_pending","storage_status","diagnostics_summary","project_list","project_resolve","project_settings_get","policy_get","taxonomy_get","task_get","task_list","task_context","session_list","session_inbox","assistant_inbox","assistant_projects","message_delivery_list","history_list","attachment_list","attachment_read","attachment_cleanup_preview","agent_resolve","triage_list","epic_list","development_status","policy_preview","relation_list","review_batch_inputs","batch_get","batch_list","source_execution_get","review_prepare","review_context"])
 }

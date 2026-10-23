@@ -134,7 +134,7 @@ elif name=='plutil': pass
 '''
         for name in ['swift', 'xcrun', 'codesign', 'ditto', 'plutil', 'mv']:
             path=self.root/'tools'/name;path.write_text(tool);path.chmod(0o755)
-        self.env = dict(os.environ, PATH=str(self.root/'tools')+os.pathsep+os.environ['PATH'], CALLS=str(self.calls), CHECKLIST_SIGN_IDENTITY='-')
+        self.env = dict(os.environ, PATH=str(self.root/'tools')+os.pathsep+os.environ['PATH'], CALLS=str(self.calls), CHECKLIST_SIGN_IDENTITY='-', CHECKLIST_BUILD_ALLOCATOR_DIR=str(self.root/'allocator'))
 
     def run_stage(self, mode='--stage', **environment):
         return subprocess.run([str(self.root/'script/build_and_run.sh'), mode], env=dict(self.env, **environment), capture_output=True, text=True)
@@ -319,19 +319,23 @@ elif name=='plutil': pass
     def test_concurrent_checkouts_keep_separate_lanes_and_outputs(self):
         other=BuildScriptTests();other.setUp();self.addCleanup(other.doCleanups)
         (other.root/'Sources/value.swift').write_text('let value = 99\n')
+        other.env['CHECKLIST_BUILD_ALLOCATOR_DIR'] = self.env['CHECKLIST_BUILD_ALLOCATOR_DIR']
         first,release=self.start_paused()
         second,other_release=other.start_paused()
         release.touch();other_release.touch()
         for process in [first,second]:
             stdout,stderr=process.communicate(timeout=30)
             self.assertEqual(process.returncode,0,stdout+stderr)
-        lanes=[]
+        lanes=[];identities=[]
         for fixture,value in [(self,'let value = 1\n'),(other,'let value = 99\n')]:
             capture=fixture.capture();receipt=json.loads((capture/'build-verification.json').read_text())
             lanes.append(receipt['build_source'])
+            identities.append(json.loads((capture/'capture-manifest.json').read_text()))
             for product in receipt['binary_sha256']:
                 self.assertEqual((capture/'Checklist.app/Contents/MacOS'/product).read_text(),value)
         self.assertNotEqual(lanes[0],lanes[1])
+        for key in ['version', 'build_number', 'build_id']:
+            self.assertNotEqual(identities[0][key], identities[1][key], key)
 
     def test_held_build_lock_refuses_before_running_native_tools(self):
         lock=self.root/'.local/build/.build-lock';lock.mkdir(parents=True)

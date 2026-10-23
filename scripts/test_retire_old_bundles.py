@@ -201,31 +201,56 @@ class RetireOldBundlesTests(unittest.TestCase):
         stub = binary / 'python3'
         stub.write_text('#!' + sys.executable + '\n' + """import json,os,sys
 with open(os.environ['TRACE'], 'a') as output: output.write(json.dumps(sys.argv[1:]) + '\\n')
-raise SystemExit(int(os.environ['VERIFY_EXIT'] if sys.argv[1].endswith('verify_install.py') else os.environ['RETIRE_EXIT']))
+if sys.argv[1].endswith('verify_install.py'):
+    exit_code = os.environ['VERIFY_EXIT']
+elif sys.argv[1].endswith('retire_old_bundles.py'):
+    exit_code = os.environ['RETIRE_EXIT']
+elif sys.argv[1] == '-':
+    source = sys.stdin.read()
+    if 'from clean_builds import post_install' not in source:
+        raise SystemExit('Unexpected cleanup heredoc')
+    exit_code = os.environ['CLEANUP_EXIT']
+else:
+    raise SystemExit('Unexpected Python call')
+raise SystemExit(int(exit_code))
 """)
         stub.chmod(0o755)
         previous = self.bundle('.Checklist-previous-20261020T010000Z-20.app')
-        cases = [(mode, verify, cleanup, had_previous)
+        capture = self.root / 'capture with spaces'
+        cases = [(mode, verify, retire, cleanup, had_previous)
                  for mode in ['--verify', '--install-stage', '--install', 'run', '--debug', '--logs', '--telemetry']
-                 for verify, cleanup, had_previous in [(0, 0, '1'), (0, 1, '0'), (1, 0, '1')]]
-        for mode, verify, cleanup, had_previous in cases:
-            with self.subTest(mode=mode, verify=verify, cleanup=cleanup, previous=had_previous):
+                 for verify, retire, cleanup, had_previous in [
+                     (0, 0, 0, '1'), (0, 1, 0, '0'), (0, 0, 1, '1'),
+                     (0, 1, 1, '1'), (1, 0, 0, '1')]]
+        for mode, verify, retire, cleanup, had_previous in cases:
+            with self.subTest(mode=mode, verify=verify, retire=retire, cleanup=cleanup, previous=had_previous):
                 trace.write_text('')
                 environment = dict(self.environment, MODE=mode, ROOT_DIR=str(REPO), DEST=str(self.applications / 'Checklist.app'),
-                                   HAD_PREVIOUS=had_previous, PREVIOUS=str(previous), INSTALL_STARTED='1234', TRACE=str(trace),
-                                   VERIFY_EXIT=str(verify), RETIRE_EXIT=str(cleanup), PATH=str(binary) + os.pathsep + os.environ['PATH'])
+                                   CAPTURE_DIR=str(capture), HAD_PREVIOUS=had_previous, PREVIOUS=str(previous), INSTALL_STARTED='1234', TRACE=str(trace),
+                                   VERIFY_EXIT=str(verify), RETIRE_EXIT=str(retire), CLEANUP_EXIT=str(cleanup),
+                                   PATH=str(binary) + os.pathsep + os.environ['PATH'])
                 result = subprocess.run(['bash', '-c', 'set -euo pipefail\nsleep() { :; }\n' + block],
                                         env=environment, capture_output=True, text=True)
                 calls = [json.loads(line) for line in trace.read_text().splitlines()]
                 if mode in ['--verify', '--install-stage'] and verify:
                     self.assertEqual(result.returncode, 1)
-                    self.assertTrue(all(call[0].endswith('verify_install.py') for call in calls))
+                    self.assertEqual(calls, [
+                        [str(REPO / 'script/verify_install.py'), environment['DEST'], '--install-started', '1234'],
+                        [str(REPO / 'script/verify_install.py'), '--failure-guidance', '--install-started', '1234']])
+                    self.assertNotIn('Warning:', result.stderr)
                     self.assertNotIn('After the installed checks pass', result.stdout)
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(calls[-1], [str(SCRIPT), '--after-install', '--keep', str(previous) if had_previous == '1' else ''])
-                    self.assertEqual(len(calls), 2 if mode in ['--verify', '--install-stage'] else 1)
-                    self.assertEqual('Warning:' in result.stderr, bool(cleanup))
+                    expected = []
+                    if mode in ['--verify', '--install-stage']:
+                        expected.append([str(REPO / 'script/verify_install.py'), environment['DEST'], '--install-started', '1234'])
+                    expected.append([str(SCRIPT), '--after-install', '--keep', str(previous) if had_previous == '1' else ''])
+                    self.assertEqual(calls[:-1], expected)
+                    self.assertEqual(calls[-1][:3], ['-', str(REPO), str(capture)])
+                    self.assertEqual(len(calls[-1]), 4)
+                    self.assertRegex(calls[-1][3], r'^[1-9][0-9]*$')
+                    self.assertEqual('Warning: old Checklist bundles' in result.stderr, bool(retire))
+                    self.assertEqual('Warning: build cleanup retained unresolved items' in result.stderr, bool(cleanup))
                     self.assertIn('--retire-previous', result.stdout)
                     if had_previous == '1': self.assertIn('Previous bundle retained at ' + str(previous), result.stdout)
                 self.assertTrue(previous.is_dir());self.assertEqual(list(self.trash.iterdir()), [])

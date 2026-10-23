@@ -24,7 +24,6 @@ extension CommandRouter {
             if try StorageSnapshotRetention.isActive(root:root) {return .backupCapture}
             guard storageMaintenanceFallbackFailures < 2 else { return .suspended }
             let importWarning = try reconcileManagedAttachmentImports(db)
-            try processTicketObjectDeletionIntents(db,permit:permit)
             try processArchiveCleanupJobs(db, permit: permit, nowMS: Int64(Date().timeIntervalSince1970 * 1000))
             storageMaintenanceFallbackFailures = 0
             return importWarning

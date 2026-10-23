@@ -15,6 +15,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 from retire_old_bundles import trash
@@ -22,6 +23,7 @@ from retire_old_bundles import trash
 REPO = Path(__file__).resolve().parents[1]
 BUILD_NAMES = {'.build', 'CompilationCache.noindex', 'CompilationCache', 'module-cache'}
 QUIET_SECONDS = 45 * 60
+WORKSPACE_MARKER = '.checklist-workspace.json'
 
 
 def within(path, parent):
@@ -93,21 +95,121 @@ def children(path):
     return sorted(path.iterdir()) if path.is_dir() and not path.is_symlink() else []
 
 
-def candidates(sessions, qualification):
-    """Only session scratchpad entries and direct qualification runs are in scope.
+def read_marker(root):
+    """None means absent; malformed/linked markers refuse cleanup, never release it."""
+    path = root / WORKSPACE_MARKER
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 16384:
+        raise ValueError('invalid workspace marker: ' + str(path))
+    # Do not follow a marker swapped to a link after lstat.
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, 'r') as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise ValueError('invalid workspace marker: ' + str(path))
+        value = json.loads(source.read(16385))
+    if (not isinstance(value, dict) or type(value.get('version')) is not int or value['version'] != 1
+            or not isinstance(value.get('session_id'), str) or not value['session_id'].strip()
+            or not isinstance(value.get('purpose'), str) or not value['purpose'].strip()
+            or type(value.get('released')) is not bool):
+        raise ValueError('invalid workspace marker: ' + str(path))
+    return value
 
-    A spare process is not inherently a Checklist session. Its individual items
-    must contain a Checklist manifest held by the retained repository.
+
+def write_marker(root, session_id, purpose=None, release=False):
+    """Only the recorded owner marks/releases a workspace; interrupted writes keep safe."""
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError('workspace must be an existing directory, not a link')
+    root = root.resolve()
+    # A filesystem session binding takes precedence over a supplied marker owner.
+    scratchpad = next((p for p in root.parents if p.name == 'scratchpad'), None)
+    if scratchpad and scratchpad.parent.name != session_id:
+        raise ValueError('workspace belongs to another scratch session')
+    previous = read_marker(root)
+    if previous and previous['session_id'] != session_id:
+        raise ValueError('only the owning session can change this workspace marker')
+    if release and previous is None:
+        raise ValueError('mark the workspace before releasing it')
+    if not release and (not purpose or not purpose.strip()):
+        raise ValueError('--mark requires a nonblank --purpose')
+    value = dict(previous) if release else {'version': 1, 'session_id': session_id, 'purpose': purpose}
+    value['released'] = release
+    # Write beside the marker, then atomically publish. An interrupted temporary
+    # file is preserved as unknown bytes; an existing protection stays in place.
+    with tempfile.NamedTemporaryFile(mode='w', dir=root, prefix=WORKSPACE_MARKER + '.', delete=False) as output:
+        json.dump(value, output, sort_keys=True)
+        output.write('\n')
+        output.flush()
+        os.fsync(output.fileno())
+        temporary = Path(output.name)
+    os.replace(temporary, root / WORKSPACE_MARKER)
+    return value
+
+
+def released_by(root, session_id=None):
+    try:
+        marker = read_marker(root)
+        return bool(marker and marker['released'] and
+                    (session_id is None or marker['session_id'] == session_id))
+    except (OSError, ValueError):
+        return False
+
+
+def in_scope(item, kind, session_id, include_released=False):
+    if kind in {'session', 'spare'}:
+        owner = item.parent.parent.name
+        return owner == session_id or (include_released and released_by(item, owner))
+    # Qualification runs have no session path: their root marker supplies ownership.
+    try:
+        marker = read_marker(item)
+        return bool(marker and (marker['session_id'] == session_id or
+                                (include_released and marker['released'])))
+    except (OSError, ValueError):
+        return False
+
+
+def candidates(sessions, qualification, session_id, include_released=False):
+    """Default scope is the caller's session, never another session's idle copies.
+
+    --include-released admits foreign roots only with that session's release.
+    Spare items still need their own retained Checklist package in plan().
     """
     for host in children(sessions):
         checklist = 'Checklist' in host.name
         if not checklist and 'spare-' not in host.name:
             continue
         for session in children(host):
+            if session.is_symlink() or (session.name != session_id and not include_released):
+                continue
             for item in children(session / 'scratchpad'):
-                yield item, 'session' if checklist else 'spare'
+                kind = 'session' if checklist else 'spare'
+                if in_scope(item, kind, session_id, include_released):
+                    yield item, kind
     for item in children(qualification):
-        yield item, 'qualification'
+        if in_scope(item, 'qualification', session_id, include_released):
+            yield item, 'qualification'
+
+
+def workspace_protection(item, before):
+    # Protect a marked workspace whether it is the scratch item, nested below it,
+    # or an ancestor of it. A released outer marker never releases an inner one.
+    roots = {p.parent for p in before if p.name == WORKSPACE_MARKER}
+    roots.update(item.parents)
+    for root in sorted(roots):
+        try:
+            marker = read_marker(root)
+        except (OSError, ValueError):
+            return 'invalid/unreadable workspace marker; retained: ' + str(root)
+        if marker and not marker['released']:
+            return 'persistent workspace marker; retained: ' + str(root)
+    # Migration guard only: never infer release from the old naming convention.
+    for path, entry in before.items():
+        if (re.fullmatch(r'ws[a-z]*\d+', path.name) and stat.S_ISDIR(entry[2])
+                and read_marker(path) is None):
+            return 'unmarked legacy persistent workspace; mark before retirement: ' + str(path)
+    return None
 
 
 def installed_fingerprint(path):
@@ -133,10 +235,8 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
         reason = 'spare item has no retained Checklist package identity'
     elif any(overlap(item, path) for path in keep):
         reason = 'explicitly retained qualified copy or persistent build slot'
-    elif any(re.fullmatch(r'ws[a-z]*\d+', path.name) and
-             stat.S_ISDIR(entry[2]) and path / 'src' in before and
-             stat.S_ISDIR(before[path / 'src'][2]) for path, entry in before.items()):
-        reason = 'persistent build slot; reuse its source and warm .build'
+    elif protection := workspace_protection(item, before):
+        reason = protection
     elif fingerprint is None:
         reason = 'latest installed identity unavailable; qualified-copy retention unresolved'
     else:
@@ -172,6 +272,8 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
         if not why:
             if not stat.S_ISREG(entry[2]):
                 why = 'link or special file; never followed or moved'
+            elif path.name == WORKSPACE_MARKER:
+                why = 'workspace ownership/release marker retained'
             elif '.git' in components:
                 why = 'Git metadata retained; checkout retirement belongs to CL-194'
             elif any(name in BUILD_NAMES for name in components):
@@ -211,10 +313,13 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
 
 
 def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
-          process_reader=running_paths, mover=trash, clock=time.time):
-    objects = git_objects(repo)
+          process_reader=running_paths, mover=trash, clock=time.time,
+          session_id=None, include_released=False):
+    if not session_id:
+        raise ValueError('caller session unknown; supply --session-id for your own session')
+    items = list(candidates(sessions, qualification, session_id, include_released))
+    objects = git_objects(repo) if items else set()
     fingerprint = installed_fingerprint(installed_info)
-    items = list(candidates(sessions, qualification))
     processes = process_reader() if items else []
     # The retained installation must not change underneath a cleanup pass.
     initial_fingerprint = fingerprint
@@ -223,6 +328,8 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
         try:
             # An old --preview is never an executable deletion plan.
             # Apply also refreshes process use immediately before moving.
+            if not in_scope(item, kind, session_id, include_released):
+                raise ValueError('workspace ownership/release changed; retained')
             decision = plan(item, kind, objects, processes, fingerprint, keep, clock())
             public = {key: value for key, value in decision.items() if key not in {'inventory', 'moves'}}
             public['action'] = 'preview'
@@ -235,6 +342,8 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
                 public['action'] = 'trashed'
                 public['destinations'] = []
                 for path in decision['moves']:
+                    if not in_scope(item, kind, session_id, include_released) or workspace_protection(item, decision['inventory']):
+                        raise ValueError('workspace ownership/release changed; stopped')
                     if installed_fingerprint(installed_info) != initial_fingerprint:
                         raise ValueError('installed round changed; rerun preview with its qualified copy retained')
                     if any(within(p, item) for p in process_reader()):
@@ -269,21 +378,41 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--mark', type=Path, help='protect a persistent workspace owned by this session')
+    mode.add_argument('--release', type=Path, help='release your marked workspace for later cleanup')
     mode.add_argument('--preview', action='store_true')
     mode.add_argument('--apply', action='store_true', help='move eligible paths to macOS Trash; never permanently delete')
-    parser.add_argument('--sessions-root', type=Path, default=Path('/private/tmp/claude-501'))
+    parser.add_argument('--purpose', help='workspace purpose; required with --mark')
+    parser.add_argument('--session-id', default=os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID'),
+                        help='caller session (default: CODEX_THREAD_ID or CLAUDE_SESSION_ID); never name another session')
+    parser.add_argument('--include-released', action='store_true',
+                        help='also inspect foreign roots explicitly released by their owning session')
+    parser.add_argument('--sessions-root', type=Path, default=Path(f'/private/tmp/claude-{os.getuid()}'))
     parser.add_argument('--qualification-root', type=Path, default=Path.home() / 'Library/Caches/ChecklistQualification')
     parser.add_argument('--repo', type=Path, default=REPO, help='retained Checklist repository holding recoverable bytes')
     parser.add_argument('--installed-info', type=Path, default=Path('/Applications/Checklist.app/Contents/Resources/build-info.json'))
     parser.add_argument('--keep-qualified', type=Path, action='append', default=[],
                         help='also retain this exact qualified round or assigned persistent slot (repeatable)')
     args = parser.parse_args()
+    native_session = os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID')
+    if native_session and args.session_id != native_session:
+        parser.error('--session-id cannot override the host caller; use --include-released for released foreign roots')
+    if not args.session_id or args.session_id in {'.', '..'} or '/' in args.session_id or not args.session_id.strip():
+        parser.error('caller session unknown/invalid; --session-id must name your own session')
+    if args.purpose is not None and args.mark is None:
+        parser.error('--purpose is only valid with --mark')
+    if args.mark is not None or args.release is not None:
+        root = (args.mark if args.mark is not None else args.release).expanduser()
+        value = write_marker(root, args.session_id, args.purpose, args.release is not None)
+        print(json.dumps({'path': str(root.resolve()), 'action': 'released' if args.release else 'marked', **value}))
+        return 0
     for root in [args.sessions_root.expanduser(), args.qualification_root.expanduser()]:
         if root.is_symlink():
             parser.error('scratch roots must not be symbolic links: ' + str(root))
     return clean(args.sessions_root.expanduser().resolve(), args.qualification_root.expanduser().resolve(),
                  args.repo.expanduser().resolve(), args.installed_info.expanduser(),
-                 [path.expanduser().resolve() for path in args.keep_qualified], args.apply)
+                 [path.expanduser().resolve() for path in args.keep_qualified], args.apply,
+                 session_id=args.session_id, include_released=args.include_released)
 
 
 if __name__ == '__main__':

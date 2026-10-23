@@ -4,6 +4,8 @@ Cite tickets, Triages and Epics as `KEY "Title"` (the name for groups) in notes,
 
 Triages coordinate two or more tickets. Handle a lone implementation or review ticket directly. When only one ticket remains in a phase, finish that ticket directly while preserving the Triage history. Do not hold passes or create singleton Review/remaining-work Triages; all ordinary status and membership guards still apply.
 
+Choose conversation roles and tools with [run implementation and review orchestrators](orchestration.md), including combined, split and disjoint-Triage setups, checkout holds and handover.
+
 ## Implementation and qualification
 
 Define one finishable Triage pass from its tickets' remaining acceptance gaps. Assign disjoint source work, compose compatible changes into one application target, reuse the normal dependency graph and run the selected compatible checks together. Record a shared build/test result with its source fingerprint, case results and ticket applicability; each ticket still needs its own exact manifest and independent review. A component pass advances this path rather than starting another preparation cycle. Use a separate package only for a concrete isolation requirement, and do not treat unrelated canonical files as immutable test inputs.
@@ -14,7 +16,20 @@ Submit ready targets into a separate Review Triage, review the shared evidence a
 
 ## Combined build rounds
 
-Round commit messages and install notes name the full version from `build-info.json`, the ordinal and build ID (for example `Integration round 23: 0.0.1.1 (build 119)`). `VERSION` holds the production series; ordinary rounds never bump it. See `docs/self-hosting.md` for the explicit zero-open-ticket release step.
+At every completed build/round/check boundary, also save a
+`python3 script/clean_builds.py --preview` report. Apply eligible authorized
+retirement to the Trash with explicit `--keep PATH` entries for all assigned idle
+slots, unfinished hand-ins and retained qualification copies. The install hook
+handles old captured outputs and legacy scratch; the command handles remaining
+builds, evidence whose owning tickets are all Done, and unused test slots. It
+retains unknown identities/statuses/use and never stops a running slot. For an
+owned bounded check, save external evidence and use `check --destroy-after-check`
+or destroy its slot after the GUI closes; retain promotion slots until finished.
+See [local cleanup](../../../docs/monorepo-workspace.md#local-build-and-hand-in-cleanup).
+This complements the session scratch cleanup below; neither command authorizes
+retiring an active pass or its evidence.
+
+Round commit messages and install notes name the full version from `build-info.json`, the ordinal and build ID (for example `Integration round 23: 0.0.1.1 (build 121)`). `VERSION` holds the production series; ordinary rounds never bump it. See `docs/self-hosting.md` for the explicit zero-open-ticket release step.
 
 Use this sequence for each authorized combined round. Use the [reviewer and check-runner briefs](driven-sessions.md#reviewer-brief-template) for the independent sessions.
 
@@ -23,10 +38,10 @@ Use this sequence for each authorized combined round. Use the [reviewer and chec
    Only the integrator writes the shared checkout, and only in its announced write window.
 2. Each hand-in contains `tree/`, `base/`, `files.json`, `base.txt` and `notes.md`.
    Each `files.json` entry has `path`, `sha256`, `base_sha256`, `mode` and `ticket`; `base.txt` identifies the starting revision. `notes.md` maps ticket hunks, checks, limitations and contributors.
-   Verify hashes and modes. Compose in an assigned persistent build-slot workspace with a three-way merge per file using `base/`; stop on any conflict. Implementers, integrators and reviewers reuse fixed slot paths outside `~/Documents`, with `src/` and sibling `.build/`. Sync sources with `rsync -a --delete --checksum --exclude .build --exclude .local <source>/ <slot>/src/`, verify the expected clean base (or the immutable capture fingerprint/files), and build with `--scratch-path <slot>/.build`. Never delete the slot cache or start a fresh cold build per task; only a new slot needs its initial build.
+   Verify hashes and modes. Compose in an assigned persistent build-slot workspace with a three-way merge per file using `base/`; stop on any conflict. Implementers, integrators and reviewers reuse fixed slot paths outside `~/Documents`, with `src/` and sibling `.build/`. When creating any persistent workspace, mark its root before source sync/build with `python3 script/clean_scratch.py --mark <slot> --purpose "persistent implementation/integration/review slot" --session-id <own session ID>`; migrate existing assigned slots the same way. Keep it marked across tasks and use `--release <slot> --session-id <own session ID>` only when the owning session retires its assignment. See the [marker and session-scope rules](driven-sessions.md#scratch-cleanup-and-cache-settings). Sync sources with `rsync -a --delete --checksum --exclude .build --exclude .local <source>/ <slot>/src/`, verify the expected clean base (or the immutable capture fingerprint/files), and build with `--scratch-path <slot>/.build`. Never delete the slot cache or start a fresh cold build per task; only a new slot needs its initial build.
 3. On that exact combined copy, use `python3 script/affected_tests.py --base <round-base> --scratch-path <slot>/.build` (or the combined changed-path list). Run its affected-target tests, affected Python tests and validate-plan before install. Round commands skip the named heavy cases unless Storage, snapshot or Media sources changed; see [test selection](../../../docs/test-selection.md). Compare failures by test name against a stored baseline and resolve every new affected-check failure before proceeding.
    Then send the pre-merge note with tickets, files, hashes and baseline comparison, copy the verified result into the shared checkout, and build and install once. Start the `--full` suite on the same immutable source in the background after install, with no heavy skips. Retain its job receipt and logs so it finishes even if the launching session ends; it does not block install or submissions. Report a full-suite failure to the orchestrator and block only the affected tickets.
-   Keep the qualified copy, logs and build identity together; retain the installation's storage/backup qualification gates. At this boundary, follow the [scratch cleanup and cache settings](driven-sessions.md#scratch-cleanup-and-cache-settings): preview and save the per-item byte/reason report, then apply eligible authorized cleanup to the Trash. Explicitly retain the latest installed round and all assigned persistent slots; never delete their warm `.build`.
+   Keep the qualified copy, logs and build identity together; retain the installation's storage/backup qualification gates. At this boundary, follow the [scratch cleanup and cache settings](driven-sessions.md#scratch-cleanup-and-cache-settings): preview and save the per-item byte/reason report, then apply eligible authorized cleanup to the Trash. Explicitly retain the latest installed round and all assigned persistent slots; never delete their warm `.build`. Cleanup defaults to the caller's own session; another session's items require its root release marker and an authorized `--include-released` pass. Checkout folders `.local/build`, `.local/evidence` and test slots are cleaned by CL-194's command, not by `clean_scratch.py`.
 4. While a submitted ticket waits for a verdict, nobody writes in its review target. Keep the captured source immutable.
    With scoped freshness installed, protect every read/write file scope of its attempt, its `additional_paths`, and every `AGENTS.md` and `CLAUDE.md` at any depth, including new instruction files.
    Before that rule is installed, protect the whole inventory, including scripts, docs and Git. Legacy captures and unscoped attempts keep whole-inventory freshness; see [source freshness](../../../docs/source-evidence.md#source-freshness-during-parallel-work).
@@ -37,7 +52,7 @@ Use this sequence for each authorized combined round. Use the [reviewer and chec
    After each runner finishes and closes its test GUI, preserve its evidence and run the same scratch cleanup step; record skips without waiting or polling.
    Supply `acceptance_evidence` on `work_submit` (or each `batch_submit` member), with `check_runner_report` references and matching `evidence_manifest.installed_build_id`; a limitation alone cannot cover an installed/native observation.
 7. The review orchestrator starts a fresh non-contributor Codex thread on `gpt-6.1-sol` per review batch. The review orchestrator owns independent reviews and verdict routing only. The reviewer uses `review_batch_inputs`, `batch_prepare`, `batch_claim` and `batch_review_record` as the reviewer brief specifies.
-   After each reviewer or rework step finishes, preserve its report/hand-in and run the same scratch cleanup step. Use `CHECKLIST_SWIFTPM_CACHE_PATH` for the shared dependency cache and `CHECKLIST_COMPILATION_CACHE_MAX_BYTES` for the documented CompilationCache budget in every brief; the measured round remains separate.
+   After each rework step finishes, preserve its hand-in and run the same scratch cleanup step for its own scratch only. Reviewer steps run no scratch cleanup; the orchestrator covers review scratch at the next round boundary. Use `CHECKLIST_SWIFTPM_CACHE_PATH` for the shared dependency cache and `CHECKLIST_COMPILATION_CACHE_MAX_BYTES` for the documented CompilationCache budget in every brief; the measured round remains separate.
    Failed tickets go to the implementation orchestrator. It reworks each failed ticket itself or gives it to a session that it started for that Triage. The reworked ticket returns to the review orchestrator for a failed-only independent recheck. Recheck only failed, inconclusive or materially affected cases; preserve valid passes and their original producer, target and hash.
 8. Agents decide engineering, process and repository questions themselves. Read earlier owner answers; ask the owner only for an uncovered decision that an agent cannot undo.
    Never ask a covered question twice. On `COVERED_BY_EARLIER_ANSWER`, use the cited answer instead of repeating the request.
@@ -54,7 +69,7 @@ Use `batch_release` with selected `{attempt_id,claim_token}` members and a non-e
 
 Plan rework at acceptance/check-case granularity as well as ticket granularity. Retain valid passing checks and select only failed, inconclusive or materially affected cases. Before broader checking, record which named cases' relevant inputs changed or which applicable explicit effective project workflow/context instruction requires it; a failed sibling or Triage/batch membership is no override. List carried results and new execution separately, preserving original targets, producers and hashes. Fresh target-bound gates remain required; use the [review procedure](review.md) for case-level evidence.
 
-The Triage can be the actual Claude or Codex task orchestrating its tickets together. Bind that real coordinating conversation when the discovered MCP supports it. In-progress tickets are valid Implementation Triage members. Active attention covers either a ticket's own work in progress or participation in an actively orchestrated Triage; the orchestrator and the individual ticket claimants remain separate, with truthful per-ticket authority and outcomes.
+The Triage can be the actual Claude or Codex task orchestrating its tickets together. Bind that real coordinating conversation when the discovered MCP supports it. In-progress tickets are valid Implementation Triage members. Active sections, counts and filters include only tickets whose own status category is In progress. Orchestration and the actual coordinator remain Triage information; advisory `active_attention` does not determine Active membership. The orchestrator and individual ticket claimants remain separate, with truthful per-ticket authority and outcomes.
 
 An Epic is a container for actual tickets. Never pre-create Epics or Triages as assumptions during project setup or at any other time. Create an Epic only when real tickets exist to go into it.
 

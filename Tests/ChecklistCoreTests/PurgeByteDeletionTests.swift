@@ -148,10 +148,14 @@ final class PurgeByteDeletionTests: XCTestCase {
         var input = params(p,trashed);input["preview_digest"] = v["digest"]!;input["command_id"] = command
         try router.dbQueue.write {db in try db.execute(sql:"CREATE TRIGGER purge_outcome_failure BEFORE UPDATE ON records WHEN NEW.type='storage_job' AND json_extract(NEW.data,'$.kind')='ticket_object_delete' AND json_extract(NEW.data,'$.state')='completed' BEGIN SELECT RAISE(ABORT,'synthetic receipt boundary');END")}
         let result = try router.handle(method:"task_purge",params:input,caller:owner)["data"] as! JSON
+        // Deletion now runs on the separate maintenance lane, after the command
+        // reply. The trigger fails its outcome commit after the actual unlink.
+        try router.runStorageMaintenance()
         XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
         XCTAssertEqual(try receipt(result)["state"] as? String,"pending")
         try router.dbQueue.write {try $0.execute(sql:"DROP TRIGGER purge_outcome_failure")}
         let root = router.root;try router.closeStore();router = nil;router = try CommandRouter(root:root)
+        try router.runStorageMaintenance()
         let replay = try router.handle(method:"task_purge",params:input,caller:owner)
         XCTAssertEqual(replay["replayed"] as? Bool,true)
         let data = replay["data"] as! JSON,summary = (data["byte_deletion"] as! JSON)["summary"] as! JSON

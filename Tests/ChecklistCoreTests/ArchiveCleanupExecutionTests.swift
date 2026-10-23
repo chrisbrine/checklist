@@ -32,6 +32,9 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
     func record(_ id: String,_ type: String) throws -> JSON { try router.dbQueue.read {try router.record($0,id,type:type)} }
     func fixture(count: Int = 1,size: Int = 64,threshold: Int64 = 1,budget: Int64 = 0) throws -> (project: JSON,task: JSON,files: [JSON]) {
         var p = try call("project_create",["name":"Owned cleanup fixture","key_prefix":"GC"])
+        // These cases isolate Archive cleanup's deadline and SQL failure seam.
+        // The independent daily ticket lifecycle must not add a deadline/event.
+        p = try call("project_settings_save",["project_id":p["id"]!,"expected_revision":p["revision"]!,"ticket_cleanup":["done_evidence_enabled":false,"closed_purge_enabled":false,"closed_days":15]])
         p = try call("archive_storage_settings",["project_id":p["id"]!,"expected_revision":p["revision"]!,"settings_revision":p["settings_revision"]!,"archive_storage":["preset":"clean_large_managed_on_archive","large_original_bytes":threshold,"retained_budget_bytes":budget]])
         let t = try call("task_create",["project_id":p["id"]!,"title":"Owned originals"])
         var files: [JSON] = []

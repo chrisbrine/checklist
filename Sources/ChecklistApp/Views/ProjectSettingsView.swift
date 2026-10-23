@@ -77,6 +77,7 @@ struct ProjectSettingsView: View {
                 }
                 MediaTypeSettings(projectID:project.id, model:store.mediaReview)
                 ArchiveStorageSettingsSection(project:project)
+                TicketCleanupSettingsSection(project:project)
                 workflowSettings
                 ReviewRequirementsEditor(draft:$reviewRequirements)
                 captureSettings

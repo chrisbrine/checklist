@@ -134,3 +134,57 @@ The service's independent enrolled-repository capture already inventories tracke
 The captured root remains the SwiftPM build authority. Existing staging still copies the three products into `Checklist.app/Contents/MacOS`, SwiftPM resource bundles into `Contents/Resources`, and both `org.checklist.service.plist` and `org.checklist.coordination.plist` into `Contents/Library/LaunchAgents`. Application ID `org.checklist.app`, helper identifiers, Keychain/bootstrap checks and the default `~/Library/Application Support/Checklist` data root are unchanged. No source move, migration, reset or schema change is part of this preparation.
 
 Disposable local-package checks establish inventory/fingerprint/captured-build behavior. A later promoted target still needs the normal root clean resolve/build/test, exact installed helper/resource/signing checks, existing-data readability and independent review; an isolated fixture is not installed-app qualification. Roll back this preparation by restoring the previous inventory/helper and documentation together. Do not delete data or change executable identities to roll back build ownership.
+
+## Local build and hand-in cleanup
+
+After a successful installation (and installed checks for `--verify` and
+`--install-stage`), `build_and_run.sh` calls `post_install_cleanup` while holding
+its build lock. It moves obsolete capture `source`, staged app, binaries and
+per-capture build outputs to the Trash, retaining the installed and immediate
+previous captures. All receipt files, timing history and unknown files remain in
+the older capture directories. It also retires legacy `swiftpm-<id>` scratch
+without a paired `lane-<id>/source`. Paired lanes for every configuration remain
+warm. Stage-only and failed install runs do not retire anything. Cleanup failure
+is reported without turning a successful install into a failed installation.
+
+For leftover builds, hand-ins and idle slots, run from the project checkout:
+
+```sh
+python3 script/clean_builds.py --preview
+# Save and inspect the per-item JSON report, then within the authorized scope:
+python3 script/clean_builds.py --apply
+```
+
+Use `--only builds|evidence|slots` to bound the pass and repeat `--keep PATH` for
+assigned slots, unfinished hand-ins and retained qualification copies. Manual
+build cleanup takes the same `.build-lock` as the builder; a held lock refuses
+cleanup. The installed app's fingerprint and `last-install.json` identify the
+installed and previous captures. Missing/mismatched receipts or an unavailable
+previous bundle retain builds until reconciled. Unknown build layouts are kept.
+
+Evidence is scoped by ticket keys in folder/file names and `files.json` ticket
+fields. A round folder may explicitly declare **every** owning ticket with
+`cleanup.json` containing `{"tickets":["CL-10","CL-11"]}`. Untagged containers
+and their logs stay; their ticket children can retire separately. Every owning
+ticket must have `status_category: "done"`; open, canceled, missing, ambiguous or
+unreadable statuses retain the evidence. The default status reader uses only
+`project_resolve` and paginated `task_list` calls through the installed CLI, with
+its cwd set to the project folder. It never reads the live database directly.
+Alternatively, supply `--project-id ID --status-file PATH` with an explicit
+`{"project_id":"ID","tasks":[{"key":"CL-10","status_category":"done"}]}`
+list. This is an operator-supplied status snapshot; refresh it before applying.
+
+Preview is read-only and apply computes new decisions, inventories and process
+observations. Apply refreshes ticket statuses and installation identity before
+moves. Live data, installed/rollback apps, in-use paths, links and unknown
+ownership are retained. Process inspection failure refuses retirement. Every
+item reports its path, logical byte count and reason; successful moves report a
+Trash destination and a total `bytes_removed`. These are bytes moved out of the
+working folders, not recovered disk space; Trash retains them. Other tools must
+honor the build/slot leases; external noncooperating writers can still race a
+filesystem inspection, so do not run cleanup during unrelated manual writes.
+
+Slot lifecycle and bounded-check cleanup are described in
+[test instances](test-instances.md#cleanup-after-bounded-checks). This command is
+separate from `clean_scratch.py`, which handles session scratch and qualification
+caches and never retires hand-in evidence.

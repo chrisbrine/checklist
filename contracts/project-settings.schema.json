@@ -6,6 +6,15 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": { "const": 1 },
+    "ticket_cleanup": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "done_evidence_enabled": { "type": "boolean", "default": true },
+        "closed_purge_enabled": { "type": "boolean", "default": true },
+        "closed_days": { "type": "integer", "minimum": 1, "maximum": 36500, "default": 15 }
+      },
+      "required": ["done_evidence_enabled", "closed_purge_enabled", "closed_days"]
+    },
     "work_health_settings": {
       "type": "object", "additionalProperties": false,
       "properties": {

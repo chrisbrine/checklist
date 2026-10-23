@@ -75,7 +75,25 @@ enum StorageSnapshotAuthority {
                   value.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { throw StorageSnapshotFailure.unsupportedAuthority }
             return value
         }
+        // Done cleanup keeps canonical evidence. Its durable exact outcomes explain
+        // unavailable bytes without modifying immutable manifests or capture lists.
+        let cleanedRows = try Row.fetchAll(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND json_extract(data,'$.cause')='done_evidence'")
+        var cleaned: [String:[JSON]] = [:]
+        for row in cleanedRows {
+            let receipt = try GRDBRecordEnvelopeAdapter.decode(row).object
+            for object in receipt["objects"] as? [JSON] ?? [] where ["removed","already_missing"].contains(object["state"] as? String ?? "") {
+                if let path = object["relative_path"] as? String {cleaned[path,default:[]].append(object)}
+            }
+        }
         func add(_ value: StorageSnapshotObject) throws {
+            if cleaned[value.relativePath]?.contains(where: {object in
+                (value.expectedSHA256 == nil || object["sha256"] as? String == value.expectedSHA256) &&
+                (value.expectedSize == nil || (object["size"] as? NSNumber)?.int64Value == value.expectedSize) &&
+                object["kind"] as? String == value.kind
+            }) == true, try !retainedExists(value.relativePath) {
+                for authority in value.authorities {unavailable.append(.init(authority:authority,reason:"evidence_cleaned"))}
+                return
+            }
             if var prior = objects[value.relativePath] {
                 guard prior.kind == value.kind,
                       prior.expectedSHA256 == nil || value.expectedSHA256 == nil || prior.expectedSHA256 == value.expectedSHA256,

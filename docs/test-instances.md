@@ -101,3 +101,35 @@ Every promotion requires a passing check for the selected build and a passing ch
 Promotion installs the original live stage through `script/build_and_run.sh --install-stage CAPTURE_DIR`; it never installs the renamed test bundle or transfers test data. That mode re-verifies the original capture and signatures before entering the existing install path. Both `--install-stage` and `--verify` require the exact installed app process and a healthy service status. Shell mode dispatch makes verification mandatory even if its Python interpreter or helper cannot run. Verification polls status with calls bounded to 30 seconds for up to 45 minutes; `CHECKLIST_VERIFY_DEADLINE_SECONDS` overrides the total bound with a minimum of 60 seconds. Timeouts and unavailable/starting replies keep waiting, with progress about every minute; recovery, definite errors, malformed replies or a missing exact app process fail immediately. On failure the installed bundle, store and previous bundle are kept. Check `checklist service status` and the service log. If the first start upgraded the store, rollback requires restoring its protected pre-upgrade generation, not the previous bundle; diagnostics name the newest completed `backups/snapshot-*` created since install began when one exists. Promotion distinguishes an install that ran but failed installed verification and reports success only after verification passes.
 
 Stop signals only an app PID with the exact slot executable path and boots out only that slot label, then waits up to 10 seconds for launchd registration and all app/service/CLI processes to disappear. CLI processes are never signaled. A timeout preserves the slot metadata and reports remaining PIDs and launchd state. A separately running slot CLI/MCP must exit before replacement or destruction. Destroy calls stop first, deletes all accounts in that slot's enrollment and HumanClaim Keychain services with bounded deletion, clears its exact preference domains through `defaults delete`, removes any verified empty plists left behind and confirms the files are gone, then moves `~/Library/Saved Application State/org.checklist.app.testN.savedState` and the whole slot folder to the Trash. Its receipt lists removal counts and names; missing items are harmless, and live and other-slot names are excluded. It never stops the live app/service or deletes production data. The live application's ordinary rollback bundle cleanup remains unchanged.
+
+## Cleanup after bounded checks
+
+For a check whose owned slot will not be promoted or inspected further, use:
+
+```sh
+./script/test_instances.py check --slot 1 --destroy-after-check > /private/tmp/checklist-slot-1-check.log 2>&1
+```
+
+This explicit bounded-check option prints the slot's check evidence, then stops
+and destroys that slot even if the check fails. Retain the external log; the slot
+and its evidence are moved to the Trash by the existing destroy path. Keep the
+ordinary `check` command when the slot is still needed for promotion or further
+inspection. After other bounded verification, capture evidence, close its marked
+GUI, and use `destroy --slot N` for the owned slot. Restore the real Checklist
+window after closing a separate native qualification app.
+
+For leftover slots, `python3 script/clean_builds.py --preview --only slots`
+reports each slot's size and retention reason. Inspect the report before the
+matching `--apply --only slots`. `--keep PATH` retains assigned idle slots.
+Cleanup never stops a running slot: a running app/service/CLI, registered launchd
+job, open file/cwd/command reference or `.slot-N.lock` retains it. Apply takes the
+same slot lock as create/start/check/promote and rechecks use before destruction;
+`destroy(..., unused_only=True)` refuses use instead of signaling processes.
+Slot identity, live-root overlap, links and ownership use the existing slot
+safety checks. Unavailable inspection retains the slot and reports failure.
+
+Hand-ins under `.local/evidence` are handled by the same cleanup command only
+when every owning ticket is Done. See
+[local build and hand-in cleanup](monorepo-workspace.md#local-build-and-hand-in-cleanup)
+for ownership/status lists, process protection and the report format. Never run
+apply against another pass's active slots or unsubmitted evidence.

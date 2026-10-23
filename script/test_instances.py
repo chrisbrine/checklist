@@ -980,12 +980,18 @@ def delete_slot_keychain(number, service):
     raise ValueError(f'Keychain deletion limit {KEYCHAIN_DELETE_LIMIT} reached for {service}; slot folder preserved.')
 
 
-def destroy(p):
+def destroy(p, *, unused_only=False):
     match = re.fullmatch(r'slot-([1-4])', p['folder'].name)
     if not match or p != paths(int(match[1])):
         raise ValueError('Refusing mismatched slot cleanup identity.')
     number = int(match[1])
-    stop(p)
+    def require_unused():
+        from clean_scratch import running_paths, within
+        stopped(p)
+        if any(within(path, p['folder'].resolve()) for path in running_paths()):
+            raise ValueError('Slot is used by a running app or check; retain it.')
+    if unused_only: require_unused()
+    else: stop(p)
     if p['folder'].exists(): load(p)
 
     preferences = Path.home() / 'Library/Preferences'
@@ -1010,6 +1016,7 @@ def destroy(p):
 
     receipt = {'slot': number, 'keychain_items_removed': {}, 'preference_domains_removed': [],
                'preference_domains_missing': [], 'trashed': []}
+    if unused_only: require_unused()
     for service in [p['keychain'], f'Checklist.Test{number}.HumanClaim']:
         receipt['keychain_items_removed'][service] = delete_slot_keychain(number, service)
     for domain, file in files.items():
@@ -1034,6 +1041,7 @@ def destroy(p):
         receipt['preference_domains_missing' if missing and not had_plist else 'preference_domains_removed'].append(domain)
     for folder, root in [(saved, saved_root), (p['folder'], BASE)]:
         if folder.exists():
+            if unused_only: require_unused()
             trash(folder, root)
             receipt['trashed'].append(str(folder))
     receipt['preference_domains_removed_count'] = len(receipt['preference_domains_removed'])
@@ -1091,6 +1099,9 @@ def main():
             source = command.add_mutually_exclusive_group()
             source.add_argument('--stage', type=Path); source.add_argument('--latest-stage', action='store_true')
             command.add_argument('--seed', type=seed_value, default='empty'); command.add_argument('--replace', action='store_true')
+        if name == 'check':
+            command.add_argument('--destroy-after-check', action='store_true',
+                                 help='bounded owned check: print evidence, then stop and destroy this slot even on failure')
         if name == 'start':
             mode = command.add_mutually_exclusive_group()
             mode.add_argument('--headless', action='store_true'); mode.add_argument('--gui', action='store_true')
@@ -1126,7 +1137,12 @@ def main():
             p = checked(number)
             if arguments.command == 'create': create(arguments, p)
             elif arguments.command == 'start': start(arguments, p)
-            elif arguments.command == 'check': check(p)
+            elif arguments.command == 'check':
+                try: check(p)
+                finally:
+                    if arguments.destroy_after_check:
+                        print('Bounded check evidence: ' + json.dumps(load(p), sort_keys=True))
+                        destroy(p)
             elif arguments.command == 'stop': stop(p)
             elif arguments.command == 'destroy': destroy(p)
             elif arguments.command == 'promote': promote(arguments, p)

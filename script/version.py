@@ -1,14 +1,17 @@
 """Checklist version allocation and explicit, local production release preparation.
 
-Build callers hold .local/build/.build-lock. This helper never installs or publishes.
+Reservations use a per-user lock shared by all checkouts, independently of the
+checkout-local compilation lock. This helper never installs or publishes.
 """
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
 import plistlib
 import re
 import subprocess
+import tempfile
 
 MAX_ORDINAL = 2147483647
 
@@ -50,31 +53,95 @@ def installed_info(bundle):
     info = json.loads(info_path.read_text()) if info_path.exists() else {}
     if 'build_number' in info and ordinal(info['build_number']) != number:
         raise ValueError('Installed build ordinal differs from Info.plist.')
-    return dict(info, build_number=number)
+    version = info.get('version', value.get('ChecklistVersion'))
+    if version and value.get('ChecklistVersion', version) != version:
+        raise ValueError('Installed version differs from Info.plist.')
+    return dict(info, build_number=number, **({'version': version} if version else {}))
 
 
-def allocate(root, build, installed=Path('/Applications/Checklist.app')):
-    root, build = Path(root), Path(build)
-    state = build / 'version-state.json'
-    prior = build / 'build-ordinal'
-    info = next_version((root / 'VERSION').read_text().strip(),
-                        prior.read_text().strip() if prior.exists() else 0,
-                        installed_info(installed), json.loads(state.read_text()) if state.exists() else {})
-    # Reserve both counters together before updating the legacy ordinal file.
-    # A crash between replacements leaves state ahead, so retries skip both.
-    for path, content in [(state, json.dumps(info) + '\n'), (prior, str(info['build_number']) + '\n')]:
-        temporary = path.with_name(path.name + '.' + str(os.getpid()))
-        with temporary.open('w') as output:
-            output.write(content)
+def sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def allocator_directory(path):
+    """Durably create the allocator directory, including any missing parents."""
+    if path == path.parent:
+        return
+    # Flush ancestors even if another caller just created them but has not yet
+    # flushed their directory entries. No reservation may outrun that creator.
+    allocator_directory(path.parent)
+    path.mkdir(exist_ok=True)
+    sync_directory(path)
+    sync_directory(path.parent)
+
+
+def reserve_state(path, state):
+    # The stable lock file is never replaced or removed. Only the JSON is replaced.
+    descriptor, temporary = tempfile.mkstemp(prefix='version-state-', dir=path.parent)
+    temporary = Path(temporary)
+    try:
+        with os.fdopen(descriptor, 'w') as output:
+            output.write(json.dumps(state, sort_keys=True) + '\n')
             output.flush()
             os.fsync(output.fileno())
         temporary.replace(path)
-        directory = os.open(build, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    return info
+        sync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def allocate(root, build, installed=Path('/Applications/Checklist.app'), allocator=None):
+    """Reserve before returning; build is a read-only legacy migration input.
+
+    All production checkouts use the same per-user directory. The override is for
+    isolated fixtures; never use a checkout-local override for production builds.
+    """
+    root, build = Path(root), Path(build)
+    location = allocator if allocator is not None else os.environ.get(
+        'CHECKLIST_BUILD_ALLOCATOR_DIR', Path.home() / 'Library/Application Support/Checklist Build')
+    location = Path(location).expanduser().resolve()
+    allocator_directory(location)
+    with (location / 'allocator.lock').open('a+b') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state_path = location / 'version-state.json'
+        if state_path.exists():
+            state = json.loads(state_path.read_text())
+            if (not isinstance(state, dict) or state.get('schema_version') != 1
+                    or not isinstance(state.get('series'), dict) or 'build_number' not in state):
+                raise ValueError('Invalid shared version history; preserve and reconcile it.')
+            number = ordinal(state['build_number'])
+            series = {production(base): ordinal(counter) for base, counter in state['series'].items()}
+        else:
+            number, series = 0, {}
+        base = production((root / 'VERSION').read_text().strip())
+        legacy = build / 'version-state.json'
+        previous = json.loads(legacy.read_text()) if legacy.exists() else {}
+        installed_value = installed_info(installed)
+        # Import every observed series, not just the current source series. This
+        # retains its counter if a checkout returns to it after building another.
+        for info in [previous, installed_value]:
+            number = max(number, ordinal(info.get('build_number', 0)))
+            value = info.get('version', '')
+            if value:
+                match = re.fullmatch(r'((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))\.(0|[1-9][0-9]*)', value)
+                if not match:
+                    raise ValueError('Invalid recorded development version; preserve and reconcile history.')
+                recorded_base, counter = match.groups()
+                series[recorded_base] = max(series.get(recorded_base, 0), ordinal(counter))
+        prior = build / 'build-ordinal'
+        if prior.exists():
+            number = max(number, ordinal(prior.read_text().strip()))
+        installed_version = installed_value.get('version')
+        if installed_version and tuple(map(int, base.split('.'))) < tuple(map(int, installed_version.split('.')[:3])):
+            raise ValueError('Source production series is below the installed version; allocation refused.')
+        info = next_version(base, number, previous={'version': f'{base}.{series.get(base, 0)}'})
+        series[base] = int(info['version'].rsplit('.', 1)[1])
+        reserve_state(state_path, {'schema_version': 1, 'build_number': info['build_number'], 'series': series})
+        return info
 
 
 def stamp(capture, stage):
