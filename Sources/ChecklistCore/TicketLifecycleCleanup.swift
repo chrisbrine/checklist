@@ -42,14 +42,26 @@ extension CommandRouter {
     }
 
     private func ticketCleanupMaintenanceProjection(_ db: Database,project: String) throws -> JSON {
+        var value = try ticketCleanupSchedulingProjection(db,project:project)
+        var preparation = try ticketCleanupPreparationState(db,project:project)
+        preparation.removeValue(forKey:"attempt_refused");value["preparation"] = preparation
+        return value
+    }
+    private func ticketCleanupSchedulingProjection(_ db: Database,project: String) throws -> JSON {
         let format = ISO8601DateFormatter(),settings = ticketCleanupSettings(try record(db,project,type:"project"))
         if !bool(settings,"done_evidence_enabled") && !bool(settings,"closed_purge_enabled") {return ["state":"disabled","next_check_at":NSNull()]}
         if try StorageSnapshotRetention.isActive(root:root) {
             return ["state":"paused","reason":"snapshot_retention","resume_condition":"snapshot_retention_released",
                     "resume_at":NSNull(),"next_check_at":format.string(from:Date().addingTimeInterval(60))]
         }
+        if let retry = try ticketCleanupProjectRetry(db,project:project),retry > Date() {
+            return ["state":"deferred","reason":try ticketCleanupPreparationState(db,project:project)["last_failure_reason"] ?? "cleanup_preparation_unavailable","next_check_at":format.string(from:retry)]
+        }
         if let retry = ticketCleanupRetryAt,retry > Date() {
             return ["state":"deferred","reason":ticketCleanupFailure ?? "cleanup_preparation_unavailable","next_check_at":format.string(from:retry)]
+        }
+        if let resume = ticketCleanupYieldAt,resume > Date() {
+            return ["state":"scheduled","reason":"maintenance_yield","next_check_at":format.string(from:resume)]
         }
         let next = Double(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-next:" + project]) ?? "0") ?? 0
         return ["state":next <= Date().timeIntervalSince1970 ? "due" : "scheduled","next_check_at":format.string(from:Date(timeIntervalSince1970:max(next,Date().timeIntervalSince1970)))]
@@ -65,9 +77,10 @@ extension CommandRouter {
         let pid = project["id"] as! String,settings = ticketCleanupSettings(project),cursor = try ticketCleanupCursor(db,pid)
         let rows = try Row.fetchAll(db,sql:"SELECT rowid AS cleanup_row," + Self.canonicalRecordColumns + " FROM records WHERE type='task' AND project_id=? AND rowid>? ORDER BY rowid LIMIT 32",arguments:[pid,cursor])
         var items: [JSON] = [],plans: [String:TicketPurgePlan] = [:],expired: [String:[Row]] = [:],admitted = 0
-        var inventory: TicketCleanupInventory?
+        var inventory: TicketCleanupInventory?,planningAttempted = false
         func plan(_ task: JSON) throws -> TicketPurgePlan {
-            if inventory == nil {inventory = try ticketCleanupReferenceCache.refresh(db)}
+            planningAttempted = true
+            if inventory == nil {inventory = try ticketCleanupInventory(db,task:task)}
             return try ticketPurgePlan(db,task:task,inventory:inventory)
         }
         for row in rows {
@@ -104,20 +117,31 @@ extension CommandRouter {
                         }
                     } else {item["reason"] = bool(settings,"closed_purge_enabled") ? (due == nil ? "unknown_change_time" : "retention_age") : "rule_disabled"}
                     if item["action"] as? String == "purge" {let plan = try plan(task);plans[tid] = plan;expired[tid] = try ticketPurgeExpiringCommands(db,task:task,plan:plan);item["objects"] = plan.byteDeletion.objects;item["summary"] = plan.byteDeletion.summary;item["record_impact"] = plan.impact.filter {!["known_backup_count","known_backup_observed_times","known_backup_creation_times"].contains($0.key)};item["purge_digest"] = plan.digest}
-                } catch let error as CoreError {item["action"] = "keep";item["reason"] = error.code}
+                } catch let error as CoreError {
+                    if ["CLEANUP_INVENTORY_LIMIT","REFERENCE_GRAPH_LIMIT","PURGE_LIMIT","CANONICAL_RECORD_INVALID"].contains(error.code) {try recordTicketCleanupPreparationRefusal(project:pid,reason:error.code)}
+                    item["action"] = "keep";item["reason"] = error.code
+                }
             }
             if item["action"] as? String != "keep" {
                 if admitted == 1 {break}
                 admitted += 1
             }
             item["scan_row"] = row["cleanup_row"] as Int64;items.append(item)
-            if admitted == 1 {break}
+            if admitted == 1 || planningAttempted {break}
         }
         let end = (items.last?["scan_row"] as? Int64) ?? cursor
         let more = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE type='task' AND project_id=? AND rowid>?)",arguments:[pid,end]) ?? false
         let selection: JSON = ["project_id":pid,"settings":settings,"items":items,"next_cursor":more ? end : 0,"more":more,
             "selected_bytes":items.reduce(Int64(0)) {$0 + (((($1["summary"] as? JSON)?["pending_bytes"]) as? NSNumber)?.int64Value ?? 0)},"physical_reclamation":"unmeasured","source_build_cache":try sourceBuildCacheRetainedEntries(db,project:pid)]
-        return TicketCleanupPreparedPass(project:project,selection:selection,plans:plans,expiredCommands:expired)
+        var observation = inventory ?? TicketCleanupInventory()
+        for plan in plans.values {observation.objects(plan.byteDeletion.objects,root:root)}
+        let ids = [pid] + items.flatMap {item -> [String] in
+            let tid = item["task_id"] as! String
+            let task = try? record(db,tid,type:"task")
+            return [tid,task?["status_id"] as? String ?? ""]
+        }
+        let fence = try TicketCleanupFence(db,inventory:observation,project:pid,ids:ids,events:plans.values.flatMap(\.events),commands:expired.values.flatMap {$0})
+        return TicketCleanupPreparedPass(fence:fence,project:project,selection:selection,plans:plans,expiredCommands:expired)
     }
 
     func prepareTicketLifecycleCleanup(_ db: Database,at time: Date = Date()) throws -> TicketCleanupPreparedPass? {
@@ -125,7 +149,11 @@ extension CommandRouter {
             let settings = ticketCleanupSettings(project)
             guard bool(settings,"done_evidence_enabled") || bool(settings,"closed_purge_enabled") else {continue}
             let next = Double(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-next:" + (project["id"] as! String)]) ?? "0") ?? 0
-            if time.timeIntervalSince1970 >= next {return try ticketCleanupSelection(db,project:project,at:time)}
+            if let retry = try ticketCleanupProjectRetry(db,project:project["id"] as! String),retry > time {continue}
+            if time.timeIntervalSince1970 >= next {
+                try beginTicketCleanupPreparation(project:project["id"] as! String)
+                return try ticketCleanupSelection(db,project:project,at:time)
+            }
         }
         return nil
     }
@@ -175,7 +203,7 @@ extension CommandRouter {
             let settings = ticketCleanupSettings(project)
             guard bool(settings,"done_evidence_enabled") || bool(settings,"closed_purge_enabled") else {continue}
             let next = Double(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-next:" + (project["id"] as! String)]) ?? "0") ?? 0
-            dates.append(Date(timeIntervalSince1970:next))
+            dates.append(max(Date(timeIntervalSince1970:next),try ticketCleanupProjectRetry(db,project:project["id"] as! String) ?? .distantPast))
         }
         return dates.min()
     }

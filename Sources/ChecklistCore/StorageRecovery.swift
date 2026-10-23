@@ -220,24 +220,37 @@ extension CommandRouter {
         let lease = try storageAdmission.acquire();defer { lease.finish() }
         ticketCleanupMaintenanceLock.lock();defer {ticketCleanupMaintenanceLock.unlock()}
         if try StorageSnapshotRetention.isActive(root:root) {return}
-        if !(ticketCleanupRetryAt.map {$0 > Date()} ?? false) {
-            do {
-                // Drain an admitted byte job before planning another ticket. Never run
-                // expensive reference traversal on the command tail or service queue.
-                var deletionPrepared = false
-                try withTicketCleanupPreparation({db -> TicketCleanupPreparedDeletion? in
-                    let result = try self.prepareTicketObjectDeletion(db);deletionPrepared = result != nil;return result
-                }) {db,permit,prepared in try self.processTicketObjectDeletionIntents(db,permit:permit,prepared:prepared)}
-                if !deletionPrepared {
-                    try withTicketCleanupPreparation({try self.prepareTicketLifecycleCleanup($0)}) {db,_,prepared in
-                        try self.commitTicketLifecycleCleanup(db,prepared:prepared,at:Date())
-                    }
+        if !(ticketCleanupRetryAt.map {$0 > Date()} ?? false) && !(ticketCleanupYieldAt.map {$0 > Date()} ?? false) {
+            let started = Date()
+            var prepared = false
+            defer {
+                // A busy cleanup backlog must yield CPU as well as the writer.
+                // Charge all preparation wall time, including refused work. The
+                // existing one-shot wake supplies four times that duration as rest.
+                if prepared || ticketCleanupPreparingProject != nil {
+                    ticketCleanupYieldAt = Date().addingTimeInterval(max(0.05,Date().timeIntervalSince(started) * 4))
                 }
-                try dbQueue.writeWithoutTransaction {_ in self.ticketCleanupRetryAt = nil;self.ticketCleanupFailure = nil}
+            }
+            do {
+                func lifecycle() throws {
+                    try withTicketCleanupPreparation({db in
+                        let result = try self.prepareTicketLifecycleCleanup(db);prepared = result != nil;return result
+                    }) {db,_,value in try self.commitTicketLifecycleCleanup(db,prepared:value,at:Date())}
+                }
+                func deletion() throws {
+                    try withTicketCleanupPreparation({db in
+                        let result = try self.prepareTicketObjectDeletion(db);prepared = result != nil;return result
+                    }) {db,permit,value in try self.processTicketObjectDeletionIntents(db,permit:permit,prepared:value)}
+                }
+                // Fair turns: a large admitted byte job cannot starve a newly
+                // due settings/startup/Done pass, nor can passes starve unlinks.
+                if ticketCleanupLifecycleTurn {try lifecycle();if !prepared {try deletion()}}
+                else {try deletion();if !prepared {try lifecycle()}}
+                ticketCleanupLifecycleTurn.toggle()
             } catch {
-                try dbQueue.writeWithoutTransaction {_ in
+                dbQueue.writeWithoutTransaction {_ in
                     self.ticketCleanupRetryAt = Date().addingTimeInterval(60)
-                    self.ticketCleanupFailure = (error as? CoreError)?.code ?? "CLEANUP_PREPARATION_UNAVAILABLE"
+                    self.ticketCleanupFailure = self.ticketCleanupFailure ?? (error as? CoreError)?.code ?? "CLEANUP_PREPARATION_UNAVAILABLE"
                 }
                 throw error
             }

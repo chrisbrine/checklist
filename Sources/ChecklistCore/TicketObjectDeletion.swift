@@ -215,8 +215,8 @@ extension CommandRouter {
         for item in try sourceBuildCacheDeletionObjects(db,owned:owned) {
             if let path = item["relative_path"] as? String {objects[path] = item}
         }
-        let backup = try? storageBackupRetentionIndex(db),references = try TicketObjectDeletionReferenceIndex(remaining,tokens:referenceTokens)
-        let mediaAuthorityComplete = (try? MediaRecordRegistry.validate(MediaRecordRegistry.envelopes(db))) != nil
+        let backup = try? ticketCleanupBackupRetentionIndex(db,objects:Array(objects.values)),references = try TicketObjectDeletionReferenceIndex(remaining,tokens:referenceTokens)
+        let mediaAuthorityComplete = (try? ticketCleanupValidateMediaAuthority(db)) != nil
         var result: [JSON] = []
         for var item in objects.values {
             if item["state"] as? String == "pending" {

@@ -97,16 +97,23 @@ extension CommandRouter {
         let removed = all.filter {owned.contains($0.key) && !protected.contains($0.key)}
         let shared = all.filter {protected.contains($0.key)}
         let removedKeys = Set(removed.map(\.key))
-        let eventRows = try Row.fetchAll(db,sql:"SELECT seq,id,entity_id,data FROM events WHERE project_id=? ORDER BY seq LIMIT 100001",arguments:[pid])
-        guard eventRows.count <= 100000 else {throw CoreError("PURGE_LIMIT","The ticket history exceeds the safe purge limit. No content was removed.")}
-        let events = try eventRows.filter {row in
+        let eventRows = try Row.fetchCursor(db,sql:"SELECT seq,id,entity_id,data FROM events WHERE project_id=? ORDER BY seq LIMIT 100001",arguments:[pid])
+        var events: [Row] = [],eventCount = 0,historyBytes = 0
+        while let row = try eventRows.next() {
+            eventCount += 1
+            guard eventCount <= 100000 else {throw CoreError("PURGE_LIMIT","The ticket history exceeds the safe purge limit.")}
+            guard (row["data"] as String).utf8.count <= TicketCleanupInventory.rowByteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A history row exceeds the memory bound.")}
             let entity = (row["entity_id"] as String?).map {Data($0.utf8)}
-            if entity == taskKey || entity.map({removedKeys.contains($0)}) == true {return true}
-            return !(try tokens(jsonObject(row["data"]))).isDisjoint(with:removedKeys.union([taskKey]))
+            let matched = try autoreleasepool {try entity == taskKey || entity.map({removedKeys.contains($0)}) == true || !tokens(jsonObject(row["data"])).isDisjoint(with:removedKeys.union([taskKey]))}
+            if matched {
+                historyBytes += (row["data"] as String).utf8.count
+                guard historyBytes <= TicketCleanupInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","Selected ticket history exceeds the memory bound.")}
+                events.append(row.copy())
+            }
         }
         let counts = removed.reduce(into:[String:Int]()) {$0[$1.type,default:0] += 1}
         let managed = all.filter {owned.contains($0.key) && $0.type == "attachment" && $0.value["mode"] as? String == "managed"}
-        let backups = try Row.fetchAll(db,sql:"SELECT value FROM metadata WHERE key LIKE 'backup-generation:%' ORDER BY key").map {jsonObject($0["value"])}
+        let backups = try Row.fetchAll(db,sql:"SELECT json_object('known_at',json_extract(value,'$.known_at'),'created_at',json_extract(value,'$.created_at')) AS value FROM metadata WHERE key LIKE 'backup-generation:%' ORDER BY key").map {jsonObject($0["value"])}
         let relationCount = all.filter {$0.project == pid && $0.type == "relation" && equals($0.value["target_task_id"],tid) && !equals($0.value["source_task_id"],tid)}.count
         let remaining = all.filter {!removedKeys.contains($0.key) && $0.key != taskKey}.map {row -> JSON in var value = groupValues[row.key] ?? row.value;value["record_type"] = row.type;return value}
         let byteDeletion = try ticketObjectDeletionPlan(db,owned:all.filter {owned.contains($0.key)}.map {($0.type,$0.value)},remaining:remaining,referenceTokens:inventory.map {_ in references})
@@ -131,15 +138,25 @@ extension CommandRouter {
 
     func ticketPurgeExpiringCommands(_ db: Database,task: JSON,plan: TicketPurgePlan) throws -> [Row] {
         let removedIDs = Set(plan.removed.map(\.key)).union([Data((task["id"] as! String).utf8)])
-        let receipts = try Row.fetchAll(db,sql:"SELECT principal,command_id,result FROM commands LIMIT 100001")
-        guard receipts.count <= 100000 else {throw CoreError("PURGE_LIMIT","The command history exceeds the safe purge limit. No content was removed.")}
+        let receipts = try Row.fetchCursor(db,sql:"SELECT rowid AS cleanup_row,principal,command_id,CAST(principal AS BLOB) AS cleanup_principal,CAST(command_id AS BLOB) AS cleanup_command_id,result FROM commands LIMIT 100001")
         func containsRemoved(_ value: Any) -> Bool {
             if let s = value as? String {return removedIDs.contains(Data(s.utf8))}
             if let a = value as? [Any] {return a.contains {containsRemoved($0)}}
             if let d = value as? JSON {return d.contains {removedIDs.contains(Data($0.key.utf8)) || containsRemoved($0.value)}}
             return false
         }
-        return receipts.filter {containsRemoved(jsonObject($0["result"]))}
+        var selected: [Row] = [],count = 0,bytes = 0
+        while let row = try receipts.next() {
+            count += 1
+            guard count <= 100000 else {throw CoreError("PURGE_LIMIT","The command history exceeds the safe purge limit.")}
+            guard (row["result"] as String).utf8.count <= TicketCleanupInventory.rowByteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A command history row exceeds the memory bound.")}
+            if autoreleasepool(invoking:{containsRemoved(jsonObject(row["result"]))}) {
+                bytes += (row["result"] as String).utf8.count
+                guard bytes <= TicketCleanupInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","Selected command history exceeds the memory bound.")}
+                selected.append(row.copy())
+            }
+        }
+        return selected
     }
 
     func taskPurge(_ db: Database,_ p: JSON,_ c: Caller, automatic: Bool = false, prepared: TicketPurgePlan? = nil, expiredCommands: [Row]? = nil) throws -> JSON {
@@ -152,15 +169,15 @@ extension CommandRouter {
         // retry of an earlier create/note/read-modify command returning purged text.
         let receipts = try expiredCommands ?? ticketPurgeExpiringCommands(db,task:task,plan:plan)
         for receipt in receipts {
-            try db.execute(sql:"UPDATE commands SET result=? WHERE principal=? AND command_id=?",arguments:[Self.prunedResult,receipt["principal"] as String,receipt["command_id"] as String])
+            try db.execute(sql:"UPDATE commands SET result=? WHERE principal=CAST(? AS TEXT) AND command_id=CAST(? AS TEXT)",arguments:[Self.prunedResult,receipt["cleanup_principal"] as Data,receipt["cleanup_command_id"] as Data])
         }
         let expired = receipts.count
         let deletion = try enqueueTicketObjectDeletion(db,project:pid,task:tid,cause:"task_purge",plan:plan.byteDeletion)
-        for row in plan.removed {try db.execute(sql:"DELETE FROM records WHERE id=? AND project_id=? AND type=?",arguments:[row.id,pid,row.type])}
+        for row in plan.removed {try db.execute(sql:"DELETE FROM records WHERE id=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND type=CAST(? AS TEXT)",arguments:[Data(row.id.utf8),Data(pid.utf8),Data(row.type.utf8)])}
         for group in plan.groups {try save(db,revised(group.value),type:group.type)}
         let tombstone: JSON = ["id":tid,"project_id":pid,"key":task["key"]!,"title":"Purged ticket","revision":int(task,"revision")+1,"purged":true,"purged_at":now(),"purged_by":automatic ? "system:ticket_cleanup" : c.principal,"trashed":true,"archived":true]
         try save(db,tombstone,type:"task")
-        for row in plan.events {try db.execute(sql:"UPDATE events SET data='{}' WHERE seq=? AND project_id=?",arguments:[row["seq"] as Int64,pid])}
+        for row in plan.events {try db.execute(sql:"UPDATE events SET data='{}' WHERE seq=? AND project_id=CAST(? AS TEXT)",arguments:[row["seq"] as Int64,Data(pid.utf8)])}
         var counts: JSON = ["removed_records":plan.removed.count,"retained_shared_records":plan.shared.count,"scrubbed_history_events":plan.events.count,"expired_command_results":expired,"managed_bytes_deleted":0]
         if automatic {counts["origin"] = "automatic_cleanup"}
         try event(db,caller:c,project:pid,entity:tid,kind:"task_purged",data:counts)

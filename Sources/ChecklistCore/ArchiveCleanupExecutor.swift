@@ -250,11 +250,12 @@ extension CommandRouter {
             let deadline = try Int64.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.not_before_ms') AS INTEGER)) FROM records WHERE type='cleanup_job' AND json_valid(data) AND json_extract(data,'$.state') IN ('queued','ready')")
             let expiry = try Double.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.expires_at') AS REAL)) FROM records WHERE type='storage_hold' AND json_valid(data) AND json_extract(data,'$.state')='active' AND CAST(json_extract(data,'$.expires_at') AS REAL)>?",arguments:[Date().timeIntervalSince1970])
             let more = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records j,json_each(j.data,'$.items') i WHERE j.type='cleanup_job' AND json_valid(j.data) AND json_extract(j.data,'$.state')='held' AND (json_extract(i.value,'$.state')='waiting' OR json_extract(i.value,'$.same_failure_count')=1))") ?? false
-            let deletionPending = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE type='storage_job' AND json_valid(data) AND json_extract(data,'$.kind')='ticket_object_delete' AND json_extract(data,'$.state')='pending')") ?? false
+            let pendingProjects = try String.fetchAll(db,sql:"SELECT DISTINCT project_id FROM records WHERE type='storage_job' AND json_valid(data) AND json_extract(data,'$.kind')='ticket_object_delete' AND json_extract(data,'$.state')='pending'")
+            let deletionDeadline = try pendingProjects.map {max(Int64((try self.ticketCleanupProjectRetry(db,project:$0) ?? .distantPast).timeIntervalSince1970 * 1000),nowMS + 50)}.min()
             let lifecycle = try self.nextTicketCleanupDeadline(db)
-            let retry = self.ticketCleanupRetryAt.map {Int64($0.timeIntervalSince1970 * 1000)}
+            let retry = [self.ticketCleanupRetryAt,self.ticketCleanupYieldAt].compactMap {$0}.max().map {Int64($0.timeIntervalSince1970 * 1000)}
             let routineRetry = self.storageMaintenanceRetryAt.map {Int64($0.timeIntervalSince1970 * 1000)}
-            let next = [lifecycle.map { max(Int64($0.timeIntervalSince1970 * 1000),retry ?? 0,nowMS + 50) },deletionPending ? max(retry ?? 0,nowMS + 50) : nil,deadline.map { max($0,routineRetry ?? 0,nowMS + 50) },expiry.map { Int64($0 * 1000) },more ? max(routineRetry ?? 0,nowMS + 1000) : nil,routineRetry].compactMap {$0}.min()
+            let next = [lifecycle.map { max(Int64($0.timeIntervalSince1970 * 1000),retry ?? 0,nowMS + 50) },deletionDeadline.map {max($0,retry ?? 0)},deadline.map { max($0,routineRetry ?? 0,nowMS + 50) },expiry.map { Int64($0 * 1000) },more ? max(routineRetry ?? 0,nowMS + 1000) : nil,routineRetry].compactMap {$0}.min()
             return next.map { Date(timeIntervalSince1970:Double($0)/1000) }
         }
     }

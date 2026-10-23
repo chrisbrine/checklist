@@ -28,6 +28,8 @@ public final class CommandRouter: @unchecked Sendable {
     private let maintenanceStateLock = NSLock()
     private var routineRetry: Date?
     private var cleanupRetry: Date?
+    private var cleanupYield: Date?
+    var ticketCleanupLifecycleTurn = true // Serialized maintenance lane only.
     private var cleanupFailure: String?
     var storageMaintenanceRetryAt: Date? {
         get {maintenanceStateLock.withLock {routineRetry}}
@@ -37,6 +39,10 @@ public final class CommandRouter: @unchecked Sendable {
         get {maintenanceStateLock.withLock {cleanupRetry}}
         set {maintenanceStateLock.withLock {cleanupRetry = newValue}}
     }
+    var ticketCleanupYieldAt: Date? {
+        get {maintenanceStateLock.withLock {cleanupYield}}
+        set {maintenanceStateLock.withLock {cleanupYield = newValue}}
+    }
     var ticketCleanupFailure: String? {
         get {maintenanceStateLock.withLock {cleanupFailure}}
         set {maintenanceStateLock.withLock {cleanupFailure = newValue}}
@@ -44,8 +50,8 @@ public final class CommandRouter: @unchecked Sendable {
     // Owned only by the serialized maintenance lane; retries a failed startup pool.
     var ticketCleanupReaders: DatabasePool?
     var ticketCleanupNeedsReader = false
+    var ticketCleanupPreparingProject: String?
     let ticketCleanupMaintenanceLock = NSLock()
-    let ticketCleanupReferenceCache = TicketCleanupReferenceCache()
     // One command's prepared files (CL-71) and the captures it created (CL-70). Set and
     // cleared inside the serialized writer; preparation itself never reads them.
     private var preparationStorage = CommandPreparation()

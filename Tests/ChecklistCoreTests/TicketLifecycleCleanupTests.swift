@@ -55,7 +55,7 @@ final class TicketLifecycleCleanupTests: XCTestCase {
     func finish() throws {
         for _ in 0..<40 {
             let pending = try router.dbQueue.read {try router.records($0,type:"storage_job").contains {$0["kind"] as? String == "ticket_object_delete" && $0["state"] as? String == "pending"}}
-            if !pending {return};try router.runStorageMaintenance()
+            if !pending {return};router.ticketCleanupYieldAt = nil;try router.runStorageMaintenance()
         }
         XCTFail("Fixture deletion did not settle")
     }
@@ -145,7 +145,7 @@ final class TicketLifecycleCleanupTests: XCTestCase {
         try router.dbQueue.write {db in try db.execute(sql:"CREATE TRIGGER lifecycle_fixture_stop BEFORE INSERT ON records WHEN json_extract(NEW.data,'$.cause')='ticket_cleanup_pass' BEGIN SELECT RAISE(ABORT,'fixture rollback'); END")}
         XCTAssertThrowsError(try pass());XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String));XCTAssertFalse(bool(try read(t),"purged"))
         try router.dbQueue.write {try $0.execute(sql:"DROP TRIGGER lifecycle_fixture_stop")}
-        try pass();let root = router.root;try router.closeStore();router = nil;router = try CommandRouter(root:root);try finish()
+        try expireCleanupBackoff();try pass();let root = router.root;try router.closeStore();router = nil;router = try CommandRouter(root:root);try finish()
         XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
     }
     func testPendingOwnerInspectionBlocksBothRulesAndAppearsInReceipt() throws {
@@ -373,9 +373,11 @@ extension TicketLifecycleCleanupTests {
         let writeSeconds = Date().timeIntervalSince(writing)
         release.signal();wait(for:[finished],timeout:15)
         XCTAssertLessThan(readSeconds,2);XCTAssertLessThan(writeSeconds,2)
-        // The write invalidated that snapshot; an actual background pump then
-        // admits a fresh one-ticket pass and a following pump deletes one file.
-        try router.runStorageMaintenance();try router.runStorageMaintenance()
+        // Unrelated writes no longer discard this one-ticket pass. A following
+        // pump deletes one file using its independently fenced read observation.
+        // The manual preparation above already consumed its lifecycle turn.
+        router.ticketCleanupLifecycleTurn = false
+        try router.runStorageMaintenance()
         XCTAssertEqual(try receipts(p).filter {($0["items"] as? [JSON] ?? []).contains {$0["action"] as? String == "done_evidence"}}.count,1)
         XCTAssertGreaterThan((try receipts(p).first?["summary"] as? JSON)?["removed_count"] as? Int ?? 0,0)
         print("CL193_PERFORMANCE managed_objects=30060 done_tickets=60 read_seconds=\(readSeconds) write_seconds=\(writeSeconds) bound_seconds=2")
@@ -398,7 +400,7 @@ extension TicketLifecycleCleanupTests {
             try self.router.processTicketObjectDeletionIntents(db,permit:permit,prepared:prepared)
         }
         XCTAssertFalse(committed);XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
-        try finish()
+        try expireCleanupBackoff();try finish()
         XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
         XCTAssertNotNil((try receipts(p).first?["summary"] as? JSON)?["retained_reasons"] as? JSON)
         let objects = (try receipts(p).first?["items"] as? [JSON])?.first?["byte_deletion"] as? JSON
@@ -463,6 +465,7 @@ extension TicketLifecycleCleanupTests {
         let writing = Date();_ = try call("message_send",["project_id":pid,"task_id":t["id"]!,"body":"Ordinary write during large file verification"]);let writeSeconds = Date().timeIntervalSince(writing)
         release.signal();wait(for:[finished],timeout:20)
         XCTAssertLessThan(readSeconds,2);XCTAssertLessThan(writeSeconds,2)
+        try expireCleanupBackoff()
         // A fresh pinned descriptor must still refuse a pathname modified after
         // its hash, even when its byte length stays exactly the same.
         try router.withTicketCleanupPreparation({db in
@@ -518,7 +521,7 @@ extension TicketLifecycleCleanupTests {
         XCTAssertEqual(held["state"] as? String,"deferred");XCTAssertNotNil(held["next_check_at"])
         XCTAssertGreaterThan(try XCTUnwrap(router.nextArchiveCleanupDeadline()).timeIntervalSinceNow,50)
         // Elapsed one-shot retry, without restarting the store or settings edits.
-        router.ticketCleanupRetryAt = Date().addingTimeInterval(-1)
+        try expireCleanupBackoff()
         try router.runStorageMaintenance();try finish()
         XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
         XCTAssertNil(router.ticketCleanupFailure)
@@ -602,7 +605,7 @@ extension TicketLifecycleCleanupTests {
             try db.execute(sql:"CREATE TEMP TRIGGER cleanup_fixture_failure BEFORE INSERT ON records WHEN NEW.type='storage_job' AND json_extract(NEW.data,'$.cause')='ticket_cleanup_pass' BEGIN SELECT RAISE(ABORT,'synthetic cleanup commit failure'); END")
         }
         for _ in 0..<2 {
-            router.ticketCleanupRetryAt = nil
+            try expireCleanupBackoff()
             XCTAssertThrowsError(try router.runStorageMaintenance())
             XCTAssertNotNil(router.ticketCleanupRetryAt)
             XCTAssertGreaterThan(try XCTUnwrap(router.nextArchiveCleanupDeadline()).timeIntervalSinceNow,50)
@@ -610,7 +613,7 @@ extension TicketLifecycleCleanupTests {
             XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
         }
         try router.dbQueue.writeWithoutTransaction {try $0.execute(sql:"DROP TRIGGER cleanup_fixture_failure")}
-        router.ticketCleanupRetryAt = Date().addingTimeInterval(-1)
+        try expireCleanupBackoff()
         try router.runStorageMaintenance();try finish()
         XCTAssertFalse(try receipts(p).isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
@@ -650,7 +653,7 @@ extension TicketLifecycleCleanupTests {
         XCTAssertEqual(router.ticketCleanupFailure,"CLEANUP_READ_LANE_UNAVAILABLE")
         XCTAssertNotNil(try router.nextArchiveCleanupDeadline())
         XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
-        router.ticketCleanupRetryAt = Date().addingTimeInterval(-1)
+        try expireCleanupBackoff()
         try router.runStorageMaintenance();try finish()
         XCTAssertFalse(try receipts(p).isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))

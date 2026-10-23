@@ -45,7 +45,7 @@ extension PurgeByteDeletionTests {
         let files = try StorageObjectFiles(root:router.root),initial = try receipt(result)["summary"] as! JSON
         for step in 0..<8 {
             if try receipt(result)["state"] as? String == "completed" {break}
-            try router.runStorageMaintenance()
+            try pumpByteDeletion()
             if step == 0 {
                 XCTAssertFalse(try files.regularOrLinkExists(path + "/z-links/alias.txt"))
                 XCTAssertTrue(try files.regularOrLinkExists(path + "/a-inner.txt"))
@@ -65,7 +65,7 @@ extension PurgeByteDeletionTests {
         let linkDirectory = router.root.appendingPathComponent(path + "/z-links")
         try FileManager.default.setAttributes([.posixPermissions:0o555],ofItemAtPath:linkDirectory.path)
         defer {try? FileManager.default.setAttributes([.posixPermissions:0o700],ofItemAtPath:linkDirectory.path)}
-        try router.runStorageMaintenance()
+        try pumpByteDeletion()
         let first = try XCTUnwrap((receipt(result)["objects"] as! [JSON]).first {$0["relative_path"] as? String == path + "/z-links/alias.txt"})
         XCTAssertEqual(first["failures"] as? Int,1);XCTAssertEqual(first["state"] as? String,"pending");try assertLinkChain(path)
         let root = router.root;try router.closeStore();router = nil;router = try CommandRouter(root:root)

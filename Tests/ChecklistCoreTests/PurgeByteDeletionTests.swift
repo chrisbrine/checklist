@@ -33,8 +33,15 @@ final class PurgeByteDeletionTests: XCTestCase {
     func preview(_ project: JSON,_ task: JSON) throws -> JSON {try call("task_purge_preview",params(project,task))}
     func purge(_ project: JSON,_ task: JSON) throws -> JSON {let v = try preview(project,task);var p = params(project,task);p["preview_digest"] = v["digest"]!;return try call("task_purge",p)}
     func receipt(_ result: JSON) throws -> JSON {try router.dbQueue.read {try router.record($0,result["byte_deletion_receipt_id"] as! String,type:"storage_job")}}
+    /// One explicitly fired byte-job step. Service pacing and lifecycle fairness
+    /// have separate clock/deadline tests; these fixtures inspect each unlink.
+    func pumpByteDeletion() throws {
+        router.ticketCleanupYieldAt = nil
+        router.ticketCleanupLifecycleTurn = false
+        try router.runStorageMaintenance()
+    }
     func finish(_ result: JSON) throws -> JSON {
-        for _ in 0..<30 {if try receipt(result)["state"] as? String == "completed" {return try receipt(result)};try router.runStorageMaintenance()}
+        for _ in 0..<30 {if try receipt(result)["state"] as? String == "completed" {return try receipt(result)};try pumpByteDeletion()}
         XCTFail("Deletion did not settle within the bounded fixture");return try receipt(result)
     }
     func testExclusiveOriginalPreviewAndCaptureBytesDeleteAfterCommitWithExactReceipt() throws {
@@ -150,12 +157,12 @@ final class PurgeByteDeletionTests: XCTestCase {
         let result = try router.handle(method:"task_purge",params:input,caller:owner)["data"] as! JSON
         // Deletion now runs on the separate maintenance lane, after the command
         // reply. The trigger fails its outcome commit after the actual unlink.
-        try router.runStorageMaintenance()
+        try pumpByteDeletion()
         XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
         XCTAssertEqual(try receipt(result)["state"] as? String,"pending")
         try router.dbQueue.write {try $0.execute(sql:"DROP TRIGGER purge_outcome_failure")}
         let root = router.root;try router.closeStore();router = nil;router = try CommandRouter(root:root)
-        try router.runStorageMaintenance()
+        try pumpByteDeletion()
         let replay = try router.handle(method:"task_purge",params:input,caller:owner)
         XCTAssertEqual(replay["replayed"] as? Bool,true)
         let data = replay["data"] as! JSON,summary = (data["byte_deletion"] as! JSON)["summary"] as! JSON
