@@ -16,19 +16,20 @@ enum StorageMaintenanceWarning: Equatable {
 extension CommandRouter {
     /// This tail is best effort only. It cannot change a committed semantic result.
     /// Error text, paths and record identities never enter the public warning.
-    /// A bounded pause belongs only to this router lifetime. Normal service restart
-    /// provides a fresh recovery opportunity; no durable latch exists without an
-    /// owner-authorized resume boundary. Never automatically restart or poll it.
+    /// Deferred infrastructure failures get a one-shot retry. Per-object failure
+    /// suspension still requires the existing explicit retry authority.
     func performStorageMaintenance(_ db: Database, permit: ArchiveStoragePermit) -> StorageMaintenanceWarning? {
         do {
             if try StorageSnapshotRetention.isActive(root:root) {return .backupCapture}
-            guard storageMaintenanceFallbackFailures < 2 else { return .suspended }
+            if let retry = storageMaintenanceRetryAt,retry > Date() {return .retryPending}
             let importWarning = try reconcileManagedAttachmentImports(db)
             try processArchiveCleanupJobs(db, permit: permit, nowMS: Int64(Date().timeIntervalSince1970 * 1000))
             storageMaintenanceFallbackFailures = 0
+            storageMaintenanceRetryAt = nil
             return importWarning
         } catch {
             storageMaintenanceFallbackFailures = min(storageMaintenanceFallbackFailures + 1, 2)
+            storageMaintenanceRetryAt = Date().addingTimeInterval(60)
             return storageMaintenanceFallbackFailures == 2 ? .suspended : .retryPending
         }
     }
@@ -43,4 +44,17 @@ extension CommandRouter {
         result["data"] = data
         return result
     }
+}
+
+/// Commands may refresh the schedule more often than its minimum timer delay.
+/// Preserve an already armed earlier wake so read traffic cannot starve it.
+public struct StorageMaintenanceWakePlan {
+    public private(set) var deadline: Date?
+    public init() {}
+    @discardableResult public mutating func update(_ next: Date?) -> Bool {
+        if let current = deadline,let next,current <= next {return false}
+        if deadline == nil && next == nil {return false}
+        deadline = next;return true
+    }
+    public mutating func fired() {deadline = nil}
 }

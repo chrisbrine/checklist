@@ -80,9 +80,24 @@ extension CommandRouter {
     /// counter also detects direct SQL, deletions, rolled-back attempts and new
     /// holds. Any intervening write discards preparation before semantic commit.
     func withTicketCleanupPreparation<T>(_ prepare: (Database) throws -> T?,commit: (Database,ArchiveStoragePermit,T) throws -> Void) throws {
-        guard let readers else {return} // No safe read lane: retain, never fall back to a long writer scan.
+        if (readers == nil || ticketCleanupNeedsReader) && ticketCleanupReaders == nil {
+            var configuration = Configuration();configuration.readonly = true
+            configuration.prepareDatabase {db in
+                try SchemaMigrations.installStorageCollation(db);Self.installTicketSearchFunctions(db)
+                try db.execute(sql:"PRAGMA busy_timeout=5000")
+            }
+            do {ticketCleanupReaders = try DatabasePool(path:root.appendingPathComponent("checklist.sqlite").path,configuration:configuration)}
+            catch {throw CoreError("CLEANUP_READ_LANE_UNAVAILABLE","Cleanup is deferred until a separate read lane can open.")}
+        }
+        guard let readers = ticketCleanupNeedsReader ? ticketCleanupReaders : (readers ?? ticketCleanupReaders) else {throw CoreError("CLEANUP_READ_LANE_UNAVAILABLE","Cleanup needs a separate read lane.")}
         let generation = try dbQueue.read {($0.totalChangesCount,try Int.fetchOne($0,sql:"PRAGMA data_version"))}
-        guard let prepared = try readers.read(prepare) else {return}
+        let prepared: T
+        do {guard let value = try readers.read(prepare) else {return};prepared = value}
+        catch is DatabaseError {
+            ticketCleanupNeedsReader = true
+            try? ticketCleanupReaders?.close();ticketCleanupReaders = nil
+            throw CoreError("CLEANUP_READ_LANE_UNAVAILABLE","Cleanup will retry a separate read lane; bytes retained.")
+        }
         try ArchiveStorageGate.withExclusive(root:root) {permit in
             try dbQueue.writeWithoutTransaction {db in
                 guard db.totalChangesCount == generation.0,try Int.fetchOne(db,sql:"PRAGMA data_version") == generation.1,try !StorageSnapshotRetention.isActive(root:root) else {return}

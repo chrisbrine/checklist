@@ -25,6 +25,25 @@ public final class CommandRouter: @unchecked Sendable {
     var managedImportRecoveryFailures: [Data:Int] = [:]
     var managedImportMaintenanceAfterRow: Int64 = 0
     var storageMaintenanceFallbackFailures = 0
+    private let maintenanceStateLock = NSLock()
+    private var routineRetry: Date?
+    private var cleanupRetry: Date?
+    private var cleanupFailure: String?
+    var storageMaintenanceRetryAt: Date? {
+        get {maintenanceStateLock.withLock {routineRetry}}
+        set {maintenanceStateLock.withLock {routineRetry = newValue}}
+    }
+    var ticketCleanupRetryAt: Date? {
+        get {maintenanceStateLock.withLock {cleanupRetry}}
+        set {maintenanceStateLock.withLock {cleanupRetry = newValue}}
+    }
+    var ticketCleanupFailure: String? {
+        get {maintenanceStateLock.withLock {cleanupFailure}}
+        set {maintenanceStateLock.withLock {cleanupFailure = newValue}}
+    }
+    // Owned only by the serialized maintenance lane; retries a failed startup pool.
+    var ticketCleanupReaders: DatabasePool?
+    var ticketCleanupNeedsReader = false
     let ticketCleanupMaintenanceLock = NSLock()
     let ticketCleanupReferenceCache = TicketCleanupReferenceCache()
     // One command's prepared files (CL-71) and the captures it created (CL-70). Set and
@@ -81,6 +100,7 @@ public final class CommandRouter: @unchecked Sendable {
             }
         } catch {
             storageMaintenanceFallbackFailures = 2
+            storageMaintenanceRetryAt = Date().addingTimeInterval(60)
         }
         try dbQueue.writeWithoutTransaction { try epicReferenceIndex.install($0) }
     }
@@ -353,6 +373,7 @@ public final class CommandRouter: @unchecked Sendable {
     /// checkpoint the WAL as the store's last connection.
     public func closeStore() throws {
         epicReferenceIndex.stop()
+        try ticketCleanupReaders?.close()
         try readers?.close()
         try dbQueue.close()
     }

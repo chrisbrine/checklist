@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import stat
 import unittest
 from unittest.mock import patch
 
@@ -43,7 +45,7 @@ class CleanupTests(unittest.TestCase):
             p = patch.object(slots, name, value); p.start(); self.addCleanup(p.stop)
         p = patch.object(slots, 'live_root', return_value=self.live); p.start(); self.addCleanup(p.stop)
         self.cleaner = clean.Cleaner(self.repo, self.installed, process_reader=lambda: self.processes,
-                                     mover=self.move, status_reader=lambda keys: dict(self.statuses))
+                                     mover=self.move, batch_mover=self.move_batch, status_reader=lambda keys: dict(self.statuses))
 
     def info(self, bundle, key):
         p = bundle / 'Contents/Resources/build-info.json'; p.parent.mkdir(parents=True, exist_ok=True)
@@ -78,6 +80,9 @@ class CleanupTests(unittest.TestCase):
     def move(self, p):
         destination = self.trash / str(len(self.moves))
         p.rename(destination); self.moves.append((p, destination)); return destination
+
+    def move_batch(self, paths):
+        return {p: self.move(p) for p in paths}
 
     def run_clean(self, method, apply=False):
         self.cleaner.apply = apply
@@ -209,13 +214,17 @@ class CleanupTests(unittest.TestCase):
         self.run_clean(self.cleaner.evidence,True)
         self.assertEqual(self.moves,[]);self.assertTrue(self.cleaner.failed)
 
-    def test_install_changes_mid_retirement_stops_remaining_moves(self):
-        self.capture(self.ids[2]); original=self.move
-        def move(p):
-            dest=original(p); self.info(self.installed,'d'*64);return dest
-        self.cleaner.mover=move
-        self.run_clean(self.cleaner.builds,True)
-        self.assertEqual(len(self.moves),1);self.assertTrue(self.cleaner.failed)
+    def test_install_changes_before_batch_retains_remaining_outputs(self):
+        self.capture(self.ids[2])
+        calls=0
+        def processes():
+            nonlocal calls
+            calls+=1
+            if calls==2:self.info(self.installed, 'd'*64)
+            return []
+        with patch.object(self.cleaner, 'process_reader', side_effect=processes):
+            self.run_clean(self.cleaner.builds, True)
+        self.assertEqual(self.moves, []); self.assertTrue(self.cleaner.failed)
 
     def test_build_lock_refuses_manual_apply_and_preview(self):
         lock=self.build/'.build-lock';lock.mkdir()
@@ -316,10 +325,11 @@ class CleanupTests(unittest.TestCase):
         self.assertIn('post_install_cleanup\n',source[hook:])
         self.assertNotIn('rm -',source[hook:])
 
-    def test_post_install_requires_actual_parent_and_build_lease(self):
+    def test_post_install_requires_own_build_lease(self):
+        (self.build/'.build-lock').mkdir()
         with patch.object(clean,'Cleaner',return_value=self.cleaner):
-            with self.assertRaisesRegex(ValueError,'installing parent'):
-                clean.post_install(self.repo,self.build/self.ids[0],-1)
+            with self.assertRaisesRegex(ValueError,'build lock held'):
+                clean.post_install(self.repo,self.build/self.ids[0])
 
     def test_build_info_inside_older_stage_is_preserved_before_trash(self):
         p=self.capture(self.ids[2]);(p/'build-info.json').unlink()
@@ -350,27 +360,170 @@ class CleanupTests(unittest.TestCase):
         with patch.object(sys,'argv',['test_instances.py','check','--slot','1']), patch.object(slots,'check') as check, patch.object(slots,'destroy') as destroy:
             slots.main();check.assert_called_once();destroy.assert_not_called()
 
-    def test_post_install_runs_retirement_under_installer_lease(self):
+    def test_post_install_runs_retirement_under_own_lease(self):
         captures=[self.capture(key) for key in self.ids]
-        (self.build/'.build-lock').mkdir()
         self.cleaner.apply=True
-        with patch.object(clean,'Cleaner',return_value=self.cleaner),patch.object(clean.os,'getppid',return_value=123):
-            output=io.StringIO()
-            with contextlib.redirect_stdout(output):self.assertEqual(clean.post_install(self.repo,captures[0],123),0)
+        def batch(paths):
+            self.assertTrue((self.build/'.build-lock').exists())
+            return self.move_batch(paths)
+        self.cleaner.batch_mover=batch
+        with patch.object(clean,'Cleaner',return_value=self.cleaner):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(clean.post_install(self.repo,captures[0]),0)
         self.assertEqual(len(self.moves),4)
         self.assertTrue((captures[0]/'source').exists());self.assertTrue((captures[1]/'source').exists())
-        self.assertTrue((self.build/'.build-lock').exists())
+        self.assertFalse((self.build/'.build-lock').exists())
 
-    def test_shell_hook_invokes_helper_and_reports_retirement_failure(self):
+    def test_shell_hook_returns_before_cleanup_and_logs_failure(self):
         source=(ROOT/'script/build_and_run.sh').read_text()
-        start=source.index('post_install_cleanup()')
-        stop=source.index('# Interactive modes',start)
+        start=source.index('post_install_cleanup()');stop=source.index('# Interactive modes',start)
         helper=self.repo/'script';helper.mkdir()
-        (helper/'clean_builds.py').write_text("def post_install(repo, capture, owner):\n print('fixture cleanup '+repo+' '+capture+' '+owner)\n return 1\n")
-        result=subprocess.run(['/bin/bash','-c',source[start:stop]],env=dict(os.environ,ROOT_DIR=str(self.repo),CAPTURE_DIR='/fixture-capture'),capture_output=True,text=True)
+        capture=self.build/self.ids[0];capture.mkdir()
+        (self.build/'.build-lock').mkdir()
+        (helper/'clean_builds.py').write_text("import time\ndef post_install(repo, capture):\n time.sleep(1)\n print('fixture failure',flush=True)\n return 1\n")
+        began=time.monotonic()
+        result=subprocess.run(['/bin/bash','-c',source[start:stop]],env=dict(os.environ,
+            ROOT_DIR=str(self.repo),BUILD_ROOT=str(self.build),CAPTURE_DIR=str(capture)),capture_output=True,text=True)
         self.assertEqual(result.returncode,0,result.stderr)
-        self.assertIn('fixture cleanup '+str(self.repo)+' /fixture-capture',result.stdout)
-        self.assertIn('Warning: build cleanup retained unresolved items',result.stderr)
+        self.assertLess(time.monotonic()-began,0.8)
+        self.assertIn('Build cleanup started in background',result.stdout)
+        self.assertFalse((self.build/'.build-lock').exists())
+        # Bound this fixture wait; the actual hook owns no recurring runtime.
+        deadline=time.monotonic()+4
+        log=capture/'post-install-cleanup.jsonl'
+        while time.monotonic()<deadline and (not log.exists() or 'fixture failure' not in log.read_text()):
+            time.sleep(0.05)
+        self.assertIn('fixture failure',log.read_text())
+
+    def test_shell_cleanup_lease_release_failure_keeps_install_successful(self):
+        source=(ROOT/'script/build_and_run.sh').read_text()
+        start=source.index('post_install_cleanup()');stop=source.index('# Interactive modes',start)
+        capture=self.build/self.ids[0];capture.mkdir()
+        lock=self.build/'.build-lock';lock.mkdir();(lock/'unexpected').write_text('retain')
+        result=subprocess.run(['/bin/bash','-c','set -euo pipefail\n'+source[start:stop]],
+            env=dict(os.environ,ROOT_DIR=str(self.repo),BUILD_ROOT=str(self.build),CAPTURE_DIR=str(capture)),
+            capture_output=True,text=True)
+        self.assertEqual(result.returncode,0)
+        self.assertIn('Warning: build cleanup',result.stderr)
+        self.assertNotIn('started in background',result.stdout)
+        self.assertTrue(lock.exists())
+
+    def test_readonly_capture_only_selected_root_gains_write(self):
+        retained=self.capture(self.ids[0]); obsolete=self.capture(self.ids[2])
+        roots=[retained/'source',obsolete/'source']
+        for root in roots:
+            (root/'nested').mkdir();(root/'nested/file').write_text('immutable')
+            (root/'nested/file').chmod(0o444);(root/'nested').chmod(0o555);root.chmod(0o555)
+        def restore():
+            for root in [retained,obsolete,self.trash]:
+                for path in root.rglob('*'):
+                    if path.is_dir():path.chmod(0o755)
+        self.addCleanup(restore)
+        self.run_clean(self.cleaner.builds)
+        self.assertEqual(stat.S_IMODE(roots[1].stat().st_mode),0o555)
+        def batch(paths):
+            self.assertEqual(stat.S_IMODE(roots[1].stat().st_mode),0o755)
+            self.assertEqual(stat.S_IMODE((roots[1]/'nested').stat().st_mode),0o555)
+            self.assertEqual(stat.S_IMODE(roots[0].stat().st_mode),0o555)
+            return self.move_batch(paths)
+        self.cleaner.batch_mover=batch
+        self.run_clean(self.cleaner.builds,True)
+        self.assertFalse(roots[1].exists())
+        self.assertEqual(stat.S_IMODE(roots[0].stat().st_mode),0o555)
+
+    def test_failed_move_restores_selected_root_permissions(self):
+        obsolete=self.capture(self.ids[2]);root=obsolete/'source';root.chmod(0o555)
+        self.addCleanup(lambda:root.chmod(0o755))
+        self.cleaner.batch_mover=lambda paths:{p:ValueError('fixture failure') for p in paths}
+        reports=self.run_clean(self.cleaner.builds,True)
+        self.assertEqual(stat.S_IMODE(root.stat().st_mode),0o555)
+        self.assertTrue(self.cleaner.failed);self.assertEqual(self.cleaner.moved,0)
+        self.assertEqual(len([r for r in reports if r['action']=='kept_error']),4)
+
+    def test_swiftpm_internal_links_retire_external_and_loop_links_report_path(self):
+        internal=self.build/('swiftpm-'+'1'*20);internal.mkdir()
+        (internal/'debug').mkdir();(internal/'debug/object').write_text('compiled')
+        (internal/'relative').symlink_to('debug',target_is_directory=True)
+        (internal/'absolute').symlink_to(internal/'debug/object')
+        external=self.build/('swiftpm-'+'2'*20);external.mkdir()
+        outside=external/'outside';outside.symlink_to(self.live,target_is_directory=True)
+        loop=self.build/('swiftpm-'+'3'*20);loop.mkdir();(loop/'loop').symlink_to('loop')
+        reports=self.run_clean(self.cleaner.builds,True)
+        self.assertFalse(internal.exists());self.assertTrue(external.exists());self.assertTrue(loop.exists())
+        self.assertTrue(any(str(outside) in r['reason'] for r in reports))
+        self.assertTrue(any(str(loop/'loop') in r['reason'] for r in reports))
+        self.assertTrue(self.live.exists())
+
+    def test_batch_rechecks_processes_and_tree_before_any_move(self):
+        p=self.capture(self.ids[2])
+        with patch.object(self.cleaner,'process_reader',side_effect=[[],[p/'source/bytes']]) as reader:
+            self.run_clean(self.cleaner.builds,True)
+        self.assertEqual(reader.call_count,2);self.assertTrue((p/'source').exists())
+        self.assertEqual(len(self.moves),3)
+
+    def test_many_build_outputs_use_one_batch_and_two_process_observations(self):
+        for n in range(100,130):self.capture(f'{n:064x}')
+        with patch.object(self.cleaner,'batch_mover',side_effect=self.move_batch) as batch, \
+             patch.object(self.cleaner,'process_reader',return_value=[]) as reader:
+            reports=self.run_clean(self.cleaner.builds,True)
+        batch.assert_called_once();self.assertEqual(len(batch.call_args.args[0]),120)
+        self.assertEqual(reader.call_count,2)
+        self.assertEqual(sum(r['action']=='trashed' for r in reports),120)
+
+    def test_preview_many_items_resolves_each_candidate_once_and_reads_processes_once(self):
+        for n in range(100,160):self.capture(f'{n:064x}')
+        paths=[self.root/f'process-{n}' for n in range(3000)]
+        resolved=Path.resolve;calls=0
+        def resolve(path,*args,**kwargs):
+            nonlocal calls
+            calls+=1
+            return resolved(path,*args,**kwargs)
+        began=time.monotonic()
+        with patch.object(Path,'resolve',resolve), \
+             patch.object(self.cleaner,'process_reader',return_value=paths) as reader:
+            reports=self.run_clean(self.cleaner.builds)
+        self.assertEqual(reader.call_count,1);self.assertEqual(len(reports),240)
+        self.assertLess(calls,10000)  # Regression was candidate count × process count.
+        self.assertLess(time.monotonic()-began,10)
+        self.assertEqual(self.moves,[])
+
+    def test_native_batch_keeps_success_receipts_on_partial_failure(self):
+        import retire_old_bundles as bundles
+        a=self.root/'a';b=self.root/'b'
+        result=subprocess.CompletedProcess([],5,f'# Moved "{a}" to "{self.trash}/a"\n','b refused')
+        with patch.dict(os.environ,{},clear=True),patch.object(bundles.subprocess,'run',return_value=result) as run:
+            outcomes=bundles.trash_many([a,b])
+        self.assertEqual(outcomes[a],self.trash/'a');self.assertIsInstance(outcomes[b],ValueError)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0],['/usr/bin/trash','--verbose',str(a),str(b)])
+        self.assertEqual(run.call_args.kwargs['timeout'],45)
+
+    def test_native_batch_timeout_preserves_already_confirmed_destinations(self):
+        import retire_old_bundles as bundles
+        a=self.root/'a';b=self.root/'b'
+        timeout=subprocess.TimeoutExpired('trash',45,output=f'# Moved "{a}" to "{self.trash}/a"\n'.encode())
+        with patch.dict(os.environ,{},clear=True),patch.object(bundles.subprocess,'run',side_effect=timeout):
+            outcomes=bundles.trash_many([a,b])
+        self.assertEqual(outcomes[a],self.trash/'a')
+        self.assertIn('timed out',str(outcomes[b]))
+
+    def test_failed_batch_process_refresh_reports_every_item_without_chmod(self):
+        p=self.capture(self.ids[2]);root=p/'source';root.chmod(0o555)
+        self.addCleanup(lambda:root.chmod(0o755))
+        with patch.object(self.cleaner,'process_reader',side_effect=[[],ValueError('inspection incomplete')]):
+            reports=self.run_clean(self.cleaner.builds,True)
+        self.assertEqual(len(reports),4)
+        self.assertTrue(all(r['action']=='kept_error' for r in reports))
+        self.assertEqual(stat.S_IMODE(root.stat().st_mode),0o555)
+        self.assertEqual(self.moves,[])
+
+    def test_process_path_resolution_deduplicates_raw_observations(self):
+        p=self.root/'open';lsof=subprocess.CompletedProcess([],0,f'n{p}\n'*1000,'')
+        with patch.object(clean_scratch.subprocess,'run',return_value=lsof), \
+             patch.object(clean_scratch.subprocess,'check_output',return_value=f'{p}\n'*1000), \
+             patch.object(Path,'resolve',autospec=True,side_effect=lambda path:path) as resolve:
+            self.assertEqual(clean_scratch.running_paths(),[p])
+        self.assertEqual(resolve.call_count,1)
 
     def test_summary_reports_logical_trash_bytes(self):
         self.handin();self.run_clean(self.cleaner.evidence,True)

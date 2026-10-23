@@ -272,7 +272,7 @@ def relative_path(value):
     path = PurePosixPath(value)
     if not value or len(path.parts) < 2 or path.is_absolute() or '\0' in value or any(x in ['', '.', '..'] for x in value.split('/')):
         raise ValueError('Unsafe snapshot relative path: ' + value)
-    if path.parts[0] not in ['objects', 'source-captures', 'staging', 'icons', 'source-executions']:
+    if path.parts[0] not in ['objects', 'source-captures', 'staging', 'icons', 'source-executions', 'source-build-cache']:
         raise ValueError('Unsupported snapshot managed family: ' + value)
     return path
 

@@ -33,7 +33,7 @@ extension CommandRouter {
             for entry in entries {
                 guard let path = entry["path"] as? String,let sha = entry["sha256"] as? String,let size = entry["size"] as? NSNumber,size.int64Value >= 0 else {throw StoreRecovery.required("backup_receipt_index_invalid")}
                 // Historical presence is metadata, not permission to open a backup or origin path.
-                if let relative = try? ManagedPaths.relative(path,family:path.contains("source-captures/") ? "source-captures" : "objects",root:root) {
+                if let relative = try? ManagedPaths.relative(path,family:path.contains("source-captures/") ? "source-captures" : path.contains("source-build-cache/") ? "source-build-cache" : "objects",root:root) {
                     originals.insert(StorageBackupRetentionIndex.key(path:relative,sha:sha,size:size.int64Value))
                 }
             }
@@ -219,22 +219,28 @@ extension CommandRouter {
     public func runStorageMaintenance() throws {
         let lease = try storageAdmission.acquire();defer { lease.finish() }
         ticketCleanupMaintenanceLock.lock();defer {ticketCleanupMaintenanceLock.unlock()}
-        guard try dbQueue.read({_ in self.storageMaintenanceFallbackFailures < 2}) else {return}
-        do {
-            // Drain an admitted byte job before planning another ticket. Never run
-            // expensive reference traversal on the command tail or service queue.
-            var deletionPrepared = false
-            try withTicketCleanupPreparation({db -> TicketCleanupPreparedDeletion? in
-                let result = try self.prepareTicketObjectDeletion(db);deletionPrepared = result != nil;return result
-            }) {db,permit,prepared in try self.processTicketObjectDeletionIntents(db,permit:permit,prepared:prepared)}
-            if !deletionPrepared {
-                try withTicketCleanupPreparation({try self.prepareTicketLifecycleCleanup($0)}) {db,_,prepared in
-                    try self.commitTicketLifecycleCleanup(db,prepared:prepared,at:Date())
+        if try StorageSnapshotRetention.isActive(root:root) {return}
+        if !(ticketCleanupRetryAt.map {$0 > Date()} ?? false) {
+            do {
+                // Drain an admitted byte job before planning another ticket. Never run
+                // expensive reference traversal on the command tail or service queue.
+                var deletionPrepared = false
+                try withTicketCleanupPreparation({db -> TicketCleanupPreparedDeletion? in
+                    let result = try self.prepareTicketObjectDeletion(db);deletionPrepared = result != nil;return result
+                }) {db,permit,prepared in try self.processTicketObjectDeletionIntents(db,permit:permit,prepared:prepared)}
+                if !deletionPrepared {
+                    try withTicketCleanupPreparation({try self.prepareTicketLifecycleCleanup($0)}) {db,_,prepared in
+                        try self.commitTicketLifecycleCleanup(db,prepared:prepared,at:Date())
+                    }
                 }
+                try dbQueue.writeWithoutTransaction {_ in self.ticketCleanupRetryAt = nil;self.ticketCleanupFailure = nil}
+            } catch {
+                try dbQueue.writeWithoutTransaction {_ in
+                    self.ticketCleanupRetryAt = Date().addingTimeInterval(60)
+                    self.ticketCleanupFailure = (error as? CoreError)?.code ?? "CLEANUP_PREPARATION_UNAVAILABLE"
+                }
+                throw error
             }
-        } catch {
-            try dbQueue.writeWithoutTransaction {_ in self.storageMaintenanceFallbackFailures = min(self.storageMaintenanceFallbackFailures + 1,2)}
-            throw error
         }
         try ArchiveStorageGate.withExclusive(root:root) { permit in
             try dbQueue.writeWithoutTransaction { _ = self.performStorageMaintenance($0,permit:permit) }

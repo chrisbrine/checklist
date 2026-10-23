@@ -201,6 +201,14 @@ enum StorageSnapshotAuthority {
                 if kind == CommandRouter.ticketObjectDeletionKind {
                     guard let entries = value["objects"] as? [JSON],entries.count <= 100000 else {throw StorageSnapshotFailure.unsupportedAuthority}
                     for entry in entries where ["pending","retained"].contains(entry["state"] as? String ?? "") {
+                        if entry["representation"] as? String == "source_build_cache" {
+                            guard let path = entry["relative_path"] as? String else {throw StorageSnapshotFailure.unsupportedAuthority}
+                            let parts = try StorageObjectFiles.parts(path)
+                            guard parts.count >= 2,parts[0] == "source-build-cache",parts[1].range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil else {throw StorageSnapshotFailure.unsupportedAuthority}
+                            // Rebuildable cache is not required backup payload.
+                            // Preserve its durable ownership/outcome metadata.
+                            unavailable.append(.init(authority:authority + ":" + path,reason:"rebuildable_source_build_cache"));continue
+                        }
                         guard let path = entry["relative_path"] as? String,let sha = entry["sha256"] as? String,let size = (entry["size"] as? NSNumber)?.int64Value else {continue}
                         guard path.hasPrefix("objects/") || path.hasPrefix("source-captures/"),size >= 0 else {throw StorageSnapshotFailure.unsupportedAuthority}
                         if try retainedExists(path) {

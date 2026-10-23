@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -212,11 +213,13 @@ elif sys.argv[1] == '-':
     exit_code = os.environ['CLEANUP_EXIT']
 else:
     raise SystemExit('Unexpected Python call')
+if sys.argv[1] == '-': print('fixture cleanup exit '+exit_code, flush=True)
 raise SystemExit(int(exit_code))
 """)
         stub.chmod(0o755)
         previous = self.bundle('.Checklist-previous-20261020T010000Z-20.app')
-        capture = self.root / 'capture with spaces'
+        capture = self.root / 'capture with spaces';capture.mkdir()
+        build = self.root / 'build';build.mkdir()
         cases = [(mode, verify, retire, cleanup, had_previous)
                  for mode in ['--verify', '--install-stage', '--install', 'run', '--debug', '--logs', '--telemetry']
                  for verify, retire, cleanup, had_previous in [
@@ -225,12 +228,22 @@ raise SystemExit(int(exit_code))
         for mode, verify, retire, cleanup, had_previous in cases:
             with self.subTest(mode=mode, verify=verify, retire=retire, cleanup=cleanup, previous=had_previous):
                 trace.write_text('')
+                (capture/'post-install-cleanup.jsonl').unlink(missing_ok=True)
+                (build/'.build-lock').mkdir(exist_ok=True)
                 environment = dict(self.environment, MODE=mode, ROOT_DIR=str(REPO), DEST=str(self.applications / 'Checklist.app'),
-                                   CAPTURE_DIR=str(capture), HAD_PREVIOUS=had_previous, PREVIOUS=str(previous), INSTALL_STARTED='1234', TRACE=str(trace),
+                                   BUILD_ROOT=str(build), BUILD_LOCK_OWNED='1', CAPTURE_DIR=str(capture), HAD_PREVIOUS=had_previous, PREVIOUS=str(previous), INSTALL_STARTED='1234', TRACE=str(trace),
                                    VERIFY_EXIT=str(verify), RETIRE_EXIT=str(retire), CLEANUP_EXIT=str(cleanup),
                                    PATH=str(binary) + os.pathsep + os.environ['PATH'])
                 result = subprocess.run(['bash', '-c', 'set -euo pipefail\nsleep() { :; }\n' + block],
                                         env=environment, capture_output=True, text=True)
+                failed_verify = mode in ['--verify', '--install-stage'] and verify
+                if not failed_verify:
+                    log=capture/'post-install-cleanup.jsonl'
+                    deadline=time.monotonic()+3
+                    while time.monotonic()<deadline and (not log.exists() or 'fixture cleanup exit ' not in log.read_text()):
+                        time.sleep(0.01)
+                    self.assertIn('fixture cleanup exit '+str(cleanup),log.read_text())
+                    self.assertFalse((build/'.build-lock').exists())
                 calls = [json.loads(line) for line in trace.read_text().splitlines()]
                 if mode in ['--verify', '--install-stage'] and verify:
                     self.assertEqual(result.returncode, 1)
@@ -247,10 +260,10 @@ raise SystemExit(int(exit_code))
                     expected.append([str(SCRIPT), '--after-install', '--keep', str(previous) if had_previous == '1' else ''])
                     self.assertEqual(calls[:-1], expected)
                     self.assertEqual(calls[-1][:3], ['-', str(REPO), str(capture)])
-                    self.assertEqual(len(calls[-1]), 4)
-                    self.assertRegex(calls[-1][3], r'^[1-9][0-9]*$')
+                    self.assertEqual(len(calls[-1]), 3)
+                    self.assertIn('Build cleanup started in background', result.stdout)
                     self.assertEqual('Warning: old Checklist bundles' in result.stderr, bool(retire))
-                    self.assertEqual('Warning: build cleanup retained unresolved items' in result.stderr, bool(cleanup))
+                    self.assertNotIn('Warning: build cleanup', result.stderr)
                     self.assertIn('--retire-previous', result.stdout)
                     if had_previous == '1': self.assertIn('Previous bundle retained at ' + str(previous), result.stdout)
                 self.assertTrue(previous.is_dir());self.assertEqual(list(self.trash.iterdir()), [])

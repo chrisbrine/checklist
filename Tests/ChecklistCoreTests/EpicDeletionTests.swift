@@ -205,7 +205,7 @@ extension CoreTests {
             var pages = 0
             for _ in 0..<1000 {
                 pages += 1
-                let more = try router.dbQueue.writeWithoutTransaction {try router.epicReferenceIndex.buildPage($0)}
+                let more = try router.epicReferenceIndex.buildPage(router)
                 if !more {break}
             }
             XCTAssertLessThan(pages,1000)
@@ -234,7 +234,7 @@ extension CoreTests {
         // Finish finite pages directly; the background continuation can safely
         // interleave because both run on the sole writer.
         for _ in 0..<100 {
-            if try !router.dbQueue.writeWithoutTransaction({try router.epicReferenceIndex.buildPage($0)}) {break}
+            if try !router.epicReferenceIndex.buildPage(router) {break}
         }
         let invalid = uuid()
         try router.dbQueue.write {db in
@@ -242,7 +242,7 @@ extension CoreTests {
         }
         let invalidBefore = try deletionFingerprint()
         do {_ = try call("epic_delete",["project_id":pid,"epic_id":gid,"expected_revision":1]);XCTFail("Oversized unproved payload must refuse")}
-        catch let error as CoreError {XCTAssertEqual(error.code,"EPIC_HISTORY_UNPROVEN");XCTAssertEqual(error.details["reason"] as? String,"reference_index_unavailable")}
+        catch let error as CoreError {XCTAssertEqual(error.code,"EPIC_HISTORY_UNPROVEN");XCTAssertEqual(error.details["reason"] as? String,"reference_index_unavailable");XCTAssertEqual(error.details["source_id"] as? String,invalid)}
         XCTAssertEqual(try deletionFingerprint(),invalidBefore)
         try router.dbQueue.write {try $0.execute(sql:"DELETE FROM records WHERE id=?",arguments:[invalid])}
         XCTAssertEqual(try call("epic_delete",["project_id":pid,"epic_id":gid,"expected_revision":1])["deleted"] as? Bool,true)
@@ -278,6 +278,105 @@ extension CoreTests {
         try router.dbQueue.write { db in
             try db.execute(sql:"INSERT OR REPLACE INTO records VALUES (?,?,'message',3,?)",arguments:[source,pid,try jsonString(["id":source,"project_id":pid,"revision":3,"epic_id":gid])])
             try db.execute(sql:"INSERT OR REPLACE INTO records VALUES (?,?,'message',4,?)",arguments:[source,pid,try jsonString(["id":source,"project_id":pid,"revision":4,"body":"No retained link"])])
+        }
+        XCTAssertEqual(try call("epic_delete",["project_id":pid,"epic_id":gid,"expected_revision":1])["deleted"] as? Bool,true)
+    }
+}
+
+
+extension CoreTests {
+    func testEpicDeleteRealSizeBackfillResumesExpiredSlices() throws {
+        let p = try project(),pid = p["id"] as! String
+        let epic = try call("epic_create",["project_id":pid,"name":"Real-size legacy proof"]),gid = epic["id"] as! String
+        try router.dbQueue.write { db in
+            // Seed a pre-index store, rather than qualifying only trigger writes.
+            for name in try String.fetchAll(db,sql:"SELECT name FROM sqlite_temp_master WHERE type='trigger' AND name LIKE 'epic_guard_%'") {
+                try db.execute(sql:"DROP TRIGGER \(name)")
+            }
+            try db.execute(sql:"""
+                WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<8600)
+                INSERT INTO records(id,project_id,type,revision,data)
+                SELECT 'retained-record-'||x,?,'message',1,json_object('body','Synthetic retained message','nested',json_object('target','elsewhere-'||x)) FROM n
+                """,arguments:[pid])
+            try db.execute(sql:"""
+                WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<20000)
+                INSERT INTO events(id,project_id,entity_id,actor,kind,occurred_at,data)
+                SELECT 'retained-event-'||x,?,'retained-record-'||x,'fixture','padding','2026-10-22',json_object('nested',json_object('target','elsewhere-'||x)) FROM n
+                """,arguments:[pid])
+            let payload = try jsonString(["body":String(repeating:"x",count:1_700_000),"nested":Dictionary(uniqueKeysWithValues:(0..<8000).map {("key-\($0)","value-\($0)")})])
+            XCTAssertLessThan(payload.utf8.count,EpicReferenceIndex.maximumPayloadBytes)
+            try db.execute(sql:"INSERT INTO records(rowid,id,project_id,type,revision,data) VALUES (-1,'large-proof-record',?,'message',1,?)",arguments:[pid,payload])
+            try db.execute(sql:"INSERT INTO events(id,project_id,entity_id,actor,kind,occurred_at,data) VALUES ('large-proof-event',?,?,'fixture','padding','2026-10-22',?)",arguments:[pid,pid,payload])
+        }
+        try router.closeStore();router = try CommandRouter(root:directory)
+        let before = try deletionFingerprint(),start = ProcessInfo.processInfo.systemUptime
+        // The first legacy row is large-proof-record (rowid -1). A zero
+        // slice budget simulates a host descheduled past its deadline, even for
+        // a single large row. It must commit one unit and retain the remainder.
+        XCTAssertTrue(try router.epicReferenceIndex.buildPage(router,seconds:0))
+        try router.dbQueue.read { db in
+            XCTAssertNil(try Int64.fetchOne(db,sql:"SELECT position FROM epic_guard_progress WHERE kind=0"))
+            XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT count(*) FROM epic_guard_refs WHERE source_id=CAST('large-proof-record' AS BLOB)"),1)
+        }
+        do {_ = try call("epic_delete",["project_id":pid,"epic_id":gid,"expected_revision":1]);XCTFail("Proof is still pending")}
+        catch let error as CoreError {XCTAssertEqual(error.details["reason"] as? String,"reference_index_pending")}
+        // Exercise the actual background continuations, sampling ordinary reads
+        // while they run. This finite fixture wait never drives the backfill.
+        var pending = true,reads = 0,maxRead: TimeInterval = 0
+        while pending && ProcessInfo.processInfo.systemUptime-start<120 {
+            let readStart = ProcessInfo.processInfo.systemUptime
+            _ = try call("service_info")
+            maxRead = max(maxRead,ProcessInfo.processInfo.systemUptime-readStart);reads += 1
+            pending = try router.dbQueue.read {try Bool.fetchOne($0,sql:"SELECT EXISTS(SELECT 1 FROM epic_guard_progress WHERE high_water IS NOT NULL AND (position IS NULL OR position<high_water))")!}
+            if pending {Thread.sleep(forTimeInterval:0.01)}
+        }
+        let seconds = ProcessInfo.processInfo.systemUptime-start
+        XCTAssertFalse(pending);XCTAssertLessThan(seconds,120);XCTAssertLessThan(maxRead,2)
+        XCTAssertEqual(try deletionFingerprint(),before)
+        XCTAssertEqual(try call("epic_delete",["project_id":pid,"epic_id":gid,"expected_revision":1])["deleted"] as? Bool,true)
+        print("CL-245 r3 records=8600 events=20000 large_payloads=2 exhausted_source=large-proof-record slice_budget=0 backfill_seconds=\(seconds) ordinary_reads=\(reads) max_read_seconds=\(maxRead)")
+    }
+}
+
+
+extension CoreTests {
+    func testEpicDeleteBackfillSlicesFenceChangedSourcesAndNameMalformedRows() throws {
+        let p = try project(),pid = p["id"] as! String
+        let epic = try call("epic_create",["project_id":pid,"name":"Slice fencing"]),gid = epic["id"] as! String
+        try router.dbQueue.write { db in
+            try db.execute(sql:"INSERT INTO records(rowid,id,project_id,type,revision,data) VALUES (-1,'slice-source',?,'message',1,?)",arguments:[pid,try jsonString(["links":[gid,"stale-target"]])])
+        }
+        try router.closeStore();router = try CommandRouter(root:directory)
+        XCTAssertTrue(try router.epicReferenceIndex.buildPage(router,seconds:0))
+        // Same revision, and repeated replacement/deletion, must still fence a
+        // parsed source. A revision-only comparison would resurrect stale links.
+        try router.dbQueue.write { db in
+            try db.execute(sql:"UPDATE records SET data='{}' WHERE id='slice-source'")
+            try db.execute(sql:"INSERT OR REPLACE INTO records VALUES ('slice-source',?,'message',1,'{}')",arguments:[pid])
+            try db.execute(sql:"DELETE FROM records WHERE id='slice-source'")
+            try db.execute(sql:"INSERT INTO records VALUES ('slice-source',?,'message',1,'{}')",arguments:[pid])
+        }
+        var more = true
+        for _ in 0..<100 where more {more = try router.epicReferenceIndex.buildPage(router)}
+        XCTAssertFalse(more)
+        try router.dbQueue.read { db in
+            XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT count(*) FROM epic_guard_refs WHERE source_id=CAST('slice-source' AS BLOB)"),0)
+        }
+        for (table,kind) in [("records","record"),("events","event")] {
+            try router.dbQueue.write { db in
+                if table == "records" {try db.execute(sql:"INSERT INTO records VALUES ('malformed-proof-source',?,'message',1,'{')",arguments:[pid])}
+                else {try db.execute(sql:"INSERT INTO events(id,project_id,entity_id,actor,kind,occurred_at,data) VALUES ('malformed-proof-source',?,?,'fixture','padding','2026-10-22','{')",arguments:[pid,pid])}
+            }
+            let before = try deletionFingerprint()
+            do {_ = try call("epic_delete",["project_id":pid,"epic_id":gid,"expected_revision":1]);XCTFail("Malformed proof must refuse")}
+            catch let error as CoreError {
+                XCTAssertEqual(error.details["reason"] as? String,"reference_index_unavailable")
+                XCTAssertEqual(error.details["source_kind"] as? String,kind)
+                XCTAssertEqual(error.details["source_id"] as? String,"malformed-proof-source")
+                XCTAssertTrue(error.message.contains("malformed-proof-source"))
+            }
+            XCTAssertEqual(try deletionFingerprint(),before)
+            try router.dbQueue.write {try $0.execute(sql:"DELETE FROM \(table) WHERE id='malformed-proof-source'")}
         }
         XCTAssertEqual(try call("epic_delete",["project_id":pid,"epic_id":gid,"expected_revision":1])["deleted"] as? Bool,true)
     }

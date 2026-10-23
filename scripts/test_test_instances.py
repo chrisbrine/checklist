@@ -739,6 +739,41 @@ class SeedIsolationTests(unittest.TestCase):
                     else:
                         with self.assertRaises(ValueError): harness.require_local_paths(database, destination, source_root=source_root)
 
+    def test_source_build_cache_descriptors_in_seed_and_start_inspection(self):
+        # CL-193 persists retained cache directories and cleanup file descriptors.
+        # Start uses the same inspection with immutable=False to include the WAL.
+        for immutable in [True, False]:
+            with self.subTest(immutable=immutable), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve();slots = base / 'slots';live = base / 'live'
+                destination = slots / 'slot-1/data';destination.mkdir(parents=True)
+                cache = 'source-build-cache/' + 'a' * 64
+                for number, value in enumerate([cache, cache + '/debug/output', str(destination / cache)]):
+                    database = destination / f'accepted-{number}.sqlite'
+                    record = {'id': 'cleanup', 'objects': [{'relative_path': value,
+                              'stored_path': value, 'representation': 'source_build_cache',
+                              'kind': 'directory' if number != 1 else 'file', 'state': 'retained'}]}
+                    store_fixture(database, 3, [('storage_job', record)])
+                    before = harness.sha(database)
+                    with patch.object(harness, 'LIVE', live), patch.object(harness, 'DEFAULT_LIVE', live), patch.object(harness, 'BASE', slots):
+                        counts = harness.require_local_paths(database, destination, immutable=immutable)
+                    category = 'managed_local_absolute' if number == 2 else 'managed_relative'
+                    self.assertEqual(counts[category], 1)
+                    self.assertEqual(harness.sha(database), before)
+                for number, (value, cause) in enumerate([
+                    (str(slots / 'slot-2/data' / cache), 'different Checklist data root'),
+                    (cache + '/../outside', 'malformed root-relative managed path')]):
+                    database = destination / f'refused-{number}.sqlite'
+                    store_fixture(database, 3, [('storage_job', {'id': 'cleanup', 'objects': [{'relative_path': value}]})])
+                    with patch.object(harness, 'LIVE', live), patch.object(harness, 'DEFAULT_LIVE', live), patch.object(harness, 'BASE', slots):
+                        with self.assertRaisesRegex(ValueError, cause):
+                            harness.require_local_paths(database, destination, immutable=immutable)
+                # Existing no-follow containment applies to the added family too.
+                (destination / 'source-build-cache').symlink_to(base / 'outside')
+                database = destination / 'symlink.sqlite'
+                store_fixture(database, 3, [('storage_job', {'id': 'cleanup', 'relative_path': cache})])
+                with self.assertRaisesRegex(ValueError, 'symlink'):
+                    harness.require_local_paths(database, destination, immutable=immutable)
+
     def test_unproved_outside_managed_descriptor_is_never_inspected(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory).resolve();outside = base / 'outside/objects/file';outside.parent.mkdir(parents=True)

@@ -10,6 +10,18 @@ final class EpicReferenceIndex {
     private let lock = NSLock()
     private var started = false
     private var stopped = false
+    // Only the utility worker (or the component fixture) owns a prepared slice.
+    // Never acquire this lock while holding the writer connection.
+    private let workLock = NSLock()
+    private var decoder: DatabaseQueue?
+    private struct Source {
+        let kind: Int,position: Int64,id: Data,project: Data?,type: String?,entity: Data?,payload: Data?
+    }
+    private struct Prepared {
+        let source: Source,targets: [Data],epic: Data?,invalid: String?
+        var offset = 0
+    }
+    private var prepared: Prepared?
     private let queue = DispatchQueue(label:"org.checklist.epic-reference-index",qos:.utility)
 
     func stop() { lock.lock(); stopped = true; lock.unlock() }
@@ -24,7 +36,8 @@ final class EpicReferenceIndex {
             CREATE INDEX temp.epic_guard_incoming ON epic_guard_refs(target,project,source_kind,source_id);
             CREATE TEMP TABLE epic_guard_members(project BLOB,epic BLOB,source_id BLOB PRIMARY KEY) WITHOUT ROWID;
             CREATE INDEX temp.epic_guard_membership ON epic_guard_members(project,epic);
-            CREATE TEMP TABLE epic_guard_invalid(source_kind INTEGER,source_id BLOB,PRIMARY KEY(source_kind,source_id)) WITHOUT ROWID;
+            CREATE TEMP TABLE epic_guard_invalid(source_kind INTEGER,source_id BLOB,reason TEXT NOT NULL,PRIMARY KEY(source_kind,source_id)) WITHOUT ROWID;
+            CREATE TEMP TABLE epic_guard_touched(source_kind INTEGER,source_id BLOB,PRIMARY KEY(source_kind,source_id)) WITHOUT ROWID;
             CREATE TEMP TABLE epic_guard_progress(kind INTEGER PRIMARY KEY,position INTEGER,high_water INTEGER);
             INSERT INTO epic_guard_progress VALUES(0,NULL,(SELECT MAX(rowid) FROM main.records));
             INSERT INTO epic_guard_progress VALUES(1,NULL,(SELECT MAX(seq) FROM main.events));
@@ -36,6 +49,7 @@ final class EpicReferenceIndex {
                 let rows = action == "INSERT" ? ["NEW"] : action == "DELETE" ? ["OLD"] : ["OLD","NEW"]
                 let cleanup = rows.map { row in
                     """
+                    INSERT INTO epic_guard_touched VALUES(\(kind),CAST(\(row).id AS BLOB)) ON CONFLICT DO NOTHING;
                     DELETE FROM epic_guard_refs WHERE source_kind=\(kind) AND source_id=CAST(\(row).id AS BLOB);
                     DELETE FROM epic_guard_invalid WHERE source_kind=\(kind) AND source_id=CAST(\(row).id AS BLOB);
                     \(kind == 0 ? "DELETE FROM epic_guard_members WHERE source_id=CAST(\(row).id AS BLOB);" : "")
@@ -63,7 +77,7 @@ final class EpicReferenceIndex {
             \(from) WHERE \(row).entity_id IS NOT NULL ON CONFLICT(source_kind,source_id,target) DO NOTHING;
             """
         return """
-            INSERT INTO epic_guard_invalid SELECT \(kind),CAST(\(row).id AS BLOB) \(from) WHERE NOT (\(valid))
+            INSERT INTO epic_guard_invalid SELECT \(kind),CAST(\(row).id AS BLOB),'invalid_payload' \(from) WHERE NOT (\(valid))
             ON CONFLICT(source_kind,source_id) DO NOTHING;
             INSERT INTO epic_guard_refs(source_kind,source_id,project,target)
             SELECT \(kind),CAST(\(row).id AS BLOB),CAST(\(row).project_id AS BLOB),CAST(j.value AS BLOB)
@@ -78,12 +92,13 @@ final class EpicReferenceIndex {
     func requireReady(_ db: Database,router: CommandRouter) throws {
         let pending = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM epic_guard_progress WHERE high_water IS NOT NULL AND (position IS NULL OR position<high_water))") ?? true
         if pending {
-            if isStopped {throw CoreError("EPIC_HISTORY_UNPROVEN","Legacy reference indexing could not finish within its bounded work budget. Nothing was removed; retain the Epic and request authorized diagnosis.",details:["reason":"reference_index_unavailable"])}
             start(router)
             throw CoreError("EPIC_HISTORY_UNPROVEN","Legacy reference indexing is pending in bounded background work. Nothing was removed; retry after indexing finishes.",details:["reason":"reference_index_pending"])
         }
-        if try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM epic_guard_invalid)") ?? true {
-            throw CoreError("EPIC_HISTORY_UNPROVEN","Retained data cannot be indexed within the safe deletion budget. Nothing was removed; retain the Epic and request authorized diagnosis.",details:["reason":"reference_index_unavailable"])
+        if let row = try Row.fetchOne(db,sql:"SELECT source_kind,source_id,reason FROM epic_guard_invalid ORDER BY source_kind,source_id LIMIT 1") {
+            let id: Data = row["source_id"],kind: Int = row["source_kind"]
+            let name = String(data:id,encoding:.utf8) ?? id.map {String(format:"%02x",$0)}.joined()
+            throw CoreError("EPIC_HISTORY_UNPROVEN","Retained \(kind == 0 ? "record" : "event") \(name) has an invalid or over-2-MB payload. Nothing was removed; repair the named source through an authorized command.",details:["reason":"reference_index_unavailable","source_kind":kind == 0 ? "record" : "event","source_id":name,"payload_reason":row["reason"] as String])
         }
     }
 
@@ -100,43 +115,105 @@ final class EpicReferenceIndex {
             do {
                 let lease = try router.storageAdmission.acquire()
                 defer {lease.finish()}
-                let more = try router.dbQueue.writeWithoutTransaction { db in
-                    guard !self.isStopped else {return false}
-                    return try self.buildPage(db)
-                }
-                if more {self.enqueue(router)}
+                if try self.buildPage(router) {self.enqueue(router)}
             } catch {
-                // No repeated retry of a failed page. Its rolled-back progress
-                // leaves deletion explicitly unavailable for this connection.
-                self.stop()
+                // Infrastructure failure does not poison the connection. Leave
+                // committed progress intact; a later request may restart work.
+                self.lock.lock();self.started = false;self.lock.unlock()
             }
         }
     }
 
-    /// At most eight rows, 2 MB per payload, 50 ms of SQLite execution per page.
-    /// Rowid/seq ranges and high-water marks never depend on corpus cardinality.
-    @discardableResult func buildPage(_ db: Database) throws -> Bool {
-        try Self.withBudget(db,seconds:0.05) {
-            try db.inTransaction {
-                for (table,column,kind) in [("records","rowid",0),("events","seq",1)] {
-                    let state = try Row.fetchOne(db,sql:"SELECT position,high_water FROM epic_guard_progress WHERE kind=?",arguments:[kind])!
-                    let position: Int64? = state["position"],high: Int64? = state["high_water"]
-                    guard let high,position == nil || position!<high else {continue}
-                    let lower = position == nil ? "" : "\(column)>? AND "
-                    let arguments = position.map {StatementArguments([$0,high])} ?? StatementArguments([high])
-                    let rows = try Row.fetchAll(db,sql:"SELECT \(column) AS position FROM main.\(table) WHERE \(lower)\(column)<=? ORDER BY \(column) LIMIT 4",arguments:arguments)
-                    for row in rows {
-                        let at: Int64 = row["position"]
-                        // Reuse the trigger's exact indexing statements for one
-                        // indexed source row. No durable bytes/rowids change.
-                        try db.execute(sql:Self.insertSQL(kind:kind,row:"r",from:"FROM (SELECT * FROM main.\(table) WHERE \(column)=\(at)) r"))
-                    }
-                    try db.execute(sql:"UPDATE epic_guard_progress SET position=? WHERE kind=?",arguments:[rows.count<4 ? high : (rows.last!["position"] as Int64),kind])
-                }
-                return .commit
+    private func hasPending(_ db: Database) throws -> Bool {
+        try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM epic_guard_progress WHERE high_water IS NOT NULL AND (position IS NULL OR position<high_water))") ?? true
+    }
+
+    private func nextSource(_ db: Database) throws -> Source? {
+        for (table,column,kind) in [("records","rowid",0),("events","seq",1)] {
+            let state = try Row.fetchOne(db,sql:"SELECT position,high_water FROM epic_guard_progress WHERE kind=?",arguments:[kind])!
+            let position: Int64? = state["position"],high: Int64? = state["high_water"]
+            guard let high,position == nil || position!<high else {continue}
+            let lower = position == nil ? "" : "\(column)>? AND "
+            let arguments = position.map {StatementArguments([$0,high])} ?? StatementArguments([high])
+            if let row = try Row.fetchOne(db,sql:"""
+                SELECT \(column) AS position,CAST(id AS BLOB) AS id,CAST(project_id AS BLOB) AS project,
+                \(kind == 0 ? "type" : "NULL") AS type,\(kind == 1 ? "CAST(entity_id AS BLOB)" : "NULL") AS entity,
+                CASE WHEN typeof(data)='text' AND length(CAST(data AS BLOB))<=\(Self.maximumPayloadBytes) THEN CAST(data AS BLOB) END AS payload
+                FROM main.\(table) WHERE \(lower)\(column)<=? ORDER BY \(column) LIMIT 1
+                """,arguments:arguments) {
+                return Source(kind:kind,position:row["position"],id:row["id"],project:row["project"],type:row["type"],entity:row["entity"],payload:row["payload"])
             }
-            return try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM epic_guard_progress WHERE high_water IS NOT NULL AND (position IS NULL OR position<high_water))") ?? false
+            try db.execute(sql:"UPDATE epic_guard_progress SET position=? WHERE kind=?",arguments:[high,kind])
         }
+        return nil
+    }
+
+    private func prepare(_ source: Source) throws -> Prepared {
+        // Parse at most 2 MB on a separate in-memory SQLite connection, using the
+        // same JSON semantics as the live triggers. No writer/coordinator is held
+        // during large payload parsing, traversal or target deduplication.
+        guard let payload = source.payload else {return Prepared(source:source,targets:[],epic:nil,invalid:"payload_type_or_size")}
+        if decoder == nil {decoder = try DatabaseQueue()}
+        return try decoder!.read { db in
+            guard try Bool.fetchOne(db,sql:"SELECT json_valid(CAST(? AS TEXT))",arguments:[payload]) == true else {
+                return Prepared(source:source,targets:[],epic:nil,invalid:"malformed_json")
+            }
+            var targets = Set<Data>()
+            if let entity = source.entity {targets.insert(entity)}
+            let cursor = try Row.fetchCursor(db,sql:"SELECT type,typeof(key) AS key_type,CAST(value AS BLOB) AS value,CAST(key AS BLOB) AS key FROM json_tree(CAST(? AS TEXT))",arguments:[payload])
+            while let row = try cursor.next() {
+                if row["type"] as String == "text" {targets.insert(row["value"] as Data)}
+                if row["key_type"] as String == "text" {targets.insert(row["key"] as Data)}
+            }
+            let epic = source.type == "task" ? try Data.fetchOne(db,sql:"SELECT CAST(json_extract(CAST(? AS TEXT),'$.epic_id') AS BLOB) WHERE json_type(CAST(? AS TEXT),'$.epic_id')='text'",arguments:[payload,payload]) : nil
+            return Prepared(source:source,targets:Array(targets),epic:epic,invalid:nil)
+        }
+    }
+
+    /// A page commits at most 64 references/rows and yields after 50 ms, always
+    /// allowing one finite unit to make progress even on a descheduled host.
+    /// Budget exhaustion retains the next offset, rather than rolling back the
+    /// whole row forever. Only this background worker reads legacy payloads.
+    @discardableResult func buildPage(_ router: CommandRouter,seconds: TimeInterval = 0.05) throws -> Bool {
+        workLock.lock();defer {workLock.unlock()}
+        let deadline = ProcessInfo.processInfo.systemUptime + seconds
+        var units = 0
+        while !isStopped && units<64 && (units == 0 || ProcessInfo.processInfo.systemUptime<deadline) {
+            if prepared == nil {
+                guard let source = try router.dbQueue.writeWithoutTransaction({try nextSource($0)}) else {return false}
+                prepared = try prepare(source)
+            }
+            let item = prepared!,source = item.source
+            var offset = item.offset,done = false,applied = 0
+            try router.dbQueue.writeWithoutTransaction { db in
+                try db.inTransaction {
+                    // A live trigger has already replaced all proof for any source
+                    // changed since startup. Never append a stale prepared slice,
+                    // even after same-revision SQL UPDATE, REPLACE or deletion.
+                    let touched = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM epic_guard_touched WHERE source_kind=? AND source_id=?)",arguments:[source.kind,source.id]) ?? true
+                    if !touched {
+                        if let invalid = item.invalid {
+                            try db.execute(sql:"INSERT INTO epic_guard_invalid VALUES (?,?,?) ON CONFLICT DO NOTHING",arguments:[source.kind,source.id,invalid])
+                        } else {
+                            while offset<item.targets.count && units+applied<64 && (applied == 0 || ProcessInfo.processInfo.systemUptime<deadline) {
+                                try db.execute(sql:"INSERT INTO epic_guard_refs VALUES (?,?,?,?) ON CONFLICT DO NOTHING",arguments:[source.kind,source.id,source.project,item.targets[offset]])
+                                offset += 1;applied += 1
+                            }
+                            if offset == item.targets.count,let epic = item.epic {
+                                try db.execute(sql:"INSERT INTO epic_guard_members VALUES (?,?,?) ON CONFLICT(source_id) DO UPDATE SET project=excluded.project,epic=excluded.epic",arguments:[source.project,epic,source.id])
+                            }
+                        }
+                    }
+                    done = touched || item.invalid != nil || offset == item.targets.count
+                    if done {try db.execute(sql:"UPDATE epic_guard_progress SET position=? WHERE kind=?",arguments:[source.position,source.kind])}
+                    return .commit
+                }
+            }
+            // Publish the slice offset only after its transaction commits.
+            if done {prepared = nil} else {prepared!.offset = offset}
+            units += max(1,applied)
+        }
+        return try router.dbQueue.read {try hasPending($0)}
     }
 
     static func budgetFailure() -> CoreError {

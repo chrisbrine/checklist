@@ -476,3 +476,280 @@ extension TicketLifecycleCleanupTests {
         print("CL193_LARGE_FILE bytes=\(bytes.count) read_seconds=\(readSeconds) write_seconds=\(writeSeconds) bound_seconds=2")
     }
 }
+
+extension TicketLifecycleCleanupTests {
+    @discardableResult
+    func cacheExecution(_ project: JSON,_ task: JSON,sourceSHA: String = String(repeating:"a",count:64)) throws -> (JSON,String) {
+        let cid = uuid(),id = uuid(),toolchain = ChecklistCore.hash(Data("synthetic Swift toolchain".utf8))
+        let path = "source-build-cache/" + ChecklistCore.hash(Data((sourceSHA + toolchain).utf8))
+        let execution: JSON = ["id":id,"project_id":project["id"]!,"task_id":task["id"]!,"source_capture_id":cid,"revision":1,"tool":"swift_test","state":"completed","toolchain_sha256":toolchain,"process_stop_unverified":false]
+        try write {db in
+            try self.router.save(db,["id":cid,"project_id":project["id"]!,"task_id":task["id"]!,"revision":1,"sha256":sourceSHA,"snapshot_path":"unavailable","files":[]],type:"source_capture")
+            try self.router.save(db,execution,type:"source_execution")
+        }
+        return (execution,path)
+    }
+
+    func testSchemaThreeStartupWithProtectedSnapshotsSeveralProjectsAndCacheArmsWithoutOtherWork() throws {
+        let (p,_,_) = try fixture()
+        _ = try fixture(category:"queued")
+        _ = try fixture(category:"canceled")
+        let (_,path) = try cacheExecution(p,try router.dbQueue.read {try router.records($0,type:"task",project:p["id"] as! String)[0]})
+        try StorageObjectFiles(root:router.root).writeNew(path + "/checkouts/package/file",bytes:Data("cache".utf8))
+        try FileManager.default.createDirectory(at:router.root.appendingPathComponent("backups/old-protected-snapshot"),withIntermediateDirectories:true)
+        let root = router.root;try router.closeStore();router = try CommandRouter(root:root)
+        XCTAssertEqual(try router.dbQueue.read {try Int.fetchOne($0,sql:"PRAGMA user_version")},3)
+        XCTAssertFalse(try StorageSnapshotRetention.isActive(root:root))
+        XCTAssertLessThan(try XCTUnwrap(router.nextArchiveCleanupDeadline()).timeIntervalSinceNow,0.2)
+        try router.runStorageMaintenance()
+        XCTAssertFalse(try receipts(p).isEmpty)
+    }
+
+    func testDeferredPreparationRecoversAndRoutineTwoFailureLatchCannotStopTicketCleanup() throws {
+        let (p,_,a) = try fixture()
+        // This reproduces the old global latch independently of migration or any
+        // pending archive job. Lifecycle must still get its own startup wake.
+        router.storageMaintenanceFallbackFailures = 2
+        router.storageMaintenanceRetryAt = Date().addingTimeInterval(60)
+        XCTAssertNotNil(try router.nextArchiveCleanupDeadline())
+        router.ticketCleanupRetryAt = Date().addingTimeInterval(60)
+        router.ticketCleanupFailure = "CLEANUP_READ_LANE_UNAVAILABLE"
+        let held = try call("ticket_cleanup_receipts",["project_id":p["id"]!])["maintenance"] as! JSON
+        XCTAssertEqual(held["state"] as? String,"deferred");XCTAssertNotNil(held["next_check_at"])
+        XCTAssertGreaterThan(try XCTUnwrap(router.nextArchiveCleanupDeadline()).timeIntervalSinceNow,50)
+        // Elapsed one-shot retry, without restarting the store or settings edits.
+        router.ticketCleanupRetryAt = Date().addingTimeInterval(-1)
+        try router.runStorageMaintenance();try finish()
+        XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
+        XCTAssertNil(router.ticketCleanupFailure)
+        router.storageMaintenanceRetryAt = Date().addingTimeInterval(-1)
+        try router.runStorageMaintenance()
+        XCTAssertEqual(router.storageMaintenanceFallbackFailures,0)
+    }
+
+    func testSnapshotRetentionPauseIsVisibleWithNextCheckAndResumesAfterRelease() throws {
+        let (p,_,a) = try fixture()
+        try StorageSnapshotRetention.withCapture(root:router.root) {_ in
+            let result = try call("ticket_cleanup_receipts",["project_id":p["id"]!])
+            XCTAssertTrue((result["receipts"] as! [JSON]).isEmpty)
+            let state = result["maintenance"] as! JSON
+            XCTAssertEqual(state["state"] as? String,"paused");XCTAssertEqual(state["reason"] as? String,"snapshot_retention")
+            XCTAssertNotNil(state["next_check_at"]);XCTAssertTrue(state["resume_at"] is NSNull)
+            XCTAssertGreaterThan(try XCTUnwrap(router.nextArchiveCleanupDeadline()).timeIntervalSinceNow,50)
+            try router.runStorageMaintenance();XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
+            XCTAssertEqual(router.storageMaintenanceFallbackFailures,0)
+        }
+        try router.runStorageMaintenance();try finish()
+        XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
+    }
+
+    func testExclusiveDoneCacheBytesUseOrdinaryFingerprintsHoldsAndReceipts() throws {
+        let (p,t,_) = try fixture(),(execution,path) = try cacheExecution(p,t)
+        let files = try StorageObjectFiles(root:router.root),bytes = Data("exclusive cache object".utf8)
+        try files.writeNew(path + "/repositories/mirror/pack",bytes:bytes)
+        try files.writeLink(path + "/debug",target:"repositories")
+        try pass();try finish()
+        XCTAssertFalse(try files.regularOrLinkExists(path + "/debug"))
+        XCTAssertFalse(try files.regularOrLinkExists(path + "/repositories/mirror/pack"))
+        XCTAssertNoThrow(try router.dbQueue.read {try router.record($0,execution["id"] as! String,type:"source_execution")})
+        let objects = try receipts(p).flatMap {($0["items"] as? [JSON] ?? []).flatMap {(($0["byte_deletion"] as? JSON)?["objects"] as? [JSON]) ?? []}}
+        let cache = try XCTUnwrap(objects.first {$0["relative_path"] as? String == path + "/repositories/mirror/pack"})
+        XCTAssertEqual(cache["state"] as? String,"removed");XCTAssertEqual(cache["sha256"] as? String,ChecklistCore.hash(bytes))
+        XCTAssertEqual((cache["size"] as? NSNumber)?.intValue,bytes.count)
+    }
+
+    func testSharedAndUnownedCachesStayAndReportRecordedReasons() throws {
+        let (p,t,_) = try fixture(),(_,path) = try cacheExecution(p,t)
+        let (other,open,_) = try fixture(category:"queued")
+        let (foreign,_) = try cacheExecution(other,open)
+        let (_,foreignPath) = try cacheExecution(other,open,sourceSHA:String(repeating:"c",count:64))
+        let files = try StorageObjectFiles(root:router.root),unowned = "source-build-cache/" + String(repeating:"f",count:64)
+        try files.writeNew(path + "/checkouts/package/file",bytes:Data("shared".utf8))
+        try files.writeNew(unowned + "/repositories/mirror",bytes:Data("unowned".utf8))
+        try files.writeNew(foreignPath + "/file",bytes:Data("foreign".utf8))
+        try pass();try finish()
+        XCTAssertTrue(try files.regularOrLinkExists(path + "/checkouts/package/file"))
+        XCTAssertTrue(try files.regularOrLinkExists(unowned + "/repositories/mirror"))
+        let retained = try receipts(p).flatMap {$0["source_build_cache"] as? [JSON] ?? []}
+        XCTAssertTrue(retained.contains {$0["relative_path"] as? String == path && $0["reason"] as? String == "shared_source_build_cache"})
+        XCTAssertTrue(retained.contains {$0["relative_path"] as? String == unowned && $0["reason"] as? String == "unowned_source_build_cache"})
+        XCTAssertFalse(retained.contains {$0["relative_path"] as? String == foreignPath})
+        let objects = try receipts(p).flatMap {($0["items"] as? [JSON] ?? []).flatMap {(($0["byte_deletion"] as? JSON)?["objects"] as? [JSON]) ?? []}}
+        XCTAssertFalse(objects.contains {strings($0,"owner_ids").contains(foreign["id"] as! String) || strings($0,"owner_ids").contains(foreign["source_capture_id"] as! String)})
+    }
+
+    func testCacheNewOwnerAndChangedExecutionFingerprintPreventUnlink() throws {
+        for newOwner in [false,true] {
+            let (p,t,_) = try fixture(),(execution,path) = try cacheExecution(p,t,sourceSHA:ChecklistCore.hash(Data(uuid().utf8)))
+            let files = try StorageObjectFiles(root:router.root)
+            try files.writeNew(path + "/file",bytes:Data("held".utf8))
+            try pass()
+            if newOwner {
+                let source = try router.dbQueue.read {try router.record($0,execution["source_capture_id"] as! String,type:"source_capture")["sha256"] as! String}
+                let (other,open,_) = try fixture(category:"queued");_ = try cacheExecution(other,open,sourceSHA:source)
+            } else {
+                try write {db in var value = execution;value["revision"] = 2;value["observation"] = "changed";try self.router.save(db,value,type:"source_execution")}
+            }
+            try finish();XCTAssertTrue(try files.regularOrLinkExists(path + "/file"))
+        }
+    }
+}
+
+extension TicketLifecycleCleanupTests {
+    func testTwoRealPreparationCommitFailuresRecoverOnTheNextDeferredWake() throws {
+        let (p,_,a) = try fixture()
+        try router.dbQueue.writeWithoutTransaction {db in
+            try db.execute(sql:"CREATE TEMP TRIGGER cleanup_fixture_failure BEFORE INSERT ON records WHEN NEW.type='storage_job' AND json_extract(NEW.data,'$.cause')='ticket_cleanup_pass' BEGIN SELECT RAISE(ABORT,'synthetic cleanup commit failure'); END")
+        }
+        for _ in 0..<2 {
+            router.ticketCleanupRetryAt = nil
+            XCTAssertThrowsError(try router.runStorageMaintenance())
+            XCTAssertNotNil(router.ticketCleanupRetryAt)
+            XCTAssertGreaterThan(try XCTUnwrap(router.nextArchiveCleanupDeadline()).timeIntervalSinceNow,50)
+            XCTAssertTrue(try receipts(p).isEmpty)
+            XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
+        }
+        try router.dbQueue.writeWithoutTransaction {try $0.execute(sql:"DROP TRIGGER cleanup_fixture_failure")}
+        router.ticketCleanupRetryAt = Date().addingTimeInterval(-1)
+        try router.runStorageMaintenance();try finish()
+        XCTAssertFalse(try receipts(p).isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
+    }
+
+    func testCacheReaderBackupAndUnsupportedLinkHoldsRetainBytes() throws {
+        for hold in ["reader","backup","link"] {
+            let (p,t,_) = try fixture(),(execution,path) = try cacheExecution(p,t,sourceSHA:ChecklistCore.hash(Data(uuid().utf8)))
+            let files = try StorageObjectFiles(root:router.root),bytes = Data("protected cache".utf8)
+            try files.writeNew(path + "/target",bytes:bytes)
+            if hold == "link" {
+                try files.writeLink(path + "/link",target:"target")
+                try write {db in try self.router.save(db,["id":uuid(),"project_id":p["id"]!,"kind":"reader","state":"active","revision":1,"relative_path":path + "/link"],type:"storage_hold")}
+            }
+            else if hold == "reader" {
+                try write {db in try self.router.save(db,["id":uuid(),"project_id":p["id"]!,"kind":"reader","state":"active","revision":1,"owner_id":execution["id"]!],type:"storage_hold")}
+            } else {
+                try write {db in try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["backup-generation:" + uuid(),try jsonString(["state":"complete","objects":[["path":path + "/target","sha256":ChecklistCore.hash(bytes),"size":bytes.count]]])])}
+            }
+            try pass();try finish()
+            XCTAssertTrue(try files.regularOrLinkExists(path + "/target"),hold)
+            let objects = try receipts(p).flatMap {($0["items"] as? [JSON] ?? []).flatMap {(($0["byte_deletion"] as? JSON)?["objects"] as? [JSON]) ?? []}}
+            XCTAssertTrue(objects.contains {$0["relative_path"] as? String == path + "/target" && $0["state"] as? String == "retained"},hold)
+        }
+    }
+}
+
+extension TicketLifecycleCleanupTests {
+    func testUnavailableMaintenanceReadPoolIsReopenedOnDeferredRetry() throws {
+        let (p,_,a) = try fixture()
+        var configuration = Configuration();configuration.readonly = true
+        configuration.prepareDatabase {try SchemaMigrations.installStorageCollation($0)}
+        let unavailable = try DatabasePool(path:router.root.appendingPathComponent("checklist.sqlite").path,configuration:configuration)
+        router.ticketCleanupNeedsReader = true;router.ticketCleanupReaders = unavailable
+        try unavailable.close()
+        XCTAssertThrowsError(try router.runStorageMaintenance())
+        XCTAssertEqual(router.ticketCleanupFailure,"CLEANUP_READ_LANE_UNAVAILABLE")
+        XCTAssertNotNil(try router.nextArchiveCleanupDeadline())
+        XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
+        router.ticketCleanupRetryAt = Date().addingTimeInterval(-1)
+        try router.runStorageMaintenance();try finish()
+        XCTAssertFalse(try receipts(p).isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
+    }
+}
+
+extension TicketLifecycleCleanupTests {
+    func testFrequentCommandRearmingCannotPostponeTheAutomaticStartupWake() throws {
+        let (p,_,_) = try fixture(),start = Date()
+        var wake = StorageMaintenanceWakePlan()
+        XCTAssertTrue(wake.update(try router.nextArchiveCleanupDeadline()))
+        let first = try XCTUnwrap(wake.deadline)
+        // Old Coordinator canceled its due timer for every successful read,
+        // repeatedly moving a 50-ms startup wake into the future.
+        for tick in 1...1000 {
+            XCTAssertFalse(wake.update(first.addingTimeInterval(Double(tick)/1000)))
+        }
+        XCTAssertEqual(wake.deadline,first)
+        wake.fired();try router.runStorageMaintenance()
+        XCTAssertFalse(try receipts(p).isEmpty)
+        XCTAssertTrue(wake.update(start.addingTimeInterval(86400)))
+        XCTAssertTrue(wake.update(start.addingTimeInterval(1))) // New earlier work wins.
+        XCTAssertTrue(wake.update(nil));XCTAssertNil(wake.deadline)
+    }
+}
+
+extension TicketLifecycleCleanupTests {
+    func testPendingAndRetainedCacheReceiptsDoNotBreakProtectedSnapshotInventory() throws {
+        let (p,t,_) = try fixture(),(execution,path) = try cacheExecution(p,t)
+        try write {db in
+            var capture = try self.router.record(db,execution["source_capture_id"] as! String,type:"source_capture")
+            capture["snapshot_path"] = "source-captures/" + (p["id"] as! String) + "/" + (capture["id"] as! String) + "/source"
+            try self.router.save(db,self.router.revised(capture),type:"source_capture")
+        }
+        let files = try StorageObjectFiles(root:router.root)
+        try files.writeNew(path + "/file",bytes:Data("rebuildable cache".utf8))
+        try pass()
+        let destination = directory.appendingPathComponent("cache-pending-backup")
+        XCTAssertNoThrow(try call("backup_create",["path":destination.path]))
+        let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self,from:Data(contentsOf:destination.appendingPathComponent("manifest.json")))
+        XCTAssertFalse(manifest.objects.contains {$0.descriptor.relativePath.hasPrefix("source-build-cache/")})
+        XCTAssertTrue(manifest.unavailable.contains {$0.reason == "rebuildable_source_build_cache"})
+        try finish();XCTAssertFalse(try files.regularOrLinkExists(path + "/file"))
+        XCTAssertNoThrow(try call("backup_create",["path":directory.appendingPathComponent("cache-completed-backup").path]))
+    }
+}
+
+extension TicketLifecycleCleanupTests {
+    func testHeldCacheDirectoryAliasKeepsItsRecordedDescendants() throws {
+        let (p,t,_) = try fixture(),(_,path) = try cacheExecution(p,t)
+        let files = try StorageObjectFiles(root:router.root)
+        try files.writeNew(path + "/arch/debug/product",bytes:Data("held directory target".utf8))
+        try files.writeLink(path + "/debug",target:"arch/debug")
+        try files.writeLink(path + "/indirect",target:"arch/debug")
+        try files.writeLink(path + "/via-parent",target:"indirect/product")
+        try write {db in
+            for alias in ["debug","via-parent"] {
+                try self.router.save(db,["id":uuid(),"project_id":p["id"]!,"kind":"reader","state":"active","revision":1,"relative_path":path + "/" + alias],type:"storage_hold")
+            }
+        }
+        try pass();try finish()
+        XCTAssertTrue(try files.regularOrLinkExists(path + "/debug"))
+        XCTAssertTrue(try files.regularOrLinkExists(path + "/via-parent"))
+        XCTAssertTrue(try files.regularOrLinkExists(path + "/arch/debug/product"))
+    }
+}
+
+extension TicketLifecycleCleanupTests {
+    func testCacheAliasChainsConvergenceAndCyclesHaveBoundedSafeOutcomes() throws {
+        for kind in ["chain","convergent","cycle","directory_cycle"] {
+            let (p,t,_) = try fixture(),(_,path) = try cacheExecution(p,t,sourceSHA:ChecklistCore.hash(Data(uuid().utf8)))
+            let files = try StorageObjectFiles(root:router.root)
+            try files.writeNew(path + "/arch/debug/product",bytes:Data("cache product".utf8))
+            if kind == "cycle" {
+                try files.writeLink(path + "/debug",target:"alias");try files.writeLink(path + "/alias",target:"debug")
+            } else if kind == "directory_cycle" {try files.writeLink(path + "/debug",target:".")}
+            else {
+                try files.writeLink(path + "/debug",target:"arch/debug")
+                if kind == "chain" {try files.writeLink(path + "/alias",target:"debug")}
+                else {try files.writeLink(path + "/arch/debug/product-alias",target:"product")}
+            }
+            try pass();try finish()
+            let retained = kind == "cycle" || kind == "directory_cycle"
+            XCTAssertEqual(try files.regularOrLinkExists(path + "/debug"),retained,kind)
+            XCTAssertEqual(try files.regularOrLinkExists(path + "/arch/debug/product"),retained,kind)
+        }
+    }
+}
+
+extension TicketLifecycleCleanupTests {
+    func testLargeCacheAliasInventoryExhaustsOneBoundedClosureBudgetAndRetainsEntry() throws {
+        let (p,t,_) = try fixture(),(_,path) = try cacheExecution(p,t)
+        let files = try StorageObjectFiles(root:router.root)
+        try files.writeNew(path + "/arch/debug/product",bytes:Data("bounded cache".utf8))
+        for index in 0..<1500 {try files.writeLink(path + "/alias-" + String(index),target:"arch/debug")}
+        try pass();try finish()
+        XCTAssertTrue(try files.regularOrLinkExists(path + "/arch/debug/product"))
+        XCTAssertTrue(try files.regularOrLinkExists(path + "/alias-0"))
+        let objects = try receipts(p).flatMap {($0["items"] as? [JSON] ?? []).flatMap {(($0["byte_deletion"] as? JSON)?["objects"] as? [JSON]) ?? []}}
+        XCTAssertTrue(objects.contains {$0["relative_path"] as? String == path + "/arch/debug/product" && strings($0,"reasons").contains("link_closure_unavailable")})
+    }
+}

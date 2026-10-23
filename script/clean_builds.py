@@ -15,7 +15,7 @@ import subprocess
 import sys
 
 from clean_scratch import inventory, running_paths, within
-from retire_old_bundles import trash
+from retire_old_bundles import trash, trash_many
 import test_instances as slots
 
 REPO = Path(__file__).resolve().parents[1]
@@ -75,28 +75,46 @@ def size_of(entries):
     return sum(e[3] for e in entries.values() if not stat.S_ISDIR(e[2]))
 
 
-def protected_reason(path, entries, protected, processes):
+def process_ancestors(paths):
+    """Index once: matching a candidate must not rescan every open-file path."""
+    return frozenset(parent for path in paths for parent in (path, *path.parents))
+
+
+def protected_reason(path, entries, protected, processes, internal_links=False):
     for target, label in protected:
         if slots.paths_overlap(path, target):
             return label
-    if any(within(p, path.resolve()) for p in processes):
+    resolved = path.resolve()
+    if resolved in processes:
         return 'running app, CLI or check uses this path'
-    if any(not (stat.S_ISREG(e[2]) or stat.S_ISDIR(e[2])) for e in entries.values()):
-        return 'contains a link or special file; ownership unresolved'
-    if any(p.stat().st_uid != os.getuid() for p in entries):
+    for entry, metadata in entries.items():
+        if stat.S_ISLNK(metadata[2]) and internal_links:
+            try:
+                target = Path(os.path.abspath(entry.parent / os.readlink(entry)))
+                if not within(target, resolved) or not within(entry.resolve(), resolved):
+                    return 'external SwiftPM link retained: ' + str(entry)
+            except (OSError, RuntimeError):
+                return 'unresolved SwiftPM link retained: ' + str(entry)
+        elif not (stat.S_ISREG(metadata[2]) or stat.S_ISDIR(metadata[2])):
+            return 'link or special file retained: ' + str(entry)
+    if any(p.lstat().st_uid != os.getuid() for p in entries):
         return 'contains files owned by another user'
     return None
 
 
 class Cleaner:
     def __init__(self, repo, installed, apply=False, process_reader=running_paths,
-                 mover=trash, status_reader=None, keep=()):
+                 mover=trash, status_reader=None, keep=(), batch_mover=trash_many):
         self.repo = safe(repo)
         self.build = safe(self.repo / '.local/build')
         self.installed = safe(installed)
         self.apply = apply
         self.process_reader = process_reader
         self.mover = mover
+        self.batch_mover = batch_mover
+        self.pending = None
+        self.process_snapshot = None
+        self.preview_process_snapshot = None
         self.status_reader = status_reader
         self.keep = [safe(p) for p in keep]
         self.moved = 0
@@ -112,27 +130,40 @@ class Cleaner:
         result += [(p, 'explicitly retained work/evidence') for p in self.keep]
         return result
 
-    def item(self, path, kind, reason=None, eligible=None, eligible_reason="eligible for Trash"):
+    def processes(self):
+        if self.process_snapshot is not None: return self.process_snapshot
+        if self.apply: return process_ancestors(self.process_reader())
+        if self.preview_process_snapshot is None:
+            self.preview_process_snapshot = process_ancestors(self.process_reader())
+        return self.preview_process_snapshot
+
+    def item(self, path, kind, reason=None, eligible=None, eligible_reason="eligible for Trash",
+             internal_links=False, before_move=None):
         """Recheck identity, policy and use before each move; no cached apply plan."""
         try:
             safe(path)
             before = inventory(path)
             protected = self.protected()
-            why = protected_reason(path, before, protected, self.process_reader()) or reason
+            processes = self.processes()
+            why = reason or protected_reason(path, before, protected, processes, internal_links)
             if not why and eligible:
                 why = eligible()
             report = {'path': str(path), 'kind': kind, 'bytes': size_of(before),
                       'action': 'kept' if why else 'eligible',
                       'reason': why or eligible_reason}
+            if not why and self.apply and self.pending is not None:
+                self.pending.append((path, before, report, eligible, internal_links, before_move))
+                return
             if not why and self.apply:
                 if inventory(path) != before:
                     raise ValueError('item changed during inspection')
-                why = protected_reason(path, before, self.protected(), self.process_reader())
+                why = protected_reason(path, before, self.protected(), process_ancestors(self.process_reader()))
                 if not why and eligible:
                     why = eligible()
                 if why:
                     report.update(action='kept', reason=why)
                 else:
+                    if before_move: before_move()
                     report.update(action='trashed', trash=str(self.mover(path)))
                     self.moved += report['bytes']
             print(json.dumps(report, sort_keys=True))
@@ -140,14 +171,93 @@ class Cleaner:
             self.failed = True
             print(json.dumps({'path': str(path), 'kind': kind, 'action': 'kept_error', 'bytes': None, 'reason': str(error)}))
 
+    def flush_builds(self):
+        """One fresh process observation for the whole batch, under the build lease."""
+        try:
+            processes = process_ancestors(self.process_reader())
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            self.failed = True
+            for _, _, report, *_ in self.pending:
+                report.update(action='kept_error', reason=str(error))
+                print(json.dumps(report, sort_keys=True))
+            return
+        selected = []
+        for path, before, report, eligible, internal_links, before_move in self.pending:
+            try:
+                safe(path)
+                if inventory(path) != before:
+                    raise ValueError('item changed during inspection')
+                why = protected_reason(path, before, self.protected(), processes, internal_links)
+                if not why and eligible: why = eligible()
+                if why:
+                    report.update(action='kept', reason=why)
+                    print(json.dumps(report, sort_keys=True))
+                    continue
+                if before_move: before_move()
+                selected.append((path, before, report))
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                self.failed = True
+                report.update(action='kept_error', reason=str(error))
+                print(json.dumps(report, sort_keys=True))
+        if not selected: return
+        # A same-volume Trash move needs write on the selected directory itself,
+        # not its descendants. Keep only that descriptor open for chmod, never
+        # follow links or change retained captures/parents. Restore failed moves.
+        modes = {}
+        try:
+            for path, before, _ in selected:
+                if stat.S_ISDIR(before[path][2]) and not before[path][2] & stat.S_IWUSR:
+                    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    try:
+                        metadata = os.fstat(fd)
+                        if (metadata.st_dev, metadata.st_ino) != before[path][:2]:
+                            raise ValueError('item changed before permission adjustment: ' + str(path))
+                        modes[path] = (stat.S_IMODE(metadata.st_mode), before[path][:2])
+                        os.fchmod(fd, modes[path][0] | stat.S_IWUSR)
+                    finally: os.close(fd)
+            results = self.batch_mover([path for path, _, _ in selected])
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            results = {path: error for path, _, _ in selected}
+        finally:
+            for path, (mode, identity) in modes.items():
+                if path.exists():
+                    # Never chmod a replacement or a link after a failed move.
+                    metadata = path.lstat()
+                    if (metadata.st_dev, metadata.st_ino) == identity and stat.S_ISDIR(metadata.st_mode):
+                        path.chmod(mode, follow_symlinks=False)
+        for path, _, report in selected:
+            destination = results.get(path, ValueError('Trash did not report an outcome'))
+            if isinstance(destination, Exception):
+                self.failed = True
+                report.update(action='kept_error', reason=str(destination))
+            else:
+                report.update(action='trashed', trash=str(destination))
+                self.moved += report['bytes']
+            print(json.dumps(report, sort_keys=True))
+
+    def preserve_build_info(self, path, folder):
+        info = path / 'Contents/Resources/build-info.json'
+        if path.name != 'Checklist.app' or not info.exists(): return
+        if fingerprint(read_json(info)) != folder.name:
+            raise ValueError('staged build-info identity mismatch; retain app')
+        receipt = folder / 'build-info.json'
+        data = info.read_bytes()
+        if receipt.exists():
+            safe(receipt)
+            if receipt.read_bytes() != data:
+                raise ValueError('build-info receipts differ; retain app')
+        else:
+            with receipt.open('xb') as output: output.write(data)
+
     def builds(self):
         retained, _ = installation(self.build, self.installed)
         def unchanged_install():
             return None if installation(self.build, self.installed)[0] == retained else 'installation changed; retain build'
-        protected = [(self.build / key, 'installed/previous build retained') for key in retained]
         old_keep = self.keep
-        self.keep = old_keep + [p for p, _ in protected]
+        self.keep = old_keep + [self.build / key for key in retained]
+        self.pending = []
         try:
+            self.process_snapshot = self.processes()
             for folder in sorted(self.build.iterdir()):
                 if FINGERPRINT.fullmatch(folder.name):
                     if folder.name in retained:
@@ -157,40 +267,23 @@ class Cleaner:
                     if fingerprint(manifest) != folder.name:
                         self.item(folder, 'build', reason='capture identity mismatch')
                         continue
-                    # Preserve capture-manifest, build-info, verification,
-                    # last-install, timing and any unrecognized records in place.
                     for child in sorted(folder.iterdir()):
-                        if child.name in OUTPUTS or re.fullmatch(r'swiftpm-[0-9a-f]{20}', child.name):
-                            # Older stages stored build-info only inside the app.
-                            # Keep its exact bytes beside the capture receipts.
-                            original = self.mover
-                            def retire_output(path):
-                                info = path / 'Contents/Resources/build-info.json'
-                                if path.name == 'Checklist.app' and info.exists():
-                                    value = read_json(info)
-                                    if fingerprint(value) != folder.name:
-                                        raise ValueError('staged build-info identity mismatch; retain app')
-                                    receipt = folder / 'build-info.json'
-                                    data = info.read_bytes()
-                                    if receipt.exists():
-                                        safe(receipt)
-                                        if receipt.read_bytes() != data:
-                                            raise ValueError('build-info receipts differ; retain app')
-                                    else:
-                                        with receipt.open('xb') as output: output.write(data)
-                                return original(path)
-                            self.mover = retire_output
-                            try:
-                                self.item(child, 'build_output', eligible=unchanged_install,
-                                          eligible_reason='obsolete copied build output; receipts retained')
-                            finally: self.mover = original
+                        scratch = bool(SCRATCH.fullmatch(child.name))
+                        if child.name in OUTPUTS or scratch:
+                            self.item(child, 'build_output', eligible=unchanged_install,
+                                      internal_links=scratch or child.name == '.build',
+                                      before_move=lambda p=child, f=folder: self.preserve_build_info(p, f),
+                                      eligible_reason='obsolete copied build output; receipts retained')
                 elif SCRATCH.fullmatch(folder.name):
                     lane = self.build / ('lane-' + SCRATCH.fullmatch(folder.name)[1]) / 'source'
-                    # Every paired lane stays warm, including other configurations.
                     why = 'current persistent SwiftPM lane retained' if lane.is_dir() else None
                     self.item(folder, 'swiftpm_scratch', reason=why, eligible=unchanged_install,
+                              internal_links=True,
                               eligible_reason='legacy SwiftPM scratch has no current persistent lane')
+            if self.apply and self.pending: self.flush_builds()
         finally:
+            self.pending = None
+            self.process_snapshot = None
             self.keep = old_keep
 
     def evidence(self):
@@ -333,15 +426,14 @@ def finish(cleaner):
     return 1 if cleaner.failed else 0
 
 
-def post_install(repo, capture, parent_pid):
-    """Only the installing shell calls this while it still owns .build-lock."""
+def post_install(repo, capture):
+    """Explicit background install step; acquire our own lease after installer exit."""
     cleaner = Cleaner(Path(repo), Path('/Applications/Checklist.app'), apply=True)
-    if int(parent_pid) != os.getppid() or not (cleaner.build / '.build-lock').is_dir():
-        raise ValueError('post-install cleanup requires the installing parent and held build lock')
-    ids, _ = installation(cleaner.build, cleaner.installed)
-    if fingerprint(read_json(Path(capture) / 'capture-manifest.json')) not in ids:
-        raise ValueError('installed build changed before cleanup')
-    cleaner.builds()
+    with build_lock(cleaner.build, True):
+        ids, _ = installation(cleaner.build, cleaner.installed)
+        if fingerprint(read_json(Path(capture) / 'capture-manifest.json')) not in ids:
+            raise ValueError('installed build changed before cleanup')
+        cleaner.builds()
     return finish(cleaner)
 
 

@@ -71,7 +71,7 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
             guard event == "copying_objects" else {return}
             observed = true
             try self.router.runStorageMaintenance()
-            XCTAssertNil(try self.router.nextArchiveCleanupDeadline())
+            XCTAssertGreaterThan(try XCTUnwrap(self.router.nextArchiveCleanupDeadline()).timeIntervalSinceNow,50)
             XCTAssertEqual(try jsonString(self.record(job["id"] as! String,"cleanup_job")),try jsonString(before))
             try ArchiveStorageGate.withExclusive(root:self.router.root) { _ in
                 let files = try StorageObjectFiles(root:self.router.root)

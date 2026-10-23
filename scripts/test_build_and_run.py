@@ -162,6 +162,51 @@ elif name=='plutil': pass
         self.assertTrue(receipt['stable_source_verified'])
         self.assertEqual(set(receipt['binary_sha256']),{'ChecklistApp','ChecklistService','checklist'})
 
+    def test_release_flags_are_captured_and_passed_to_both_build_calls(self):
+        result = self.run_stage()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        manifest = json.loads((self.capture() / 'capture-manifest.json').read_text())
+        flags = ['-Xswiftc', '-no-whole-module-optimization', '-Xswiftc', '-incremental', '-Xswiftc', '-enable-batch-mode']
+        self.assertEqual(manifest['configuration'], 'release')
+        self.assertEqual(manifest['swift_flags'], flags)
+        self.assertIn('swift_flag=-no-whole-module-optimization\n', manifest['toolchain'])
+        self.assertIn('swift_flag=-incremental\n', manifest['toolchain'])
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        for call in [c for c in calls if c[:2] == ['swift', 'build']]:
+            start = call.index('-Xswiftc')
+            self.assertEqual(call[start:start + len(flags)], flags)
+            self.assertNotIn('-Onone', call)
+            self.assertEqual(call[call.index('--build-system') + 1], 'native')
+
+    def test_debug_keeps_its_compiler_defaults(self):
+        result = self.run_stage(CHECKLIST_BUILD_CONFIGURATION='debug')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        manifest = json.loads((self.capture() / 'capture-manifest.json').read_text())
+        self.assertEqual(manifest['configuration'], 'debug')
+        self.assertEqual(manifest['swift_flags'], [])
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        for call in [c for c in calls if c[:2] == ['swift', 'build']]:
+            self.assertNotIn('-Xswiftc', call)
+
+    def test_changed_compilation_flags_select_a_new_capture_lane_and_scratch(self):
+        first = self.run_stage()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        before = self.capture()
+        first_manifest = json.loads((before / 'capture-manifest.json').read_text())
+        first_receipt = json.loads((before / 'build-verification.json').read_text())
+        script = self.root / 'script/build_and_run.sh'
+        script.write_text(script.read_text().replace('-Xswiftc -enable-batch-mode)', '-Xswiftc -enable-batch-mode -Xswiftc -Osize)'))
+        second = self.run_stage()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        latest = next(p.parent for p in (self.root / '.local/build').glob('*/capture-manifest.json') if p.parent != before)
+        manifest = json.loads((latest / 'capture-manifest.json').read_text())
+        receipt = json.loads((latest / 'build-verification.json').read_text())
+        self.assertNotEqual(first_manifest['source_fingerprint'], manifest['source_fingerprint'])
+        self.assertNotEqual(first_manifest['toolchain'], manifest['toolchain'])
+        self.assertEqual(manifest['swift_flags'][-2:], ['-Xswiftc', '-Osize'])
+        self.assertNotEqual(first_receipt['build_source'], receipt['build_source'])
+        self.assertEqual(len(list((self.root / '.local/build').glob('swiftpm-*'))), 2)
+
     def test_cached_stage_skips_compile_stage_and_sign(self):
         first=self.run_stage();self.assertEqual(first.returncode,0,first.stderr)
         original_source=json.loads((self.capture()/'build-verification.json').read_text())['build_source']
@@ -282,6 +327,7 @@ elif name=='plutil': pass
         calls=[json.loads(line) for line in self.calls.read_text().splitlines()]
         clean=[c for c in calls if c[:2]==['swift','package']]
         self.assertEqual(len(clean),1);self.assertEqual(clean[0][-1],'clean')
+        self.assertEqual(clean[0][clean[0].index('--build-system') + 1], 'native')
         self.assertEqual(clean[0][clean[0].index('--scratch-path')+1],str(scratch))
         self.assertTrue((self.capture()/'source/Sources/value.swift').is_file())
 

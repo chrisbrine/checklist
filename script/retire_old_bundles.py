@@ -91,6 +91,53 @@ def native_trash(bundle):
     return Path(location)
 
 
+def trash_many(paths):
+    """One native Trash process; retain successful receipts even on partial failure."""
+    paths = list(paths)
+    if not paths: return {}
+    if os.environ.get('CHECKLIST_TRASH_DIR') is not None:
+        results = {}
+        for path in paths:
+            try: results[path] = trash(path)
+            except (OSError, ValueError) as error: results[path] = error
+        return results
+    if not TRASH_TOOL.exists():
+        # Old macOS fallback: one Foundation host, one result per requested path.
+        script = """ObjC.import('Foundation');
+function run(argv) {
+    return JSON.stringify(argv.map(function(path) {
+        const destination = Ref(), error = Ref();
+        if ($.NSFileManager.defaultManager.trashItemAtURLResultingItemURLError(
+            $.NSURL.fileURLWithPath(path), destination, error))
+            return {path: path, destination: ObjC.unwrap(destination[0].path)};
+        return {path: path, error: ObjC.unwrap(error[0].localizedDescription)};
+    }));
+}
+"""
+        result = subprocess.run(['/usr/bin/osascript', '-l', 'JavaScript', '-e', script,
+                                 *map(str, paths)], text=True, capture_output=True, check=True, timeout=45)
+        return {Path(row['path']): Path(row['destination']) if 'destination' in row else
+                ValueError(row['error']) for row in json.loads(result.stdout)}
+    try:
+        result = subprocess.run([str(TRASH_TOOL), '--verbose', *map(str, paths)],
+                                text=True, capture_output=True, timeout=45)
+    except subprocess.TimeoutExpired as error:
+        # subprocess kills/waits for the timed-out tool. Its earlier successful
+        # move receipts are still authoritative; never retry the whole batch.
+        def decoded(value):
+            return value.decode(errors='replace') if isinstance(value, bytes) else value or ''
+        result = subprocess.CompletedProcess([], 1, decoded(error.stdout),
+                                             'Trash timed out: ' + decoded(error.stderr))
+    results = {}
+    for path in paths:
+        prefix = '# Moved "' + str(path) + '" to "'
+        locations = [line[len(prefix):-1] for line in result.stdout.splitlines()
+                     if line.startswith(prefix) and line.endswith('"')]
+        results[path] = Path(locations[0]) if len(locations) == 1 else ValueError(
+            'Trash move unconfirmed for ' + str(path) + ': ' + (result.stderr.strip() or result.stdout.strip()))
+    return results
+
+
 def retire(bundles, keep=None):
     # Resolve aliases for process matching, but move the applications entry itself.
     paths = tuple(executable_paths())

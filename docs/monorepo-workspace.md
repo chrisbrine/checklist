@@ -65,15 +65,15 @@ See [test instances](test-instances.md) for the four isolated identities, backup
 
 ## Captured build lane and timing
 
-`ChecklistProducts` is a build aggregation target. It depends on `ChecklistApp`, `ChecklistService` and `ChecklistCLI`. One `swift build --target ChecklistProducts` builds and links all three shipping executables. The helper reads `--show-bin-path` once before compilation. It removes only final shipping executables and resource bundles from that output directory, retaining objects and module caches. This prevents a changed manifest or group from reusing a stale final product. It does not build the storage crash or CLI input probes for a shipping stage. SwiftPM's normal build-manifest cache stays enabled. Release remains the default configuration.
+`ChecklistProducts` is a build aggregation target. It depends on `ChecklistApp`, `ChecklistService` and `ChecklistCLI`. One `swift build --target ChecklistProducts` builds and links all three shipping executables. The helper reads `--show-bin-path` once before compilation. It removes only final shipping executables and resource bundles from that output directory, retaining objects and module caches. This prevents a changed manifest or group from reusing a stale final product. It does not build the storage crash or CLI input probes for a shipping stage. SwiftPM's normal build-manifest cache stays enabled. Release remains the default configuration and retains `-O`. Release stages explicitly select `--build-system native` with `-Xswiftc -no-whole-module-optimization -Xswiftc -incremental -Xswiftc -enable-batch-mode`, so unchanged per-file objects and dependency records can be reused. The current Swift Build engine still plans whole-module dependency outputs when these compiler flags alone override release mode; that combination fails with missing dependency files. Native SwiftPM supplies the matching per-file output maps. Debug keeps the toolchain's normal defaults. Requalify this explicit engine selection when upgrading SwiftPM.
 
-The immutable capture remains the build authority. Under `.local/build`, each toolchain/configuration/signing profile has a stable `lane-<toolchain-id>/source` path and a separate `swiftpm-<toolchain-id>` scratch path. `script/build_support.py` copies only the verified capture into that lane. It preserves unchanged file bytes and timestamps and removes stale inputs. It checks the complete lane membership, bytes and executable modes against the capture before and after compilation. Extra inputs, symlinks and changed files fail the build. Later checkout edits are reported as provenance and never enter the lane.
+The immutable capture remains the build authority. Under `.local/build`, each toolchain/configuration/build-flags/signing profile has a stable `lane-<toolchain-id>/source` path and a separate `swiftpm-<toolchain-id>` scratch path. `script/build_support.py` copies only the verified capture into that lane. It preserves unchanged file bytes and timestamps and removes stale inputs. It checks the complete lane membership, bytes and executable modes against the capture before and after compilation. Extra inputs, symlinks and changed files fail the build. Later checkout edits are reported as provenance and never enter the lane. The toolchain identity includes the selected build engine and every compiler argument; `capture-manifest.json` also records `swift_flags`. A flag change creates a new fingerprint, lane and scratch path rather than reusing outputs from another recipe.
 
 The existing `.local/build/.build-lock` covers capture, lane synchronization, compilation, staging, signing, verification and installation. A second invocation in the same checkout fails before touching the lane or scratch directory. The helper does not queue builds. Different checkouts have separate build roots. A stale lock requires reconciliation; do not remove a live build's lock or share its lane manually.
 
-`<fingerprint>/build-verification.json` records signed executable hashes and `timing`. The timing record contains total seconds, UTC start, start/end load averages and `phases`. The phases are `capture`, `compile`, `stage`, `sign`, `verify` and `install`. Each phase records seconds and a completed or skipped status. Executed phases also record their start/end load averages. Compile includes lane synchronization, compilation, the binary-path query and the post-build lane check. Verify covers staged signing, icon and captured-source checks. Install covers the existing bundle copy, quiescence, replacement and signature check. Native launch and installed-service qualification follow that installation receipt.
+`<fingerprint>/build-verification.json` records signed executable hashes and `timing`. The timing record contains total seconds, UTC start, start/end load averages and `phases`. The phases are `capture`, `compile`, `stage`, `sign`, `verify` and `install`. Each phase records seconds and a completed or skipped status. Executed phases also record their start/end load averages. Compile includes lane synchronization, compilation and linking, the binary-path query and the post-build lane check. Compiler and linker times are not independently available from this aggregate receipt; do not report the aggregate as compiler-only time. Verify covers staged signing, icon and captured-source checks. Install covers the existing bundle copy, quiescence, replacement and signature check. Native launch and installed-service qualification follow that installation receipt.
 
-A stage-only run records installation as skipped. Reusing an existing verified stage records compile, stage and sign as skipped. `build-timings.jsonl` retains timing snapshots for repeated uses of a capture. Install modes also copy the timing record into `.local/build/last-install.json`. These records measure elapsed time under the reported host load; they do not control contention from other projects. CL-173 has no completed application timing comparison yet. Native fixture checks establish aggregation, resource regeneration and capture isolation; they do not establish the requested application speedup.
+A stage-only run records installation as skipped. Reusing an existing verified stage records compile, stage and sign as skipped. `build-timings.jsonl` retains timing snapshots for repeated uses of a capture. Install modes also copy the timing record into `.local/build/last-install.json`. These records measure elapsed time under the reported host load; they do not control contention from other projects. The first CL-173 change landed in `61aa4b5`; use its parent `0219e5eb209887c7474aa73f0e3228c9db3da673` as the formal pre-ticket baseline. The later `a9c998d` already contains the stable-lane and aggregate-build changes, so its comparison with `e4ec087` does not measure the whole ticket. Complete comparable-load medians of three, including clean-build parity, remain an independent qualification step. Development single runs and fixture checks do not complete that gate.
 
 ### Repeatable quiet-window measurements
 
@@ -138,14 +138,29 @@ Disposable local-package checks establish inventory/fingerprint/captured-build b
 ## Local build and hand-in cleanup
 
 After a successful installation (and installed checks for `--verify` and
-`--install-stage`), `build_and_run.sh` calls `post_install_cleanup` while holding
-its build lock. It moves obsolete capture `source`, staged app, binaries and
-per-capture build outputs to the Trash, retaining the installed and immediate
+`--install-stage`), `build_and_run.sh` releases its build lock and starts an
+explicit background `post_install_cleanup` step, printing its PID and
+`<capture>/post-install-cleanup.jsonl` report path. Cleanup acquires its own build
+lease; a concurrent builder makes it refuse safely. Installation returns without
+waiting for cleanup, and interactive modes do not hold its lease. Read the report
+summary before treating retirement as complete; startup/refusal errors are in the
+same log. No schedule or persistent worker is created. Cleanup moves obsolete
+capture `source`, staged app, binaries and per-capture build outputs to the Trash, retaining the installed and immediate
 previous captures. All receipt files, timing history and unknown files remain in
 the older capture directories. It also retires legacy `swiftpm-<id>` scratch
 without a paired `lane-<id>/source`. Paired lanes for every configuration remain
 warm. Stage-only and failed install runs do not retire anything. Cleanup failure
-is reported without turning a successful install into a failed installation.
+is logged without turning a successful install into a failed installation.
+Build outputs move in one native Trash batch (45-second transport timeout), with
+individual destinations/errors and confirmed logical-byte totals. A failed batch
+can have successful individual moves; those receipts remain in the report. Only
+a selected read-only directory root gains owner write permission for the move;
+its nested directories, files, parents and every retained capture keep their
+permissions. A failed move restores that root’s original mode. SwiftPM scratch
+may contain relative or absolute symlinks whose immediate and resolved targets
+remain inside that same scratch folder. External, cyclic or unresolved links
+retain the entire scratch folder and report the offending link path. No external
+target exceptions are currently needed or allowed.
 
 For leftover builds, hand-ins and idle slots, run from the project checkout:
 
@@ -175,10 +190,14 @@ Alternatively, supply `--project-id ID --status-file PATH` with an explicit
 list. This is an operator-supplied status snapshot; refresh it before applying.
 
 Preview is read-only and apply computes new decisions, inventories and process
-observations. Apply refreshes ticket statuses and installation identity before
-moves. Live data, installed/rollback apps, in-use paths, links and unknown
-ownership are retained. Process inspection failure refuses retirement. Every
-item reports its path, logical byte count and reason; successful moves report a
+observations. Preview caches one process snapshot for the pass; build apply
+refreshes it once before the batch, then rechecks inventories and installation
+identity under the build lease. Process paths are deduplicated before resolution
+and indexed by ancestors once, rather than resolved/scanned for every item.
+Evidence apply still refreshes ticket statuses and process use before each move.
+Live data, installed/rollback apps, in-use paths, links outside the SwiftPM
+exception above and unknown ownership are retained. Process inspection failure
+refuses retirement. Every item reports its path, logical byte count and reason; successful moves report a
 Trash destination and a total `bytes_removed`. These are bytes moved out of the
 working folders, not recovered disk space; Trash retains them. Other tools must
 honor the build/slot leases; external noncooperating writers can still race a

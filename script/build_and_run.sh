@@ -10,6 +10,7 @@ if ! mkdir "$BUILD_ROOT/.build-lock" 2>/dev/null; then
   echo "Another Checklist build owns $BUILD_ROOT/.build-lock; reconcile it before retrying." >&2
   exit 1
 fi
+BUILD_LOCK_OWNED=1
 INCOMING=""
 STAGE_ASSEMBLY=""
 BUILD_SOURCE=""
@@ -18,7 +19,7 @@ cleanup() {
   if [ -n "$STAGE_ASSEMBLY" ] && [ -d "$STAGE_ASSEMBLY" ]; then rm -rf "$STAGE_ASSEMBLY"; fi
   if [ -n "$VERIFICATION_RECEIPT" ]; then rm -f "$VERIFICATION_RECEIPT"; fi
   if [ -n "${TIMING_FILE:-}" ]; then rm -f "$TIMING_FILE"; fi
-  rmdir "$BUILD_ROOT/.build-lock" 2>/dev/null || true
+  if [ "$BUILD_LOCK_OWNED" = 1 ]; then rmdir "$BUILD_ROOT/.build-lock" 2>/dev/null || true; fi
   if [ -n "$INCOMING" ] && [ -d "$INCOMING" ]; then echo "A verified install stage remains for reconciliation: $INCOMING" >&2; fi
 }
 trap cleanup EXIT
@@ -29,6 +30,15 @@ phase init
 phase start capture
 CONFIGURATION="${CHECKLIST_BUILD_CONFIGURATION:-release}"
 case "$CONFIGURATION" in debug|release) ;; *) echo "CHECKLIST_BUILD_CONFIGURATION must be debug or release." >&2; exit 2;; esac
+# Keep release -O, but retain per-file dependency records and object reuse.
+SWIFT_FLAGS=()
+BUILD_FLAGS=()
+if [ "$CONFIGURATION" = release ]; then
+  # Swift Build still plans WMO dependency outputs when only -Xswiftc changes.
+  # Native SwiftPM supplies per-file output maps for incremental release.
+  BUILD_FLAGS=(--build-system native)
+  SWIFT_FLAGS=(-Xswiftc -no-whole-module-optimization -Xswiftc -incremental -Xswiftc -enable-batch-mode)
+fi
 if [ "${CHECKLIST_SIGN_IDENTITY+x}" = x ]; then
   SIGN_IDENTITY="${CHECKLIST_SIGN_IDENTITY:--}"
 elif [ -f "$BUILD_ROOT/signing-identity" ]; then
@@ -62,7 +72,7 @@ PYVERIFY
 else
 capture_source() {
 TOOLCHAIN_FILE="$(mktemp "$BUILD_ROOT/toolchain.XXXXXX")"
-{ swift --version; xcrun --sdk macosx --show-sdk-version; uname -m; echo "$CONFIGURATION"; } > "$TOOLCHAIN_FILE"
+{ swift --version; xcrun --sdk macosx --show-sdk-version; uname -m; echo "$CONFIGURATION"; printf 'build_flag=%s\n' ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"}; printf 'swift_flag=%s\n' ${SWIFT_FLAGS[@]+"${SWIFT_FLAGS[@]}"}; } > "$TOOLCHAIN_FILE"
 python3 - "$TOOLCHAIN_FILE" <<'PY'
 import hashlib,os,sys
 from pathlib import Path
@@ -71,7 +81,7 @@ from pathlib import Path
 identity=os.environ['CHECKLIST_SIGN_IDENTITY']
 with Path(sys.argv[1]).open('a') as output:output.write('signing_identity_sha256='+hashlib.sha256(identity.encode()).hexdigest()+'\n')
 PY
-CAPTURE_INFO="$(python3 - "$ROOT_DIR" "$BUILD_ROOT" "$TOOLCHAIN_FILE" "$CONFIGURATION" <<'PY'
+CAPTURE_INFO="$(python3 - "$ROOT_DIR" "$BUILD_ROOT" "$TOOLCHAIN_FILE" "$CONFIGURATION" ${SWIFT_FLAGS[@]+"${SWIFT_FLAGS[@]}"} <<'PY'
 import datetime,hashlib,json,os,plistlib,shutil,stat,sys,tempfile
 from pathlib import Path
 root,build,toolchain_file=map(Path,sys.argv[1:4]);configuration=sys.argv[4]
@@ -99,7 +109,7 @@ if not destination.exists():
   sys.path.insert(0,str(source/'script'));from version import allocate
   version_info=allocate(source,build);number=version_info['build_number']
   identity=os.environ['CHECKLIST_SIGN_IDENTITY']
-  manifest={'schema_version':1,'source_fingerprint':fingerprint,'build_id':fingerprint[:16],'build_number':number,'source_root':str(root),'configuration':configuration,'toolchain':toolchain,'signing_profile':'ad-hoc' if identity=='-' else 'certificate','signing_identity_sha256':hashlib.sha256(identity.encode()).hexdigest(),'input_roots':input_roots,'inputs':before,'captured_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+  manifest={'schema_version':1,'source_fingerprint':fingerprint,'build_id':fingerprint[:16],'build_number':number,'source_root':str(root),'configuration':configuration,'swift_flags':sys.argv[5:],'toolchain':toolchain,'signing_profile':'ad-hoc' if identity=='-' else 'certificate','signing_identity_sha256':hashlib.sha256(identity.encode()).hexdigest(),'input_roots':input_roots,'inputs':before,'captured_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}
   manifest.update(version_info)
   (temporary/'capture-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
   for p in sorted(source.rglob('*'),reverse=True): p.chmod(0o555 if p.is_dir() or bool(p.stat().st_mode&stat.S_IXUSR) else 0o444)
@@ -128,11 +138,11 @@ compile_products() {
   phase start compile
   python3 "$BUILD_HELPER" sync "$CAPTURE_DIR" "$BUILD_SOURCE"
   if [ "$MODE" = --clean-stage ]; then
-    swift package --package-path "$BUILD_SOURCE" --scratch-path "$SCRATCH" clean
+    swift package --package-path "$BUILD_SOURCE" --scratch-path "$SCRATCH" ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} clean
   fi
-  BIN_DIR="$(swift build --package-path "$BUILD_SOURCE" --scratch-path "$SCRATCH" --configuration "$CONFIGURATION" --force-resolved-versions --show-bin-path)"
+  BIN_DIR="$(swift build --package-path "$BUILD_SOURCE" --scratch-path "$SCRATCH" --configuration "$CONFIGURATION" ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} --force-resolved-versions ${SWIFT_FLAGS[@]+"${SWIFT_FLAGS[@]}"} --show-bin-path)"
   python3 "$BUILD_HELPER" clean-products "$BIN_DIR" "$SCRATCH"
-  swift build --package-path "$BUILD_SOURCE" --scratch-path "$SCRATCH" --configuration "$CONFIGURATION" --force-resolved-versions --target ChecklistProducts
+  swift build --package-path "$BUILD_SOURCE" --scratch-path "$SCRATCH" --configuration "$CONFIGURATION" ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} --force-resolved-versions ${SWIFT_FLAGS[@]+"${SWIFT_FLAGS[@]}"} --target ChecklistProducts
   python3 "$BUILD_HELPER" verify "$CAPTURE_DIR" "$BUILD_SOURCE"
   phase stop compile
 }
@@ -387,18 +397,28 @@ if ! python3 "$ROOT_DIR/script/retire_old_bundles.py" --after-install --keep "$P
   echo "Warning: old Checklist bundles could not all move to the Trash; see the retirement output." >&2
 fi
 echo "After the installed checks pass, retire the previous bundle: python3 \"$ROOT_DIR/script/retire_old_bundles.py\" --retire-previous"
-# Keep retirement outside capture/compile/stage/sign and after installed checks.
+# Keep cleanup after installed checks and off the installation result path.
 post_install_cleanup() {
-  if ! python3 - "$ROOT_DIR" "$CAPTURE_DIR" "$$" <<'PYCLEAN'
+  local cleanup_log="$CAPTURE_DIR/post-install-cleanup.jsonl"
+  # Hand back the installer lease before starting a separately leased cleanup.
+  # A concurrent builder wins safely: cleanup refuses its held lock.
+  if ! rmdir "$BUILD_ROOT/.build-lock"; then
+    echo "Warning: build cleanup could not acquire its own lease; run script/clean_builds.py --preview." >&2
+    return 0
+  fi
+  BUILD_LOCK_OWNED=0
+  nohup python3 - "$ROOT_DIR" "$CAPTURE_DIR" >"$cleanup_log" 2>&1 <<'PYCLEAN' &
 import sys
 from pathlib import Path
 sys.path.insert(0,str(Path(sys.argv[1])/'script'))
 from clean_builds import post_install
-sys.exit(post_install(*sys.argv[1:]))
+try:
+    sys.exit(post_install(*sys.argv[1:]))
+except Exception as error:
+    print('Cleanup refused: '+str(error), file=sys.stderr)
+    sys.exit(1)
 PYCLEAN
-  then
-    echo "Warning: build cleanup retained unresolved items; run script/clean_builds.py --preview." >&2
-  fi
+  echo "Build cleanup started in background (pid $!); report: $cleanup_log"
 }
 post_install_cleanup
 # Interactive modes can wait indefinitely; retire older bundles before entering them.

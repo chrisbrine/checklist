@@ -30,12 +30,29 @@ extension CommandRouter {
         if let id = p["receipt_id"] as? String {
             let receipt = try scoped(db,id,pid,type:"storage_job")
             guard receipt["cause"] as? String == "ticket_cleanup_pass" else {throw CoreError("NOT_FOUND","No cleanup pass with this ID.")}
-            return try ticketCleanupPassProjection(db,receipt:receipt)
+            var value = try ticketCleanupPassProjection(db,receipt:receipt)
+            value["maintenance"] = try ticketCleanupMaintenanceProjection(db,project:pid)
+            return value
         }
         let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND project_id=? AND json_extract(data,'$.cause')='ticket_cleanup_pass' ORDER BY rowid DESC LIMIT 50",arguments:[pid])
         var result: JSON = ["receipts":try rows.map {try ticketCleanupPassProjection(db,receipt:GRDBRecordEnvelopeAdapter.decode($0).object)}]
         result["first_pass_receipt_id"] = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-first:" + pid])
+        result["maintenance"] = try ticketCleanupMaintenanceProjection(db,project:pid)
         return result
+    }
+
+    private func ticketCleanupMaintenanceProjection(_ db: Database,project: String) throws -> JSON {
+        let format = ISO8601DateFormatter(),settings = ticketCleanupSettings(try record(db,project,type:"project"))
+        if !bool(settings,"done_evidence_enabled") && !bool(settings,"closed_purge_enabled") {return ["state":"disabled","next_check_at":NSNull()]}
+        if try StorageSnapshotRetention.isActive(root:root) {
+            return ["state":"paused","reason":"snapshot_retention","resume_condition":"snapshot_retention_released",
+                    "resume_at":NSNull(),"next_check_at":format.string(from:Date().addingTimeInterval(60))]
+        }
+        if let retry = ticketCleanupRetryAt,retry > Date() {
+            return ["state":"deferred","reason":ticketCleanupFailure ?? "cleanup_preparation_unavailable","next_check_at":format.string(from:retry)]
+        }
+        let next = Double(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-next:" + project]) ?? "0") ?? 0
+        return ["state":next <= Date().timeIntervalSince1970 ? "due" : "scheduled","next_check_at":format.string(from:Date(timeIntervalSince1970:max(next,Date().timeIntervalSince1970)))]
     }
 
     private func ticketCleanupCursor(_ db: Database,_ pid: String) throws -> Int64 {
@@ -99,7 +116,7 @@ extension CommandRouter {
         let end = (items.last?["scan_row"] as? Int64) ?? cursor
         let more = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE type='task' AND project_id=? AND rowid>?)",arguments:[pid,end]) ?? false
         let selection: JSON = ["project_id":pid,"settings":settings,"items":items,"next_cursor":more ? end : 0,"more":more,
-            "selected_bytes":items.reduce(Int64(0)) {$0 + (((($1["summary"] as? JSON)?["pending_bytes"]) as? NSNumber)?.int64Value ?? 0)},"physical_reclamation":"unmeasured"]
+            "selected_bytes":items.reduce(Int64(0)) {$0 + (((($1["summary"] as? JSON)?["pending_bytes"]) as? NSNumber)?.int64Value ?? 0)},"physical_reclamation":"unmeasured","source_build_cache":try sourceBuildCacheRetainedEntries(db,project:pid)]
         return TicketCleanupPreparedPass(project:project,selection:selection,plans:plans,expiredCommands:expired)
     }
 
@@ -140,7 +157,7 @@ extension CommandRouter {
                 var item = item
                 for field in ["scan_row","objects","plan_digest","purge_digest","record_impact"] {item.removeValue(forKey:field)}
                 return item
-            },"objects":[],"summary":Self.ticketObjectDeletionSummary([])]
+            },"objects":[],"summary":Self.ticketObjectDeletionSummary([]),"source_build_cache":selection["source_build_cache"] ?? []]
             try self.save(db,receipt,type:"storage_job")
             try self.event(db,caller:Caller(role:"owner",installation:"storage",projectIDs:[]),project:pid,entity:pid,kind:"ticket_cleanup_pass",data:["origin":"automatic_cleanup","receipt_id":id,"admitted_count":items.filter {$0["action"] as? String != "keep"}.count])
             try db.execute(sql:"INSERT OR IGNORE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-first:" + pid,id])

@@ -18,12 +18,66 @@ import sys
 import tempfile
 import time
 
-from retire_old_bundles import trash
+from retire_old_bundles import TRASH_TOOL, trash
 
 REPO = Path(__file__).resolve().parents[1]
 BUILD_NAMES = {'.build', 'CompilationCache.noindex', 'CompilationCache', 'module-cache'}
 QUIET_SECONDS = 45 * 60
 WORKSPACE_MARKER = '.checklist-workspace.json'
+# Bound memory and argv while amortizing process inspection and native Trash startup.
+ITEM_BATCH_SIZE = 32
+MOVE_BATCH_SIZE = 256
+MOVE_BATCH_BYTES = 64 * 1024
+
+
+def trash_paths(paths):
+    """Yield confirmed receipts, including successes before a partial failure."""
+    if os.environ.get('CHECKLIST_TRASH_DIR') is not None:
+        for path in paths:
+            yield path, trash(path)
+        return
+    if TRASH_TOOL.exists():
+        result = subprocess.run([str(TRASH_TOOL), '--stopOnError', '--verbose', *map(str, paths)],
+                                text=True, capture_output=True)
+        cursor = 0
+        for index, path in enumerate(paths):
+            prefix = '# Moved "' + str(path) + '" to "'
+            if not result.stdout.startswith(prefix, cursor):
+                break  # Partial failure: retain preceding confirmed receipts.
+            start = cursor + len(prefix)
+            next_prefix = ('"\n# Moved "' + str(paths[index + 1]) + '" to "'
+                           if index + 1 < len(paths) else None)
+            end = result.stdout.find(next_prefix, start) if next_prefix else -1
+            if end < 0:
+                end = result.stdout.rfind('"\n', start)
+            if end < 0:
+                raise ValueError('Trash receipt unrecognized; inspect paths before retry')
+            # Use known source boundaries, not splitlines: filenames can contain
+            # quotes and newlines. The destination is a flat Trash basename.
+            yield path, Path(result.stdout[start:end])
+            cursor = end + 2
+    else:
+        # Preserve the established single-path compatibility route on systems
+        # without the native batch tool; current macOS uses one call per batch.
+        for path in paths:
+            yield path, trash(path)
+        return
+    if result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, result.args,
+                                            output=result.stdout, stderr=result.stderr)
+
+
+def move_batches(entries):
+    batch, size = [], 0
+    for entry in entries:
+        length = len(os.fsencode(entry[1])) + 1
+        if batch and (len(batch) >= MOVE_BATCH_SIZE or size + length > MOVE_BATCH_BYTES):
+            yield batch
+            batch, size = [], 0
+        batch.append(entry)
+        size += length
+    if batch:
+        yield batch
 
 
 def within(path, parent):
@@ -74,8 +128,9 @@ def running_paths():
                             capture_output=True, text=True)
     if result.returncode != 0 or result.stderr.strip():
         raise ValueError('process inspection incomplete: ' + result.stderr.strip())
-    paths = [Path(line[1:]).resolve() for line in result.stdout.splitlines()
-             if line.startswith('n/')]
+    # lsof repeats shared executables/libraries for many processes. Resolve each
+    # distinct path once; duplicates carry no extra use/protection information.
+    paths = {line[1:] for line in result.stdout.splitlines() if line.startswith('n/')}
     commands = subprocess.check_output(['/bin/ps', '-axo', 'command='], text=True)
     for line in commands.splitlines():
         try:
@@ -87,8 +142,14 @@ def running_paths():
         for argument in arguments:
             value = argument.split('=', 1)[-1] if argument.startswith('-') else argument
             if value.startswith('/'):
-                paths.append(Path(value).resolve())
-    return paths
+                paths.add(value)
+    return [Path(path).resolve() for path in sorted(paths)]
+
+
+def used_items(processes, items):
+    """Match observed paths to candidate roots once, rather than paths × items."""
+    roots = set(items)
+    return {parent for path in processes for parent in (path, *path.parents) if parent in roots}
 
 
 def children(path):
@@ -293,8 +354,11 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
     removable_tree = {}
     for path, entry in reversed(list(before.items())):
         children_by_parent.setdefault(path.parent, []).append(path)
-        removable_tree[path] = (all(removable_tree[p] for p in children_by_parent.get(path, []))
-                                 and bool(children_by_parent.get(path))) if stat.S_ISDIR(entry[2]) else path in removable
+        # Empty folders can accompany an eligible tree, but never override an
+        # item-wide hold or remove even empty Git metadata.
+        removable_tree[path] = (not reason and '.git' not in (item.name,) + path.relative_to(item).parts
+                                 and all(removable_tree[p] for p in children_by_parent.get(path, []))
+                               ) if stat.S_ISDIR(entry[2]) else path in removable
     def select(path):
         entry = before[path]
         if not stat.S_ISDIR(entry[2]):
@@ -312,8 +376,53 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
             'reasons': dict(reasons), 'moves': moves, 'inventory': before}
 
 
+def apply_batch(batch, installed_info, fingerprint, process_reader, mover,
+                session_id, include_released):
+    decisions = {id(decision): decision for decision, _ in batch}.values()
+    # Inspect processes before the filesystem so changes during lsof are also fenced.
+    processes = process_reader()
+    if used_items(processes, (Path(d['path']) for d in decisions)):
+        raise ValueError('running process began using item; stopped')
+    for decision in decisions:
+        item = Path(decision['path'])
+        if not in_scope(item, decision['kind'], session_id, include_released):
+            raise ValueError('workspace ownership/release changed; stopped')
+        if inventory(item) != decision['inventory']:
+            raise ValueError('item changed during inspection/Trash moves; stopped')
+        if workspace_protection(item, decision['inventory']):
+            raise ValueError('workspace ownership/release changed; stopped')
+    if installed_fingerprint(installed_info) != fingerprint:
+        raise ValueError('installed round changed; rerun preview with its qualified copy retained')
+    paths = [path for _, path in batch]
+    confirmed = set()
+    for path, destination in mover(paths):
+        if path not in paths or path in confirmed:
+            raise ValueError('unexpected or duplicate Trash receipt; stopped')
+        confirmed.add(path)
+        decision = next(d for d, p in batch if p == path)
+        receipt = {'source': str(path), 'trash': str(destination)}
+        decision['public']['destinations'].append(receipt)
+        print(json.dumps({'action': 'trash_move', **receipt}), flush=True)
+    if confirmed != set(paths):
+        raise ValueError('Trash receipts incomplete; inspect paths before retry')
+    for decision in decisions:
+        item = Path(decision['path'])
+        removed = {p for d, p in batch if d is decision}
+        remaining = {p: e for p, e in decision['inventory'].items()
+                     if not any(parent in removed for parent in (p, *p.parents))}
+        after = inventory(item) if item not in removed else {}
+        # Moving a child updates directory timestamps, never remaining file bytes
+        # or directory identity/mode. Do not silently adopt an exchanged directory.
+        if set(after) != set(remaining) or any(
+            after[p] != e if not stat.S_ISDIR(e[2]) else after[p][:3] != e[:3]
+            for p, e in remaining.items()
+        ):
+            raise ValueError('remaining files changed during Trash move; stopped')
+        decision['inventory'] = after
+
+
 def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
-          process_reader=running_paths, mover=trash, clock=time.time,
+          process_reader=running_paths, mover=trash_paths, clock=time.time,
           session_id=None, include_released=False):
     if not session_id:
         raise ValueError('caller session unknown; supply --session-id for your own session')
@@ -321,57 +430,43 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
     objects = git_objects(repo) if items else set()
     fingerprint = installed_fingerprint(installed_info)
     processes = process_reader() if items else []
-    # The retained installation must not change underneath a cleanup pass.
-    initial_fingerprint = fingerprint
+    used = used_items(processes, (item for item, _ in items))
     failed = False
-    for item, kind in items:
+    for offset in range(0, len(items), ITEM_BATCH_SIZE):
+        pending = []
+        for item, kind in items[offset:offset + ITEM_BATCH_SIZE]:
+            try:
+                # An old --preview is never an executable deletion plan.
+                if not in_scope(item, kind, session_id, include_released):
+                    raise ValueError('workspace ownership/release changed; retained')
+                decision = plan(item, kind, objects, [item] if item in used else [], fingerprint, keep, clock())
+                public = {key: value for key, value in decision.items() if key not in {'inventory', 'moves'}}
+                public['action'] = 'preview'
+                public['eligible_paths'] = [str(path) for path in decision['moves']]
+                if apply and decision['moves']:
+                    public.update(action='trashed', destinations=[])
+                    decision['public'] = public
+                    pending.append(decision)
+                else:
+                    print(json.dumps(public, sort_keys=True))
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                print(json.dumps({'path': str(item), 'action': 'kept_error', 'reason': str(error)}))
+                failed = True
         try:
-            # An old --preview is never an executable deletion plan.
-            # Apply also refreshes process use immediately before moving.
-            if not in_scope(item, kind, session_id, include_released):
-                raise ValueError('workspace ownership/release changed; retained')
-            decision = plan(item, kind, objects, processes, fingerprint, keep, clock())
-            public = {key: value for key, value in decision.items() if key not in {'inventory', 'moves'}}
-            public['action'] = 'preview'
-            public['eligible_paths'] = [str(path) for path in decision['moves']]
-            if apply and decision['moves']:
-                if inventory(item) != decision['inventory']:
-                    raise ValueError('item changed during inspection; rerun preview')
-                if any(within(path, item) for path in process_reader()):
-                    raise ValueError('running process began using item; rerun preview')
-                public['action'] = 'trashed'
-                public['destinations'] = []
-                for path in decision['moves']:
-                    if not in_scope(item, kind, session_id, include_released) or workspace_protection(item, decision['inventory']):
-                        raise ValueError('workspace ownership/release changed; stopped')
-                    if installed_fingerprint(installed_info) != initial_fingerprint:
-                        raise ValueError('installed round changed; rerun preview with its qualified copy retained')
-                    if any(within(p, item) for p in process_reader()):
-                        raise ValueError('running process began using item; stopped')
-                    # Check all remaining bytes, not just this leaf; stop if an
-                    # actor changes the item between Trash operations.
-                    current = inventory(item)
-                    if current != decision['inventory']:
-                        raise ValueError('item changed during Trash moves; stopped')
-                    destination = mover(path)
-                    public['destinations'].append({'source': str(path), 'trash': str(destination)})
-                    print(json.dumps({'action': 'trash_move', **public['destinations'][-1]}))
-                    # Moving a child updates parent timestamps; take the new
-                    # baseline only after confirming remaining file identities.
-                    remaining = {p: e for p, e in current.items() if not within(p, path)}
-                    if item == path:
-                        decision['inventory'] = {}
-                    else:
-                        after = inventory(item)
-                        if set(after) != set(remaining) or any(
-                            after[p] != e for p, e in remaining.items() if not stat.S_ISDIR(e[2])
-                        ):
-                            raise ValueError('remaining files changed during Trash move; stopped')
-                        decision['inventory'] = after
-            print(json.dumps(public, sort_keys=True))
+            for batch in move_batches((d, p) for d in pending for p in d['moves']):
+                apply_batch(batch, installed_info, fingerprint, process_reader, mover,
+                            session_id, include_released)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
-            print(json.dumps({'path': str(item), 'action': 'kept_error', 'reason': str(error)}))
+            # Native Trash can fail after moving part of a batch. Keep confirmed
+            # per-path receipts and all item accounting; never retry blindly.
+            for decision in pending:
+                decision['public'].update(action='kept_error', reason=str(error))
             failed = True
+            for decision in pending:
+                print(json.dumps(decision['public'], sort_keys=True))
+            return 1
+        for decision in pending:
+            print(json.dumps(decision['public'], sort_keys=True))
     return 1 if failed else 0
 
 

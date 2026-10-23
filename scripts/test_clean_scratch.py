@@ -122,6 +122,18 @@ class CleanScratchTests(unittest.TestCase):
         for value in [item, item / 'open.txt', item / '.build', item / 'space file']:
             self.assertIn(value, paths)
 
+    def test_process_paths_are_deduplicated_and_match_exact_candidate_ancestors(self):
+        item = self.item()
+        other = Path(str(item) + '-other')
+        paths = [item / '.build/output', item / 'source', other / 'file']
+        self.assertEqual(cleanup.used_items(paths, [item, item / '.build', other]),
+                         {item, item / '.build', other})
+        self.assertEqual(cleanup.used_items(paths[2:], [item]), set())
+        lsof = subprocess.CompletedProcess([], 0, stdout=(f'p10\nn{item}/source\n' * 10), stderr='')
+        with patch.object(cleanup.subprocess, 'run', return_value=lsof), \
+             patch.object(cleanup.subprocess, 'check_output', return_value=f'{item}/source\n'):
+            self.assertEqual(cleanup.running_paths(), [(item / 'source').resolve()])
+
     def test_process_inspection_failure_refuses_all_moves(self):
         item = self.item();self.write(item, '.build/object')
         with self.assertRaisesRegex(ValueError, 'inspection incomplete'):
@@ -429,7 +441,7 @@ class CleanScratchTests(unittest.TestCase):
 
     def test_failed_trash_move_keeps_bytes_and_reports_error(self):
         item = self.item();file = self.write(item, '.build/object')
-        def fail(path):
+        def fail(paths):
             raise OSError('fixture Trash unavailable')
         result, records = self.run_cleanup(apply=True, mover=fail)
         self.assertEqual(result, 1);self.assertTrue(file.exists())
@@ -439,11 +451,13 @@ class CleanScratchTests(unittest.TestCase):
         item = self.item();self.write(item, '.build/object')
         note = self.write(item, 'note', b'unique evidence')
         source = self.write(item, 'src/source.py', b'old source\n')
-        def changing_mover(path):
-            destination = self.trash / path.name;path.rename(destination)
-            note.write_bytes(b'changed concurrently')
-            return destination
-        result, records = self.run_cleanup(apply=True, mover=changing_mover)
+        def changing_mover(paths):
+            for path in paths:
+                destination = self.trash / path.name;path.rename(destination)
+                note.write_bytes(b'changed concurrently')
+                yield path, destination
+        with patch.object(cleanup, 'MOVE_BATCH_SIZE', 1):
+            result, records = self.run_cleanup(apply=True, mover=changing_mover)
         self.assertEqual(result, 1);self.assertTrue(source.exists())
         self.assertEqual(records[0]['action'], 'trash_move')
         self.assertIn('remaining files changed', records[1]['reason'])
@@ -466,11 +480,139 @@ class CleanScratchTests(unittest.TestCase):
         item = self.item();self.write(item, '.build/object')
         source = self.write(item, 'src/source.py', b'old source\n')
         self.write(item, 'note', b'private')
-        reader = iter([[], [], [], [item / 'new-process-cwd']])
-        result, records = self.run_cleanup(apply=True, process_reader=lambda: next(reader))
+        reader = iter([[], [], [item / 'new-process-cwd']])
+        with patch.object(cleanup, 'MOVE_BATCH_SIZE', 1):
+            result, records = self.run_cleanup(apply=True, process_reader=lambda: next(reader))
         self.assertEqual(result, 1);self.assertTrue(source.exists())
         self.assertEqual(records[0]['action'], 'trash_move')
         self.assertIn('running process began', records[1]['reason'])
+
+    def test_empty_subdirectories_do_not_fragment_whole_build_or_git_trees(self):
+        item = self.item()
+        for name in ['.build', 'CompilationCache.noindex', 'module-cache']:
+            self.write(item, name + '/deep/tree/object')
+            (item / name / 'deep/empty').mkdir()
+        self.write(item, 'src/deep/source.py', b'old source\n')
+        (item / 'src/empty').mkdir()
+        self.write(item, 'unique-note', b'keep')
+        # Even empty Git metadata must survive.
+        (item / '.git').mkdir()
+        expected = {item / name for name in ['.build', 'CompilationCache.noindex', 'module-cache', 'src']}
+        self.assertEqual(set(self.plan(item)['moves']), expected)
+        with patch.object(cleanup, 'trash_paths', wraps=cleanup.trash_paths) as mover:
+            result, records = self.run_cleanup(apply=True, mover=mover)
+        self.assertEqual(result, 0)
+        self.assertEqual(set(mover.call_args.args[0]), expected)
+        self.assertEqual(mover.call_count, 1)
+        self.assertEqual(len([r for r in records if r['action'] == 'trash_move']), 4)
+        self.assertTrue((item / '.git').is_dir())
+        self.assertEqual((item / 'unique-note').read_bytes(), b'keep')
+
+    def test_batch_spans_items_and_partly_eligible_folder_keeps_unique_files(self):
+        expected = set()
+        for i in range(5):
+            item = self.item(f'copy-{i}')
+            expected.add(self.write(item, 'mixed/old.py', b'old source\n'))
+            self.write(item, 'mixed/unique.py', b'unlanded')
+            self.write(item, '.build/deep/object')
+            expected.add(item / '.build')
+        with patch.object(cleanup, 'trash_paths', wraps=cleanup.trash_paths) as mover:
+            result, records = self.run_cleanup(apply=True, mover=mover)
+        self.assertEqual(result, 0)
+        self.assertEqual(mover.call_count, 1)
+        self.assertEqual(set(mover.call_args.args[0]), expected)
+        self.assertEqual(len([r for r in records if r['action'] == 'trashed']), 5)
+        self.assertEqual(len([r for r in records if r['action'] == 'trash_move']), 10)
+        for item, _ in cleanup.candidates(self.sessions, self.qualification, 'session'):
+            self.assertEqual((item / 'mixed/unique.py').read_bytes(), b'unlanded')
+            self.assertFalse((item / 'mixed/old.py').exists())
+
+    def test_batch_bounds_count_and_encoded_argv_bytes(self):
+        entries = [(None, Path('/tmp/' + 'é' * i)) for i in range(1, 9)]
+        with patch.object(cleanup, 'MOVE_BATCH_SIZE', 3), patch.object(cleanup, 'MOVE_BATCH_BYTES', 40):
+            batches = list(cleanup.move_batches(entries))
+        self.assertEqual([entry for batch in batches for entry in batch], entries)
+        for batch in batches:
+            self.assertLessEqual(len(batch), 3)
+            self.assertLessEqual(sum(len(os.fsencode(p)) + 1 for _, p in batch), 40)
+
+    def test_native_trash_is_one_call_and_retains_partial_success_receipts(self):
+        paths = [Path('/fixture/a'), Path('/fixture/b')]
+        for code, stdout, count in [(0, '# Moved "/fixture/a" to "/Trash/a"\n# Moved "/fixture/b" to "/Trash/b"\n', 2),
+                                    (1, '# Moved "/fixture/a" to "/Trash/a"\n', 1)]:
+            result = subprocess.CompletedProcess(['trash'], code, stdout=stdout, stderr='failure' if code else '')
+            receipts = []
+            with patch.dict(os.environ, {}, clear=True), patch.object(cleanup, 'TRASH_TOOL') as tool, \
+                 patch.object(cleanup.subprocess, 'run', return_value=result) as runner:
+                tool.exists.return_value = True
+                tool.__str__.return_value = '/usr/bin/trash'
+                try:
+                    receipts.extend(cleanup.trash_paths(paths))
+                except subprocess.CalledProcessError:
+                    self.assertEqual(code, 1)
+                self.assertEqual(runner.call_count, 1)
+                self.assertEqual(runner.call_args.args[0], ['/usr/bin/trash', '--stopOnError', '--verbose', *map(str, paths)])
+            self.assertEqual(len(receipts), count)
+
+    def test_native_receipts_preserve_quotes_and_newlines_in_path_names(self):
+        paths = [Path('/fixture/a"\nline'), Path('/fixture/b\n"line')]
+        destinations = [Path('/Trash/a"\nline'), Path('/Trash/b\n"line')]
+        output = ''.join(f'# Moved "{p}" to "{d}"\n' for p, d in zip(paths, destinations))
+        result = subprocess.CompletedProcess(['trash'], 0, stdout=output, stderr='')
+        with patch.dict(os.environ, {}, clear=True), patch.object(cleanup, 'TRASH_TOOL') as tool, \
+             patch.object(cleanup.subprocess, 'run', return_value=result):
+            tool.exists.return_value = True
+            self.assertEqual(list(cleanup.trash_paths(paths)), list(zip(paths, destinations)))
+
+    def test_partial_batch_failure_reports_moved_and_unmoved_item_bytes(self):
+        first = self.item('a');self.write(first, '.build/object')
+        second = self.item('b');self.write(second, '.build/object')
+        def partial(paths):
+            yield paths[0], cleanup.trash(paths[0])
+            raise OSError('partial failure')
+        result, records = self.run_cleanup(apply=True, mover=partial)
+        self.assertEqual(result, 1)
+        self.assertFalse(first.exists());self.assertTrue(second.exists())
+        self.assertEqual(len([r for r in records if r['action'] == 'trash_move']), 1)
+        errors = [r for r in records if r['action'] == 'kept_error']
+        self.assertEqual(len(errors), 2)
+        self.assertEqual([len(r['destinations']) for r in errors], [1, 0])
+        self.assertTrue(all(r['build_bytes'] == len(b'generated') for r in errors))
+
+    def test_incomplete_receipts_refuse_success(self):
+        item = self.item();self.write(item, '.build/object')
+        result, records = self.run_cleanup(apply=True, mover=lambda paths: [])
+        self.assertEqual(result, 1)
+        self.assertIn('receipts incomplete', records[0]['reason'])
+        self.assertTrue(item.exists())
+
+    def test_large_deep_tree_apply_time_bound_and_linear_inspection(self):
+        # 250 items, 32,000 small files plus 11 GB logical sparse output. The
+        # temporary Trash seam measures traversal/batching without native UI.
+        for i in range(250):
+            item = self.item(f'copy-{i:03d}')
+            for j in range(128):
+                self.write(item, f'.build/checkouts/dependency/level-{j % 8}/Sources/file-{j}', b'x')
+            (item / '.build/checkouts/dependency/empty').mkdir()
+            with (item / '.build/large.o').open('wb') as output:
+                output.truncate(44_000_000)
+            self.write(item, 'note.md', b'private evidence')
+        started = time.monotonic()
+        with patch.object(cleanup, 'inventory', wraps=cleanup.inventory) as inspected, \
+             patch.object(cleanup, 'trash_paths', wraps=cleanup.trash_paths) as mover, \
+             patch.object(cleanup, 'running_paths', return_value=[]) as processes:
+            result, records = self.run_cleanup(apply=True, mover=mover, process_reader=processes)
+        elapsed = time.monotonic() - started
+        self.assertEqual(result, 0)
+        self.assertLess(elapsed, 60, f'large tree apply took {elapsed:.2f}s')
+        self.assertEqual(mover.call_count, 8)  # One batch per 32-item window.
+        self.assertEqual(processes.call_count, 9)
+        self.assertEqual(inspected.call_count, 750)  # Plan, pre-move, post-move per item.
+        summaries = [r for r in records if r['action'] == 'trashed']
+        self.assertEqual(len(summaries), 250)
+        self.assertEqual(sum(r['build_bytes'] for r in summaries), 11_000_032_000)
+        self.assertTrue(all(r['kept_bytes'] == len(b'private evidence') for r in summaries))
+        print(f'large-tree fixture: 250 items, 32,000 small files, 11,000,032,000 logical eligible bytes, {elapsed:.3f}s apply')
 
     def test_main_refuses_symlink_root(self):
         link = self.root / 'linked-sessions';link.symlink_to(self.sessions, target_is_directory=True)

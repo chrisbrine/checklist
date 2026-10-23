@@ -66,20 +66,24 @@ extension CommandRouter {
         var entries: [String:StorageSnapshotObject] = [:],closures: [Int:[String]] = [:]
         var uncertainCaptures = Set<String>(),uncertainAll = false
         func capturePrefix(_ path: String) -> String? {
-            guard let parts = try? StorageObjectFiles.parts(path),parts.count >= 5,parts[0] == "source-captures",parts[3] == "source" else {return nil}
+            guard let parts = try? StorageObjectFiles.parts(path) else {return nil}
+            if parts.count >= 3,parts[0] == "source-build-cache" {return parts.prefix(2).joined(separator:"/")}
+            guard parts.count >= 5,parts[0] == "source-captures",parts[3] == "source" else {return nil}
             return parts.prefix(4).joined(separator:"/")
         }
         for object in objects {
             guard let path = object["relative_path"] as? String else {continue}
             entries[path] = .init(relativePath:path,kind:object["kind"] as? String ?? "",expectedSHA256:object["sha256"] as? String,expectedSize:(object["size"] as? NSNumber)?.int64Value,executable:object["executable"] as? Bool == true,linkTarget:object["link_target"] as? String,authorities:[])
         }
+        let cachePaths = entries.keys.filter {$0.hasPrefix("source-build-cache/")}
+        var cacheVisits = 0
         for index in objects.indices where objects[index]["kind"] as? String == "symlink" && ["pending","retained"].contains(objects[index]["state"] as? String ?? "") {
             guard let path = objects[index]["relative_path"] as? String else {uncertainAll = true;continue}
             do {
                 // An ambiguous or changed link may have a different live target.
                 // Its recorded chain alone cannot authorize deleting its capture.
                 guard !(objects[index]["reasons"] as? [String] ?? []).contains("ambiguous_identity"),objects[index]["last_failure"] as? String != "CLEANUP_IDENTITY_CHANGED" else {throw StorageSnapshotFailure.unsupportedAuthority}
-                closures[index] = try StorageSnapshotAuthority.capturedLinkClosure(path,entries:entries)
+                closures[index] = try path.hasPrefix("source-build-cache/") ? sourceBuildCacheLinkClosure(path,entries:entries,cachePaths:cachePaths,visits:&cacheVisits) : StorageSnapshotAuthority.capturedLinkClosure(path,entries:entries)
             } catch {
                 if let capture = capturePrefix(path) {uncertainCaptures.insert(capture)} else {uncertainAll = true}
             }
@@ -99,6 +103,50 @@ extension CommandRouter {
         }
         for (index,closure) in closures where objects[index]["state"] as? String == "pending" {pendingTargets.formUnion(closure.dropFirst())}
         return pendingTargets
+    }
+
+    /// Cache aliases may resolve to directories (SwiftPM's debug alias). Only
+    /// recorded descendants inside this exact cache entry enter the closure.
+    private static func sourceBuildCacheLinkClosure(_ path: String,entries: [String:StorageSnapshotObject],cachePaths: [String],visits totalVisits: inout Int) throws -> [String] {
+        let parts = try StorageObjectFiles.parts(path)
+        guard parts.count >= 3,parts[0] == "source-build-cache" else {throw StorageSnapshotFailure.unsupportedAuthority}
+        let prefix = Array(parts.prefix(2))
+        var visiting = Set<String>(),closure = Set<String>(),visits = totalVisits
+        defer {totalVisits = visits}
+        guard visits < 2000000 else {throw StorageSnapshotFailure.limit}
+        func visit(_ path: String,depth: Int) throws {
+            visits += 1;guard visits <= 2000000 else {throw StorageSnapshotFailure.limit}
+            guard depth <= 32,!visiting.contains(path),let entry = entries[path] else {throw StorageSnapshotFailure.unsupportedAuthority}
+            if closure.contains(path) {return}
+            visiting.insert(path);defer {visiting.remove(path)}
+            closure.insert(path)
+            guard entry.kind == "symlink" else {return}
+            guard let target = entry.linkTarget,!target.isEmpty,!target.hasPrefix("/"),!target.contains("\0"),StorageObjectFiles.sha(Data(target.utf8)) == entry.expectedSHA256 else {throw StorageSnapshotFailure.unsupportedAuthority}
+            var destination = try StorageObjectFiles.parts(path);destination.removeLast()
+            for part in target.split(separator:"/") {
+                // Lexical parent reduction must never skip a symlinked parent.
+                guard entries[destination.joined(separator:"/")]?.kind != "symlink" else {throw StorageSnapshotFailure.unsupportedAuthority}
+                if part == "." {continue}
+                if part == ".." {guard destination.count > 2 else {throw StorageSnapshotFailure.unsupportedAuthority};destination.removeLast()}
+                else {destination.append(String(part))}
+            }
+            guard Array(destination.prefix(2)) == prefix else {throw StorageSnapshotFailure.unsupportedAuthority}
+            let resolved = destination.joined(separator:"/")
+            if entries[resolved] != nil {try visit(resolved,depth:depth+1)}
+            else {
+                // A directory has no unlink descriptor; protect every inventoried
+                // descendant, including any further link chains. Never follow it.
+                for candidate in cachePaths {
+                    visits += 1;guard visits <= 2000000 else {throw StorageSnapshotFailure.limit}
+                    if candidate.hasPrefix(resolved + "/") {
+                        guard !visiting.contains(candidate) else {throw StorageSnapshotFailure.unsupportedAuthority}
+                        if !closure.contains(candidate) {try visit(candidate,depth:depth+1)}
+                    }
+                }
+            }
+        }
+        try visit(path,depth:0)
+        return [path] + closure.filter {$0 != path}.sorted()
     }
 
     func ticketObjectDeletionPlan(_ db: Database, owned: [(String,JSON)], remaining: [JSON], referenceTokens: [Data:Set<Data>]? = nil) throws -> TicketObjectDeletionPlan {
@@ -164,6 +212,9 @@ extension CommandRouter {
             } else if type == "source_capture" {try capture(value,owner:id)}
             else if type == "manifest",let evidence = value["evidence"] as? JSON,let source = evidence["source_capture"] as? JSON {try capture(source,owner:id)}
         }
+        for item in try sourceBuildCacheDeletionObjects(db,owned:owned) {
+            if let path = item["relative_path"] as? String {objects[path] = item}
+        }
         let backup = try? storageBackupRetentionIndex(db),references = try TicketObjectDeletionReferenceIndex(remaining,tokens:referenceTokens)
         let mediaAuthorityComplete = (try? MediaRecordRegistry.validate(MediaRecordRegistry.envelopes(db))) != nil
         var result: [JSON] = []
@@ -183,11 +234,12 @@ extension CommandRouter {
 
     func ticketObjectDeletionHolds(_ db: Database, object: JSON, references: TicketObjectDeletionReferenceIndex, backup: StorageBackupRetentionIndex?,mediaAuthorityComplete: Bool) throws -> Set<String> {
         guard let relative = object["relative_path"] as? String,let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value else {return ["identity_unavailable"]}
-        var holds = Set<String>()
+        var holds = try sourceBuildCacheDeletionHolds(db,object:object)
         if !mediaAuthorityComplete {holds.insert("media_authority_unavailable")}
         let absolute = root.appendingPathComponent(relative).path
         var tokens = Set((object["owner_ids"] as? [String] ?? []).map {Data($0.utf8)})
         tokens.formUnion([relative,absolute,object["stored_path"] as? String ?? ""].filter {!$0.isEmpty}.map {Data($0.utf8)})
+        if let cache = object["cache_path"] as? String {tokens.formUnion([Data(cache.utf8),Data(root.appendingPathComponent(cache).path.utf8)])}
         if let capture = object["capture_path"] as? String {tokens.formUnion([Data(capture.utf8),Data(root.appendingPathComponent(capture).path.utf8)])}
         var matched = Set<Int>()
         for token in tokens {matched.formUnion(references.reverse[token] ?? [])}

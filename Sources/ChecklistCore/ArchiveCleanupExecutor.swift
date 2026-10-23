@@ -38,7 +38,7 @@ final class TicketObjectRemovalVerification {
     let size: Int64
     let descriptor: Int32
     let identity: stat
-    init?(root: URL,relative: String,sha256: String,size: Int64) throws {
+    init?(root: URL,relative: String,sha256: String? = nil,size: Int64? = nil,check: () throws -> Void = {}) throws {
         let files = try StorageObjectFiles(root:root)
         let directory: Int32,name: String
         do {(directory,name) = try files.parent(relative)} catch {if errno == ENOENT {return nil};throw error}
@@ -48,21 +48,22 @@ final class TicketObjectRemovalVerification {
         guard fd >= 0 else {throw CoreError("CLEANUP_OBJECT_UNAVAILABLE","The original could not be opened safely.")}
         do {
             var before = stat(),after = stat()
-            guard fstat(fd,&before) == 0,before.st_mode & S_IFMT == S_IFREG,before.st_size == size else {throw CoreError("CLEANUP_IDENTITY_CHANGED","Original identity changed; bytes retained.")}
+            guard fstat(fd,&before) == 0,before.st_mode & S_IFMT == S_IFREG,(size == nil || before.st_size == size) else {throw CoreError("CLEANUP_IDENTITY_CHANGED","Original identity changed; bytes retained.")}
             var hasher = SHA256(),buffer = [UInt8](repeating:0,count:65536),counted: Int64 = 0
             while true {
+                try check()
                 let count = Darwin.read(fd,&buffer,buffer.count)
                 if count < 0,errno == EINTR {continue}
                 guard count >= 0 else {throw CoreError("CLEANUP_OBJECT_UNAVAILABLE","Original verification failed; bytes retained.")}
                 if count == 0 {break}
                 counted += Int64(count)
-                guard counted <= size else {throw CoreError("CLEANUP_IDENTITY_CHANGED","Original size changed; bytes retained.")}
+                guard counted <= (size ?? before.st_size) else {throw CoreError("CLEANUP_IDENTITY_CHANGED","Original size changed; bytes retained.")}
                 hasher.update(data:Data(buffer.prefix(count)))
             }
             let digest = hasher.finalize().map {String(format:"%02x",$0)}.joined()
-            guard counted == size,digest == sha256,fstat(fd,&after) == 0,Self.same(before,after) else {throw CoreError("CLEANUP_IDENTITY_CHANGED","Original changed during verification; bytes retained.")}
+            guard counted == (size ?? before.st_size),(sha256 == nil || digest == sha256),fstat(fd,&after) == 0,Self.same(before,after) else {throw CoreError("CLEANUP_IDENTITY_CHANGED","Original changed during verification; bytes retained.")}
             self.root = Data(root.standardizedFileURL.path.utf8);self.relative = Data(relative.utf8)
-            self.sha256 = sha256;self.size = size;self.descriptor = fd;self.identity = after
+            self.sha256 = digest;self.size = counted;self.descriptor = fd;self.identity = after
         } catch {Darwin.close(fd);throw error}
     }
     deinit {Darwin.close(descriptor)}
@@ -77,13 +78,14 @@ extension ArchiveStoragePermit {
     /// The sole unlink path. Archive callers admit originals only; durable ticket
     /// intents also admit exact previews, capture files, sidecars and link text.
     /// No directory, followed link, external original or workspace is admitted.
-    fileprivate func removeOriginal(relative: String,sha256: String,size: Int64,capturedSource: Bool = false,linkTarget: String? = nil,verified: TicketObjectRemovalVerification? = nil,requirePreverified: Bool = false) throws -> Bool {
+    fileprivate func removeOriginal(relative: String,sha256: String,size: Int64,capturedSource: Bool = false,sourceBuildCache: Bool = false,linkTarget: String? = nil,verified: TicketObjectRemovalVerification? = nil,requirePreverified: Bool = false) throws -> Bool {
         try requireRoot(files.root)
         try StorageSnapshotRetention.requireNoCapture(root:files.root)
         let parts = try StorageObjectFiles.parts(relative)
         let source = capturedSource && parts.count >= 4 && parts[0] == "source-captures" && (parts[3] == "source" && parts.count >= 5 || parts.count == 4 && parts[3] == "manifest.json")
+        let cache = sourceBuildCache && parts.count >= 3 && parts[0] == "source-build-cache" && parts[1].range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil
         guard size >= 0,sha256.range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil,
-              relative.hasPrefix("objects/") && linkTarget == nil || source else { throw CoreError("CLEANUP_PATH_REFUSED", "Cleanup requires an exact managed object descriptor.") }
+              relative.hasPrefix("objects/") && linkTarget == nil || source || cache else { throw CoreError("CLEANUP_PATH_REFUSED", "Cleanup requires an exact managed object descriptor.") }
         let directory: Int32,name: String
         do {(directory,name) = try files.parent(relative)} catch {if errno == ENOENT {return false};throw error}
         defer { Darwin.close(directory) }
@@ -242,16 +244,17 @@ extension CommandRouter {
     /// Service uses a one-shot deadline, never a polling/model timer. Held work
     /// resumes on a relevant command or an expiring actual reader/backup lease.
     public func nextArchiveCleanupDeadline() throws -> Date? {
-        if try StorageSnapshotRetention.isActive(root:root) {return nil}
-        guard storageMaintenanceFallbackFailures < 2 else { return nil }
+        if try StorageSnapshotRetention.isActive(root:root) {return Date().addingTimeInterval(60)}
         return try dbQueue.read { db in
             let nowMS = self.archiveCleanupNowMS()
             let deadline = try Int64.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.not_before_ms') AS INTEGER)) FROM records WHERE type='cleanup_job' AND json_valid(data) AND json_extract(data,'$.state') IN ('queued','ready')")
             let expiry = try Double.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.expires_at') AS REAL)) FROM records WHERE type='storage_hold' AND json_valid(data) AND json_extract(data,'$.state')='active' AND CAST(json_extract(data,'$.expires_at') AS REAL)>?",arguments:[Date().timeIntervalSince1970])
             let more = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records j,json_each(j.data,'$.items') i WHERE j.type='cleanup_job' AND json_valid(j.data) AND json_extract(j.data,'$.state')='held' AND (json_extract(i.value,'$.state')='waiting' OR json_extract(i.value,'$.same_failure_count')=1))") ?? false
-            let deletionPending = try readers != nil && Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE type='storage_job' AND json_valid(data) AND json_extract(data,'$.kind')='ticket_object_delete' AND json_extract(data,'$.state')='pending')") ?? false
-            let lifecycle = try readers == nil ? nil : self.nextTicketCleanupDeadline(db)
-            let next = [lifecycle.map { max(Int64($0.timeIntervalSince1970 * 1000),nowMS + 50) },deletionPending ? nowMS + 50 : nil,deadline.map { max($0,nowMS + 50) },expiry.map { Int64($0 * 1000) },more ? nowMS + 1000 : nil].compactMap {$0}.min()
+            let deletionPending = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE type='storage_job' AND json_valid(data) AND json_extract(data,'$.kind')='ticket_object_delete' AND json_extract(data,'$.state')='pending')") ?? false
+            let lifecycle = try self.nextTicketCleanupDeadline(db)
+            let retry = self.ticketCleanupRetryAt.map {Int64($0.timeIntervalSince1970 * 1000)}
+            let routineRetry = self.storageMaintenanceRetryAt.map {Int64($0.timeIntervalSince1970 * 1000)}
+            let next = [lifecycle.map { max(Int64($0.timeIntervalSince1970 * 1000),retry ?? 0,nowMS + 50) },deletionPending ? max(retry ?? 0,nowMS + 50) : nil,deadline.map { max($0,routineRetry ?? 0,nowMS + 50) },expiry.map { Int64($0 * 1000) },more ? max(routineRetry ?? 0,nowMS + 1000) : nil,routineRetry].compactMap {$0}.min()
             return next.map { Date(timeIntervalSince1970:Double($0)/1000) }
         }
     }
@@ -296,7 +299,7 @@ extension CommandRouter {
                     guard let relative = object["relative_path"] as? String,let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value,
                           object["kind"] as? String == "file" || object["kind"] as? String == "symlink" else {throw CoreError("CLEANUP_INTENT_INVALID","The deletion descriptor requires repair; bytes retained.")}
                     if let failure = prepared.verificationFailure {throw failure}
-                    let removed = try permit.removeOriginal(relative:relative,sha256:sha,size:size,capturedSource:relative.hasPrefix("source-captures/"),linkTarget:object["link_target"] as? String,verified:prepared.verification,requirePreverified:true)
+                    let removed = try permit.removeOriginal(relative:relative,sha256:sha,size:size,capturedSource:relative.hasPrefix("source-captures/"),sourceBuildCache:object["representation"] as? String == "source_build_cache",linkTarget:object["link_target"] as? String,verified:prepared.verification,requirePreverified:true)
                     result["state"] = removed ? "removed" : "already_missing"
                 }
                 objects[index] = result
