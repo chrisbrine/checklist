@@ -198,6 +198,8 @@ extension CommandRouter {
         var tasks = try records(db,type:"task",project:pid)
         if let override = taskOverride { tasks.removeAll {$0["id"] as? String == override["id"] as? String};tasks.append(override) }
         let assigned = tasks.filter {$0["epic_id"] as? String == gid}
+        // Retain membership evidence even after removal, ticket purge or receipt expiry.
+        if !assigned.isEmpty || !previous.isEmpty { group["has_held_ticket"] = true }
         group["members"] = assigned.map { task -> JSON in ["task_id":task["id"]!,"joined_at":previous.first(where: {$0["task_id"] as? String == task["id"] as? String})?["joined_at"] ?? now()] }
         group["task_ids"] = assigned.compactMap {$0["id"] as? String};group = revised(group);try save(db,group,type:"group");return group
     }

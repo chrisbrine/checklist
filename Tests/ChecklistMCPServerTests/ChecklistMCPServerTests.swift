@@ -3,6 +3,8 @@ import Darwin
 import MCP
 import Logging
 import ChecklistIPC
+import GRDB
+@testable import ChecklistCore
 @testable import ChecklistBridges
 @testable import ChecklistMCPServer
 
@@ -20,6 +22,7 @@ final class ChecklistMCPServerTests: XCTestCase {
         var responseText: String?
         var responseData: [String:Any]?
         var callHandler: ((String) throws -> Void)?
+        var requestHandler: ((String, [String:Any]) throws -> [String:Any])?
         var unregisteredWorkspace = false
         var projectCreationEnabled = false
 
@@ -69,10 +72,11 @@ final class ChecklistMCPServerTests: XCTestCase {
             }
         }
 
-        func call(_ name: String, client: Int) throws -> [String: Any] {
+        func call(_ name: String, params: [String:Any], client: Int) throws -> [String: Any] {
             try locked {
                 requests.append((name, client))
                 try callHandler?(name)
+                if let requestHandler { return try requestHandler(name,params) }
                 if name == "project_create",projectCreationEnabled {
                     unregisteredWorkspace=false
                     return ["data":["id":"synthetic-project","root_path":context.workspacePath]]
@@ -102,8 +106,67 @@ final class ChecklistMCPServerTests: XCTestCase {
             return try fixture.bootstrap(timeBudget)
         }
         func call(_ method: String, _ params: [String: Any], replyTimeout: TimeInterval?) throws -> [String: Any] {
-            try fixture.call(method, client: index)
+            try fixture.call(method, params: params, client: index)
         }
+    }
+
+    func testEpicDeleteThroughMCPActiveArchivedMembershipRefusalsAndRetainedRows() async throws {
+        let fixture = try Fixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        let root = try FileManager.default.url(for:.cachesDirectory,in:.userDomainMask,appropriateFor:nil,create:true)
+            .appendingPathComponent("ChecklistQualification/CL-245-MCP-" + UUID().uuidString)
+        let router = try CommandRouter(root:root)
+        defer { try? router.closeStore();try? FileManager.default.removeItem(at:root) }
+        let owner = Caller(role:"owner",installation:"synthetic-owner",projectIDs:[])
+        func call(_ method: String,_ params: [String:Any]) throws -> [String:Any] {
+            var params = params
+            if !CommandRouter.readMethods.contains(method) {params["command_id"] = UUID().uuidString}
+            return try router.handle(method:method,params:params,caller:owner)["data"] as! [String:Any]
+        }
+        let project = try call("project_create",["name":"Synthetic MCP delete","key_prefix":"DEL","root_path":fixture.context.workspacePath]),pid = project["id"] as! String
+        _ = try call("session_register",["project_id":pid,"session_id":fixture.context.nativeSessionID,"provider":"claude","role":"worker"])
+        let agent = Caller(role:"worker",installation:"synthetic-agent",projectIDs:[pid],sessionID:fixture.context.nativeSessionID,workspace:fixture.context.workspacePath)
+        fixture.requestHandler = { method,params in
+            do {return try router.handle(method:method,params:params,caller:agent)}
+            catch let error as CoreError {throw ChecklistError(error.code,error.message,details:error.details)}
+        }
+        let session = try await start(fixture)
+        let tools = try await session.client.listTools()
+        let tool = try XCTUnwrap(tools.tools.first {$0.name == "epic_delete"})
+        let schema = try JSONSerialization.jsonObject(with:JSONEncoder().encode(tool.inputSchema)) as! [String:Any]
+        XCTAssertTrue(Set(schema["required"] as! [String]).isSuperset(of:["epic_id","expected_revision","project_id","command_id"]))
+        for archived in [false,true] {
+            var epic = try call("epic_create",["project_id":pid,"name":"Mistake"])
+            if archived {epic = try call("epic_edit",["project_id":pid,"epic_id":epic["id"]!,"expected_revision":epic["revision"]!,"archived":true])}
+            let gid = epic["id"] as! String
+            func retainedRows() throws -> [String] {
+                try router.dbQueue.read { db in
+                    try Row.fetchAll(db,sql:"SELECT rowid,hex(CAST(data AS BLOB)) AS bytes FROM records WHERE id != ? ORDER BY rowid",arguments:[gid]).map {String($0["rowid"] as Int64) + ":" + ($0["bytes"] as String)}
+                }
+            }
+            let before = try retainedRows()
+            let result = try await session.client.callTool(name:"epic_delete",arguments:["project_id":.string(pid),"epic_id":.string(gid),"expected_revision":.int(epic["revision"] as! Int),"command_id":.string(UUID().uuidString)])
+            XCTAssertFalse(result.isError ?? false)
+            let envelope = try JSONSerialization.jsonObject(with:Data(text(result.content).utf8)) as! [String:Any]
+            let data = envelope["data"] as! [String:Any]
+            XCTAssertEqual(data["deleted"] as? Bool,true);XCTAssertEqual(data["origin"] as? String,"agent")
+            XCTAssertEqual(try retainedRows(),before)
+        }
+        let epic = try call("epic_create",["project_id":pid,"name":"Used"]),gid = epic["id"] as! String
+        var task = try call("task_create",["project_id":pid,"title":"Member","epic_id":gid])
+        for historical in [false,true] {
+            if historical {task = try call("task_edit",["project_id":pid,"task_id":task["id"]!,"expected_revision":task["revision"]!,"patch":["epic_id":NSNull()]])}
+            let group = (try call("epic_list",["project_id":pid,"key":epic["key"]!])["groups"] as! [[String:Any]])[0]
+            let before = try await router.dbQueue.read {try SchemaMigrations.contentFingerprint($0)}
+            let result = try await session.client.callTool(name:"epic_delete",arguments:["project_id":.string(pid),"epic_id":.string(gid),"expected_revision":.int(group["revision"] as! Int),"command_id":.string(UUID().uuidString)])
+            XCTAssertTrue(result.isError ?? false)
+            let frames = try await session.transport.frames().map {try JSONSerialization.jsonObject(with:$0) as! [String:Any]}
+            let error = try XCTUnwrap((frames.last?["result"] as? [String:Any])?["structuredContent"] as? [String:Any])
+            XCTAssertEqual((error["error"] as! [String:Any])["code"] as? String,historical ? "EPIC_HELD_TICKETS":"EPIC_HAS_TICKETS")
+            let after = try await router.dbQueue.read {try SchemaMigrations.contentFingerprint($0)}
+            XCTAssertEqual(after,before)
+        }
+        try await assertProtocolOnly(session)
     }
 
     func testNativeSessionRequiredNamesExactReconnectAndDoesNotReplay() async throws {

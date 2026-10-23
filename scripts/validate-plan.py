@@ -44,6 +44,29 @@ def headings(path: Path) -> set[str]:
     return result
 
 
+def synthetic_project_cleanup_errors(body: str) -> list[int]:
+    """Flag affirmative project-archive cleanup guidance, not ticket archive tests.
+
+    This is a narrow prose regression guard, not proof of runtime isolation.
+    Keep paragraphs together so wrapped runner briefs receive the same check.
+    """
+    lines = []
+    project = r'synthetic(?:[ \t\n-]+test)?[ \t\n-]+projects?'
+    archive = r'archiv(?:e|es|ed|ing)'
+    for paragraph in re.finditer(r'[^\n]+(?:\n(?!\n)[^\n]+)*', body):
+        text = paragraph.group().lower()
+        if not re.search(project, text):
+            continue
+        # Explicit prohibitions are guidance we want to retain. Strip just the
+        # negated action, so a later affirmative instruction still gets caught.
+        text = re.sub(r"(?:never|do not|don't|must not|cannot|not)\s+"
+                      r'(?:be\s+|retain(?:ed)?\s+by\s+)?' + archive, '', text)
+        if (re.search(archive + r'\s+(?:it|them|(?:the\s+)?' + project + r')\b', text)
+                or re.search(project + r'\s+(?:(?:must|should)\s+be|is|are)\s+' + archive + r'\b', text)):
+            lines.append(body.count('\n', 0, paragraph.start()) + 1)
+    return lines
+
+
 def check() -> dict:
     errors: list[str] = []
     selected = public_files()
@@ -196,6 +219,11 @@ def check() -> dict:
         for label, match in private_identifiers(body):
             line = body.count('\n', 0, match.start()) + 1
             errors.append(f'Concrete private identifier ({label}): {path.relative_to(ROOT)}:{line}')
+        if path.suffix in {'.md', '.json'} and (
+                path.name == 'AGENTS.md' or path.relative_to(ROOT).parts[0]
+                in {'docs', 'skills', 'examples', 'templates'}):
+            for line in synthetic_project_cleanup_errors(body):
+                errors.append(f'Synthetic project archive cleanup guidance: {path.relative_to(ROOT)}:{line}; use a disposable test slot and destroy it')
         if path.suffix != '.md': continue
         if re.search(r'^(<<<<<<<|=======|>>>>>>>)', body, re.M): errors.append(f'Conflict marker: {path.relative_to(ROOT)}')
         if any(line.rstrip() != line for line in body.splitlines()): errors.append(f'Trailing whitespace: {path.relative_to(ROOT)}')

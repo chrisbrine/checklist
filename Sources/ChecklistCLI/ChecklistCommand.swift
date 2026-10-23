@@ -1,4 +1,5 @@
 import Foundation
+import ChecklistProviders
 import MCP
 import ChecklistIPC
 import ChecklistMCPServer
@@ -115,7 +116,7 @@ struct ChecklistCommand {
             case "call":
                 try printJSON(await call(arguments:arguments,bridge:bridge))
             case "help", "--help", "-h": printHelp()
-            case "version", "--version": print("Checklist 0.1.0 · MCP Swift SDK 0.12.1")
+            case "version", "--version": print("Checklist \(ChecklistBuildVersion.current.version) · build \(ChecklistBuildVersion.current.buildID) (\(ChecklistBuildVersion.current.buildNumber)) · MCP Swift SDK 0.12.1")
             default: throw CLIError("Unknown command. Run checklist help.")
             }
         } catch {

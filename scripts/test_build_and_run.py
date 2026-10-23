@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -87,9 +88,10 @@ class BuildScriptTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         for folder in ['script', 'Sources', 'Resources', 'tools']:
             (self.root / folder).mkdir()
-        for name in ['build_and_run.sh', 'build_input_inventory.py', 'build_support.py']:
+        for name in ['build_and_run.sh', 'build_input_inventory.py', 'build_support.py', 'version.py']:
             shutil.copyfile(ROOT / 'script' / name, self.root / 'script' / name)
         (self.root / 'script/build_and_run.sh').chmod(0o755)
+        (self.root / 'VERSION').write_text('0.0.1\n')
         (self.root / 'Package.swift').write_text('// fixture\n')
         (self.root / 'Package.resolved').write_text('{}\n')
         (self.root / 'Sources/value.swift').write_text('let value = 1\n')
@@ -98,13 +100,22 @@ class BuildScriptTests(unittest.TestCase):
             (self.root / 'Resources' / name).write_bytes(plistlib.dumps({'Label': name}))
         self.calls = self.root / 'calls.jsonl'
         tool = '''#!/usr/bin/env python3
-import hashlib,json,os,pathlib,shutil,sys
+import hashlib,json,os,pathlib,shutil,sys,time
 name=pathlib.Path(sys.argv[0]).name;args=sys.argv[1:]
 with open(os.environ['CALLS'],'a') as out: out.write(json.dumps([name,*args])+'\\n')
 if name=='swift':
  if args==['--version']: print('Swift fixture');sys.exit()
  source=pathlib.Path(args[args.index('--package-path')+1]);scratch=pathlib.Path(args[args.index('--scratch-path')+1]);bin=scratch/'bin'
+ if args[0]=='package':
+  if scratch.exists(): shutil.rmtree(scratch)
+  sys.exit()
  if '--show-bin-path' in args: print(bin);sys.exit()
+ if os.environ.get('PAUSE_READY'):
+  pathlib.Path(os.environ['PAUSE_READY']).touch()
+  deadline=time.monotonic()+20
+  while not pathlib.Path(os.environ['PAUSE_RELEASE']).exists():
+   if time.monotonic()>deadline: raise SystemExit('Timed out waiting for test release')
+   time.sleep(.02)
  if os.environ.get('EDIT_CHECKOUT'):
   pathlib.Path(os.environ['EDIT_CHECKOUT']).write_text('#error("checkout edit must not compile")')
  bin.mkdir(parents=True,exist_ok=True)
@@ -116,14 +127,17 @@ elif name=='xcrun': print('fixture-sdk')
 elif name=='codesign':
  if '-d' in args: print('TeamIdentifier=not set',file=sys.stderr)
 elif name=='ditto': shutil.copytree(args[0],args[1],dirs_exist_ok=True)
+elif name=='mv':
+ if os.environ.get('FAIL_STAGE_PUBLISH') and '/stage-' in args[0] and args[0].endswith('/Checklist.app'):sys.exit(74)
+ os.execv('/bin/mv',['/bin/mv',*args])
 elif name=='plutil': pass
 '''
-        for name in ['swift', 'xcrun', 'codesign', 'ditto', 'plutil']:
+        for name in ['swift', 'xcrun', 'codesign', 'ditto', 'plutil', 'mv']:
             path=self.root/'tools'/name;path.write_text(tool);path.chmod(0o755)
         self.env = dict(os.environ, PATH=str(self.root/'tools')+os.pathsep+os.environ['PATH'], CALLS=str(self.calls), CHECKLIST_SIGN_IDENTITY='-')
 
-    def run_stage(self, **environment):
-        return subprocess.run([str(self.root/'script/build_and_run.sh'), '--stage'], env=dict(self.env, **environment), capture_output=True, text=True)
+    def run_stage(self, mode='--stage', **environment):
+        return subprocess.run([str(self.root/'script/build_and_run.sh'), mode], env=dict(self.env, **environment), capture_output=True, text=True)
 
     def capture(self):
         return next((self.root/'.local/build').glob('*/capture-manifest.json')).parent
@@ -182,7 +196,12 @@ elif name=='plutil': pass
         capture=self.capture();receipt=json.loads((capture/'build-verification.json').read_text())
         self.assertTrue(receipt['checkout_changed_after_capture'])
         self.assertIn('Sources/value.swift',receipt['checkout_changed_paths'])
-        self.assertEqual((capture/'Checklist.app/Contents/MacOS/ChecklistApp').read_text(),'let value = 1\n')
+        captured=(capture/'source/Sources/value.swift').read_bytes()
+        self.assertNotEqual((self.root/'Sources/value.swift').read_bytes(),captured)
+        for product,sha256 in receipt['binary_sha256'].items():
+            binary=capture/'Checklist.app/Contents/MacOS'/product
+            self.assertEqual(binary.read_bytes(),captured)
+            self.assertEqual(hashlib.sha256(binary.read_bytes()).hexdigest(),sha256)
 
     def test_modified_lane_after_compile_refuses_to_publish_stage(self):
         result=self.run_stage(EDIT_LANE='1')
@@ -215,6 +234,104 @@ elif name=='plutil': pass
         second=self.run_stage(OMIT_PRODUCT='ChecklistService')
         self.assertNotEqual(second.returncode,0)
         self.assertFalse((self.capture()/'Checklist.app').exists())
+
+    def test_rebuild_stage_reuses_lane_and_scratch_across_captures(self):
+        first=self.run_stage();self.assertEqual(first.returncode,0,first.stderr)
+        capture=self.capture();before=json.loads((capture/'build-verification.json').read_text())
+        lane=Path(before['build_source']);unchanged=lane/'Resources/AppIcon.icns'
+        mtime=unchanged.stat().st_mtime_ns
+        scratch=next((self.root/'.local/build').glob('swiftpm-*'))
+        marker=scratch/'compiled.o';marker.write_text('retained object')
+        (self.root/'Sources/value.swift').write_text('let value = 2\n')
+        second=self.run_stage();self.assertEqual(second.returncode,0,second.stderr)
+        captures=list((self.root/'.local/build').glob('*/capture-manifest.json'))
+        self.assertEqual(len(captures),2)
+        latest=next(p.parent for p in captures if p.parent!=capture)
+        after=json.loads((latest/'build-verification.json').read_text())
+        self.assertEqual(before['build_source'],after['build_source'])
+        self.assertEqual(unchanged.stat().st_mtime_ns,mtime)
+        self.assertEqual(marker.read_text(),'retained object')
+        rebuilt=self.run_stage(mode='--rebuild-stage');self.assertEqual(rebuilt.returncode,0,rebuilt.stderr)
+        receipt=json.loads((latest/'build-verification.json').read_text())
+        self.assertEqual(receipt['timing']['phases']['compile']['status'],'completed')
+        self.assertFalse((latest/'Checklist.app/Checklist.app').exists())
+        self.assertEqual(marker.read_text(),'retained object')
+        failed=self.run_stage(mode='--rebuild-stage',OMIT_PRODUCT='ChecklistService')
+        self.assertNotEqual(failed.returncode,0)
+        self.assertEqual((latest/'Checklist.app/Contents/MacOS/ChecklistService').read_text(),'let value = 2\n')
+        self.assertEqual(json.loads((latest/'build-verification.json').read_text()),receipt)
+
+    def test_failed_rebuild_publication_restores_prior_stage_and_receipt(self):
+        first=self.run_stage();self.assertEqual(first.returncode,0,first.stderr)
+        capture=self.capture();receipt=capture/'build-verification.json'
+        original=receipt.read_bytes()
+        failed=self.run_stage(mode='--rebuild-stage',FAIL_STAGE_PUBLISH='1')
+        self.assertNotEqual(failed.returncode,0)
+        self.assertEqual(receipt.read_bytes(),original)
+        for product in ['ChecklistApp','ChecklistService','checklist']:
+            self.assertEqual((capture/'Checklist.app/Contents/MacOS'/product).read_text(),'let value = 1\n')
+        self.assertEqual(list(capture.glob('build-verification.*.json')),[])
+        self.assertFalse((self.root/'.local/build/.build-lock').exists())
+
+    def test_clean_stage_is_explicit_and_cleans_only_selected_scratch(self):
+        first=self.run_stage();self.assertEqual(first.returncode,0,first.stderr)
+        scratch=next((self.root/'.local/build').glob('swiftpm-*'))
+        marker=scratch/'compiled.o';marker.write_text('old object')
+        result=self.run_stage(mode='--clean-stage');self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse(marker.exists())
+        calls=[json.loads(line) for line in self.calls.read_text().splitlines()]
+        clean=[c for c in calls if c[:2]==['swift','package']]
+        self.assertEqual(len(clean),1);self.assertEqual(clean[0][-1],'clean')
+        self.assertEqual(clean[0][clean[0].index('--scratch-path')+1],str(scratch))
+        self.assertTrue((self.capture()/'source/Sources/value.swift').is_file())
+
+    def start_paused(self):
+        ready=self.root/'ready';release=self.root/'release'
+        process=subprocess.Popen([str(self.root/'script/build_and_run.sh'),'--stage'],
+            env=dict(self.env,PAUSE_READY=str(ready),PAUSE_RELEASE=str(release)),
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        def finish():
+            release.touch()
+            if process.poll() is None:
+                process.communicate(timeout=30)
+        self.addCleanup(finish)
+        deadline=time.monotonic()+20
+        while not ready.exists():
+            if process.poll() is not None or time.monotonic()>deadline:
+                self.fail('First build did not reach the compile barrier: '+str(process.poll()))
+            time.sleep(.02)
+        return process,release
+
+    def test_concurrent_same_checkout_refuses_without_touching_running_lane(self):
+        first,release=self.start_paused()
+        calls=self.calls.read_bytes()
+        lane=next((self.root/'.local/build').glob('lane-*/source'))
+        captured=(lane/'Sources/value.swift').read_bytes()
+        second=self.run_stage()
+        self.assertNotEqual(second.returncode,0)
+        self.assertIn('Another Checklist build owns',second.stderr)
+        self.assertEqual(self.calls.read_bytes(),calls)
+        self.assertEqual((lane/'Sources/value.swift').read_bytes(),captured)
+        release.touch();stdout,stderr=first.communicate(timeout=30)
+        self.assertEqual(first.returncode,0,stdout+stderr)
+        self.assertFalse((self.root/'.local/build/.build-lock').exists())
+
+    def test_concurrent_checkouts_keep_separate_lanes_and_outputs(self):
+        other=BuildScriptTests();other.setUp();self.addCleanup(other.doCleanups)
+        (other.root/'Sources/value.swift').write_text('let value = 99\n')
+        first,release=self.start_paused()
+        second,other_release=other.start_paused()
+        release.touch();other_release.touch()
+        for process in [first,second]:
+            stdout,stderr=process.communicate(timeout=30)
+            self.assertEqual(process.returncode,0,stdout+stderr)
+        lanes=[]
+        for fixture,value in [(self,'let value = 1\n'),(other,'let value = 99\n')]:
+            capture=fixture.capture();receipt=json.loads((capture/'build-verification.json').read_text())
+            lanes.append(receipt['build_source'])
+            for product in receipt['binary_sha256']:
+                self.assertEqual((capture/'Checklist.app/Contents/MacOS'/product).read_text(),value)
+        self.assertNotEqual(lanes[0],lanes[1])
 
     def test_held_build_lock_refuses_before_running_native_tools(self):
         lock=self.root/'.local/build/.build-lock';lock.mkdir(parents=True)

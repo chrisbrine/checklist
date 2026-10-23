@@ -8,6 +8,8 @@ python3 script/affected_tests.py --paths Sources/ChecklistApp/Support/Canceled.s
 python3 script/affected_tests.py --paths-file changed-paths.txt --scratch-path <build-slot>/.build --json
 ```
 
+Script tests in both round checks and the background full suite use **uv-managed CPython 3.12**, selected explicitly with `uv run --no-project --python 3.12 --with jsonschema --with pyyaml python <script>`. The selector emits this same interpreter and dependency prefix for every Python test and `validate-plan.py`, including in `--full` mode. Use the emitted commands for both runs; an unpinned `uv run` or a bare `python3` test command can select a different interpreter. The `python3` commands above only launch the planner.
+
 The script prints commands; it does not execute them. JSON contains argv arrays in `commands`, plus `test_targets`, `affected_targets`, `python_tests`, `skip` and `fallback_paths`. `--paths-file -` reads newline-delimited paths from stdin. Paths are relative to the repository root. `--base` includes committed changes since the base, staged and unstaged changes, deletions, both rename endpoints and untracked files. Supply the union of all tickets' changed paths when planning a combined round.
 
 ## Target selection
@@ -44,7 +46,7 @@ Unknown paths, package/build changes and other full-fallback inputs also enable 
 python3 script/affected_tests.py --full --scratch-path <build-slot>/.build
 ```
 
-`--full` emits a Swift suite command with no filters or skips and all Python test commands. After the affected checks and validation pass, install once using the qualified composed source and the existing installation/storage gates. Start the full suite on that same immutable source in the background after install. It does not block the install or ticket submissions. Keep its PID/job receipt, source fingerprint and logs; report failures to the orchestrator and map each failing case to the affected tickets. Only those tickets are blocked; passing unrelated tickets continue. A background run must not be lost when its launching session ends. This is one bounded suite job, not a monitoring loop.
+`--full` emits a Swift suite command with no filters or skips and all Python test commands using the same pinned CPython 3.12 prefix as round checks. After the affected checks and validation pass, install once using the qualified composed source and the existing installation/storage gates. Start the full suite on that same immutable source in the background after install. It does not block the install or ticket submissions. Keep its PID/job receipt, source fingerprint and logs; report failures to the orchestrator and map each failing case to the affected tickets. Only those tickets are blocked; passing unrelated tickets continue. A background run must not be lost when its launching session ends. This is one bounded suite job, not a monitoring loop.
 
 ## Persistent build slots and installed checks
 

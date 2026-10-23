@@ -1357,8 +1357,14 @@ class SlotStartupTests(unittest.TestCase):
 
 
 class InstalledVerificationTests(unittest.TestCase):
+    def setUp(self):
+        # Startup timing fixtures use an imaginary bundle; exact metadata checks
+        # have real temporary bundle fixtures in test_version.py.
+        metadata = patch.object(verify_install, 'verify_bundle', return_value=self.status()['data'])
+        metadata.start();self.addCleanup(metadata.stop)
+
     def status(self):
-        return {'data': {'name': 'Checklist', 'version': '0.1.0', 'capabilities': ['durable_store']}}
+        return {'data': {'name': 'Checklist', 'version': '0.0.1.1', 'build_id': '0123456789abcdef', 'build_number': 118, 'capabilities': ['durable_store']}}
 
     class Clock:
         def __init__(self): self.now = 0; self.sleeps = []
@@ -1448,7 +1454,8 @@ class InstalledVerificationTests(unittest.TestCase):
             original = Path.stat
             def metadata(path, *args, **kwargs):
                 if path in snapshots:
-                    return SimpleNamespace(st_birthtime=[started - 10, started + 10, started + 20, started + 30][snapshots.index(path)])
+                    return SimpleNamespace(st_mode=original(path, *args, **kwargs).st_mode,
+                                           st_birthtime=[started - 10, started + 10, started + 20, started + 30][snapshots.index(path)])
                 return original(path, *args, **kwargs)
             with patch.object(Path, 'stat', metadata):
                 guidance = verify_install.failure_guidance(started, data_root=data)

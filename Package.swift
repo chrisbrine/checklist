@@ -19,7 +19,7 @@ let package = Package(
         .target(name: "ChecklistBridges", dependencies: ["ChecklistCore", "ChecklistIPC", "ChecklistProviders"]),
         .target(name: "ChecklistMCPServer", dependencies: ["ChecklistIPC", "ChecklistBridges", .product(name: "MCP", package: "swift-sdk")]),
         .executableTarget(name: "ChecklistService", dependencies: ["ChecklistCore", "ChecklistIPC", "ChecklistBridges", "ChecklistProviders"]),
-        .executableTarget(name: "ChecklistCLI", dependencies: ["ChecklistIPC", "ChecklistBridges", "ChecklistMCPServer", .product(name: "MCP", package: "swift-sdk")]),
+        .executableTarget(name: "ChecklistCLI", dependencies: ["ChecklistProviders", "ChecklistIPC", "ChecklistBridges", "ChecklistMCPServer", .product(name: "MCP", package: "swift-sdk")]),
         .executableTarget(name: "ChecklistApp", dependencies: ["ChecklistIPC", "ChecklistCore", "ChecklistProviders"]),
         // Build-only group: link all shipping executables in one SwiftPM pass.
         .target(name: "ChecklistProducts", dependencies: ["ChecklistApp", "ChecklistService", "ChecklistCLI"]),

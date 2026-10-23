@@ -1,5 +1,6 @@
 import XCTest
 import GRDB
+import ChecklistProviders
 @testable import ChecklistCore
 
 final class DiagnosticsTests: XCTestCase {
@@ -42,6 +43,17 @@ final class DiagnosticsTests: XCTestCase {
         let bytes = try jsonString(summary)
         for secret in secrets + ["private-task-id", projectID, statusID, "private-message-id", directory.path] { XCTAssertFalse(bytes.contains(secret)) }
         XCTAssertEqual(Set(summary.keys), ["schema_version", "observed_at", "service", "record_counts"])
+    }
+
+    func testServiceInfoAndDiagnosticsReportTheSameBundleIdentity() throws {
+        let service = try call("service_info")
+        let diagnostics = try call("diagnostics_summary")["service"] as! JSON
+        XCTAssertEqual(service["version"] as? String, ChecklistBuildVersion.current.version)
+        XCTAssertEqual(service["build_id"] as? String, ChecklistBuildVersion.current.buildID)
+        XCTAssertEqual(service["build_number"] as? Int, ChecklistBuildVersion.current.buildNumber)
+        for key in ["version", "build_id", "build_number"] {
+            XCTAssertEqual(String(describing: service[key]!), String(describing: diagnostics[key]!))
+        }
     }
 
     func testDiagnosticsIsReadOnlyAndRequiresScopedWorkerOrOwner() throws {

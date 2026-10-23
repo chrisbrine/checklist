@@ -50,6 +50,8 @@ Each Triage is for one handling phase: **Implementation** or **Review**. For imp
 
 A Triage is the coordinated pass run by an actual Claude or Codex conversation orchestrating those related tickets. Add already in-progress tickets to its Implementation Triage when appropriate. A ticket deserves Active attention when its own work is in progress or it belongs to a Triage currently being orchestrated. Use a real discovered session/orchestration binding; retain each ticket's separate implementation and review claims, target and result. Creating a group neither launches another model nor creates worker authority.
 
+An Epic is a container for actual tickets. Never pre-create Epics or Triages as assumptions during project setup or at any other time. Create an Epic only when real tickets exist to go into it. Delete a mistakenly created empty Epic with `epic_delete` (CL-245), rather than archiving it. Use the command only when discovered; if unavailable, report the missing command and leave deletion pending. During setup, configure the project first, then capture actual tickets before organizing them into Epics or phase Triages.
+
 ## Select the relevant procedure
 
 - New/unregistered project or connection problems: [setup](references/setup.md).

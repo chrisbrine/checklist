@@ -218,7 +218,7 @@ The preview reports pending, retained and already-missing object counts and logi
 
 ## Required proof before release
 
-The implementation must demonstrate the following with synthetic projects and actual installed storage behavior:
+The implementation must demonstrate the following with synthetic projects and actual installed storage behavior in disposable [test slots](test-instances.md). Create each project through that slot’s CLI (`project_create`) from its actual authorized workspace; never create synthetic projects in the live installation. After evidence capture, destroy the owned slots so their projects and enrollments are removed rather than retained:
 
 - Same task keys in separate projects, composite-link rejection, unauthorized search/attachment denial and no digest-existence/refcount disclosure across projects.
 - Lost command reply, conflicting payload reuse, concurrent claim and exact-once domain/outbox commit through a service crash; receipt uncertainty never becomes fabricated delivery.

@@ -10,7 +10,7 @@ extension CommandRouter {
             throw CoreError("TICKET_PURGED","This ticket was permanently removed. Its remaining reference cannot be edited or restored.")
         }
         switch method {
-        case "service_info": return ["session_id":c.sessionID ?? "","caller":["session_id":c.sessionID ?? "","role":c.role,"installation":c.installation],"name":"Checklist","version":"0.1.0","store_incarnation":incarnation,"role":c.role,"project_ids":c.projectIDs,"capabilities":["durable_store","project_isolation","pickup_inbox","named_contacts","human_requests","managed_attachments","scope_reservations","captured_source_review","triage_batches","phase_triages","triage_orchestration","typed_relations","policy_reconciliation","request_revisions"],"provider_plugins":providerPlugins.summaries,"native_push":false,"native_push_status":NativeCommunicationRoutes.summary,"native_routes":NativeCommunicationRoutes.serviceInfo,"unsupported":["automatic_model_launch","native_idle_push","restore","MCP_events"]]
+        case "service_info": return ["session_id":c.sessionID ?? "","caller":["session_id":c.sessionID ?? "","role":c.role,"installation":c.installation],"name":"Checklist","version":ChecklistBuildVersion.current.version,"build_id":ChecklistBuildVersion.current.buildID,"build_number":ChecklistBuildVersion.current.buildNumber,"store_incarnation":incarnation,"role":c.role,"project_ids":c.projectIDs,"capabilities":["durable_store","project_isolation","pickup_inbox","named_contacts","human_requests","managed_attachments","scope_reservations","captured_source_review","triage_batches","phase_triages","triage_orchestration","typed_relations","policy_reconciliation","request_revisions"],"provider_plugins":providerPlugins.summaries,"native_push":false,"native_push_status":NativeCommunicationRoutes.summary,"native_routes":NativeCommunicationRoutes.serviceInfo,"unsupported":["automatic_model_launch","native_idle_push","restore","MCP_events"]]
         case "tool_catalog": return ["tools":toolCatalog(c)]
         case "changes_wait":
             let scope = try authorizationScope(db,c)
@@ -119,6 +119,7 @@ extension CommandRouter {
         case "agent_resolve": return try resolve(db,p,c)
         case "human_request_create", "human_request_answer", "human_request_cancel", "human_request_revise", "human_request_snooze": return try requestWrite(db,p,c,method)
         case "epic_create", "triage_create", "epic_edit", "triage_edit", "group_edit", "group_membership": return try groupWrite(db,p,c,method)
+        case "epic_delete": return try epicDelete(db,p,c)
         case "epic_list", "triage_list": return try groupList(db,p,c,method)
         case "archive_storage_settings": return try archiveStorageSettingsCommand(db,p,c)
         case "cleanup_job_list","cleanup_job_get","cleanup_job_cancel","cleanup_job_retry": return try archiveCleanupJobCommand(db,p,c,method)

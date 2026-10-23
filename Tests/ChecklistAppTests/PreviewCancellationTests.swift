@@ -36,7 +36,7 @@ final class PreviewCancellationTests: XCTestCase {
     }
 
     @MainActor func testExplicitCancellationDuringCopyReleasesHoldAndKeepsNextPreview() async throws {
-        let (url, source) = try fixture(bytes: 128 * 1024 * 1024)
+        let (url, source) = try fixture(bytes: 1024 * 1024)
         let (nextURL, nextSource) = try fixture(bytes: 20, name: "next.md")
         var calls: [String] = [], released: [String] = []
         let store = makeStore(root: url.deletingLastPathComponent()) { method, params in
@@ -49,17 +49,25 @@ final class PreviewCancellationTests: XCTestCase {
             reply["read_hold_id"] = next ? "next-hold" : "active-hold"
             return reply
         }
-        let loader = FilePreviewLoader()
+        let resumeCopy = DispatchSemaphore(value: 0)
+        let loader = FilePreviewLoader(didCopyChunkForTesting: { count in
+            // Keep the first write partial until the throttled main-queue observer
+            // cancels, regardless of filesystem speed or scheduler load.
+            if count == 256 * 1024 {
+                XCTAssertEqual(resumeCopy.wait(timeout: .now() + 10), .success, "Progress observer must cancel the paused copy")
+            }
+        })
         var observedPartial: Int64 = 0
         let observation = loader.$copiedBytes.sink { count in
             if observedPartial == 0, loader.copying, count > 0, count < loader.totalBytes {
                 observedPartial = count
                 loader.cancelPreparation()
+                resumeCopy.signal()
             }
         }
         defer { observation.cancel() }
         await loader.load(source, store: store)
-        XCTAssertGreaterThan(observedPartial, 0, "Cancellation must be issued during confirmed copying")
+        XCTAssertEqual(observedPartial, 256 * 1024, "Cancellation must be issued while the first chunk is paused")
         XCTAssertTrue(loader.canceled); XCTAssertFalse(loader.loading); XCTAssertFalse(loader.copying)
         XCTAssertNil(loader.file); XCTAssertTrue(loader.problem.isEmpty)
         XCTAssertGreaterThan(loader.copiedBytes, 0); XCTAssertLessThan(loader.copiedBytes, loader.totalBytes)

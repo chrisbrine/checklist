@@ -656,11 +656,11 @@
       "reason": "Synthetic redaction, path quoting, instance isolation or native routing fixture; no actual owner or native session."
     },
     "Tests/ChecklistCoreTests/DiagnosticsTests.swift": {
-      "sha256": "af365ba3bbd5ee7a1d66d06662959ee856e52c2cdd5879db6aa87bc0447ce114",
+      "sha256": "f1ef133b84c631a6da1fa93e67362dfef47cf8142376f4bb839476ce219125f9",
       "patterns": [
         "home_path"
       ],
-      "reason": "Renewed CL-91 review for round 11: CL-135 changes only the worker tool-catalog expectation for project-scoped diagnostics. The fictional owner-home secret path remains a redaction-test input; no actual owner path, credential or native session is included."
+      "reason": "Renewed review for round 23 / CL-223: the added service-info/diagnostics bundle-identity assertions introduce no private identifiers. The fictional owner-home secret path remains a redaction-test input; other identifiers are descriptive synthetic fixture strings or generated at runtime, with no concrete native actor/thread UUIDs, actual owner path, credential or native session."
     },
     "Tests/ChecklistCoreTests/HumanAnswerNoticeTests.swift": {
       "sha256": "ee6bc212aa2c22be3f32cee095f40f40d0ea2aa83706fea7514c89489844d905",

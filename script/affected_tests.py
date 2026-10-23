@@ -61,12 +61,17 @@ PYTHON_TEST_OWNERS = {
 # Executable target -> runtime test consumers (including copied/signed shims).
 # The CLI is imported by ChecklistCLITests; MCP tests launch the input probe,
 # not the shipping CLI. StorageCrashProbe is launched via CHECKLIST_STORAGE_PROBE.
+# Build-version fixtures inspect bundle identity for the app and service names.
 RUNTIME_TEST_CONSUMERS = {
+    'ChecklistApp': ('ChecklistProvidersTests',),
+    'ChecklistService': ('ChecklistProvidersTests',),
     'StorageCrashProbe': ('ChecklistCoreTests',),
     'ChecklistCLIInputProbe': ('ChecklistMCPServerTests',),
 }
-VALIDATE = ['uv', 'run', '--no-project', '--with', 'jsonschema', '--with', 'pyyaml',
-            'python', 'scripts/validate-plan.py']
+# One interpreter for round checks, background full suites and validation.
+SCRIPT_PYTHON = ['uv', 'run', '--no-project', '--python', '3.12',
+                 '--with', 'jsonschema', '--with', 'pyyaml', 'python']
+VALIDATE = SCRIPT_PYTHON + ['scripts/validate-plan.py']
 
 
 def package_graph(root, scratch):
@@ -212,8 +217,7 @@ def select(root, graph, paths, scratch, full=False):
             command = ['env', 'CHECKLIST_STORAGE_PROBE=' + str(scratch / 'out/Products/Debug/StorageCrashProbe')] + command
         swift.append(command)
     # uv supplies the dependencies needed by the exporter/validator tests too.
-    python_commands = [['uv', 'run', '--no-project', '--with', 'jsonschema', '--with', 'pyyaml',
-                        'python', path] for path in sorted(python)]
+    python_commands = [SCRIPT_PYTHON + [path] for path in sorted(python)]
     return {'paths': normalized, 'affected_targets': sorted(affected), 'test_targets': tests,
             'python_tests': sorted(python), 'fallback_paths': unknown, 'skip': skip, 'full': full,
             'swift_commands': swift, 'commands': swift + python_commands + [VALIDATE]}

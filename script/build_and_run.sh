@@ -3,7 +3,7 @@
 set -euo pipefail
 MODE="${1:-run}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-case "$MODE" in run|--verify|--install|--install-stage|--stage|--debug|--logs|--telemetry) ;; *) echo "usage: $0 [--verify|--install|--install-stage|--stage|--debug|--logs|--telemetry]" >&2; exit 2;; esac
+case "$MODE" in run|--verify|--install|--install-stage|--stage|--rebuild-stage|--clean-stage|--debug|--logs|--telemetry) ;; *) echo "usage: $0 [--verify|--install|--install-stage|--stage|--rebuild-stage|--clean-stage|--debug|--logs|--telemetry]" >&2; exit 2;; esac
 BUILD_ROOT="$ROOT_DIR/.local/build"
 mkdir -p "$BUILD_ROOT"
 if ! mkdir "$BUILD_ROOT/.build-lock" 2>/dev/null; then
@@ -13,8 +13,10 @@ fi
 INCOMING=""
 STAGE_ASSEMBLY=""
 BUILD_SOURCE=""
+VERIFICATION_RECEIPT=""
 cleanup() {
   if [ -n "$STAGE_ASSEMBLY" ] && [ -d "$STAGE_ASSEMBLY" ]; then rm -rf "$STAGE_ASSEMBLY"; fi
+  if [ -n "$VERIFICATION_RECEIPT" ]; then rm -f "$VERIFICATION_RECEIPT"; fi
   if [ -n "${TIMING_FILE:-}" ]; then rm -f "$TIMING_FILE"; fi
   rmdir "$BUILD_ROOT/.build-lock" 2>/dev/null || true
   if [ -n "$INCOMING" ] && [ -d "$INCOMING" ]; then echo "A verified install stage remains for reconciliation: $INCOMING" >&2; fi
@@ -58,6 +60,7 @@ PYVERIFY
   STAGE_FINAL="$CAPTURE_DIR/Checklist.app"
   STAGE="$STAGE_FINAL"
 else
+capture_source() {
 TOOLCHAIN_FILE="$(mktemp "$BUILD_ROOT/toolchain.XXXXXX")"
 { swift --version; xcrun --sdk macosx --show-sdk-version; uname -m; echo "$CONFIGURATION"; } > "$TOOLCHAIN_FILE"
 python3 - "$TOOLCHAIN_FILE" <<'PY'
@@ -93,18 +96,11 @@ if not destination.exists():
   for entry in before:
    p=source/entry['path'];p.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(root/entry['path'],p);p.chmod(0o755 if entry['executable'] else 0o644)
   if inventory(source)!=before or inventory(root)!=before: raise RuntimeError('Build inputs changed while capturing. Capture again; the installed app is untouched.')
-  ordinal_path=build/'build-ordinal'
-  prior=int(ordinal_path.read_text().strip()) if ordinal_path.exists() else 0
-  if prior<0 or prior>=2147483647:raise RuntimeError('Build ordinal is outside its supported integer range; preserve and reconcile it before retrying.')
-  installed=Path('/Applications/Checklist.app/Contents/Info.plist')
-  if installed.exists():
-   version=str(plistlib.loads(installed.read_bytes()).get('CFBundleVersion','0'))
-   if version.isdecimal():prior=max(prior,int(version))
-  number=prior+1
-  if number>2147483647:raise RuntimeError('Build ordinal exhausted; preserve installation history before changing the version policy.')
-  ordinal_temporary=build/('build-ordinal.'+str(os.getpid()));ordinal_temporary.write_text(str(number)+'\n');ordinal_temporary.replace(ordinal_path)
+  sys.path.insert(0,str(source/'script'));from version import allocate
+  version_info=allocate(source,build);number=version_info['build_number']
   identity=os.environ['CHECKLIST_SIGN_IDENTITY']
   manifest={'schema_version':1,'source_fingerprint':fingerprint,'build_id':fingerprint[:16],'build_number':number,'source_root':str(root),'configuration':configuration,'toolchain':toolchain,'signing_profile':'ad-hoc' if identity=='-' else 'certificate','signing_identity_sha256':hashlib.sha256(identity.encode()).hexdigest(),'input_roots':input_roots,'inputs':before,'captured_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+  manifest.update(version_info)
   (temporary/'capture-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
   for p in sorted(source.rglob('*'),reverse=True): p.chmod(0o555 if p.is_dir() or bool(p.stat().st_mode&stat.S_IXUSR) else 0o444)
   source.chmod(0o555);temporary.rename(destination)
@@ -125,21 +121,22 @@ SCRATCH="$BUILD_ROOT/swiftpm-$TOOLCHAIN_ID"
 STAGE_FINAL="$CAPTURE_DIR/Checklist.app"
 STAGE="$STAGE_FINAL"
 BUILD_HELPER="$SOURCE/script/build_support.py"
+}
+capture_source
 phase stop capture
-if [ ! -d "$STAGE_FINAL" ]; then
-  # A failed copy/build/sign never publishes a directory reusable as a full stage.
-  STAGE_ASSEMBLY="$(mktemp -d "$CAPTURE_DIR/stage-XXXXXX")"
-  STAGE="$STAGE_ASSEMBLY/Checklist.app"
-  # One serialized lane per toolchain/profile keeps SwiftPM's package path
-  # stable. Only verified capture bytes enter it; checkout edits cannot enter.
-  BUILD_SOURCE="$BUILD_ROOT/lane-$TOOLCHAIN_ID/source"
+compile_products() {
   phase start compile
   python3 "$BUILD_HELPER" sync "$CAPTURE_DIR" "$BUILD_SOURCE"
+  if [ "$MODE" = --clean-stage ]; then
+    swift package --package-path "$BUILD_SOURCE" --scratch-path "$SCRATCH" clean
+  fi
   BIN_DIR="$(swift build --package-path "$BUILD_SOURCE" --scratch-path "$SCRATCH" --configuration "$CONFIGURATION" --force-resolved-versions --show-bin-path)"
   python3 "$BUILD_HELPER" clean-products "$BIN_DIR" "$SCRATCH"
   swift build --package-path "$BUILD_SOURCE" --scratch-path "$SCRATCH" --configuration "$CONFIGURATION" --force-resolved-versions --target ChecklistProducts
   python3 "$BUILD_HELPER" verify "$CAPTURE_DIR" "$BUILD_SOURCE"
   phase stop compile
+}
+assemble_stage() {
   phase start stage
   mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
   for executable in ChecklistApp ChecklistService checklist; do
@@ -159,8 +156,6 @@ if [ ! -d "$STAGE_FINAL" ]; then
 <key>CFBundleDisplayName</key><string>Checklist</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.1.0</string>
-<key>CFBundleVersion</key><string>1</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>NSHighResolutionCapable</key><true/>
@@ -173,16 +168,7 @@ if [ ! -d "$STAGE_FINAL" ]; then
 </dict></array>
 </dict></plist>
 PLIST
-  python3 - "$CAPTURE_DIR" "$STAGE" <<'PY'
-import datetime,json,plistlib,sys
-from pathlib import Path
-capture,stage=map(Path,sys.argv[1:]);manifest=json.loads((capture/'capture-manifest.json').read_text())
-info={key:manifest[key] for key in ['build_id','build_number','source_fingerprint','source_root','configuration','toolchain','captured_at','signing_identity_sha256']}
-info.update(built_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),profile='local-development',signing=manifest['signing_profile'],source_capture=str(capture/'source'))
-(stage/'Contents/Info.plist').write_bytes(plistlib.dumps(dict(plistlib.loads((stage/'Contents/Info.plist').read_bytes()),CFBundleVersion=str(manifest['build_number']))))
-(stage/'Contents/Resources/build-info.json').write_text(json.dumps(info,indent=2)+'\n')
-(stage/'Contents/Resources/source-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
-PY
+  python3 "$SOURCE/script/version.py" --stamp "$CAPTURE_DIR" "$STAGE"
   for resource in skills plugins templates; do
     if [ -d "$SOURCE/$resource" ]; then ditto "$SOURCE/$resource" "$STAGE/Contents/Resources/$resource"; fi
   done
@@ -194,14 +180,28 @@ PY
     plutil -lint "$STAGE/Contents/Library/LaunchAgents/$agent_plist"
   done
   phase stop stage
+}
+sign_stage() {
   phase start sign
   for executable in ChecklistService checklist; do codesign --force --sign "$SIGN_IDENTITY" --timestamp=none --identifier "org.checklist.$executable" "$STAGE/Contents/MacOS/$executable"; done
   codesign --force --sign "$SIGN_IDENTITY" --timestamp=none --identifier org.checklist.app "$STAGE"
   phase stop sign
+}
+if [ ! -d "$STAGE_FINAL" ] || [ "$MODE" = --rebuild-stage ] || [ "$MODE" = --clean-stage ]; then
+  # A failed copy/build/sign never publishes a directory reusable as a full stage.
+  STAGE_ASSEMBLY="$(mktemp -d "$CAPTURE_DIR/stage-XXXXXX")"
+  STAGE="$STAGE_ASSEMBLY/Checklist.app"
+  # One serialized lane per toolchain/profile keeps SwiftPM's package path
+  # stable. Only verified capture bytes enter it; checkout edits cannot enter.
+  BUILD_SOURCE="$BUILD_ROOT/lane-$TOOLCHAIN_ID/source"
+  compile_products
+  assemble_stage
+  sign_stage
 fi
 fi
 if [ "$MODE" = --install-stage ]; then phase stop capture; fi
 phase start verify
+VERIFICATION_RECEIPT="$CAPTURE_DIR/build-verification.$$.json"
 codesign --verify --deep --strict "$STAGE"
 python3 - "$STAGE" "$CAPTURE_DIR" <<'PY'
 import hashlib,json,plistlib,re,subprocess,sys
@@ -222,7 +222,7 @@ print('Verified one signing team across the app and both helpers ('+manifest['si
 PY
 # The captured tree is the build authority. The writer barrier ended after
 # capture, so later checkout edits are provenance, not a reason to reject it.
-python3 - "$CAPTURE_DIR" "$ROOT_DIR" "$STAGE" "${BUILD_SOURCE:-}" <<'PY'
+python3 - "$CAPTURE_DIR" "$ROOT_DIR" "$STAGE" "${BUILD_SOURCE:-}" "$VERIFICATION_RECEIPT" <<'PY'
 import datetime,hashlib,json,stat,sys
 from pathlib import Path
 capture,root,stage=map(Path,sys.argv[1:4]);manifest=json.loads((capture/'capture-manifest.json').read_text())
@@ -250,16 +250,28 @@ try:
  receipt['checkout_changed_paths']=changed[:100];receipt['checkout_changed_path_count']=len(changed)
 except (OSError,RuntimeError) as error:
  receipt.update(checkout_changed_after_capture=True,checkout_comparison_error=str(error))
-(capture/'build-verification.json').write_text(json.dumps(receipt,indent=2)+'\n')
+Path(sys.argv[5]).write_text(json.dumps(receipt,indent=2)+'\n')
 print('Verified immutable source capture '+manifest['build_id'])
 if receipt['checkout_changed_after_capture']:print('Checkout advanced after capture. This bundle contains the verified captured source, not the latest checkout.')
 PY
 if [ -n "$STAGE_ASSEMBLY" ]; then
-  mv "$STAGE" "$STAGE_FINAL"
+  # Publish only the verified replacement; preserve a prior stage on failure.
+  if [ -d "$STAGE_FINAL" ]; then
+    mv "$STAGE_FINAL" "$STAGE_ASSEMBLY/previous.app"
+    if ! mv "$STAGE" "$STAGE_FINAL"; then
+      mv "$STAGE_ASSEMBLY/previous.app" "$STAGE_FINAL"
+      exit 1
+    fi
+    rm -rf "$STAGE_ASSEMBLY/previous.app"
+  else
+    mv "$STAGE" "$STAGE_FINAL"
+  fi
   rmdir "$STAGE_ASSEMBLY"
   STAGE_ASSEMBLY=""
   STAGE="$STAGE_FINAL"
 fi
+mv "$VERIFICATION_RECEIPT" "$CAPTURE_DIR/build-verification.json"
+VERIFICATION_RECEIPT=""
 phase stop verify
 phase finish
 save_timing() {
@@ -273,7 +285,7 @@ with (capture/'build-timings.jsonl').open('a') as output:output.write(json.dumps
 PYTIMING
 }
 save_timing
-if [ "$MODE" = --stage ]; then echo "Staged $STAGE"; exit 0; fi
+case "$MODE" in --stage|--rebuild-stage|--clean-stage) echo "Staged $STAGE"; exit 0;; esac
 phase start install
 DEST="/Applications/Checklist.app"
 INSTALL_STARTED="$(date +%s)"

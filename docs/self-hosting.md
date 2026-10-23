@@ -39,3 +39,35 @@ Show the task's Built → Installed → Verified sequence and its next action fi
 ## Gate before enabling automatic install
 
 Prove a successful and a failed staged build, simultaneous complete-fingerprint deduplication, explicit retry after failure, UI-closed build, denied Applications write, interrupted replacement, service/schema mismatch, retained active claim, MCP reconnect, draft restoration and failed-running-version verification. Prove ordinary review cannot close an affected task or remove it from a review-exit triage before its installed-build gate passes. Exercise the flow with a disposable app/store first. Only then enable the already granted workflow for the actual `/Applications/Checklist.app`. A new installation needs its own bounded opt-in; an existing valid local grant does not require another routine approval. Importing the project or reading this guide can never enable automatic installation.
+
+## Build versions
+
+`VERSION` is the single repository source of the production series, initially `0.0.1`.
+Ordinary development builds never edit it. `script/version.py` allocates the next
+four-part version (`0.0.1.N`) under the build lock, continuing the installed and local
+build history. The fourth component counts development builds within the production
+series: no recorded same-series version starts at `.1`, then `.2`, and so on. The
+installed same-series version and local allocation state supply the highest fourth
+component; historical ordinals do not seed it. A new production series starts at `.1`.
+Both counters are reserved together before the legacy ordinal file is updated, so
+an interrupted allocation can skip numbers but never reuse a reserved version.
+The separate global `build_number` never resets and stays above the installed ordinal,
+including when changing series or returning to an older source version.
+
+The capture and bundled `source-manifest.json` and `build-info.json` record `version`,
+`production_version`, `build_number` and `build_id`. Apple plist fields retain the
+three-part production version and integer ordinal; `ChecklistVersion` and
+`ChecklistBuildID` carry the complete public identity. Settings → General, the CLI
+`version` command, `service_info` and diagnostics expose that same identity.
+Stage and installation verification reject inconsistent metadata or a stale service.
+
+Only when the current open queue reaches zero, explicitly prepare the next production
+series with `python3 script/version.py --release` in the clean main checkout. It reads
+the actual workspace project through the installed CLI, prints its open ticket count,
+refuses a nonzero count, raises the third component, commits only `VERSION`, and tags
+that commit `vX.Y.Z`. `--release --dry-run` performs the same read-only preflight and
+prints the proposed commit/tag without changing files or Git refs. This step neither
+builds nor publishes; the following ordinary build starts the new development sequence.
+Never run release preparation as a routine integration step while tickets remain open.
+Integration round commit messages and install notes name the full four-part version,
+for example `Integration round 23: 0.0.1.1 (build 119)`, alongside the build ID.

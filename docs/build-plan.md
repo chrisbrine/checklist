@@ -16,7 +16,7 @@ Exit: measured packaging/startup results and provider capability matrix with act
 
 ## 1. One complete production task
 
-Build the smallest trustworthy vertical slice using one synthetic Bug task in a fake game project. Do not implement all proposed tools first.
+Build the smallest trustworthy vertical slice using one synthetic Bug task in a fake game project in a disposable [test slot](test-instances.md). Create the project with `project_create` through the slot CLI from its actual authorized workspace. Never create synthetic projects in the live installation; destroy the owned slot after evidence capture instead of retaining its projects. Do not implement all proposed tools first.
 
 1. Native title/project capture, Draft/Ready, brief/outcome and one simple status preset; project-scoped store and caller workspace binding.
 2. Enrolled worker claims atomically, gets brief/pinned decisions, checkpoints and shows actual session/last checkpoint.

@@ -75,6 +75,48 @@ The existing `.local/build/.build-lock` covers capture, lane synchronization, co
 
 A stage-only run records installation as skipped. Reusing an existing verified stage records compile, stage and sign as skipped. `build-timings.jsonl` retains timing snapshots for repeated uses of a capture. Install modes also copy the timing record into `.local/build/last-install.json`. These records measure elapsed time under the reported host load; they do not control contention from other projects. CL-173 has no completed application timing comparison yet. Native fixture checks establish aggregation, resource regeneration and capture isolation; they do not establish the requested application speedup.
 
+### Repeatable quiet-window measurements
+
+`--stage` can reuse a completed verified bundle. `--rebuild-stage` deliberately
+compiles and stages again for the same capture, retaining the lane and compiled
+objects. `--clean-stage` additionally runs `swift package clean` against only the
+selected lane's scratch before compilation. Both modes stop after verification;
+they never install or open an app. A failed rebuild keeps the prior verified
+stage. Capture, compile, assemble and sign have named shell functions for later
+version/cleanup hooks; the existing timing phases remain unchanged.
+
+Use `script/measure_build_times.py` in an **exclusive private, already-warmed
+checkout** of the staged combined build, during a quiet window. Do not run it in
+the shared checkout or concurrently with other builds. It temporarily appends a
+comment to one Core or App Swift file and restores original bytes and timestamps
+on success or ordinary failure. Saved `originals/` bytes in the evidence folder
+allow recovery if the runner is killed. Each of the four cases (unchanged, Core change,
+App change, clean) runs three times, each preceded by an unmeasured baseline
+warmup. A no-change run uses `--rebuild-stage`, so a cached stage cannot masquerade
+as a fast compile. The clean cases deliberately discard that helper lane's
+compiled outputs, leaving its dependency checkouts and immutable captures in
+place. Do not point these clean runs at an implementation pass's warm build slot.
+
+```sh
+CHECKLIST_BUILD_CONFIGURATION=release CHECKLIST_SIGN_IDENTITY=- \
+  python3 script/measure_build_times.py \
+  --checkout /private/tmp/checklist-measure-after \
+  --output /private/tmp/checklist-times-after --label after-EXACT-REVISION \
+  --allow-source-edits-and-clean
+```
+
+If a shared Swift build-slot wrapper applies, run the entire Python command
+through that wrapper so its child Swift commands remain in one reserved slot.
+The runner requires the two measurement modes above; for an older comparison
+revision, backport only these stage-control hooks, preserving its original
+compile recipe. Use separate warmed before/after copies with the same toolchain,
+configuration and signing selection. Keep both `results.json` files and all raw
+logs. Results include 12 measured runs, 12 separately recorded warmups, medians,
+start/end load averages, phase receipts, source fingerprints and restored input
+hashes. Compare the matching cases only at comparable load; the runner does not
+assert the quarter-time target or clean-build parity automatically. No complete
+before/after timing comparison was run during the parallel Pass 2 work.
+
 ## Complete local package inputs
 
 Create `Packages/ChecklistShared` only when the first real shared implementation is extracted. The root then declares `.package(path: "Packages/ChecklistShared")`; target dependencies explicitly name its real products. A local package may depend on other complete local packages under `Packages`, including nested directories. Every source needed by a local path dependency must stay within the captured root; external paths, symlinked packages and nested repositories/submodules are not supported substitutes for captured inputs. No empty package/platform scaffold is required now.

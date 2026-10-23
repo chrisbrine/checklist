@@ -320,8 +320,14 @@ public final class CommandRouter: @unchecked Sendable {
                 }
                 throw error
             }
-            var maintenanceWarning = self.performStorageMaintenance(db, permit: permit)
-            _ = self.pruneRoutineRecordsIfDue(db)
+            // Unused-Epic deletion promises to preserve every unrelated row,
+            // including on receipt replay. Defer ordinary maintenance to another
+            // command or startup instead of coupling it to this narrow deletion.
+            var maintenanceWarning: StorageMaintenanceWarning?
+            if method != "epic_delete" {
+                maintenanceWarning = self.performStorageMaintenance(db, permit: permit)
+                _ = self.pruneRoutineRecordsIfDue(db)
+            }
             do {output = try self.addingTicketObjectDeletionReceipt(db,output:output)}
             catch {maintenanceWarning = maintenanceWarning ?? .retryPending}
             // Dynamic recipient notices are not part of the durable command outcome.

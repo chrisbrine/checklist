@@ -1,4 +1,5 @@
 import Foundation
+import ChecklistProviders
 import GRDB
 
 extension CommandRouter {
@@ -31,7 +32,7 @@ extension CommandRouter {
         return [
             "schema_version": 1,
             "observed_at": now(),
-            "service": ["version": "0.1.0", "state": "responsive"],
+            "service": ["version": ChecklistBuildVersion.current.version, "build_id": ChecklistBuildVersion.current.buildID, "build_number": ChecklistBuildVersion.current.buildNumber, "state": "responsive"],
             "record_counts": counts
         ]
     }

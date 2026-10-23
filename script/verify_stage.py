@@ -5,6 +5,7 @@ from pathlib import Path
 import plistlib
 import re
 import subprocess
+from version import verify_bundle
 
 
 def sha(path):
@@ -50,7 +51,9 @@ def verify(capture):
     resources = bundle / 'Contents/Resources'
     if json.loads((resources / 'source-manifest.json').read_text()) != manifest:
         raise ValueError('Bundled source manifest differs from capture.')
-    info = json.loads((resources / 'build-info.json').read_text())
+    info = verify_bundle(bundle)
+    if info['production_version'] != (capture / 'source/VERSION').read_text().strip():
+        raise ValueError('Bundle production version differs from captured VERSION.')
     for key in ['build_id', 'source_fingerprint', 'build_number', 'signing_identity_sha256']:
         if info[key] != manifest[key]:
             raise ValueError('Bundled build identity differs from capture: ' + key)

@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from version import verify_bundle
 
 
 SAFE_FAILURE_GUIDANCE = ('The installed bundle and the store were kept. Check checklist service status and the service log. '
@@ -100,6 +101,9 @@ def verify(destination, paths=None, runner=subprocess.run, *, clock=time.monoton
                 if not errors and not any(value in ['starting', 'unavailable'] for value in states):
                     if result.returncode or not healthy_status(payload):
                         fail('The installed Checklist service is not healthy (status command failed or invalid status).')
+                    identity = verify_bundle(destination)
+                    for key in ['version', 'build_id', 'build_number']:
+                        if body.get(key) != identity[key]: fail('Running service differs from installed bundle: ' + key)
                     return {'installed_app': str(executable), 'service_state': 'healthy'}
         now = clock()
         if now >= deadline:

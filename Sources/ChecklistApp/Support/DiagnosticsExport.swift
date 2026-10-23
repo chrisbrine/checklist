@@ -94,7 +94,7 @@ enum DiagnosticsExport {
         let responsive = service["state"] as? String == "responsive"
         return DiagnosticsReport(
             exportedAt: date,
-            versions: .init(app: version(appVersion), bundle: version(bundleVersion), buildID: buildID(buildMetadata["build_id"]), macOS: "\(operatingSystem.majorVersion).\(operatingSystem.minorVersion).\(operatingSystem.patchVersion)", architecture: architecture),
+            versions: .init(app: version(buildMetadata["version"] as? String ?? appVersion), bundle: version(bundleVersion), buildID: buildID(buildMetadata["build_id"]), macOS: "\(operatingSystem.majorVersion).\(operatingSystem.minorVersion).\(operatingSystem.patchVersion)", architecture: architecture),
             service: .init(state: responsive ? "responsive" : "unavailable", version: version(service["version"] as? String), countsAvailable: responsive && !counts.isEmpty),
             recordCounts: responsive ? counts : [:],
             recentErrors: Array(recentErrors.suffix(DiagnosticsRecorder.limit))

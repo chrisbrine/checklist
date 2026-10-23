@@ -23,7 +23,7 @@ final class AuthorizedPreviewFile: @unchecked Sendable {
     }
     deinit { try? FileManager.default.removeItem(at: directory) }
 
-    static func copy(path: String, source: Record, isCanceled: () -> Bool = { Task.isCancelled }, progress: Progress? = nil) throws -> AuthorizedPreviewFile {
+    static func copy(path: String, source: Record, isCanceled: () -> Bool = { Task.isCancelled }, progress: Progress? = nil, didCopyChunkForTesting: (@Sendable (Int64) -> Void)? = nil) throws -> AuthorizedPreviewFile {
         if isCanceled() || progress?.isCancelled == true { throw CancellationError() }
         let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { throw FilePreviewFailure("The authorized original is missing or cannot be read safely.") }
@@ -52,6 +52,7 @@ final class AuthorizedPreviewFile: @unchecked Sendable {
             guard count <= before.st_size else { throw FilePreviewFailure("The original changed while preparing its preview.") }
             digest.update(data: chunk); try output.write(contentsOf: chunk)
             progress?.completedUnitCount = count
+            didCopyChunkForTesting?(count)
         }
         var after = stat()
         let hash = digest.finalize().map { String(format: "%02x", $0) }.joined()
@@ -104,6 +105,11 @@ final class FilePreviewLoader: ObservableObject {
     private var generation = UUID()
     private var copyProgress: Progress?
     private var progressObservation: AnyCancellable?
+    // Tests can hold the detached copy at a known write boundary until cancellation.
+    private let didCopyChunkForTesting: (@Sendable (Int64) -> Void)?
+    init(didCopyChunkForTesting: (@Sendable (Int64) -> Void)? = nil) {
+        self.didCopyChunkForTesting = didCopyChunkForTesting
+    }
     var cancellationSummary: String {
         let outcome = totalBytes > 0
             ? "Preparation stopped after copying \(copiedBytes) of \(totalBytes) bytes."
@@ -162,7 +168,10 @@ final class FilePreviewLoader: ObservableObject {
                     guard let self, self.generation == current, self.loading else { return }
                     self.copiedBytes = max(self.copiedBytes, count)
                 }
-            let work = Task.detached(priority: .userInitiated) { try AuthorizedPreviewFile.copy(path: path, source: attachment, progress: progress) }
+            let didCopyChunkForTesting = self.didCopyChunkForTesting
+            let work = Task.detached(priority: .userInitiated) {
+                try AuthorizedPreviewFile.copy(path: path, source: attachment, progress: progress, didCopyChunkForTesting: didCopyChunkForTesting)
+            }
             let copy = try await withTaskCancellationHandler(operation: { try await work.value }, onCancel: { work.cancel() })
             try Task.checkCancellation()
             guard generation == current, !canceling else { throw CancellationError() }

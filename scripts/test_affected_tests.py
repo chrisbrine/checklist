@@ -51,7 +51,7 @@ class SelectionTests(unittest.TestCase):
 
     def test_app_only(self):
         plan = self.plan('Sources/ChecklistApp/ContentView.swift')
-        self.assertEqual(plan['test_targets'], ['ChecklistAppTests'])
+        self.assertEqual(plan['test_targets'], ['ChecklistAppTests', 'ChecklistProvidersTests'])
         self.assertIn('ChecklistProducts', plan['affected_targets'])
         self.assertEqual(plan['commands'][-1], selector.VALIDATE)
         self.assertIn('^ChecklistAppTests\\.', plan['swift_commands'][0])
@@ -60,7 +60,7 @@ class SelectionTests(unittest.TestCase):
     def test_core_includes_transitive_dependents(self):
         self.assertEqual(self.plan('Sources/ChecklistCore/Domain.swift')['test_targets'],
                          ['ChecklistAppTests', 'ChecklistBridgesTests', 'ChecklistCLITests',
-                          'ChecklistCoreTests', 'ChecklistIPCTests', 'ChecklistMCPServerTests'])
+                          'ChecklistCoreTests', 'ChecklistIPCTests', 'ChecklistMCPServerTests', 'ChecklistProvidersTests'])
 
     def test_test_target_does_not_select_its_dependencies(self):
         self.assertEqual(self.plan('Tests/ChecklistBridgesTests/NewTests.swift')['test_targets'], ['ChecklistBridgesTests'])
@@ -87,6 +87,19 @@ class SelectionTests(unittest.TestCase):
                 plan = self.plan(path)
                 self.assertEqual(plan['python_tests'], [expected])
                 self.assertFalse(plan['swift_commands'])
+
+    def test_round_and_full_use_the_same_pinned_python(self):
+        prefix = ['uv', 'run', '--no-project', '--python', '3.12',
+                  '--with', 'jsonschema', '--with', 'pyyaml', 'python']
+        for full in [False, True]:
+            with self.subTest(full=full):
+                plan = self.plan('scripts/test_test_instances.py', full=full)
+                commands = [command for command in plan['commands'] if command not in plan['swift_commands']]
+                self.assertEqual(len(commands), len(plan['python_tests']) + 1)
+                for command in commands:
+                    self.assertEqual(command[:-1], prefix)
+                self.assertIn(prefix + ['scripts/test_test_instances.py'], commands)
+                self.assertEqual(commands[-1], prefix + ['scripts/validate-plan.py'])
 
     def test_validator_selects_its_own_checks_only(self):
         self.assertEqual(self.plan('scripts/validate-plan.py')['commands'], [selector.VALIDATE])
@@ -157,7 +170,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(plan['test_targets'], ['ChecklistIPCTests'])
         self.assertEqual(plan['python_tests'], ['scripts/test_test_instances.py'])
         self.assertEqual(plan['fallback_paths'], [])
-        self.assertIn(['uv', 'run', '--no-project', '--with', 'jsonschema', '--with', 'pyyaml',
+        self.assertIn(['uv', 'run', '--no-project', '--python', '3.12', '--with', 'jsonschema', '--with', 'pyyaml',
                        'python', 'scripts/test_test_instances.py'], plan['commands'])
 
     def test_unavailable_mapped_consumer_falls_back(self):
@@ -217,7 +230,7 @@ class SelectionTests(unittest.TestCase):
 
     def test_mixed_paths_union_and_empty_paths(self):
         plan = self.plan('./Sources/ChecklistApp/A.swift', 'Sources/ChecklistApp/A.swift', 'script/test_instances.py')
-        self.assertEqual(plan['test_targets'], ['ChecklistAppTests'])
+        self.assertEqual(plan['test_targets'], ['ChecklistAppTests', 'ChecklistProvidersTests'])
         self.assertEqual(plan['python_tests'], ['scripts/test_test_instances.py'])
         self.assertEqual(len(plan['paths']), 2)
         self.assertEqual(self.plan()['commands'], [selector.VALIDATE])
@@ -260,7 +273,7 @@ class SelectionTests(unittest.TestCase):
                  patch.object(selector.sys, 'stdin', io.StringIO('Sources/ChecklistApp/A.swift\n')), \
                  contextlib.redirect_stdout(output):
                 selector.main(['--root', str(self.root), '--json', *args])
-            self.assertEqual(json.loads(output.getvalue())['test_targets'], ['ChecklistAppTests'])
+            self.assertEqual(json.loads(output.getvalue())['test_targets'], ['ChecklistAppTests', 'ChecklistProvidersTests'])
 
 
 # These tests create a different script in an owned workspace, or reject the

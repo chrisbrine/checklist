@@ -1,4 +1,5 @@
 import ChecklistIPC
+import ChecklistProviders
 import SwiftUI
 import AppKit
 
@@ -22,6 +23,7 @@ struct GeneralSettingsView: View {
     var body: some View {
         Form {
             Section("Checklist") {
+                LabeledContent("Version", value: ChecklistBuildVersion.current.version).accessibilityIdentifier("checklistVersion")
                 LabeledContent("Installed build", value: store.buildLabel)
                 LabeledContent("Service", value: store.connected ? "Connected" : "Disconnected")
                 Text("Local macOS production checklist. Existing checklists have not been migrated.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)

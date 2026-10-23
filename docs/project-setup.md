@@ -21,7 +21,11 @@ If that route is unavailable or the replacement is also refused, `CLIENT_OUTDATE
 
 ## Add a project
 
-An authorized native conversation can create its own unregistered folder with `project_create`, then finish name/key prefix, icon/accent, brief/pinned decisions, defaults, policy, statuses/tags, Epics and tickets through the existing agent tools. It uses the same default `agent_rule_changes=allowed` as owner creation. Root moves, the permission switch and owner answers/approvals remain owner actions; a workspace-less assistant cannot create a project. See the [creation contract](mcp-contract.md#remaining-agent-project-commands-cl-135).
+For synthetic qualification, use only a disposable [test slot](test-instances.md): invoke `project_create` through the slot CLI in the actual authorized workspace and destroy the owned slot after evidence capture. Never create synthetic projects in the live installation or retain them by archiving.
+
+An authorized native conversation can create its own unregistered folder with `project_create`, then finish name/key prefix, icon/accent, brief/pinned decisions, defaults, policy, statuses/tags and actual tickets through the existing agent tools. It uses the same default `agent_rule_changes=allowed` as owner creation. Root moves, the permission switch and owner answers/approvals remain owner actions; a workspace-less assistant cannot create a project. See the [creation contract](mcp-contract.md#remaining-agent-project-commands-cl-135).
+
+An Epic is a container for actual tickets. Never pre-create Epics or Triages as assumptions during project setup or at any other time. Create an Epic only when real tickets exist to go into it. Delete a mistakenly created empty Epic with `epic_delete` (CL-245), rather than archiving it. Use the command only when discovered; if unavailable, report the missing command and leave deletion pending. Form a phase Triage only for two or more actual tickets.
 
 In the app, choose **Add Project → Choose Folder**, confirm name/key prefix and optional symbol/image/accent, then choose participating work providers and a simple preset: **Claude coordinates / Codex works**, **Shared work**, or **Codex-led**. Defaults provide statuses, review/storage behavior and an empty task list. Title/project capture is immediately usable; no routing graph or named-agent catalog is required. Manual/coordinator-directed pickup does not launch another model.
 
