@@ -15,14 +15,32 @@ INCOMING=""
 STAGE_ASSEMBLY=""
 BUILD_SOURCE=""
 VERIFICATION_RECEIPT=""
+# Only generated output is made writable; never pass the immutable source here.
+remove_generated() { chmod -R u+w "$1" && rm -rf "$1"; }
 cleanup() {
-  if [ -n "$STAGE_ASSEMBLY" ] && [ -d "$STAGE_ASSEMBLY" ]; then rm -rf "$STAGE_ASSEMBLY"; fi
-  if [ -n "$VERIFICATION_RECEIPT" ]; then rm -f "$VERIFICATION_RECEIPT"; fi
-  if [ -n "${TIMING_FILE:-}" ]; then rm -f "$TIMING_FILE"; fi
-  if [ "$BUILD_LOCK_OWNED" = 1 ]; then rmdir "$BUILD_ROOT/.build-lock" 2>/dev/null || true; fi
+  local status=$? cleanup_failed=0
+  trap - EXIT
+  trap '' HUP INT TERM
+  if [ -n "$STAGE_ASSEMBLY" ] && [ -d "$STAGE_ASSEMBLY" ]; then
+    remove_generated "$STAGE_ASSEMBLY" || { echo "Cleanup failed for generated stage: $STAGE_ASSEMBLY" >&2; cleanup_failed=1; }
+  fi
+  if [ -n "$VERIFICATION_RECEIPT" ]; then
+    rm -f "$VERIFICATION_RECEIPT" || { echo "Cleanup failed for verification receipt: $VERIFICATION_RECEIPT" >&2; cleanup_failed=1; }
+  fi
+  if [ -n "${TIMING_FILE:-}" ]; then
+    rm -f "$TIMING_FILE" || { echo "Cleanup failed for timing file: $TIMING_FILE" >&2; cleanup_failed=1; }
+  fi
+  if [ "$BUILD_LOCK_OWNED" = 1 ]; then
+    rmdir "$BUILD_ROOT/.build-lock" || { echo "Cleanup failed to release build lock: $BUILD_ROOT/.build-lock" >&2; cleanup_failed=1; }
+  fi
   if [ -n "$INCOMING" ] && [ -d "$INCOMING" ]; then echo "A verified install stage remains for reconciliation: $INCOMING" >&2; fi
+  if [ "$status" = 0 ] && [ "$cleanup_failed" = 1 ]; then status=1; fi
+  exit "$status"
 }
 trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 TIMING_FILE="$(mktemp "$BUILD_ROOT/timing.XXXXXX")"
 BUILD_HELPER="$ROOT_DIR/script/build_support.py"
 phase() { python3 "$BUILD_HELPER" timing "$TIMING_FILE" "$@"; }
@@ -189,6 +207,8 @@ PLIST
     chmod 644 "$STAGE/Contents/Library/LaunchAgents/$agent_plist"
     plutil -lint "$STAGE/Contents/Library/LaunchAgents/$agent_plist"
   done
+  # ditto preserves read-only capture modes; generated resources must be removable.
+  chmod -R u+w "$STAGE/Contents/Resources"
   phase stop stage
 }
 sign_stage() {
@@ -272,7 +292,7 @@ if [ -n "$STAGE_ASSEMBLY" ]; then
       mv "$STAGE_ASSEMBLY/previous.app" "$STAGE_FINAL"
       exit 1
     fi
-    rm -rf "$STAGE_ASSEMBLY/previous.app"
+    remove_generated "$STAGE_ASSEMBLY/previous.app"
   else
     mv "$STAGE" "$STAGE_FINAL"
   fi

@@ -14,7 +14,7 @@ import stat
 import subprocess
 import sys
 
-from clean_scratch import inventory, running_paths, within
+from clean_scratch import inventory, running_paths, within, workspace_protection
 from retire_old_bundles import trash, trash_many
 import test_instances as slots
 
@@ -81,20 +81,25 @@ def process_ancestors(paths):
 
 
 def protected_reason(path, entries, protected, processes, internal_links=False):
+    if protection := workspace_protection(path, entries):
+        return protection
     for target, label in protected:
         if slots.paths_overlap(path, target):
             return label
-    resolved = path.resolve()
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        return 'unresolved cleanup path retained: ' + str(path) + ': ' + str(error)
     if resolved in processes:
         return 'running app, CLI or check uses this path'
     for entry, metadata in entries.items():
         if stat.S_ISLNK(metadata[2]) and internal_links:
             try:
                 target = Path(os.path.abspath(entry.parent / os.readlink(entry)))
-                if not within(target, resolved) or not within(entry.resolve(), resolved):
+                if not within(target, resolved) or not within(entry.resolve(strict=True), resolved):
                     return 'external SwiftPM link retained: ' + str(entry)
-            except (OSError, RuntimeError):
-                return 'unresolved SwiftPM link retained: ' + str(entry)
+            except (OSError, RuntimeError) as error:
+                return 'unresolved SwiftPM link retained: ' + str(entry) + ': ' + str(error)
         elif not (stat.S_ISREG(metadata[2]) or stat.S_ISDIR(metadata[2])):
             return 'link or special file retained: ' + str(entry)
     if any(p.lstat().st_uid != os.getuid() for p in entries):
@@ -157,7 +162,7 @@ class Cleaner:
             if not why and self.apply:
                 if inventory(path) != before:
                     raise ValueError('item changed during inspection')
-                why = protected_reason(path, before, self.protected(), process_ancestors(self.process_reader()))
+                why = protected_reason(path, before, self.protected(), process_ancestors(self.process_reader()), internal_links)
                 if not why and eligible:
                     why = eligible()
                 if why:

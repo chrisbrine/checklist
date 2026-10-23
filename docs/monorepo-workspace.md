@@ -69,7 +69,7 @@ See [test instances](test-instances.md) for the four isolated identities, backup
 
 The immutable capture remains the build authority. Under `.local/build`, each toolchain/configuration/build-flags/signing profile has a stable `lane-<toolchain-id>/source` path and a separate `swiftpm-<toolchain-id>` scratch path. `script/build_support.py` copies only the verified capture into that lane. It preserves unchanged file bytes and timestamps and removes stale inputs. It checks the complete lane membership, bytes and executable modes against the capture before and after compilation. Extra inputs, symlinks and changed files fail the build. Later checkout edits are reported as provenance and never enter the lane. The toolchain identity includes the selected build engine and every compiler argument; `capture-manifest.json` also records `swift_flags`. A flag change creates a new fingerprint, lane and scratch path rather than reusing outputs from another recipe.
 
-The existing `.local/build/.build-lock` covers capture, lane synchronization, compilation, staging, signing, verification and installation. A second invocation in the same checkout fails before touching the lane or scratch directory. The helper does not queue builds. Different checkouts have separate build roots. A stale lock requires reconciliation; do not remove a live build's lock or share its lane manually.
+The existing `.local/build/.build-lock` covers capture, lane synchronization, compilation, staging, signing, verification and installation. A second invocation in the same checkout fails before touching the lane or scratch directory. The helper does not queue builds. Ordinary exits and HUP/INT/TERM release the lock even if generated-output cleanup fails; cleanup errors are reported and make an otherwise successful run fail. Uncatchable termination still requires stale-lock reconciliation. Different checkouts have separate build roots. A stale lock requires reconciliation; do not remove a live build's lock or share its lane manually.
 
 `<fingerprint>/build-verification.json` records signed executable hashes and `timing`. The timing record contains total seconds, UTC start, start/end load averages and `phases`. The phases are `capture`, `compile`, `stage`, `sign`, `verify` and `install`. Each phase records seconds and a completed or skipped status. Executed phases also record their start/end load averages. Compile includes lane synchronization, compilation and linking, the binary-path query and the post-build lane check. Compiler and linker times are not independently available from this aggregate receipt; do not report the aggregate as compiler-only time. Verify covers staged signing, icon and captured-source checks. Install covers the existing bundle copy, quiescence, replacement and signature check. Native launch and installed-service qualification follow that installation receipt.
 
@@ -81,8 +81,11 @@ A stage-only run records installation as skipped. Reusing an existing verified s
 compiles and stages again for the same capture, retaining the lane and compiled
 objects. `--clean-stage` additionally runs `swift package clean` against only the
 selected lane's scratch before compilation. Both modes stop after verification;
-they never install or open an app. A failed rebuild keeps the prior verified
-stage. Capture, compile, assemble and sign have named shell functions for later
+they never install or open an app. A rebuild preserves the prior stage until
+its replacement passes verification. Copied bundle resources gain owner write permission before signing, and
+removal restores owner write only within generated stages (including older
+read-only stages). Immutable capture bytes and modes stay unchanged. Capture,
+compile, assemble and sign have named shell functions for later
 version/cleanup hooks; the existing timing phases remain unchanged.
 
 Use `script/measure_build_times.py` in an **exclusive private, already-warmed
@@ -173,7 +176,14 @@ python3 script/clean_builds.py --apply
 Use `--only builds|evidence|slots` to bound the pass and repeat `--keep PATH` for
 assigned slots, unfinished hand-ins and retained qualification copies. Manual
 build cleanup takes the same `.build-lock` as the builder; a held lock refuses
-cleanup. The installed app's fingerprint and `last-install.json` identify the
+cleanup. Preview, apply and the post-install hook share `clean_scratch.py`'s
+workspace marker protection: an unreleased `.checklist-workspace.json` at an
+item's root, below it or above it keeps the whole item. Malformed, unreadable or
+linked markers also keep it and report why. Released markers remove only their
+own protection; all other safeguards still apply. Unmarked legacy persistent
+workspace names remain protected by the shared migration guard. Apply rechecks
+markers before moving evidence, build outputs or slots.
+The installed app's fingerprint and `last-install.json` identify the
 installed and previous captures. Missing/mismatched receipts or an unavailable
 previous bundle retain builds until reconciled. Unknown build layouts are kept.
 

@@ -145,6 +145,124 @@ class CleanupTests(unittest.TestCase):
             destroy.assert_not_called()
         self.assertEqual(self.moves,[])
 
+    def marker(self, root, released=False):
+        clean_scratch.write_marker(root, 'fixture-session', 'persistent test workspace')
+        if released: clean_scratch.write_marker(root, 'fixture-session', release=True)
+
+    def assert_marker_keeps(self, method, path, reason='persistent workspace marker'):
+        for apply in [False, True]:
+            reports = self.run_clean(method, apply)
+            report = next(r for r in reports if r['path'] == str(path))
+            self.assertEqual(report['action'], 'kept', report)
+            self.assertIn(reason, report['reason'])
+            self.assertTrue(path.exists())
+        self.assertEqual(self.moves, [])
+
+    def test_evidence_workspace_markers_at_root_child_and_ancestor(self):
+        for location in ['root', 'child', 'ancestor']:
+            with self.subTest(location=location):
+                p = self.handin('round-' + location + '/CL-1')
+                root = p if location == 'root' else p / 'nested' if location == 'child' else p.parent
+                root.mkdir(exist_ok=True)
+                self.marker(root)
+                self.assert_marker_keeps(self.cleaner.evidence, p)
+
+    def test_invalid_linked_and_unreadable_workspace_markers_keep_evidence(self):
+        for kind in ['malformed', 'linked', 'unreadable']:
+            with self.subTest(kind=kind):
+                p = self.handin(kind + '/CL-1')
+                marker = p / clean_scratch.WORKSPACE_MARKER
+                if kind == 'malformed': marker.write_text('{')
+                elif kind == 'linked': marker.symlink_to(p / 'report')
+                else: self.marker(p)
+                native_open = clean_scratch.os.open
+                def read(path, *args, **kwargs):
+                    if kind == 'unreadable' and Path(path) == marker:
+                        raise PermissionError('fixture unreadable marker')
+                    return native_open(path, *args, **kwargs)
+                with patch.object(clean_scratch.os, 'open', side_effect=read):
+                    self.assert_marker_keeps(self.cleaner.evidence, p, 'invalid/unreadable workspace marker')
+
+    def test_released_workspace_marker_does_not_bypass_open_ticket_or_inner_marker(self):
+        p = self.handin('released/CL-1-CL-2'); self.marker(p, released=True)
+        reports = self.run_clean(self.cleaner.evidence, True)
+        self.assertTrue(p.exists()); self.assertIn('open or unknown', reports[-1]['reason'])
+        self.statuses['CL-2'] = 'done'
+        nested = p / 'nested'; nested.mkdir(); self.marker(nested)
+        self.assert_marker_keeps(self.cleaner.evidence, p)
+        clean_scratch.write_marker(nested, 'fixture-session', release=True)
+        reports = self.run_clean(self.cleaner.evidence)
+        self.assertEqual(reports[-1]['action'], 'eligible')
+        self.run_clean(self.cleaner.evidence, True)
+        self.assertFalse(p.exists()); self.assertEqual(len(self.moves), 1)
+
+    def test_marked_capture_protects_every_output_and_unpaired_scratch(self):
+        p = self.capture(self.ids[2]); self.marker(p)
+        scratch = self.build / ('swiftpm-' + '1'*20); scratch.mkdir(); self.marker(scratch)
+        for apply in [False, True]:
+            reports = self.run_clean(self.cleaner.builds, apply)
+            self.assertEqual(len(reports), 5)
+            self.assertTrue(all(r['action'] == 'kept' and 'workspace marker' in r['reason'] for r in reports))
+        self.assertEqual(self.moves, [])
+        self.assertTrue((p/'source/bytes').exists()); self.assertTrue(scratch.exists())
+
+    def test_marked_idle_slot_never_destroys(self):
+        p = self.slot(); self.marker(p['folder'])
+        with patch.object(slots, 'launch_state', return_value={'registered': False}), \
+             patch.object(slots, 'processes', return_value={}), patch.object(slots, 'destroy') as destroy:
+            self.assert_marker_keeps(self.cleaner.test_slots, p['folder'])
+            destroy.assert_not_called()
+
+    def test_ancestor_marker_added_before_evidence_move_is_rechecked(self):
+        p = self.handin(); calls = 0
+        def processes():
+            nonlocal calls
+            calls += 1
+            if calls == 2: self.marker(self.evidence)
+            return []
+        self.cleaner.process_reader = processes
+        reports = self.run_clean(self.cleaner.evidence, True)
+        self.assertEqual(reports[-1]['action'], 'kept')
+        self.assertIn('workspace marker', reports[-1]['reason'])
+        self.assertTrue(p.exists()); self.assertEqual(self.moves, [])
+
+    def test_ancestor_marker_added_before_build_batch_is_rechecked(self):
+        p = self.capture(self.ids[2]); calls = 0
+        def processes():
+            nonlocal calls
+            calls += 1
+            if calls == 2: self.marker(p)
+            return []
+        self.cleaner.process_reader = processes
+        reports = self.run_clean(self.cleaner.builds, True)
+        self.assertTrue(all(r['action'] == 'kept' and 'workspace marker' in r['reason'] for r in reports))
+        self.assertEqual(self.moves, [])
+
+    def test_post_install_honors_workspace_markers(self):
+        current = self.capture(self.ids[0])
+        obsolete = self.capture(self.ids[2]); self.marker(obsolete)
+        scratch = self.build / ('swiftpm-' + '1'*20); scratch.mkdir(); self.marker(scratch)
+        self.cleaner.apply = True
+        with patch.object(clean, 'Cleaner', return_value=self.cleaner), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(clean.post_install(self.repo, current), 0)
+        self.assertEqual(self.moves, [])
+        self.assertTrue((obsolete/'source/bytes').exists()); self.assertTrue(scratch.exists())
+
+    def test_swiftpm_cyclic_and_dangling_links_retained_in_preview_and_apply(self):
+        for kind in ['cycle', 'dangling']:
+            with self.subTest(kind=kind):
+                scratch = self.build / ('swiftpm-' + ('1' if kind == 'cycle' else '2')*20)
+                scratch.mkdir(); link = scratch / 'link'
+                link.symlink_to('link' if kind == 'cycle' else 'missing')
+                for apply in [False, True]:
+                    reports = self.run_clean(self.cleaner.builds, apply)
+                    report = next(r for r in reports if r['path'] == str(scratch))
+                    self.assertEqual(report['action'], 'kept', report)
+                    self.assertIn('unresolved SwiftPM link', report['reason'])
+                    self.assertIn(str(link), report['reason'])
+                    self.assertTrue(scratch.exists())
+        self.assertEqual(self.moves, [])
+
     def test_open_unknown_and_canceled_evidence_retained_only_all_done_trashed(self):
         p=self.handin('CL-1-CL-2'); self.run_clean(self.cleaner.evidence,True); self.assertTrue(p.exists())
         self.statuses.pop('CL-2'); self.run_clean(self.cleaner.evidence,True); self.assertTrue(p.exists())
