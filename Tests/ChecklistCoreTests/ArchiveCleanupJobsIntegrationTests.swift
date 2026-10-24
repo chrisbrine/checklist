@@ -17,7 +17,7 @@ final class ArchiveCleanupJobsIntegrationTests: XCTestCase {
     override func tearDownWithError() throws {router = nil;try? FileManager.default.removeItem(at:directory)}
     func call(_ method: String,_ p: JSON,command: String? = nil) throws -> JSON {
         var params = p;if !CommandRouter.readMethods.contains(method) {params["command_id"] = command ?? UUID().uuidString}
-        let output = try router.handle(method:method,params:params,caller:owner)
+        let output = try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:params),caller:owner)
         return try XCTUnwrap(output["data"] as? JSON)
     }
     func transaction<T>(_ body: (Database) throws -> T) throws -> T {

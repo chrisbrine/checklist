@@ -40,7 +40,7 @@ extension CommandRouter {
             for key in ["add","remove"] where changes[key] != nil { guard let values = changes[key] as? [String],values.count <= 200 else { throw CoreError("INVALID_INPUT","Choose up to 200 tag IDs.") } }
             guard !strings(changes,"add").isEmpty || !strings(changes,"remove").isEmpty,Set(strings(changes,"add").map(SnapshotRecordIdentity.init)).isDisjoint(with:strings(changes,"remove").map(SnapshotRecordIdentity.init)) else { throw CoreError("INVALID_INPUT","Choose tags to add or remove, without overlap.") }
         case "assignee": guard let value = changes["planned_assignee"] else { throw CoreError("INVALID_INPUT","Choose a planned assignee.") };try validateAssignment(value)
-        case "epic": guard changes["epic_id"] is String || changes["epic_id"] is NSNull else { throw CoreError("INVALID_INPUT","Choose an Epic or none.") }
+        case "epic": _ = try requiredEpicID(changes["epic_id"])
         case "triage": _ = try text(changes,"triage_id");guard ["add","remove"].contains(changes["action"] as? String ?? "") else { throw CoreError("INVALID_INPUT","Add or remove Triage membership.") }
         case "archive": guard ["archive","unarchive","trash","restore"].contains(changes["action"] as? String ?? "") else { throw CoreError("INVALID_INPUT","Choose archive, unarchive, trash or restore.") }
         default: break

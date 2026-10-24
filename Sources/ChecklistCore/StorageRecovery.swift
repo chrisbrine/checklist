@@ -228,7 +228,7 @@ extension CommandRouter {
                 // Charge all preparation wall time, including refused work. The
                 // existing one-shot wake supplies four times that duration as rest.
                 if prepared || ticketCleanupPreparingProject != nil {
-                    ticketCleanupYieldAt = Date().addingTimeInterval(max(0.05,Date().timeIntervalSince(started) * 4))
+                    scheduleTicketCleanupRest(since:started)
                 }
             }
             do {

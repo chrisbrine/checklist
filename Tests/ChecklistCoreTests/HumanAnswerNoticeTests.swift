@@ -11,7 +11,7 @@ final class HumanAnswerNoticeTests: XCTestCase {
     override func tearDownWithError() throws {router = nil;try? FileManager.default.removeItem(at:root)}
     func envelope(_ method: String,_ params: JSON = [:],_ caller: Caller? = nil, command: String? = nil) throws -> JSON {
         var input = params;if !CommandRouter.readMethods.contains(method) {input["command_id"] = command ?? uuid()}
-        return try router.handle(method:method,params:input,caller:caller ?? owner)
+        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:input),caller:caller ?? owner)
     }
     @discardableResult func call(_ method: String,_ params: JSON = [:],_ caller: Caller? = nil, command: String? = nil) throws -> JSON {try envelope(method,params,caller,command:command)["data"] as! JSON}
     func fixture(key: String? = nil) throws -> (project:JSON,task:JSON,requester:Caller,handler:Caller,other:Caller) {

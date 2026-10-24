@@ -26,7 +26,7 @@ final class TicketPagePerformanceTests: XCTestCase {
         // Status/task/group fixtures use the same complete domain boundary as commands.
         try router.dbQueue.writeWithoutTransaction { db in
             try router.withValidatedDomainTransaction(db) {
-                try router.save(db,row,type:type)
+                try router.save(db,fixtureDomainValue(router,db:db,value:row,type:type),type:type)
                 return .commit
             }
         }

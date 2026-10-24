@@ -120,6 +120,16 @@ extension CommandRouter {
     private func saveTicketCleanupPreparationState(_ db: Database,project: String,state: JSON) throws {
         try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-preparation:" + project,try jsonString(state)])
     }
+    func scheduleTicketCleanupRest(since started: Date,at time: Date = Date()) {
+        let rest = time.addingTimeInterval(max(0.05,time.timeIntervalSince(started) * 4))
+        let projectRetry = try? dbQueue.read {db -> Date? in
+            guard let project = self.ticketCleanupPreparingProject else {return nil}
+            return try self.ticketCleanupProjectRetry(db,project:project)
+        }
+        // An explicit refusal retry is already a rest deadline. Long failed
+        // preparations must not hide that durable wake behind a longer yield.
+        ticketCleanupYieldAt = max(time,[rest,projectRetry,ticketCleanupRetryAt].compactMap {$0}.min() ?? rest)
+    }
     func runTicketLifecycleCleanup(at time: Date = Date()) throws {
         ticketCleanupMaintenanceLock.lock();defer {ticketCleanupMaintenanceLock.unlock()}
         try withTicketCleanupPreparation({try self.prepareTicketLifecycleCleanup($0,at:time)}) {db,_,prepared in

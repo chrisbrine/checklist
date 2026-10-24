@@ -93,6 +93,7 @@ extension CommandRouter {
         case "task_archive": return try taskArchive(db,p,c)
         case "task_purge_preview": return try taskPurgePreview(db,p,c)
         case "task_purge": return try taskPurge(db,p,c)
+        case "connection_revoke", "connection_allow": return try ownerConversationAccess(db,p,c,method)
         case "session_register", "session_update": return try sessionWrite(db,p,c,method)
         case "session_attach_task": return try attachSessionToTask(db,p,c)
         case "session_list": return try taskSessionList(db,p,c)
@@ -164,6 +165,7 @@ extension CommandRouter {
     }
     func assembledTaskProjection(_ task: JSON, status: JSON?, activeAttention: Bool, tags: [JSON], relation: JSON) -> JSON {
         var t = task
+        t["needs_epic"] = !bool(task,"purged") && (task["epic_id"] as? String ?? "").trimmingCharacters(in:.whitespacesAndNewlines).isEmpty
         if let status {t["status_name"] = status["name"];t["status_category"] = status["category"];t["status"] = status["name"]}
         // Advisory handling context, not an Active membership/count flag (CL-215).
         t["active_attention"] = activeAttention;t["body"] = t["brief"];t["assignee"] = t["planned_assignee"];t["tags"] = tags
@@ -205,7 +207,12 @@ extension CommandRouter {
             r["root_path"] = path
         }
         if method == "project_archive" { r["archived"] = bool(p,"archived",default:true); if bool(r,"archived") && !bool(previous,"archived") { try requireNoActiveProjectWork(db,project:pid) } }
-        r = try prepareProjectContextChange(db,old:previous,updated:r,caller:c); r = revised(r); try save(db,r,type:"project"); try propagateProjectContextChange(db,old:previous,updated:r,caller:c); try event(db,caller:c,project:pid,entity:pid,kind:"project_updated",data:["origin":c.isOwner ? "human_ui" : "agent"]); return r
+        var eventData: JSON = ["origin":c.isOwner ? "human_ui" : "agent"]
+        if method == "project_archive" {
+            let reason = try text(p,"reason",max:4000,required:false)
+            if !reason.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty { eventData["reason"] = reason }
+        }
+        r = try prepareProjectContextChange(db,old:previous,updated:r,caller:c); r = revised(r); try save(db,r,type:"project"); try propagateProjectContextChange(db,old:previous,updated:r,caller:c); try event(db,caller:c,project:pid,entity:pid,kind:"project_updated",data:eventData); return r
     }
     func taxonomyWrite(_ db: Database,_ p: JSON,_ c: Caller,_ method: String) throws -> JSON {
         let pid = try scope(db,p,c,write:true); try requireAgentEditAuthority(db,project:try record(db,pid,type:"project"),caller:c); let type = method.hasPrefix("status") ? "status" : "tag"; var r: JSON
@@ -250,7 +257,9 @@ extension CommandRouter {
         let time = now(); var task: JSON = ["id":uuid(),"project_id":pid,"key":key,"title":title,"brief":try text(p,"brief",required:false),"acceptance":p["acceptance"] ?? [],"acceptance_revision":1,"kind":kind,"readiness":"draft","status_id":status["id"]!,"priority":p["priority"] ?? "normal","tag_ids":strings(p,"tag_ids"),"revision":1,"archived":false,"trashed":false,"created_at":time,"updated_at":time]
         if let assignment = p["planned_assignee"] { try validateAssignment(assignment); task["planned_assignee"] = assignment }
         if let fields = try validatedStarterFields(p["starter_fields"],kind:kind) { task["starter_fields"] = fields }
-        if let epic = p["epic_id"] as? String { let group = try scoped(db,epic,pid,type:"group");guard group["kind"] as? String == "epic" else { throw CoreError("INVALID_INPUT","Only an Epic can be a persistent subproject.") };task["epic_id"] = epic }
+        task["epic_id"] = try requiredEpicID(db,project:pid,value:p["epic_id"])
+        let epic = try scoped(db,task["epic_id"] as! String,pid,type:"group")
+        guard epic["kind"] as? String == "epic",!bool(epic,"archived") else { throw CoreError("INVALID_INPUT","Choose a current Epic in this project.") }
         for tag in strings(task,"tag_ids") { _ = try scoped(db,tag,pid,type:"tag") }
         try validateTaskPolicyAssignment(db,project:project,task:&task,input:p,caller:c)
         task["created_by"] = c.principal; task["origin"] = c.isOwner ? "human_ui" : c.role
@@ -302,6 +311,7 @@ extension CommandRouter {
             r[key] = value
         }
         if r["readiness"] as? String == "ready" { guard !(r["brief"] as? String ?? "").trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else { throw CoreError("NOT_READY","Add the intended outcome before making this task Ready.") } }
+        _ = try requiredEpicID(r["epic_id"])
         let project = try record(db,pid,type:"project")
         try validateTaskPolicyAssignment(db,project:project,task:&r,input:patch,caller:c)
         if patch["readiness"] as? String == "ready" { try requireNotSuperseded(r) }
@@ -337,12 +347,15 @@ extension CommandRouter {
         let pid = try scope(db,p,c,write:true); try requireAgentEditAuthority(db,project:try record(db,pid,type:"project"),caller:c); var r = try task(db,p,pid); try revision(p,r); try requireRetirementSafe(db,task:r)
         let action = p["action"] as? String ?? "archive"
         guard ["archive","unarchive","trash","restore"].contains(action) else { throw CoreError("INVALID_INPUT","Unsupported archive action.") }
+        let reason = try text(p,"reason",max:4000,required:false)
+        var eventData: JSON = ["origin":c.isOwner ? "human_ui" : "agent"]
+        if !reason.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty { eventData["reason"] = reason }
         if action == "archive" { if bool(p,"cleanup") { try queueArchiveRetentionCleanup(db,task:r,previewID:p["cleanup_preview_id"] as? String,caller:c) }; r["archived"] = true; r["archived_at"] = now() }
         if action == "unarchive" {try cancelArchiveCleanupForUnarchive(db,task:r,caller:c); r["archived"] = false }
-        if action == "trash" { r["trashed"] = true; r["trash_reason"] = try text(p,"reason",max:4000,required:false); r["trashed_at"] = now() }
+        if action == "trash" { r["trashed"] = true; r["trash_reason"] = reason; r["trashed_at"] = now() }
         if action == "restore" { r["trashed"] = false }
         if bool(p,"undo"),action == "unarchive" { try requireArchiveUndoSafe(db,task:r) }
-        r = revised(r); try save(db,r,type:"task"); try event(db,caller:c,project:pid,entity:r["id"] as? String,kind:"task_"+action,data:["origin":c.isOwner ? "human_ui" : "agent","reason":action == "trash" ? r["trash_reason"] ?? "" : ""])
+        r = revised(r); try save(db,r,type:"task"); try event(db,caller:c,project:pid,entity:r["id"] as? String,kind:"task_"+action,data:eventData)
         var result = try taskProjection(db,r)
         if ["archive","unarchive"].contains(action) {
             result["cleaned_original_count"] = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type='attachment' AND project_id=? AND json_extract(data,'$.task_id')=? AND json_extract(data,'$.availability')='original_cleaned'",arguments:[pid,r["id"] as! String]) ?? 0

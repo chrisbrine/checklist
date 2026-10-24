@@ -202,6 +202,9 @@ extension CommandRouter {
             if let closure = try deliveryNativeClosure(db,delivery) {
                 result["state"] = "fenced"; result["native_closure_ref"] = closure["id"]
                 result["fenced_at"] = closure["observed_at"]
+            } else if !["acknowledged","addressed"].contains(state), let ownerDisconnect = delivery["owner_disconnect_ref"] as? String {
+                result["state"] = "fenced"; result["owner_disconnect_ref"] = ownerDisconnect
+                result["fenced_at"] = delivery["owner_disconnected_at"]
             }
             return result
         }

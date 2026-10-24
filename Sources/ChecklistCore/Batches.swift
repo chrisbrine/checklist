@@ -126,8 +126,8 @@ extension CommandRouter {
         var results: [JSON] = []
         for input in inputs {
             var memberInput = input;memberInput["project_id"] = pid
-            // Non-final batch verdicts keep all current handling memberships; terminal outcomes depart.
-            let operation: TicketStatusOperation = method == "batch_review_record" && ["blocked","not_run","evidence_missing"].contains(input["verdict"] as? String ?? "") ? .triage : .individual
+            // Reviewer-side blockers retain handling membership; implementation returns depart.
+            let operation: TicketStatusOperation = method == "batch_review_record" && input["verdict"] as? String == "blocked" && input["blocked_on"] as? String != "implementation" ? .triage : .individual
             var result = try work(db,memberInput,c,action,operation:operation)
             let task = try scoped(db,attempts[results.count]["task_id"] as! String,pid,type:"task")
             result["task_id"] = task["id"];result["key"] = task["key"];result["title"] = task["title"];results.append(result)

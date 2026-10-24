@@ -7,7 +7,6 @@ struct TaskWorkspaceView: View {
     @State private var expandedTriages = RecordIdentitySet()
     @State private var filteredExpansion: [RecordIdentity: Bool] = [:]
     @State private var showCreateTriage = false
-    @State private var showTrash = false
     @State private var pastTriages: [Record]?
     @State private var pastTriagesLoading = false
     @State private var pastTriagesError: String?
@@ -31,8 +30,7 @@ struct TaskWorkspaceView: View {
             } else {
                 ProgressView("Loading tickets…").frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-        }.sheet(isPresented:$showTrash) {TrashTicketsView().environmentObject(store)}
-            .sheet(isPresented: $showCreateTriage) { CreateTriageSheet(onCreated: { id in expandedTriages.insert(id); persistExpansion() }).environmentObject(store) }
+        }.sheet(isPresented: $showCreateTriage) { CreateTriageSheet(onCreated: { id in expandedTriages.insert(id); persistExpansion() }).environmentObject(store) }
             .sheet(item: $bulkDraft) { draft in
                 TicketBulkEditSheet(draft: draft) { receipt in bulkReceipt = receipt; bulkSelection.clear() }.environmentObject(store)
             }
@@ -111,7 +109,13 @@ struct TaskWorkspaceView: View {
     var bulkControls: some View {
         VStack(alignment: .leading, spacing: Spacing.small) {
             HStack(spacing: Spacing.control) {
-                Button(bulkSelection.selecting ? "Finish selecting" : "Select tickets") { if bulkSelection.selecting { bulkSelection.clear() } else { bulkSelection.selecting = true } }
+                Button { if bulkSelection.selecting { bulkSelection.clear() } else { bulkSelection.selecting = true } } label: {
+                    TicketHeaderActionLabel(title: bulkSelection.selecting ? "Finish selecting" : "Select tickets", symbol: bulkSelection.selecting ? "checkmark.circle" : "checklist")
+                }.buttonStyle(.checklistPlain)
+                    .help(bulkSelection.selecting ? "Finish selecting tickets and clear the selection" : "Select tickets for a bulk change")
+                    .accessibilityLabel(bulkSelection.selecting ? "Finish selecting" : "Select tickets")
+                    .accessibilityValue(bulkSelection.selecting ? "Selection mode on, \(bulkSelection.count) selected" : "Selection mode off")
+                    .accessibilityIdentifier("ticketSelection")
                 if bulkSelection.selecting {
                     Text("\(bulkSelection.count) selected").checklistFont(.bodyStrong)
                     if bulkSelection.count > 0 {
@@ -146,7 +150,7 @@ struct TaskWorkspaceView: View {
             Text(hasFilters ? "\(list.visibleTicketCount) of \(list.scopedTicketCount) tickets" : "\(list.visibleTicketCount) tickets").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
             Spacer()
             if store.page == .tasks {
-                Button { showCreateTriage = true } label: { Label("New Triage",systemImage:"plus") }.buttonStyle(.checklistBordered).controlSize(.small).checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
+                Button { showCreateTriage = true } label: { TicketHeaderActionLabel(title: "New Triage", symbol: "plus") }.buttonStyle(.checklistPlain).help("Create a Triage to handle related tickets together").accessibilityLabel("New Triage").accessibilityIdentifier("newTriage").checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
                 Menu {
                     if let project = store.projectID {
                         Button(pastTriages == nil ? "Load empty or archived Triages" : "Refresh empty or archived Triages") {loadPastTriages(project)}
@@ -191,7 +195,6 @@ struct TaskWorkspaceView: View {
         HStack(spacing: Spacing.small) {
             visibilityChip("Incomplete", closed: false)
             visibilityChip("Done / Archived", closed: true)
-            Button("Trash") {showTrash = true}.buttonStyle(.checklistBordered)
         }.padding(.horizontal, Spacing.page).padding(.bottom, Spacing.control)
             .accessibilityIdentifier("ticketVisibility").checklistActionScroll()
     }
@@ -353,5 +356,24 @@ private struct TaskRowLabel: View, Equatable {
             if presentation.showsStatus { TicketStatusPills(name: presentation.statusName, category: presentation.statusCategory, draft: presentation.draft) }
             Text(presentation.age).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).padding(.top, Spacing.tight)
         }.padding(.horizontal, Spacing.control).padding(.vertical, Spacing.control).background(presentation.selected ? Color.checklistAccent.opacity(0.1) : .clear, in: RoundedRectangle(cornerRadius: Radius.medium)).contentShape(Rectangle())
+    }
+}
+
+/// Quiet header actions share the existing plain-button interaction feedback.
+struct TicketHeaderActionLabel: View {
+    let title: String
+    let symbol: String
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    static func textColor(increasedContrast: Bool) -> Color {
+        // The stronger high-contrast pressed fill needs primary text to retain 4.5:1.
+        increasedContrast ? .primary : .checklistSecondaryText
+    }
+
+    var body: some View {
+        Label(title, systemImage: symbol).checklistFont(.callout)
+            .foregroundStyle(Self.textColor(increasedContrast: contrast == .increased))
+            .padding(.horizontal, Spacing.small).padding(.vertical, Spacing.tight)
+            .frame(minHeight: HitTarget.icon)
     }
 }

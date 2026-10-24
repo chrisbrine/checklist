@@ -36,8 +36,8 @@ extension CoreTests {
     }
     func testGroupKeysNumberKindsAndProjectsSeparatelyAndStayStable() throws {
         let p = try project("Groups","GK"), other = try project("Other","OT"), pid = p["id"]!
-        let t = try task(p), g = try call("triage_create",["project_id":pid,"name":"First triage"])
         let e = try call("epic_create",["project_id":pid,"name":"First epic"])
+        let t = try task(p), g = try call("triage_create",["project_id":pid,"name":"First triage"])
         XCTAssertEqual(t["key"] as? String,"GK-1");XCTAssertEqual(g["key"] as? String,"GK-T1");XCTAssertEqual(e["key"] as? String,"GK-E1")
         XCTAssertEqual(try call("triage_create",["project_id":other["id"]!,"name":"Other"])["key"] as? String,"OT-T1")
         _ = try call("triage_edit",["project_id":pid,"triage_id":g["id"]!,"expected_revision":g["revision"]!,"name":"Renamed","archived":true])
@@ -68,7 +68,7 @@ extension CoreTests {
         XCTAssertEqual(try call("triage_create",["project_id":pid,"name":"After restart"])["key"] as? String,"LG-T13")
     }
     func testGroupKeysInContextPagesBatchReceiptsHistoryAndEffects() throws {
-        let p = try project("Projection","PJ"),a = try ready(p,task(p,"First")),b = try ready(p,task(p,"Second")),g = try call("triage_create",["project_id":p["id"]!,"name":"Pass"]),e = try call("epic_create",["project_id":p["id"]!,"name":"Area"])
+        let p = try project("Projection","PJ"),a = try ready(p,task(p,"First")),b = try ready(p,task(p,"Second")),g = try call("triage_create",["project_id":p["id"]!,"name":"Pass"]),e = (try call("epic_list",["project_id":p["id"]!])["groups"] as! [JSON])[0]
         try addTriage(p,g,a);try addTriage(p,g,b)
         _ = try call("group_membership",["project_id":p["id"]!,"group_id":e["id"]!,"expected_revision":e["revision"]!,"task_id":a["id"]!,"action":"add"])
         let context = try call("task_context",["project_id":p["id"]!,"task_id":a["id"]!])

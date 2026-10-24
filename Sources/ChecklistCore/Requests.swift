@@ -72,7 +72,7 @@ extension CommandRouter {
         if !isAnswer { _ = try text(p,"explanation",max:16000) }
         let answers = try validatedRequestAnswers(r,params:p,requireComplete:isAnswer)
         let files = try preparedHumanRequestFiles(r,params:p)
-        let complete = isAnswer
+        let complete = isAnswer && !answers.contains { $0["result"] as? String == "not_checked" }
         if complete,let target = r["target_attachment_id"] as? String {
             if let mid = r["target_manifest_id"] as? String {
                 let currentTask = try scoped(db,r["task_id"] as! String,pid,type:"task")
@@ -270,7 +270,10 @@ extension CommandRouter {
             } else {
                 let result = try requestAnswerString(answer,keys:["result","value"],max:100)
                 guard (type == "approval" ? ["approved","changes_requested","declined","not_checked"] : ["passed","failed","declined","not_checked"]).contains(result) else { throw incompleteRequestItem(q) }
-                if requireComplete && result == "not_checked" { throw incompleteRequestItem(q) }
+                if requireComplete && result == "not_checked" {
+                    let explanation = try requestAnswerString(params,keys:["explanation"],max:16000)
+                    if explanation.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty { throw incompleteRequestItem(q) }
+                }
                 answer = ["question_id":q["id"]!,"result":result]
             }
             normalized.append(answer)

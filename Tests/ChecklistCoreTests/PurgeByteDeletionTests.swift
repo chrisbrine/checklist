@@ -15,7 +15,7 @@ final class PurgeByteDeletionTests: XCTestCase {
     func call(_ method: String,_ input: JSON) throws -> JSON {
         var input = input
         if !CommandRouter.readMethods.contains(method) {input["command_id"] = uuid()}
-        return try router.handle(method:method,params:input,caller:owner)["data"] as! JSON
+        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:input),caller:owner)["data"] as! JSON
     }
     func write(_ body: (Database) throws -> Void) throws {
         try ArchiveStorageGate.withExclusive(root:router.root) {_ in try router.dbQueue.writeWithoutTransaction {db in try router.withValidatedDomainTransaction(db) {try body(db);return .commit}}}

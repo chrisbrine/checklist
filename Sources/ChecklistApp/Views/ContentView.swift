@@ -84,6 +84,7 @@ struct ContentView: View {
             }
         }
         .navigationTitle("Checklist")
+        .checklistHiddenWindowTitle()
         .sheet(isPresented: $store.showCapture) { CaptureTaskView().environmentObject(store) }
         .sheet(isPresented: $store.showNewProject) { NewProjectView().environmentObject(store) }
         .alert("Checklist", isPresented: Binding(get: { store.error != nil }, set: { if !$0 { store.error = nil } })) {

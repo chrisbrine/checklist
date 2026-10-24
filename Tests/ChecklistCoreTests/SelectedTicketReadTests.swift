@@ -18,7 +18,7 @@ final class SelectedTicketReadTests: XCTestCase {
         try write {db in
             try router.save(db,["id":"queued","project_id":pid,"name":"Queued","category":"queued","revision":1],type:"status")
             for id in [tid,"e\u{301}"] {
-                try router.save(db,["id":id,"project_id":pid,"key":id,"title":"Synthetic "+id,"brief":"","status_id":"queued","readiness":"ready","revision":1,"tag_ids":[String](),"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"],type:"task")
+                try router.save(db,fixtureDomainValue(router,db:db,value:["id":id,"project_id":pid,"key":id,"title":"Synthetic "+id,"brief":"","status_id":"queued","readiness":"ready","revision":1,"tag_ids":[String](),"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"],type:"task"),type:"task")
             }
         }
     }
@@ -73,8 +73,8 @@ final class SelectedTicketReadTests: XCTestCase {
         XCTAssertEqual(task["prerequisites_satisfied"] as? Bool,false)
         XCTAssertEqual((task["prerequisites"] as? [JSON])?.compactMap {$0["relation_id"] as? String},["dependency"])
         let groups = (result["collections"] as! JSON)["groups"] as! [JSON]
-        XCTAssertEqual(groups.compactMap {$0["id"] as? String},["active-triage"])
-        XCTAssertEqual(groups.first?["members_complete"] as? Bool,false)
+        XCTAssertEqual(Set(groups.compactMap {$0["id"] as? String}),["fixture-primary-epic:"+pid,"active-triage"])
+        XCTAssertEqual(groups.first {$0["id"] as? String == "active-triage"}?["members_complete"] as? Bool,false)
     }
     func testOwnerContextModesRefuseWorkerBeforeReadEffects() throws {
         let worker = Caller(role:"worker",installation:"synthetic-selected-worker",projectIDs:[pid],workspace:root.path)

@@ -8,7 +8,7 @@ struct QuickCaptureView: View {
     var close: () -> Void
     var submitDraft: () -> Void
     var openTicket: (String) -> Void
-    static let lockedReason = "This ticket is being created; its title, project and files are fixed."
+    static let lockedReason = "This ticket is being created; its title, project, Epic and files are fixed."
     @FocusState private var titleFocused: Bool
     @State private var targeted = false
     var body: some View {
@@ -24,6 +24,7 @@ struct QuickCaptureView: View {
         .background(targeted ? Color.accentColor.opacity(0.08) : Color.clear)
         .onDrop(of: [UTType.fileURL.identifier], isTargeted: $targeted, perform: drop)
         .onExitCommand { close() }
+        .task(id:model.draft.projectID) {await model.loadEpics()}
     }
 
     @ViewBuilder var form: some View {
@@ -38,6 +39,20 @@ struct QuickCaptureView: View {
             if !model.draft.projectID.isEmpty, !model.projects.contains(where: { $0.id == model.draft.projectID }) { Text("Saved project").tag(model.draft.projectID) }
             ForEach(model.projects) { Text($0.name).tag($0.id) }
         }.checklistDisabled([(locked, QuickCaptureView.lockedReason)]).accessibilityIdentifier("quickCaptureProject")
+        if !model.draft.projectID.isEmpty {
+            if model.epicTotal == 0,!model.epicLoading {CaptureEpicCreator(projectID:model.draft.projectID,request:model.createEpicRequest) {epic in guard RecordIdentity(epic.string("project_id"))==RecordIdentity(model.draft.projectID) else {return};model.draft.epicID=epic.id;Task {await model.loadEpics()}}}
+            Picker("Epic", selection: Binding(get: {model.draft.epicID ?? ""}, set: {model.draft.epicID = $0})) {
+                Text("Choose an Epic").tag("")
+                if let saved = model.draft.epicID, !saved.isEmpty, !model.availableEpics.contains(where: {$0.id == saved}) {Text("Saved Epic").tag(saved)}
+                ForEach(model.availableEpics) {Text(ProductionGroups.label($0)).tag($0.id)}
+            }.checklistDisabled([(locked, QuickCaptureView.lockedReason), (model.epicLoading, "Epics are still loading.")]).accessibilityIdentifier("quickCaptureEpic")
+            AccessibleHStack {
+                if model.epicLoading {ProgressView().controlSize(.small)}
+                if let cursor = model.epicPrevious {Button("Previous Epics") {Task {await model.loadEpics(cursor:cursor)}}}
+                if let cursor = model.epicNext {Button("More Epics") {Task {await model.loadEpics(cursor:cursor)}}}
+                if let failure = model.epicError {Text(failure).foregroundStyle(.orange);Button("Retry Epics") {Task {await model.loadEpics()}}}
+            }.checklistFont(.micro).checklistDisabled([(model.epicLoading, "Epics are still loading.")])
+        }
         VStack(alignment: .leading, spacing: Spacing.tight) {
             Text("Note (optional)").checklistFont(.caption).foregroundStyle(Color.checklistSecondaryText)
             TextEditor(text: $model.draft.note).checklistFont(.body).frame(minHeight: 70).padding(Spacing.tight)
@@ -79,6 +94,7 @@ struct QuickCaptureView: View {
                 .buttonStyle(.checklistProminent).keyboardShortcut(.return, modifiers: .command)
                 .checklistDisabled([(model.draft.pendingCreate == nil && model.draft.createdTaskID == nil && model.draft.projectID.isEmpty, "Choose a project first."),
                                     (model.draft.pendingCreate == nil && model.draft.createdTaskID == nil && model.draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Enter a title first."),
+                                    (model.draft.pendingCreate == nil && model.draft.createdTaskID == nil && (model.draft.epicID ?? "").isEmpty, "Choose an Epic first."),
                                     (model.state == .sending, DisabledReasons.saving)])
         }
     }

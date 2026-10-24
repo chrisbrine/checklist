@@ -16,7 +16,7 @@ final class TicketBulkEditTests: XCTestCase {
     override func tearDownWithError() throws {router = nil;try? FileManager.default.removeItem(at:directory)}
     @discardableResult func call(_ method: String,_ input: JSON = [:],caller: Caller? = nil,command: String = UUID().uuidString) throws -> JSON {
         var p = input;if !CommandRouter.readMethods.contains(method) {p["command_id"] = command}
-        return try router.handle(method:method,params:p,caller:caller ?? owner)["data"] as! JSON
+        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:caller ?? owner)["data"] as! JSON
     }
     func fixture() throws -> (JSON,[JSON]) {
         let project = try call("project_create",["name":"Bulk","key_prefix":"B","root_path":directory.path])

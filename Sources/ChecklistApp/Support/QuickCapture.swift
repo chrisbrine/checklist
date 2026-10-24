@@ -20,13 +20,16 @@ struct QuickCaptureDraft: Codable, Equatable {
         let projectID: String
         let title: String
         let brief: String
+        var epicID: String? = nil
         var parameters: [String: Any] {
             var value: [String: Any] = ["command_id": commandID, "project_id": projectID, "title": title]
+            if let epicID { value["epic_id"] = epicID }
             if !brief.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { value["brief"] = brief }
             return value
         }
     }
     var pendingCreate: PendingCreate? = nil
+    var epicID: String? = nil
     var projectID = ""
     var title = ""
     var note = ""
@@ -65,9 +68,10 @@ final class QuickCaptureModel: ObservableObject {
         didSet {
             // A refused request may be retried unchanged, but different text needs a fresh ID.
             if draft.pendingCreate == nil, draft.createdTaskID == nil,
-               draft.projectID != oldValue.projectID || draft.title != oldValue.title || draft.note != oldValue.note {
+               draft.projectID != oldValue.projectID || draft.epicID != oldValue.epicID || draft.title != oldValue.title || draft.note != oldValue.note {
                 draft.createCommandID = nil
             }
+            if draft.projectID != oldValue.projectID { let last=CaptureEpicDefaults.last(draft.projectID,preferences:preferences); draft.epicID = last.isEmpty ? nil : last }
             if draft != oldValue { persist() }
         }
     }
@@ -75,6 +79,14 @@ final class QuickCaptureModel: ObservableObject {
     @Published private(set) var state: State = .editing
     @Published private(set) var projectsAvailable = false
     @Published var problem: String?
+    @Published private(set) var epics: [Record] = []
+    @Published private(set) var epicLoading = false
+    @Published private(set) var epicError: String?
+    @Published private(set) var epicTotal: Int?
+    @Published private(set) var epicNext: String?
+    @Published private(set) var epicPrevious: String?
+    private var epicRead = UUID()
+    private var epicProject = ""
     private var draftSaveFailed = false
     private let journal: LocalDraftJournal
     private let preferences: UserDefaults
@@ -88,6 +100,7 @@ final class QuickCaptureModel: ObservableObject {
         if draft.projectID.isEmpty, draft.pendingCreate == nil, draft.createdTaskID == nil, draft.isEmpty {
             draft.projectID = preferences.string(forKey: Self.lastProjectKey) ?? ""
         }
+        if draft.epicID == nil, draft.pendingCreate == nil, draft.createdTaskID == nil {let last=CaptureEpicDefaults.last(draft.projectID,preferences:preferences);if !last.isEmpty {draft.epicID=last}}
         if draft.createdTaskID != nil { state = .filesPending(Self.savedTicketFiles) }
         else if draft.pendingCreate != nil { state = .uncertain(Self.uncertainCreate) }
     }
@@ -123,14 +136,32 @@ final class QuickCaptureModel: ObservableObject {
         }
     }
 
+    func createEpicRequest(_ method:String,_ params:[String:Any]) async throws -> [String:Any] {try await transport(method,params)}
+    var availableEpics: [Record] { epics.filter { RecordIdentity($0.string("project_id")) == RecordIdentity(draft.projectID) } }
+    func loadEpics(cursor: String? = nil) async {
+        let project = draft.projectID, read = UUID(); epicRead = read
+        if epicProject != project { epics = []; epicNext = nil; epicPrevious = nil; epicTotal = nil; epicProject = project }
+        guard !project.isEmpty else { epicLoading = false; return }
+        epicLoading = true; epicError = nil
+        do {
+            let query = WorkspacePageQuery(surface: "epics", project: project)
+            let page = try WorkspacePage(await transport("workspace_page", query.parameters(cursor: cursor)), query: query)
+            guard !Task.isCancelled, epicRead == read, RecordIdentity(draft.projectID) == RecordIdentity(project) else { return }
+            epics = page.rows; epicTotal = page.total; epicNext = page.next; epicPrevious = page.previous; epicLoading = false
+        } catch {
+            guard epicRead == read else { return }
+            epicLoading = false; epicError = "Could not load Epics. Your draft and saved Epic are kept."
+        }
+    }
+
     var canSend: Bool {
         state != .sending && (draft.pendingCreate != nil || draft.createdTaskID != nil ||
-            (!draft.projectID.isEmpty && !draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+            (!draft.projectID.isEmpty && !(draft.epicID ?? "").isEmpty && !draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
     }
     var sendTitle: String { draft.createdTaskID != nil ? "Finish attaching files" : draft.pendingCreate != nil ? "Check again" : "Create Draft" }
     var hasNewerEdits: Bool {
         guard let intent = draft.pendingCreate else { return false }
-        return draft.projectID != intent.projectID || draft.title != intent.title || draft.note != intent.brief
+        return draft.projectID != intent.projectID || draft.epicID != intent.epicID || draft.title != intent.title || draft.note != intent.brief
     }
     static let savedTicketFiles = "The ticket is saved. Some files may still need attaching. Check again to finish using the same files."
     private var filesLocked: Bool { draft.pendingCreate != nil || draft.createdTaskID != nil || state == .sending }
@@ -185,7 +216,7 @@ final class QuickCaptureModel: ObservableObject {
                 if draft.pendingCreate == nil {
                     let commandID = draft.createCommandID ?? UUID().uuidString
                     draft.createCommandID = commandID
-                    draft.pendingCreate = .init(commandID: commandID, projectID: draft.projectID, title: draft.title, brief: draft.note)
+                    draft.pendingCreate = .init(commandID: commandID, projectID: draft.projectID, title: draft.title, brief: draft.note, epicID: draft.epicID)
                 }
                 // Never send a create whose exact intent has not reached the journal.
                 do { try journal.save(draft, kind: Self.journalKind, key: "draft") }
@@ -204,13 +235,17 @@ final class QuickCaptureModel: ObservableObject {
             }
             let finished = State.captured(key: draft.createdKey ?? "", taskID: draft.createdTaskID!, projectID: projectID)
             preferences.set(projectID, forKey: Self.lastProjectKey)
+            CaptureEpicDefaults.remember(draft.pendingCreate?.epicID ?? draft.epicID ?? "",project:projectID,preferences:preferences)
             // Text edited while checking is a separate draft, never a second use of this command.
-            let next = hasNewerEdits ? QuickCaptureDraft(projectID: draft.projectID, title: draft.title, note: draft.note) : QuickCaptureDraft(projectID: projectID)
+            let next = hasNewerEdits ? QuickCaptureDraft(epicID: draft.epicID, projectID: draft.projectID, title: draft.title, note: draft.note) : QuickCaptureDraft(epicID: draft.pendingCreate?.epicID ?? draft.epicID, projectID: projectID)
             draft = next
             state = finished
         } catch {
             if draft.createdTaskID != nil {
                 state = .filesPending(Self.savedTicketFiles + " " + PlainError.text(error))
+            } else if (error as? ChecklistError)?.code == "EPIC_REQUIRED", !Self.isUncertain(error) {
+                draft.pendingCreate = nil; draft.createCommandID = nil
+                state = .notSent(Self.text(for: error))
             } else if wasPending || Self.isUncertain(error) {
                 state = .uncertain(Self.uncertainCreate)
             } else {
@@ -231,7 +266,7 @@ final class QuickCaptureModel: ObservableObject {
         // known pre-send/validation failures establish that this create was not accepted.
         return !["SERVICE_UNAVAILABLE", "SERVICE_REGISTRATION_FAILED", "SERVICE_SETUP_REQUIRED",
                  "STORE_BUSY", "STORAGE_DRAINING", "STORAGE_NOT_READY", "INVALID_INPUT", "INVALID_PARAMS",
-                 "VALIDATION_ERROR"].contains(failure.code)
+                 "VALIDATION_ERROR", "EPIC_REQUIRED"].contains(failure.code)
     }
     static func text(for error: Error) -> String {
         guard let failure = error as? ChecklistError else { return notSentOffline }

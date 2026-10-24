@@ -1,4 +1,5 @@
 import XCTest
+import GRDB
 @testable import ChecklistCore
 
 final class ListFilterTests: XCTestCase {
@@ -22,6 +23,8 @@ final class ListFilterTests: XCTestCase {
         first = try call("task_create",["project_id":project["id"]!,"key":"CL-14","title":"First matching ticket","epic_id":epic["id"]!])
         second = try call("task_create",["project_id":project["id"]!,"key":"CL-141","title":"Second matching ticket","epic_id":epic["id"]!])
         third = try call("task_create",["project_id":project["id"]!,"key":"CL-2","title":"Third matching ticket"])
+        // Retained legacy reads still support the No Epic filter; new creation requires one.
+        try router.dbQueue.writeWithoutTransaction {db in try db.execute(sql:"UPDATE records SET data=json_remove(data,'$.epic_id') WHERE id=?",arguments:[third["id"] as! String])}
         triage = try call("triage_create",["project_id":project["id"]!,"name":"Current handling"])
         for task in [first!,third!] {
             triage = try call("group_membership",["project_id":project["id"]!,"group_id":triage["id"]!,"expected_revision":triage["revision"]!,"task_id":task["id"]!,"action":"add"])
@@ -33,7 +36,7 @@ final class ListFilterTests: XCTestCase {
     override func tearDownWithError() throws { router = nil;try? FileManager.default.removeItem(at:root) }
     @discardableResult func call(_ method: String,_ params: JSON,_ caller: Caller? = nil) throws -> JSON {
         var p = params;if !CommandRouter.readMethods.contains(method) {p["command_id"] = uuid()}
-        return try router.handle(method:method,params:p,caller:caller ?? owner)["data"] as! JSON
+        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:caller ?? owner)["data"] as! JSON
     }
     func page(_ filters: JSON = [:],_ caller: Caller? = nil) throws -> JSON {
         var p = filters;p["project_id"] = project["id"]!

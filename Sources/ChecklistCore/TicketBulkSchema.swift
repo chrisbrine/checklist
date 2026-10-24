@@ -17,7 +17,7 @@ extension CommandRouter {
             status,
             choice("tags",["add":tags,"remove":tags],[]),
             choice("assignee",["planned_assignee":["oneOf":[["enum":["human","unassigned"]],["type":"object","properties":["kind":["enum":["human","unassigned","agent"]],"provider":id,"session_id":id],"required":["kind"],"additionalProperties":false]]],"assignment_reason":["type":"string","maxLength":2000]],["planned_assignee"]),
-            choice("epic",["epic_id":["type":["string","null"],"maxLength":4000]],["epic_id"]),
+            choice("epic",["epic_id":id],["epic_id"]),
             choice("triage",["triage_id":id,"action":["enum":["add","remove"]]],["triage_id","action"]),
             choice("archive",["action":["enum":["archive","unarchive","trash","restore"]]],["action"])
         ]]

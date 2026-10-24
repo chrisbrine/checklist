@@ -32,7 +32,7 @@ extension EvidenceAuthorityTests {
     }
 
     // CL-41
-    func testEvidenceMissingReturnsTheSameTargetForMoreEvidence() throws {
+    func testLegacyEvidenceMissingReturnsTheSameTargetForMoreEvidence() throws {
         try sourceFixture()
         let p = try project(), author = try native(p, "em-author", domain: "codex:4101:1:0")
         let first = try native(p, "em-reviewer", domain: "claude:4102:1:0", provider: "claude"), second = Caller(role: "owner", installation: "em-second", projectIDs: [])
@@ -42,7 +42,15 @@ extension EvidenceAuthorityTests {
         missing["reason"] = "The build log for the release configuration is not attached."
         var withFinding = missing; withFinding["findings"] = [finding("gap", try sourceRef(submitted))]
         assertCode("INVALID_INPUT") { _ = try self.call("review_record", withFinding, first) }
-        let verdict = try call("review_record", missing, first)
+        // Retained CL-41 records remain readable. New verdicts use CL-216's fresh submission flow.
+        var verdict = try call("review_record", reviewInput(p, review, verdict: "blocked"), first)
+        verdict["verdict"] = "evidence_missing";verdict["reason"] = missing["reason"]
+        try router.dbQueue.write { db in
+            try router.save(db,verdict,type:"review")
+            var request = try router.record(db,review["review_request_id"] as! String,type:"review_request")
+            request["state"] = "evidence_requested";request["evidence_request"] = ["reason":missing["reason"]!,"review_id":verdict["id"]!]
+            try router.save(db,request,type:"review_request")
+        }
         XCTAssertEqual(verdict["verdict"] as? String, "evidence_missing"); XCTAssertEqual((verdict["completion"] as? JSON)?["completed"] as? Bool, false)
         let request = try record(review["review_request_id"], "review_request")
         XCTAssertEqual(request["state"] as? String, "evidence_requested")
@@ -84,28 +92,6 @@ extension EvidenceAuthorityTests {
         XCTAssertEqual(cited?["role"] as? String, "supplemental_evidence")
         let rounds = (try call("task_context", ["project_id": p["id"]!, "task_id": t["id"]!])["review_summary"] as! JSON)["rounds"] as! [JSON]
         XCTAssertEqual(rounds.first?["evidence_missing"] as? Int, 1); XCTAssertEqual(rounds.first?["failed_rounds"] as? Int, 0)
-    }
-
-    func testNotRunKeepsTheReviewOpenAndIsNotAFail() throws {
-        try sourceFixture()
-        let p = try project(), author = try native(p, "nr-author", domain: "codex:4111:1:0"), reviewer = try native(p, "nr-reviewer", domain: "claude:4112:1:0", provider: "claude")
-        let t = try ready(p), submitted = try submit(p, t, author), review = try reviewClaim(p, submitted, reviewer)
-        var notRun = reviewInput(p, review, verdict: "not_run"); notRun["reason"] = "The device lab was offline."
-        assertCode("INVALID_INPUT") { _ = try self.call("review_record", notRun, reviewer) }
-        notRun["check"] = "iPhone playtest"
-        _ = try call("review_record", notRun, reviewer)
-        let request = try record(review["review_request_id"], "review_request")
-        XCTAssertEqual(request["state"] as? String, "queued")
-        XCTAssertEqual((request["not_run_checks"] as? [JSON])?.first?["check"] as? String, "iPhone playtest")
-        let ticket = try current(p, t)
-        XCTAssertEqual(ticket["status_category"] as? String, "review"); XCTAssertNil(ticket["completed_at"])
-        let context = try call("task_context", ["project_id": p["id"]!, "task_id": t["id"]!])
-        XCTAssertEqual(context["next_action"] as? String, "claim_pending_review")
-        let rounds = (context["review_summary"] as! JSON)["rounds"] as! [JSON]
-        XCTAssertEqual(rounds.first?["failed_rounds"] as? Int, 0, "not_run is not a fail"); XCTAssertEqual(rounds.first?["not_run"] as? Int, 1)
-        var reason = reviewInput(p, try reviewClaim(p, ["task": ticket, "review_request_ids": submitted["review_request_ids"]!, "manifest_id": submitted["manifest_id"]!], reviewer), verdict: "reject")
-        reason["reason"] = "not for reject"
-        assertCode("INVALID_INPUT") { _ = try self.call("review_record", reason, reviewer) }
     }
 
     // CL-42

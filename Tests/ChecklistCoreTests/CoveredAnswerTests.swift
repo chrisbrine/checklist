@@ -13,7 +13,7 @@ final class CoveredAnswerTests: XCTestCase {
     override func tearDownWithError() throws { router = nil; try? FileManager.default.removeItem(at:root) }
     @discardableResult func call(_ method: String,_ params: JSON,_ caller: Caller? = nil) throws -> JSON {
         var p = params; if !CommandRouter.readMethods.contains(method) { p["command_id"] = uuid() }
-        return try router.handle(method:method,params:p,caller:caller ?? owner)["data"] as! JSON
+        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:caller ?? owner)["data"] as! JSON
     }
     func fixture() throws -> (JSON,JSON,Caller) {
         let workspace = root.appendingPathComponent("workspace");try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)

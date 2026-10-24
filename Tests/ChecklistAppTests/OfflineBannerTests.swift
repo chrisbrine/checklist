@@ -62,7 +62,7 @@ import ChecklistIPC
                                        if reads <= 2 { throw Down() }   // the first read, and the retry after the failed wait
                                        var params = params
                                        if !CommandReply.readMethods.contains(method) && params["command_id"] == nil { params["command_id"] = UUID().uuidString }
-                                       return try router.handle(method: method, params: params, caller: owner)
+                                       return try router.handle(method: method, params: appFixtureTaskInput(router,method:method,input:params), caller: owner)
                                    })
         store.liveWaitPause = 5_000_000; store.liveRetryPause = 5_000_000
         let live = Task { await store.startLiveUpdates() }

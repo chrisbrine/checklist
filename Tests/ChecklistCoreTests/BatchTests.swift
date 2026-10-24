@@ -301,22 +301,30 @@ extension CoreTests {
         try assertEmptyTriage(p,group);try assertEmptyTriage(p,reviewGroup)
     }
 
-    func testBatchNonFinalVerdictsRetainAllTriagesWhileIndividualVerdictsDepart() throws {
-        for verdict in ["blocked","not_run","evidence_missing"] {
+    func testBatchOnlyReviewerSideBlockedRetainsTriages() throws {
+        for kind in ["blocked","not_run","evidence_missing","implementation_blocked"] {
+            let verdict = kind == "implementation_blocked" ? "blocked" : kind
+            let returned = kind != "blocked"
             for batched in [true,false] {
                 let value = try submittedArtifact(),p = value.project,group = try triage(p,phase:"review"),other = try triage(p,"Other review",phase:"review")
                 try addTriage(p,group,value.task);try addTriage(p,other,value.task)
                 let reviewer = Caller(role:"owner",installation:"non-final-"+verdict,projectIDs:[]),batch = try prepareReviewBatch(p,group,[value.task],reviewer)
                 let claim = (try claimFixedBatch(p,batch,reviewer)["claims"] as! [JSON])[0]
                 var input: JSON = ["attempt_id":claim["id"]!,"claim_token":claim["claim_token"]!,"review_request_id":claim["review_request_id"]!,"target_manifest_id":claim["manifest_id"]!,"gate":"review","verdict":verdict]
-                if verdict != "blocked" { input["reason"] = "The selected check needs its inputs" }
+                if returned { input["reason"] = "The selected check needs its inputs" }
+                if kind == "implementation_blocked" { input["blocked_on"] = "implementation" }
                 if verdict == "not_run" { input["check"] = "Inspect result" }
                 if batched { _ = try call("batch_review_record",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":1,"members":[input]],reviewer) }
                 else { input["project_id"] = p["id"];_ = try call("review_record",input,reviewer) }
-                for triage in [group,other] { XCTAssertEqual(strings(try currentTriage(p,triage),"task_ids"),batched ? [value.task["id"] as! String] : [],verdict) }
+                for triage in [group,other] { XCTAssertEqual(strings(try currentTriage(p,triage),"task_ids"),batched && !returned ? [value.task["id"] as! String] : [],kind) }
                 let request = try router.dbQueue.read {try router.record($0,claim["review_request_id"] as! String,type:"review_request")}
-                XCTAssertEqual(request["state"] as? String,verdict == "evidence_missing" ? "evidence_requested" : "queued")
-                XCTAssertNil(try call("task_get",["project_id":p["id"]!,"task_id":value.task["id"]!])["active_attempt_id"])
+                XCTAssertEqual(request["state"] as? String,returned ? "returned" : "queued")
+                let task = try call("task_get",["project_id":p["id"]!,"task_id":value.task["id"]!])
+                XCTAssertNil(task["active_attempt_id"],"Owner-only submissions have no native implementing holder")
+                XCTAssertEqual(task["status_category"] as? String,returned ? "queued" : "review")
+                let history = try call("history_list",["project_id":p["id"]!,"task_id":value.task["id"]!])
+                let departures = (history["events"] as! [JSON]).filter {$0["kind"] as? String == "task_left_triage"}
+                XCTAssertEqual(departures.count,returned || !batched ? 2 : 0,kind)
             }
         }
     }

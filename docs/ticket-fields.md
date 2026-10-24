@@ -9,18 +9,25 @@ Ticket fields describe facts the service must validate or agents must select rel
 | Information | Draft capture | Ready | Queue / pickup | Review | Completion |
 | --- | --- | --- | --- | --- | --- |
 | Project and title | Required; the project scopes identity and the title makes capture usable | Retained | Retained | Retained | Retained |
+| Primary Epic (`epic_id`) | Required same-project Epic; create one for the concrete ticket if needed | Retained | Retained | Retained | Retained, including archived tickets |
 | Requested outcome in brief | Optional | Required, so a handler knows the intended result | Required for pickup through Ready; queueing alone does not make a Draft Ready | Included in the exact acceptance revision | Current submitted acceptance must still match |
 | Acceptance criteria | Optional | Optional explicit checks; a concrete brief remains required | Included in context when present | Reviewer checks the captured criteria and target | Each configured gate must pass for current acceptance |
 | Kind | Optional; defaults to Work | Select only when its starter or policy helps | Effective kind policy applies | Captured kind policy determines gates | Captured/reconciled policy determines gates |
 | Planned assignee | Optional; unassigned is valid | An explicit agent exception must name an eligible provider/session and record a reason | Actual caller role/session/grants are validated; human assignment remains separate | Actual reviewer identity and independence required | Actual authority and all gates required |
 | Required prerequisites | Optional typed same-project links | Not required: a refined brief can be Ready while prerequisites are open | Queueing and Triage planning are allowed; required links gate pickup and claim | Claiming review still uses dependency guards | Required prerequisites are rechecked |
-| Priority, tags, Epic | Optional | Optional | Hints/context; never authority | Context only | No invented requirements |
+| Priority, tags | Optional | Optional | Hints/context; never authority | Context only | No invented requirements |
 | Starter fields (`starter_fields`: Bug reproduction/expected/actual; Playtest build/platform/clip) | Optional; capture offers them for that kind only | Optional; the brief still carries the outcome | Included in task context when present | Context for the reviewer | No invented requirements |
 | Triage | Optional temporary phase grouping | Optional | Grouping does not grant a claim | Separate Review Triage; exact per-ticket results | Passing tickets complete independently |
 | Evidence / attempts / checks | None required to capture | None required to prepare work | Real claim and bounded scopes precede actual work | Immutable target, exact gate/request and independent review identity required | Current evidence, accepted gates, resolved findings and applicable human/direction dependencies required |
 | Notes / decision rationale | Optional | Add useful context without making fields compulsory | Preserve source and full history | Link findings/dispositions to exact evidence | History remains retrievable |
 
 Draft readiness means the brief still needs refinement; Ready means it is refined. Prerequisites never decide readiness (owner decision, 18 October 2026, CL-133). Queueing is a status action. It can queue a Draft for later preparation, and it accepts tickets with open prerequisites so a planned Triage can order them. Only Ready tickets whose required prerequisites are Done can be picked up or claimed. A prerequisite reopening or being canceled changes the dependent's derived eligibility immediately; it does not silently rewrite the dependent's status, readiness, brief, or revision.
+
+## Required primary Epic (CL-228)
+
+Every ticket has exactly one primary Epic. This is a product invariant, not editable project policy. `task_create`, `task_edit`, bulk edits and the shared service save boundary refuse a missing, blank or null Epic with `EPIC_REQUIRED`. Moves reconcile both containers atomically; clearing membership is not a move. An Epic with live (unarchived, untrashed) tickets cannot be archived before they move. Legacy rows remain readable with `needs_epic=true`; agents repair them through the MCP, including archived tickets, without direct database edits.
+
+Capture requires project, title and Epic, remembers the last-used Epic per project, and offers Epic creation for an empty project. The detail requires an Epic and exposes a revision-checked move. Internal creators must carry the source ticket's Epic into successors/rework, and synthetic checks must name an Epic. A future import/restore must preserve or explicitly map every Epic. Media rework-ticket creation, automatic successors, and full ticket import/restore are not implemented routes in the current service. The shared save guard protects any later route. Canceled assistant integration retains its restricted contract: no assistant Epic selection or intake-setting authority is added, and a missing-Epic Draft is refused until a separately authorized intake route exists.
 
 ## Canonical prerequisite view
 

@@ -27,7 +27,7 @@ final class ActiveSectionTests: XCTestCase {
                                   "status_id": "status-" + (id == "draft" ? "queued" : id), "readiness": id == "draft" ? "draft" : "ready",
                                   "archived": false, "trashed": false, "tag_ids": [String](), "updated_at": "2026-10-22T00:00:00Z"]
                 if id == "queued" { task["planned_assignee"] = "human" }
-                try self.router.save(db, task, type: "task")
+                try self.router.save(db, fixtureDomainValue(self.router,db:db,value:task,type:"task"), type: "task")
             }
             try self.router.save(db, ["id": "owner-question", "project_id": self.pid, "task_id": "queued", "revision": 1, "state": "pending"], type: "request")
             try self.router.save(db, ["id": "triage", "project_id": self.pid, "revision": 1, "kind": "triage", "phase": "implementation",

@@ -170,7 +170,10 @@ def main():
         if project_id:
             assert {"task_create", "task_get"} <= names, names
             nonce = uuid.uuid4().hex[:10]
-            create = {"project_id": project_id, "command_id": str(uuid.uuid4()),
+            epic_result = probe.tool("epic_create", {"project_id": project_id, "command_id": str(uuid.uuid4()),
+                                                    "name": "MCP verification " + nonce})
+            epic = epic_result.get("data", epic_result)
+            create = {"project_id": project_id, "epic_id": epic["id"], "command_id": str(uuid.uuid4()),
                       "title": "MCP verification " + nonce, "brief": "Synthetic installed-protocol verification. No source checklist migration.", "kind": "question"}
             first = probe.tool("task_create", create)
             retry = probe.tool("task_create", create)

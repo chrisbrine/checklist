@@ -24,6 +24,7 @@ import unicodedata
 from urllib.parse import unquote, urlsplit
 import uuid
 
+from clean_scratch import caller_session, mark_qualification, validate_fingerprint
 from verify_stage import sha, signing_teams, verify as verify_stage
 from verify_install import failure_guidance
 
@@ -445,6 +446,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None)
         if record_kind == 'capture_bindings':
             if key == 'stored': return ('lookup', 'source-captures')
             if key == 'relative': return ('managed', 'source-captures')
+        if key == 'declared_path' and '.file_scopes[]' in location: return ('recursive_binding', None)
         if key == 'path':
             if parent.get('mode') == 'managed': return ('managed', 'objects')
             if parent.get('mode') in {'reference', 'external_reference'}: return ('binding', None)
@@ -473,7 +475,17 @@ def require_local_paths(database, destination, immutable=True, source_root=None)
         # Captures retain which trusted Git performed the inventory. The reader
         # never executes this field; later work resolves trusted Git afresh.
         if key == 'git_path' and capture: return ('provenance', None)
+        # Human command examples are validated text, never executed by Core.
+        # Retain this formerly strict field's blanket file-URL refusal.
+        if key == 'working_directory' and record_kind == 'request' and location.endswith('.command'):
+            return ('instruction', None)
         if key in PATH_FIELDS or key in PATH_LIST_FIELDS: return ('strict', None)
+        # These scalar fields are prose, never file authority in Core. Keep
+        # unknown fields strict and continue inspecting structured children.
+        if key in {'body', 'brief', 'reason', 'summary'} or (
+                key == 'evidence' and record_kind == 'manifest' and location.endswith('.evidence.checks[]')) or (
+                record_kind in {'attempt', 'source_execution'} and key in {'file_state_refs', 'stop_observation_refs'}):
+            return ('text', None)
         return (None, None)
 
     def inspect(value, location, record_kind=None, rule=(None, None), inert=False):
@@ -488,8 +500,8 @@ def require_local_paths(database, destination, immutable=True, source_root=None)
         elif isinstance(value, str):
             kind, family = rule
             has_file_url = re.search(r'\bfile:', value, re.IGNORECASE) is not None
-            if has_file_url and kind is not None: refuse(location, 'a stored file URL')
-            if kind is None:
+            if has_file_url and kind not in {None, 'text'}: refuse(location, 'a stored file URL')
+            if kind in {None, 'text'}:
                 # Inspect serialized payloads at their leaves, not as quoted prose.
                 try: decoded = json.loads(value)
                 except (ValueError, TypeError): pass
@@ -508,7 +520,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None)
                     check_slot_absolute(decoded_path, location)
                     return
             if inert:
-                if kind is not None or value.startswith('/') or has_file_url:
+                if kind not in {None, 'text'} or value.startswith('/') or has_file_url:
                     counts['inert_metadata_path_occurrences' if inert == 'metadata' else 'inert_history_path_occurrences'] += 1
             elif kind == 'managed': check_managed(value, family, location)
             elif kind == 'lookup':
@@ -542,6 +554,9 @@ def require_local_paths(database, destination, immutable=True, source_root=None)
             elif kind == 'provenance':
                 check_absolute(value, location)
                 counts['capture_git_provenance'] += 1
+            elif kind in {'text', 'instruction'}:
+                if value.startswith('/') or has_file_url:
+                    counts['inert_history_path_occurrences'] += 1
             elif kind == 'strict' or value.startswith('/'):
                 check_slot_absolute(value, location)
             elif has_file_url:
@@ -752,8 +767,18 @@ def create(arguments, p):
         load(p)  # Do not replace unrelated directories.
     capture, manifest = stage_selection(arguments)
     identity = sign_identity(manifest)
+    session_id = getattr(arguments, 'session_id', None)
+    has_identity = session_id is not None or os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID')
+    session = caller_session(session_id) if has_identity else None
+    validate_fingerprint(manifest['source_fingerprint'])
     if p['folder'].exists(): destroy(p)
     p['folder'].mkdir(mode=0o700)
+    if session is not None:
+        mark_qualification(p['folder'], manifest['source_fingerprint'],
+                           'disposable test slot ' + str(arguments.slot), session)
+    else:
+        print('Warning: no caller session identity; skipping qualification marker for ' + str(p['folder'])
+              + '. Supply --session-id with your actual session ID to record ownership.', file=sys.stderr)
     metadata = {'slot': arguments.slot, 'build_id': manifest['build_id'], 'source_fingerprint': manifest['source_fingerprint'],
                 'stage_path': str(capture), 'seed': {'kind': 'incomplete'}, 'created_at': now(), 'mode': 'incomplete', 'checks': None}
     save(p, metadata)
@@ -1098,6 +1123,7 @@ def main():
         if name == 'create':
             source = command.add_mutually_exclusive_group()
             source.add_argument('--stage', type=Path); source.add_argument('--latest-stage', action='store_true')
+            command.add_argument('--session-id', help='actual owning session when no native host ID is exported')
             command.add_argument('--seed', type=seed_value, default='empty'); command.add_argument('--replace', action='store_true')
         if name == 'check':
             command.add_argument('--destroy-after-check', action='store_true',

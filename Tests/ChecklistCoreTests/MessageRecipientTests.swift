@@ -19,7 +19,7 @@ final class MessageRecipientTests: XCTestCase {
     func call(_ method: String, _ input: JSON = [:], _ caller: Caller? = nil, command: String? = nil) throws -> JSON {
         var params = input
         if !CommandRouter.readMethods.contains(method) { params["command_id"] = command ?? uuid() }
-        return try router.handle(method: method, params: params, caller: caller ?? owner)["data"] as! JSON
+        return try router.handle(method: method, params: fixtureTaskInput(router,method:method,input:params), caller: caller ?? owner)["data"] as! JSON
     }
     struct Fixture {
         let project: JSON

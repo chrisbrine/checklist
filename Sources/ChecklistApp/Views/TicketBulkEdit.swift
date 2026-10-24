@@ -65,7 +65,7 @@ struct TicketBulkEditSheet: View {
                 return ["kind": "assignee", "planned_assignee": ["kind": "agent", "session_id": worker.id, "provider": worker.string("provider")], "assignment_reason": reason.trimmingCharacters(in: .whitespacesAndNewlines)]
             }
             return ["kind": "assignee", "planned_assignee": assignment]
-        case "epic": return ["kind": "epic", "epic_id": groupID.isEmpty ? NSNull() : groupID]
+        case "epic": return ["kind": "epic", "epic_id": groupID]
         case "triage": return ["kind": "triage", "triage_id": groupID, "action": triageAction]
         default: return ["kind": "archive", "action": archiveAction]
         }
@@ -76,7 +76,7 @@ struct TicketBulkEditSheet: View {
         case "status": return !missingStatusReason && !statusReasonTooLong
         case "tags": return selectedTags.count > 0
         case "assignee": return ["unassigned", "human"].contains(assignment) || (workerOptions.contains { RecordIdentity($0.id) == RecordIdentity(assignment) } && !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        case "triage": return !groupID.isEmpty
+        case "epic", "triage": return !groupID.isEmpty
         default: return true
         }
     }
@@ -155,7 +155,7 @@ struct TicketBulkEditSheet: View {
         case "epic", "triage":
             if draft.kind == "triage" { Picker("Triage change", selection: $triageAction) { Text("Add").tag("add"); Text("Remove").tag("remove") }.pickerStyle(.segmented) }
             Picker(draft.kind == "epic" ? "Epic" : "Triage", selection: $groupID) {
-                Text(draft.kind == "epic" ? "No Epic" : "Choose Triage").tag("")
+                Text(draft.kind == "epic" ? "Choose Epic" : "Choose Triage").tag("")
                 ForEach(options) { group in Text(ProductionGroups.label(group)).tag(group.id) }
             }
             optionPages

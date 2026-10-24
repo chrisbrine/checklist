@@ -10,11 +10,21 @@ extension CoreTests {
         let batch = try prepareReviewBatch(p,f.group,[task,f.tasks[2]],f.reviewer)
         let claims = try claimFixedBatch(p,batch,f.reviewer)["claims"] as! [JSON]
         let inputs: [JSON] = claims.map { claim in
-            var input: JSON = ["attempt_id":claim["id"]!,"claim_token":claim["claim_token"]!,"review_request_id":claim["review_request_id"]!,"target_manifest_id":claim["manifest_id"]!,"gate":"review","verdict":verdict,"reason":"Need the recorded check output"]
-            if verdict == "not_run" { input["check"] = "Inspect recorded output" }
+            let input: JSON = ["attempt_id":claim["id"]!,"claim_token":claim["claim_token"]!,"review_request_id":claim["review_request_id"]!,"target_manifest_id":claim["manifest_id"]!,"gate":"review","verdict":"blocked"]
             return input
         }
         _ = try call("batch_review_record",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":1,"members":inputs],f.reviewer)
+        // Historical CL-41 requests are retained unchanged by CL-216; current verdicts no longer create them.
+        if verdict != "blocked" {
+            try reviewFixtureWrite { db in
+                for claim in claims {
+                    var request = try router.record(db,claim["review_request_id"] as! String,type:"review_request")
+                    request["state"] = verdict == "evidence_missing" ? "evidence_requested" : "queued"
+                    if verdict == "evidence_missing" { request["evidence_request"] = ["reason":"Need the recorded check output"] }
+                    try router.save(db,request,type:"review_request")
+                }
+            }
+        }
         let claim = claims.first { $0["task_id"] as? String == task["id"] as? String }!
         let request = try router.dbQueue.read { try router.record($0,claim["review_request_id"] as! String,type:"review_request") }
         return (p,task,[f.group,other],request,f.reviewer)

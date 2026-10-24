@@ -11,16 +11,25 @@ extension CommandRouter {
     static let finalReportLimit = 64_000
     /// Fields that belong to one attempt only: a new attempt made from it (handoff, delegation or
     /// takeover) never inherits its draft verdict, final report or resource wait.
-    static let attemptOwnRecordKeys = ["draft_verdict", "final_report", "final_report_at", "final_report_origin", "final_report_author", "final_report_sha256", "waiting_for_resource", "waiting_since", "waiting_seconds"]
+    static let attemptOwnRecordKeys = ["returned_from_review_id", "review_return_from_attempt_id", "draft_verdict", "final_report", "final_report_at", "final_report_origin", "final_report_author", "final_report_sha256", "waiting_for_resource", "waiting_since", "waiting_seconds"]
     /// An active attempt without a checkpoint for this long is quiet, unless it waits for a resource.
     static let quietCheckpointSeconds: TimeInterval = 30 * 60
 
     /// Only `advice` leaves completion open; every other severity, including older values, blocks it.
     static func findingBlocksCompletion(_ finding: JSON) -> Bool { finding["severity"] as? String != "advice" }
 
-    /// `reason` (and `check` for not_run) for the two verdicts that are neither a pass nor a fail.
+    /// Explicit blocker ownership, or `reason` (and `check` for not_run) for a review gap.
     /// They name a gap, not a defect, so they carry no findings, dispositions or release hold.
     func reviewOutcomeDetails(_ p: JSON, verdict: String) throws -> JSON {
+        if verdict == "blocked" {
+            guard p["check"] == nil else { throw CoreError("INVALID_INPUT", "check belongs to not_run.") }
+            let side = p["blocked_on"] == nil ? "reviewer" : try text(p,"blocked_on",max:40)
+            guard ["implementation","reviewer"].contains(side) else { throw CoreError("INVALID_INPUT", "blocked_on is implementation or reviewer.") }
+            var details: JSON = ["blocked_on":side]
+            if side == "implementation" || p["reason"] != nil { details["reason"] = try text(p,"reason",max:8000) }
+            return details
+        }
+        guard p["blocked_on"] == nil else { throw CoreError("INVALID_INPUT", "blocked_on belongs to blocked.") }
         guard ["evidence_missing", "not_run"].contains(verdict) else {
             guard p["reason"] == nil, p["check"] == nil else { throw CoreError("INVALID_INPUT", "reason and check belong to an evidence_missing or not_run verdict.") }
             return [:]

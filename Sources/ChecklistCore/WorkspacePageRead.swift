@@ -58,7 +58,13 @@ extension CommandRouter {
                 args += ["quietBefore":Date().timeIntervalSince1970 - Self.quietCheckpointSeconds,"todayStart":Calendar.current.startOfDay(for:Date()).timeIntervalSince1970]
                 filter += " AND " + Self.needFilter(surface)
             // CL-67: the latest three verdicts of each project, so a busy project cannot hide another one.
-            case "recent_reviews":filter += " AND r.type='review' AND (SELECT COUNT(*) FROM records n WHERE n.project_id=r.project_id AND n.type='review' AND (checklist_timestamp(json_extract(n.data,'$.created_at'))>checklist_timestamp(json_extract(r.data,'$.created_at')) OR (checklist_timestamp(json_extract(n.data,'$.created_at'))=checklist_timestamp(json_extract(r.data,'$.created_at')) AND n.id>r.id)))<3"
+            case "recent_reviews":filter += """
+                 AND r.type='review' AND r.id IN (
+                   SELECT id FROM (
+                     SELECT id,ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY checklist_timestamp(json_extract(data,'$.created_at')) DESC,id DESC) AS review_rank
+                     FROM records WHERE type='review' AND project_id IN (SELECT value FROM json_each(:projects))
+                   ) WHERE review_rank<=3)
+                """
             case "completed_since":
                 args += ["since":sinceDate!.timeIntervalSince1970]
                 filter += " AND r.type='task' AND COALESCE(json_extract(r.data,'$.trashed'),0)=0 AND checklist_timestamp(json_extract(r.data,'$.completed_at'))>:since AND EXISTS (SELECT 1 FROM records s WHERE s.id=json_extract(r.data,'$.status_id') AND s.type='status' AND s.project_id=r.project_id AND json_extract(s.data,'$.category') IN ('done','completed'))"

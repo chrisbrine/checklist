@@ -16,7 +16,7 @@ final class OrdinaryMentionPublicBoundaryTests: XCTestCase {
     func call(_ method: String, _ params: JSON, _ caller: Caller? = nil, command: String? = nil) throws -> JSON {
         var input = params
         if !CommandRouter.readMethods.contains(method) { input["command_id"] = command ?? uuid() }
-        return try router.handle(method: method, params: input, caller: caller ?? owner)["data"] as! JSON
+        return try router.handle(method: method, params: fixtureTaskInput(router,method:method,input:input), caller: caller ?? owner)["data"] as! JSON
     }
     struct Fixture {
         let project: JSON, source: JSON, target: JSON, targetAttempt: JSON

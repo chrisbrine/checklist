@@ -172,24 +172,32 @@ extension CommandRouter {
                 let current = session.map {canReceive($0,project:source["project_id"] as! String) && sessionGeneration($0) == orchestration["session_authorization_generation"] as? String} ?? false
                 group["orchestration_connection"] = current ? "current" : "recovery_required"
             }
-            let exits = try records(db,type:"triage_membership_exit",project:source["project_id"] as? String)
-            group["membership_history"] = try records(db,type:"triage_membership_interval",project:source["project_id"] as? String).filter {$0["triage_id"] as? String == source["id"] as? String}.map { interval -> JSON in
+            let exits = try groupRelatedRecords(db,source,type:"triage_membership_exit",field:"triage_id")
+            group["membership_history"] = try groupRelatedRecords(db,source,type:"triage_membership_interval",field:"triage_id").map { interval -> JSON in
                 var interval = interval;interval["exit"] = exits.first {$0["membership_id"] as? String == interval["id"] as? String} ?? NSNull();return interval
             }
-            group["batches"] = try records(db,type:"batch",project:source["project_id"] as? String).filter {$0["triage_id"] as? String == source["id"] as? String}.map { batch -> JSON in
+            group["batches"] = try groupRelatedRecords(db,source,type:"batch",field:"triage_id").map { batch -> JSON in
                 var summary: JSON = ["id":batch["id"]!,"phase":batch["phase"]!,"created_at":batch["created_at"]!,"triage_revision":batch["triage_revision"]!,"member_count":(batch["members"] as? [JSON] ?? []).count,"digest":batch["digest"]!]
                 summary.merge(try batchLifecycle(db,batch)) { _,new in new };return summary
             }
             return group
         }
         guard source["kind"] as? String == "epic" else { return group }
-        let assigned = try records(db,type:"task",project:source["project_id"] as? String).filter {$0["epic_id"] as? String == source["id"] as? String}
+        let assigned = try groupRelatedRecords(db,source,type:"task",field:"epic_id")
         let previous = source["members"] as? [JSON] ?? []
         group["members"] = assigned.map { task -> JSON in ["task_id":task["id"]!,"joined_at":previous.first(where: {$0["task_id"] as? String == task["id"] as? String})?["joined_at"] ?? task["updated_at"] ?? task["created_at"] ?? ""] }
         group["task_ids"] = assigned.compactMap {$0["id"] as? String}
         group["brief"] = source["brief"] ?? source["description"] ?? source["purpose"] ?? ""
         group["description"] = group["brief"]
         return group
+    }
+    /// Existing scope index selects the record family; unrelated rich histories
+    /// never cross the canonical decoding boundary for each individual group.
+    private func groupRelatedRecords(_ db: Database,_ group: JSON,type: String,field: String) throws -> [JSON] {
+        let pid = group["project_id"] as! String,gid = group["id"] as! String
+        return try readSnapshotCache.records(db,key:["group-related",pid,gid,type,field]) {
+            try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND json_extract(data,'$."+field+"')=CAST(? AS TEXT) COLLATE BINARY ORDER BY rowid",arguments:[Data(type.utf8),Data(pid.utf8),Data(gid.utf8)])
+        }
     }
     func syncEpic(_ db: Database,_ source: JSON,taskOverride: JSON? = nil) throws -> JSON {
         guard source["kind"] as? String == "epic" else { throw CoreError("INVALID_INPUT","Persistent membership synchronization applies only to Epics.") }
@@ -205,13 +213,11 @@ extension CommandRouter {
     }
     func editTaskEpic(_ db: Database,task: inout JSON,value: Any) throws {
         let pid = task["project_id"] as! String,old = task["epic_id"] as? String
-        if let destination = value as? String {
-            let epic = try scoped(db,destination,pid,type:"group");guard epic["kind"] as? String == "epic" else { throw CoreError("INVALID_INPUT","An Epic must be a persistent subproject, not a Triage.") }
-            guard old == nil || old == destination else { throw CoreError("EPIC_MOVE_REQUIRED","Use an explicit Epic move so the source and destination are reviewed together.",details:["from_epic_id":old!,"task_revision":task["revision"]!]) }
-            task["epic_id"] = destination;_ = try syncEpic(db,epic,taskOverride:task)
-        } else if value is NSNull {
-            task.removeValue(forKey:"epic_id");if let old = old,let source = try? scoped(db,old,pid,type:"group"),source["kind"] as? String == "epic" { _ = try syncEpic(db,source,taskOverride:task) }
-        } else { throw CoreError("INVALID_INPUT","Use an Epic ID or null to clear the Epic.") }
+        let destination = try requiredEpicID(value)
+        let epic = try scoped(db,destination,pid,type:"group");guard epic["kind"] as? String == "epic" else { throw CoreError("INVALID_INPUT","An Epic must be a persistent subproject, not a Triage.") }
+        guard old == destination || !bool(epic,"archived") else { throw CoreError("INVALID_INPUT","Restore this Epic before adding tickets.") }
+        guard old == nil || old == destination else { throw CoreError("EPIC_MOVE_REQUIRED","Use an explicit Epic move so the source and destination are reviewed together.",details:["from_epic_id":old!,"task_revision":task["revision"]!]) }
+        task["epic_id"] = destination;_ = try syncEpic(db,epic,taskOverride:task)
     }
     func groupList(_ db: Database,_ p: JSON,_ c: Caller,_ method: String) throws -> JSON {
         let pid = try scope(db,p,c), kind = method == "epic_list" ? "epic" : "triage"
@@ -254,7 +260,13 @@ extension CommandRouter {
                 for memberID in triageMemberIDs(group) { try validateTriageTaskPhase(db,task:scoped(db,memberID,pid,type:"task"),phase:phase) }
                 group["phase"] = phase
             }
-            if p["archived"] != nil { group["archived"] = bool(p,"archived") }
+            if p["archived"] != nil {
+                if bool(p,"archived"),group["kind"] as? String == "epic" {
+                    let live = try String.fetchOne(db,sql:"SELECT id FROM records WHERE type='task' AND project_id=? AND json_extract(data,'$.epic_id')=? AND COALESCE(json_extract(data,'$.archived'),0)=0 AND COALESCE(json_extract(data,'$.trashed'),0)=0 AND COALESCE(json_extract(data,'$.purged'),0)=0 LIMIT 1",arguments:[pid,gid])
+                    guard live == nil else {throw CoreError("EPIC_IN_USE","Move this Epic's live tickets to another Epic before archiving it.")}
+                }
+                group["archived"] = bool(p,"archived")
+            }
             group = revised(group);try save(db,group,type:"group");try event(db,caller:c,project:pid,entity:gid,kind:"group_edited");return try groupProjection(db,group)
         }
         let tid = try text(p,"task_id");var task = try scoped(db,tid,pid,type:"task")
@@ -264,8 +276,9 @@ extension CommandRouter {
             guard ["add","remove","move"].contains(action) else { throw CoreError("INVALID_INPUT","Epic membership supports add, remove or explicit move.") }
             let old = task["epic_id"] as? String
             if action == "remove" {
-                if old == gid { task.removeValue(forKey:"epic_id");task = revised(task);try save(db,task,type:"task") }
+                if old == gid { throw CoreError("EPIC_REQUIRED","Every ticket needs a primary Epic. Move it to another Epic instead.") }
             } else {
+                guard old == gid || !bool(group,"archived") else { throw CoreError("INVALID_INPUT","Restore this Epic before adding tickets.") }
                 if let old = old,old != gid {
                     guard action == "move",p["expected_task_revision"] != nil,p["from_epic_id"] as? String == old else { throw CoreError("EPIC_MOVE_REQUIRED","This task already belongs to another Epic. Confirm an explicit move.",details:["from_epic_id":old,"task_revision":task["revision"]!]) }
                     let source = try scoped(db,old,pid,type:"group");guard source["kind"] as? String == "epic" else { throw CoreError("INVALID_INPUT","The source Epic link requires repair.") };guard p["from_epic_revision"] != nil else { throw CoreError("REVISION_REQUIRED","Read the source Epic before moving this task.") };try revision(["expected_revision":p["from_epic_revision"]!],source)

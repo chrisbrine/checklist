@@ -298,6 +298,12 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
                 })
             }))
         }
+        // Ticket-scoped owner access actions use Core's revision-checked,
+        // idempotent transaction. Keep the native enrollment for explicit Allow again.
+        if ["connection_revoke", "connection_allow"].contains(method), params["session_id"] != nil {
+            guard caller.role == "owner" else { throw ChecklistError("FORBIDDEN", "Conversation access requires the owner.") }
+            return .router(method:method,params:params,caller:caller)
+        }
         if method == "connection_revoke" {
             guard caller.role == "owner", let installation = params["installation"] as? String else { throw ChecklistError("FORBIDDEN", "Disconnect requires the owner.") }
             guard let commandID = params["command_id"] as? String, UUID(uuidString: commandID) != nil else { throw ChecklistError("INVALID_INPUT", "Disconnect requires a UUID command_id.") }
@@ -463,10 +469,12 @@ final class Peer: NSObject, ChecklistRPC {
     init(coordinator: Coordinator, connection: NSXPCConnection) { self.coordinator=coordinator;self.connection=connection }
     func execute(_ request: Data, withReply reply: @escaping (Data) -> Void) {
         guard request.count <= 4 * 1024 * 1024 else { reply(Data("{\"error\":{\"code\":\"TOO_LARGE\",\"message\":\"Command is larger than 4 MiB.\"}}".utf8));return }
-        coordinator.queue.async { [self] in
+        // Drain caller-thread JSON/serialization and hook temporaries for each
+        // request, including off-queue reads and deferred change replies.
+        coordinator.queue.async { [self] in autoreleasepool {
             if let object = try? JSONSerialization.jsonObject(with:request) as? [String:Any], object["method"] as? String == "changes_wait", let connection {
                 let id = UUID()
-                let finish: () -> Void = { [self] in
+                let finish: () -> Void = { [self] in autoreleasepool {
                     do {
                         let result = try coordinator.execute(object,connection:connection)
                         let payload = result["data"] as? [String:Any] ?? result
@@ -478,14 +486,14 @@ final class Peer: NSObject, ChecklistRPC {
                         coordinator.waiters.removeValue(forKey:id)
                         reply(Self.errorBytes(error))
                     }
-                }
+                }}
                 coordinator.waiters[id] = finish
                 finish()
-                coordinator.queue.asyncAfter(deadline:.now()+8) { [self] in
+                coordinator.queue.asyncAfter(deadline:.now()+8) { [self] in autoreleasepool {
                     guard coordinator.waiters.removeValue(forKey:id) != nil else { return }
                     do { let result=try coordinator.execute(object,connection:connection);reply((try? JSONSerialization.data(withJSONObject:result)) ?? Data("{}".utf8)) }
                     catch { reply(Self.errorBytes(error)) }
-                }
+                }}
                 return
             }
             let routed: Coordinator.Routed
@@ -502,18 +510,18 @@ final class Peer: NSObject, ChecklistRPC {
                 // never cancels it; a same-ID retry uses the router's stored receipt.
                 // Hooks return to the serial queue after the reply.
                 let router = coordinator.router
-                DispatchQueue.global(qos:.userInitiated).async { [self] in
+                DispatchQueue.global(qos:.userInitiated).async { [self] in autoreleasepool {
                     let result: [String:Any]
                     do { result = try router.handle(method:method,params:params,caller:caller) } catch { result = ["error":Self.publicError(error)] }
                     reply((try? JSONSerialization.data(withJSONObject:result,options:[.sortedKeys])) ?? Data("{}".utf8))
-                    coordinator.queue.async { [self] in afterCommand(result) }
-                }
+                    coordinator.queue.async { [self] in autoreleasepool {afterCommand(result)} }
+                }}
             case .router(let method,let params,let caller):
                 let result: [String:Any]
                 do { result = try coordinator.router.handle(method:method,params:params,caller:caller) } catch { result = ["error":Self.publicError(error)] }
                 finish(result,reply:reply)
             }
-        }
+        }}
     }
     /// On the serial queue.
     func finish(_ result:[String:Any],reply:(Data)->Void) {

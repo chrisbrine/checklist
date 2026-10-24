@@ -47,6 +47,14 @@ struct RequestDetailView: View {
     var answered: Bool { ["answered", "resolved", "canceled", "superseded"].contains(Canceled.normalized(request.string("state"))) }
     var incompleteMessage: String? { answered ? nil : RequestDraftIdentity.incompleteMessage(draft, questions: questions, fileRequests: fileRequests) }
     var complete: Bool { RequestDraftIdentity.isComplete(draft, questions: questions, fileRequests: fileRequests) && !staleDraft && fileProblems.isEmpty && fileInspector.ready(for: fileInspectionScope) && imageApprovalReady }
+    var sendBlockedReason: String? {
+        if staleDraft { return "This form changed. Review the current version first." }
+        if let incompleteMessage { return incompleteMessage }
+        if let problem = fileProblems.values.sorted().first { return problem }
+        if !fileInspector.ready(for: fileInspectionScope) { return "Wait for the selected files to finish being checked." }
+        if !imageApprovalReady { return "Inspect and mark every available original before approving, or choose a different response." }
+        return nil
+    }
     var fileInspectionScope: RequestFileInspectionScope {
         RequestFileInspectionScope(request: request, draft: draft, fileRequests: fileRequests, storeIncarnation: store.storeIncarnation)
     }
@@ -89,7 +97,8 @@ struct RequestDetailView: View {
                     if !spec.object("command").isEmpty { commandView(Record(values: spec.object("command"))) }
                     ForEach(questions) { question in questionView(question) }
                     ForEach(fileRequests) { file in fileView(file) }
-                    DetailSection(title: "Optional explanation") {
+                    DetailSection(title: draft.values.values.contains("not_checked") ? "Explanation for Not checked (required)" : "Optional explanation") {
+                        if draft.values.values.contains("not_checked") { Text("Send answer saves your response and explanation. This request stays unresolved; no check or approval is recorded as passed.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                         TextEditor(text: Binding(get: { draft.explanation }, set: { draft.explanation = $0; save() })).checklistFont(.body).frame(minHeight: 75).padding(Spacing.compact).overlay(RoundedRectangle(cornerRadius: Radius.medium).stroke(.quaternary)).checklistDisabled([(answered, "This request is already answered."), (staleDraft, "This request changed. Review the current version first.")])
                     }
                     if !priorDrafts.isEmpty {
@@ -141,11 +150,11 @@ struct RequestDetailView: View {
         VStack(alignment: .leading, spacing: Spacing.row) {
             if answered { Text(Self.footerText(request)).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             else { DraftSaveStatusView(kind: "answer", draftID: request.id); Text("Sending records only the results you explicitly select.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
-            if draft.explanation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !answered { Text("Add an explanation to request clarification or say you cannot do this.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+            if draft.explanation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !answered { Text("Add an explanation to use Need clarification or Cannot do in Other response.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             if let progress = fileInspector.progress {
                 ProgressView(value: progress.fraction) { Text("Checking selected files…").checklistFont(.micro) }
             }
-            if let incompleteMessage { Text(incompleteMessage).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+            if let sendBlockedReason, !answered { Text(sendBlockedReason).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             AccessibleHStack {
                 Menu("Other response") {
                     Button("Need clarification") { send("clarification") }.checklistDisabled([(!store.connected, DisabledReasons.offline), (draft.explanation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write an explanation first."), (staleDraft, "This request changed. Review the current version first."), (fileInspector.isChecking, "The selected files are still being checked.")])
@@ -155,7 +164,7 @@ struct RequestDetailView: View {
                     Button("Cancel request…", role: .destructive) { confirmation = Confirmations.cancelRequest { store.run("human_request_cancel", ["project_id": request.string("project_id"), "request_id": request.id, "expected_revision": request.integer("revision"), "reason": draft.explanation], success: "Request canceled") } }
                 }.checklistDisabled([(answered, "This request is already answered."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
                 Spacer()
-                Button("Send answer") { send("answered") }.buttonStyle(.checklistProminent).keyboardShortcut(.return, modifiers: .command).checklistDisabled([(!complete, incompleteMessage ?? "Complete every required item. Choose No to decline; use Other response for Not checked."), (answered, "This request is already answered."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
+                Button("Send answer") { send("answered") }.buttonStyle(.checklistProminent).keyboardShortcut(.return, modifiers: .command).checklistDisabled([(!complete, sendBlockedReason ?? "Complete every required item before sending."), (answered, "This request is already answered."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
             }
         }.padding(Spacing.group).background(.bar)
     }
@@ -173,7 +182,7 @@ struct RequestDetailView: View {
             let type = question.string("type")
             if !question.object("command").isEmpty { commandView(Record(values: question.object("command"))) }
             if ["single_choice", "multiple_choice", "choice", "approval", "check"].contains(type) {
-                let options: [Record] = type == "approval" ? [Record(values: ["id": "approved", "label": "Approve"]), Record(values: ["id": "changes_requested", "label": "Needs changes"]), Record(values: ["id": "declined", "label": "No · I decline"]), Record(values: ["id": "not_checked", "label": "Not checked"])] : type == "check" ? [Record(values: ["id": "passed", "label": "I ran it · Passed"]), Record(values: ["id": "failed", "label": "I ran it · Failed"]), Record(values: ["id": "declined", "label": "No · I decline"]), Record(values: ["id": "not_checked", "label": "Not checked"])] : question.records("options")
+                let options: [Record] = type == "approval" ? [Record(values: ["id": "approved", "label": "Approve"]), Record(values: ["id": "changes_requested", "label": "Needs changes"]), Record(values: ["id": "declined", "label": "No · I decline"]), Record(values: ["id": "not_checked", "label": "Other response · Not checked"])] : type == "check" ? [Record(values: ["id": "passed", "label": "I ran it · Passed"]), Record(values: ["id": "failed", "label": "I ran it · Failed"]), Record(values: ["id": "declined", "label": "No · I decline"]), Record(values: ["id": "not_checked", "label": "Other response · Not checked"])] : question.records("options")
                 VStack(alignment: .leading, spacing: Spacing.small) {
                     ForEach(options) { option in
                         Button {
@@ -302,20 +311,12 @@ struct RequestDetailView: View {
         }
     }
     func submit(_ response: String) {
-        let answers: [[String: Any]] = questions.compactMap { question in
-            let value = draft.values[question.id] ?? "", custom = draft.customValues[question.id] ?? ""
-            guard !value.isEmpty || !custom.isEmpty else { return nil }
-            let type = question.string("type")
-            if ["choice", "single_choice", "multiple_choice"].contains(type) { return ["question_id": question.id, "option_ids": value.split(separator: "\n").map(String.init), "custom_text": custom] }
-            var answer: [String: Any] = ["question_id": question.id]
-            answer[["approval", "check"].contains(type) ? "result" : "text"] = value
-            return answer
-        }
+        let answers = RequestDraftIdentity.answers(draft, questions: questions)
         let files: [[String: Any]] = fileRequests.map { file in ["file_request_id": file.id, "paths": draft.paths[file.id] ?? [], "mode": draft.fileModes[file.id] ?? "reference", "path_sha256": draft.pathHashes.filter { (draft.paths[file.id] ?? []).contains($0.key) }, "explanation": draft.explanations[file.id] ?? ""] }
         var params: [String: Any] = ["project_id": request.string("project_id"), "request_id": request.id, "expected_revision": request.integer("revision"), "form_identity": formIdentity, "answers": response == "answered" ? answers : [], "files": response == "answered" ? files : [], "response": response, "explanation": draft.explanation]
         if !request.string("target_sha256").isEmpty { params["target_sha256"] = request.string("target_sha256") }
         params["inspected_images"] = response == "answered" ? draft.inspectedImages : []
-        let success = response == "answered" ? "Answer saved; agent delivery is recorded separately" : "Response saved; request remains unresolved"
+        let success = response == "answered" && !answers.contains { $0["result"] as? String == "not_checked" } ? "Answer saved; agent delivery is recorded separately" : "Response saved; request remains unresolved"
         let submission = RequestAnswerSubmission(request: request, action: response)
         answerCompletion.observe(submission)
         let recordedAnswer: ([String: Any]) -> Void = { recorded in

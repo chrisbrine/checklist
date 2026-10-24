@@ -17,7 +17,8 @@ extension TicketRetirementTests {
         let storedPath = attachment["path"] as! String
         _ = try call("attachment_add",["project_id":pid,"task_id":tid,"path":external.path,"mode":"reference"])
         var epic = try call("epic_create",["project_id":pid,"name":"Epic"])
-        epic = try call("group_membership",["project_id":pid,"group_id":epic["id"]!,"task_id":tid,"expected_revision":epic["revision"]!,"action":"add"])
+        let source=(try call("epic_list",["project_id":pid])["groups"] as! [JSON]).first {$0["id"] as? String == original["epic_id"] as? String}!
+        epic = try call("group_membership",["project_id":pid,"group_id":epic["id"]!,"task_id":tid,"expected_revision":epic["revision"]!,"expected_task_revision":original["revision"]!,"action":"move","from_epic_id":source["id"]!,"from_epic_revision":source["revision"]!])
         var triage = try call("triage_create",["project_id":pid,"name":"Triage"])
         triage = try call("group_membership",["project_id":pid,"group_id":triage["id"]!,"task_id":tid,"expected_revision":triage["revision"]!,"action":"add"])
         let attempt = uuid(),message = uuid(),delivery = uuid(),shared = uuid()

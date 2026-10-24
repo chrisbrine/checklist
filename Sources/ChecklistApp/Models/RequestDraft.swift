@@ -48,18 +48,31 @@ enum RequestDraftIdentity {
         let list = names.count == 1 ? names[0] : names.dropLast().joined(separator: ", ") + " and " + names.last!
         let hasFiles = items.contains { item in fileRequests.contains { $0.id == item.id } }
         let action = hasFiles ? "Complete" : "Answer"
-        let guidance = items.contains { ["approval", "check"].contains($0.string("type")) }
-            ? " Choose No to decline; use Other response for Not checked." : ""
-        return "\(action) \(list)." + guidance
+        let needsExplanation = items.contains { ["approval", "check"].contains($0.string("type")) && draft.values[$0.id] == "not_checked" }
+        let guidance = needsExplanation ? " Add an explanation for Not checked." : items.contains { ["approval", "check"].contains($0.string("type")) }
+            ? " Choose a result, or select Other response · Not checked and add an explanation." : ""
+        return "\(action) \(list)." + guidance + " You can also use Need clarification or Cannot do with an explanation."
     }
     private static func incompleteItems(_ draft: AnswerDraft, questions: [Record], fileRequests: [Record]) -> [Record] {
         let answers = questions.filter { question in
-            if ["approval", "check"].contains(question.string("type")) && draft.values[question.id] == "not_checked" { return true }
+            if ["approval", "check"].contains(question.string("type")) && draft.values[question.id] == "not_checked" { return draft.explanation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             guard question.values["required"] as? Bool ?? true else { return false }
             return (draft.values[question.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !(question.bool("allow_custom") && !(draft.customValues[question.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
         let files = fileRequests.filter { ($0.values["required"] as? Bool ?? true) && (draft.paths[$0.id] ?? []).isEmpty }
         return answers + files
+    }
+    /// Use the same typed payload for sending and validation tests. Owner notes stay in explanation.
+    static func answers(_ draft: AnswerDraft, questions: [Record]) -> [[String: Any]] {
+        questions.compactMap { question in
+            let value = draft.values[question.id] ?? "", custom = draft.customValues[question.id] ?? ""
+            guard !value.isEmpty || !custom.isEmpty else { return nil }
+            let type = question.string("type")
+            if ["choice", "single_choice", "multiple_choice"].contains(type) { return ["question_id": question.id, "option_ids": value.split(separator: "\n").map(String.init), "custom_text": custom] }
+            var answer: [String: Any] = ["question_id": question.id]
+            answer[["approval", "check"].contains(type) ? "result" : "text"] = value
+            return answer
+        }
     }
     static func fileProblems(_ draft: inout AnswerDraft, fileRequests: [Record]) -> [String: String] {
         let paths = fileRequests.flatMap { draft.paths[$0.id] ?? [] }

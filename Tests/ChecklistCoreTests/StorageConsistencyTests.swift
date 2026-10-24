@@ -36,9 +36,13 @@ final class StorageFixture {
     deinit { try? close();try? FileManager.default.removeItem(at:base) }
     @discardableResult func call(_ method: String,_ params: JSON = [:],command: String = UUID().uuidString.lowercased(),caller: Caller? = nil) throws -> JSON {
         var p = params;if !CommandRouter.readMethods.contains(method) {p["command_id"] = command}
-        return try router!.handle(method:method,params:p,caller:caller ?? owner)
+        return try router!.handle(method:method,params:fixtureTaskInput(router!,method:method,input:p),caller:caller ?? owner)
     }
-    func project() throws -> JSON {try call("project_create",["name":"Storage fixture","key_prefix":"SF","root_path":workspace.path])["data"] as! JSON}
+    func project() throws -> JSON {
+        let project=try call("project_create",["name":"Storage fixture","key_prefix":"SF","root_path":workspace.path])["data"] as! JSON
+        _ = try call("epic_create",["project_id":project["id"]!,"name":"Storage fixture tickets"])
+        return project
+    }
     func task(_ project: JSON) throws -> JSON {try call("task_create",["project_id":project["id"]!,"title":"Storage invariant"])["data"] as! JSON}
     func writeCommand(_ params: JSON) throws {try JSONSerialization.data(withJSONObject:params,options:.sortedKeys).write(to:base.appendingPathComponent("command.json"))}
     func spawn(_ mode: String,command: String = UUID().uuidString.lowercased()) throws -> Process {

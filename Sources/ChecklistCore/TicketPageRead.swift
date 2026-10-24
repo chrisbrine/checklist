@@ -15,9 +15,18 @@ extension CommandRouter {
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let standard = ISO8601DateFormatter()
+        // SQLite serializes each connection. Repeated date strings across the
+        // Overview's count/order queries need one parse, with a bounded cache.
+        var timestamps: [String:Double] = [:]
         db.add(function: DatabaseFunction("checklist_timestamp", argumentCount: 1) { values in
             let value = String.fromDatabaseValue(values[0]) ?? ""
-            return (fractional.date(from:value) ?? standard.date(from:value) ?? .distantPast).timeIntervalSince1970
+            if let cached = timestamps[value] {return cached}
+            let result = (fractional.date(from:value) ?? standard.date(from:value) ?? .distantPast).timeIntervalSince1970
+            if value.utf8.count <= 64 {
+                if timestamps.count >= 1024 {timestamps.removeAll(keepingCapacity:true)}
+                timestamps[value] = result
+            }
+            return result
         })
         // Locale is intentionally not marked deterministic and is cursor-bound.
         db.add(collation: DatabaseCollation("checklist_display_label") { left, right in

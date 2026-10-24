@@ -17,14 +17,17 @@ final class TicketPurgePreviewTests: XCTestCase {
         impact["expected_revision"] = 3;impact["task_id"] = "another-ticket";bad["impact"] = impact
         XCTAssertThrowsError(try TicketPurgePreview(reply:bad,ticket:ticket,incarnation:"store"))
     }
-    func testOnlyTrashOffersPermanentDeletionAndRequiresDestructiveConfirmation() throws {
+    func testTicketListHasNoTrashSurfaceOrPermanentDeletionAction() throws {
         let root = URL(fileURLWithPath:#filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let views = root.appendingPathComponent("Sources/ChecklistApp/Views")
         let files = try FileManager.default.contentsOfDirectory(at:views,includingPropertiesForKeys:nil).filter {$0.pathExtension == "swift"}
         let senders = try files.filter {try String(contentsOf:$0,encoding:.utf8).contains("store.run(\"task_purge\",")}
-        XCTAssertEqual(senders.map(\.lastPathComponent),["TrashTicketsView.swift"])
-        let source = try String(contentsOf:views.appendingPathComponent("TrashTicketsView.swift"),encoding:.utf8)
-        XCTAssertTrue(source.contains(".confirmationDialog(\"Delete this ticket permanently?\""))
-        XCTAssertTrue(source.contains("Button(\"Delete permanently\",role:.destructive)"))
+        XCTAssertTrue(senders.isEmpty, "Permanent deletion has no owner-facing Trash surface")
+        XCTAssertFalse(FileManager.default.fileExists(atPath:views.appendingPathComponent("TrashTicketsView.swift").path))
+        let source = try String(contentsOf:views.appendingPathComponent("TaskWorkspaceView.swift"),encoding:.utf8)
+        XCTAssertFalse(source.contains("showTrash"))
+        XCTAssertFalse(source.contains("Button(\"Trash\")"))
+        XCTAssertTrue(source.contains("visibilityChip(\"Incomplete\", closed: false)"))
+        XCTAssertTrue(source.contains("visibilityChip(\"Done / Archived\", closed: true)"))
     }
 }

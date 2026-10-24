@@ -23,7 +23,8 @@ extension CoreTests {
     func testIndividualSameStatusLeavesAllTriagesButMetadataDoesNot() throws {
         let p = try project();let task = try task(p);let first = try triage(p),second = try triage(p,"Review together")
         var epic = try call("epic_create",["project_id":p["id"]!,"name":"Persistent subsystem","brief":"Keep context"])
-        epic = try call("group_membership",["project_id":p["id"]!,"group_id":epic["id"]!,"expected_revision":epic["revision"]!,"task_id":task["id"]!])
+        let source = (try call("epic_list",["project_id":p["id"]!])["groups"] as! [JSON]).first {$0["id"] as? String == task["epic_id"] as? String}!
+        epic = try call("group_membership",["project_id":p["id"]!,"group_id":epic["id"]!,"expected_revision":epic["revision"]!,"task_id":task["id"]!,"expected_task_revision":task["revision"]!,"action":"move","from_epic_id":source["id"]!,"from_epic_revision":source["revision"]!])
         let attached = try call("task_get",["project_id":p["id"]!,"task_id":task["id"]!]);try addTriage(p,first,task);try addTriage(p,second,task,"review_accepted")
         let edited = try call("task_edit",["project_id":p["id"]!,"task_id":task["id"]!,"expected_revision":attached["revision"]!,"patch":["title":"Updated production brief"]])
         _ = try call("message_send",["project_id":p["id"]!,"task_id":task["id"]!,"body":"Note without changing the handling group"])
@@ -112,7 +113,7 @@ extension CoreTests {
         let value = try submittedArtifact(gates:["human_approval"],holdPassing:true);let p = value.project;let first = value.task;let second = try ready(p,task(p,"Other completion target"));let claim = try call("work_claim",["project_id":p["id"]!,"task_id":second["id"]!,"expected_revision":second["revision"]!]);_ = try submitTriageArtifact(p,second,claim)
         let request = try humanApproval(value);_ = try call("human_request_answer",try observedGateAnswer(["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":request["revision"]!,"target_sha256":value.artifact["sha256"]!,"answers":[["question_id":"approve","value":"approved"]]], task:value.task))
         let group = try triage(p,phase:"review"),other = try triage(p,"Also tracked here",phase:"review");try addTriage(p,group,first);try addTriage(p,group,second);try addTriage(p,other,first,"review_accepted")
-        var epic = try call("epic_create",["project_id":p["id"]!,"name":"Persistent results"]);epic = try call("group_membership",["project_id":p["id"]!,"group_id":epic["id"]!,"expected_revision":epic["revision"]!,"task_id":first["id"]!])
+        let epic = (try call("epic_list",["project_id":p["id"]!])["groups"] as! [JSON]).first {$0["id"] as? String == first["epic_id"] as? String}!
         let before = try call("snapshot")
         assertCode("TRIAGE_TRANSITION_BLOCKED") { _ = try self.call("triage_transition",self.triageInput(p,group,["action":"complete"])) }
         let after = try call("snapshot");for key in ["tasks","groups","events"] { XCTAssertEqual(try jsonString(["rows":before[key]!]),try jsonString(["rows":after[key]!]),key) }

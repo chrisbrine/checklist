@@ -11,6 +11,9 @@ extension CommandRouter {
         if !c.isOwner,(try? scoped(db,id,pid,type:"session")) == nil { throw CoreError("FORBIDDEN","Pair this connection in the app before registering its session.") }
         var r = (try? scoped(db,id,pid,type:"session")) ?? ["id":id,"project_id":pid,"revision":0,"created_at":now()]
         let original = r
+        if !c.isOwner, p["state"] as? String == "revoked" || bool(r,"owner_revoked") || bool(r,"owner_reconnect_allowed") || ["revoked","ended"].contains(r["state"] as? String ?? "") {
+            throw CoreError("FORBIDDEN","Only the owner can disconnect a conversation or allow it again.")
+        }
         if method == "session_update" { try revision(p,r) }
         if let profile = p["profile_id"] as? String { guard (p["role"] as? String ?? r["role"] as? String ?? c.role) == "assistant" else { throw CoreError("FORBIDDEN","Personal assistant identities cannot be bound to worker sessions.") }; _ = try record(db,profile,type:"profile"); if !c.isOwner && r["profile_id"] as? String != profile { throw CoreError("FORBIDDEN","Only the owner pairs a profile to a connection.") }; r["profile_id"] = profile }
         if c.isOwner { r["project_ids"] = (p["project_ids"] != nil ? Array(Set(strings(p,"project_ids") + [pid])) : (r["project_ids"] ?? [pid])); r["role"] = p["role"] as? String ?? r["role"] as? String ?? "worker"; r["provider"] = p["provider"] ?? r["provider"] ?? "manual"; r["workspace"] = p["workspace"] ?? r["workspace"] ?? ""; r["installation"] = p["installation"] ?? r["installation"] ?? c.installation; if let domain = p["execution_domain"] as? String { r["execution_domain"] = domain } }
@@ -92,6 +95,7 @@ extension CommandRouter {
             var t = try task(db,p,pid); try revision(p,t)
             guard !bool(t,"archived"),!bool(t,"trashed"),t["readiness"] as? String == "ready" else { throw CoreError("NOT_READY","Only Ready, visible tasks can be claimed.") }
             try requirePrerequisitesSatisfied(db,task:t)
+            if p["phase"] as? String != "review",let returned = try pickupReturnedImplementation(db,params:p,task:t,caller:c) { return returned }
             guard t["active_attempt_id"] == nil,t["active_verification_request_id"] == nil else { throw CoreError("CLAIM_CONFLICT","Another session already holds this task.") }
             if let a = t["planned_assignee"] as? String,a == "human",!c.isOwner,p["phase"] as? String != "review" { throw CoreError("POLICY_DENIED","This task is assigned to the owner.") }
             if let a = t["planned_assignee"] as? JSON,a["kind"] as? String == "human",!c.isOwner,p["phase"] as? String != "review" { throw CoreError("POLICY_DENIED","This task is assigned to the owner.") }
@@ -204,6 +208,7 @@ extension CommandRouter {
         _ = try validateManifestTarget(db,task:t,manifestID:a["manifest_id"] as! String)
         let verdict = try text(p,"verdict"); guard Self.reviewVerdicts.contains(verdict) else { throw CoreError("INVALID_INPUT","Use pass, reject, blocked, evidence_missing or not_run.") }
         let outcome = try reviewOutcomeDetails(p,verdict:verdict)
+        let returnsToImplementation = verdict == "evidence_missing" || verdict == "not_run" || (verdict == "blocked" && outcome["blocked_on"] as? String == "implementation")
         let checks = try normalizedReviewChecks(db,p,task:t)
         let hold = try releaseHoldRequest(p,verdict:verdict)
         let appliedReviewRequirement = try reviewRequirementState(db,task:t)
@@ -223,15 +228,19 @@ extension CommandRouter {
         switch verdict {
         // A blocked verdict ends this claim and returns the same request to any eligible reviewer (CL-137).
         case "blocked": req["state"] = "queued"; req["blocked_verdict_ids"] = strings(req,"blocked_verdict_ids") + [reviewID]
-        // CL-41: a check that did not run keeps the gate open for any eligible reviewer; it is not a fail.
+        // Keep missing-check details in history; CL-216 closes these requests below without counting a fail.
         case "not_run": req["state"] = "queued"; req["not_run_checks"] = (req["not_run_checks"] as? [JSON] ?? []) + [["check":outcome["check"]!,"reason":outcome["reason"]!,"review_id":reviewID,"recorded_at":now()]]
-        // CL-41: missing evidence returns the gate for more evidence on the same target; review_request
-        // with supersedes_request_id queues it again without a new implementation round.
+        // Preserve the evidence request details even when returning to a fresh implementation round.
         case "evidence_missing": req["state"] = "evidence_requested"; req["evidence_request"] = ["reason":outcome["reason"]!,"review_id":reviewID,"requested_at":now()]
         default: req["state"] = verdict
         }
+        if returnsToImplementation { req["state"] = "returned";req["return_verdict"] = verdict;req["closed_at"] = now() }
         try recordFinalReport(p,caller:c,attempt:&a)
         try save(db,revised(req),type:"review_request"); a["state"] = "finished"; a.removeValue(forKey:"token_hash"); a.removeValue(forKey:"draft_verdict"); try save(db,revised(a),type:"attempt"); t.removeValue(forKey:"active_attempt_id"); if verdict == "reject" { t["status_id"] = try status(db,pid,"queued")["id"]; t.removeValue(forKey:"current_manifest_id"); t.removeValue(forKey:"release_hold") }
+        if returnsToImplementation {
+            r["implementation_return"] = try returnReviewToImplementation(db,task:&t,manifest:inspectionManifest,review:r,caller:actor)
+            try save(db,r,type:"review")
+        }
         // Every verdict ends this review claim. A pass on the last open gate marks the
         // ticket Done when every completion check holds (owner decision, 19 October 2026).
         var completion: JSON = ["completed":false]
@@ -256,8 +265,8 @@ extension CommandRouter {
                 t["status_id"] = done["id"]; t["completed_at"] = now(); completion = ["completed":true]
             } catch let waiting as CoreError { completion = ["completed":false,"waiting_for":waiting.code,"reason":waiting.message] }
         }
-        t = revised(t); try save(db,t,type:"task"); try recordTicketStatusAction(db,task:t,caller:actor,operation:operation)
-        try event(db,caller:actor,project:pid,entity:t["id"] as? String,kind:"review_"+verdict,data:submittedBy == nil ? [:] : ["review_id":reviewID,"reviewer":c.principal,"submitted_draft":true])
+        t = revised(t); try save(db,t,type:"task"); try recordTicketStatusAction(db,task:t,caller:actor,operation:returnsToImplementation ? .individual : operation)
+        try event(db,caller:actor,project:pid,entity:t["id"] as? String,kind:"review_"+verdict,data:["review_id":reviewID,"review_request_id":a["review_request_id"]!,"manifest_id":a["manifest_id"]!,"reviewer":c.principal,"submitted_draft":submittedBy != nil].merging(outcome) { _,new in new })
         if bool(completion,"completed") { try event(db,caller:actor,project:pid,entity:t["id"] as? String,kind:"task_completed",data:["origin":"review_pass","review_id":reviewID]) }
         r["completion"] = completion; r["task"] = try taskProjection(db,t); return r
     }

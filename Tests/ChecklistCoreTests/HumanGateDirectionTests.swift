@@ -9,7 +9,7 @@ final class HumanGateDirectionTests: XCTestCase {
     override func tearDownWithError() throws { router = nil;try? FileManager.default.removeItem(at:root) }
     @discardableResult func call(_ method: String,_ params: JSON = [:]) throws -> JSON {
         var input = params;if !CommandRouter.readMethods.contains(method) { input["command_id"] = uuid() }
-        return try router.handle(method:method,params:input,caller:owner)["data"] as! JSON
+        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:input),caller:owner)["data"] as! JSON
     }
     func assertCode(_ code: String,_ body: () throws -> Void,file: StaticString = #filePath,line: UInt = #line) {
         XCTAssertThrowsError(try body(),file:file,line:line) {XCTAssertEqual(($0 as? CoreError)?.code,code,file:file,line:line)}
@@ -100,4 +100,24 @@ final class HumanGateDirectionTests: XCTestCase {
         let plainAnswer = try call("human_request_answer",["project_id":value.project["id"]!,"request_id":plainRequest["id"]!,"expected_revision":1,"answers":[["question_id":"q","text":"Use the saved detail"]]])
         XCTAssertEqual(plainAnswer["state"] as? String,"answered")
     }
+    func testSendNotCheckedRecordsExplanationWithoutVerdictOrSlotRelease() throws {
+        let value = try fixture()
+        let before = try router.dbQueue.read { db in
+            try jsonString(["task":try router.record(db,value.task["id"] as! String,type:"task"),"gate":try router.record(db,value.request["review_request_id"] as! String,type:"review_request"),"reviews":try router.records(db,type:"review")])
+        }
+        var input = try approval(value)
+        input["response"] = "answered"; input["explanation"] = "I cannot inspect the original on this machine"
+        input["answers"] = [["question_id":"approve","result":"not_checked"]]
+        let saved = try call("human_request_answer",input)
+        XCTAssertEqual(saved["state"] as? String,"pending"); XCTAssertNil(saved["gate_outcome"])
+        let response = (saved["responses"] as! [JSON]).last!
+        XCTAssertEqual(response["complete"] as? Bool,false)
+        XCTAssertEqual(response["explanation"] as? String,input["explanation"] as? String)
+        XCTAssertEqual((response["answers"] as! [JSON])[0]["result"] as? String,"not_checked")
+        let after = try router.dbQueue.read { db in
+            try jsonString(["task":try router.record(db,value.task["id"] as! String,type:"task"),"gate":try router.record(db,value.request["review_request_id"] as! String,type:"review_request"),"reviews":try router.records(db,type:"review")])
+        }
+        XCTAssertEqual(after,before)
+    }
+
 }

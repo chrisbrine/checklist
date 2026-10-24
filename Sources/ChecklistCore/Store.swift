@@ -5,6 +5,7 @@ import CryptoKit
 
 public final class CommandRouter: @unchecked Sendable {
     let epicReferenceIndex = EpicReferenceIndex()
+    let readSnapshotCache = ReadSnapshotCache()
     let dbQueue: DatabaseQueue
     /// Read-only connections for pure reads (CL-72). Nil when the store cannot open them;
     /// reads then use the writer path.
@@ -123,8 +124,9 @@ public final class CommandRouter: @unchecked Sendable {
     func record(_ db: Database, _ id: String, type: String? = nil) throws -> JSON {
         let query = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE id = CAST(? AS TEXT)" + (type == nil ? "" : " AND type = CAST(? AS TEXT)")
         let arguments = type.map { StatementArguments([Data(id.utf8), Data($0.utf8)]) } ?? StatementArguments([Data(id.utf8)])
-        guard let row = try Row.fetchOne(db,sql:query,arguments:arguments) else { throw CoreError("NOT_FOUND", "This record is not available.") }
-        return try GRDBRecordEnvelopeAdapter.decode(row,expectedType:type).object
+        let values = try readSnapshotCache.records(db,key:["record",id,type]) {try Row.fetchAll(db,sql:query,arguments:arguments)}
+        guard let value = values.first else { throw CoreError("NOT_FOUND", "This record is not available.") }
+        return value
     }
     func records(_ db: Database, type: String, project: String? = nil) throws -> [JSON] {
         var query = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type = CAST(? AS TEXT)"
@@ -133,8 +135,9 @@ public final class CommandRouter: @unchecked Sendable {
             if type == "session" { query += " AND " + Self.sessionProjectCandidate; arguments += [Data(project.utf8),Data(project.utf8)] }
             else { query += " AND project_id = CAST(? AS TEXT)"; arguments.append(Data(project.utf8)) }
         }
-        let rows = try Row.fetchAll(db,sql:query + " ORDER BY rowid",arguments:StatementArguments(arguments))
-        return try rows.map { try GRDBRecordEnvelopeAdapter.decode($0,expectedType:type).object }
+        return try readSnapshotCache.records(db,key:["records",type,project]) {
+            try Row.fetchAll(db,sql:query + " ORDER BY rowid",arguments:StatementArguments(arguments))
+        }
     }
     /// A pure read runs on a read-only connection; a write there asks for the writer path.
     func requireWriter(_ db: Database) throws {
@@ -206,13 +209,16 @@ public final class CommandRouter: @unchecked Sendable {
         var arguments: [DatabaseValueConvertible] = [Data(id.utf8),Data(type.utf8)]
         if type == "session" { query += Self.sessionProjectCandidate; arguments += [Data(project.utf8),Data(project.utf8)] }
         else { query += "project_id = CAST(? AS TEXT)"; arguments.append(Data(project.utf8)) }
-        guard let row = try Row.fetchOne(db,sql:query,arguments:StatementArguments(arguments)) else { throw CoreError("NOT_FOUND", "This record is not available in this project.") }
-        return try GRDBRecordEnvelopeAdapter.decode(row,expectedType:type).object
+        let values = try readSnapshotCache.records(db,key:["scoped",id,project,type]) {try Row.fetchAll(db,sql:query,arguments:StatementArguments(arguments))}
+        guard let value = values.first else { throw CoreError("NOT_FOUND", "This record is not available in this project.") }
+        return value
     }
     func task(_ db: Database, _ p: JSON, _ pid: String) throws -> JSON {
         if let id = p["task_id"] as? String ?? p["id"] as? String { return try scoped(db,id,pid,type:"task") }
         if let key = p["key"] as? String {
-            let matches = try records(db,type:"task",project:pid).filter {($0["key"] as? String) == key}
+            let matches = try readSnapshotCache.records(db,key:["task-key",pid,key]) {
+                try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='task' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.key')=CAST(? AS TEXT) COLLATE BINARY ORDER BY rowid LIMIT 2",arguments:[Data(pid.utf8),Data(key.utf8)])
+            }
             guard matches.count <= 1 else {throw CoreError("AMBIGUOUS_TASK","More than one ticket uses this display key. Select its stable internal ID.")}
             if let match = matches.first {return match}
         }
@@ -395,7 +401,7 @@ public final class CommandRouter: @unchecked Sendable {
         return false
     }
     func executePureRead(_ readers: DatabasePool,method: String,params: [String: Any],caller: Caller) throws -> [String: Any] {
-        try readers.read { db in
+        try readers.read { db in try readSnapshotCache.withSnapshot(db,caller:caller) {
             if !caller.isOwner,let pid = params["project_id"] as? String {
                 _ = try self.scope(db,["project_id":pid],caller)
                 if caller.role == "assistant" { try self.assistantPermission(caller,pid,["message_ack","assistant_inbox"].contains(method) ? "receive_messages" : "read") }
@@ -405,7 +411,7 @@ public final class CommandRouter: @unchecked Sendable {
             do { output = try self.addingHumanAnswerNotices(db,output:output,params:params,caller:caller) }
             catch { output = self.addingHumanAnswerNoticeFailure(output,caller:caller) }
             return output
-        }
+        }}
     }
     /// CL-70: after the command, a capture that a committed record names loses only its
     /// marker; any other capture this command wrote is removed.

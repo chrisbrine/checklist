@@ -17,12 +17,12 @@ final class ReadPerformanceFixture {
     func call(_ method: String, _ input: JSON = [:]) throws -> JSON {
         var p = input
         if !CommandRouter.readMethods.contains(method) { p["command_id"] = UUID().uuidString }
-        return try router.handle(method: method, params: p, caller: owner)["data"] as! JSON
+        return try router.handle(method: method, params: fixtureTaskInput(router,method:method,input:p), caller: owner)["data"] as! JSON
     }
     func save(_ values: [(String, JSON)]) throws {
         try router.dbQueue.writeWithoutTransaction { db in
             try router.withValidatedDomainTransaction(db) {
-                for (type, value) in values { try router.save(db, value, type: type) }
+                for (type, value) in values { try router.save(db, fixtureDomainValue(router,db:db,value:value,type:type), type: type) }
                 return .commit
             }
         }

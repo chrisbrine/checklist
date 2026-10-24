@@ -82,6 +82,9 @@ extension CommandRouter {
         if next.type == "task",let previous, bool(try GRDBRecordEnvelopeAdapter.decode(previous,expectedType:"task").object,"purged") {
             throw CoreError("TICKET_PURGED","A permanently removed ticket cannot be changed or restored.")
         }
+        // Covers internal/import writers as well as public commands. Legacy
+        // tickets remain readable but must be repaired before their next save.
+        if next.type == "task",!bool(next.object,"purged") { _ = try requiredEpicID(next.object["epic_id"]) }
         var oldProject: String?
         if let previous {
             // C1b already validated this exact prior envelope and witness. Do

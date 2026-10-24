@@ -27,7 +27,7 @@ final class DiagnosticsTests: XCTestCase {
         let before = try call("diagnostics_summary")["record_counts"] as! [String:Int]
         try router.dbQueue.writeWithoutTransaction { db in
             try router.withValidatedDomainTransaction(db) {
-                try router.save(db, ["id": "private-task-id", "project_id": projectID, "status_id":statusID, "title": secrets[0], "brief": secrets[1], "root_path": secrets[2], "claim_token": secrets[3], "session_id": secrets[4], "native_endpoint": secrets[5], "revision": 1], type: "task")
+                try router.save(db, fixtureDomainValue(router,db:db,value:["id": "private-task-id", "project_id": projectID, "status_id":statusID, "title": secrets[0], "brief": secrets[1], "root_path": secrets[2], "claim_token": secrets[3], "session_id": secrets[4], "native_endpoint": secrets[5], "revision": 1],type:"task"), type: "task")
                 try router.save(db, ["id": "private-message-id", "project_id":projectID, "body": secrets[0], "revision": 1], type: "message")
                 // Unknown historical families are diagnostic input, never valid new domain writes.
                 try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (?,NULL,?,1,?)",arguments:["unknown-private-id",secrets[2],try jsonString(["id":"unknown-private-id","revision":1])])

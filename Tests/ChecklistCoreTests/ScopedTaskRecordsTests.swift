@@ -19,7 +19,7 @@ final class ScopedTaskRecordsTests:XCTestCase {
     override func tearDownWithError()throws {router=nil;try? FileManager.default.removeItem(at:root)}
     private func call(_ method:String,_ p:JSON,_ caller:Caller?=nil)throws->JSON {
         var p=p;if !CommandRouter.readMethods.contains(method) {p["command_id"]=UUID().uuidString}
-        return try router.handle(method:method,params:p,caller:caller ?? owner)["data"] as! JSON
+        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:caller ?? owner)["data"] as! JSON
     }
     private func write(_ body:(Database)throws->Void)throws {
         try router.dbQueue.writeWithoutTransaction {db in try router.withValidatedDomainTransaction(db) {try body(db);return .commit}}

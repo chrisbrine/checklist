@@ -42,7 +42,7 @@ import ChecklistIPC
                            requestTransport: { [self] method, params in
                 calls.append((method, params))
                 if failRead, CommandReply.readMethods.contains(method) { throw ChecklistError("SERVICE_UNAVAILABLE", "Synthetic failed identity read") }
-                var reply = try router.handle(method: method, params: params, caller: owner)
+                var reply = try router.handle(method: method, params: appFixtureTaskInput(router,method:method,input:params), caller: owner)
                 if method == "service_info", let retryIncarnation {
                     var data = reply["data"] as! [String: Any]; data["store_incarnation"] = retryIncarnation; reply["data"] = data
                 }

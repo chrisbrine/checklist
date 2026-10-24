@@ -98,7 +98,7 @@ import ChecklistIPC
         func command(_ method: String, _ params: [String: Any]) throws -> [String: Any] {
             var params = params
             if !CommandReply.readMethods.contains(method) && params["command_id"] == nil { params["command_id"] = UUID().uuidString }
-            return try router.handle(method: method, params: params, caller: owner)
+            return try router.handle(method: method, params: appFixtureTaskInput(router,method:method,input:params), caller: owner)
         }
         let project = try command("project_create", ["name": "A", "key_prefix": "A", "root_path": root.appendingPathComponent("a").path])["data"] as! [String: Any]
         let pid = project["id"] as! String

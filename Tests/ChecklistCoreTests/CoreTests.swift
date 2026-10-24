@@ -27,7 +27,7 @@ final class CoreTests: XCTestCase {
         if method == "review_record" {p = try addingSyntheticReviewEvidence(p,actor:caller ?? owner)}
         if method == "batch_review_record",let members = p["members"] as? [JSON] {p["members"] = try members.map {try addingSyntheticReviewEvidence($0,actor:caller ?? owner)}}
         if !CommandRouter.readMethods.contains(method) { p["command_id"] = command ?? UUID().uuidString }
-        return try router.handle(method:method,params:p,caller:caller ?? owner)["data"] as! JSON
+        return try router.handle(method:method,params:(caller?.role == "assistant" ? p : try fixtureTaskInput(router,method:method,input:p)),caller:caller ?? owner)["data"] as! JSON
     }
     func addingSyntheticReviewEvidence(_ input: JSON,actor: Caller) throws -> JSON {
         var p = input
@@ -296,7 +296,7 @@ final class CoreTests: XCTestCase {
         var readOnly = fullAssistantPermissions;readOnly["create_drafts_on_request"] = false;readOnly["post_notes_on_request"] = false
         let allowed = Caller(role:"assistant",installation:"fine",projectIDs:projectIDs,sessionID:sid,assistantGrants:[projectIDs[0]:fullAssistantPermissions,projectIDs[1]:fullAssistantPermissions])
         let command = UUID().uuidString;let input: JSON = ["project_id":b["id"]!,"title":"Requested Draft"]
-        let created = try call("task_create",input,allowed,command);XCTAssertEqual(created["readiness"] as? String,"draft")
+        assertCode("EPIC_REQUIRED") {_ = try self.call("task_create",input,allowed,command)}
         let changed = Caller(role:"assistant",installation:"fine",projectIDs:projectIDs,sessionID:sid,assistantGrants:[projectIDs[0]:fullAssistantPermissions,projectIDs[1]:readOnly])
         assertCode("FORBIDDEN") { _ = try self.call("task_create",input,changed,command) }
         let onlyRead = Caller(role:"assistant",installation:"reader",projectIDs:projectIDs,sessionID:sid,assistantGrants:[projectIDs[0]:readOnly,projectIDs[1]:readOnly])
@@ -521,7 +521,9 @@ final class CoreTests: XCTestCase {
     }
     func testEpicsArePersistentSubprojectsAndTriagesHandleAcrossThem() throws {
         let p = try project();let pid = p["id"] as! String;var first = try call("epic_create",["project_id":pid,"name":"Input subsystem","brief":"Persistent input production work"]);var second = try call("epic_create",["project_id":pid,"name":"Interface subsystem","brief":"Persistent interface production work"])
-        let t1 = try task(p,"Input task"),t2 = try task(p,"Interface task")
+        let t1 = try call("task_create",["project_id":pid,"title":"Input task","brief":"Input responds correctly","epic_id":first["id"]!]),t2 = try call("task_create",["project_id":pid,"title":"Interface task","brief":"Input responds correctly","epic_id":second["id"]!])
+        first = (try call("epic_list",["project_id":pid,"key":first["key"]!])["groups"] as! [JSON])[0]
+        second = (try call("epic_list",["project_id":pid,"key":second["key"]!])["groups"] as! [JSON])[0]
         first = try call("group_membership",["project_id":pid,"group_id":first["id"]!,"expected_revision":first["revision"]!,"task_id":t1["id"]!,"action":"add"])
         second = try call("group_membership",["project_id":pid,"group_id":second["id"]!,"expected_revision":second["revision"]!,"task_id":t2["id"]!,"action":"add"])
         var triage = try call("triage_create",["project_id":pid,"name":"Handle interaction regressions","purpose":"Temporary work spanning both subprojects"])

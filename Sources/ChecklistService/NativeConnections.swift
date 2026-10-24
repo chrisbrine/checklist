@@ -51,17 +51,27 @@ extension Coordinator {
         let installation = !relay && enrollments[creationInstallation]?.sessionID == sid ? creationInstallation : defaultInstallation
         guard !enrollments.values.contains(where:{$0.sessionID == boundSessionID && $0.installation != installation}) else { throw ChecklistError("BINDING_CHANGED","This reported session is already bound to another connection. Use a thread created for this project.") }
         if var existing=enrollments[installation] {
+            let access = try router.handle(method:"session_list",params:["project_id":pid],caller:owner)
+            let accessBody = access["data"] as? [String:Any] ?? access
+            let sessions = accessBody["sessions"] as? [[String:Any]] ?? []
+            if let session = sessions.first(where: { $0["id"] as? String == boundSessionID }) {
+                guard session["owner_revoked"] as? Bool != true else {
+                    throw ChecklistError("CONNECTION_REVOKED","The owner disconnected this conversation in Checklist. It stays refused until the owner selects Allow again on its ticket.")
+                }
+                if session["owner_reconnect_allowed"] as? Bool == true {
+                    let resumed = try reconnectNativeSession(existing,project:pid,executionDomain:executionDomain,binding:binding,process:process,endpoint:context["native_endpoint"] as? String,owner:owner,ownerAllowed:true)
+                    return connectionResult(resumed,project:pid)
+                }
+            }
             if existing.revoked == true || existing.nativeExecutionDomain != executionDomain {
                 // A host resumed this conversation in a new process; never borrow the old generation.
-                let resumed=try resumeAfterVerifiedClosure(existing,project:pid,executionDomain:executionDomain,binding:binding,process:process,endpoint:context["native_endpoint"] as? String,owner:owner)
+                let resumed=try reconnectNativeSession(existing,project:pid,executionDomain:executionDomain,binding:binding,process:process,endpoint:context["native_endpoint"] as? String,owner:owner)
                 return connectionResult(resumed,project:pid)
             }
             guard existing.sessionID == boundSessionID,existing.workspace == binding,existing.provider == provider,relay || existing.projectIDs == [pid] else { throw ChecklistError("BINDING_CHANGED","The registered workspace changed. Review this connection in Checklist before reconnecting.") }
             guard (existing.assistantRelay == true) == relay else { throw ChecklistError("CONNECTION_MODE_MISMATCH","This native thread cannot change its access role.") }
             // Ordinary MCP/client restarts do not rotate claims, deliveries or grants.
             guard let credential = try ChecklistKeychain.read(installation), SHA256.hash(data: Data(credential.utf8)).map({ String(format: "%02x", $0) }).joined() == existing.tokenDigest else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This thread's saved credential does not match its enrollment. Repair it in Checklist.") }
-            let current=try router.handle(method:"session_list",params:["project_id":pid],caller:owner)
-            let sessions=(current["data"] as? [String:Any] ?? current)["sessions"] as? [[String:Any]] ?? []
             if let session=sessions.first(where:{$0["id"] as? String == boundSessionID}) {
                 guard !["revoked","ended"].contains(session["state"] as? String ?? "") else { throw ChecklistError("CONNECTION_REVOKED","This thread was ended or disconnected. Its authority cannot be resumed automatically.") }
                 guard ConnectionCommit.registrationMatches(session, sessionID: existing.sessionID, installation: existing.installation, generation: existing.generation, role: existing.role, provider: existing.provider, projects: existing.projectIDs) else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This prepared connection does not match its committed session. Repair it in Checklist.") }
@@ -210,32 +220,34 @@ extension Coordinator {
     /// in a new process. After the verified closure of the earlier process released
     /// its work, the thread gets a new credential and authorization generation.
     /// Released claims and queued deliveries stay with the ended generation; an owner
-    /// disconnect stays final.
-    private func resumeAfterVerifiedClosure(_ existing:Enrollment,project:String,executionDomain:String,binding:String?,process:pid_t,endpoint:String?,owner:Caller) throws -> Enrollment {
+    /// disconnect stays refused until the owner explicitly allows a fresh bootstrap.
+    private func reconnectNativeSession(_ existing:Enrollment,project:String,executionDomain:String,binding:String?,process:pid_t,endpoint:String?,owner:Caller,ownerAllowed:Bool = false) throws -> Enrollment {
         let ownerDisconnected=ChecklistError("CONNECTION_REVOKED","The owner disconnected this thread in Checklist. It cannot reconnect automatically.")
         // Verified closure applies only to these enrollments; any other revocation is the owner's.
-        guard existing.automatic == true,existing.role == "worker",existing.assistantRelay != true,let plugin=ProviderPluginRegistry.bundled.plugin(existing.provider, requiring: .registryClosure),
+        guard existing.automatic == true,existing.role == "worker",existing.assistantRelay != true,let plugin=ProviderPluginRegistry.bundled.plugin(existing.provider, requiring: ownerAllowed ? .workSession : .registryClosure),
               existing.identityVerification == plugin.nativeHost?.identityVerification,let oldDomain=existing.nativeExecutionDomain else {
             if existing.revoked == true { throw ownerDisconnected }
             throw ChecklistError("NATIVE_SESSION_MISMATCH","This reported thread was connected by a different native host process. Its claims and messages cannot be borrowed.")
         }
-        guard existing.ownerRevoked != true else { throw ownerDisconnected }
-        // execute() observed native lifecycles before this request, so an unfenced
-        // enrollment means the earlier process has no verified closure yet.
-        guard existing.revoked == true else { throw ChecklistError("NATIVE_SESSION_MISMATCH","This thread's earlier process has no verified closure yet. Its claims and messages cannot be borrowed.") }
-        // The same live process cannot have a verified closure, so its revocation is the owner's.
-        guard oldDomain != executionDomain else { throw ownerDisconnected }
+        if !ownerAllowed {
+            guard existing.ownerRevoked != true else { throw ownerDisconnected }
+            // execute() observed native lifecycles before this request, so an unfenced
+            // enrollment means the earlier process has no verified closure yet.
+            guard existing.revoked == true else { throw ChecklistError("NATIVE_SESSION_MISMATCH","This thread's earlier process has no verified closure yet. Its claims and messages cannot be borrowed.") }
+            // The same live process cannot have a verified closure, so its revocation is the owner's.
+            guard oldDomain != executionDomain else { throw ownerDisconnected }
+        }
         guard existing.workspace == binding,existing.projectIDs == [project] else { throw ChecklistError("BINDING_CHANGED","The registered workspace changed. Review this connection in Checklist before reconnecting.") }
         // An owner disconnect before this build removed the saved credential; a verified closure kept it.
         let priorCredential=try ChecklistKeychain.read(existing.installation)
-        guard let priorCredential,SHA256.hash(data:Data(priorCredential.utf8)).map({String(format:"%02x",$0)}).joined() == existing.tokenDigest else {
-            throw ownerDisconnected
+        if !ownerAllowed {
+            guard let priorCredential,SHA256.hash(data:Data(priorCredential.utf8)).map({String(format:"%02x",$0)}).joined() == existing.tokenDigest else { throw ownerDisconnected }
         }
         var bytes=[UInt8](repeating:0,count:32)
         guard SecRandomCopyBytes(kSecRandomDefault,bytes.count,&bytes)==errSecSuccess else { throw ChecklistError("RANDOM_FAILURE","Could not create the thread connection.") }
         let token=Data(bytes).base64EncodedString()
         var resumed=existing
-        resumed.generation=UUID().uuidString;resumed.nativeExecutionDomain=executionDomain;resumed.revoked=false
+        resumed.generation=UUID().uuidString;resumed.nativeExecutionDomain=executionDomain;resumed.revoked=false;resumed.ownerRevoked=false
         resumed.tokenDigest=SHA256.hash(data:Data(token.utf8)).map{String(format:"%02x",$0)}.joined()
         resumed.nativeEndpoint=nil;resumed.nativeDevice=nil;resumed.nativeInode=nil
         if ProviderPluginRegistry.bundled.plugin(existing.provider, requiring: .nativePeer) != nil,let endpoint { try bindProviderEndpoint(&resumed,endpoint:endpoint,process:process) }
@@ -245,8 +257,14 @@ extension Coordinator {
         _ = try ConnectionCommit.perform(
             saveCredential: { try ChecklistKeychain.write(existing.installation, token) },
             saveEnrollment: { enrollments[existing.installation] = resumed; try saveEnrollments() },
-            registerSession: { try router.resumeVerifiedNativeSession(resumption, caller: owner) },
-            rollback: { try ConnectionCommit.restore(enrollment: { enrollments[existing.installation] = existing; try saveEnrollments() }, credential: { try ChecklistKeychain.write(existing.installation, priorCredential) }) })
+            registerSession: {
+                if ownerAllowed { return try router.reconnectOwnerAllowedSession(resumption,caller:owner) }
+                return try router.resumeVerifiedNativeSession(resumption, caller: owner)
+            },
+            rollback: { try ConnectionCommit.restore(enrollment: { enrollments[existing.installation] = existing; try saveEnrollments() }, credential: {
+                if let priorCredential { try ChecklistKeychain.write(existing.installation, priorCredential) }
+                else { try ChecklistKeychain.removeChecked(existing.installation) }
+            }) })
         try requireCommittedRegistration(resumed, project: project, caller: owner)
         return resumed
     }

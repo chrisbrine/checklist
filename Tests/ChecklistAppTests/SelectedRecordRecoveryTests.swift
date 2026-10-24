@@ -35,7 +35,7 @@ import ChecklistIPC
         }
         func command(_ method: String,_ values: [String:Any]) throws -> [String:Any] {
             var p = values;if !CommandRouter.readMethods.contains(method) {p["command_id"] = UUID().uuidString}
-            return try router.handle(method:method,params:p,caller:owner)["data"] as! [String:Any]
+            return try router.handle(method:method,params:appFixtureTaskInput(router,method:method,input:p),caller:owner)["data"] as! [String:Any]
         }
         func mutateOther() throws {
             let row = try command("task_get",["project_id":project,"task_id":other])

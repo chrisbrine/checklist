@@ -1,4 +1,5 @@
 import SwiftUI
+import ChecklistIPC
 
 struct CaptureTaskView: View {
     @EnvironmentObject var store: ChecklistStore
@@ -14,6 +15,7 @@ struct CaptureTaskView: View {
     @State private var createCommandID:String?
     @State private var createdTaskID:String?
     @State private var epicPage:[Record]=[]
+    @State private var epicTotal:Int?
     @State private var epicNext:String?
     @State private var epicPrevious:String?
     @State private var epicLoading=false
@@ -27,11 +29,12 @@ struct CaptureTaskView: View {
             if let createdTaskID {Text("Ticket captured · "+String(createdTaskID.prefix(8))+". Finish its selected files before starting another ticket.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)}
             if !projectID.isEmpty {
                 Picker("Epic", selection: Binding(get: { epicID }, set: { epicID = $0; persistCapture() })) {
-                    Text("No Epic").tag("")
+                    Text("Choose an Epic").tag("")
                     if !epicID.isEmpty,!availableEpics.contains(where:{RecordIdentity($0.id)==RecordIdentity(epicID)}) {Text("Saved Epic · "+String(epicID.prefix(8))).tag(epicID)}
                     ForEach(availableEpics) {Text($0.string("name")).tag($0.id)}
                 }.checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving), (epicLoading, "Epics are still loading.")])
                 AccessibleHStack {if epicLoading {ProgressView().controlSize(.small)};if let token=epicPrevious {Button("Previous Epics") {Task {await loadEpics(cursor:token)}}};if let token=epicNext {Button("More Epics") {Task {await loadEpics(cursor:token)}}}}.checklistFont(.micro).checklistDisabled([(epicLoading, "Epics are still loading.")])
+                if epicTotal == 0,!epicLoading {CaptureEpicCreator(projectID:projectID,request: {try await store.request($0,$1)}) {epic in guard RecordIdentity(epic.string("project_id"))==RecordIdentity(projectID) else {return};epicID=epic.id;epicPage=[epic];epicTotal=1;persistCapture()}}
                 if let epicError {Text(epicError).checklistFont(.micro).foregroundStyle(.orange)}
             }
             TextField("What needs doing?", text: Binding(get: { title }, set: { title = $0; persistCapture() })).checklistFont(.subheading).textFieldStyle(.roundedBorder).focused($titleFocused).accessibilityIdentifier("captureTitle").checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)])
@@ -43,7 +46,7 @@ struct CaptureTaskView: View {
             }
             TextEditor(text: Binding(get: { brief }, set: { brief = $0; persistCapture() })).checklistFont(.body).frame(height: 110).padding(Spacing.compact).overlay(RoundedRectangle(cornerRadius: Radius.medium).stroke(.quaternary)).accessibilityLabel("Optional brief").checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)])
             AttachmentCaptureSection(pending:$pendingAttachments,destination:Binding(get:{CaptureAttachmentDestination(storeIncarnation:store.storeIncarnation,projectID:projectID,taskID:nil)},set:{_ in}),disabled:store.busy || captureNeedsReconciliation)
-            Text("A title is enough to capture it. Add the outcome and make it ready when you're set.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+            Text("Choose a project and Epic and add a title to capture it. Add the outcome and make it ready when you're set.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             if !title.isEmpty || !brief.isEmpty {
                 DraftSaveStatusView(kind: "capture", draftID: projectID)
                 if captureNeedsReconciliation {
@@ -55,7 +58,7 @@ struct CaptureTaskView: View {
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Spacer()
                 Button(createdTaskID != nil ? "Finish attachments" : createCommandID != nil ? "Finish creating this ticket" : "Create Draft") { createDraft() }.buttonStyle(.checklistProminent).keyboardShortcut(.return, modifiers: .command)
-                    .checklistDisabled([(projectID.isEmpty, "Choose a project first."), (title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Enter a title first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline), (captureNeedsReconciliation, "This draft belongs to an earlier store. Confirm its destination first."), (createCommandID == nil && epicLoading, "Epics are still loading.")])
+                    .checklistDisabled([(projectID.isEmpty, "Choose a project first."), (createdTaskID == nil && createCommandID == nil && epicID.isEmpty, "Choose an Epic first."), (title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Enter a title first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline), (captureNeedsReconciliation, "This draft belongs to an earlier store. Confirm its destination first."), (createCommandID == nil && epicLoading, "Epics are still loading.")])
             }
         }.padding(Spacing.page).checklistSheet(width: 510).modifier(CaptureAllowsQuit()).onAppear {
             if let epic = store.groups.first(where: { $0.id == store.captureEpicID && $0.string("kind") == "epic" }) { switchProject(epic.string("project_id")); epicID = epic.id }
@@ -75,12 +78,12 @@ struct CaptureTaskView: View {
     func applyCaptureDefaults() { kind = captureDefaults["default_kind"] as? String ?? "work" }
     func switchProject(_ next: String) {
         if !title.isEmpty || !brief.isEmpty { persistCapture() }
-        epicRead=UUID();epicPage=[];epicNext=nil;epicPrevious=nil;epicError=nil;epicLoading = !next.isEmpty
+        epicRead=UUID();epicPage=[];epicNext=nil;epicPrevious=nil;epicTotal=nil;epicError=nil;epicLoading = !next.isEmpty
         projectID = next
         if let draft = store.captureDrafts[next] {
-            title = draft.title; brief = draft.brief; kind = draft.kind; epicID = draft.epicID; starterFields = draft.starterFields ?? [:]; draftStoreIncarnation = draft.storeIncarnation;createdTaskID=draft.createdTaskID;createCommandID=draft.createCommandID
+            title = draft.title; brief = draft.brief; kind = draft.kind; epicID = draft.epicID.isEmpty ? CaptureEpicDefaults.last(next,preferences:store.windowPreferences) : draft.epicID; starterFields = draft.starterFields ?? [:]; draftStoreIncarnation = draft.storeIncarnation;createdTaskID=draft.createdTaskID;createCommandID=draft.createCommandID
         } else {
-            title = ""; brief = ""; epicID = ""; starterFields = [:];createdTaskID=nil;createCommandID=nil; draftStoreIncarnation = store.storeIncarnation; applyCaptureDefaults()
+            title = ""; brief = ""; epicID = CaptureEpicDefaults.last(next,preferences:store.windowPreferences); starterFields = [:];createdTaskID=nil;createCommandID=nil; draftStoreIncarnation = store.storeIncarnation; applyCaptureDefaults()
         }
     }
     func persistCapture() { store.saveCapture(CaptureDraft(projectID: projectID, title: title, brief: brief, kind: kind, epicID: epicID, storeIncarnation: draftStoreIncarnation,createdTaskID:createdTaskID,createCommandID:createCommandID,starterFields:starterFields.isEmpty ? nil : starterFields)) }
@@ -101,7 +104,9 @@ struct CaptureTaskView: View {
         do {params=try store.captureCreateParameters(projectID:submittedProject);createCommandID=params["command_id"] as? String}
         catch {store.error=PlainError.text(error);return}
         guard let command=createCommandID else {return}
-        store.run("task_create",params,success:"Draft captured; attaching selected files") {result in
+        store.run("task_create",params,success:"Draft captured; attaching selected files",failure:{error in
+            if (error as? ChecklistError)?.code == "EPIC_REQUIRED" {createCommandID=nil;persistCapture()}
+        }) {result in
             guard let id=store.recordCapturedTask(result,projectID:submittedProject,commandID:command,store:submittedStore) else {store.error="The ticket may already be created. Check it again; your draft and files are kept.";return}
             createdTaskID=id;persistCapture();finish(id)
         }
@@ -117,7 +122,7 @@ struct CaptureTaskView: View {
             let response=try await store.request("workspace_page",query.parameters(cursor:cursor))
             guard !Task.isCancelled,epicRead==read,RecordIdentity(projectID)==RecordIdentity(project) else{return}
             let page=try WorkspacePage(response,query:query)
-            epicPage=page.rows;epicNext=page.next;epicPrevious=page.previous;epicLoading=false
+            epicPage=page.rows;epicTotal=page.total;epicNext=page.next;epicPrevious=page.previous;epicLoading=false
             // Omission from this page never invalidates a durable draft's Epic.
         } catch {if epicRead==read {epicLoading=false;epicError="Could not load Epic choices. The saved Epic is preserved; retry by reopening capture."}}
     }

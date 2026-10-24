@@ -153,9 +153,10 @@ final class ChecklistMCPServerTests: XCTestCase {
             XCTAssertEqual(try retainedRows(),before)
         }
         let epic = try call("epic_create",["project_id":pid,"name":"Used"]),gid = epic["id"] as! String
-        var task = try call("task_create",["project_id":pid,"title":"Member","epic_id":gid])
+        let destination = try call("epic_create",["project_id":pid,"name":"Destination"])
+        let task = try call("task_create",["project_id":pid,"title":"Member","epic_id":gid])
         for historical in [false,true] {
-            if historical {task = try call("task_edit",["project_id":pid,"task_id":task["id"]!,"expected_revision":task["revision"]!,"patch":["epic_id":NSNull()]])}
+            if historical {_ = try call("task_bulk_edit",["project_id":pid,"tasks":[["task_id":task["id"]!,"expected_revision":task["revision"]!]],"changes":["kind":"epic","epic_id":destination["id"]!],"preview":false])}
             let group = (try call("epic_list",["project_id":pid,"key":epic["key"]!])["groups"] as! [[String:Any]])[0]
             let before = try await router.dbQueue.read {try SchemaMigrations.contentFingerprint($0)}
             let result = try await session.client.callTool(name:"epic_delete",arguments:["project_id":.string(pid),"epic_id":.string(gid),"expected_revision":.int(group["revision"] as! Int),"command_id":.string(UUID().uuidString)])

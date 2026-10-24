@@ -17,7 +17,7 @@ final class SubmissionEvidenceFixture {
         var p = method == "review_context" ? input.filter {["task_id","review_request_id","target_manifest_id","gate","evidence_refs"].contains($0.key)} : input
         p["project_id"] = project["id"]
         if !CommandRouter.readMethods.contains(method) { p["command_id"] = UUID().uuidString }
-        return try router.handle(method:method,params:p,caller:caller ?? storage.owner)["data"] as! JSON
+        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:caller ?? storage.owner)["data"] as! JSON
     }
     func record(_ id: Any,_ type: String) throws -> JSON { try router.dbQueue.read { try router.record($0,id as! String,type:type) } }
     func worker(_ label: String) throws -> Caller {

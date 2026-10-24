@@ -72,7 +72,7 @@ final class NativeCommunicationRoutesTests: XCTestCase {
         func call(_ method: String, _ input: JSON = [:], _ caller: Caller? = nil) throws -> JSON {
             var input = input
             if !CommandRouter.readMethods.contains(method) { input["command_id"] = uuid() }
-            return try XCTUnwrap(router.handle(method: method, params: input, caller: caller ?? owner)["data"] as? JSON)
+            return try XCTUnwrap(router.handle(method: method, params: fixtureTaskInput(router,method:method,input:input), caller: caller ?? owner)["data"] as? JSON)
         }
         func advertised(_ caller: Caller? = nil) throws -> Data {
             let info = try call("service_info", [:], caller)

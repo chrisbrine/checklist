@@ -105,8 +105,11 @@ CHECKLIST_BUILD_CONFIGURATION=release CHECKLIST_SIGN_IDENTITY=- \
   python3 script/measure_build_times.py \
   --checkout /private/tmp/checklist-measure-after \
   --output /private/tmp/checklist-times-after --label after-EXACT-REVISION \
+  --source-fingerprint <captured-round-source-fingerprint> \
   --allow-source-edits-and-clean
 ```
+
+The runner marks the output root with the owning native session, label/purpose and required exact `--source-fingerprint` before saving originals or building. If no native ID is exported, supply `--session-id <actual session ID>`; exported identities cannot be overridden. Keep failed outputs protected for inspection. Mark any separately created enclosing qualification run and warmed checkout at creation too, before source/store copies. After preserving the evidence externally, only the owner releases a disposable run; released obsolete fingerprinted runs under `~/Library/Caches/ChecklistQualification` are eligible for whole-run Trash retirement, while the latest installed round stays. Unmarked runs older than seven days are reported with sizes and never retired automatically. See the [root marker procedure](../skills/checklist/references/driven-sessions.md#scratch-cleanup-and-cache-settings).
 
 If a shared Swift build-slot wrapper applies, run the entire Python command
 through that wrapper so its child Swift commands remain in one reserved slot.

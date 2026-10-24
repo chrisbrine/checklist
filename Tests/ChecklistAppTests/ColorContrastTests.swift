@@ -63,6 +63,24 @@ final class ColorContrastTests: XCTestCase {
         }
     }
 
+    /// Use the actual header text token and the shared plain-button feedback, composited in sRGB.
+    /// Disabled controls are exempt from AA; all enabled idle/hover/pressed states must pass.
+    func testQuietTicketHeaderActionsMeetAAIncludingPressedHighContrast() {
+        inAppearances { appearance, backgrounds in
+            let increased = appearance == .accessibilityHighContrastAqua || appearance == .accessibilityHighContrastDarkAqua
+            let text = RGB(TicketHeaderActionLabel.textColor(increasedContrast: increased))
+            for (state, hovered, pressed) in [("idle", false, false), ("hover", true, false), ("pressed", true, true)] {
+                let feedback = InteractionAppearance.resolve(hovered: hovered, pressed: pressed, enabled: true, focused: false, increasedContrast: increased)
+                for (label, background) in backgrounds where !label.contains("card") && !label.contains("selected row") {
+                    let fill = RGB(Color.primary.opacity(feedback.fillOpacity)).over(background)
+                    let ratio = text.contrast(on: fill)
+                    XCTAssertGreaterThanOrEqual(ratio, 4.5, "\(appearance.rawValue) \(label) \(state): \(ratio)")
+                    print("ticket header \(appearance.rawValue) \(label) \(state): \(ratio)")
+                }
+            }
+        }
+    }
+
     func testInformativeViewTextUsesSecondaryToken() throws {
         let views = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()

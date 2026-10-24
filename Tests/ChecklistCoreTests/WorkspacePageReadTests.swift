@@ -83,7 +83,7 @@ extension CoreTests {
             return .commit
         }}
         let list=try call("workspace_page",["project_id":pid,"surface":"epics"])
-        XCTAssertEqual((list["rows"] as! [JSON]).first?["ticket_count"] as? Int,1)
+        XCTAssertEqual((list["rows"] as! [JSON]).first {$0["id"] as? String == epic["id"] as? String}?["ticket_count"] as? Int,1)
         let members=try call("workspace_page",["project_id":pid,"surface":"epic_tasks","record_id":epic["id"]!])
         XCTAssertEqual((members["rows"] as! [JSON]).compactMap {$0["id"] as? String},[tid])
         let candidates=try call("workspace_page",["project_id":pid,"surface":"epic_candidates","record_id":epic["id"]!])

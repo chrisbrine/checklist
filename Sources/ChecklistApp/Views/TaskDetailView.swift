@@ -66,7 +66,7 @@ struct TaskDetailView: View {
                                 Button("Keep draft") { editing = false; persistEdit(hasChanges: true) }
                                 Spacer()
                                 Button("Save changes") { saveEdit() }.buttonStyle(.checklistProminent)
-                                    .checklistDisabled([(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Enter a title first."), (editNeedsReconciliation, "The ticket changed after you started editing. Choose how to keep your edits first."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving), (!store.selectedTicketCurrent(task.id), DisabledReasons.ticketLoading)])
+                                    .checklistDisabled([(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Enter a title first."), (task.string("epic_id").isEmpty, "Choose a primary Epic below before saving."), (editNeedsReconciliation, "The ticket changed after you started editing. Choose how to keep your edits first."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving), (!store.selectedTicketCurrent(task.id), DisabledReasons.ticketLoading)])
                             }
                         }
                     } else {
@@ -76,9 +76,7 @@ struct TaskDetailView: View {
                         }
                     }
                     StarterFieldsSection(task: task)
-                    if let epic = store.detailRecords("groups",task:task).first(where: { $0.id == task.string("epic_id") && $0.string("kind") == "epic" }) {
-                        DetailSection(title: "Epic") { Button { store.open(.group(epic.id)) } label: { Label(ProductionGroups.label(epic), systemImage: "folder") }.buttonStyle(.link) }
-                    }
+                    TicketEpicSection(task:task)
                     let handlingTriages = store.detailRecords("groups",task:task).filter { $0.string("kind") == "triage" && ($0.bool("selected_task_member") || $0.strings("task_ids").contains(task.id)) }
                     if !handlingTriages.isEmpty {
                         DetailSection(title: "Triages") { ForEach(handlingTriages) { triage in Button { store.open(.group(triage.id)) } label: { Label(ProductionGroups.label(triage), systemImage: "tray.2") }.buttonStyle(.link) } }
@@ -133,6 +131,7 @@ struct TaskDetailView: View {
                                 VStack(alignment:.leading,spacing: Spacing.hairline) {
                                     Text(event.string("type",fallback:event.string("kind"))).checklistFont(.microEmphasis)
                                     Text(relativeTime(event.string("occurred_at",fallback:event.string("created_at")))).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                                    if let reason = event.object("data")["reason"] as? String, !reason.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty { Text(reason).checklistFont(.callout).textSelection(.enabled) }
                                 }.frame(maxWidth:.infinity,alignment:.leading)
                             }
                         }.padding(.top,Spacing.small)

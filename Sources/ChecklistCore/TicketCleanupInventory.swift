@@ -7,6 +7,7 @@ import GRDB
 struct TicketCleanupInventory {
     static let byteLimit = 16 * 1024 * 1024
     static let rowByteLimit = 4 * 1024 * 1024
+    static let projectionByteLimit = 16 * 1024
     var rows: [PurgeRow] = []
     var tokens: [Data:Set<Data>] = [:]
     var needles = Set<Data>()
@@ -28,9 +29,12 @@ struct TicketCleanupInventory {
         },budget:&budget)
         return matched
     }
-    mutating func add(_ row: PurgeRow,bytes: Int) throws {
+    mutating func add(_ row: PurgeRow,bytes: Int,load: () throws -> JSON) throws {
         guard !rows.contains(where: {$0.key == row.key}) else {return}
         guard bytes <= Self.rowByteLimit,retainedBytes + bytes <= Self.byteLimit,rows.count < 4096 else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The selected ticket exceeds the bounded cleanup inventory; bytes retained.")}
+        // Only admitted rows cross the full canonical decoding boundary. The
+        // snapshot and the original inventory budgets still bind that load.
+        let row = bytes > Self.projectionByteLimit ? PurgeRow(id:row.id,type:row.type,project:row.project,value:try load()) : row
         retainedBytes += bytes;rows.append(row)
         var found = Set<Data>(),budget = 2000000
         try Self.strings(row.value,{found.insert(Data($0.utf8))},budget:&budget)
@@ -53,15 +57,24 @@ struct TicketCleanupInventory {
 }
 
 extension CommandRouter {
-    /// Large unrelated payloads stay in SQLite. Validate their complete UTF-8
-    /// in 64 KiB pieces and decode only the canonical/ownership header. Exact
-    /// reference matching still traverses their complete JSON in SQLite.
+    /// Unrelated payloads above 16 KiB use canonical/ownership headers. Preserve
+    /// full Foundation JSON validation through 4 MiB; larger payloads retain the
+    /// existing 64 KiB UTF-8 streaming path. SQLite matches complete references.
     private func streamTicketCleanupRows(_ db: Database,needles: Set<Data> = [],holdDigests: Set<Data> = [],prefixes: Set<String> = [],_ body: (PurgeRow,Int) throws -> Void) throws {
         let keys = "'id','project_id','revision','kind','project_ids','owner_id','owner_kind','attachment_id','expires_at','task_id','source_task_id','message_id','attempt_id','parent_attempt_id','request_id','review_request_id','manifest_id','membership_id','delegation_id','conversation_id','source_capture_id'"
         let projection = "(SELECT '{'||COALESCE(group_concat(json_quote(key)||':'||CASE WHEN key='project_ids' THEN CASE WHEN type='array' AND NOT EXISTS(SELECT 1 FROM json_each(CASE WHEN type='array' THEN value ELSE '[]' END) grant_value WHERE grant_value.type!='text' OR length(CAST(grant_value.value AS BLOB))=0) THEN '[]' ELSE 'null' END WHEN length(CAST(records.data -> fullkey AS BLOB))>65536 THEN 'null' WHEN key='revision' THEN records.data -> fullkey WHEN type='true' THEN 'true' WHEN type='false' THEN 'false' ELSE json_quote(value) END),'')||'}' FROM json_each(records.data) WHERE key IN (" + keys + "))"
-        let bounded = "CASE WHEN length(CAST(records.data AS BLOB))<=\(TicketCleanupInventory.rowByteLimit) THEN records.data WHEN json_valid(records.data) AND json_type(records.data)='object' THEN " + projection + " ELSE '{}' END"
-        let values = try jsonString(["tokens":needles.map {String(decoding:$0,as:UTF8.self)},"prefixes":Array(prefixes),"digests":holdDigests.map {String(decoding:$0,as:UTF8.self)}])
+        let bounded = "CASE WHEN length(CAST(records.data AS BLOB))<=\(TicketCleanupInventory.projectionByteLimit) THEN records.data WHEN json_valid(records.data) AND json_type(records.data)='object' THEN " + projection + " ELSE '{}' END"
+        // Keep each lookup's array separate and build prefix bounds once. Empty
+        // ownership scans need no reference traversal; a prefix match requires
+        // the slash separator in the complete value or key.
+        let tokens = try jsonString(needles.map {String(decoding:$0,as:UTF8.self)})
+        let paths = try jsonString(Array(prefixes))
+        let digests = try jsonString(holdDigests.map {String(decoding:$0,as:UTF8.self)})
+        func matches(_ field: String) -> String {
+            "(CAST(\(field) AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?)) OR (instr(\(field),'/')>0 AND EXISTS(SELECT 1 FROM cleanup_prefixes p WHERE CAST(\(field) AS BLOB)>=p.lo AND CAST(\(field) AS BLOB)<p.hi)) OR (records.type='storage_hold' AND CAST(\(field) AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))))"
+        }
         let sql = """
+            WITH cleanup_prefixes AS MATERIALIZED (SELECT CAST(value||'/' AS BLOB) lo,CAST(value||'0' AS BLOB) hi FROM json_each(?))
             SELECT CASE WHEN length(CAST(id AS BLOB))<=\(TicketCleanupInventory.rowByteLimit) THEN id END AS id,
                 CASE WHEN length(CAST(project_id AS BLOB))<=\(TicketCleanupInventory.rowByteLimit) THEN project_id END AS project_id,
                 CASE WHEN length(CAST(type AS BLOB))<=\(TicketCleanupInventory.rowByteLimit) THEN type END AS type,revision,\(bounded) AS data,
@@ -69,14 +82,13 @@ extension CommandRouter {
                 CASE WHEN length(CAST(project_id AS BLOB))<=\(TicketCleanupInventory.rowByteLimit) THEN CAST(project_id AS BLOB) END AS _envelope_project_id_bytes,
                 CASE WHEN length(CAST(type AS BLOB))<=\(TicketCleanupInventory.rowByteLimit) THEN CAST(type AS BLOB) END AS _envelope_type_bytes,CAST(\(bounded) AS BLOB) AS _envelope_data_bytes,
                 length(CAST(records.data AS BLOB)) AS original_size,typeof(records.data) AS original_type,json_valid(records.data) AS valid_json,
-                CASE WHEN length(CAST(records.data AS BLOB))>\(TicketCleanupInventory.rowByteLimit) AND json_valid(records.data) THEN EXISTS(
+                CASE WHEN \(!needles.isEmpty || !prefixes.isEmpty || !holdDigests.isEmpty ? 1 : 0) AND length(CAST(records.data AS BLOB))>\(TicketCleanupInventory.projectionByteLimit) AND json_valid(records.data) THEN EXISTS(
                     SELECT 1 FROM json_tree(records.data) j WHERE
-                    (j.type='text' AND (CAST(j.atom AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?,'$.tokens')) OR EXISTS(SELECT 1 FROM json_each(?,'$.prefixes') p WHERE CAST(j.atom AS BLOB)>=CAST(p.value||'/' AS BLOB) AND CAST(j.atom AS BLOB)<CAST(p.value||'0' AS BLOB))))
-                    OR (records.type='storage_hold' AND j.type='text' AND CAST(j.atom AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?,'$.digests')))
-                    OR (typeof(j.key)='text' AND CAST(j.key AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?,'$.tokens')))
+                    (j.type='text' AND \(matches("j.atom")))
+                    OR (typeof(j.key)='text' AND \(matches("j.key")))
                 ) ELSE 0 END AS large_match FROM records ORDER BY rowid
             """
-        let cursor = try Row.fetchCursor(db,sql:sql,arguments:[values,values,values,values])
+        let cursor = try Row.fetchCursor(db,sql:sql,arguments:[paths,tokens,digests,tokens,digests])
         var count = 0
         while let raw = try cursor.next() {
             count += 1
@@ -86,11 +98,15 @@ extension CommandRouter {
                 guard raw["original_type"] as String == "text",raw["valid_json"] as Bool else {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.sqlData))}
                 let envelope = try GRDBRecordEnvelopeAdapter.decode(raw)
                 var value = envelope.object
-                if size > TicketCleanupInventory.rowByteLimit {
+                if size > TicketCleanupInventory.projectionByteLimit {
                     let id = envelope.id
+                    // Retain at most the original row limit for Foundation's strict
+                    // JSON/Unicode check, without lexically scanning its body.
+                    var validationBytes: Data? = size <= TicketCleanupInventory.rowByteLimit ? Data() : nil
                     var tail = Data(),offset = 1
                     while offset <= size {
                         let chunk = try Data.fetchOne(db,sql:"SELECT substr(CAST(data AS BLOB),?,65536) FROM records WHERE id=CAST(? AS TEXT)",arguments:[offset,Data(id.utf8)])!
+                        validationBytes?.append(chunk)
                         tail.append(chunk);offset += chunk.count
                         var split = tail.count
                         if offset <= size {
@@ -103,6 +119,11 @@ extension CommandRouter {
                         tail = Data(tail.dropFirst(split))
                     }
                     guard tail.isEmpty else {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.sqlData))}
+                    if let bytes = validationBytes {
+                        do {
+                            guard try JSONSerialization.jsonObject(with:bytes) is JSON else {throw EnvelopeFailure(.jsonObject)}
+                        } catch {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.jsonObject))}
+                    }
                     value["_cleanup_large_match"] = raw["large_match"] as Bool
                 }
                 try body(PurgeRow(id:envelope.id,type:envelope.type,project:envelope.projectID,value:value),size)
@@ -125,7 +146,7 @@ extension CommandRouter {
                 let local = row.value["task_id"] == nil || row.value["task_id"] as? String == tid
                 let child = local && parents.contains {field in (row.value[field] as? String).map {owned.contains(Data($0.utf8))} ?? false}
                 if direct || eligible && (row.value["task_id"] as? String == tid || child) {
-                    owned.insert(row.key);try result.add(row,bytes:size)
+                    owned.insert(row.key);try result.add(row,bytes:size) {try self.record(db,row.id,type:row.type)}
                 }
             }
             if before == owned.count {break}
@@ -159,7 +180,7 @@ extension CommandRouter {
                 var budget = 2000000
                 try TicketCleanupInventory.strings(row.value,{s in if digests.contains(Data(s.utf8)) {relevant = true}},budget:&budget)
             }
-            if relevant {try result.add(row,bytes:size)}
+            if relevant {try result.add(row,bytes:size) {try self.record(db,row.id,type:row.type)}}
         }
         result.holdDigests = digests
         return result
@@ -169,7 +190,7 @@ extension CommandRouter {
         result.objects(receipt["objects"] as? [JSON] ?? [],root:root)
         if let tid = receipt["task_id"] as? String {result.needles.insert(Data(tid.utf8))}
         try streamTicketCleanupRows(db,needles:result.needles,holdDigests:result.holdDigests,prefixes:result.prefixes) {row,size in
-            if try row.type == "project" || bool(row.value,"_cleanup_large_match") || result.mentions(row.value,includeDigests:row.type == "storage_hold") {try result.add(row,bytes:size)}
+            if try row.type == "project" || bool(row.value,"_cleanup_large_match") || result.mentions(row.value,includeDigests:row.type == "storage_hold") {try result.add(row,bytes:size) {try self.record(db,row.id,type:row.type)}}
         }
         return result
     }

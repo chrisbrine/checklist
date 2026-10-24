@@ -26,11 +26,12 @@ final class TicketPageFilterTests: XCTestCase {
         var params = params; if !CommandRouter.readMethods.contains(method) { params["command_id"] = UUID().uuidString }
         return try router.handle(method:method,params:params,caller:owner)["data"] as! JSON
     }
-    private func save(_ value:JSON,type:String) throws { try router.dbQueue.writeWithoutTransaction { db in try router.withValidatedDomainTransaction(db) { try router.save(db,value,type:type); return .commit } } }
+    private func save(_ value:JSON,type:String) throws { try router.dbQueue.writeWithoutTransaction { db in try router.withValidatedDomainTransaction(db) { try router.save(db,fixtureDomainValue(router,db:db,value:value,type:type),type:type); return .commit } } }
     private func task(_ id:String,tags:[String],assignee:Any? = nil,epic:String? = nil, attempt:String? = nil) throws {
         var value:JSON = ["id":id,"project_id":project,"key":id,"title":"Find \(id)","brief":"Synthetic","status_id":"queued","readiness":"ready","tag_ids":tags,"revision":1,"order":1,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"]
         value["planned_assignee"] = assignee; value["epic_id"] = epic; value["active_attempt_id"] = attempt
         try save(value,type:"task")
+        if epic == nil {try router.dbQueue.writeWithoutTransaction {db in try db.execute(sql:"UPDATE records SET data=json_remove(data,'$.epic_id') WHERE id=?",arguments:[id])}} // Owned pre-rule read fixture.
     }
     private func page(_ filters:JSON = [:],text:String = "") throws -> JSON {
         var view:JSON = ["surface":"tickets","status_filter":"all","tag_filter":"all","group_by":"none","order_by":"manual"]

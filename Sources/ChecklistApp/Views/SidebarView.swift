@@ -52,18 +52,17 @@ struct SidebarView: View {
             }.listStyle(.sidebar).scrollContentBackground(.hidden)
             VStack(spacing: Spacing.control) {
                 Divider()
-                AccessibleHStack(spacing: Spacing.small) {
+                HStack(spacing: Spacing.small) {
                     Circle().fill(store.connected ? Color.checklistAccentText : .orange).frame(width: 7, height: 7)
                     Text(store.connected ? "Service connected" : "Service disconnected").checklistFont(.caption)
-                    Spacer()
-                    if store.loading { ProgressView().controlSize(.mini) }
-                    else { Button { Task { await store.refresh() } } label: { Image(systemName: "arrow.clockwise") }.buttonStyle(.checklistIcon).foregroundStyle(Color.checklistSecondaryText).help("Refresh service").accessibilityLabel("Refresh service") }
-                }
-                HStack {
-                    Text("Build \(store.buildLabel)").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-                    Spacer()
-                    Button(action: openSettings) { Image(systemName: "gearshape").frame(width: 28, height: 28) }.buttonStyle(.checklistIcon).foregroundStyle(Color.checklistSecondaryText).help("Checklist Settings").accessibilityLabel("Checklist Settings").accessibilityIdentifier("openChecklistSettings")
-                }
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    HStack(spacing: Spacing.small) {
+                        if store.loading { ProgressView().controlSize(.mini).frame(width: 28, height: 28) }
+                        else { Button { Task { await store.refresh() } } label: { Image(systemName: "arrow.clockwise") }.buttonStyle(.checklistIcon).foregroundStyle(Color.checklistSecondaryText).help("Refresh service").accessibilityLabel("Refresh service") }
+                        Button(action: openSettings) { Image(systemName: "gearshape").frame(width: 28, height: 28) }.buttonStyle(.checklistIcon).foregroundStyle(Color.checklistSecondaryText).help("Checklist Settings").accessibilityLabel("Checklist Settings").accessibilityIdentifier("openChecklistSettings")
+                    }.fixedSize()
+                }.accessibilityIdentifier("sidebarServiceFooter")
             }.padding(.horizontal, Spacing.section).padding(.bottom, Spacing.group)
         }.background(.bar).checklistFont(.body).checklistConfirmation($confirmation)
     }

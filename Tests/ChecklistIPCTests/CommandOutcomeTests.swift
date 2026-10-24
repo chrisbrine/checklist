@@ -20,7 +20,8 @@ final class CommandOutcomeTests: XCTestCase {
     }
     func fixture() throws -> (String, String) {
         let project = try call("project_create", ["name": "Disposable", "root_path": root.path, "key_prefix": "FT"])["data"] as! [String: Any]
-        let task = try call("task_create", ["project_id": project["id"]!, "title": "Lost reply"])["data"] as! [String: Any]
+        let epic = try call("epic_create", ["project_id": project["id"]!, "name": "Fixture tickets"])["data"] as! [String: Any]
+        let task = try call("task_create", ["project_id": project["id"]!, "title": "Lost reply", "epic_id": epic["id"]!])["data"] as! [String: Any]
         return (project["id"] as! String, task["id"] as! String)
     }
     func bytes(_ x: Any) throws -> Data { try JSONSerialization.data(withJSONObject: x) }

@@ -13,7 +13,7 @@ extension CoreTests {
             _ = try router.handle(method: "tool_catalog", params: [:], caller: owner)
             _ = try router.handle(method: "task_list", params: ["project_id": p["id"]!], caller: owner)
         }
-        let created = try router.handle(method: "task_create", params: ["project_id": p["id"]!, "title": "Cursor check", "command_id": UUID().uuidString], caller: owner)
+        let created = try router.handle(method: "task_create", params: fixtureTaskInput(router,method:"task_create",input:["project_id": p["id"]!, "title": "Cursor check", "command_id": UUID().uuidString]), caller: owner)
         XCTAssertEqual(try cursorRowCount(), before, "cursors are sealed, not stored")
         let token = try XCTUnwrap(created["event_cursor"] as? String)
         XCTAssertTrue(token.hasPrefix(SealedCursor.prefix))
@@ -58,19 +58,19 @@ extension CoreTests {
 
     func testOldCommandResultsAreTombstonedAndTheirReplayIsRefused() throws {
         let p = try project(), oldCommand = UUID().uuidString
-        let old = try router.handle(method: "task_create", params: ["project_id": p["id"]!, "title": "Old command", "command_id": oldCommand], caller: owner)
+        let old = try router.handle(method: "task_create", params: fixtureTaskInput(router,method:"task_create",input:["project_id": p["id"]!, "title": "Old command", "command_id": oldCommand]), caller: owner)
         // Mark every current row as written 31 days ago.
         try router.dbQueue.write { db in
             let top = try Int64.fetchOne(db, sql: "SELECT MAX(rowid) FROM commands") ?? 0
             try db.execute(sql: "INSERT OR REPLACE INTO metadata(key,value) VALUES ('command_retention_marks',?)", arguments: [try jsonString([[Date().timeIntervalSince1970 - 31 * 86_400, Double(top)]])])
         }
         let recentCommand = UUID().uuidString
-        _ = try router.handle(method: "task_create", params: ["project_id": p["id"]!, "title": "Recent command", "command_id": recentCommand], caller: owner)
+        _ = try router.handle(method: "task_create", params: fixtureTaskInput(router,method:"task_create",input:["project_id": p["id"]!, "title": "Recent command", "command_id": recentCommand]), caller: owner)
         let counts = try router.dbQueue.writeWithoutTransaction { try router.pruneRoutineRecords($0) }
         XCTAssertGreaterThan(counts.commandResults, 0)
-        assertCode("COMMAND_RESULT_EXPIRED") { _ = try self.router.handle(method: "task_create", params: ["project_id": p["id"]!, "title": "Old command", "command_id": oldCommand], caller: self.owner) }
+        assertCode("COMMAND_RESULT_EXPIRED") { _ = try self.router.handle(method: "task_create", params: fixtureTaskInput(self.router,method:"task_create",input:["project_id": p["id"]!, "title": "Old command", "command_id": oldCommand]), caller: self.owner) }
         XCTAssertEqual(try router.dbQueue.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM records WHERE type='task' AND json_extract(data,'$.title')='Old command'") }, 1, "an expired retry never runs twice")
-        let replay = try router.handle(method: "task_create", params: ["project_id": p["id"]!, "title": "Recent command", "command_id": recentCommand], caller: owner)
+        let replay = try router.handle(method: "task_create", params: fixtureTaskInput(router,method:"task_create",input:["project_id": p["id"]!, "title": "Recent command", "command_id": recentCommand]), caller: owner)
         XCTAssertEqual(replay["replayed"] as? Bool, true)
         // The project_create result carries the policy that older attempts read back.
         let kept = try router.dbQueue.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM commands WHERE json_type(result,'$.data.policy') IS NOT NULL") ?? 0 }

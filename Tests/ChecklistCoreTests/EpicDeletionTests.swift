@@ -58,18 +58,22 @@ extension CoreTests {
             XCTAssertEqual(try call("epic_delete",input,agent,command)["epic_id"] as? String,gid)
             XCTAssertEqual(try deletionFingerprint(),after,"A lost-reply retry must not add another event")
         }
-        XCTAssertEqual(try call("epic_create",["project_id":pid,"name":"Next"])["key"] as? String,"AR-E3")
+        XCTAssertEqual(try call("epic_create",["project_id":pid,"name":"Next"])["key"] as? String,"AR-E4")
     }
     func testEpicDeleteRefusesCurrentAndHistoricalMembershipFromEveryPath() throws {
         let p = try project()
         for route in ["create","edit","membership"] {
             let epic = try call("epic_create",["project_id":p["id"]!,"name":route]),gid = epic["id"] as! String
             var ticket = route == "create" ? try call("task_create",["project_id":p["id"]!,"title":"Member","epic_id":gid]) : try task(p)
+            if route != "create" {
+                try router.dbQueue.writeWithoutTransaction {db in try db.execute(sql:"UPDATE records SET data=json_remove(data,'$.epic_id') WHERE id=?",arguments:[ticket["id"] as! String])}
+            }
             if route == "edit" { ticket = try call("task_edit",["project_id":p["id"]!,"task_id":ticket["id"]!,"expected_revision":ticket["revision"]!,"patch":["epic_id":gid]]) }
             if route == "membership" { _ = try call("group_membership",["project_id":p["id"]!,"group_id":gid,"expected_revision":1,"task_id":ticket["id"]!,"action":"add"]);ticket = try call("task_get",["project_id":p["id"]!,"task_id":ticket["id"]!]) }
             var current = try call("epic_list",["project_id":p["id"]!,"key":epic["key"]!])["groups"] as! [JSON]
             assertCode("EPIC_HAS_TICKETS") { _ = try self.call("epic_delete",["project_id":p["id"]!,"epic_id":gid,"expected_revision":current[0]["revision"]!]) }
-            _ = try call("task_edit",["project_id":p["id"]!,"task_id":ticket["id"]!,"expected_revision":ticket["revision"]!,"patch":["epic_id":NSNull()]])
+            let destination=try call("epic_create",["project_id":p["id"]!,"name":"Destination " + route])
+            _ = try call("task_bulk_edit",["project_id":p["id"]!,"tasks":[["task_id":ticket["id"]!,"expected_revision":ticket["revision"]!]],"changes":["kind":"epic","epic_id":destination["id"]!],"preview":false])
             current = try call("epic_list",["project_id":p["id"]!,"key":epic["key"]!])["groups"] as! [JSON]
             let before = try deletionFingerprint()
             assertCode("EPIC_HELD_TICKETS") { _ = try self.call("epic_delete",["project_id":p["id"]!,"epic_id":gid,"expected_revision":current[0]["revision"]!]) }

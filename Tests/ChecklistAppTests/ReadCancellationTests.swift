@@ -30,7 +30,7 @@ import ChecklistIPC
         func command(_ method: String, _ params: [String: Any]) throws -> [String: Any] {
             var p = params
             if !CommandReply.readMethods.contains(method) { p["command_id"] = UUID().uuidString }
-            return try router.handle(method: method, params: p, caller: owner)
+            return try router.handle(method: method, params: appFixtureTaskInput(router,method:method,input:p), caller: owner)
         }
         func transport(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
             calls.append((method, params))

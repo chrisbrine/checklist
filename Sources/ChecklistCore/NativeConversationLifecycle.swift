@@ -137,7 +137,7 @@ extension CommandRouter {
                 let endedGeneration = uuid()
                 observation["ended_authorization_generation"] = endedGeneration
                 // An owner disconnect stays final when its process later closes.
-                if session["state"] as? String == "revoked" { session["owner_revoked"] = true }
+                if session["state"] as? String == "revoked", !bool(session,"owner_reconnect_allowed") { session["owner_revoked"] = true }
                 session["state"] = "ended"; session["authorization_generation"] = endedGeneration
                 session["native_closure_ref"] = observationID; session["ended_at"] = now()
                 try save(db, revised(session), type: "session")

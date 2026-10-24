@@ -59,7 +59,7 @@ import XCTest
         func call(_ method: String, _ params: [String: Any]) throws -> [String: Any] {
             var input = params
             if !CommandRouter.readMethods.contains(method) { input["command_id"] = UUID().uuidString }
-            return try router.handle(method: method, params: input, caller: owner)["data"] as! [String: Any]
+            return try router.handle(method: method, params: appFixtureTaskInput(router,method:method,input:input), caller: owner)["data"] as! [String: Any]
         }
         let project = try call("project_create", ["name": "Active page", "key_prefix": "AP"]), pid = project["id"] as! String
         var ids: [String: String] = [:]

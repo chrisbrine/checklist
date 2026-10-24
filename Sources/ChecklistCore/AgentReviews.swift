@@ -115,7 +115,7 @@ extension CommandRouter {
         let pid = task["project_id"] as! String,evidence = manifest["evidence"] as? JSON ?? [:],targetArtifacts = (evidence["artifact_refs"] as? [JSON] ?? []) + acceptanceArtifactRefs(evidence)
         var validated: [JSON] = [],owned = false
         guard !refs.isEmpty,refs.count <= 100 else {throw CoreError("REVIEW_ASSESSMENT_INCOMPLETE","Assessments need reviewer-chosen evidence references.")}
-        // CL-41: evidence added after an evidence_missing verdict, recorded on a review request of
+        // Legacy CL-41 supplemental evidence retained on a review request of
         // this ticket and this exact target, is selectable and citable; it keeps its author.
         let supplemental = try records(db,type:"review_request",project:pid).filter {$0["task_id"] as? String == task["id"] as? String && $0["manifest_id"] as? String == manifest["id"] as? String}.flatMap {$0["supplemental_evidence_refs"] as? [JSON] ?? []}
         for ref in refs {

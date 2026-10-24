@@ -76,8 +76,8 @@ extension CommandRouter {
         collections["events"] = try Row.fetchAll(db,sql:"SELECT id,project_id,entity_id,actor,kind,occurred_at,data FROM events WHERE project_id=CAST(? AS TEXT) AND entity_id=CAST(? AS TEXT) COLLATE BINARY ORDER BY seq DESC LIMIT 50",arguments:[Data(pid.utf8),Data(tid.utf8)]).map {row -> JSON in ["id":row["id"] as String,"project_id":pid,"entity_id":tid,"actor":row["actor"] as String,"kind":row["kind"] as String,"occurred_at":row["occurred_at"] as String,"data":jsonObject(row["data"])]}
         let sessionIDs = try jsonString((collections["attempts"] as? [JSON] ?? []).compactMap {$0["session_id"] as? String})
         collections["sessions"] = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='session' AND id IN (SELECT value FROM json_each(?)) ORDER BY rowid",arguments:[sessionIDs]).map { row -> JSON in
-            let source = try GRDBRecordEnvelopeAdapter.decode(row).object;var value: JSON = [:]
-            for key in ["id","label","provider","state","role","updated_at"] {value[key]=source[key] ?? ""}
+            let source = try GRDBRecordEnvelopeAdapter.decode(row).object;var value: JSON = ["project_id":pid]
+            for key in ["id","label","provider","state","role","updated_at","native_conversation_title","installation","revision","owner_revoked","owner_reconnect_allowed","owner_disconnect_pending_attempt_ids"] {value[key]=source[key] ?? ""}
             return value
         }
         // Explicit references, not pretend complete membership lists.
@@ -126,13 +126,13 @@ extension CommandRouter {
             case "review_request","review":predicate="json_extract(data,'$.manifest_id')=CAST(? AS TEXT) COLLATE BINARY";args.append(Data(current.utf8))
             case "finding":predicate="json_extract(data,'$.state')='open'"
             case "finding_resolution":predicate="json_extract(data,'$.finding_id') IN (SELECT id FROM records WHERE type='finding' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND json_extract(data,'$.state')='open')";args += [Data(pid.utf8),Data(tid.utf8)]
-            case "attempt":predicate="json_extract(data,'$.state')='active' OR id=CAST(? AS TEXT)";args.append(Data(currentAttempt.utf8))
+            case "attempt":predicate="json_extract(data,'$.state')='active' OR id=CAST(? AS TEXT) OR EXISTS (SELECT 1 FROM records s WHERE s.type='session' AND s.id=json_extract(records.data,'$.session_id') AND (json_extract(s.data,'$.owner_revoked')=1 OR json_extract(s.data,'$.owner_reconnect_allowed')=1))";args.append(Data(currentAttempt.utf8))
             case "attachment":predicate="id IN (SELECT value FROM json_each(?))";args.append(try jsonString(artifactIDs))
             case "request":predicate="COALESCE(json_extract(data,'$.state'),'pending') NOT IN ('answered','canceled','\(LegacyStoredValue.canceled)','superseded','resolved')"
             case "source_execution":predicate="json_extract(data,'$.state') IN ('queued','running','interrupted') OR json_extract(data,'$.process_stop_unverified')=1"
             case "task_alias":predicate="COALESCE(json_extract(data,'$.state'),'active')='active'"
             case "task_session":
-                predicate="EXISTS (SELECT 1 FROM records s WHERE s.type='session' AND s.id=json_extract(records.data,'$.session_id') AND json_extract(s.data,'$.role')='worker' AND COALESCE(json_extract(s.data,'$.state'),'') NOT IN ('ended','revoked') AND COALESCE(json_extract(s.data,'$.authorization_generation'),'unqualified-legacy')=json_extract(records.data,'$.session_authorization_generation') COLLATE BINARY AND json_extract(s.data,'$.execution_domain') IS json_extract(records.data,'$.execution_domain') AND (s.project_id=records.project_id OR EXISTS (SELECT 1 FROM json_each(json_extract(s.data,'$.project_ids')) WHERE value=records.project_id)))"
+                predicate="EXISTS (SELECT 1 FROM records s WHERE s.type='session' AND s.id=json_extract(records.data,'$.session_id') AND json_extract(s.data,'$.role')='worker' AND ((COALESCE(json_extract(s.data,'$.state'),'') NOT IN ('ended','revoked') AND COALESCE(json_extract(s.data,'$.authorization_generation'),'unqualified-legacy')=json_extract(records.data,'$.session_authorization_generation') COLLATE BINARY AND json_extract(s.data,'$.execution_domain') IS json_extract(records.data,'$.execution_domain')) OR json_extract(s.data,'$.owner_revoked')=1 OR json_extract(s.data,'$.owner_reconnect_allowed')=1) AND (s.project_id=records.project_id OR EXISTS (SELECT 1 FROM json_each(json_extract(s.data,'$.project_ids')) WHERE value=records.project_id)))"
             default:predicate="1"
             }
             let base=" FROM records WHERE type=? AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND ("+predicate+")"
@@ -174,7 +174,7 @@ extension CommandRouter {
         collections["sessions"] = try Array(sessions.prefix(200)).map {row -> JSON in
             let source = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"session").object
             var result:JSON=["project_id":pid,"project_ids":[pid]]
-            for key in ["id","label","provider","role","state","native_conversation_title","updated_at","authorization_generation"] {result[key]=source[key] ?? ""}
+            for key in ["id","label","provider","role","state","native_conversation_title","updated_at","authorization_generation","installation","revision","owner_revoked","owner_reconnect_allowed","owner_disconnect_pending_attempt_ids"] {result[key]=source[key] ?? ""}
             return result
         }
         if sessions.count > 200 {complete = false}

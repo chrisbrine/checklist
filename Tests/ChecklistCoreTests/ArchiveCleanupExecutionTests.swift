@@ -23,7 +23,7 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
     override func tearDownWithError() throws { router = nil;try? FileManager.default.removeItem(at:directory) }
     func call(_ method: String,_ input: JSON,command: String = UUID().uuidString) throws -> JSON {
         var p = input;if !CommandRouter.readMethods.contains(method) {p["command_id"] = command}
-        let reply = try router.handle(method:method,params:p,caller:owner)
+        let reply = try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:owner)
         return try XCTUnwrap(reply["data"] as? JSON)
     }
     func transaction(_ body: (Database) throws -> Void) throws {

@@ -15,6 +15,8 @@ import statistics
 import subprocess
 import time
 
+from clean_scratch import caller_session, mark_qualification, validate_fingerprint
+
 CASES = ('unchanged', 'core-change', 'app-change', 'clean')
 REPETITIONS = 3
 
@@ -53,7 +55,7 @@ def stage(checkout, output, name, mode):
     return record
 
 
-def measure(checkout, output, label, core, app):
+def measure(checkout, output, label, core, app, source_fingerprint, session_id=None):
     checkout, output = Path(checkout).resolve(), Path(output).resolve()
     sources = {'core-change': checkout / core, 'app-change': checkout / app}
     originals = {}
@@ -64,9 +66,12 @@ def measure(checkout, output, label, core, app):
         originals[path] = (path.read_bytes(), path.stat())
     if (checkout / '.local/build/.build-lock').exists():
         raise ValueError('A build already owns this checkout.')
+    session = caller_session(session_id)
+    validate_fingerprint(source_fingerprint)
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
         raise ValueError('Use an empty output directory to preserve earlier evidence.')
+    mark_qualification(output, source_fingerprint, 'build measurement ' + label, session)
     lock = checkout / '.local/build/.measurement-lock'
     lock.parent.mkdir(parents=True, exist_ok=True)
     lock.mkdir()  # A second runner must not change these sources.
@@ -118,6 +123,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkout', type=Path, required=True, help='exclusive private, warmed checkout; never the shared working checkout')
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--source-fingerprint', required=True, help='exact round fingerprint whose qualification copy this run retains')
+    parser.add_argument('--session-id', help='actual owning session when no native host ID is exported')
     parser.add_argument('--label', required=True, help='before/after plus exact revision or source fingerprint')
     parser.add_argument('--core-file', default='Sources/ChecklistCore/Store.swift')
     parser.add_argument('--app-file', default='Sources/ChecklistApp/App/ChecklistApp.swift')
@@ -125,7 +132,7 @@ def main():
     args = parser.parse_args()
     if not args.allow_source_edits_and_clean:
         parser.error('Run only in an exclusive private copy; pass --allow-source-edits-and-clean to execute.')
-    report = measure(args.checkout, args.output, args.label, args.core_file, args.app_file)
+    report = measure(args.checkout, args.output, args.label, args.core_file, args.app_file, args.source_fingerprint, args.session_id)
     print(json.dumps(report['medians_seconds'], indent=2))
 
 

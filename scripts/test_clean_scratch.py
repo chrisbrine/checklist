@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import stat
 import sys
 import tempfile
 import time
@@ -200,6 +201,133 @@ class CleanScratchTests(unittest.TestCase):
         self.assertEqual(result, 0);self.assertFalse((old / '.build').exists())
         self.assertTrue((latest / '.build/object').exists())
         self.assertIn('latest installed round', next(r['reason'] for r in records if r.get('path') == str(latest)))
+
+    def qualification_run(self, name='run', fingerprint='b' * 64, release=True):
+        root = self.item(name, qualification=True)
+        cleanup.mark_qualification(root, fingerprint, 'disposable qualification fixture')
+        if release:
+            cleanup.write_marker(root, 'session', release=True)
+        self.write(root, 'store/checklist.sqlite', b'copied-store-not-in-git')
+        self.write(root, 'store/objects/object', b'copied-managed-object')
+        return root
+
+    def test_obsolete_released_run_previews_and_trashes_whole_copied_store(self):
+        root = self.qualification_run()
+        before = cleanup.inventory(root)
+        result, records = self.run_cleanup()
+        self.assertEqual(result, 0)
+        self.assertEqual(cleanup.inventory(root), before)
+        self.assertEqual(records[0]['eligible_paths'], [str(root)])
+        self.assertEqual(records[0]['qualification_bytes'], records[0]['total_bytes'])
+        result, records = self.run_cleanup(apply=True)
+        self.assertEqual(result, 0)
+        self.assertFalse(root.exists())
+        self.assertEqual(len([r for r in records if r['action'] == 'trash_move']), 1)
+        copied = next(self.trash.rglob('checklist.sqlite'))
+        self.assertEqual(copied.read_bytes(), b'copied-store-not-in-git')
+
+    def test_latest_root_identity_and_unknown_installed_identity_retain_stores(self):
+        root = self.qualification_run(fingerprint=self.fingerprint)
+        result, records = self.run_cleanup(apply=True)
+        self.assertEqual(result, 0)
+        self.assertIn('latest installed round', records[0]['reason'])
+        self.assertEqual(records[0]['eligible_paths'], [])
+        self.assertTrue((root / 'store/checklist.sqlite').exists())
+        self.installed.write_text('{}')
+        self.assertEqual(self.run_cleanup(apply=True)[1][0]['eligible_paths'], [])
+
+    def test_qualification_retirement_keeps_active_recent_running_and_explicit_runs(self):
+        root = self.qualification_run(release=False)
+        self.assertIn('persistent workspace', self.plan(root, kind='qualification')['reason'])
+        cleanup.write_marker(root, 'session', release=True)
+        for options, reason in [({'now': time.time()}, 'last 45 minutes'),
+                                ({'processes': [root / 'store/checklist.sqlite']}, 'running process'),
+                                ({'keep': [root]}, 'explicitly retained')]:
+            with self.subTest(reason=reason):
+                decision = self.plan(root, kind='qualification', **options)
+                self.assertEqual(decision['moves'], [])
+                self.assertIn(reason, decision['reason'])
+
+    def test_qualification_retirement_keeps_nested_workspaces_latest_receipts_and_links(self):
+        for case in ['nested', 'latest', 'link', 'git']:
+            with self.subTest(case=case):
+                root = self.qualification_run(case)
+                if case == 'nested':
+                    nested = root / 'persistent';nested.mkdir();self.mark(nested)
+                elif case == 'latest':
+                    self.write(root, 'nested/build-info.json', json.dumps({'source_fingerprint': self.fingerprint}).encode())
+                elif case == 'link':
+                    (root / 'outside').symlink_to(self.repo)
+                else:
+                    self.write(root, '.git/config', b'preserve')
+                self.assertEqual(self.plan(root, kind='qualification')['moves'], [])
+
+    def test_unmarked_older_than_seven_days_is_reported_with_size_but_never_moved(self):
+        root = self.item('unknown', qualification=True)
+        self.write(root, 'store/checklist.sqlite', b'unknown-store')
+        outside = self.root / 'outside';outside.mkdir();self.write(outside, 'file', b'not counted')
+        (root / 'link').symlink_to(outside)
+        before = cleanup.inventory(root)
+        self.assertEqual(self.run_cleanup()[1], [])  # Under seven days.
+        self.now += 8 * 24 * 60 * 60
+        for apply in [False, True]:
+            result, records = self.run_cleanup(apply=apply, include_released=True)
+            self.assertEqual(result, 0)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]['action'], 'unmarked_qualification')
+            self.assertGreater(records[0]['age_seconds'], 7 * 24 * 60 * 60)
+            self.assertEqual(records[0]['total_bytes'], sum(e[3] for e in before.values() if not stat.S_ISDIR(e[2])))
+            self.assertEqual(records[0]['eligible_paths'], [])
+            self.assertEqual(cleanup.inventory(root), before)
+        self.assertEqual(list(self.trash.iterdir()), [])
+
+    def test_qualification_marker_binds_owner_and_fingerprint_across_release_and_reuse(self):
+        root = self.qualification_run(release=False)
+        with patch.dict(os.environ, CODEX_THREAD_ID='foreign'):
+            with self.assertRaisesRegex(ValueError, 'owning session'):
+                cleanup.mark_qualification(root, 'c' * 64, 'foreign')
+        for value in ['round-28', 'A' * 64, None]:
+            with self.assertRaisesRegex(ValueError, 'fingerprint'):
+                cleanup.mark_qualification(root, value, 'invalid')
+        cleanup.write_marker(root, 'session', release=True)
+        cleanup.write_marker(root, 'session', 'reused')
+        marker = cleanup.read_marker(root)
+        self.assertEqual(marker['source_fingerprint'], 'b' * 64)
+        self.assertFalse(marker['released'])
+        with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': ''}):
+            with self.assertRaisesRegex(ValueError, 'session unknown'):
+                cleanup.mark_qualification(root, 'b' * 64, 'missing owner')
+        with self.assertRaisesRegex(ValueError, 'override'):
+            cleanup.mark_qualification(root, 'b' * 64, 'wrong owner', 'foreign')
+
+    def test_new_qualification_run_fences_installed_change_before_trash(self):
+        root = self.qualification_run()
+        calls = 0
+        def reader():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.installed.write_text(json.dumps({'source_fingerprint': 'c' * 64}))
+            return []
+        result, records = self.run_cleanup(apply=True, process_reader=reader)
+        self.assertEqual(result, 1)
+        self.assertTrue(root.exists())
+        self.assertIn('installed round changed', records[-1]['reason'])
+
+    def test_qualification_marker_cli_and_corrupt_or_linked_roots_fail_closed(self):
+        root = self.item('marked-by-cli', qualification=True)
+        with patch.object(sys, 'argv', ['clean_scratch.py', '--mark', str(root),
+                '--purpose', 'qualification', '--source-fingerprint', 'b' * 64]), redirect_stdout(io.StringIO()):
+            self.assertEqual(cleanup.main(), 0)
+        self.assertEqual(cleanup.read_marker(root)['source_fingerprint'], 'b' * 64)
+        linked = self.qualification / 'linked';linked.symlink_to(root)
+        self.assertNotIn(linked, [p for p, _ in cleanup.candidates(self.sessions, self.qualification, 'session')])
+        (root / cleanup.WORKSPACE_MARKER).write_text('{')
+        result, records = self.run_cleanup(apply=True)
+        self.assertEqual(result, 1)
+        self.assertEqual(records[0]['action'], 'kept_error')
+        self.assertTrue(root.exists())
+        self.assertEqual(list(self.trash.iterdir()), [])
 
     def test_latest_round_in_session_copy_and_explicit_copy_both_kept(self):
         for receipt in ['capture-manifest.json', 'source-manifest.json', 'build-info.json']:

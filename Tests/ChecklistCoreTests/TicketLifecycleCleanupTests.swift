@@ -14,7 +14,7 @@ final class TicketLifecycleCleanupTests: XCTestCase {
     override func tearDownWithError() throws {try router?.closeStore();router = nil;try? FileManager.default.removeItem(at:directory)}
     func call(_ method: String,_ p: JSON) throws -> JSON {
         var p = p;if !CommandRouter.readMethods.contains(method) {p["command_id"] = uuid()}
-        return try router.handle(method:method,params:p,caller:owner)["data"] as! JSON
+        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:owner)["data"] as! JSON
     }
     func write(_ body: (Database) throws -> Void) throws {
         try ArchiveStorageGate.withExclusive(root:router.root) {_ in try router.dbQueue.writeWithoutTransaction {db in try router.withValidatedDomainTransaction(db) {try body(db);return .commit}}}
@@ -343,7 +343,7 @@ extension TicketLifecycleCleanupTests {
             let capture: JSON = ["id":cid,"project_id":pid,"task_id":tid,"revision":1,"snapshot_path":path,"files":entries]
             try files.writeNew(String(path.dropLast(7)) + "/manifest.json",bytes:Data(try jsonString(capture).utf8))
             captures.append(capture)
-            tasks.append(["id":tid,"project_id":pid,"key":"LC-PERF-" + String(n),"title":"Synthetic large cleanup","status_id":done,"revision":1,"updated_at":now()])
+            tasks.append(["id":tid,"project_id":pid,"key":"LC-PERF-" + String(n),"title":"Synthetic large cleanup","epic_id":t["epic_id"]!,"status_id":done,"revision":1,"updated_at":now()])
         }
         try write {db in
             for task in tasks {try self.router.save(db,task,type:"task")}

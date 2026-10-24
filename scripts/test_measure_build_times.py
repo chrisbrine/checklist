@@ -17,6 +17,8 @@ class MeasurementTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
+        caller = patch.dict(os.environ, {'CODEX_THREAD_ID': 'measurement-session', 'CLAUDE_SESSION_ID': ''})
+        caller.start();self.addCleanup(caller.stop)
         self.root = Path(self.temporary.name).resolve()
         self.checkout = self.root / 'checkout'
         self.output = self.root / 'evidence'
@@ -42,7 +44,7 @@ print('Staged '+str(capture/'Checklist.app'))
 
     def run_measurement(self):
         with contextlib.redirect_stdout(io.StringIO()):
-            return measure.measure(self.checkout, self.output, 'after-fixture', self.core, self.app)
+            return measure.measure(self.checkout, self.output, 'after-fixture', self.core, self.app, 'b' * 64)
 
     def test_four_cases_three_runs_raw_logs_loads_medians_and_source_restoration(self):
         original = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in [self.checkout/self.core, self.checkout/self.app]}
@@ -69,6 +71,28 @@ print('Staged '+str(capture/'Checklist.app'))
             self.assertEqual(path.stat().st_mtime_ns, mtime)
         self.assertFalse((self.checkout/'.local/build/.measurement-lock').exists())
 
+    def test_root_is_marked_before_first_build_and_failure_keeps_protection(self):
+        original = measure.stage
+        def stage(*args):
+            marker = json.loads((self.output / '.checklist-workspace.json').read_text())
+            self.assertEqual(marker['session_id'], 'measurement-session')
+            self.assertEqual(marker['source_fingerprint'], 'b' * 64)
+            self.assertFalse(marker['released'])
+            return original(*args)
+        with patch.object(measure, 'stage', side_effect=stage), patch.dict(os.environ, SKIP_COMPILE='1'):
+            with self.assertRaisesRegex(RuntimeError, 'without compiling'):
+                self.run_measurement()
+        self.assertTrue((self.output / '.checklist-workspace.json').is_file())
+
+    def test_invalid_owner_or_fingerprint_cannot_create_an_unmarked_output(self):
+        with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': ''}):
+            with self.assertRaisesRegex(ValueError, 'session unknown'):
+                self.run_measurement()
+        self.assertFalse(self.output.exists())
+        with self.assertRaisesRegex(ValueError, 'fingerprint'):
+            measure.measure(self.checkout, self.output, 'invalid', self.core, self.app, 'short')
+        self.assertFalse(self.output.exists())
+
     def test_failure_retains_logs_and_restores_edited_source(self):
         with patch.dict(os.environ, FAIL_ON_EDIT='1'), self.assertRaisesRegex(RuntimeError, 'Build failed'):
             self.run_measurement()
@@ -92,7 +116,7 @@ print('Staged '+str(capture/'Checklist.app'))
             self.run_measurement()
         lock.rmdir()
         with self.assertRaisesRegex(ValueError, 'regular Swift'):
-            measure.measure(self.checkout,self.output,'invalid','../outside.swift',self.app)
+            measure.measure(self.checkout,self.output,'invalid','../outside.swift',self.app, 'b' * 64)
 
 
 if __name__ == '__main__':

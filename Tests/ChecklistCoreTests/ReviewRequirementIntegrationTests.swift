@@ -18,7 +18,7 @@ final class ReviewRequirementIntegrationTests: XCTestCase {
     override func tearDownWithError() throws {router = nil;try? FileManager.default.removeItem(at:directory)}
     @discardableResult func call(_ method: String,_ raw: JSON,_ actor: Caller? = nil) throws -> JSON {
         var p = raw;if !CommandRouter.readMethods.contains(method) {p["command_id"] = uuid()}
-        return try router.handle(method:method,params:p,caller:actor ?? author)["data"] as! JSON
+        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:actor ?? author)["data"] as! JSON
     }
     func assertCode(_ code: String,_ body: () throws -> Void,file: StaticString = #filePath,line: UInt = #line) {
         XCTAssertThrowsError(try body(),file:file,line:line) {XCTAssertEqual(($0 as? CoreError)?.code,code,file:file,line:line)}

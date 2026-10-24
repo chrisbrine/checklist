@@ -25,7 +25,7 @@ import ChecklistIPC
         func command(_ method: String, _ params: [String: Any]) throws -> [String: Any] {
             var params = params
             if !CommandReply.readMethods.contains(method) { params["command_id"] = UUID().uuidString }
-            return try router.handle(method: method, params: params, caller: owner)
+            return try router.handle(method: method, params: appFixtureTaskInput(router,method:method,input:params), caller: owner)
         }
         func existingProject(archived: Bool) throws -> String {
             let workspace = root.appendingPathComponent("workspace")

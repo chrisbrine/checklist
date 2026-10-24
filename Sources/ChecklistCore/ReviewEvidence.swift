@@ -139,12 +139,12 @@ extension CommandRouter {
         // New targets and actual phase changes still use the individual status departure.
         let category = try taskProjection(db,task)["status_category"] as? String
         let continuesReview = existing != nil && category == "review"
-        if p["supplemental_evidence_refs"] != nil,existing?["state"] as? String != "evidence_requested" { throw CoreError("INVALID_INPUT","Supplemental evidence answers an evidence_missing verdict on this target and gate.") }
+        if p["supplemental_evidence_refs"] != nil,existing?["state"] as? String != "evidence_requested" { throw CoreError("INVALID_INPUT","Supplemental evidence answers a retained legacy evidence_requested request on this target and gate; new review gaps require a fresh work_submit.") }
         if let existing = existing,existing["state"] as? String == "queued" { if !continuesReview { try recordTicketStatusAction(db,task:task,caller:c) }; var result = existing;result["key"] = task["key"];result["title"] = task["title"];return result }
         if let existing = existing { guard p["supersedes_request_id"] as? String == existing["id"] as? String else { throw CoreError("REVIEW_TARGET_MISMATCH","Name the current request when explicitly starting another review round.") }; _ = try text(p,"reason",max:8000) }
         var request: JSON = ["id":uuid(),"project_id":pid,"task_id":task["id"]!,"manifest_id":mid,"gate":gate,"state":"queued","revision":1,"created_at":now()]
         if let existing = existing { request["supersedes_request_id"] = existing["id"] }
-        // CL-41: after evidence_missing the same target returns to review with the added evidence;
+        // Retained legacy CL-41 evidence_requested records can return the same target with added evidence;
         // no new implementation round and no new manifest.
         if let existing,existing["state"] as? String == "evidence_requested" { request["answers_evidence_request"] = existing["evidence_request"] ?? NSNull() }
         if let refs = p["supplemental_evidence_refs"] as? [JSON] {

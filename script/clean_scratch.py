@@ -2,7 +2,8 @@
 """Preview Checklist scratch cleanup; --apply moves eligible bytes to the Trash.
 
 Logical byte counts are not a promise of recovered disk space (APFS/sparse files).
-No checkout, global compiler cache, evidence record or Git metadata is deleted.
+Session cleanup preserves unique evidence and Git metadata. Released fingerprinted
+qualification runs retire whole after their evidence is preserved externally.
 """
 import argparse
 from collections import Counter
@@ -23,6 +24,7 @@ from retire_old_bundles import TRASH_TOOL, trash
 REPO = Path(__file__).resolve().parents[1]
 BUILD_NAMES = {'.build', 'CompilationCache.noindex', 'CompilationCache', 'module-cache'}
 QUIET_SECONDS = 45 * 60
+UNMARKED_AGE_SECONDS = 7 * 24 * 60 * 60
 WORKSPACE_MARKER = '.checklist-workspace.json'
 # Bound memory and argv while amortizing process inspection and native Trash startup.
 ITEM_BATCH_SIZE = 32
@@ -176,10 +178,33 @@ def read_marker(root):
             or not isinstance(value.get('purpose'), str) or not value['purpose'].strip()
             or type(value.get('released')) is not bool):
         raise ValueError('invalid workspace marker: ' + str(path))
+    if 'source_fingerprint' in value:
+        validate_fingerprint(value['source_fingerprint'])
     return value
 
 
-def write_marker(root, session_id, purpose=None, release=False):
+def validate_fingerprint(value):
+    if not isinstance(value, str) or not re.fullmatch('[0-9a-f]{64}', value):
+        raise ValueError('qualification source fingerprint must be 64 lowercase hexadecimal characters')
+    return value
+
+
+def caller_session(session_id=None):
+    native = os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID')
+    if native and session_id and native != session_id:
+        raise ValueError('--session-id cannot override the host caller')
+    value = native or session_id
+    if not value or value in {'.', '..'} or '/' in value or not value.strip():
+        raise ValueError('caller session unknown/invalid; supply your actual --session-id')
+    return value
+
+
+def mark_qualification(root, fingerprint, purpose, session_id=None):
+    return write_marker(root, caller_session(session_id), purpose,
+                        source_fingerprint=validate_fingerprint(fingerprint))
+
+
+def write_marker(root, session_id, purpose=None, release=False, source_fingerprint=None):
     """Only the recorded owner marks/releases a workspace; interrupted writes keep safe."""
     if root.is_symlink() or not root.is_dir():
         raise ValueError('workspace must be an existing directory, not a link')
@@ -195,7 +220,10 @@ def write_marker(root, session_id, purpose=None, release=False):
         raise ValueError('mark the workspace before releasing it')
     if not release and (not purpose or not purpose.strip()):
         raise ValueError('--mark requires a nonblank --purpose')
-    value = dict(previous) if release else {'version': 1, 'session_id': session_id, 'purpose': purpose}
+    value = dict(previous or {})
+    value.update(version=1, session_id=session_id, purpose=previous['purpose'] if release else purpose)
+    if source_fingerprint is not None:
+        value['source_fingerprint'] = validate_fingerprint(source_fingerprint)
     value['released'] = release
     # Write beside the marker, then atomically publish. An interrupted temporary
     # file is preserved as unknown bytes; an existing protection stays in place.
@@ -223,6 +251,8 @@ def in_scope(item, kind, session_id, include_released=False):
         owner = item.parent.parent.name
         return owner == session_id or (include_released and released_by(item, owner))
     # Qualification runs have no session path: their root marker supplies ownership.
+    if item.is_symlink():
+        return False
     try:
         marker = read_marker(item)
         return bool(marker and (marker['session_id'] == session_id or
@@ -300,9 +330,11 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
         reason = protection
     elif fingerprint is None:
         reason = 'latest installed identity unavailable; qualified-copy retention unresolved'
+    elif (kind == 'qualification' and (read_marker(item) or {}).get('source_fingerprint') == fingerprint):
+        reason = 'qualified copy of latest installed round (matching root source fingerprint)'
     else:
         for path, entry in files.items():
-            if path.name not in {'capture-manifest.json', 'build-info.json', 'source-manifest.json'}:
+            if path.name not in {'capture-manifest.json', 'build-info.json', 'source-manifest.json', WORKSPACE_MARKER}:
                 continue
             if not stat.S_ISREG(entry[2]):
                 continue
@@ -321,7 +353,14 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
                           for entry in before.values()):
         reason = 'files or directories changed in the last 45 minutes'
 
-    counts = Counter(build_bytes=0, git_redundant_source_bytes=0, kept_bytes=0)
+    # Only an explicitly fingerprinted, released root authorizes disposal of
+    # unique copied stores. Legacy workspace markers retain byte-only cleanup.
+    retire_run = kind == 'qualification' and bool((read_marker(item) or {}).get('source_fingerprint'))
+    if retire_run and not reason and any(
+            not stat.S_ISREG(entry[2]) or '.git' in path.relative_to(item).parts
+            for path, entry in files.items()):
+        reason = 'qualification run contains links, special files or Git metadata; retained'
+    counts = Counter(build_bytes=0, git_redundant_source_bytes=0, qualification_bytes=0, kept_bytes=0)
     reasons = Counter()
     removable = set()
     for path, entry in files.items():
@@ -331,7 +370,9 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
         why = reason
         category = 'kept_bytes'
         if not why:
-            if not stat.S_ISREG(entry[2]):
+            if retire_run:
+                category, why = 'qualification_bytes', 'released obsolete qualification run (including copied stores)'
+            elif not stat.S_ISREG(entry[2]):
                 why = 'link or special file; never followed or moved'
             elif path.name == WORKSPACE_MARKER:
                 why = 'workspace ownership/release marker retained'
@@ -426,12 +467,30 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
           session_id=None, include_released=False):
     if not session_id:
         raise ValueError('caller session unknown; supply --session-id for your own session')
+    failed = False
+    # Unknown runs are visible for reconciliation, never inferred disposable.
+    for item in children(qualification):
+        if item.is_symlink() or not item.is_dir():
+            continue
+        try:
+            if read_marker(item) is not None:
+                continue
+            observed = inventory(item)
+            changed = max(max(entry[4], entry[5]) / 1e9 for entry in observed.values())
+            if clock() - changed >= UNMARKED_AGE_SECONDS:
+                size = sum(entry[3] for entry in observed.values() if not stat.S_ISDIR(entry[2]))
+                print(json.dumps({'path': str(item), 'kind': 'qualification',
+                                  'action': 'unmarked_qualification', 'total_bytes': size,
+                                  'age_seconds': clock() - changed, 'eligible_paths': [],
+                                  'reason': 'unmarked qualification run older than 7 days; retained for owner reconciliation'}))
+        except (OSError, ValueError) as error:
+            print(json.dumps({'path': str(item), 'action': 'kept_error', 'reason': str(error)}))
+            failed = True
     items = list(candidates(sessions, qualification, session_id, include_released))
     objects = git_objects(repo) if items else set()
     fingerprint = installed_fingerprint(installed_info)
     processes = process_reader() if items else []
     used = used_items(processes, (item for item, _ in items))
-    failed = False
     for offset in range(0, len(items), ITEM_BATCH_SIZE):
         pending = []
         for item, kind in items[offset:offset + ITEM_BATCH_SIZE]:
@@ -478,6 +537,8 @@ def main():
     mode.add_argument('--preview', action='store_true')
     mode.add_argument('--apply', action='store_true', help='move eligible paths to macOS Trash; never permanently delete')
     parser.add_argument('--purpose', help='workspace purpose; required with --mark')
+    parser.add_argument('--source-fingerprint', type=validate_fingerprint,
+                        help='with --mark: bind a disposable qualification run to its exact build source fingerprint')
     parser.add_argument('--session-id', default=os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID'),
                         help='caller session (default: CODEX_THREAD_ID or CLAUDE_SESSION_ID); never name another session')
     parser.add_argument('--include-released', action='store_true',
@@ -494,11 +555,13 @@ def main():
         parser.error('--session-id cannot override the host caller; use --include-released for released foreign roots')
     if not args.session_id or args.session_id in {'.', '..'} or '/' in args.session_id or not args.session_id.strip():
         parser.error('caller session unknown/invalid; --session-id must name your own session')
+    if args.source_fingerprint is not None and args.mark is None:
+        parser.error('--source-fingerprint is only valid with --mark')
     if args.purpose is not None and args.mark is None:
         parser.error('--purpose is only valid with --mark')
     if args.mark is not None or args.release is not None:
         root = (args.mark if args.mark is not None else args.release).expanduser()
-        value = write_marker(root, args.session_id, args.purpose, args.release is not None)
+        value = write_marker(root, args.session_id, args.purpose, args.release is not None, args.source_fingerprint)
         print(json.dumps({'path': str(root.resolve()), 'action': 'released' if args.release else 'marked', **value}))
         return 0
     for root in [args.sessions_root.expanduser(), args.qualification_root.expanduser()]:

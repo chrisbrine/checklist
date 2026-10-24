@@ -29,7 +29,7 @@ final class HumanRequestManagedCopyTests: XCTestCase {
     @discardableResult func call(_ method: String,_ params: JSON = [:],caller: Caller? = nil) throws -> JSON {
         var p = params
         if !CommandRouter.readMethods.contains(method),p["command_id"] == nil { p["command_id"] = uuid() }
-        return try router.handle(method:method,params:p,caller:caller ?? owner)["data"] as! JSON
+        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:caller ?? owner)["data"] as! JSON
     }
     func file(_ name: String,_ text: String) throws -> URL {
         let file = root.appendingPathComponent(name); try Data(text.utf8).write(to:file); return file

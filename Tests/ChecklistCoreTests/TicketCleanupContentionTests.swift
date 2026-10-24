@@ -18,6 +18,70 @@ private final class CleanupTraffic: @unchecked Sendable {
 }
 
 extension TicketLifecycleCleanupTests {
+    func testProjectedInventoryRetainsCompleteOwnedChildrenAndForeignReferences() throws {
+        let (p,t,a) = try fixture(),pid = p["id"] as! String,tid = t["id"] as! String
+        let other = try call("task_create",["project_id":pid,"title":"Reference owner"])
+        let parent = uuid(),child = uuid(),foreign = uuid(),padding = String(repeating:"payload-",count:4096)
+        try write {db in
+            var attachment = try self.router.record(db,a["id"] as! String,type:"attachment")
+            attachment["private_metadata"] = padding
+            try self.router.save(db,self.router.revised(attachment),type:"attachment")
+            try self.router.save(db,["id":parent,"project_id":pid,"task_id":tid,"revision":1,"body":padding],type:"message")
+            try self.router.save(db,["id":child,"project_id":pid,"message_id":parent,"revision":1,"body":padding],type:"message")
+            try self.router.save(db,["id":foreign,"project_id":pid,"task_id":other["id"]!,"revision":1,"body":padding,"nested":["attachment":a["id"]!]],type:"message")
+        }
+        let inventory = try router.readers!.read {try self.router.ticketCleanupInventory($0,task:t)}
+        for id in [parent,child,foreign] {
+            XCTAssertEqual(inventory.rows.first {$0.id == id}?.value["body"] as? String,padding)
+        }
+        let attachment = try XCTUnwrap(inventory.rows.first {$0.id == a["id"] as! String})
+        XCTAssertEqual(attachment.value["private_metadata"] as? String,padding)
+        XCTAssertNotNil(attachment.value["path"])
+        XCTAssertTrue(inventory.tokens[Data(foreign.utf8)]?.contains(Data((a["id"] as! String).utf8)) == true)
+        try pass();try finish()
+        XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String),"A nested reference outside the selected ownership still retains its bytes")
+    }
+
+    func testProjectedUnrelatedPayloadStillValidatesCompleteUTF8() throws {
+        let (p,t,a) = try fixture(),id = uuid()
+        var bytes = Data("{\"id\":\"\(id)\",\"project_id\":\"\(p["id"]!)\",\"revision\":1,\"body\":\"".utf8)
+        bytes.append(Data(repeating:120,count:32768));bytes.append(0xff);bytes.append(Data("\"}".utf8))
+        try write {db in
+            try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES(?,?,'message',1,CAST(? AS TEXT))",arguments:[id,p["id"] as! String,bytes])
+        }
+        XCTAssertThrowsError(try router.readers!.read {try self.router.ticketCleanupInventory($0,task:t)}) {
+            XCTAssertEqual(($0 as? CoreError)?.code,"CANONICAL_RECORD_INVALID")
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
+    }
+
+    func testProjectedUnrelatedPayloadStillRejectsUnpairedSurrogateEscape() throws {
+        let (p,t,a) = try fixture(),id = uuid(),padding = String(repeating:"x",count:32768)
+        let raw = "{\"id\":\"\(id)\",\"project_id\":\"\(p["id"]!)\",\"revision\":1,\"body\":\"\(padding)\",\"value\":\"\\ud800\"}"
+        XCTAssertThrowsError(try JSONSerialization.jsonObject(with:Data(raw.utf8)))
+        try write {db in
+            XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT json_valid(?)",arguments:[raw]),1)
+            try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES(?,?,'message',1,?)",arguments:[id,p["id"] as! String,raw])
+        }
+        XCTAssertThrowsError(try router.readers!.read {try self.router.ticketCleanupInventory($0,task:t)}) {
+            XCTAssertEqual(($0 as? CoreError)?.code,"CANONICAL_RECORD_INVALID")
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
+    }
+
+    func testProjectedReferenceKeysIncludeCapturePrefixesAndTypedDigests() throws {
+        let (p,t,a) = try fixture(),pid = p["id"] as! String,capture = uuid(),foreign = uuid(),hold = uuid()
+        let path = "source-captures/" + pid + "/" + capture + "/source",padding = String(repeating:"payload-",count:4096)
+        try write {db in
+            try self.router.save(db,["id":capture,"project_id":pid,"task_id":t["id"]!,"revision":1,"snapshot_path":path,"files":[]],type:"source_capture")
+            try self.router.save(db,["id":foreign,"project_id":pid,"revision":1,"nested":[path + "/retained.txt":padding]],type:"message")
+            try self.router.save(db,["id":hold,"project_id":pid,"revision":1,"kind":"reader","state":"active","nested":[a["sha256"] as! String:padding]],type:"storage_hold")
+        }
+        let inventory = try router.readers!.read {try self.router.ticketCleanupInventory($0,task:t)}
+        XCTAssertNotNil(inventory.rows.first {$0.id == foreign},"A capture path in a JSON key is still a reference")
+        XCTAssertNotNil(inventory.rows.first {$0.id == hold},"A typed hold's digest in a JSON key still protects the object")
+    }
+
     private func residentBytes() -> UInt64 {
         var info = mach_task_basic_info(),count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<integer_t>.size)
         let result = withUnsafeMutablePointer(to:&info) {pointer in
@@ -296,10 +360,11 @@ extension TicketLifecycleCleanupTests {
 
     func testProjectCounterWriteMustNotFenceCleanup() throws {
         let (p,_,a) = try fixture(),pid = p["id"] as! String
+        let counterEpic = try call("epic_create",["project_id":p["id"]!,"name":"Concurrent writer ticket"])
         var committed = false
         try router.withTicketCleanupPreparation({db in
             let prepared = try self.router.prepareTicketLifecycleCleanup(db)
-            _ = try self.call("task_create",["project_id":pid,"title":"Unrelated counter allocation"])
+            _ = try self.call("task_create",["project_id":pid,"title":"Unrelated counter allocation","epic_id":counterEpic["id"]!])
             return prepared
         }) {db,_,prepared in
             committed = true
@@ -337,6 +402,7 @@ extension TicketLifecycleCleanupTests {
 extension TicketLifecycleCleanupTests {
     func testChangeIndexBudgetRetainsBytesAndDoesNotInterruptWriter() throws {
         let (p,_,a) = try fixture()
+        let counterEpic = try call("epic_create",["project_id":p["id"]!,"name":"Concurrent writer ticket"])
         var committed = false
         try router.withTicketCleanupPreparation({db in
             let prepared = try self.router.prepareTicketLifecycleCleanup(db)
@@ -345,7 +411,7 @@ extension TicketLifecycleCleanupTests {
                 XCTAssertLessThanOrEqual(try Int.fetchOne(writer,sql:"SELECT units FROM ticket_cleanup_budget")!,TicketCleanupChanges.rowLimit)
                 XCTAssertLessThanOrEqual(try Int.fetchOne(writer,sql:"SELECT bytes FROM ticket_cleanup_budget")!,TicketCleanupChanges.byteLimit)
             }
-            _ = try self.call("task_create",["project_id":p["id"]!,"title":"Writer still commits after index limit"])
+            _ = try self.call("task_create",["project_id":p["id"]!,"title":"Writer still commits after index limit","epic_id":counterEpic["id"]!])
             return prepared
         }) {_,_,_ in committed = true}
         XCTAssertFalse(committed)
@@ -383,7 +449,8 @@ extension TicketLifecycleCleanupTests {
     func testSustainedWritersBoundRSSCPUAndBackoff() throws {
         guard let raw = ProcessInfo.processInfo.environment["CL193_SOAK_SECONDS"],let duration = Double(raw),duration >= 180 else {throw XCTSkip("Run with CL193_SOAK_SECONDS=360 for sustained resource qualification")}
         let (p,t,a) = try fixture(),pid = p["id"] as! String
-        let other = try call("task_create",["project_id":pid,"title":"Independent traffic ticket"]),otherID = other["id"] as! String
+        let trafficEpic = try call("epic_create",["project_id":pid,"name":"Independent traffic"])
+        let other = try call("task_create",["project_id":pid,"title":"Independent traffic ticket","epic_id":trafficEpic["id"]!]),otherID = other["id"] as! String
         try write {db in
             try autoreleasepool {
                 let payload = String(repeating:"unrelated-payload-",count:1536)
@@ -405,7 +472,7 @@ extension TicketLifecycleCleanupTests {
                     do {try autoreleasepool {
                         _ = try fixtureRouter.handle(method:"message_send",params:["command_id":uuid(),"project_id":pid,"task_id":otherID,"body":"Sustained unrelated writer \(worker)"],caller:self.owner)
                         // Actual ticket creation writes the project's next_number.
-                        _ = try fixtureRouter.handle(method:"task_create",params:["command_id":uuid(),"project_id":pid,"title":"Counter traffic \(worker)"],caller:self.owner)
+                        _ = try fixtureRouter.handle(method:"task_create",params:["command_id":uuid(),"project_id":pid,"title":"Counter traffic \(worker)","epic_id":trafficEpic["id"]!],caller:self.owner)
                         traffic.recordWrite()
                     }} catch {XCTFail("Sustained writer: \(error)");return}
                     Thread.sleep(forTimeInterval:2)
@@ -555,13 +622,59 @@ extension TicketLifecycleCleanupTests {
             project["pinned_decisions"] = [a["path"]!]
             try self.router.save(db,self.router.revised(project),type:"project")
         }
+        let counterEpic = try call("epic_create",["project_id":p["id"]!,"name":"Concurrent writer ticket"])
         var committed = false
         try router.withTicketCleanupPreparation({db in
             let prepared = try self.router.prepareTicketLifecycleCleanup(db)
-            _ = try self.call("task_create",["project_id":pid,"title":"Unrelated counter with existing reference"])
+            _ = try self.call("task_create",["project_id":pid,"title":"Unrelated counter with existing reference","epic_id":counterEpic["id"]!])
             return prepared
         }) {db,_,value in committed = true;try self.router.commitTicketLifecycleCleanup(db,prepared:value,at:Date())}
         XCTAssertTrue(committed)
         XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String),"Existing project reference still retains its bytes")
+    }
+}
+
+
+extension TicketLifecycleCleanupTests {
+    func testProjectedReferenceScanBoundsWorkWithManyOwnedTokens() throws {
+        let (p,t,_) = try fixture(),pid = p["id"] as! String,tid = t["id"] as! String
+        let other = try call("task_create",["project_id":pid,"title":"Unrelated projection corpus"])
+        try write {db in
+            for _ in 0..<400 {
+                try self.router.save(db,["id":uuid(),"project_id":pid,"task_id":tid,"revision":1,"body":"Owned token"],type:"message")
+            }
+            // Real source captures contribute thousands of typed digest tokens.
+            try self.router.save(db,["id":uuid(),"project_id":pid,"task_id":tid,"revision":1,
+                "digests":(0..<1500).map {String(format:"%064x",$0)}],type:"message")
+            let values = (0..<3000).map {"Unrelated reference value \($0)"}
+            for _ in 0..<120 {
+                try self.router.save(db,["id":uuid(),"project_id":pid,"task_id":other["id"]!,"revision":1,"values":values],type:"message")
+            }
+        }
+        let started = ProcessInfo.processInfo.systemUptime
+        let inventory = try router.readers!.read {try self.router.ticketCleanupInventory($0,task:t)}
+        print("CL256_TOKEN_SCAN seconds=\(ProcessInfo.processInfo.systemUptime-started) digests=\(inventory.holdDigests.count)")
+        XCTAssertGreaterThanOrEqual(inventory.needles.count,401)
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime-started,5,"An unrelated JSON leaf must not reparse the complete owned-token set for each prefix check")
+    }
+}
+
+
+extension TicketLifecycleCleanupTests {
+    func testLongRefusedPreparationRestDoesNotPostponeDurableRetry() throws {
+        let (p,_,_) = try fixture(),pid = p["id"] as! String
+        try router.beginTicketCleanupPreparation(project:pid)
+        try router.recordTicketCleanupPreparationRefusal(project:pid,reason:"CLEANUP_CONCURRENT_WRITE")
+        let time = Date(),retry = try router.dbQueue.read {try self.router.ticketCleanupProjectRetry($0,project:pid)}
+        router.scheduleTicketCleanupRest(since:time.addingTimeInterval(-300),at:time)
+        XCTAssertEqual(router.ticketCleanupYieldAt,try XCTUnwrap(retry))
+        XCTAssertLessThanOrEqual(try XCTUnwrap(router.nextArchiveCleanupDeadline()),try XCTUnwrap(retry).addingTimeInterval(0.01))
+        let overdue = try XCTUnwrap(retry).addingTimeInterval(1)
+        router.scheduleTicketCleanupRest(since:time.addingTimeInterval(-300),at:overdue)
+        XCTAssertEqual(router.ticketCleanupYieldAt,overdue,"A retry already due must run without another long rest")
+        router.ticketCleanupPreparingProject = nil
+        router.ticketCleanupRetryAt = nil
+        router.scheduleTicketCleanupRest(since:time.addingTimeInterval(-10),at:time)
+        XCTAssertEqual(try XCTUnwrap(router.ticketCleanupYieldAt).timeIntervalSince(time),40,accuracy:0.001,"Successful work retains its four-times-wall-time CPU rest")
     }
 }

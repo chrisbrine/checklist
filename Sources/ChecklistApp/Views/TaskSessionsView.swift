@@ -7,6 +7,7 @@ struct TaskSessionsView: View {
     let task: Record
     @State private var recoveryAttempt: Record?
     @State private var handoffProvider: HandoffProvider?
+    @State private var accessConfirmation: PendingConfirmation?
     var attempts: [Record] { RecordOrdering.newestFirst(store.detailRecords("attempts",task:task).filter { $0.string("task_id") == task.id }, timestamp: "started_at") }
     var current: Record? { attempts.first { $0.id == task.string("active_attempt_id") } }
     var activeContributors: [Record] { attempts.filter { $0.id != current?.id && $0.string("state") == "active" } }
@@ -64,6 +65,7 @@ struct TaskSessionsView: View {
                 }
             }.sheet(item: $recoveryAttempt) { attempt in TaskRecoverySheet(task: task, attempt: attempt).environmentObject(store) }
                 .sheet(item: $handoffProvider) { provider in TaskHandoffSheet(task: task, provider: provider).environmentObject(store) }
+                .checklistConfirmation($accessConfirmation)
         }
     }
     @ViewBuilder func contextRow(_ link: Record, historical: Bool) -> some View {
@@ -110,7 +112,7 @@ struct TaskSessionsView: View {
             if !attempt.string("reason", fallback: attempt.string("recovery_reason")).isEmpty { Text("Disposition: \(attempt.string("reason", fallback: attempt.string("recovery_reason")))").checklistFont(.micro).textSelection(.enabled) }
             if let session { Text("Session: \(GlossaryText.humanize(session.string("state", fallback: "Unknown")))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             sessionActions(session)
-            if session?.string("state") == "revoked" { Label("Session access revoked; work still needs a recorded disposition", systemImage: "exclamationmark.circle").checklistFont(.micro).foregroundStyle(.orange) }
+
             technicalIdentity(attempt, session: session, isAttempt: true)
         }.frame(maxWidth: .infinity, alignment: .leading).checklistCard(padding: Card.padding)
     }
@@ -131,6 +133,21 @@ struct TaskSessionsView: View {
                 Text("An exact conversation link is unavailable. Open the provider app to find this session, or prepare this ticket for a new thread.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             } else if let reason = provider.unavailabilityReason {
                 Text(reason).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+            }
+            if session.bool("owner_revoked") {
+                Text("Disconnected by you · reconnect refused until Allow again").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+            } else if session.bool("owner_reconnect_allowed") {
+                Text("Allowed again · waiting for this conversation to reconnect").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+            }
+            if !session.strings("owner_disconnect_pending_attempt_ids").isEmpty {
+                Text("Retained claims need stopped-work recovery before Allow again. Reservations stay protected.").checklistFont(.micro).foregroundStyle(.orange)
+            }
+            if let action = ConversationAccessAction.available(for:session) {
+                Button(action.label) {
+                    accessConfirmation = action.confirmation(session) {
+                        store.run(action.method,action.parameters(session,task:task),success:action.success)
+                    }
+                }.checklistFont(.micro).checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
             }
         }
     }

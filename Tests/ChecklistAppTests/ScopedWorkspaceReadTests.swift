@@ -18,7 +18,7 @@ import ChecklistIPC
         var continuationFailure:String?
         var waitCursors:[String?]=[]
         var failRead: (method: String, detail: String?)?
-        var a="",b="",task=""
+        var a="",b="",task="",epic=""
         init(defaults: IsolatedDefaults)throws {
             let cache=FileManager.default.urls(for:.cachesDirectory,in:.userDomainMask).first!.appendingPathComponent("ChecklistSyntheticTests")
             try FileManager.default.createDirectory(at:cache,withIntermediateDirectories:true)
@@ -29,17 +29,18 @@ import ChecklistIPC
             try FileManager.default.createDirectory(at:root.appendingPathComponent("b"),withIntermediateDirectories:true)
             func call(_ method:String,_ params:[String:Any])throws->[String:Any] {
                 var params=params;params["command_id"]=UUID().uuidString
-                return try router.handle(method:method,params:params,caller:owner)["data"] as! [String:Any]
+                return try router.handle(method:method,params:appFixtureTaskInput(router,method:method,input:params),caller:owner)["data"] as! [String:Any]
             }
             a=try call("project_create",["name":"A","key_prefix":"A","root_path":root.appendingPathComponent("a").path])["id"] as! String
             b=try call("project_create",["name":"B","key_prefix":"B","root_path":root.appendingPathComponent("b").path])["id"] as! String
-            task=try call("task_create",["project_id":a,"title":"Selected"])["id"] as! String
+            let captured=try call("task_create",["project_id":a,"title":"Selected"])
+            task=captured["id"] as! String;epic=captured["epic_id"] as! String
             preferences.set(Page.epics.rawValue,forKey:"lastPage");preferences.set(a,forKey:"lastProject")
         }
         func cleanup() {try? FileManager.default.removeItem(at:root)}
         func command(_ method:String,_ params:[String:Any])throws->[String:Any] {
             var params=params;if !CommandReply.readMethods.contains(method) && params["command_id"] == nil {params["command_id"]=UUID().uuidString}
-            return try router.handle(method:method,params:params,caller:owner)
+            return try router.handle(method:method,params:appFixtureTaskInput(router,method:method,input:params),caller:owner)
         }
         func transport(_ method:String,_ params:[String:Any]) async throws->[String:Any] {
             if method=="changes_wait" {
@@ -308,7 +309,7 @@ import ChecklistIPC
     func testCommittedCaptureReconcilesOriginalUUIDAcrossRestartAndRecoversExactTarget()async throws {
         let f=try Fixture(defaults: isolatedDefaults("ScopedAppTests"));defer {f.cleanup()};var first:ChecklistStore?=f.store();await first!.refresh()
         let storeID=first!.storeIncarnation
-        first!.saveCapture(CaptureDraft(projectID:f.a,title:"Lost create",brief:"Preserved brief",kind:"work",epicID:"",storeIncarnation:storeID))
+        first!.saveCapture(CaptureDraft(projectID:f.a,title:"Lost create",brief:"Preserved brief",kind:"work",epicID:f.epic,storeIncarnation:storeID))
         let original=try first!.captureCreateParameters(projectID:f.a),uuid=original["command_id"] as! String
         f.loseCreateReply=true
         first!.run("task_create",original,success:"captured")

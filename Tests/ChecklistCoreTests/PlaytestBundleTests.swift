@@ -13,7 +13,7 @@ final class PlaytestBundleTests: XCTestCase {
     override func tearDownWithError() throws { router = nil;try? FileManager.default.removeItem(at:directory) }
     @discardableResult func call(_ method: String,_ input: JSON,_ actor: Caller? = nil) throws -> JSON {
         var input = method == "work_submit" ? try fixtureAcceptanceEvidence(router,input:input) : input;if !CommandRouter.readMethods.contains(method) { input["command_id"] = UUID().uuidString }
-        let response = try router.handle(method:method,params:input,caller:actor ?? owner)
+        let response = try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:input),caller:actor ?? owner)
         return try XCTUnwrap(response["data"] as? JSON)
     }
     func record(_ id: Any,_ type: String) throws -> JSON { try router.dbQueue.read { try router.record($0,id as! String,type:type) } }

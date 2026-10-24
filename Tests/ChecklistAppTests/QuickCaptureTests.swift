@@ -52,7 +52,9 @@ import ChecklistIPC
                     XCTAssertEqual(try Data(contentsOf: file), Data("Unsent file".utf8))
                     if !saved.title.isEmpty {
                         restored.draft.projectID = "p1"
-                        XCTAssertTrue(restored.canSend, "Choosing a project enables a titled draft")
+                        XCTAssertFalse(restored.canSend, "A titled draft still needs an Epic")
+                        restored.draft.epicID = "e1"
+                        XCTAssertTrue(restored.canSend)
                     }
                 }
             }
@@ -153,7 +155,7 @@ import ChecklistIPC
         await first.loadProjects()
         XCTAssertFalse(first.projectsAvailable)
         first.draft.title = "Boss door does not open"
-        first.draft.projectID = "p1"
+        first.draft.projectID = "p1"; first.draft.epicID = "e1"
         first.draft.note = "Seen in the second level"
         let file = root.appendingPathComponent("shot.png")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -190,6 +192,7 @@ import ChecklistIPC
         let router: CommandRouter
         let owner = Caller(role: "owner", installation: "quick-capture-qualification", projectIDs: [])
         let projectID: String
+        let epicID: String
         var loseReply = true
         var loseAttachmentReply = false
         var refusal: String?
@@ -205,6 +208,8 @@ import ChecklistIPC
             let reply = try router.handle(method: "project_create", params: ["command_id": UUID().uuidString,
                 "name": "Quick capture qualification", "key_prefix": "QC", "root_path": workspace.path], caller: owner)
             projectID = try XCTUnwrap((reply["data"] as? [String: Any])?["id"] as? String)
+            let epic=try router.handle(method:"epic_create",params:["command_id":UUID().uuidString,"project_id":projectID,"name":"Capture fixture"],caller:owner)["data"] as! [String:Any]
+            epicID=epic["id"] as! String
         }
         func cleanup() { try? FileManager.default.removeItem(at: root) }
         func transport(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
@@ -236,7 +241,7 @@ import ChecklistIPC
     func testUnknownCreateKeepsOriginalIntentAndNewerEditsAsNextDraft() async throws {
         let fixture = try CreateFixture(); defer { fixture.cleanup() }
         let quick = model(fixture.transport)
-        quick.draft.projectID = fixture.projectID
+        quick.draft.projectID = fixture.projectID; quick.draft.epicID = fixture.epicID
         quick.draft.title = "Original title"
         quick.draft.note = "Original brief"
         let file = fixture.root.appendingPathComponent("capture.txt")
@@ -287,7 +292,7 @@ import ChecklistIPC
     func testRestartReplaysOriginalCreateDespiteSavedNewerTitle() async throws {
         let fixture = try CreateFixture(); defer { fixture.cleanup() }
         var quick: QuickCaptureModel? = model(fixture.transport)
-        quick!.draft.projectID = fixture.projectID
+        quick!.draft.projectID = fixture.projectID; quick!.draft.epicID = fixture.epicID
         quick!.draft.title = "Original before restart"
         await quick!.send()
         quick!.draft.title = "Newer after restart"
@@ -308,7 +313,7 @@ import ChecklistIPC
         let fixture = try CreateFixture(); defer { fixture.cleanup() }
         fixture.refusal = "SERVICE_UNAVAILABLE"
         let quick = model(fixture.transport)
-        quick.draft.projectID = fixture.projectID
+        quick.draft.projectID = fixture.projectID; quick.draft.epicID = fixture.epicID
         quick.draft.title = "Before refusal"
         await quick.send()
         guard case .notSent(let text) = quick.state else { return XCTFail("A connect refusal is Not sent") }
@@ -325,7 +330,7 @@ import ChecklistIPC
         let fixture = try CreateFixture(); defer { fixture.cleanup() }
         fixture.loseReply = false
         let quick = model(fixture.transport)
-        quick.draft.projectID = fixture.projectID
+        quick.draft.projectID = fixture.projectID; quick.draft.epicID = fixture.epicID
         quick.draft.title = String(repeating: "x", count: 2001)
         await quick.send()
         guard case .notSent = quick.state else { return XCTFail("A validation refusal is Not sent") }
@@ -344,7 +349,7 @@ import ChecklistIPC
             if offline { throw ChecklistError("SERVICE_UNAVAILABLE", "Connection refused") }
             return try await fixture.transport(method, params)
         }
-        quick.draft.projectID = fixture.projectID
+        quick.draft.projectID = fixture.projectID; quick.draft.epicID = fixture.epicID
         quick.draft.title = "Saved before outage"
         await quick.send()
         let original = quick.draft.pendingCreate
@@ -364,7 +369,7 @@ import ChecklistIPC
         let fixture = try CreateFixture(); defer { fixture.cleanup() }
         fixture.loseReply = false; fixture.loseAttachmentReply = true
         let quick = model(fixture.transport)
-        quick.draft.projectID = fixture.projectID; quick.draft.title = "Ticket with file"
+        quick.draft.projectID = fixture.projectID; quick.draft.epicID = fixture.epicID; quick.draft.title = "Ticket with file"
         let file = fixture.root.appendingPathComponent("attachment.txt")
         try Data("Qualification file".utf8).write(to: file)
         quick.attach([file])
@@ -401,7 +406,7 @@ import ChecklistIPC
             // Each error gets its own journal, so these are independent first sends.
             let journal = LocalDraftJournal(directory: root.appendingPathComponent(UUID().uuidString))
             let quick = QuickCaptureModel(journal: journal, preferences: preferences!, transport: { _, _ in throw error })
-            quick.draft.projectID = "p1"; quick.draft.title = "Uncertain send"
+            quick.draft.projectID = "p1"; quick.draft.epicID = "e1"; quick.draft.title = "Uncertain send"
             await quick.send()
             XCTAssertEqual(quick.state, .uncertain(QuickCaptureModel.uncertainCreate))
             XCTAssertNotNil(quick.draft.pendingCreate)
@@ -422,15 +427,19 @@ import ChecklistIPC
         XCTAssertEqual(restored.draft.note, "Older note")
         XCTAssertEqual(restored.draft.createCommandID, "old-command")
         XCTAssertNil(restored.draft.pendingCreate)
+        XCTAssertFalse(restored.canSend)
+        restored.draft.epicID = "e1"
         XCTAssertTrue(restored.canSend)
     }
 
-    func testTitleOnlyCaptureNeedsAProjectAndATitle() async {
+    func testCaptureNeedsAProjectTitleAndEpic() async {
         let quick = model { method, _ in method == "project_list" ? ["projects": [["id": "p1", "name": "Only"]]] : ["id": "t9", "key": "ONLY-1"] }
         await quick.loadProjects()
         XCTAssertEqual(quick.draft.projectID, "p1", "With one project it is chosen")
         XCTAssertFalse(quick.canSend)
         quick.draft.title = "Remember to check audio"
+        XCTAssertFalse(quick.canSend)
+        quick.draft.epicID = "e1"
         XCTAssertTrue(quick.canSend)
         await quick.send()
         XCTAssertEqual(quick.state, .captured(key: "ONLY-1", taskID: "t9", projectID: "p1"))
@@ -582,13 +591,13 @@ import ChecklistIPC
         let controller = QuickCaptureController(model: quick)
         controller.submitDraft()
         quick.draft.title = "   "
-        quick.draft.projectID = "p1"
+        quick.draft.projectID = "p1"; quick.draft.epicID = "e1"
         controller.submitDraft()
         quick.draft.title = "A valid title"
         quick.draft.projectID = ""
         controller.submitDraft()
         XCTAssertEqual(creates, 0)
-        quick.draft.projectID = "p1"
+        quick.draft.projectID = "p1"; quick.draft.epicID = "e1"
         controller.submitDraft()
         await fulfillment(of: [started], timeout: 2)
         XCTAssertEqual(quick.state, .sending)
@@ -597,4 +606,46 @@ import ChecklistIPC
         await fulfillment(of: [finished], timeout: 2)
         XCTAssertEqual(creates, 1)
     }
+    func testRequiredEpicChoicesAndLastSuccessfulDefaultStayProjectScoped() async throws {
+        let fixture=try CreateFixture();defer {fixture.cleanup()};fixture.loseReply=false
+        let quick=model(fixture.transport)
+        quick.draft.projectID=fixture.projectID;quick.draft.title="Concrete ticket"
+        XCTAssertFalse(quick.canSend)
+        await quick.loadEpics()
+        XCTAssertEqual(quick.availableEpics.map(\.id),[fixture.epicID])
+        quick.draft.epicID=fixture.epicID
+        XCTAssertTrue(quick.canSend)
+        await quick.send()
+        XCTAssertEqual(fixture.creates.first?["epic_id"] as? String,fixture.epicID)
+        XCTAssertEqual(CaptureEpicDefaults.last(fixture.projectID,preferences:preferences),fixture.epicID)
+        let other=QuickCaptureModel(journal:LocalDraftJournal(directory:root.appendingPathComponent("second")),preferences:preferences,transport:fixture.transport)
+        other.draft.projectID=fixture.projectID
+        XCTAssertEqual(other.draft.epicID,fixture.epicID)
+        other.draft.projectID="other-project"
+        XCTAssertNil(other.draft.epicID,"An Epic cannot follow a capture into another project")
+    }
+
+    func testRequiredEpicEmptyProjectCanCreateConcreteEpicAndLegacyIntentCanBeRepaired() async throws {
+        let fixture=try CreateFixture();defer {fixture.cleanup()};fixture.loseReply=false
+        let project=try await fixture.transport("project_create",["command_id":UUID().uuidString,"name":"Empty","key_prefix":"EMPTY"])
+        let pid=project["id"] as! String,quick=model(fixture.transport)
+        quick.draft.projectID=pid;quick.draft.title="Concrete first ticket"
+        await quick.loadEpics()
+        XCTAssertEqual(quick.epicTotal,0);XCTAssertFalse(quick.canSend)
+        let epic=try await quick.createEpicRequest("epic_create",["command_id":UUID().uuidString,"project_id":pid,"name":"Concrete work"])
+        quick.draft.epicID=epic["id"] as? String
+        await quick.loadEpics()
+        XCTAssertEqual(quick.epicTotal,1);XCTAssertTrue(quick.canSend)
+        await quick.send()
+        XCTAssertEqual(fixture.creates.last?["epic_id"] as? String,epic["id"] as? String)
+        quick.startAnother();quick.draft.title="Older uncommitted intent"
+        quick.draft.epicID=nil
+        quick.draft.pendingCreate = .init(commandID:UUID().uuidString,projectID:pid,title:quick.draft.title,brief:"")
+        await quick.send()
+        XCTAssertNil(quick.draft.pendingCreate,"A definite EPIC_REQUIRED refusal releases the old immutable intent")
+        XCTAssertFalse(quick.canSend)
+        quick.draft.epicID=epic["id"] as? String
+        XCTAssertTrue(quick.canSend)
+    }
+
 }

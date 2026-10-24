@@ -146,7 +146,6 @@
     "Sources/ChecklistApp/Views/TicketNextActionBar.swift",
     "Sources/ChecklistApp/Views/TicketRetirementControls.swift",
     "Sources/ChecklistApp/Views/TicketStatusPills.swift",
-    "Sources/ChecklistApp/Views/TrashTicketsView.swift",
     "Sources/ChecklistApp/Views/TriageDetailView.swift",
     "Sources/ChecklistApp/Views/ViewStates.swift",
     "Sources/ChecklistBridges/ClaudeLocalBridge.swift",
@@ -661,18 +660,18 @@
       "reason": "Synthetic redaction, path quoting, instance isolation or native routing fixture; no actual owner or native session."
     },
     "Tests/ChecklistCoreTests/DiagnosticsTests.swift": {
-      "sha256": "f1ef133b84c631a6da1fa93e67362dfef47cf8142376f4bb839476ce219125f9",
+      "sha256": "753c46837e69eedb2efb5d9ea6b0bee4f495f6b80c92265c5c4cd82151bb8bb6",
       "patterns": [
         "home_path"
       ],
-      "reason": "Renewed review for round 23 / CL-223: the added service-info/diagnostics bundle-identity assertions introduce no private identifiers. The fictional owner-home secret path remains a redaction-test input; other identifiers are descriptive synthetic fixture strings or generated at runtime, with no concrete native actor/thread UUIDs, actual owner path, credential or native session."
+      "reason": "Renewed review for round 28 / CL-228: the only change routes the existing fixture through the required-Epic fixture helper and adds no identifier. the added service-info/diagnostics bundle-identity assertions introduce no private identifiers. The fictional owner-home secret path remains a redaction-test input; other identifiers are descriptive synthetic fixture strings or generated at runtime, with no concrete native actor/thread UUIDs, actual owner path, credential or native session."
     },
     "Tests/ChecklistCoreTests/HumanAnswerNoticeTests.swift": {
-      "sha256": "ee6bc212aa2c22be3f32cee095f40f40d0ea2aa83706fea7514c89489844d905",
+      "sha256": "a4afc50b3e3ca9a812543a4d151d5878ffeb3cf43627ab0f6acd2e48e191ad88",
       "patterns": [
         "home_path"
       ],
-      "reason": "Synthetic redaction, path quoting, instance isolation or native routing fixture; no actual owner or native session."
+      "reason": "Renewed review for round 28 / CL-228: the only change routes the existing fixture through the required-Epic fixture helper and adds no identifier. Synthetic redaction, path quoting, instance isolation or native routing fixture; no actual owner or native session."
     },
     "Tests/ChecklistIPCTests/ChecklistInstanceTests.swift": {
       "sha256": "163cd55067578a3762045ee800a5b954ce7eddde1f9a90260a588f5b4c25fa71",

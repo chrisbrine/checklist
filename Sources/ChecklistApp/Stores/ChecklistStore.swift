@@ -94,8 +94,8 @@ final class ChecklistStore: ObservableObject {
     }
     // CL-116: one window-local media presentation; service remains durable authority.
     let mediaReview = MediaReviewModel()
-    @Published var page: Page = .overview { didSet { prepareTicketWorkspace() } }
-    @Published var projectID: String? = nil { didSet { prepareTicketWorkspace() } }
+    @Published var page: Page = .overview { didSet { if page != oldValue { resetOverviewScope() }; prepareTicketWorkspace() } }
+    @Published var projectID: String? = nil { didSet { if projectID.map(RecordIdentity.init) != oldValue.map(RecordIdentity.init) { resetOverviewScope(clear: true) }; prepareTicketWorkspace() } }
     @Published var detail: Detail? {
         willSet { navigationMemory.prepareNavigation(to: newValue?.persistenceKey) }
         didSet { if let detail, let bytes = try? JSONEncoder().encode(detail) { preferences.set(bytes, forKey: "lastDetail") } else { preferences.removeObject(forKey: "lastDetail") } }
@@ -581,7 +581,7 @@ final class ChecklistStore: ObservableObject {
         preferences.set(Date(), forKey: "overviewLastVisit")
         scheduleOverviewNeeds(only: "completed_since", force: true)
     }
-    func endOverviewVisit() { overviewVisitActive = false }
+    func endOverviewVisit() { overviewVisitActive = false; resetOverviewScope() }
     static func overviewTitle(_ surface: String) -> String {
         surface == "completed_since" ? "Completed since your last visit" : surface == "recent_reviews" ? "Latest review results" : overviewGroups.first { $0.surface == surface }?.title ?? "Overview"
     }
@@ -590,106 +590,148 @@ final class ChecklistStore: ObservableObject {
         scheduleOverviewNeeds(only: "completed_since", force: true)
     }
     private static let digestFormatter = ISO8601DateFormatter()
-    /// One loader reads the groups in turn. Each read blocks a transport thread until the service answers, so
-    /// ten parallel reads per window could starve the shared threads that the live updates also use.
-    private var overviewRead: Task<Void,Never>?
+    /// One owned loader serves scheduling, refresh and live coverage. A timed-out combined read
+    /// switches this visit/project to sequential reads; focus and digest changes keep that mode.
+    private var overviewRead: Task<Bool,Never>?
+    private var overviewReadID = UUID()
+    private var overviewSequential = false
+    private let overviewDefaultDigestSince = Date().addingTimeInterval(-86400)
+    private struct OverviewRead {
+        let query: WorkspacePageQuery
+        let cursor: String?
+        let generation: UUID
+    }
+    private var overviewPending: [String: OverviewRead] = [:]
     /// The one group shown in full with paging; nil shows every group's first rows.
     @Published var overviewFocus: String? { didSet { if overviewFocus != oldValue { scheduleOverviewNeeds(force: true) } } }
     func overviewQuery(_ surface: String) -> WorkspacePageQuery {
         var query = WorkspacePageQuery(surface: surface, project: projectID)
         query.limit = surface == "human_tasks" ? 1 : overviewFocus == surface ? 50 : surface == "recent_reviews" ? 60 : surface == "completed_since" ? 20 : 5
-        if surface == "completed_since" { query.since = Self.digestFormatter.string(from: overviewDigestSince ?? Date().addingTimeInterval(-86400)) }
+        if surface == "completed_since" { query.since = Self.digestFormatter.string(from: overviewDigestSince ?? overviewDefaultDigestSince) }
         return query
     }
     func scheduleOverviewNeeds(cursor: String? = nil, only: String? = nil, force: Bool = false) {
         guard startedLiveUpdates, !restoringPreferences, page == .overview else { return }
-        if only == nil && overviewFocus == nil {
-            // Every group's first page comes from one "overview" command (one service pass, not ten).
-            let due = shownOverviewSurfaces.contains { surface in
-                let query = overviewQuery(surface), observation = overviewObservations[surface]!
-                return force || observation.query != query || observation.page == nil && !observation.loading
-            }
-            guard due else { return }
-            overviewRead?.cancel(); overviewPending = []
-            overviewRead = Task { [weak self] in _ = await self?.readOverviewGroups() }
-            return
-        }
-        let due = shownOverviewSurfaces.filter { surface in
-            let query = overviewQuery(surface), observation = overviewObservations[surface]!
-            return (only == nil || only == surface) && (force || observation.query != query || observation.page == nil && !observation.loading)
-        }
-        guard !due.isEmpty else { return }
-        // A narrower request ("only") still finishes every group the stopped loader had not read yet.
-        let pending = overviewPending.subtracting(due)
-        overviewRead?.cancel()
-        overviewPending = Set(due).union(pending)
-        let order = shownOverviewSurfaces.filter { overviewPending.contains($0) }
-        overviewRead = Task { [weak self] in
-            for surface in order {
-                guard let self, !Task.isCancelled else { return }
-                await self.readOverviewNeed(surface, cursor: surface == only ? cursor : nil)
-                self.overviewPending.remove(surface)
-            }
-        }
+        _ = startOverviewRead(cursor: cursor, only: only, force: force)
     }
-    private var overviewPending: Set<String> = []
     private var shownOverviewSurfaces: [String] {
         overviewObservations.keys.sorted().filter { overviewFocus == nil || overviewFocus == $0 || $0 == "human_tasks" }
     }
+    private func resetOverviewScope(clear: Bool = false) {
+        retireOverviewRead(); overviewSequential = false
+        if clear { for observation in overviewObservations.values { observation.cancel(clear: true) } }
+    }
+    private func retireOverviewRead() {
+        overviewReadID = UUID(); overviewRead?.cancel(); overviewRead = nil
+        for (surface, read) in overviewPending { overviewObservations[surface]?.cancel(read.generation) }
+        overviewPending = [:]
+    }
+    /// Freeze every query and cursor before yielding. Even the combined phase owns its pending
+    /// surfaces, so a narrower Retry can finish outstanding groups without reviving completed ones.
+    private func startOverviewRead(cursor: String? = nil, only: String? = nil, force: Bool) -> Task<Bool,Never>? {
+        guard page == .overview, !Task.isCancelled else { return nil }
+        let surfaces = shownOverviewSurfaces
+        let due = surfaces.filter { surface in
+            let query = overviewQuery(surface), observation = overviewObservations[surface]!
+            return (only == nil || only == surface) && (force || observation.query != query || observation.page == nil && !observation.loading && observation.error == nil)
+        }
+        guard !due.isEmpty else { return overviewRead }
+        let previous = overviewPending
+        retireOverviewRead()
+        let combined = only == nil && overviewFocus == nil && !overviewSequential
+        let order = combined ? surfaces : surfaces.filter { due.contains($0) || previous[$0] != nil }
+        for surface in order {
+            let query = overviewQuery(surface)
+            let nextCursor = surface == only ? cursor : previous[surface].flatMap { $0.query == query && !due.contains(surface) ? $0.cursor : nil }
+            overviewPending[surface] = OverviewRead(query: query, cursor: nextCursor, generation: overviewObservations[surface]!.begin(query))
+        }
+        let id = overviewReadID, focus = overviewFocus, reads = overviewPending
+        let task = Task { [weak self] in
+            guard let self else { return false }
+            defer {
+                // An obsolete task may never clear its replacement's pending set or loading state.
+                if self.overviewReadID == id {
+                    for (surface, read) in self.overviewPending { self.overviewObservations[surface]?.cancel(read.generation) }
+                    self.overviewPending = [:]; self.overviewRead = nil
+                }
+            }
+            guard !Task.isCancelled, self.overviewReadCurrent(id, focus: focus, reads: reads) else { return false }
+            if combined {
+                guard await self.readOverviewGroups(id: id, focus: focus, reads: reads) else { return false }
+            }
+            for surface in order {
+                guard self.overviewReadCurrent(id, focus: focus, reads: reads), !Task.isCancelled else { return false }
+                guard self.overviewPending[surface] != nil, let read = reads[surface] else { continue }
+                guard await self.readOverviewNeed(surface, read: read, id: id, focus: focus, reads: reads) else { return false }
+                self.overviewPending.removeValue(forKey: surface)
+            }
+            return !Task.isCancelled
+        }
+        overviewRead = task
+        return task
+    }
+    private func overviewReadCurrent(_ id: UUID, focus: String?, reads: [String: OverviewRead]) -> Bool {
+        overviewReadID == id && page == .overview && overviewFocus == focus && reads.allSatisfy { overviewQuery($0.key) == $0.value.query }
+    }
     func moveOverviewPage(_ surface: String, cursor: String) { scheduleOverviewNeeds(cursor: cursor, only: surface, force: true) }
     @discardableResult private func readOverviewNeeds() async -> Bool {
-        overviewRead?.cancel(); overviewPending = []
-        if overviewFocus == nil { return await readOverviewGroups() }
-        for surface in shownOverviewSurfaces { guard await readOverviewNeed(surface, cursor: nil) else { return false } }
-        return !Task.isCancelled
+        guard let read = startOverviewRead(force: true) else { return false }
+        let id = overviewReadID
+        return await withTaskCancellationHandler {
+            let accepted = await read.value
+            return accepted && overviewReadID == id && !Task.isCancelled
+        } onCancel: {
+            read.cancel()
+            Task { @MainActor [weak self] in
+                if self?.overviewReadID == id { self?.retireOverviewRead() }
+            }
+        }
     }
-    @discardableResult private func readOverviewGroups() async -> Bool {
-        let surfaces = shownOverviewSurfaces
-        var started: [String: (query: WorkspacePageQuery, generation: UUID)] = [:]
-        for surface in surfaces { let query = overviewQuery(surface); started[surface] = (query, overviewObservations[surface]!.begin(query)) }
-        var params: [String: Any] = ["surface": "overview", "since": overviewQuery("completed_since").since]
-        params["project_id"] = projectID
+    /// Returns true after either settling the combined result or selecting the bounded fallback.
+    private func readOverviewGroups(id: UUID, focus: String?, reads: [String: OverviewRead]) async -> Bool {
+        var params: [String: Any] = ["surface": "overview", "since": reads["completed_since"]!.query.since]
+        params["project_id"] = reads["completed_since"]!.query.project
         do {
             let response = try await request("workspace_page", params)
-            guard !Task.isCancelled, page == .overview else { return false }
+            guard !Task.isCancelled, overviewReadCurrent(id, focus: focus, reads: reads) else { return false }
             let groups = response["groups"] as? [String: [String: Any]] ?? [:]
-            var stale = false, accepted = false
-            for surface in surfaces {
-                guard let (query, generation) = started[surface], let observation = overviewObservations[surface] else { continue }
-                guard overviewQuery(surface) == query else { observation.cancel(generation); stale = true; continue }
-                guard let group = groups[surface] else { observation.fail(generation); continue }
-                do { if try observation.receive(group, query: query, generation: generation), let installed = observation.page { ticketCatalog.install(workspace: installed); accepted = true } }
-                catch { observation.fail(generation) }
+            for (surface, read) in reads {
+                if let group = groups[surface] { installOverviewPage(group, surface: surface, read: read, eventCursor: response["event_cursor"] as? String ?? response["content_cursor"] as? String) }
+                else { overviewObservations[surface]?.fail(read.generation) }
+                overviewPending.removeValue(forKey: surface)
             }
-            if accepted {
-                acceptServiceRead()
-                if eventCursor == nil { eventCursor = response["event_cursor"] as? String ?? (response["content_cursor"] as? String) }
-            }
-            // The window's scope changed while the read ran: read again instead of leaving groups loading.
-            if stale { scheduleOverviewNeeds(force: true) }
         } catch {
-            if isReadCancellation(error) {
-                for (surface, value) in started { overviewObservations[surface]?.cancel(value.generation) }
-                return false
+            guard !isReadCancellation(error), overviewReadCurrent(id, focus: focus, reads: reads) else { return false }
+            if let timeout = error as? ChecklistError, timeout.code == "OUTCOME_UNKNOWN",
+               timeout.details["reason"] as? String == "reply_timeout", timeout.details["command_id"] == nil {
+                overviewSequential = true // Keep loading/retained pages; do not publish ten transient errors.
+                return true
             }
             connectionAttempted = true
-            for (surface, value) in started { overviewObservations[surface]?.fail(value.generation) }
+            for (surface, read) in reads { overviewObservations[surface]?.fail(read.generation) }
+            overviewPending = [:]
         }
         return !Task.isCancelled
     }
-    @discardableResult private func readOverviewNeed(_ surface: String, cursor: String?) async -> Bool {
-        let query = overviewQuery(surface), observation = overviewObservations[surface]!, generation = observation.begin(query)
+    private func installOverviewPage(_ response: [String: Any], surface: String, read: OverviewRead, eventCursor: String? = nil) {
+        let observation = overviewObservations[surface]!
         do {
-            let response = try await request("workspace_page", query.parameters(cursor: cursor))
-            guard !Task.isCancelled, page == .overview else { return false }
-            // The window's scope changed while this read ran: read the group again instead of leaving it loading.
-            guard overviewQuery(surface) == query else { observation.cancel(generation); scheduleOverviewNeeds(only: surface, force: true); return false }
-            if try observation.receive(response, query: query, generation: generation), let installed = observation.page {
-                ticketCatalog.install(workspace: installed)
-                acceptServiceRead()
-                if eventCursor == nil { eventCursor = response["event_cursor"] as? String ?? installed.contentCursor }
+            if try observation.receive(response, query: read.query, generation: read.generation), let installed = observation.page {
+                ticketCatalog.install(workspace: installed); acceptServiceRead()
+                // Incidental pages never advance an established live coverage interval.
+                if self.eventCursor == nil { self.eventCursor = eventCursor ?? response["event_cursor"] as? String ?? installed.contentCursor }
             }
-        } catch { if isReadCancellation(error) { observation.cancel(generation); return false } else { connectionAttempted = true; observation.fail(generation) } }
+        } catch { observation.fail(read.generation) }
+    }
+    private func readOverviewNeed(_ surface: String, read: OverviewRead, id: UUID, focus: String?, reads: [String: OverviewRead]) async -> Bool {
+        do {
+            let response = try await request("workspace_page", read.query.parameters(cursor: read.cursor))
+            guard !Task.isCancelled, overviewReadCurrent(id, focus: focus, reads: reads) else { return false }
+            installOverviewPage(response, surface: surface, read: read)
+        } catch {
+            guard !isReadCancellation(error), overviewReadCurrent(id, focus: focus, reads: reads) else { return false }
+            connectionAttempted = true; overviewObservations[surface]?.fail(read.generation)
+        }
         return !Task.isCancelled
     }
     func retryWorkspacePage() {scheduleWorkspacePage(force:true)}
@@ -905,6 +947,7 @@ final class ChecklistStore: ObservableObject {
     func captureCreateParameters(projectID:String)throws->[String:Any] {
         guard var draft=captureDrafts[projectID],RecordIdentity(draft.projectID)==RecordIdentity(projectID),
               RecordIdentity(draft.storeIncarnation)==RecordIdentity(storeIncarnation),draft.createdTaskID == nil else {throw ChecklistError("CAPTURE_RECONCILIATION_REQUIRED","Inspect the preserved capture destination before creating a ticket.")}
+        guard draft.createCommandID != nil || !draft.epicID.isEmpty else {throw ChecklistError("EPIC_REQUIRED","Choose a primary Epic for this ticket.")}
         if draft.createCommandID == nil {draft.createCommandID=UUID().uuidString}
         saveCapture(draft)
         guard draftSaveError("capture",projectID)==nil,let command=draft.createCommandID else {throw ChecklistError("CAPTURE_JOURNAL_REQUIRED","Save the original capture command before sending it.")}
@@ -921,6 +964,7 @@ final class ChecklistStore: ObservableObject {
               var draft=captureDrafts[projectID],draft.createCommandID.map(RecordIdentity.init)==RecordIdentity(commandID),
               RecordIdentity(draft.storeIncarnation)==RecordIdentity(store) else {return nil}
         draft.createdTaskID=id;saveCapture(draft)
+        CaptureEpicDefaults.remember(draft.epicID,project:projectID,preferences:preferences)
         return draftSaveError("capture",projectID)==nil ? id : nil
     }
     /// A saved blank-project draft takes priority over ordinary capture defaults.
@@ -1184,7 +1228,7 @@ final class ChecklistStore: ObservableObject {
         // Every workspace page now carries the global count; fence any older reply.
         workspaceRead?.cancel(); workspaceObservation.cancel()
         if page == .overview {
-            overviewRead?.cancel(); for observation in overviewObservations.values { observation.cancel() }
+            retireOverviewRead(); for observation in overviewObservations.values { observation.cancel() }
         }
         if detail == .request(record.id) { otherDetailRead?.cancel(); otherDetailObservation.cancel() }
         ticketPageRead?.cancel(); ticketPageReadID = UUID()
@@ -1305,7 +1349,7 @@ final class ChecklistStore: ObservableObject {
         otherDetailRead?.cancel();otherDetailObservation.cancel()
         groupTasksRead?.cancel();groupTasksObservation.cancel()
         groupCandidatesRead?.cancel();groupCandidatesObservation.cancel()
-        overviewRead?.cancel(); overviewPending = []; for observation in overviewObservations.values { observation.cancel() }
+        retireOverviewRead(); for observation in overviewObservations.values { observation.cancel() }
         selectedTicketRead?.cancel();selectedTicketReadID=UUID();selectedRecordsReadID=UUID();selectedWorkRead?.cancel()
         recordHistoryRead?.cancel();recordHistoryObservation.cancel();invalidateSelectedEligibility()
         selectedTicketLoading=false;selectedRecordsLoading=false

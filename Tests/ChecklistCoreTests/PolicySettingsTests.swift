@@ -9,7 +9,7 @@ final class PolicySettingsTests: XCTestCase {
     override func tearDownWithError() throws { router = nil; try? FileManager.default.removeItem(at:directory) }
     @discardableResult func call(_ method: String,_ p: JSON = [:],_ caller: Caller? = nil) throws -> JSON {
         var params = p; if !CommandRouter.readMethods.contains(method) { params["command_id"] = uuid() }
-        return try router.handle(method:method,params:params,caller:caller ?? owner)["data"] as! JSON
+        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:params),caller:caller ?? owner)["data"] as! JSON
     }
     func project() throws -> JSON { try call("project_create",["name":"Policy fixture","key_prefix":"POL","root_path":directory.path]) }
     func ready(_ project: JSON,kind: String = "work") throws -> JSON {

@@ -36,6 +36,10 @@ enum RequestAnswerCompletionChecks {
         let notChecked = changed(response, ["complete": false, "answers": [["question_id": "check", "result": "not_checked"]]])
         let partial = changed(reply, ["state": "pending", "responses": [notChecked.values]])
         check(reconcile(partial) == nil, "incomplete Not checked cannot dismiss as a sent answer")
+        let sentNotChecked = changed(notChecked, ["explanation": "I could not inspect this build"])
+        let sentPartial = changed(partial, ["responses": [sentNotChecked.values]])
+        check(reconcile(sentPartial)?.shouldDismiss == true, "Send saves an explained Not checked without claiming completion")
+        check(reconcile(sentPartial)?.draft.explanation == draft.explanation, "Not checked receipt preserves owner notes")
         for action in ["clarification", "cannot_do"] {
             let alternate = RequestAnswerSubmission(request: request, action: action)
             let record = changed(response, ["action": action, "complete": false])

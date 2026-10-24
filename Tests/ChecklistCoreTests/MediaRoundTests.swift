@@ -256,7 +256,7 @@ final class MediaRoundTests: XCTestCase {
         XCTAssertTrue(strings(try f.get(r),"attention_ids").isEmpty)
         XCTAssertEqual(try f.rows("media_review_context").filter {$0["kind"] as? String == "project_approval"}.count,1)
         // An ordinary informational note does not enter the media applicability resolver.
-        let task = try f.router.handle(method:"task_create",params:["command_id":uuid(),"project_id":f.project,"title":"Informational note fixture"],caller:f.owner)["data"] as! JSON
+        let task = try f.router.handle(method:"task_create",params:fixtureTaskInput(f.router,method:"task_create",input:["command_id":uuid(),"project_id":f.project,"title":"Informational note fixture"]),caller:f.owner)["data"] as! JSON
         _ = try f.router.handle(method:"message_send",params:["command_id":uuid(),"project_id":f.project,"task_id":task["id"]!,"body":"FYI, no new media direction"],caller:f.owner)
         XCTAssertTrue(strings(try f.get(r),"attention_ids").isEmpty)
         // A type name such as Owner/Reviewer has no effect on this worker's authority.

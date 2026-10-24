@@ -155,7 +155,7 @@ private final class ImageInspectionServiceFixture {
     @discardableResult func call(_ method: String, _ values: JSON, _ caller: Caller? = nil) throws -> JSON {
         var params = values
         if !CommandRouter.readMethods.contains(method) { params["command_id"] = UUID().uuidString }
-        return try router.handle(method: method, params: params, caller: caller ?? owner)["data"] as! JSON
+        return try router.handle(method: method, params: fixtureTaskInput(router,method:method,input:params), caller: caller ?? owner)["data"] as! JSON
     }
     func submission(fileExtension: String = "png", gates: [String] = ["human_approval"]) throws -> (JSON, JSON, JSON, JSON, [JSON]) {
         let workspace = root.appendingPathComponent("workspace"); try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)

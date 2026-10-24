@@ -18,7 +18,7 @@ final class TicketDraftDisplayTests: XCTestCase {
     private func call(_ method: String, _ input: JSON) throws -> JSON {
         var input = input
         if !CommandRouter.readMethods.contains(method) { input["command_id"] = UUID().uuidString }
-        return try router.handle(method: method, params: input, caller: owner)["data"] as! JSON
+        return try router.handle(method: method, params: fixtureTaskInput(router,method:method,input:input), caller: owner)["data"] as! JSON
     }
     private func ticket(_ title: String) throws -> JSON {
         try call("task_create", ["project_id": project, "title": title, "brief": "Synthetic outcome"])

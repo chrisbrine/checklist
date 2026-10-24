@@ -138,10 +138,12 @@ extension CoreTests {
         // TaskReferenceValidation.swift: the portable task needs its same-project status,
         // and the validated domain boundary owns the complete graph's outer commit.
         let statuses = try router.dbQueue.read { try router.records($0,type:"status",project:destinationProject["id"] as? String) }
+        let epic = try router.dbQueue.read {try router.record($0,mapped["epic_id"] as! String,type:"group")}
         try fresh.dbQueue.writeWithoutTransaction { db in
             try fresh.withValidatedDomainTransaction(db) {
                 try fresh.save(db, destinationProject, type: "project")
                 for status in statuses { try fresh.save(db,status,type:"status") }
+                try fresh.save(db,epic,type:"group")
                 try fresh.save(db, mapped, type: "task")
                 return .commit
             }

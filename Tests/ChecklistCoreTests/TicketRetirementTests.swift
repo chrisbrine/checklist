@@ -19,7 +19,7 @@ final class TicketRetirementTests: XCTestCase {
     @discardableResult func call(_ method: String,_ input: JSON = [:],_ caller: Caller? = nil) throws -> JSON {
         var p = input
         if !CommandRouter.readMethods.contains(method) {p["command_id"] = UUID().uuidString}
-        return try router.handle(method:method,params:p,caller:caller ?? owner)["data"] as! JSON
+        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:caller ?? owner)["data"] as! JSON
     }
     func fixtureWrite(_ body: (Database) throws -> Void) throws {
         try router.dbQueue.writeWithoutTransaction {db in try router.withValidatedDomainTransaction(db) {try body(db);return .commit}}
@@ -196,10 +196,11 @@ final class TicketRetirementTests: XCTestCase {
     func testArchivingEpicAndTriageLeavesMemberTicketsUnchanged() throws {
         let (p,t) = try fixture()
         for kind in ["epic","triage"] {
-            var group = try call(kind+"_create",["project_id":p["id"]!,"name":"Synthetic grouping"])
-            group = try call("group_membership",["project_id":p["id"]!,"group_id":group["id"]!,"task_id":t["id"]!,"expected_revision":group["revision"]!,"action":"add"])
-            let before = try read(p,t)
-            _ = try call(kind+"_edit",["project_id":p["id"]!,"group_id":group["id"]!,"expected_revision":group["revision"]!,"archived":true])
+            var group = kind == "epic" ? (try call("epic_list",["project_id":p["id"]!])["groups"] as! [JSON])[0] : try call("triage_create",["project_id":p["id"]!,"name":"Synthetic grouping"])
+            if kind == "triage" {group = try call("group_membership",["project_id":p["id"]!,"group_id":group["id"]!,"task_id":t["id"]!,"expected_revision":group["revision"]!,"action":"add"])}
+            let before = try read(p,t),input:JSON=["project_id":p["id"]!,"group_id":group["id"]!,"expected_revision":group["revision"]!,"archived":true]
+            if kind == "epic" {code("EPIC_IN_USE") {_ = try self.call("epic_edit",input)}}
+            else {_ = try call("triage_edit",input)}
             XCTAssertEqual(try jsonString(before),try jsonString(read(p,t)))
         }
     }

@@ -2,7 +2,7 @@ import XCTest
 import ChecklistIPC
 @testable import ChecklistApp
 
-/// CL-68: Bug and Playtest capture offers optional fields; title-only capture still works.
+/// CL-68: Bug and Playtest capture offers optional fields; capture still keeps starter fields optional.
 @MainActor final class StarterFieldCaptureTests: XCTestCase {
     func testStarterFieldsBelongToTheirKindAndStayOptional() {
         XCTAssertEqual(StarterFields.fields(for: "bug").map(\.key), ["reproduction", "expected", "actual"])
@@ -24,12 +24,12 @@ import ChecklistIPC
         defer { try? FileManager.default.removeItem(at: root) }
         let store = ChecklistStore(draftJournal: LocalDraftJournal(directory: root), preferences: preferences, restorePendingCommand: false,
                                    desktopAlerts: DesktopAlertCoordinator(sink: StarterAlertSink()), requestTransport: { _, _ in throw ChecklistError("SERVICE_UNAVAILABLE", "offline") })
-        store.saveCapture(CaptureDraft(projectID: "p1", title: "Boss is too hard", brief: "", kind: "playtest", epicID: "", storeIncarnation: store.storeIncarnation,
+        store.saveCapture(CaptureDraft(projectID: "p1", title: "Boss is too hard", brief: "", kind: "playtest", epicID: "e1", storeIncarnation: store.storeIncarnation,
                                        starterFields: ["build": "0.4.2", "platform": "macOS", "reproduction": "not for playtest"]))
         let params = try store.captureCreateParameters(projectID: "p1")
         XCTAssertEqual(params["starter_fields"] as? [String: String], ["build": "0.4.2", "platform": "macOS"])
-        store.saveCapture(CaptureDraft(projectID: "p2", title: "Only a title", brief: "", kind: "work", epicID: "", storeIncarnation: store.storeIncarnation))
-        XCTAssertNil(try store.captureCreateParameters(projectID: "p2")["starter_fields"], "Title-only capture sends no starter fields")
+        store.saveCapture(CaptureDraft(projectID: "p2", title: "Only a title", brief: "", kind: "work", epicID: "e2", storeIncarnation: store.storeIncarnation))
+        XCTAssertNil(try store.captureCreateParameters(projectID: "p2")["starter_fields"], "Capture without starter fields remains valid")
         let reloaded = try LocalDraftJournal(directory: root).recover(CaptureDraft.self, kind: "capture").values["p1"]
         XCTAssertEqual(reloaded?.starterFields?["platform"], "macOS", "The fields survive in the saved draft")
     }

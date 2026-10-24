@@ -13,7 +13,7 @@ final class HumanRequestTests: XCTestCase {
     override func tearDownWithError() throws { router = nil; try? FileManager.default.removeItem(at:root) }
     @discardableResult func call(_ method: String,_ params: JSON = [:],_ caller: Caller? = nil) throws -> JSON {
         var p = params; if !CommandRouter.readMethods.contains(method) { p["command_id"] = uuid() }
-        return try router.handle(method:method,params:p,caller:caller ?? owner)["data"] as! JSON
+        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:caller ?? owner)["data"] as! JSON
     }
     func fixture() throws -> (JSON,JSON) {
         let workspace = root.appendingPathComponent("workspace"); try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
@@ -138,7 +138,7 @@ final class HumanRequestTests: XCTestCase {
         let r = try call("human_request_create",["project_id":p["id"]!,"task_id":t["id"]!,"questions":[["id":"check","type":"check","prompt":"Keyboard navigation is turned on"]],"file_requests":[["id":"file","prompt":"Select the keyboard report"]]],worker)
         let before = try router.dbQueue.read { db in try jsonString(try ["request","message","delivery","attachment","storage_job"].flatMap { try router.records(db,type:$0) }) }
         let base: JSON = ["project_id":p["id"]!,"request_id":r["id"]!,"expected_revision":1,"response":"answered","explanation":"No, I decline"]
-        for answers: [JSON] in [[],[["question_id":"check","result":"not_checked"]],[["question_id":"check","result":""]]] {
+        for answers: [JSON] in [[],[["question_id":"check","result":""]]] {
             var input = base; input["answers"] = answers
             XCTAssertThrowsError(try call("human_request_answer",input)) {
                 XCTAssertEqual(($0 as? CoreError)?.code,"ANSWER_INCOMPLETE")
@@ -169,6 +169,36 @@ final class HumanRequestTests: XCTestCase {
             let context = try call("task_context",["project_id":p["id"]!,"task_id":t["id"]!],worker)
             XCTAssertEqual((context["counts"] as? JSON)?["pending_requests"] as? Int,0)
             XCTAssertEqual((((context["requests"] as! [JSON]).first!["responses"] as! [JSON]).last!["answers"] as! [JSON])[0]["result"] as? String,"declined")
+        }
+    }
+    func testSendNotCheckedPreservesOwnerWordsAndReachesRequesterWithoutCompleting() throws {
+        let (p,_) = try fixture(), worker = try requester(p,"not-checked-recipient")
+        for type in ["check","approval"] {
+            for required in [true,false] {
+                let t = try call("task_create",["project_id":p["id"]!,"title":"Inspect \(type) \(required)","brief":"Record owner response"])
+                let r = try call("human_request_create",["project_id":p["id"]!,"task_id":t["id"]!,"questions":[["id":"q","type":type,"prompt":"Inspect \(type) \(required)","required":required]]],worker)
+                let base: JSON = ["project_id":p["id"]!,"request_id":r["id"]!,"expected_revision":1,"response":"answered","answers":[["question_id":"q","result":"not_checked"]]]
+                for explanation in [""," \n "] {
+                    var invalid = base; invalid["explanation"] = explanation
+                    assertCode("ANSWER_INCOMPLETE") { _ = try self.call("human_request_answer",invalid) }
+                }
+                var input = base; input["explanation"] = "I could not inspect this build. Please provide access."
+                let saved = try call("human_request_answer",input)
+                XCTAssertEqual(saved["state"] as? String,"pending"); XCTAssertNil(saved["gate_outcome"])
+                let response = (saved["responses"] as! [JSON]).last!
+                XCTAssertEqual(response["complete"] as? Bool,false)
+                XCTAssertEqual(response["action"] as? String,"answered")
+                XCTAssertEqual(response["explanation"] as? String,input["explanation"] as? String)
+                XCTAssertEqual((response["answers"] as! [JSON])[0]["result"] as? String,"not_checked")
+                XCTAssertEqual(((saved["message"] as! JSON)["deliveries"] as! [JSON]).first?["recipient_session_id"] as? String,worker.sessionID)
+                let context = try call("task_context",["project_id":p["id"]!,"task_id":t["id"]!],worker)
+                let read = (context["requests"] as! [JSON]).first { $0["id"] as? String == r["id"] as? String }!
+                let stored = (read["responses"] as! [JSON]).last!
+                XCTAssertEqual(stored["explanation"] as? String,input["explanation"] as? String)
+                XCTAssertEqual((stored["answers"] as! [JSON])[0]["result"] as? String,"not_checked")
+                let current = try call("task_get",["project_id":p["id"]!,"task_id":t["id"]!])
+                XCTAssertEqual(current["revision"] as? Int,t["revision"] as? Int)
+            }
         }
     }
     func testMixedOptionalSelectionsValidateEverySelectedAnswerAndFile() throws {

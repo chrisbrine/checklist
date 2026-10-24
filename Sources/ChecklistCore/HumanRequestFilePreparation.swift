@@ -51,8 +51,8 @@ extension CommandRouter {
             if let identity = p["form_identity"] as? String,identity != (try self.requestFormIdentity(request)) { throw CoreError("REQUEST_CHANGED","This answer belongs to an older form. Its draft has not been sent.") }
             let isAnswer = ["answered","send"].contains(action)
             if !isAnswer { _ = try text(p,"explanation",max:16000) }
-            _ = try self.validatedRequestAnswers(request,params:p,requireComplete:isAnswer)
-            let complete = isAnswer
+            let answers = try self.validatedRequestAnswers(request,params:p,requireComplete:isAnswer)
+            let complete = isAnswer && !answers.contains { $0["result"] as? String == "not_checked" }
             if complete,request["review_request_id"] != nil { try self.validateHumanGateDirection(db,request:request,params:p,caller:c) }
             return (request,complete,isAnswer)
         }
