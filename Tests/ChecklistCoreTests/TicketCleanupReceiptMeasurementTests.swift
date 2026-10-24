@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -7,7 +8,7 @@ final class TicketCleanupReceiptMeasurementTests: XCTestCase {
     func testOwnedStoreReceiptRead() throws {
         guard let path = ProcessInfo.processInfo.environment["CHECKLIST_RECEIPT_MEASURE_ROOT"],
               let projectID = ProcessInfo.processInfo.environment["CHECKLIST_RECEIPT_MEASURE_PROJECT_ID"] else {throw XCTSkip("Requires an owned store copy and its project ID")}
-        let router = try CommandRouter(root:URL(fileURLWithPath:path))
+        let router = try TestStore.router(root:URL(fileURLWithPath:path))
         defer {try? router.closeStore()}
         let owner = Caller(role:"owner",installation:"receipt-measurement",projectIDs:[])
         for run in 1...3 {

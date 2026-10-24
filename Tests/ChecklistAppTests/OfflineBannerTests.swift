@@ -1,7 +1,6 @@
 import XCTest
 import ChecklistIPC
 @testable import ChecklistApp
-@testable import ChecklistCore
 
 /// CL-60: a service outage shows one offline banner, the alert does not repeat, and reconnection clears it.
 @MainActor final class OfflineBannerTests: XCTestCase {
@@ -42,10 +41,7 @@ import ChecklistIPC
         let root = cache.appendingPathComponent("reconnect-" + UUID().uuidString)
         let preferences = isolatedDefaults("Reconnect").preferences
         defer { try? FileManager.default.removeItem(at: root) }
-        let router = try CommandRouter(root: root), owner = Caller(role: "owner", installation: "reconnect-fixture", projectIDs: [])
-        try FileManager.default.createDirectory(at: root.appendingPathComponent("a"), withIntermediateDirectories: true)
-        let project = try router.handle(method: "project_create", params: ["command_id": UUID().uuidString, "name": "A", "key_prefix": "A",
-                                                                           "root_path": root.appendingPathComponent("a").path], caller: owner)["data"] as! [String: Any]
+        let project: [String: Any] = ["id": "reconnect-project", "name": "A"]
         preferences.set(Page.epics.rawValue, forKey: "lastPage"); preferences.set(project["id"] as! String, forKey: "lastProject")
         var waits = 0, healthyWaits = 0, reads = 0
         let store = ChecklistStore(draftJournal: LocalDraftJournal(directory: root.appendingPathComponent("drafts")), preferences: preferences, restorePendingCommand: false,
@@ -60,9 +56,15 @@ import ChecklistIPC
                                        }
                                        reads += 1
                                        if reads <= 2 { throw Down() }   // the first read, and the retry after the failed wait
-                                       var params = params
-                                       if !CommandReply.readMethods.contains(method) && params["command_id"] == nil { params["command_id"] = UUID().uuidString }
-                                       return try router.handle(method: method, params: appFixtureTaskInput(router,method:method,input:params), caller: owner)
+                                       if method == "project_list" { return ["data": ["projects": [project]], "event_cursor": "healthy"] }
+                                       if method == "workspace_page" {
+                                           return ["data": ["workspace_version": 1, "surface": params["surface"] ?? "epics", "record_id": "",
+                                               "rows": [], "total": 0, "needs_you_count": 0, "has_more": false,
+                                               "next_cursor": NSNull(), "previous_cursor": NSNull(), "projects": [project],
+                                               "service": ["store_incarnation": "reconnect-fixture"], "content_cursor": "healthy"], "event_cursor": "healthy"]
+                                       }
+                                       XCTFail("Unexpected reconnect read: \(method)")
+                                       return [:]
                                    })
         store.liveWaitPause = 5_000_000; store.liveRetryPause = 5_000_000
         let live = Task { await store.startLiveUpdates() }

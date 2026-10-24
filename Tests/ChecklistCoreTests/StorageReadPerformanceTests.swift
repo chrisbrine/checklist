@@ -138,6 +138,7 @@ final class StorageReadPerformanceTests: XCTestCase {
     }
 
     func testDeliveryPassLookupTimingAtFiveThousandRecords() throws {
+        try QualificationSuite.requireEnabled()
         let f = try ReadPerformanceFixture("CL-152"), r = f.router
         let pid = "project", sid = "recipient"
         var rows: [(String, JSON)] = [("session", ["id": sid, "project_id": pid, "revision": 1, "state": "revoked", "authorization_generation": "fixture"])]
@@ -177,6 +178,7 @@ final class StorageReadPerformanceTests: XCTestCase {
 
 final class ArchivePreviewPerformanceTests: XCTestCase {
     func testFourFourHundredFileCapturesKeepExactPreviewUnderOneSecond() throws {
+        try QualificationSuite.requireEnabled()
         let f = try ReadPerformanceFixture("CL-150")
         let project = try f.call("project_create", ["name": "Archive fixture", "key_prefix": "AP"])
         let pid = project["id"] as! String

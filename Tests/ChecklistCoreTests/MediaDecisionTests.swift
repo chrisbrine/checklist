@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import Foundation
 import GRDB
@@ -119,6 +120,7 @@ final class MediaDecisionTests: XCTestCase {
         XCTAssertTrue(try f.rows("media_owner_decision").isEmpty)
     }
     func test450SelectionLostReplyFailedMiddleOnlyRefreshAndLaterReversal() throws {
+        try QualificationSuite.requireEnabled()
         let (f,r) = try setup(450)
         let op = try f.call("media_bulk_prepare",params(f,r)),chunks = op["chunks"] as! [JSON]
         XCTAssertEqual(chunks.map {($0["items"] as! [JSON]).count},[200,200,50])
@@ -127,7 +129,7 @@ final class MediaDecisionTests: XCTestCase {
         // Commit chunk one and discard its reply, then restart/reconcile the store.
         _ = try apply(f,op,chunks[0])
         try f.router.closeStore()
-        f.router = try CommandRouter(root:f.root,serviceLease:f.storage.lease)
+        f.router = try TestStore.router(root:f.root,serviceLease:f.storage.lease)
         f.storage.router = f.router
         let recovered = try bulkGet(f,op)
         XCTAssertEqual(strings(recovered,"committed_item_ids").count,200)

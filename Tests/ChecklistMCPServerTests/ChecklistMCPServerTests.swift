@@ -110,6 +110,80 @@ final class ChecklistMCPServerTests: XCTestCase {
         }
     }
 
+    func testDirectCLIServiceInfoSkipsCatalogAndForwardsExactParameters() async throws {
+        let fixture = try Fixture(provider:"codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        fixture.requestHandler = { name,params in
+            XCTAssertEqual(name,"service_info","The direct CLI status read needs no catalog preflight")
+            XCTAssertEqual(params["unexpected"] as? String,"preserve for service validation")
+            return ["data":["build_id":"current-service"],"_checklist_timing":["total_ms":1.5]]
+        }
+        let bridge = Bridge(configuration:.init(workspace:fixture.context.workspacePath,command:"call"),environment:fixture.environment)
+        _ = try await bridge.connect()
+        try await bridge.verifySession()
+        let reply = try await bridge.call("service_info",.object(["unexpected":.string("preserve for service validation")]))
+        let object = try XCTUnwrap(try jsonObject(reply) as? [String:Any])
+        XCTAssertEqual((object["data"] as? [String:Any])?["build_id"] as? String,"current-service")
+        XCTAssertEqual((object["_checklist_timing"] as? [String:Any])?["total_ms"] as? Double,1.5)
+        XCTAssertEqual(fixture.calls.map { $0.0 },["service_info"])
+        XCTAssertEqual(fixture.attempts.count,1)
+        XCTAssertEqual(fixture.calls.first?.1.nativeContext?["native_session_id"] as? String,fixture.context.nativeSessionID)
+    }
+
+    func testDirectCLIServiceInfoPreservesFreshServiceIdentityAndRevocationErrors() async throws {
+        let fixture = try Fixture(provider:"codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        let bridge = Bridge(configuration:.init(workspace:fixture.context.workspacePath,command:"call"),environment:fixture.environment)
+        _ = try await bridge.connect()
+        _ = try await bridge.call("service_info",.object([:]))
+        for code in ["CONNECTION_REVOKED","NATIVE_SESSION_REQUIRED","CONNECTION_REPAIR_REQUIRED","INVALID_INPUT","CLIENT_OUTDATED"] {
+            fixture.callHandler = { name in
+                XCTAssertEqual(name,"service_info")
+                throw ChecklistError(code,"Synthetic current service refusal")
+            }
+            do { _ = try await bridge.call("service_info",.object([:])); XCTFail("Must preserve \(code)") }
+            catch let error as ChecklistError { XCTAssertEqual(error.code,code) }
+        }
+        XCTAssertEqual(fixture.calls.map {$0.0},Array(repeating:"service_info",count:6))
+    }
+
+    func testDirectCLIServiceInfoKeepsExpectedSessionVerification() async throws {
+        let fixture = try Fixture(provider:"codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        let bridge = Bridge(configuration:.init(workspace:fixture.context.workspacePath,expectedSession:"different-session",command:"call"),environment:fixture.environment)
+        _ = try await bridge.connect()
+        do { try await bridge.verifySession(); XCTFail("An expected-session mismatch must still stop the CLI") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("SESSION_MISMATCH")) }
+        XCTAssertEqual(fixture.calls.map {$0.0},["service_info"])
+    }
+
+    func testDirectCLIServiceInfoKeepsLimitedWorkspaceNoticeAndOtherMethodGuard() async throws {
+        let fixture = try Fixture(provider:"codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        fixture.unregisteredWorkspace = true
+        let bridge = Bridge(configuration:.init(workspace:fixture.context.workspacePath,command:"call"),environment:fixture.environment)
+        _ = try await bridge.connect()
+        let reply = try await bridge.call("service_info",.object([:]))
+        let object = try XCTUnwrap(try jsonObject(reply) as? [String:Any])
+        let connection = (object["data"] as? [String:Any])?["connection"] as? [String:Any]
+        XCTAssertEqual(connection?["connected"] as? Bool,false)
+        XCTAssertEqual(connection?["state"] as? String,"project_setup_required")
+        do { _ = try await bridge.call("task_list",.object([:])); XCTFail("Limited setup cannot expose other methods") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("METHOD_UNAVAILABLE")) }
+        XCTAssertEqual(fixture.calls.map {$0.0},["service_info"])
+    }
+
+    func testMCPStatusAndOtherCLIMethodsStillRefreshCatalog() async throws {
+        for (command,method) in [("mcp","service_info"),("call","task_list")] {
+            let fixture = try Fixture(provider:"codex")
+            fixture.setDiscoveries([.available(fixture.context)])
+            let bridge = Bridge(configuration:.init(workspace:fixture.context.workspacePath,command:command),environment:fixture.environment)
+            _ = try await bridge.connect()
+            _ = try await bridge.call(method,.object([:]))
+            XCTAssertEqual(fixture.calls.map {$0.0},["tool_catalog",method])
+        }
+    }
+
     func testProjectArchiveReasonsThroughMCPHistorySelector() async throws {
         let fixture = try Fixture()
         fixture.setDiscoveries([.available(fixture.context)])

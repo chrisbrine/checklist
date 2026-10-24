@@ -19,6 +19,8 @@ import ChecklistIPC
         let preferences: UserDefaults
         var calls: [Call] = [], held: [Held] = []
         var waitCursors: [String?] = []
+        var holdNextWait = false
+        var heldWait: CheckedContinuation<[String: Any], Error>?
         var hold = false, combinedError: Error?, failingSurface: String?
         var readVersion = "overview-fixture"
         var active = 0, maximumActive = 0
@@ -41,7 +43,14 @@ import ChecklistIPC
             return ["groups": groups, "service": ["store_incarnation":"store", "read_version":readVersion], "event_cursor": "combined-coverage"]
         }
         func transport(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
-            if method == "changes_wait" { waitCursors.append(params["cursor"] as? String); try await Task.sleep(nanoseconds: 30_000_000_000); throw CancellationError() }
+            if method == "changes_wait" {
+                waitCursors.append(params["cursor"] as? String)
+                if holdNextWait {
+                    holdNextWait = false
+                    return try await withCheckedThrowingContinuation { heldWait = $0 }
+                }
+                try await Task.sleep(nanoseconds: 30_000_000_000); throw CancellationError()
+            }
             if method == "project_list" { return ["projects": [["id": "p"], ["id": "q"]]] }
             XCTAssertEqual(method, "workspace_page")
             let call = Call(params: params); calls.append(call)
@@ -61,7 +70,10 @@ import ChecklistIPC
             ChecklistStore(draftJournal: LocalDraftJournal(directory: root), preferences: preferences, restorePendingCommand: false,
                 desktopAlerts: DesktopAlertCoordinator(sink: RecoveryAlertSink()), requestTransport: { [self] in try await transport($0, $1) })
         }
-        func cleanup() { while !held.isEmpty { release(error: CancellationError()) }; try? FileManager.default.removeItem(at: root) }
+        func releaseWait(error: Error) {
+            let wait = heldWait; heldWait = nil; wait?.resume(throwing: error)
+        }
+        func cleanup() { releaseWait(error: CancellationError()); while !held.isEmpty { release(error: CancellationError()) }; try? FileManager.default.removeItem(at: root) }
     }
     private func fixture() -> Fixture { Fixture(isolatedDefaults("OverviewRecovery").preferences) }
     private func until(_ predicate: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
@@ -138,6 +150,106 @@ import ChecklistIPC
         XCTAssertEqual(f.calls.map(\.surface), ["overview"] + surfaces)
         XCTAssertEqual(f.maximumActive, 1); XCTAssertEqual(store.needsCount, 91)
         XCTAssertTrue(store.overviewObservations.values.allSatisfy { $0.page != nil && !$0.loading && $0.error == nil })
+    }
+    func testLiveWaitTimeoutDuringFallbackDoesNotRepeatCompletedSurfaces() async throws {
+        for finishesDuringPause in [false, true] {
+            let f = fixture(); defer { f.cleanup() }; f.holdNextWait = true
+            let store = f.store(); store.liveRetryPause = finishesDuringPause ? 100_000_000 : 0
+            let live = Task { await store.startLiveUpdates() }
+            defer { live.cancel(); store.stopWindowReads() }
+            try await until { f.heldWait != nil }
+            let before = f.calls.count
+            f.hold = true
+            let read = Task { await store.refresh() }
+            try await until { f.held.count == 1 }; f.release(error: timeout)
+            for surface in surfaces.prefix(8) {
+                try await until { f.held.count == 1 }
+                XCTAssertEqual(f.held[0].call.surface, surface)
+                f.release()
+            }
+            try await until { f.held.count == 1 }
+            XCTAssertEqual(f.held[0].call.surface, "recent_reviews")
+            f.releaseWait(error: timeout) // The same stopped service also timed out its long poll.
+            try await until { store.lastServiceFailure != nil }
+            XCTAssertTrue(surfaces.prefix(8).allSatisfy { store.overviewObservations[$0]?.page != nil },
+                "A failed long poll supplies no new version that could invalidate accepted pages")
+            if finishesDuringPause { f.hold = false }
+            try await drain(f, store: store); await read.value
+            try await until { f.waitCursors.count == 2 }
+            XCTAssertEqual(Array(f.calls.dropFirst(before)).map(\.surface), ["overview"] + surfaces,
+                "Reconnect must finish the owned fallback instead of restarting its eight completed surfaces")
+            XCTAssertEqual(f.maximumActive, 1)
+            XCTAssertTrue(store.overviewObservations.values.allSatisfy { $0.page != nil && !$0.loading && $0.error == nil })
+            XCTAssertTrue(store.connected); XCTAssertNil(store.error)
+            XCTAssertEqual(f.waitCursors.last!, "combined-coverage", "Reconnect cannot skip unseen change coverage")
+        }
+    }
+    func testLiveWaitRecoveryKeepsVersionFenceAndRepairsOnlyPagesBeforeTheCommit() async throws {
+        let f = fixture(); defer { f.cleanup() }; f.holdNextWait = true
+        let store = f.store(); store.liveRetryPause = 0
+        let live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); store.stopWindowReads() }
+        try await until { f.heldWait != nil }
+        let before = f.calls.count; f.hold = true
+        let read = Task { await store.refresh() }
+        try await until { f.held.count == 1 }; f.release(error: timeout)
+        try await until { f.held.count == 1 }; f.release() // completed_since precedes the real commit.
+        try await until { f.held.count == 1 }
+        f.releaseWait(error: timeout)
+        try await until { store.lastServiceFailure != nil }
+        f.readVersion = "commit-during-reconnect"
+        f.release() // human_tasks learns the commit while recovery joins the same loader.
+        try await until { f.held.count == 1 }
+        XCTAssertNil(store.overviewObservations["completed_since"]?.page, "Known old content must disappear immediately")
+        try await drain(f, store: store); await read.value
+        try await until { f.waitCursors.count == 2 }
+        XCTAssertEqual(Array(f.calls.dropFirst(before)).map(\.surface), ["overview"] + surfaces + ["completed_since"])
+        XCTAssertEqual(f.maximumActive, 1)
+        XCTAssertTrue(store.overviewObservations.values.allSatisfy { $0.page != nil && !$0.loading && $0.error == nil })
+    }
+    func testLiveCoverageAndScopeErrorsStillReplacePendingFallback() async throws {
+        for code in ["CURSOR_RESET", "DENIED"] {
+            let f = fixture(); defer { f.cleanup() }; f.holdNextWait = true
+            let store = f.store(); store.liveRetryPause = 0
+            let live = Task { await store.startLiveUpdates() }
+            defer { live.cancel(); store.stopWindowReads() }
+            try await until { f.heldWait != nil }
+            let before = f.calls.count; f.hold = true
+            let read = Task { await store.refresh() }
+            try await until { f.held.count == 1 }; f.release(error: timeout)
+            try await until { f.held.count == 1 }; f.release()
+            try await until { f.held.count == 1 }
+            f.releaseWait(error: ChecklistError(code, "Synthetic lost scope or coverage"))
+            try await until { f.held.count == 2 }
+            XCTAssertTrue(store.overviewObservations.values.allSatisfy { $0.page == nil })
+            f.release() // The obsolete human_tasks reply cannot install into the reset scope.
+            await read.value
+            try await drain(f, store: store)
+            try await until { f.waitCursors.count == 2 }
+            XCTAssertEqual(Array(f.calls.dropFirst(before)).map(\.surface), ["overview"] + Array(surfaces.prefix(2)) + surfaces)
+            XCTAssertEqual(f.waitCursors.last!, code == "CURSOR_RESET" ? "content-completed_since" : "combined-coverage")
+            XCTAssertTrue(store.overviewObservations.values.allSatisfy { $0.page != nil && !$0.loading && $0.error == nil })
+        }
+    }
+    func testCancelLiveRecoveryRetiresFallbackWithoutStartingRemainingSurfaces() async throws {
+        let f = fixture(); defer { f.cleanup() }; f.holdNextWait = true
+        let store = f.store(); store.liveRetryPause = 0
+        let live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); store.stopWindowReads() }
+        try await until { f.heldWait != nil }
+        let before = f.calls.count; f.hold = true
+        let read = Task { await store.refresh() }
+        try await until { f.held.count == 1 }; f.release(error: timeout)
+        try await until { f.held.count == 1 }; f.release()
+        try await until { f.held.count == 1 }
+        f.releaseWait(error: timeout)
+        try await until { store.lastServiceFailure != nil }
+        for _ in 0..<20 { await Task.yield() }
+        f.hold = false; live.cancel(); f.release()
+        await live.value; await read.value
+        XCTAssertEqual(Array(f.calls.dropFirst(before)).map(\.surface), ["overview"] + Array(surfaces.prefix(2)))
+        XCTAssertTrue(store.overviewObservations.values.allSatisfy { !$0.loading && $0.error == nil })
+        XCTAssertEqual(f.waitCursors.count, 1)
     }
     func testFallbackLearningCommittedVersionDoesNotRestartItsPendingSurfaces() async throws {
         let f = fixture();defer {f.cleanup()};let store = f.store()

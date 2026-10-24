@@ -1,4 +1,5 @@
 import XCTest
+import ChecklistTestSupport
 import Foundation
 import Darwin
 import GRDB
@@ -13,7 +14,9 @@ final class StorageFixture {
     let owner = Caller(role:"owner",installation:"storage-fixture",projectIDs:[])
     var lease: StorageServiceLease?
     var router: CommandRouter?
-    init(open: Bool = true) throws {
+    private let fast: Bool
+    init(open: Bool = true, fast: Bool = false) throws {
+        self.fast = fast
         // Keep the real storage no-follow walk intact. Foundation maps the
         // system temporary-directory alias back to /var on this macOS host;
         // qualification fixtures use the owner's physical Library/Caches root.
@@ -30,7 +33,7 @@ final class StorageFixture {
     func reopen() throws {
         if router != nil || lease != nil { try close() }
         let freshLease = try StorageServiceLease(root:root)
-        let freshRouter = try CommandRouter(root:root,serviceLease:freshLease)
+        let freshRouter = try fast ? TestStore.router(root:root,serviceLease:freshLease) : CommandRouter(root:root,serviceLease:freshLease)
         lease = freshLease;router = freshRouter
     }
     deinit { try? close();try? FileManager.default.removeItem(at:base) }

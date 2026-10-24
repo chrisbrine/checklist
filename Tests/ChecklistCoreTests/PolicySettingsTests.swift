@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistCore
 
@@ -5,7 +6,7 @@ final class PolicySettingsTests: XCTestCase {
     var directory: URL!
     var router: CommandRouter!
     let owner = Caller(role:"owner",installation:"policy-settings-owner",projectIDs:[])
-    override func setUpWithError() throws { directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString); router = try CommandRouter(root:directory) }
+    override func setUpWithError() throws { directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString); router = try TestStore.router(root:directory) }
     override func tearDownWithError() throws { router = nil; try? FileManager.default.removeItem(at:directory) }
     @discardableResult func call(_ method: String,_ p: JSON = [:],_ caller: Caller? = nil) throws -> JSON {
         var params = p; if !CommandRouter.readMethods.contains(method) { params["command_id"] = uuid() }

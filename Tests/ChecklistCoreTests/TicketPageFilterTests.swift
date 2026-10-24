@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -11,7 +12,7 @@ final class TicketPageFilterTests: XCTestCase {
         // macOS /var and /tmp paths traverse a symlink that storage admission rejects; use the test cache root.
         root = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appendingPathComponent("ChecklistQualification/CL-16/filter-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
-        router = try CommandRouter(root:root)
+        router = try TestStore.router(root:root)
         project = try call("project_create",["name":"Synthetic filters", "key_prefix":"FILTER", "root_path":root.path])["id"] as! String
         try save(["id":"queued", "project_id":project, "name":"Queued", "category":"queued", "revision":1], type:"status")
         for id in ["art", "bug"] { try save(["id":id,"project_id":project,"name":id,"revision":1],type:"tag") }

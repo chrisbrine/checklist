@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistApp
 @testable import ChecklistCore
@@ -18,7 +19,7 @@ import ChecklistIPC
         var heldError: Error?
         init(_ defaults: IsolatedDefaults, archived: Bool = false, manifests: Int = 0) throws {
             root = FileManager.default.temporaryDirectory.appendingPathComponent("Checklist-CL174-"+UUID().uuidString)
-            preferences = defaults.preferences;router = try CommandRouter(root:root)
+            preferences = defaults.preferences;router = try TestStore.router(root:root)
             project = try command("project_create",["name":"Recovery","key_prefix":"R","root_path":root.path])["id"] as! String
             task = try command("task_create",["project_id":project,"title":"Selected"])["id"] as! String
             other = try command("task_create",["project_id":project,"title":"Other"])["id"] as! String

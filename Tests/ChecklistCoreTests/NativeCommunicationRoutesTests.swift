@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistCore
 
@@ -67,7 +68,7 @@ final class NativeCommunicationRoutesTests: XCTestCase {
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
         let directory = parent.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = try CommandRouter(root: directory)
+        let router = try TestStore.router(root: directory)
         let owner = Caller(role: "owner", installation: "qualification-advertisement-test", projectIDs: [])
         func call(_ method: String, _ input: JSON = [:], _ caller: Caller? = nil) throws -> JSON {
             var input = input

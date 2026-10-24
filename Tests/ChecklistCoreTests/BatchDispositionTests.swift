@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -19,7 +20,7 @@ extension CoreTests {
         for key in ["tasks","attempts"] {XCTAssertEqual(try jsonString(before[key]!),try jsonString(after[key]!))}
         XCTAssertEqual(groupsBefore,try router.dbQueue.read {try jsonString(router.records($0,type:"group"))})
         XCTAssertEqual(frozen,try router.dbQueue.read {try jsonString(router.record($0,batch["id"] as! String,type:"batch"))})
-        router = nil;router = try CommandRouter(root:directory)
+        router = nil;router = try TestStore.router(root:directory)
         let get = try call("batch_get",["project_id":p["id"]!,"batch_id":batch["id"]!],worker)
         let list = try call("batch_list",["project_id":p["id"]!,"triage_id":batch["triage_id"]!],worker)["batches"] as! [JSON]
         let groups = try call("triage_list",["project_id":p["id"]!],worker)["groups"] as! [JSON]

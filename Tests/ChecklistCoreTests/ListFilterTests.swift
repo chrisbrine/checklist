@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -16,7 +17,7 @@ final class ListFilterTests: XCTestCase {
     override func setUpWithError() throws {
         root = URL(fileURLWithPath:#filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(".build/ListFilterTests/\(uuid())")
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
-        router = try CommandRouter(root:root)
+        router = try TestStore.router(root:root)
         let workspace = root.appendingPathComponent("workspace");try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
         project = try call("project_create",["name":"List filters","key_prefix":"CL","root_path":workspace.path])
         epic = try call("epic_create",["project_id":project["id"]!,"name":"Primary Epic"])

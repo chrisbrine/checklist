@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 import Darwin
@@ -97,6 +98,7 @@ extension TicketLifecycleCleanupTests {
         return Int64(usage.ru_maxrss) // Darwin reports bytes.
     }
     func testPreparationProgressUnderConstantUnrelatedWritesAndBoundsMemory() throws {
+        try QualificationSuite.requireEnabled()
         let (p,_,_) = try fixture(),pid = p["id"] as! String
         for n in 0..<2 {
             let task = try call("task_create",["project_id":pid,"title":"Selected ticket \(n)"])
@@ -205,7 +207,7 @@ extension TicketLifecycleCleanupTests {
             }) {_,_,_ in XCTFail("Backoff must not commit")}
         }
         XCTAssertEqual(attempts,0)
-        let root = router.root;try router.closeStore();router = try CommandRouter(root:root)
+        let root = router.root;try router.closeStore();router = try TestStore.router(root:root)
         try router.runStorageMaintenance()
         let restarted = try call("ticket_cleanup_receipts",["project_id":pid])["maintenance"] as! JSON
         XCTAssertEqual((restarted["preparation"] as? JSON)?["attempt_count"] as? Int,attempt["attempt_count"] as? Int)
@@ -298,6 +300,7 @@ extension TicketLifecycleCleanupTests {
 
 extension TicketLifecycleCleanupTests {
     func testSelectedPayloadAndHistoryPreparationHasBoundedPeak() throws {
+        try QualificationSuite.requireEnabled()
         let (p,t,_) = try fixture(age:20),pid = p["id"] as! String,tid = t["id"] as! String
         try write {db in
             try self.router.save(db,["id":uuid(),"project_id":pid,"task_id":tid,"revision":1,"body":String(repeating:"s",count:3 * 1024 * 1024)],type:"message")
@@ -376,6 +379,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testBackupDescriptorStreamingHasBoundedAllocations() throws {
+        try QualificationSuite.requireEnabled()
         let (p,_,_) = try fixture()
         try write {db in
             let objects = (0..<72760).map {n in ["path":"objects/diagnostic-\(n)","sha256":String(repeating:"a",count:64),"size":1] as JSON}
@@ -447,7 +451,8 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testSustainedWritersBoundRSSCPUAndBackoff() throws {
-        guard let raw = ProcessInfo.processInfo.environment["CL193_SOAK_SECONDS"],let duration = Double(raw),duration >= 180 else {throw XCTSkip("Run with CL193_SOAK_SECONDS=360 for sustained resource qualification")}
+        try QualificationSuite.requireEnabled()
+        guard let duration = Double(ProcessInfo.processInfo.environment["CL193_SOAK_SECONDS"] ?? "360"),duration >= 180 else {throw XCTSkip("Qualification soak duration must be at least 180 seconds")}
         let (p,t,a) = try fixture(),pid = p["id"] as! String
         let trafficEpic = try call("epic_create",["project_id":pid,"name":"Independent traffic"])
         let other = try call("task_create",["project_id":pid,"title":"Independent traffic ticket","epic_id":trafficEpic["id"]!]),otherID = other["id"] as! String
@@ -637,6 +642,7 @@ extension TicketLifecycleCleanupTests {
 
 extension TicketLifecycleCleanupTests {
     func testProjectedReferenceScanBoundsWorkWithManyOwnedTokens() throws {
+        try QualificationSuite.requireEnabled()
         let (p,t,_) = try fixture(),pid = p["id"] as! String,tid = t["id"] as! String
         let other = try call("task_create",["project_id":pid,"title":"Unrelated projection corpus"])
         try write {db in

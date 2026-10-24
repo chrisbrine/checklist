@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import AppKit
 @testable import ChecklistApp
@@ -27,7 +28,7 @@ import ChecklistIPC
             try FileManager.default.createDirectory(at:cache,withIntermediateDirectories:true)
             root=cache.appendingPathComponent("scoped-app-"+UUID().uuidString)
             preferences=defaults.preferences
-            router=try CommandRouter(root:root)
+            router=try TestStore.router(root:root)
             try FileManager.default.createDirectory(at:root.appendingPathComponent("a"),withIntermediateDirectories:true)
             try FileManager.default.createDirectory(at:root.appendingPathComponent("b"),withIntermediateDirectories:true)
             func call(_ method:String,_ params:[String:Any])throws->[String:Any] {

@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistCore
 
@@ -9,7 +10,7 @@ final class EvidenceMeasuresTests: XCTestCase {
     override func setUpWithError() throws {
         directory = FileManager.default.urls(for:.cachesDirectory,in:.userDomainMask)[0].appendingPathComponent("ChecklistCoreTests").appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true)
-        router = try CommandRouter(root:directory.appendingPathComponent("store"))
+        router = try TestStore.router(root:directory.appendingPathComponent("store"))
     }
     override func tearDownWithError() throws { router = nil;try? FileManager.default.removeItem(at:directory) }
     @discardableResult func call(_ method: String,_ input: JSON,_ actor: Caller? = nil) throws -> JSON {
@@ -57,7 +58,7 @@ final class EvidenceMeasuresTests: XCTestCase {
         XCTAssertEqual((evidence["measures"] as? [JSON])?.first?["after"] as? Double,26000)
         let context = try call("task_context",["project_id":p["id"]!,"task_id":t["id"]!]),summary = try XCTUnwrap(context["evidence_measures"] as? JSON)
         XCTAssertEqual((summary["warnings"] as? [JSON])?.count,1);XCTAssertEqual(summary["advisory_only"] as? Bool,true)
-        router = try CommandRouter(root:directory.appendingPathComponent("store"))
+        router = try TestStore.router(root:directory.appendingPathComponent("store"))
         XCTAssertEqual(try jsonString(record(submission["manifest_id"]!,"manifest")["evidence"]!),try jsonString(evidence))
     }
     func testInvalidSubmissionLeavesClaimAndNoManifest() throws {

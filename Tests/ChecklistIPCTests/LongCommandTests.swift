@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import Foundation
 import XCTest
 @testable import ChecklistCore
@@ -54,7 +55,7 @@ final class LongCommandTests: XCTestCase {
         let root = parent.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        let router = try CommandRouter(root: root)
+        let router = try TestStore.router(root: root)
         let commandID = UUID().uuidString.lowercased()
         let committed = expectation(description: "Original and replay finish"); committed.expectedFulfillmentCount = 2
         let service = Service(router: router, delay: delay, committed: committed)

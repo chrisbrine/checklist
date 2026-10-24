@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import Foundation
 import CoreFoundation
@@ -39,6 +40,7 @@ final class MediaListQueryTests: XCTestCase {
         }
     }
     func testThousandItemBoundedGroupedPagesFreezeOrderAcrossInsertsAndUpdates() throws {
+        try QualificationSuite.requireEnabled()
         let f = try Fixture(),type = try f.type(schema()),round = try f.round(type)
         // Leave room for one live insert after the first page.
         try seed(f,round,count:999)
@@ -104,7 +106,7 @@ final class MediaListQueryTests: XCTestCase {
         let workerFirst = try page(f,round,limit:1,as:f.worker),workerCursor = workerFirst["next_cursor"] as! String
         try f.router.dbQueue.write {db in var session = try f.router.record(db,f.worker.sessionID!,type:"session");session["authorization_generation"] = uuid();try f.router.save(db,f.router.revised(session),type:"session")}
         checks.checkError("CURSOR_RESET") {try page(f,round,cursor:workerCursor,limit:1,as:f.worker)}
-        try f.router.closeStore();f.router = try CommandRouter(root:f.root,serviceLease:f.storage.lease);f.storage.router = f.router
+        try f.router.closeStore();f.router = try TestStore.router(root:f.root,serviceLease:f.storage.lease);f.storage.router = f.router
         XCTAssertEqual(((try page(f,round,cursor:cursor,limit:1))["rows"] as! [JSON]).count,1)
         // Keep the key but change the logical incarnation passed to the production cursor
         // binding, equivalent to a restored store's authority fence.

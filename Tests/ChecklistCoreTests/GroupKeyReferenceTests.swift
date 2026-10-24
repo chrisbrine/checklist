@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -64,7 +65,7 @@ extension CoreTests {
             XCTAssertEqual(try router.record(db,pid,type:"project")["next_triage_number"] as? Int,13)
             let before = try SchemaMigrations.contentFingerprint(db);try GroupKeys.backfill(db);XCTAssertEqual(try SchemaMigrations.contentFingerprint(db),before)
         }
-        try router.closeStore();router = try CommandRouter(root:directory)
+        try router.closeStore();router = try TestStore.router(root:directory)
         XCTAssertEqual(try call("triage_create",["project_id":pid,"name":"After restart"])["key"] as? String,"LG-T13")
     }
     func testGroupKeysInContextPagesBatchReceiptsHistoryAndEffects() throws {

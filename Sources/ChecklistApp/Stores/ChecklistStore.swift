@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import Combine
+import OSLog
 import ChecklistIPC
 
 struct PendingCommandPersistence {
@@ -27,7 +28,8 @@ final class ChecklistStore: ObservableObject {
     private let ticketCatalog = TicketCatalogObservation()
     private let selectedObservation = SelectedTicketObservation()
     private let draftObservation = DraftObservation()
-    private var selectedTicketDisplay: SelectedTicketDisplay? { get {selectedObservation.display} set {selectedObservation.display = newValue} }
+    private var selectedTicketFromCache = false
+    private var selectedTicketDisplay: SelectedTicketDisplay? { get {selectedObservation.display} set {selectedObservation.display = newValue;selectedTicketFromCache = false} }
     private(set) var selectedTicketLoading: Bool { get {selectedObservation.loading} set {selectedObservation.loading = newValue} }
     private(set) var selectedTicketError: String? { get {selectedObservation.error} set {selectedObservation.error = newValue} }
     private var selectedRecordCollections: [String:Any] { get {selectedObservation.collections} set {selectedObservation.collections = newValue} }
@@ -151,16 +153,121 @@ final class ChecklistStore: ObservableObject {
     private var restoringPreferences = true
     private var refreshing = false
     private var eventCursor: String?
+    private static let liveLogger = Logger(subsystem: "org.checklist.app", category: "LiveUpdates")
+    // Coverage and installed content have separate clocks. An ignored reply must
+    // never make a visible surface fresh merely because the subscription moved.
+    private var visibleChange = UUID(), visibleInstalledChange: UUID?
+    private var selectedChange = UUID(), selectedInstalledChange: UUID?
+    private var visibleStaleSince: TimeInterval?, selectedStaleSince: TimeInterval?
+    private var pendingCoverageCursor: String?
+    private var pendingCoverageScope: LiveSurfaceScope?
+    private var liveSurfaceRead: Task<Bool,Never>?
+    private var liveSurfaceScope: LiveSurfaceScope?
+    private var liveSurfaceReadID = UUID(), liveSurfaceEpoch = UUID()
+    private var freshnessWatchdog: Task<Void,Never>?
+    private var visibleRetryAfter: TimeInterval = 0, selectedRetryAfter: TimeInterval = 0
+    private var selectedReadEpoch = UUID(), selectedReadTaskID: RecordIdentity?, selectedReadScope: RecordIdentity?
+    private var selectedReadInstalledID: UUID?
+    private struct LiveSurfaceScope: Equatable {
+        let page: Page
+        let tickets: TicketPageQuery
+        let workspace: WorkspacePageQuery
+        let focus: String?
+        let digest: Date?
+    }
+    private var liveScope: LiveSurfaceScope {
+        LiveSurfaceScope(page:page,tickets:ticketPageQuery,workspace:workspaceQuery,focus:overviewFocus,digest:overviewDigestSince)
+    }
+    private func markVisibleStale() {
+        visibleChange = UUID()
+        if visibleStaleSince == nil { visibleStaleSince = ProcessInfo.processInfo.systemUptime }
+    }
+    private func markSelectedStale() {
+        selectedChange = UUID()
+        if selectedStaleSince == nil { selectedStaleSince = ProcessInfo.processInfo.systemUptime }
+    }
+    private func logLiveRead(_ surface: String, start: TimeInterval, outcome: String) {
+        let ms = Int((ProcessInfo.processInfo.systemUptime - start) * 1000)
+        Self.liveLogger.notice("read surface=\(surface, privacy:.public) duration_ms=\(ms) outcome=\(outcome, privacy:.public)")
+    }
+    /// Join a read only while its exact visible query still owns it.
+    private func readLiveSurface() async -> Bool {
+        let scope = liveScope
+        if let read = liveSurfaceRead, liveSurfaceScope == scope, liveSurfaceEpoch == contentEpoch {
+            return await withTaskCancellationHandler { await read.value } onCancel: { read.cancel() }
+        }
+        liveSurfaceRead?.cancel()
+        let id = UUID(), change = visibleChange
+        liveSurfaceReadID = id; liveSurfaceScope = scope; liveSurfaceEpoch = contentEpoch
+        let read = Task { [weak self] in
+            guard let self else { return false }
+            let installed: Bool
+            if self.usesTicketPages { self.ticketPageRead?.cancel(); installed = await self.readTicketPage(query:scope.tickets,cursor:nil) }
+            else if self.page == .overview { installed = await self.readOverviewNeeds(force:false,retry:true) }
+            else { self.workspaceRead?.cancel(); installed = await self.readWorkspacePage(cursor:nil) }
+            guard !Task.isCancelled, self.liveScope == scope else { return false }
+            if installed, self.visibleChange == change {
+                self.visibleInstalledChange = change; self.visibleStaleSince = nil
+            }
+            return installed
+        }
+        liveSurfaceRead = read
+        let installed = await withTaskCancellationHandler { await read.value } onCancel: { read.cancel() }
+        if liveSurfaceReadID == id { liveSurfaceRead = nil; liveSurfaceScope = nil }
+        return installed
+    }
+    private func readLiveSelected() async -> Bool {
+        guard case .task(let id) = detail else { return true }
+        scheduleSelectedTicket(for:detail,coalesce:true)
+        let read = selectedTicketRead, readID = selectedTicketReadID
+        await withTaskCancellationHandler { await read?.value } onCancel: { read?.cancel() }
+        return !Task.isCancelled && isSelectedTicket(id) && selectedReadInstalledID == readID
+    }
+    private func runFreshnessWatchdog() async {
+        // A held list reply must never hold the detail watchdog behind it.
+        async let visible: Void = watchFreshness(selected:false)
+        async let selected: Void = watchFreshness(selected:true)
+        _ = await (visible,selected)
+    }
+    private func watchFreshness(selected: Bool) async {
+        while !Task.isCancelled {
+            do { try await Task.sleep(nanoseconds:100_000_000) } catch { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            let since = selected ? selectedStaleSince : visibleStaleSince
+            let installed = selected ? selectedInstalledChange == selectedChange : visibleInstalledChange == visibleChange
+            let retryAfter = selected ? selectedRetryAfter : visibleRetryAfter
+            // Leave half a second for a normal-load read before the two-second limit.
+            guard !installed, let since, now - since >= 1.5, now >= retryAfter else { continue }
+            let surface = selected ? "selected_ticket" : page.rawValue, lag = Int((now - since) * 1000)
+            Self.liveLogger.notice("watchdog surface=\(surface, privacy:.public) lag_ms=\(lag)")
+            // Even ignored replies retry at the ordinary bounded pace.
+            if selected {
+                selectedRetryAfter = now + Double(liveRetryPause) / 1_000_000_000
+                _ = await readLiveSelected()
+            } else {
+                visibleRetryAfter = now + Double(liveRetryPause) / 1_000_000_000
+                _ = await readLiveSurface()
+            }
+        }
+    }
+    private func advanceEventCursor(_ cursor: String?, source: String) {
+        guard let cursor else { return }
+        eventCursor = cursor
+        Self.liveLogger.notice("cursor_advanced source=\(source, privacy:.public)")
+    }
     // Window-local last pages. The opaque service version binds store, reader snapshot
     // and caller/grants; event/mutation knowledge retires every retained query at once.
     private var contentVersion: String?
     private var contentEpoch = UUID()
     private var cachedTickets: [(query: TicketPageQuery, value: TicketPagePreparation)] = []
     private var cachedWorkspace: [(query: WorkspacePageQuery, value: WorkspacePage, index: Int)] = []
+    private var cachedSelectedTickets: [(scope: RecordIdentity?, value: SelectedTicketDisplay)] = []
     private func invalidateContentCache(clearVisible: Bool = true, retireReads: Bool = true) {
         if retireReads { contentEpoch = UUID() }
-        cachedTickets = []; cachedWorkspace = []
+        cachedTickets = []; cachedWorkspace = []; cachedSelectedTickets = []
         if clearVisible {
+            if startedLiveUpdates { markVisibleStale() }
+            if selectedTicketFromCache { selectedTicketDisplay = nil }
             ticketPages.discardContent(); pagedTicketWorkspace = nil
             workspaceObservation.discardContent()
             for observation in overviewObservations.values { observation.discardContent() }
@@ -181,9 +288,16 @@ final class ChecklistStore: ObservableObject {
     private func restoreWorkspacePage(_ observation: WorkspacePageObservation, query: WorkspacePageQuery) -> Int? {
         guard observation.query != query || observation.page == nil,
               let cached = cachedWorkspace.last(where: { $0.query == query }) else { return nil }
+        // Shared metadata is already installed for this version. Replaying each
+        // cached group would compare/encode the catalog again and replace newer health.
         observation.restore(cached.value)
-        ticketCatalog.install(workspace:cached.value)
         return cached.index
+    }
+    private func cacheSelectedTicket(_ value: SelectedTicketDisplay, scope: RecordIdentity?) {
+        guard let contentVersion, !contentVersion.isEmpty, value.service.string("read_version") == contentVersion else { return }
+        cachedSelectedTickets.removeAll { $0.scope == scope && RecordIdentity($0.value.task.id) == RecordIdentity(value.task.id) }
+        cachedSelectedTickets.append((scope, value))
+        if cachedSelectedTickets.count > 12 { cachedSelectedTickets.removeFirst() }
     }
     private let desktopAlerts: DesktopAlertCoordinator
     let navigationMemory: DetailItemNavigationMemory
@@ -373,7 +487,7 @@ final class ChecklistStore: ObservableObject {
         // this consumer and grant a fresh retry budget. Old authority is retired.
         fullSelectedRecordID = nil;selectedRecordCollections = [:]
         invalidateSelectedEligibility()
-        selectedTicketDisplay = value;acceptServiceRead()
+        selectedTicketDisplay = value;cacheSelectedTicket(value, scope:projectID.map(RecordIdentity.init));acceptServiceRead()
         scheduleSelectedEligibility(for:detail)
         return value
     }
@@ -446,29 +560,40 @@ final class ChecklistStore: ObservableObject {
             }
         }
     }
-    private func scheduleSelectedTicket(for selection: Detail?, cursor: String? = nil) {
+    private func scheduleSelectedTicket(for selection: Detail?, cursor: String? = nil, coalesce: Bool = false) {
+        if coalesce, case .task(let id) = selection, selectedTicketLoading, selectedTicketRead != nil,
+           selectedReadEpoch == contentEpoch, selectedReadTaskID == RecordIdentity(id), selectedReadScope == projectID.map(RecordIdentity.init) { return }
         cancelSelectedRecordRecovery()
         selectedTicketRead?.cancel(); selectedTicketReadID = UUID();selectedRecordsReadID = UUID()
         recordHistoryRead?.cancel();recordHistoryObservation.cancel(clear:true)
         selectedWorkRead?.cancel()
         if fullSelectedRecordID != nil {selectedRecordsLoading = true}
-        guard case .task(let id) = selection else {selectedTicketDisplay = nil;fullSelectedRecordID = nil;selectedRecordCollections = [:];selectedRecordsLoading = false;selectedRecordsError = nil;selectedTicketLoading = false;return}
+        guard case .task(let id) = selection else {selectedStaleSince = nil;selectedInstalledChange = selectedChange;selectedTicketDisplay = nil;fullSelectedRecordID = nil;selectedRecordCollections = [:];selectedRecordsLoading = false;selectedRecordsError = nil;selectedTicketLoading = false;return}
         if selectedTicketDisplay.map({RecordIdentity($0.task.id) != RecordIdentity(id)}) ?? true {selectedTicketDisplay = nil;fullSelectedRecordID = nil;selectedRecordCollections = [:];selectedRecordsLoading = false;selectedRecordsError = nil}
+        let scope = projectID.map(RecordIdentity.init)
+        if selectedTicketDisplay == nil, cursor == nil,
+           let cached = cachedSelectedTickets.last(where: { $0.scope == scope && RecordIdentity($0.value.task.id) == RecordIdentity(id) }) {
+            selectedTicketDisplay = cached.value; selectedTicketFromCache = true
+        }
         guard startedLiveUpdates else {return}
         let readID = selectedTicketReadID, recordsReadID = selectedRecordsReadID
+        selectedReadEpoch = contentEpoch; selectedReadTaskID = RecordIdentity(id); selectedReadScope = scope
         selectedTicketLoading = true;selectedTicketError = nil;selectedTicketMissing = false
         selectedTicketRead = Task { [weak self] in
             guard let self else {return}
+            let start = ProcessInfo.processInfo.systemUptime
+            var outcome = "ignored:fenced"
+            defer { self.logLiveRead("selected_ticket",start:start,outcome:outcome) }
             do {
                 var p: [String:Any] = ["task_id":id,"detail_level":"ui"]
                 if let cursor {p["history_cursor"] = cursor}
                 let response: [String:Any]
-                do {response = try await self.request("task_context",p, ifCurrent: { self.selectedTicketReadID == readID && self.isSelectedTicket(id) })}
+                do {response = try await self.request("task_context",p, ifCurrent: { self.selectedTicketReadID == readID && self.isSelectedTicket(id) && self.projectID.map(RecordIdentity.init) == scope })}
                 catch let error as ChecklistError where cursor != nil && error.code == "CURSOR_RESET" {
                     guard !Task.isCancelled,self.selectedTicketReadID == readID,self.isSelectedTicket(id) else {return}
                     // One fresh-head read after the conversation changed. This
                     // never retries a mutation or revives an obsolete selection.
-                    response = try await self.request("task_context",["task_id":id,"detail_level":"ui"], ifCurrent: { self.selectedTicketReadID == readID && self.isSelectedTicket(id) })
+                    response = try await self.request("task_context",["task_id":id,"detail_level":"ui"], ifCurrent: { self.selectedTicketReadID == readID && self.isSelectedTicket(id) && self.projectID.map(RecordIdentity.init) == scope })
                 }
                 guard !Task.isCancelled,self.selectedTicketReadID == readID,self.isSelectedTicket(id) else {return}
                 let value = try SelectedTicketDisplay(response:response)
@@ -481,7 +606,10 @@ final class ChecklistStore: ObservableObject {
                     self.invalidateSelectedEligibility()
                 }
                 self.scopedReadGeneration = UUID()
-                self.selectedTicketDisplay = value;self.selectedTicketLoading = false;self.acceptServiceRead()
+                self.selectedTicketDisplay = value;self.cacheSelectedTicket(value, scope:scope)
+                self.selectedTicketLoading = false;self.acceptServiceRead()
+                self.selectedReadInstalledID = readID; outcome = "installed"
+                self.selectedInstalledChange = self.selectedChange; self.selectedStaleSince = nil
                 if changedStore {self.scheduleTicketPage(force:true)}
                 if self.fullSelectedRecordLoaded(id) {self.loadFullSelectedRecord(id)}
                 self.scheduleSelectedEligibility(for:self.detail)
@@ -492,6 +620,12 @@ final class ChecklistStore: ObservableObject {
                     if self.selectedRecordsReadID == recordsReadID {self.selectedRecordsLoading = false}
                     return
                 }
+                if let failure = error as? ChecklistError, ["NOT_FOUND", "FORBIDDEN", "DENIED"].contains(failure.code) {
+                    self.cachedSelectedTickets = []; self.selectedTicketDisplay = nil
+                    self.fullSelectedRecordID = nil; self.selectedRecordCollections = [:]; self.selectedRecordsLoading = false
+                }
+                outcome = "failed:" + ((error as? ChecklistError)?.code ?? "INVALID_RESPONSE")
+                self.selectedRetryAfter = ProcessInfo.processInfo.systemUptime + Double(self.liveRetryPause) / 1_000_000_000
                 self.selectedTicketError = "Could not load the selected ticket. Your draft is preserved."
                 // A removed ticket (for example from an old desktop alert) shows the unavailable state (CL-59).
                 self.selectedTicketMissing = (error as? ChecklistError)?.code == "NOT_FOUND"
@@ -502,6 +636,7 @@ final class ChecklistStore: ObservableObject {
     private func invalidateSelectedTicketFreshness() {
         cancelSelectedRecordRecovery()
         guard case .task = detail else {return}
+        markSelectedStale()
         selectedTicketRead?.cancel();selectedTicketReadID = UUID();selectedRecordsReadID = UUID()
         selectedTicketLoading = true;selectedTicketError = nil;selectedTicketMissing = false
         selectedRecordsLoading = fullSelectedRecordID != nil
@@ -562,6 +697,10 @@ final class ChecklistStore: ObservableObject {
         ticketPageRead = Task { [weak self] in _ = await self?.readTicketPage(query: query, cursor: cursor) }
     }
     @discardableResult private func readTicketPage(query: TicketPageQuery, cursor: String?) async -> Bool {
+        let start = ProcessInfo.processInfo.systemUptime
+        var outcome = "ignored:fenced"
+        defer { logLiveRead(query.surface,start:start,outcome:outcome) }
+        let scope = liveScope
         let observed = ticketPages.begin(query: query, cursor: cursor)
         let readID = UUID(); ticketPageReadID = readID
         pagedTicketWorkspace = ticketPages.prepared(expansion: ticketExpansion)
@@ -576,19 +715,25 @@ final class ChecklistStore: ObservableObject {
                 invalidateSelectedTicketFreshness()
                 invalidateSelectedEligibility()
             }
-            guard ticketPages.receive(page, for: observed) else { return false }
+            guard ticketPages.receive(page, for: observed) else { outcome = "ignored:installation_rejected"; return false }
             ticketCatalog.install(page)
             cacheTicketPage(query)
+            outcome = "installed"
             scopedReadGeneration = UUID()
             pagedTicketWorkspace = ticketPages.prepared(expansion: ticketExpansion)
+            guard pagedTicketWorkspace != nil else { outcome = "failed:INVALID_PAGE_ORDER"; return false }
+            if scope == liveScope { visibleInstalledChange = visibleChange; visibleStaleSince = nil }
             acceptServiceRead()
-            if eventCursor == nil {eventCursor = result["event_cursor"] as? String ?? page.contentCursor}
+            if eventCursor == nil, pendingCoverageScope == nil {advanceEventCursor(result["event_cursor"] as? String ?? page.contentCursor,source:"tickets")}
             if changedStore {scheduleSelectedTicket(for:detail)}
         } catch {
             if isReadCancellation(error) { ticketPages.cancel(observed); return false }
             guard ticketPageReadID == readID else { return false }
             connectionAttempted = true
             ticketPages.fail(observed)
+            outcome = "failed:" + ((error as? ChecklistError)?.code ?? "INVALID_RESPONSE")
+            visibleRetryAfter = ProcessInfo.processInfo.systemUptime + Double(liveRetryPause) / 1_000_000_000
+            return false
         }
         return !Task.isCancelled
     }
@@ -695,7 +840,7 @@ final class ChecklistStore: ObservableObject {
     }
     /// Freeze every query and cursor before yielding. Even the combined phase owns its pending
     /// surfaces, so a narrower Retry can finish outstanding groups without reviving completed ones.
-    private func startOverviewRead(cursor: String? = nil, only: String? = nil, force: Bool) -> Task<Bool,Never>? {
+    private func startOverviewRead(cursor: String? = nil, only: String? = nil, force: Bool, retry: Bool = false) -> Task<Bool,Never>? {
         guard page == .overview, !Task.isCancelled else { return nil }
         prepareOverviewVisit()
         let surfaces = shownOverviewSurfaces
@@ -704,12 +849,12 @@ final class ChecklistStore: ObservableObject {
         }
         let due = surfaces.filter { surface in
             let query = overviewQuery(surface), observation = overviewObservations[surface]!
-            return (only == nil || only == surface) && (force || observation.query != query || observation.page == nil && !observation.loading && observation.error == nil)
+            return (only == nil || only == surface) && (force || retry && observation.error != nil || observation.query != query || observation.page == nil && !observation.loading && observation.error == nil)
         }
         guard !due.isEmpty else { return overviewRead }
         let previous = overviewPending
         retireOverviewRead()
-        let combined = only == nil && overviewFocus == nil && !overviewSequential
+        let combined = only == nil && overviewFocus == nil && !overviewSequential && due.count == surfaces.count
         let order = combined ? surfaces : surfaces.filter { due.contains($0) || previous[$0] != nil }
         for surface in order {
             let query = overviewQuery(surface)
@@ -717,6 +862,7 @@ final class ChecklistStore: ObservableObject {
             overviewPending[surface] = OverviewRead(query: query, cursor: nextCursor, generation: overviewObservations[surface]!.begin(query))
         }
         let id = overviewReadID, focus = overviewFocus, reads = overviewPending
+        let scope = liveScope
         let task = Task { [weak self] in
             guard let self else { return false }
             defer {
@@ -731,6 +877,7 @@ final class ChecklistStore: ObservableObject {
                 guard await self.readOverviewGroups(id: id, focus: focus, reads: reads) else { return false }
             }
             var remaining = order
+            var allInstalled = true
             var attemptedVersions: [String:String] = [:]
             while true {
                 guard self.overviewReadCurrent(id, focus: focus, reads: reads), !Task.isCancelled else { return false }
@@ -752,11 +899,19 @@ final class ChecklistStore: ObservableObject {
                 }
                 let surface = remaining.removeFirst()
                 guard let read = self.overviewPending[surface] else { continue }
-                guard await self.readOverviewNeed(surface, read: read, id: id, focus: focus, reads: reads) else { return false }
+                if !(await self.readOverviewNeed(surface, read: read, id: id, focus: focus, reads: reads)) {
+                    guard !Task.isCancelled, self.overviewReadCurrent(id,focus:focus,reads:reads) else { return false }
+                    self.overviewObservations[surface]?.cancel(read.generation)
+                    allInstalled = false
+                }
                 self.overviewPending.removeValue(forKey: surface)
                 attemptedVersions[surface] = self.contentVersion ?? ""
             }
-            return !Task.isCancelled
+            let complete = self.shownOverviewSurfaces.allSatisfy { self.overviewObservations[$0]?.page != nil && self.overviewObservations[$0]?.error == nil }
+            if allInstalled, complete, !Task.isCancelled, self.liveScope == scope {
+                self.visibleInstalledChange = self.visibleChange; self.visibleStaleSince = nil
+            }
+            return allInstalled && !Task.isCancelled
         }
         overviewRead = task
         return task
@@ -765,9 +920,11 @@ final class ChecklistStore: ObservableObject {
         overviewReadID == id && page == .overview && overviewFocus == focus && reads.allSatisfy { overviewQuery($0.key) == $0.value.query }
     }
     func moveOverviewPage(_ surface: String, cursor: String) { scheduleOverviewNeeds(cursor: cursor, only: surface, force: true) }
-    @discardableResult private func readOverviewNeeds() async -> Bool {
-        guard let read = startOverviewRead(force: true) else { return false }
-        let id = overviewReadID
+    @discardableResult private func readOverviewNeeds(force:Bool = true,retry:Bool = false) async -> Bool {
+        guard let read = startOverviewRead(force:force,retry:retry) else { return false }
+        return await awaitOverviewRead(read, id: overviewReadID)
+    }
+    private func awaitOverviewRead(_ read: Task<Bool,Never>, id: UUID) async -> Bool {
         return await withTaskCancellationHandler {
             let accepted = await read.value
             return accepted && overviewReadID == id && !Task.isCancelled
@@ -780,53 +937,75 @@ final class ChecklistStore: ObservableObject {
     }
     /// Returns true after either settling the combined result or selecting the bounded fallback.
     private func readOverviewGroups(id: UUID, focus: String?, reads: [String: OverviewRead]) async -> Bool {
+        let start = ProcessInfo.processInfo.systemUptime
+        var outcome = "ignored:fenced"
+        defer { logLiveRead("overview",start:start,outcome:outcome) }
         var params: [String: Any] = ["surface": "overview", "since": reads["completed_since"]!.query.since]
         params["project_id"] = reads["completed_since"]!.query.project
         do {
             let response = try await request("workspace_page", params, ifCurrent: { self.overviewReadCurrent(id, focus:focus, reads:reads) })
             guard !Task.isCancelled, overviewReadCurrent(id, focus: focus, reads: reads) else { return false }
             let groups = response["groups"] as? [String: [String: Any]] ?? [:]
+            var installed = true
             for (surface, read) in reads {
                 if var group = groups[surface] {
                     // Combined replies carry shared catalogs/identity once. Legacy self-contained
                     // groups still parse through the same strict single-page validator.
                     for key in ["projects", "service", "needs_you_count", "content_cursor"] where group[key] == nil { group[key] = response[key] }
-                    installOverviewPage(group, surface: surface, read: read, eventCursor: response["event_cursor"] as? String ?? response["content_cursor"] as? String)
+                    if !installOverviewPage(group, surface: surface, read: read, eventCursor: response["event_cursor"] as? String ?? response["content_cursor"] as? String) { installed = false }
                 }
-                else { overviewObservations[surface]?.fail(read.generation) }
+                else { overviewObservations[surface]?.fail(read.generation); installed = false }
                 overviewPending.removeValue(forKey: surface)
             }
+            guard installed else { outcome = "failed:INVALID_RESPONSE"; return false }
+            outcome = "installed"
         } catch {
             guard !isReadCancellation(error), overviewReadCurrent(id, focus: focus, reads: reads) else { return false }
             if let timeout = error as? ChecklistError, timeout.code == "OUTCOME_UNKNOWN",
                timeout.details["reason"] as? String == "reply_timeout", timeout.details["command_id"] == nil {
                 overviewSequential = true // Keep loading/retained pages; do not publish ten transient errors.
+                outcome = "ignored:timeout_fallback"
                 return true
             }
             connectionAttempted = true
             for (surface, read) in reads { overviewObservations[surface]?.fail(read.generation) }
             overviewPending = [:]
+            outcome = "failed:" + ((error as? ChecklistError)?.code ?? "INVALID_RESPONSE")
+            visibleRetryAfter = ProcessInfo.processInfo.systemUptime + Double(liveRetryPause) / 1_000_000_000
+            return false
         }
         return !Task.isCancelled
     }
-    private func installOverviewPage(_ response: [String: Any], surface: String, read: OverviewRead, eventCursor: String? = nil) {
+    @discardableResult private func installOverviewPage(_ response: [String: Any], surface: String, read: OverviewRead, eventCursor: String? = nil) -> Bool {
         let observation = overviewObservations[surface]!
         do {
             if try observation.receive(response, query: read.query, generation: read.generation), let installed = observation.page {
                 ticketCatalog.install(workspace: installed); cacheWorkspacePage(installed); acceptServiceRead()
                 // Incidental pages never advance an established live coverage interval.
-                if self.eventCursor == nil { self.eventCursor = eventCursor ?? response["event_cursor"] as? String ?? installed.contentCursor }
+                if self.eventCursor == nil, pendingCoverageScope == nil { advanceEventCursor(eventCursor ?? response["event_cursor"] as? String ?? installed.contentCursor,source:"overview") }
+                return true
             }
         } catch { observation.fail(read.generation) }
+        return false
     }
     private func readOverviewNeed(_ surface: String, read: OverviewRead, id: UUID, focus: String?, reads: [String: OverviewRead]) async -> Bool {
+        let start = ProcessInfo.processInfo.systemUptime
+        var outcome = "ignored:fenced"
+        defer { logLiveRead(surface,start:start,outcome:outcome) }
         do {
             let response = try await request("workspace_page", read.query.parameters(cursor: read.cursor), ifCurrent: { self.overviewReadCurrent(id, focus:focus, reads:reads) })
             guard !Task.isCancelled, overviewReadCurrent(id, focus: focus, reads: reads) else { return false }
-            installOverviewPage(response, surface: surface, read: read)
+            guard installOverviewPage(response, surface: surface, read: read) else {
+                outcome = overviewObservations[surface]?.error == nil ? "ignored:installation_rejected" : "failed:INVALID_RESPONSE"
+                return false
+            }
+            outcome = "installed"
         } catch {
             guard !isReadCancellation(error), overviewReadCurrent(id, focus: focus, reads: reads) else { return false }
             connectionAttempted = true; overviewObservations[surface]?.fail(read.generation)
+            outcome = "failed:" + ((error as? ChecklistError)?.code ?? "INVALID_RESPONSE")
+            visibleRetryAfter = ProcessInfo.processInfo.systemUptime + Double(liveRetryPause) / 1_000_000_000
+            return false
         }
         return !Task.isCancelled
     }
@@ -842,8 +1021,12 @@ final class ChecklistStore: ObservableObject {
         workspaceRead=Task {[weak self] in _ = await self?.readWorkspacePage(cursor:cursor,pageIndex:pageIndex)}
     }
     @discardableResult private func readWorkspacePage(cursor:String?,pageIndex:Int? = nil) async -> Bool {
+        let start = ProcessInfo.processInfo.systemUptime
+        var outcome = "ignored:fenced"
         let query=workspaceQuery
+        defer { logLiveRead(query.surface,start:start,outcome:outcome) }
         let targetIndex = pageIndex ?? (workspaceObservation.query == query && workspaceObservation.page != nil ? workspacePageIndex : 0)
+        let scope = liveScope
         let id=workspaceObservation.begin(query)
         func current() -> Bool { !Task.isCancelled && !usesTicketPages && workspaceQuery == query && workspaceObservation.isCurrent(id) }
         do {
@@ -867,9 +1050,17 @@ final class ChecklistStore: ObservableObject {
             if try workspaceObservation.receive(response,query:query,generation:id) {
                 if let installed = workspaceObservation.page { ticketCatalog.install(workspace:installed); cacheWorkspacePage(installed, index: index) }
                 workspacePageIndex = index
-                acceptServiceRead();if eventCursor == nil {eventCursor=response["event_cursor"] as? String ?? workspaceObservation.page?.contentCursor}
-            }
-        } catch {if isReadCancellation(error) {workspaceObservation.cancel(id);return false} else {connectionAttempted = true;workspaceObservation.fail(id)}}
+                outcome = "installed"
+                if scope == liveScope { visibleInstalledChange = visibleChange; visibleStaleSince = nil }
+                acceptServiceRead();if eventCursor == nil, pendingCoverageScope == nil {advanceEventCursor(response["event_cursor"] as? String ?? workspaceObservation.page?.contentCursor,source:"workspace")}
+            } else { outcome = "ignored:installation_rejected"; return false }
+        } catch {
+            if isReadCancellation(error) {workspaceObservation.cancel(id);return false}
+            connectionAttempted = true;workspaceObservation.fail(id)
+            outcome = "failed:" + ((error as? ChecklistError)?.code ?? "INVALID_RESPONSE")
+            visibleRetryAfter = ProcessInfo.processInfo.systemUptime + Double(liveRetryPause) / 1_000_000_000
+            return false
+        }
         return !Task.isCancelled
     }
     private func scheduleOtherDetail(for detail:Detail?) {
@@ -1181,9 +1372,7 @@ final class ChecklistStore: ObservableObject {
                         guard let self else { return }
                         // List freshness must not cancel a selected-context recovery that
                         // discovered this generation, or replace its shared consumer read.
-                        if self.usesTicketPages { _ = await self.readTicketPage(query:self.ticketPageQuery, cursor:nil) }
-                        else if self.page == .overview { _ = await self.readOverviewNeeds() }
-                        else { _ = await self.readWorkspacePage(cursor:nil) }
+                        _ = await self.readLiveSurface()
                     }
                 }
             }
@@ -1215,16 +1404,16 @@ final class ChecklistStore: ObservableObject {
 
     func refresh(quiet: Bool = false) async {
         archivePreviewEpoch = UUID()
+        // Selection is an independent visible surface, even when the list fails.
+        if case .task = detail { scheduleSelectedTicket(for:detail,coalesce:true) }
         if usesTicketPages {
             ticketPageRead?.cancel()
-            guard await readTicketPage(query: ticketPageQuery, cursor: nil) else { return }
-            if case .task(let id) = detail {
-                scheduleSelectedTicket(for:detail)
-            } else if detail != nil {scheduleOtherDetail(for:detail)}
+            guard await readTicketPage(query:ticketPageQuery,cursor:nil) else { return }
         } else {
-            if page == .overview { guard await readOverviewNeeds() else { return } } else { guard await readWorkspacePage(cursor:nil) else { return } }
-            if case .task = detail {scheduleSelectedTicket(for:detail)} else {scheduleOtherDetail(for:detail)}
+            if page == .overview { guard await readOverviewNeeds() else { return } }
+            else { guard await readWorkspacePage(cursor:nil) else { return } }
         }
+        if case .task = detail {} else if detail != nil { scheduleOtherDetail(for:detail) }
     }
 
     private func refreshFullSnapshot(quiet: Bool = false) async {
@@ -1261,7 +1450,7 @@ final class ChecklistStore: ObservableObject {
                 data = installed
                 await desktopAlerts.observe(snapshot: data)
                 loadTaskView()
-                eventCursor = snapshot["event_cursor"] as? String ?? snapshot["cursor"] as? String ?? (data["cursor"] as? String) ?? eventCursor
+                advanceEventCursor(snapshot["event_cursor"] as? String ?? snapshot["cursor"] as? String ?? (data["cursor"] as? String),source:"snapshot")
                 if let projectID, !projects.contains(where: { $0.id == projectID }) { self.projectID = nil }
                 acceptServiceRead()
             } catch {
@@ -1453,7 +1642,11 @@ final class ChecklistStore: ObservableObject {
 
     /// Called by the authenticated event subscription. Cursor advancement belongs
     /// to this coverage interval, never an incidental newer list/read response.
-    func applyChangeCoverage(_ changes:[String:Any]) async {
+    @discardableResult func applyChangeCoverage(_ changes:[String:Any]) async -> Bool {
+        if page == .overview { prepareOverviewVisit() }
+        let scope = liveScope
+        let cursor = changes["event_cursor"] as? String
+        let newInterval = pendingCoverageCursor == nil || pendingCoverageCursor != cursor || pendingCoverageScope != scope
         archivePreviewEpoch = UUID()
         fullSnapshotDirty=true
         let coverage=changes["coverage"] as? [String:Any]
@@ -1477,27 +1670,54 @@ final class ChecklistStore: ObservableObject {
             if page == .epics {return !f.isDisjoint(with:["all","tasks","groups"])}
             return !f.isDisjoint(with:needsSurface == "requests" ? ["all","requests","tasks"] : ["all","tasks"])
         }
-        invalidateContentCache(clearVisible: false, retireReads: usesTicketPages ? ticketAffected : workspaceAffected)
         let selectedID: String? = {if case .task(let id)=detail{return id};return nil}()
         let selectedProject=selectedTicketDisplay?.task.string("project_id")
         let selectedAffected=selectedID != nil && (reset || rows.contains {inProject($0,selectedProject) && touches($0,task:selectedID)})
         let otherTask=selectedOther?.object("selected_task")["id"] as? String
         let otherAffected=selectedOther != nil && (reset || rows.contains {inProject($0,selectedOther?.string("project_id")) && (selectedOther?.string("record_type")=="group" ? !families($0).isDisjoint(with:["all","groups","tasks"]) : touches($0,task:otherTask))})
-        if selectedAffected {invalidateSelectedTicketFreshness();invalidateSelectedEligibility()}
-        if usesTicketPages && ticketAffected {ticketPages.discardContent();pagedTicketWorkspace = nil;ticketPageRead?.cancel();guard await readTicketPage(query:ticketPageQuery,cursor:nil) else {return}}
-        else if !usesTicketPages && workspaceAffected {
-            if page == .overview {
-                for observation in overviewObservations.values { observation.discardContent() }
-                guard await readOverviewNeeds() else {return}
-            } else {workspaceObservation.discardContent();workspaceRead?.cancel();guard await readWorkspacePage(cursor:nil) else {return}}
+        let affected = usesTicketPages ? ticketAffected : workspaceAffected
+        if newInterval {
+            pendingCoverageCursor = cursor; pendingCoverageScope = scope
+            invalidateContentCache(clearVisible:false,retireReads:affected || selectedAffected)
+            // The interval already retired old replies. Its parallel readers may
+            // discover the same new version without canceling one another.
+            if affected || selectedAffected { contentVersion = nil }
+            if affected {
+                markVisibleStale()
+                if usesTicketPages { ticketPages.discardContent(); pagedTicketWorkspace = nil }
+                else if page == .overview { for observation in overviewObservations.values { observation.discardContent() } }
+                else { workspaceObservation.discardContent() }
+            }
+            if selectedAffected { selectedTicketDisplay = nil; invalidateSelectedTicketFreshness(); invalidateSelectedEligibility() }
         }
-        guard !Task.isCancelled else { return }
-        if selectedAffected {scheduleSelectedTicket(for:detail)}
-        if otherAffected {scheduleOtherDetail(for:detail)}
-        if let cursor=changes["event_cursor"] as? String {eventCursor=cursor}
+        let familyNames = Set(rows.flatMap { $0["families"] as? [String] ?? ["all"] }).sorted().joined(separator:",")
+        let taskCount = Set(rows.flatMap { $0["task_ids"] as? [String] ?? [] }).count
+        if newInterval { Self.liveLogger.notice("changed families=\(familyNames, privacy:.public) task_count=\(taskCount) visible_affected=\(affected)") }
+        let refreshSelected = selectedAffected && selectedInstalledChange != selectedChange
+        let refreshVisible = affected && visibleInstalledChange != visibleChange
+        async let selectedOK = refreshSelected ? readLiveSelected() : true
+        async let visibleOK = refreshVisible ? readLiveSurface() : true
+        let installed = await (visibleOK,selectedOK)
+        guard installed.0, installed.1, !Task.isCancelled, liveScope == scope,
+              !affected || visibleInstalledChange == visibleChange,
+              !selectedAffected || selectedInstalledChange == selectedChange else {
+            // A manual refresh may have superseded this reader and installed a
+            // fresh baseline. Do not let the abandoned interval block bootstrap.
+            if !installed.0, visibleInstalledChange == visibleChange {
+                pendingCoverageCursor = nil; pendingCoverageScope = nil
+            }
+            return false
+        }
+        if otherAffected { scheduleOtherDetail(for:detail) }
+        advanceEventCursor(cursor,source:"coverage")
+        pendingCoverageCursor = nil; pendingCoverageScope = nil
+        return true
     }
 
     func stopWindowReads() {
+        freshnessWatchdog?.cancel(); freshnessWatchdog = nil
+        liveSurfaceRead?.cancel(); liveSurfaceRead = nil; liveSurfaceScope = nil
+        visibleStaleSince = nil; selectedStaleSince = nil; pendingCoverageCursor = nil; pendingCoverageScope = nil
         invalidateContentCache(clearVisible: false); contentVersion = nil
         cancelSelectedRecordRecovery()
         ticketPageRead?.cancel();ticketPageReadID=UUID();ticketPages.invalidate()
@@ -1544,6 +1764,12 @@ final class ChecklistStore: ObservableObject {
 
     func startLiveUpdates() async {
         startedLiveUpdates = true
+        freshnessWatchdog?.cancel()
+        let watchdog = Task { [weak self] in
+            guard let self else { return }; await self.runFreshnessWatchdog()
+        }
+        freshnessWatchdog = watchdog
+        defer { watchdog.cancel() }
         await refresh()
         if await recoverMissingRestoredProject() { await refresh() }
         // Event invalidation only: this never polls or launches an agent/model.
@@ -1559,7 +1785,12 @@ final class ChecklistStore: ObservableObject {
                 try Task.checkCancellation()
                 if changes["changed"] as? Bool == true {
                     NativeRenderMetrics.changeObserved()
-                    await applyChangeCoverage(changes)
+                    if !(await applyChangeCoverage(changes)) {
+                        try await Task.sleep(nanoseconds:liveRetryPause)
+                        // Ask again from the last applied cursor. Newer changes
+                        // must still reach the list while a detail keeps failing.
+                        continue
+                    }
                 }
                 try await Task.sleep(nanoseconds: liveWaitPause)
             } catch {
@@ -1569,9 +1800,18 @@ final class ChecklistStore: ObservableObject {
                     continue
                 }
                 recordServiceOutage(error)
-                invalidateContentCache(); contentVersion = nil
+                let failure = error as? ChecklistError
+                let reset = failure?.code == "CURSOR_RESET"
+                // An interrupted read is not a data change. Keep the owned Overview
+                // loader and its accepted pages; its next version still fences a real commit.
+                // Definite scope/coverage errors retain the ordinary invalidation path.
+                let interruptedRead = failure?.code == "OUTCOME_UNKNOWN" && failure?.details["command_id"] == nil
+                let overviewRecovery = page == .overview && interruptedRead ? overviewRead : nil
+                let overviewRecoveryID = overviewReadID
+                invalidateContentCache(clearVisible: overviewRecovery == nil, retireReads: overviewRecovery == nil)
+                if overviewRecovery == nil { contentVersion = nil }
                 fullSnapshotDirty = true
-                if (error as? ChecklistError)?.code == "CURSOR_RESET" {
+                if reset {
                     // The old coverage interval no longer exists. Only this
                     // explicit reset allows the successful reload to establish a
                     // new interval; ordinary reads never skip unseen events.
@@ -1589,7 +1829,21 @@ final class ChecklistStore: ObservableObject {
                 // Service reconnect is a local UI data subscription, never model pickup.
                 try? await Task.sleep(nanoseconds: liveRetryPause)
                 guard !Task.isCancelled else { return }
-                await refresh(quiet: true)
+                if let overviewRecovery, overviewReadID == overviewRecoveryID {
+                    // Also join a loader that finished during the retry pause. Starting
+                    // a forced refresh here would repeat its already completed surfaces.
+                    _ = await awaitOverviewRead(overviewRecovery, id: overviewRecoveryID)
+                } else if reset {
+                    // The watchdog may already have installed the reset head during
+                    // the retry pause. Join its reads instead of loading twice.
+                    let selectedDue = selectedStaleSince != nil
+                    async let selected = selectedDue ? readLiveSelected() : true
+                    if visibleInstalledChange != visibleChange { _ = await readLiveSurface() }
+                    _ = await selected
+                    if case .task = detail {} else if detail != nil { scheduleOtherDetail(for:detail) }
+                } else {
+                    await refresh(quiet:true)
+                }
             }
         }
     }

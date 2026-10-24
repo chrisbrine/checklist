@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -265,7 +266,7 @@ extension CoreTests {
         guard parent.path == parent.resolvingSymlinksInPath().path else {throw XCTSkip("A symlink-free fixture parent is required")}
         directory = parent.appendingPathComponent("batch-source-"+UUID().uuidString)
         try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
-        router = try CommandRouter(root:directory.appendingPathComponent("service"))
+        router = try TestStore.router(root:directory.appendingPathComponent("service"))
         let workspace = directory.appendingPathComponent("workspace")
         try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
         try Data("first source".utf8).write(to:workspace.appendingPathComponent("a.txt"))

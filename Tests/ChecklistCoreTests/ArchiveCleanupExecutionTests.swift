@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import Foundation
 import GRDB
@@ -18,7 +19,7 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
             .resolvingSymlinksInPath().appendingPathComponent("ChecklistQualification/CL-150")
         directory = parent.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        router = try CommandRouter(root:directory.appendingPathComponent("store"))
+        router = try TestStore.router(root:directory.appendingPathComponent("store"))
     }
     override func tearDownWithError() throws { router = nil;try? FileManager.default.removeItem(at:directory) }
     func call(_ method: String,_ input: JSON,command: String = UUID().uuidString) throws -> JSON {
@@ -193,7 +194,7 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
         try router.runStorageMaintenance();XCTAssertFalse(exists(a))
         XCTAssertEqual(try record(a["id"] as! String,"attachment")["availability"] as? String,"available")
         router.dbQueue.writeWithoutTransaction { _ = sqlite3_set_authorizer($0.sqliteConnection,nil,nil) }
-        router = nil;router = try CommandRouter(root:directory.appendingPathComponent("store"))
+        router = nil;router = try TestStore.router(root:directory.appendingPathComponent("store"))
         let recovered = try call("cleanup_job_get",["project_id":f.project["id"]!,"cleanup_job_id":job["id"]!])
         XCTAssertEqual(recovered["state"] as? String,"completed")
         XCTAssertEqual(try ArchiveCleanupJob.integer(recovered["already_missing_logical_original_bytes"]),64)

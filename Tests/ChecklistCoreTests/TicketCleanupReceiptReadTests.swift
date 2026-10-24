@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 import CryptoKit
@@ -10,7 +11,7 @@ final class TicketCleanupReceiptReadTests: XCTestCase {
     private let owner = Caller(role:"owner",installation:"cleanup-read-test",projectIDs:[])
     override func setUpWithError() throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("cleanup-read-"+uuid())
-        router = try CommandRouter(root:root)
+        router = try TestStore.router(root:root)
         let created = try router.handle(method:"project_create",params:["name":"Synthetic receipt read","key_prefix":"RR","root_path":root.path,"command_id":uuid()],caller:owner)["data"] as! JSON
         pid = created["id"] as! String
     }

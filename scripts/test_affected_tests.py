@@ -43,6 +43,9 @@ class SelectionTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         (self.root / 'scripts').mkdir()
+        core = self.root / 'Sources/ChecklistCore'; core.mkdir(parents=True)
+        for name in ['OrdinaryMentionTokens.swift', 'OrdinaryMentionCommands.swift']:
+            (core / name).write_text('OrdinaryMentionTokens')
         for name in ['test_affected_tests.py', 'test_test_instances.py', 'test_prepare_public_source.py']:
             (self.root / 'scripts' / name).touch()
 
@@ -55,7 +58,8 @@ class SelectionTests(unittest.TestCase):
         self.assertIn('ChecklistProducts', plan['affected_targets'])
         self.assertEqual(plan['commands'][-1], selector.VALIDATE)
         self.assertIn('^ChecklistAppTests\\.', plan['swift_commands'][0])
-        self.assertEqual(plan['swift_commands'][0][:2], ['swift', 'test'])
+        self.assertIn('--parallel', plan['swift_commands'][0])
+        self.assertIn('--enable-dependency-cache', plan['swift_commands'][0])
 
     def test_core_includes_transitive_dependents(self):
         self.assertEqual(self.plan('Sources/ChecklistCore/Domain.swift')['test_targets'],
@@ -123,8 +127,7 @@ class SelectionTests(unittest.TestCase):
     def test_heavy_skip_matches_real_swift_test_identifiers(self):
         command = self.plan('Sources/ChecklistApp/ContentView.swift')['swift_commands'][0]
         patterns = [command[i + 1] for i, arg in enumerate(command) if arg == '--skip']
-        identifiers = [selector.HEAVY_TESTS[0], selector.HEAVY_TESTS[1] + '/testFrozen',
-                       selector.HEAVY_TESTS[2] + '/testDecision']
+        identifiers = list(selector.QUALIFICATION_TESTS)
         for identifier in identifiers:
             self.assertTrue(any(re.search(pattern, identifier) for pattern in patterns), identifier)
         self.assertFalse(any(re.search(pattern, 'ChecklistCoreTests.StorageSnapshotCapacityTests/testSmall')
@@ -148,7 +151,7 @@ class SelectionTests(unittest.TestCase):
                 plan = self.plan(path)
                 self.assertIn('ChecklistCoreTests', plan['test_targets'])
                 self.assertEqual(plan['skip'], [])
-                self.assertNotIn('--skip', plan['swift_commands'][0])
+                self.assertIn('CHECKLIST_QUALIFICATION=1', plan['qualification_commands'][0])
 
     def test_unknown_impact_never_skips_heavy_cases(self):
         for path in ['Package.swift', 'Package.resolved', 'mystery.txt', 'docs/new-fixture.bin',
@@ -220,13 +223,126 @@ class SelectionTests(unittest.TestCase):
         plan = selector.select(self.root, graph, ['fixtures/assets/catalog.json'], self.root / '.build')
         self.assertEqual(plan['test_targets'], ['AssetsTests'])
 
-    def test_full_has_no_filters_or_skips(self):
-        plan = self.plan('Sources/ChecklistApp/ContentView.swift', full=True)
-        self.assertEqual(plan['swift_commands'], [['env', 'CHECKLIST_STORAGE_PROBE=' + str(self.root / '.build/out/Products/Debug/StorageCrashProbe'),
-                                                   'swift', 'test', '--scratch-path', str(self.root / '.build')]])
-        self.assertEqual(plan['skip'], [])
+    def test_full_default_and_qualification_are_distinct(self):
+        plan = self.plan(full=True)
+        command = plan['swift_commands'][0]
+        self.assertIn('--parallel', command)
+        self.assertNotIn('--filter', command)
+        self.assertEqual(plan['skip'], list(selector.QUALIFICATION_TESTS))
+        self.assertIn('CHECKLIST_QUALIFICATION=0', command)
+        qualified = selector.select(self.root, GRAPH, [], self.root / '.build', full=True, qualification=True)
+        self.assertEqual(qualified['skip'], [])
+        self.assertEqual(qualified['isolated_test_groups'], list(selector.ISOLATED_TEST_GROUPS))
+        self.assertIn('CHECKLIST_QUALIFICATION=1', qualified['qualification_commands'][0])
         self.assertEqual(len(plan['test_targets']), 7)
         self.assertEqual(len(plan['python_tests']), 3)
+
+    def test_template_store_changes_select_qualification(self):
+        graph = json.loads(json.dumps(GRAPH))
+        graph['targets'].append(target('ChecklistTestSupport', ['ChecklistCore'], path='Tests/ChecklistTestSupport'))
+        next(t for t in graph['targets'] if t['name'] == 'ChecklistCoreTests')['target_dependencies'].append('ChecklistTestSupport')
+        plan = selector.select(self.root, graph, ['Tests/ChecklistTestSupport/TestStore.swift'], self.root / '.build')
+        self.assertIn('ChecklistCoreTests', plan['test_targets'])
+        self.assertEqual(plan['qualification_tests'], list(selector.QUALIFICATION_TESTS))
+
+    def test_changed_qualification_fixture_selects_its_case(self):
+        path = self.root / 'Tests/ChecklistCoreTests/MediaDecisionTests.swift'
+        path.parent.mkdir(parents=True)
+        method = 'test450SelectionLostReplyFailedMiddleOnlyRefreshAndLaterReversal'
+        path.write_text('func ' + method + '() throws {\n try QualificationSuite.requireEnabled()\n}')
+        plan = self.plan(path.relative_to(self.root).as_posix())
+        self.assertEqual(plan['qualification_tests'], ['ChecklistCoreTests.MediaDecisionTests/' + method])
+        self.assertTrue(plan['qualification_commands'])
+        helper = self.plan('Tests/ChecklistCoreTests/QualificationSuite.swift')
+        self.assertEqual(helper['qualification_tests'], list(selector.QUALIFICATION_TESTS))
+
+    def test_full_default_overrides_manifest_auto_qualification(self):
+        plan = self.plan('Package.swift', full=True)
+        self.assertFalse(plan['qualification'])
+        self.assertEqual(plan['qualification_commands'], [])
+
+    def test_qualification_is_a_separate_single_worker_suite(self):
+        plan = self.plan('Sources/ChecklistCore/Store.swift')
+        self.assertIn('CHECKLIST_QUALIFICATION=0', plan['swift_commands'][0])
+        self.assertEqual(len(plan['qualification_commands']), 1)
+        command = plan['qualification_commands'][0]
+        self.assertIn('CHECKLIST_QUALIFICATION=1', command)
+        self.assertEqual(command[command.index('--num-workers') + 1], '1')
+        patterns = [command[i + 1] for i, arg in enumerate(command) if arg == '--filter']
+        for case in selector.QUALIFICATION_TESTS:
+            self.assertTrue(any(re.search(pattern, case) for pattern in patterns), case)
+        self.assertFalse(any(re.search(pattern, 'ChecklistCoreTests.CoreTests/testSmall') for pattern in patterns))
+
+    def test_closed_core_grammar_selects_its_boundary_group(self):
+        plan = self.plan('Sources/ChecklistCore/OrdinaryMentionTokens.swift')
+        self.assertEqual(plan['test_groups']['ChecklistCoreTests'], ['OrdinaryMentionPublicBoundaryTests'])
+        self.assertTrue(plan['qualification'])
+        self.assertEqual(len(plan['default_swift_commands']), 1)
+        self.assertEqual(plan['isolated_test_groups'], [])
+        self.assertIn('^ChecklistCoreTests\\.(?:OrdinaryMentionPublicBoundaryTests)(?:/|$)', plan['swift_commands'][0])
+        self.assertIn('CHECKLIST_TEST_TEMPLATE_ROOT=' + str(self.root / '.build/test-store-templates'), plan['swift_commands'][0])
+
+    def test_new_symbol_reader_invalidates_closed_group(self):
+        (self.root / 'Sources/ChecklistCore/Another.swift').write_text('OrdinaryMentionTokens.parse(body)')
+        plan = self.plan('Sources/ChecklistCore/OrdinaryMentionTokens.swift')
+        self.assertNotIn('ChecklistCoreTests', plan['test_groups'])
+        self.assertTrue(plan['qualification'])
+
+    def test_unmapped_core_input_overrides_narrow_group(self):
+        plan = self.plan('Sources/ChecklistCore/OrdinaryMentionTokens.swift', 'Sources/ChecklistCore/Store.swift')
+        self.assertNotIn('ChecklistCoreTests', plan['test_groups'])
+        self.assertTrue(plan['qualification'])
+        self.assertTrue(plan['isolated_test_groups'])
+        docs = self.plan('Sources/ChecklistCore/OrdinaryMentionTokens.swift', 'README.md')
+        self.assertIn('ChecklistCoreTests', docs['test_groups'])
+        self.assertTrue(docs['qualification'])
+        resource = self.plan('Sources/ChecklistCore/OrdinaryMentionTokens.swift', 'docs/integrations.md')
+        self.assertNotIn('ChecklistCoreTests', resource['test_groups'])
+
+    def test_independent_test_files_select_classes_but_shared_helpers_do_not(self):
+        directory = self.root / 'Tests/ChecklistCoreTests'; directory.mkdir(parents=True)
+        source = directory / 'SmallTests.swift'
+        source.write_text('import XCTest\nfinal class SmallTests: XCTestCase { func testOne() {} }\n')
+        path = source.relative_to(self.root).as_posix()
+        self.assertEqual(self.plan(path)['test_groups']['ChecklistCoreTests'], ['SmallTests'])
+        sibling = directory / 'Other.swift'
+        sibling.write_text('extension SmallTests { func testTwo() {} }')
+        self.assertNotIn('ChecklistCoreTests', self.plan(path)['test_groups'])
+        sibling.unlink()
+        source.write_text('final class SmallTests: XCTestCase { func setupFixture() {} func testOne() {} }')
+        self.assertNotIn('ChecklistCoreTests', self.plan(path)['test_groups'])
+        source.write_text('struct Shared {}\nfinal class SmallTests: XCTestCase { func testOne() {} }')
+        self.assertNotIn('ChecklistCoreTests', self.plan(path)['test_groups'])
+        source.unlink()
+        self.assertNotIn('ChecklistCoreTests', self.plan(path)['test_groups'])
+
+    def test_independent_class_groups_union(self):
+        directory = self.root / 'Tests/ChecklistCoreTests'; directory.mkdir(parents=True)
+        paths = []
+        for name in ['FirstTests', 'SecondTests']:
+            p = directory / (name + '.swift')
+            p.write_text('final class ' + name + ': XCTestCase { func testOne() {} }')
+            paths.append(p.relative_to(self.root).as_posix())
+        self.assertEqual(self.plan(*paths)['test_groups']['ChecklistCoreTests'], ['FirstTests', 'SecondTests'])
+
+    def test_native_git_class_is_isolated_without_omitting_it(self):
+        plan = self.plan(full=True)
+        self.assertEqual(len(plan['swift_commands']), 2)
+        parallel, isolated = plan['swift_commands']
+        self.assertIn('^ChecklistCoreTests\\.SourceGitConfinementTests(?:/|$)', parallel)
+        self.assertIn('--parallel', isolated)
+        self.assertEqual(isolated[isolated.index('--num-workers') + 1], '1')
+        self.assertIn('^ChecklistCoreTests\\.SourceGitConfinementTests(?:/|$)', isolated)
+        self.assertNotIn('--skip', isolated)
+
+    def test_qualification_registry_matches_gated_methods(self):
+        root = Path(__file__).resolve().parents[1]
+        gated = []
+        for source in (root / 'Tests/ChecklistCoreTests').glob('*.swift'):
+            gated.extend(re.findall(r'func (test\w+)\(\) throws \{\s+try QualificationSuite.requireEnabled\(\)', source.read_text()))
+        registered = [name.split('/')[1] for name in selector.QUALIFICATION_TESTS]
+        self.assertCountEqual(gated, registered)
+        self.assertEqual(len(set(registered)), len(registered))
 
     def test_mixed_paths_union_and_empty_paths(self):
         plan = self.plan('./Sources/ChecklistApp/A.swift', 'Sources/ChecklistApp/A.swift', 'script/test_instances.py')

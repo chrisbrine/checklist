@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistCore
 
@@ -9,7 +10,7 @@ final class DirectionContextTests: XCTestCase {
         let parent = try FileManager.default.url(for:.cachesDirectory,in:.userDomainMask,appropriateFor:nil,create:true).appendingPathComponent("ChecklistQualification/CL-24/DirectionContextTests",isDirectory:true)
         try FileManager.default.createDirectory(at:parent,withIntermediateDirectories:true)
         directory = parent.appendingPathComponent(UUID().uuidString)
-        router = try CommandRouter(root:directory.appendingPathComponent("store"))
+        router = try TestStore.router(root:directory.appendingPathComponent("store"))
     }
     override func tearDownWithError() throws { router = nil; try? FileManager.default.removeItem(at:directory) }
     @discardableResult func call(_ method: String,_ params: JSON,_ caller: Caller? = nil) throws -> JSON {

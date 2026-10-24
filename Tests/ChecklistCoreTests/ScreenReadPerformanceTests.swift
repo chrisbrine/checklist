@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -5,6 +6,7 @@ import GRDB
 /// Opt-in qualification against an owned copy of a stopped test slot. No live path default.
 final class ScreenReadPerformanceTests: XCTestCase {
     func testRealSizeScreenReads() throws {
+        try QualificationSuite.requireEnabled()
         let f = try ReadPerformanceFixture("CL-254"), r = f.router
         let project = try f.call("project_create",["name":"Screen performance","key_prefix":"PERF"])
         let pid = project["id"] as! String
@@ -34,6 +36,7 @@ final class ScreenReadPerformanceTests: XCTestCase {
     }
 
     func testOverviewWithRetainedReviewHistory() throws {
+        try QualificationSuite.requireEnabled()
         let f = try ReadPerformanceFixture("CL-254-reviews")
         let project = try f.call("project_create",["name":"Review history","key_prefix":"REV"])
         let pid = project["id"] as! String
@@ -88,7 +91,7 @@ final class ScreenReadPerformanceTests: XCTestCase {
     func testOwnedStoreMeasurements() throws {
         guard let path = ProcessInfo.processInfo.environment["CHECKLIST_READ_BENCHMARK_ROOT"],
               let pid = ProcessInfo.processInfo.environment["CHECKLIST_READ_BENCHMARK_PROJECT_ID"] else { throw XCTSkip("Requires an owned test-slot copy and its project ID") }
-        let router = try CommandRouter(root:URL(fileURLWithPath:path))
+        let router = try TestStore.router(root:URL(fileURLWithPath:path))
         defer {try? router.closeStore()}
         let owner = Caller(role:"owner",installation:"CL-254-measurement",projectIDs:[])
         let tid = try router.dbQueue.read {db in try router.records(db,type:"task",project:pid).first?["id"] as? String ?? ""}

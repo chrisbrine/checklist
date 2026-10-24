@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistCore
 
@@ -27,7 +28,7 @@ final class AgentReviewAssessmentTests: XCTestCase {
     var directory: URL!,workspace: URL!,router: CommandRouter!
     let owner = Caller(role:"owner",installation:"review-fixture-owner",projectIDs:[])
     let critic = Caller(role:"owner",installation:"review-fixture-critic",projectIDs:[])
-    override func setUpWithError() throws {directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString);workspace = directory.appendingPathComponent("workspace");try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true);router = try CommandRouter(root:directory.appendingPathComponent("store"))}
+    override func setUpWithError() throws {directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString);workspace = directory.appendingPathComponent("workspace");try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true);router = try TestStore.router(root:directory.appendingPathComponent("store"))}
     override func tearDownWithError() throws {router = nil;try? FileManager.default.removeItem(at:directory)}
     @discardableResult func call(_ method: String,_ input: JSON,_ actor: Caller? = nil) throws -> JSON {var p = method == "work_submit" ? try fixtureAcceptanceEvidence(router,input:input) : input;if !CommandRouter.readMethods.contains(method) {p["command_id"] = UUID().uuidString};return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:actor ?? owner)["data"] as! JSON}
     func assertCode(_ code: String,_ body: () throws -> Void,file: StaticString = #filePath,line: UInt = #line) {XCTAssertThrowsError(try body(),file:file,line:line) {XCTAssertEqual(($0 as? CoreError)?.code,code,file:file,line:line)}}

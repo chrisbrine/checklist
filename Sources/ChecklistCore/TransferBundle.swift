@@ -16,15 +16,24 @@ struct TransferBundle {
     let blockers: [String]
     let source: StorageObjectFiles
     let identities: [(String,FileIdentity?)]
+    let sourceHashes: [String:String]
 
-    func validateSource() throws {
+    /// Hash the single commit read of each available source, then parse only
+    /// those verified bytes. Metadata alone cannot fence an in-place rewrite.
+    func validateSource() throws -> Self {
         let current = try StorageObjectFiles(root:source.root)
         var original = stat(),selected = stat()
         guard fstat(source.descriptor,&original) == 0,fstat(current.descriptor,&selected) == 0,original.st_dev == selected.st_dev,original.st_ino == selected.st_ino else {throw CoreError("IMPORT_PREVIEW_CHANGED","The selected source folder changed.")}
+        var verified: [String:Data] = [:]
         for (path,identity) in identities {
             let present = try? current.openRegular(path) {FileIdentity(descriptor:$0)}
             guard present == identity else {throw CoreError("IMPORT_PREVIEW_CHANGED","A selected source file changed after it was read.")}
+            if let expected = sourceHashes[path],verified[path] == nil {
+                guard let bytes = try? current.read(path,maximum:Self.byteLimit),hash(bytes) == expected else {throw CoreError("IMPORT_PREVIEW_CHANGED","A selected source file content changed after preparation.",details:["path":path])}
+                verified[path] = bytes
+            }
         }
+        return try Self.read(source:current,format:schema,namespace:namespace,snapshot:verified)
     }
 
     static let formats: Set<String> = ["checklist-project/1","synthetic-board/1","synthetic-client/1","synthetic-media/5"]
@@ -32,9 +41,19 @@ struct TransferBundle {
     static func read(path: String,format: String,namespace: String) throws -> Self {
         guard formats.contains(format),!namespace.isEmpty,namespace.utf8.count <= 500 else {throw CoreError("IMPORT_FORMAT_UNSUPPORTED","Select a supported explicit format/version and a stable source namespace.")}
         let source = try StorageObjectFiles(root:URL(fileURLWithPath:path,isDirectory:true))
+        return try read(source:source,format:format,namespace:namespace,snapshot:nil)
+    }
+    private static func read(source: StorageObjectFiles,format: String,namespace: String,snapshot: [String:Data]?) throws -> Self {
+        func readBytes(_ path: String) throws -> Data {
+            if let snapshot {
+                guard let bytes = snapshot[path] else {throw StorageSnapshotFailure.io}
+                return bytes
+            }
+            return try source.read(path,maximum:byteLimit)
+        }
         let documentPath = format == "checklist-project/1" ? "project.json" : "bundle.json"
         let initialIdentity = try source.openRegular(documentPath) {FileIdentity(descriptor:$0)}
-        let bytes = try source.read(documentPath,maximum:byteLimit)
+        let bytes = try readBytes(documentPath)
         guard initialIdentity == (try source.openRegular(documentPath) {FileIdentity(descriptor:$0)}) else {throw CoreError("IMPORT_PREVIEW_CHANGED","Source changed while reading.")}
         var identities: [(String,FileIdentity?)] = [(documentPath,initialIdentity)]
         guard let doc = try JSONSerialization.jsonObject(with:bytes) as? JSON else {throw CoreError("IMPORT_SHAPE_INVALID","The selected bundle must be an object.")}
@@ -117,7 +136,7 @@ struct TransferBundle {
             // symlink, directory and FIFO inputs. No relinking or external read.
             var data: Data?
             let before = try? source.openRegular(path) {FileIdentity(descriptor:$0)}
-            if !path.hasPrefix("/"),!path.split(separator:"/",omittingEmptySubsequences:false).contains(where:{$0 == ".." || $0 == "." || $0.isEmpty}) {data = try? source.read(path,maximum:byteLimit)}
+            if !path.hasPrefix("/"),!path.split(separator:"/",omittingEmptySubsequences:false).contains(where:{$0 == ".." || $0 == "." || $0.isEmpty}) {data = try? readBytes(path)}
             let after = try? source.openRegular(path) {FileIdentity(descriptor:$0)}
             guard before == after else {throw CoreError("IMPORT_PREVIEW_CHANGED","Source changed while reading a referenced file.")}
             identities.append((path,after))
@@ -127,9 +146,11 @@ struct TransferBundle {
             if data == nil {diagnostic("missing_file",path)}
             files.append(.init(path:path,sha256:data.map(hash),bytes:data,availability:availability))
         }
+        var sourceHashes = Dictionary(uniqueKeysWithValues:files.compactMap {file in file.sha256.map {(file.path,$0)}})
+        sourceHashes[documentPath] = hash(bytes)
         let fileIdentity = files.map {[$0.path,$0.sha256 ?? "unavailable"]}
         let sourceHash = hash(Data((hash(bytes) + (try jsonString(fileIdentity))).utf8))
-        return Self(schema:format,namespace:namespace,document:doc,entries:entries,files:files,sourceHash:sourceHash,diagnostics:diagnostics,blockers:blockers,source:source,identities:identities)
+        return Self(schema:format,namespace:namespace,document:doc,entries:entries,files:files,sourceHash:sourceHash,diagnostics:diagnostics,blockers:blockers,source:source,identities:identities,sourceHashes:sourceHashes)
     }
 
     static func verdicts(_ payload: Any,shape: String) throws -> [JSON] {

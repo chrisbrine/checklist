@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import Foundation
 import GRDB
@@ -16,7 +17,7 @@ final class MediaRoundTests: XCTestCase {
         var worker: Caller
         let project: String
         init() throws {
-            storage = try StorageFixture()
+            storage = try StorageFixture(fast:true)
             base = storage.base;workspace = storage.workspace;root = storage.root
             router = storage.router!;owner = storage.owner
             project = try storage.project()["id"] as! String
@@ -305,7 +306,7 @@ final class MediaRoundTests: XCTestCase {
             var changed = target;changed["title"] = "Overwrite forbidden"
             XCTAssertThrowsError(try f.router.save(db,changed,type:"media_item_target"))
         }
-        try f.router.closeStore();f.router = try CommandRouter(root:f.root)
+        try f.router.closeStore();f.router = try TestStore.router(root:f.root)
         XCTAssertEqual((try f.get(r)["items"] as! [JSON])[0]["disposition"] as? String,"accepted")
     }
     func testNoInferredAcceptanceOrFilePathPublicationAndClosedRoundStaysFrozen() throws {
@@ -448,6 +449,7 @@ final class MediaRoundTests: XCTestCase {
         XCTAssertEqual(try f.allState(),before)
     }
     func testLargeRetainedHistoryDoesNotHoldWriterDuringPreparation() throws {
+        try QualificationSuite.requireEnabled()
         let f = try Fixture(),t = try f.type(schema()),r = try f.round(t),item = try f.item(r)
         let baselineStart = Date()
         let first = try f.call("media_item_update",["item_id":item["id"]!,"expected_revision":item["revision"]!,"title":"Baseline"])

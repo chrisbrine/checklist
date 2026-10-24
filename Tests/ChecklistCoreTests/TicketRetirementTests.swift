@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -13,7 +14,7 @@ final class TicketRetirementTests: XCTestCase {
         directory = parent.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
         directory = directory.resolvingSymlinksInPath()
-        router = try CommandRouter(root:directory)
+        router = try TestStore.router(root:directory)
     }
     override func tearDownWithError() throws {router = nil;try? FileManager.default.removeItem(at:directory)}
     @discardableResult func call(_ method: String,_ input: JSON = [:],_ caller: Caller? = nil) throws -> JSON {

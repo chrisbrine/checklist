@@ -1,15 +1,15 @@
 import XCTest
 @testable import ChecklistApp
-@testable import ChecklistCore
 
 @MainActor final class TicketPagePreparationTests: XCTestCase {
     func testCancelRetiresOnlyMatchingRequestAndPreservesPreparation() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("page-cancel-" + UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let router = try CommandRouter(root: root)
+        // Cancellation/generation logic needs the page protocol, not SQLite.
         let query = TicketPageQuery(surface: "tickets", projectID: nil, text: "", statusFilter: "all", tagFilter: "all", groupBy: "status", orderBy: "manual")
-        let reply = try router.handle(method: "task_list", params: query.parameters(), caller: Caller(role: "owner", installation: "page-cancel", projectIDs: []))
-        let page = try TicketPage(response: reply["data"] as! [String: Any])
+        let page = try TicketPage(response: ["schema_version": 1, "tickets_page": [
+            "query_key": "empty-query", "content_cursor": "empty-content", "tasks": [], "ordinary_ids": [], "triages": [],
+            "scoped_count": 0, "matched_count": 0, "has_more": false, "next_cursor": NSNull(), "previous_cursor": NSNull(),
+            "projects": [], "statuses": [], "tags": [], "epics": [], "outstanding_request_count": 0, "human_task_count": 0,
+            "overview_requests": [], "overview_request_count": 0, "service": ["store_incarnation": "page-fixture"]]])
         var preparation = TicketPagePreparation()
         XCTAssertTrue(preparation.receive(page, for: preparation.begin(query: query)))
         let rows = preparation.prepared(expansion: TicketWorkspaceExpansion())?.rows.count

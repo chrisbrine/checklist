@@ -1,6 +1,8 @@
+import ChecklistTestSupport
 import XCTest
 import AppKit
 import GRDB
+import Darwin
 @testable import ChecklistCore
 
 final class ProjectImportTests: XCTestCase {
@@ -81,6 +83,79 @@ final class ProjectImportTests: XCTestCase {
             XCTAssertEqual(try f.router!.dbQueue.read {try Int.fetchOne($0,sql:"SELECT COUNT(*) FROM records")},count)
         }
     }
+    /// R22B's Before -> AFTER! reproducer: write in place and restore the
+    /// nanosecond mtime, leaving every FileIdentity field unchanged.
+    private func rewritePreservingIdentity(_ file: URL,_ bytes: Data) throws {
+        let before = try XCTUnwrap(FileIdentity(path:file.path))
+        var info = stat();XCTAssertEqual(lstat(file.path,&info),0)
+        XCTAssertEqual(Int64(bytes.count),before.size)
+        let writer = try FileHandle(forWritingTo:file)
+        try writer.write(contentsOf:bytes);try writer.synchronize();try writer.close()
+        var times = [info.st_atimespec,info.st_mtimespec]
+        XCTAssertEqual(utimensat(AT_FDCWD,file.path,&times,0),0)
+        XCTAssertEqual(FileIdentity(path:file.path),before)
+        XCTAssertEqual(try Data(contentsOf:file),bytes)
+    }
+    private func assertPreparedImportRefusesWithoutWrites(_ f: StorageFixture,_ params: JSON,_ prepared: TransferBundle,file: StaticString = #filePath,line: UInt = #line) throws {
+        let router = f.router!
+        let rows = try router.dbQueue.read {try String.fetchAll($0,sql:"SELECT data FROM records ORDER BY id")}
+        let events = try router.dbQueue.read {try Int.fetchOne($0,sql:"SELECT COUNT(*) FROM events")}
+        let commands = try router.dbQueue.read {try Int.fetchOne($0,sql:"SELECT COUNT(*) FROM commands")}
+        let objects = try FileManager.default.contentsOfDirectory(atPath:router.root.appendingPathComponent("objects").path).sorted()
+        // Enter the same post-preparation commit boundary used by import_commit.
+        // This makes the reviewer's gate-controlled race deterministic without
+        // relying on object publication (which now happens after verification).
+        XCTAssertThrowsError(try router.importTransaction(method:"import_commit",params:params,caller:f.owner,command:UUID().uuidString,intent:"fixture",bundle:prepared),file:file,line:line) {
+            XCTAssertEqual(($0 as? CoreError)?.code,"IMPORT_PREVIEW_CHANGED",file:file,line:line)
+        }
+        XCTAssertEqual(try router.dbQueue.read {try String.fetchAll($0,sql:"SELECT data FROM records ORDER BY id")},rows,file:file,line:line)
+        XCTAssertEqual(try router.dbQueue.read {try Int.fetchOne($0,sql:"SELECT COUNT(*) FROM events")},events,file:file,line:line)
+        XCTAssertEqual(try router.dbQueue.read {try Int.fetchOne($0,sql:"SELECT COUNT(*) FROM commands")},commands,file:file,line:line)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath:router.root.appendingPathComponent("objects").path).sorted(),objects,file:file,line:line)
+        XCTAssertTrue(try router.dbQueue.read {try router.records($0,type:"task").isEmpty},file:file,line:line)
+    }
+    func testPreparedCommitRejectsContentChangeWithSameInodeSizeAndMtimeBeforeAnyWrite() throws {
+        let f = try StorageFixture(),p = try f.project()
+        var doc = basic([["id":"A","title":"Before"]]);doc["evidence"] = "payload.bin"
+        let dir = try source(f,doc),payload = Data(repeating:71,count:65_536)
+        try payload.write(to:dir.appendingPathComponent("payload.bin"))
+        var params = try input(f,p,dir)
+        params["preview_digest"] = (try f.call("import_preview",params)["data"] as! JSON)["preview_digest"]
+        let prepared = try TransferBundle.read(path:dir.path,format:format,namespace:"fixture")
+        let file = dir.appendingPathComponent("bundle.json")
+        let original = try Data(contentsOf:file)
+        XCTAssertEqual(prepared.sourceHashes["bundle.json"],ChecklistCore.hash(original))
+        let changed = Data(String(decoding:original,as:UTF8.self).replacingOccurrences(of:"Before",with:"AFTER!").utf8)
+        XCTAssertNotEqual(changed,original)
+        try rewritePreservingIdentity(file,changed)
+        try assertPreparedImportRefusesWithoutWrites(f,params,prepared)
+    }
+    func testOneChangedReferencedFileRejectsWholePreparedCommitBeforeAnyWrite() throws {
+        let f = try StorageFixture(),p = try f.project()
+        var doc = basic();doc["evidence"] = "first.bin";doc["path"] = "second.bin"
+        let dir = try source(f,doc)
+        try Data([1,2,3]).write(to:dir.appendingPathComponent("first.bin"))
+        try Data([4,5,6]).write(to:dir.appendingPathComponent("second.bin"))
+        let params = try input(f,p,dir),prepared = try TransferBundle.read(path:dir.path,format:format,namespace:"fixture")
+        XCTAssertEqual(prepared.sourceHashes.count,3)
+        try rewritePreservingIdentity(dir.appendingPathComponent("second.bin"),Data([7,8,9]))
+        try assertPreparedImportRefusesWithoutWrites(f,params,prepared)
+    }
+    func testUnchangedPreparedSourceVerifiesAndCommits() throws {
+        let f = try StorageFixture(),p = try f.project()
+        var doc = basic([["id":"A","title":"Before"]]);doc["evidence"] = "payload.bin"
+        let dir = try source(f,doc),payload = Data([1,2,3])
+        try payload.write(to:dir.appendingPathComponent("payload.bin"))
+        let prepared = try TransferBundle.read(path:dir.path,format:format,namespace:"fixture")
+        XCTAssertEqual(prepared.sourceHashes["payload.bin"],ChecklistCore.hash(payload))
+        let verified = try prepared.validateSource()
+        XCTAssertEqual(try jsonString(verified.document),try jsonString(doc))
+        XCTAssertEqual(verified.files.first?.bytes,payload)
+        let result = try commit(f,input(f,p,dir))
+        XCTAssertEqual(result["task_count"] as? Int,1)
+        XCTAssertEqual(try f.router!.dbQueue.read {try f.router!.records($0,type:"task").first?["title"] as? String},"Before")
+    }
+
     func testSameCommandAndNewCommandReplayRetainSeparateEqualTextEvents() throws {
         let f = try StorageFixture(),p = try f.project();var doc = basic()
         doc["events"] = [["event_seq":41,"body":"identical"],["event_seq":42,"body":"identical"]]
@@ -189,7 +264,7 @@ final class ProjectImportTests: XCTestCase {
         _ = try f.call("backup_create",["path":after.path])
         let preview = try f.call("restore_preview",["path":after.path])["data"] as! JSON
         let restored = try f.call("restore_create",["path":after.path,"manifest_sha256":preview["manifest_sha256"]!])["data"] as! JSON
-        let root = URL(fileURLWithPath:restored["path"] as! String),copy = try CommandRouter(root:root,serviceLease:StorageServiceLease(root:root));defer {try? copy.closeStore()}
+        let root = URL(fileURLWithPath:restored["path"] as! String),copy = try TestStore.router(root:root,serviceLease:StorageServiceLease(root:root));defer {try? copy.closeStore()}
         XCTAssertEqual(try copy.dbQueue.read {try copy.records($0,type:"import_receipt").first?["id"] as? String},imported["receipt_id"] as? String)
         XCTAssertEqual(try copy.dbQueue.read {try copy.records($0,type:"import_record").count},2)
     }

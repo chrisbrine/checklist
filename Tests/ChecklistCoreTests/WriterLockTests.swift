@@ -5,6 +5,7 @@ import XCTest
 /// calls are bounded. CHECKLIST_CL71_SOURCE_MB sets the synthetic source size (default 32).
 extension EvidenceAuthorityTests {
     func testLargeSubmitBlocksOtherCommandsOnlyBriefly() throws {
+        try QualificationSuite.requireEnabled()
         let megabytes = Int(ProcessInfo.processInfo.environment["CHECKLIST_CL71_SOURCE_MB"] ?? "") ?? 32
         let chunk = Data((0..<(1 << 20)).map { UInt8(truncatingIfNeeded: $0 &* 31) })
         for index in 0..<megabytes { try (chunk + Data("\(index)".utf8)).write(to: workspace.appendingPathComponent("asset-\(index).bin")) }
@@ -30,10 +31,10 @@ extension EvidenceAuthorityTests {
         XCTAssertNil(submitError)
         lock.lock(); let total = submitSeconds; lock.unlock()
         let report: JSON = ["source_mb": megabytes, "submit_seconds": total, "probes": writes.count, "max_write_seconds": writes.max() ?? 0, "max_read_seconds": reads.max() ?? 0,
-                            "median_write_seconds": writes.sorted()[writes.count / 2], "median_read_seconds": reads.sorted()[reads.count / 2]]
+                            "median_write_seconds": try XCTUnwrap(writes.sorted().dropFirst(writes.count / 2).first), "median_read_seconds": try XCTUnwrap(reads.sorted().dropFirst(reads.count / 2).first)]
         let text = try jsonString(report)
         print("CL-71 measurement: " + text)
-        try? Data(text.utf8).write(to: FileManager.default.temporaryDirectory.appendingPathComponent("cl71-measurement-\(megabytes)mb.json"))
+        try? Data(text.utf8).write(to: directory.appendingPathComponent("cl71-measurement-\(megabytes)mb.json"))
         XCTAssertGreaterThanOrEqual(writes.count, 3, "the probe ran while the submission was in progress")
         XCTAssertLessThan(writes.max() ?? .infinity, max(0.5, total * 0.25), "a write waited for the submission's file work")
         XCTAssertLessThan(reads.max() ?? .infinity, max(0.5, total * 0.25), "a read waited for the submission's file work")
@@ -60,6 +61,7 @@ extension EvidenceAuthorityTests {
 
     /// Finding d21e29c2: a reference-mode import reads and hashes its file before the writer.
     func testLargeReferenceImportBlocksOtherCommandsOnlyBriefly() throws {
+        try QualificationSuite.requireEnabled()
         let p = try project(), t = try ready(p), other = try ready(p)
         let file = workspace.appendingPathComponent("large-reference.bin")
         let chunk = Data((0..<(1 << 20)).map { UInt8(truncatingIfNeeded: $0 &* 7) })
@@ -75,6 +77,7 @@ extension EvidenceAuthorityTests {
 
     /// Finding d21e29c2: a review claim validates the captured target before the writer.
     func testReviewClaimValidatesTheCapturedTargetBeforeTheWriter() throws {
+        try QualificationSuite.requireEnabled()
         let chunk = Data((0..<(1 << 20)).map { UInt8(truncatingIfNeeded: $0 &* 13) })
         for index in 0..<128 { try (chunk + Data("\(index)".utf8)).write(to: workspace.appendingPathComponent("captured-\(index).bin")) }
         try git(["init"])

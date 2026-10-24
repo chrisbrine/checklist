@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistApp
 @testable import ChecklistCore
@@ -55,7 +56,7 @@ import XCTest
     func testOwnerPagePreparationCountsCoordinatorAndSidebarRoundTrip() throws {
         let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("active-app-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let router = try CommandRouter(root: root), owner = Caller(role: "owner", installation: "active-app-test", projectIDs: [])
+        let router = try TestStore.router(root: root), owner = Caller(role: "owner", installation: "active-app-test", projectIDs: [])
         func call(_ method: String, _ params: [String: Any]) throws -> [String: Any] {
             var input = params
             if !CommandRouter.readMethods.contains(method) { input["command_id"] = UUID().uuidString }

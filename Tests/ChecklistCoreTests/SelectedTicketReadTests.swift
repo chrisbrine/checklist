@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -13,7 +14,7 @@ final class SelectedTicketReadTests: XCTestCase {
         let parent=FileManager.default.urls(for:.cachesDirectory,in:.userDomainMask).first!.appendingPathComponent("ChecklistSyntheticTests")
         try FileManager.default.createDirectory(at:parent,withIntermediateDirectories:true)
         root=parent.appendingPathComponent("CL20-selected-"+UUID().uuidString)
-        router = try CommandRouter(root:root)
+        router = try TestStore.router(root:root)
         pid = try call("project_create",["name":"Synthetic Selected","key_prefix":"S","root_path":root.path])["id"] as! String
         try write {db in
             try router.save(db,["id":"queued","project_id":pid,"name":"Queued","category":"queued","revision":1],type:"status")

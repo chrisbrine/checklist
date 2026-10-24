@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistCore
 
@@ -8,7 +9,7 @@ final class PlaytestBundleTests: XCTestCase {
     override func setUpWithError() throws {
         directory = FileManager.default.urls(for:.cachesDirectory,in:.userDomainMask)[0].appendingPathComponent("ChecklistCoreTests").appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true)
-        router = try CommandRouter(root:directory.appendingPathComponent("store"))
+        router = try TestStore.router(root:directory.appendingPathComponent("store"))
     }
     override func tearDownWithError() throws { router = nil;try? FileManager.default.removeItem(at:directory) }
     @discardableResult func call(_ method: String,_ input: JSON,_ actor: Caller? = nil) throws -> JSON {
@@ -56,7 +57,7 @@ final class PlaytestBundleTests: XCTestCase {
         XCTAssertEqual(b.files.count,5);XCTAssertEqual((e["artifact_refs"] as? [JSON])?.count,5);XCTAssertNotNil(UUID(uuidString:raw["id"] as! String))
         XCTAssertEqual(m["digest"] as? String,ChecklistCore.hash(Data(try jsonString(e).utf8)))
         for ref in b.files { let file = try record(ref["artifact_id"]!,"attachment");XCTAssertEqual(file["sha256"] as? String,ref["sha256"] as? String) }
-        router = try CommandRouter(root:directory.appendingPathComponent("store"))
+        router = try TestStore.router(root:directory.appendingPathComponent("store"))
         let current = try record(t["id"]!,"task")
         _ = try router.dbQueue.read { try router.validateManifestTarget($0,task:current,manifestID:s["manifest_id"] as! String) }
     }

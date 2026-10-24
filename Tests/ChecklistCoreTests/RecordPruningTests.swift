@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -37,7 +38,7 @@ extension CoreTests {
         let old = try SealedCursor.seal(sequence: 3, created: Date().timeIntervalSince1970 - SealedCursor.maximumAge - 1, binding: binding, key: router.cursorKey)
         assertCode("CURSOR_RESET") { _ = try self.router.dbQueue.read { db in try self.router.cursorSequence(db, ["cursor": old], caller: self.owner, scope: scope) } }
         // The key lives in the store, so a service restart keeps open views valid.
-        router = nil; router = try CommandRouter(root: directory)
+        router = nil; router = try TestStore.router(root: directory)
         XCTAssertNoThrow(try router.dbQueue.read { db in _ = try router.cursorSequence(db, ["cursor": token], caller: owner, scope: scope) })
     }
 

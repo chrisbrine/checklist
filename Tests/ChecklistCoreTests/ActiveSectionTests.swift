@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -14,7 +15,7 @@ final class ActiveSectionTests: XCTestCase {
 
     override func setUpWithError() throws {
         root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("active-section-" + UUID().uuidString)
-        router = try CommandRouter(root: root)
+        router = try TestStore.router(root: root)
         pid = try call("project_create", ["name": "Active section fixture", "key_prefix": "AS", "root_path": root.path])["id"] as! String
         try write { db in
             for category in self.members where category != "draft" {

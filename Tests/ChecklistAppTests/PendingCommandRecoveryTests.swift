@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import Security
 @testable import ChecklistApp
@@ -27,7 +28,7 @@ import ChecklistIPC
                 .deletingLastPathComponent().deletingLastPathComponent()
                 .appendingPathComponent(".build/recovery-" + UUID().uuidString)
             self.defaults = defaults
-            router = try CommandRouter(root: root)
+            router = try TestStore.router(root: root)
             let info = try router.handle(method: "service_info", params: [:], caller: owner)["data"] as! [String: Any]
             incarnation = info["store_incarnation"] as! String
             defaults.preferences.set(Page.epics.rawValue, forKey: "lastPage")

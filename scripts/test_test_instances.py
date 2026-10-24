@@ -74,9 +74,9 @@ class TestInstancesTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError): harness.slot_number(invalid)
 
     def test_seed_arguments_are_validated_before_slot_changes(self):
-        for value in ['empty', 'latest-backup', 'backup:/owned/snapshot', 'slot:1', 'slot:4']:
+        for value in ['empty', 'latest-backup', 'backup:/owned/snapshot', 'restored:/owned/restore/restored-job', 'slot:1', 'slot:4']:
             self.assertEqual(harness.seed_value(value), value)
-        for value in ['backup:', 'slot:0', 'slot:5', 'slot:01', 'other']:
+        for value in ['backup:', 'restored:', 'slot:0', 'slot:5', 'slot:01', 'other']:
             with self.subTest(value=value), self.assertRaises(ValueError): harness.seed_value(value)
 
     def test_exact_paths_and_names(self):
@@ -627,6 +627,180 @@ class SnapshotLogicTests(unittest.TestCase):
             identity = harness.database_observation(source / 'database.sqlite')['identity']
             harness.snapshot_seed(source, destination)
             self.assertEqual(json.loads((destination / 'checklist-store.identity.json').read_text()), identity)
+
+
+class RestoredSeedTests(unittest.TestCase):
+    def fixture(self, base):
+        source = base / 'restore' / ('restored-' + 'a' * 32); source.mkdir(parents=True)
+        records = [('session', {'id': 'session', 'state': 'revoked', 'authorization_generation': 'new-generation', 'restore_quarantined': True}),
+                   ('task', {'id': 'task', 'active_attempt_id': 'attempt', 'recovery_required': True}),
+                   ('attempt', {'id': 'attempt', 'state': 'active', 'recovery_required': True}),
+                   ('delivery', {'id': 'delivery', 'state': 'quarantined', 'push_state': 'quarantined', 'restore_prior_state': 'queued'})]
+        identity = store_fixture(source / 'checklist.sqlite', 3, records)
+        receipt = {'format': 1, 'state': 'complete', 'command_id': '10000000-0000-4000-8000-000000000001',
+                   'principal': 'owner:fixture', 'intent_digest': 'b' * 64, 'manifest_sha256': 'c' * 64,
+                   'source_store_id': identity['logical_store_id'], 'incarnation': identity['incarnation'],
+                   'restored_at': '2026-10-24T00:00:00Z', 'dispatch': 'quarantined'}
+        with closing(sqlite3.connect(source / 'checklist.sqlite')) as db, db:
+            db.create_collation('checklist_storage_v2', lambda a, b: (a.encode() > b.encode()) - (a.encode() < b.encode()))
+            db.executemany('INSERT INTO metadata VALUES (?,?)', [('incarnation', identity['incarnation']), ('restore_receipt', json.dumps(receipt))])
+        (source / 'checklist-store.identity.json').write_text(json.dumps(identity))
+        receipt['database_sha256'] = harness.sha(source / 'checklist.sqlite')
+        (source / 'restore-receipt.json').write_text(json.dumps(receipt))
+        (source / 'objects').mkdir();(source / 'objects/file').write_bytes(b'managed')
+        destination = base / 'copy';destination.mkdir()
+        return source, destination, receipt
+
+    def test_valid_seed_preserves_bytes_incarnation_fences_and_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination, receipt = self.fixture(Path(directory).resolve())
+            original = harness.restored_inventory(source)
+            seed = harness.restored_seed(source, destination)
+            self.assertEqual(harness.restored_inventory(destination), original)
+            self.assertEqual(harness.restored_inventory(source), original)
+            self.assertEqual(seed['kind'], 'restored')
+            self.assertEqual(seed['restore_job'], receipt['command_id'])
+            self.assertEqual(seed['database_sha256'], harness.sha(destination / 'checklist.sqlite'))
+            self.assertEqual(seed['receipt_sha256'], harness.sha(source / 'restore-receipt.json'))
+            self.assertEqual(seed['manifest_sha256'], receipt['manifest_sha256'])
+            self.assertTrue(seed['current_schema_no_migration'])
+            self.assertEqual(seed['before_start']['identity']['incarnation'], receipt['incarnation'])
+            with closing(sqlite3.connect(destination / 'checklist.sqlite')) as db:
+                values = {kind: json.loads(raw) for kind, raw in db.execute('SELECT type,data FROM records')}
+            self.assertEqual(values['session']['state'], 'revoked')
+            self.assertTrue(values['attempt']['recovery_required'])
+            self.assertTrue(values['task']['recovery_required'])
+            self.assertEqual(values['delivery']['state'], 'quarantined')
+
+    def test_unvalidated_and_non_restore_folders_refuse(self):
+        for fault in ['no_receipt', 'incomplete', 'non_restore', 'staging', 'identity', 'database', 'db_receipt']:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve(); source, destination, receipt = self.fixture(base)
+                if fault == 'no_receipt': (source / 'restore-receipt.json').unlink()
+                elif fault == 'incomplete':
+                    receipt['state'] = 'pending';(source / 'restore-receipt.json').write_text(json.dumps(receipt))
+                elif fault in ['non_restore', 'staging']:
+                    target = base / ('non-restore' if fault == 'non_restore' else '.restore-staging-' + 'a' * 32)
+                    source.rename(target);source = target
+                elif fault == 'identity': (source / 'checklist-store.identity.json').write_text('{}')
+                elif fault == 'database':
+                    with (source / 'checklist.sqlite').open('ab') as file: file.write(b'changed')
+                else:
+                    receipt['principal'] = 'other';(source / 'restore-receipt.json').write_text(json.dumps(receipt))
+                with self.assertRaises(ValueError): harness.restored_seed(source, destination)
+                self.assertEqual(list(destination.iterdir()), [])
+
+    def test_live_default_live_traversal_and_alias_refuse_before_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve();live = base / 'live';default = base / 'default';live.mkdir();default.mkdir()
+            (base / 'alias').symlink_to(live)
+            with patch.object(harness, 'LIVE', live), patch.object(harness, 'DEFAULT_LIVE', default), patch.object(harness, 'restored_inventory') as inventory:
+                for source in [live, live / 'restore/restored-job', default, base / 'alias', base / 'x/../restore/restored-job']:
+                    with self.subTest(source=source), self.assertRaises(ValueError): harness.restored_seed(source, base / 'copy')
+                inventory.assert_not_called()
+
+    def test_runtime_credentials_wal_unsafe_paths_and_special_files_refuse(self):
+        for fault in ['connections.json', 'checklist.sqlite-wal', 'symlink', 'directory_link', 'fifo']:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                source, destination, _ = self.fixture(Path(directory).resolve())
+                if fault == 'symlink': (source / 'objects/link').symlink_to('/etc/passwd')
+                elif fault == 'directory_link': (source / 'objects/alias').symlink_to(destination, target_is_directory=True)
+                elif fault == 'fifo': os.mkfifo(source / 'objects/fifo')
+                else: (source / fault).write_text('not a restored publication')
+                with self.assertRaises(ValueError): harness.restored_seed(source, destination)
+                self.assertEqual(list(destination.iterdir()), [])
+
+    def test_capture_links_are_copied_without_following(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination, _ = self.fixture(Path(directory).resolve())
+            capture = source / 'source-captures/project/capture/source';capture.mkdir(parents=True)
+            (capture / 'file').write_bytes(b'capture');(capture / 'link').symlink_to('file')
+            harness.restored_seed(source, destination)
+            self.assertTrue((destination / 'source-captures/project/capture/source/link').is_symlink())
+
+    def test_capture_links_cannot_escape_cycle_or_target_missing_bytes(self):
+        for target in ['../../../../outside', 'missing', 'link']:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                source, destination, _ = self.fixture(Path(directory).resolve())
+                capture = source / 'source-captures/project/capture/source';capture.mkdir(parents=True)
+                (capture / 'link').symlink_to(target)
+                with self.assertRaises(ValueError): harness.restored_seed(source, destination)
+                self.assertEqual(list(destination.iterdir()), [])
+
+    def test_restored_start_uses_normal_signed_preflight_and_service(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve() / 'slots'):
+            base = Path(directory).resolve();p = harness.checked(4);p['data'].mkdir(parents=True)
+            source, destination, _ = self.fixture(base)
+            seed = harness.restored_seed(source, destination, p['data'])
+            harness.shutil.copytree(destination, p['data'], dirs_exist_ok=True)
+            harness.save(p, {'slot': 4, 'stage_path': str(base / 'stage'), 'mode': 'stopped', 'seed': seed})
+            before = harness.sha(p['data'] / 'checklist.sqlite')
+            with patch.object(harness, 'bundle_check', return_value={}) as bundle, patch.object(harness, 'require_managed_path_support') as stage, patch.object(harness, 'launch_state', return_value={'registered': False}), patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}), patch.object(harness, 'service_status') as health, patch.object(harness, 'run') as run:
+                harness.start(SimpleNamespace(slot=4, gui=False), p)
+            bundle.assert_called_once();stage.assert_called_once();health.assert_called_once()
+            self.assertEqual(run.call_args.args[0][:2], ['launchctl', 'bootstrap'])
+            self.assertEqual(harness.sha(p['data'] / 'checklist.sqlite'), before)
+            self.assertEqual(harness.load(p)['mode'], 'headless')
+
+    def test_copy_corruption_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination, _ = self.fixture(Path(directory).resolve())
+            copytree = harness.shutil.copytree
+            def corrupt(*args, **kwargs):
+                result = copytree(*args, **kwargs)
+                (destination / 'objects/file').write_bytes(b'changed')
+                return result
+            with patch.object(harness.shutil, 'copytree', side_effect=corrupt):
+                with self.assertRaisesRegex(ValueError, 'copy verification'): harness.restored_seed(source, destination)
+
+    def test_existing_path_checks_still_apply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination, receipt = self.fixture(Path(directory).resolve())
+            with closing(sqlite3.connect(source / 'checklist.sqlite')) as db, db:
+                db.create_collation('checklist_storage_v2', lambda a, b: (a.encode() > b.encode()) - (a.encode() < b.encode()))
+                db.execute('INSERT INTO records VALUES (?,?,?,?,?)', ('bad', None, 'attachment', 1, json.dumps(attachment('objects/../escape'))))
+            receipt['database_sha256'] = harness.sha(source / 'checklist.sqlite')
+            (source / 'restore-receipt.json').write_text(json.dumps(receipt))
+            with self.assertRaisesRegex(ValueError, 'malformed root-relative'): harness.restored_seed(source, destination)
+
+    def test_same_slot_replacement_verifies_copy_before_destroy(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve() / 'slots'):
+            base = Path(directory).resolve();p = harness.checked(4);p['data'].mkdir(parents=True)
+            source, _, receipt = self.fixture(p['data'])
+            original = harness.restored_inventory(source)
+            harness.save(p, {'slot': 4, 'build_id': 'old'})
+            stage = base / 'stage';info = stage / 'Checklist.app/Contents/Info.plist';info.parent.mkdir(parents=True)
+            info.write_bytes(plistlib.dumps({'CFBundleExecutable': 'ChecklistApp'}))
+            selected = {'build_id': 'fixture', 'source_fingerprint': 'b' * 64, 'signing_profile': 'ad-hoc'}
+            retired = base / 'retired'
+            def destroy(slot):
+                prepared = list(harness.BASE.glob('.restored-seed-*/data'))
+                self.assertEqual(len(prepared), 1)
+                self.assertEqual(harness.restored_inventory(prepared[0]), original)
+                slot['folder'].rename(retired)
+            def run(command):
+                if command[0] == 'ditto': harness.shutil.copytree(command[1], command[2])
+                return subprocess.CompletedProcess(command, 0, '', '')
+            args = SimpleNamespace(slot=4, seed='restored:' + str(source), replace=True, session_id='fixture-session')
+            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(stage, selected)), patch.object(harness, 'require_managed_path_support'), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'signing_teams'), patch.object(harness, 'destroy', side_effect=destroy), patch.object(harness, 'run', side_effect=run):
+                harness.create(args, p)
+            seed = harness.load(p)['seed']
+            self.assertEqual(seed['kind'], 'restored')
+            self.assertEqual(seed['before_start']['identity']['incarnation'], receipt['incarnation'])
+            self.assertEqual(harness.restored_inventory(p['data']), original)
+            self.assertEqual(harness.restored_inventory(retired / 'data' / 'restore' / source.name), original)
+            self.assertEqual(list(harness.BASE.glob('.restored-seed-*')), [])
+
+    def test_refused_restore_preserves_existing_slot(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve() / 'slots'):
+            base = Path(directory).resolve();p = harness.checked(4);p['folder'].mkdir(parents=True)
+            harness.save(p, {'slot': 4, 'build_id': 'old'})
+            selected = {'source_fingerprint': 'b' * 64}
+            args = SimpleNamespace(slot=4, seed='restored:' + str(base / 'not-restored'), replace=True, session_id='fixture-session')
+            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(base, selected)), patch.object(harness, 'require_managed_path_support'), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'destroy') as destroy, patch.object(harness, 'run') as run:
+                with self.assertRaises(ValueError): harness.create(args, p)
+                destroy.assert_not_called();run.assert_not_called()
+            self.assertEqual(harness.load(p)['build_id'], 'old')
 
 
 class SeedIsolationTests(unittest.TestCase):
@@ -1249,6 +1423,123 @@ class SeedIsolationTests(unittest.TestCase):
             self.assertEqual(seed['path_inspection']['inert_metadata_path_occurrences'], 3)
             self.assertEqual(seed['path_inspection']['managed_relative'], 1)
             self.assertEqual(harness.sha(destination / 'checklist.sqlite'), manifest['databaseSHA256'])
+
+    def storage_summary_fixture(self, base, key, value, records=()):
+        data = base / 'slot-4/data';data.mkdir(parents=True)
+        database = data / 'checklist.sqlite';store_fixture(database, 3, records)
+        with closing(sqlite3.connect(database)) as db, db:
+            db.create_collation('checklist_storage_v2', lambda a, b: (a.encode() > b.encode()) - (a.encode() < b.encode()))
+            db.execute('INSERT INTO metadata VALUES (?,?)', (key, json.dumps(value)))
+        return database, data
+
+    def storage_copy_summary(self, key, path, source_root):
+        # StorageRecovery/StorageRestore summaries passed to recordStorageCopyObservation.
+        summary = {'kind': 'backup' if key.endswith('-backup') else 'restore_copy',
+                   'operation_id': '40000000-0000-4000-8000-000000000004', 'path': str(path),
+                   'source_root': str(source_root), 'store_id': '20000000-0000-4000-8000-000000000002',
+                   'captured_at': '2026-10-24T00:00:00Z', 'verified_at': '2026-10-24T00:01:00Z',
+                   'verification': 'manifest_database_managed_files', 'manifest_sha256': 'a' * 64,
+                   'usage': {'logical_bytes': 100, 'allocated_file_bytes': 4096, 'file_count': 3,
+                             'measured_at': '2026-10-24T00:01:00Z',
+                             'scope': 'verified_copy_files_excluding_directories',
+                             'exclusive_physical_bytes': None, 'physical_reclaimable_bytes': None,
+                             'shared_extents': 'not_deduplicated', 'availability': 'not_rechecked'}}
+        if key.endswith('-rehearsal'):
+            summary.update(verification='copy_integrity_and_authority_fencing', native_startup_verified=False)
+        return summary
+
+    def test_storage_summary_inside_slot_is_inert_without_filesystem_access(self):
+        for key, immutable, source in itertools.product(
+                ['storage-last-verified-backup', 'storage-last-verified-rehearsal'], [True, False], ['data', 'source']):
+            with self.subTest(key=key, immutable=immutable, source=source), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve()
+                summary = base / 'slot-4/backup'
+                source_root = base / 'slot-4' / source
+                database, data = self.storage_summary_fixture(base, key, self.storage_copy_summary(key, summary, source_root))
+                # Even a symlink is only summary text: never follow or open it.
+                summary.symlink_to(base / 'outside')
+                if source == 'source': source_root.symlink_to(base / 'outside-source')
+                before = harness.sha(database)
+                with ExitStack() as stack:
+                    for name in ['stat', 'lstat', 'resolve', 'open']:
+                        stack.enter_context(patch.object(Path, name, side_effect=AssertionError('summary path was accessed')))
+                    stack.enter_context(patch.object(harness, 'contained', side_effect=AssertionError('summary path was inspected')))
+                    result = harness.require_local_paths(database, data, immutable=immutable)
+                self.assertEqual(result['inert_metadata_path_occurrences'], 2)
+                self.assertEqual(harness.sha(database), before)
+
+    def test_storage_summary_outside_relative_and_traversing_paths_keep_errors(self):
+        for key, immutable, field, case in itertools.product(
+                ['storage-last-verified-backup', 'storage-last-verified-rehearsal'], [True, False], ['path', 'source_root'],
+                ['outside', 'sibling', 'live', 'other_slot', 'relative', 'traversing', 'dot', 'empty_component', 'nul', 'url']):
+            with self.subTest(key=key, immutable=immutable, field=field, case=case), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve()
+                value = {'outside': str(base / 'outside/backup'), 'sibling': str(base / 'slot-40/backup'),
+                         'live': str(harness.LIVE), 'other_slot': str(base / 'slot-3/data'),
+                         'relative': 'slot-4/backup', 'traversing': str(base / 'slot-4') + '/data/../backup',
+                         'dot': str(base / 'slot-4') + '/./backup', 'empty_component': str(base / 'slot-4') + '//backup',
+                         'nul': str(base / 'slot-4/backup') + '\0', 'url': (base / 'slot-4/backup').as_uri()}[case]
+                summary = self.storage_copy_summary(key, base / 'slot-4/backup', base / 'slot-4/data')
+                summary[field] = value
+                database, data = self.storage_summary_fixture(base, key, summary)
+                cause = ('a stored absolute path outside the destination slot root' if case in ['outside', 'sibling', 'live', 'other_slot'] else
+                         'a stored file URL' if case == 'url' else 'a relative, malformed or traversing stored file path')
+                with self.assertRaises(ValueError) as raised:
+                    harness.require_local_paths(database, data, immutable=immutable)
+                self.assertEqual(str(raised.exception), 'Seed contains ' + cause + ' (metadata.value.' + field + '). ' + harness.RELOCATION_REQUIRED)
+
+    def test_storage_summary_exception_does_not_relax_other_strict_fields(self):
+        for case in ['unknown_metadata', 'other_field', 'nested_path', 'record_path']:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve();value = str(base / 'slot-4/backup')
+                key = 'unknown' if case == 'unknown_metadata' else 'storage-last-verified-backup'
+                summary = {'path': value}
+                records = ()
+                if case == 'other_field': summary = {'database_path': value}
+                if case == 'nested_path': summary = {'nested': {'path': value}}
+                if case == 'record_path':
+                    summary = {'path': value};records = [('fixture', {'id': 'fixture', 'path': value})]
+                database, data = self.storage_summary_fixture(base, key, summary, records)
+                with self.assertRaisesRegex(ValueError, 'a stored absolute path outside the destination slot root'):
+                    harness.require_local_paths(database, data)
+
+    def test_storage_summary_source_root_exception_stays_top_level_and_metadata_only(self):
+        for case in ['unknown_metadata', 'nested', 'record']:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve()
+                key = 'unknown' if case == 'unknown_metadata' else 'storage-last-verified-backup'
+                summary = {'source_root': str(harness.LIVE)}
+                records = ()
+                if case == 'nested': summary = {'nested': summary}
+                if case == 'record':
+                    records = [('fixture', {'id': 'fixture', **summary})]
+                    summary = self.storage_copy_summary(key, base / 'slot-4/backup', base / 'slot-4/data')
+                database, data = self.storage_summary_fixture(base, key, summary, records)
+                with self.assertRaisesRegex(ValueError, 'a project reference into a Checklist data root'):
+                    harness.require_local_paths(database, data)
+
+    def test_start_and_check_accept_inside_slot_storage_summary(self):
+        for key in ['storage-last-verified-backup', 'storage-last-verified-rehearsal']:
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve()
+                self.storage_summary_fixture(base, key, self.storage_copy_summary(key, base / 'slot-4/backup', base / 'slot-4/data'))
+                with patch.object(harness, 'BASE', base):
+                    p = harness.checked(4)
+                metadata = {'slot': 4, 'stage_path': str(base / 'stage'), 'build_id': 'fixture',
+                            'source_fingerprint': 'fixture', 'seed': {'kind': 'backup'}, 'mode': 'stopped'}
+                harness.save(p, metadata)
+                healthy = {'data': {'name': 'Checklist', 'version': 'fixture', 'capabilities': ['durable_store']}}
+                with patch.object(harness, 'BASE', base), patch.object(harness, 'bundle_check', return_value={}), patch.object(harness, 'require_managed_path_support'), \
+                     patch.object(harness, 'launch_state', return_value={'registered': True}), \
+                     patch.object(harness, 'service_status', return_value=healthy), \
+                     patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}), \
+                     patch.object(harness, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run, \
+                     redirect_stdout(io.StringIO()):
+                    harness.start(SimpleNamespace(slot=4, gui=False), p)
+                    harness.check(p)
+                self.assertEqual(harness.load(p)['mode'], 'headless')
+                self.assertTrue(harness.load(p)['checks']['passed'])
+                self.assertEqual(run.call_count, 2)  # Only mocked CLI/MCP smokes, no native process.
 
     def test_capture_lookup_local_targets_and_unknown_metadata_keep_refusals(self):
         for number, (key, value) in enumerate([

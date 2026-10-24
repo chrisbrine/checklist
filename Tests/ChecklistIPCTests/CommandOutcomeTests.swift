@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -10,7 +11,7 @@ final class CommandOutcomeTests: XCTestCase {
     override func setUpWithError() throws {
         let parent=FileManager.default.temporaryDirectory.appendingPathComponent("ChecklistSyntheticTests")
         try FileManager.default.createDirectory(at:parent,withIntermediateDirectories:true)
-        root=parent.appendingPathComponent("command-outcome-"+UUID().uuidString);router=try CommandRouter(root:root)
+        root=parent.appendingPathComponent("command-outcome-"+UUID().uuidString);router=try TestStore.router(root:root)
     }
     override func tearDownWithError() throws { router = nil; try? FileManager.default.removeItem(at: root) }
     func call(_ method: String, _ p: [String: Any] = [:]) throws -> [String: Any] {

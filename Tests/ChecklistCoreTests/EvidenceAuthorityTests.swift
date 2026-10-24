@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistCore
 
@@ -13,7 +14,7 @@ final class EvidenceAuthorityTests: XCTestCase {
         directory = parent.appendingPathComponent("EvidenceAuthorityTests-" + UUID().uuidString, isDirectory: true)
         workspace = directory.appendingPathComponent("workspace")
         try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
-        router = try CommandRouter(root:directory.appendingPathComponent("store"))
+        router = try TestStore.router(root:directory.appendingPathComponent("store"))
     }
     override func tearDownWithError() throws { router = nil;try? FileManager.default.removeItem(at:directory) }
     @discardableResult func call(_ method: String,_ input: JSON,_ caller: Caller? = nil,command: String? = nil) throws -> JSON {

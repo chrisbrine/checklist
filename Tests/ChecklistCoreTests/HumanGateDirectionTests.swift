@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistCore
 
@@ -5,7 +6,7 @@ final class HumanGateDirectionTests: XCTestCase {
     var root: URL!
     var router: CommandRouter!
     let owner = Caller(role:"owner",installation:"human-gate-directions",projectIDs:[])
-    override func setUpWithError() throws { root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString);router = try CommandRouter(root:root) }
+    override func setUpWithError() throws { root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString);router = try TestStore.router(root:root) }
     override func tearDownWithError() throws { router = nil;try? FileManager.default.removeItem(at:root) }
     @discardableResult func call(_ method: String,_ params: JSON = [:]) throws -> JSON {
         var input = params;if !CommandRouter.readMethods.contains(method) { input["command_id"] = uuid() }

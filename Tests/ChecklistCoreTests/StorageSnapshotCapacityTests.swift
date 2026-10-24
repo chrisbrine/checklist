@@ -142,6 +142,7 @@ final class StorageSnapshotCapacityTests: XCTestCase {
     }
 
     func testMoreThanThirtyThousandObjectsAndEightMiBManifestRoundTripWithoutPruning() throws {
+        try QualificationSuite.requireEnabled()
         let f = try Fixture(), source = f.root.appendingPathComponent("source-captures/project/capture/source")
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
         let bytes = Data("retained evidence".utf8), sha = StorageObjectFiles.sha(bytes)

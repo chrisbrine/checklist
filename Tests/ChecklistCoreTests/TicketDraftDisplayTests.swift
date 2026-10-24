@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistCore
 
@@ -11,7 +12,7 @@ final class TicketDraftDisplayTests: XCTestCase {
         root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("ChecklistQualification/CL-156/" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        router = try CommandRouter(root: root)
+        router = try TestStore.router(root: root)
         project = try call("project_create", ["name": "Synthetic Draft display", "key_prefix": "DRAFT", "root_path": root.path])["id"] as! String
     }
     override func tearDownWithError() throws { router = nil; try FileManager.default.removeItem(at: root) }

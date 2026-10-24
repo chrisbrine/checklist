@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import Foundation
 import GRDB
@@ -11,7 +12,7 @@ final class ConnectionRegistrationTests: XCTestCase {
     override func setUpWithError() throws {
         if ProcessInfo.processInfo.environment["CL82_CHILD_MODE"] != nil { return }
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        router = try CommandRouter(root: root)
+        router = try TestStore.router(root: root)
     }
     override func tearDownWithError() throws { router = nil; if let root { try? FileManager.default.removeItem(at: root) } }
     func call(_ method: String, _ p: JSON) throws -> JSON {
@@ -129,7 +130,7 @@ final class ConnectionRegistrationTests: XCTestCase {
             try process.run(); process.waitUntilExit()
             let diagnostics = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
             XCTAssertEqual(process.terminationReason, .uncaughtSignal, diagnostics); XCTAssertEqual(process.terminationStatus, SIGKILL, diagnostics)
-            router = try CommandRouter(root: root)
+            router = try TestStore.router(root: root)
             let count = try receiptCount(original["command_id"] as! String)
             if mode == "after_commit" {
                 XCTAssertEqual(count, 1); XCTAssertTrue(try current(original, sid: f.sid))
@@ -152,7 +153,7 @@ final class ConnectionRegistrationTests: XCTestCase {
         guard directory.path.hasPrefix(temporary + "/"), try Data(contentsOf: directory.appendingPathComponent(".cl82-fixture")) == Data("CL82_DISPOSABLE_FAULT_TEST_ONLY".utf8) else { throw CoreError("FIXTURE_ROOT_REQUIRED", "Refusing any non-disposable fault root") }
         let input = try JSONSerialization.jsonObject(with: Data(contentsOf: directory.appendingPathComponent("crash-inputs.json"))) as! JSON
         let original = input["intent"] as! JSON, pid = input["project_id"] as! String, sid = input["session_id"] as! String
-        let child = try CommandRouter(root: directory); var armed = false
+        let child = try TestStore.router(root: directory); var armed = false
         if mode == "before_commit" {
             child.dbQueue.writeWithoutTransaction { db in db.trace { event in
                 if armed && event.description.uppercased().hasPrefix("COMMIT") { raise(SIGKILL) }

@@ -14,7 +14,7 @@ The script prints commands; it does not execute them. JSON contains argv arrays 
 
 ## Target selection
 
-The selector reads `swift package describe --type json` and caches the result under `<scratch-path>/affected-tests/<Package.swift SHA-256>.json`. A manifest change invalidates the cache. It uses target paths from that graph, including custom paths and nested fixture targets, and follows reverse `target_dependencies` transitively. Graph closure for a changed test target selects itself, without selecting tests of its dependencies; explicit file readers can add other consumers. The named runtime-consumer map also selects Core tests for `StorageCrashProbe` (including its nested released fixture) and MCPServer tests for `ChecklistCLIInputProbe`. The tests launch or copy these executables at runtime without a SwiftPM dependency. The shipping CLI is imported by CLI tests; the MCP shim tests launch the input probe instead. Source-inspection dependencies also select App tests when Service, CLI, Bridges or Core test sources change (the glossary checks enumerate those trees). App source selects `ChecklistAppTests`; Core source currently selects App, Bridges, CLI, Core, IPC and MCPServer tests. Providers tests are selected when Providers or one of their dependencies changes.
+The selector reads `swift package describe --type json` and caches the result under `<scratch-path>/affected-tests/<Package.swift SHA-256>.json`. A manifest change invalidates the cache. It uses target paths from that graph, including custom paths and nested fixture targets, and follows reverse `target_dependencies` transitively. Graph closure for a changed test target selects itself, without selecting tests of its dependencies; explicit file readers can add other consumers. The named runtime-consumer map also selects Core tests for `StorageCrashProbe` (including its nested released fixture) and MCPServer tests for `ChecklistCLIInputProbe`. The tests launch or copy these executables at runtime without a SwiftPM dependency. The shipping CLI is imported by CLI tests; the MCP shim tests launch the input probe instead. Source-inspection dependencies also select App tests when Service, CLI, Bridges or Core test sources change (the glossary checks enumerate those trees). App source selects `ChecklistAppTests`, its extracted App test targets and bundle-identity consumers. Core source selects its transitive App, Bridges, CLI, IPC, MCPServer, Service and Providers test consumers. Use `test_targets` from the actual graph for the complete list.
 
 Each selected test target gets an anchored `--filter` in the generated `swift test` command; SwiftPM combines these filters. Python sources select their corresponding `scripts/test_<stem>.py` (hyphens become underscores), Python test files select themselves, and named shared Python helpers have explicit test owners. The validator selects its own shape/reference checks. `FILE_TEST_CONSUMERS` and `FILE_PYTHON_TEST_CONSUMERS` map repository inputs to every Swift test target and Python test script that reads them at runtime, before applying validation-only rules. Shared inputs select the union of both maps and any SwiftPM resource consumers; one known reader never excludes another:
 
@@ -36,17 +36,88 @@ SwiftPM's `--filter` controls test execution. It can still build other test modu
 
 When Core is selected, the generated command includes `env CHECKLIST_STORAGE_PROBE=<build-slot>/.build/out/Products/Debug/StorageCrashProbe`, the current toolchain's probe location, so the crash tests run too. If using a toolchain with another binary layout, adjust that value to its `StorageCrashProbe` executable. Keep baseline comparisons by failing test name; a previous unrelated failure is not a pass for the current ticket.
 
-## Heavy cases and the background full suite
+## Fast default and opt-in qualification
 
-`HEAVY_TESTS` in the selector names the 30,000-object `StorageSnapshotCapacityTests` method, `MediaFrozenIntakeTests` and `MediaDecisionTests`. Round commands skip these cases only when their production dependencies are unaffected. These fixtures instantiate `CommandRouter`, persist domain records and exercise shared models/JSON/hashing, managed attachment preparation and provider policy. Therefore **every ChecklistCore source or resource change** enables the whole heavy set, as does a change to any of Core's transitive source dependencies (currently ChecklistProviders). There is no Core exclusion list: no Core file is proven unreachable by these fixtures. `HEAVY_MODULES` names the production module and the selector walks its forward dependency graph; custom target paths work too. App `Media/` remains an explicit trigger.
-
-Unknown paths, package/build changes and other full-fallback inputs also enable all heavy cases because their impact is unbounded. Small snapshot-capacity cases still run in filtered checks. Changes to heavy test files alone retain the round skips; run the relevant case explicitly during implementation when changing that test. Full mode always runs the heavy set.
+The full **default** Swift suite runs with `--parallel`. Its budget on this Mac is
+180 seconds wall time with an incremental build; an affected App or typical Core
+run has a 60-second budget. Record the load average and command with each timing.
+All 13 targets use process-isolated SwiftPM test workers. The native
+`SourceGitConfinementTests` class runs separately with `--parallel --num-workers 1`:
+its positive controls repeatedly received SIGKILL alongside concurrent Git probes
+on this Mac. The remaining Core tests retain parallel workers. The selector supplies the
+shared SwiftPM dependency cache flags. Keep the build-slot concurrency wrapper. Run independent Python checks concurrently
+with the Swift pipeline (up to three Python processes), keeping Swift invocations
+on one scratch path sequential. Record slot-wait time separately from execution;
+shared build-slot queueing can exceed the test budget without executing a test.
 
 ```sh
 python3 script/affected_tests.py --full --scratch-path <build-slot>/.build
+python3 script/affected_tests.py --full --qualification --scratch-path <build-slot>/.build
 ```
 
-`--full` emits a Swift suite command with no filters or skips and all Python test commands using the same pinned CPython 3.12 prefix as round checks. After the affected checks and validation pass, install once using the qualified composed source and the existing installation/storage gates. Start the full suite on that same immutable source in the background after install. It does not block the install or ticket submissions. Keep its PID/job receipt, source fingerprint and logs; report failures to the orchestrator and map each failing case to the affected tickets. Only those tickets are blocked; passing unrelated tickets continue. A background run must not be lost when its launching session ends. This is one bounded suite job, not a monitoring loop.
+The second command opts into the **Qualification suite**: real-size object/media
+round trips, scale/query/cleanup measurements, writer contention and memory soaks.
+`QUALIFICATION_TESTS` lists exact XCTest identifiers. Their original fixtures and
+assertions stay in place; `QualificationSuite.requireEnabled()` makes a direct
+`swift test` skip them unless `CHECKLIST_QUALIFICATION=1`. The planner's single
+`--qualification` switch adds a separate single-worker qualification invocation
+with this variable enabled. Scale/soak probes therefore do not compete with the
+default unit workers. JSON `qualification_commands` identifies these argv arrays;
+they are also included in `swift_commands`/`commands`. The aggregate `skip` list
+names cases omitted across the whole plan, including qualification commands.
+The sustained-writer soak defaults to 360 seconds when qualification is enabled;
+`CL193_SOAK_SECONDS` may set a longer measurement (minimum 180 seconds).
+Small correctness cases in the same classes still run by default. Owned-copy
+qualifiers additionally require their existing explicitly selected private-copy
+inputs; the switch never selects a live store or fabricates those inputs.
+
+Affected plans include qualification when Core or its transitive dependencies,
+App Media sources, or unknown/package/build inputs change. Editing a gated
+qualification fixture selects its registered cases; editing the gate helper
+selects them all. JSON `qualification_tests` gives the exact included IDs. Full default mode
+always omits qualification; full qualification mode always includes it. This
+keeps the default budget separate from scale and soak coverage without dropping
+any assertions. `skip` and `qualification` in JSON make that decision reviewable.
+
+After affected checks pass, use the existing installation/storage gates. A bounded
+full qualification job on the exact immutable source can run in the background;
+retain its PID/job receipt, source fingerprint and logs. Map failures to their
+own tickets. A previous failure is never a passing result for this ticket.
+
+## Private template stores and finer groups
+
+`ChecklistTestSupport.TestStore` creates a pre-migrated empty template once per
+linked test-bundle identity under the assigned scratch path. An OS file lock
+protects atomic publication across parallel XCTest processes. Each fixture gets
+an APFS copy-on-write clone (ordinary copy fallback), fresh logical-store and
+incarnation IDs, and a fresh cursor seal key. Only disposable seed preparation
+uses relaxed SQLite synchronization; the returned production Router reopens
+with its normal FULL durability, admission, pools and startup recovery. Reopening
+an existing fixture preserves its data. Fresh storage, migration, crash and
+failure qualifiers keep their original bootstrap path. `TestStoreTests` checks
+isolation, concurrent copies, reopen preservation and paired setup medians.
+
+Logic-only cancellation and offline recovery tests use protocol-shaped replies
+through the existing page parser and request transport. Separate App/Core route
+contract tests retain actual Router coverage.
+
+`test_groups` in the plan names narrowed XCTest classes. Independent final test
+classes with test methods only can select their own class; shared helpers,
+extensions, other global declarations and deleted files retain whole-target
+selection. Mixed paths union groups; any broad input for a target overrides its
+narrow groups. Repository input consumers still supplement that selection.
+
+The explicit Core grammar map selects `OrdinaryMentionPublicBoundaryTests` for
+`OrdinaryMentionTokens.swift` in the fast unit suite, keeping dependent targets broad.
+Qualification still follows Core production dependencies: ordinary-note parsing
+also runs in the writer-traffic fixtures. `default_swift_commands` gives the fast
+blocking component; `qualification_commands` is its separate scale/soak component. A scan of the
+symbol's production readers invalidates that map when a caller is added or
+removed. Unmapped Core source and resource changes retain whole-target coverage
+and the conservative qualification trigger. `--full` always runs the fast
+default even with changed paths; `--full --qualification` always adds all scale
+and soak cases. Test execution filters do not claim a production module split or
+promise SwiftPM will compile only those classes.
 
 ## Persistent build slots and installed checks
 

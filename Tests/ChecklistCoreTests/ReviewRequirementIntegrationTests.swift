@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 import ImageIO
@@ -13,7 +14,7 @@ final class ReviewRequirementIntegrationTests: XCTestCase {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         workspace = directory.appendingPathComponent("workspace")
         try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
-        router = try CommandRouter(root:directory.appendingPathComponent("store"))
+        router = try TestStore.router(root:directory.appendingPathComponent("store"))
     }
     override func tearDownWithError() throws {router = nil;try? FileManager.default.removeItem(at:directory)}
     @discardableResult func call(_ method: String,_ raw: JSON,_ actor: Caller? = nil) throws -> JSON {

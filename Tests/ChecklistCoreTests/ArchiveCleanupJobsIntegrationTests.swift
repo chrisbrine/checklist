@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -12,7 +13,7 @@ final class ArchiveCleanupJobsIntegrationTests: XCTestCase {
     override func setUpWithError() throws {
         let base = FileManager.default.urls(for:.cachesDirectory,in:.userDomainMask)[0].appendingPathComponent("ChecklistCoreTests",isDirectory:true)
         directory = base.appendingPathComponent(UUID().uuidString)
-        router = try CommandRouter(root:directory)
+        router = try TestStore.router(root:directory)
     }
     override func tearDownWithError() throws {router = nil;try? FileManager.default.removeItem(at:directory)}
     func call(_ method: String,_ p: JSON,command: String? = nil) throws -> JSON {

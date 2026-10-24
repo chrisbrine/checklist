@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 // Disposable public-command fixtures; native delivery qualification is separate.
 import XCTest
 import GRDB
@@ -9,7 +10,7 @@ final class OrdinaryMentionPublicBoundaryTests: XCTestCase {
     let owner = Caller(role: "owner", installation: "public-mention-test", projectIDs: [])
     override func setUpWithError() throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(uuid())
-        router = try CommandRouter(root: directory.appendingPathComponent("store"))
+        router = try TestStore.router(root: directory.appendingPathComponent("store"))
     }
     override func tearDownWithError() throws { router = nil; try? FileManager.default.removeItem(at: directory) }
     @discardableResult

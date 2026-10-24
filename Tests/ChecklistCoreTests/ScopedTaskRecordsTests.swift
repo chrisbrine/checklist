@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -12,7 +13,7 @@ final class ScopedTaskRecordsTests:XCTestCase {
         let parent=FileManager.default.urls(for:.cachesDirectory,in:.userDomainMask).first!.appendingPathComponent("ChecklistSyntheticTests")
         try FileManager.default.createDirectory(at:parent,withIntermediateDirectories:true)
         root=parent.appendingPathComponent("CL20-scoped-"+UUID().uuidString)
-        router=try CommandRouter(root:root)
+        router=try TestStore.router(root:root)
         pid=try call("project_create",["name":"Scoped synthetic","key_prefix":"SC","root_path":root.path])["id"] as! String
         tid=try call("task_create",["project_id":pid,"title":"Selected"])["id"] as! String
     }

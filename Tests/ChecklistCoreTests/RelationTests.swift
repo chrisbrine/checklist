@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistCore
 
@@ -134,7 +135,7 @@ extension CoreTests {
         var edge = stored; edge["source_task_id"] = mapped["id"]
         var alias = (exported["task_alias"] as! [JSON])[0]; alias["task_id"] = mapped["id"]
         // IDs remain globally unique in one installation; a portable import preserves them into a fresh store.
-        let fresh = try CommandRouter(root: directory.appendingPathComponent("fresh-store"))
+        let fresh = try TestStore.router(root: directory.appendingPathComponent("fresh-store"))
         // TaskReferenceValidation.swift: the portable task needs its same-project status,
         // and the validated domain boundary owns the complete graph's outer commit.
         let statuses = try router.dbQueue.read { try router.records($0,type:"status",project:destinationProject["id"] as? String) }

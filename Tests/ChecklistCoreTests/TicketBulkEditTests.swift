@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -11,7 +12,7 @@ final class TicketBulkEditTests: XCTestCase {
         let root = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appendingPathComponent("ChecklistQualification/CL-16", isDirectory: true)
         directory = root.appendingPathComponent("bulk-tests-"+UUID().uuidString)
         try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
-        router = try CommandRouter(root:directory)
+        router = try TestStore.router(root:directory)
     }
     override func tearDownWithError() throws {router = nil;try? FileManager.default.removeItem(at:directory)}
     @discardableResult func call(_ method: String,_ input: JSON = [:],caller: Caller? = nil,command: String = UUID().uuidString) throws -> JSON {

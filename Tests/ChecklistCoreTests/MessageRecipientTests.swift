@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -11,7 +12,7 @@ final class MessageRecipientTests: XCTestCase {
         let parent = try FileManager.default.url(for:.cachesDirectory,in:.userDomainMask,appropriateFor:nil,create:true).appendingPathComponent("ChecklistQualification/CL-24/MessageRecipientTests",isDirectory:true)
         try FileManager.default.createDirectory(at:parent,withIntermediateDirectories:true)
         directory = parent.appendingPathComponent(UUID().uuidString)
-        router = try CommandRouter(root: directory)
+        router = try TestStore.router(root: directory)
     }
     override func tearDownWithError() throws { router = nil; try? FileManager.default.removeItem(at: directory) }
 

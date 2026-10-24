@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -11,7 +12,7 @@ final class TicketPagePerformanceTests: XCTestCase {
     private var worker: Caller { Caller(role:"worker",installation:"page-performance-worker",projectIDs:[pid],workspace:directory.path) }
     override func setUpWithError() throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("CL20-page-perf-"+UUID().uuidString)
-        router = try CommandRouter(root:directory)
+        router = try TestStore.router(root:directory)
         pid = try call("project_create",["name":"Synthetic Performance","key_prefix":"PERF","root_path":directory.path])["id"] as! String
         try save(["id":"q","project_id":pid,"name":"Queued","category":"queued","revision":1],"status")
         try save(["id":"a","project_id":pid,"name":"Active","category":"active","revision":1],"status")

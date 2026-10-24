@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import ChecklistIPC
 @testable import ChecklistApp
@@ -18,7 +19,7 @@ import ChecklistIPC
         var heldCatalog: CheckedContinuation<[String: Any], Error>?
         init(_ preferences: UserDefaults) throws {
             root = FileManager.default.temporaryDirectory.appendingPathComponent("restored-project-" + UUID().uuidString)
-            router = try CommandRouter(root: root)
+            router = try TestStore.router(root: root)
             self.preferences = preferences
         }
         func cleanup() { try? FileManager.default.removeItem(at: root) }

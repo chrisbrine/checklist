@@ -191,6 +191,7 @@ final class MediaFrozenIntakeTests: XCTestCase {
         XCTAssertTrue(try f.rows("media_item").isEmpty)
     }
     func test300SourcePreviewExactConfirmationStop200Resume96AndPlanRevision() throws {
+        try QualificationSuite.requireEnabled()
         let f = try Fixture(),type = try f.type(imageSchema()),round = try f.round(type)
         var sources = try (0..<292).map {try source(f,"clip-\($0).png",$0)}
         for i in 0..<4 {let url = f.workspace.appendingPathComponent("duplicate-\(i).png");try Data(contentsOf:URL(fileURLWithPath:sources[i]["path"] as! String)).write(to:url);sources.append(["path":url.path])}

@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -16,7 +17,7 @@ final class HumanRequestManagedCopyTests: XCTestCase {
         let temporary = ProcessInfo.processInfo.environment["CHECKLIST_TEST_TMPDIR"].map { URL(fileURLWithPath:$0,isDirectory:true) } ?? fallback
         root = temporary.appendingPathComponent(uuid(),isDirectory:true)
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
-        router = try CommandRouter(root:root)
+        router = try TestStore.router(root:root)
         let workspace = root.appendingPathComponent("workspace")
         try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
         project = try call("project_create",["name":"Managed answers","root_path":workspace.path])
@@ -292,7 +293,7 @@ final class HumanRequestManagedCopyTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at:link,withDestinationURL:destination.deletingLastPathComponent())
         XCTAssertThrowsError(try StorageObjectFiles(root:link))
         XCTAssertThrowsError(try StorageObjectFiles(root:link.appendingPathComponent("child")))
-        XCTAssertThrowsError(try CommandRouter(root:link))
+        XCTAssertThrowsError(try TestStore.router(root:link))
         XCTAssertNoThrow(try StorageObjectFiles(root:root))
     }
 

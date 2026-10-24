@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistCore
 
@@ -149,7 +150,7 @@ private final class ImageInspectionServiceFixture {
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
         root = parent.appendingPathComponent("Synthetic-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        router = try CommandRouter(root: root.appendingPathComponent("store"))
+        router = try TestStore.router(root: root.appendingPathComponent("store"))
     }
     func close() { router = nil; try? FileManager.default.removeItem(at: root) }
     @discardableResult func call(_ method: String, _ values: JSON, _ caller: Caller? = nil) throws -> JSON {

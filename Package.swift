@@ -34,10 +34,11 @@ let package = Package(
         .testTarget(name: "TestResultEvidenceProjectionTests", dependencies: ["ChecklistApp"]),
         .testTarget(name: "TestResultParserTests", dependencies: ["ChecklistApp"]),
         .testTarget(name: "ChecklistProvidersTests", dependencies: ["ChecklistProviders"]),
-        .testTarget(name: "ChecklistCoreTests", dependencies: ["ChecklistCore", "ChecklistBridges", "ChecklistProviders", .product(name: "GRDB", package: "GRDB.swift")]),
-        .testTarget(name: "ChecklistAppTests", dependencies: ["ChecklistApp", "ChecklistCore", "ChecklistIPC", "ChecklistProviders"]),
+        .target(name: "ChecklistTestSupport", dependencies: ["ChecklistCore", "ChecklistProviders", .product(name: "GRDB", package: "GRDB.swift")], path: "Tests/ChecklistTestSupport"),
+        .testTarget(name: "ChecklistCoreTests", dependencies: ["ChecklistTestSupport", "ChecklistCore", "ChecklistBridges", "ChecklistProviders", .product(name: "GRDB", package: "GRDB.swift")]),
+        .testTarget(name: "ChecklistAppTests", dependencies: ["ChecklistTestSupport", "ChecklistApp", "ChecklistCore", "ChecklistIPC", "ChecklistProviders"]),
         .testTarget(name: "ChecklistCLITests", dependencies: ["ChecklistCLI", .product(name: "MCP", package: "swift-sdk")]),
-        .testTarget(name: "ChecklistIPCTests", dependencies: ["ChecklistIPC", "ChecklistCore", .product(name: "GRDB", package: "GRDB.swift")]),
+        .testTarget(name: "ChecklistIPCTests", dependencies: ["ChecklistTestSupport", "ChecklistIPC", "ChecklistCore", .product(name: "GRDB", package: "GRDB.swift")]),
         .testTarget(name: "ChecklistBridgesTests", dependencies: ["ChecklistBridges", "ChecklistIPC", "ChecklistProviders"]),
         .testTarget(name: "ChecklistMCPServerTests", dependencies: ["ChecklistMCPServer", "ChecklistBridges", "ChecklistIPC", .product(name: "MCP", package: "swift-sdk")])
     ], swiftLanguageModes: [.v5]

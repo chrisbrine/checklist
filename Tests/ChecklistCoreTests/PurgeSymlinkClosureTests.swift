@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 import Darwin
@@ -68,7 +69,7 @@ extension PurgeByteDeletionTests {
         try pumpByteDeletion()
         let first = try XCTUnwrap((receipt(result)["objects"] as! [JSON]).first {$0["relative_path"] as? String == path + "/z-links/alias.txt"})
         XCTAssertEqual(first["failures"] as? Int,1);XCTAssertEqual(first["state"] as? String,"pending");try assertLinkChain(path)
-        let root = router.root;try router.closeStore();router = nil;router = try CommandRouter(root:root)
+        let root = router.root;try router.closeStore();router = nil;router = try TestStore.router(root:root)
         let done = try finish(result),summary = done["summary"] as! JSON,objects = done["objects"] as! [JSON]
         try assertLinkChain(path)
         XCTAssertEqual(summary["retained_count"] as? Int,3);XCTAssertEqual(summary["removed_count"] as? Int,2)
@@ -97,7 +98,7 @@ extension PurgeByteDeletionTests {
                 if kind == "backup" {hold.removeValue(forKey:"project_id")}
                 try self.router.save(db,hold,type:"storage_hold")
             }
-            let root = router.root;try router.closeStore();router = nil;router = try CommandRouter(root:root)
+            let root = router.root;try router.closeStore();router = nil;router = try TestStore.router(root:root)
             let done = try finish(result),objects = done["objects"] as! [JSON]
             try assertLinkChain(path)
             XCTAssertTrue((objects.first {$0["relative_path"] as? String == path + "/z-links/alias.txt"}?["reasons"] as? [String] ?? []).contains(reason))

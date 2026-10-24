@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistCore
 
@@ -8,7 +9,7 @@ final class HumanRequestTests: XCTestCase {
     override func setUpWithError() throws {
         root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/ChecklistQualification/CL-147").appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
-        router = try CommandRouter(root:root)
+        router = try TestStore.router(root:root)
     }
     override func tearDownWithError() throws { router = nil; try? FileManager.default.removeItem(at:root) }
     @discardableResult func call(_ method: String,_ params: JSON = [:],_ caller: Caller? = nil) throws -> JSON {

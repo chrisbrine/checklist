@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import AppKit
 import Carbon.HIToolbox
@@ -202,7 +203,7 @@ import ChecklistIPC
             let cache = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/ChecklistQualification")
             try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
             root = cache.appendingPathComponent("quick-capture-" + UUID().uuidString)
-            router = try CommandRouter(root: root)
+            router = try TestStore.router(root: root)
             let workspace = root.appendingPathComponent("workspace")
             try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
             let reply = try router.handle(method: "project_create", params: ["command_id": UUID().uuidString,

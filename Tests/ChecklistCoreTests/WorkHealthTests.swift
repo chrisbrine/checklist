@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -70,7 +71,7 @@ extension EvidenceAuthorityTests {
         let first = try health(p,t)
         try checkHealth(); try checkHealth()
         XCTAssertEqual(try healthRows("message",task:t).count,1)
-        try router.closeStore(); router = try CommandRouter(root:directory.appendingPathComponent("store"))
+        try router.closeStore(); router = try TestStore.router(root:directory.appendingPathComponent("store"))
         try checkHealth()
         let second = try health(p,t)
         XCTAssertEqual(first["request_id"] as? String,second["request_id"] as? String)
@@ -239,6 +240,7 @@ extension EvidenceAuthorityTests {
         try checkHealth(at:start.addingTimeInterval(1322));XCTAssertEqual(try health(p,t)["state"] as? String,"no_response")
     }
     func testWorkHealthLargeProjectDecodesOnlyCandidatePage() throws {
+        try QualificationSuite.requireEnabled()
         let p = try project(), t = try ready(p), w = try native(p,"health-large",domain:"health-large"), a = try claim(p,t,caller:w)
         try healthWrite { db in
             for index in 0..<20000 {

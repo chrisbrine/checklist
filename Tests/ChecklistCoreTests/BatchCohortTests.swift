@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -123,7 +124,7 @@ extension CoreTests {
     }
     func testSharedBatchRestartReconstructsUnionAndReplayFencesGeneration() throws {
         let p = try cohortProject(),worker = try cohortWorker(p),batch = try sharedBatch(p,worker),command = UUID().uuidString,claims = try claimFixedBatch(p,batch,worker,command)["claims"] as! [JSON]
-        router = nil;router = try CommandRouter(root:directory)
+        router = nil;router = try TestStore.router(root:directory)
         var auth = cohortAuth(p,claims[0]);auth["file_scopes"] = [["path":"src/shared.swift","access":"write"]]
         _ = try call("work_scope_adjust",auth,worker)
         let replay = try claimFixedBatch(p,batch,worker,command)["claims"] as! [JSON]
@@ -156,7 +157,7 @@ extension CoreTests {
     func testSharedBatchSourceTargetsKeepEachTicketsOwnHashAndFreshness() throws {
         router = nil;try FileManager.default.removeItem(at:directory)
         try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true)
-        router = try CommandRouter(root:directory.appendingPathComponent("service"))
+        router = try TestStore.router(root:directory.appendingPathComponent("service"))
         let p = try cohortProject(),root = URL(fileURLWithPath:p["root_path"] as! String),file = root.appendingPathComponent("src/shared.swift"),worker = try cohortWorker(p)
         try FileManager.default.createDirectory(at:file.deletingLastPathComponent(),withIntermediateDirectories:true)
         try Data("first result".utf8).write(to:file)

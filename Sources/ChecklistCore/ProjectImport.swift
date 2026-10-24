@@ -43,7 +43,7 @@ extension CommandRouter {
         if !caller.isOwner {
             guard let workspace = caller.workspace,containsPath(workspace,SafeFileRead.normalizedPrivatePrefix(URL(fileURLWithPath:path).standardizedFileURL.path)) else {throw CoreError("FILE_ACCESS_REQUIRED","Selected import must be inside the enrolled workspace.")}
         }
-        // All filesystem reads/hash work runs before the SQL writer/object gate.
+        // Prepare hashes of the exact selected bytes outside the SQL writer.
         let bundle = try TransferBundle.read(path:path,format:format,namespace:namespace)
         if method == "import_preview" {
             return try dbQueue.read {db in
@@ -56,40 +56,46 @@ extension CommandRouter {
                 return ["data":["format":"checklist-intermediate/1","source_schema":bundle.schema,"source_namespace":namespace,"source_sha256":bundle.sourceHash,"source_time":timestamp,"destination_revision":try record(db,pid,type:"project")["revision"]!,"preview_digest":digest,"counts":counts,"status_proposals":statuses,"alias_proposals":bundle.entries.filter {$0.family == "task"}.map {["source_id":$0.sourceID,"alias":$0.payload["key"] ?? $0.sourceID,"aliases":$0.payload["aliases"] ?? []]},"tag_proposals":bundle.entries.filter {$0.family == "task"}.map {["source_id":$0.sourceID,"tags":$0.payload["tags"] ?? $0.payload["tag_ids"] ?? []]},"diagnostics":bundle.diagnostics,"blockers":bundle.blockers,"files":bundle.files.map {["path":$0.path,"sha256":$0.sha256 ?? "","availability":$0.availability]},"authority":"historical_unverified","canonical_bundle":["format":"checklist-intermediate","version":1,"records":bundle.entries.map {["family":$0.family,"source_id":$0.sourceID,"payload":$0.payload]},"source_envelope":bundle.document]]]
             }
         }
-        // Content-addressed immutable copies are durable before SQL publication.
-        // Interrupted/unreferenced copies are retained; rollback never unlinks
-        // bytes which another record, backup or concurrent import may retain.
-        let files = try StorageObjectFiles(root:root)
-        for file in bundle.files where file.bytes != nil {
-            let destination = "objects/import-" + file.sha256!
-            if let existing = try? files.read(destination,maximum:TransferBundle.byteLimit) {
-                guard hash(existing) == file.sha256 else {throw CoreError("IMPORT_OBJECT_CONFLICT","An immutable imported file failed verification.")}
-            } else {try files.writeNew(destination,bytes:file.bytes!)}
-        }
         return try importTransaction(method:method,params:params,caller:caller,command:command,intent:intent,bundle:bundle)
     }
     private func importPreviewDigest(bundle: TransferBundle,destination: String,params: JSON) throws -> String {
         hash(Data((bundle.schema + "\n" + bundle.namespace + "\n" + bundle.sourceHash + "\n" + destination + "\n" + (params["epic_id"] as? String ?? "")).utf8))
     }
-    private func importTransaction(method: String,params: JSON,caller: Caller,command: String,intent: String,bundle: TransferBundle?) throws -> JSON {
-        try ArchiveStorageGate.withExclusive(root:root) { _ in try dbQueue.writeWithoutTransaction { db in
-            var output: JSON = [:]
-            try withValidatedDomainTransaction(db) {
-                let (pid,project) = try importAuthorization(db,params,caller,write:true)
-                try requirePendingCommandIntent(db,command:command,digest:intent,caller:caller)
-                if let row = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[caller.principal,command]) {
-                    guard row["digest"] as String == intent else {throw CoreError("IDEMPOTENCY_CONFLICT","This command ID belongs to another intent.")}
-                    let result = jsonObject(row["result"]);if Self.isPrunedResult(result) {throw Self.expiredCommandError(command)}
-                    output = result.merging(["replayed":true]) {_,new in new};return .commit
+    func importTransaction(method: String,params: JSON,caller: Caller,command: String,intent: String,bundle: TransferBundle?) throws -> JSON {
+        try ArchiveStorageGate.withExclusive(root:root) { _ in
+            // Revalidate after waiting for the gate, before any imported bytes or
+            // rows are written. The transaction consumes only this verified read.
+            let bundle = try bundle?.validateSource()
+            if let bundle {
+                // Content-addressed immutable copies are durable before SQL publication.
+                // Interrupted/unreferenced copies are retained; rollback never unlinks
+                // bytes which another record, backup or concurrent import may retain.
+                let files = try StorageObjectFiles(root:root)
+                for file in bundle.files where file.bytes != nil {
+                    let destination = "objects/import-" + file.sha256!
+                    if let existing = try? files.read(destination,maximum:TransferBundle.byteLimit) {
+                        guard hash(existing) == file.sha256 else {throw CoreError("IMPORT_OBJECT_CONFLICT","An immutable imported file failed verification.")}
+                    } else {try files.writeNew(destination,bytes:file.bytes!)}
                 }
-                let data: JSON
-                if method == "import_rollback" {data = try rollbackProjectImport(db,params,caller,pid:pid,project:project)}
-                else {data = try commitProjectImport(db,params,caller,pid:pid,project:project,bundle:bundle!)}
-                output = ["data":data,"command_id":command]
-                try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[caller.principal,command,intent,try jsonString(output)])
-                return .commit
             }
-            return output
+            return try dbQueue.writeWithoutTransaction { db in
+                var output: JSON = [:]
+                try withValidatedDomainTransaction(db) {
+                    let (pid,project) = try importAuthorization(db,params,caller,write:true)
+                    try requirePendingCommandIntent(db,command:command,digest:intent,caller:caller)
+                    if let row = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[caller.principal,command]) {
+                        guard row["digest"] as String == intent else {throw CoreError("IDEMPOTENCY_CONFLICT","This command ID belongs to another intent.")}
+                        let result = jsonObject(row["result"]);if Self.isPrunedResult(result) {throw Self.expiredCommandError(command)}
+                        output = result.merging(["replayed":true]) {_,new in new};return .commit
+                    }
+                    let data: JSON
+                    if method == "import_rollback" {data = try rollbackProjectImport(db,params,caller,pid:pid,project:project)}
+                    else {data = try commitProjectImport(db,params,caller,pid:pid,project:project,bundle:bundle!)}
+                    output = ["data":data,"command_id":command]
+                    try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[caller.principal,command,intent,try jsonString(output)])
+                    return .commit
+                }
+                return output
         }}
     }
     private func commitProjectImport(_ db: Database,_ params: JSON,_ caller: Caller,pid: String,project: JSON,bundle: TransferBundle) throws -> JSON {
@@ -100,7 +106,6 @@ extension CommandRouter {
             return ["receipt_id":prior["id"]!,"source_replayed":true]
         }
         try revision(params,project)
-        try bundle.validateSource()
         let expected = try importPreviewDigest(bundle:bundle,destination:importDestinationDigest(db,pid),params:params)
         guard try text(params,"preview_digest",max:64) == expected else {throw CoreError("IMPORT_PREVIEW_CHANGED","Source, mapping or destination changed after preview; regenerate the preview.")}
         guard bundle.blockers.isEmpty else {throw CoreError("IMPORT_MAPPING_REQUIRED","Resolve duplicate source identities/aliases before committing.",details:["blockers":bundle.blockers])}

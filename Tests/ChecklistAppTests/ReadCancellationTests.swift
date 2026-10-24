@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import SwiftUI
 import ChecklistIPC
@@ -20,7 +21,7 @@ import ChecklistIPC
         init(_ preferences: UserDefaults) throws {
             self.preferences = preferences
             root = FileManager.default.temporaryDirectory.appendingPathComponent("read-cancel-" + UUID().uuidString)
-            router = try CommandRouter(root: root)
+            router = try TestStore.router(root: root)
             let source = root.appendingPathComponent("source")
             try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
             project = try command("project_create", ["name": "Synthetic cancellation", "key_prefix": "SC", "root_path": source.path])["data"].flatMap { ($0 as? [String: Any])?["id"] } as! String

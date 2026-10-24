@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -7,9 +8,9 @@ final class PurgeByteDeletionTests: XCTestCase {
     var router: CommandRouter!
     let owner = Caller(role:"owner",installation:"purge-bytes-tests",projectIDs:[])
     override func setUpWithError() throws {
-        directory = URL(fileURLWithPath:#filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(".purge-byte-fixtures/" + uuid())
+        directory = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("checklist-purge-bytes-" + uuid())
         try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true)
-        router = try CommandRouter(root:directory.appendingPathComponent("store"))
+        router = try TestStore.router(root:directory.appendingPathComponent("store"))
     }
     override func tearDownWithError() throws {try router?.closeStore();router = nil;try? FileManager.default.removeItem(at:directory)}
     func call(_ method: String,_ input: JSON) throws -> JSON {
@@ -121,7 +122,7 @@ final class PurgeByteDeletionTests: XCTestCase {
         let root = router.root
         // A new owner admitted before recovery must win the final all-record check.
         try write {db in let foreign: JSON = ["id":uuid(),"project_id":p["id"]!,"revision":1,"path":a["path"]!];try self.router.save(db,foreign,type:"manifest")}
-        try router.closeStore();router = nil;router = try CommandRouter(root:root)
+        try router.closeStore();router = nil;router = try TestStore.router(root:root)
         let done = try finish(result)
         XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String));XCTAssertEqual((done["summary"] as! JSON)["removed_count"] as? Int,0)
         XCTAssertTrue(((done["objects"] as! [JSON])[0]["reasons"] as! [String]).contains("remaining_record"))
@@ -134,7 +135,7 @@ final class PurgeByteDeletionTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
         XCTAssertEqual(try router.dbQueue.read {try router.records($0,type:"storage_job").filter {$0["kind"] as? String == CommandRouter.ticketObjectDeletionKind}.count},0)
         var result: JSON = [:];try write {db in result = try self.router.taskPurge(db,input,self.owner)}
-        let root = router.root;try router.closeStore();router = nil;router = try CommandRouter(root:root)
+        let root = router.root;try router.closeStore();router = nil;router = try TestStore.router(root:root)
         XCTAssertEqual((try finish(result)["summary"] as! JSON)["removed_count"] as? Int,1)
         XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
     }
@@ -161,7 +162,7 @@ final class PurgeByteDeletionTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
         XCTAssertEqual(try receipt(result)["state"] as? String,"pending")
         try router.dbQueue.write {try $0.execute(sql:"DROP TRIGGER purge_outcome_failure")}
-        let root = router.root;try router.closeStore();router = nil;router = try CommandRouter(root:root)
+        let root = router.root;try router.closeStore();router = nil;router = try TestStore.router(root:root)
         try pumpByteDeletion()
         let replay = try router.handle(method:"task_purge",params:input,caller:owner)
         XCTAssertEqual(replay["replayed"] as? Bool,true)

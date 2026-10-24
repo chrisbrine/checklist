@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import ChecklistIPC
 @testable import ChecklistApp
@@ -93,7 +94,7 @@ import ChecklistIPC
         let root = cache.appendingPathComponent("overview-" + UUID().uuidString)
         let preferences = isolatedDefaults("Overview").preferences
         defer { try? FileManager.default.removeItem(at: root) }
-        let router = try CommandRouter(root: root), owner = Caller(role: "owner", installation: "overview-fixture", projectIDs: [])
+        let router = try TestStore.router(root: root), owner = Caller(role: "owner", installation: "overview-fixture", projectIDs: [])
         try FileManager.default.createDirectory(at: root.appendingPathComponent("a"), withIntermediateDirectories: true)
         func command(_ method: String, _ params: [String: Any]) throws -> [String: Any] {
             var params = params

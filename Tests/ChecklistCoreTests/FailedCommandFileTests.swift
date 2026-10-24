@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -17,7 +18,7 @@ extension EvidenceAuthorityTests {
     func pendingMarkers() -> [String] {
         (try? FileManager.default.contentsOfDirectory(atPath: storeRoot.appendingPathComponent("staging/source-captures").path)) ?? []
     }
-    func reopenRouter() throws { router = nil; router = try CommandRouter(root: storeRoot) }
+    func reopenRouter() throws { router = nil; router = try TestStore.router(root: storeRoot) }
 
     func testFailedSourceSubmitLeavesNoCaptureAndRetryLeavesOne() throws {
         try sourceFixture()

@@ -1,10 +1,11 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistCore
 
 extension CoreTests {
     func testExportCopiesChecksummedSourceCapturesAndExecutionLogsWithPortableReferences() throws {
         // A project source tree is external to its Checklist store.
-        try router.closeStore(); router = try CommandRouter(root: directory.appendingPathComponent("store"))
+        try router.closeStore(); router = try TestStore.router(root: directory.appendingPathComponent("store"))
         let workspace = directory.appendingPathComponent("export-source")
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         let sourceBytes = Data("Complete captured source".utf8)

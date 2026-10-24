@@ -10,15 +10,39 @@ import shlex
 import subprocess
 import sys
 
-HEAVY_TESTS = (
+QUALIFICATION_TESTS = (
     'ChecklistCoreTests.StorageSnapshotCapacityTests/testMoreThanThirtyThousandObjectsAndEightMiBManifestRoundTripWithoutPruning',
-    'ChecklistCoreTests.MediaFrozenIntakeTests',
-    'ChecklistCoreTests.MediaDecisionTests',
+    'ChecklistCoreTests.MediaFrozenIntakeTests/test300SourcePreviewExactConfirmationStop200Resume96AndPlanRevision',
+    'ChecklistCoreTests.MediaDecisionTests/test450SelectionLostReplyFailedMiddleOnlyRefreshAndLaterReversal',
+    'ChecklistCoreTests.EvidenceAuthorityTests/testWorkHealthLargeProjectDecodesOnlyCandidatePage',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testPreparationProgressUnderConstantUnrelatedWritesAndBoundsMemory',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testBackupDescriptorStreamingHasBoundedAllocations',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testProjectedReferenceScanBoundsWorkWithManyOwnedTokens',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testSustainedWritersBoundRSSCPUAndBackoff',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testSelectedPayloadAndHistoryPreparationHasBoundedPeak',
+    'ChecklistCoreTests.CoreTests/testEpicDeleteRealSizeBackfillResumesExpiredSlices',
+    'ChecklistCoreTests.CoreTests/testEpicDeleteIndexedThirtyThousandRecordsAndEventsAndConcurrentRead',
+    'ChecklistCoreTests.MediaListQueryTests/testThousandItemBoundedGroupedPagesFreezeOrderAcrossInsertsAndUpdates',
+    'ChecklistCoreTests.ScreenReadPerformanceTests/testRealSizeScreenReads',
+    'ChecklistCoreTests.ScreenReadPerformanceTests/testOverviewWithRetainedReviewHistory',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeAutomaticFirstPassKeepsConcurrentReadAndWriteUnderTwoSeconds',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeCacheAliasInventoryExhaustsOneBoundedClosureBudgetAndRetainsEntry',
+    'ChecklistCoreTests.MediaRoundTests/testLargeRetainedHistoryDoesNotHoldWriterDuringPreparation',
+    'ChecklistCoreTests.StorageReadPerformanceTests/testDeliveryPassLookupTimingAtFiveThousandRecords',
+    'ChecklistCoreTests.ArchivePreviewPerformanceTests/testFourFourHundredFileCapturesKeepExactPreviewUnderOneSecond',
+    'ChecklistCoreTests.EvidenceAuthorityTests/testLargeSubmitBlocksOtherCommandsOnlyBriefly',
+    'ChecklistCoreTests.EvidenceAuthorityTests/testLargeReferenceImportBlocksOtherCommandsOnlyBriefly',
+    'ChecklistCoreTests.EvidenceAuthorityTests/testReviewClaimValidatesTheCapturedTargetBeforeTheWriter',
 )
+# Compatibility name for consumers of the original selector plan.
+HEAVY_TESTS = QUALIFICATION_TESTS
+# macOS Seatbelt positive controls fail with SIGKILL when Git probes overlap.
+# Keep native guards intact and isolate this class from all other test work.
+ISOLATED_TEST_GROUPS = ('ChecklistCoreTests.SourceGitConfinementTests',)
 # Heavy fixtures instantiate CommandRouter and exercise shared models, hashing,
 # imports, persistence and provider policy. No Core source is proven unreachable.
 HEAVY_MODULES = ('ChecklistCore',)
-HEAVY_SOURCE_PREFIXES = ('Sources/ChecklistApp/Media/',)
+HEAVY_SOURCE_PREFIXES = ('Sources/ChecklistApp/Media/', 'Tests/ChecklistTestSupport/')
 # Explicit validation-only families; runtime inputs below take precedence.
 # Other non-code files (including arbitrary Markdown and docs binary fixtures)
 # have unknown impact and select the full suite.
@@ -69,6 +93,52 @@ RUNTIME_TEST_CONSUMERS = {
     'StorageCrashProbe': ('ChecklistCoreTests',),
     'ChecklistCLIInputProbe': ('ChecklistMCPServerTests',),
 }
+# Small, closed entry points whose tests are narrower than their SwiftPM module.
+# The grammar and ordinary-note command behavior have a dedicated boundary
+# group. Dependent targets stay broad; the migration fixture reads stored types.
+# Unmapped Core source changes retain whole-target coverage.
+SOURCE_TEST_GROUPS = {
+    'Sources/ChecklistCore/OrdinaryMentionTokens.swift': {
+        'ChecklistCoreTests': ('OrdinaryMentionPublicBoundaryTests',),
+    },
+}
+
+
+SOURCE_GROUP_SYMBOLS = {
+    'Sources/ChecklistCore/OrdinaryMentionTokens.swift': (
+        'OrdinaryMentionTokens', {'Sources/ChecklistCore/OrdinaryMentionTokens.swift', 'Sources/ChecklistCore/OrdinaryMentionCommands.swift'}),
+}
+
+
+def source_test_groups(root, path):
+    mapping = SOURCE_TEST_GROUPS.get(path, {})
+    if path in SOURCE_GROUP_SYMBOLS:
+        symbol, expected = SOURCE_GROUP_SYMBOLS[path]
+        readers = {source.relative_to(root).as_posix() for source in (root / 'Sources/ChecklistCore').rglob('*.swift')
+                   if re.search(r'\b' + re.escape(symbol) + r'\b', source.read_text())}
+        if readers != expected:
+            return {}  # A new/deleted caller invalidates the narrower map.
+    return mapping
+
+
+def test_file_groups(root, target, path):
+    """Narrow independent test-only files; shared fixture/extension edits stay whole-target."""
+    source = root / path
+    if not source.is_file() or source.suffix != '.swift':
+        return None
+    text = source.read_text()
+    classes = re.findall(r'final class (\w+)\s*:\s*XCTestCase', text)
+    methods = re.findall(r'func (\w+)\s*\(', text)
+    if (not classes or not methods or any(not name.startswith('test') for name in methods)
+            or re.search(r'^(?:(?:private|fileprivate|internal|public) )?(?:let|var|func|struct|enum|class|extension)\b', text, re.M)):
+        return None
+    # A class used by another fixture, extension or subclass is shared state.
+    for sibling in (root / target['path']).rglob('*.swift'):
+        if sibling != source and any(re.search(r'\b' + re.escape(name) + r'\b', sibling.read_text()) for name in classes):
+            return None
+    return tuple(classes)
+
+
 # One interpreter for round checks, background full suites and validation.
 SCRIPT_PYTHON = ['uv', 'run', '--no-project', '--python', '3.12',
                  '--with', 'jsonschema', '--with', 'pyyaml', 'python']
@@ -130,7 +200,19 @@ def is_target_resource(root, target, path):
     return False
 
 
-def select(root, graph, paths, scratch, full=False):
+def changed_qualification_tests(root, paths):
+    selected = set()
+    for path in paths:
+        if path == 'Tests/ChecklistCoreTests/QualificationSuite.swift':
+            return list(QUALIFICATION_TESTS)
+        source = root / path
+        if path.startswith('Tests/ChecklistCoreTests/') and source.suffix == '.swift' and source.is_file():
+            methods = re.findall(r'func (test\w+)\(\) throws \{\s+try QualificationSuite.requireEnabled\(\)', source.read_text())
+            selected.update(case for case in QUALIFICATION_TESTS if case.split('/')[1] in methods)
+    return [case for case in QUALIFICATION_TESTS if case in selected]
+
+
+def select(root, graph, paths, scratch, full=False, qualification=False):
     targets = {target['name']: target for target in graph['targets']}
     all_tests = {name for name, target in targets.items() if target['type'] == 'test'}
     affected, changed_targets, python, unknown = set(), set(), set(), []
@@ -205,22 +287,80 @@ def select(root, graph, paths, scratch, full=False):
                 pending.append(dependency)
     heavy_changed = bool(changed_targets.intersection(heavy_dependencies)) or any(
         path.startswith(HEAVY_SOURCE_PREFIXES) for path in normalized)
-    skip = list(HEAVY_TESTS) if tests and not full and not unknown and not heavy_changed else []
+    changed_qualifiers = changed_qualification_tests(root, normalized)
+    explicitly_qualified = qualification
+    qualification = qualification or (not full and (bool(unknown) or heavy_changed or bool(changed_qualifiers)))
+    source_groups = {path: source_test_groups(root, path) for path in normalized}
+    groups = {}
+    if not full and not unknown:
+        for name in tests:
+            relevant = []
+            for path in normalized:
+                mapping = source_groups[path]
+                owner = next((target for target in owners if path.startswith(target['path'] + '/')), None)
+                if name in mapping:
+                    relevant.append(mapping[name])
+                elif name in FILE_TEST_CONSUMERS.get(path, ()):
+                    relevant.append(None)
+                elif owner and owner['name'] == name:
+                    relevant.append(test_file_groups(root, owner, path))
+                elif owner and owner['type'] != 'test':
+                    relevant.append(None)
+            if relevant and all(relevant):
+                groups[name] = sorted({group for selected in relevant for group in selected})
+    # Group narrowing applies to the fast unit suite. Qualification retains
+    # the production dependency closure: ordinary-note parsing also runs in
+    # the writer-traffic and scale fixtures.
+    qualification_tests = (list(QUALIFICATION_TESTS) if qualification and
+                           (explicitly_qualified or heavy_changed or unknown or full) else
+                           changed_qualifiers if qualification else [])
+    skip = [case for case in QUALIFICATION_TESTS if case not in qualification_tests] if tests else []
     swift = []
+    isolated = []
+    qualification_commands = []
     if tests or full:
-        command = ['swift', 'test', '--scratch-path', str(scratch)]
+        command = ['swift', 'test', '--parallel', '--cache-path',
+                   str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
+                   '--enable-dependency-cache', '--scratch-path', str(scratch)]
         if not full:
             for target in tests:
-                command.extend(['--filter', '^' + re.escape(target) + r'\.'])
-            for case in skip:
-                command.extend(['--skip', '^' + re.escape(case) + r'(?:/|$)'])
+                suffix = '(?:' + '|'.join(re.escape(group) for group in groups[target]) + r')(?:/|$)' if target in groups else ''
+                command.extend(['--filter', '^' + re.escape(target) + r'\.' + suffix])
+        for case in QUALIFICATION_TESTS:
+            command.extend(['--skip', '^' + re.escape(case) + r'(?:/|$)'])
         if 'ChecklistCoreTests' in tests:
             command = ['env', 'CHECKLIST_STORAGE_PROBE=' + str(scratch / 'out/Products/Debug/StorageCrashProbe')] + command
+        command = ['env', 'CHECKLIST_TEST_TEMPLATE_ROOT=' + str(scratch / 'test-store-templates'), 'CHECKLIST_QUALIFICATION=0'] + command
+        isolated = list(ISOLATED_TEST_GROUPS) if 'ChecklistCoreTests' in tests and (
+            'ChecklistCoreTests' not in groups or 'SourceGitConfinementTests' in groups['ChecklistCoreTests']) else []
+        for group in isolated:
+            command.extend(['--skip', '^' + re.escape(group) + r'(?:/|$)'])
         swift.append(command)
+        if isolated:
+            single = command[:command.index('swift') + 2]
+            single.extend(['--parallel', '--num-workers', '1', '--cache-path',
+                           str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
+                           '--enable-dependency-cache', '--scratch-path', str(scratch)])
+            for group in isolated:
+                single.extend(['--filter', '^' + re.escape(group) + r'(?:/|$)'])
+            swift.append(single)
+        if qualification and 'ChecklistCoreTests' in tests:
+            qualified = command[:command.index('swift') + 2]
+            qualified = ['CHECKLIST_QUALIFICATION=1' if arg == 'CHECKLIST_QUALIFICATION=0' else arg for arg in qualified]
+            qualified.extend(['--parallel', '--num-workers', '1', '--cache-path',
+                              str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
+                              '--enable-dependency-cache', '--scratch-path', str(scratch)])
+            for case in qualification_tests:
+                qualified.extend(['--filter', '^' + re.escape(case) + '$'])
+            qualification_commands.append(qualified)
+            swift.append(qualified)
     # uv supplies the dependencies needed by the exporter/validator tests too.
     python_commands = [SCRIPT_PYTHON + [path] for path in sorted(python)]
     return {'paths': normalized, 'affected_targets': sorted(affected), 'test_targets': tests,
-            'python_tests': sorted(python), 'fallback_paths': unknown, 'skip': skip, 'full': full,
+            'python_tests': sorted(python), 'fallback_paths': unknown, 'skip': skip, 'full': full, 'qualification': qualification,
+            'isolated_test_groups': isolated, 'test_groups': groups,
+            'default_swift_commands': [command for command in swift if command not in qualification_commands],
+            'qualification_commands': qualification_commands, 'qualification_tests': qualification_tests,
             'swift_commands': swift, 'commands': swift + python_commands + [VALIDATE]}
 
 
@@ -230,7 +370,8 @@ def main(argv=None):
     source.add_argument('--base', help='diff commit against the working tree, including untracked files')
     source.add_argument('--paths', nargs='+', help='repository-relative changed paths')
     source.add_argument('--paths-file', type=Path, help='newline-delimited paths, or - for stdin')
-    parser.add_argument('--full', action='store_true', help='full Swift suite without filters/skips and all Python tests')
+    parser.add_argument('--full', action='store_true', help='full default Swift suite in parallel and all Python tests')
+    parser.add_argument('--qualification', action='store_true', help='include the opt-in scale, timing and soak qualification suite')
     parser.add_argument('--json', action='store_true', help='emit the plan as JSON argv arrays')
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument('--scratch-path', type=Path, default=Path('.build'))
@@ -246,13 +387,17 @@ def main(argv=None):
         elif args.paths_file:
             contents = sys.stdin.read() if str(args.paths_file) == '-' else args.paths_file.read_text()
             paths = contents.splitlines()
-        plan = select(root, package_graph(root, scratch), paths, scratch, args.full)
+        plan = select(root, package_graph(root, scratch), paths, scratch, args.full, args.qualification)
         if args.json:
             print(json.dumps(plan, indent=2))
         else:
             print('Test targets: ' + (', '.join(plan['test_targets']) or '(none)'))
             if plan['fallback_paths']:
                 print('Full selection for: ' + ', '.join(plan['fallback_paths']))
+            for target, groups in plan['test_groups'].items():
+                print('Test groups: ' + target + ': ' + ', '.join(groups))
+            if plan['qualification_commands']:
+                print('Qualification suite: separate single-worker invocation')
             if plan['skip']:
                 print('Heavy cases skipped: ' + ', '.join(plan['skip']))
             for command in plan['commands']:

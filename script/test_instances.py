@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Manage four disposable Checklist test slots. Never build or alter the live store."""
 import argparse
-from contextlib import contextmanager, ExitStack
+from contextlib import contextmanager, ExitStack, closing
 import ctypes
 from datetime import datetime, timezone
 import fcntl
@@ -20,6 +20,7 @@ import struct
 import subprocess
 import sys
 import time
+import tempfile
 import unicodedata
 from urllib.parse import unquote, urlsplit
 import uuid
@@ -63,10 +64,10 @@ def slot_number(value):
 
 
 def seed_value(value):
-    if value in ['empty', 'latest-backup'] or (value.startswith('backup:') and value[7:]): return value
+    if value in ['empty', 'latest-backup'] or any(value.startswith(kind + ':') and value[len(kind) + 1:] for kind in ['backup', 'restored']): return value
     if value.startswith('slot:'):
         slot_number(value[5:]); return value
-    raise ValueError('Seed must be empty, latest-backup, backup:PATH or slot:M.')
+    raise ValueError('Seed must be empty, latest-backup, backup:PATH, restored:PATH or slot:M.')
 
 
 def paths(number):
@@ -449,6 +450,8 @@ def require_local_paths(database, destination, immutable=True, source_root=None)
             if key == 'stored': return ('lookup', 'source-captures')
             if key == 'relative': return ('managed', 'source-captures')
         if key == 'declared_path' and '.file_scopes[]' in location: return ('recursive_binding', None)
+        if record_kind == 'storage_summary' and location == 'metadata.value' and key in {'path', 'source_root'}:
+            return ('slot_summary', None)
         if key == 'path':
             if parent.get('mode') == 'managed': return ('managed', 'objects')
             if parent.get('mode') in {'reference', 'external_reference'}: return ('binding', None)
@@ -524,6 +527,13 @@ def require_local_paths(database, destination, immutable=True, source_root=None)
             if inert:
                 if kind not in {None, 'text'} or value.startswith('/') or has_file_url:
                     counts['inert_metadata_path_occurrences' if inert == 'metadata' else 'inert_history_path_occurrences'] += 1
+            elif kind == 'slot_summary':
+                # Display-only copy observation: compare spelling, never inspect
+                # the referenced backup/restore path or any symlink there.
+                path = check_absolute(value, location)
+                if not path.is_relative_to(destination.parent):
+                    refuse(location, 'a stored absolute path outside the destination slot root')
+                counts['inert_metadata_path_occurrences'] += 1
             elif kind == 'managed': check_managed(value, family, location)
             elif kind == 'lookup':
                 if value.startswith('/'):
@@ -579,6 +589,10 @@ def require_local_paths(database, destination, immutable=True, source_root=None)
                 record_kind = row[columns.index('type')] if table == 'records' and 'type' in columns else None
                 metadata_key = row[columns.index('key')] if table == 'metadata' and 'key' in columns else None
                 if metadata_key == 'managed-capture-paths-v3': record_kind = 'capture_bindings'
+                # Unlike older inert receipts below, summaries allow only their
+                # top-level copy/source paths under this slot folder; other fields stay strict.
+                if metadata_key is not None and metadata_key.startswith('storage-last-verified-'):
+                    record_kind = 'storage_summary'
                 for column, value in zip(columns, row):
                     inert = (table == 'commands' and column == 'result') or (table == 'events' and column == 'data')
                     if column == 'value' and metadata_key is not None and (metadata_key == 'preupgrade_snapshot' or metadata_key.startswith('backup-generation:')):
@@ -703,6 +717,107 @@ def snapshot_seed(source, destination, destination_root=None):
             'current_schema_no_migration': observation['schema'] == 3}
 
 
+def restored_inventory(root):
+    """Hash only owned candidate entries; never follow a link out of a capture."""
+    inventory, links = [], {}
+    fixed = {'checklist.sqlite', 'checklist-store.identity.json', 'restore-receipt.json'}
+    for folder, directories, files in os.walk(root, followlinks=False):
+        for name in sorted(directories + files):
+            file = Path(folder) / name
+            info = file.lstat()
+            if info.st_uid != os.getuid(): raise ValueError('Restored root entries must belong to the current user.')
+            relative = file.relative_to(root).as_posix()
+            if stat.S_ISDIR(info.st_mode):
+                if relative.split('/')[0] not in ['objects', 'source-captures', 'staging', 'icons', 'source-executions', 'source-build-cache']:
+                    raise ValueError('Unexpected restored directory: ' + relative)
+                continue
+            if relative not in fixed: relative_path(relative)
+            if stat.S_ISLNK(info.st_mode):
+                parts = PurePosixPath(relative).parts
+                target = os.readlink(file)
+                if len(parts) < 5 or parts[0] != 'source-captures' or parts[3] != 'source' or target.startswith('/'):
+                    raise ValueError('Unsafe restored capture link: ' + relative)
+                # Same confinement and terminal-file proof as snapshot seeds.
+                resolved = list(parts[:-1])
+                for part in target.split('/'):
+                    if part == '..':
+                        if len(resolved) <= 4: raise ValueError('Restored link escapes its capture.')
+                        resolved.pop()
+                    elif part not in ['', '.']: resolved.append(part)
+                links[relative] = '/'.join(resolved)
+                digest = hashlib.sha256(target.encode()).hexdigest()
+                size = len(target.encode())
+                kind = 'symlink'
+            elif stat.S_ISREG(info.st_mode):
+                contained(file, root)
+                digest, size, kind = sha(file), info.st_size, 'file'
+            else: raise ValueError('Restored root contains a special file.')
+            inventory.append([relative, kind, digest, size, bool(info.st_mode & 0o111) if kind == 'file' else False])
+    regular = {entry[0] for entry in inventory if entry[1] == 'file'}
+    for name in links:
+        visited = set()
+        while name in links:
+            if name in visited or len(visited) >= 32: raise ValueError('Restored capture link cycle.')
+            visited.add(name); name = links[name]
+        if name not in regular: raise ValueError('Restored capture link target is absent.')
+    return sorted(inventory)
+
+
+def restored_seed(source, destination, destination_root=None):
+    source = source.expanduser().absolute()
+    contained(source, source)
+    # Restore qualification never reads any part of either live root, including backups/restore.
+    if any(paths_overlap(source, live) for live in {LIVE, DEFAULT_LIVE}):
+        raise ValueError('Restored seed must not overlap the live data root; use a disposable restore.')
+    if source.parent.name != 'restore' or not re.fullmatch(r'restored-[0-9a-f]{32}', source.name):
+        raise ValueError('Restored seed must be a product-published restore/restored-<job> folder.')
+    receipt_file = contained(source / 'restore-receipt.json', source)
+    if not receipt_file.is_file() or receipt_file.stat().st_size > 16_384:
+        raise ValueError('Restored root has no complete product validation receipt.')
+    receipt_bytes = receipt_file.read_bytes()
+    try:
+        receipt = json.loads(receipt_bytes)
+        if receipt['format'] != 1 or receipt['state'] != 'complete' or receipt['dispatch'] != 'quarantined':
+            raise ValueError('Restore validation receipt is not complete and quarantined.')
+        for key in ['command_id', 'source_store_id', 'incarnation']: uuid.UUID(receipt[key])
+        for key in ['intent_digest', 'manifest_sha256', 'database_sha256']:
+            if not re.fullmatch(r'[0-9a-f]{64}', receipt[key]): raise ValueError('Invalid restore receipt hash.')
+        if not receipt['principal'] or not receipt['restored_at']: raise ValueError('Incomplete restore receipt.')
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError('Invalid product restore validation receipt: ' + str(error)) from error
+    before = restored_inventory(source)
+    if not any(entry[0] == 'restore-receipt.json' and entry[2] == hashlib.sha256(receipt_bytes).hexdigest() for entry in before):
+        raise ValueError('Restore validation receipt changed during inspection.')
+    database = source / 'checklist.sqlite'
+    if sha(database) != receipt['database_sha256']:
+        raise ValueError('Restored database differs from its validation receipt.')
+    observation = database_observation(database)
+    identity_file = contained(source / 'checklist-store.identity.json', source)
+    identity = json.loads(identity_file.read_bytes())
+    if (not isinstance(identity, dict) or observation['schema'] != 3 or observation['quick_check'] != 'ok' or observation['identity'] != identity
+            or identity.get('format_version') != 1 or identity.get('state') != 'ready'
+            or identity.get('schema_revision') != 3 or identity.get('database_generation') != 1
+            or identity.get('logical_store_id') != receipt['source_store_id'] or identity.get('incarnation') != receipt['incarnation']):
+        raise ValueError('Restored database/identity does not match its validation receipt.')
+    with closing(sqlite3.connect(database.as_uri() + '?mode=ro&immutable=1', uri=True)) as connection:
+        connection.create_collation('checklist_storage_v2', lambda a, b: (a.encode() > b.encode()) - (a.encode() < b.encode()))
+        values = dict(connection.execute("SELECT key,value FROM metadata WHERE key IN ('incarnation','restore_receipt')"))
+    if (values.get('incarnation') != receipt['incarnation']
+            or json.loads(values.get('restore_receipt', '{}')) != {k: v for k, v in receipt.items() if k != 'database_sha256'}):
+        raise ValueError('Restored database has no matching authority-fencing receipt.')
+    inspection = require_local_paths(database, destination_root or destination, source_root=source)
+    shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=True)
+    if restored_inventory(destination) != before or restored_inventory(source) != before:
+        raise ValueError('Restored root copy verification failed or source changed.')
+    require_local_paths(destination / 'checklist.sqlite', destination_root or destination, source_root=source)
+    return {'kind': 'restored', 'source': str(source), 'source_root': str(source),
+            'restore_job': receipt['command_id'], 'manifest_sha256': receipt['manifest_sha256'],
+            'database_sha256': receipt['database_sha256'], 'receipt_sha256': hashlib.sha256(receipt_bytes).hexdigest(),
+            'source_hash': hashlib.sha256(json.dumps(before).encode()).hexdigest(),
+            'age_seconds_at_create': max(0, time.time() - receipt_file.stat().st_mtime),
+            'before_start': observation, 'path_inspection': inspection, 'current_schema_no_migration': True}
+
+
 def slot_seed(other, destination, destination_root=None):
     stopped(other)
     metadata = load(other)
@@ -778,42 +893,55 @@ def create(arguments, p):
     capture, manifest = stage_selection(arguments)
     identity = sign_identity(manifest)
     validate_fingerprint(manifest['source_fingerprint'])
-    if p['folder'].exists(): destroy(p)
-    p['folder'].mkdir(mode=0o700)
-    mark_qualification(p['folder'], manifest['source_fingerprint'],
-                       'disposable test slot ' + str(arguments.slot), session)
-    metadata = {'slot': arguments.slot, 'build_id': manifest['build_id'], 'source_fingerprint': manifest['source_fingerprint'],
-                'stage_path': str(capture), 'seed': {'kind': 'incomplete'}, 'created_at': now(), 'mode': 'incomplete', 'checks': None}
-    save(p, metadata)
-    pending = contained(p['folder'] / '.seed-data', p['folder']); pending.mkdir(mode=0o700)
-    try:
-        if arguments.seed != 'empty': require_managed_path_support(capture, manifest)
-        seed = {'kind': 'empty', 'source_hash': None, 'age_seconds_at_create': 0}
-        if arguments.seed == 'latest-backup':
-            seed = snapshot_seed(latest_backup(), pending, p['data'])
-        elif arguments.seed.startswith('backup:'):
-            seed = snapshot_seed(Path(arguments.seed[7:]), pending, p['data'])
-        elif arguments.seed.startswith('slot:'):
-            seed = slot_seed(checked(slot_number(arguments.seed[5:])), pending, p['data'])
-        elif arguments.seed != 'empty': raise ValueError('Seed must be empty, latest-backup, backup:PATH or slot:M.')
-    except (ValueError, OSError, sqlite3.Error) as error:
-        metadata.update(mode='refused', seed={'kind': 'refused', 'reason': str(error)})
+    with ExitStack() as preparation:
+        prepared = None
+        if arguments.seed.startswith('restored:'):
+            require_managed_path_support(capture, manifest)
+            # Keep the verified copy outside the replaced folder. Its source may
+            # be that slot's own restore/ candidate; replacement must happen last.
+            temporary = preparation.enter_context(tempfile.TemporaryDirectory(prefix='.restored-seed-', dir=BASE))
+            prepared = Path(temporary) / 'data'; prepared.mkdir(mode=0o700)
+            restored = restored_seed(Path(arguments.seed[9:]), prepared, p['data'])
+        if p['folder'].exists(): destroy(p)
+        p['folder'].mkdir(mode=0o700)
+        mark_qualification(p['folder'], manifest['source_fingerprint'],
+                           'disposable test slot ' + str(arguments.slot), session)
+        metadata = {'slot': arguments.slot, 'build_id': manifest['build_id'], 'source_fingerprint': manifest['source_fingerprint'],
+                    'stage_path': str(capture), 'seed': {'kind': 'incomplete'}, 'created_at': now(), 'mode': 'incomplete', 'checks': None}
         save(p, metadata)
-        raise
-    # Neither the service root nor an executable app is published for a refused seed.
-    pending.rename(p['data'])
-    run(['ditto', capture / 'Checklist.app', p['bundle']])
-    info_file = p['bundle'] / 'Contents/Info.plist'
-    info_file.write_bytes(plistlib.dumps(rewrite_info(plistlib.loads(info_file.read_bytes()), arguments.slot)))
-    # Test bundles never register Login Items and carry no live launchd labels.
-    agents = p['bundle'] / 'Contents/Library/LaunchAgents'
-    if agents.exists(): shutil.rmtree(contained(agents, p['folder']))
-    run(['codesign', '--force', '--sign', identity, '--timestamp=none', '--identifier', p['identifier'], p['bundle']])
-    run(['codesign', '--verify', '--deep', '--strict', p['bundle']])
-    signing_teams(p['bundle'], manifest['signing_profile'])
-    save(p, {'slot': arguments.slot, 'build_id': manifest['build_id'], 'source_fingerprint': manifest['source_fingerprint'],
-             'stage_path': str(capture), 'seed': seed, 'created_at': now(), 'mode': 'stopped', 'checks': None})
-    print(f'Created slot {arguments.slot}: build {manifest["build_id"]}; seed {seed["kind"]}')
+        pending = contained(p['folder'] / '.seed-data', p['folder'])
+        if prepared is not None: prepared.rename(pending)
+        else: pending.mkdir(mode=0o700)
+        try:
+            if arguments.seed != 'empty': require_managed_path_support(capture, manifest)
+            seed = {'kind': 'empty', 'source_hash': None, 'age_seconds_at_create': 0}
+            if prepared is not None:
+                seed = restored
+            elif arguments.seed == 'latest-backup':
+                seed = snapshot_seed(latest_backup(), pending, p['data'])
+            elif arguments.seed.startswith('backup:'):
+                seed = snapshot_seed(Path(arguments.seed[7:]), pending, p['data'])
+            elif arguments.seed.startswith('slot:'):
+                seed = slot_seed(checked(slot_number(arguments.seed[5:])), pending, p['data'])
+            elif arguments.seed != 'empty': raise ValueError('Seed must be empty, latest-backup, backup:PATH, restored:PATH or slot:M.')
+        except (ValueError, OSError, sqlite3.Error) as error:
+            metadata.update(mode='refused', seed={'kind': 'refused', 'reason': str(error)})
+            save(p, metadata)
+            raise
+        # Neither the service root nor an executable app is published for a refused seed.
+        pending.rename(p['data'])
+        run(['ditto', capture / 'Checklist.app', p['bundle']])
+        info_file = p['bundle'] / 'Contents/Info.plist'
+        info_file.write_bytes(plistlib.dumps(rewrite_info(plistlib.loads(info_file.read_bytes()), arguments.slot)))
+        # Test bundles never register Login Items and carry no live launchd labels.
+        agents = p['bundle'] / 'Contents/Library/LaunchAgents'
+        if agents.exists(): shutil.rmtree(contained(agents, p['folder']))
+        run(['codesign', '--force', '--sign', identity, '--timestamp=none', '--identifier', p['identifier'], p['bundle']])
+        run(['codesign', '--verify', '--deep', '--strict', p['bundle']])
+        signing_teams(p['bundle'], manifest['signing_profile'])
+        save(p, {'slot': arguments.slot, 'build_id': manifest['build_id'], 'source_fingerprint': manifest['source_fingerprint'],
+                 'stage_path': str(capture), 'seed': seed, 'created_at': now(), 'mode': 'stopped', 'checks': None})
+        print(f'Created slot {arguments.slot}: build {manifest["build_id"]}; seed {seed["kind"]}')
 
 
 def executable_payload(path):
@@ -906,7 +1034,7 @@ def service_status(p, *, bound=None):
 def start(arguments, p):
     bound = start_deadline_seconds()  # Reject invalid configuration before bootstrap.
     metadata = load(p)
-    if metadata['seed']['kind'] not in ['empty', 'backup', 'slot'] or metadata['mode'] in ['incomplete', 'refused']:
+    if metadata['seed']['kind'] not in ['empty', 'backup', 'slot', 'restored'] or metadata['mode'] in ['incomplete', 'refused']:
         raise ValueError('Slot creation did not complete: ' + metadata['seed'].get('reason', 'incomplete seed'))
     manifest = bundle_check(p, metadata)
     if metadata['seed']['kind'] != 'empty':

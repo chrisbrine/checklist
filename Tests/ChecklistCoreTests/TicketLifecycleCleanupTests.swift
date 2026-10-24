@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -9,7 +10,7 @@ final class TicketLifecycleCleanupTests: XCTestCase {
     let defaults: JSON = ["done_evidence_enabled":true,"closed_purge_enabled":true,"closed_days":15]
     override func setUpWithError() throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("checklist-lifecycle-" + uuid())
-        router = try CommandRouter(root:directory.appendingPathComponent("store"))
+        router = try TestStore.router(root:directory.appendingPathComponent("store"))
     }
     override func tearDownWithError() throws {try router?.closeStore();router = nil;try? FileManager.default.removeItem(at:directory)}
     func call(_ method: String,_ p: JSON) throws -> JSON {
@@ -73,7 +74,7 @@ final class TicketLifecycleCleanupTests: XCTestCase {
         XCTAssertEqual(settings["closed_purge_enabled"] as? Bool,true)
         XCTAssertNil(p["ticket_cleanup_activated_at"])
         XCTAssertFalse(CommandRouter.readMethods.contains("ticket_cleanup_preview"))
-        let root = router.root;try router.closeStore();router = try CommandRouter(root:root)
+        let root = router.root;try router.closeStore();router = try TestStore.router(root:root)
         // Startup exposes an immediate service maintenance deadline, without doing
         // a first-install graph traversal before the service can accept requests.
         XCTAssertLessThanOrEqual(try XCTUnwrap(router.nextArchiveCleanupDeadline()).timeIntervalSinceNow,0.2)
@@ -131,7 +132,7 @@ final class TicketLifecycleCleanupTests: XCTestCase {
                 default:try self.router.save(db,["id":uuid(),"project_id":p["id"]!,"artifact_id":a["id"]!,"revision":1],type:"manifest")
                 }
             }
-            let root = router.root;try router.closeStore();router = nil;router = try CommandRouter(root:root);try finish()
+            let root = router.root;try router.closeStore();router = nil;router = try TestStore.router(root:root);try finish()
             XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String),protection)
             XCTAssertGreaterThan((try receipts(p).first?["summary"] as? JSON)?["retained_count"] as? Int ?? 0,0,protection)
         }
@@ -150,7 +151,7 @@ final class TicketLifecycleCleanupTests: XCTestCase {
         try router.dbQueue.write {db in try db.execute(sql:"CREATE TRIGGER lifecycle_fixture_stop BEFORE INSERT ON records WHEN json_extract(NEW.data,'$.cause')='ticket_cleanup_pass' BEGIN SELECT RAISE(ABORT,'fixture rollback'); END")}
         XCTAssertThrowsError(try pass());XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String));XCTAssertFalse(bool(try read(t),"purged"))
         try router.dbQueue.write {try $0.execute(sql:"DROP TRIGGER lifecycle_fixture_stop")}
-        try expireCleanupBackoff();try pass();let root = router.root;try router.closeStore();router = nil;router = try CommandRouter(root:root);try finish()
+        try expireCleanupBackoff();try pass();let root = router.root;try router.closeStore();router = nil;router = try TestStore.router(root:root);try finish()
         XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
     }
     func testPendingOwnerInspectionBlocksBothRulesAndAppearsInReceipt() throws {
@@ -175,7 +176,7 @@ final class TicketLifecycleCleanupTests: XCTestCase {
         _ = try configure(p);let v = try selection(p)
         XCTAssertEqual((v["items"] as? [JSON])?.filter {$0["action"] as? String == "purge"}.count,1)
         try pass();XCTAssertEqual(try router.dbQueue.read {try router.records($0,type:"task",project:p["id"] as? String).filter {bool($0,"purged")}.count},1)
-        let root = router.root;try router.closeStore();router = nil;router = try CommandRouter(root:root)
+        let root = router.root;try router.closeStore();router = nil;router = try TestStore.router(root:root)
         for i in 1...12 {try pass(at:Date().addingTimeInterval(Double(i)))};XCTAssertEqual(try router.dbQueue.read {try router.records($0,type:"task",project:p["id"] as? String).filter {bool($0,"purged")}.count},13)
     }
 }
@@ -330,6 +331,7 @@ extension TicketLifecycleCleanupTests {
         XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
     }
     func testLargeAutomaticFirstPassKeepsConcurrentReadAndWriteUnderTwoSeconds() throws {
+        try QualificationSuite.requireEnabled()
         let (p,t,_) = try fixture(category:"queued"),pid = p["id"] as! String
         let files = try StorageObjectFiles(root:router.root),bytes = Data("x".utf8),sha = ChecklistCore.hash(bytes)
         var captures: [JSON] = [],tasks: [JSON] = []
@@ -505,7 +507,7 @@ extension TicketLifecycleCleanupTests {
         let (_,path) = try cacheExecution(p,try router.dbQueue.read {try router.records($0,type:"task",project:p["id"] as! String)[0]})
         try StorageObjectFiles(root:router.root).writeNew(path + "/checkouts/package/file",bytes:Data("cache".utf8))
         try FileManager.default.createDirectory(at:router.root.appendingPathComponent("backups/old-protected-snapshot"),withIntermediateDirectories:true)
-        let root = router.root;try router.closeStore();router = try CommandRouter(root:root)
+        let root = router.root;try router.closeStore();router = try TestStore.router(root:root)
         XCTAssertEqual(try router.dbQueue.read {try Int.fetchOne($0,sql:"PRAGMA user_version")},3)
         XCTAssertFalse(try StorageSnapshotRetention.isActive(root:root))
         XCTAssertLessThan(try XCTUnwrap(router.nextArchiveCleanupDeadline()).timeIntervalSinceNow,0.2)
@@ -750,6 +752,7 @@ extension TicketLifecycleCleanupTests {
 
 extension TicketLifecycleCleanupTests {
     func testLargeCacheAliasInventoryExhaustsOneBoundedClosureBudgetAndRetainsEntry() throws {
+        try QualificationSuite.requireEnabled()
         let (p,t,_) = try fixture(),(_,path) = try cacheExecution(p,t)
         let files = try StorageObjectFiles(root:router.root)
         try files.writeNew(path + "/arch/debug/product",bytes:Data("bounded cache".utf8))
