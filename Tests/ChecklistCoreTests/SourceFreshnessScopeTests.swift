@@ -101,10 +101,10 @@ final class SourceFreshnessScopeTests: XCTestCase {
     }
     func testGitHeadAndIndexChangeWithoutRelevantByteChangesStaysFresh() throws {
         let (f,s,r) = try submitted()
-        _ = try SourceGit.run(f.workspace.path,["init"])
-        _ = try SourceGit.run(f.workspace.path,["add","."])
+        _ = try SourceGit.run(f.workspace.path,["init"], protectedRoots: [NSTemporaryDirectory() + "checklist-fixture-protected"])
+        _ = try SourceGit.run(f.workspace.path,["add","."], protectedRoots: [NSTemporaryDirectory() + "checklist-fixture-protected"])
         _ = try f.call("review_context",f.selectors(s),r)
-        _ = try SourceGit.run(f.workspace.path,["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-m","same bytes"])
+        _ = try SourceGit.run(f.workspace.path,["-c","maintenance.auto=false","-c","gc.auto=0","-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-m","same bytes"], protectedRoots: [NSTemporaryDirectory() + "checklist-fixture-protected"])
         _ = try f.call("review_context",f.selectors(s),r);_ = try f.call("work_claim",f.selectors(s),r)
     }
     func testExecutableBitAndSymlinkTargetAreRelevant() throws {

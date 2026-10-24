@@ -272,7 +272,7 @@ extension CommandRouter {
         try? FileManager.default.removeItem(at:item)
         return lstat(item.path,&info) != 0 && errno == ENOENT
     }
-    static let projectExportTypes = ["policy_revision","task","relation","task_alias","status","tag","message","conversation","delivery","request","group","attachment","review","review_request","finding","finding_resolution","manifest","attempt","session","task_session","source_capture","source_execution","batch","batch_claim","batch_disposition","triage_membership_interval","triage_membership_exit","project_context_revision","direction_disposition","checkpoint","policy_proposal","taxonomy_revision","storage_job","storage_hold"] + MediaRecordRegistry.families.sorted()
+    static let projectExportTypes = ["import_record","import_receipt","policy_revision","task","relation","task_alias","status","tag","message","conversation","delivery","request","group","attachment","review","review_request","finding","finding_resolution","manifest","attempt","session","task_session","source_capture","source_execution","batch","batch_claim","batch_disposition","triage_membership_interval","triage_membership_exit","project_context_revision","direction_disposition","checkpoint","policy_proposal","taxonomy_revision","storage_job","storage_hold"] + MediaRecordRegistry.families.sorted()
 
     func projectExportRecords(_ db: Database,pid: String) throws -> JSON {
         // Validate ALL project envelopes before applying the portable projection. An
@@ -297,7 +297,6 @@ extension CommandRouter {
                     }
                     _ = try managedRelative(path,family:"objects")
                 }
-                for key in ["token_hash","incarnation","session_generation","authorization_generation"] { values[i].removeValue(forKey:key) }
                 if type == "session" { values[i]["project_ids"] = [pid] }
             }
             exported[type] = values
@@ -319,7 +318,7 @@ extension CommandRouter {
         let profileIDs = Set((exported["session"] as? [JSON] ?? []).compactMap {$0["profile_id"] as? String})
         exported["profiles"] = try records(db,type:"profile").filter {profileIDs.contains($0["id"] as? String ?? "")}
         exported["events"] = try Row.fetchAll(db,sql:"SELECT id,entity_id,actor,kind,occurred_at,data FROM events WHERE project_id=? ORDER BY seq",arguments:[pid]).map { row -> JSON in ["id":row["id"] as String,"entity_id":row["entity_id"] as String? ?? "","actor":row["actor"] as String,"kind":row["kind"] as String,"occurred_at":row["occurred_at"] as String,"data":jsonObject(row["data"])] }
-        return exported
+        return PortableProjectExport.project(exported)
     }
     func writeProjectExport(_ captured: JSON,directory: URL) throws {
         var exported = captured

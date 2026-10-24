@@ -306,8 +306,9 @@ extension CommandRouter {
                 if mode == "managed",let managedCopy {
                     guard path.hasPrefix("/") else { throw CoreError("FILE_ACCESS_REQUIRED","Choose an absolute local file path.") }
                     let kind = spec["kind"] as? String ?? spec["selection"] as? String ?? "either"
-                    var directory: ObjCBool = false
-                    guard kind != "directory",!(FileManager.default.fileExists(atPath:canonical(path),isDirectory:&directory) && directory.boolValue) else { throw CoreError("ANSWER_INCOMPLETE","Directories can be referenced, while managed copies require files.") }
+                    // The managed preparation opens/type-checks this selection
+                    // through its bounded descriptor path before any observation.
+                    guard kind != "directory" else { throw CoreError("ANSWER_INCOMPLETE","Directories can be referenced, while managed copies require files.") }
                     hashes[path] = try managedCopy(file,path)
                     continue
                 }

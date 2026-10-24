@@ -190,7 +190,7 @@ def validate_fingerprint(value):
 
 
 def caller_session(session_id=None):
-    native = os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID')
+    native = os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID') or os.environ.get('CHECKLIST_SESSION_ID')
     if native and session_id and native != session_id:
         raise ValueError('--session-id cannot override the host caller')
     value = native or session_id
@@ -539,8 +539,8 @@ def main():
     parser.add_argument('--purpose', help='workspace purpose; required with --mark')
     parser.add_argument('--source-fingerprint', type=validate_fingerprint,
                         help='with --mark: bind a disposable qualification run to its exact build source fingerprint')
-    parser.add_argument('--session-id', default=os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID'),
-                        help='caller session (default: CODEX_THREAD_ID or CLAUDE_SESSION_ID); never name another session')
+    parser.add_argument('--session-id', default=os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID') or os.environ.get('CHECKLIST_SESSION_ID'),
+                        help='caller session (default: CODEX_THREAD_ID, CLAUDE_SESSION_ID or CHECKLIST_SESSION_ID); never name another session')
     parser.add_argument('--include-released', action='store_true',
                         help='also inspect foreign roots explicitly released by their owning session')
     parser.add_argument('--sessions-root', type=Path, default=Path(f'/private/tmp/claude-{os.getuid()}'))
@@ -550,7 +550,7 @@ def main():
     parser.add_argument('--keep-qualified', type=Path, action='append', default=[],
                         help='also retain this exact qualified round or assigned persistent slot (repeatable)')
     args = parser.parse_args()
-    native_session = os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID')
+    native_session = os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID') or os.environ.get('CHECKLIST_SESSION_ID')
     if native_session and args.session_id != native_session:
         parser.error('--session-id cannot override the host caller; use --include-released for released foreign roots')
     if not args.session_id or args.session_id in {'.', '..'} or '/' in args.session_id or not args.session_id.strip():

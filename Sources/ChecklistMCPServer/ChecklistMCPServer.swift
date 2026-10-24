@@ -17,6 +17,8 @@ public enum ChecklistMCPServer {
     }
 
     public static func start(bridge: Bridge, transport: any Transport = StdioTransport()) async throws -> Server {
+        let started = ProcessInfo.processInfo.systemUptime
+        defer { if CallTimingLog.enabled { CallTimingLog.write(["scope":"mcp_startup", "total_ms":(ProcessInfo.processInfo.systemUptime-started)*1000]) } }
         _ = try await bridge.connect()
         try await bridge.verifySession()
         await bridge.reportStartupNotice()

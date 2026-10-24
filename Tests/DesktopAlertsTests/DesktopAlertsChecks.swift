@@ -1,4 +1,8 @@
 import Foundation
+#if canImport(ChecklistApp)
+import XCTest
+@testable import ChecklistApp
+#endif
 
 @MainActor final class FakeDesktopAlertSink: DesktopAlertSink {
     var status = DesktopAlertAuthorization.allowed
@@ -27,7 +31,10 @@ import Foundation
     func remove(_ identifiers: [String]) { removed += identifiers }
 }
 
-@main @MainActor struct DesktopAlertsChecks {
+#if !canImport(ChecklistApp)
+@main
+#endif
+@MainActor struct DesktopAlertsChecks {
     static var checks = 0
     static func expect(_ value: @autoclosure () -> Bool,_ message: String) throws {
         checks += 1
@@ -158,3 +165,11 @@ import Foundation
         print("Desktop alert checks passed: \(checks). Fake sink only; no system notification or OS permission request, and no preference write.")
     }
 }
+
+#if canImport(ChecklistApp)
+@MainActor final class DesktopAlertsTests: XCTestCase {
+    func testStandaloneChecks() async throws {
+        try await DesktopAlertsChecks.main()
+    }
+}
+#endif

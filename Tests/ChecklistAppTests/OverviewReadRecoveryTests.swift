@@ -20,6 +20,7 @@ import ChecklistIPC
         var calls: [Call] = [], held: [Held] = []
         var waitCursors: [String?] = []
         var hold = false, combinedError: Error?, failingSurface: String?
+        var readVersion = "overview-fixture"
         var active = 0, maximumActive = 0
         init(_ preferences: UserDefaults) { self.preferences = preferences; preferences.set(Page.overview.rawValue, forKey: "lastPage") }
         func page(_ params: [String: Any]) -> [String: Any] {
@@ -27,7 +28,7 @@ import ChecklistIPC
             let suffix = params["cursor"] as? String ?? params["since"] as? String ?? "first"
             return ["workspace_version": 1, "surface": surface, "record_id": "", "rows": [["id": "\(project)-\(surface)-\(suffix)", "project_id": project]],
                     "total": 37, "needs_you_count": 91, "has_more": true, "next_cursor": "next-\(surface)", "previous_cursor": NSNull(),
-                    "projects": [["id": "p"], ["id": "q"]], "service": ["store_incarnation": "store"], "content_cursor": "content-\(surface)"]
+                    "projects": [["id": "p"], ["id": "q"]], "service": ["store_incarnation": "store", "read_version": readVersion], "content_cursor": "content-\(surface)"]
         }
         func reply(_ call: Call) -> [String: Any] {
             if call.surface != "overview" { return page(call.params) }
@@ -37,7 +38,7 @@ import ChecklistIPC
                 if surface != "completed_since" { params.removeValue(forKey: "since") }
                 groups[surface] = page(params)
             }
-            return ["groups": groups, "event_cursor": "combined-coverage"]
+            return ["groups": groups, "service": ["store_incarnation":"store", "read_version":readVersion], "event_cursor": "combined-coverage"]
         }
         func transport(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
             if method == "changes_wait" { waitCursors.append(params["cursor"] as? String); try await Task.sleep(nanoseconds: 30_000_000_000); throw CancellationError() }
@@ -77,6 +78,35 @@ import ChecklistIPC
         }
         XCTFail("More than the bounded ten surface reads")
     }
+    func testCachedOverviewReturnRestoresMatchingGroupsSynchronously() async throws {
+        let f = fixture(); defer { f.cleanup() }
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); store.stopWindowReads() }
+        try await until { store.overviewObservations.values.allSatisfy { $0.page != nil && !$0.loading } }
+        let original = store.overviewObservations["needs_pickup"]!.rows.map(\.id)
+        store.select(.overview, project:"q")
+        try await until { store.overviewObservations["needs_pickup"]?.page?.query.project == "q" }
+        f.hold = true
+        let start = ProcessInfo.processInfo.systemUptime
+        store.select(.overview)
+        XCTAssertEqual(store.overviewObservations["needs_pickup"]!.rows.map(\.id), original)
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 0.3)
+        try await drain(f, store:store)
+        XCTAssertEqual(f.calls.filter { $0.surface == "overview" }.count, 3)
+    }
+
+    func testNativeAppearanceDoesNotReplaceCombinedFastPathWithTenSingles() async throws {
+        let f = fixture(); defer { f.cleanup() }; f.hold = true
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); store.stopWindowReads() }
+        try await until { f.held.count == 1 }
+        store.beginOverviewVisit() // SwiftUI onAppear follows the initial loader.
+        await Task.yield()
+        while !f.held.isEmpty { f.release(); await Task.yield() }
+        try await until { store.overviewObservations.values.allSatisfy { !$0.loading } }
+        XCTAssertEqual(f.calls.map(\.surface), ["overview"])
+    }
+
     func testFastCombinedReadKeepsTenExactPagesAndOneRequest() async throws {
         let f = fixture(); defer { f.cleanup() }; let store = f.store()
         await store.refresh()
@@ -108,6 +138,33 @@ import ChecklistIPC
         XCTAssertEqual(f.calls.map(\.surface), ["overview"] + surfaces)
         XCTAssertEqual(f.maximumActive, 1); XCTAssertEqual(store.needsCount, 91)
         XCTAssertTrue(store.overviewObservations.values.allSatisfy { $0.page != nil && !$0.loading && $0.error == nil })
+    }
+    func testFallbackLearningCommittedVersionDoesNotRestartItsPendingSurfaces() async throws {
+        let f = fixture();defer {f.cleanup()};let store = f.store()
+        await store.refresh()
+        f.readVersion = "after-committed-change";f.combinedError = timeout
+        let before = f.calls.count
+        await store.refresh()
+        // A token change discovered by the first fallback page must not schedule
+        // another Overview loader behind the sequential one already in progress.
+        for _ in 0..<30 { await Task.yield() }
+        XCTAssertEqual(Array(f.calls.dropFirst(before)).map(\.surface),["overview"] + surfaces)
+        XCTAssertEqual(f.maximumActive,1)
+        XCTAssertTrue(store.overviewObservations.values.allSatisfy { $0.page != nil && !$0.loading && $0.error == nil })
+    }
+    func testCommitMidwayThroughFallbackRepairsOnlyInvalidatedCompletedPages() async throws {
+        let f = fixture();defer {f.cleanup()};let store = f.store()
+        await store.refresh();f.hold = true
+        let before = f.calls.count, read = Task { await store.refresh() }
+        try await until {f.held.count == 1};f.release(error:timeout)
+        try await until {f.held.count == 1};f.release() // completed_since at the older version
+        try await until {f.held.count == 1}
+        XCTAssertEqual(f.held[0].call.surface,"human_tasks")
+        f.readVersion = "commit-during-fallback";f.release()
+        try await drain(f,store:store);await read.value
+        XCTAssertEqual(Array(f.calls.dropFirst(before)).map(\.surface),["overview"] + surfaces + ["completed_since"])
+        XCTAssertEqual(f.maximumActive,1)
+        XCTAssertTrue(store.overviewObservations.values.allSatisfy {$0.page != nil && !$0.loading && $0.error == nil})
     }
     func testOneFallbackFailureSettlesAndExplicitRetryOnlyReadsThatSurface() async throws {
         let f = fixture(); defer { f.cleanup() }; f.combinedError = timeout; f.failingSurface = "needs_active"

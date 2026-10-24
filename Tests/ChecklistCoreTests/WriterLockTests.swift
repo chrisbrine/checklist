@@ -196,13 +196,13 @@ extension EvidenceAuthorityTests {
         let scripts = directory.appendingPathComponent("fake-git"); try FileManager.default.createDirectory(at: scripts, withIntermediateDirectories: true)
         // A child that writes 1 MiB to stderr before stdout would block a parent that reads stdout first.
         let noisy = scripts.appendingPathComponent("noisy"), hanging = scripts.appendingPathComponent("hanging")
-        try "#!/bin/sh\nhead -c 1048576 /dev/zero >&2\necho done\n".write(to: noisy, atomically: true, encoding: .utf8)
-        try "#!/bin/sh\nsleep 30\n".write(to: hanging, atomically: true, encoding: .utf8)
+        try "#!/bin/sh\ni=0; while [ $i -lt 20000 ]; do echo 012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789 >&2; i=$((i+1)); done\necho done\n".write(to: noisy, atomically: true, encoding: .utf8)
+        try "#!/bin/sh\nwhile :; do :; done\n".write(to: hanging, atomically: true, encoding: .utf8)
         for file in [noisy, hanging] { try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path) }
-        let output = try SourceGit.run(workspace.path, ["status"], executable: noisy.path, timeout: 10)
+        let output = try SourceGit.run(workspace.path, ["status"], protectedRoots: [NSTemporaryDirectory() + "checklist-fixture-protected"], executable: noisy.path, timeout: 10)
         XCTAssertEqual(String(data: output, encoding: .utf8), "done\n")
         let start = Date()
-        XCTAssertThrowsError(try SourceGit.run(workspace.path, ["status"], executable: hanging.path, timeout: 1)) {
+        XCTAssertThrowsError(try SourceGit.run(workspace.path, ["status"], protectedRoots: [NSTemporaryDirectory() + "checklist-fixture-protected"], executable: hanging.path, timeout: 1)) {
             XCTAssertEqual(($0 as? CoreError)?.code, "SOURCE_CAPTURE_INCOMPLETE")
             XCTAssertEqual(($0 as? CoreError)?.details["reason"] as? String, "git_timeout")
         }

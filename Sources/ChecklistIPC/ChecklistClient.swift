@@ -19,6 +19,9 @@ public final class ChecklistClient: @unchecked Sendable {
     /// native host ancestry, working directory and registered project itself.
     /// No caller-selected role, profile or credential is accepted by this path.
     public func bootstrap(_ nativeContext: [String: Any], timeBudget: TimeInterval? = nil) throws -> [String: Any] {
+        let started = ProcessInfo.processInfo.systemUptime
+        var preparationMS: Double = 0
+        defer { if CallTimingLog.enabled { CallTimingLog.write(["scope":"client", "method":"connection_bootstrap", "preparation_ms":preparationMS, "total_ms":(ProcessInfo.processInfo.systemUptime-started)*1000]) } }
         if let timeBudget, !timeBudget.isFinite || timeBudget < 0 {
             throw ChecklistError("INVALID_INPUT", "The bootstrap time budget must be a finite, nonnegative number of seconds.")
         }
@@ -31,8 +34,10 @@ public final class ChecklistClient: @unchecked Sendable {
         }
         _ = try remaining()
         try ChecklistPaths.prepare()
-        let request: [String: Any] = ["method": "connection_bootstrap", "params": nativeContext, "installation": "automatic", "owner_channel": false]
+        var request: [String: Any] = ["method": "connection_bootstrap", "params": nativeContext, "installation": "automatic", "owner_channel": false]
+        if CallTimingLog.enabled { request["diagnostics_timing"] = true }
         let bytes = try JSONSerialization.data(withJSONObject: request)
+        preparationMS = (ProcessInfo.processInfo.systemUptime-started)*1000
         do { return try requestOnce(bytes, replyTimeout: remaining()) }
         catch let error as ChecklistError where error.code == "SERVICE_UNAVAILABLE" {
             if let deadline {
@@ -51,6 +56,9 @@ public final class ChecklistClient: @unchecked Sendable {
     /// Wait for the service's result by default. A caller with a bounded lifetime can
     /// supply a timeout; expiry does not cancel the command or authorize a new UUID.
     public func call(_ method: String, _ params: [String: Any] = [:], replyTimeout: TimeInterval? = nil) throws -> [String: Any] {
+        let started = ProcessInfo.processInfo.systemUptime
+        var preparationMS: Double = 0
+        defer { if CallTimingLog.enabled { CallTimingLog.write(["scope":"client", "method":method, "preparation_ms":preparationMS, "total_ms":(ProcessInfo.processInfo.systemUptime-started)*1000]) } }
         try ChecklistPaths.prepare()
         if owner { try Self.registerInstalledBuild() }
         var command = params
@@ -61,7 +69,9 @@ public final class ChecklistClient: @unchecked Sendable {
         if let workspace { request["workspace"] = workspace }
         if let nativeContext, !owner { request["native_context"] = nativeContext }
         if !owner, usesStoredCredential, let token = try ChecklistKeychain.read(installation) { request["credential"] = token }
+        if CallTimingLog.enabled { request["diagnostics_timing"] = true }
         let bytes = try JSONSerialization.data(withJSONObject: request)
+        preparationMS = (ProcessInfo.processInfo.systemUptime-started)*1000
         do { return try requestOnce(bytes, replyTimeout: replyTimeout) }
         catch let error as ChecklistError where error.code == "SERVICE_UNAVAILABLE" {
             try Self.startService()
@@ -109,7 +119,14 @@ public final class ChecklistClient: @unchecked Sendable {
         if let replyTimeout, !replyTimeout.isFinite || replyTimeout < 0 {
             throw ChecklistError("INVALID_INPUT", "The reply timeout must be a finite, nonnegative number of seconds.")
         }
+        let started = ProcessInfo.processInfo.systemUptime
         let request = (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any]
+        var diagnostic: [String:Any] = [:]
+        defer { if request?["diagnostics_timing"] as? Bool == true {
+            diagnostic["scope"] = "ipc"; diagnostic["method"] = request?["method"] as? String ?? ""
+            diagnostic["total_ms"] = (ProcessInfo.processInfo.systemUptime-started)*1000
+            CallTimingLog.write(diagnostic)
+        } }
         let commandID = (request?["params"] as? [String: Any])?["command_id"] as? String
         let connection = suppliedConnection ?? NSXPCConnection(machServiceName: ChecklistInstance.current.machServiceName, options: [])
         connection.remoteObjectInterface = NSXPCInterface(with: ChecklistRPC.self)
@@ -145,6 +162,8 @@ public final class ChecklistClient: @unchecked Sendable {
             }
             throw error
         }
+        diagnostic["round_trip_ms"] = (ProcessInfo.processInfo.systemUptime-started)*1000
+        if request?["diagnostics_timing"] as? Bool == true, let object = try? JSONSerialization.jsonObject(with:received) as? [String:Any] { diagnostic["service"] = object["_checklist_timing"] }
         return try CommandReply.decode(received, method: request?["method"] as? String ?? "", commandID: commandID)
     }
 

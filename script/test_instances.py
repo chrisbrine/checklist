@@ -288,7 +288,9 @@ def database_observation(database, immutable=True):
         counts = dict(connection.execute('SELECT type,count(*) FROM records GROUP BY type'))
         identity = connection.execute("SELECT value FROM metadata WHERE key='store_identity'").fetchone()
         return {'schema': version, 'quick_check': quick, 'record_counts': counts,
-                'identity': json.loads(identity[0]) if identity else None}
+                'identity': json.loads(identity[0]) if identity else None,
+                'table_rows': {table: connection.execute('SELECT count(*) FROM ' + table).fetchone()[0]
+                               for table in ['metadata', 'records', 'commands', 'events', 'cursors']}}
     finally:
         connection.close()
 
@@ -664,6 +666,12 @@ def snapshot_seed(source, destination, destination_root=None):
     observation = database_observation(source / 'database.sqlite')
     if observation['quick_check'] != 'ok' or observation['schema'] != manifest['schema']:
         raise ValueError('Snapshot database integrity/schema mismatch.')
+    if 'recordFamilies' in manifest:
+        counts = manifest['recordFamilies']
+        if not isinstance(counts, dict) or any(type(n) is not int or n < 0 for n in counts.values()) or {k: n for k, n in counts.items() if n} != observation['record_counts']:
+            raise ValueError('Snapshot canonical family counts mismatch.')
+    if 'tableRows' in manifest and manifest['tableRows'] != observation['table_rows']:
+        raise ValueError('Snapshot table counts mismatch.')
     inspection = require_local_paths(source / 'database.sqlite', destination_root or destination, source_root=manifest['sourceRoot'])
     # Verification finishes before any source byte is used in the new store.
     shutil.copyfile(source / 'database.sqlite', destination / 'checklist.sqlite')
@@ -691,7 +699,8 @@ def snapshot_seed(source, destination, destination_root=None):
     print(f'Snapshot age: {age / 86400:.2f} days; schema {observation["schema"]}; quick_check {observation["quick_check"]}')
     return {'kind': 'backup', 'source': str(source), 'source_hash': hashlib.sha256(raw).hexdigest(),
             'age_seconds_at_create': age, 'source_root': manifest['sourceRoot'], 'before_start': observation,
-            'live_snapshot': is_live_snapshot(source, manifest['sourceRoot']), 'path_inspection': inspection}
+            'live_snapshot': is_live_snapshot(source, manifest['sourceRoot']), 'path_inspection': inspection,
+            'current_schema_no_migration': observation['schema'] == 3}
 
 
 def slot_seed(other, destination, destination_root=None):
@@ -761,24 +770,18 @@ def trash(folder, root=None):
 
 
 def create(arguments, p):
+    session = caller_session(getattr(arguments, 'session_id', None))
     stopped(p)
     if p['folder'].exists():
         if not arguments.replace: raise ValueError('Slot exists; use --replace after stopping it.')
         load(p)  # Do not replace unrelated directories.
     capture, manifest = stage_selection(arguments)
     identity = sign_identity(manifest)
-    session_id = getattr(arguments, 'session_id', None)
-    has_identity = session_id is not None or os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID')
-    session = caller_session(session_id) if has_identity else None
     validate_fingerprint(manifest['source_fingerprint'])
     if p['folder'].exists(): destroy(p)
     p['folder'].mkdir(mode=0o700)
-    if session is not None:
-        mark_qualification(p['folder'], manifest['source_fingerprint'],
-                           'disposable test slot ' + str(arguments.slot), session)
-    else:
-        print('Warning: no caller session identity; skipping qualification marker for ' + str(p['folder'])
-              + '. Supply --session-id with your actual session ID to record ownership.', file=sys.stderr)
+    mark_qualification(p['folder'], manifest['source_fingerprint'],
+                       'disposable test slot ' + str(arguments.slot), session)
     metadata = {'slot': arguments.slot, 'build_id': manifest['build_id'], 'source_fingerprint': manifest['source_fingerprint'],
                 'stage_path': str(capture), 'seed': {'kind': 'incomplete'}, 'created_at': now(), 'mode': 'incomplete', 'checks': None}
     save(p, metadata)
@@ -1133,6 +1136,9 @@ def main():
             mode.add_argument('--headless', action='store_true'); mode.add_argument('--gui', action='store_true')
         if name == 'promote': command.add_argument('--dry-run', action='store_true')
     arguments = parser.parse_args()
+    if arguments.command == 'create':
+        # Identity first, then every source/destination's live-root admission, then locks/changes.
+        arguments.session_id = caller_session(arguments.session_id)
     if arguments.command in ['stop', 'destroy'] and bool(arguments.slot) == bool(arguments.all):
         parser.error('Choose exactly one of --slot or --all.')
     if arguments.command == 'status':

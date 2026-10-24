@@ -74,6 +74,8 @@ extension CommandRouter {
         let read: ((Database) throws -> Void) throws -> Void
         let write: ((Database) throws -> Void) throws -> Void
         let underGate: (() throws -> Void) throws -> Void
+        var folderAccess = StorageFolderAccess()
+        var observeSourceIdentity: (FileIdentity) -> Void = { _ in }
     }
     func managedImportAccessOutsideWriter() -> ManagedImportAccess {
         ManagedImportAccess(read: { body in try self.readForPreparation(body) },
@@ -108,10 +110,10 @@ extension CommandRouter {
             guard !raw.isEmpty else { throw CoreError("FILE_ACCESS_REQUIRED", "Choose a local file.") }
             let project = try self.record(db,pid,type:"project")
             if source["kind"] as? String == "workspace_file", !raw.hasPrefix("/"), let base = project["root_path"] as? String {
-                path = canonical(URL(fileURLWithPath:base).appendingPathComponent(raw).path)
-            } else { path = canonical(raw) }
+                path = try StorageFolderAccess.lexicalPath(base + "/" + raw)
+            } else { path = try StorageFolderAccess.lexicalPath(raw) }
             if !c.isOwner {
-                guard let workspace = c.workspace, containsPath(canonical(workspace),path), let base = project["root_path"] as? String, containsPath(base,path) else { throw CoreError("FILE_ACCESS_REQUIRED", "Agent file imports must stay inside its enrolled workspace.") }
+                guard let workspace = c.workspace, containsPath(try StorageFolderAccess.lexicalPath(workspace),path), let base = project["root_path"] as? String, containsPath(try StorageFolderAccess.lexicalPath(base),path) else { throw CoreError("FILE_ACCESS_REQUIRED", "Agent file imports must stay inside its enrolled workspace.") }
             }
             generation = try self.callerSessionGeneration(db,c,project:pid)
         }
@@ -172,7 +174,7 @@ extension CommandRouter {
             }
             return prepared
         }
-        let files = try StorageObjectFiles(root:root)
+        let files = try StorageObjectFiles(root:root,folderAccess:access.folderAccess)
         if job["state"] as? String == "finalized", job["objects"] == nil { throw managedImportFailure("invalid_finalized_authority") }
         if job["objects"] != nil {
             let objects = try managedImportObjects(job)
@@ -199,11 +201,22 @@ extension CommandRouter {
                 return try preparedValue(job)
             }
         }
-        let values = try sourceURL.resourceValues(forKeys:[.isRegularFileKey,.fileSizeKey])
-        guard values.isRegularFile == true else { throw CoreError("INVALID_INPUT", "Attach a regular file.") }
-        guard (values.fileSize ?? 0) <= 500 * 1024 * 1024 else { throw CoreError("FILE_TOO_LARGE", "This local importer accepts files up to 500 MiB.") }
-        let sourceFiles = try StorageObjectFiles(root:sourceURL.deletingLastPathComponent())
-        let bytes = try sourceFiles.read(sourceURL.lastPathComponent,maximum:500 * 1024 * 1024), sha = hash(bytes)
+        // Open before any Foundation file observation can enter the protected
+        // source folder. Descriptor validation/read below supplies type and size.
+        let sourceFiles = try StorageObjectFiles(root:sourceURL.deletingLastPathComponent(),folderAccess:access.folderAccess)
+        let bytes: Data
+        do {
+            let size = try sourceFiles.openRegular(sourceURL.lastPathComponent) { descriptor -> Int64 in
+                guard let identity = FileIdentity(descriptor:descriptor) else { throw StorageSnapshotFailure.unsupportedAuthority }
+                access.observeSourceIdentity(identity)
+                return identity.size
+            }
+            guard size <= 500 * 1024 * 1024 else { throw CoreError("FILE_TOO_LARGE", "This local importer accepts files up to 500 MiB.") }
+            bytes = try sourceFiles.read(sourceURL.lastPathComponent,maximum:500 * 1024 * 1024)
+        } catch StorageSnapshotFailure.io { throw CoreError("FILE_ACCESS_REQUIRED", "The selected original ‘\(sourceURL.path)’ cannot be read. Check folder access or privacy/sync availability and retry the original command ID.") }
+        catch StorageSnapshotFailure.unsupportedAuthority { throw CoreError("INVALID_INPUT", "Attach a regular file.") }
+        catch StorageSnapshotFailure.limit { throw CoreError("FILE_TOO_LARGE", "This local importer accepts files up to 500 MiB.") }
+        let sha = hash(bytes)
         guard bytes.count <= 500 * 1024 * 1024 else { throw CoreError("FILE_TOO_LARGE", "This local importer accepts files up to 500 MiB.") }
         if let expected = p["expected_sha256"] as? String, expected != sha { throw CoreError("SOURCE_CHANGED", "The file changed before import.") }
         if let expected = job["sha256"] as? String, expected != sha { throw CoreError("SOURCE_CHANGED", "The source no longer matches this pending command's staged identity.") }
@@ -395,7 +408,7 @@ extension CommandRouter {
     func managedImportExists(_ files: StorageObjectFiles,_ path: String) throws -> Bool {
         let directory: Int32, name: String
         do { (directory,name) = try files.parent(path) }
-        catch { if errno == ENOENT { return false };throw error }
+        catch { if StorageFolderAccess.isMissing(error) { return false };throw error }
         defer { Darwin.close(directory) }
         var info = stat()
         if fstatat(directory,name,&info,AT_SYMLINK_NOFOLLOW) != 0 { guard errno == ENOENT else { throw managedImportFailure("object_observation_failed") }; return false }

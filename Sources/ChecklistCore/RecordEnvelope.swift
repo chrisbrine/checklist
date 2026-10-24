@@ -77,7 +77,7 @@ struct EnvelopeFamily {
             "group", "handoff", "manifest", "native_closure", "message", "ordinary_mention_plan", "policy_proposal", "policy_revision",
             "project_context_revision", "recipient_target", "relation", "request", "review", "review_request",
             "source_capture", "source_execution", "storage_job", "status", "tag", "task", "task_alias", "task_session",
-            "taxonomy_revision", "triage_membership_exit", "triage_membership_interval"]
+            "import_record", "import_receipt", "taxonomy_revision", "triage_membership_exit", "triage_membership_interval"]
         var values = Dictionary(uniqueKeysWithValues: projectOwned.map { ($0, EnvelopeFamily(name: $0, ownership: .project)) })
         let exceptions: [(String, EnvelopeOwnership)] = [("project", .selfOwnedProject), ("profile", .global), ("session", .session), ("storage_hold", .hold)]
         for name in MediaRecordRegistry.families {

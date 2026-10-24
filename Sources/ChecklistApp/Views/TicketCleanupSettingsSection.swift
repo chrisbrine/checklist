@@ -6,8 +6,7 @@ struct TicketCleanupSettingsSection: View {
     @State private var done = true
     @State private var purge = true
     @State private var days = 15
-    @State private var receipts: [Record] = []
-    @State private var error = ""
+    @State private var refreshID = UUID()
     var settings: [String:Any] {["done_evidence_enabled":done,"closed_purge_enabled":purge,"closed_days":days]}
     var body: some View {
         DetailSection(title:"Closed ticket cleanup") {
@@ -15,26 +14,73 @@ struct TicketCleanupSettingsSection: View {
             Toggle("Purge unchanged Done and Canceled tickets",isOn:$purge).toggleStyle(.checkbox)
             Stepper("Keep closed tickets for \(days) days",value:$days,in:1...36500)
             Text("Cleanup runs automatically in the background. Evidence cleanup keeps ticket history and file names, sizes and SHA-256. Purge removes private records and leaves a minimal ticket reference. Shared files, Keep original, readers and backups remain protected. Reopening cannot restore removed files.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-            if !error.isEmpty {Text(error).checklistFont(.micro).foregroundStyle(Color.red)}
             Button("Save cleanup settings") { save() }
                 .checklistDisabled([(!store.connected,DisabledReasons.offline),(store.busy,DisabledReasons.saving)])
-            ForEach(receipts) { receipt in
-                let summary = receipt.object("summary")
-                Text("\(receipt.string("created_at")): \(summary["removed_bytes"] as? Int ?? 0) bytes removed · \(summary["retained_count"] as? Int ?? 0) files kept · \(receipt.string("bytes_state"))").checklistFont(.micro)
-            }
+            TicketCleanupReceiptRows(observation:store.ticketCleanupReceipts,scope:receiptScope)
             Button("Refresh cleanup receipts") { loadReceipts() }
-        }.onAppear {load();loadReceipts()}
+        }.onAppear {load()}
+        .task(id:receiptScope + refreshID.uuidString) {
+            await store.ticketCleanupReceipts.load(scope:receiptScope) {
+                try await store.request("ticket_cleanup_receipts",["project_id":project.id,"limit":50])
+            }
+        }
         .onChange(of:project.integer("revision")) { _,_ in load() }
     }
     private func load() {
         let value = project.object("ticket_cleanup")
         done = value["done_evidence_enabled"] as? Bool ?? true;purge = value["closed_purge_enabled"] as? Bool ?? true;days = value["closed_days"] as? Int ?? 15
     }
+    private var receiptScope: String {project.id + ":" + store.storeIncarnation + ":" + store.archivePreviewEpoch.uuidString}
     private func loadReceipts() {
-        Task {do {let reply = try await store.request("ticket_cleanup_receipts",["project_id":project.id]);receipts = (reply["receipts"] as? [[String:Any]] ?? []).map(Record.init)} catch {self.error = PlainError.text(error)}}
+        store.ticketCleanupReceipts.invalidate(scope:receiptScope)
+        refreshID = UUID()
     }
     private func save() {
         let params: [String:Any] = ["project_id":project.id,"expected_revision":project.integer("revision"),"ticket_cleanup":settings]
         store.run("project_settings_save",params,success:"Ticket cleanup settings saved") { _ in loadReceipts() }
+    }
+}
+
+
+@MainActor final class TicketCleanupReceiptObservation: ObservableObject {
+    @Published private(set) var receipts: [Record] = []
+    @Published private(set) var scope = ""
+    @Published private(set) var error = ""
+    private var cache: [String:[Record]] = [:]
+    private var generation = UUID()
+    func invalidate(scope: String) {
+        cache.removeValue(forKey:scope)
+        if self.scope == scope {generation = UUID()}
+    }
+    func load(scope: String,fetch: () async throws -> [String:Any]) async {
+        guard !Task.isCancelled else {return}
+        let token = UUID();generation = token
+        if self.scope != scope {receipts = []}
+        self.scope = scope;error = ""
+        if let cached = cache[scope] {receipts = cached;return}
+        do {
+            let reply = try await fetch()
+            guard generation == token,!Task.isCancelled else {return}
+            receipts = (reply["receipts"] as? [[String:Any]] ?? []).map(Record.init)
+            if cache.count >= 5 {cache.removeAll()}
+            cache[scope] = receipts
+        } catch {
+            guard generation == token,!Task.isCancelled,!(error is CancellationError) else {return}
+            self.error = PlainError.text(error)
+        }
+    }
+}
+
+private struct TicketCleanupReceiptRows: View {
+    @ObservedObject var observation: TicketCleanupReceiptObservation
+    let scope: String
+    var body: some View {
+        if observation.scope == scope {
+            ForEach(observation.receipts) { receipt in
+                let summary = receipt.object("summary")
+                Text("\(receipt.string("created_at")): \(summary["removed_bytes"] as? Int ?? 0) bytes removed · \(summary["retained_count"] as? Int ?? 0) files kept · \(receipt.string("bytes_state"))").checklistFont(.micro)
+            }
+            if !observation.error.isEmpty {Text(observation.error).checklistFont(.micro).foregroundStyle(Color.red)}
+        }
     }
 }

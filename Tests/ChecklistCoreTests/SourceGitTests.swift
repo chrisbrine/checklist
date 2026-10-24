@@ -58,7 +58,7 @@ final class SourceGitTests: XCTestCase {
         let shim = try script(f, "git", "echo \"You have not agreed to the Xcode license agreements. Please run 'sudo xcodebuild -license'\" >&2; exit 69")
         let selected = try SourceGit.resolve(candidates: [shim.path])
         for args in [["--version"], ["rev-parse", "--show-toplevel"], ["ls-files", "-z"]] {
-            XCTAssertThrowsError(try SourceGit.run(f.directory.path, args, executable: selected)) {
+            XCTAssertThrowsError(try SourceGit.run(f.directory.path, args, protectedRoots: [NSTemporaryDirectory() + "checklist-fixture-protected"], executable: selected)) {
                 let error = $0 as? CoreError
                 XCTAssertEqual(error?.code, "SOURCE_GIT_LICENSE_REQUIRED")
                 XCTAssertTrue(error?.message.contains("Xcode license") == true)
@@ -73,7 +73,7 @@ final class SourceGitTests: XCTestCase {
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
         try Data("fixture".utf8).write(to: source.appendingPathComponent("file.txt"))
         let executable = try SourceGit.resolve()
-        _ = try SourceGit.run(source.path, ["init"], executable: executable)
+        _ = try SourceGit.run(source.path, ["init"], protectedRoots: [NSTemporaryDirectory() + "checklist-fixture-protected"], executable: executable)
         let inventory = try f.router.sourceInventory(source.path, useCache: false)
         XCTAssertEqual(inventory["git_path"] as? String, executable)
         XCTAssertTrue((inventory["git_version"] as? String)?.hasPrefix("git version ") == true)

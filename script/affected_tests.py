@@ -37,6 +37,7 @@ FILE_TEST_CONSUMERS = {
     'contracts/human-request.schema.json': ('ChecklistCoreTests',),
     'contracts/ticket-bulk-edit.schema.json': ('ChecklistCoreTests',),
     'examples/media-intake.json': ('ChecklistCoreTests',),
+    'examples/legacy-import-plan.json': ('ChecklistCoreTests',),
     'Tests/Fixtures/path-overlap-vectors.json': ('ChecklistIPCTests',),
 }
 # Keep Python readers separate from Swift target names; select both for shared inputs.

@@ -75,6 +75,9 @@ struct TicketPagePreparation {
         error = nil
     }
 
+    /// Keep the current request fence when its reply establishes a new service version.
+    mutating func discardContent() { page = nil; preparation = nil; installedToken = UUID() }
+
     mutating func invalidate() {
         activeRequest = nil
         page = nil

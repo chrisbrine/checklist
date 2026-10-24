@@ -48,6 +48,43 @@ final class ScreenReadPerformanceTests: XCTestCase {
         XCTAssertLessThan(elapsed,1)
     }
 
+    /// Never bootstraps the real copy: production pure-read dispatch on a read-only pool.
+    func testReadOnlyBackupScreenMeasurements() throws {
+        guard let path = ProcessInfo.processInfo.environment["CHECKLIST_READ_ONLY_DATABASE"],
+              let pid = ProcessInfo.processInfo.environment["CHECKLIST_READ_BENCHMARK_PROJECT_ID"] else {
+            throw XCTSkip("Requires an explicitly selected private backup copy and project")
+        }
+        let f = try ReadPerformanceFixture("CL-254-read-only")
+        var configuration = Configuration(); configuration.readonly = true
+        configuration.prepareDatabase { db in
+            try SchemaMigrations.installStorageCollation(db)
+            try CommandRouter.installTicketSearchFunctions(db)
+        }
+        let pool = try DatabasePool(path: path, configuration: configuration)
+        defer { try? pool.close() }
+        let owner = Caller(role: "owner", installation: "CL-254-read-only", projectIDs: [])
+        let surfaces = ["overview", "completed_since", "human_tasks", "needs_active", "needs_done_today", "needs_pickup", "needs_quiet", "needs_recovery", "needs_review", "recent_reviews", "requests", "epics"]
+        var load = [Double](repeating: 0, count: 3); getloadavg(&load, 3)
+        print("P9-r1 load=\(load) database=\(path)")
+        for surface in surfaces {
+            for iteration in 0..<2 {
+                let params: JSON = ["surface": surface, "since": "2026-10-22T00:00:00Z"]
+                let start = ProcessInfo.processInfo.systemUptime
+                let reply = try f.router.executePureRead(pool, method: "workspace_page", params: params, caller: owner)
+                let seconds = ProcessInfo.processInfo.systemUptime - start
+                let bytes = try JSONSerialization.data(withJSONObject: reply).count
+                print("P9-r1 surface=\(surface) iteration=\(iteration) service_ms=\(seconds * 1000) bytes=\(bytes)")
+                XCTAssertLessThan(seconds, 1, surface)
+            }
+        }
+        let view: JSON = ["surface":"tickets", "status_filter":"all", "tag_filter":"all", "group_by":"status", "order_by":"manual"]
+        for iteration in 0..<2 {
+            let start = ProcessInfo.processInfo.systemUptime
+            let reply = try f.router.executePureRead(pool, method: "task_list", params: ["project_id":pid, "view":view, "limit":100], caller:owner)
+            print("P9-r1 Tickets iteration=\(iteration) service_ms=\((ProcessInfo.processInfo.systemUptime-start)*1000) bytes=\(try JSONSerialization.data(withJSONObject:reply).count)")
+        }
+    }
+
     func testOwnedStoreMeasurements() throws {
         guard let path = ProcessInfo.processInfo.environment["CHECKLIST_READ_BENCHMARK_ROOT"],
               let pid = ProcessInfo.processInfo.environment["CHECKLIST_READ_BENCHMARK_PROJECT_ID"] else { throw XCTSkip("Requires an owned test-slot copy and its project ID") }

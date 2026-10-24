@@ -4,6 +4,7 @@ ANSWER_CHECK_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ANSWER_CHECK_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/checklist-answer-completion.XXXXXX")"
 trap 'rm -rf "$ANSWER_CHECK_TEMP"' EXIT
 xcrun swiftc -swift-version 5 \
+  "$ANSWER_CHECK_ROOT/Sources/ChecklistApp/Support/Canceled.swift" \
   "$ANSWER_CHECK_ROOT/Sources/ChecklistApp/Models/Record.swift" \
   "$ANSWER_CHECK_ROOT/Sources/ChecklistApp/Models/RequestDraft.swift" \
   "$ANSWER_CHECK_ROOT/Sources/ChecklistApp/Models/RequestAnswerCompletion.swift" \

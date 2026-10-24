@@ -287,7 +287,7 @@ extension CommandRouter {
             let directory = (first["stage"] as! String).split(separator:"/").dropLast().joined(separator:"/")
             let entries: [String]
             do { entries = try managedDirectoryEntries(files,relative:directory) }
-            catch { if errno == ENOENT { entries = [] } else { throw error } }
+            catch { if StorageFolderAccess.isMissing(error) { entries = [] } else { throw error } }
             for name in entries {
                 guard objects.contains(where: { object in
                     let prefix = (object["representation"] as! String) + ".partial-"

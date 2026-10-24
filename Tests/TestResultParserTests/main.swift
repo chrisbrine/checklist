@@ -1,4 +1,6 @@
 import Foundation
+import XCTest
+@testable import ChecklistApp
 
 enum CheckFailure: Error { case failed(String) }
 func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
@@ -181,14 +183,29 @@ let checks: [(String, () throws -> Void)] = [
     })
 ]
 
-let requested = Set(CommandLine.arguments.dropFirst())
-let known = Set(checks.map { $0.0 })
-guard requested.isSubset(of: known) else { print("Unknown selected check; pass exact reported names."); exit(2) }
-let selected = checks.filter { requested.isEmpty || requested.contains($0.0) }
-var failures = 0
-for (name, check) in selected {
-    do { try check(); print("PASS \(name)") }
-    catch { failures += 1; print("FAIL \(name): \(error)") }
+final class TestResultParserTests: XCTestCase {
+    func testNUnitNestedSuitesDecodedNamesAndCaseCounts() throws { try checks[0].1() }
+    func testBasicLegacyNUnitOutcomeLabels() throws { try checks[1].1() }
+    func testTRXNamespaceSkippedOutcomeAndFailingName() throws { try checks[2].1() }
+    func testTRXDataDrivenAggregateIsNotCountedTwice() throws { try checks[3].1() }
+    func testUnknownAndInconclusiveResultsCannotBecomePasses() throws { try checks[4].1() }
+    func testDeclaredCountersDoNotReplaceContradictoryLeafResults() throws { try checks[5].1() }
+    func testOverallRunFailureWithPassingCasesRemainsVisible() throws { try checks[6].1() }
+    func testSwiftNestedTotalsSkippedCaseAndZeroTestTrailer() throws { try checks[7].1() }
+    func testCRLFSwiftOutput() throws { try checks[8].1() }
+    func testIncompleteSwiftRunRejected() throws { try checks[9].1() }
+    func testInnerSuiteSummaryWithAnOpenOuterXCTestRunIsRejected() throws { try checks[10].1() }
+    func testCompletedOuterXCTestRunRetainsLaterFailures() throws { try checks[11].1() }
+    func testConcatenatedCompleteSwiftRunsRejected() throws { try checks[12].1() }
+    func testSwiftTestingOnlyAndArbitraryShellContentNotInterpreted() throws { try checks[13].1() }
+    func testExternalDTDAndEntityReferencesRejected() throws { try checks[14].1() }
+    func testInternalEntityExpansionRejected() throws { try checks[15].1() }
+    func testMalformedAndUnsupportedXMLRejected() throws { try checks[16].1() }
+    func testUTF8AndInputByteBoundaries() throws { try checks[17].1() }
+    func testNameCharacterAndCombiningByteLimits() throws { try checks[18].1() }
+    func testXMLDepthBound() throws { try checks[19].1() }
+    func testCaseCountBound() throws { try checks[20].1() }
+    func testDeadlineAndCancellationStopParsing() throws { try checks[21].1() }
+    func testNegativeAndOverflowingCountersRejected() throws { try checks[22].1() }
+    func testCompleteEmptyRunsRemainZeroCounts() throws { try checks[23].1() }
 }
-print("\(selected.count) selected parser checks, \(failures) failures")
-if failures != 0 { exit(1) }

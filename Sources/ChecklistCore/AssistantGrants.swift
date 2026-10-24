@@ -51,6 +51,7 @@ extension CommandRouter {
         return sessionGeneration(session)
     }
     func deliveryCurrent(_ db: Database,_ delivery: JSON) throws -> Bool {
+        guard delivery["restore_incarnation"] == nil else {return false}
         guard let sid = delivery["recipient_session_id"] as? String,let pid = delivery["project_id"] as? String,let session = try? scoped(db,sid,pid,type:"session") else { return false }
         return canReceive(session,project:pid) && delivery["recipient_authorization_generation"] as? String == sessionGeneration(session)
     }

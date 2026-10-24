@@ -226,7 +226,7 @@ extension CommandRouter {
         if let previous = p["supersedes_verdict_id"] as? String { let old = try scoped(db,previous,pid,type:"review"); guard old["task_id"] as? String == t["id"] as? String,old["gate"] as? String == a["gate"] as? String else { throw CoreError("REVIEW_TARGET_MISMATCH","The superseded verdict belongs to another task or gate.") }; r["supersedes_verdict_id"] = previous }
         try save(db,r,type:"review"); var req = try scoped(db,a["review_request_id"] as! String,pid,type:"review_request"); req["latest_verdict_id"] = reviewID
         switch verdict {
-        // A blocked verdict ends this claim and returns the same request to any eligible reviewer (CL-137).
+        // Reviewer-side blocked returns the same request for reviewer pickup (CL-137); implementation-side blocked returns to implementation below (CL-216).
         case "blocked": req["state"] = "queued"; req["blocked_verdict_ids"] = strings(req,"blocked_verdict_ids") + [reviewID]
         // Keep missing-check details in history; CL-216 closes these requests below without counting a fail.
         case "not_run": req["state"] = "queued"; req["not_run_checks"] = (req["not_run_checks"] as? [JSON] ?? []) + [["check":outcome["check"]!,"reason":outcome["reason"]!,"review_id":reviewID,"recorded_at":now()]]

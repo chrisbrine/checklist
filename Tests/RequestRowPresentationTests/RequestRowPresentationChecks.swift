@@ -1,6 +1,13 @@
 import Foundation
+#if canImport(ChecklistApp)
+import XCTest
+@testable import ChecklistApp
+#endif
 
-@main struct RequestRowPresentationChecks {
+#if !canImport(ChecklistApp)
+@main
+#endif
+struct RequestRowPresentationChecks {
     static var checks = 0
     static func expect(_ result: @autoclosure () -> Bool,_ message: String) throws {
         checks += 1
@@ -57,3 +64,11 @@ import Foundation
         print("Request row checks passed: \(checks). Presentation only; no service or UI mutation.")
     }
 }
+
+#if canImport(ChecklistApp)
+final class RequestRowPresentationTests: XCTestCase {
+    func testStandaloneChecks() throws {
+        try RequestRowPresentationChecks.main()
+    }
+}
+#endif

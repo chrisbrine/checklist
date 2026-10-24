@@ -97,6 +97,12 @@ struct WorkspacePage {
               let b = try? JSONSerialization.data(withJSONObject: rhs.map(\.values), options: .sortedKeys) else { return false }
         return a == b
     }
+    func restore(_ page: WorkspacePage) {
+        cancel(clear: true)
+        query = page.query; self.page = page; rows = page.rows
+    }
+    /// A known commit retires content without canceling the read that observed it.
+    func discardContent() { page = nil; rows = []; retainedRequest = nil }
     func applyAnsweredRequest(_ record: Record) {
         guard var current = page, let index = current.rows.firstIndex(where: {
             RecordIdentity($0.id) == RecordIdentity(record.id) && RecordIdentity($0.string("project_id")) == RecordIdentity(record.string("project_id"))

@@ -66,6 +66,18 @@ extension CoreTests {
         let combined = try call("workspace_page", ["project_id": pid, "surface": "overview", "since": since])
         let groups = combined["groups"] as! JSON
         XCTAssertEqual(Set(groups.keys), Set(CommandRouter.overviewGroupLimits.map(\.surface)))
+        XCTAssertEqual((combined["projects"] as? [JSON])?.count,1)
+        let service = try XCTUnwrap(combined["service"] as? JSON)
+        XCTAssertEqual(service["store_incarnation"] as? String,router.incarnation)
+        XCTAssertNotNil(service["caller"])
+        XCTAssertNil(service["native_routes"],"Capability catalogs belong to service_info, not every surface reply")
+        XCTAssertNotNil(service["read_version"])
+        for (name,value) in groups {
+            let group = try XCTUnwrap(value as? JSON)
+            for shared in ["projects","service","content_cursor","needs_you_count"] {
+                XCTAssertNil(group[shared],"Shared metadata repeats in \(name).\(shared)")
+            }
+        }
         for surface in ["needs_review", "needs_pickup", "needs_active", "needs_quiet", "needs_recovery", "needs_done_today"] {
             let group = groups[surface] as! JSON
             XCTAssertEqual(group["surface"] as? String, surface)
@@ -73,6 +85,16 @@ extension CoreTests {
             XCTAssertEqual(Set((group["rows"] as! [JSON]).compactMap { $0["id"] as? String }), try page(surface).1, surface)
         }
         XCTAssertEqual(((groups["completed_since"] as! JSON)["rows"] as! [JSON]).count, 1, "The digest group uses the given start")
+    }
+
+    func testQuietTriageSiblingQueryUsesPrimaryKeyLookups() throws {
+        try router.dbQueue.read {db in
+            let sql = "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM records r WHERE r.project_id IN (SELECT value FROM json_each(:projects)) AND " + CommandRouter.needFilter("needs_quiet")
+            let plan = try Row.fetchAll(db,sql:sql,arguments:["projects":"[]","quietBefore":Date().timeIntervalSince1970]).map {$0["detail"] as String}
+            XCTAssertTrue(plan.contains {$0.contains("SCAN sibling")},plan.joined(separator:"\n"))
+            XCTAssertTrue(plan.contains {$0.contains("SEARCH t USING INDEX sqlite_autoindex_records_1 (id=?)")},plan.joined(separator:"\n"))
+            XCTAssertFalse(plan.contains {$0.contains("SEARCH t USING INDEX records_scope")},"A Triage sibling must not scan all project tasks")
+        }
     }
 
     /// CL-67: latest verdicts name ticket, reviewer and time; the digest lists tickets completed after the last visit.

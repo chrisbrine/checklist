@@ -5,6 +5,7 @@ struct PreparedHumanRequestFiles {
     struct Selection {
         let path: String
         let identity: FileIdentity?
+        var managed = false
     }
     struct Import {
         let params: JSON
@@ -34,7 +35,7 @@ extension CommandRouter {
 
     /// All source reads, hashing and staging occur here, before the answer's writer.
     /// The trusted answer repeats revision, form, authority and direction fences at commit.
-    func prepareHumanRequestAnswerFiles(params p: JSON,caller c: Caller) throws -> PreparedHumanRequestFiles? {
+    func prepareHumanRequestAnswerFiles(params p: JSON,caller c: Caller,folderAccess: StorageFolderAccess = .init()) throws -> PreparedHumanRequestFiles? {
         let digest = hash(Data(("human_request_answer" + (try jsonString(p))).utf8))
         let plan: (request: JSON,complete: Bool,isAnswer: Bool)? = try readForPreparation { db in
             let pid = try self.scope(db,p,c,write:true)
@@ -80,21 +81,29 @@ extension CommandRouter {
                 try ArchiveStorageGate.withExclusive(root:self.root) { _ in try self.dbQueue.write { db in
                     try self.requirePendingCommandIntent(db,command:input["command_id"] as! String,digest:hash(Data(("attachment_add" + (try jsonString(input))).utf8)),caller:c)
                 } }
-                let resolved = canonical(path), before = FileIdentity(path:resolved)
+                let resolved = try StorageFolderAccess.lexicalPath(path)
                 let prepared: ManagedAttachmentPreparation
+                var before: FileIdentity?
                 do {
-                    guard let value = try self.prepareManagedAttachmentImport(method:"attachment_add",params:input,caller:c,access:self.managedImportAccessOutsideWriter()) else { throw self.managedImportFailure("answer_import_receipt_without_answer") }
+                    var access = self.managedImportAccessOutsideWriter();access.folderAccess = folderAccess
+                    // A retained finalized same-intent import never opens its
+                    // external source. Observe only when the importer reads it.
+                    access.observeSourceIdentity = { before = $0 }
+                    guard let value = try self.prepareManagedAttachmentImport(method:"attachment_add",params:input,caller:c,access:access) else { throw self.managedImportFailure("answer_import_receipt_without_answer") }
                     prepared = value
                 } catch {
                     try? ArchiveStorageGate.withExclusive(root:self.root) { _ in try self.dbQueue.writeWithoutTransaction {
                         try self.recordManagedImportPreparationFailure($0,method:"attachment_add",params:input,caller:c,error:error)
                     } }
                     // Chooser failures retain the answer draft and never expose raw IO paths.
+                    if case StorageSnapshotFailure.unsupportedAuthority = error { throw CoreError("ANSWER_INCOMPLETE","Directories can be referenced, while managed copies require files.") }
                     if error is CocoaError || error is StorageSnapshotFailure { throw CoreError("FILE_ACCESS_REQUIRED","A selected original cannot be read. Your draft remains saved.") }
                     throw error
                 }
-                guard FileIdentity(path:resolved) == before,canonical(path) == resolved else { throw CoreError("SOURCE_CHANGED","A selected original changed during import. Your draft remains saved.") }
-                if let before { selections[path] = .init(path:resolved,identity:before) }
+                if let before {
+                    guard try self.managedAnswerSelectionIdentity(resolved,folderAccess:folderAccess) == before else { throw CoreError("SOURCE_CHANGED","A selected original changed during import. Your draft remains saved.") }
+                    selections[path] = .init(path:resolved,identity:before,managed:true)
+                }
                 imports[input["command_id"] as! String] = .init(params:input,prepared:prepared)
                 return prepared.attachment["sha256"] as! String
             } : nil,observe: { path,identity in
@@ -110,10 +119,24 @@ extension CommandRouter {
         }
     }
 
+    private func managedAnswerSelectionIdentity(_ path: String,folderAccess: StorageFolderAccess = .init()) throws -> FileIdentity? {
+        do {
+            let url = URL(fileURLWithPath:path),files = try StorageObjectFiles(root:url.deletingLastPathComponent(),folderAccess:folderAccess)
+            // Metadata under the pinned parent needs no source read permission.
+            // A prepared answer never reopens or rehashes external content.
+            return FileIdentity(directory:files.descriptor,name:url.lastPathComponent)
+        } catch where StorageFolderAccess.isMissing(error) { return nil }
+    }
+
     func preparedHumanRequestFiles(_ request: JSON,params p: JSON) throws -> [JSON] {
         guard let prepared = commandPreparation.humanRequestFiles,prepared.requestID == request["id"] as? String,
               prepared.revision == int(request,"revision"),prepared.digest == hash(Data(("human_request_answer" + (try jsonString(p))).utf8)) else { throw managedImportFailure("missing_answer_preparation") }
         for (raw,selected) in prepared.selections {
+            if selected.managed {
+                guard try StorageFolderAccess.lexicalPath(raw) == selected.path,
+                      try managedAnswerSelectionIdentity(selected.path) == selected.identity else { throw CoreError("SOURCE_CHANGED","A selected original changed before the answer committed.") }
+                continue
+            }
             guard canonical(raw) == selected.path else { throw CoreError("SOURCE_CHANGED","A selected original changed before the answer committed.") }
             if let identity = selected.identity {
                 guard FileIdentity(path:selected.path) == identity else { throw CoreError("SOURCE_CHANGED","A selected original changed before the answer committed.") }

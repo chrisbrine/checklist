@@ -32,6 +32,10 @@ struct StorageSnapshotManifest: Codable {
     let objects: [StorageSnapshotMaterializedObject]
     let unavailable: [StorageSnapshotAbsence]
     let externalReferences: [String]
+    var recordFamilies: [String:Int]? = nil
+    var tableRows: [String:Int]? = nil
+    // Added without changing format 1; older verified generations have no time.
+    var capturedAt: String? = nil
 }
 struct StorageSnapshotReceipt {
     let kind = "checklist-store-snapshot"
@@ -83,7 +87,7 @@ enum StorageSnapshot {
         try budget.check()
         guard budget.pagesPerStep > 0, budget.maximumBytes > 0, budget.maximumObjectBytes > 0,
               budget.maximumObjects > 0, budget.maximumRecords > 0, budget.maximumManifestBytes > 0 else { throw StorageSnapshotFailure.limit }
-        let parent = try StorageObjectFiles(root: fixture.parent), sourceFiles = try StorageObjectFiles(root: fixture.source)
+        let parent = try StorageObjectFiles(root: fixture.parent,folderAccess:budget.folderAccess), sourceFiles = try StorageObjectFiles(root: fixture.source,folderAccess:budget.folderAccess)
         let names = names(operation, publicationName: fixture.publicationName), stage = try parent.makeDirectory(names.staging)
         let intent = ["format": "1", "kind": kind, "operation_id": operation.uuidString.lowercased(), "store_id": fixture.storeID, "source_root": fixture.source.path]
         let intentData = try encoded(intent)
@@ -94,10 +98,11 @@ enum StorageSnapshot {
         writerConfiguration.prepareDatabase { db in try SchemaMigrations.installStorageCollation(db); try db.execute(sql: "PRAGMA foreign_keys=ON; PRAGMA busy_timeout=50") }
         let writer = try DatabaseQueue(path: StorageBootstrap.writableURI(fixture.source.appendingPathComponent("checklist.sqlite")), configuration: writerConfiguration)
         defer { try? writer.close() }
-        let (inventory, schema) = try writer.writeWithoutTransaction { lease -> (StorageSnapshotInventory, Int) in
+        let (inventory, schema, families, tables, capturedAt) = try writer.writeWithoutTransaction { lease -> (StorageSnapshotInventory, Int, [String:Int], [String:Int], String) in
             try lease.beginTransaction(.immediate)
             defer { try? lease.rollback() }
             try budget.observe("writer_lease_acquired")
+            let capturedAt = now() // Source writes are fenced by this lease.
             // The source is a distinct read-only connection; the lease connection
             // never calls backup while it owns a source write transaction.
             var readConfiguration = Configuration(); readConfiguration.readonly = true
@@ -140,15 +145,15 @@ enum StorageSnapshot {
             budget.measurement.metadataBytes = try stage.size("database.sqlite") + intentSize
             budget.measurement.bytes = budget.measurement.metadataBytes
             let copy = try DatabaseQueue(path: stage.root.appendingPathComponent("database.sqlite").path, configuration: readConfiguration)
-            let inventory: StorageSnapshotInventory, schema: Int
+            let inventory: StorageSnapshotInventory, schema: Int, families: [String:Int], tables: [String:Int]
             do {
-                (inventory, schema) = try copy.read { db in
+                (inventory, schema, families, tables) = try copy.read { db in
                     _ = try SchemaMigrations.inspect(db)
-                    return (try StorageSnapshotAuthority.inventory(db, root: fixture.source, budget: budget, retainedExists: { try sourceFiles.regularOrLinkExists($0) }), try Int.fetchOne(db, sql: "PRAGMA user_version") ?? -1)
+                    return (try StorageSnapshotAuthority.inventory(db, root: fixture.source, budget: budget, retainedExists: { try sourceFiles.regularOrLinkExists($0) }), try Int.fetchOne(db, sql: "PRAGMA user_version") ?? -1, try recordFamilyCounts(db), try tableCounts(db))
                 }
                 try copy.close()
             } catch { try? copy.close(); throw error }
-            return (inventory, schema)
+            return (inventory, schema, families, tables, capturedAt)
         }
         // Close the SQLite lease and all live/copy read connections before the
         // continuation, so ordinary writes and WAL checkpointing can proceed.
@@ -201,7 +206,7 @@ enum StorageSnapshot {
             let manifest = StorageSnapshotManifest(format: 1, kind: kind, operationID: operation.uuidString.lowercased(),
                 storeID: fixture.storeID, sourceRoot: fixture.source.path, schema: schema, databaseSHA256: database.0,
                 databaseSize: database.1, objects: materialized.sorted { $0.descriptor.relativePath < $1.descriptor.relativePath },
-                unavailable: inventory.unavailable, externalReferences: inventory.externalReferences)
+                unavailable: inventory.unavailable, externalReferences: inventory.externalReferences, recordFamilies: families, tableRows: tables, capturedAt: capturedAt)
             let manifestData = try encoded(manifest)
             budget.measurement.bytes = total + Int64(manifestData.count)
             budget.measurement.lowerBound = false
@@ -220,15 +225,32 @@ enum StorageSnapshot {
         }
     }
 
+    static func recordFamilyCounts(_ db: Database) throws -> [String:Int] {
+        var counts = Dictionary(uniqueKeysWithValues: EnvelopeFamily.catalog.keys.map {($0,0)})
+        for row in try Row.fetchAll(db,sql:"SELECT type,COUNT(*) AS n FROM records GROUP BY type") {
+            let type: String = row["type"]
+            guard counts[type] != nil else {throw StorageSnapshotFailure.unsupportedAuthority}
+            counts[type] = row["n"] as Int
+        }
+        return counts
+    }
+    static func tableCounts(_ db: Database) throws -> [String:Int] {
+        var counts: [String:Int] = [:]
+        for table in ["metadata","records","commands","events","cursors"] {
+            counts[table] = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM " + table) ?? 0
+        }
+        return counts
+    }
+
     static func reconcile(parent: URL, operation: UUID, publicationName: String? = nil, budget: StorageSnapshotBudget) throws -> StorageSnapshotReceipt {
         do { return try reconcileGeneration(parent: parent, operation: operation, publicationName: publicationName, budget: budget) }
         catch { throw budget.reporting(error) }
     }
 
     private static func reconcileGeneration(parent: URL, operation: UUID, publicationName: String?, budget: StorageSnapshotBudget) throws -> StorageSnapshotReceipt {
-        let published = try StorageObjectFiles(root: parent.appendingPathComponent(names(operation, publicationName: publicationName).published, isDirectory: true))
+        let published = try StorageObjectFiles(root: parent.appendingPathComponent(names(operation, publicationName: publicationName).published, isDirectory: true),folderAccess:budget.folderAccess)
         let digest = try verify(published, operation: operation, budget: budget)
-        let containingDirectory = try StorageObjectFiles(root: parent)
+        let containingDirectory = try StorageObjectFiles(root: parent,folderAccess:budget.folderAccess)
         // Readability cannot establish the rename's required durability barrier.
         // Retry that barrier even when recovering a previously uncertain result.
         try containingDirectory.synchronizePublicationDirectory {
@@ -243,9 +265,9 @@ enum StorageSnapshot {
     /// partial owned stage is retained under a unique incomplete name before
     /// rebuilding; neither original data nor a completed generation is deleted.
     static func resumeStaging(parent: URL, operation: UUID, publicationName: String, budget: StorageSnapshotBudget) throws -> StorageSnapshotReceipt? {
-        let containing = try StorageObjectFiles(root:parent)
+        let containing = try StorageObjectFiles(root:parent,folderAccess:budget.folderAccess)
         let stageName = names(operation).staging
-        let stage = try StorageObjectFiles(root:parent.appendingPathComponent(stageName,isDirectory:true))
+        let stage = try StorageObjectFiles(root:parent.appendingPathComponent(stageName,isDirectory:true),folderAccess:budget.folderAccess)
         do {
             _ = try verify(stage,operation:operation,budget:budget)
         } catch {
@@ -261,17 +283,20 @@ enum StorageSnapshot {
         return try reconcile(parent:parent,operation:operation,publicationName:publicationName,budget:budget)
     }
 
-    private static func verify(_ files: StorageObjectFiles, operation: UUID, budget: StorageSnapshotBudget) throws -> String {
+    static func verify(_ files: StorageObjectFiles, operation: UUID, budget: StorageSnapshotBudget) throws -> String {
         try budget.check()
         let manifestSize = try files.size("manifest.json")
         guard manifestSize <= budget.maximumManifestBytes else { throw budget.capacityFailure("snapshot_manifest_capacity") }
         let manifestData = try files.read("manifest.json", maximum: budget.maximumManifestBytes)
-        guard let shape = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any], Set(shape.keys) == [
+        guard let shape = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any], Set(shape.keys).subtracting(["recordFamilies","tableRows","capturedAt"]) == [
             "format", "kind", "operationID", "storeID", "sourceRoot", "schema", "databaseSHA256", "databaseSize", "objects", "unavailable", "externalReferences"
         ] else { throw StorageSnapshotFailure.incomplete }
         let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self, from: manifestData)
         guard manifest.format == 1, manifest.kind == kind, manifest.operationID == operation.uuidString.lowercased(),
               UUID(uuidString: manifest.storeID) != nil, [0, 1, 2, 3].contains(manifest.schema), manifest.objects.count <= budget.maximumObjects else { throw StorageSnapshotFailure.incomplete }
+        if let capturedAt = manifest.capturedAt {
+            guard capturedAt.utf8.count <= 40,ISO8601DateFormatter().date(from:capturedAt) != nil else {throw StorageSnapshotFailure.incomplete}
+        }
         let intentData = try files.read("intent.json", maximum: 1024)
         let intent = try JSONDecoder().decode([String: String].self, from: intentData)
         guard intent == ["format": "1", "kind": kind, "operation_id": manifest.operationID, "store_id": manifest.storeID, "source_root": manifest.sourceRoot] else { throw StorageSnapshotFailure.incomplete }
@@ -286,6 +311,10 @@ enum StorageSnapshot {
         do {
             required = try copy.read { db in
                 _ = try SchemaMigrations.inspect(db)
+                // Additive registered families can be absent from older manifests
+                // only when they contain zero rows. Nonzero counts remain exact.
+                if let counts = manifest.recordFamilies { guard counts.filter({$0.value != 0}) == (try recordFamilyCounts(db)).filter({$0.value != 0}) else {throw StorageSnapshotFailure.incomplete} }
+                if let counts = manifest.tableRows { guard counts == (try tableCounts(db)) else {throw StorageSnapshotFailure.incomplete} }
                 guard try Int.fetchOne(db, sql: "PRAGMA user_version") == manifest.schema else { throw StorageSnapshotFailure.incomplete }
                 let sourceRoot = URL(fileURLWithPath: manifest.sourceRoot, isDirectory: true)
                 return try StorageSnapshotAuthority.inventory(db, root: sourceRoot, budget: budget, objectRoot: files.root.appendingPathComponent("managed"), retainedExists: { try files.regularOrLinkExists("managed/" + $0) })

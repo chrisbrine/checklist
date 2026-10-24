@@ -1,5 +1,7 @@
 import Foundation
 import GRDB
+import CryptoKit
+import SQLite3
 
 /// Canonical records only: projections, time-dependent health, authority and
 /// cursors are recomputed on every request. One bounded snapshot is retained.
@@ -15,9 +17,41 @@ final class ReadSnapshotCache {
             database = db; self.version = version; self.namespace = namespace
         }
     }
+    private final class Frame {
+        let snapshot: Snapshot
+        let readVersion: String?
+        init(_ snapshot: Snapshot,readVersion: String?) {self.snapshot=snapshot;self.readVersion=readVersion}
+    }
     private let lock = NSLock()
     private let contextKey = "ChecklistReadSnapshot-" + UUID().uuidString
     private var retained: Snapshot?
+    private let versionKey = SymmetricKey(size:.bits256)
+
+    /// Display identity is independent of which canonical-record cache happens
+    /// to be retained. Interleaved callers/readers cannot rotate an unchanged
+    /// caller's token. No SQLite snapshot bytes or local counters leave Core.
+    func readVersion(_ db: Database) -> String? {
+        guard let frame = Thread.current.threadDictionary[contextKey] as? Frame,frame.snapshot.database === db else {return nil}
+        return frame.readVersion
+    }
+
+    private func snapshotReadVersion(_ db: Database,namespace: Data) -> String? {
+        var snapshot: UnsafeMutablePointer<sqlite3_snapshot>?
+        guard sqlite3_snapshot_get(db.sqliteConnection,"main",&snapshot) == SQLITE_OK,let snapshot else {
+            // Empty WAL and non-WAL stores have no comparable snapshot handle.
+            // Omit reusable display identity instead of guessing from a reader's
+            // connection-local data_version. Canonical caching remains scoped.
+            return nil
+        }
+        defer {sqlite3_snapshot_free(snapshot)}
+        // Treat the complete fixed-size handle as opaque bytes. The keyed digest
+        // is deterministic for this pinned WAL snapshot and exact caller scope,
+        // including when an older reader finishes after a newer commit. It needs
+        // no retained handles, per-caller map or growing generation history.
+        var identity = Data(bytes:snapshot,count:MemoryLayout<sqlite3_snapshot>.size)
+        identity.append(namespace)
+        return "r2." + Data(HMAC<SHA256>.authenticationCode(for:identity,using:versionKey)).base64EncodedString()
+    }
 
     func withSnapshot<T>(_ db: Database, caller: Caller, body: () throws -> T) throws -> T {
         // Foundation parsing and Thread dictionary bridging can autorelease
@@ -37,16 +71,17 @@ final class ReadSnapshotCache {
                 let value = Snapshot(db,version:version,namespace:namespace);retained = value;return value
             }
             let previous = Thread.current.threadDictionary[contextKey]
-            Thread.current.threadDictionary[contextKey] = snapshot
+            Thread.current.threadDictionary[contextKey] = Frame(snapshot,readVersion:snapshotReadVersion(db,namespace:namespace))
             defer {Thread.current.threadDictionary[contextKey] = previous}
             return try body()
         }
     }
 
     func records(_ db: Database, key: [String?], load: () throws -> [Row]) throws -> [JSON] {
-        guard let snapshot = Thread.current.threadDictionary[contextKey] as? Snapshot,snapshot.database === db else {
+        guard let frame = Thread.current.threadDictionary[contextKey] as? Frame,frame.snapshot.database === db else {
             return try load().map {try GRDBRecordEnvelopeAdapter.decode($0).object}
         }
+        let snapshot = frame.snapshot
         let key = Data(try jsonString(key.map {$0 as Any? ?? NSNull()}).utf8)
         if let value = snapshot.entries[key] {return value}
         let rows = try load()

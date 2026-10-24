@@ -236,7 +236,10 @@ extension CommandRouter {
     func queueOrdinaryDeliveries(_ db: Database, message: JSON, recipients: [JSON]) throws -> [JSON] {
         try mentionTransaction(db)
         let pid = message["project_id"] as! String, mid = message["id"] as! String
-        var deliveries = try records(db, type: "delivery", project: pid).filter { mentionEqual($0["message_id"] as? String, mid) }
+        // A new note must not decode the project's entire retained outbox.
+        // Malformed JSON remains selected so canonical validation still refuses it.
+        let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='delivery' AND project_id=CAST(? AS TEXT) AND CASE WHEN json_valid(data) THEN json_type(data,'$.message_id')='text' AND json_extract(data,'$.message_id')=CAST(? AS TEXT) COLLATE BINARY ELSE 1 END ORDER BY rowid",arguments:[Data(pid.utf8),Data(mid.utf8)])
+        var deliveries = try rows.map {try GRDBRecordEnvelopeAdapter.decode($0,expectedType:"delivery").object}
         for recipient in recipients {
             let sid = try text(recipient, "session_id", max: 4000), generation = try text(recipient, "authorization_generation", max: 4000)
             let session = try scoped(db, sid, pid, type: "session")

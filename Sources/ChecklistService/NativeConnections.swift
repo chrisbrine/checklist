@@ -10,8 +10,15 @@ import ChecklistBridges
 // Automatic worker connections have a native process boundary. A thread ID is
 // host-exported context, not a cryptographically attested thread identity.
 extension Coordinator {
-    func bootstrap(_ context:[String:Any], connection:NSXPCConnection) throws -> [String:Any] {
+    struct BootstrapResult { let reply:[String:Any]; let changed:Bool }
+    func bootstrap(_ context:[String:Any], connection:NSXPCConnection) throws -> BootstrapResult {
         let native = try verifiedNativeWorkspace(context, connection: connection)
+        return try bootstrapVerifiedWorkspace(context, native: native, readCredential: ChecklistKeychain.read)
+    }
+
+    // Peer/process verification stays at the XPC boundary; this stage retains all grant checks.
+    func bootstrapVerifiedWorkspace(_ context: [String: Any], native: VerifiedNativeWorkspace,
+                                    readCredential: (String) throws -> String?) throws -> BootstrapResult {
         let (provider, sid, process, executionDomain, workspace) = (native.provider, native.session, native.process, native.executionDomain, native.workspace)
         let plugin = ProviderPluginRegistry.bundled.plugin(provider, requiring: .workSession)!
         let owner=Caller(role:"owner",installation:"native-thread-bootstrap",projectIDs:[])
@@ -28,11 +35,11 @@ extension Coordinator {
             projects.sort { ($0["id"] as? String ?? "") < ($1["id"] as? String ?? "") }
         }
         if !relay && projects.isEmpty {
-            return ["data": ["connected": false, "state": "project_setup_required", "native_context_verified": true,
-                              "workspace": workspace, "provider": provider, "session_id": sid]]
+            return BootstrapResult(reply:["data": ["connected": false, "state": "project_setup_required", "native_context_verified": true,
+                              "workspace": workspace, "provider": provider, "session_id": sid]],changed:false)
         }
         guard (relay ? !projects.isEmpty:projects.count == 1),let project=projects.first,
-              project["archived"] as? Bool != true,let pid=project["id"] as? String else { throw ChecklistError("PROJECT_SETUP_REQUIRED","Add this workspace as a project in Checklist first. Existing checklists are never imported automatically.") }
+              let pid=project["id"] as? String else { throw ChecklistError("PROJECT_SETUP_REQUIRED","Add this workspace as a project in Checklist first. Existing checklists are never imported automatically.") }
         let projectRoot=project["root_path"] as? String ?? ""
         guard relay || !projectRoot.isEmpty else { throw ChecklistError("PROJECT_SETUP_REQUIRED","This project needs a workspace folder.") }
         let projectIDs=projects.compactMap{$0["id"] as? String}
@@ -49,8 +56,20 @@ extension Coordinator {
         // Reuse that enrollment; an ordinary reconnect must preserve its receipt principal.
         let creationInstallation=NativeWorkspaceCreation.installation(provider:provider,session:sid,workspace:binding ?? workspace)
         let installation = !relay && enrollments[creationInstallation]?.sessionID == sid ? creationInstallation : defaultInstallation
+        if project["archived"] as? Bool == true {
+            // Archiving hides ordinary discovery, not an existing worker's read/restore grant.
+            // Never enroll, repair or rotate a connection here; Core still fences project writes.
+            guard !relay,let existing=enrollments[installation],existing.automatic == true,
+                  existing.role == "worker",existing.assistantRelay != true,existing.revoked != true,existing.ownerRevoked != true,
+                  existing.sessionID == boundSessionID,existing.provider == provider,existing.workspace == binding,
+                  existing.projectIDs == [pid],existing.nativeExecutionDomain == executionDomain else {
+                throw ChecklistError("PROJECT_ARCHIVED","This workspace is archived. Only its existing active worker connection can read its history or restore it.")
+            }
+            try requireCommittedRegistration(existing,project:pid,caller:owner)
+        }
         guard !enrollments.values.contains(where:{$0.sessionID == boundSessionID && $0.installation != installation}) else { throw ChecklistError("BINDING_CHANGED","This reported session is already bound to another connection. Use a thread created for this project.") }
         if var existing=enrollments[installation] {
+            var changed = false
             let access = try router.handle(method:"session_list",params:["project_id":pid],caller:owner)
             let accessBody = access["data"] as? [String:Any] ?? access
             let sessions = accessBody["sessions"] as? [[String:Any]] ?? []
@@ -60,32 +79,32 @@ extension Coordinator {
                 }
                 if session["owner_reconnect_allowed"] as? Bool == true {
                     let resumed = try reconnectNativeSession(existing,project:pid,executionDomain:executionDomain,binding:binding,process:process,endpoint:context["native_endpoint"] as? String,owner:owner,ownerAllowed:true)
-                    return connectionResult(resumed,project:pid)
+                    return BootstrapResult(reply:connectionResult(resumed,project:pid),changed:true)
                 }
             }
             if existing.revoked == true || existing.nativeExecutionDomain != executionDomain {
                 // A host resumed this conversation in a new process; never borrow the old generation.
                 let resumed=try reconnectNativeSession(existing,project:pid,executionDomain:executionDomain,binding:binding,process:process,endpoint:context["native_endpoint"] as? String,owner:owner)
-                return connectionResult(resumed,project:pid)
+                return BootstrapResult(reply:connectionResult(resumed,project:pid),changed:true)
             }
             guard existing.sessionID == boundSessionID,existing.workspace == binding,existing.provider == provider,relay || existing.projectIDs == [pid] else { throw ChecklistError("BINDING_CHANGED","The registered workspace changed. Review this connection in Checklist before reconnecting.") }
             guard (existing.assistantRelay == true) == relay else { throw ChecklistError("CONNECTION_MODE_MISMATCH","This native thread cannot change its access role.") }
             // Ordinary MCP/client restarts do not rotate claims, deliveries or grants.
-            guard let credential = try ChecklistKeychain.read(installation), SHA256.hash(data: Data(credential.utf8)).map({ String(format: "%02x", $0) }).joined() == existing.tokenDigest else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This thread's saved credential does not match its enrollment. Repair it in Checklist.") }
+            guard let credential = try readCredential(installation), SHA256.hash(data: Data(credential.utf8)).map({ String(format: "%02x", $0) }).joined() == existing.tokenDigest else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This thread's saved credential does not match its enrollment. Repair it in Checklist.") }
             if let session=sessions.first(where:{$0["id"] as? String == boundSessionID}) {
                 guard !["revoked","ended"].contains(session["state"] as? String ?? "") else { throw ChecklistError("CONNECTION_REVOKED","This thread was ended or disconnected. Its authority cannot be resumed automatically.") }
                 guard ConnectionCommit.registrationMatches(session, sessionID: existing.sessionID, installation: existing.installation, generation: existing.generation, role: existing.role, provider: existing.provider, projects: existing.projectIDs) else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This prepared connection does not match its committed session. Repair it in Checklist.") }
             } else {
                 // Repair only an interrupted initial registration. Existing generations stay intact.
-                _ = try registerAutomatic(existing,project:pid,caller:owner)
+                _ = try registerAutomatic(existing,project:pid,caller:owner);changed = true
             }
             if relay,(existing.assistantGrants != grantMap || existing.relayPolicyRevisions != grantRevisions || existing.projectIDs != projectIDs) {
                 existing.assistantGrants=grantMap;existing.relayPolicyRevisions=grantRevisions;existing.relaySelector=selector;existing.projectIDs=projectIDs;existing.generation=UUID().uuidString
-                _ = try registerAutomatic(existing,project:pid,caller:owner)
+                _ = try registerAutomatic(existing,project:pid,caller:owner);changed = true
                 enrollments[installation]=existing;try saveEnrollments()
             }
             try requireCommittedRegistration(existing, project: pid, caller: owner)
-            return connectionResult(existing, project:pid)
+            return BootstrapResult(reply:connectionResult(existing, project:pid),changed:changed)
         }
         let snapshot=try router.handle(method:"snapshot",params:[:],caller:owner)
         let records=(snapshot["data"] as? [String:Any] ?? snapshot)["sessions"] as? [[String:Any]] ?? []
@@ -108,10 +127,10 @@ extension Coordinator {
             registerSession: { try registerAutomatic(enrollment, project: pid, caller: owner) },
             rollback: { try ConnectionCommit.restore(enrollment: { enrollments.removeValue(forKey: installation); try saveEnrollments() }, credential: { try ChecklistKeychain.removeChecked(installation) }) })
         try requireCommittedRegistration(enrollment, project: pid, caller: owner)
-        return connectionResult(enrollment,project:pid)
+        return BootstrapResult(reply:connectionResult(enrollment,project:pid),changed:true)
     }
 
-    private struct VerifiedNativeWorkspace {
+    struct VerifiedNativeWorkspace {
         let provider: String
         let session: String
         let process: pid_t
@@ -346,23 +365,14 @@ extension Coordinator {
         let expected=ChecklistPaths.serviceExecutable.deletingLastPathComponent().appendingPathComponent("checklist")
         var buffer=[CChar](repeating:0,count:4096)
         guard proc_pidpath(pid,&buffer,UInt32(buffer.count)) > 0,canonical(String(cString:buffer)) == canonical(expected.path) else { return false }
-        var code:SecStaticCode?;var expectedInfo:CFDictionary?
-        guard SecStaticCodeCreateWithPath(expected as CFURL,[],&code)==errSecSuccess,let code,
-              SecStaticCodeCheckValidity(code,[],nil)==errSecSuccess,
-              SecCodeCopySigningInformation(code,SecCSFlags(rawValue:kSecCSSigningInformation),&expectedInfo)==errSecSuccess,
-              let expectedHash=(expectedInfo as? [String:Any])?[kSecCodeInfoUnique as String] as? Data,
+        guard let expectedIdentity=nativeCodeIdentity.executable(expected),
               let actual=signingInfo(pid),actual[kSecCodeInfoIdentifier as String] as? String == "org.checklist.checklist",
               let actualHash=actual[kSecCodeInfoUnique as String] as? Data else { return false }
-        return actualHash == expectedHash
+        return actualHash == expectedIdentity.cdhash
     }
 
     private func signingInfo(_ pid:pid_t)->[String:Any]? {
-        var code:SecCode?;var staticCode:SecStaticCode?;var info:CFDictionary?
-        guard SecCodeCopyGuestWithAttributes(nil,[kSecGuestAttributePid as String:NSNumber(value:pid)] as CFDictionary,[],&code)==errSecSuccess,let code,
-              SecCodeCheckValidity(code,[],nil)==errSecSuccess,
-              SecCodeCopyStaticCode(code,[],&staticCode)==errSecSuccess,let staticCode,
-              SecCodeCopySigningInformation(staticCode,SecCSFlags(rawValue:kSecCSSigningInformation),&info)==errSecSuccess else { return nil }
-        return info as? [String:Any]
+        nativeCodeIdentity.signingInfo(pid)
     }
 
     private func nativeProcess(_ pid:pid_t,provider:String) throws -> pid_t {

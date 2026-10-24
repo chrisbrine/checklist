@@ -59,7 +59,12 @@ final class TicketLifecycleCleanupTests: XCTestCase {
         }
         XCTFail("Fixture deletion did not settle")
     }
-    func receipts(_ p: JSON) throws -> [JSON] {try call("ticket_cleanup_receipts",["project_id":p["id"]!])["receipts"] as! [JSON]}
+    // Deletion-engine fixtures inspect the full internal projection. Public read
+    // summary/detail paging is covered separately by TicketCleanupReceiptReadTests.
+    func receipts(_ p: JSON) throws -> [JSON] {
+        let summaries = try call("ticket_cleanup_receipts",["project_id":p["id"]!])["receipts"] as! [JSON]
+        return try router.dbQueue.read {db in try summaries.map {try router.ticketCleanupPassProjection(db,receipt:router.record(db,$0["id"] as! String,type:"storage_job"))}}
+    }
     func testDefaultsStartAutomaticallyWithoutPreviewOrActivationIncludingRestart() throws {
         let (p,t,a) = try fixture(age:20)
         let settings = router.ticketCleanupSettings(p)

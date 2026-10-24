@@ -122,11 +122,7 @@ struct ContentView: View {
         .background {
             Button("Search") { isSearchFocused = true }.keyboardShortcut("f").hidden()
         }
-        .checklistDisabled([(settingsPresentation.isPresented, "Close Settings first.")])
-        .accessibilityHidden(settingsPresentation.isPresented)
-        .overlay {
-            if settingsPresentation.isPresented { Color.black.opacity(0.18).ignoresSafeArea().allowsHitTesting(false).accessibilityHidden(true) }
-        }
+        .modifier(SettingsModalBackground(isPresented: settingsPresentation.isPresented))
     }
 
     @ViewBuilder var mainContent: some View {

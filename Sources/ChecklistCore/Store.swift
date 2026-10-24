@@ -15,6 +15,7 @@ public final class CommandRouter: @unchecked Sendable {
     var workHealthScanPosition: Int64 = 0
     private let preparationLock = NSLock()
     let root: URL
+    private let gateFiles: StorageObjectFiles
     let managedCapturePaths: [Data:String]
     let incarnation: String
     let providerPlugins: ProviderPluginRegistry
@@ -72,10 +73,12 @@ public final class CommandRouter: @unchecked Sendable {
         let opened: StorageBootstrap.Opened
         do { opened = try StorageBootstrap.open(root:root,serviceLease:serviceLease,prepareDatabase:Self.installTicketSearchFunctions) }
         catch { StoreRecovery.recordFailure(root:root,error:error);throw error }
+        let gateFiles = try StorageObjectFiles(root:root,pinRootForGates:true)
+        self.gateFiles = gateFiles
         self.managedCapturePaths = try opened.queue.read { try ManagedPathRelocation.captureBindings($0, root: root) }
         self.dbQueue = opened.queue
         self.incarnation = opened.incarnation
-        self.cursorKey = (try? ArchiveStorageGate.withExclusive(root: root) { _ in try opened.queue.write { db in try SealedCursor.storeKey(db) } }) ?? SymmetricKey(size: .bits256)
+        self.cursorKey = (try? ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { _ in try opened.queue.write { db in try SealedCursor.storeKey(db) } }) ?? SymmetricKey(size: .bits256)
         var readerConfiguration = Configuration()
         readerConfiguration.readonly = true
         readerConfiguration.prepareDatabase { db in
@@ -85,7 +88,7 @@ public final class CommandRouter: @unchecked Sendable {
         self.readers = try? DatabasePool(path: root.appendingPathComponent("checklist.sqlite").path, configuration: readerConfiguration)
         // Authority reconciliation must commit even when unrelated maintenance is broken.
         do {
-            try ArchiveStorageGate.withExclusive(root: root) { _ in
+            try ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { _ in
                 try dbQueue.write { db in try self.interruptSourceExecutionsAfterRestart(db) }
             }
         } catch {
@@ -95,7 +98,7 @@ public final class CommandRouter: @unchecked Sendable {
         do {
             let startupLease = try storageAdmission.acquire()
             defer { startupLease.finish() }
-            try ArchiveStorageGate.withExclusive(root: root) { permit in
+            try ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { permit in
                 try dbQueue.writeWithoutTransaction { db in
                     // CL-70: files left by commands that never committed, before any new command.
                     try? self.sweepPendingSourceCaptures(db)
@@ -194,6 +197,7 @@ public final class CommandRouter: @unchecked Sendable {
             let session: JSON
             do { session = try scoped(db,sid,pid,type:"session") }
             catch let error as CoreError where error.code == "NOT_FOUND" { throw CoreError("FORBIDDEN","This connection has no registered session in this project.") }
+            guard !bool(session,"restore_quarantined") else {throw CoreError("CONNECTION_REVOKED","Restored sessions require fresh native identity revalidation.")}
             if session["execution_domain"] != nil || caller.executionDomain != nil {
                 guard let domain = caller.executionDomain,session["execution_domain"] as? String == domain else { throw CoreError("FORBIDDEN","This connection does not match its verified host execution domain.") }
             }
@@ -250,6 +254,11 @@ public final class CommandRouter: @unchecked Sendable {
         return Int(sequence)
     }
     public func handle(method: String, params: [String: Any], caller: Caller) throws -> [String: Any] {
+        // Validation, preparation and owner projection also bridge Foundation
+        // objects outside the SQL callbacks. Bound their lifetime on this thread.
+        try autoreleasepool {try handleCommand(method:method,params:params,caller:caller)}
+    }
+    private func handleCommand(method: String, params: [String: Any], caller: Caller) throws -> [String: Any] {
         guard ["owner","worker","assistant"].contains(caller.role), !caller.installation.isEmpty else { throw CoreError("FORBIDDEN", "An authenticated connection is required.") }
         guard let encoded = try? JSONSerialization.data(withJSONObject:params), encoded.count <= 2_000_000 else { throw CoreError("INVALID_INPUT", "Command input is too large or invalid.") }
         try validateInput(method,params,caller)
@@ -267,6 +276,8 @@ public final class CommandRouter: @unchecked Sendable {
         }
         let operationLease = try storageAdmission.acquire()
         defer { operationLease.finish() }
+        if Self.storageRestoreMethods.contains(method) {return try executeStorageRestore(method:method,params:params,caller:caller)}
+        if Self.projectImportMethods.contains(method) {return try executeProjectImport(method:method,params:params,caller:caller)}
         // CL-72: a pure read runs on a read-only connection, without the object gate or the
         // writer. A read that turns out to write (for example a first cleanup preview) runs
         // again on the writer path below.
@@ -277,7 +288,7 @@ public final class CommandRouter: @unchecked Sendable {
         // A crash-left export reserves its intent before any command's file preparation.
         // The shared transaction guard checks it again under the object gate.
         if !Self.readMethods.contains(method),let command = params["command_id"] as? String {
-            try ArchiveStorageGate.withExclusive(root:root) { _ in
+            try ArchiveStorageGate.withExclusive(root:root,files:gateFiles) { _ in
                 try requirePendingExportIntent(command:command,digest:hash(Data((method + (try jsonString(params))).utf8)),caller:caller)
             }
         }
@@ -297,11 +308,14 @@ public final class CommandRouter: @unchecked Sendable {
         let managedImport: ManagedAttachmentPreparation?
         do { managedImport = try prepareManagedAttachmentImport(method:method,params:params,caller:caller,access:managedImportAccessOutsideWriter()) }
         catch {
-            try? ArchiveStorageGate.withExclusive(root: root) { _ in try dbQueue.writeWithoutTransaction { db in try self.recordManagedImportPreparationFailure(db,method:method,params:params,caller:caller,error:error) } }
+            try? ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { _ in try dbQueue.writeWithoutTransaction { db in try self.recordManagedImportPreparationFailure(db,method:method,params:params,caller:caller,error:error) } }
             throw error
         }
-        return try ArchiveStorageGate.withExclusive(root: root) { permit in
-        return try dbQueue.writeWithoutTransaction { db in
+        return try ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { permit in
+        return try dbQueue.writeWithoutTransaction { db in try autoreleasepool {
+            // Decode/encode temporaries belong to this command, including its
+            // post-commit maintenance and notices. Drain on the writer's thread;
+            // a pool on the calling service queue cannot guarantee that lifetime.
             self.commandPreparation = preparation; self.inlineSourceCaptures = []; self.consumedSourceCaptures = []; self.exportPublications = []
             defer { createdCaptures += self.inlineSourceCaptures; publishedExports += self.exportPublications; self.commandPreparation = CommandPreparation(); self.inlineSourceCaptures = []; self.consumedSourceCaptures = []; self.exportPublications = [] }
             if method == "export_project" {
@@ -378,7 +392,7 @@ public final class CommandRouter: @unchecked Sendable {
             do { output = try self.addingHumanAnswerNotices(db,output:output,params:params,caller:caller) }
             catch { output = self.addingHumanAnswerNoticeFailure(output,caller:caller) }
             return self.ownerManagedPathProjection(self.addingStorageMaintenanceNotice(output, warning: maintenanceWarning),caller:caller)
-        }
+        }}
     }
     }
     /// Closes the read-only connections before the writer, so the writer's close can
@@ -419,5 +433,5 @@ public final class CommandRouter: @unchecked Sendable {
         guard !captures.isEmpty else { return }
         try? dbQueue.read { db in _ = self.discardUncommittedSourceCaptures(db, captures) }
     }
-    static let readMethods: Set<String> = mediaOwnerReads.union(["ticket_cleanup_receipts","work_health_get","cleanup_job_get","cleanup_job_list","workspace_page","service_info","tool_catalog","snapshot","changes_wait","delivery_pending","storage_status","diagnostics_summary","project_list","project_resolve","project_settings_get","policy_get","taxonomy_get","task_get","task_list","task_context","session_list","session_inbox","assistant_inbox","assistant_projects","message_delivery_list","history_list","attachment_list","attachment_read","attachment_cleanup_preview","agent_resolve","triage_list","epic_list","development_status","policy_preview","relation_list","review_batch_inputs","batch_get","batch_list","source_execution_get","review_prepare","review_context"])
+    static let readMethods: Set<String> = mediaOwnerReads.union(["import_preview","import_receipt_get","restore_preview","ticket_cleanup_receipts","work_health_get","cleanup_job_get","cleanup_job_list","workspace_page","service_info","tool_catalog","snapshot","changes_wait","delivery_pending","storage_status","diagnostics_summary","project_list","project_resolve","project_settings_get","policy_get","taxonomy_get","task_get","task_list","task_context","session_list","session_inbox","assistant_inbox","assistant_projects","message_delivery_list","history_list","attachment_list","attachment_read","attachment_cleanup_preview","agent_resolve","triage_list","epic_list","development_status","policy_preview","relation_list","review_batch_inputs","batch_get","batch_list","source_execution_get","review_prepare","review_context"])
 }

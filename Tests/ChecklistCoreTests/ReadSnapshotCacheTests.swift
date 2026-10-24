@@ -1,8 +1,151 @@
 import XCTest
 import GRDB
+import SQLite3
 @testable import ChecklistCore
 
+private final class VersionWALHandle {
+    let pointer:UnsafeMutablePointer<sqlite3_snapshot>
+    let bytes:Data
+    init?(_ db:Database) {
+        var pointer:UnsafeMutablePointer<sqlite3_snapshot>?
+        guard sqlite3_snapshot_get(db.sqliteConnection,"main",&pointer)==SQLITE_OK,let pointer else {return nil}
+        self.pointer=pointer;bytes=Data(bytes:pointer,count:MemoryLayout<sqlite3_snapshot>.size)
+    }
+    deinit {sqlite3_snapshot_free(pointer)}
+}
+
 final class ReadSnapshotCacheTests: XCTestCase {
+    func testOpaqueReadVersionChangesOnCommitAndCallerButSurvivesReaderChurnAndRollback() throws {
+        let f = try ReadPerformanceFixture("CL-254-read-version"),r = f.router,reader = try XCTUnwrap(r.readers)
+        func version(_ caller: Caller) throws -> String {
+            try reader.read {db in try r.readSnapshotCache.withSnapshot(db,caller:caller) {
+                try XCTUnwrap(r.readSnapshotCache.readVersion(db))
+            }}
+        }
+        let first = try version(f.owner)
+        XCTAssertEqual(try version(f.owner),first)
+        try f.save([("message",["id":"version-note","project_id":"project","revision":1])])
+        let committed = try version(f.owner)
+        XCTAssertNotEqual(committed,first,"A write with no event still changes the token")
+        try r.dbQueue.writeWithoutTransaction {db in
+            try db.inTransaction {try db.execute(sql:"DELETE FROM records WHERE id='version-note'");return .rollback}
+        }
+        XCTAssertEqual(try version(f.owner),committed)
+        var changed = f.owner;changed.projectIDs = ["different-project"]
+        XCTAssertNotEqual(try version(changed),committed)
+        let restored = try version(f.owner)
+        XCTAssertEqual(restored,committed,"An interleaved caller must not rotate unchanged display identity")
+        try r.dbQueue.read {db in XCTAssertNil(r.readSnapshotCache.readVersion(db),"Writer reads do not issue cache authority")}
+        var configuration = Configuration();configuration.readonly = true
+        let other = try DatabaseQueue(path:r.root.appendingPathComponent("checklist.sqlite").path,configuration:configuration)
+        defer {try? other.close()}
+        try other.read {db in try r.readSnapshotCache.withSnapshot(db,caller:f.owner) {
+            XCTAssertEqual(r.readSnapshotCache.readVersion(db),restored,"The same pinned WAL snapshot is comparable across readers")
+        }}
+    }
+
+    func testInterleavedPoolReadersKeepScopeTokensAndPinnedOldReadCannotAliasNewCommit() throws {
+        let f = try ReadPerformanceFixture("CL-254-pool-version"),r = f.router,reader = try XCTUnwrap(r.readers)
+        try f.save([("message",["id":"pinned-version","project_id":"project","revision":1])])
+        final class Observation: @unchecked Sendable {
+            let lock=NSLock();var before:String?;var after:String?;var error:Error?
+        }
+        let values=Observation(),pinned=DispatchSemaphore(value:0),resume=DispatchSemaphore(value:0),finished=expectation(description:"pinned reader finishes")
+        DispatchQueue.global().async {
+            defer {finished.fulfill()}
+            do {try reader.read {db in try r.readSnapshotCache.withSnapshot(db,caller:f.owner) {
+                XCTAssertEqual(try r.record(db,"pinned-version")["revision"] as? Int,1)
+                values.lock.withLock {values.before=r.readSnapshotCache.readVersion(db)}
+                pinned.signal()
+                guard resume.wait(timeout:.now()+10) == .success else {throw NSError(domain:"PinnedReadTimeout",code:1)}
+                values.lock.withLock {values.after=r.readSnapshotCache.readVersion(db)}
+                XCTAssertEqual(try r.record(db,"pinned-version")["revision"] as? Int,1)
+            }}} catch {values.lock.withLock {values.error=error};pinned.signal()}
+        }
+        defer {resume.signal()}
+        XCTAssertEqual(pinned.wait(timeout:.now()+10),.success)
+        let old=try XCTUnwrap(values.lock.withLock {values.before})
+        var other=f.owner;other.installation="interleaved-bridge"
+        for _ in 0..<12 {
+            try reader.read {db in try r.readSnapshotCache.withSnapshot(db,caller:other) {XCTAssertNotEqual(r.readSnapshotCache.readVersion(db),old)}}
+            try reader.read {db in try r.readSnapshotCache.withSnapshot(db,caller:f.owner) {XCTAssertEqual(r.readSnapshotCache.readVersion(db),old)}}
+        }
+        try f.save([("message",["id":"pinned-version","project_id":"project","revision":2])])
+        let current=try reader.read {db in try r.readSnapshotCache.withSnapshot(db,caller:f.owner) {try XCTUnwrap(r.readSnapshotCache.readVersion(db))}}
+        XCTAssertNotEqual(current,old,"An eventless commit changes the pinned snapshot")
+        resume.signal();wait(for:[finished],timeout:10)
+        XCTAssertNil(values.lock.withLock {values.error})
+        XCTAssertEqual(values.lock.withLock {values.after},old,"The precommit reader retains its own older identity")
+        try reader.read {db in try r.readSnapshotCache.withSnapshot(db,caller:f.owner) {XCTAssertEqual(r.readSnapshotCache.readVersion(db),current)}}
+    }
+
+    func testUnavailableWALSnapshotOmitsDisplayVersionWithoutAffectingReads() throws {
+        let f=try ReadPerformanceFixture("CL-254-version-fallback"),path=f.router.root.appendingPathComponent("non-wal.sqlite").path
+        let writer=try DatabaseQueue(path:path)
+        try writer.write {try $0.execute(sql:"CREATE TABLE fixture(value); INSERT INTO fixture VALUES(1)")}
+        try writer.close()
+        var configuration=Configuration();configuration.readonly=true
+        let reader=try DatabaseQueue(path:path,configuration:configuration)
+        defer {try? reader.close()}
+        try reader.read {db in try f.router.readSnapshotCache.withSnapshot(db,caller:f.owner) {
+            XCTAssertNil(f.router.readSnapshotCache.readVersion(db))
+            XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT value FROM fixture"),1)
+        }}
+        // After checkpoint SQLite may retain a valid snapshot header or report
+        // no snapshot. Both preserve reads of the same committed contents.
+        let pool=try XCTUnwrap(f.router.readers)
+        let before=try pool.read {db in try f.router.readSnapshotCache.withSnapshot(db,caller:f.owner) {
+            (f.router.readSnapshotCache.readVersion(db),try Int.fetchOne(db,sql:"PRAGMA data_version"),VersionWALHandle(db))
+        }}
+        try f.router.dbQueue.writeWithoutTransaction {try $0.execute(sql:"PRAGMA wal_checkpoint(TRUNCATE)")}
+        try pool.read {db in try f.router.readSnapshotCache.withSnapshot(db,caller:f.owner) {
+            let after=f.router.readSnapshotCache.readVersion(db)
+            let version=try Int.fetchOne(db,sql:"PRAGMA data_version"),handle=VersionWALHandle(db)
+            let comparison=before.2.flatMap {old in handle.map {sqlite3_snapshot_cmp(old.pointer,$0.pointer)}}
+            print("P9-r2 TRUNCATE before_data_version=\(String(describing:before.1)) after_data_version=\(String(describing:version)) token_stable=\(after == before.0) snapshot_cmp=\(String(describing:comparison)) opaque_bytes_equal=\(before.2?.bytes == handle?.bytes)")
+            XCTAssertTrue(after == nil || after == before.0 || version != before.1)
+            XCTAssertNotNil(try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM metadata"))
+        }}
+    }
+
+    func testCommittedChangeThenCheckpointCannotAliasRetainedReaderVersion() throws {
+        let f=try ReadPerformanceFixture("CL-254-commit-checkpoint"),r=f.router,pool=try XCTUnwrap(r.readers)
+        try f.save([("message",["id":"checkpoint-version","project_id":"project","revision":1])])
+        let before=try pool.read {db in try r.readSnapshotCache.withSnapshot(db,caller:f.owner) {
+            (r.readSnapshotCache.readVersion(db),try r.record(db,"checkpoint-version")["revision"] as? Int)
+        }}
+        XCTAssertEqual(before.1,1)
+        try f.save([("message",["id":"checkpoint-version","project_id":"project","revision":2])])
+        try r.dbQueue.writeWithoutTransaction {try $0.execute(sql:"PRAGMA wal_checkpoint(TRUNCATE)")}
+        try pool.read {db in try r.readSnapshotCache.withSnapshot(db,caller:f.owner) {
+            let after=r.readSnapshotCache.readVersion(db)
+            XCTAssertTrue(after == nil || after != before.0,"A committed change followed by checkpoint cannot reuse the old display token")
+            XCTAssertEqual(try r.record(db,"checkpoint-version")["revision"] as? Int,2)
+        }}
+    }
+
+    func testCheckpointAndSpilledRollbackNeverReusesChangedContentsAsCurrent() throws {
+        let f=try ReadPerformanceFixture("CL-254-spilled-rollback"),r=f.router,reader=try XCTUnwrap(r.readers)
+        try f.save((0..<128).map {("message",["id":"spill-\($0)","project_id":"project","revision":1,"body":String(repeating:"retained ",count:1024)] as JSON)})
+        try r.dbQueue.writeWithoutTransaction {try $0.execute(sql:"PRAGMA wal_checkpoint(FULL)")}
+        let before=try reader.read {db in try r.readSnapshotCache.withSnapshot(db,caller:f.owner) {r.readSnapshotCache.readVersion(db)}}
+        try r.dbQueue.writeWithoutTransaction {db in
+            try db.execute(sql:"PRAGMA cache_size=1")
+            defer {try? db.execute(sql:"PRAGMA cache_size=-2000")}
+            try db.inTransaction {
+                try db.execute(sql:"UPDATE records SET data=json_set(data,'$.temporary',?) WHERE type='message'",arguments:[String(repeating:"rolled back ",count:1024)])
+                return .rollback
+            }
+        }
+        try reader.read {db in try r.readSnapshotCache.withSnapshot(db,caller:f.owner) {
+            let after=r.readSnapshotCache.readVersion(db)
+            print("P9-r2 checkpoint/spilled rollback before_version=\(before != nil) after_version=\(after != nil) stable=\(before == after)")
+            XCTAssertTrue(after == nil || after == before,"A reset/empty WAL may omit identity; it must not invent a different committed snapshot")
+            XCTAssertNil(try r.record(db,"spill-0")["temporary"])
+            XCTAssertEqual(try r.record(db,"spill-0")["revision"] as? Int,1)
+        }}
+    }
+
     func testEveryCommittedFamilyAndEventInvalidatesAndRollbackDoesNotLeak() throws {
         let f = try ReadPerformanceFixture("CL-254-cache"),r = f.router
         let reader = try XCTUnwrap(r.readers)
@@ -17,18 +160,23 @@ final class ReadSnapshotCacheTests: XCTestCase {
             if type == "group" {value["kind"] = kind.lowercased();value["task_ids"] = [] as [String]}
             if type == "message" {value["body"] = "original note"}
             try f.save([(type,value)])
+            var observedVersion:String?
             func read() throws -> JSON {
                 try reader.read { db in try r.readSnapshotCache.withSnapshot(db,caller:f.owner) {
+                    observedVersion=r.readSnapshotCache.readVersion(db)
                     let first = try r.record(db,id,type:type)
                     XCTAssertEqual(try jsonString(first),try jsonString(r.record(db,id,type:type)))
                     return first
                 }}
             }
             XCTAssertEqual(try read()["revision"] as? Int,1)
+            let originalVersion=try XCTUnwrap(observedVersion)
             value["revision"] = 2;value["name"] = "changed";value["archived"] = true
             // No event: data_version must cover writes, not only event cursors.
             try f.save([(type,value)])
             XCTAssertEqual(try read()["revision"] as? Int,2,kind)
+            let committedVersion=try XCTUnwrap(observedVersion)
+            XCTAssertNotEqual(committedVersion,originalVersion,kind)
             try r.dbQueue.writeWithoutTransaction {db in
                 try r.withValidatedDomainTransaction(db) {
                     var rolled = value;rolled["revision"] = 3
@@ -36,8 +184,10 @@ final class ReadSnapshotCacheTests: XCTestCase {
                 }
             }
             XCTAssertEqual(try read()["revision"] as? Int,2,"rollback \(kind)")
+            XCTAssertEqual(observedVersion,committedVersion,"rollback \(kind)")
             try r.dbQueue.write {try $0.execute(sql:"DELETE FROM records WHERE id=?",arguments:[id])}
             XCTAssertThrowsError(try read(),"delete \(kind)")
+            XCTAssertNotEqual(observedVersion,committedVersion,"delete \(kind)")
         }
         try reader.read {db in try r.readSnapshotCache.withSnapshot(db,caller:f.owner) {_ = try r.records(db,type:"message",project:"project")}}
         try r.dbQueue.write {try r.event($0,caller:f.owner,project:"project",entity:nil,kind:"event-only")}

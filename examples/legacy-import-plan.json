@@ -1,6 +1,6 @@
 {
   "fixture_version": 1,
-  "scope": "Synthetic CL-21 planning fixtures only; no source reader or import compatibility is implemented.",
+  "scope": "Synthetic CL-21 fixtures for the explicitly versioned fictional readers; no compatibility with unselected real source boards is claimed.",
   "cases": [
     {
       "id": "snapshot-events",

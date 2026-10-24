@@ -1,4 +1,6 @@
 import Foundation
+import XCTest
+@testable import ChecklistApp
 
 enum CheckFailure: Error { case failed(String) }
 func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
@@ -71,14 +73,10 @@ let checks: [(String, () throws -> Void)] = [
         try require(projection.previous(for: row) == nil, "Oldest target has no later-target comparison")
     })
 ]
-let requested = Set(CommandLine.arguments.dropFirst())
-let known = Set(checks.map { $0.0 })
-guard requested.isSubset(of: known) else { print("Unknown selected check; use exact names."); exit(2) }
-let selected = checks.filter { requested.isEmpty || requested.contains($0.0) }
-var failures = 0
-for (name, check) in selected {
-    do { try check(); print("PASS \(name)") }
-    catch { failures += 1; print("FAIL \(name): \(error)") }
+final class TestResultEvidenceProjectionTests: XCTestCase {
+    func testUnusedM1ReviewerResultStaysBoundBeforeAVerdictAndComparesToM0() throws { try checks[0].1() }
+    func testGenuineUnsubmittedUploadRemainsDistinctFromReviewerEvidence() throws { try checks[1].1() }
+    func testALaterReferenceCannotOverrideServiceRecordedReviewerTarget() throws { try checks[2].1() }
+    func testIncompleteAndConflictingReviewerMetadataNeverFallsIntoUnsubmitted() throws { try checks[3].1() }
+    func testServiceTargetAttributionSurvivesBoundedAttemptHistoryLoading() throws { try checks[4].1() }
 }
-print("\(selected.count) selected evidence-projection checks, \(failures) failures")
-if failures != 0 { exit(1) }

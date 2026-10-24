@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 import ChecklistIPC
 @testable import ChecklistApp
 @testable import ChecklistCore
@@ -64,6 +65,157 @@ import ChecklistIPC
     }
     private func health(_ store: ChecklistStore) -> [String] {
         [String(store.connected), String(store.connectionAttempted), store.lastServiceFailure ?? "nil"]
+    }
+    func testIndependentSettingsReadsSurviveScreenCacheInvalidation() async throws {
+        for method in ["storage_status", "restore_preview", "ticket_cleanup_receipts"] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            var held: CheckedContinuation<[String:Any],Error>?
+            let store = ChecklistStore(draftJournal:LocalDraftJournal(directory:root), preferences:isolatedDefaults("IndependentSettingsReads").preferences, restorePendingCommand:false,
+                desktopAlerts:DesktopAlertCoordinator(sink:CancellationAlertSink()), requestTransport: { _, _ in
+                    try await withCheckedThrowingContinuation { held = $0 }
+                })
+            var current = true
+            let read = Task { try await store.request(method, ifCurrent:{ current }) }
+            try await until { held != nil }
+            store.data = ["service":["store_incarnation":"new-screen-generation"]]
+            held?.resume(returning:["accepted":method])
+            do {
+                let reply = try await read.value
+                XCTAssertEqual(reply["accepted"] as? String,method)
+            } catch { XCTFail("An unrelated screen invalidation cancelled \(method): \(error)") }
+            current = false
+        }
+    }
+
+    func testSupersededSettingsReplyIsRejectedBeforeItCanAffectContent() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at:root) }
+        var held: CheckedContinuation<[String:Any],Error>?
+        let store = ChecklistStore(draftJournal:LocalDraftJournal(directory:root), preferences:isolatedDefaults("SupersededSettingsRead").preferences, restorePendingCommand:false,
+            desktopAlerts:DesktopAlertCoordinator(sink:CancellationAlertSink()), requestTransport:{ _, _ in
+                try await withCheckedThrowingContinuation { held = $0 }
+            })
+        var current = true
+        let read = Task { try await store.request("storage_status",ifCurrent:{ current }) }
+        try await until { held != nil };current = false
+        held?.resume(returning:["accepted":"obsolete"])
+        do { _ = try await read.value;XCTFail("Superseded settings reply must be retired") }
+        catch { XCTAssertTrue(error is CancellationError) }
+    }
+    /// CL-224: use actual readers and a mounted sidebar, including refreshes that
+    /// retain an existing page. An idle changes_wait must never keep the spinner on.
+    func testFooterReplacesOnlyRefreshForInitialAndManualPageLoads() async throws {
+        for page in [Page.tasks, .archived, .overview, .needsYou, .epics, .activity] {
+            let f = try Fixture(isolatedDefaults("FooterLoads").preferences); defer { f.cleanup() }
+            f.preferences.set(page.rawValue, forKey: "lastPage")
+            let method = [Page.tasks, .archived].contains(page) ? "task_list" : "workspace_page"
+            f.hold = { name, _ in name == method }
+            let store = f.store(), live = Task { await store.startLiveUpdates() }
+            defer { live.cancel(); store.stopWindowReads() }
+            let host = NSHostingView(rootView: SidebarView().environmentObject(store).defaultAppStorage(f.preferences).frame(width: 224, height: 700))
+            let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 224, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
+            window.title = "Synthetic Checklist held-load footer (offscreen)"
+            window.isReleasedWhenClosed = false; window.contentView = host; window.orderFront(nil)
+            defer { window.contentView = nil; window.close() }
+            try await until { f.held != nil }
+            try await assertFooter(host, loading: true, context: "initial \(page)")
+            f.release()
+            try await until { f.calls.contains { $0.0 == "changes_wait" } }
+            try await assertFooter(host, loading: false, context: "idle \(page)")
+            for quiet in [false, true] {
+                f.hold = { name, _ in name == method }
+                let refresh = Task { await store.refresh(quiet: quiet) } // Cmd-R uses the default false.
+                try await until { f.held != nil }
+                try await assertFooter(host, loading: true, context: "refresh \(page), quiet=\(quiet)")
+                f.release(); await refresh.value
+                try await assertFooter(host, loading: false, context: "settled \(page), quiet=\(quiet)")
+            }
+        }
+    }
+    func testFooterRestoresRefreshAfterPageFailureOrCancellation() async throws {
+        for page in [Page.tasks, .overview, .needsYou] {
+            for failure in [OfflineBannerTests.Down() as Error, CancellationError()] {
+                let f = try Fixture(isolatedDefaults("FooterReadEnd").preferences); defer { f.cleanup() }
+                f.preferences.set(page.rawValue, forKey: "lastPage")
+                let store = f.store(), live = Task { await store.startLiveUpdates() }
+                defer { live.cancel(); store.stopWindowReads() }
+                try await until { f.calls.contains { $0.0 == "changes_wait" } }
+                let host = NSHostingView(rootView: SidebarView().environmentObject(store).defaultAppStorage(f.preferences).frame(width: 224, height: 700))
+                let method = page == .tasks ? "task_list" : "workspace_page"
+                f.hold = { name, _ in name == method }
+                let refresh = Task { await store.refresh() }
+                try await until { f.held != nil }
+                try await assertFooter(host, loading: true, context: "held \(page) \(failure)")
+                f.release(failure); await refresh.value
+                try await assertFooter(host, loading: false, context: "ended \(page) \(failure)")
+            }
+        }
+    }
+    func testFooterIgnoresUnfinishedReadsAfterLeavingTheirPage() async throws {
+        for initial in [Page.tasks, .needsYou] {
+            let f = try Fixture(isolatedDefaults("FooterOffscreenRead").preferences); defer { f.cleanup() }
+            f.preferences.set(initial.rawValue, forKey: "lastPage")
+            f.hold = { name, _ in name == (initial == .tasks ? "task_list" : "workspace_page") }
+            let store = f.store(), live = Task { await store.startLiveUpdates() }
+            defer { live.cancel(); store.stopWindowReads() }
+            let host = NSHostingView(rootView: SidebarView().environmentObject(store).defaultAppStorage(f.preferences).frame(width: 224, height: 700))
+            try await until { f.held != nil }
+            try await assertFooter(host, loading: true, context: "before navigation \(initial)")
+            store.select(initial == .tasks ? .needsYou : .tasks)
+            try await until { initial == .tasks ? store.workspacePageLoaded && !store.workspaceLoading : store.preparedTicketWorkspace != nil && !store.ticketPageLoading }
+            XCTAssertNotNil(f.held, "The obsolete request is deliberately still pending")
+            try await assertFooter(host, loading: false, context: "after navigation \(initial)")
+            f.release()
+        }
+    }
+    func testFooterTracksMediaRefreshOnlyWhenMediaIsVisible() async throws {
+        for visible in [false, true] {
+            let f = try Fixture(isolatedDefaults("FooterMediaLoad").preferences); defer { f.cleanup() }
+            f.preferences.set(Page.tasks.rawValue, forKey: "lastPage")
+            f.preferences.set(f.project, forKey: "lastProject")
+            let store = f.store(), live = Task { await store.startLiveUpdates() }
+            defer { live.cancel(); store.stopWindowReads() }
+            try await until { f.calls.contains { $0.0 == "changes_wait" } }
+            if visible {
+                store.select(.media, project: f.project)
+                try await until { store.workspacePageLoaded && !store.workspaceLoading }
+            }
+            let host = NSHostingView(rootView: SidebarView().environmentObject(store).defaultAppStorage(f.preferences).frame(width: 224, height: 700))
+            f.hold = { name, _ in name == "media_navigation" }
+            let media = Task { await store.mediaReview.connect(store: store) }
+            try await until { f.held != nil }
+            try await assertFooter(host, loading: visible, context: "held media, visible=\(visible)")
+            f.release(); await media.value
+            try await until { !store.ticketPageLoading && !store.workspaceLoading }
+            try await assertFooter(host, loading: false, context: "settled media, visible=\(visible)")
+        }
+    }
+    private func assertFooter(_ host: NSView, loading: Bool, context: String, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let enhanced = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
+        let previous = NSApplication.shared.accessibilityAttributeValue(enhanced) ?? false
+        NSApplication.shared.accessibilitySetValue(true, forAttribute: enhanced)
+        defer { NSApplication.shared.accessibilitySetValue(previous, forAttribute: enhanced) }
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        host.layoutSubtreeIfNeeded()
+        func attribute(_ object: NSObject, _ name: String) -> Any? {
+            let selector = NSSelectorFromString(name)
+            return object.responds(to: selector) ? object.perform(selector)?.takeUnretainedValue() : nil
+        }
+        func nodes(_ object: NSObject, depth: Int = 0) -> [NSObject] {
+            guard depth < 30 else { return [] }
+            return [object] + (attribute(object, "accessibilityChildren") as? [NSObject] ?? []).flatMap { nodes($0, depth: depth + 1) }
+        }
+        let elements = nodes(host)
+        let buttons = elements.filter { attribute($0, "accessibilityRole") as? String == "AXButton" }
+        let labels = buttons.compactMap { attribute($0, "accessibilityLabel") as? String }
+        XCTAssertEqual(labels.contains("Refresh service"), !loading, context, file: file, line: line)
+        XCTAssertTrue(labels.contains("Checklist Settings"), context, file: file, line: line)
+        func progressViews(_ view: NSView) -> [NSProgressIndicator] {
+            (view as? NSProgressIndicator).map { [$0] } ?? view.subviews.flatMap { progressViews($0) }
+        }
+        XCTAssertEqual(!progressViews(host).isEmpty, loading, context, file: file, line: line)
     }
     func testRefreshAndSnapshotCancellationPreserveEveryHealthTuple() async throws {
         for initial in ["unknown", "healthy", "outage"] {

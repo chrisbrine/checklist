@@ -4,6 +4,8 @@ A test slot is a disposable copy of one verified staged build, with its own serv
 
 ## Stage and create
 
+Establish the caller's actual identity before creating a slot. Native Codex/Claude sessions export it automatically. Otherwise set `CHECKLIST_SESSION_ID` to your actual session ID or add `--session-id <actual session ID>` to each `create` command. Missing or invalid identity refuses before slot locks, replacement, seeding or app copying. Never supply a made-up ID. The preflight order is identity first, then live-root/overlap admission for every source and destination, then lock acquisition and slot changes. If both identity and a root are invalid, identity is the first error; a valid identity never bypasses root admission.
+
 Build once with the ordinary immutable capture helper:
 
 ```sh
@@ -17,7 +19,7 @@ CHECKLIST_BUILD_CONFIGURATION=debug ./script/build_and_run.sh --stage
 
 Each folder is `~/Library/Application Support/Checklist Test Instances/slot-N/`; its store is `data/`, app is `Checklist Test N.app`, and `slot.json` records the original stage/build, seed, mode and check results. Each slot has its own short-lived sibling lock directory. A busy slot is refused; locks are never removed by another command.
 
-`create` writes `.checklist-workspace.json` at the slot root immediately after creating the folder, before seeding or app copying. It records the actual owning session, purpose, captured `source_fingerprint` and `released:false`; failed seeds retain that protection. The session comes from `CODEX_THREAD_ID`/`CLAUDE_SESSION_ID`, or `create --session-id <actual session ID>` when neither is exported. An exported host identity cannot be overridden. With neither a host identity nor `--session-id`, creation (including `--replace`) continues with a warning and skips the marker; it never invents an owner. Invalid or conflicting supplied identities still refuse before replacement. An unmarked slot gains no qualification-run release authority. Slot cleanup continues through `destroy` or `clean_builds.py`. For a manually created qualification run or synthetic-project workspace under `~/Library/Caches/ChecklistQualification`, mark the enclosing run root with its exact fingerprint **before** copying stores or using the slot CLI's `project_create`; see the [qualification marker procedure](../skills/checklist/references/driven-sessions.md#scratch-cleanup-and-cache-settings). The harness does not create those external project workspaces.
+`create` writes `.checklist-workspace.json` at the slot root immediately after creating the folder, before seeding or app copying. It records the actual owning session, purpose, captured `source_fingerprint` and `released:false`; failed seeds retain that protection. The session comes from `CODEX_THREAD_ID`/`CLAUDE_SESSION_ID`, then `CHECKLIST_SESSION_ID`, or `create --session-id <actual session ID>` when none is exported. An exported identity cannot be overridden. Missing, invalid or conflicting identity refuses before any slot locks or slot changes, including `--replace`; a new slot is always marked before seeding or copying. Slot cleanup continues through `destroy` or `clean_builds.py`. For a manually created qualification run or synthetic-project workspace under `~/Library/Caches/ChecklistQualification`, mark the enclosing run root with its exact fingerprint **before** copying stores or using the slot CLI's `project_create`; see the [qualification marker procedure](../skills/checklist/references/driven-sessions.md#scratch-cleanup-and-cache-settings). The harness does not create those external project workspaces.
 
 Slot attachment drafts and Open in… working copies use the sibling `caches/` folder outside `data/`, so destroying the slot removes them without touching the live app's cache folders.
 
@@ -63,9 +65,16 @@ The harness bootstraps a nonpersistent launchd job directly from the slot folder
 
 The first start of a real-backup seed runs the protected pre-upgrade snapshot and migration and can take 20 minutes or more. `start` waits for health with status calls capped at 30 seconds and progress about once a minute. `CHECKLIST_START_DEADLINE_SECONDS` sets the total health-wait bound (default 2700 seconds; finite and at least 60). Per-call timeouts and unavailable/starting replies keep waiting; recovery, definite errors and malformed replies fail immediately. At the bound, the slot service keeps running its protected startup: run `start --slot N` again to keep waiting or `status --slot N` to inspect it. Destroying the slot during a protected snapshot discards that work. Starting an already running slot waits for health without bootstrapping another job. A direct `check` uses the same bounded wait for its status leg before the MCP probe; its other smoke-command bounds remain unchanged.
 
-The GUI window title identifies `Checklist Test N` and a persistent strip says **TEST INSTANCE N · synthetic/test data**. Headless operation covers the service, CLI and MCP. Human answers/approvals, `agent_rule_changes` and `backup_create` still require the actual signed GUI owner channel. A headless process gains no owner authority. Live owner drafts and the Finder data action keep their former fixed Library paths even under `CHECKLIST_DATA_ROOT`; test slots use their own derived root. Both ordinary and review handoff prompts retain the exact former live CLI literal for no slot, and use the test bundle’s shell-quoted CLI path for a test slot.
+The GUI window title identifies `Checklist Test N` and a persistent strip says **TEST INSTANCE N · synthetic/test data**. Headless operation covers the service, CLI and MCP. Human answers/approvals and the per-project `agent_rule_changes` switch require the actual signed GUI owner channel. Enrolled workers can create constrained backups when that switch allows agent changes; owner-selected backup destinations and restore remain trusted GUI operations. A headless process gains no owner authority. Live owner drafts and the Finder data action keep their former fixed Library paths even under `CHECKLIST_DATA_ROOT`; test slots use their own derived root. Both ordinary and review handoff prompts retain the exact former live CLI literal for no slot, and use the test bundle’s shell-quoted CLI path for a test slot.
 
 `check` runs the 18 CLI argument guards, service status and the official-SDK MCP smoke's `--service-only` mode using that slot's CLI. The MCP probe uses an explicit unenrolled binding, reads service information and checks the limited catalog, schema rejection and resources without bootstrapping a native conversation. The receipt also records a read-only observation of the running store’s schema, quick check and record counts, including committed WAL data. These are bounded smoke checks; acceptance cases for a particular change still need their own evidence.
+
+## Orchestrator runner preparation
+
+1. Resolve the actual native caller identity before `create`; if no native ID is exported, use `CHECKLIST_SESSION_ID` or `create --session-id <actual session ID>`. A runner assignment does not authorize impersonating the orchestrator. Keep an assigned persistent build workspace's existing orchestrator-owned marker.
+2. Select the exact verified stage and create the assigned disposable slot with that identity. Verify the slot root's `.checklist-workspace.json` names its creator and the stage fingerprint before handing it to a runner. Preserve any failed seed and its marker for inspection.
+3. Start headless with `./script/test_instances.py start --slot N --headless`; this command takes no `--session-id`. Identify the separate test app/data before a GUI start. The slot creator's marker is retained; starting a slot does not transfer ownership.
+4. Give the runner the exact build, slot CLI, authorized synthetic workspace and external evidence path. Capture evidence before destroying the owned slot through `destroy --slot N`; report incomplete cleanup and restore the real Checklist window after closing its GUI.
 
 ## Selected-record qualification faults (CL-205)
 
@@ -139,3 +148,19 @@ when every owning ticket is Done. See
 [local build and hand-in cleanup](monorepo-workspace.md#local-build-and-hand-in-cleanup)
 for ownership/status lists, process protection and the report format. Never run
 apply against another pass's active slots or unsubmitted evidence.
+
+
+### Agent-created backup seeds (CL-258)
+
+An enrolled worker in a project with `agent_rule_changes=allowed` can create the same verified full-store snapshot without an owner click:
+
+```json
+{"project_id":"<enrolled project UUID>","command_id":"<new UUID>","qualification_name":"round29","reason":"Owned-copy qualification"}
+```
+
+Call `backup_create` through that installation's CLI/MCP and retain its returned path, operation ID and manifest digest. It publishes under that installation's `backups/qualification-round29/`; agents cannot choose an outside path. The orchestrator may then use `create --slot N --stage <verified stage> --seed backup:<returned path>` under its ordinary slot authorization. The harness verifies the new family/table counts, complete file hashes and identity and records `current_schema_no_migration=true` for protocol 3. It copies database bytes without rewriting schema, identity or historical authority; this remains qualification seeding, distinct from the owner-only fenced restore command. On startup, compare protocol-3 identity/schema and migration ledger before/after to prove no migration occurred. Use `--latest-stage` when appropriate to the existing documented create syntax; no seed operation launches a model.
+
+The trusted app's Storage → Preview backup restore verifies a backup, shows its unavailable/external references and prepares a separate restored data root only after explicit owner confirmation. It keeps the existing installation intact. Starting that root requires a separately authorized disposable qualification harness; it is not a test-slot enrollment shortcut or permission to change the live root.
+
+
+Current format-1 backups may include optional checksummed `capturedAt` metadata. The current-schema seed validator accepts this additive field and preserves database bytes/version without migration; older snapshots remain readable with an unknown capture time. Native Storage status distinguishes restore-copy verification from later installed startup/reconnection qualification.

@@ -10,6 +10,7 @@ graph LR
   App --> Core[ChecklistCore]
   App --> Providers[ChecklistProviders]
   Core --> Providers
+  Core --> FileAccess[ChecklistFileAccess / native C]
   Bridges --> Providers
   Service --> Providers
   Service[ChecklistService] --> Core[ChecklistCore]
@@ -29,6 +30,8 @@ graph LR
 Both external dependencies use exact root-manifest versions. The committed root `Package.resolved` pins their transitive revisions. Do not regenerate the lock as a side effect of moving a module. Native file previews now import the portable public preview/inspection values from the existing Core target; the app never opens the service database. This adds the App → Core build edge (and its GRDB link dependency), without a schema migration or a second persistence runtime. A future shared-package extraction can move those Foundation-only values behind the compatibility facade. Core tests also declare their existing ChecklistBridges import as a test dependency.
 
 Bridges imports Core’s shared agent-reference formatter; Core has no reverse dependency on Bridges. `ChecklistProviders` is the Foundation-only versioned provider-plugin contract/bundled metadata and interpretation target consumed by Core, App, Bridges and Service. Native transport stays in Bridges and authentication stays in Service. See [provider plugins](provider-plugins.md).
+
+`ChecklistFileAccess` is a small internal C dependency of Core for deadline-bounded descriptor opens. It is linked into the existing products, not a new executable, model runtime or installed service. Only its selected-root syscall walk runs in one reusable native child, with anonymous request/lifetime channels and no inherited store descriptors; relative descendant/file operations run in process, and Core retains authorization, metadata and publication authority. Core tests exercise the child boundary.
 
 Both direct dependencies use exact root-manifest versions. The committed root `Package.resolved` pins their transitive revisions. Do not regenerate the lock as a side effect of moving a module. CL-128 adds the internal provider target and its explicit build edges; CL-173 adds the build aggregation target. External dependency pins, executable identities and runtime/data schema stay unchanged.
 
@@ -52,6 +55,7 @@ App preference regression: `python3 scripts/check-app-test-preferences.py` runs 
 Test slots reuse that verified stage without another build:
 
 ```sh
+# Native caller identity must be exported; otherwise add --session-id <actual session ID>.
 ./script/test_instances.py create --slot 1 --latest-stage
 ./script/test_instances.py start --slot 1 --headless
 ./script/test_instances.py check --slot 1

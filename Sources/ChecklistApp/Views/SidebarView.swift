@@ -5,6 +5,7 @@ struct SidebarView: View {
     @Environment(\.openChecklistSettings) private var openSettings
     @State private var confirmation: PendingConfirmation?
     @State private var showArchivedProjects = false
+    @State private var mediaLoading = false
     var body: some View {
         let _ = NativeRenderMetrics.body(.sidebar)
         VStack(spacing: Spacing.none) {
@@ -58,13 +59,14 @@ struct SidebarView: View {
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 0)
                     HStack(spacing: Spacing.small) {
-                        if store.loading { ProgressView().controlSize(.mini).frame(width: 28, height: 28) }
+                        if store.sidebarLoading || (store.page == .media && mediaLoading) { ProgressView().controlSize(.mini).frame(width: 28, height: 28) }
                         else { Button { Task { await store.refresh() } } label: { Image(systemName: "arrow.clockwise") }.buttonStyle(.checklistIcon).foregroundStyle(Color.checklistSecondaryText).help("Refresh service").accessibilityLabel("Refresh service") }
                         Button(action: openSettings) { Image(systemName: "gearshape").frame(width: 28, height: 28) }.buttonStyle(.checklistIcon).foregroundStyle(Color.checklistSecondaryText).help("Checklist Settings").accessibilityLabel("Checklist Settings").accessibilityIdentifier("openChecklistSettings")
                     }.fixedSize()
                 }.accessibilityIdentifier("sidebarServiceFooter")
             }.padding(.horizontal, Spacing.section).padding(.bottom, Spacing.group)
         }.background(.bar).checklistFont(.body).checklistConfirmation($confirmation)
+            .onReceive(store.mediaReview.$loading) { mediaLoading = $0 }
     }
     /// An archived project stays readable; Restore brings it back to the active list with the same identity.
     func archivedProjectRow(_ project: Record) -> some View {

@@ -198,7 +198,7 @@ extension CommandRouter {
             let fields = ["id","message_id","recipient_session_id","recipient_authorization_generation","push_state","host_status","created_at","updated_at","delivered_at","acknowledged_at","addressed_at","host_status_at"]
             var result = delivery.filter { fields.contains($0.key) }
             let state = delivery["state"] as? String ?? "queued"
-            result["state"] = ["acknowledged","addressed"].contains(state) ? "acknowledged" : (state == "delivered" ? "delivered" : "queued")
+            result["state"] = state == "quarantined" ? "quarantined" : ["acknowledged","addressed"].contains(state) ? "acknowledged" : (state == "delivered" ? "delivered" : "queued")
             if let closure = try deliveryNativeClosure(db,delivery) {
                 result["state"] = "fenced"; result["native_closure_ref"] = closure["id"]
                 result["fenced_at"] = closure["observed_at"]
@@ -238,10 +238,13 @@ extension CommandRouter {
     }
     func history(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         let pid = try scope(db,p,c)
-        let keys = ["task_id","triage_id","epic_id","conversation_id"].filter { p[$0] != nil }
-        guard keys.count == 1 else { throw CoreError("INVALID_INPUT","Select exactly one task, group or conversation.") }
-        let key = keys[0],id = try text(p,key); let type = key == "task_id" ? "task" : (key == "conversation_id" ? "conversation" : "group")
-        let r = try scoped(db,id,pid,type:type)
+        let keys = ["task_id","triage_id","epic_id","conversation_id","entity"].filter { p[$0] != nil }
+        guard keys.count == 1 else { throw CoreError("INVALID_INPUT","Select exactly one task, group, conversation or project entity.") }
+        let key = keys[0]
+        if key == "entity",try text(p,key) != "project" { throw CoreError("INVALID_INPUT","entity must be project.") }
+        let id = key == "entity" ? pid : try text(p,key)
+        let type = key == "entity" ? "project" : (key == "task_id" ? "task" : (key == "conversation_id" ? "conversation" : "group"))
+        let r = try type == "project" ? record(db,pid,type:"project") : scoped(db,id,pid,type:type)
         if type == "conversation",!c.isOwner { try assistantPermission(c,pid,"receive_messages"); guard let sid = c.sessionID,strings(r,"participants").contains(sid),(r["participant_authorization_generations"] as? [String:String])?[sid] == (try callerSessionGeneration(db,c,project:pid)) else { throw CoreError("FORBIDDEN","Only conversation participants can read these messages.") } }
         let cursorScope = pid+":"+key+":"+id+":"+(try authorizationScope(db,c))+":"+(try callerSessionGeneration(db,c,project:pid)); let after = try cursorSequence(db,p,caller:c,scope:cursorScope)
         let limit = min(max(int(p,"limit",default:200),1),200)

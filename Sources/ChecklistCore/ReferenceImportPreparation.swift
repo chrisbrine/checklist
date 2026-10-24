@@ -19,6 +19,15 @@ struct FileIdentity: Equatable {
         modifiedSeconds = info.st_mtimespec.tv_sec; modifiedNanoseconds = info.st_mtimespec.tv_nsec
     }
 
+    /// Metadata under an already bounded/pinned parent. No read permission or
+    /// content open is needed to revalidate a prepared managed owner answer.
+    init?(directory: Int32,name: String) {
+        var info = stat()
+        guard fstatat(directory,name,&info,AT_SYMLINK_NOFOLLOW) == 0,info.st_mode & S_IFMT == S_IFREG else { return nil }
+        device = UInt64(info.st_dev); inode = UInt64(info.st_ino); size = Int64(info.st_size)
+        modifiedSeconds = info.st_mtimespec.tv_sec; modifiedNanoseconds = info.st_mtimespec.tv_nsec
+    }
+
     /// `lstat`: a symlink in the final component is not a regular file.
     init?(path: String) {
         var info = stat()

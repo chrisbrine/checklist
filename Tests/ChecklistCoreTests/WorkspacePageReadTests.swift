@@ -44,7 +44,7 @@ extension CoreTests {
             let page = try call("workspace_page",["project_id":pid,"surface":surface,"text":"no matching row","limit":1])
             XCTAssertEqual(page["needs_you_count"] as? Int,4,surface)
             if let groups = page["groups"] as? [String:JSON] {
-                for (name,group) in groups { XCTAssertEqual(group["needs_you_count"] as? Int,4,name) }
+                for (name,group) in groups { XCTAssertNil(group["needs_you_count"],"Shared count occurs once: \(name)") }
             } else { XCTAssertEqual(page["total"] as? Int,0) }
         }
         _ = try call("human_request_cancel",["project_id":pid,"request_id":"visible","expected_revision":1])

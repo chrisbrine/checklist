@@ -58,38 +58,108 @@ struct GeneralSettingsView: View {
 
 struct StorageSettingsView: View {
     @EnvironmentObject var store: ChecklistStore
-    @State private var info: [String: Any] = [:]
-    @State private var result = ""
-    @State private var backingUp = false
+    @StateObject private var observation = StorageSettingsObservation()
+    private var info: [String:Any] {observation.info}
+    private var restorePreview: [String:Any] {observation.restorePreview}
     var body: some View {
         Form {
             Section("Local store") {
                 Text("Checklist keeps one local database and managed attachment storage. External references stay in their original location.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
-                ForEach(info.keys.sorted(), id: \.self) { key in if let text = info[key] as? String { LabeledContent(GlossaryText.humanize(key).capitalized, value: text) } else if let number = info[key] as? NSNumber { LabeledContent(GlossaryText.humanize(key).capitalized, value: number.stringValue) } }
+                LabeledContent("Database", value:info["database_path"] as? String ?? "Loading…")
+                LabeledContent("Available managed originals", value:StorageSettingsSummary.bytes(info["managed_bytes"]))
+                Text("Original sizes are logical lengths from attachment records; they exclude previews, source captures and database files.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 Button("Show app data in Finder") { NSWorkspace.shared.open(ChecklistInstance.current.ownerDataRoot) }
             }
+            Section("Last verified backup") {
+                ForEach(StorageSettingsSummary.observation(info["last_verified_backup"])) {row in LabeledContent(row.label,value:row.value)}
+            }
+            Section("Last verified rehearsal") {
+                ForEach(StorageSettingsSummary.observation(info["last_verified_rehearsal"])) {row in LabeledContent(row.label,value:row.value)}
+                Text("Restore-copy checks and pre-upgrade database rehearsals do not qualify native startup or session reconnection.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+            }
+            Section("Retained storage at verification") {
+                ForEach(StorageSettingsSummary.retained(info["retained_usage"])) {row in LabeledContent(row.label,value:row.value)}
+                Text("Recorded backup and restore copies only. Measurements exclude staging, directories and unrecorded copies, and are not rechecked for moved or deleted folders. Allocated blocks count each inode once within a copy; hard links between copies and shared APFS extents may count the same physical storage again. These figures do not measure space freed by deletion.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                Button("Refresh storage status") {Task {await refreshStorageStatus()}}
+                if !observation.statusError.isEmpty {Text(observation.statusError).checklistFont(.micro).textSelection(.enabled)}
+            }
             Section("Export & backup") {
-                Button("Back up all projects…") { backup() }.checklistDisabled([(backingUp, "Wait for this backup to finish.")])
-                if backingUp {
+                Button("Back up all projects…") { backup() }.checklistDisabled([(observation.backingUp || observation.restoring, "Wait for storage verification to finish.")])
+                if observation.backingUp {
                     ProgressView("Copying and verifying backup…").controlSize(.small)
                 }
                 Text("Large stores can take about 10 minutes; Checklist allows up to 30 minutes. You can keep adding notes and editing tickets while files copy. Cleanup waits until backup finishes.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-                Text("Backups include records and managed objects. Restore is not available in this build. Credentials are never portable authority.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-                if !result.isEmpty { Text(result).checklistFont(.micro).textSelection(.enabled) }
+                Button("Preview backup restore…") { previewRestore() }.checklistDisabled([(observation.backingUp || observation.restoring, "Wait for storage verification to finish."), (store.busy, "Wait for the current change to finish."), (store.hasPendingMutation, "Use Check the last change before starting another change.")])
+                if observation.restoring { ProgressView("Verifying and preparing restored copy…").controlSize(.small) }
+                Text("Restore prepares a separate data root and keeps this installation intact. Prior sessions need fresh connections, active work needs recovery and unresolved deliveries stay quarantined.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                if !observation.result.isEmpty { Text(observation.result).checklistFont(.micro).textSelection(.enabled) }
             }
-        }.formStyle(.grouped).task { do { info = try await store.request("storage_status") } catch { result = PlainError.text(error) } }
+        }.formStyle(.grouped).sheet(isPresented:$observation.showingRestorePreview) {
+            ScrollView { LazyVStack(alignment:.leading,spacing:Spacing.control) {
+                Text("Restore backup to a separate data root").font(.headline)
+                Text("The complete database and managed files passed verification. This installation stays available. Credentials and native connections are not restored.")
+                ForEach(StorageSettingsSummary.preview(restorePreview)) {row in LabeledContent(row.label,value:row.value)}
+                Text("Projects: \(restorePreview["project_count"] as? Int ?? 0). " + ((restorePreview["projects"] as? [[String:Any]] ?? []).prefix(10).compactMap {$0["name"] as? String}.joined(separator:", ")))
+                Text("Managed files: \(restorePreview["managed_files"] as? Int ?? 0). Unavailable managed content: \((restorePreview["unavailable"] as? [[String:Any]])?.count ?? 0). External references: \((restorePreview["external_references"] as? [String])?.count ?? 0).")
+                ForEach((restorePreview["record_families"] as? [String:Int] ?? [:]).keys.sorted(),id:\.self) {family in
+                    let count = (restorePreview["record_families"] as? [String:Int])?[family] ?? 0
+                    if count > 0 {LabeledContent(GlossaryText.humanize(family).capitalized,value:String(count))}
+                }
+                if let unavailable = restorePreview["unavailable"] as? [[String:Any]],!unavailable.isEmpty {
+                    Text("Unavailable content").font(.headline)
+                    ForEach(Array(unavailable.enumerated()),id:\.offset) {entry in
+                        Text("\(entry.element["authority"] as? String ?? "Unknown original"): \(GlossaryText.humanize(entry.element["reason"] as? String ?? "Unavailable"))").checklistFont(.micro)
+                    }
+                }
+                Text("Active work requires explicit recovery. Pending or uncertain messages will not be resent.")
+                HStack { Button("Cancel") {observation.showingRestorePreview = false}; Spacer(); Button("Prepare restored copy") {restoreCopy()} }
+            }.padding() }.frame(width:560,height:620)
+        }.task(id:store.storeIncarnation) {await refreshStorageStatus()}
+        .onChange(of:store.storeIncarnation) {_,scope in observation.changeScope(scope)}
+    }
+    func refreshStorageStatus() async {
+        let scope = store.storeIncarnation;observation.changeScope(scope)
+        await observation.refreshStatus {try await store.request("storage_status",ifCurrent:{store.storeIncarnation == scope})}
+    }
+    func previewRestore() {
+        let panel = NSOpenPanel();panel.canChooseDirectories = true;panel.canChooseFiles = false;panel.allowsMultipleSelection = false
+        panel.message = "Choose a completed Checklist backup folder to verify."
+        panel.begin { response in
+            guard response == .OK,let url = panel.url else {return}
+            let scope = store.storeIncarnation;observation.changeScope(scope)
+            Task {
+                guard store.storeIncarnation == scope else {return}
+                await observation.previewRestore {try await store.request("restore_preview",["path":url.path],ifCurrent:{store.storeIncarnation == scope})}
+            }
+        }
+    }
+    func restoreCopy() {
+        let scope = store.storeIncarnation
+        observation.showingRestorePreview = false;observation.result = ""
+        let params: [String:Any] = ["command_id":UUID().uuidString,"path":restorePreview["path"] ?? "","manifest_sha256":restorePreview["manifest_sha256"] ?? ""]
+        // Preserve the exact original command in the app's incarnation-bound
+        // recovery journal if publication succeeds but its reply is lost.
+        store.run("restore_create",params,failure:{error in
+            guard observation.scope == scope else {return}
+            observation.restoring = false
+            if !(error is CancellationError) {observation.result = PlainError.text(error)}
+        },completion:{reply in
+            guard observation.scope == scope else {return}
+            observation.restoring = false;observation.storageDidChange()
+            observation.result = "Restored copy prepared at \(reply["path"] as? String ?? ""). This installation is preserved."
+            Task {await refreshStorageStatus()}
+        })
+        observation.restoring = store.busy
     }
     func backup() {
         let panel = NSSavePanel(); panel.nameFieldStringValue = "Checklist-backup"; panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        backingUp = true; result = ""
+        let scope = store.storeIncarnation;observation.changeScope(scope)
         Task {
-            defer {backingUp = false}
-            do {
-                let reply = try await store.request("backup_create", ["command_id": UUID().uuidString, "path": url.path])
-                result = "Backup saved to \(reply["path"] as? String ?? url.path). Restore is not yet available."
-            } catch { result = PlainError.text(error) }
+            guard store.storeIncarnation == scope else {return}
+            await observation.backup(path:url.path,fetch:{
+                try await store.request("backup_create",["command_id":UUID().uuidString,"path":url.path],ifCurrent:{store.storeIncarnation == scope})
+            },status:{try await store.request("storage_status",ifCurrent:{store.storeIncarnation == scope})})
         }
     }
 }
-

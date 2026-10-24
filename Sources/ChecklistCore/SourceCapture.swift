@@ -53,15 +53,82 @@ enum SourceGit {
         throw CoreError("SOURCE_GIT_UNAVAILABLE", refusals.isEmpty ? "Source capture needs a trusted command-line Git in /opt/homebrew/bin, /usr/local/bin or /usr/bin." : refusals.joined(separator: " "), details: ["reason": "no_trusted_git"])
     }
 
-    static func run(_ path: String, _ args: [String], executable: String? = nil, timeout: TimeInterval = defaultTimeout) throws -> Data {
+    /// A store root is mandatory at the call site. Known owner namespaces are added
+    /// independently of HOME/GIT_* so inherited settings cannot shrink the boundary.
+    struct Confinement {
+        let profile: String
+        let paths: [String]
+        static let launcher = "/usr/bin/sandbox-exec"
+
+        init(protectedRoots: [String], additionalOwnerHome: String? = nil) throws {
+            guard !protectedRoots.isEmpty,
+                  let accountHome = NSHomeDirectoryForUser(NSUserName()) else { throw Self.unavailable() }
+            let homes = [accountHome] + (additionalOwnerHome.map { [$0] } ?? [])
+            let roots = protectedRoots + homes.flatMap { [$0 + "/Library/Application Support/Checklist", $0 + "/Library/Application Support/Checklist Test Instances"] }
+            func quoted(_ path: String) throws -> String {
+                guard path.hasPrefix("/"), !path.utf8.contains(0), !path.contains("\n"), !path.contains("\r"), path != "/", !path.split(separator: "/").contains("..") else { throw Self.unavailable() }
+                return "\"" + path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+            }
+            var paths = Set<String>()
+            for path in roots {
+                _ = try quoted(path)
+                // Foundation can shorten /private/tmp back to /tmp, which is
+                // not the kernel path Seatbelt matches. Retain the input and
+                // resolve the deepest existing ancestor with realpath, including
+                // for default/test roots which do not exist yet.
+                paths.insert(path)
+                var components = path.split(separator: "/").map(String.init), suffix: [String] = []
+                while true {
+                    let ancestor = "/" + components.joined(separator: "/")
+                    if let physical = Darwin.realpath(ancestor, nil) {
+                        let prefix = String(cString: physical); free(physical)
+                        paths.insert(prefix + (suffix.isEmpty ? "" : (prefix == "/" ? "" : "/") + suffix.joined(separator: "/")))
+                        break
+                    }
+                    guard [ENOENT, ENOTDIR].contains(errno), let last = components.popLast() else { throw Self.unavailable() }
+                    suffix.insert(last, at: 0)
+                }
+            }
+            self.paths = paths.sorted()
+            // SIGKILL makes even optional config/ignore/attribute reads fail, rather
+            // than letting Git silently continue with a different inventory.
+            profile = "(version 1)(allow default)" +
+                "(deny file-read* (require-any " + (try self.paths.map { "(subpath " + (try quoted($0)) + ")" }.joined(separator: " ")) + ") (with send-signal SIGKILL))" +
+                "(deny process-fork (with send-signal SIGKILL))"
+        }
+
+        static func unavailable() -> CoreError {
+            CoreError("SOURCE_GIT_CONFINEMENT_UNAVAILABLE", "Source Git requires working macOS protected-root confinement. The deprecated /usr/bin/sandbox-exec launcher or its profile could not be used; no unconfined fallback is permitted.")
+        }
+    }
+
+    static func environment(_ inherited: [String: String]) -> [String: String] {
+        // Preserve owner global/conditional config and locale, but no inherited
+        // repository/config/trace override or dynamic-loader/helper injection.
+        var result = inherited.filter { ["HOME", "XDG_CONFIG_HOME", "USER", "LOGNAME", "TMPDIR", "LANG"].contains($0.key) || $0.key.hasPrefix("LC_") }
+        result["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+        result["GIT_OPTIONAL_LOCKS"] = "0"
+        result["GIT_TERMINAL_PROMPT"] = "0"
+        result["GIT_NO_LAZY_FETCH"] = "1"
+        return result
+    }
+
+    static func run(_ path: String, _ args: [String], protectedRoots: [String], executable: String? = nil, timeout: TimeInterval = defaultTimeout,
+                    acceptedExitCodes: Set<Int32> = [0], additionalOwnerHome: String? = nil, inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment) throws -> Data {
+        let confinement = try Confinement(protectedRoots: protectedRoots, additionalOwnerHome: additionalOwnerHome)
         let executable = try executable.map { try trustedExecutable($0) } ?? resolve()
+        do { _ = try trustedExecutable(Confinement.launcher) }
+        catch { throw Confinement.unavailable() }
         let process = Process(), out = Pipe(), err = Pipe(), exited = DispatchSemaphore(value: 0)
-        process.executableURL = URL(fileURLWithPath: executable); process.arguments = ["-C", path] + args
+        process.executableURL = URL(fileURLWithPath: Confinement.launcher)
+        process.arguments = ["-p", confinement.profile, executable, "-c", "core.fsmonitor=false", "-C", path] + args
+        process.environment = environment(inheritedEnvironment)
         process.standardOutput = out; process.standardError = err; process.standardInput = FileHandle.nullDevice
         process.terminationHandler = { _ in exited.signal() }
         let readers = DispatchGroup(), lock = NSLock()
         var output = Data(), errors = Data()
-        try process.run()
+        do { try process.run() }
+        catch { throw Confinement.unavailable() }
         for (handle, isOutput) in [(out.fileHandleForReading, true), (err.fileHandleForReading, false)] {
             readers.enter()
             DispatchQueue.global(qos: .userInitiated).async {
@@ -80,8 +147,12 @@ enum SourceGit {
         // The child has exited; its pipes reach end of file unless a grandchild still holds them.
         guard readers.wait(timeout: .now() + 5) == .success else { throw CoreError("SOURCE_CAPTURE_INCOMPLETE", "Git output did not close after git exited.", details: ["reason": "git_pipe_open"]) }
         lock.lock(); defer { lock.unlock() }
-        guard process.terminationStatus == 0 else {
-            let reason = String(data: errors.prefix(4096), encoding: .utf8) ?? "git failed"
+        guard process.terminationReason == .exit else {
+            throw CoreError("SOURCE_GIT_CONFINED", "Source Git was terminated by protected-root or helper confinement (or an external signal); no source inventory was accepted.", details: ["signal": process.terminationStatus])
+        }
+        let reason = String(data: errors.prefix(4096), encoding: .utf8) ?? "git failed"
+        if reason.contains("sandbox-exec:") { throw Confinement.unavailable() }
+        guard acceptedExitCodes.contains(process.terminationStatus) else {
             let diagnostic = reason.lowercased()
             if diagnostic.contains("xcode") && diagnostic.contains("license") {
                 throw CoreError("SOURCE_GIT_LICENSE_REQUIRED", "Git could not run because the Xcode license has not been accepted. The owner must run sudo xcodebuild -license accept in Terminal, then retry.", details: ["git_path": executable, "reason": "xcode_license_not_accepted"])
@@ -95,19 +166,20 @@ enum SourceGit {
 extension CommandRouter {
     func sourceGit(_ path: String,_ args: [String]) throws -> Data {
         _ = try sourceGitMetadataOutsideStore(path)
-        return try SourceGit.run(path,args)
+        return try SourceGit.run(path,args,protectedRoots:[root.path])
     }
     /// Bindings are not permission to recursively inventory this instance's data.
     /// Use the existing physical/Unicode/volume-case reservation comparison so
     /// aliases cannot move a source read across the store boundary.
     private func requireSourceOutsideStore(_ path: String, recursive: Bool) throws {
-        let source = reservationKey(path), store = reservationKey(root.path)
-        guard !containsPath(store, source), !(recursive && containsPath(source, store)) else {
+        let source = reservationKey(path)
+        let stores = try SourceGit.Confinement(protectedRoots: [root.path]).paths.map(reservationKey)
+        guard !stores.contains(where: { containsPath($0, source) || (recursive && containsPath(source, $0)) }) else {
             throw CoreError("SOURCE_CAPTURE_INCOMPLETE", "Source capture cannot read a Checklist data root or a folder containing it.", details: ["reason":"checklist_store_overlap"])
         }
     }
-    /// Inspect only Git's filesystem pointers here. Git configuration remains
-    /// project content under the owner's binding trust (CL-180).
+    /// Reject direct metadata overlap before reading pointers. Indirect config,
+    /// object and helper paths are additionally confined by the Git process sandbox.
     private func sourceGitMetadataOutsideStore(_ path: String) throws -> Bool {
         let project = URL(fileURLWithPath:path), entry = project.appendingPathComponent(".git")
         func information(_ url: URL) throws -> stat? {
@@ -159,15 +231,16 @@ extension CommandRouter {
         var gitProvenance: JSON = [:]
         if git {
             let executable = try SourceGit.resolve()
-            func sourceGit(_ path: String, _ args: [String]) throws -> Data {
+            func sourceGit(_ path: String, _ args: [String], acceptedExitCodes: Set<Int32> = [0]) throws -> Data {
                 _ = try sourceGitMetadataOutsideStore(path)
-                return try SourceGit.run(path, args, executable: executable)
+                return try SourceGit.run(path, args, protectedRoots: [root.path], executable: executable, acceptedExitCodes: acceptedExitCodes)
             }
             let version = String(decoding: try sourceGit(path, ["--version"]), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
             gitProvenance = ["git_path": executable, "git_version": version]
             let top = String(data:try sourceGit(path,["rev-parse","--show-toplevel"]),encoding:.utf8)?.trimmingCharacters(in:.whitespacesAndNewlines) ?? ""
             guard reservationKey(top) == reservationKey(path) else { throw CoreError("SOURCE_CAPTURE_INCOMPLETE","Capture the complete enrolled repository root, not a nested checkout view.") }
-            base = (try? String(data:sourceGit(path,["rev-parse","HEAD"]),encoding:.utf8)?.trimmingCharacters(in:.whitespacesAndNewlines)) ?? "unborn"
+            let head = String(decoding: try sourceGit(path,["rev-parse","--verify","--quiet","HEAD"],acceptedExitCodes:[0,1]),as:UTF8.self).trimmingCharacters(in:.whitespacesAndNewlines)
+            base = head.isEmpty ? "unborn" : head
             let entries = try sourceGit(path,["ls-files","--stage","-z"])
             guard !String(decoding:entries,as:UTF8.self).split(separator:"\0").contains(where: {$0.hasPrefix("160000 ")}) else { throw CoreError("SOURCE_CAPTURE_INCOMPLETE","Submodule source needs an explicitly supported complete capture; a commit pointer alone is insufficient.") }
             index = hash(entries)
@@ -520,7 +593,7 @@ extension CommandRouter {
     /// Methods that the service may run off its serial queue: their large file work runs
     /// before the writer, and pure reads use the read-only connections (CL-71, CL-72).
     public static func runsOutsideSerialQueue(_ method: String) -> Bool {
-        sourceCaptureMethods.contains(method) || sourceTargetMethods.contains(method) || method == "attachment_add" || method == "backup_create" || method == "epic_delete" || pureReadMethods.contains(method)
+        sourceCaptureMethods.contains(method) || sourceTargetMethods.contains(method) || method == "attachment_add" || method == "backup_create" || storageRestoreMethods.contains(method) || projectImportMethods.contains(method) || method == "epic_delete" || pureReadMethods.contains(method)
     }
 
     func inventoryKey(_ path: String, _ additional: [String]) -> String {

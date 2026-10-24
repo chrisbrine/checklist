@@ -27,16 +27,7 @@ extension CommandRouter {
 
     func ticketCleanupRead(_ db: Database,_ p: JSON,_ c: Caller,_ method: String) throws -> JSON {
         try worker(c);let pid = try scope(db,p,c)
-        if let id = p["receipt_id"] as? String {
-            let receipt = try scoped(db,id,pid,type:"storage_job")
-            guard receipt["cause"] as? String == "ticket_cleanup_pass" else {throw CoreError("NOT_FOUND","No cleanup pass with this ID.")}
-            var value = try ticketCleanupPassProjection(db,receipt:receipt)
-            value["maintenance"] = try ticketCleanupMaintenanceProjection(db,project:pid)
-            return value
-        }
-        let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND project_id=? AND json_extract(data,'$.cause')='ticket_cleanup_pass' ORDER BY rowid DESC LIMIT 50",arguments:[pid])
-        var result: JSON = ["receipts":try rows.map {try ticketCleanupPassProjection(db,receipt:GRDBRecordEnvelopeAdapter.decode($0).object)}]
-        result["first_pass_receipt_id"] = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-first:" + pid])
+        var result = try ticketCleanupReceiptPage(db,p,c,pid)
         result["maintenance"] = try ticketCleanupMaintenanceProjection(db,project:pid)
         return result
     }

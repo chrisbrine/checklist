@@ -90,11 +90,11 @@ final class SourceCaptureStoreBoundaryTests: XCTestCase {
         _ = try f.write("project/source.txt")
         let executable = try SourceGit.resolve(), metadata = f.store.appendingPathComponent("git-meta")
         if mode == "commondir" {
-            _ = try SourceGit.run(project.path,["init","--quiet"],executable:executable)
-            _ = try SourceGit.run(f.base.path,["init","--bare","--quiet",metadata.path],executable:executable)
+            _ = try SourceGit.run(project.path,["init","--quiet"], protectedRoots: [NSTemporaryDirectory() + "checklist-fixture-protected"],executable:executable)
+            _ = try SourceGit.run(f.base.path,["init","--bare","--quiet",metadata.path], protectedRoots: [NSTemporaryDirectory() + "checklist-fixture-protected"],executable:executable)
             try Data("../../store/git-meta\n".utf8).write(to:project.appendingPathComponent(".git/commondir"))
         } else {
-            _ = try SourceGit.run(project.path,["init","--quiet","--separate-git-dir=" + metadata.path],executable:executable)
+            _ = try SourceGit.run(project.path,["init","--quiet","--separate-git-dir=" + metadata.path], protectedRoots: [NSTemporaryDirectory() + "checklist-fixture-protected"],executable:executable)
             try FileManager.default.removeItem(at:project.appendingPathComponent(".git"))
             if mode == "symlink" {
                 try FileManager.default.createSymbolicLink(atPath:project.appendingPathComponent(".git").path,withDestinationPath:"../store/git-meta")
@@ -127,10 +127,15 @@ final class SourceCaptureStoreBoundaryTests: XCTestCase {
     func testExternalGitdirWorktreeStillInventoriesAndCaptures() throws {
         let f = try Fixture(storePath:"store"), main = f.base.appendingPathComponent("main"), project = f.base.appendingPathComponent("worktree")
         let source = try f.write("main/source.txt",bytes:Data("worktree source".utf8)), executable = try SourceGit.resolve()
-        _ = try SourceGit.run(main.path,["init","--quiet"],executable:executable)
-        _ = try SourceGit.run(main.path,["add","source.txt"],executable:executable)
-        _ = try SourceGit.run(main.path,["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","--quiet","-m","fixture"],executable:executable)
-        _ = try SourceGit.run(main.path,["worktree","add","--quiet","--detach",project.path],executable:executable)
+        _ = try SourceGit.run(main.path,["init","--quiet"], protectedRoots: [NSTemporaryDirectory() + "checklist-fixture-protected"],executable:executable)
+        _ = try SourceGit.run(main.path,["add","source.txt"], protectedRoots: [NSTemporaryDirectory() + "checklist-fixture-protected"],executable:executable)
+        _ = try SourceGit.run(main.path,["-c","maintenance.auto=false","-c","gc.auto=0","-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","--quiet","-m","fixture"], protectedRoots: [NSTemporaryDirectory() + "checklist-fixture-protected"],executable:executable)
+        // Fixture creation invokes Git's own reset child. Production capture is
+        // confined below; worktree creation is not a production inventory command.
+        let setup = Process(); setup.executableURL = URL(fileURLWithPath: executable)
+        setup.arguments = ["-C",main.path,"worktree","add","--quiet","--detach",project.path]
+        setup.standardOutput = FileHandle.nullDevice; setup.standardError = FileHandle.nullDevice
+        try setup.run(); setup.waitUntilExit(); XCTAssertEqual(setup.terminationStatus,0)
         XCTAssertTrue(try String(contentsOf:project.appendingPathComponent(".git"),encoding:.utf8).hasPrefix("gitdir: "))
         XCTAssertTrue(FileManager.default.fileExists(atPath:main.appendingPathComponent(".git/worktrees/worktree/commondir").path))
         let inventory = try f.router.sourceInventory(project.path,useCache:false)

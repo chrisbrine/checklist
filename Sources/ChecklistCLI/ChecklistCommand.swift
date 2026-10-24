@@ -80,6 +80,8 @@ struct CLIError: LocalizedError {
 @main
 struct ChecklistCommand {
     static func main() async {
+        let started = ProcessInfo.processInfo.systemUptime
+        defer { if CallTimingLog.enabled { CallTimingLog.write(["scope":"cli", "total_ms":(ProcessInfo.processInfo.systemUptime-started)*1000]) } }
         let instance = ChecklistInstance.current
         do {
             try DelegateInstanceExpectation.verifyIfPresent(instance: instance)

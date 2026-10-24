@@ -6,7 +6,7 @@ A native macOS checklist app for independent game and app production, with coord
 
 Build and install with `./script/build_and_run.sh --verify` (or `CHECKLIST_BUILD_CONFIGURATION=debug` for a development build). This captures and verifies immutable inputs, signs the bundle and installs `/Applications/Checklist.app`. Existing or newly opened Codex/Claude conversations connect through the bundled CLI/MCP bootstrap using their actual host/session/workspace. Worker status/current-prior attempts and recovery stay on each ticket. No assistant connection/settings UI is active. The exact supported bootstrap/host capabilities are recorded in the implementation status. The Codex app Run action uses the same helper.
 
-For isolated verification before installation, use `./script/build_and_run.sh --stage`, then `./script/test_instances.py create --slot 1 --latest-stage` and `start --slot 1`. Up to four test slots can run headless or with a clearly marked GUI. [Test instances](docs/test-instances.md) covers snapshot seeds, checks, promotion gates and cleanup.
+For isolated verification before installation, use `./script/build_and_run.sh --stage`, then `./script/test_instances.py create --slot 1 --latest-stage` and `start --slot 1`. Creation requires the actual native session ID; if none is exported, use `CHECKLIST_SESSION_ID` or `create --session-id <actual session ID>`. Up to four test slots can run headless or with a clearly marked GUI. [Test instances](docs/test-instances.md) covers snapshot seeds, checks, promotion gates and cleanup.
 
 Triages coordinate one **Implementation** or **Review** pass through an actual Codex or Claude conversation. Already in-progress tickets can join an implementation pass; Active attention also includes members of an actively orchestrated Triage. Submission moves a ticket into a separate review pass. Passing tickets complete independently, and only failed or remaining tickets return for more work, unless an explicit project policy overrides the shared completion default. Ticket claims and exact review gates remain per ticket.
 
@@ -42,6 +42,33 @@ Root development commands, package ownership and the current acyclic target grap
 The build starts with one complete production task: capture, claim, note/image, human answer, immutable review/fix, completion and archive. Native packaging and each advertised communication route need actual installed-client evidence; static concepts and simulated adapters are not runtime qualification.
 
 Private source-project audits, native conversation receipts, old project-specific concepts and local authorization records are retained locally and excluded from the public source set. Public examples and screenshots use fictional projects.
+
+## Project checks
+
+Run these from the repository root with the installed macOS Swift/Xcode toolchain:
+
+| Check | Command |
+| --- | --- |
+| Shipping executables (compile only) | `swift build --cache-path "$HOME/Library/Caches/ChecklistSwiftPM" --enable-dependency-cache --target ChecklistProducts` |
+| All Swift tests | `CHECKLIST_STORAGE_PROBE="$(swift build --cache-path "$HOME/Library/Caches/ChecklistSwiftPM" --enable-dependency-cache --show-bin-path)/StorageCrashProbe" swift test --cache-path "$HOME/Library/Caches/ChecklistSwiftPM" --enable-dependency-cache` |
+| Python script tests | `uv run --no-project --with jsonschema --with pyyaml python -m unittest discover -s scripts -p 'test_*.py'` |
+| Plan, schemas and examples | `uv run --no-project --with jsonschema --with pyyaml python scripts/validate-plan.py` |
+| Whitespace errors | `git diff --check` |
+
+`swift test` discovers all thirteen test targets, including `ChecklistServiceTests`,
+`DesktopAlertsTests`, `RequestAnswerCompletionTests`, `RequestRowPresentationTests`,
+`TestResultEvidenceProjectionTests` and `TestResultParserTests`. To select one target,
+append `--filter '^ChecklistServiceTests\.'` (replace the target name as needed).
+The three older standalone check scripts remain usable; their checks also run under
+SwiftPM. Shared build-slot users must use their assigned warm `--scratch-path` and
+build-slot wrapper for every Swift build/test. The all-tests command supplies the
+required storage crash-probe path. For an
+assigned scratch layout, pass that same `--scratch-path` to both commands, or set
+`CHECKLIST_STORAGE_PROBE` to its built `StorageCrashProbe` executable explicitly.
+
+These checks support independent agent review. Installed app, signed owner-channel
+and native provider observations remain separate checks described in
+[acceptance](docs/acceptance.md) and [integration qualification](docs/integrations.md).
 
 ## License
 

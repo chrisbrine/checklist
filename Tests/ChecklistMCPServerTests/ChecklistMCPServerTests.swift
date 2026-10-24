@@ -110,6 +110,58 @@ final class ChecklistMCPServerTests: XCTestCase {
         }
     }
 
+    func testProjectArchiveReasonsThroughMCPHistorySelector() async throws {
+        let fixture = try Fixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("checklist-project-history-" + UUID().uuidString)
+        let router = try CommandRouter(root:root)
+        defer { try? router.closeStore();try? FileManager.default.removeItem(at:root) }
+        let owner = Caller(role:"owner",installation:"synthetic-owner",projectIDs:[])
+        func call(_ method: String,_ params: [String:Any]) throws -> [String:Any] {
+            var params = params
+            if !CommandRouter.readMethods.contains(method) {params["command_id"] = UUID().uuidString}
+            return try router.handle(method:method,params:params,caller:owner)["data"] as! [String:Any]
+        }
+        let project = try call("project_create",["name":"Synthetic MCP project history","key_prefix":"HIS","root_path":fixture.context.workspacePath]),pid = project["id"] as! String
+        _ = try call("session_register",["project_id":pid,"session_id":fixture.context.nativeSessionID,"provider":"claude","role":"worker"])
+        let agent = Caller(role:"worker",installation:"synthetic-agent",projectIDs:[pid],sessionID:fixture.context.nativeSessionID,workspace:fixture.context.workspacePath)
+        fixture.requestHandler = { method,params in
+            do {return try router.handle(method:method,params:params,caller:agent)}
+            catch let error as CoreError {throw ChecklistError(error.code,error.message,details:error.details)}
+        }
+        let session = try await start(fixture)
+        let tools = try await session.client.listTools()
+        let tool = try XCTUnwrap(tools.tools.first {$0.name == "history_list"})
+        let schema = try JSONSerialization.jsonObject(with:JSONEncoder().encode(tool.inputSchema)) as! [String:Any]
+        XCTAssertEqual(((schema["properties"] as? [String:Any])?["entity"] as? [String:Any])?["enum"] as? [String],["project"])
+        for reason: String? in ["  MCP reason: café\nSecond line.  ",nil,""," \n\t"] {
+            for archived in [true,false] {
+                let current = try call("project_settings_get",["project_id":pid])
+                var arguments: [String:MCP.Value] = ["project_id":.string(pid),"expected_revision":.int(current["revision"] as! Int),"archived":.bool(archived),"command_id":.string(UUID().uuidString)]
+                if let reason {arguments["reason"] = .string(reason)}
+                let changed = try await session.client.callTool(name:"project_archive",arguments:arguments)
+                XCTAssertFalse(changed.isError ?? false)
+                let reply = try await session.client.callTool(name:"history_list",arguments:["project_id":.string(pid),"entity":.string("project")])
+                XCTAssertFalse(reply.isError ?? false)
+                let envelope = try JSONSerialization.jsonObject(with:Data(text(reply.content).utf8)) as! [String:Any]
+                let events = (envelope["data"] as! [String:Any])["events"] as! [[String:Any]]
+                let event = try XCTUnwrap(events.last {$0["kind"] as? String == "project_updated"})
+                let data = try XCTUnwrap(event["data"] as? [String:Any])
+                XCTAssertEqual(data["reason"] as? String,reason.flatMap {$0.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty ? nil : $0})
+                XCTAssertEqual(data["origin"] as? String,"agent")
+                XCTAssertEqual(event["actor"] as? String,agent.principal)
+                XCTAssertEqual((event["subject"] as? [String:Any])?["id"] as? String,pid)
+            }
+        }
+        for selectors: [String:MCP.Value] in [[:],["entity":.string("task")],["entity":.string("project"),"task_id":.string("unused")]] {
+            var arguments = selectors;arguments["project_id"] = .string(pid)
+            let reply = try await session.client.callTool(name:"history_list",arguments:arguments)
+            XCTAssertTrue(reply.isError ?? false)
+        }
+        try await assertProtocolOnly(session)
+    }
+
     func testEpicDeleteThroughMCPActiveArchivedMembershipRefusalsAndRetainedRows() async throws {
         let fixture = try Fixture()
         fixture.setDiscoveries([.available(fixture.context)])

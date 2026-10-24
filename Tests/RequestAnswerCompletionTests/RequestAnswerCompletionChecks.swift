@@ -1,10 +1,21 @@
 import Foundation
+#if canImport(ChecklistApp)
+import XCTest
+@testable import ChecklistApp
+#endif
 
+#if !canImport(ChecklistApp)
 @main
+#endif
+
 enum RequestAnswerCompletionChecks {
     static var count = 0
     static func check(_ condition: @autoclosure () -> Bool, _ name: String) {
+        #if canImport(ChecklistApp)
+        XCTAssertTrue(condition(), name)
+        #else
         guard condition() else { fatalError("FAIL: \(name)") }
+        #endif
         count += 1; print("PASS: \(name)")
     }
     static func changed(_ record: Record, _ values: [String: Any]) -> Record {
@@ -85,3 +96,11 @@ enum RequestAnswerCompletionChecks {
         print("\(count) request answer completion checks passed")
     }
 }
+
+#if canImport(ChecklistApp)
+final class RequestAnswerCompletionTests: XCTestCase {
+    func testStandaloneChecks() throws {
+        RequestAnswerCompletionChecks.main()
+    }
+}
+#endif

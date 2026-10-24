@@ -12,7 +12,7 @@ final class SidebarFooterTests: XCTestCase {
         XCTAssertTrue(footer.contains("Service connected"))
         XCTAssertTrue(footer.contains("Service disconnected"))
         XCTAssertTrue(footer.contains(".fixedSize(horizontal: false, vertical: true)"), "Status text wraps at the narrow sidebar width")
-        XCTAssertTrue(footer.contains("if store.loading { ProgressView().controlSize(.mini).frame(width: 28, height: 28) }"))
+        XCTAssertTrue(footer.contains("if store.sidebarLoading || (store.page == .media && mediaLoading) { ProgressView().controlSize(.mini).frame(width: 28, height: 28) }"))
         XCTAssertTrue(footer.contains("else { Button { Task { await store.refresh() } }"))
         XCTAssertTrue(footer.contains(".help(\"Refresh service\").accessibilityLabel(\"Refresh service\")"))
         let refreshEnd = try XCTUnwrap(footer.range(of: ".accessibilityLabel(\"Refresh service\") }"))

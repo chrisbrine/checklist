@@ -14,8 +14,10 @@ final class ArchiveStoragePermit {
     }
 }
 enum ArchiveStorageGate {
-    static func withExclusive<T>(root: URL,_ body: (ArchiveStoragePermit) throws -> T) throws -> T {
-        let files = try StorageObjectFiles(root:root)
+    static func withExclusive<T>(root: URL,files pinned: StorageObjectFiles? = nil,_ body: (ArchiveStoragePermit) throws -> T) throws -> T {
+        let files: StorageObjectFiles
+        if let pinned { try pinned.requireNamedRoot(root);files = pinned }
+        else { files = try StorageObjectFiles(root:root) }
         let fd = openat(files.descriptor,".archive-storage.lock",O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC,0o600)
         guard fd >= 0 else { throw CoreError("STORAGE_GATE_UNAVAILABLE", "The managed object gate cannot be opened.") }
         defer { Darwin.close(fd) }
@@ -41,7 +43,7 @@ final class TicketObjectRemovalVerification {
     init?(root: URL,relative: String,sha256: String? = nil,size: Int64? = nil,check: () throws -> Void = {}) throws {
         let files = try StorageObjectFiles(root:root)
         let directory: Int32,name: String
-        do {(directory,name) = try files.parent(relative)} catch {if errno == ENOENT {return nil};throw error}
+        do {(directory,name) = try files.parent(relative)} catch {if StorageFolderAccess.isMissing(error) {return nil};throw error}
         defer {Darwin.close(directory)}
         let fd = openat(directory,name,O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         if fd < 0,errno == ENOENT {return nil}
@@ -87,7 +89,7 @@ extension ArchiveStoragePermit {
         guard size >= 0,sha256.range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil,
               relative.hasPrefix("objects/") && linkTarget == nil || source || cache else { throw CoreError("CLEANUP_PATH_REFUSED", "Cleanup requires an exact managed object descriptor.") }
         let directory: Int32,name: String
-        do {(directory,name) = try files.parent(relative)} catch {if errno == ENOENT {return false};throw error}
+        do {(directory,name) = try files.parent(relative)} catch {if StorageFolderAccess.isMissing(error) {return false};throw error}
         defer { Darwin.close(directory) }
         var originalFD: Int32 = -1
         defer {if originalFD >= 0 {Darwin.close(originalFD)}}

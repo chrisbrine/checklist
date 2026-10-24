@@ -38,6 +38,7 @@ struct StorageSnapshotBudget {
     var maximumManifestBytes: Int = Self.manifestByteLimit
     var maximumRecords: Int = 100_000
     var pagesPerStep: Int32 = 64
+    var folderAccess = StorageFolderAccess()
 
     func check() throws {
         if canceled() { throw StorageSnapshotFailure.canceled }
@@ -77,35 +78,114 @@ struct StorageSnapshotBudget {
 final class StorageObjectFiles {
     let root: URL
     let descriptor: Int32
+    let folderAccess: StorageFolderAccess
+    private let rootKey: Data
+    private struct GateAncestor { let parent: Int32; let name: String; let device: dev_t; let inode: ino_t }
+    private var gateAncestors: [GateAncestor]?
 
-    init(root: URL) throws {
+    init(root: URL, folderAccess: StorageFolderAccess = .init(), pinRootForGates: Bool = false) throws {
         guard root.isFileURL, root.path.hasPrefix("/") else { throw StorageSnapshotFailure.io }
         self.root = root.standardizedFileURL
-        var current = Darwin.open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        guard current >= 0 else { throw StorageSnapshotFailure.io }
-        do {
-            // Foundation standardization can turn physical /private/tmp and
-            // /private/var paths back into these macOS aliases. Resolve ONLY the
-            // verified platform prefix; all selected descendants still traverse
-            // with O_NOFOLLOW, including the store's own final entry.
-            var descriptorPath = self.root.path
-            for alias in ["/tmp","/var"] where descriptorPath.hasPrefix(alias + "/") {
-                guard let physical = realpath(alias,nil) else { throw StorageSnapshotFailure.io }
-                defer { free(physical) }
-                let prefix = String(cString:physical)
-                guard prefix == "/private" + alias else { throw StorageSnapshotFailure.io }
-                descriptorPath = prefix + descriptorPath.dropFirst(alias.count)
-                break
-            }
-            for part in try Self.parts(descriptorPath, absolute: true) {
-                let next = openat(current, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-                guard next >= 0 else { throw StorageSnapshotFailure.io }
-                Darwin.close(current); current = next
-            }
-        } catch { Darwin.close(current); throw error }
-        descriptor = current
+        self.folderAccess = folderAccess
+        // Foundation standardization can turn physical /private/tmp and
+        // /private/var paths back into these macOS aliases. Resolve ONLY the
+        // verified platform prefix; all selected descendants still traverse
+        // with O_NOFOLLOW, including the store's own final entry.
+        var descriptorPath = self.root.path
+        for alias in ["/tmp","/var"] where descriptorPath.hasPrefix(alias + "/") {
+            guard let physical = realpath(alias,nil) else { throw StorageSnapshotFailure.io }
+            defer { free(physical) }
+            let prefix = String(cString:physical)
+            guard prefix == "/private" + alias else { throw StorageSnapshotFailure.io }
+            descriptorPath = prefix + descriptorPath.dropFirst(alias.count)
+            break
+        }
+        _ = try Self.parts(descriptorPath, absolute: true)
+        rootKey = Data(descriptorPath.utf8)
+        if !pinRootForGates,folderAccess.reusePinnedRoots,let pinned = PinnedRoots.shared.root(for:rootKey) {
+            try pinned.requireNamedRoot(self.root)
+            descriptor = fcntl(pinned.descriptor,F_DUPFD_CLOEXEC,0)
+            guard descriptor >= 0 else { throw StorageSnapshotFailure.io }
+        } else { descriptor = try folderAccess.open(path:descriptorPath,folder:self.root) }
+        if pinRootForGates {
+            gateAncestors = try pinGateAncestors(descriptorPath)
+            PinnedRoots.shared.insert(self,key:rootKey)
+        }
     }
-    deinit { Darwin.close(descriptor) }
+    deinit {
+        if gateAncestors != nil { PinnedRoots.shared.remove(self,key:rootKey) }
+        for ancestor in gateAncestors ?? [] { Darwin.close(ancestor.parent) }
+        Darwin.close(descriptor)
+    }
+
+    private func pinGateAncestors(_ physicalPath: String) throws -> [GateAncestor] {
+        let parts = try Self.parts(physicalPath,absolute:true)
+        guard parts.count <= 64 else { throw StorageSnapshotFailure.unsupportedAuthority }
+        var ancestors: [GateAncestor] = [],current = Darwin.open("/",O_RDONLY | O_DIRECTORY | O_CLOEXEC),transferred = false
+        guard current >= 0 else { throw StorageSnapshotFailure.io }
+        defer {
+            Darwin.close(current)
+            if !transferred { for ancestor in ancestors { Darwin.close(ancestor.parent) } }
+        }
+        for part in parts {
+            // The complete root has already passed the bounded access boundary.
+            let next = openat(current,part,O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+            guard next >= 0 else { throw StorageSnapshotFailure.io }
+            var info = stat()
+            guard fstat(next,&info) == 0 else { Darwin.close(next);throw StorageSnapshotFailure.io }
+            ancestors.append(.init(parent:current,name:part,device:info.st_dev,inode:info.st_ino))
+            current = next
+        }
+        var actual = stat(),pinned = stat()
+        guard fstat(current,&actual) == 0,fstat(descriptor,&pinned) == 0,actual.st_dev == pinned.st_dev,actual.st_ino == pinned.st_ino else { throw StorageSnapshotFailure.sourceChanged }
+        transferred = true
+        return ancestors
+    }
+
+    /// The router may reuse its already-open store root for its lifetime. Check
+    /// the named directory still denotes that inode before lending the authority.
+    /// This reuses no selected external source or backup destination descriptor.
+    func requireNamedRoot(_ expected: URL) throws {
+        func changed() -> CoreError {
+            CoreError("STORAGE_GATE_UNAVAILABLE","The pinned store folder ‘\(root.path)’ changed or is unavailable. Preserve the store and restart Checklist.",details:["reason":"store_root_identity_changed"])
+        }
+        guard Data(root.path.utf8) == Data(expected.standardizedFileURL.path.utf8),let ancestors = gateAncestors else { throw changed() }
+        // Each lookup is relative to its retained parent descriptor. A rename
+        // between checks cannot redirect the next lookup through a symlink.
+        for ancestor in ancestors {
+            var entry = stat()
+            guard fstatat(ancestor.parent,ancestor.name,&entry,AT_SYMLINK_NOFOLLOW) == 0,
+                  entry.st_mode & S_IFMT == S_IFDIR,entry.st_dev == ancestor.device,entry.st_ino == ancestor.inode else { throw changed() }
+        }
+        var actual = stat()
+        guard let last = ancestors.last,fstat(descriptor,&actual) == 0,actual.st_dev == last.device,actual.st_ino == last.inode else { throw changed() }
+    }
+
+    private final class PinnedRoots {
+        private struct Entry { weak var root: StorageObjectFiles?; let id: ObjectIdentifier }
+        static let shared = PinnedRoots()
+        private let lock = NSLock()
+        private var entries: [Data:[Entry]] = [:]
+        func root(for key: Data) -> StorageObjectFiles? {
+            // Retain before unlocking; validation and all I/O happen outside it.
+            var retained: StorageObjectFiles?
+            lock.lock()
+            for entry in entries[key] ?? [] {
+                if let root = entry.root { retained = root;break }
+            }
+            lock.unlock()
+            return retained
+        }
+        func insert(_ root: StorageObjectFiles,key: Data) {
+            lock.withLock { entries[key,default:[]].append(Entry(root:root,id:ObjectIdentifier(root))) }
+        }
+        func remove(_ root: StorageObjectFiles,key: Data) {
+            lock.withLock {
+                let remaining = (entries[key] ?? []).filter { $0.id != ObjectIdentifier(root) }
+                entries[key] = remaining.isEmpty ? nil : remaining
+            }
+        }
+    }
 
     static func parts(_ path: String, absolute: Bool = false) throws -> [String] {
         guard !path.contains("\0"), absolute == path.hasPrefix("/") else { throw StorageSnapshotFailure.unsupportedAuthority }
@@ -134,7 +214,7 @@ final class StorageObjectFiles {
     func regularOrLinkExists(_ path: String) throws -> Bool {
         let parentFD: Int32, name: String
         do { (parentFD, name) = try parent(path) }
-        catch { if errno == ENOENT { return false }; throw error }
+        catch { if StorageFolderAccess.isMissing(error) { return false }; throw error }
         defer { Darwin.close(parentFD) }
         var info = stat()
         if fstatat(parentFD, name, &info, AT_SYMLINK_NOFOLLOW) != 0 {
@@ -144,9 +224,20 @@ final class StorageObjectFiles {
         return true
     }
 
+    func directoryExists(_ path: String) throws -> Bool {
+        let parent: Int32,name: String
+        do { (parent,name) = try self.parent(path) }
+        catch where StorageFolderAccess.isMissing(error) { return false }
+        defer { Darwin.close(parent) }
+        let opened = openat(parent,name,O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        guard opened >= 0 else { if errno == ENOENT { return false };throw StorageSnapshotFailure.io }
+        Darwin.close(opened)
+        return true
+    }
+
     func openRegular<T>(_ path: String, _ body: (Int32) throws -> T) throws -> T {
         let (directory, name) = try parent(path); defer { Darwin.close(directory) }
-        let file = openat(directory, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let file = openat(directory, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         guard file >= 0 else { throw StorageSnapshotFailure.io }
         defer { Darwin.close(file) }
         var info = stat()
@@ -238,8 +329,8 @@ final class StorageObjectFiles {
         }
     }
 
-    func copy(_ path: String, to destination: StorageObjectFiles, expected: String?, budget: StorageSnapshotBudget) throws -> (String, Int64) {
-        let target = "managed/" + path
+    func copy(_ path: String, to destination: StorageObjectFiles, expected: String?, budget: StorageSnapshotBudget, targetPath: String? = nil, executable: Bool = false) throws -> (String, Int64) {
+        let target = targetPath ?? ("managed/" + path)
         let (directory, name) = try destination.parent(target, create: true); defer { Darwin.close(directory) }
         let output = openat(directory, name, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard output >= 0 else { throw StorageSnapshotFailure.io }
@@ -273,6 +364,7 @@ final class StorageObjectFiles {
             return (Self.hex(digest.finalize()), total)
         }
         guard expected == nil || copied.0 == expected else { throw StorageSnapshotFailure.sourceChanged }
+        guard fchmod(output, executable ? 0o700 : 0o600) == 0 else {throw StorageSnapshotFailure.io}
         try Self.flush(output)
         guard fsync(directory) == 0 else { throw StorageSnapshotFailure.io }
         let verified = try destination.digest(target, budget: budget)
@@ -294,7 +386,7 @@ final class StorageObjectFiles {
     func makeDirectory(_ name: String) throws -> StorageObjectFiles {
         _ = try Self.parts(name)
         guard !name.contains("/"), mkdirat(descriptor, name, 0o700) == 0, fsync(descriptor) == 0 else { throw StorageSnapshotFailure.io }
-        return try StorageObjectFiles(root: root.appendingPathComponent(name, isDirectory: true))
+        return try StorageObjectFiles(root: root.appendingPathComponent(name, isDirectory: true),folderAccess:folderAccess)
     }
     func publish(_ staging: String, as name: String, beforeFlush: () throws -> Void = {}) throws {
         guard !staging.contains("/"), !name.contains("/") else { throw StorageSnapshotFailure.io }
@@ -306,22 +398,42 @@ final class StorageObjectFiles {
         guard fsync(descriptor) == 0 else { throw StorageSnapshotFailure.publicationUncertain }
     }
     func listedFiles(budget: StorageSnapshotBudget) throws -> Set<String> {
-        guard let entries = FileManager.default.enumerator(atPath: root.path) else { throw StorageSnapshotFailure.io }
-        var files: Set<String> = []
-        while let path = entries.nextObject() as? String {
+        // Enumerate relative to the already-open root; never resolve a managed
+        // descendant through Foundation or a symlink.
+        var files: Set<String> = [], directories = [""]
+        while let relative = directories.popLast() {
             try budget.check()
-            let (directory, name) = try parent(path); defer { Darwin.close(directory) }
-            var info = stat()
-            guard fstatat(directory, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else { throw StorageSnapshotFailure.io }
-            switch info.st_mode & S_IFMT {
-            case S_IFDIR: break
-            case S_IFREG: files.insert(path)
-            // Captured links resolve to files. There are no link descendants to
-            // skip; skipDescendants here can skip the next sibling link.
-            case S_IFLNK: files.insert(path)
-            default: throw StorageSnapshotFailure.unsupportedAuthority
+            let directory: Int32
+            if relative.isEmpty { directory = dup(descriptor) }
+            else {
+                let (parent,name) = try self.parent(relative)
+                defer { Darwin.close(parent) }
+                directory = openat(parent,name,O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
             }
-            guard files.count <= budget.maximumObjects + 3 else { throw StorageSnapshotFailure.limit }
+            guard directory >= 0 else { throw StorageSnapshotFailure.io }
+            guard let entries = fdopendir(directory) else { Darwin.close(directory);throw StorageSnapshotFailure.io }
+            defer { closedir(entries) }
+            while true {
+                errno = 0
+                guard let entry = readdir(entries) else {
+                    guard errno == 0 else { throw StorageSnapshotFailure.io }
+                    break
+                }
+                try budget.check()
+                guard let name = withUnsafeBytes(of:entry.pointee.d_name, { bytes in
+                    String(bytes:bytes.prefix(while:{$0 != 0}),encoding:.utf8)
+                }) else { throw StorageSnapshotFailure.unsupportedAuthority }
+                if name == "." || name == ".." { continue }
+                let path = relative.isEmpty ? name : relative + "/" + name
+                var info = stat()
+                guard fstatat(dirfd(entries),name,&info,AT_SYMLINK_NOFOLLOW) == 0 else { throw StorageSnapshotFailure.io }
+                switch info.st_mode & S_IFMT {
+                case S_IFDIR: directories.append(path)
+                case S_IFREG, S_IFLNK: files.insert(path)
+                default: throw StorageSnapshotFailure.unsupportedAuthority
+                }
+                guard files.count <= budget.maximumObjects + 3 else { throw StorageSnapshotFailure.limit }
+            }
         }
         return files
     }

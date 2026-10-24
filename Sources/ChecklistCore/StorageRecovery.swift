@@ -1,5 +1,6 @@
 import Foundation
 import GRDB
+import Darwin
 
 /// Historical verified-backup presence, not proof of current external bytes or
 /// physical allocation. Construct once for a scoped projection, never per item.
@@ -53,11 +54,31 @@ extension CommandRouter {
         }
     }
 
+    private func authorizeStorageBackup(_ db: Database,params: JSON,caller: Caller) throws {
+        if caller.isOwner { return }
+        try worker(caller)
+        let pid = try scope(db,params,caller,write:true)
+        try requireAgentEditAuthority(db,project:record(db,pid,type:"project"),caller:caller)
+    }
+    private func storageBackupDestination(params: JSON,caller: Caller,command: String) throws -> URL {
+        if caller.isOwner,params["path"] != nil {
+            return URL(fileURLWithPath:try text(params,"path"),isDirectory:true).standardizedFileURL
+        }
+        let label = try text(params,"qualification_name",max:64,required:false)
+        guard label.isEmpty || label.range(of:"^[A-Za-z0-9_-]{1,64}$",options:.regularExpression) != nil else {
+            throw CoreError("INVALID_INPUT","qualification_name uses at most 64 letters, numbers, underscores or hyphens.")
+        }
+        let relative = "backups/" + (label.isEmpty ? "" : "qualification-" + label + "/")
+        let files = try StorageObjectFiles(root:root)
+        let (fd,_) = try files.parent(relative + ".parent",create:true);Darwin.close(fd)
+        return root.appendingPathComponent(relative + "snapshot-" + command.lowercased(),isDirectory:true)
+    }
+
     /// Admitted by handle, but never occupies its serial writer during copying.
     /// An explicit budget is an internal fixture seam, not a service callback.
     func executeStorageBackup(params: JSON, caller: Caller, budget: StorageSnapshotBudget = .production()) throws -> JSON {
         do {
-            try owner(caller)
+            try dbQueue.read { try authorizeStorageBackup($0,params:params,caller:caller) }
             return try StorageSnapshotRetention.withCapture(root:root) { retention in
                 try createStorageBackup(params:params,caller:caller,budget:budget,retention:retention)
             }
@@ -87,9 +108,11 @@ extension CommandRouter {
         let command = try text(params,"command_id",max:100)
         guard UUID(uuidString:command) != nil else { throw CoreError("INVALID_INPUT","command_id must be a UUID.") }
         let digest = hash(Data(("backup_create" + (try jsonString(params))).utf8))
+        let destination = try storageBackupDestination(params:params,caller:caller,command:command)
         let key = try pendingStorageCommandKey(principal:caller.principal,command:command)
         let (identity, operation, replay) = try ArchiveStorageGate.withExclusive(root:root) { _ in
             try dbQueue.writeWithoutTransaction { db in
+                try authorizeStorageBackup(db,params:params,caller:caller)
                 guard let identityRaw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='store_identity'") else {throw StoreRecovery.required("missing_migration_identity")}
                 let identity = try StoreIdentityReceipt.decode(Data(identityRaw.utf8))
                 // Parent ownership remains principal+UUID in this store; physical stage
@@ -116,16 +139,15 @@ extension CommandRouter {
             }
         }
         if var replay { replay["replayed"] = true;return replay }
-        let destination = URL(fileURLWithPath:try text(params,"path"),isDirectory:true).standardizedFileURL
         guard destination.path != root.standardizedFileURL.path,
               !destination.path.hasPrefix(root.standardizedFileURL.path + "/objects/"),
               !destination.path.hasPrefix(root.standardizedFileURL.path + "/source-captures/") else { throw CoreError("INVALID_INPUT","Choose a separate backup destination.") }
         let parent = destination.deletingLastPathComponent(), name = destination.lastPathComponent
         func commitBackup(_ receipt: StorageSnapshotReceipt) throws -> JSON {
-            let generation = try prepareStorageBackupReceipt(destination:destination,receipt:receipt,identity:identity)
+            let prepared = try prepareStorageBackupReceipt(destination:destination,receipt:receipt,identity:identity,budget:budget)
             return try ArchiveStorageGate.withExclusive(root:root) { permit in
                 try dbQueue.writeWithoutTransaction { db in
-                    try self.commitStorageBackupReceipt(db,params:params,caller:caller,permit:permit,command:command,digest:digest,key:key,destination:destination,receipt:receipt,identity:identity,generation:generation)
+                    try self.commitStorageBackupReceipt(db,params:params,caller:caller,permit:permit,command:command,digest:digest,key:key,destination:destination,receipt:receipt,identity:identity,generation:prepared.generation,summary:prepared.summary)
                 }
             }
         }
@@ -133,14 +155,15 @@ extension CommandRouter {
         do {
             // A previously published generation after lost SQL receipt is
             // reconciled under the original UUID and full manifest verification.
-            let exists = FileManager.default.fileExists(atPath:destination.path)
+            let parentFiles = try StorageObjectFiles(root:parent,folderAccess:budget.folderAccess)
+            let exists = try parentFiles.directoryExists(name)
             if exists {
-                _ = try self.currentBackupManifest(destination,identity:identity)
+                _ = try self.currentBackupManifest(destination,identity:identity,folderAccess:budget.folderAccess)
                 receipt = try StorageSnapshot.reconcile(parent:parent,operation:operation,publicationName:name,budget:budget)
             } else {
                 let stage = parent.appendingPathComponent(StorageSnapshot.names(operation).staging)
-                if FileManager.default.fileExists(atPath:stage.path) {
-                    let staged = try StorageObjectFiles(root:stage)
+                if try parentFiles.directoryExists(stage.lastPathComponent) {
+                    let staged = try StorageObjectFiles(root:stage,folderAccess:budget.folderAccess)
                     if try staged.regularOrLinkExists("intent.json") {
                         let bytes = try staged.read("intent.json",maximum:16_384)
                         guard let intent = try JSONSerialization.jsonObject(with:bytes) as? [String:String],
@@ -169,13 +192,13 @@ extension CommandRouter {
         }
         return try commitBackup(receipt)
     }
-    private func currentBackupManifest(_ directory: URL,identity: StoreIdentityReceipt) throws -> StorageSnapshotManifest {
-        let bytes = try StorageObjectFiles(root:directory).read("manifest.json",maximum:StorageSnapshotBudget.manifestByteLimit)
+    private func currentBackupManifest(_ directory: URL,identity: StoreIdentityReceipt,folderAccess: StorageFolderAccess = .init()) throws -> StorageSnapshotManifest {
+        let bytes = try StorageObjectFiles(root:directory,folderAccess:folderAccess).read("manifest.json",maximum:StorageSnapshotBudget.manifestByteLimit)
         let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self,from:bytes)
         guard manifest.storeID.utf8.elementsEqual(identity.logical_store_id.utf8),manifest.sourceRoot.utf8.elementsEqual(root.path.utf8) else {throw CoreError("BACKUP_TARGET_MISMATCH","This backup belongs to another logical store or source root.")}
         return manifest
     }
-    private func prepareStorageBackupReceipt(destination: URL,receipt: StorageSnapshotReceipt,identity: StoreIdentityReceipt) throws -> String {
+    private func prepareStorageBackupReceipt(destination: URL,receipt: StorageSnapshotReceipt,identity: StoreIdentityReceipt,budget: StorageSnapshotBudget) throws -> (generation: String,summary: JSON) {
         let manifestBytes = try StorageObjectFiles(root:destination).read("manifest.json",maximum:StorageSnapshotBudget.manifestByteLimit)
         guard hash(manifestBytes) == receipt.manifestSHA256 else {throw StorageSnapshotFailure.sourceChanged}
         let manifest = try currentBackupManifest(destination,identity:identity)
@@ -192,20 +215,28 @@ extension CommandRouter {
         let indexedObjects: [JSON] = manifest.objects.map {
             ["path":$0.descriptor.relativePath,"sha256":$0.sha256,"size":$0.size]
         }
-        let generation: JSON = ["format":1,"state":"complete","operation_id":receipt.operationID.uuidString.lowercased(),"manifest_sha256":receipt.manifestSHA256,"known_at":now(),"current_physical_verified":false,"objects":indexedObjects]
-        return try jsonString(generation)
+        let files = try StorageObjectFiles(root:destination)
+        let usage = try StorageCopyUsage.measure(files,paths:["database.sqlite","manifest.json","intent.json"] + manifest.objects.map {"managed/" + $0.descriptor.relativePath},budget:budget)
+        let summary: JSON = ["kind":"backup","operation_id":receipt.operationID.uuidString.lowercased(),"path":destination.path,
+            "source_root":manifest.sourceRoot,"store_id":manifest.storeID,"captured_at":manifest.capturedAt as Any? ?? NSNull(),
+            "verified_at":now(),"verification":"manifest_database_managed_files","manifest_sha256":receipt.manifestSHA256,"usage":usage]
+        let generation: JSON = ["summary":summary,"format":1,"state":"complete","operation_id":receipt.operationID.uuidString.lowercased(),"manifest_sha256":receipt.manifestSHA256,"known_at":now(),"current_physical_verified":false,"objects":indexedObjects]
+        return (try jsonString(generation),summary)
     }
-    private func commitStorageBackupReceipt(_ db: Database,params: JSON,caller: Caller,permit: ArchiveStoragePermit,command: String,digest: String,key: String,destination: URL,receipt: StorageSnapshotReceipt,identity: StoreIdentityReceipt,generation: String) throws -> JSON {
+    private func commitStorageBackupReceipt(_ db: Database,params: JSON,caller: Caller,permit: ArchiveStoragePermit,command: String,digest: String,key: String,destination: URL,receipt: StorageSnapshotReceipt,identity: StoreIdentityReceipt,generation: String,summary: JSON) throws -> JSON {
         try permit.requireRoot(root)
         guard let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='store_identity'"),
               try StoreIdentityReceipt.decode(Data(raw.utf8)) == identity else {throw CoreError("BACKUP_TARGET_MISMATCH","The store generation changed during backup.")}
         var output: JSON = [:]
         try withValidatedDomainTransaction(db) {
+            try authorizeStorageBackup(db,params:params,caller:caller)
             try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
-            let data: JSON = ["path":destination.path,"format":"checklist-store-snapshot","manifest_sha256":receipt.manifestSHA256,"operation_id":receipt.operationID.uuidString.lowercased(),"restore_supported":false,"status":"complete"]
+            let data: JSON = ["path":destination.path,"format":"checklist-store-snapshot","manifest_sha256":receipt.manifestSHA256,"operation_id":receipt.operationID.uuidString.lowercased(),"restore_supported":true,"status":"complete"]
+            try event(db,caller:caller,project:params["project_id"] as? String,entity:nil,kind:"backup_created",data:["origin":caller.isOwner ? "human_ui" : "agent","session_id":caller.sessionID ?? "","operation_id":receipt.operationID.uuidString.lowercased(),"manifest_sha256":receipt.manifestSHA256,"reason":try text(params,"reason",max:4000,required:false)])
             output = ["data":data,"command_id":command,"event_cursor":try self.cursor(db,caller:caller,scope:self.authorizationScope(db,caller))]
             try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[caller.principal,command,digest,try jsonString(output)])
             try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["backup-generation:" + receipt.operationID.uuidString.lowercased(),generation])
+            try recordStorageCopyObservation(db,key:"backup",summary:summary)
             try db.execute(sql:"DELETE FROM metadata WHERE key=?",arguments:[key]);return .commit
         }
         let warning = performStorageMaintenance(db,permit:permit)

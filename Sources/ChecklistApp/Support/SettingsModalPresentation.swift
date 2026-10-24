@@ -239,3 +239,19 @@ final class SettingsAnchorView: NSView {
     override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); if let content { presentation?.attach(self, content: content) } }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
+
+/// Keep the invoking workspace mounted while the native sheet is presented.
+struct SettingsModalBackground: ViewModifier {
+    @Environment(\.isEnabled) private var isEnabled
+    let isPresented: Bool
+    func body(content: Content) -> some View {
+        content
+            // A conditional disabled-reason wrapper replaces the workspace,
+            // detaching its native anchor and canceling its live read tasks.
+            .environment(\.isEnabled, isEnabled && !isPresented)
+            .accessibilityHidden(isPresented)
+            .overlay {
+                if isPresented { Color.black.opacity(0.18).ignoresSafeArea().allowsHitTesting(false).accessibilityHidden(true) }
+            }
+    }
+}

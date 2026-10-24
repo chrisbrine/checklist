@@ -11,6 +11,9 @@ import ChecklistIPC
         var calls:[(String,[String:Any])]=[]
         var pending:[String:String]=[:]
         var holdSurface:String?
+        var holdMethod:String?
+        var scopeVersion: String?
+        var omitReadVersion = false
         var held:CheckedContinuation<[String:Any],Error>?
         var heldReply:[String:Any]?
         var loseCreateReply=false
@@ -57,10 +60,20 @@ import ChecklistIPC
                 continuationFailure=nil
                 throw ChecklistError(code,"Synthetic typed continuation failure")
             }
-            let reply=try command(method,params)
+            var reply=try command(method,params)
+            if let scopeVersion, var data = reply["data"] as? [String:Any] {
+                if var service = data["service"] as? [String:Any] { service["read_version"] = scopeVersion; data["service"] = service }
+                if var page = data["tickets_page"] as? [String:Any], var service = page["service"] as? [String:Any] { service["read_version"] = scopeVersion; page["service"] = service; data["tickets_page"] = page }
+                reply["data"] = data
+            }
+            if omitReadVersion, var data = reply["data"] as? [String:Any] {
+                if var service = data["service"] as? [String:Any] { service.removeValue(forKey:"read_version"); data["service"] = service }
+                if var page = data["tickets_page"] as? [String:Any], var service = page["service"] as? [String:Any] { service.removeValue(forKey:"read_version"); page["service"] = service; data["tickets_page"] = page }
+                reply["data"] = data
+            }
             if method=="task_create" && loseCreateReply {loseCreateReply=false;throw CommandReply.unknown(commandID:params["command_id"] as? String,reason:"synthetic_committed_lost_reply")}
-            if method=="workspace_page",params["surface"] as? String==holdSurface {
-                holdSurface=nil;heldReply=reply
+            if method == holdMethod || method=="workspace_page" && params["surface"] as? String==holdSurface {
+                holdSurface=nil;holdMethod=nil;heldReply=reply
                 return try await withCheckedThrowingContinuation {held=$0}
             }
             return reply
@@ -88,6 +101,146 @@ import ChecklistIPC
     private func changes(_ pid:String,families:[String],task:String?=nil)->[String:Any] {
         ["event_cursor":"observed-interval","coverage":["schema_version":2,"complete":true,"reset":false,"changes":[["project_id":pid,"families":families,"task_ids":task.map{[$0]} ?? [],"all_tasks":task==nil]]]]
     }
+    func testCachedProjectSwitchRestoresTicketsBeforeBackgroundReply() async throws {
+        let f = try Fixture(defaults: isolatedDefaults("CachedTickets")); defer { f.cleanup() }
+        f.preferences.set(Page.tasks.rawValue, forKey: "lastPage"); f.scopeVersion = "grant-one-version-one"
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); f.release(); store.stopWindowReads() }
+        try await until { store.connected && !store.ticketPageLoading }
+        let original = store.preparedTicketWorkspace?.visibleTicketIDs
+        let originalStatuses = store.ticketStatuses.map(\.id)
+        XCTAssertEqual(store.ticketPageMatchedCount, 1)
+        store.select(.tasks, project: f.b)
+        try await until { !store.ticketPageLoading && store.preparedTicketWorkspace != nil && store.ticketPageMatchedCount == 0 }
+        f.holdMethod = "task_list"
+        let start = ProcessInfo.processInfo.systemUptime
+        store.select(.tasks, project: f.a)
+        XCTAssertEqual(store.ticketPageMatchedCount, 1)
+        XCTAssertEqual(store.preparedTicketWorkspace?.visibleTicketIDs, original)
+        XCTAssertEqual(store.ticketStatuses.map(\.id), originalStatuses, "Cached rows and their project's filter catalog return together")
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 0.3)
+        try await until { f.held != nil }; f.release()
+        try await until { !store.ticketPageLoading }
+    }
+    func testCachedEpicsReturnAndProjectSwitchRestoreBeforeBackgroundReply() async throws {
+        let f = try Fixture(defaults: isolatedDefaults("CachedEpics")); defer { f.cleanup() }
+        f.scopeVersion = "grant-one-version-one"
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); f.release(); store.stopWindowReads() }
+        try await until { store.workspacePageLoaded && !store.workspaceLoading }
+        let original = store.workspaceRows.map(\.id)
+        XCTAssertFalse(original.isEmpty)
+        store.select(.tasks, project: f.b)
+        try await until { !store.ticketPageLoading }
+        f.holdSurface = "epics"
+        store.select(.epics, project: f.a)
+        XCTAssertEqual(store.workspaceRows.map(\.id), original)
+        XCTAssertTrue(store.workspacePageLoaded)
+        try await until { f.held != nil }; f.release()
+        try await until { !store.workspaceLoading }
+    }
+    func testNewKnownReadVersionAndGrantRetireOtherProjectCaches() async throws {
+        for version in ["same-grant-new-data", "new-grant-same-data"] {
+            let f = try Fixture(defaults: isolatedDefaults("CacheVersion")); defer { f.cleanup() }
+            f.scopeVersion = "initial"; f.preferences.set(Page.tasks.rawValue, forKey:"lastPage")
+            let store = f.store(), live = Task { await store.startLiveUpdates() }
+            defer { live.cancel(); f.release(); store.stopWindowReads() }
+            try await until { store.connected && !store.ticketPageLoading }
+            f.scopeVersion = version
+            store.select(.tasks, project: f.b)
+            try await until { !store.ticketPageLoading && store.preparedTicketWorkspace != nil && store.ticketPageMatchedCount == 0 }
+            f.holdMethod = "task_list"; store.select(.tasks, project: f.a)
+            XCTAssertNil(store.preparedTicketWorkspace, "A page under the earlier data/grant version cannot reappear")
+            try await until { f.held != nil }; f.release()
+            try await until { !store.ticketPageLoading }
+        }
+    }
+    func testNewVersionLearnedByDetailReadFencesEarlierPageAndRefreshesVisibleContent() async throws {
+        let f = try Fixture(defaults: isolatedDefaults("CacheLateReply")); defer { f.cleanup() }
+        f.scopeVersion = "before"; f.preferences.set(Page.tasks.rawValue, forKey:"lastPage")
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); f.release(); store.stopWindowReads() }
+        try await until { store.connected && !store.ticketPageLoading }
+        f.holdMethod = "task_list"
+        let earlier = Task { await store.refresh() }
+        try await until { f.held != nil }
+        _ = try f.command("task_edit", ["project_id":f.a, "task_id":f.task, "expected_revision":1, "patch":["title":"After committed change"]])
+        f.scopeVersion = "after"
+        _ = try await store.request("workspace_page", ["surface":"epics", "project_id":f.a])
+        try await until { store.preparedTicketWorkspace?.list.ordinaryTickets.first?.string("title") == "After committed change" }
+        f.release(); await earlier.value
+        XCTAssertEqual(store.preparedTicketWorkspace?.list.ordinaryTickets.first?.string("title"), "After committed change")
+        XCTAssertFalse(store.ticketPageLoading)
+    }
+
+    func testMissingVersionDropsExistingCachesAndNeverRetainsUnqualifiedPages() async throws {
+        let f = try Fixture(defaults:isolatedDefaults("CacheMissingVersion")); defer { f.cleanup() }
+        f.preferences.set(Page.tasks.rawValue,forKey:"lastPage")
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); f.release(); store.stopWindowReads() }
+        try await until { store.connected && !store.ticketPageLoading }
+        f.omitReadVersion = true
+        for _ in 0..<2 {
+            store.select(.tasks, project:f.b)
+            try await until { store.preparedTicketWorkspace != nil && !store.ticketPageLoading && store.ticketPageMatchedCount == 0 }
+            f.holdMethod = "task_list"; store.select(.tasks, project:f.a)
+            XCTAssertNil(store.preparedTicketWorkspace)
+            try await until { f.held != nil }; f.release()
+            try await until { store.preparedTicketWorkspace != nil && !store.ticketPageLoading }
+        }
+    }
+    func testUnversionedOverviewAndTicketsDoNotReappearAfterLeavingTheirPage() async throws {
+        let f = try Fixture(defaults:isolatedDefaults("CacheUnqualifiedReturn")); defer { f.cleanup() }
+        f.preferences.set(Page.overview.rawValue,forKey:"lastPage"); f.omitReadVersion = true
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); f.release(); store.stopWindowReads() }
+        try await until { store.overviewObservations.values.allSatisfy { $0.page != nil && !$0.loading } }
+        store.select(.tasks,project:f.a)
+        try await until { store.preparedTicketWorkspace != nil && !store.ticketPageLoading }
+        f.holdSurface = "overview"; store.select(.overview,project:f.a)
+        XCTAssertTrue(store.overviewObservations.values.allSatisfy { $0.page == nil })
+        try await until { f.held != nil }; f.release()
+        try await until { store.overviewObservations.values.allSatisfy { $0.page != nil && !$0.loading } }
+        f.holdMethod = "task_list"; store.select(.tasks,project:f.a)
+        XCTAssertNil(store.preparedTicketWorkspace)
+        try await until { f.held != nil }; f.release()
+        try await until { store.preparedTicketWorkspace != nil && !store.ticketPageLoading }
+    }
+
+    func testNewListVersionRetiresAndRefreshesOlderSelectedContext() async throws {
+        let f = try Fixture(defaults:isolatedDefaults("CacheSelectedVersion")); defer { f.cleanup() }
+        f.preferences.set(Page.tasks.rawValue,forKey:"lastPage"); f.scopeVersion = "before"
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); f.release(); store.stopWindowReads() }
+        try await until { store.connected && !store.ticketPageLoading }
+        store.open(.task(f.task)); try await until { store.selectedTicketCurrent(f.task) }
+        f.holdMethod = "task_context"; store.retrySelectedTicket()
+        try await until { f.held != nil }
+        _ = try f.command("task_edit",["project_id":f.a,"task_id":f.task,"expected_revision":1,"patch":["title":"New selected title"]])
+        f.scopeVersion = "after"
+        await store.refresh()
+        f.release()
+        try await until { store.selectedTicketCurrent(f.task) && store.selectedTask(f.task)?.string("title") == "New selected title" }
+        XCTAssertEqual(store.selectedTask(f.task)?.string("title"),"New selected title")
+    }
+
+    func testEveryKnownChangeFamilyRetiresCachedProjectBeforeSwitch() async throws {
+        for family in ["tasks", "groups", "statuses", "messages", "settings", "archive", "purge", "all"] {
+            let f = try Fixture(defaults: isolatedDefaults("CacheCoverage")); defer { f.cleanup() }
+            f.scopeVersion = "unchanged-fixture-token"; f.preferences.set(Page.tasks.rawValue, forKey:"lastPage")
+            let store = f.store(), live = Task { await store.startLiveUpdates() }
+            defer { live.cancel(); f.release(); store.stopWindowReads() }
+            try await until { store.connected && !store.ticketPageLoading }
+            store.select(.tasks, project:f.b)
+            try await until { !store.ticketPageLoading && store.preparedTicketWorkspace != nil && store.ticketPageMatchedCount == 0 }
+            await store.applyChangeCoverage(changes(f.a, families:[family]))
+            f.holdMethod = "task_list"; store.select(.tasks, project:f.a)
+            XCTAssertNil(store.preparedTicketWorkspace, family)
+            try await until { f.held != nil }; f.release()
+            try await until { !store.ticketPageLoading }
+        }
+    }
+
     func testAnswerDeclineAndApprovalImmediatelyRemoveNeedsYouRowsAndDockCountsBeforeRefresh() async throws {
         for page in [Page.needsYou,.overview] {
             for (type, result) in [("text", "Answer"), ("check", "passed"), ("check", "declined"), ("approval", "approved")] {

@@ -22,7 +22,7 @@ class CleanScratchTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
-        caller = patch.dict(os.environ, {'CODEX_THREAD_ID': 'session', 'CLAUDE_SESSION_ID': ''})
+        caller = patch.dict(os.environ, {'CODEX_THREAD_ID': 'session', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
         caller.start();self.addCleanup(caller.stop)
         self.repo = self.root / 'retained';self.repo.mkdir()
         self.package = b'let package = Package(name: "Checklist")\n'
@@ -294,11 +294,34 @@ class CleanScratchTests(unittest.TestCase):
         marker = cleanup.read_marker(root)
         self.assertEqual(marker['source_fingerprint'], 'b' * 64)
         self.assertFalse(marker['released'])
-        with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': ''}):
+        with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}):
             with self.assertRaisesRegex(ValueError, 'session unknown'):
                 cleanup.mark_qualification(root, 'b' * 64, 'missing owner')
         with self.assertRaisesRegex(ValueError, 'override'):
             cleanup.mark_qualification(root, 'b' * 64, 'wrong owner', 'foreign')
+
+    def test_caller_identity_sources_and_refusal_preserve_markers(self):
+        root = self.qualification_run(release=False)
+        before = (root / cleanup.WORKSPACE_MARKER).read_bytes()
+        for environment, explicit in [({}, 'session'), ({'CODEX_THREAD_ID': 'session'}, None),
+                                      ({'CLAUDE_SESSION_ID': 'session'}, None),
+                                      ({'CHECKLIST_SESSION_ID': 'session'}, None)]:
+            with self.subTest(environment=environment), patch.dict(os.environ, environment, clear=True):
+                cleanup.mark_qualification(root, 'b' * 64, 'disposable qualification fixture', explicit)
+                self.assertEqual(cleanup.read_marker(root)['session_id'], 'session')
+        before = (root / cleanup.WORKSPACE_MARKER).read_bytes()
+        for environment, explicit in [({}, None), ({'CHECKLIST_SESSION_ID': 'session'}, 'other'),
+                                      ({'CODEX_THREAD_ID': 'session'}, 'other'),
+                                      ({'CHECKLIST_SESSION_ID': 'invalid/session'}, None)]:
+            with self.subTest(environment=environment), patch.dict(os.environ, environment, clear=True):
+                with self.assertRaises(ValueError):
+                    cleanup.mark_qualification(root, 'c' * 64, 'must not change', explicit)
+                self.assertEqual((root / cleanup.WORKSPACE_MARKER).read_bytes(), before)
+        with patch.dict(os.environ, {'CHECKLIST_SESSION_ID': 'session'}, clear=True), \
+             patch.object(sys, 'argv', ['clean_scratch.py', '--mark', str(root), '--purpose', 'env owner']), \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(cleanup.main(), 0)
+            self.assertEqual(cleanup.read_marker(root)['session_id'], 'session')
 
     def test_new_qualification_run_fences_installed_change_before_trash(self):
         root = self.qualification_run()
@@ -546,7 +569,7 @@ class CleanScratchTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as error:
                 cleanup.main()
             self.assertEqual(error.exception.code, 2)
-        with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': ''}), \
+        with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), \
              patch.object(sys, 'argv', ['clean_scratch.py', '--preview']), patch('sys.stderr', io.StringIO()):
             with self.assertRaises(SystemExit) as error:
                 cleanup.main()

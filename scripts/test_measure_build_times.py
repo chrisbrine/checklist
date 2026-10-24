@@ -17,7 +17,7 @@ class MeasurementTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        caller = patch.dict(os.environ, {'CODEX_THREAD_ID': 'measurement-session', 'CLAUDE_SESSION_ID': ''})
+        caller = patch.dict(os.environ, {'CODEX_THREAD_ID': 'measurement-session', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
         caller.start();self.addCleanup(caller.stop)
         self.root = Path(self.temporary.name).resolve()
         self.checkout = self.root / 'checkout'
@@ -85,7 +85,7 @@ print('Staged '+str(capture/'Checklist.app'))
         self.assertTrue((self.output / '.checklist-workspace.json').is_file())
 
     def test_invalid_owner_or_fingerprint_cannot_create_an_unmarked_output(self):
-        with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': ''}):
+        with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}):
             with self.assertRaisesRegex(ValueError, 'session unknown'):
                 self.run_measurement()
         self.assertFalse(self.output.exists())

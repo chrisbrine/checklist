@@ -10,7 +10,10 @@ extension CommandRouter {
             throw CoreError("TICKET_PURGED","This ticket was permanently removed. Its remaining reference cannot be edited or restored.")
         }
         switch method {
-        case "service_info": return ["session_id":c.sessionID ?? "","caller":["session_id":c.sessionID ?? "","role":c.role,"installation":c.installation],"name":"Checklist","version":ChecklistBuildVersion.current.version,"build_id":ChecklistBuildVersion.current.buildID,"build_number":ChecklistBuildVersion.current.buildNumber,"store_incarnation":incarnation,"role":c.role,"project_ids":c.projectIDs,"capabilities":["durable_store","project_isolation","pickup_inbox","named_contacts","human_requests","managed_attachments","scope_reservations","captured_source_review","triage_batches","phase_triages","triage_orchestration","typed_relations","policy_reconciliation","request_revisions"],"provider_plugins":providerPlugins.summaries,"native_push":false,"native_push_status":NativeCommunicationRoutes.summary,"native_routes":NativeCommunicationRoutes.serviceInfo,"unsupported":["automatic_model_launch","native_idle_push","restore","MCP_events"]]
+        case "service_info":
+            var info: JSON = ["session_id":c.sessionID ?? "","caller":["session_id":c.sessionID ?? "","role":c.role,"installation":c.installation],"name":"Checklist","version":ChecklistBuildVersion.current.version,"build_id":ChecklistBuildVersion.current.buildID,"build_number":ChecklistBuildVersion.current.buildNumber,"store_incarnation":incarnation,"role":c.role,"project_ids":c.projectIDs,"capabilities":["durable_store","project_isolation","pickup_inbox","named_contacts","human_requests","managed_attachments","scope_reservations","captured_source_review","triage_batches","phase_triages","triage_orchestration","typed_relations","policy_reconciliation","request_revisions"],"provider_plugins":providerPlugins.summaries,"native_push":false,"native_push_status":NativeCommunicationRoutes.summary,"native_routes":NativeCommunicationRoutes.serviceInfo,"unsupported":["automatic_model_launch","native_idle_push","MCP_events"]]
+            if let version = readSnapshotCache.readVersion(db) {info["read_version"] = version}
+            return info
         case "tool_catalog": return ["tools":toolCatalog(c)]
         case "changes_wait":
             let scope = try authorizationScope(db,c)
@@ -26,7 +29,7 @@ extension CommandRouter {
         case "delivery_host_status": return try deliveryHostStatus(db,p,c)
         case "snapshot": try owner(c); return try snapshot(db,c:c)
         case "diagnostics_summary": return try diagnosticsSummary(db,p,c)
-        case "storage_status": try owner(c); return ["database_path":root.appendingPathComponent("checklist.sqlite").path,"managed_bytes":try records(db,type:"attachment").filter {$0["mode"] as? String == "managed" && $0["availability"] as? String == "available"}.reduce(0) {$0+int($1,"size")},"cleanup_enabled":true,"restore_supported":false]
+        case "storage_status": return try storageStatus(db,caller:c)
         // An archived project leaves the ordinary project list; include_archived lists it for a restore.
         case "project_list", "assistant_projects": return ["projects":try projects(db,c).filter { bool(p,"include_archived") || !bool($0,"archived") }]
         case "project_resolve":
@@ -128,7 +131,9 @@ extension CommandRouter {
         case "attachment_read_release": return try releaseAttachmentRead(db,p,c)
         case "attachment_add", "attachment_update": return try attachmentWrite(db,p,c,method)
         case "attachment_list", "attachment_read", "attachment_cleanup_preview": return try attachmentRead(db,p,c,method)
+        case "import_preview", "import_commit", "import_rollback", "import_receipt_get": throw CoreError("STORAGE_BOUNDARY_REQUIRED","Project import runs through the prepared transfer boundary.")
         case "export_project": return try exportProject(db,p,c)
+        case "restore_preview", "restore_create": throw CoreError("STORAGE_BOUNDARY_REQUIRED","Restore runs through the trusted storage boundary.")
         case "backup_create": throw CoreError("STORAGE_BOUNDARY_REQUIRED","Backup runs through the storage admission boundary before a domain transaction.")
         default: throw CoreError("UNSUPPORTED_METHOD","\(method) is not implemented in this build. No action was performed.")
         }

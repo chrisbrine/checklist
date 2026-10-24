@@ -59,7 +59,8 @@ class TestInstancesTests(unittest.TestCase):
             argv = ['test_instances.py', 'create', '--slot', '4', '--session-id', 'actual-session']
             if replace:
                 argv.append('--replace')
-            with patch.object(sys, 'argv', argv), patch.object(harness, 'checked'), \
+            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), \
+                 patch.object(sys, 'argv', argv), patch.object(harness, 'checked'), \
                  patch.object(harness, 'locked', return_value=ExitStack()), patch.object(harness, 'create') as create:
                 harness.main()
                 arguments = create.call_args.args[0]
@@ -289,7 +290,7 @@ class StopWaitTests(unittest.TestCase):
 
 class DestroyCleanupTests(unittest.TestCase):
     def setUp(self):
-        identity = patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': ''})
+        identity = patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
         identity.start()
         self.addCleanup(identity.stop)
 
@@ -375,7 +376,7 @@ class DestroyCleanupTests(unittest.TestCase):
         identities = [('explicit', {}, 'slot-fixture'),
                       ('codex', {'CODEX_THREAD_ID': 'slot-fixture'}, None),
                       ('claude', {'CLAUDE_SESSION_ID': 'slot-fixture'}, None),
-                      ('missing', {}, None)]
+                      ('checklist', {'CHECKLIST_SESSION_ID': 'slot-fixture'}, None)]
         for number, (identity, environment, session_id) in itertools.product(range(1, 5), identities):
             with self.subTest(slot=number, identity=identity), self.slot(number) as state, \
                  patch.dict(os.environ, environment), redirect_stderr(io.StringIO()) as warnings:
@@ -388,14 +389,10 @@ class DestroyCleanupTests(unittest.TestCase):
                         return cleanup_run(command, **kwargs)
                     if command[0] == 'ditto':
                         marker_path = state.p['folder'] / '.checklist-workspace.json'
-                        if identity == 'missing':
-                            self.assertFalse(marker_path.exists())
-                            self.assertIn('skipping qualification marker', warnings.getvalue())
-                        else:
-                            marker = json.loads(marker_path.read_text())
-                            self.assertEqual(marker['session_id'], 'slot-fixture')
-                            self.assertFalse(marker['released'])
-                            self.assertEqual(marker['source_fingerprint'], 'b' * 64)
+                        marker = json.loads(marker_path.read_text())
+                        self.assertEqual(marker['session_id'], 'slot-fixture')
+                        self.assertFalse(marker['released'])
+                        self.assertEqual(marker['source_fingerprint'], 'b' * 64)
                         self.assertTrue(all(count == 0 for count in state.counts.values()))
                         self.assertTrue(all(not (state.preferences / (domain + '.plist')).exists()
                                             for domain in state.domains))
@@ -424,6 +421,34 @@ class DestroyCleanupTests(unittest.TestCase):
                 self.assertEqual(harness.load(state.p)['build_id'], 'replacement')
                 self.assertEqual(len(list((state.home / '.Trash').iterdir())), 2)
 
+    def test_missing_identity_refuses_create_and_replace_before_any_side_effect(self):
+        for number, replace, seed in itertools.product(range(1, 5), [False, True],
+                                                     ['empty', 'backup:/owned/store', 'slot:2']):
+            with self.subTest(slot=number, replace=replace, seed=seed), self.slot(number) as state:
+                if not replace:
+                    # Exercise a new destination without running the actual destroy path.
+                    (state.p['folder'] / 'slot.json').unlink()
+                    state.p['folder'].rmdir()
+                before = sorted(str(p.relative_to(state.home)) for p in state.home.rglob('*'))
+                with patch.object(harness, 'stopped') as stopped, \
+                     patch.object(harness, 'stage_selection') as stage, \
+                     patch.object(harness, 'destroy') as destroy:
+                    with self.assertRaisesRegex(ValueError, 'caller session unknown/invalid'):
+                        harness.create(SimpleNamespace(slot=number, replace=replace, seed=seed), state.p)
+                    stopped.assert_not_called();stage.assert_not_called();destroy.assert_not_called()
+                self.assertEqual(state.calls, [])
+                self.assertEqual(sorted(str(p.relative_to(state.home)) for p in state.home.rglob('*')), before)
+
+    def test_missing_identity_cli_refuses_before_slot_locks_or_admission(self):
+        for replace in [False, True]:
+            argv = ['test_instances.py', 'create', '--slot', '4', '--seed', 'backup:/owned/store']
+            if replace: argv.append('--replace')
+            with patch.object(sys, 'argv', argv), patch.object(harness, 'checked') as checked, \
+                 patch.object(harness, 'locked') as locked, patch.object(harness, 'create') as create:
+                with self.assertRaisesRegex(ValueError, 'caller session unknown/invalid'):
+                    harness.main()
+                checked.assert_not_called();locked.assert_not_called();create.assert_not_called()
+
     def test_replace_cleanup_failure_preserves_slot_and_never_copies_stage(self):
         with self.slot() as state, patch.object(harness, 'stopped'), \
              patch.object(harness, 'stage_selection', return_value=(state.home / 'stage', {'source_fingerprint': 'b' * 64})), \
@@ -431,7 +456,7 @@ class DestroyCleanupTests(unittest.TestCase):
              patch.object(harness, 'run', return_value=SimpleNamespace(
                  returncode=36, stdout='', stderr='Keychain unavailable')) as run:
             with self.assertRaisesRegex(ValueError, 'Keychain unavailable'):
-                harness.create(SimpleNamespace(slot=4, replace=True, seed='empty'), state.p)
+                harness.create(SimpleNamespace(slot=4, replace=True, seed='empty', session_id='slot-fixture'), state.p)
             self.assertTrue(state.p['folder'].is_dir())
             self.assertEqual(harness.load(state.p), {'slot': 4})
             self.assertEqual(run.call_count, 1)
@@ -457,7 +482,7 @@ class DestroyCleanupTests(unittest.TestCase):
     def test_existing_slot_without_replace_never_cleans_names(self):
         with self.slot() as state, patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection') as stage:
             with self.assertRaisesRegex(ValueError, 'Slot exists'):
-                harness.create(SimpleNamespace(slot=4, replace=False, seed='empty'), state.p)
+                harness.create(SimpleNamespace(slot=4, replace=False, seed='empty', session_id='slot-fixture'), state.p)
             self.assertEqual(state.calls, [])
             stage.assert_not_called(); state.stopped.assert_not_called()
 
@@ -565,6 +590,27 @@ class SnapshotLogicTests(unittest.TestCase):
             self.assertEqual(seed['source_hash'], harness.sha(source / 'manifest.json'))
             self.assertFalse(seed['live_snapshot'])
             self.assertFalse((destination / 'checklist-store.identity.json').exists())
+
+    def test_agent_current_snapshot_family_counts_and_no_migration_seed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination, manifest = self.fixture(Path(directory).resolve(), schema=3)
+            observation = harness.database_observation(source / 'database.sqlite')
+            manifest.update(recordFamilies={'project': 0, 'task': 0}, tableRows=observation['table_rows'])
+            (source / 'manifest.json').write_text(json.dumps(manifest))
+            seed = harness.snapshot_seed(source, destination)
+            self.assertTrue(seed['current_schema_no_migration'])
+            self.assertEqual(harness.sha(destination / 'checklist.sqlite'), manifest['databaseSHA256'])
+            self.assertEqual(harness.database_observation(destination / 'checklist.sqlite')['schema'], 3)
+
+    def test_manifest_count_mismatch_refuses_before_seed_bytes(self):
+        for field, value in [('recordFamilies', {'task': 1}), ('tableRows', {'records': 99})]:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                source, destination, manifest = self.fixture(Path(directory).resolve(), schema=3)
+                manifest[field] = value
+                (source / 'manifest.json').write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(ValueError, 'counts mismatch'):
+                    harness.snapshot_seed(source, destination)
+                self.assertEqual(list(destination.iterdir()), [])
 
     def test_bad_hash_and_extra_file_refuse_before_materialization(self):
         for fault in ['hash', 'extra']:
@@ -834,7 +880,7 @@ class SeedIsolationTests(unittest.TestCase):
             def run(command):
                 if command[0] == 'ditto': harness.shutil.copytree(command[1], command[2])
                 return subprocess.CompletedProcess(command, 0, '', '')
-            with patch.dict(os.environ, {'CODEX_THREAD_ID': 'slot-fixture', 'CLAUDE_SESSION_ID': ''}), patch.object(sys, 'argv', ['test_instances.py', 'create', '--slot', '4', '--stage', str(stage), '--seed', 'backup:' + str(source)]), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(stage, selected)), patch.object(harness, 'require_managed_path_support'), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'signing_teams'), patch.object(harness, 'run', side_effect=run):
+            with patch.dict(os.environ, {'CODEX_THREAD_ID': 'slot-fixture', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(sys, 'argv', ['test_instances.py', 'create', '--slot', '4', '--stage', str(stage), '--seed', 'backup:' + str(source)]), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(stage, selected)), patch.object(harness, 'require_managed_path_support'), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'signing_teams'), patch.object(harness, 'run', side_effect=run):
                 harness.main()
             p = harness.checked(4);created = harness.load(p)
             self.assertEqual(created['mode'], 'stopped')
@@ -1160,7 +1206,7 @@ class SeedIsolationTests(unittest.TestCase):
             p = harness.checked(1)
             manifest = {'build_id': 'fixture', 'source_fingerprint': 'b' * 64}
             args = SimpleNamespace(slot=1, replace=False, seed='backup:' + str(source), session_id='slot-fixture')
-            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(base, manifest)), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'require_managed_path_support'), patch.object(harness, 'run') as run:
+            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(base, manifest)), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'require_managed_path_support'), patch.object(harness, 'run') as run:
                 with self.assertRaisesRegex(ValueError, 'managed.path contract'): harness.create(args, p)
                 marker = json.loads((p['folder'] / '.checklist-workspace.json').read_text())
                 self.assertFalse(marker['released'])
@@ -1243,6 +1289,11 @@ class SeedIsolationTests(unittest.TestCase):
 
 
 class LiveRootTests(unittest.TestCase):
+    def setUp(self):
+        # Root-admission cases supply their own creator; never inherit the host caller.
+        identity = patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
+        identity.start();self.addCleanup(identity.stop)
+
     def test_checked_refuses_another_slots_aliased_root(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory).resolve()
@@ -1282,10 +1333,11 @@ class LiveRootTests(unittest.TestCase):
                         Path(unicodedata.normalize('NFD', str(data).lower())) / 'FÛTURE/child']
             for live in variants:
                 for command in commands:
+                    identity_args = ['--session-id', 'live-root-fixture'] if command[0] == 'create' else []
                     with self.subTest(live=live, command=command), ExitStack() as stack:
                         stack.enter_context(patch.object(harness, 'BASE', base))
                         stack.enter_context(patch.object(harness, 'LIVE', live))
-                        stack.enter_context(patch.object(sys, 'argv', ['test_instances.py', *command, '--slot', '1']))
+                        stack.enter_context(patch.object(sys, 'argv', ['test_instances.py', *command, '--slot', '1', *identity_args]))
                         actions = [stack.enter_context(patch.object(harness, name))
                                    for name in ['locked', 'run', 'load', 'save', 'trash', 'processes', 'launch_state', 'stage_selection', 'slot_seed']]
                         with self.assertRaisesRegex(ValueError, 'effective live root'): harness.checked(1)
@@ -1337,10 +1389,11 @@ class LiveRootTests(unittest.TestCase):
             (data.parent / 'slot.json').write_text(json.dumps({'slot': 1}))
             for live in self.overlaps(base):
                 for command in commands:
+                    identity_args = ['--session-id', 'live-root-fixture'] if command[0] == 'create' else []
                     with self.subTest(live=live, command=command), ExitStack() as stack:
                         stack.enter_context(patch.object(harness, 'BASE', base))
                         stack.enter_context(patch.object(harness, 'LIVE', live))
-                        stack.enter_context(patch.object(sys, 'argv', ['test_instances.py', *command, '--slot', '1']))
+                        stack.enter_context(patch.object(sys, 'argv', ['test_instances.py', *command, '--slot', '1', *identity_args]))
                         actions = [stack.enter_context(patch.object(harness, name))
                                    for name in ['run', 'load', 'save', 'trash', 'processes', 'launch_state', 'stage_selection', 'slot_seed']]
                         with self.assertRaisesRegex(ValueError, 'effective live root'): harness.main()
@@ -1358,10 +1411,11 @@ class LiveRootTests(unittest.TestCase):
             (base / 'slot-2/data').mkdir(parents=True)
             for live in self.overlaps(base, 2):
                 for command in commands:
+                    identity_args = ['--session-id', 'live-root-fixture'] if command[0] == 'create' else []
                     with self.subTest(live=live, command=command), ExitStack() as stack:
                         stack.enter_context(patch.object(harness, 'BASE', base))
                         stack.enter_context(patch.object(harness, 'LIVE', live))
-                        stack.enter_context(patch.object(sys, 'argv', ['test_instances.py', *command]))
+                        stack.enter_context(patch.object(sys, 'argv', ['test_instances.py', *command, *identity_args]))
                         locks = stack.enter_context(patch.object(harness, 'locked'))
                         actions = [stack.enter_context(patch.object(harness, name))
                                    for name in ['create', 'stop', 'destroy', 'promote']]

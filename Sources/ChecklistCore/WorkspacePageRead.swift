@@ -5,6 +5,9 @@ extension CommandRouter {
     /// Owner workspace surfaces keep one bounded value, separate from the full
     /// snapshot index. An omitted row never means that the record was deleted.
     func workspacePage(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
+        try workspacePage(db,p,c,sharedMetadata:nil)
+    }
+    private func workspacePage(_ db: Database,_ p: JSON,_ c: Caller,sharedMetadata: JSON?) throws -> JSON {
         try owner(c)
         if p["surface"] as? String == "overview" { return try overviewGroupsPage(db,p,c) }
         let surfaces = ["requests","human_tasks","epics","activity","epic_tasks","epic_candidates","triage_tasks","triage_candidates","worker_sessions","record","recent_reviews","completed_since"] + Self.needSurfaces
@@ -118,12 +121,21 @@ extension CommandRouter {
         // Sidebar metadata spans every owned project even when record rows are
         // scoped to one project. Keep that catalog separate from the SQL row
         // scope above; only the trusted owner may use this command.
-        let catalogs = try projects(db,c)
-        let needs = try ownerNeedsYouCounts(db)
-        return ["workspace_version":1,"surface":surface,"record_id":recordID,"rows":rows,"total":total,"needs_you_count":needs.requests + needs.tasks,"has_more":fetched.count>limit,
+        let metadata: JSON
+        if let sharedMetadata {metadata = sharedMetadata}
+        else {
+            let needs = try ownerNeedsYouCounts(db)
+            // Native pages need authenticated identity, not the provider/route
+            // capability catalogs. Those remain available from service_info.
+            let identityKeys: Set<String> = ["session_id","caller","name","version","build_id","build_number","store_incarnation","role","project_ids","read_version"]
+            let service = try dispatch(db,method:"service_info",p:[:],c:c).filter {identityKeys.contains($0.key)}
+            metadata = ["projects":try projects(db,c),"service":service,"needs_you_count":needs.requests + needs.tasks,
+                        "content_cursor":try cursor(db,caller:c,scope:authorizationScope(db,c),sequence:latest)]
+        }
+        let page: JSON = ["workspace_version":1,"surface":surface,"record_id":recordID,"rows":rows,"total":total,"has_more":fetched.count>limit,
                 "next_cursor":fetched.count>limit ? try cursor(db,caller:c,scope:cursorScope,sequence:offset+limit) : NSNull(),
-                "previous_cursor":offset>0 ? try cursor(db,caller:c,scope:cursorScope,sequence:max(0,offset-limit)) : NSNull(),
-                "projects":catalogs,"service":try dispatch(db,method:"service_info",p:[:],c:c),"content_cursor":try cursor(db,caller:c,scope:authorizationScope(db,c),sequence:latest)]
+                "previous_cursor":offset>0 ? try cursor(db,caller:c,scope:cursorScope,sequence:max(0,offset-limit)) : NSNull()]
+        return page.merging(metadata) {_,shared in shared}
     }
     /// Overview groups by what needs the owner (CL-53). Each is an ordinary paged task surface with an
     /// exact total; together they derive from existing ticket, attempt and session records only.
@@ -144,14 +156,18 @@ extension CommandRouter {
         let quiet = "(COALESCE(json_extract(r.data,'$.work_health.attention'),0)=1 OR (" + session + "<>'human' AND json_extract(" + attempt + ",'$.waiting_for_resource') IS NULL AND checklist_timestamp(COALESCE(json_extract(" + attempt + ",'$.last_checkpoint'),json_extract(" + attempt + ",'$.started_at')))<=:quietBefore))"
         // Unclaimed historical health does not remain actionable after release.
         // A member still handled by an active phase or sibling remains Active attention.
+        // Build the scoped member set once. Correlating this lookup per ticket
+        // let SQLite scan all project tasks before each group's json_each rows;
+        // CROSS JOIN keeps each sibling an exact primary-key lookup instead.
         let unclaimedHealthActive = """
-            (\(category)='active' OR EXISTS (
-              SELECT 1 FROM records g WHERE g.type='group' AND g.project_id=r.project_id
+            (\(category)='active' OR (r.project_id,r.id) IN (
+              SELECT g.project_id,CASE WHEN m.type='object' THEN json_extract(m.value,'$.task_id') ELSE m.value END
+              FROM records g CROSS JOIN json_each(CASE WHEN json_array_length(json_extract(g.data,'$.members'))>0 THEN json_extract(g.data,'$.members') ELSE json_extract(g.data,'$.task_ids') END) m
+              WHERE g.type='group' AND g.project_id IN (SELECT value FROM json_each(:projects))
               AND json_extract(g.data,'$.kind')='triage' AND COALESCE(json_extract(g.data,'$.archived'),0)=0
-              AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_array_length(json_extract(g.data,'$.members'))>0 THEN json_extract(g.data,'$.members') ELSE json_extract(g.data,'$.task_ids') END) m WHERE (CASE WHEN m.type='object' THEN json_extract(m.value,'$.task_id') ELSE m.value END)=r.id)
               AND (json_extract(g.data,'$.orchestration.state')='active' OR EXISTS (
-                SELECT 1 FROM json_each(CASE WHEN json_array_length(json_extract(g.data,'$.members'))>0 THEN json_extract(g.data,'$.members') ELSE json_extract(g.data,'$.task_ids') END) m
-                JOIN records t ON t.id=(CASE WHEN m.type='object' THEN json_extract(m.value,'$.task_id') ELSE m.value END) AND t.type='task' AND t.project_id=g.project_id
+                SELECT 1 FROM json_each(CASE WHEN json_array_length(json_extract(g.data,'$.members'))>0 THEN json_extract(g.data,'$.members') ELSE json_extract(g.data,'$.task_ids') END) sibling
+                CROSS JOIN records t ON t.id=(CASE WHEN sibling.type='object' THEN json_extract(sibling.value,'$.task_id') ELSE sibling.value END) AND t.type='task' AND t.project_id=g.project_id
                 LEFT JOIN records s ON s.id=json_extract(t.data,'$.status_id') AND s.type='status' AND s.project_id=t.project_id
                 WHERE json_extract(t.data,'$.active_attempt_id') IS NOT NULL OR json_extract(s.data,'$.category')='active'))))
             """
@@ -172,25 +188,28 @@ extension CommandRouter {
         }
     }
 
-    /// CL-53: every Overview group's first page in one command. Each group is the exact single-surface reply
-    /// (rows, total, cursors), so "Show all" can continue from it; one command also means one native
-    /// dispatch pass after it instead of one per group.
+    /// Every Overview group's first page in one command. Rows, totals and page
+    /// cursors match singles; shared catalogs/identity/coverage occur once.
     static let overviewGroupLimits: [(surface: String, limit: Int)] = [("requests",5),("human_tasks",1),("needs_review",5),("needs_pickup",5),
         ("needs_active",5),("needs_quiet",5),("needs_recovery",5),("needs_done_today",5),("recent_reviews",60),("completed_since",20)]
     private func overviewGroupsPage(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         var groups: JSON = [:]
-        var last: JSON = [:]
+        var metadata: JSON?
         for (surface,limit) in Self.overviewGroupLimits {
             var sub: JSON = ["surface":surface,"limit":limit]
             if let project = p["project_id"] { sub["project_id"] = project }
             if surface == "completed_since" { sub["since"] = p["since"] ?? NSNull() }
             if surface == "completed_since" && (p["since"] as? String ?? "").isEmpty { continue }
-            last = try workspacePage(db,sub,c); groups[surface] = last
+            var page = try workspacePage(db,sub,c,sharedMetadata:metadata)
+            if metadata == nil {metadata = page.filter {Self.overviewSharedFields.contains($0.key)}}
+            for key in Self.overviewSharedFields {page.removeValue(forKey:key)}
+            groups[surface] = page
         }
-        return ["workspace_version":1,"surface":"overview","record_id":"","groups":groups,"rows":[JSON](),"total":0,"has_more":false,
-                "next_cursor":NSNull(),"previous_cursor":NSNull(),"projects":last["projects"] ?? [JSON](),"service":last["service"] ?? [:],
-                "content_cursor":last["content_cursor"] ?? NSNull(),"needs_you_count":last["needs_you_count"] ?? 0]
+        let page: JSON = ["workspace_version":1,"surface":"overview","record_id":"","groups":groups,"rows":[JSON](),"total":0,"has_more":false,
+                          "next_cursor":NSNull(),"previous_cursor":NSNull()]
+        return page.merging(metadata ?? [:]) {_,shared in shared}
     }
+    private static let overviewSharedFields: Set<String> = ["projects","service","content_cursor","needs_you_count"]
 
     /// The active attempt of a listed ticket: who works, in which phase, and how recent its checkpoint is.
     private func activeWork(_ db: Database, task: JSON) throws -> JSON? {

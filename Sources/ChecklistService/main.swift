@@ -77,7 +77,9 @@ final class StorageRecoveryPeer: NSObject, ChecklistRPC {
 final class Coordinator: NSObject, NSXPCListenerDelegate {
     let router: CommandRouter
     let listener = NSXPCListener(machServiceName: ChecklistInstance.current.machServiceName)
-    let queue = DispatchQueue(label: "org.checklist.commands")
+    // Bound request envelopes, reply serialization and afterCommand bridge
+    // temporaries even when the service thread's outer pool is long-lived.
+    let queue = DispatchQueue(label: "org.checklist.commands", autoreleaseFrequency: .workItem)
     var enrollments: [String: Enrollment] = [:]
     var waiters: [UUID: () -> Void] = [:]
     var nativeListener: NativeReplyListener?
@@ -90,12 +92,14 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     var nativeInFlight: [String: NativeInFlight] = [:]
     var workHealthWake: DispatchWorkItem?
     var workHealthFailures = 0
-    let enrollmentFile = ChecklistPaths.root.appendingPathComponent("connections.json")
+    let enrollmentFile: URL
     let expectedOwnerPath: String
     let expectedOwnerHash: Data?
+    let nativeCodeIdentity = NativeCodeIdentity()
     let clientIdentity = ClientCodeIdentity.bundledAdmission()
-    init(router: CommandRouter) {
+    init(router: CommandRouter, enrollmentFile: URL = ChecklistPaths.root.appendingPathComponent("connections.json"), startBackgroundWork: Bool = true) {
         self.router = router
+        self.enrollmentFile = enrollmentFile
         let gui=ChecklistPaths.serviceExecutable.deletingLastPathComponent().appendingPathComponent("ChecklistApp").resolvingSymlinksInPath()
         self.expectedOwnerPath=gui.path
         var code:SecStaticCode?
@@ -107,7 +111,9 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         super.init()
         if let data = try? Data(contentsOf: enrollmentFile), let records = try? JSONDecoder().decode([String: Enrollment].self, from: data) { enrollments = records }
         listener.delegate = self
-        queue.async { [weak self] in self?.observeNativeConversationLifecycles();self?.armStorageWake();self?.runWorkHealth() }
+        if startBackgroundWork {
+            queue.async { [weak self] in self?.observeNativeConversationLifecycles();self?.armStorageWake();self?.runWorkHealth() }
+        }
     }
     /// Advisory database supervision only; never launches or polls a model.
     /// One bounded page per wake; persisted deadlines survive sleep/restart.
@@ -214,11 +220,13 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         guard x.count == y.count else { return false }
         return zip(x,y).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
     }
-    enum Routed { case done([String: Any]); case router(method: String, params: [String: Any], caller: Caller) }
-    func execute(_ request: [String: Any], connection: NSXPCConnection) throws -> [String: Any] {
-        switch try route(request, connection: connection) {
-        case .done(let result): return result
-        case .router(let method, let params, let caller): return try router.handle(method:method,params:params,caller:caller)
+    enum Routed { case done([String: Any], runHooks: Bool = true); case router(method: String, params: [String: Any], caller: Caller) }
+    func execute(_ request: [String: Any], connection: NSXPCConnection, timing: ServiceCallTiming? = nil) throws -> [String: Any] {
+        let routed = try ServiceCallTiming.measure(timing,"bootstrap_verification_ms") { try route(request, connection: connection) }
+        switch routed {
+        case .done(let result, _): return result
+        case .router(let method, let params, let caller):
+            return try ServiceCallTiming.measure(timing,"execution_ms") { try router.handle(method:method,params:params,caller:caller) }
         }
     }
     /// Resolves the caller and every coordinator-owned operation on the serial queue.
@@ -226,7 +234,8 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     func route(_ request: [String: Any], connection: NSXPCConnection) throws -> Routed {
         observeNativeConversationLifecycles()
         if request["method"] as? String == "connection_bootstrap" {
-            return .done(try bootstrap(request["params"] as? [String:Any] ?? [:], connection:connection))
+            let result = try bootstrap(request["params"] as? [String:Any] ?? [:], connection:connection)
+            return .done(result.reply, runHooks:result.changed)
         }
         let method = request["method"] as? String ?? ""
         let params = request["params"] as? [String: Any] ?? [:]
@@ -327,6 +336,9 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         if !FileManager.default.fileExists(atPath:directory.path) { try? FileManager.default.createDirectory(at:directory,withIntermediateDirectories:false,attributes:[.posixPermissions:0o700]) }
         do { nativeListener=try NativeReplyListener(path:directory.appendingPathComponent("\(getpid()).sock").path) }
         catch { fputs("Native reply listener unavailable: \(error.localizedDescription)\n",stderr);return }
+        // Startup owns one pending-delivery pass; ordinary pure reads no longer
+        // provide incidental dispatch after a service restart.
+        queue.async { [self] in autoreleasepool {dispatchNative()} }
         DispatchQueue.global(qos:.utility).async { [self] in
             guard let listener = nativeListener else { return }
             NativeReplyLoop.run(shouldContinue: { self.nativeListener != nil },
@@ -471,38 +483,42 @@ final class Peer: NSObject, ChecklistRPC {
         guard request.count <= 4 * 1024 * 1024 else { reply(Data("{\"error\":{\"code\":\"TOO_LARGE\",\"message\":\"Command is larger than 4 MiB.\"}}".utf8));return }
         // Drain caller-thread JSON/serialization and hook temporaries for each
         // request, including off-queue reads and deferred change replies.
+        let received = ProcessInfo.processInfo.systemUptime
         coordinator.queue.async { [self] in autoreleasepool {
-            if let object = try? JSONSerialization.jsonObject(with:request) as? [String:Any], object["method"] as? String == "changes_wait", let connection {
+            let object = (try? JSONSerialization.jsonObject(with:request)) as? [String:Any]
+            let timing = object?["diagnostics_timing"] as? Bool == true ? ServiceCallTiming(received:received) : nil
+            timing?.queued(since: received)
+            if let object, object["method"] as? String == "changes_wait", let connection {
                 let id = UUID()
                 let finish: () -> Void = { [self] in autoreleasepool {
                     do {
-                        let result = try coordinator.execute(object,connection:connection)
+                        let result = try coordinator.execute(object,connection:connection,timing:timing)
                         let payload = result["data"] as? [String:Any] ?? result
                         if payload["changed"] as? Bool == true {
                             coordinator.waiters.removeValue(forKey:id)
-                            reply((try? JSONSerialization.data(withJSONObject:result)) ?? Data("{}".utf8))
+                            reply(Self.responseBytes(result,timing:timing))
                         }
                     } catch {
                         coordinator.waiters.removeValue(forKey:id)
-                        reply(Self.errorBytes(error))
+                        reply(Self.responseBytes(["error":Self.publicError(error)],timing:timing))
                     }
                 }}
                 coordinator.waiters[id] = finish
                 finish()
                 coordinator.queue.asyncAfter(deadline:.now()+8) { [self] in autoreleasepool {
                     guard coordinator.waiters.removeValue(forKey:id) != nil else { return }
-                    do { let result=try coordinator.execute(object,connection:connection);reply((try? JSONSerialization.data(withJSONObject:result)) ?? Data("{}".utf8)) }
-                    catch { reply(Self.errorBytes(error)) }
+                    do { let result=try coordinator.execute(object,connection:connection,timing:timing);reply(Self.responseBytes(result,timing:timing)) }
+                    catch { reply(Self.responseBytes(["error":Self.publicError(error)],timing:timing)) }
                 }}
                 return
             }
             let routed: Coordinator.Routed
             do {
-                guard let connection, let object = try JSONSerialization.jsonObject(with: request) as? [String:Any] else { throw ChecklistError("INVALID_INPUT","Invalid command envelope.") }
-                routed = try coordinator.route(object,connection:connection)
-            } catch { finish(["error":Self.publicError(error)],reply:reply);return }
+                guard let connection, let object else { throw ChecklistError("INVALID_INPUT","Invalid command envelope.") }
+                routed = try ServiceCallTiming.measure(timing,"bootstrap_verification_ms") { try coordinator.route(object,connection:connection) }
+            } catch { finish(["error":Self.publicError(error)],timing:timing,runHooks:Self.requiresAfterCommand(object?["method"] as? String ?? ""),reply:reply);return }
             switch routed {
-            case .done(let result): finish(result,reply:reply)
+            case .done(let result,let runHooks): finish(result,timing:timing,runHooks:runHooks,reply:reply)
             case .router(let method,let params,let caller) where CommandRouter.runsOutsideSerialQueue(method):
                 // CL-71/72: file work and pure reads do not hold the serial queue; the router
                 // serializes writes itself. Retain the original reply until handle returns
@@ -510,25 +526,42 @@ final class Peer: NSObject, ChecklistRPC {
                 // never cancels it; a same-ID retry uses the router's stored receipt.
                 // Hooks return to the serial queue after the reply.
                 let router = coordinator.router
+                let queued = ProcessInfo.processInfo.systemUptime
                 DispatchQueue.global(qos:.userInitiated).async { [self] in autoreleasepool {
+                    timing?.queued(since:queued)
                     let result: [String:Any]
-                    do { result = try router.handle(method:method,params:params,caller:caller) } catch { result = ["error":Self.publicError(error)] }
-                    reply((try? JSONSerialization.data(withJSONObject:result,options:[.sortedKeys])) ?? Data("{}".utf8))
-                    coordinator.queue.async { [self] in autoreleasepool {afterCommand(result)} }
+                    do { result = try ServiceCallTiming.measure(timing,"execution_ms") { try router.handle(method:method,params:params,caller:caller) } } catch { result = ["error":Self.publicError(error)] }
+                    reply(Self.responseBytes(result,timing:timing))
+                    coordinator.queue.async { [self] in autoreleasepool {afterCommand(result,runHooks:Self.requiresAfterCommand(method),timed:timing)} }
                 }}
             case .router(let method,let params,let caller):
                 let result: [String:Any]
-                do { result = try coordinator.router.handle(method:method,params:params,caller:caller) } catch { result = ["error":Self.publicError(error)] }
-                finish(result,reply:reply)
+                do { result = try ServiceCallTiming.measure(timing,"execution_ms") { try coordinator.router.handle(method:method,params:params,caller:caller) } } catch { result = ["error":Self.publicError(error)] }
+                finish(result,timing:timing,runHooks:Self.requiresAfterCommand(method),reply:reply)
             }
         }}
     }
-    /// On the serial queue.
-    func finish(_ result:[String:Any],reply:(Data)->Void) {
-        reply((try? JSONSerialization.data(withJSONObject:result,options:[.sortedKeys])) ?? Data("{}".utf8))
-        afterCommand(result)
+    /// These paths do not prepare managed reads/leases or repair availability.
+    /// Keep hooks on other reads that can fall back to the writer.
+    static func requiresAfterCommand(_ method:String) -> Bool {
+        !["service_info","tool_catalog","task_get","session_list","project_list","project_resolve"].contains(method)
     }
-    func afterCommand(_ result:[String:Any]) {
+    /// On the serial queue.
+    func finish(_ result:[String:Any],timing:ServiceCallTiming? = nil,runHooks:Bool = true,reply:(Data)->Void) {
+        reply(Self.responseBytes(result,timing:timing))
+        afterCommand(result,runHooks:runHooks,timed:timing)
+    }
+    static func responseBytes(_ result:[String:Any],timing:ServiceCallTiming?) -> Data {
+        if let timing {return (try? timing.encode(result)) ?? Data("{}".utf8)}
+        return (try? JSONSerialization.data(withJSONObject:result,options:[.sortedKeys])) ?? Data("{}".utf8)
+    }
+    func afterCommand(_ result:[String:Any],runHooks:Bool = true,timed:ServiceCallTiming? = nil) {
+        // The selected pure reads cannot create deliveries or cleanup deadlines. Their hooks used
+        // to re-read/project every pending native delivery after each reply.
+        // Startup, committed writes and native/storage event hooks own those wakes.
+        guard runHooks else { return }
+        let started = ProcessInfo.processInfo.systemUptime
+        defer {if let timed {CallTimingLog.write(["scope":"service_hooks","request_id":timed.requestID,"total_ms":(ProcessInfo.processInfo.systemUptime-started)*1000])}}
         if result["error"] == nil {
             coordinator.changed();coordinator.dispatchNative()
             coordinator.armStorageWake()
