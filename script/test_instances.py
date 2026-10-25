@@ -351,7 +351,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
     source_root is the verified snapshot manifest's origin or the stopped source
     slot's root. Legacy managed descriptors from that root are admitted for Core's
     protected relocation, not redirected by this harness. Other Checklist roots
-    remain forbidden. Verified live snapshots may admit display-only source
+    remain forbidden. Verified source manifests may admit display-only source
     summaries; startup restricts those to the exact recorded metadata fields.
     Counts are occurrences, including repeated project refs.
     """
@@ -825,10 +825,38 @@ def restored_inventory(root):
     return sorted(inventory)
 
 
+def restored_source_manifest(source, receipt):
+    """Recover origin only from the exact manifest verified by the product restore.
+
+    Format-1 restore receipts do not embed sourceRoot. Search only published
+    backups of the restoring installation and the configured/default live root;
+    neither database summaries nor stored managed paths choose a file to open.
+    """
+    for root in sorted({source.parent.parent, LIVE, DEFAULT_LIVE}):
+        for pattern in ['snapshot-*/manifest.json', 'qualification-*/snapshot-*/manifest.json']:
+            for file in sorted((root / 'backups').glob(pattern)):
+                try:
+                    contained(file, root / 'backups')
+                    if not file.is_file() or file.stat().st_size > 128 * 1_048_576: continue
+                    with file.open('rb') as stream: raw = stream.read(128 * 1_048_576 + 1)
+                except (OSError, ValueError):
+                    continue
+                if len(raw) > 128 * 1_048_576 or hashlib.sha256(raw).hexdigest() != receipt['manifest_sha256']: continue
+                manifest = json.loads(raw)
+                origin = manifest.get('sourceRoot')
+                if (manifest.get('format') not in [1, 2] or manifest.get('kind') != 'checklist-store-snapshot'
+                        or manifest.get('schema') != 3 or manifest.get('storeID') != receipt['source_store_id']
+                        or not isinstance(origin, str) or not origin.startswith('/') or '\0' in origin
+                        or any(part in ['', '.', '..'] for part in origin.split('/')[1:])):
+                    raise ValueError('Restored source manifest does not match its validation receipt.')
+                return file, origin
+    return None, str(source)  # Preserve strict admission for self-contained legacy candidates.
+
+
 def restored_seed(source, destination, destination_root=None):
     source = source.expanduser().absolute()
     contained(source, source)
-    # Restore qualification never reads any part of either live root, including backups/restore.
+    # Candidate bytes must be disposable; origin proof may read published backup manifests.
     if any(paths_overlap(source, live) for live in {LIVE, DEFAULT_LIVE}):
         raise ValueError('Restored seed must not overlap the live data root; use a disposable restore.')
     if source.parent.name != 'restore' or not re.fullmatch(r'restored-[0-9a-f]{32}', source.name):
@@ -867,12 +895,19 @@ def restored_seed(source, destination, destination_root=None):
     if (values.get('incarnation') != receipt['incarnation']
             or json.loads(values.get('restore_receipt', '{}')) != {k: v for k, v in receipt.items() if k != 'database_sha256'}):
         raise ValueError('Restored database has no matching authority-fencing receipt.')
-    inspection = require_local_paths(database, destination_root or destination, source_root=source)
+    source_manifest, source_root = restored_source_manifest(source, receipt)
+    summary_source_root = source_root if source_manifest is not None else None
+    inspection = require_local_paths(database, destination_root or destination, source_root=source_root,
+                                     summary_source_root=summary_source_root)
+    source_summary_paths = inspection.pop('source_summary_paths', {})
     shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=True)
     if restored_inventory(destination) != before or restored_inventory(source) != before:
         raise ValueError('Restored root copy verification failed or source changed.')
-    require_local_paths(destination / 'checklist.sqlite', destination_root or destination, source_root=source)
-    return {'kind': 'restored', 'source': str(source), 'source_root': str(source),
+    require_local_paths(destination / 'checklist.sqlite', destination_root or destination, source_root=source_root,
+                        summary_source_root=summary_source_root, summary_source_paths=source_summary_paths)
+    return {'kind': 'restored', 'source': str(source), 'source_root': source_root,
+            'source_manifest': str(source_manifest) if source_manifest is not None else None,
+            'source_summary_paths': source_summary_paths,
             'restore_job': receipt['command_id'], 'manifest_sha256': receipt['manifest_sha256'],
             'database_sha256': receipt['database_sha256'], 'receipt_sha256': hashlib.sha256(receipt_bytes).hexdigest(),
             'source_hash': hashlib.sha256(json.dumps(before).encode()).hexdigest(),
@@ -1102,7 +1137,8 @@ def start(arguments, p):
     if metadata['seed']['kind'] != 'empty':
         require_managed_path_support(Path(metadata['stage_path']), manifest)
         seed = metadata['seed']
-        summary_source_root = seed.get('source_root') if seed['kind'] == 'backup' and seed.get('live_snapshot') else None
+        source_summaries = (seed['kind'] == 'backup' and seed.get('live_snapshot')) or (seed['kind'] == 'restored' and seed.get('source_manifest'))
+        summary_source_root = seed.get('source_root') if source_summaries else None
         require_local_paths(p['data'] / 'checklist.sqlite', p['data'], immutable=False, source_root=seed.get('source_root'),
                             summary_source_root=summary_source_root, summary_source_paths=seed.get('source_summary_paths', {}))
     logs = contained(p['folder'] / 'logs', p['folder']); logs.mkdir(mode=0o700, exist_ok=True)

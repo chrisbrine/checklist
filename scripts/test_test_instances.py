@@ -673,6 +673,13 @@ class SnapshotLogicTests(unittest.TestCase):
 
 
 class RestoredSeedTests(unittest.TestCase):
+    def setUp(self):
+        # Origin discovery must never enumerate the developer's real backups.
+        directory = tempfile.TemporaryDirectory();self.addCleanup(directory.cleanup)
+        for name in ['LIVE', 'DEFAULT_LIVE']:
+            patched = patch.object(harness, name, Path(directory.name).resolve() / name)
+            patched.start();self.addCleanup(patched.stop)
+
     def fixture(self, base):
         source = base / 'restore' / ('restored-' + 'a' * 32); source.mkdir(parents=True)
         records = [('session', {'id': 'session', 'state': 'revoked', 'authorization_generation': 'new-generation', 'restore_quarantined': True}),
@@ -693,6 +700,157 @@ class RestoredSeedTests(unittest.TestCase):
         (source / 'objects').mkdir();(source / 'objects/file').write_bytes(b'managed')
         destination = base / 'copy';destination.mkdir()
         return source, destination, receipt
+
+    def origin_fixture(self, base, snapshot_format=2, records=(), summaries=()):
+        source, destination, receipt = self.fixture(base)
+        destination.rmdir();destination = base / 'slots/slot-4/data';destination.mkdir(parents=True)
+        origin = base / 'Checklist'
+        manifest_file = origin / 'backups/snapshot-fixture/manifest.json'
+        manifest_file.parent.mkdir(parents=True)
+        manifest = {'format': snapshot_format, 'kind': 'checklist-store-snapshot', 'schema': 3,
+                    'storeID': receipt['source_store_id'], 'sourceRoot': str(origin)}
+        manifest_file.write_text(json.dumps(manifest))
+        receipt['manifest_sha256'] = harness.sha(manifest_file)
+        self.update_restored_fixture(source, receipt, records, summaries)
+        return source, destination, receipt, origin, manifest_file
+
+    def update_restored_fixture(self, source, receipt, records=(), summaries=()):
+        with closing(sqlite3.connect(source / 'checklist.sqlite')) as db, db:
+            db.create_collation('checklist_storage_v2', lambda a, b: (a.encode() > b.encode()) - (a.encode() < b.encode()))
+            for kind, record in records:
+                db.execute('INSERT INTO records VALUES (?,?,?,?,?)', (record['id'], None, kind, 1, json.dumps(record)))
+            for key, summary in summaries:
+                db.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)', (key, json.dumps(summary)))
+            db.execute("UPDATE metadata SET value=? WHERE key='restore_receipt'",
+                       (json.dumps({k: v for k, v in receipt.items() if k != 'database_sha256'}),))
+        receipt['database_sha256'] = harness.sha(source / 'checklist.sqlite')
+        (source / 'restore-receipt.json').write_text(json.dumps(receipt))
+
+    def test_restored_source_backup_summary_is_receipt_bound_and_byte_preserving(self):
+        for snapshot_format in [1, 2]:
+            with self.subTest(format=snapshot_format), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve()
+                source, destination, receipt, origin, manifest = self.origin_fixture(base, snapshot_format)
+                key = 'storage-last-verified-backup'
+                summary = {'path': str(origin / 'backups/snapshot-earlier'), 'source_root': str(origin)}
+                self.update_restored_fixture(source, receipt, summaries=[(key, summary)])
+                before = harness.restored_inventory(source)
+                with patch.object(harness, 'LIVE', origin), patch.object(harness, 'DEFAULT_LIVE', origin):
+                    seed = harness.restored_seed(source, destination)
+                self.assertEqual(seed['source_root'], str(origin))
+                self.assertEqual(seed['source_manifest'], str(manifest))
+                self.assertEqual(seed['source_summary_paths'], {key: summary})
+                self.assertEqual(harness.restored_inventory(source), before)
+                self.assertEqual(harness.restored_inventory(destination), before)
+
+    def test_restored_source_capture_paths_use_verified_origin_and_local_copy(self):
+        for snapshot_format in [1, 2]:
+            with self.subTest(format=snapshot_format), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve()
+                source, destination, receipt, origin, _ = self.origin_fixture(base, snapshot_format)
+                relative = 'source-captures/project/capture/source'
+                capture = source / relative;capture.mkdir(parents=True)
+                (capture / 'file').write_bytes(b'captured bytes')
+                record = {'id': 'manifest', 'evidence': {'source_capture': {'snapshot_path': str(origin / relative)}}}
+                self.update_restored_fixture(source, receipt, records=[('manifest', record)])
+                before = harness.restored_inventory(source)
+                with patch.object(harness, 'LIVE', origin), patch.object(harness, 'DEFAULT_LIVE', origin):
+                    seed = harness.restored_seed(source, destination)
+                self.assertEqual(seed['path_inspection']['managed_origin_absolute'], 1)
+                self.assertFalse((origin / relative).exists())  # Origin bytes are never consulted.
+                self.assertEqual(harness.restored_inventory(source), before)
+                self.assertEqual(harness.restored_inventory(destination), before)
+
+    def test_restored_origin_does_not_admit_unrelated_roots_or_unsafe_local_links(self):
+        for case in ['managed', 'summary', 'local_link']:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve()
+                source, destination, receipt, origin, _ = self.origin_fixture(base)
+                unrelated = base / 'Checklist Test Instances/slot-2/data'
+                path = unrelated / 'source-captures/project/capture/source'
+                summaries = []
+                records = [('manifest', {'id': 'manifest', 'evidence': {'source_capture': {'snapshot_path': str(path)}}})]
+                expected = 'managed path into a different Checklist data root'
+                if case == 'summary':
+                    records = [];summaries = [('storage-last-verified-backup', {'path': str(unrelated / 'backups/snapshot-other')})]
+                    expected = 'outside the destination slot root'
+                elif case == 'local_link':
+                    capture = source / 'source-captures/project/capture/source';capture.mkdir(parents=True)
+                    (capture / 'file').write_bytes(b'captured bytes')
+                    (capture / 'link').symlink_to('file')
+                    records[0][1]['evidence']['source_capture']['snapshot_path'] = str(origin / capture.relative_to(source) / 'link')
+                    expected = 'stored file path through a symlink'
+                self.update_restored_fixture(source, receipt, records, summaries)
+                before = harness.restored_inventory(source)
+                with patch.object(harness, 'LIVE', origin), patch.object(harness, 'DEFAULT_LIVE', origin), \
+                     patch.object(harness, 'BASE', unrelated.parent.parent):
+                    with self.assertRaisesRegex(ValueError, expected): harness.restored_seed(source, destination)
+                self.assertEqual(list(destination.iterdir()), [])
+                self.assertEqual(harness.restored_inventory(source), before)
+
+    def test_restored_source_manifest_requires_matching_hash_store_schema_and_safe_root(self):
+        for case in ['hash', 'missing', 'symlink', 'unpublished', 'store', 'schema', 'relative', 'traversal']:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve()
+                source, destination, receipt, origin, manifest = self.origin_fixture(base)
+                summary = {'path': str(origin / 'backups/snapshot-earlier'), 'source_root': str(origin)}
+                if case == 'hash': manifest.write_text(manifest.read_text() + '\n')
+                elif case == 'missing': manifest.unlink()
+                elif case == 'symlink':
+                    other = base / 'manifest.json';manifest.rename(other);manifest.symlink_to(other)
+                elif case == 'unpublished': manifest.parent.rename(manifest.parent.with_name('.snapshot-incomplete-fixture'))
+                else:
+                    value = json.loads(manifest.read_text())
+                    if case == 'store': value['storeID'] = '10000000-0000-4000-8000-000000000001'
+                    elif case == 'schema': value['schema'] = 2
+                    elif case == 'relative': value['sourceRoot'] = 'Checklist'
+                    else: value['sourceRoot'] = str(origin / '../Checklist')
+                    manifest.write_text(json.dumps(value));receipt['manifest_sha256'] = harness.sha(manifest)
+                self.update_restored_fixture(source, receipt, summaries=[('storage-last-verified-backup', summary)])
+                before = harness.restored_inventory(source)
+                with patch.object(harness, 'LIVE', origin), patch.object(harness, 'DEFAULT_LIVE', origin):
+                    with self.assertRaises(ValueError): harness.restored_seed(source, destination)
+                self.assertEqual(list(destination.iterdir()), [])
+                self.assertEqual(harness.restored_inventory(source), before)
+
+    def test_restoring_installation_qualification_manifest_supplies_origin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            source, destination, _, origin, manifest = self.origin_fixture(base)
+            target = base / 'backups/qualification-fixture/snapshot-fixture/manifest.json'
+            target.parent.mkdir(parents=True);manifest.rename(target)
+            with patch.object(harness, 'LIVE', base / 'other-live'), patch.object(harness, 'DEFAULT_LIVE', base / 'default-live'):
+                seed = harness.restored_seed(source, destination)
+            self.assertEqual(seed['source_root'], str(origin))
+            self.assertEqual(seed['source_manifest'], str(target))
+
+    def test_restored_summary_start_retains_exact_source_values_without_reopening_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            source, destination, receipt, origin, manifest = self.origin_fixture(base)
+            key = 'storage-last-verified-backup'
+            summary = {'path': str(origin / 'backups/snapshot-earlier'), 'source_root': str(origin)}
+            self.update_restored_fixture(source, receipt, summaries=[(key, summary)])
+            with patch.object(harness, 'LIVE', origin), patch.object(harness, 'DEFAULT_LIVE', origin), \
+                 patch.object(harness, 'BASE', destination.parent.parent):
+                p = harness.checked(4)
+                seed = harness.restored_seed(source, destination)
+                harness.save(p, {'slot': 4, 'stage_path': str(base / 'stage'), 'mode': 'stopped', 'seed': seed})
+                manifest.unlink()
+                before = harness.sha(destination / 'checklist.sqlite')
+                with patch.object(harness, 'bundle_check', return_value={}), patch.object(harness, 'require_managed_path_support'), \
+                     patch.object(harness, 'launch_state', return_value={'registered': True}), \
+                     patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}), \
+                     patch.object(harness, 'service_status') as health, patch.object(harness, 'run') as run:
+                    harness.start(SimpleNamespace(slot=4, gui=False), p)
+                    harness.start(SimpleNamespace(slot=4, gui=False), p)
+                    self.assertEqual(health.call_count, 2)
+                    self.assertEqual(harness.sha(destination / 'checklist.sqlite'), before)
+                    changed = dict(summary, path=str(origin / 'backups/snapshot-new'))
+                    self.update_restored_fixture(destination, receipt, summaries=[(key, changed)])
+                    with self.assertRaisesRegex(ValueError, 'outside the destination slot root'):
+                        harness.start(SimpleNamespace(slot=4, gui=False), p)
+                    self.assertEqual(health.call_count, 2);run.assert_not_called()
 
     def test_valid_seed_preserves_bytes_incarnation_fences_and_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
