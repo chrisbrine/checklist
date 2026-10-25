@@ -743,6 +743,32 @@ class RestoredSeedTests(unittest.TestCase):
                 self.assertEqual(harness.restored_inventory(source), before)
                 self.assertEqual(harness.restored_inventory(destination), before)
 
+    def test_restored_summary_exception_requires_live_origin_snapshot(self):
+        # CL-276 review 18111a9a: a receipt-matching manifest from a non-live origin
+        # (for example another test slot) keeps managed-origin checks but no summary exception.
+        for snapshot_format in [1, 2]:
+            with self.subTest(format=snapshot_format), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve()
+                source, destination, receipt, origin, manifest = self.origin_fixture(base, snapshot_format)
+                live = base / 'live-elsewhere'
+                with patch.object(harness, 'LIVE', live), patch.object(harness, 'DEFAULT_LIVE', origin):
+                    seed = harness.restored_seed(source, destination)
+                self.assertEqual(seed['source_manifest'], str(manifest))
+                self.assertEqual(seed['source_root'], str(origin))
+                self.assertFalse(seed['live_snapshot'])
+                self.assertEqual(seed['source_summary_paths'], {})
+                key = 'storage-last-verified-backup'
+                summary = {'path': str(origin / 'backups/snapshot-earlier'), 'source_root': str(origin)}
+                self.update_restored_fixture(source, receipt, summaries=[(key, summary)])
+                again = base / 'slots/slot-4/data-again'; again.mkdir(parents=True)
+                before = harness.restored_inventory(source)
+                with patch.object(harness, 'LIVE', live), patch.object(harness, 'DEFAULT_LIVE', origin):
+                    with self.assertRaises(ValueError):
+                        harness.restored_seed(source, again)
+                self.assertEqual(harness.restored_inventory(source), before)
+                with patch.object(harness, 'LIVE', origin), patch.object(harness, 'DEFAULT_LIVE', origin):
+                    self.assertTrue(harness.restored_seed(source, again)['live_snapshot'])
+
     def test_restored_source_capture_paths_use_verified_origin_and_local_copy(self):
         for snapshot_format in [1, 2]:
             with self.subTest(format=snapshot_format), tempfile.TemporaryDirectory() as directory:
@@ -983,7 +1009,9 @@ class RestoredSeedTests(unittest.TestCase):
                 if command[0] == 'ditto': harness.shutil.copytree(command[1], command[2])
                 return subprocess.CompletedProcess(command, 0, '', '')
             args = SimpleNamespace(slot=4, seed='restored:' + str(source), replace=True, session_id='fixture-session')
-            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(stage, selected)), patch.object(harness, 'require_managed_path_support'), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'signing_teams'), patch.object(harness, 'destroy', side_effect=destroy), patch.object(harness, 'run', side_effect=run):
+            # Marking is covered by the clean_scratch tests; a TMPDIR inside a session
+            # scratchpad must not decide this copy-before-destroy case (CL-276 review).
+            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(stage, selected)), patch.object(harness, 'require_managed_path_support'), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'signing_teams'), patch.object(harness, 'destroy', side_effect=destroy), patch.object(harness, 'run', side_effect=run), patch.object(harness, 'mark_qualification'):
                 harness.create(args, p)
             seed = harness.load(p)['seed']
             self.assertEqual(seed['kind'], 'restored')

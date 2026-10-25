@@ -896,7 +896,9 @@ def restored_seed(source, destination, destination_root=None):
             or json.loads(values.get('restore_receipt', '{}')) != {k: v for k, v in receipt.items() if k != 'database_sha256'}):
         raise ValueError('Restored database has no matching authority-fencing receipt.')
     source_manifest, source_root = restored_source_manifest(source, receipt)
-    summary_source_root = source_root if source_manifest is not None else None
+    # Display-only summaries get the backup: seed's exception only from a live-origin snapshot.
+    live_snapshot = source_manifest is not None and is_live_snapshot(source_manifest.parent, source_root)
+    summary_source_root = source_root if live_snapshot else None
     inspection = require_local_paths(database, destination_root or destination, source_root=source_root,
                                      summary_source_root=summary_source_root)
     source_summary_paths = inspection.pop('source_summary_paths', {})
@@ -906,7 +908,7 @@ def restored_seed(source, destination, destination_root=None):
     require_local_paths(destination / 'checklist.sqlite', destination_root or destination, source_root=source_root,
                         summary_source_root=summary_source_root, summary_source_paths=source_summary_paths)
     return {'kind': 'restored', 'source': str(source), 'source_root': source_root,
-            'source_manifest': str(source_manifest) if source_manifest is not None else None,
+            'source_manifest': str(source_manifest) if source_manifest is not None else None, 'live_snapshot': live_snapshot,
             'source_summary_paths': source_summary_paths,
             'restore_job': receipt['command_id'], 'manifest_sha256': receipt['manifest_sha256'],
             'database_sha256': receipt['database_sha256'], 'receipt_sha256': hashlib.sha256(receipt_bytes).hexdigest(),
@@ -1137,7 +1139,10 @@ def start(arguments, p):
     if metadata['seed']['kind'] != 'empty':
         require_managed_path_support(Path(metadata['stage_path']), manifest)
         seed = metadata['seed']
-        source_summaries = (seed['kind'] == 'backup' and seed.get('live_snapshot')) or (seed['kind'] == 'restored' and seed.get('source_manifest'))
+        # Recorded paths only; a restored seed made before CL-276 r1 has no live_snapshot field.
+        source_summaries = (seed['kind'] == 'backup' and seed.get('live_snapshot')) or (
+            seed['kind'] == 'restored' and seed.get('source_manifest') is not None
+            and is_live_snapshot(Path(seed['source_manifest']).parent, seed.get('source_root')))
         summary_source_root = seed.get('source_root') if source_summaries else None
         require_local_paths(p['data'] / 'checklist.sqlite', p['data'], immutable=False, source_root=seed.get('source_root'),
                             summary_source_root=summary_source_root, summary_source_paths=seed.get('source_summary_paths', {}))
