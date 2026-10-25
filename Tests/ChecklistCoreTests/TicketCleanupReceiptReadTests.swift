@@ -64,6 +64,7 @@ final class TicketCleanupReceiptReadTests: XCTestCase {
         }
     }
     func testLatestSummaryPagesRetainFirstReceiptAndAreBoundedWithLargeItems() throws {
+        try QualificationSuite.requireEnabled()
         let large = (0..<250).map {["task_id":"t\($0)","action":"keep","reason":"open_ticket","summary":["detail":String(repeating:"x",count:2000)]] as JSON}
         for i in 0..<52 {_ = try receipt("pass-\(i)",items:large)}
         try router.dbQueue.write {try $0.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-first:"+pid,"pass-0"])}

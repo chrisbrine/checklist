@@ -30,7 +30,7 @@ struct TicketCleanupSettingsSection: View {
         let value = project.object("ticket_cleanup")
         done = value["done_evidence_enabled"] as? Bool ?? true;purge = value["closed_purge_enabled"] as? Bool ?? true;days = value["closed_days"] as? Int ?? 15
     }
-    private var receiptScope: String {project.id + ":" + store.storeIncarnation + ":" + store.archivePreviewEpoch.uuidString}
+    private var receiptScope: String {store.cleanupReceiptScope(project.id)}
     private func loadReceipts() {
         store.ticketCleanupReceipts.invalidate(scope:receiptScope)
         refreshID = UUID()
@@ -43,11 +43,13 @@ struct TicketCleanupSettingsSection: View {
 
 
 @MainActor final class TicketCleanupReceiptObservation: ObservableObject {
+    @Published private(set) var loaded = false
     @Published private(set) var receipts: [Record] = []
     @Published private(set) var scope = ""
     @Published private(set) var error = ""
     private var cache: [String:[Record]] = [:]
     private var generation = UUID()
+    func isCached(scope: String) -> Bool {cache[scope] != nil}
     func invalidate(scope: String) {
         cache.removeValue(forKey:scope)
         if self.scope == scope {generation = UUID()}
@@ -55,15 +57,15 @@ struct TicketCleanupSettingsSection: View {
     func load(scope: String,fetch: () async throws -> [String:Any]) async {
         guard !Task.isCancelled else {return}
         let token = UUID();generation = token
-        if self.scope != scope {receipts = []}
+        if self.scope != scope {receipts = [];loaded = false}
         self.scope = scope;error = ""
-        if let cached = cache[scope] {receipts = cached;return}
+        if let cached = cache[scope] {receipts = cached;loaded = true;return}
         do {
             let reply = try await fetch()
             guard generation == token,!Task.isCancelled else {return}
             receipts = (reply["receipts"] as? [[String:Any]] ?? []).map(Record.init)
             if cache.count >= 5 {cache.removeAll()}
-            cache[scope] = receipts
+            cache[scope] = receipts;loaded = true
         } catch {
             guard generation == token,!Task.isCancelled,!(error is CancellationError) else {return}
             self.error = PlainError.text(error)
@@ -82,5 +84,19 @@ private struct TicketCleanupReceiptRows: View {
             }
             if !observation.error.isEmpty {Text(observation.error).checklistFont(.micro).foregroundStyle(Color.red)}
         }
+    }
+}
+
+/// Observe receipt readiness independently of the large settings form. The
+/// panel's display pass commits the receipt rows even when they are below its
+/// viewport; measuring the rows' own draw would wait for a manual scroll.
+struct TicketCleanupContentFrame: View {
+    @EnvironmentObject var store: ChecklistStore
+    @ObservedObject var observation: TicketCleanupReceiptObservation
+    let projectID: String
+    var body: some View {
+        Color.clear.screenContentFrame(store.screenTiming,.cleanup,
+            ready:store.detail == .project(projectID) && store.selectedOther?.id == projectID && observation.scope == store.cleanupReceiptScope(projectID) && observation.loaded)
+            .allowsHitTesting(false).accessibilityHidden(true)
     }
 }

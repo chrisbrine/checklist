@@ -464,10 +464,37 @@ extension CommandRouter {
         }
     }
 
+    /// Rebuildable, connection-local selection. Every writer path (including
+    /// direct SQL, UPSERT, REPLACE and rollback) updates it in the same transaction.
+    /// Retained settled/other jobs can contain hundreds of MB of JSON; reparsing
+    /// that corpus after every ordinary note is not recovery work.
+    @discardableResult func ensureManagedImportRecoveryIndex(_ db: Database) throws -> Bool {
+        if try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM temp.sqlite_master WHERE type='table' AND name='checklist_import_recovery')") == true {return true}
+        // Empty/small fixture stores need no TEMP schema until the first job.
+        // The sole writer constructs the complete selection before recovering it.
+        guard try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM main.records WHERE type='storage_job')") == true else {return false}
+        func candidate(_ prefix: String) -> String {
+            "CASE WHEN json_valid(\(prefix)data) THEN CASE WHEN json_type(\(prefix)data)='object' THEN json_extract(\(prefix)data,'$.state') IN ('committed','repair_required') ELSE 1 END ELSE 1 END"
+        }
+        try db.inSavepoint {
+            try db.execute(sql:"CREATE TEMP TABLE checklist_import_recovery(record_rowid INTEGER PRIMARY KEY,source_id BLOB NOT NULL UNIQUE)")
+            try db.execute(sql:"INSERT INTO checklist_import_recovery SELECT rowid,CAST(id AS BLOB) FROM main.records WHERE type='storage_job' AND " + candidate(""))
+            for action in ["INSERT","UPDATE","DELETE"] {
+                let rows = action == "INSERT" ? ["NEW"] : action == "DELETE" ? ["OLD"] : ["OLD","NEW"]
+                let remove = rows.map {"DELETE FROM checklist_import_recovery WHERE record_rowid=\($0).rowid OR source_id=CAST(\($0).id AS BLOB);"}.joined()
+                let insert = action == "DELETE" ? "" : "INSERT INTO checklist_import_recovery SELECT NEW.rowid,CAST(NEW.id AS BLOB) WHERE NEW.type='storage_job' AND " + candidate("NEW.") + " ON CONFLICT(record_rowid) DO UPDATE SET source_id=excluded.source_id;"
+                try db.execute(sql:"CREATE TEMP TRIGGER checklist_import_recovery_" + action.lowercased() + " AFTER " + action + " ON main.records BEGIN " + remove + insert + " END")
+            }
+            return .commit
+        }
+        return true
+    }
+
     /// Bounded metadata recovery; never publishes a pending attachment or deletes
     /// a finalized original. Referenced objects and uncertain jobs are retained.
     func reconcileManagedAttachmentImports(_ db: Database) throws -> StorageMaintenanceWarning? {
-        let rows = try Row.fetchAll(db,sql:"SELECT rowid AS maintenance_position," + Self.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND rowid>? AND CASE WHEN json_valid(data) THEN CASE WHEN json_type(data)='object' THEN json_extract(data,'$.state') IN ('committed','repair_required') ELSE 1 END ELSE 1 END ORDER BY rowid LIMIT 32",arguments:[managedImportMaintenanceAfterRow])
+        guard try ensureManagedImportRecoveryIndex(db) else {return nil}
+        let rows = try Row.fetchAll(db,sql:"SELECT r.rowid AS maintenance_position," + Self.canonicalColumns(alias:"r") + " FROM temp.checklist_import_recovery i CROSS JOIN main.records r ON r.rowid=i.record_rowid AND CAST(r.id AS BLOB)=i.source_id WHERE i.record_rowid>? AND r.type='storage_job' ORDER BY i.record_rowid LIMIT 32",arguments:[managedImportMaintenanceAfterRow])
         managedImportMaintenanceAfterRow = rows.count == 32 ? (rows.last!["maintenance_position"] as Int64) : 0
         var warning: StorageMaintenanceWarning?
         for row in rows {

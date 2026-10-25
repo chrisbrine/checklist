@@ -273,10 +273,11 @@ public actor Bridge {
 
     private func localCall(_ name: String, _ arguments: Value) throws -> Value {
         if let error = registryStart.error, !ClaudeRegistryStart.limitedToolNames.contains(name) { throw error }
-        // service_info is a known read in every connection's limited/full catalog.
-        // Direct CLI calls still bootstrap/verify and send all parameters to the
-        // service's current caller/schema checks; no cached grant or result is used.
-        if command != "call" || name != "service_info" {
+        // Direct CLI calls already bootstrap/verify. The service checks its current
+        // caller, catalog/schema and grants for the actual command. Fetching and
+        // decoding the entire catalog here adds a serialized round trip per call.
+        // Keep local setup restrictions and MCP's advertised-tool checks.
+        if command != "call" || setupNotice != nil {
             let available = try localTools()
             guard available.contains(where: { $0.name == name }) else {
                 throw BridgeError("METHOD_UNAVAILABLE: This tool is unavailable to the paired connection: \(name)")

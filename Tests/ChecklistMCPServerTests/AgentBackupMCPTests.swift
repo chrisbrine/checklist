@@ -23,6 +23,7 @@ final class AgentBackupMCPTests: XCTestCase {
         private let lock = NSLock()
         private var backupCalls = 0
         private var backupFinished = false
+        var backupFailure: ChecklistError?
 
         init(role: String = "worker") throws {
             let caches = try FileManager.default.url(for:.cachesDirectory,in:.userDomainMask,appropriateFor:nil,create:true).resolvingSymlinksInPath()
@@ -53,6 +54,7 @@ final class AgentBackupMCPTests: XCTestCase {
             do {
                 if method == "backup_create" {
                     lock.lock();backupCalls += 1;lock.unlock()
+                    if let backupFailure { throw backupFailure }
                 }
                 defer {
                     if method == "backup_create" {lock.lock();backupFinished = true;lock.unlock()}
@@ -118,6 +120,16 @@ final class AgentBackupMCPTests: XCTestCase {
         let receipt = try StorageSnapshot.verify(files,operation:UUID(uuidString:manifest.operationID)!,budget:.production())
         XCTAssertEqual(receipt,data["manifest_sha256"] as? String)
         return (destination,manifest)
+    }
+
+    func testMCPBackupCapacityFailureNamesItsLimitInTextAndKeepsServerUsable() async throws {
+        let f = try Fixture()
+        f.backupFailure = ChecklistError("BACKUP_CAPACITY_EXCEEDED","Store preserved.",details:["reason":"snapshot_manifest_capacity"])
+        let client = try await start(f),reply = try await client.callTool(name:"backup_create",arguments:arguments(f))
+        XCTAssertTrue(reply.isError ?? false)
+        XCTAssertTrue(text(reply).contains("Reason: snapshot_manifest_capacity."),text(reply))
+        XCTAssertEqual(f.numberOfBackupCalls,1)
+        try await client.ping()
     }
 
     func testMCPAgentBackupAllowedRouteCreatesVerifiedSnapshotAndAgentEvent() async throws {

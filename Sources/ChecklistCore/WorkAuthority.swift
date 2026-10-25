@@ -45,7 +45,18 @@ extension CommandRouter {
         return (files,lanes)
     }
     func activeDescendants(_ db: Database, attempt: JSON) throws -> [JSON] {
-        let all = try records(db,type:"attempt",project:attempt["project_id"] as? String)
+        let project = attempt["project_id"] as? String
+        // Retained completed attempts cannot be active descendants. Select candidates
+        // in SQLite before canonical decoding, then retain the graph checks below.
+        // json_each considers every duplicate/escaped state key; Foundation's final
+        // value still decides eligibility. Malformed JSON remains fail-closed.
+        let all = try readSnapshotCache.records(db,key:["active-descendant-candidates",project]) {
+            var sql = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='attempt'"
+            var arguments = StatementArguments()
+            if let project {sql += " AND project_id=CAST(? AS TEXT)";arguments += [Data(project.utf8)]}
+            sql += " AND CASE WHEN json_valid(data) THEN EXISTS (SELECT 1 FROM json_each(records.data) WHERE key='state' AND type='text' AND CAST(value AS BLOB)=CAST('active' AS BLOB)) ELSE 1 END ORDER BY rowid"
+            return try Row.fetchAll(db,sql:sql,arguments:arguments)
+        }
         var parents = Set([attempt["id"] as! String]),result: [JSON] = []
         while true {
             let added = all.filter { row in row["state"] as? String == "active" && !parents.contains(row["id"] as? String ?? "") && parents.contains(row["parent_attempt_id"] as? String ?? "") }

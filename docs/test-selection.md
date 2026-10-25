@@ -40,11 +40,29 @@ When Core is selected, the generated command includes `env CHECKLIST_STORAGE_PRO
 
 The full **default** Swift suite runs with `--parallel`. Its budget on this Mac is
 180 seconds wall time with an incremental build; an affected App or typical Core
-run has a 60-second budget. Record the load average and command with each timing.
-All 13 targets use process-isolated SwiftPM test workers. The native
-`SourceGitConfinementTests` class runs separately with `--parallel --num-workers 1`:
+run has a 60-second budget. Record the load average at execution start and end, and the command with each timing.
+For CL-266 margin checks, aim for 120 seconds default and 40 seconds affected App
+under the recorded load; the acceptance limits remain 180 and 60 seconds.
+All 13 targets share 64 process-isolated SwiftPM test workers (`--num-workers 64`).
+SwiftPM launches a test host for each selected XCTest method; these are not
+64 workers per target. The count overlaps repeated host startup; splitting a
+test class does not reduce the number of host launches. The worker count does not change the build-slot cap.
+Long App recovery and MCP archive-reason matrices expose their variants as
+separate XCTest methods, retaining all original combinations and assertions so
+one method does not leave a worker running the whole matrix at the end. The native
+`SourceGitConfinementTests` class runs separately in one serial XCTest host:
+`xcrun xctest -XCTest ChecklistCoreTests.SourceGitConfinementTests <scratch>/debug/ChecklistCoreTests.xctest`.
+The parallel pass builds that exact bundle first. This avoids SwiftPM's separate
+whole-package rediscovery (and unused App-host loading) for this isolated class:
 its positive controls repeatedly received SIGKILL alongside concurrent Git probes
-on this Mac. The remaining Core tests retain parallel workers. The selector supplies the
+on this Mac. Its 12 methods remain serial and isolated from other test work;
+the direct class selector avoids both 12 separate single-worker hosts and
+`--no-parallel` launching unrelated empty bundles. `DelegateChildBindingTests` also runs in its own serial host against
+`<scratch>/debug/ChecklistMCPServerTests.xctest`, keeping suspended-child signing
+and exec observation off the concurrent unit queue. Its four cases and their
+assertions remain in every applicable default plan. Neither isolated host runs
+alongside the parallel pass. Core and MCPServer retain parallel workers for
+their other methods, as do all other test targets. The selector supplies the
 shared SwiftPM dependency cache flags. Keep the build-slot concurrency wrapper. Run independent Python checks concurrently
 with the Swift pipeline (up to three Python processes), keeping Swift invocations
 on one scratch path sequential. Record slot-wait time separately from execution;
@@ -56,25 +74,42 @@ python3 script/affected_tests.py --full --qualification --scratch-path <build-sl
 ```
 
 The second command opts into the **Qualification suite**: real-size object/media
-round trips, scale/query/cleanup measurements, writer contention and memory soaks.
-`QUALIFICATION_TESTS` lists exact XCTest identifiers. Their original fixtures and
-assertions stay in place; `QualificationSuite.requireEnabled()` makes a direct
+round trips, scale/query/cleanup measurements, writer contention, memory soaks
+and deliberately elapsed-time observations. The latter include
+`ChecklistIPCTests.LongCommandTests/testCommandLongerThanOldDeadlineReturnsCommittedResultThroughRealClient`
+(the unchanged 16-second real XPC deadline check) and
+`ChecklistAppTests.IsolatedDefaultsTests/testPreferencesRemainAbsentAfterChildProcessExit`
+(the unchanged post-exit persistence observation). The other IPC timeout/replay
+and in-memory preferences correctness cases remain in the default suite.
+`ChecklistCoreTests.TestStoreTests/testWarmStoreSetupReportsPairedMedians` keeps
+its 25-pair setup measurement, and
+`ChecklistCoreTests.MediaListQueryTests/testExamplesStayCollapsedUntilShowThenCapPageAndNeverGrantApproval`
+keeps its 70-item accepted-history pagination fixture, in qualification too.
+`ChecklistCoreTests.TicketCleanupReceiptReadTests/testLatestSummaryPagesRetainFirstReceiptAndAreBoundedWithLargeItems`
+retains all 52 receipts, 250 items per receipt and its one-second read assertion
+in that same single-worker group. Small receipt paging/cursor cases stay default.
+`QUALIFICATION_TESTS` lists exact XCTest identifiers across Core, App and IPC. Their original fixtures and
+assertions stay in place; the shared `QualificationSuite.requireEnabled()` makes a direct
 `swift test` skip them unless `CHECKLIST_QUALIFICATION=1`. The planner's single
 `--qualification` switch adds a separate single-worker qualification invocation
 with this variable enabled. Scale/soak probes therefore do not compete with the
-default unit workers. JSON `qualification_commands` identifies these argv arrays;
+default unit workers. The historical `default_swift_commands`/`swift_commands` fields contain the
+ordered native XCTest commands as well as SwiftPM argv arrays.
+JSON `qualification_commands` identifies qualification argv arrays;
 they are also included in `swift_commands`/`commands`. The aggregate `skip` list
 names cases omitted across the whole plan, including qualification commands.
 The sustained-writer soak defaults to 360 seconds when qualification is enabled;
 `CL193_SOAK_SECONDS` may set a longer measurement (minimum 180 seconds).
+Affected qualification commands include only registered cases in the selected test targets,
+including App and IPC timing cases when their production dependencies change.
 Small correctness cases in the same classes still run by default. Owned-copy
 qualifiers additionally require their existing explicitly selected private-copy
 inputs; the switch never selects a live store or fabricates those inputs.
 
-Affected plans include qualification when Core or its transitive dependencies,
-App Media sources, or unknown/package/build inputs change. Editing a gated
+Affected plans include qualification for selected test targets when their Core,
+App or IPC production dependencies, or unknown/package/build inputs change. Editing a gated
 qualification fixture selects its registered cases; editing the gate helper
-selects them all. JSON `qualification_tests` gives the exact included IDs. Full default mode
+selects all registered cases in the selected targets. JSON `qualification_tests` gives the exact included IDs. Full default mode
 always omits qualification; full qualification mode always includes it. This
 keeps the default budget separate from scale and soak coverage without dropping
 any assertions. `skip` and `qualification` in JSON make that decision reviewable.
@@ -88,11 +123,20 @@ own tickets. A previous failure is never a passing result for this ticket.
 
 `ChecklistTestSupport.TestStore` creates a pre-migrated empty template once per
 linked test-bundle identity under the assigned scratch path. An OS file lock
-protects atomic publication across parallel XCTest processes. Each fixture gets
+protects atomic publication across parallel XCTest processes. Each process
+retains the published template URL for its immutable loaded test image. Each fixture gets
 an APFS copy-on-write clone (ordinary copy fallback), fresh logical-store and
-incarnation IDs, and a fresh cursor seal key. Only disposable seed preparation
-uses relaxed SQLite synchronization; the returned production Router reopens
-with its normal FULL durability, admission, pools and startup recovery. Reopening
+incarnation IDs, and a fresh cursor seal key generated during private seed
+preparation so reopening does not need another durable key write. Only disposable seed preparation
+uses relaxed SQLite synchronization. The Router still opens through production
+admission, pools and startup recovery. Disposable unit fixtures then select
+SQLite `NORMAL` synchronization on their own writer, preserving WAL, foreign
+keys, transaction visibility and reopen behavior without a disk durability
+barrier per command. Qualification fixtures retain `FULL` (the helper's `durable`
+option also selects it explicitly). Direct production/storage/migration/crash
+constructors are unchanged. `TestStoreTests` checks this separation against a
+fresh production Router. The setup benchmark measures the actual unit helper
+with `durable: false` against fresh production setup. Reopening
 an existing fixture preserves its data. Fresh storage, migration, crash and
 failure qualifiers keep their original bootstrap path. `TestStoreTests` checks
 isolation, concurrent copies, reopen preservation and paired setup medians.

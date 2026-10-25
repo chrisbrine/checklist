@@ -34,6 +34,38 @@ final class CallTimingTests: XCTestCase {
             XCTAssertEqual((error as? ChecklistError)?.code,"CONNECTION_REVOKED")
         }
     }
+    private final class TimingPeer: NSObject, NSXPCListenerDelegate, ChecklistRPC {
+        let listener = NSXPCListener.anonymous()
+        var connections: [NSXPCConnection] = []
+        override init() {super.init();listener.delegate=self;listener.resume()}
+        func listener(_ listener: NSXPCListener,shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
+            connection.exportedInterface=NSXPCInterface(with:ChecklistRPC.self);connection.exportedObject=self
+            connections.append(connection);connection.resume();return true
+        }
+        func execute(_ request: Data,withReply reply: @escaping (Data)->Void) {
+            reply(try! ServiceCallTiming().encode(["data":["fixture":true]]))
+        }
+        func stop() {listener.invalidate();connections.forEach {$0.invalidate()}}
+    }
+    func testAnonymousIPCReportsSetupAndSendSeparatelyWithoutChangingReply() throws {
+        let peer = TimingPeer();defer {peer.stop()}
+        let pipe = Pipe(),saved = dup(STDERR_FILENO)
+        XCTAssertGreaterThanOrEqual(saved,0)
+        dup2(pipe.fileHandleForWriting.fileDescriptor,STDERR_FILENO)
+        defer {dup2(saved,STDERR_FILENO);close(saved)}
+        let request = try JSONSerialization.data(withJSONObject:["method":"service_info","params":[:],"diagnostics_timing":true])
+        let reply = try ChecklistClient(usesStoredCredential:false).requestOnce(request,replyTimeout:3,connection:NSXPCConnection(listenerEndpoint:peer.listener.endpoint))
+        dup2(saved,STDERR_FILENO);try pipe.fileHandleForWriting.close()
+        XCTAssertEqual((reply["data"] as? [String:Any])?["fixture"] as? Bool,true)
+        let lines = String(decoding:pipe.fileHandleForReading.readDataToEndOfFile(),as:UTF8.self).split(separator:"\n")
+        let line = try XCTUnwrap(lines.first {$0.hasPrefix("ChecklistTiming ")})
+        let fields = try JSONSerialization.jsonObject(with:Data(line.dropFirst("ChecklistTiming ".count).utf8)) as! [String:Any]
+        let setup = try XCTUnwrap(fields["connection_setup_ms"] as? Double),send = try XCTUnwrap(fields["send_to_reply_ms"] as? Double)
+        XCTAssertGreaterThanOrEqual(setup,0);XCTAssertGreaterThanOrEqual(send,0)
+        XCTAssertEqual(setup+send,fields["round_trip_ms"] as! Double,accuracy:1)
+        XCTAssertNotNil(fields["service"] as? [String:Any])
+    }
+
     func testDiagnosticLogIsOneJSONLineWithoutProtocolStdout() throws {
         let pipe = Pipe()
         CallTimingLog.write(["scope":"test","total_ms":1.25],to:pipe.fileHandleForWriting)

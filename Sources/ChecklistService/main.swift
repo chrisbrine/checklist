@@ -347,11 +347,32 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
                 onError: { error in fputs("Native reply rejected: \(error.localizedDescription)\n", stderr) })
         }
     }
+    /// Selection only. Core rechecks the delivery's current session/grant, and
+    /// delivery_record plus the existing pre-I/O check retain the durable fence.
+    static func nativeEndpointAvailable(_ enrollment: Enrollment) -> Bool {
+        guard let path = enrollment.nativeEndpoint else {return false}
+        var attrs = stat()
+        return lstat(path,&attrs) == 0 && UInt64(attrs.st_dev) == enrollment.nativeDevice && UInt64(attrs.st_ino) == enrollment.nativeInode
+    }
+    func nativeDispatchDeliveries(endpointAvailable: (Enrollment)->Bool = Coordinator.nativeEndpointAvailable,
+                                  load: ([String:Any]) -> [String:Any]?) -> [[String:Any]] {
+        let sessions = enrollments.values.filter {$0.nativeEndpoint != nil && $0.revoked != true && endpointAvailable($0)}.map { $0.sessionID }
+        var pending: [[String:Any]] = []
+        // Bound each internal request without imposing a new installation-wide
+        // enrollment limit. An empty route set performs no outbox projection.
+        for start in stride(from:0,to:sessions.count,by:256) {
+            let selected = Array(sessions[start..<min(start+256,sessions.count)])
+            pending += load(["native_session_ids":selected,"native_dispatch_candidates":true])?["deliveries"] as? [[String:Any]] ?? []
+        }
+        return pending
+    }
     func dispatchNative() {
         observeNativeConversationLifecycles()
         guard let listener=nativeListener else { return }
         let bridge=Caller(role:"owner",installation:"native-bridge",projectIDs:[])
-        guard let result=try? router.handle(method:"delivery_pending",params:[:],caller:bridge),let data=result["data"] as? [String:Any],let pending=data["deliveries"] as? [[String:Any]] else { return }
+        let pending = nativeDispatchDeliveries { params in
+            (try? router.handle(method:"delivery_pending",params:params,caller:bridge))?["data"] as? [String:Any]
+        }
         for delivery in pending {
             guard let id=delivery["id"] as? String,!attemptedDeliveries.contains(id), delivery["push_state"] as? String == "unavailable",
                   let sid=delivery["recipient_session_id"] as? String,
@@ -380,7 +401,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
                     let stillAuthorized=queue.sync { () -> Bool in
                         guard self.enrollments[enrollment.installation]?.generation == enrollment.generation,
                               self.enrollments[enrollment.installation]?.revoked != true,
-                              let current=try? self.router.handle(method:"delivery_pending",params:[:],caller:bridge),let data=current["data"] as? [String:Any],let deliveries=data["deliveries"] as? [[String:Any]] else { return false }
+                              let current=try? self.router.handle(method:"delivery_pending",params:["native_session_ids":[sid]],caller:bridge),let data=current["data"] as? [String:Any],let deliveries=data["deliveries"] as? [[String:Any]] else { return false }
                         return deliveries.contains { $0["id"] as? String == id }
                     }
                     guard stillAuthorized else { throw ChecklistError("RECIPIENT_REVOKED","Native send canceled before I/O because the route was revoked.") }

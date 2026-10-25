@@ -1,4 +1,5 @@
 import XCTest
+import GRDB
 import ChecklistTestSupport
 @testable import ChecklistCore
 
@@ -46,15 +47,31 @@ final class TestStoreTests: XCTestCase {
         XCTAssertEqual(errors, []); XCTAssertEqual(identities.count, 12)
     }
 
-    func testWarmStoreSetupReportsPairedMedians() throws {
+    func testUnitSynchronizationDoesNotChangeProductionOrQualification() throws {
         let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
-        let warm = try TestStore.router(root: root.appendingPathComponent("warm")); try warm.closeStore()
+        let unit = try TestStore.router(root: root.appendingPathComponent("unit"), durable: false)
+        let qualified = try TestStore.router(root: root.appendingPathComponent("qualified"), durable: true)
+        let production = try CommandRouter(root: root.appendingPathComponent("production"))
+        defer { try? unit.closeStore(); try? qualified.closeStore(); try? production.closeStore() }
+        for (router, synchronization) in [(unit, 1), (qualified, 2), (production, 2)] {
+            try router.dbQueue.read { db in
+                XCTAssertEqual(try Int.fetchOne(db, sql: "PRAGMA synchronous"), synchronization)
+                XCTAssertEqual(try Int.fetchOne(db, sql: "PRAGMA foreign_keys"), 1)
+                XCTAssertEqual(try String.fetchOne(db, sql: "PRAGMA journal_mode"), "wal")
+            }
+        }
+    }
+
+    func testWarmStoreSetupReportsPairedMedians() throws {
+        try QualificationSuite.requireEnabled()
+        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let warm = try TestStore.router(root: root.appendingPathComponent("warm"), durable: false); try warm.closeStore()
         var samples: [Double] = [], baseline: [Double] = []
         for index in 0..<25 {
             func sample(fast: Bool) throws {
                 let path = root.appendingPathComponent((fast ? "fast-" : "base-") + String(index))
                 let start = ProcessInfo.processInfo.systemUptime
-                let router = try fast ? TestStore.router(root: path) : CommandRouter(root: path)
+                let router = try fast ? TestStore.router(root: path, durable: false) : CommandRouter(root: path)
                 let elapsed = (ProcessInfo.processInfo.systemUptime - start) * 1000
                 if fast { samples.append(elapsed) } else { baseline.append(elapsed) }
                 try router.closeStore()

@@ -23,7 +23,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// The notification delegate must exist before launch ends, so that a click that launched the app opens its item (CL-59).
     func applicationWillFinishLaunching(_ notification: Notification) {
-        MainActor.assumeIsolated { _ = DesktopAlertCoordinator.shared }
+        MainActor.assumeIsolated {
+            // Set the app-wide appearance before any window or panel is shown.
+            if let name = TestInstanceAppearance.resolve() { NSApp.appearance = NSAppearance(named: name) }
+            _ = DesktopAlertCoordinator.shared
+        }
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)

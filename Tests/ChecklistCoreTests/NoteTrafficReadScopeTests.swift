@@ -37,6 +37,27 @@ final class NoteTrafficReadScopeTests: XCTestCase {
 }
 
 extension CoreTests {
+    func testNativePendingSelectionKeepsExactRecipientsAndCurrentGrantFences() throws {
+        let f = try nativeHandlerFixture(),bridge = Caller(role:"owner",installation:"native-bridge",projectIDs:[])
+        let note = try call("message_send",["project_id":f.pid,"task_id":f.task["id"]!,"body":"Native selection"])
+        let id = (note["deliveries"] as! [JSON])[0]["id"] as! String
+        func selected(_ ids: [String]) throws -> [JSON] {try call("delivery_pending",["native_session_ids":ids],bridge)["deliveries"] as! [JSON]}
+        XCTAssertEqual(try selected([f.sid]).map {$0["id"] as! String},[id])
+        let candidates: JSON = ["native_session_ids":[f.sid],"native_dispatch_candidates":true]
+        XCTAssertEqual((try call("delivery_pending",candidates,bridge)["deliveries"] as! [JSON]).count,1)
+        _ = try call("delivery_record",["delivery_id":id,"state":"uncertain","receipt":["stage":"native_send_started"]],bridge)
+        XCTAssertTrue((try call("delivery_pending",candidates,bridge)["deliveries"] as! [JSON]).isEmpty,"A durably fenced send cannot be a new native candidate")
+        XCTAssertEqual(try selected([f.sid]).count,1,"The existing pre-I/O authorization recheck must still see an uncertain delivery")
+        XCTAssertTrue(try selected([]).isEmpty)
+        XCTAssertTrue(try selected([f.sid + "\0tail"]).isEmpty,"Selection keeps the complete identity")
+        XCTAssertTrue(try selected(["other-session"]).isEmpty)
+        XCTAssertThrowsError(try call("delivery_pending",["native_session_ids":[f.sid],"include_acknowledged":true],bridge))
+        XCTAssertThrowsError(try call("delivery_pending",["native_session_ids":[f.sid]],f.worker),"The filter cannot expose the internal bridge to workers")
+        _ = try call("message_ack",["project_id":f.pid,"delivery_id":id],f.worker)
+        XCTAssertTrue(try selected([f.sid]).isEmpty,"Acknowledgment retires a cached candidate")
+        XCTAssertEqual((try call("delivery_pending",["include_acknowledged":true],bridge)["deliveries"] as! [JSON]).count,1)
+    }
+
     func testPendingDeliveryHistoryModeAndAcknowledgmentInvalidateCachedReads() throws {
         let f = try nativeHandlerFixture(),bridge = Caller(role:"owner",installation:"native-bridge",projectIDs:[])
         let first = try call("message_send",["project_id":f.pid,"task_id":f.task["id"]!,"body":"Acknowledged"])

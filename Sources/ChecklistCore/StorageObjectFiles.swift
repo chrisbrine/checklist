@@ -18,9 +18,9 @@ final class StorageSnapshotMeasurement {
 
 struct StorageSnapshotBudget {
     // CL-163: bounded product policy, shared by owner backup and pre-upgrade.
-    // The qualified retained store needs ~1.7 GiB, 56k objects and a 35 MB manifest.
+    // CL-270: compact metadata and backup-local content sharing qualify capture growth.
     static let byteLimit: Int64 = 8 * 1_073_741_824
-    static let objectLimit = 200_000
+    static let objectLimit = 500_000
     static let manifestByteLimit = 128 * 1_048_576
     static let productionSeconds: TimeInterval = 1_800
     static func production() -> Self {
@@ -39,6 +39,7 @@ struct StorageSnapshotBudget {
     var maximumRecords: Int = 100_000
     var pagesPerStep: Int32 = 64
     var folderAccess = StorageFolderAccess()
+    var linkFile: (Int32, String, Int32, String) -> Int32 = { linkat($0, $1, $2, $3, 0) }
 
     func check() throws {
         if canceled() { throw StorageSnapshotFailure.canceled }
@@ -82,11 +83,15 @@ final class StorageObjectFiles {
     private let rootKey: Data
     private struct GateAncestor { let parent: Int32; let name: String; let device: dev_t; let inode: ino_t }
     private var gateAncestors: [GateAncestor]?
+    // Enabled only for a newly created, unpublished snapshot/restore stage.
+    private let batchSynchronization: Bool
+    private var pendingDirectories: Set<String> = []
 
-    init(root: URL, folderAccess: StorageFolderAccess = .init(), pinRootForGates: Bool = false) throws {
+    init(root: URL, folderAccess: StorageFolderAccess = .init(), pinRootForGates: Bool = false, batchSynchronization: Bool = false) throws {
         guard root.isFileURL, root.path.hasPrefix("/") else { throw StorageSnapshotFailure.io }
         self.root = root.standardizedFileURL
         self.folderAccess = folderAccess
+        self.batchSynchronization = batchSynchronization
         // Foundation standardization can turn physical /private/tmp and
         // /private/var paths back into these macOS aliases. Resolve ONLY the
         // verified platform prefix; all selected descendants still traverse
@@ -197,6 +202,10 @@ final class StorageObjectFiles {
     func parent(_ path: String, create: Bool = false) throws -> (Int32, String) {
         var parts = try Self.parts(path)
         let name = parts.removeLast()
+        if create, batchSynchronization {
+            var prefix = ""; pendingDirectories.insert(prefix)
+            for part in parts { prefix = prefix.isEmpty ? part : prefix + "/" + part; pendingDirectories.insert(prefix) }
+        }
         var current = dup(descriptor)
         guard current >= 0 else { throw StorageSnapshotFailure.io }
         do {
@@ -204,7 +213,7 @@ final class StorageObjectFiles {
                 if create, mkdirat(current, part, 0o700) != 0, errno != EEXIST { throw StorageSnapshotFailure.io }
                 let next = openat(current, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                 guard next >= 0 else { throw StorageSnapshotFailure.io }
-                if create, fsync(current) != 0 { Darwin.close(next); throw StorageSnapshotFailure.io }
+                if create, !batchSynchronization, fsync(current) != 0 { Darwin.close(next); throw StorageSnapshotFailure.io }
                 Darwin.close(current); current = next
             }
             return (current, name)
@@ -255,9 +264,9 @@ final class StorageObjectFiles {
 
     func read(_ path: String, maximum: Int) throws -> Data {
         try openRegular(path) { file in
-            var result = Data(), buffer = [UInt8](repeating: 0, count: 65_536)
+            var result = Data(), buffer = Data(count: 65_536)
             while true {
-                let count = Darwin.read(file, &buffer, buffer.count)
+                let count = buffer.withUnsafeMutableBytes { Darwin.read(file, $0.baseAddress, $0.count) }
                 if count < 0, errno == EINTR { continue }
                 guard count >= 0 else { throw StorageSnapshotFailure.io }
                 if count == 0 { return result }
@@ -314,17 +323,23 @@ final class StorageObjectFiles {
 
     func digest(_ path: String, budget: StorageSnapshotBudget) throws -> (String, Int64) {
         try openRegular(path) { file in
-            var digest = SHA256(), count: Int64 = 0, buffer = [UInt8](repeating: 0, count: 65_536)
+            var before = stat(); guard fstat(file, &before) == 0 else { throw StorageSnapshotFailure.io }
+            var digest = SHA256(), count: Int64 = 0, buffer = Data(count: 65_536)
             while true {
                 try budget.check()
-                let size = Darwin.read(file, &buffer, buffer.count)
+                let size = buffer.withUnsafeMutableBytes { Darwin.read(file, $0.baseAddress, $0.count) }
                 if size < 0, errno == EINTR { continue }
                 guard size >= 0 else { throw StorageSnapshotFailure.io }
                 if size == 0 { break }
                 count += Int64(size)
                 guard count <= budget.maximumBytes else { throw StorageSnapshotFailure.limit }
-                digest.update(data: Data(buffer.prefix(size)))
+                digest.update(data: buffer.prefix(size))
             }
+            var after = stat()
+            guard fstat(file, &after) == 0, before.st_dev == after.st_dev, before.st_ino == after.st_ino,
+                  before.st_size == after.st_size, count == after.st_size,
+                  before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec, before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
+                  before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec, before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec else { throw StorageSnapshotFailure.sourceChanged }
             return (Self.hex(digest.finalize()), count)
         }
     }
@@ -337,16 +352,16 @@ final class StorageObjectFiles {
         defer { Darwin.close(output) }
         let copied = try openRegular(path) { file -> (String, Int64) in
             var before = stat(); guard fstat(file, &before) == 0 else { throw StorageSnapshotFailure.io }
-            var digest = SHA256(), total: Int64 = 0, buffer = [UInt8](repeating: 0, count: 65_536)
+            var digest = SHA256(), total: Int64 = 0, buffer = Data(count: 65_536)
             while true {
                 try budget.check()
-                let size = Darwin.read(file, &buffer, buffer.count)
+                let size = buffer.withUnsafeMutableBytes { Darwin.read(file, $0.baseAddress, $0.count) }
                 if size < 0, errno == EINTR { continue }
                 guard size >= 0 else { throw StorageSnapshotFailure.io }
                 if size == 0 { break }
                 total += Int64(size)
                 guard total <= budget.maximumObjectBytes else { throw StorageSnapshotFailure.limit }
-                digest.update(data: Data(buffer.prefix(size)))
+                digest.update(data: buffer.prefix(size))
                 try buffer.withUnsafeBytes { raw in
                     var offset = 0
                     while offset < size {
@@ -365,11 +380,35 @@ final class StorageObjectFiles {
         }
         guard expected == nil || copied.0 == expected else { throw StorageSnapshotFailure.sourceChanged }
         guard fchmod(output, executable ? 0o700 : 0o600) == 0 else {throw StorageSnapshotFailure.io}
-        try Self.flush(output)
-        guard fsync(directory) == 0 else { throw StorageSnapshotFailure.io }
+        if destination.batchSynchronization {
+            guard fsync(output) == 0 else { throw StorageSnapshotFailure.io }
+        } else { try Self.flush(output) }
+        guard destination.batchSynchronization || fsync(directory) == 0 else { throw StorageSnapshotFailure.io }
         let verified = try destination.digest(target, budget: budget)
         guard verified == copied else { throw StorageSnapshotFailure.sourceChanged }
         return copied
+    }
+
+    /// A duplicate links only to already fsynced bytes inside this owned stage.
+    /// Every pathname remains in the manifest and receives full verification.
+    func writeHardLink(_ path: String, to existing: String,
+                       link: (Int32, String, Int32, String) -> Int32) throws -> Bool {
+        return try openRegular(existing) { file in
+            let (source, sourceName) = try parent(existing); defer { Darwin.close(source) }
+            let (destination, name) = try parent(path, create: true); defer { Darwin.close(destination) }
+            if link(source, sourceName, destination, name) != 0 {
+                // Keep owner destinations without hard links and saturated link
+                // groups usable; fallback copies retain all normal byte checks.
+                if [EMLINK, ENOTSUP, EPERM].contains(errno) { return false }
+                throw StorageSnapshotFailure.io
+            }
+            var pinned = stat(), linked = stat()
+            guard fstat(file, &pinned) == 0, fstatat(destination, name, &linked, AT_SYMLINK_NOFOLLOW) == 0,
+                  pinned.st_dev == linked.st_dev, pinned.st_ino == linked.st_ino,
+                  linked.st_mode & S_IFMT == S_IFREG else { throw StorageSnapshotFailure.sourceChanged }
+            guard batchSynchronization || fsync(destination) == 0 else { throw StorageSnapshotFailure.io }
+            return true
+        }
     }
 
     func linkTarget(_ path: String) throws -> String {
@@ -381,13 +420,31 @@ final class StorageObjectFiles {
     }
     func writeLink(_ path: String, target: String) throws {
         let (directory, name) = try parent(path, create: true); defer { Darwin.close(directory) }
-        guard symlinkat(target, directory, name) == 0, fsync(directory) == 0 else { throw StorageSnapshotFailure.io }
+        guard symlinkat(target, directory, name) == 0, (batchSynchronization || fsync(directory) == 0) else { throw StorageSnapshotFailure.io }
     }
-    func makeDirectory(_ name: String) throws -> StorageObjectFiles {
+    func makeDirectory(_ name: String, batchSynchronization: Bool = false) throws -> StorageObjectFiles {
         _ = try Self.parts(name)
         guard !name.contains("/"), mkdirat(descriptor, name, 0o700) == 0, fsync(descriptor) == 0 else { throw StorageSnapshotFailure.io }
-        return try StorageObjectFiles(root: root.appendingPathComponent(name, isDirectory: true),folderAccess:folderAccess)
+        return try StorageObjectFiles(root: root.appendingPathComponent(name, isDirectory: true),folderAccess:folderAccess,batchSynchronization:batchSynchronization)
     }
+    /// Each regular file has already been fsynced. Sync all directory entries
+    /// bottom-up before creating the commit manifest/receipt. Its F_FULLFSYNC
+    /// then persists every earlier fsync on this same device (fcntl(2)).
+    /// A partial stage has no publication authority.
+    func synchronizeCopiedDirectories(budget: StorageSnapshotBudget) throws {
+        guard batchSynchronization else { return }
+        var rootInfo = stat(); guard fstat(descriptor, &rootInfo) == 0 else { throw StorageSnapshotFailure.io }
+        for path in pendingDirectories.sorted(by: { $0.utf8.count > $1.utf8.count }) {
+            try budget.check()
+            let (directory, _) = try parent(path.isEmpty ? ".sync" : path + "/.sync")
+            defer { Darwin.close(directory) }
+            var info = stat()
+            guard fstat(directory, &info) == 0, info.st_dev == rootInfo.st_dev else { throw StorageSnapshotFailure.unsupportedAuthority }
+            guard fsync(directory) == 0 else { throw StorageSnapshotFailure.io }
+        }
+        pendingDirectories.removeAll()
+    }
+
     func publish(_ staging: String, as name: String, beforeFlush: () throws -> Void = {}) throws {
         guard !staging.contains("/"), !name.contains("/") else { throw StorageSnapshotFailure.io }
         guard renameatx_np(descriptor, staging, descriptor, name, UInt32(RENAME_EXCL)) == 0 else { throw StorageSnapshotFailure.io }
@@ -440,6 +497,11 @@ final class StorageObjectFiles {
     static func flush(_ file: Int32) throws {
         guard fsync(file) == 0, fcntl(file, F_FULLFSYNC) == 0 else { throw StorageSnapshotFailure.io }
     }
-    static func hex<S: Sequence>(_ bytes: S) -> String where S.Element == UInt8 { bytes.map { String(format: "%02x", $0) }.joined() }
+    static func hex<S: Sequence>(_ digest: S) -> String where S.Element == UInt8 {
+        let digits = Array("0123456789abcdef".utf8)
+        var bytes: [UInt8] = []; bytes.reserveCapacity(64)
+        for byte in digest { bytes.append(digits[Int(byte >> 4)]); bytes.append(digits[Int(byte & 15)]) }
+        return String(decoding: bytes, as: UTF8.self)
+    }
     static func sha(_ data: Data) -> String { hex(SHA256.hash(data: data)) }
 }

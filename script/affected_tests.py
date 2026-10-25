@@ -11,6 +11,11 @@ import subprocess
 import sys
 
 QUALIFICATION_TESTS = (
+    'ChecklistCoreTests.TicketCleanupReceiptReadTests/testLatestSummaryPagesRetainFirstReceiptAndAreBoundedWithLargeItems',
+    'ChecklistCoreTests.TestStoreTests/testWarmStoreSetupReportsPairedMedians',
+    'ChecklistCoreTests.MediaListQueryTests/testExamplesStayCollapsedUntilShowThenCapPageAndNeverGrantApproval',
+    'ChecklistIPCTests.LongCommandTests/testCommandLongerThanOldDeadlineReturnsCommittedResultThroughRealClient',
+    'ChecklistAppTests.IsolatedDefaultsTests/testPreferencesRemainAbsentAfterChildProcessExit',
     'ChecklistCoreTests.StorageSnapshotCapacityTests/testMoreThanThirtyThousandObjectsAndEightMiBManifestRoundTripWithoutPruning',
     'ChecklistCoreTests.MediaFrozenIntakeTests/test300SourcePreviewExactConfirmationStop200Resume96AndPlanRevision',
     'ChecklistCoreTests.MediaDecisionTests/test450SelectionLostReplyFailedMiddleOnlyRefreshAndLaterReversal',
@@ -38,10 +43,11 @@ QUALIFICATION_TESTS = (
 HEAVY_TESTS = QUALIFICATION_TESTS
 # macOS Seatbelt positive controls fail with SIGKILL when Git probes overlap.
 # Keep native guards intact and isolate this class from all other test work.
-ISOLATED_TEST_GROUPS = ('ChecklistCoreTests.SourceGitConfinementTests',)
+ISOLATED_TEST_GROUPS = ('ChecklistCoreTests.SourceGitConfinementTests',
+                        'ChecklistMCPServerTests.DelegateChildBindingTests')
 # Heavy fixtures instantiate CommandRouter and exercise shared models, hashing,
 # imports, persistence and provider policy. No Core source is proven unreachable.
-HEAVY_MODULES = ('ChecklistCore',)
+HEAVY_MODULES = ('ChecklistCore', 'ChecklistIPC', 'ChecklistApp')
 HEAVY_SOURCE_PREFIXES = ('Sources/ChecklistApp/Media/', 'Tests/ChecklistTestSupport/')
 # Explicit validation-only families; runtime inputs below take precedence.
 # Other non-code files (including arbitrary Markdown and docs binary fixtures)
@@ -206,7 +212,7 @@ def changed_qualification_tests(root, paths):
         if path == 'Tests/ChecklistCoreTests/QualificationSuite.swift':
             return list(QUALIFICATION_TESTS)
         source = root / path
-        if path.startswith('Tests/ChecklistCoreTests/') and source.suffix == '.swift' and source.is_file():
+        if path.startswith('Tests/') and source.suffix == '.swift' and source.is_file():
             methods = re.findall(r'func (test\w+)\(\) throws \{\s+try QualificationSuite.requireEnabled\(\)', source.read_text())
             selected.update(case for case in QUALIFICATION_TESTS if case.split('/')[1] in methods)
     return [case for case in QUALIFICATION_TESTS if case in selected]
@@ -314,12 +320,13 @@ def select(root, graph, paths, scratch, full=False, qualification=False):
     qualification_tests = (list(QUALIFICATION_TESTS) if qualification and
                            (explicitly_qualified or heavy_changed or unknown or full) else
                            changed_qualifiers if qualification else [])
+    qualification_tests = [case for case in qualification_tests if case.split('.')[0] in tests]
     skip = [case for case in QUALIFICATION_TESTS if case not in qualification_tests] if tests else []
     swift = []
     isolated = []
     qualification_commands = []
     if tests or full:
-        command = ['swift', 'test', '--parallel', '--cache-path',
+        command = ['swift', 'test', '--parallel', '--num-workers', '64', '--cache-path',
                    str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
                    '--enable-dependency-cache', '--scratch-path', str(scratch)]
         if not full:
@@ -331,20 +338,21 @@ def select(root, graph, paths, scratch, full=False, qualification=False):
         if 'ChecklistCoreTests' in tests:
             command = ['env', 'CHECKLIST_STORAGE_PROBE=' + str(scratch / 'out/Products/Debug/StorageCrashProbe')] + command
         command = ['env', 'CHECKLIST_TEST_TEMPLATE_ROOT=' + str(scratch / 'test-store-templates'), 'CHECKLIST_QUALIFICATION=0'] + command
-        isolated = list(ISOLATED_TEST_GROUPS) if 'ChecklistCoreTests' in tests and (
-            'ChecklistCoreTests' not in groups or 'SourceGitConfinementTests' in groups['ChecklistCoreTests']) else []
+        isolated = [group for group in ISOLATED_TEST_GROUPS
+                    if group.split('.')[0] in tests and (group.split('.')[0] not in groups
+                    or group.split('.')[1] in groups[group.split('.')[0]])]
         for group in isolated:
             command.extend(['--skip', '^' + re.escape(group) + r'(?:/|$)'])
         swift.append(command)
-        if isolated:
-            single = command[:command.index('swift') + 2]
-            single.extend(['--parallel', '--num-workers', '1', '--cache-path',
-                           str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
-                           '--enable-dependency-cache', '--scratch-path', str(scratch)])
-            for group in isolated:
-                single.extend(['--filter', '^' + re.escape(group) + r'(?:/|$)'])
+        for target in sorted({group.split('.')[0] for group in isolated}):
+            # The parallel pass above builds this exact test bundle. Selecting
+            # the native class directly avoids rediscovering/starting every
+            # unrelated bundle, while all its methods remain in one serial host.
+            single = command[:command.index('swift')]
+            single.extend(['xcrun', 'xctest', '-XCTest', ','.join(group for group in isolated if group.startswith(target + '.')),
+                           str(scratch / 'debug' / (target + '.xctest'))])
             swift.append(single)
-        if qualification and 'ChecklistCoreTests' in tests:
+        if qualification_tests:
             qualified = command[:command.index('swift') + 2]
             qualified = ['CHECKLIST_QUALIFICATION=1' if arg == 'CHECKLIST_QUALIFICATION=0' else arg for arg in qualified]
             qualified.extend(['--parallel', '--num-workers', '1', '--cache-path',

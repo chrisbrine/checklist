@@ -198,7 +198,7 @@ The failed-only build-97 source rework replaces SwiftUI VideoPlayer's unresolved
 
 CL-166 and CL-167 add separate project Triage/Epic counters and immutable `PREFIX-Tn`/`PREFIX-En` keys, an idempotent additive startup backfill, keyed app labels and key/name projections. Agent text shares bounded, sanitized key/title references; relays, answer pickup notices, inbox subjects and service notes retain readable names alongside tool IDs. Build, 74 affected cases and contract validation passed; full-suite comparison retains the baseline's 28 failing cases after one confirmation-fixture recheck. An owned existing-store copy backfilled 88 Triages and 7 Epics, preserved 167 ticket keys and group records on restart, and opened with the prior Core build. A complete re-rooted copy later backfilled 89 Triages and 7 Epics with unchanged ticket keys and restart records. Ordinary backup fails with `StorageSnapshotFailure.limit` in both unchanged BASE and the staged code: 56,132 required objects and 1,720,742,384 bytes exceed the existing 30,000-object and 1 GiB limits. No required file is missing or has a size/kind mismatch; neither backup produced a manifest. Backup qualification remains blocked by those existing limits. Installed UI/native delivery and independent review remain with the orchestrator and fresh reviewer.
 
-CL-163 shares explicit 8 GiB / 200,000-object / 128 MiB-manifest / 1,800-second snapshot bounds between owner backup and pre-upgrade protection, measures capacity failures with recovery guidance, and retains every captured source/attachment and the existing no-follow, flush, exact verification and restart-safe staging guarantees.
+CL-163 shares explicit 8 GiB / 500,000-object / 128 MiB-manifest / 1,800-second snapshot bounds between owner backup and pre-upgrade protection, measures capacity failures with recovery guidance, and retains every captured source/attachment and the existing no-follow, flush, exact verification and restart-safe staging guarantees.
 
 ### Instance-local managed paths (21 October 2026)
 
@@ -311,6 +311,83 @@ The source-level ten-minute gate uses a 1.5 GiB bound and a 2 MiB/min trend tole
 
 The service-frame fixture includes reply encoding inside each command's pool and a separate after-command pool, matching the changed service boundaries. An earlier Core-only driver encoded outside those boundaries and retained a 3.82 MiB/min trend; that failed observation is retained separately, not reported as a passing service gate. Baseline windows ended after 120 seconds; their still-running cleanup drains were stopped, so they are measured fixture evidence rather than completed XCTest passes. These are in-process debug results on private copies, with an owner fixture and an unclaimed copied ticket. Exact combined-build signed-slot IPC latency, native bootstrap and ten-minute footprint/CPU qualification remain with the orchestrator's runner; no installed pass is claimed.
 
+### CL-251 round 31 latency rework
+
+P251 profiles the supplied 24 October agent backup (542 tickets, 20,707 events,
+158,696 verified managed objects). The signed build-163 solo runner's 994 calls
+spent median 955–997 ms waiting for bootstrap admission and 574/884 ms waiting
+for note/read admission. Actual note/read execution was 202/32 ms. Every CLI
+call also fetched the full catalog. These carried installed observations remain
+attributed to runner 01a16f9f; they are not new final-build measurements.
+
+Private-process sampling identifies retained-attempt decoding during note routing
+and post-command import recovery scanning 2,005 jobs / 181,309,269 JSON bytes.
+The supplied store contains no committed/repair-required imports. Active-descendant
+selection now narrows candidates in SQLite before canonical validation and the
+unchanged graph walk. Import recovery uses a transactional TEMP candidate table
+with insert/update/delete triggers; initial construction preserves the original
+selection predicate, malformed-row handling, page size, retry and recovery checks.
+It rebuilds on writer restart and follows savepoints/rollback, UPSERT and REPLACE.
+Construction is lazy until a storage job exists; an empty store creates no TEMP
+schema. The first implementation increased the 50-open fixture's template setup
+median from 14.49 to 46.18 ms; lazy construction restores it to 14.83 ms in the
+focused recheck. Durable tables, migration, canonical validation and fsync requirements are unchanged.
+Startup's maintenance path constructs this temporary selection, so composed startup
+and protected-backup qualification on the owned real-store copy remains required.
+
+Native dispatch selects current endpoint/session candidates before expanding the
+outbox, omits already fenced sends, and skips projection when no endpoint is
+available. Its durable send fence, current grant/generation checks and immediate
+pre-I/O recheck remain. Direct CLI commands retain native binding and service
+validation while skipping redundant catalog download/decoding. Opt-in CLI/IPC
+phase diagnostics are described in the MCP contract.
+
+Matched debug in-process H1-derived runs use complete independent copies of the
+same backup, three ordinary note lanes and one `task_get` lane at two-second due
+times for 180 seconds, service command/reply pools and a separate cleanup lane.
+Both deliberately retain the broad delivery read after notes (reads skip it,
+matching build 163). This conservative comparison isolates Core work; it does
+not emulate native authentication or the new native-dispatch selection.
+
+| Measurement | r30j base | P251 before lazy-init refinement |
+| --- | ---: | ---: |
+| Startup, seconds | 11.795 | 9.383 |
+| Completed notes / reads after drain | 227 / 90 | 270 / 90 |
+| Note median / p95, seconds | 1.6380 / 2.7504 | 0.1863 / 0.5663 |
+| Read median / p95, seconds | 0.0451 / 0.1652 | 0.0445 / 0.0604 |
+| Peak sampled footprint, MiB | 396.27 | 346.47 |
+| Post-60-second OLS, MiB/min | -153.52 | +149.40 |
+| CPU seconds/minute | 101.79 | 99.51 |
+| CPU seconds/completed window call | 0.9726 | 0.8293 |
+
+Both sampled peaks are below 1.5 GiB. The final three-minute positive OLS does
+not pass the no-upward-trend check; late maintenance and the broad outbox hook
+remain in this fixture, and its utility maintenance had not drained at summary.
+No ten-minute memory pass is claimed. Exact signed combined-build client latency,
+traffic cadence, footprint/CPU and native dispatch still require the runner.
+
+A separate twelve-call private-copy cost probe measures final note execution at
+41.15 ms, read execution at 37.41 ms and note fsync/F_FULLFSYNC at 0.116 ms median.
+The measurement-only arm64 interposer forwards the original sync operations;
+its fsync plus full-fsync positive control records both calls. General pending
+history remains available; a selected-session pending projection still costs
+244 ms on this historical outbox, so transport selection must be qualified in
+the composed service. Raw timing, samples, executable/object hashes, copied-file
+verification and component-versus-native limits are in the P251 hand-in.
+
+Final lazy-initialization anonymous-XPC fixture (180 s, same fresh backup,
+actual CLI call/Bridge/rendering and Core, synthetic native binding/Keychain):
+base note/read medians 3.0472/3.0521 s,
+final 0.4447/0.3583 s; final p95
+1.5462/1.3336 s. Final completed
+270 notes and 90 reads, sampled peak
+346.92 MiB, post-warm-up OLS
+-47.13 MiB/min and
+29.36 combined process CPU s/min. The empty-native-route
+case skips outbox expansion; base retains it. These resident-process component
+results omit native identity/credential verification and repeated process startup;
+they do not close the exact signed ten-minute/client gate.
+
 ### Agent backup and disposable owner restore (CL-258 / CL-6 source)
 
 Workers discover `backup_create` with enrolled-project policy checks, constrained store-owned published/named qualification destinations and actual agent provenance. Owner backup retains its selected-path route. New manifests enumerate all canonical families and authoritative table counts in addition to the full database and managed-file checksums. The seed harness verifies these counts and records a current-schema no-migration seed without modifying database bytes.
@@ -355,3 +432,20 @@ LIVE29, a non-contributor runner, measured installed build `fd8cfebe2543b0b6`: t
 The direct CLI `service_info` call now omits the redundant catalog request. This known read is available in limited and full discovery, and the service still verifies the current caller and parameters. Native bootstrap, expected-session checks and stale-binary handling remain in place. Other CLI methods and MCP discovery retain their catalog behavior. There is no persistent catalog/identity/grant cache to invalidate. Fake-client unit tests cover the removed request, exact parameter/diagnostic forwarding, fresh refusals, expected-session mismatch, limited-workspace notice and unchanged discovery for other calls. S-r2 records affected whole-target base/final timings and the exact ten-call remeasurement; no installed after-r2 latency is claimed.
 
 CL-254 live updates keep coverage separate from installed visible content: failed or rejected Tickets, Overview, workspace and selected-ticket reads do not advance the change cursor, and retry at the bounded live retry pause with the existing failure notice. Window-local freshness generations drive a watchdog independently of the long event wait, starting a coalesced recovery read after 1.5 seconds to leave read time within the two-second normal-load display budget, whether the open window is frontmost or behind another app. Selected detail refreshes alongside the list, with selection, scope and version fences. The `org.checklist.app` / `LiveUpdates` notice log records changed coverage families/counts, read duration/outcome, cursor advances and watchdog lag without ticket text or paths; exact installed latency still requires the round's seeded-slot measurement.
+
+
+CL-254 / CL-260 / CL-177 round-31 screen rework adds a window-local `org.checklist.app` / `ScreenTiming` notice for Overview, Tickets, Epics, selected ticket, project switch and project cleanup. Fixed public fields give surface, cached/cold and action-to-native-content-display-pass milliseconds; this is not physical scan-out timing. No titles, notes, IDs or paths are recorded. Bounded NativeRenderMetrics samples also retain these observations without hot-path serialization. A tiny observed probe body passes each navigation token explicitly to AppKit, including retained native view identities; its transparent non-interactive overlay avoids an occluded background clock. Cleanup readiness is observed independently and committed at the settings panel display pass, including a cold arrival below the viewport. A 50-note native fixture and a main-thread sample identified repeated ICU timestamp parsing inside the message-sort comparator. Presentation sorting now decorates each row once and uses a locked bounded timestamp cache, preserving chronological tie rules. Shared display catalogs/rows compare JSON-shaped values directly with byte-exact strings; a compact combined Overview reply installs its shared catalog once. Cached Tickets restore their project filter taxonomy without replaying shared projects, service health or owner counts. Project settings can restore a versioned record before its background read, so receipt-cache display is no longer behind that read. The next exact digest query is prepared once when leaving Overview. Detail sections and conversation rows use lazy layout so a bounded 50-note conversation does not eagerly construct offscreen native rows before the first frame. Complete live coverage marks same-query Overview pages due without blanking their retained rows/counts; replacement pages install independently. Reset, authority/version, scope, cancellation and cursor-success gates remain. Template/offscreen host tests and installed-slot observations are separate evidence; this paragraph claims no installed latency pass.
+
+### Compact backup growth (CL-270 source)
+
+Format-2 manifests intern repeated content and prefix-compress descriptor strings;
+format-1 generations remain verifiable/restorable. New generations share duplicate
+regular bytes through backup-local hard links after hashing each source path,
+with verified-copy fallback on unsupported/saturated links. Unpublished generations
+fsync files and touched directories before one full-device commit barrier; live
+managed writes keep immediate durability.
+The logical object ceiling is 500,000; the 8 GiB, 128 MiB manifest, per-file,
+record and 1,800-second bounds remain. No SQLite protocol migration is introduced.
+Package B270 retains measurements, template tests and private-copy qualification;
+exact composed installed startup/protected-copy/restore qualification and a fresh
+live agent backup remain orchestrator runner work.

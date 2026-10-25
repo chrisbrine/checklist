@@ -148,6 +148,8 @@ public final class ChecklistClient: @unchecked Sendable {
         guard let remote = connection.remoteObjectProxyWithErrorHandler({ error in
             complete(nil, error)
         }) as? ChecklistRPC else { throw ChecklistError("SERVICE_UNAVAILABLE", "XPC service unavailable.") }
+        let sent = ProcessInfo.processInfo.systemUptime
+        diagnostic["connection_setup_ms"] = (sent-started)*1000
         remote.execute(bytes) { value in complete(value, nil) }
         let deadline: DispatchTime = replyTimeout.map { .now() + max(0, $0) } ?? .distantFuture
         guard semaphore.wait(timeout: deadline) == .success else {
@@ -162,6 +164,7 @@ public final class ChecklistClient: @unchecked Sendable {
             }
             throw error
         }
+        diagnostic["send_to_reply_ms"] = (ProcessInfo.processInfo.systemUptime-sent)*1000
         diagnostic["round_trip_ms"] = (ProcessInfo.processInfo.systemUptime-started)*1000
         if request?["diagnostics_timing"] as? Bool == true, let object = try? JSONSerialization.jsonObject(with:received) as? [String:Any] { diagnostic["service"] = object["_checklist_timing"] }
         return try CommandReply.decode(received, method: request?["method"] as? String ?? "", commandID: commandID)

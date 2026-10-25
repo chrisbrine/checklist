@@ -275,12 +275,42 @@ extension CommandRouter {
         try owner(c); guard c.installation == "native-bridge" else { throw CoreError("FORBIDDEN","This command is reserved for the bundled delivery service.") }
         if method == "delivery_pending" {
             let includeAcknowledged = bool(p,"include_acknowledged")
-            // Select the open outbox before decoding; retain the full-history
-            // diagnostic mode and fail closed on malformed selected JSON.
-            let deliveries = try readSnapshotCache.records(db,key:["pending-deliveries",includeAcknowledged ? "all":"open"]) {
-                try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='delivery'" + (includeAcknowledged ? "":" AND CASE WHEN json_valid(data) THEN COALESCE(json_extract(data,'$.state') NOT IN ('acknowledged','addressed'),1) ELSE 1 END") + " ORDER BY rowid")
+            let nativeSessions: [String]?
+            if let value = p["native_session_ids"] {
+                guard let ids = value as? [String],ids.count <= 4096,
+                      ids.allSatisfy({!$0.isEmpty && $0.utf8.count <= 4000}),!includeAcknowledged else {
+                    throw CoreError("INVALID_INPUT","Native dispatch needs bounded exact session IDs, without acknowledged history.")
+                }
+                nativeSessions = ids
+            } else {nativeSessions = nil}
+            // Native dispatch can reach only current enrolled endpoints. Narrow its
+            // read before expanding retained messages/tickets. General pending/history
+            // reads keep their previous scope. This is not a grant or cached verdict.
+            let nativeSelection = try nativeSessions.map {try jsonString($0)}
+            let nativeCandidates = bool(p,"native_dispatch_candidates")
+            guard !nativeCandidates || nativeSessions != nil else {throw CoreError("INVALID_INPUT","Native candidates require exact session selection.")}
+            let deliveries = try readSnapshotCache.records(db,key:["pending-deliveries",includeAcknowledged ? "all":"open",nativeSelection,nativeCandidates ? "candidates":"pending"]) {
+                var sql = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='delivery'"
+                var arguments = StatementArguments()
+                if !includeAcknowledged {
+                    sql += " AND CASE WHEN json_valid(data) THEN COALESCE(json_extract(data,'$.state') NOT IN ('acknowledged','addressed'),1) ELSE 1 END"
+                }
+                if let nativeSelection {
+                    // Bind bytes to preserve NUL and Unicode identity. Every duplicate
+                    // recipient key is considered; canonical/session checks still run.
+                    sql += " AND CASE WHEN json_valid(data) THEN EXISTS (SELECT 1 FROM json_each(records.data) recipient JOIN json_each(CAST(? AS TEXT)) selected ON CAST(recipient.value AS BLOB)=CAST(selected.value AS BLOB) WHERE recipient.key='recipient_session_id' AND recipient.type='text') ELSE 1 END"
+                    arguments += [Data(nativeSelection.utf8)]
+                }
+                if nativeCandidates {
+                    sql += " AND CASE WHEN json_valid(data) THEN EXISTS (SELECT 1 FROM json_each(records.data) WHERE key='push_state' AND type='text' AND CAST(value AS BLOB)=CAST('unavailable' AS BLOB)) ELSE 1 END"
+                }
+                return try Row.fetchAll(db,sql:sql + " ORDER BY rowid",arguments:arguments)
             }
-            let eligible = try deliveries.filter { d in if bool(p,"include_acknowledged") { return true }; let session = try record(db,d["recipient_session_id"] as! String,type:"session"); return canReceive(session,project:d["project_id"] as! String) && d["recipient_authorization_generation"] as? String == sessionGeneration(session) }
+            let selectedSessions = nativeSessions.map {Set($0.map {Data($0.utf8)})}
+            let eligible = try deliveries.filter { d in
+                if nativeCandidates && d["push_state"] as? String != "unavailable" {return false}
+                if let selectedSessions,let sid = d["recipient_session_id"] as? String,!selectedSessions.contains(Data(sid.utf8)) {return false}
+                if bool(p,"include_acknowledged") { return true }; let session = try record(db,d["recipient_session_id"] as! String,type:"session"); return canReceive(session,project:d["project_id"] as! String) && d["recipient_authorization_generation"] as? String == sessionGeneration(session) }
             return ["deliveries":try eligible.map { d -> JSON in var d = d; var message = try record(db,d["message_id"] as! String,type:"message");let subject = try subject(db,message:message);message["subject"] = subject;d["subject"] = subject
                 if let tid = message["task_id"] as? String { d["ticket"] = try scoped(db,tid,message["project_id"] as! String,type:"task") }
                 d["message"] = message; d["session"] = try record(db,d["recipient_session_id"] as! String,type:"session"); return d }]

@@ -88,8 +88,8 @@ enum StorageSnapshot {
         guard budget.pagesPerStep > 0, budget.maximumBytes > 0, budget.maximumObjectBytes > 0,
               budget.maximumObjects > 0, budget.maximumRecords > 0, budget.maximumManifestBytes > 0 else { throw StorageSnapshotFailure.limit }
         let parent = try StorageObjectFiles(root: fixture.parent,folderAccess:budget.folderAccess), sourceFiles = try StorageObjectFiles(root: fixture.source,folderAccess:budget.folderAccess)
-        let names = names(operation, publicationName: fixture.publicationName), stage = try parent.makeDirectory(names.staging)
-        let intent = ["format": "1", "kind": kind, "operation_id": operation.uuidString.lowercased(), "store_id": fixture.storeID, "source_root": fixture.source.path]
+        let names = names(operation, publicationName: fixture.publicationName), stage = try parent.makeDirectory(names.staging, batchSynchronization: true)
+        let intent = ["format": "2", "kind": kind, "operation_id": operation.uuidString.lowercased(), "store_id": fixture.storeID, "source_root": fixture.source.path]
         let intentData = try encoded(intent)
         let intentSize = try budget.adding(Int64(intentData.count), to: 0)
         try stage.writeNew("intent.json", bytes: intentData)
@@ -184,12 +184,27 @@ enum StorageSnapshot {
             let database = try stage.digest("database.sqlite", budget: budget)
             var total = try budget.adding(database.1, to: intentSize)
             var materialized: [StorageSnapshotMaterializedObject] = []
+            var copiedContent: [String:(path: String, size: Int64)] = [:]
             try budget.observe("copying_objects")
             for descriptor in inventory.objects where descriptor.kind == "file" {
                 try budget.check()
                 var remainingBudget = budget
                 remainingBudget.maximumObjectBytes = min(budget.maximumObjectBytes, budget.maximumBytes - total)
-                let value = try sourceFiles.copy(descriptor.relativePath, to: stage, expected: descriptor.expectedSHA256, budget: remainingBudget)
+                let value: (String, Int64)
+                if let expected = descriptor.expectedSHA256, let prior = copiedContent[expected] {
+                    // Hash every source path: an expected hash alone never proves
+                    // its bytes. Only the owned backup shares inodes, never the store.
+                    value = try sourceFiles.digest(descriptor.relativePath, budget: remainingBudget)
+                    guard value == (expected, prior.size), value.1 <= remainingBudget.maximumObjectBytes else { throw StorageSnapshotFailure.sourceChanged }
+                    if try !stage.writeHardLink("managed/" + descriptor.relativePath, to: prior.path, link: budget.linkFile) {
+                        let copied = try sourceFiles.copy(descriptor.relativePath, to: stage, expected: expected, budget: remainingBudget)
+                        guard copied == value else { throw StorageSnapshotFailure.sourceChanged }
+                        copiedContent[expected] = ("managed/" + descriptor.relativePath, value.1)
+                    }
+                } else {
+                    value = try sourceFiles.copy(descriptor.relativePath, to: stage, expected: descriptor.expectedSHA256, budget: remainingBudget)
+                    copiedContent[value.0] = ("managed/" + descriptor.relativePath, value.1)
+                }
                 guard descriptor.expectedSize == nil || descriptor.expectedSize == value.1 else { throw StorageSnapshotFailure.sourceChanged }
                 total = try budget.adding(value.1, to: total)
                 materialized.append(.init(descriptor: descriptor, sha256: value.0, size: value.1))
@@ -203,7 +218,7 @@ enum StorageSnapshot {
                 try stage.writeLink("managed/" + descriptor.relativePath, target: target)
                 materialized.append(.init(descriptor: descriptor, sha256: expected, size: Int64(target.utf8.count)))
             }
-            let manifest = StorageSnapshotManifest(format: 1, kind: kind, operationID: operation.uuidString.lowercased(),
+            let manifest = StorageSnapshotManifest(format: 2, kind: kind, operationID: operation.uuidString.lowercased(),
                 storeID: fixture.storeID, sourceRoot: fixture.source.path, schema: schema, databaseSHA256: database.0,
                 databaseSize: database.1, objects: materialized.sorted { $0.descriptor.relativePath < $1.descriptor.relativePath },
                 unavailable: inventory.unavailable, externalReferences: inventory.externalReferences, recordFamilies: families, tableRows: tables, capturedAt: capturedAt)
@@ -212,6 +227,9 @@ enum StorageSnapshot {
             budget.measurement.lowerBound = false
             guard manifestData.count <= budget.maximumManifestBytes else { throw budget.capacityFailure("snapshot_manifest_capacity") }
             total = try budget.adding(Int64(manifestData.count), to: total)
+            try stage.synchronizeCopiedDirectories(budget: budget)
+            try budget.observe("directories_synchronized")
+            try budget.check()
             try stage.writeNew("manifest.json", bytes: manifestData)
             try budget.observe("manifest_written")
             _ = try verify(stage, operation: operation, budget: budget)
@@ -279,6 +297,11 @@ enum StorageSnapshot {
             return nil
         }
         try budget.check()
+        // A previous attempt may have ended during the commit barrier. Redo
+        // the root-entry fsync and full-device barrier before publication.
+        try stage.synchronizePublicationDirectory()
+        try stage.synchronizeOwnedFile("manifest.json")
+        try budget.check()
         try containing.publish(stageName,as:publicationName)
         return try reconcile(parent:parent,operation:operation,publicationName:publicationName,budget:budget)
     }
@@ -292,14 +315,14 @@ enum StorageSnapshot {
             "format", "kind", "operationID", "storeID", "sourceRoot", "schema", "databaseSHA256", "databaseSize", "objects", "unavailable", "externalReferences"
         ] else { throw StorageSnapshotFailure.incomplete }
         let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self, from: manifestData)
-        guard manifest.format == 1, manifest.kind == kind, manifest.operationID == operation.uuidString.lowercased(),
+        guard [1, 2].contains(manifest.format), manifest.kind == kind, manifest.operationID == operation.uuidString.lowercased(),
               UUID(uuidString: manifest.storeID) != nil, [0, 1, 2, 3].contains(manifest.schema), manifest.objects.count <= budget.maximumObjects else { throw StorageSnapshotFailure.incomplete }
         if let capturedAt = manifest.capturedAt {
             guard capturedAt.utf8.count <= 40,ISO8601DateFormatter().date(from:capturedAt) != nil else {throw StorageSnapshotFailure.incomplete}
         }
         let intentData = try files.read("intent.json", maximum: 1024)
         let intent = try JSONDecoder().decode([String: String].self, from: intentData)
-        guard intent == ["format": "1", "kind": kind, "operation_id": manifest.operationID, "store_id": manifest.storeID, "source_root": manifest.sourceRoot] else { throw StorageSnapshotFailure.incomplete }
+        guard intent == ["format": String(manifest.format), "kind": kind, "operation_id": manifest.operationID, "store_id": manifest.storeID, "source_root": manifest.sourceRoot] else { throw StorageSnapshotFailure.incomplete }
         let database = try files.digest("database.sqlite", budget: budget)
         guard database == (manifest.databaseSHA256, manifest.databaseSize) else { throw StorageSnapshotFailure.sourceChanged }
         var readConfiguration = Configuration(); readConfiguration.readonly = true

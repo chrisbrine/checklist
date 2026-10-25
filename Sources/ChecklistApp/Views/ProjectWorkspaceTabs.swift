@@ -8,13 +8,14 @@ struct ProjectWorkspaceTabs: View {
             tab("Epics", page: .epics)
             MediaProjectTab(model:store.mediaReview)
             Spacer()
-        }.checklistActionScroll().padding(.horizontal, Spacing.page).padding(.top, Spacing.control).overlay(alignment: .bottom) { Divider() }
+        }.screenContentFrame(store.screenTiming,.tickets,ready:store.page == .tasks && store.preparedTicketWorkspace != nil)
+        .screenContentFrame(store.screenTiming,.projectSwitch,ready:store.page == .tasks && store.preparedTicketWorkspace != nil)
+        .checklistActionScroll().padding(.horizontal, Spacing.page).padding(.top, Spacing.control).overlay(alignment: .bottom) { Divider() }
     }
     func tab(_ title: String, page: Page) -> some View {
         let selected = page == .tasks ? [.tasks, .archived].contains(store.page) : store.page == page
         return Button {
-            store.page = page
-            store.windowPreferences.set(page.rawValue, forKey: "lastPage")
+            store.select(page,project:store.projectID)
         } label: {
             // The unselected title stays readable (the system secondary color measures 3.95:1 on white).
             Text(title).checklistFont(selected ? .bodyStrong : .bodyEmphasis).foregroundStyle(selected ? Color.checklistAccentText : Color.primary.opacity(0.72))

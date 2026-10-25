@@ -242,7 +242,19 @@ import ChecklistIPC
         }
     }
     func testObsoleteRecoveryCannotInstallAfterSelectionProjectStoreOrWindowChange() async throws {
-        for history in [false,true] {for lateFailure in [false,true] {for change in ["selection","project","store","window"] {
+        try await assertObsoleteRecoveryCannotInstall(after: "selection")
+    }
+    func testObsoleteRecoveryCannotInstallAfterProjectChange() async throws {
+        try await assertObsoleteRecoveryCannotInstall(after: "project")
+    }
+    func testObsoleteRecoveryCannotInstallAfterStoreChange() async throws {
+        try await assertObsoleteRecoveryCannotInstall(after: "store")
+    }
+    func testObsoleteRecoveryCannotInstallAfterWindowChange() async throws {
+        try await assertObsoleteRecoveryCannotInstall(after: "window")
+    }
+    private func assertObsoleteRecoveryCannotInstall(after change: String) async throws {
+        for history in [false,true] {for lateFailure in [false,true] {do {
             let f = try Fixture(isolatedDefaults("CL174-obsolete"));defer {f.cleanup()}
             let store = f.store(),live = Task {await store.startLiveUpdates()};defer {live.cancel();store.stopWindowReads()}
             try await select(store,f);try f.mutateOther();f.hold = "ui"

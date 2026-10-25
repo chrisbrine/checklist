@@ -1,4 +1,5 @@
 import Foundation
+import XCTest
 import Darwin
 import CryptoKit
 import GRDB
@@ -12,7 +13,8 @@ private final class TestStoreBundleMarker: NSObject {}
 public enum TestStore {
     public static func router(root: URL, serviceLease: StorageServiceLease? = nil,
                               cliCommand: String = "/Applications/Checklist.app/Contents/MacOS/checklist",
-                              providerPlugins: ProviderPluginRegistry = .bundled) throws -> CommandRouter {
+                              providerPlugins: ProviderPluginRegistry = .bundled,
+                              durable: Bool = ProcessInfo.processInfo.environment["CHECKLIST_QUALIFICATION"] == "1") throws -> CommandRouter {
         let anchored = root.resolvingSymlinksInPath()
         // Reopen existing fixtures through production admission; never replace data.
         if !FileManager.default.fileExists(atPath: anchored.appendingPathComponent("checklist.sqlite").path),
@@ -20,7 +22,14 @@ public enum TestStore {
             try StoreDirectory(root: anchored).requireFreshScaffoldingOnly()
             try seed(anchored)
         }
-        return try CommandRouter(root: root, serviceLease: serviceLease, cliCommand: cliCommand, providerPlugins: providerPlugins)
+        let router = try CommandRouter(root: root, serviceLease: serviceLease, cliCommand: cliCommand, providerPlugins: providerPlugins)
+        if !durable {
+            // Disposable unit fixtures need transaction/reopen semantics, not a
+            // power-loss durability barrier on every command. Qualification and
+            // direct CommandRouter storage/crash fixtures retain production FULL.
+            try router.dbQueue.writeWithoutTransaction { try $0.execute(sql: "PRAGMA synchronous=NORMAL") }
+        }
+        return router
     }
 
     private static var templateRoot: URL {
@@ -65,8 +74,13 @@ public enum TestStore {
         return ready
     }
 
+    // The loaded test image and its environment are fixed for this process.
+    // Swift's lazy static initialization also shares publication across local
+    // fixture threads; independent workers still take the publication file lock.
+    private static let publishedTemplate = Result { try template() }
+
     private static func seed(_ root: URL) throws {
-        let source = try template()
+        let source = try publishedTemplate.get()
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let database = root.appendingPathComponent("checklist.sqlite")
         let original = source.appendingPathComponent("checklist.sqlite")
@@ -81,7 +95,7 @@ public enum TestStore {
         configuration.prepareDatabase {
             try SchemaMigrations.installStorageCollation($0)
             // Only disposable fixture seeding: the returned production router
-            // reopens with its normal FULL synchronization before any test work.
+            // reopens with production FULL; only unit fixtures then select NORMAL.
             try $0.execute(sql: "PRAGMA synchronous=OFF")
         }
         let queue = try DatabaseQueue(path: database.path, configuration: configuration)
@@ -90,11 +104,24 @@ public enum TestStore {
                 try db.execute(sql: "UPDATE metadata SET value=? WHERE key='incarnation'", arguments: [identity.incarnation])
                 try db.execute(sql: "UPDATE metadata SET value=? WHERE key='store_identity'", arguments: [String(decoding: try identity.encoded(), as: UTF8.self)])
                 try db.execute(sql: "DELETE FROM metadata WHERE key='cursor_seal_key'")
+                // Give this clone a fresh key during private seed preparation,
+                // avoiding a durable metadata write on the production reopen.
+                _ = try SealedCursor.storeKey(db)
             }
             try queue.close()
         } catch { try? queue.close(); throw error }
         let receipt = root.appendingPathComponent(StoreIdentityReceipt.fileName)
         try identity.encoded().write(to: receipt, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: receipt.path)
+    }
+}
+
+/// Scale, timing and soak coverage. Kept in its original test classes so all
+/// fixture helpers and assertions remain identical to the ordinary test build.
+public enum QualificationSuite {
+    public static func requireEnabled() throws {
+        guard ProcessInfo.processInfo.environment["CHECKLIST_QUALIFICATION"] == "1" else {
+            throw XCTSkip("Qualification suite: run script/affected_tests.py --full --qualification")
+        }
     }
 }

@@ -91,6 +91,7 @@ struct ChecklistCommand {
                 expectedSession: arguments.session, automatic: !arguments.installationExplicit,
                 assistantProject: arguments.assistant ? arguments.project : nil, command: arguments.command.first ?? ""),
                 environment: .init(shimUpdate: arguments.command.first == "mcp" ? shimUpdate : nil))
+            if CallTimingLog.enabled {CallTimingLog.write(["scope":"cli_setup","total_ms":(ProcessInfo.processInfo.systemUptime-started)*1000])}
             switch arguments.command.first ?? "help" {
             case "connect":
                 guard arguments.command.count == 1 else { throw CLIError("Usage: checklist connect [--task KEY_OR_UUID] or checklist connect --assistant --project UUID_OR_EXACT_NAME") }
@@ -129,10 +130,14 @@ struct ChecklistCommand {
 
     static func call(arguments: Arguments, bridge: Bridge) async throws -> Value {
         guard arguments.command.count == 2 || arguments.command.count == 3 else { throw CLIError("Usage: checklist call METHOD '{JSON}' [--workspace PATH]") }
+        let started = ProcessInfo.processInfo.systemUptime
         let data = try CallArgumentInput.read(arguments.command.count == 3 ? arguments.command[2] : "{}")
         let value = try JSONDecoder().decode(Value.self, from: data)
+        let decoded = ProcessInfo.processInfo.systemUptime
         _ = try await bridge.connect()
         try await bridge.verifySession()
+        let bound = ProcessInfo.processInfo.systemUptime
+        defer {if CallTimingLog.enabled {CallTimingLog.write(["scope":"cli_call","argument_decode_ms":(decoded-started)*1000,"bootstrap_session_ms":(bound-decoded)*1000,"command_ms":(ProcessInfo.processInfo.systemUptime-bound)*1000])}}
         return try await bridge.call(arguments.command[1], value)
     }
 

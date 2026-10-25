@@ -41,7 +41,7 @@ final class StorageSnapshotCapacityTests: XCTestCase {
     func testProductionCapacityAndSharedDeadlineHaveMeasuredHeadroom() throws {
         let before = ProcessInfo.processInfo.systemUptime, budget = StorageSnapshotBudget.production()
         XCTAssertEqual(budget.maximumBytes, 8 * 1_073_741_824)
-        XCTAssertEqual(budget.maximumObjects, 200_000)
+        XCTAssertEqual(budget.maximumObjects, 500_000)
         XCTAssertEqual(budget.maximumManifestBytes, 128 * 1_048_576)
         XCTAssertEqual(budget.maximumObjectBytes, 524_288_000)
         XCTAssertEqual(budget.maximumRecords, 100_000)
@@ -139,6 +139,88 @@ final class StorageSnapshotCapacityTests: XCTestCase {
         }
         XCTAssertEqual(try Data(contentsOf: source.appendingPathComponent("a")), bytes)
         XCTAssertEqual(try Data(contentsOf: source.appendingPathComponent("b")), bytes)
+    }
+
+    func testDuplicateContentSharesOnlyBackupBytesAndLegacyRestoreStillWorks() throws {
+        let f = try Fixture(), source = f.root.appendingPathComponent("source-captures/project/capture/source")
+        try FileManager.default.createDirectory(at:source,withIntermediateDirectories:true)
+        let bytes = Data("retained duplicate".utf8), sha = StorageObjectFiles.sha(bytes)
+        for name in ["a", "b"] { try bytes.write(to:source.appendingPathComponent(name)) }
+        _ = try f.capture(["a", "b"].map { ["path":$0,"kind":"file","sha256":sha,"size":bytes.count] })
+        let operation = UUID(), receipt = try f.build(operation,.production())
+        let backup = f.base.appendingPathComponent(StorageSnapshot.names(operation).published)
+        let a = backup.appendingPathComponent("managed/source-captures/project/capture/source/a")
+        let b = backup.appendingPathComponent("managed/source-captures/project/capture/source/b")
+        var original = stat(), first = stat(), second = stat()
+        XCTAssertEqual(lstat(source.appendingPathComponent("a").path,&original),0)
+        XCTAssertEqual(lstat(a.path,&first),0);XCTAssertEqual(lstat(b.path,&second),0)
+        XCTAssertEqual(first.st_ino,second.st_ino);XCTAssertNotEqual(first.st_ino,original.st_ino)
+        let manifestURL = backup.appendingPathComponent("manifest.json")
+        let current = try JSONDecoder().decode(StorageSnapshotManifest.self,from:Data(contentsOf:manifestURL))
+        XCTAssertEqual(current.format,2);XCTAssertEqual(current.objects.count,2)
+        XCTAssertEqual(try StorageSnapshot.reconcile(parent:f.base,operation:operation,budget:.production()).manifestSHA256,receipt.manifestSHA256)
+        // Exercise a genuine format-1 generation through full verification and
+        // disposable restore, including independent duplicate destination inodes.
+        let legacy = StorageSnapshotManifest(format:1,kind:current.kind,operationID:current.operationID,storeID:current.storeID,sourceRoot:current.sourceRoot,schema:current.schema,databaseSHA256:current.databaseSHA256,databaseSize:current.databaseSize,objects:current.objects,unavailable:current.unavailable,externalReferences:current.externalReferences,recordFamilies:current.recordFamilies,tableRows:current.tableRows,capturedAt:current.capturedAt)
+        try StorageSnapshot.encoded(legacy).write(to:manifestURL)
+        let intentURL = backup.appendingPathComponent("intent.json")
+        var intent = try JSONDecoder().decode([String:String].self,from:Data(contentsOf:intentURL));intent["format"] = "1"
+        try StorageSnapshot.encoded(intent).write(to:intentURL)
+        let preview = try f.router.handle(method:"restore_preview",params:["path":backup.path],caller:f.owner)["data"] as! JSON
+        let restored = try f.router.handle(method:"restore_create",params:["path":backup.path,"manifest_sha256":preview["manifest_sha256"]!,"command_id":UUID().uuidString],caller:f.owner)["data"] as! JSON
+        let restoredRoot = URL(fileURLWithPath:restored["path"] as! String)
+        let restoredA = restoredRoot.appendingPathComponent("source-captures/project/capture/source/a")
+        let restoredB = restoredRoot.appendingPathComponent("source-captures/project/capture/source/b")
+        XCTAssertEqual(try Data(contentsOf:restoredA),bytes);XCTAssertEqual(try Data(contentsOf:restoredB),bytes)
+        XCTAssertEqual(lstat(restoredA.path,&first),0);XCTAssertEqual(lstat(restoredB.path,&second),0)
+        XCTAssertNotEqual(first.st_ino,second.st_ino)
+        try Data("corrupt".utf8).write(to:a)
+        XCTAssertThrowsError(try StorageSnapshot.reconcile(parent:f.base,operation:operation,budget:.production()))
+    }
+
+    func testDuplicateExpectedHashDoesNotHideChangedSourceBytes() throws {
+        let f = try Fixture(), source = f.root.appendingPathComponent("source-captures/project/capture/source")
+        try FileManager.default.createDirectory(at:source,withIntermediateDirectories:true)
+        let bytes = Data("same".utf8), sha = StorageObjectFiles.sha(bytes)
+        for name in ["a", "b"] { try bytes.write(to:source.appendingPathComponent(name)) }
+        _ = try f.capture(["a", "b"].map { ["path":$0,"kind":"file","sha256":sha,"size":bytes.count] })
+        var budget = StorageSnapshotBudget.production(),copied = false
+        budget.observe = { boundary in
+            if boundary == "object_copied", !copied { copied = true; try Data("evil".utf8).write(to:source.appendingPathComponent("b")) }
+        }
+        XCTAssertThrowsError(try f.build(UUID(),budget)) { error in
+            guard case StorageSnapshotFailure.sourceChanged = error else { return XCTFail("\(error)") }
+        }
+    }
+
+    func testUnavailableOrSaturatedHardLinksFallBackToVerifiedIndependentCopies() throws {
+        for code in [ENOTSUP, EMLINK, EPERM] {
+            let f = try Fixture(), source = f.root.appendingPathComponent("source-captures/project/capture/source")
+            try FileManager.default.createDirectory(at:source,withIntermediateDirectories:true)
+            let bytes = Data("same retained content".utf8), sha = StorageObjectFiles.sha(bytes)
+            for name in ["a","b"] {try bytes.write(to:source.appendingPathComponent(name))}
+            _ = try f.capture(["a","b"].map {["path":$0,"kind":"file","sha256":sha,"size":bytes.count]})
+            var budget = StorageSnapshotBudget.production()
+            budget.linkFile = {_,_,_,_ in errno = code;return -1}
+            let op = UUID();_ = try f.build(op,budget)
+            let backup = f.base.appendingPathComponent(StorageSnapshot.names(op).published)
+            var a=stat(),b=stat()
+            XCTAssertEqual(lstat(backup.appendingPathComponent("managed/source-captures/project/capture/source/a").path,&a),0)
+            XCTAssertEqual(lstat(backup.appendingPathComponent("managed/source-captures/project/capture/source/b").path,&b),0)
+            XCTAssertNotEqual(a.st_ino,b.st_ino)
+            XCTAssertNoThrow(try StorageSnapshot.reconcile(parent:f.base,operation:op,budget:.production()))
+        }
+    }
+
+    func testInterruptedDirectoryBarrierCannotPublishOrResumeWithoutCommitManifest() throws {
+        let f=try Fixture(),op=UUID()
+        var budget=StorageSnapshotBudget.production()
+        budget.observe = {if $0 == "directories_synchronized" {throw StorageSnapshotFailure.io}}
+        XCTAssertThrowsError(try f.build(op,budget))
+        let names=StorageSnapshot.names(op)
+        XCTAssertFalse(FileManager.default.fileExists(atPath:f.base.appendingPathComponent(names.published).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath:f.base.appendingPathComponent(names.staging+"/manifest.json").path))
+        XCTAssertNil(try StorageSnapshot.resumeStaging(parent:f.base,operation:op,publicationName:names.published,budget:.production()))
     }
 
     func testMoreThanThirtyThousandObjectsAndEightMiBManifestRoundTripWithoutPruning() throws {

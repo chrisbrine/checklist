@@ -105,6 +105,7 @@ final class ChecklistStore: ObservableObject {
     }
     // CL-116: one window-local media presentation; service remains durable authority.
     let mediaReview = MediaReviewModel()
+    let screenTiming = ScreenTiming()
     let ticketCleanupReceipts = TicketCleanupReceiptObservation()
     @Published var page: Page = .overview { didSet {
         if page != oldValue {
@@ -270,6 +271,7 @@ final class ChecklistStore: ObservableObject {
             if selectedTicketFromCache { selectedTicketDisplay = nil }
             ticketPages.discardContent(); pagedTicketWorkspace = nil
             workspaceObservation.discardContent()
+            if selectedOther?.string("record_type") == "project" {otherDetailObservation.discardContent()}
             for observation in overviewObservations.values { observation.discardContent() }
         }
     }
@@ -299,6 +301,7 @@ final class ChecklistStore: ObservableObject {
         cachedSelectedTickets.append((scope, value))
         if cachedSelectedTickets.count > 12 { cachedSelectedTickets.removeFirst() }
     }
+    var desktopAlertCoordinator: DesktopAlertCoordinator { desktopAlerts }
     private let desktopAlerts: DesktopAlertCoordinator
     let navigationMemory: DetailItemNavigationMemory
     private let qualificationFaults: QualificationFaults
@@ -573,7 +576,7 @@ final class ChecklistStore: ObservableObject {
         let scope = projectID.map(RecordIdentity.init)
         if selectedTicketDisplay == nil, cursor == nil,
            let cached = cachedSelectedTickets.last(where: { $0.scope == scope && RecordIdentity($0.value.task.id) == RecordIdentity(id) }) {
-            selectedTicketDisplay = cached.value; selectedTicketFromCache = true
+            selectedTicketDisplay = cached.value; selectedTicketFromCache = true; screenTiming.cached(.ticketDetail, true)
         }
         guard startedLiveUpdates else {return}
         let readID = selectedTicketReadID, recordsReadID = selectedRecordsReadID
@@ -688,7 +691,7 @@ final class ChecklistStore: ObservableObject {
             ticketPages.invalidate()
             if let cached = cachedTickets.last(where: { $0.query == query }) {
                 ticketPages = cached.value
-                if let page = ticketPages.page { ticketCatalog.install(page) }
+                if let page = ticketPages.page {ticketCatalog.restoreFilters(page)}
             }
             pagedTicketWorkspace = ticketPages.prepared(expansion: ticketExpansion)
         }
@@ -782,9 +785,12 @@ final class ChecklistStore: ObservableObject {
     /// Each Overview visit shows completions since the previous visit and keeps that start while it is shown;
     /// the next visit starts from this one (CL-67).
     private var overviewVisitActive = false
+    private var overviewVisitProject: String?
+    private var nextDigestRead: Task<Void,Never>?
     private func prepareOverviewVisit() {
         guard !overviewVisitActive else { return }
         overviewVisitActive = true
+        overviewVisitProject = projectID
         overviewDigestSince = preferences.object(forKey: "overviewLastVisit") as? Date ?? Date().addingTimeInterval(-86400)
         preferences.set(Date(), forKey: "overviewLastVisit")
     }
@@ -793,7 +799,27 @@ final class ChecklistStore: ObservableObject {
         prepareOverviewVisit()
         scheduleOverviewNeeds(force: true)
     }
-    func endOverviewVisit() { overviewVisitActive = false; resetOverviewScope() }
+    func endOverviewVisit() {
+        guard overviewVisitActive else {return}
+        overviewVisitActive = false; resetOverviewScope()
+        // The next visit has a new digest query. Prepare that exact scope after
+        // leaving, rather than replaying the previous visit's completed rows.
+        guard page != .overview, startedLiveUpdates, connected,
+              let since = preferences.object(forKey:"overviewLastVisit") as? Date else {return}
+        var query = WorkspacePageQuery(surface:"completed_since",project:overviewVisitProject)
+        query.limit = 20;query.since = Self.digestFormatter.string(from:since)
+        let epoch = contentEpoch
+        nextDigestRead?.cancel()
+        nextDigestRead = Task { [weak self] in
+            guard let self else {return}
+            do {
+                let response = try await self.request("workspace_page",query.parameters(),ifCurrent:{self.contentEpoch == epoch})
+                guard !Task.isCancelled, self.contentEpoch == epoch else {return}
+                let page = try WorkspacePage(response,query:query)
+                self.cacheWorkspacePage(page)
+            } catch { /* Navigation prefetch has no visible failure or retry loop. */ }
+        }
+    }
     static func overviewTitle(_ surface: String) -> String {
         surface == "completed_since" ? "Completed since your last visit" : surface == "recent_reviews" ? "Latest review results" : overviewGroups.first { $0.surface == surface }?.title ?? "Overview"
     }
@@ -849,7 +875,7 @@ final class ChecklistStore: ObservableObject {
         }
         let due = surfaces.filter { surface in
             let query = overviewQuery(surface), observation = overviewObservations[surface]!
-            return (only == nil || only == surface) && (force || retry && observation.error != nil || observation.query != query || observation.page == nil && !observation.loading && observation.error == nil)
+            return (only == nil || only == surface) && (force || observation.needsRefresh || retry && observation.error != nil || observation.query != query || observation.page == nil && !observation.loading && observation.error == nil)
         }
         guard !due.isEmpty else { return overviewRead }
         let previous = overviewPending
@@ -907,7 +933,7 @@ final class ChecklistStore: ObservableObject {
                 self.overviewPending.removeValue(forKey: surface)
                 attemptedVersions[surface] = self.contentVersion ?? ""
             }
-            let complete = self.shownOverviewSurfaces.allSatisfy { self.overviewObservations[$0]?.page != nil && self.overviewObservations[$0]?.error == nil }
+            let complete = self.shownOverviewSurfaces.allSatisfy { self.overviewObservations[$0]?.page != nil && self.overviewObservations[$0]?.needsRefresh == false && self.overviewObservations[$0]?.error == nil }
             if allInstalled, complete, !Task.isCancelled, self.liveScope == scope {
                 self.visibleInstalledChange = self.visibleChange; self.visibleStaleSince = nil
             }
@@ -947,12 +973,14 @@ final class ChecklistStore: ObservableObject {
             guard !Task.isCancelled, overviewReadCurrent(id, focus: focus, reads: reads) else { return false }
             let groups = response["groups"] as? [String: [String: Any]] ?? [:]
             var installed = true
+            var installedCatalog = false
             for (surface, read) in reads {
                 if var group = groups[surface] {
                     // Combined replies carry shared catalogs/identity once. Legacy self-contained
                     // groups still parse through the same strict single-page validator.
                     for key in ["projects", "service", "needs_you_count", "content_cursor"] where group[key] == nil { group[key] = response[key] }
-                    if !installOverviewPage(group, surface: surface, read: read, eventCursor: response["event_cursor"] as? String ?? response["content_cursor"] as? String) { installed = false }
+                    if !installOverviewPage(group, surface: surface, read: read, eventCursor: response["event_cursor"] as? String ?? response["content_cursor"] as? String, installCatalog: !installedCatalog || groups[surface]?["projects"] != nil) { installed = false }
+                    else { installedCatalog = true }
                 }
                 else { overviewObservations[surface]?.fail(read.generation); installed = false }
                 overviewPending.removeValue(forKey: surface)
@@ -976,11 +1004,11 @@ final class ChecklistStore: ObservableObject {
         }
         return !Task.isCancelled
     }
-    @discardableResult private func installOverviewPage(_ response: [String: Any], surface: String, read: OverviewRead, eventCursor: String? = nil) -> Bool {
+    @discardableResult private func installOverviewPage(_ response: [String: Any], surface: String, read: OverviewRead, eventCursor: String? = nil, installCatalog: Bool = true) -> Bool {
         let observation = overviewObservations[surface]!
         do {
             if try observation.receive(response, query: read.query, generation: read.generation), let installed = observation.page {
-                ticketCatalog.install(workspace: installed); cacheWorkspacePage(installed); acceptServiceRead()
+                if installCatalog { ticketCatalog.install(workspace: installed) }; cacheWorkspacePage(installed); acceptServiceRead()
                 // Incidental pages never advance an established live coverage interval.
                 if self.eventCursor == nil, pendingCoverageScope == nil { advanceEventCursor(eventCursor ?? response["event_cursor"] as? String ?? installed.contentCursor,source:"overview") }
                 return true
@@ -1073,18 +1101,39 @@ final class ChecklistStore: ObservableObject {
         groupCandidatesRead?.cancel();groupCandidatesObservation.cancel(clear:!sameRecord)
         guard startedLiveUpdates,let detail,let id else{return}
         let query=WorkspacePageQuery(surface:"record",project:nil,record:id)
+        if case .project = detail, restoreWorkspacePage(otherDetailObservation,query:query) != nil {
+            screenTiming.cached(.cleanup, ticketCleanupReceipts.isCached(scope:cleanupReceiptScope(id)))
+        }
         let generation=otherDetailObservation.begin(query)
         otherDetailRead=Task {[weak self] in
             guard let self else{return}
             do {
                 let response=try await self.request("workspace_page",query.parameters())
                 guard !Task.isCancelled,self.detail==detail else{return}
-                if try self.otherDetailObservation.receive(response,query:query,generation:generation),let group=self.selectedOther,group.string("record_type")=="group" {
-                    if let taskQuery,RecordIdentity(taskQuery.record)==RecordIdentity(group.id) {self.loadGroupTasks(group,closed:taskQuery.archived)}
-                    if let candidateQuery,RecordIdentity(candidateQuery.record)==RecordIdentity(group.id) {self.loadGroupCandidates(group,closed:candidateQuery.archived)}
+                if try self.otherDetailObservation.receive(response,query:query,generation:generation) {
+                    if case .project = detail, let installed = self.otherDetailObservation.page {self.cacheWorkspacePage(installed)}
+                    if let group=self.selectedOther,group.string("record_type")=="group" {
+                        if let taskQuery,RecordIdentity(taskQuery.record)==RecordIdentity(group.id) {self.loadGroupTasks(group,closed:taskQuery.archived)}
+                        if let candidateQuery,RecordIdentity(candidateQuery.record)==RecordIdentity(group.id) {self.loadGroupCandidates(group,closed:candidateQuery.archived)}
+                    }
                 }
-            } catch {if self.isReadCancellation(error) {self.otherDetailObservation.cancel(generation)} else {self.otherDetailObservation.fail(generation)}}
+            } catch {
+                if self.isReadCancellation(error) {self.otherDetailObservation.cancel(generation)}
+                else {
+                    guard self.detail == detail,self.otherDetailObservation.isCurrent(generation) else {return}
+                    if ["FORBIDDEN","DENIED","NOT_FOUND"].contains((error as? ChecklistError)?.code ?? "") {
+                        self.cachedWorkspace.removeAll {$0.query == query}
+                        self.otherDetailObservation.discardContent()
+                    }
+                    self.otherDetailObservation.fail(generation)
+                }
+            }
         }
+    }
+    func cleanupReceiptScope(_ project: String) -> String {
+        let version = otherDetailObservation.page?.service.string("read_version") ?? ""
+        let identity = version.isEmpty ? otherDetailObservation.readScope.uuidString : version
+        return project + ":" + storeIncarnation + ":" + archivePreviewEpoch.uuidString + ":" + identity
     }
     func retryOtherDetail() {scheduleOtherDetail(for:detail)}
     func loadGroupTasks(_ group:Record,closed:Bool,cursor:String? = nil) {
@@ -1143,6 +1192,11 @@ final class ChecklistStore: ObservableObject {
     }
 
     func select(_ page: Page, project: String? = nil) {
+        for surface in [ScreenTiming.Surface.overview, .tickets, .epics, .projectSwitch] { screenTiming.cancel(surface) }
+        let switchedProject = projectID.map(RecordIdentity.init) != project.map(RecordIdentity.init)
+        if switchedProject { screenTiming.begin(.projectSwitch) }
+        let surface: ScreenTiming.Surface? = page == .overview ? .overview : page == .tasks ? .tickets : page == .epics ? .epics : nil
+        if let surface { screenTiming.begin(surface) }
         restoringPreferences = true
         self.page = page; projectID = project
         loadTaskView()
@@ -1152,6 +1206,14 @@ final class ChecklistStore: ObservableObject {
         prepareTicketWorkspace()
         if usesTicketPages { scheduleTicketPage(force:true) }
         else { scheduleWorkspacePage(force:true) }
+        let cached = screenContentReady
+        if let surface { screenTiming.cached(surface, cached) }
+        if switchedProject { screenTiming.cached(.projectSwitch, cached) }
+    }
+    var screenContentReady: Bool {
+        if page == .overview { return shownOverviewSurfaces.allSatisfy { overviewObservations[$0]?.page != nil } }
+        if usesTicketPages { return preparedTicketWorkspace != nil }
+        return workspacePageLoaded
     }
     func loadTaskView() {
         let restoringBefore = restoringPreferences; restoringPreferences = true
@@ -1185,6 +1247,15 @@ final class ChecklistStore: ObservableObject {
         loadTaskView()
     }
     func open(_ detail: Detail) {
+        screenTiming.cancel(.ticketDetail);screenTiming.cancel(.cleanup)
+        if case .task(let id) = detail {
+            screenTiming.begin(.ticketDetail)
+            if self.detail == detail,selectedTask(id) != nil {screenTiming.cached(.ticketDetail,true)}
+        }
+        if case .project(let id) = detail {
+            screenTiming.begin(.cleanup)
+            if self.detail == detail,selectedOther?.id == id {screenTiming.cached(.cleanup,ticketCleanupReceipts.isCached(scope:cleanupReceiptScope(id)))}
+        }
         
         if let prior = self.detail, prior != detail { detailBackStack.append(prior) }
         if self.detail == nil {
@@ -1193,8 +1264,8 @@ final class ChecklistStore: ObservableObject {
             replaceDetail(detail)
         }
     }
-    func closeDetail() { withAnimation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration: 0.2)) { detail = nil; detailBackStack = [] } }
-    func goBack() { if let prior = detailBackStack.popLast() { replaceDetail(prior) } else { closeDetail() } }
+    func closeDetail() { screenTiming.cancel(.ticketDetail); screenTiming.cancel(.cleanup); withAnimation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration: 0.2)) { detail = nil; detailBackStack = [] } }
+    func goBack() { if let prior = detailBackStack.popLast() { screenTiming.cancel(.ticketDetail);screenTiming.cancel(.cleanup);if case .task = prior {screenTiming.begin(.ticketDetail)};if case .project = prior {screenTiming.begin(.cleanup)};replaceDetail(prior) } else { closeDetail() } }
     private func replaceDetail(_ detail: Detail) {
         // The panel animates when presented or closed. Replacing its item commits
         // one native item tree before another may restore editor state.
@@ -1350,6 +1421,7 @@ final class ChecklistStore: ObservableObject {
         let version = (method == "service_info" ? payload : service)?["read_version"] as? String
         if contentRead, let version {
             if let current = contentVersion, current != version {
+                archivePreviewEpoch = UUID()
                 invalidateContentCache()
                 fullSelectedRecordID = nil; selectedRecordCollections = [:]
                 invalidateSelectedEligibility()
@@ -1379,6 +1451,7 @@ final class ChecklistStore: ObservableObject {
             contentVersion = version
         } else if contentRead, contentVersion != nil {
             // Writer fallback and legacy/unqualified reads cannot authorize reusable pages.
+            archivePreviewEpoch = UUID()
             invalidateContentCache(clearVisible:false); contentVersion = nil
         }
         succeeded=true
@@ -1685,7 +1758,7 @@ final class ChecklistStore: ObservableObject {
             if affected {
                 markVisibleStale()
                 if usesTicketPages { ticketPages.discardContent(); pagedTicketWorkspace = nil }
-                else if page == .overview { for observation in overviewObservations.values { observation.discardContent() } }
+                else if page == .overview { for observation in overviewObservations.values { if reset {observation.discardContent()} else {observation.markNeedsRefresh()} } }
                 else { workspaceObservation.discardContent() }
             }
             if selectedAffected { selectedTicketDisplay = nil; invalidateSelectedTicketFreshness(); invalidateSelectedEligibility() }
@@ -1715,6 +1788,8 @@ final class ChecklistStore: ObservableObject {
     }
 
     func stopWindowReads() {
+        for surface in ScreenTiming.Surface.allCases {screenTiming.cancel(surface)}
+        nextDigestRead?.cancel();nextDigestRead = nil
         freshnessWatchdog?.cancel(); freshnessWatchdog = nil
         liveSurfaceRead?.cancel(); liveSurfaceRead = nil; liveSurfaceScope = nil
         visibleStaleSince = nil; selectedStaleSince = nil; pendingCoverageCursor = nil; pendingCoverageScope = nil

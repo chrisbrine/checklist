@@ -42,7 +42,7 @@ struct ProjectSettingsView: View {
     @State private var editingTaxonomy: TaxonomyEdit?
     @State private var retiringStatus: Record?
     @State private var confirmation: PendingConfirmation?
-    var body: some View { confirmableBody.checklistConfirmation($confirmation) }
+    var body: some View { confirmableBody.checklistConfirmation($confirmation).overlay(TicketCleanupContentFrame(observation:store.ticketCleanupReceipts,projectID:project.id)) }
     @ViewBuilder var confirmableBody: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Spacing.page) {
@@ -180,7 +180,7 @@ struct ProjectSettingsView: View {
             Picker("Initial grouping",selection:$defaultGrouping) { Text("Status").tag("status"); Text("Epic").tag("epic"); Text("None").tag("none") }
             Picker("Initial order",selection:$defaultOrder) { Text("Manual").tag("manual"); Text("Priority").tag("priority"); Text("Recent update").tag("updated_desc") }
             Picker("Desktop alerts",selection:$alerts) { Text("Inherit app preference").tag("inherit"); Text("Actionable Needs You").tag("needs_you"); Text("Quiet").tag("quiet") }
-            DesktopAlertPreferencesView()
+            DesktopAlertPreferencesView(alerts:store.desktopAlertCoordinator)
             Text("Personal views keep their saved choices. Quiet alerts keep Needs You, failures and live updates visible.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
         }
     }

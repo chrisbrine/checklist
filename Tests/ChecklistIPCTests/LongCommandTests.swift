@@ -1,4 +1,5 @@
 import ChecklistTestSupport
+import ChecklistTestSupport
 import Foundation
 import XCTest
 @testable import ChecklistCore
@@ -98,6 +99,7 @@ final class LongCommandTests: XCTestCase {
     }
 
     func testCommandLongerThanOldDeadlineReturnsCommittedResultThroughRealClient() throws {
+        try QualificationSuite.requireEnabled()
         try run(delay: 16, timeout: nil)
     }
     func testBoundedClientGetsOriginalIDAndRetryReplaysAfterCommit() throws {

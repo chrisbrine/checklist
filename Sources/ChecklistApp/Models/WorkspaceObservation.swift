@@ -31,6 +31,12 @@ import Observation
         let count = page.outstandingRequestCount + page.humanTaskCount
         if needsCount != count { needsCount = count }
     }
+    /// Filter choices are project-scoped. Restore them with cached ticket rows,
+    /// without replaying shared health, owner counts or the project catalog.
+    func restoreFilters(_ page: TicketPage) {
+        if !same(statuses,page.statuses) { statuses = page.statuses }
+        if !same(tags,page.tags) { tags = page.tags }
+    }
     /// Workspace totals are global owner counts, independent of row scope, filters and pagination.
     func install(workspace page: WorkspacePage) {
         if !same(projects,page.projects) { projects = page.projects }
@@ -39,11 +45,8 @@ import Observation
     }
     func clear() { projects = nil;statuses = nil;tags = nil;service = nil;needsCount = nil }
     private func same(_ lhs: [Record]?,_ rhs: [Record]) -> Bool {
-        guard let lhs,let a = try? JSONSerialization.data(withJSONObject:lhs.map(\.values),options:[.sortedKeys]),
-              let b = try? JSONSerialization.data(withJSONObject:rhs.map(\.values),options:[.sortedKeys]) else {return false}
-        // Comparing encoded bytes preserves opaque string values, unlike text
-        // canonical-equivalence equality. Invalid shapes are never cached equal.
-        return a == b
+        guard let lhs else {return false}
+        return DisplayValueEquality.records(lhs,rhs)
     }
 }
 

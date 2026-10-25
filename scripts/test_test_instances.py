@@ -67,6 +67,25 @@ class TestInstancesTests(unittest.TestCase):
                 self.assertEqual(arguments.session_id, 'actual-session')
                 self.assertEqual(arguments.replace, replace)
 
+    def test_start_gui_appearance_option(self):
+        for appearance in ['dark', 'light']:
+            argv = ['test_instances.py', 'start', '--slot', '4', '--gui', '--appearance', appearance]
+            with patch.object(sys, 'argv', argv), patch.object(harness, 'checked'), \
+                 patch.object(harness, 'locked', return_value=ExitStack()), patch.object(harness, 'start') as start:
+                harness.main()
+                arguments = start.call_args.args[0]
+                self.assertTrue(arguments.gui)
+                self.assertEqual(arguments.appearance, appearance)
+
+    def test_start_rejects_invalid_or_headless_appearance_before_slot_access(self):
+        for options in [['--gui', '--appearance', 'auto'], ['--appearance', 'dark'],
+                        ['--headless', '--appearance', 'light']]:
+            with patch.object(sys, 'argv', ['test_instances.py', 'start', '--slot', '4', *options]), \
+                 patch.object(harness, 'checked') as checked, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error: harness.main()
+                self.assertEqual(error.exception.code, 2)
+                checked.assert_not_called()
+
     def test_slot_range(self):
         for number in range(1, 5):
             self.assertEqual(harness.slot_number(str(number)), number)
@@ -590,6 +609,30 @@ class SnapshotLogicTests(unittest.TestCase):
             self.assertEqual(seed['source_hash'], harness.sha(source / 'manifest.json'))
             self.assertFalse(seed['live_snapshot'])
             self.assertFalse((destination / 'checklist-store.identity.json').exists())
+
+    def test_compact_format_two_seed_and_invalid_tables(self):
+        # Same wire rows as the Swift codec: content is shared, paths/authority
+        # are reconstructed exactly before ordinary hash/membership validation.
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination, manifest = self.fixture(Path(directory).resolve(), schema=3)
+            entry = manifest['objects'][0]
+            strings = [entry['descriptor']['relativePath'], 'file', entry['sha256']]
+            table = dict(strings=[[0, s] for s in strings], contents=[[2, 7]],
+                         entries=[[0, 1, -1, -1, 0, -1, 0]])
+            manifest.update(format=2, objects=table)
+            (source / 'manifest.json').write_text(json.dumps(manifest))
+            intent = json.loads((source / 'intent.json').read_text()); intent['format'] = '2'
+            (source / 'intent.json').write_text(json.dumps(intent))
+            seed = harness.snapshot_seed(source, destination)
+            self.assertTrue(seed['current_schema_no_migration'])
+            self.assertEqual((destination / 'objects/file').read_bytes(), b'managed')
+            for field, value in [('strings', [[1, 'bad']]), ('contents', [[2, 7], [2, 7]]),
+                                 ('entries', [[99, 1, -1, -1, 0, -1, 0]]),
+                                 ('entries', [[0, 1, -2, -1, 0, -1, 0]]),
+                                 ('entries', [[0, 1, -1, -1, 2, -1, 0]])]:
+                with self.subTest(field=field, value=value):
+                    bad = dict(table); bad[field] = value
+                    with self.assertRaises(ValueError): harness.snapshot_objects(dict(format=2, objects=bad))
 
     def test_agent_current_snapshot_family_counts_and_no_migration_seed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1773,7 +1816,7 @@ class SlotStartupTests(unittest.TestCase):
             output = io.StringIO();progress = io.StringIO()
             def run(command, **kwargs):
                 commands.append(list(map(str, command)))
-                if command[0] == 'launchctl': return subprocess.CompletedProcess(command, 0, '', '')
+                if command[0] in ['launchctl', 'open']: return subprocess.CompletedProcess(command, 0, '', '')
                 self.assertEqual(command, [p['bundle'] / 'Contents/MacOS/checklist', 'service', 'status'])
                 calls.append(kwargs)
                 response = next(responses)
@@ -1790,6 +1833,15 @@ class SlotStartupTests(unittest.TestCase):
                             patch.object(harness.time, 'sleep', clock.sleep), redirect_stdout(output), redirect_stderr(progress)]:
                 stack.enter_context(context)
             yield p, clock, calls, commands, output, progress
+
+    def test_gui_start_passes_appearance_as_app_arguments(self):
+        for appearance in ['dark', 'light', None]:
+            with self.fixture([self.healthy()]) as (p, clock, calls, commands, output, progress):
+                harness.start(SimpleNamespace(slot=4, gui=True, appearance=appearance), p)
+                expected = ['open', '-n', str(p['bundle'])]
+                if appearance: expected += ['--args', '-ChecklistTestAppearance', appearance]
+                self.assertEqual([command for command in commands if command[0] == 'open'], [expected])
+                self.assertIn('Slot 4 ready (gui)', output.getvalue())
 
     def test_start_timeouts_and_unavailable_then_healthy(self):
         unavailable = subprocess.CompletedProcess([], 1, '', 'Checklist: SERVICE_UNAVAILABLE: not responding')

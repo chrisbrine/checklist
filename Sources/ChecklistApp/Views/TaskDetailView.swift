@@ -46,7 +46,7 @@ struct TaskDetailView: View {
         } else {
         VStack(spacing: Spacing.none) {
             ScrollView {
-                VStack(alignment: .leading, spacing: Spacing.page) {
+                LazyVStack(alignment: .leading, spacing: Spacing.page) {
                     header
                     TicketNextActionBar(task: task)
                     TicketRetirementControls(task:task,files:files,undo:$ticketUndo)
@@ -117,7 +117,9 @@ struct TaskDetailView: View {
                             Button("Older messages") {if let cursor = store.selectedMessageNextCursor {store.moveSelectedMessages(cursor)}}.checklistDisabled([(store.selectedTicketLoading, "The ticket is still loading."), (store.selectedMessageNextCursor == nil, "There are no older messages.")])
                         }
                         if messages.isEmpty { Text("Notes and agent messages build the context for this ticket.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText) }
-                        ForEach(messages) { message in MessageRow(message: message, task: task) }
+                        LazyVStack(alignment: .leading, spacing: Spacing.small) {
+                            ForEach(messages) { message in MessageRow(message: message, task: task) }
+                        }
                     }
                     let currentHistory = eventHistory.records(in:store.storeIncarnation)
                     let history = currentHistory ?? store.detailRecords("events",task:task)

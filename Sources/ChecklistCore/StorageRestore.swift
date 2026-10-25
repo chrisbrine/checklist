@@ -99,7 +99,7 @@ extension CommandRouter {
             if FileManager.default.fileExists(atPath:parentURL.appendingPathComponent(stageName).path) {
                 try parent.publish(stageName,as:".restore-incomplete-" + uuid())
             }
-            let stage = try parent.makeDirectory(stageName)
+            let stage = try parent.makeDirectory(stageName, batchSynchronization: true)
             var databaseBudget = budget;databaseBudget.maximumObjectBytes = budget.maximumBytes
             _ = try source.copy("database.sqlite",to:stage,expected:manifest.databaseSHA256,budget:databaseBudget,targetPath:"checklist.sqlite")
             for object in manifest.objects {
@@ -113,6 +113,7 @@ extension CommandRouter {
                     try stage.writeLink(descriptor.relativePath,target:target)
                 }
             }
+            try stage.synchronizeCopiedDirectories(budget:budget)
             receipt = try fenceRestoredAuthority(stage:stage,params:params,caller:caller,manifest:manifest,manifestSHA:manifestSHA,intent:intent,budget:budget)
             try stage.writeNew(receiptName,bytes:Data((try jsonString(receipt)).utf8))
             try stage.synchronizeOwnedFile("checklist.sqlite")

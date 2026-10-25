@@ -63,6 +63,7 @@ For one combined coordinator, split implementation/review threads or several dis
 - Contact a named agent, group tasks, route work, communicate with parent/child sessions, or change policies: [coordination](references/coordinate.md).
 - Review exact submitted work and report verdicts: [review](references/review.md).
 - Change project rules or settings, edit statuses/tags, defer/cancel/archive/delete, or prepare export: [administration](references/administration.md).
+- Recommended practices for any project (guidance, not requirements): evidence that matches each acceptance item, rule-text searches, helper briefs, measurements, diagnosis, store limits, tests and rework: [recommended practices](references/recommended-practices.md).
 - Optional: an orchestrator starts a provider session outside its native host (for example `codex exec`) and that session needs Checklist: [driven sessions](references/driven-sessions.md). Native Codex and Claude conversations skip it.
 
 Read only the procedure needed. The server's live policy and schema are authoritative for configurable behavior; this skill describes safe use, not a competing hard-coded project policy.

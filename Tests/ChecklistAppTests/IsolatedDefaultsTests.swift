@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistApp
 
@@ -47,6 +48,7 @@ final class IsolatedDefaultsTests: XCTestCase {
     }
 
     @MainActor func testPreferencesRemainAbsentAfterChildProcessExit() throws {
+        try QualificationSuite.requireEnabled()
         let marker = "CHECKLIST_DEFAULTS_EXIT_PROBE"
         if let manifest = ProcessInfo.processInfo.environment[marker] {
             let suite = IsolatedDefaults("ProcessExit"), id = UUID()

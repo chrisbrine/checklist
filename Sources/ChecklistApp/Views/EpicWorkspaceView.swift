@@ -17,7 +17,9 @@ struct EpicWorkspaceView: View {
             } else {
                 ScrollView { LazyVStack(spacing: Spacing.control) { ForEach(epics) { epic in EpicOverviewRow(epic: epic) } } }
             }
-        }.padding(Spacing.page).onAppear {store.configureWorkspace(archived:showArchived)}.onChange(of:showArchived) {_,value in store.configureWorkspace(archived:value)}.sheet(isPresented: $showCreate) { CreateEpicSheet().environmentObject(store) }
+        }.screenContentFrame(store.screenTiming, .epics, ready: store.page == .epics && store.workspacePageLoaded)
+        .screenContentFrame(store.screenTiming, .projectSwitch, ready: store.page == .epics && store.workspacePageLoaded)
+        .padding(Spacing.page).onAppear {store.configureWorkspace(archived:showArchived)}.onChange(of:showArchived) {_,value in store.configureWorkspace(archived:value)}.sheet(isPresented: $showCreate) { CreateEpicSheet().environmentObject(store) }
     }
 }
 

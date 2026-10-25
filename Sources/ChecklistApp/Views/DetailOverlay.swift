@@ -16,7 +16,7 @@ struct DetailOverlay: View {
             Divider()
             Group {
                 if case .task(let id) = detail {
-                    if let task = store.selectedTask(id) {TaskDetailView(task:task).id(id)}
+                    if let task = store.selectedTask(id) {TaskDetailView(task:task).id(id).screenContentFrame(store.screenTiming, .ticketDetail, ready: store.detail == .task(id) && store.selectedTask(id) != nil)}
                     else if store.showsOfflineBanner || store.selectedTicketMissing {DetailUnavailable(symbol: "doc.text", title: "Ticket unavailable")}
                     else if let failure = store.selectedTicketError {VStack(spacing: Spacing.control) {Text(failure);Button("Retry ticket") {store.retrySelectedTicket()}}.padding(Spacing.group)}
                     else {ProgressView("Loading selected ticket…")}
@@ -39,7 +39,7 @@ struct DetailOverlay: View {
                         } else if store.otherDetailLoading { ProgressView("Loading current detail…") }
                         else { DetailUnavailable(symbol: "bubble.left", title: "Request unavailable") }
                     }
-                } else if store.otherDetailLoading {ProgressView("Loading current detail…")}
+                } else if store.otherDetailLoading && store.selectedOther == nil {ProgressView("Loading current detail…")}
                 else if let error=store.otherDetailError {VStack(spacing: Spacing.control) {Text(error).multilineTextAlignment(.center);Button("Retry detail") {store.retryOtherDetail()}}.padding(Spacing.group)}
                 else {switch detail {
                 case .task: EmptyView()

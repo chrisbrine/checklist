@@ -605,6 +605,50 @@ def require_local_paths(database, destination, immutable=True, source_root=None)
     return counts
 
 
+def snapshot_objects(manifest):
+    """Expand the versioned compact table without changing descriptor authority."""
+    if manifest['format'] == 1:
+        return manifest['objects']
+    if manifest['format'] != 2:
+        raise ValueError('Unsupported snapshot format.')
+    table = manifest['objects']
+    entries, contents, prefixes = table['entries'], table['contents'], table['strings']
+    if len(entries) > 500_000 or len(contents) > len(entries) or len(prefixes) > 4_000_000:
+        raise ValueError('Snapshot compact table exceeds capacity.')
+    strings, previous, total = [], b'', 0
+    for prefix in prefixes:
+        if (len(prefix) != 2 or type(prefix[0]) is not int or not 0 <= prefix[0] <= len(previous)
+                or not isinstance(prefix[1], str)):
+            raise ValueError('Invalid snapshot string prefix.')
+        previous = previous[:prefix[0]] + prefix[1].encode('utf-8')
+        total += len(previous)
+        if total > 512 * 1_048_576:
+            raise ValueError('Snapshot expanded strings exceed capacity.')
+        strings.append(previous.decode('utf-8'))
+    def string(index):
+        if type(index) is not int or not 0 <= index < len(strings):
+            raise ValueError('Invalid snapshot string index.')
+        return strings[index]
+    result, used = [], set()
+    for row in entries:
+        if (len(row) < 7 or any(type(n) is not int for n in row) or row[3] < -1
+                or row[4] not in [0, 1] or not 0 <= row[6] < len(contents)):
+            raise ValueError('Invalid snapshot descriptor row.')
+        content = contents[row[6]]
+        if len(content) != 2 or type(content[1]) is not int or content[1] < 0:
+            raise ValueError('Invalid snapshot content row.')
+        descriptor = dict(relativePath=string(row[0]), kind=string(row[1]), executable=bool(row[4]),
+                          authorities=[string(n) for n in row[7:]])
+        for key, index in [('expectedSHA256', row[2]), ('linkTarget', row[5])]:
+            if index != -1: descriptor[key] = string(index)
+        if row[3] != -1: descriptor['expectedSize'] = row[3]
+        result.append(dict(descriptor=descriptor, sha256=string(content[0]), size=content[1]))
+        used.add(row[6])
+    if len(used) != len(contents):
+        raise ValueError('Snapshot has unused content rows.')
+    return result
+
+
 def snapshot_seed(source, destination, destination_root=None):
     source = source.expanduser().absolute()
     # Live access is confined to published backups, never its open database or connections.
@@ -616,17 +660,17 @@ def snapshot_seed(source, destination, destination_root=None):
     contained(manifest_file, source)
     raw = manifest_file.read_bytes()
     manifest = json.loads(raw)
-    if manifest['format'] != 1 or manifest['kind'] != 'checklist-store-snapshot' or manifest['schema'] not in [0, 1, 2, 3]:
+    if manifest['format'] not in [1, 2] or manifest['kind'] != 'checklist-store-snapshot' or manifest['schema'] not in [0, 1, 2, 3]:
         raise ValueError('Unsupported snapshot format/schema.')
     uuid.UUID(manifest['storeID']); uuid.UUID(manifest['operationID'])
     contained(source / 'intent.json', source)
     intent = json.loads((source / 'intent.json').read_text())
-    if intent != {'format': '1', 'kind': manifest['kind'], 'operation_id': manifest['operationID'],
+    if intent != {'format': str(manifest['format']), 'kind': manifest['kind'], 'operation_id': manifest['operationID'],
                   'store_id': manifest['storeID'], 'source_root': manifest['sourceRoot']}:
         raise ValueError('Snapshot publication intent does not match its manifest.')
     expected = {'database.sqlite', 'intent.json', 'manifest.json'}
     entries = [('database.sqlite', manifest['databaseSHA256'], manifest['databaseSize'], None)]
-    for entry in manifest['objects']:
+    for entry in snapshot_objects(manifest):
         descriptor = entry['descriptor']
         relative_path(descriptor['relativePath'])
         name = 'managed/' + descriptor['relativePath']
@@ -1054,7 +1098,10 @@ def start(arguments, p):
     service_status(p, bound=bound)
     if arguments.gui:
         print(f'Opening Checklist Test {arguments.slot}: synthetic/test data only.')
-        run(['open', '-n', p['bundle']])
+        command = ['open', '-n', p['bundle']]
+        if getattr(arguments, 'appearance', None):
+            command += ['--args', '-ChecklistTestAppearance', arguments.appearance]
+        run(command)
     print(f'Slot {arguments.slot} ready ({metadata["mode"]}).')
 
 
@@ -1262,8 +1309,11 @@ def main():
         if name == 'start':
             mode = command.add_mutually_exclusive_group()
             mode.add_argument('--headless', action='store_true'); mode.add_argument('--gui', action='store_true')
+            command.add_argument('--appearance', choices=['dark', 'light'], help='force test app appearance (requires --gui)')
         if name == 'promote': command.add_argument('--dry-run', action='store_true')
     arguments = parser.parse_args()
+    if arguments.command == 'start' and arguments.appearance and not arguments.gui:
+        parser.error('--appearance requires --gui.')
     if arguments.command == 'create':
         # Identity first, then every source/destination's live-root admission, then locks/changes.
         arguments.session_id = caller_session(arguments.session_id)

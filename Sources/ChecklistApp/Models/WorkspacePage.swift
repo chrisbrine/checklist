@@ -68,12 +68,14 @@ struct WorkspacePage {
     var page: WorkspacePage?
     private(set) var rows: [Record] = []
     private(set) var retainedRequest: Record?
+    private(set) var needsRefresh = false
     var loading=false
     var error:String?
     private(set) var query:WorkspacePageQuery?
     private var generation=UUID()
+    var readScope: UUID {generation}
     func begin(_ query:WorkspacePageQuery)->UUID {
-        if self.query != query {page=nil;rows=[];retainedRequest=nil}
+        if self.query != query {page=nil;rows=[];retainedRequest=nil;needsRefresh=false}
         self.query=query;generation=UUID();loading=true;error=nil;return generation
     }
     @discardableResult func receive(_ response:[String:Any],query:WorkspacePageQuery,generation:UUID)throws->Bool {
@@ -90,19 +92,20 @@ struct WorkspacePage {
         if query.surface == "record", let request = incoming.rows.first, request.string("record_type") == "request" {
             retainedRequest = request
         }
-        page=incoming;loading=false;return true
+        page=incoming;needsRefresh=false;loading=false;return true
     }
     private static func same(_ lhs: [Record], _ rhs: [Record]) -> Bool {
-        guard let a = try? JSONSerialization.data(withJSONObject: lhs.map(\.values), options: .sortedKeys),
-              let b = try? JSONSerialization.data(withJSONObject: rhs.map(\.values), options: .sortedKeys) else { return false }
-        return a == b
+        DisplayValueEquality.records(lhs,rhs)
     }
     func restore(_ page: WorkspacePage) {
         cancel(clear: true)
         query = page.query; self.page = page; rows = page.rows
     }
     /// A known commit retires content without canceling the read that observed it.
-    func discardContent() { page = nil; rows = []; retainedRequest = nil }
+    func discardContent() { page = nil; rows = []; retainedRequest = nil; needsRefresh = false }
+    /// Coverage retires freshness and reusable caches, not the visible projection.
+    /// A different query or authority reset still clears these rows immediately.
+    func markNeedsRefresh() { needsRefresh = true }
     func applyAnsweredRequest(_ record: Record) {
         guard var current = page, let index = current.rows.firstIndex(where: {
             RecordIdentity($0.id) == RecordIdentity(record.id) && RecordIdentity($0.string("project_id")) == RecordIdentity(record.string("project_id"))
@@ -120,7 +123,7 @@ struct WorkspacePage {
     func isCurrent(_ generation:UUID)->Bool {self.generation==generation}
     func fail(_ generation:UUID,message:String = "Could not load this page. Refresh to load it again; drafts are kept.") {guard self.generation==generation else{return};loading=false;error=message}
     func cancel(_ generation:UUID) {guard self.generation==generation else{return};cancel()}
-    func cancel(clear:Bool=false) {generation=UUID();loading=false;if clear {page=nil;rows=[];retainedRequest=nil;query=nil;error=nil}}
+    func cancel(clear:Bool=false) {generation=UUID();loading=false;if clear {page=nil;rows=[];retainedRequest=nil;query=nil;error=nil;needsRefresh=false}}
 }
 
 // Opaque record IDs are byte-exact; refreshed arrays must not define row identity.

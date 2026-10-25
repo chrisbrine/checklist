@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -11,7 +12,7 @@ final class ReadPerformanceFixture {
         let caches = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true).resolvingSymlinksInPath()
         directory = caches.appendingPathComponent("ChecklistQualification/\(ticket)/" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        router = try CommandRouter(root: directory.appendingPathComponent("store"))
+        router = try TestStore.router(root: directory.appendingPathComponent("store"))
     }
     deinit { try? router.closeStore(); try? FileManager.default.removeItem(at: directory) }
     func call(_ method: String, _ input: JSON = [:]) throws -> JSON {

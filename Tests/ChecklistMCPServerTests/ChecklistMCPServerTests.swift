@@ -110,6 +110,25 @@ final class ChecklistMCPServerTests: XCTestCase {
         }
     }
 
+    func testDirectCLICommandsSkipCatalogAndPreserveServiceRefusals() async throws {
+        let fixture = try Fixture(provider:"codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        let bridge = Bridge(configuration:.init(workspace:fixture.context.workspacePath,command:"call"),environment:fixture.environment)
+        _ = try await bridge.connect()
+        for method in ["message_send","task_get","unknown_method"] {
+            fixture.requestHandler = { name,params in
+                XCTAssertEqual(name,method)
+                XCTAssertEqual(params["unexpected"] as? String,"service validates exact input")
+                throw ChecklistError("FORBIDDEN","Current service grant refusal")
+            }
+            do { _ = try await bridge.call(method,.object(["unexpected":.string("service validates exact input")]));XCTFail("Service refusal must survive") }
+            catch let error as ChecklistError {XCTAssertEqual(error.code,"FORBIDDEN")}
+        }
+        XCTAssertEqual(fixture.calls.map {$0.0},["message_send","task_get","unknown_method"])
+        XCTAssertEqual(fixture.attempts.count,1)
+        XCTAssertTrue(fixture.calls.allSatisfy {$0.1.nativeContext?["native_session_id"] as? String == fixture.context.nativeSessionID})
+    }
+
     func testDirectCLIServiceInfoSkipsCatalogAndForwardsExactParameters() async throws {
         let fixture = try Fixture(provider:"codex")
         fixture.setDiscoveries([.available(fixture.context)])
@@ -173,18 +192,30 @@ final class ChecklistMCPServerTests: XCTestCase {
         XCTAssertEqual(fixture.calls.map {$0.0},["service_info"])
     }
 
-    func testMCPStatusAndOtherCLIMethodsStillRefreshCatalog() async throws {
+    func testMCPCatalogRefreshAndDirectCLIServiceValidation() async throws {
         for (command,method) in [("mcp","service_info"),("call","task_list")] {
             let fixture = try Fixture(provider:"codex")
             fixture.setDiscoveries([.available(fixture.context)])
             let bridge = Bridge(configuration:.init(workspace:fixture.context.workspacePath,command:command),environment:fixture.environment)
             _ = try await bridge.connect()
             _ = try await bridge.call(method,.object([:]))
-            XCTAssertEqual(fixture.calls.map {$0.0},["tool_catalog",method])
+            XCTAssertEqual(fixture.calls.map {$0.0},command == "call" ? [method] : ["tool_catalog",method])
         }
     }
 
     func testProjectArchiveReasonsThroughMCPHistorySelector() async throws {
+        try await assertProjectArchiveReason("  MCP reason: café\nSecond line.  ")
+    }
+    func testProjectArchiveMissingReasonThroughMCPHistorySelector() async throws {
+        try await assertProjectArchiveReason(nil)
+    }
+    func testProjectArchiveEmptyReasonThroughMCPHistorySelector() async throws {
+        try await assertProjectArchiveReason("")
+    }
+    func testProjectArchiveWhitespaceReasonThroughMCPHistorySelector() async throws {
+        try await assertProjectArchiveReason(" \n\t")
+    }
+    private func assertProjectArchiveReason(_ reason: String?) async throws {
         let fixture = try Fixture()
         fixture.setDiscoveries([.available(fixture.context)])
         let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
@@ -209,7 +240,7 @@ final class ChecklistMCPServerTests: XCTestCase {
         let tool = try XCTUnwrap(tools.tools.first {$0.name == "history_list"})
         let schema = try JSONSerialization.jsonObject(with:JSONEncoder().encode(tool.inputSchema)) as! [String:Any]
         XCTAssertEqual(((schema["properties"] as? [String:Any])?["entity"] as? [String:Any])?["enum"] as? [String],["project"])
-        for reason: String? in ["  MCP reason: café\nSecond line.  ",nil,""," \n\t"] {
+        do {
             for archived in [true,false] {
                 let current = try call("project_settings_get",["project_id":pid])
                 var arguments: [String:MCP.Value] = ["project_id":.string(pid),"expected_revision":.int(current["revision"] as! Int),"archived":.bool(archived),"command_id":.string(UUID().uuidString)]

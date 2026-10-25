@@ -129,6 +129,8 @@ struct ContentView: View {
         switch store.page {
         case .overview: OverviewView()
         case .tasks, .archived: VStack(spacing: Spacing.none) { ArchivedProjectNotice(); TaskWorkspaceView() }
+            .screenContentFrame(store.screenTiming,.tickets,ready:store.page == .tasks && store.projectID == nil && store.preparedTicketWorkspace != nil)
+            .screenContentFrame(store.screenTiming,.projectSwitch,ready:store.page == .tasks && store.projectID == nil && store.preparedTicketWorkspace != nil)
         case .needsYou: NeedsYouView()
         case .epics: VStack(spacing: Spacing.none) { ArchivedProjectNotice(); EpicWorkspaceView() }
         case .media: MediaReviewWorkspace(model:store.mediaReview)

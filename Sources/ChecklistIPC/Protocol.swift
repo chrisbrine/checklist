@@ -24,7 +24,9 @@ public struct ChecklistError: LocalizedError {
     public let details: [String: Any]
     public var errorDescription: String? {
         let identity = (details["command_id"] as? String).map { " Command ID: \($0)." } ?? ""
-        return "\(code): \(message)" + identity
+        let reason = ["BACKUP_CAPACITY_EXCEEDED", "BACKUP_DEADLINE_EXCEEDED"].contains(code)
+            ? (details["reason"] as? String).map { " Reason: \($0)." } ?? "" : ""
+        return "\(code): \(message)" + reason + identity
     }
     public init(_ code: String, _ message: String, details: [String: Any] = [:]) { self.code = code; self.message = message; self.details = details }
 }

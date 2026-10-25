@@ -33,6 +33,8 @@ enum NativeRenderMetrics {
         var elapsedNanoseconds: UInt64 = 0
     }
     struct Snapshot: Codable {
+        struct Screen: Codable { let cached: Bool; let milliseconds: Double }
+        let screens: [String:Screen]
         let schemaVersion: Int
         let sample: Int
         let epoch: UInt64
@@ -48,6 +50,7 @@ enum NativeRenderMetrics {
     }
     private final class State: @unchecked Sendable {
         let lock = NSLock()
+        var screens: [String:Snapshot.Screen] = [:]
         var enabled = false
         var epoch: UInt64 = 0
         var sample = 0
@@ -75,7 +78,12 @@ enum NativeRenderMetrics {
         state.lock.lock();defer {state.lock.unlock()}
         state.epoch &+= 1;state.sample = sample;state.start = DispatchTime.now().uptimeNanoseconds
         state.deadline = state.start + 30_000_000_000;state.expired = false
-        state.bodies = [:];state.firstBody = [:];state.firstAppearance = [:];state.requests = [:];state.events = 0;state.observedChanges = 0;state.truncated = false;state.enabled = true
+        state.screens = [:];state.bodies = [:];state.firstBody = [:];state.firstAppearance = [:];state.requests = [:];state.events = 0;state.observedChanges = 0;state.truncated = false;state.enabled = true
+    }
+    static func screenInstalled(_ surface: String, cached: Bool, milliseconds: Double) {
+        state.lock.lock();defer {state.lock.unlock()}
+        guard state.enabled,state.consume(),state.screens[surface] == nil else {return}
+        state.screens[surface] = .init(cached:cached,milliseconds:milliseconds)
     }
     static func body(_ body: Body) {
         state.lock.lock();defer {state.lock.unlock()}
@@ -117,7 +125,7 @@ enum NativeRenderMetrics {
         state.lock.lock();defer {state.lock.unlock()}
         guard state.enabled else {return nil}
         state.enabled = false
-        return .init(schemaVersion:1,sample:state.sample,epoch:state.epoch,
+        return .init(screens:state.screens,schemaVersion:2,sample:state.sample,epoch:state.epoch,
                      durationNanoseconds:DispatchTime.now().uptimeNanoseconds-state.start,observedChanges:state.observedChanges,
                      bodies:Dictionary(uniqueKeysWithValues:Body.allCases.map {($0.rawValue,state.bodies[$0] ?? 0)}),
                      firstBodyNanoseconds:Dictionary(uniqueKeysWithValues:state.firstBody.map {($0.key.rawValue,$0.value)}),
@@ -128,6 +136,6 @@ enum NativeRenderMetrics {
     static func cancel() {
         state.lock.lock();defer {state.lock.unlock()}
         state.enabled = false;state.epoch &+= 1
-        state.bodies = [:];state.firstBody = [:];state.firstAppearance = [:];state.requests = [:]
+        state.screens = [:];state.bodies = [:];state.firstBody = [:];state.firstAppearance = [:];state.requests = [:]
     }
 }

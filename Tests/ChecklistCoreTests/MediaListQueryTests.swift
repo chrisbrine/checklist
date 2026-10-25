@@ -120,6 +120,7 @@ final class MediaListQueryTests: XCTestCase {
         return (f,old,current,item)
     }
     func testExamplesStayCollapsedUntilShowThenCapPageAndNeverGrantApproval() throws {
+        try QualificationSuite.requireEnabled()
         let (f,old,current,item) = try acceptedHistory(70)
         let before = try f.allState()
         let collapsed = try show(f,current,item,expanded:false)

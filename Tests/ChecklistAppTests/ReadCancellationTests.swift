@@ -198,8 +198,6 @@ import ChecklistIPC
         NSApplication.shared.accessibilitySetValue(true, forAttribute: enhanced)
         defer { NSApplication.shared.accessibilitySetValue(previous, forAttribute: enhanced) }
         host.layoutSubtreeIfNeeded()
-        try await Task.sleep(nanoseconds: 100_000_000)
-        host.layoutSubtreeIfNeeded()
         func attribute(_ object: NSObject, _ name: String) -> Any? {
             let selector = NSSelectorFromString(name)
             return object.responds(to: selector) ? object.perform(selector)?.takeUnretainedValue() : nil
@@ -208,15 +206,25 @@ import ChecklistIPC
             guard depth < 30 else { return [] }
             return [object] + (attribute(object, "accessibilityChildren") as? [NSObject] ?? []).flatMap { nodes($0, depth: depth + 1) }
         }
-        let elements = nodes(host)
-        let buttons = elements.filter { attribute($0, "accessibilityRole") as? String == "AXButton" }
-        let labels = buttons.compactMap { attribute($0, "accessibilityLabel") as? String }
-        XCTAssertEqual(labels.contains("Refresh service"), !loading, context, file: file, line: line)
-        XCTAssertTrue(labels.contains("Checklist Settings"), context, file: file, line: line)
         func progressViews(_ view: NSView) -> [NSProgressIndicator] {
             (view as? NSProgressIndicator).map { [$0] } ?? view.subviews.flatMap { progressViews($0) }
         }
-        XCTAssertEqual(!progressViews(host).isEmpty, loading, context, file: file, line: line)
+        func footer() -> (labels: [String], loading: Bool) {
+            host.layoutSubtreeIfNeeded()
+            let buttons = nodes(host).filter { attribute($0, "accessibilityRole") as? String == "AXButton" }
+            return (buttons.compactMap { attribute($0, "accessibilityLabel") as? String }, !progressViews(host).isEmpty)
+        }
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+        var observed = footer()
+        while (observed.labels.contains("Refresh service") != !loading ||
+               !observed.labels.contains("Checklist Settings") || observed.loading != loading),
+              ProcessInfo.processInfo.systemUptime < deadline {
+            try await Task.sleep(nanoseconds: 1_000_000)
+            observed = footer()
+        }
+        XCTAssertEqual(observed.labels.contains("Refresh service"), !loading, context, file: file, line: line)
+        XCTAssertTrue(observed.labels.contains("Checklist Settings"), context, file: file, line: line)
+        XCTAssertEqual(observed.loading, loading, context, file: file, line: line)
     }
     func testRefreshAndSnapshotCancellationPreserveEveryHealthTuple() async throws {
         for initial in ["unknown", "healthy", "outage"] {

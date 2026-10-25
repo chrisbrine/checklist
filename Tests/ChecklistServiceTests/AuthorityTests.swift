@@ -50,6 +50,27 @@ final class AuthorityTests: XCTestCase {
             XCTAssertEqual((error as? ChecklistError)?.code, code, file: file, line: line)
         }
     }
+    func testNativeDispatchSelectsOnlyCurrentEndpointSessionsBeforeProjection() throws {
+        var projected = 0
+        XCTAssertTrue(coordinator.nativeDispatchDeliveries { _ in projected += 1;return nil }.isEmpty)
+        XCTAssertEqual(projected,0,"An empty native route set must not expand the outbox")
+        var current = enrollment();current.nativeEndpoint = "/synthetic/endpoint"
+        var revoked = current;revoked.installation = "revoked";revoked.sessionID = "revoked-session";revoked.revoked = true
+        var pickup = enrollment();pickup.installation = "pickup";pickup.sessionID = "pickup-session"
+        coordinator.enrollments = [current.installation:current,revoked.installation:revoked,pickup.installation:pickup]
+        let rows = coordinator.nativeDispatchDeliveries(endpointAvailable:{_ in true}) {params in
+            projected += 1
+            XCTAssertEqual(params["native_dispatch_candidates"] as? Bool,true)
+            XCTAssertEqual(params["native_session_ids"] as? [String],[current.sessionID])
+            return ["deliveries":[["id":"eligible-delivery"]]]
+        }
+        XCTAssertEqual(rows.first?["id"] as? String,"eligible-delivery")
+        XCTAssertEqual(projected,1)
+        XCTAssertTrue(coordinator.nativeDispatchDeliveries(endpointAvailable:{_ in false}) { _ in XCTFail("An absent endpoint cannot be projected");return nil }.isEmpty)
+        current.revoked = true;coordinator.enrollments[current.installation] = current
+        XCTAssertTrue(coordinator.nativeDispatchDeliveries { _ in XCTFail("A revoked route cannot be projected");return nil }.isEmpty)
+    }
+
     func testOwnerFlagCannotMintHumanAuthority() throws {
         var input = request(); input["owner_channel"] = true
         rejects("OWNER_CHANNEL_REQUIRED") { try coordinator.caller(input, connection: connection) }

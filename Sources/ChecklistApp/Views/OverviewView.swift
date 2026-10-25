@@ -26,6 +26,8 @@ struct OverviewView: View {
                 }
             }.padding(Spacing.page).frame(maxWidth: .infinity, alignment: .leading)
         }
+        .screenContentFrame(store.screenTiming, .overview, ready: store.page == .overview && store.screenContentReady)
+        .screenContentFrame(store.screenTiming, .projectSwitch, ready: store.page == .overview && store.screenContentReady)
         .onAppear { store.beginOverviewVisit() }
         .onDisappear { store.endOverviewVisit() }
     }
