@@ -10,20 +10,25 @@ import ChecklistIPC
         let page: Page
         init(_ preferences:UserDefaults, page:Page = .tasks) {self.preferences = preferences;self.page = page}
         var status = "In progress", version = "v1"
+        var revision = 1
+        var title = "Fixture"
         var calls: [String] = []
         var pageReads: [String] = []
         var failNext = false, ignoreNext = false, holdList = false, holdContext = false
         var failMethod = "task_list"
         var held: [(String, CheckedContinuation<[String:Any],Error>, [String:Any])] = []
         var wait: CheckedContinuation<[String:Any],Error>?
+        var extraWaits: [CheckedContinuation<[String:Any],Error>] = []
+        var queuedChanges: [[String:Any]] = []
         var cursors: [String?] = []
         var replayChanges = false
         var contextVersion: String?
         var holdSurface = "needs_review"
         var inTriage = false
+        var statusCoverage = false
         var service: [String:Any] { ["store_incarnation":"fixture", "read_version":version] }
         func task(_ id:String = "a", project:String = "p") -> [String:Any] {
-            ["id":id,"project_id":project,"title":"Fixture", "revision":version == "v1" ? 1 : 2,"status_name":status,"status_category":status == "Review" ? "review" : "active","status_id":status]
+            ["id":id,"project_id":project,"title":title, "revision":revision,"status_name":status,"status_category":status == "Review" ? "review" : "active","status_id":status]
         }
         func context(_ id:String) -> [String:Any] {
             let collections = Dictionary(uniqueKeysWithValues:["messages","attachments","attempts","requests","events","sessions","groups","statuses","tags"].map {($0, [[String:Any]]())})
@@ -48,6 +53,8 @@ import ChecklistIPC
         func transport(_ method:String,_ params:[String:Any]) async throws -> [String:Any] {
             if method == "changes_wait" {
                 cursors.append(params["cursor"] as? String)
+                if !queuedChanges.isEmpty {return queuedChanges.removeFirst()}
+                if let wait {extraWaits.append(wait);self.wait = nil}
                 if replayChanges, params["cursor"] as? String != "c1" {return changes()}
                 return try await withCheckedThrowingContinuation { wait = $0 }
             }
@@ -65,13 +72,22 @@ import ChecklistIPC
                 if method == "workspace_page" { reply = workspace(params,invalid:ignored) }
                 else { XCTAssertEqual(method,"task_list");reply = list(ignored ? "foreign" : "p") }
             }
-            if holdList && (method == "task_list" || method == "workspace_page" && (page != .overview || ["overview",holdSurface].contains(params["surface"] as? String ?? ""))) || method == "task_context" && holdContext {
+            if holdList && (method == "task_list" || method == "workspace_page" && (page != .overview || (holdSurface == "all" || ["overview",holdSurface].contains(params["surface"] as? String ?? "")))) || method == "task_context" && holdContext {
                 return try await withCheckedThrowingContinuation { held.append((method,$0,reply)) }
             }
             return reply
         }
-        func changes() -> [String:Any] { ["changed":true,"event_cursor":"c1","coverage":["schema_version":2,"complete":true,"reset":false,"changes":[["project_id":"p","families":["tasks","work","groups"],"task_ids":["a"],"all_tasks":false]]]] }
-        func commit() { status = "Review";version = "v2" }
+        func changes() -> [String:Any] {
+            var result: [String:Any] = ["changed":true,"event_cursor":"c1","coverage":["schema_version":2,"complete":true,"reset":false,"changes":[["project_id":"p","families":["tasks","work","groups"],"task_ids":["a"],"all_tasks":false]]]]
+            if statusCoverage {
+                var coverage = result["coverage"] as! [String:Any]
+                coverage["store_incarnation"] = "fixture"
+                coverage["status_updates"] = [["task":task(),"surfaces":status == "Review" ? ["needs_review"] : ["needs_pickup"]]]
+                result["coverage"] = coverage
+            }
+            return result
+        }
+        func commit() { status = "Review";version = "v2";revision = 2;title = "Updated fixture" }
         func release(_ method:String) { guard let i = held.firstIndex(where: {$0.0 == method}) else {return};let row = held.remove(at:i);row.1.resume(returning:row.2) }
         func store() -> ChecklistStore {
             preferences.set(page.rawValue,forKey:"lastPage");preferences.set("p",forKey:"lastProject")
@@ -83,6 +99,7 @@ import ChecklistIPC
         }
         func cleanup() {
             wait?.resume(throwing:CancellationError());wait = nil
+            for wait in extraWaits {wait.resume(throwing:CancellationError())};extraWaits = []
             for row in held {row.1.resume(throwing:CancellationError())};held = []
             if FileManager.default.fileExists(atPath:root.path) { try? FileManager.default.removeItem(at:root) }
         }
@@ -101,6 +118,141 @@ import ChecklistIPC
         }
         if page == .overview {return store.overviewObservations["needs_review"]?.rows.first?.string("status_name")}
         return store.workspaceRows.first?.string("status_name")
+    }
+    func testLiveStatusCoverageArrivesWhileEarlierPagesStayHeld() async throws {
+        let f = Fixture(isolatedDefaults("StatusReadAhead").preferences,page:.overview)
+        let store = f.store(),live = Task {await store.startLiveUpdates()}
+        defer {live.cancel();store.stopWindowReads();f.cleanup()}
+        try await until {f.wait != nil}
+        store.open(.task("a"));try await until {store.selectedTicketCurrent("a")}
+        var now: TimeInterval = 1802.7;store.liveNow = {now}
+        f.statusCoverage = true;f.holdList = true;f.holdSurface = "all";f.holdContext = true
+        // A work update starts a slow full read, before the status commits.
+        var earlier = f.changes(),coverage = earlier["coverage"] as! [String:Any]
+        coverage["changes"] = [["project_id":"p","families":["work"],"task_ids":["a"],"all_tasks":false]]
+        earlier["coverage"] = coverage
+        let firstWait = f.wait;f.wait = nil;firstWait?.resume(returning:earlier)
+        try await until {f.held.count >= 4}
+        now += 0.25;f.commit()
+        var statusChange = f.changes();statusChange["event_cursor"] = "c2"
+        if let wait = f.wait {f.wait = nil;wait.resume(returning:statusChange)}
+        else {f.queuedChanges.append(statusChange)}
+        try await until {store.selectedTask("a")?.string("status_name") == "Review" && self.shownStatus(store,page:.overview) == "Review"}
+        XCTAssertEqual(f.held.count,4,"No page or context reply was released for the status")
+        XCTAssertEqual(cursor(store),"c0","Read-ahead is not acknowledgment of either unfinished interval")
+        XCTAssertFalse(store.selectedTicketCurrent("a"))
+        XCTAssertEqual(f.pageReads.filter {$0 == "overview"}.count,1)
+    }
+
+    func testCommittedStatusDisplaysBeforeHeldPagesAndContextAfterIdle() async throws {
+        let f = Fixture(isolatedDefaults("CoverageStatusIdle").preferences,page:.overview)
+        let store = f.store(), live = Task {await store.startLiveUpdates()}
+        defer {live.cancel();store.stopWindowReads();f.cleanup()}
+        try await until {f.wait != nil}
+        store.open(.task("a"));try await until {store.selectedTicketCurrent("a")}
+        var now: TimeInterval = 1802.7;store.liveNow = {now}
+        f.commit();f.statusCoverage = true;f.holdList = true;f.holdSurface = "all";f.holdContext = true
+        let apply = Task {await store.applyChangeCoverage(f.changes())};defer {apply.cancel()}
+        try await until {f.held.count >= 4}
+        // No elapsed-time assertion: coverage must publish synchronously before
+        // any deliberately stalled transport or watchdog clock can complete.
+        XCTAssertEqual(shownStatus(store,page:.overview),"Review")
+        XCTAssertEqual(store.selectedTask("a")?.string("status_name"),"Review")
+        XCTAssertFalse(store.overviewObservations["needs_active"]!.rows.contains {$0.id == "a"})
+        XCTAssertEqual(store.selectedTask("a")?.string("title"),"Fixture","Only status fields are patched")
+        XCTAssertEqual(cursor(store),"c0","The status patch does not cover unfinished page reads")
+        now += 0.25
+        XCTAssertEqual(f.pageReads.filter {$0 == "overview"}.count,1)
+        f.holdList = false;f.holdContext = false
+        while !f.held.isEmpty {f.release(f.held[0].0)}
+        let accepted = await apply.value;XCTAssertTrue(accepted)
+        XCTAssertEqual(cursor(store),"c1")
+        XCTAssertEqual(store.selectedTask("a")?.string("title"),"Updated fixture","Full context replaces the status patch")
+    }
+
+    func testCoverageStatusCannotReplaceNewerDisplayedTicket() async throws {
+        let f = Fixture(isolatedDefaults("CoverageStatusRevision").preferences,page:.overview)
+        f.version = "v3";f.status = "Queued";f.revision = 3
+        let store = f.store(),live = Task {await store.startLiveUpdates()}
+        defer {live.cancel();store.stopWindowReads();f.cleanup()}
+        try await until {f.wait != nil}
+        store.open(.task("a"));try await until {store.selectedTicketCurrent("a")}
+        f.statusCoverage = true;f.version = "v2";f.status = "Review";f.revision = 2
+        f.holdList = true;f.holdSurface = "all";f.holdContext = true
+        let apply = Task {await store.applyChangeCoverage(f.changes())};defer {apply.cancel()}
+        try await until {f.held.count >= 4}
+        XCTAssertEqual(store.selectedTask("a")?.string("status_name"),"Queued")
+        XCTAssertEqual(shownStatus(store,page:.overview),"Queued")
+        f.holdList = false;f.holdContext = false;f.version = "v3";f.status = "Queued";f.revision = 3
+        // Stale in-flight replies must be rejected, then the ordinary retry can
+        // obtain a complete newer page/context.
+        while !f.held.isEmpty {f.release(f.held[0].0)}
+        _ = await apply.value
+        XCTAssertEqual(store.selectedTask("a")?.string("status_name"),"Queued")
+        XCTAssertEqual(shownStatus(store,page:.overview),"Queued")
+    }
+
+    func testNewCommittedStatusFencesEarlierHeldStatusReplies() async throws {
+        let f = Fixture(isolatedDefaults("CoverageStatusSupersession").preferences,page:.overview)
+        let store = f.store(),live = Task {await store.startLiveUpdates()}
+        defer {live.cancel();store.stopWindowReads();f.cleanup()}
+        try await until {f.wait != nil}
+        store.open(.task("a"));try await until {store.selectedTicketCurrent("a")}
+        var now: TimeInterval = 1802.7;store.liveNow = {now}
+        f.commit();f.statusCoverage = true;f.holdList = true;f.holdSurface = "all";f.holdContext = true
+        let old = Task {await store.applyChangeCoverage(f.changes())};defer {old.cancel()}
+        try await until {f.held.count >= 4}
+        XCTAssertEqual(shownStatus(store,page:.overview),"Review")
+        XCTAssertFalse(store.selectedTicketCurrent("a"),"A status patch is not a complete current context")
+        now += 0.25;f.revision = 3;f.version = "v3";f.status = "Queued"
+        f.holdList = false;f.holdContext = false
+        var newer = f.changes();newer["event_cursor"] = "c2"
+        let accepted = await store.applyChangeCoverage(newer);XCTAssertTrue(accepted)
+        XCTAssertEqual(store.selectedTask("a")?.string("status_name"),"Queued")
+        XCTAssertEqual(shownStatus(store,page:.overview),"Queued")
+        while !f.held.isEmpty {f.release(f.held[0].0)}
+        _ = await old.value
+        XCTAssertEqual(store.selectedTask("a")?.string("status_name"),"Queued")
+        XCTAssertEqual(shownStatus(store,page:.overview),"Queued")
+        XCTAssertEqual(cursor(store),"c2")
+        XCTAssertEqual(f.pageReads.filter {$0 == "overview"}.count,1)
+    }
+
+    func testMessageOnlyCoverageDoesNotFanOutOverviewReads() async throws {
+        let f = Fixture(isolatedDefaults("OverviewNoteCoverage").preferences,page:.overview)
+        let store = f.store(),live = Task {await store.startLiveUpdates()}
+        defer {live.cancel();store.stopWindowReads();f.cleanup()}
+        try await until {f.wait != nil}
+        let before = f.pageReads
+        var changes = f.changes()
+        changes["coverage"] = ["schema_version":2,"complete":true,"reset":false,
+            "changes":[["project_id":"p","families":["messages"],"task_ids":["b"],"all_tasks":false]]]
+        let accepted = await store.applyChangeCoverage(changes)
+        XCTAssertTrue(accepted)
+        XCTAssertEqual(f.pageReads,before,"Note writers cannot enqueue all ten Overview groups")
+        XCTAssertEqual(cursor(store),"c1")
+    }
+
+    func testCoverageStatusRejectsWrongIncarnationAndProject() async throws {
+        for foreignStore in [true,false] {
+            let f = Fixture(isolatedDefaults("CoverageStatusScope").preferences,page:.overview)
+            let store = f.store(),live = Task {await store.startLiveUpdates()}
+            defer {live.cancel();store.stopWindowReads();f.cleanup()}
+            try await until {f.wait != nil}
+            store.open(.task("a"));try await until {store.selectedTicketCurrent("a")}
+            f.commit();f.statusCoverage = true;f.holdList = true;f.holdSurface = "all";f.holdContext = true
+            var changes = f.changes(),coverage = changes["coverage"] as! [String:Any]
+            if foreignStore {coverage["store_incarnation"] = "other-store"}
+            else {coverage["status_updates"] = [["task":f.task(project:"other-project"),"surfaces":["needs_review"]]]}
+            changes["coverage"] = coverage
+            let apply = Task {await store.applyChangeCoverage(changes)};defer {apply.cancel()}
+            try await until {f.held.count >= 4}
+            XCTAssertEqual(shownStatus(store,page:.overview),"In progress")
+            XCTAssertEqual(store.selectedTask("a")?.string("status_name"),"In progress")
+            f.holdList = false;f.holdContext = false
+            while !f.held.isEmpty {f.release(f.held[0].0)}
+            _ = await apply.value
+        }
     }
     func testFailedReadRetriesWithoutAdvancingCursor() async throws {
         for (page,selected) in [(Page.tasks,false),(.overview,false),(.epics,false),(.tasks,true)] {

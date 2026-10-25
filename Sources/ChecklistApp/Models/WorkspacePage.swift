@@ -106,6 +106,23 @@ struct WorkspacePage {
     /// Coverage retires freshness and reusable caches, not the visible projection.
     /// A different query or authority reset still clears these rows immediately.
     func markNeedsRefresh() { needsRefresh = true }
+    /// A committed status can move an already displayed ticket before the full
+    /// page arrives. Counts/cursors remain provisional until that page replaces it.
+    func applyCommittedStatus(_ task: Record, member: Bool) {
+        guard var current = page, let query, query.text.isEmpty,
+              current.projects.contains(where: {RecordIdentity($0.id) == RecordIdentity(task.string("project_id"))}),
+              query.project.map({RecordIdentity($0) == RecordIdentity(task.string("project_id"))}) ?? true else {return}
+        let index = current.rows.firstIndex {RecordIdentity($0.id) == RecordIdentity(task.id) && RecordIdentity($0.string("project_id")) == RecordIdentity(task.string("project_id"))}
+        if let index {
+            if member {current.rows[index] = task} else {current.rows.remove(at:index)}
+        } else if member, current.previous == nil {
+            current.rows.insert(task,at:0)
+            current.rows = Array(current.rows.prefix(query.limit))
+        }
+        current.total = max(current.total,current.rows.count)
+        if !Self.same(rows,current.rows) {rows = current.rows}
+        page = current
+    }
     func applyAnsweredRequest(_ record: Record) {
         guard var current = page, let index = current.rows.firstIndex(where: {
             RecordIdentity($0.id) == RecordIdentity(record.id) && RecordIdentity($0.string("project_id")) == RecordIdentity(record.string("project_id"))

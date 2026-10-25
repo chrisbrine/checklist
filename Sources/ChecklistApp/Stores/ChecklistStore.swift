@@ -163,6 +163,13 @@ final class ChecklistStore: ObservableObject {
     private var pendingCoverageCursor: String?
     private var pendingCoverageScope: LiveSurfaceScope?
     private var pendingCoverageIsComplete = false
+    private struct StatusIdentity: Hashable {
+        let project: RecordIdentity
+        let task: RecordIdentity
+        init(_ row: Record) {project = RecordIdentity(row.string("project_id"));task = RecordIdentity(row.id)}
+    }
+    private var coverageStatusFloors: [StatusIdentity:Int] = [:]
+    private var coverageStatusIncarnation: String?
     private var liveSurfaceRead: Task<Bool,Never>?
     private var liveSurfaceScope: LiveSurfaceScope?
     private var liveSurfaceReadID = UUID(), liveSurfaceEpoch = UUID()
@@ -445,7 +452,7 @@ final class ChecklistStore: ObservableObject {
         guard case .task(let current) = detail else {return false}
         return RecordIdentity(current) == RecordIdentity(id)
     }
-    func selectedTicketCurrent(_ id: String) -> Bool {isSelectedTicket(id) && !selectedTicketLoading && selectedTicketError == nil && hasSelectedTicketDisplay(id)}
+    func selectedTicketCurrent(_ id: String) -> Bool {isSelectedTicket(id) && selectedInstalledChange == selectedChange && !selectedTicketLoading && selectedTicketError == nil && hasSelectedTicketDisplay(id)}
     var selectedRecordsCurrent: Bool {fullSelectedRecordID != nil && !selectedTicketLoading && selectedTicketError == nil && !selectedRecordsLoading && selectedRecordsError == nil}
     func hasSelectedTicketDisplay(_ id: String) -> Bool { selectedTicketDisplay.map {RecordIdentity($0.task.id) == RecordIdentity(id)} ?? false }
     func selectedRecordCount(_ key: String, task: Record) -> Int {
@@ -1080,6 +1087,7 @@ final class ChecklistStore: ObservableObject {
         do {
             if try observation.receive(response, query: read.query, generation: read.generation), let installed = observation.page {
                 if installCatalog { ticketCatalog.install(workspace: installed) }; cacheWorkspacePage(installed); acceptServiceRead()
+                if visibleStaleSince != nil {visibleStaleSince = liveNow()}
                 // Incidental pages never advance an established live coverage interval.
                 if self.eventCursor == nil, pendingCoverageScope == nil { advanceEventCursor(eventCursor ?? response["event_cursor"] as? String ?? installed.contentCursor,source:"overview") }
                 return true
@@ -1508,6 +1516,26 @@ final class ChecklistStore: ObservableObject {
         // read token is stable only for this exact caller/grant and database snapshot.
         let payload = reply["data"] as? [String:Any] ?? reply["result"] as? [String:Any] ?? reply
         let service = payload["service"] as? [String:Any] ?? (payload["tickets_page"] as? [String:Any])?["service"] as? [String:Any]
+        if ["workspace_page","task_list","task_context"].contains(method),
+           let incarnation = service?["store_incarnation"] as? String, incarnation == coverageStatusIncarnation {
+            let taskSurfaces: Set<String> = ["needs_review","needs_pickup","needs_active","needs_quiet","needs_recovery","needs_done_today","human_tasks","completed_since","epic_tasks","epic_candidates","triage_tasks","triage_candidates"]
+            var records = taskSurfaces.contains(params["surface"] as? String ?? "") ? payload["rows"] as? [[String:Any]] ?? [] : []
+            if let task = payload["task"] as? [String:Any] {records.append(task)}
+            if let tickets = payload["tickets_page"] as? [String:Any] {records += tickets["tasks"] as? [[String:Any]] ?? []}
+            if let groups = payload["groups"] as? [String:[String:Any]] {
+                for (surface,group) in groups where taskSurfaces.contains(surface) {records += group["rows"] as? [[String:Any]] ?? []}
+            }
+            let displayed = overviewObservations.values.flatMap(\.rows) + (selectedTicketDisplay.map {[$0.task]} ?? [])
+            var floors = coverageStatusFloors
+            for record in displayed {floors[StatusIdentity(record)] = max(floors[StatusIdentity(record)] ?? 0,record.integer("revision",fallback:0))}
+            if records.contains(where: { row in
+                let record = Record(values:row)
+                return record.integer("revision",fallback:0) < (floors[StatusIdentity(record)] ?? 0)
+            }) {
+                Self.liveLogger.notice("read path=status_revision_retired method=\(method, privacy:.public)")
+                throw CancellationError()
+            }
+        }
         // Only the projections that populate the window's content cache share
         // its epoch. Storage, restore previews and receipt reads own independent
         // lifetimes; navigating or refreshing a list must not cancel those reads.
@@ -1825,9 +1853,87 @@ final class ChecklistStore: ObservableObject {
         }
     }
 
+    /// Status-only coverage is display data, never a fresh context or a cursor
+    /// acknowledgment. All normal page/context reads still have to succeed.
+    @discardableResult private func applyCommittedStatuses(_ coverage: [String:Any], retireReads: Bool = false) -> Int {
+        guard let incarnation = coverage["store_incarnation"] as? String,
+              !incarnation.isEmpty, incarnation == storeIncarnation,
+              let updates = coverage["status_updates"] as? [[String:Any]], updates.count <= 100 else {return 0}
+        coverageStatusIncarnation = incarnation
+        let displayed = overviewObservations.values.flatMap(\.rows) + (selectedTicketDisplay.map {[$0.task]} ?? [])
+        let displayedIDs = Set(displayed.map(StatusIdentity.init))
+        var floors = coverageStatusFloors.filter {displayedIDs.contains($0.key)}
+        var installed = 0
+        let surfaces: Set<String> = ["needs_review","needs_pickup","needs_active","needs_quiet","needs_recovery","needs_done_today"]
+        for update in updates {
+            guard let values = update["task"] as? [String:Any],
+                  let id = values["id"] as? String, !id.isEmpty,
+                  let project = values["project_id"] as? String, !project.isEmpty,
+                  let revision = values["revision"] as? Int, revision > 0,
+                  values["status_id"] is String, values["status_name"] is String, values["status_category"] is String,
+                  let memberships = update["surfaces"] as? [String],Set(memberships).isSubset(of:surfaces) else {continue}
+            let patch = Record(values:values), key = StatusIdentity(patch)
+            let visible = overviewObservations.values.flatMap(\.rows).filter {StatusIdentity($0) == key}
+            let selected = selectedTicketDisplay.flatMap {StatusIdentity($0.task) == key ? $0.task : nil}
+            let known = visible + (selected.map {[$0]} ?? [])
+            guard let source = known.max(by: {$0.integer("revision") < $1.integer("revision")}) else {continue}
+            let displayedRevision = source.integer("revision")
+            floors[key] = max(floors[key] ?? 0,max(revision,displayedRevision))
+            guard revision > displayedRevision else {continue}
+            if retireReads, installed == 0 {
+                // These page replies may have pinned a snapshot before the
+                // read-ahead status. Retire even empty replies before publishing.
+                invalidateContentCache(clearVisible:false);contentVersion = nil
+                markVisibleStale();visibleStaleSince = liveNow()
+            }
+            if retireReads, selected != nil {
+                invalidateSelectedTicketFreshness();selectedStaleSince = liveNow();invalidateSelectedEligibility()
+            }
+            // Only committed status fields are overlaid. Older context/work data
+            // stays visibly refreshing and cannot authorize selected actions.
+            let fields = values.filter {["id","project_id","revision","status_id","status_name","status_category","archived","trashed"].contains($0.key)}
+            let task = Record(values:source.values.merging(fields) {_,new in new})
+            if var display = selectedTicketDisplay, StatusIdentity(display.task) == key {
+                display.task = Record(values:display.task.values.merging(fields) {_,new in new})
+                selectedTicketDisplay = display
+            }
+            if page == .overview, projectID.map({RecordIdentity($0) == key.project}) ?? true {
+                for surface in surfaces {overviewObservations[surface]?.applyCommittedStatus(task,member:memberships.contains(surface))}
+            }
+            installed += 1
+        }
+        coverageStatusFloors = floors
+        if installed > 0 {Self.liveLogger.notice("changed path=committed_status task_count=\(installed)")}
+        return installed
+    }
+
+    /// Read ahead only while this interval's full reads are pending. The local
+    /// observation cursor never acknowledges the applied page/context cursor.
+    private func observeStatusCoverage(after cursor: String, scope: LiveSurfaceScope) async {
+        var observed = cursor
+        while !Task.isCancelled, liveScope == scope, pendingCoverageCursor == cursor {
+            do {
+                let start = liveNow()
+                let changes = try await request("changes_wait",["cursor":observed,"timeout_ms":8000,"include_coverage":true])
+                try Task.checkCancellation()
+                guard liveScope == scope, pendingCoverageCursor == cursor else {return}
+                if changes["changed"] as? Bool == true {
+                    guard let coverage = changes["coverage"] as? [String:Any],
+                          coverage["schema_version"] as? Int == 2, coverage["complete"] as? Bool == true,
+                          coverage["reset"] as? Bool == false, let next = changes["event_cursor"] as? String else {return}
+                    applyCommittedStatuses(coverage,retireReads:true)
+                    observed = next
+                    let ms = Int((liveNow() - start) * 1000)
+                    Self.liveLogger.notice("subscription path=status_read_ahead duration_ms=\(ms)")
+                } else {try await Task.sleep(nanoseconds:liveWaitPause)}
+            } catch {return} // The primary subscription owns reset/outage recovery.
+        }
+    }
+
     /// Called by the authenticated event subscription. Cursor advancement belongs
     /// to this coverage interval, never an incidental newer list/read response.
-    @discardableResult func applyChangeCoverage(_ changes:[String:Any]) async -> Bool {
+    @discardableResult func applyChangeCoverage(_ changes:[String:Any], observeFurtherChanges: Bool = false) async -> Bool {
+        guard !Task.isCancelled else {return false}
         if page == .overview { prepareOverviewVisit() }
         let scope = liveScope
         let cursor = changes["event_cursor"] as? String
@@ -1851,7 +1957,8 @@ final class ChecklistStore: ObservableObject {
         let ticketAffected=catalogAffected || needsAffected || visible.contains {row in let f=families(row);return !f.isDisjoint(with:["all","tasks","groups"]) || !search.isEmpty && f.contains("messages")}
         let workspaceAffected=catalogAffected || needsAffected || visible.contains {row in
             let f=families(row)
-            if page == .activity || page == .overview {return true}
+            if page == .activity {return true}
+            if page == .overview {return !f.isDisjoint(with:["all","tasks","groups","work","requests"])}
             if page == .epics {return !f.isDisjoint(with:["all","tasks","groups"])}
             return !f.isDisjoint(with:needsSurface == "requests" ? ["all","requests","tasks"] : ["all","tasks"])
         }
@@ -1866,20 +1973,30 @@ final class ChecklistStore: ObservableObject {
             invalidateContentCache(clearVisible:false,retireReads:affected || selectedAffected)
             // The interval already retired old replies. Its parallel readers may
             // discover the same new version without canceling one another.
-            if affected || selectedAffected { contentVersion = nil }
+            contentVersion = nil
             if affected {
-                markVisibleStale()
+                markVisibleStale(); visibleStaleSince = liveNow()
                 if usesTicketPages { ticketPages.discardContent(); pagedTicketWorkspace = nil }
                 else if page == .overview { for observation in overviewObservations.values { if reset {observation.discardContent()} else {observation.markNeedsRefresh()} } }
                 else { workspaceObservation.discardContent() }
             }
-            if selectedAffected { selectedTicketDisplay = nil; invalidateSelectedTicketFreshness(); invalidateSelectedEligibility() }
+            if selectedAffected {
+                if reset || selectedTicketFromCache {selectedTicketDisplay = nil}
+                invalidateSelectedTicketFreshness();selectedStaleSince = liveNow();invalidateSelectedEligibility()
+            }
+            if reset {coverageStatusFloors = [:];coverageStatusIncarnation = nil}
+            else if let coverage {applyCommittedStatuses(coverage)}
         }
         let familyNames = Set(rows.flatMap { $0["families"] as? [String] ?? ["all"] }).sorted().joined(separator:",")
         let taskCount = Set(rows.flatMap { $0["task_ids"] as? [String] ?? [] }).count
         if newInterval { Self.liveLogger.notice("changed families=\(familyNames, privacy:.public) task_count=\(taskCount) visible_affected=\(affected)") }
         let refreshSelected = selectedAffected && selectedInstalledChange != selectedChange
         let refreshVisible = affected && visibleInstalledChange != visibleChange
+        let readAhead: Task<Void,Never>?
+        if observeFurtherChanges, !reset, let cursor, refreshSelected || refreshVisible {
+            readAhead = Task { [weak self] in await self?.observeStatusCoverage(after:cursor,scope:scope) }
+        } else {readAhead = nil}
+        defer {readAhead?.cancel()}
         async let selectedOK = refreshSelected ? readLiveSelected() : true
         async let visibleOK = refreshVisible ? readLiveSurface() : true
         let installed = await (visibleOK,selectedOK)
@@ -1902,6 +2019,7 @@ final class ChecklistStore: ObservableObject {
     func stopWindowReads() {
         for surface in ScreenTiming.Surface.allCases {screenTiming.cancel(surface)}
         nextDigestRead?.cancel();nextDigestRead = nil
+        coverageStatusFloors = [:];coverageStatusIncarnation = nil
         freshnessWatchdog?.cancel(); freshnessWatchdog = nil
         liveSurfaceRead?.cancel(); liveSurfaceRead = nil; liveSurfaceScope = nil
         visibleStaleSince = nil; selectedStaleSince = nil; pendingCoverageCursor = nil; pendingCoverageScope = nil
@@ -1986,7 +2104,7 @@ final class ChecklistStore: ObservableObject {
                 try Task.checkCancellation()
                 if changes["changed"] as? Bool == true {
                     NativeRenderMetrics.changeObserved()
-                    if !(await applyChangeCoverage(changes)) {
+                    if !(await applyChangeCoverage(changes,observeFurtherChanges:true)) {
                         Self.liveLogger.notice("subscription path=coverage_retry")
                         try await Task.sleep(nanoseconds:min(liveRetryPause,100_000_000))
                         // Ask again from the last applied cursor. Newer changes

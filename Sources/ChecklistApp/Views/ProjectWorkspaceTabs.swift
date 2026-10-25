@@ -8,9 +8,7 @@ struct ProjectWorkspaceTabs: View {
             tab("Epics", page: .epics)
             MediaProjectTab(model:store.mediaReview)
             Spacer()
-        }.screenContentFrame(store.screenTiming,.tickets,ready:store.page == .tasks && store.preparedTicketWorkspace != nil)
-        .screenContentFrame(store.screenTiming,.projectSwitch,ready:store.page == .tasks && store.preparedTicketWorkspace != nil)
-        .checklistActionScroll().padding(.horizontal, Spacing.page).padding(.top, Spacing.control).overlay(alignment: .bottom) { Divider() }
+        }.checklistActionScroll().padding(.horizontal, Spacing.page).padding(.top, Spacing.control).overlay(alignment: .bottom) { Divider() }
     }
     func tab(_ title: String, page: Page) -> some View {
         let selected = page == .tasks ? [.tasks, .archived].contains(store.page) : store.page == page

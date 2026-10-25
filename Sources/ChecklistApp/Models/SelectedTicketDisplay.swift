@@ -3,7 +3,7 @@ import Foundation
 /// Only the currently selected ticket. This value never replaces the full index
 /// and never claims that its bounded history is a complete review record.
 struct SelectedTicketDisplay {
-    let task: Record
+    var task: Record
     let project: Record
     let service: Record
     let collections: [String: Any]

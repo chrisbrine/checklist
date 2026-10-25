@@ -1,7 +1,17 @@
 import SwiftUI
 import AppKit
 
+/// Project navigation owns a fresh native subtree. Same-project refreshes keep
+/// interaction state, but an old project's retained list/AX tree cannot cover the
+/// newly installed cached page while SwiftUI reconciles its rows.
 struct TaskWorkspaceView: View {
+    @EnvironmentObject var store: ChecklistStore
+    var body: some View {
+        ProjectTicketContent().id(store.projectID.map(RecordIdentity.init))
+    }
+}
+
+private struct ProjectTicketContent: View {
     @EnvironmentObject var store: ChecklistStore
     @Environment(\.checklistTextScale) private var textScale
     @State private var expandedTriages = RecordIdentitySet()
@@ -97,7 +107,12 @@ struct TaskWorkspaceView: View {
                 }.onHover { stability.pointer($0, rows: freshRows) }
                     .onKeyPress(phases: [.down, .repeat]) { _ in stability.keyboard(rows: freshRows); return .ignored }
             }
-        }.focusedSceneValue(\.checklistTicketOrder, TicketKeyboardNavigation.order(stability.rows(freshRows, visibleRecordIDs: visibleTicketIDs)))
+        }
+            // Only the subtree containing the heading, counts and ticket rows
+            // may finish these clocks; project tabs can paint independently.
+            .screenContentFrame(store.screenTiming, .tickets, ready: store.page == .tasks)
+            .screenContentFrame(store.screenTiming, .projectSwitch, ready: store.page == .tasks)
+            .focusedSceneValue(\.checklistTicketOrder, TicketKeyboardNavigation.order(stability.rows(freshRows, visibleRecordIDs: visibleTicketIDs)))
             .environment(\.ticketBulkRowInteraction, TicketBulkRowInteraction(selected: { bulkSelection.contains($0) }, activate: { ticket, command, shift in
                 bulkSelection.activate(ticket, order: TicketBulkSelection.renderedTickets(stability.rows(freshRows, visibleRecordIDs: visibleTicketIDs)), command: command, shift: shift)
             }))

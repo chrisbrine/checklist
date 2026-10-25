@@ -4,7 +4,7 @@ The development build provides bounded identity, workflow, capture, view and ale
 
 ## What belongs to a project
 
-Project Settings opens from the project menu in the same right-hand slide-in overlay as other detail. Start with **Identity**, **Work**, and **Storage** sections; advanced diagnostics remain behind contextual links. The ordinary identity form shows name, icon, accent and key prefix with a live sidebar preview.
+Project Settings opens from the project menu in the same right-hand slide-in overlay as other detail. Start with **Identity**, **Work**, and **Storage** sections; advanced diagnostics remain behind contextual links. The ordinary identity form shows name, icon, accent and key prefix with a live sidebar preview. Project context opens its brief and pinned-decision editors with **Edit project context**. The workflow shows the selected coordinator context session; **Choose coordinator context session** opens the full picker. Both controls are built on demand so cached cleanup receipts can participate in the initial settings display pass. Hiding either control keeps the local draft; all existing editor and picker labels remain available when opened.
 
 | Element | Useful customization for games and apps | Source of truth |
 |---|---|---|

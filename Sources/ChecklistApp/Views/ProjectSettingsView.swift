@@ -10,6 +10,8 @@ struct ProjectSettingsView: View {
     @State private var accent = "teal"
     @State private var brief = ""
     @State private var pinnedDecisions = PinnedDecisionDrafts()
+    @State private var editingContext = false
+    @State private var choosingCoordinatorSession = false
     @State private var preset = "shared"
     @State private var requireReview = true
     @State private var requireHumanApproval = false
@@ -62,18 +64,24 @@ struct ProjectSettingsView: View {
                     Text("Existing keys keep their identity when the prefix changes.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
                 DetailSection(title: "Project context") {
-                    TextEditor(text: $brief).checklistFont(.body).frame(height: 100).padding(Spacing.compact).overlay(RoundedRectangle(cornerRadius: Radius.medium).stroke(.quaternary))
-                    Text("Brief and decisions accompany future agent pickup.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-                    ForEach(pinnedDecisions.rows) { decision in
-                        VStack(alignment:.leading,spacing: Spacing.small) {
-                            TextField("Decision title (optional)",text:pinText(decision.id,"title")).textFieldStyle(.roundedBorder)
-                            TextEditor(text:pinText(decision.id,"body")).checklistFont(.body).frame(height:65).overlay(RoundedRectangle(cornerRadius: Radius.medium).stroke(.quaternary))
-                            Text("Applies to all kinds unless selected below").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-                            AccessibleHStack { ForEach(PolicyKindSettings.kinds,id:\.self) { kind in Toggle(kind.capitalized,isOn:pinKind(decision.id,kind)).toggleStyle(.checkbox) } }
-                            AccessibleHStack { Text("Approval and stable identity are recorded by Checklist.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText); Spacer(); Button("Remove decision…") { confirmation = Confirmations.removeDecision { pinnedDecisions.remove(decision.id) } } }
-                        }.padding(.vertical,Spacing.small)
+                    Button(editingContext ? "Hide project context editor" : "Edit project context") { editingContext.toggle() }
+                    Text("\(pinnedDecisions.count) pinned decisions · Brief and decisions accompany future agent pickup.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                    // Keep native text systems out of the receipt display pass.
+                    // Drafts live in this parent, so closing an editor keeps edits.
+                    if editingContext {
+                        TextEditor(text: $brief).checklistFont(.body).frame(height: 100).padding(Spacing.compact).overlay(RoundedRectangle(cornerRadius: Radius.medium).stroke(.quaternary))
+                        Text("Brief and decisions accompany future agent pickup.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                        ForEach(pinnedDecisions.rows) { decision in
+                            VStack(alignment:.leading,spacing: Spacing.small) {
+                                TextField("Decision title (optional)",text:pinText(decision.id,"title")).textFieldStyle(.roundedBorder)
+                                TextEditor(text:pinText(decision.id,"body")).checklistFont(.body).frame(height:65).overlay(RoundedRectangle(cornerRadius: Radius.medium).stroke(.quaternary))
+                                Text("Applies to all kinds unless selected below").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                                AccessibleHStack { ForEach(PolicyKindSettings.kinds,id:\.self) { kind in Toggle(kind.capitalized,isOn:pinKind(decision.id,kind)).toggleStyle(.checkbox) } }
+                                AccessibleHStack { Text("Approval and stable identity are recorded by Checklist.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText); Spacer(); Button("Remove decision…") { confirmation = Confirmations.removeDecision { pinnedDecisions.remove(decision.id) } } }
+                            }.padding(.vertical,Spacing.small)
+                        }
+                        Button("Add pinned decision") { pinnedDecisions.appendEmpty() }.checklistDisabled([(pinnedDecisions.count >= 25, "A project can pin at most 25 decisions.")])
                     }
-                    Button("Add pinned decision") { pinnedDecisions.appendEmpty() }.checklistDisabled([(pinnedDecisions.count >= 25, "A project can pin at most 25 decisions.")])
                 }
                 MediaTypeSettings(projectID:project.id, model:store.mediaReview)
                 ArchiveStorageSettingsSection(project:project)
@@ -132,7 +140,13 @@ struct ProjectSettingsView: View {
             PolicyProviderPicker(title:"Coordinator", selection:$coordinator)
             PolicyProviderPicker(title:"Implementation", selection:$implementer)
             PolicyProviderPicker(title:"Independent review", selection:$reviewer)
-            Picker("Coordinator context copies",selection:$coordinatorSession) { Text("No selected session").tag(""); ForEach(store.workSessions.filter { $0.string("project_id") == project.id || $0.strings("project_ids").contains(project.id) }) { session in Text("\(session.string("label",fallback:"Worker")) · \(session.string("provider")) · \(session.id.prefix(8))").tag(session.id) } }
+            Text("Coordinator context copies: \(coordinatorSessionLabel)").checklistFont(.callout)
+            Button(choosingCoordinatorSession ? "Hide coordinator session picker" : "Choose coordinator context session") { choosingCoordinatorSession.toggle() }
+            // A project may have hundreds of retained sessions. Build their
+            // menu only when requested, rather than on every settings open.
+            if choosingCoordinatorSession {
+                Picker("Coordinator context copies",selection:$coordinatorSession) { Text("No selected session").tag(""); ForEach(store.workSessions.filter { $0.string("project_id") == project.id || $0.strings("project_ids").contains(project.id) }) { session in Text("\(session.string("label",fallback:"Worker")) · \(session.string("provider")) · \(session.id.prefix(8))").tag(session.id) } }
+            }
             Text("Select an existing eligible worker to receive relevant context copies. This does not assign work or enroll a connection.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             Toggle("Agents may change this project's rules and settings", isOn: $agentsChangeRules).toggleStyle(.checkbox).help("On by default. Agents change rules, statuses, tags and settings; each change is recorded as an agent action. Only you can switch this.")
             Toggle("Require independent review", isOn: $requireReview).toggleStyle(.checkbox)
@@ -166,6 +180,11 @@ struct ProjectSettingsView: View {
                 }
             }
         }
+    }
+    private var coordinatorSessionLabel: String {
+        guard !coordinatorSession.isEmpty else {return "No selected session"}
+        guard let session = store.workSessions.first(where: {$0.id == coordinatorSession}) else {return coordinatorSession}
+        return "\(session.string("label",fallback:"Worker")) · \(session.string("provider")) · \(session.id.prefix(8))"
     }
     var captureSettings: some View {
         DetailSection(title:"Project defaults") {

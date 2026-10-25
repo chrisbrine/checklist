@@ -7,6 +7,134 @@ import ChecklistCore
 /// CL-272 item 3. Real product views in bounded, offscreen AppKit hosts;
 /// all reads are inert templates, with no service, test slot or live store.
 @MainActor final class RemainingLazyListAccessibilityTests: XCTestCase {
+    func testSidebarSurvivesAccessibilityActionsWhileProjectsChange() async throws {
+        let fixture = ChangingListFixture(page: .activity, preferences: isolatedDefaults("SidebarAX").preferences)
+        defer { fixture.clean() }
+        let store = fixture.store()
+        defer { store.stopWindowReads() }
+        var projects = (0..<160).map { index in
+            ["id": "project-\(index)", "name": "Project \(index) generation 0", "archived": index >= 80] as [String: Any]
+        }
+        store.data = ["projects": projects]
+        let host = ChangingListHost(SidebarView().environmentObject(store))
+        defer { host.close() }
+        let pid = ProcessInfo.processInfo.processIdentifier
+        try await AXProbe.until { host.view.layoutSubtreeIfNeeded(); return !AXProbe.scrollViews(host.view).isEmpty }
+        let scroll = try XCTUnwrap(AXProbe.scrollViews(host.view).first)
+        let table = try XCTUnwrap(scroll.documentView as? NSTableView)
+        func realizedRows() -> Int {
+            (0..<table.numberOfRows).filter { table.rowView(atRow: $0, makeIfNecessary: false) != nil }.count
+        }
+        XCTAssertGreaterThan(table.numberOfRows, 80)
+        XCTAssertLessThan(realizedRows(), table.numberOfRows, "The real sidebar List must retain unrealized native rows")
+        print("SIDEBAR native document \(NSStringFromClass(type(of: table))), rows \(table.numberOfRows), created \(realizedRows())")
+        // List has its own AppKit AX surface; do not target the lazy-stack guard
+        // or substitute direct clip-view scrolling for an accessibility action.
+        func actions() async throws {
+            host.view.layoutSubtreeIfNeeded()
+            let targets = AXProbe.scrollTargets(host.view)
+            print("SIDEBAR AX targets \(targets.map { NSStringFromClass(type(of: $0)) + String(describing: AXProbe.scrollActions($0)) })")
+            let node = try XCTUnwrap(targets.first { $0 === scroll } ?? targets.first)
+            XCTAssertNotEqual(NSStringFromClass(type(of: node)), LazyListAccessibilityGuard.nodeClassName)
+            let names = AXProbe.scrollActions(node)
+            let start = scroll.contentView.bounds.origin.y
+            AXProbe.perform(node, "AXScrollToBottom")
+            host.view.layoutSubtreeIfNeeded()
+            let bottom = scroll.contentView.bounds.origin.y
+            AXProbe.perform(node, "AXScrollToTop") // Exact scroll-to-beginning request from CL-272.
+            host.view.layoutSubtreeIfNeeded()
+            let top = scroll.contentView.bounds.origin.y
+            print("SIDEBAR exact edges start=\(start) bottom=\(bottom) top=\(top)")
+            if names.contains("AXScrollToBottom") && names.contains("AXScrollToTop") {
+                XCTAssertGreaterThan(abs(bottom - top), 5, "Advertised exact edge actions must move the sidebar")
+            } else {
+                // Native List currently exposes page actions only. Still send
+                // both exact requests above, then prove its supported AX path moves.
+                XCTAssertTrue(names.contains("AXScrollDownByPage"))
+                XCTAssertTrue(names.contains("AXScrollUpByPage"))
+                XCTAssertEqual(bottom, start, "Unadvertised bottom request is a native no-op")
+                XCTAssertEqual(top, start, "Unadvertised beginning request is a native no-op")
+                // Exercise both directions: one can be at its boundary. Native
+                // List uses its own coordinate convention for these page actions.
+                AXProbe.perform(node, "AXScrollUpByPage")
+                try await Task.sleep(nanoseconds: 100_000_000)
+                host.view.layoutSubtreeIfNeeded()
+                let up = scroll.contentView.bounds.origin.y
+                AXProbe.perform(node, "AXScrollDownByPage")
+                try await Task.sleep(nanoseconds: 100_000_000)
+                host.view.layoutSubtreeIfNeeded()
+                let down = scroll.contentView.bounds.origin.y
+                XCTAssertGreaterThan(abs(down - up), 5, "Supported native List AX actions must move the actual sidebar")
+                print("SIDEBAR page up=\(up) down=\(down); exact edge actions unadvertised")
+            }
+            XCTAssertEqual(ProcessInfo.processInfo.processIdentifier, pid)
+            XCTAssertTrue(host.window.contentView === host.view, "The mounted app view remains alive after AX actions")
+        }
+        try await actions()
+        // Native List rows are exposed through accessibilityRows, rather than
+        // the SwiftUI lazy stack's accessibilityChildren/disclosure nodes.
+        // Expand the actual outline disclosure as setup for archived-row checks.
+        let outline = try XCTUnwrap(table as? NSOutlineView)
+        let expandable = (0..<outline.numberOfRows).filter { outline.isExpandable(outline.item(atRow: $0)) }
+        let archivedRow = try XCTUnwrap(expandable.last { row in
+            guard let item = outline.item(atRow: row) else { return false }
+            return !(outline.delegate?.outlineView?(outline, isGroupItem: item) ?? false)
+        })
+        let archivedItem = try XCTUnwrap(outline.item(atRow: archivedRow))
+        XCTAssertTrue(AXProbe.text(try XCTUnwrap(outline.rowView(atRow: archivedRow, makeIfNecessary: true))).contains("Archived projects (80)"))
+        outline.scrollRowToVisible(archivedRow)
+        outline.expandItem(archivedItem)
+        try await AXProbe.until { host.view.layoutSubtreeIfNeeded(); return table.numberOfRows > 160 }
+        XCTAssertTrue(outline.isItemExpanded(archivedItem))
+        print("SIDEBAR expanded archived outline row \(archivedRow), rows \(table.numberOfRows), created \(realizedRows())")
+        XCTAssertEqual(store.activeProjects.count, 80)
+        XCTAssertEqual(store.archivedProjects.count, 80)
+        try await actions()
+        func assertRenderedProject(_ id: String, archived: Bool) async throws {
+            let rows = archived ? store.archivedProjects : store.activeProjects
+            let index = try XCTUnwrap(rows.firstIndex { $0.id == id })
+            // Overview, Needs You and Projects precede active rows; Add Project
+            // and the archived disclosure precede its child rows.
+            let row = archived ? store.activeProjects.count + 5 + index : 3 + index
+            outline.scrollRowToVisible(row) // Observation setup, outside measured AX actions.
+            try await AXProbe.until {
+                host.view.layoutSubtreeIfNeeded()
+                guard let native = outline.rowView(atRow: row, makeIfNecessary: false) else { return false }
+                return AXProbe.text(native).contains(rows[index].string("name"))
+            }
+        }
+        for change in 0..<4 {
+            // Each independent change straddles an exact-action pair, then a
+            // second pair runs after SwiftUI has installed the changed rows.
+            switch change {
+            case 0: projects.insert(["id": "added", "name": "Added project", "archived": false], at: 0)
+            case 1: projects[1]["archived"] = true
+            case 2: projects[81]["archived"] = false
+            default: projects[2]["name"] = "Renamed active project"; projects[82]["name"] = "Renamed archived project"
+            }
+            store.data = ["projects": projects]
+            try await actions()
+            try await Task.sleep(nanoseconds: 30_000_000)
+            host.view.layoutSubtreeIfNeeded()
+            XCTAssertLessThan(realizedRows(), table.numberOfRows)
+            XCTAssertEqual(table.numberOfRows, projects.count + 7, "The mounted outline installs the changed project collection")
+            try await actions()
+            switch change {
+            case 0: try await assertRenderedProject("added", archived: false)
+            case 1: try await assertRenderedProject("project-0", archived: true)
+            case 2: try await assertRenderedProject("project-80", archived: false)
+            default:
+                try await assertRenderedProject("project-1", archived: false)
+                try await assertRenderedProject("project-81", archived: true)
+            }
+        }
+        XCTAssertEqual(store.activeProjects.count, 81)
+        XCTAssertEqual(store.archivedProjects.count, 80)
+        XCTAssertTrue(store.activeProjects.contains { $0.string("name") == "Renamed active project" })
+        XCTAssertTrue(store.archivedProjects.contains { $0.string("name") == "Renamed archived project" })
+        print("SIDEBAR 10 exact top/bottom pairs across active/archived add/archive/unarchive/rename; process \(pid) alive")
+    }
+
     func testTicketsSurviveAccessibilityEdgesWhileRowsChange() async throws {
         let fixture = ChangingListFixture(page: .tasks, preferences: isolatedDefaults("RemainingLazyAX").preferences)
         defer { fixture.clean() }

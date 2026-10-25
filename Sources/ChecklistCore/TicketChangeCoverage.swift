@@ -50,6 +50,39 @@ extension CommandRouter {
             projects[key]=coverage
         }
         let changes:[JSON]=order.compactMap {key in guard let value=projects[key] else{return nil};return ["project_id":value.project,"families":value.families.sorted(),"task_ids":value.tasks,"all_tasks":value.allTasks]}
-        return ["schema_version":2,"complete":true,"reset":reset,"project_ids":reset ? [] : changes.map {$0["project_id"]!},"changes":reset ? [] : changes]
+        var result: JSON = ["schema_version":2,"complete":true,"reset":reset,"project_ids":reset ? [] : changes.map {$0["project_id"]!},"changes":reset ? [] : changes]
+        // A bounded status-only projection shares this read transaction and its
+        // authority with coverage. No task text/history or global sequence escapes.
+        let affected = changes.filter { !Set($0["families"] as? [String] ?? []).isDisjoint(with:["tasks","all"]) && !($0["task_ids"] as? [String] ?? []).isEmpty }
+        let count = affected.reduce(0) {$0 + ($1["task_ids"] as? [String] ?? []).count}
+        if !reset, count <= 100 {
+            var updates: [JSON] = []
+            for change in affected {
+                let project = change["project_id"] as! String
+                let tasks = change["task_ids"] as? [String] ?? []
+                let projects = try jsonString([project])
+                let arguments: StatementArguments = ["projects":projects,"ids":try jsonString(tasks),
+                    "quietBefore":Date().timeIntervalSince1970 - Self.quietCheckpointSeconds,
+                    "todayStart":Calendar.current.startOfDay(for:Date()).timeIntervalSince1970]
+                var membership: [SnapshotRecordIdentity:[String]] = [:]
+                for surface in Self.needSurfaces {
+                    let matches = try String.fetchAll(db,sql:"SELECT r.id FROM records r WHERE r.project_id IN (SELECT value FROM json_each(:projects)) AND r.id IN (SELECT value FROM json_each(:ids)) AND " + Self.needFilter(surface),arguments:arguments)
+                    for id in matches {membership[SnapshotRecordIdentity(id),default:[]].append(surface)}
+                }
+                for id in tasks {
+                    guard let task = try? scoped(db,id,project,type:"task"),
+                          let statusID = task["status_id"] as? String,
+                          let status = try? scoped(db,statusID,project,type:"status") else {continue}
+                    let value: JSON = ["id":id,"project_id":project,"revision":task["revision"] ?? 1,
+                        "status_id":statusID,"status_name":status["name"] ?? status["label"] ?? "",
+                        "status_category":status["category"] ?? "",
+                        "archived":bool(task,"archived"),"trashed":bool(task,"trashed")]
+                    updates.append(["task":value,"surfaces":membership[SnapshotRecordIdentity(id)] ?? []])
+                }
+            }
+            result["store_incarnation"] = incarnation
+            result["status_updates"] = updates
+        }
+        return result
     }
 }

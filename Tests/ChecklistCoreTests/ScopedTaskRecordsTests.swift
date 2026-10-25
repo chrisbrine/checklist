@@ -160,6 +160,73 @@ final class ScopedTaskRecordsTests:XCTestCase {
         let summary=try call("task_context",["project_id":pid,"task_id":tid])
         XCTAssertEqual((summary["review_requirements"] as? JSON)?["state"] as? String,"applied")
     }
+    func testCommittedCoverageStatusIsBoundedScopedAndMatchesNeedPredicates() throws {
+        try write {db in
+            let statuses = try router.records(db,type:"status",project:pid)
+            let review = statuses.first {$0["category"] as? String == "review"}!
+            var task = try router.scoped(db,tid,pid,type:"task")
+            task["status_id"] = review["id"];task["revision"] = 2
+            task["current_manifest_id"] = "coverage-manifest"
+            task.removeValue(forKey:"active_attempt_id")
+            try router.save(db,task,type:"task")
+            try router.save(db,["id":"coverage-review","project_id":pid,"task_id":tid,
+                "manifest_id":"coverage-manifest","state":"queued","gate":"review","revision":1],type:"review_request")
+        }
+        let coverage = try router.dbQueue.read {db -> JSON in
+            let end = try Int.fetchOne(db,sql:"SELECT MAX(seq) FROM events") ?? 0
+            // Existing fixture events establish a non-reset cursor before a new event.
+            return try router.ticketChangeCoverage(db,after:max(1,end-1),through:end)
+        }
+        XCTAssertNotNil(coverage["status_updates"])
+        try router.dbQueue.write {db in
+            let before = try Int.fetchOne(db,sql:"SELECT MAX(seq) FROM events") ?? 0
+            try router.event(db,caller:owner,project:pid,entity:tid,kind:"task_status_changed")
+            let after = try Int.fetchOne(db,sql:"SELECT MAX(seq) FROM events") ?? 0
+            let result = try router.ticketChangeCoverage(db,after:before,through:after)
+            XCTAssertEqual(result["store_incarnation"] as? String,router.incarnation)
+            let updates = result["status_updates"] as! [JSON]
+            XCTAssertEqual(updates.count,1)
+            let value = updates[0]["task"] as! JSON
+            XCTAssertEqual(value["id"] as? String,tid)
+            XCTAssertEqual(value["project_id"] as? String,pid)
+            XCTAssertEqual(value["revision"] as? Int,2)
+            XCTAssertEqual(value["status_category"] as? String,"review")
+            XCTAssertNil(value["brief"]);XCTAssertNil(value["title"])
+            let expected = try CommandRouter.needSurfaces.filter {surface in
+                let page = try router.workspacePage(db,["project_id":pid,"surface":surface],owner)
+                return (page["rows"] as! [JSON]).contains {$0["id"] as? String == tid}
+            }
+            XCTAssertEqual(Set(updates[0]["surfaces"] as! [String]),Set(expected))
+            XCTAssertTrue(expected.contains("needs_review"))
+            let reset = try router.ticketChangeCoverage(db,after:0,through:after)
+            XCTAssertNil(reset["status_updates"])
+        }
+    }
+
+    func testStatusCoverageRemainsOwnerOnly() throws {
+        let worker = Caller(role:"worker",installation:"coverage-worker",projectIDs:[pid],workspace:root.path)
+        XCTAssertThrowsError(try call("changes_wait",["project_id":pid,"include_coverage":true],worker)) {error in
+            XCTAssertEqual((error as? CoreError)?.code,"HUMAN_CHANNEL_REQUIRED")
+        }
+        XCTAssertFalse(try router.ownerChangeCoverageRequested([:],worker))
+    }
+
+    func testCoverageOmitsStatusFastPathBeyondOneHundredTasks() throws {
+        try write {db in
+            let before = try Int.fetchOne(db,sql:"SELECT MAX(seq) FROM events") ?? 0
+            let template = try router.scoped(db,tid,pid,type:"task")
+            for index in 0..<101 {
+                var task = template;let id = "coverage-bound-\(index)";task["id"] = id
+                try router.save(db,task,type:"task")
+                try router.event(db,caller:owner,project:pid,entity:id,kind:"task_updated")
+            }
+            let after = try Int.fetchOne(db,sql:"SELECT MAX(seq) FROM events") ?? 0
+            let result = try router.ticketChangeCoverage(db,after:before,through:after)
+            XCTAssertEqual(result["reset"] as? Bool,false)
+            XCTAssertNil(result["status_updates"],"Large catch-up retains ordinary bounded page recovery")
+            XCTAssertEqual(((result["changes"] as! [JSON])[0]["task_ids"] as! [String]).count,101)
+        }
+    }
     func testAffectedCoverageKeepsCheckpointLocalAndExpandsPrerequisiteDependents()throws {
         let dependent=try call("task_create",["project_id":pid,"title":"Dependent"])["id"] as! String
         try write {db in

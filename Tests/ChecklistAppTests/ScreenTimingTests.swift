@@ -14,6 +14,7 @@ import ChecklistIPC
         let surfaces = ChecklistStore.overviewGroups.map(\.surface) + ["human_tasks", "recent_reviews", "completed_since"]
         let events = (0..<20_707).map { ["id":"event-\($0)", "project_id":"p", "created_at":"2026-10-24T10:00:00Z"] }
         let tasks = (0..<542).map { ["id":"task-\($0)", "project_id":"p", "key":"T-\($0)", "title":"Synthetic ticket \($0)", "status_id":"queued", "status_category":"queued", "revision":1, "epic_id":"epic-0"] as [String:Any] }
+        var largeSettings = false
         var version = "v1", delay: UInt64 = 0
         var timeoutOverview = false
         var holdQuiet = false
@@ -25,7 +26,7 @@ import ChecklistIPC
             let held = heldReceipts;heldReceipts = []
             for (continuation,reply) in held {if let error {continuation.resume(throwing:error)} else {continuation.resume(returning:reply)}}
         }
-        var projects: [[String:Any]] { (0..<5).map { ["id":$0 == 0 ? "p" : "q\($0)", "name":"Synthetic project \($0)", "revision":1, "brief":String(repeating:"Context. ",count:100)] } }
+        var projects: [[String:Any]] { (0..<5).map { ["id":$0 == 0 ? "p" : "q\($0)", "name":"Synthetic project \($0)", "revision":1, "brief":String(repeating:"Context. ",count:100), "pinned_decisions":largeSettings ? (0..<2).map {["id":"decision-\($0)","title":"Decision \($0)","body":String(repeating:"Pinned context. ",count:200)]} : []] } }
         var service: [String:Any] { ["store_incarnation":"fixture-store", "read_version":version] }
         func workspace(_ params: [String:Any]) -> [String:Any] {
             let surface = params["surface"] as! String
@@ -68,7 +69,7 @@ import ChecklistIPC
             case "media_navigation": return ["types":[]]
             case "cleanup_job_list": return ["cleanup_jobs":[]]
             case "ticket_cleanup_receipts":
-                let reply: [String:Any] = ["receipts":(0..<50).map {["id":"receipt-\($0)","created_at":"2026-10-24T10:00:00Z","summary":["removed_bytes":removedBytes,"retained_count":542],"bytes_state":"complete"]}]
+                let reply: [String:Any] = ["receipts":(0..<50).map {["id":"receipt-\($0)","created_at":largeSettings ? String(format:"2026-10-24T10:00:%02dZ",$0) : "2026-10-24T10:00:00Z","summary":["removed_bytes":removedBytes,"retained_count":542],"bytes_state":"complete"]}]
                 if holdReceipts {return try await withCheckedThrowingContinuation {heldReceipts.append(($0,reply))}}
                 return reply
             default: XCTFail("Unexpected fake request \(method)");return [:]
@@ -82,11 +83,12 @@ import ChecklistIPC
     }
     private struct Host: View {
         @ObservedObject var store: ChecklistStore
+        var width: CGFloat = 1100
         var body: some View {
             Group {
                 if let detail = store.detail {DetailOverlay(detail:detail)}
                 else {switch store.page {case .overview: OverviewView();case .tasks: VStack(spacing:0) {ProjectWorkspaceTabs();TaskWorkspaceView()};case .epics: EpicWorkspaceView();default: Text("Other")}}
-            }.environmentObject(store).defaultAppStorage(store.windowPreferences).frame(width:1100,height:850)
+            }.environmentObject(store).defaultAppStorage(store.windowPreferences).frame(width:width,height:850)
         }
     }
     private func until(_ predicate: () -> Bool) async throws {
@@ -212,6 +214,73 @@ import ChecklistIPC
         f.releaseReceipts()
         try await settle("The background reply must replace changed receipt facts") {bytes() == Array(repeating:99,count:50)}
         XCTAssertTrue(receipts.error.isEmpty)
+    }
+    /// Real-size settings template, with reads held so only retained content
+    /// can satisfy the native first pass. Counts are structural, not budgets.
+    func testCachedLargeSettingsFirstPassOmitsEditorsAndSessionMenu() async throws {
+        _ = NSApplication.shared
+        let restoreAX = AXProbe.enableEnhancedUserInterface();defer {restoreAX()}
+        let f = Fixture(isolatedDefaults("LargeCachedCleanup").preferences)
+        f.largeSettings = true
+        let store = f.store(), live = Task {await store.startLiveUpdates()}
+        store.data["sessions"] = (0..<479).map {["id":"session-\($0)","project_id":"p","role":"worker","label":"Worker \($0)","provider":"codex"]}
+        let host = NSHostingView(rootView:Host(store:store,width:560))
+        let window = NSWindow(contentRect:NSRect(x:-10000,y:-10000,width:1100,height:850),styleMask:[],backing:.buffered,defer:false)
+        window.title = "Synthetic Checklist large settings host (offscreen)"
+        window.isReleasedWhenClosed = false;window.contentView = host;window.orderFront(nil)
+        defer {NativeRenderMetrics.cancel();f.releaseReceipts(throwing:CancellationError());live.cancel();store.stopWindowReads();window.contentView = nil;window.close();try? FileManager.default.removeItem(at:f.root)}
+        func views(_ view: NSView) -> [NSView] {[view] + view.subviews.flatMap(views)}
+        func draw() {
+            host.layoutSubtreeIfNeeded();host.displayIfNeeded();window.displayIfNeeded()
+            for view in views(host) where String(describing:type(of:view)).contains("FrameView") {view.display()}
+        }
+        try await until {ready(store) && !store.sidebarLoading}
+        XCTAssertEqual(store.workSessions.count,479)
+        store.open(.project("p"));try await until {!store.otherDetailLoading}
+        for _ in 0..<400 {draw();if store.ticketCleanupReceipts.loaded {break};try await Task.sleep(nanoseconds:5_000_000)}
+        XCTAssertEqual(store.ticketCleanupReceipts.receipts.count,50)
+        store.closeDetail();draw();try await Task.sleep(nanoseconds:20_000_000)
+        f.holdReceipts = true;f.delay = 450_000_000
+        NativeRenderMetrics.begin(sample:260)
+        let start = ProcessInfo.processInfo.systemUptime
+        store.open(.project("p"))
+        let installMS = (ProcessInfo.processInfo.systemUptime-start)*1000
+        XCTAssertEqual(store.screenTiming.navigation(.cleanup)?.cached,true)
+        XCTAssertEqual(store.ticketCleanupReceipts.scope,store.cleanupReceiptScope("p"))
+        // No suspension between navigation and the first hosted layout/draw.
+        draw()
+        for _ in 0..<100 {draw();if store.screenTiming.navigation(.cleanup) == nil {break};try await Task.sleep(nanoseconds:5_000_000)}
+        let drawMS = (ProcessInfo.processInfo.systemUptime-start)*1000
+        let editors = views(host).filter {$0 is NSTextView}.count
+        let text = AXProbe.text(window)
+        let sample = try XCTUnwrap(NativeRenderMetrics.finish())
+        print("C260b first-pass install_ms=\(installMS) draw_ms=\(drawMS) native_ms=\(sample.screens["cleanup"]?.milliseconds ?? -1) editors=\(editors) sessions=479 decisions=2")
+        for second in 0..<50 {
+            XCTAssertTrue(text.contains(String(format:"2026-10-24T10:00:%02dZ: 42 bytes removed · 542 files kept · complete",second)),"First pass must expose every retained receipt in accessibility")
+        }
+        XCTAssertFalse(text.contains("99 bytes removed"),"Wrong-fact control")
+        XCTAssertEqual(editors,0,"Context editors must be built only on demand")
+        func hasPicker() -> Bool {AXProbe.nodes(window).contains {node in ["accessibilityLabel","accessibilityTitle","accessibilityValue"].contains {AXProbe.attribute(node,$0) as? String == "Coordinator context copies"}}}
+        XCTAssertFalse(hasPicker(),"The coordinator session picker must be built only on demand")
+        XCTAssertTrue(text.contains("Save project settings"))
+        XCTAssertNotNil(sample.screens["cleanup"],"Native pass must complete while background reads are pending")
+        XCTAssertEqual(store.ticketCleanupReceipts.receipts.first?.object("summary")["removed_bytes"] as? Int,42)
+        // Both controls remain available, and hiding the editor preserves edits.
+        let contextStart = ProcessInfo.processInfo.systemUptime
+        AXProbe.press(try XCTUnwrap(AXProbe.button(window,"Edit project context")))
+        try await until {draw();return views(host).filter {$0 is NSTextView}.count == 3}
+        print("C260b demand context_ms=\((ProcessInfo.processInfo.systemUptime-contextStart)*1000)")
+        let editor = try XCTUnwrap(views(host).compactMap {$0 as? NSTextView}.first {$0.string.contains("Context. ")})
+        editor.string = "Edited synthetic project brief";editor.didChangeText()
+        AXProbe.press(try XCTUnwrap(AXProbe.button(window,"Hide project context editor")))
+        try await until {draw();return views(host).allSatisfy {!($0 is NSTextView)}}
+        AXProbe.press(try XCTUnwrap(AXProbe.button(window,"Edit project context")))
+        try await until {draw();return views(host).compactMap {$0 as? NSTextView}.contains {$0.string == "Edited synthetic project brief"}}
+        let pickerStart = ProcessInfo.processInfo.systemUptime
+        AXProbe.press(try XCTUnwrap(AXProbe.button(window,"Choose coordinator context session")))
+        try await until {draw();return hasPicker()}
+        print("C260b demand session_picker_ms=\((ProcessInfo.processInfo.systemUptime-pickerStart)*1000)")
+        XCTAssertEqual(store.workSessions.count,479)
     }
     func testAutomaticOverviewRefreshRetainsValidRowsAndCountsUntilEachReply() async throws {
         let f = Fixture(isolatedDefaults("RetainedOverview").preferences),store = f.store()

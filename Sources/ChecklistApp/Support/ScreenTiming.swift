@@ -36,20 +36,8 @@ import OSLog
     }
 }
 
-/// updateNSView arms the probe only when that surface's own content is present.
-/// The transparent overlay draws after the surface's native content. Record
-/// that pass immediately; it is not a physical scan-out timestamp.
-private struct ScreenContentFrame: View {
-    let timing: ScreenTiming
-    let surface: ScreenTiming.Surface
-    let ready: Bool
-    var body: some View {
-        // Track the clock in this tiny body, not in AppKit's untracked update
-        // callback or in the potentially large content surface's body.
-        NativeContentFrame(timing:timing,surface:surface,navigation:ready ? timing.navigation(surface) : nil)
-    }
-}
-
+/// The navigation token is captured by the content builder, not observed by a
+/// retained probe. A new clock cannot arm a frame built for preceding content.
 private struct NativeContentFrame: NSViewRepresentable {
     let timing: ScreenTiming
     let surface: ScreenTiming.Surface
@@ -81,6 +69,6 @@ extension View {
         // Opaque native scroll views may completely occlude a background and
         // skip its draw. A transparent, non-interactive overlay participates in
         // the content's display pass even when that content fills the surface.
-        overlay(ScreenContentFrame(timing: timing, surface: surface, ready: ready).allowsHitTesting(false).accessibilityHidden(true))
+        overlay(NativeContentFrame(timing: timing, surface: surface, navigation: ready ? timing.navigation(surface) : nil).allowsHitTesting(false).accessibilityHidden(true))
     }
 }
