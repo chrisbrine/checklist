@@ -210,7 +210,9 @@ enum RestorePreviewTemplate {
         return { NSApplication.shared.accessibilitySetValue(was, forAttribute: enhanced) }
     }
     static func until(_ predicate: () -> Bool) async throws {
-        for _ in 0..<500 { if predicate() { return }; try await Task.sleep(nanoseconds: 10_000_000) }
+        // A liveness bound, not a budget: 60 s keeps a stuck fixture finite while a
+        // concurrent build slows the hosted app (CL-275 review: 5 s did not settle).
+        for _ in 0..<6000 { if predicate() { return }; try await Task.sleep(nanoseconds: 10_000_000) }
         XCTFail("Bounded accessibility fixture did not settle"); throw CancellationError()
     }
     static func attribute(_ object: NSObject, _ name: String) -> Any? {

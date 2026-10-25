@@ -25,7 +25,9 @@ final class WindowTitleTests: XCTestCase {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let content = try String(contentsOf: root.appendingPathComponent("Sources/ChecklistApp/Views/ContentView.swift"), encoding: .utf8)
         XCTAssertTrue(content.contains(".navigationTitle(\"Checklist\")\n        .checklistHiddenWindowTitle()"))
-        for control in ["Toggle sidebar", "All projects", "globalSearch", "New ticket (⌘N)"] { XCTAssertTrue(content.contains(control), control) }
+        for control in ["Toggle sidebar", "ProjectPicker()", "globalSearch", "New ticket (⌘N)"] { XCTAssertTrue(content.contains(control), control) }
+        let picker = try String(contentsOf: root.appendingPathComponent("Sources/ChecklistApp/Views/ProjectPicker.swift"), encoding: .utf8)
+        XCTAssertTrue(picker.contains("All projects"))
         let policy = try String(contentsOf: root.appendingPathComponent("Sources/ChecklistApp/Support/HiddenWindowTitle.swift"), encoding: .utf8)
         XCTAssertTrue(policy.contains("if #available(macOS 15, *)"))
         XCTAssertTrue(policy.contains("self.toolbar(removing: .title)"))

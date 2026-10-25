@@ -42,6 +42,30 @@ import XCTest
         XCTAssertEqual(model.receipts.map(\.id),["fresh"])
         XCTAssertTrue(model.install(scope:"p"));XCTAssertEqual(model.receipts.map(\.id),["fresh"],"The fresh reply replaces the retained rows")
     }
+    func testSamePanelRetainsFactsAcrossReadVersionsWithoutCachingTheNewScope() async {
+        let model = TicketCleanupReceiptObservation()
+        await model.load(scope:"p:store:v1",presentationID:"visit:store") {["receipts":[["id":"accepted"]]]}
+        var continuation: CheckedContinuation<[String:Any],Error>?
+        let read = Task {await model.load(scope:"p:store:v2",presentationID:"visit:store") {try await withCheckedThrowingContinuation {continuation = $0}}}
+        for _ in 0..<100 {if continuation != nil {break};await Task.yield()}
+        XCTAssertNotNil(continuation)
+        XCTAssertEqual(model.receipts.map(\.id),["accepted"])
+        XCTAssertTrue(model.loaded)
+        XCTAssertFalse(model.install(scope:"p:store:v2"),"Displayed facts do not authorize scoped cache reuse")
+        continuation?.resume(returning:["receipts":[["id":"fresh"]]])
+        await read.value
+        XCTAssertEqual(model.receipts.map(\.id),["fresh"])
+        XCTAssertTrue(model.install(scope:"p:store:v2"))
+    }
+    func testNewPanelOrStoreCannotRetainAnotherPresentationOnCacheMiss() async {
+        for next in ["new-visit:store","visit:new-store"] {
+            let model = TicketCleanupReceiptObservation()
+            await model.load(scope:"p:store:v1",presentationID:"visit:store") {["receipts":[["id":"accepted"]]]}
+            await model.load(scope:"p:other-scope",presentationID:next) {throw CancellationError()}
+            XCTAssertTrue(model.receipts.isEmpty)
+            XCTAssertFalse(model.loaded)
+        }
+    }
     func testLateProjectReplyDoesNotReplaceCurrentProject() async {
         let model = TicketCleanupReceiptObservation()
         var continuation: CheckedContinuation<[String:Any],Error>?

@@ -86,6 +86,9 @@ struct ProjectSettingsView: View {
                 MediaTypeSettings(projectID:project.id, model:store.mediaReview)
                 ArchiveStorageSettingsSection(project:project)
                 TicketCleanupSettingsSection(project:project)
+                // Keep receipt rows eager, but mount the remaining form only
+                // as it scrolls into view. Context edits keep their normal layout.
+                LazyVStack(alignment: .leading, spacing: Spacing.page) {
                 workflowSettings
                 ReviewRequirementsEditor(draft:$reviewRequirements)
                 captureSettings
@@ -124,6 +127,7 @@ struct ProjectSettingsView: View {
                     }
                 }
                 AccessibleHStack { Button("Epics") { store.select(.epics, project: project.id); store.closeDetail() }; Button("Tickets") { store.select(.tasks, project: project.id); store.closeDetail() } }
+                }
             }.padding(Spacing.page)
         }.sheet(item: $editingTaxonomy) { item in TaxonomyEditor(item: item, projectID: project.id).environmentObject(store) }.sheet(item:$retiringStatus) { status in StatusRetirementView(status:status,projectID:project.id).environmentObject(store) }.onAppear { loadDraft() }
     }

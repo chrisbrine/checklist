@@ -59,7 +59,10 @@ struct TicketListFilterControls: View {
                     HStack { Button("Cancel") { savingView = false }.keyboardShortcut(.cancelAction); Spacer(); Button("Save view") { save() }.keyboardShortcut(.defaultAction) }
                 }.padding(Spacing.page).frame(width:400)
             }
-            .task(id:store.projectID) { workerReadID = UUID(); loadingWorkers = false; workers = []; workerCursor = nil; workerError = nil; await loadWorkers() }
+            .task(id:store.projectID.map(RecordIdentity.init)) { workerReadID = UUID(); loadingWorkers = false; workers = []; workerCursor = nil; workerError = nil; await loadWorkers() }
+            .onChange(of: store.projectID.map(RecordIdentity.init)) { _, _ in
+                savingView = false; viewName = ""
+            }
     }
     func save() { store.savePersonalTicketView(name:viewName); if !viewName.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty && viewName.count <= 80 && store.personalViews.contains(where: { $0.name == viewName.trimmingCharacters(in:.whitespacesAndNewlines) }) { savingView = false } }
     func filter(_ key: WritableKeyPath<TicketListFilters,String>) -> Binding<String> { Binding(get: { store.listFilters[keyPath:key] }, set: { value in var filters = store.listFilters; filters[keyPath:key] = value; store.listFilters = filters }) }

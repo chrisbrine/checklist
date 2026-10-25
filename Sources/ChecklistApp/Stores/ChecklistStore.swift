@@ -831,9 +831,14 @@ final class ChecklistStore: ObservableObject {
         var query = WorkspacePageQuery(surface:"completed_since",project:overviewVisitProject)
         query.limit = 20;query.since = Self.digestFormatter.string(from:since)
         let epoch = contentEpoch
+        let destination = liveScope, tickets = ticketPageRead, workspace = workspaceRead
         nextDigestRead?.cancel()
         nextDigestRead = Task { [weak self] in
             guard let self else {return}
+            // An optional return-page prefetch must not contend with, or learn
+            // a different snapshot and restart, the cold destination read.
+            if self.usesTicketPages {await tickets?.value} else {await workspace?.value}
+            guard !Task.isCancelled, self.contentEpoch == epoch, self.liveScope == destination, self.screenContentReady else {return}
             do {
                 let response = try await self.request("workspace_page",query.parameters(),ifCurrent:{self.contentEpoch == epoch})
                 guard !Task.isCancelled, self.contentEpoch == epoch else {return}
@@ -1282,6 +1287,7 @@ final class ChecklistStore: ObservableObject {
     }
 
     func select(_ page: Page, project: String? = nil) {
+        let precedingScope = liveScope
         for surface in [ScreenTiming.Surface.overview, .tickets, .epics, .projectSwitch] { screenTiming.cancel(surface) }
         let switchedProject = projectID.map(RecordIdentity.init) != project.map(RecordIdentity.init)
         if switchedProject { screenTiming.begin(.projectSwitch) }
@@ -1297,6 +1303,17 @@ final class ChecklistStore: ObservableObject {
         if usesTicketPages { scheduleTicketPage(force:true) }
         else { scheduleWorkspacePage(force:true) }
         let cached = screenContentReady
+        if precedingScope != liveScope {
+            // The old surface's overdue coverage/read does not own navigation's
+            // new query. Give this read its own recovery interval instead of
+            // immediately replacing it with the preceding surface's watchdog.
+            liveSurfaceRead?.cancel(); liveSurfaceRead = nil; liveSurfaceScope = nil
+            liveSurfaceReadID = UUID()
+            visibleChange = UUID()
+            visibleInstalledChange = cached ? visibleChange : nil
+            visibleStaleSince = cached ? nil : liveNow()
+            visibleRetryAfter = 0
+        }
         if let surface { screenTiming.cached(surface, cached) }
         if switchedProject { screenTiming.cached(.projectSwitch, cached) }
     }
@@ -1349,7 +1366,14 @@ final class ChecklistStore: ObservableObject {
         
         if let prior = self.detail, prior != detail { detailBackStack.append(prior) }
         if self.detail == nil {
-            withAnimation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration: 0.2)) { self.detail = detail }
+            // Ticket and settings content commit without a sliding insertion,
+            // which can expose an intermediate accessibility tree.
+            switch detail {
+            case .project: replaceDetail(detail)
+            case .task: withAnimation(nil) { self.detail = detail }
+            default:
+                withAnimation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration: 0.2)) { self.detail = detail }
+            }
         } else {
             replaceDetail(detail)
         }
@@ -1502,7 +1526,9 @@ final class ChecklistStore: ObservableObject {
             let timing = reply["_checklist_timing"] as? [String:Any] ?? [:]
             let queueMS = (timing["queue_wait_ms"] as? Double).map(Int.init) ?? -1
             let executionMS = (timing["execution_ms"] as? Double).map(Int.init) ?? -1
-            Self.liveLogger.notice("read path=transport method=\(method, privacy:.public) duration_ms=\(transportMS) queue_ms=\(queueMS) execution_ms=\(executionMS)")
+            let surface = params["surface"] as? String ?? ""
+            let publicSurface = ["worker_sessions","overview","needs_review","needs_pickup","needs_active","needs_quiet","needs_recovery","needs_done_today","requests","human_tasks","recent_reviews","completed_since","record","epics","activity","triage_tasks","triage_candidates","epic_tasks","epic_candidates"].contains(surface) ? surface : "other"
+            Self.liveLogger.notice("read path=transport method=\(method, privacy:.public) surface=\(publicSurface, privacy:.public) duration_ms=\(transportMS) queue_ms=\(queueMS) execution_ms=\(executionMS)")
         }
         try Task.checkCancellation()
         guard ifCurrent() else {
@@ -1525,7 +1551,7 @@ final class ChecklistStore: ObservableObject {
             if let groups = payload["groups"] as? [String:[String:Any]] {
                 for (surface,group) in groups where taskSurfaces.contains(surface) {records += group["rows"] as? [[String:Any]] ?? []}
             }
-            let displayed = overviewObservations.values.flatMap(\.rows) + (selectedTicketDisplay.map {[$0.task]} ?? [])
+            let displayed = overviewObservations.values.flatMap(\.rows) + ticketPages.displayedTasks + (selectedTicketDisplay.map {[$0.task]} ?? [])
             var floors = coverageStatusFloors
             for record in displayed {floors[StatusIdentity(record)] = max(floors[StatusIdentity(record)] ?? 0,record.integer("revision",fallback:0))}
             if records.contains(where: { row in
@@ -1860,10 +1886,11 @@ final class ChecklistStore: ObservableObject {
               !incarnation.isEmpty, incarnation == storeIncarnation,
               let updates = coverage["status_updates"] as? [[String:Any]], updates.count <= 100 else {return 0}
         coverageStatusIncarnation = incarnation
-        let displayed = overviewObservations.values.flatMap(\.rows) + (selectedTicketDisplay.map {[$0.task]} ?? [])
+        let displayed = overviewObservations.values.flatMap(\.rows) + ticketPages.displayedTasks + (selectedTicketDisplay.map {[$0.task]} ?? [])
         let displayedIDs = Set(displayed.map(StatusIdentity.init))
         var floors = coverageStatusFloors.filter {displayedIDs.contains($0.key)}
         var installed = 0
+        var ticketUpdates: [(task:Record,triages:[Record])] = []
         let surfaces: Set<String> = ["needs_review","needs_pickup","needs_active","needs_quiet","needs_recovery","needs_done_today"]
         for update in updates {
             guard let values = update["task"] as? [String:Any],
@@ -1873,9 +1900,21 @@ final class ChecklistStore: ObservableObject {
                   values["status_id"] is String, values["status_name"] is String, values["status_category"] is String,
                   let memberships = update["surfaces"] as? [String],Set(memberships).isSubset(of:surfaces) else {continue}
             let patch = Record(values:values), key = StatusIdentity(patch)
-            let visible = overviewObservations.values.flatMap(\.rows).filter {StatusIdentity($0) == key}
+            let visible = (overviewObservations.values.flatMap(\.rows) + ticketPages.displayedTasks).filter {StatusIdentity($0) == key}
             let selected = selectedTicketDisplay.flatMap {StatusIdentity($0.task) == key ? $0.task : nil}
             let known = visible + (selected.map {[$0]} ?? [])
+            // Membership metadata has no authority beyond this status display.
+            // Keep equal/unknown members for proving a complete header snapshot.
+            let floor = max(floors[key] ?? 0,known.map {$0.integer("revision")}.max() ?? 0)
+            if revision >= floor {
+                let triages = (update["triages"] as? [[String:Any]] ?? []).prefix(100).compactMap {value -> Record? in
+                    guard let id = value["id"] as? String,!id.isEmpty,
+                          let revision = value["revision"] as? Int,revision > 0,
+                          let count = value["member_count"] as? Int,count > 0,count <= 100 else {return nil}
+                    return Record(values:value)
+                }
+                ticketUpdates.append((patch,triages))
+            }
             guard let source = known.max(by: {$0.integer("revision") < $1.integer("revision")}) else {continue}
             let displayedRevision = source.integer("revision")
             floors[key] = max(floors[key] ?? 0,max(revision,displayedRevision))
@@ -1901,6 +1940,10 @@ final class ChecklistStore: ObservableObject {
                 for surface in surfaces {overviewObservations[surface]?.applyCommittedStatus(task,member:memberships.contains(surface))}
             }
             installed += 1
+        }
+        if usesTicketPages, ticketPages.query == ticketPageQuery {
+            ticketPages.applyCommittedStatuses(ticketUpdates)
+            pagedTicketWorkspace = ticketPages.prepared(expansion:ticketExpansion)
         }
         coverageStatusFloors = floors
         if installed > 0 {Self.liveLogger.notice("changed path=committed_status task_count=\(installed)")}
@@ -1976,7 +2019,11 @@ final class ChecklistStore: ObservableObject {
             contentVersion = nil
             if affected {
                 markVisibleStale(); visibleStaleSince = liveNow()
-                if usesTicketPages { ticketPages.discardContent(); pagedTicketWorkspace = nil }
+                if usesTicketPages {
+                    let statusProjection = coverage?["status_updates"] is [[String:Any]]
+                    let taskChange = visible.contains {!families($0).isDisjoint(with:["all","tasks","groups"])}
+                    if reset || taskChange && !statusProjection {ticketPages.discardContent(); pagedTicketWorkspace = nil}
+                }
                 else if page == .overview { for observation in overviewObservations.values { if reset {observation.discardContent()} else {observation.markNeedsRefresh()} } }
                 else { workspaceObservation.discardContent() }
             }

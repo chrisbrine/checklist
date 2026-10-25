@@ -95,7 +95,21 @@ final class ProjectIconTests: XCTestCase {
     @MainActor private func render<V: View>(_ view: V) throws -> NSBitmapImageRep {
         let renderer = ImageRenderer(content: view)
         renderer.scale = 2
-        return NSBitmapImageRep(cgImage: try XCTUnwrap(renderer.cgImage))
+        // The convenience cgImage path can vary by one premultiplied sample even
+        // for identical views. Fix the bitmap precision and color space so the
+        // appearance comparison stays exact, including antialiased edges.
+        let colorSpace = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
+        var image: CGImage?
+        renderer.render(rasterizationScale: 2) { size, draw in
+            let width = Int(size.width * 2), height = Int(size.height * 2)
+            guard let context = CGContext(data: nil, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4, space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+            context.scaleBy(x: 2, y: 2)
+            draw(context)
+            image = context.makeImage()
+        }
+        return NSBitmapImageRep(cgImage: try XCTUnwrap(image))
     }
 
     private func fixture(width: Int, height: Int) throws -> (url: URL, project: Record) {

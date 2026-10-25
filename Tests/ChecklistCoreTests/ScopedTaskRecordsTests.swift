@@ -203,6 +203,52 @@ final class ScopedTaskRecordsTests:XCTestCase {
         }
     }
 
+    func testCommittedCoverageIncludesExactMembershipAfterAtomicGroupStatus() throws {
+        let other = try call("task_create",["project_id":pid,"title":"Second member"])["id"] as! String
+        try write {db in
+            try router.save(db,["id":"coverage-triage","project_id":pid,"kind":"triage","name":"Coverage pair","phase":"implementation","members":[["task_id":tid],["task_id":other]],"task_ids":[tid,other],"revision":1],type:"group")
+        }
+        let before = try router.dbQueue.read {try Int.fetchOne($0,sql:"SELECT MAX(seq) FROM events") ?? 0}
+        let first = try call("task_get",["project_id":pid,"task_id":tid])
+        let second = try call("task_get",["project_id":pid,"task_id":other])
+        _ = try call("triage_transition",["project_id":pid,"triage_id":"coverage-triage","expected_revision":1,
+            "expected_member_revisions":[tid:first["revision"]!,other:second["revision"]!],"action":"block","reason":"Synthetic coverage test"])
+        try router.dbQueue.read {db in
+            let after = try Int.fetchOne(db,sql:"SELECT MAX(seq) FROM events") ?? 0
+            let coverage = try router.ticketChangeCoverage(db,after:before,through:after)
+            let updates = coverage["status_updates"] as! [JSON]
+            XCTAssertEqual(Set(updates.compactMap {($0["task"] as? JSON)?["id"] as? String}),Set([tid,other]))
+            for update in updates {
+                let task = update["task"] as! JSON
+                XCTAssertEqual(task["status_category"] as? String,"blocked")
+                let triages = try XCTUnwrap(update["triages"] as? [JSON])
+                XCTAssertEqual(triages.count,1)
+                XCTAssertEqual(Set(triages[0].keys),Set(["id","revision","member_count"]))
+                XCTAssertEqual(triages[0]["id"] as? String,"coverage-triage")
+                XCTAssertEqual(triages[0]["revision"] as? Int,2)
+                XCTAssertEqual(triages[0]["member_count"] as? Int,2)
+                XCTAssertNil(task["title"]);XCTAssertNil(task["members"])
+            }
+        }
+    }
+
+    func testCommittedCoverageBoundsMembershipFanoutWithoutDroppingTaskStatus() throws {
+        let other = try call("task_create",["project_id":pid,"title":"Second member"])["id"] as! String
+        try write {db in
+            for i in 0..<101 {
+                try router.save(db,["id":"coverage-group-\(i)","project_id":pid,"kind":"triage","name":"Synthetic pair","phase":"implementation","members":[["task_id":tid],["task_id":other]],"revision":1],type:"group")
+            }
+            let before = try Int.fetchOne(db,sql:"SELECT MAX(seq) FROM events") ?? 0
+            try router.event(db,caller:owner,project:pid,entity:tid,kind:"task_updated")
+            let after = try Int.fetchOne(db,sql:"SELECT MAX(seq) FROM events") ?? 0
+            let result = try router.ticketChangeCoverage(db,after:before,through:after)
+            let updates = result["status_updates"] as! [JSON]
+            XCTAssertEqual(updates.count,1)
+            XCTAssertEqual((updates[0]["task"] as? JSON)?["id"] as? String,tid)
+            XCTAssertNil(updates[0]["triages"],"Over 100 membership links falls back to normal header reads")
+        }
+    }
+
     func testStatusCoverageRemainsOwnerOnly() throws {
         let worker = Caller(role:"worker",installation:"coverage-worker",projectIDs:[pid],workspace:root.path)
         XCTAssertThrowsError(try call("changes_wait",["project_id":pid,"include_coverage":true],worker)) {error in

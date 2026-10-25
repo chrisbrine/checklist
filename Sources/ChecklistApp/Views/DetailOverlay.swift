@@ -16,7 +16,7 @@ struct DetailOverlay: View {
             Divider()
             Group {
                 if case .task(let id) = detail {
-                    if let task = store.selectedTask(id) {TaskDetailView(task:task).id(id).screenContentFrame(store.screenTiming, .ticketDetail, ready: store.detail == .task(id) && store.selectedTask(id) != nil)}
+                    if let task = store.selectedTask(id) {TaskDetailView(task:task).id(id).screenContentFrame(store.screenTiming, .ticketDetail, ready: store.detail == .task(id) && store.selectedTask(id) != nil, accessibilityContent:ScreenAccessibilityContent(text:task.bool("purged") ? [breadcrumb,"Purged ticket",task.string("key")] : [breadcrumb,task.string("title")],staticTextOnly:true))}
                     else if store.showsOfflineBanner || store.selectedTicketMissing {DetailUnavailable(symbol: "doc.text", title: "Ticket unavailable")}
                     else if let failure = store.selectedTicketError {VStack(spacing: Spacing.control) {Text(failure);Button("Retry ticket") {store.retrySelectedTicket()}}.padding(Spacing.group)}
                     else {ProgressView("Loading selected ticket…")}
@@ -49,6 +49,9 @@ struct DetailOverlay: View {
                 }}
             }.background(DetailItemStateRetention(key: detail.persistenceKey).id(detail.persistenceKey))
         }.background(OverlayFocusAnchor(item: detail.persistenceKey, label: focusLabel))
+            // Read the open detail as one destination before controls behind it.
+            // Background navigation remains accessible after this container.
+            .accessibilityElement(children: .contain).accessibilitySortPriority(1)
     }
     var focusLabel: String {
         switch detail {

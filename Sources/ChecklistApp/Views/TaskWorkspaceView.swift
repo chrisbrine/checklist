@@ -1,13 +1,12 @@
 import SwiftUI
 import AppKit
 
-/// Project navigation owns a fresh native subtree. Same-project refreshes keep
-/// interaction state, but an old project's retained list/AX tree cannot cover the
-/// newly installed cached page while SwiftUI reconciles its rows.
+/// Keep the controls mounted across projects. Only the native ticket list needs
+/// a new identity to retire the preceding project's rows and accessibility tree.
 struct TaskWorkspaceView: View {
     @EnvironmentObject var store: ChecklistStore
     var body: some View {
-        ProjectTicketContent().id(store.projectID.map(RecordIdentity.init))
+        ProjectTicketContent()
     }
 }
 
@@ -55,7 +54,8 @@ private struct ProjectTicketContent: View {
             .onChange(of: RecordIdentity(store.tagFilter)) { _, _ in filteredExpansion = [:]; store.updateTicketWorkspaceExpansion(expansionState); stability.reset() }
             .onChange(of: store.listFilters) { _, _ in filteredExpansion = [:]; store.updateTicketWorkspaceExpansion(expansionState); stability.reset() }
             .onChange(of: store.projectID.map(RecordIdentity.init)) { _, _ in
-                bulkSelection.clear(); bulkReceipt = nil
+                bulkSelection.clear(); bulkReceipt = nil; bulkDraft = nil; showCreateTriage = false
+                filteredExpansion = [:]; store.updateTicketWorkspaceExpansion(expansionState)
                 stability.reset();pastTriagesReadID = UUID();pastTriages = nil;pastTriagesLoading = false;pastTriagesError = nil;pastTriagesProject = nil
             }
             .onChange(of: store.page) { _, _ in stability.reset(); bulkSelection.clear() }
@@ -69,6 +69,15 @@ private struct ProjectTicketContent: View {
         let visibleTicketIDs = prepared.visibleTicketIDs
         let freshRows = prepared.rows
         let overviewRequests = prepared.overviewRequests
+        let firstRowText = freshRows.lazy.compactMap { row -> String? in
+                switch row.content {
+                case .triage(let section): return ProductionGroups.label(section.triage)
+                case .ticket(let task), .triageMember(let task): return task.string("title")
+                default: return nil
+                }
+            }.first
+        let frameText = [store.currentProject?.string("name") ?? store.page.title,
+            "Showing \(store.ticketPageShownCount) of \(store.ticketPageMatchedCount) matching tickets"] + (firstRowText.map {[$0]} ?? [])
         return VStack(alignment: .leading, spacing: Spacing.none) {
             header(list).checklistActionScroll()
             surfaceControls
@@ -104,14 +113,15 @@ private struct ProjectTicketContent: View {
                             ticketListRow(row)
                         }
                     }.padding(.horizontal, Spacing.page).padding(.bottom, Spacing.spacious)
-                }.onHover { stability.pointer($0, rows: freshRows) }
+                }.id(store.projectID.map(RecordIdentity.init))
+                    .onHover { stability.pointer($0, rows: freshRows) }
                     .onKeyPress(phases: [.down, .repeat]) { _ in stability.keyboard(rows: freshRows); return .ignored }
             }
         }
             // Only the subtree containing the heading, counts and ticket rows
             // may finish these clocks; project tabs can paint independently.
-            .screenContentFrame(store.screenTiming, .tickets, ready: store.page == .tasks)
-            .screenContentFrame(store.screenTiming, .projectSwitch, ready: store.page == .tasks)
+            .screenContentFrame(store.screenTiming, .tickets, ready: store.page == .tasks, accessibilityContent:ScreenAccessibilityContent(text:frameText))
+            .screenContentFrame(store.screenTiming, .projectSwitch, ready: store.page == .tasks, accessibilityContent:ScreenAccessibilityContent(text:frameText))
             .focusedSceneValue(\.checklistTicketOrder, TicketKeyboardNavigation.order(stability.rows(freshRows, visibleRecordIDs: visibleTicketIDs)))
             .environment(\.ticketBulkRowInteraction, TicketBulkRowInteraction(selected: { bulkSelection.contains($0) }, activate: { ticket, command, shift in
                 bulkSelection.activate(ticket, order: TicketBulkSelection.renderedTickets(stability.rows(freshRows, visibleRecordIDs: visibleTicketIDs)), command: command, shift: shift)

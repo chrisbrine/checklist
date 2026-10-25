@@ -356,11 +356,14 @@ import ChecklistCore
         }
         return nil
     }
-    static func revealConversation(_ host: ChangingListHost) async throws {
+    static func revealConversation(_ host: ChangingListHost, containing expectedText: String? = nil) async throws {
         let scroll = try XCTUnwrap(AXProbe.scrollViews(host.view).first)
         for _ in 0..<30 {
             host.view.layoutSubtreeIfNeeded()
-            if lazyNodes(host.view).count >= 2 { return }
+            // Lazy AX nodes can outlive their realized rows. After a refresh,
+            // keep revealing until the new generation is exposed; polling an
+            // offscreen cached AX subtree alone cannot make it current.
+            if lazyNodes(host.view).count >= 2, expectedText.map({ AXProbe.text(host.view).contains($0) }) ?? true { return }
             scroll.contentView.scroll(to: NSPoint(x: 0, y: scroll.contentView.bounds.origin.y + 100))
             scroll.reflectScrolledClipView(scroll.contentView)
             try await Task.sleep(nanoseconds: 10_000_000)
@@ -404,7 +407,7 @@ import ChecklistCore
             try edges(stale) // Retained AX node straddles the published data change.
             try await Task.sleep(nanoseconds: 30_000_000)
             host.view.layoutSubtreeIfNeeded()
-            if nested { try await revealConversation(host) }
+            if nested { try await revealConversation(host, containing: "generation \(round + 1)") }
             try await AXProbe.until {
                 host.view.layoutSubtreeIfNeeded()
                 return AXProbe.text(host.view).contains("generation \(round + 1)")

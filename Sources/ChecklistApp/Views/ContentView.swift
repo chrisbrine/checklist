@@ -31,6 +31,7 @@ struct ContentView: View {
                     }.frame(maxWidth: .infinity, maxHeight: .infinity)
                     if let detail = store.detail {
                         DetailOverlay(detail: detail)
+                            .accessibilitySortPriority(1)
                             .frame(width: min(560, geometry.size.width - 20))
                             .background(DetailOverlayInteractionRegion(interaction: detailInteraction, region: .overlay))
                             .background(.regularMaterial)
@@ -56,19 +57,7 @@ struct ContentView: View {
                     .help("Toggle sidebar (⌃⌘S)").accessibilityLabel("Toggle sidebar")
             }
             ToolbarItem(placement: .navigation) {
-                Menu {
-                    Button("All projects") { store.select(.tasks) }
-                    ForEach(store.activeProjects) { project in
-                        Button { store.select(.tasks, project: project.id) } label: {
-                            Label { Text(project.string("name")) } icon: { ProjectIcon(project: project, size: 18) }
-                        }
-                    }
-                    Divider()
-                    Button("New Project…") { store.showNewProject = true }
-                    if let id = store.projectID { Button("Project Settings…") { store.open(.project(id)) } }
-                } label: {
-                    HStack(spacing: Spacing.small) { if let project = store.currentProject { ProjectIcon(project: project, size: 18) } else { Image(systemName: "folder") }; Text(store.currentProject?.string("name") ?? "All projects") }
-                }
+                ProjectPicker()
             }
             ToolbarItem(placement: .principal) {
                 HStack(spacing: Spacing.small) {

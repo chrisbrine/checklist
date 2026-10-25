@@ -57,6 +57,7 @@ extension CommandRouter {
         let count = affected.reduce(0) {$0 + ($1["task_ids"] as? [String] ?? []).count}
         if !reset, count <= 100 {
             var updates: [JSON] = []
+            var membershipLinks = 0
             for change in affected {
                 let project = change["project_id"] as! String
                 let tasks = change["task_ids"] as? [String] ?? []
@@ -69,6 +70,28 @@ extension CommandRouter {
                     let matches = try String.fetchAll(db,sql:"SELECT r.id FROM records r WHERE r.project_id IN (SELECT value FROM json_each(:projects)) AND r.id IN (SELECT value FROM json_each(:ids)) AND " + Self.needFilter(surface),arguments:arguments)
                     for id in matches {membership[SnapshotRecordIdentity(id),default:[]].append(surface)}
                 }
+                // Same current-membership expression as the bounded Tickets read.
+                // Project-scoped SQL reads identities/counts only, not rich group history.
+                let memberArray = "CASE WHEN json_array_length(json_extract(g.data,'$.members'))>0 THEN json_extract(g.data,'$.members') ELSE json_extract(g.data,'$.task_ids') END"
+                let memberID = "CASE WHEN j.type='object' THEN json_extract(j.value,'$.task_id') ELSE j.value END"
+                let memberCountID = "CASE WHEN m.type='object' THEN json_extract(m.value,'$.task_id') ELSE m.value END"
+                let links = try Row.fetchAll(db,sql:"""
+                    SELECT DISTINCT CAST(g.id AS BLOB) group_bytes,g.revision,
+                      CAST(\(memberID) AS BLOB) task_bytes,
+                      (SELECT COUNT(DISTINCT CAST(\(memberCountID) AS BLOB)) FROM json_each(\(memberArray)) m) member_count
+                    FROM records g,json_each(\(memberArray)) j
+                    WHERE g.type='group' AND g.project_id=CAST(:project AS TEXT)
+                      AND json_extract(g.data,'$.kind')='triage'
+                      AND (\(memberID)) COLLATE BINARY IN (SELECT value FROM json_each(:ids))
+                    LIMIT 101
+                    """,arguments:["project":Data(project.utf8),"ids":try jsonString(tasks)])
+                var triages: [SnapshotRecordIdentity:[JSON]] = [:]
+                for link in links {
+                    guard let groupBytes = link["group_bytes"] as Data?,let group = String(data:groupBytes,encoding:.utf8),
+                          let taskBytes = link["task_bytes"] as Data?,let task = String(data:taskBytes,encoding:.utf8) else {continue}
+                    triages[SnapshotRecordIdentity(task),default:[]].append(["id":group,"revision":link["revision"] as Int,"member_count":link["member_count"] as Int])
+                }
+                membershipLinks += links.count
                 for id in tasks {
                     guard let task = try? scoped(db,id,project,type:"task"),
                           let statusID = task["status_id"] as? String,
@@ -77,9 +100,12 @@ extension CommandRouter {
                         "status_id":statusID,"status_name":status["name"] ?? status["label"] ?? "",
                         "status_category":status["category"] ?? "",
                         "archived":bool(task,"archived"),"trashed":bool(task,"trashed")]
-                    updates.append(["task":value,"surfaces":membership[SnapshotRecordIdentity(id)] ?? []])
+                    updates.append(["task":value,"surfaces":membership[SnapshotRecordIdentity(id)] ?? [],"triages":triages[SnapshotRecordIdentity(id)] ?? []])
                 }
             }
+            // Large fan-out keeps task status delivery but falls back to page
+            // reads for headers rather than publishing incomplete membership.
+            if membershipLinks > 100 {updates = updates.map {$0.filter {$0.key != "triages"}}}
             result["store_incarnation"] = incarnation
             result["status_updates"] = updates
         }

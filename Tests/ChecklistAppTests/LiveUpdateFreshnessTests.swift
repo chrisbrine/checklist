@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 import ChecklistIPC
 @testable import ChecklistApp
 
@@ -119,6 +120,133 @@ import ChecklistIPC
         if page == .overview {return store.overviewObservations["needs_review"]?.rows.first?.string("status_name")}
         return store.workspaceRows.first?.string("status_name")
     }
+
+    func testTicketsCommittedStatusOverlaysOrdinaryAndTriageMemberBeforeHeldReads() async throws {
+        for grouped in [false,true] {
+            let f = Fixture(isolatedDefaults("TicketsCommittedStatus").preferences)
+            f.inTriage = grouped
+            let store = f.store(), live = Task {await store.startLiveUpdates()}
+            defer {live.cancel();store.stopWindowReads();f.cleanup()}
+            try await until {f.wait != nil}
+            store.open(.task("a"));try await until {store.selectedTicketCurrent("a")}
+            var now: TimeInterval = 1802.7;store.liveNow = {now}
+            f.commit();f.statusCoverage = true;f.holdList = true;f.holdContext = true
+            let apply = Task {await store.applyChangeCoverage(f.changes())};defer {apply.cancel()}
+            try await until {f.held.count == 2}
+            XCTAssertEqual(shownStatus(store,page:.tasks),"Review")
+            XCTAssertEqual(store.selectedTask("a")?.string("status_name"),"Review")
+            XCTAssertEqual(cursor(store),"c0")
+            XCTAssertFalse(store.selectedTicketCurrent("a"))
+            XCTAssertEqual(store.preparedTicketWorkspace?.list.triages.count,grouped ? 1 : 0)
+            now += 0.25
+            f.holdList = false;f.holdContext = false
+            while !f.held.isEmpty {f.release(f.held[0].0)}
+            let accepted = await apply.value;XCTAssertTrue(accepted)
+            XCTAssertEqual(store.preparedTicketWorkspace?.rows.compactMap {row -> Record? in
+                switch row.content {case .ticket(let t),.triageMember(let t):return t;default:return nil}
+            }.first?.string("title"),"Updated fixture")
+            XCTAssertTrue(store.selectedTicketCurrent("a"));XCTAssertEqual(cursor(store),"c1")
+        }
+    }
+
+    func testTicketsCommittedStatusReadAheadFencesEarlierPageWithoutAcknowledgingIt() async throws {
+        let f = Fixture(isolatedDefaults("TicketsStatusReadAhead").preferences)
+        f.inTriage = true
+        let store = f.store(), live = Task {await store.startLiveUpdates()}
+        defer {live.cancel();store.stopWindowReads();f.cleanup()}
+        try await until {f.wait != nil}
+        var now: TimeInterval = 1802.7;store.liveNow = {now}
+        f.holdList = true;f.statusCoverage = true
+        let first = f.wait;f.wait = nil;first?.resume(returning:f.changes())
+        try await until {f.held.count == 1}
+        now += 0.25;f.commit();f.statusCoverage = true
+        var changed = f.changes();changed["event_cursor"] = "c2"
+        if let wait = f.wait {f.wait = nil;wait.resume(returning:changed)} else {f.queuedChanges.append(changed)}
+        try await until {self.shownStatus(store,page:.tasks) == "Review"}
+        XCTAssertEqual(cursor(store),"c0");XCTAssertEqual(f.held.count,1)
+        // Read-ahead observes but does not consume the primary subscription's
+        // replay from its last applied cursor.
+        f.queuedChanges.append(changed)
+        f.holdList = false;f.release("task_list")
+        try await until {self.cursor(store) == "c2"}
+        XCTAssertEqual(shownStatus(store,page:.tasks),"Review")
+    }
+
+    func testTicketsTriageHeaderRequiresCompleteRevisionMatchedCoverage() async throws {
+        for variant in ["complete","partial","wrong_group_revision","new_group_revision","mixed"] {
+            let f = Fixture(isolatedDefaults("TriageStatusCoverage").preferences)
+            f.inTriage = true
+            let store = f.store(), live = Task {await store.startLiveUpdates()}
+            defer {live.cancel();store.stopWindowReads();f.cleanup()}
+            try await until {f.wait != nil}
+            store.liveNow = {1802.7}
+            f.commit();f.statusCoverage = true;f.holdList = true
+            var changes = f.changes(), coverage = changes["coverage"] as! [String:Any]
+            let membership: [String:Any] = ["id":"triage","revision":variant == "wrong_group_revision" ? 0 : variant == "new_group_revision" ? 2 : 1,"member_count":2]
+            var b = f.task("b")
+            if variant == "mixed" {b["status_id"] = "Queued";b["status_name"] = "Queued";b["status_category"] = "queued"}
+            var updates = [["task":f.task(),"surfaces":["needs_review"],"triages":[membership]]] as [[String:Any]]
+            if variant != "partial" {updates.append(["task":b,"surfaces":[],"triages":[membership]])}
+            coverage["status_updates"] = updates;changes["coverage"] = coverage
+            let apply = Task {await store.applyChangeCoverage(changes)};defer {apply.cancel()}
+            try await until {f.held.count == 1}
+            XCTAssertEqual(shownStatus(store,page:.tasks),"Review")
+            let summary = store.preparedTicketWorkspace?.list.triages.first
+            XCTAssertEqual(summary?.triage.string("status_name"),["complete","new_group_revision"].contains(variant) ? "Review" : variant == "mixed" ? "Mixed" : "In progress")
+            XCTAssertEqual(summary?.visibleMembers.map(\.id),["a"],"Unloaded members never become page rows")
+            XCTAssertEqual(summary?.triage.bool("members_complete"),false)
+            XCTAssertEqual(cursor(store),"c0")
+            f.holdList = false;f.release("task_list");_ = await apply.value
+        }
+    }
+
+    func testTicketsStatusOverlayKeepsStoreProjectAndRevisionFences() async throws {
+        for variant in ["store","project","older","equal"] {
+            let f = Fixture(isolatedDefaults("TicketsStatusFences").preferences)
+            f.revision = 3;f.inTriage = true
+            let store = f.store(), live = Task {await store.startLiveUpdates()}
+            defer {live.cancel();store.stopWindowReads();f.cleanup()}
+            try await until {f.wait != nil}
+            store.liveNow = {1802.7}
+            f.statusCoverage = true;f.holdList = true
+            f.status = "Review";f.version = "v2";f.revision = variant == "older" ? 2 : variant == "equal" ? 3 : 4
+            var changes = f.changes(), coverage = changes["coverage"] as! [String:Any]
+            if variant == "store" {coverage["store_incarnation"] = "foreign"}
+            if variant == "project" {coverage["status_updates"] = [["task":f.task(project:"foreign"),"surfaces":[]]]}
+            changes["coverage"] = coverage
+            let apply = Task {await store.applyChangeCoverage(changes)};defer {apply.cancel()}
+            try await until {f.held.count == 1}
+            XCTAssertEqual(shownStatus(store,page:.tasks),"In progress")
+            f.holdList = false;f.release("task_list");_ = await apply.value
+        }
+    }
+
+    func testTicketsNoteCoverageRetainsMountedFiltersWhilePageWaits() async throws {
+        _ = NSApplication.shared
+        let f = Fixture(isolatedDefaults("TicketsFilterMount").preferences)
+        let store = f.store(), live = Task {await store.startLiveUpdates()}
+        let host = NSHostingView(rootView:TaskWorkspaceView().environmentObject(store).frame(width:1100,height:850))
+        let window = NSWindow(contentRect:NSRect(x:-10000,y:-10000,width:1100,height:850),styleMask:[],backing:.buffered,defer:false)
+        window.title = "Synthetic Tickets coverage host (offscreen)";window.isReleasedWhenClosed = false
+        window.contentView = host;window.orderFront(nil)
+        defer {live.cancel();store.stopWindowReads();window.contentView = nil;window.close();f.cleanup()}
+        func draw() {host.layoutSubtreeIfNeeded();host.displayIfNeeded();window.displayIfNeeded()}
+        try await until {draw();return f.wait != nil && f.pageReads.contains("worker_sessions")}
+        let lists = f.calls.filter {$0 == "task_list"}.count
+        store.search = "Fixture";try await until {f.calls.filter {$0 == "task_list"}.count > lists && !store.ticketPageLoading}
+        draw();let reads = f.pageReads.filter {$0 == "worker_sessions"}.count
+        store.liveNow = {1802.7};f.holdList = true
+        var changes = f.changes();changes["coverage"] = ["schema_version":2,"complete":true,"reset":false,
+            "changes":[["project_id":"p","families":["messages"],"task_ids":["b"],"all_tasks":false]]]
+        let apply = Task {await store.applyChangeCoverage(changes)};defer {apply.cancel()}
+        try await until {f.held.contains {$0.0 == "task_list"}}
+        draw();XCTAssertNotNil(store.preparedTicketWorkspace,"Complete coverage must keep the mounted content and controls")
+        try await Task.sleep(nanoseconds:20_000_000);draw()
+        f.holdList = false;while !f.held.isEmpty {f.release(f.held[0].0)};_ = await apply.value
+        draw();try await Task.sleep(nanoseconds:20_000_000);draw()
+        XCTAssertEqual(f.pageReads.filter {$0 == "worker_sessions"}.count,reads,"A note refresh must not remount the controls' worker-session read")
+    }
+
     func testLiveStatusCoverageArrivesWhileEarlierPagesStayHeld() async throws {
         let f = Fixture(isolatedDefaults("StatusReadAhead").preferences,page:.overview)
         let store = f.store(),live = Task {await store.startLiveUpdates()}

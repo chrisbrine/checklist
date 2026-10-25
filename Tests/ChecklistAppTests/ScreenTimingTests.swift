@@ -15,6 +15,7 @@ import ChecklistIPC
         let events = (0..<20_707).map { ["id":"event-\($0)", "project_id":"p", "created_at":"2026-10-24T10:00:00Z"] }
         let tasks = (0..<542).map { ["id":"task-\($0)", "project_id":"p", "key":"T-\($0)", "title":"Synthetic ticket \($0)", "status_id":"queued", "status_category":"queued", "revision":1, "epic_id":"epic-0"] as [String:Any] }
         var largeSettings = false
+        var fullSettings = false
         var version = "v1", delay: UInt64 = 0
         var timeoutOverview = false
         var holdQuiet = false
@@ -37,7 +38,14 @@ import ChecklistIPC
             }
             let project = params["project_id"] as? String ?? "p"
             let rows: [[String:Any]]
-            if surface == "record" {rows = [projects[0].merging(["id":params["record_id"] as! String,"project_id":"p","record_type":"project"]) {_,n in n}]}
+            if surface == "record" {
+                var row = projects[0].merging(["id":params["record_id"] as! String,"project_id":"p","record_type":"project"]) {_,n in n}
+                if fullSettings {
+                    row["detail_statuses"] = (0..<7).map {["id":"status-\($0)","project_id":"p","name":"Status \($0)","category":"queued","sort_order":$0] as [String:Any]}
+                    row["detail_tags"] = [[String:Any]]()
+                }
+                rows = [row]
+            }
             else if surface == "epics" {rows = (0..<8).map { ["id":"epic-\($0)","project_id":project,"name":"Synthetic Epic \($0)","kind":"epic","ticket_count":67,"done_count":10] }}
             else if ["human_tasks","requests","recent_reviews"].contains(surface) {rows = []}
             else {rows = Array(tasks.prefix(surface == "completed_since" ? 1 : 5)).map {$0.merging(["project_id":project,"title":version == "v1" ? "Original synthetic row" : "Updated synthetic row"]) {_,n in n}}}
@@ -91,6 +99,28 @@ import ChecklistIPC
             }.environmentObject(store).defaultAppStorage(store.windowPreferences).frame(width:width,height:850)
         }
     }
+    /// Match the mounted workspace/overlay and production styling without
+    /// ContentView's notification-permission and native window lifecycle tasks.
+    private struct FullSettingsHost: View {
+        @ObservedObject var store: ChecklistStore
+        var body: some View {
+            HStack(spacing:0) {
+                SidebarView().frame(width:224)
+                GeometryReader { geometry in
+                    ZStack(alignment:.trailing) {
+                        VStack(spacing:0) {ProjectWorkspaceTabs();TaskWorkspaceView()}
+                            .frame(maxWidth:.infinity,maxHeight:.infinity)
+                        if let detail = store.detail {
+                            DetailOverlay(detail:detail).accessibilitySortPriority(1).frame(width:min(560,geometry.size.width-20))
+                                .background(.regularMaterial).clipShape(RoundedRectangle(cornerRadius:Radius.large))
+                                .padding(.vertical,Spacing.row).padding(.trailing,Spacing.row)
+                                .transition(.move(edge:.trailing).combined(with:.opacity))
+                        }
+                    }
+                }
+            }.environmentObject(store).defaultAppStorage(store.windowPreferences).checklistTextScaleRoot()
+        }
+    }
     private func until(_ predicate: () -> Bool) async throws {
         for _ in 0..<1000 {if predicate() {return};try await Task.sleep(nanoseconds:5_000_000)}
         XCTFail("Template did not settle");throw CancellationError()
@@ -102,6 +132,7 @@ import ChecklistIPC
     }
     private func measure(_ surface: Surface, cached: Bool = true, action: (ChecklistStore)->Void) async throws {
         _ = NSApplication.shared
+        let restoreAX = AXProbe.enableEnhancedUserInterface();defer {restoreAX()}
         let f = Fixture(isolatedDefaults("ScreenTiming").preferences), store = f.store(), live = Task {await store.startLiveUpdates()}
         let host = NSHostingView(rootView:Host(store:store))
         // A synthetic XCTest host outside the desktop, never an installed app window.
@@ -165,11 +196,50 @@ import ChecklistIPC
         XCTAssertLessThan(milliseconds,cached ? 300 : 1_000)
         if surface == .ticketDetail {XCTAssertLessThan(snapshot.bodies["messageRow"] ?? 0,50,"First frame must not eagerly construct the whole offscreen conversation")}
     }
+    func testRealSizeCachedTicketFrameContainsHeaderBeforeBackgroundContext() async throws {
+        _ = NSApplication.shared
+        let restoreAX = AXProbe.enableEnhancedUserInterface();defer {restoreAX()}
+        let f = Fixture(isolatedDefaults("CachedTicketAXFrame").preferences)
+        let store = f.store(), live = Task {await store.startLiveUpdates()}
+        let host = NSHostingView(rootView:FullSettingsHost(store:store))
+        let window = NSWindow(contentRect:NSRect(x:-10000,y:-10000,width:1100,height:850),styleMask:[],backing:.buffered,defer:false)
+        window.title = "Synthetic 542-ticket / 50-note detail (offscreen)";window.isReleasedWhenClosed = false;window.contentView = host;window.orderFront(nil)
+        defer {NativeRenderMetrics.cancel();live.cancel();store.stopWindowReads();window.contentView = nil;window.close();try? FileManager.default.removeItem(at:f.root)}
+        func draw() {
+            host.layoutSubtreeIfNeeded();host.displayIfNeeded();window.displayIfNeeded()
+            func probes(_ view:NSView) {for child in view.subviews {probes(child)};if String(describing:type(of:view)).contains("FrameView") {view.display()}}
+            probes(host)
+        }
+        try await AXProbe.until {store.screenContentReady && !store.sidebarLoading}
+        store.select(.tasks,project:"p");try await AXProbe.until {store.ticketPageMatchedCount == 542 && !store.ticketPageLoading}
+        store.open(.task("task-0"));try await AXProbe.until {store.selectedTicketCurrent("task-0")};draw()
+        XCTAssertEqual(store.detailRecords("messages",task:try XCTUnwrap(store.selectedTask("task-0"))).count,50)
+        store.closeDetail();for _ in 0..<3 {await Task.yield();draw()}
+        f.delay = 30_000_000_000
+        NativeRenderMetrics.begin(sample:254)
+        store.open(.task("task-0"))
+        for _ in 0..<3 {await Task.yield();draw()}
+        let text = AXProbe.text(host)
+        XCTAssertTrue(text.contains("Synthetic project 0  /  T-0"));XCTAssertTrue(text.contains("Synthetic ticket 0"));XCTAssertTrue(text.contains("Queued"))
+        func readingOrder(_ node:NSObject, depth:Int = 0) -> [NSObject] {
+            guard depth < 40 else {return []}
+            return [node] + (AXProbe.attribute(node,"accessibilityChildren") as? [NSObject] ?? []).flatMap {readingOrder($0,depth:depth+1)}
+        }
+        let order = readingOrder(host)
+        let header = try XCTUnwrap(order.firstIndex {AXProbe.attribute($0,"accessibilityValue") as? String == "Synthetic ticket 0"})
+        let background = try XCTUnwrap(order.firstIndex {AXProbe.attribute($0,"accessibilityIdentifier") as? String == "newTriage"})
+        XCTAssertLessThan(header,background,"The open detail precedes background workspace controls in AX reading order")
+        let frame = try XCTUnwrap(NativeRenderMetrics.finish())
+        XCTAssertEqual(frame.screens["ticket_detail"]?.cached,true)
+        XCTAssertLessThan(frame.bodies["messageRow"] ?? 0,50,"Offscreen notes stay lazy")
+        XCTAssertTrue(store.selectedTicketLoading,"The first accessible cached frame precedes the suspended refresh")
+    }
     /// CL-260 item 2: a cached settings open installs its retained receipts at
     /// navigation, completes its native display pass with them, and only then
     /// replaces them from the background receipt read. No wall-clock budget.
     func testCachedCleanupOpenDisplaysRetainedReceiptsBeforeBackgroundRead() async throws {
         _ = NSApplication.shared
+        let restoreAX = AXProbe.enableEnhancedUserInterface();defer {restoreAX()}
         let f = Fixture(isolatedDefaults("CachedCleanupOpen").preferences), store = f.store(), live = Task {await store.startLiveUpdates()}
         let host = NSHostingView(rootView:Host(store:store))
         // A synthetic XCTest host outside the desktop, never an installed app window.
@@ -196,7 +266,7 @@ import ChecklistIPC
         store.closeDetail();store.open(.project("q1"));try await until {!store.otherDetailLoading}
         try await settle("Other settings visit did not load receipts") {receipts.loaded && receipts.scope == store.cleanupReceiptScope("q1")}
         let readsOpen = receiptReads()
-        store.closeDetail();draw();try await Task.sleep(nanoseconds:20_000_000);draw()
+        store.closeDetail();draw();try await Task.sleep(nanoseconds:250_000_000);draw();draw()
         XCTAssertEqual(receiptReads(),readsOpen,"Closing settings must not issue a generation-scoped receipt read")
         XCTAssertEqual(receipts.scope,store.cleanupReceiptScope("q1").components(separatedBy:":").prefix(3).joined(separator:":") + ":v1","Closing settings must not replace the retained receipt scope")
         f.holdReceipts = true;f.removedBytes = 99
@@ -214,6 +284,127 @@ import ChecklistIPC
         f.releaseReceipts()
         try await settle("The background reply must replace changed receipt facts") {bytes() == Array(repeating:99,count:50)}
         XCTAssertTrue(receipts.error.isEmpty)
+    }
+    /// N260: use the complete workspace and production control styling. The
+    /// old detail-only host omitted both and hid eager offscreen form work.
+    func testCachedCleanupInFullWorkspaceDefersOffscreenSettings() async throws {
+        _ = NSApplication.shared
+        let restoreAX = AXProbe.enableEnhancedUserInterface();defer {restoreAX()}
+        let f = Fixture(isolatedDefaults("FullSettingsCleanup").preferences)
+        f.largeSettings = true;f.fullSettings = true
+        let store = f.store(), live = Task {await store.startLiveUpdates()}
+        store.data["sessions"] = (0..<479).map {["id":"session-\($0)","project_id":"p","role":"worker","label":"Worker \($0)","provider":"codex"]}
+        let host = NSHostingView(rootView:FullSettingsHost(store:store))
+        let window = NSWindow(contentRect:NSRect(x:-10000,y:-10000,width:1240,height:820),styleMask:[],backing:.buffered,defer:false)
+        window.title = "Synthetic Checklist full settings host (offscreen)"
+        window.isReleasedWhenClosed = false;window.contentView = host;window.orderFront(nil)
+        defer {f.releaseReceipts(throwing:CancellationError());live.cancel();store.stopWindowReads();window.contentView = nil;window.close();try? FileManager.default.removeItem(at:f.root)}
+        func views(_ view:NSView) -> [NSView] {[view] + view.subviews.flatMap(views)}
+        func draw() {
+            host.layoutSubtreeIfNeeded();host.displayIfNeeded();window.displayIfNeeded()
+            for view in views(host) where String(describing:type(of:view)).contains("FrameView") {view.display()}
+        }
+        func settle(_ predicate: () -> Bool) async throws {
+            for _ in 0..<400 {draw();if predicate() {return};try await Task.sleep(nanoseconds:5_000_000)}
+            XCTFail("Full settings template did not settle");throw CancellationError()
+        }
+        try await until {ready(store) && !store.sidebarLoading}
+        store.select(.tasks,project:"p");try await until {store.preparedTicketWorkspace != nil && !store.ticketPageLoading}
+        store.open(.project("p"));try await settle {store.ticketCleanupReceipts.receipts.count == 50}
+        XCTAssertEqual(store.statuses("p").count,7)
+        XCTAssertEqual(store.workSessions.count,479)
+        store.closeDetail();draw();try await Task.sleep(nanoseconds:250_000_000);draw()
+        f.holdReceipts = true
+        store.open(.project("p"))
+        XCTAssertEqual(store.screenTiming.navigation(.cleanup)?.cached,true)
+        try await settle {store.screenTiming.navigation(.cleanup) == nil && !f.heldReceipts.isEmpty}
+        let text = AXProbe.text(window)
+        for second in 0..<50 {
+            XCTAssertTrue(text.contains(String(format:"2026-10-24T10:00:%02dZ: 42 bytes removed · 542 files kept · complete",second)),"Every retained receipt is part of the first native pass")
+        }
+        XCTAssertFalse(text.contains("Customize project default"),"Offscreen review controls must not join the cleanup display pass")
+        XCTAssertFalse(text.contains("Status 0"),"Offscreen taxonomy controls must not join the cleanup display pass")
+        XCTAssertTrue(text.contains("Edit project context"))
+        XCTAssertEqual(store.ticketCleanupReceipts.receipts.count,50)
+        // Lazy sections remain reachable in their original order, with drafts
+        // owned by ProjectSettingsView rather than a transient section body.
+        let scroll = try XCTUnwrap(views(host).compactMap {$0 as? NSScrollView}.last {!$0.isHiddenOrHasHiddenAncestor && !$0.visibleRect.isEmpty && $0.bounds.height > 400 && $0.bounds.width > 400 && $0.bounds.width < 600 && ($0.documentView?.bounds.height ?? 0) > 2000})
+        for _ in 0..<100 {
+            guard !AXProbe.text(window).contains("Status 0") else {break}
+            var bounds = scroll.contentView.bounds;bounds.origin.y += 100
+            scroll.contentView.scroll(to:scroll.contentView.constrainBoundsRect(bounds).origin);scroll.reflectScrolledClipView(scroll.contentView)
+            draw();try await Task.sleep(nanoseconds:5_000_000)
+        }
+        XCTAssertTrue(AXProbe.text(window).contains("Status 0"),"The taxonomy editor remains available on scroll: bounds=\(scroll.contentView.bounds) document=\(String(describing:scroll.documentView?.bounds)) text=\(AXProbe.text(window).suffix(1500))")
+    }
+    func testCleanupFrameWaitsForReceiptAXContent() async throws {
+        _ = NSApplication.shared
+        let restoreAX = AXProbe.enableEnhancedUserInterface();defer {restoreAX()}
+        let f = Fixture(isolatedDefaults("CleanupAXFrame").preferences)
+        f.largeSettings = true;f.fullSettings = true
+        let store = f.store(), live = Task {await store.startLiveUpdates()}
+        let host = NSHostingView(rootView:FullSettingsHost(store:store).accessibilityHidden(true))
+        let window = NSWindow(contentRect:NSRect(x:-10000,y:-10000,width:1240,height:820),styleMask:[],backing:.buffered,defer:false)
+        window.title = "Synthetic Checklist AX frame host (offscreen)"
+        window.isReleasedWhenClosed = false;window.contentView = host;window.orderFront(nil)
+        defer {NativeRenderMetrics.cancel();live.cancel();store.stopWindowReads();window.contentView = nil;window.close();try? FileManager.default.removeItem(at:f.root)}
+        func draw() {
+            host.layoutSubtreeIfNeeded();host.displayIfNeeded();window.displayIfNeeded()
+            func probes(_ view:NSView) {for child in view.subviews {probes(child)};if String(describing:type(of:view)).contains("FrameView") {view.display()}}
+            probes(host)
+        }
+        try await until {ready(store) && !store.sidebarLoading}
+        NativeRenderMetrics.begin(sample:260)
+        store.open(.project("p"))
+        try await until {draw();return store.ticketCleanupReceipts.loaded}
+        draw()
+        XCTAssertFalse(AXProbe.text(window).contains("bytes removed"))
+        XCTAssertNotNil(store.screenTiming.navigation(.cleanup),"A model-ready panel with no receipt AX content cannot complete the display clock")
+        XCTAssertNil(NativeRenderMetrics.finish()?.screens["cleanup"])
+        NativeRenderMetrics.begin(sample:261)
+        host.rootView = FullSettingsHost(store:store).accessibilityHidden(false)
+        try await until {draw();return store.screenTiming.navigation(.cleanup) == nil}
+        let text = AXProbe.text(window)
+        for second in 0..<50 {XCTAssertTrue(text.contains(String(format:"2026-10-24T10:00:%02dZ: 42 bytes removed · 542 files kept · complete",second)))}
+        XCTAssertNotNil(NativeRenderMetrics.finish()?.screens["cleanup"])
+    }
+    /// Cached receipt content must survive an unrelated record read-version
+    /// change while its replacement read is held. Use the real-size workspace,
+    /// not just a detail-only host, and judge each displayed pass's AX facts.
+    func testCachedCleanupKeepsAXFactsAcrossBackgroundVersionChange() async throws {
+        _ = NSApplication.shared
+        let restoreAX = AXProbe.enableEnhancedUserInterface();defer {restoreAX()}
+        let f = Fixture(isolatedDefaults("CleanupVersionChange").preferences)
+        f.largeSettings = true;f.fullSettings = true
+        let store = f.store(), live = Task {await store.startLiveUpdates()}
+        store.data["sessions"] = (0..<531).map {["id":"session-\($0)","project_id":"p","role":"worker","label":"Worker \($0)","provider":"codex"]}
+        let host = NSHostingView(rootView:FullSettingsHost(store:store))
+        let window = NSWindow(contentRect:NSRect(x:-10000,y:-10000,width:1240,height:820),styleMask:[],backing:.buffered,defer:false)
+        window.title = "Synthetic Checklist receipt version host (offscreen)"
+        window.isReleasedWhenClosed = false;window.contentView = host;window.orderFront(nil)
+        defer {NativeRenderMetrics.cancel();f.releaseReceipts(throwing:CancellationError());live.cancel();store.stopWindowReads();window.contentView = nil;window.close();try? FileManager.default.removeItem(at:f.root)}
+        func draw() {
+            host.layoutSubtreeIfNeeded();host.displayIfNeeded();window.displayIfNeeded()
+            func probes(_ view:NSView) {for child in view.subviews {probes(child)};if String(describing:type(of:view)).contains("FrameView") {view.display()}}
+            probes(host)
+        }
+        try await until {ready(store) && !store.sidebarLoading}
+        store.select(.tasks,project:"p");try await until {store.preparedTicketWorkspace != nil && !store.ticketPageLoading}
+        store.open(.project("p"));try await until {draw();return store.ticketCleanupReceipts.receipts.count == 50}
+        store.closeDetail();draw();try await Task.sleep(nanoseconds:250_000_000);draw()
+        f.version = "v2";f.holdReceipts = true
+        store.open(.project("p"))
+        XCTAssertEqual(store.screenTiming.navigation(.cleanup)?.cached,true)
+        // Wait for the new project record, keeping both receipt refreshes held.
+        try await until {draw();return store.selectedOther != nil && !store.otherDetailLoading && !f.heldReceipts.isEmpty && store.cleanupReceiptScope("p").hasSuffix(":v2")}
+        draw()
+        let expected = (0..<50).map {String(format:"2026-10-24T10:00:%02dZ: 42 bytes removed · 542 files kept · complete",$0)}
+        let text = AXProbe.text(window)
+        XCTAssertTrue(expected.allSatisfy(text.contains),"A background version change must not erase accepted receipt facts while refreshing")
+        XCTAssertFalse(text.contains("99 bytes removed"),"Wrong-fact control")
+        f.releaseReceipts()
+        try await until {draw();return store.ticketCleanupReceipts.loaded && store.screenTiming.navigation(.cleanup) == nil}
+        XCTAssertTrue(expected.allSatisfy(AXProbe.text(window).contains))
     }
     /// Real-size settings template, with reads held so only retained content
     /// can satisfy the native first pass. Counts are structural, not budgets.
@@ -239,7 +430,7 @@ import ChecklistIPC
         store.open(.project("p"));try await until {!store.otherDetailLoading}
         for _ in 0..<400 {draw();if store.ticketCleanupReceipts.loaded {break};try await Task.sleep(nanoseconds:5_000_000)}
         XCTAssertEqual(store.ticketCleanupReceipts.receipts.count,50)
-        store.closeDetail();draw();try await Task.sleep(nanoseconds:20_000_000)
+        store.closeDetail();draw();try await Task.sleep(nanoseconds:250_000_000);draw()
         f.holdReceipts = true;f.delay = 450_000_000
         NativeRenderMetrics.begin(sample:260)
         let start = ProcessInfo.processInfo.systemUptime
@@ -262,7 +453,7 @@ import ChecklistIPC
         XCTAssertEqual(editors,0,"Context editors must be built only on demand")
         func hasPicker() -> Bool {AXProbe.nodes(window).contains {node in ["accessibilityLabel","accessibilityTitle","accessibilityValue"].contains {AXProbe.attribute(node,$0) as? String == "Coordinator context copies"}}}
         XCTAssertFalse(hasPicker(),"The coordinator session picker must be built only on demand")
-        XCTAssertTrue(text.contains("Save project settings"))
+        XCTAssertFalse(text.contains("Customize project default"),"Offscreen settings are deferred until scrolling")
         XCTAssertNotNil(sample.screens["cleanup"],"Native pass must complete while background reads are pending")
         XCTAssertEqual(store.ticketCleanupReceipts.receipts.first?.object("summary")["removed_bytes"] as? Int,42)
         // Both controls remain available, and hiding the editor preserves edits.
@@ -276,8 +467,18 @@ import ChecklistIPC
         try await until {draw();return views(host).allSatisfy {!($0 is NSTextView)}}
         AXProbe.press(try XCTUnwrap(AXProbe.button(window,"Edit project context")))
         try await until {draw();return views(host).compactMap {$0 as? NSTextView}.contains {$0.string == "Edited synthetic project brief"}}
+        AXProbe.press(try XCTUnwrap(AXProbe.button(window,"Hide project context editor")))
+        try await until {draw();return views(host).allSatisfy {!($0 is NSTextView)}}
+        let scroll = try XCTUnwrap(views(host).compactMap {$0 as? NSScrollView}.last {!$0.isHiddenOrHasHiddenAncestor && !$0.visibleRect.isEmpty && $0.bounds.height > 400 && $0.bounds.width > 400 && $0.bounds.width < 600 && ($0.documentView?.bounds.height ?? 0) > 2000})
+        for _ in 0..<100 {
+            if AXProbe.button(window,"Choose coordinator context session") != nil {break}
+            var bounds = scroll.contentView.bounds;bounds.origin.y += 100
+            scroll.contentView.scroll(to:scroll.contentView.constrainBoundsRect(bounds).origin);scroll.reflectScrolledClipView(scroll.contentView)
+            draw();try await Task.sleep(nanoseconds:5_000_000)
+        }
+        print("N260 context scroll bounds=\(scroll.contentView.bounds) frame=\(scroll.frame) document=\(String(describing:scroll.documentView?.frame)) flipped=\(scroll.documentView?.isFlipped ?? false)")
         let pickerStart = ProcessInfo.processInfo.systemUptime
-        AXProbe.press(try XCTUnwrap(AXProbe.button(window,"Choose coordinator context session")))
+        AXProbe.press(try XCTUnwrap(AXProbe.button(window,"Choose coordinator context session"),AXProbe.text(window).suffix(1500).description))
         try await until {draw();return hasPicker()}
         print("C260b demand session_picker_ms=\((ProcessInfo.processInfo.systemUptime-pickerStart)*1000)")
         XCTAssertEqual(store.workSessions.count,479)
