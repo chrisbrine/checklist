@@ -18,6 +18,13 @@ struct TaskRowPresentation: Equatable {
     var showsStatus: Bool { closed || draft }
     let statusCategory: String
     let age: String
+    /// Match the visible facts without asking AX to flatten the styled label tree.
+    var accessibilityLabel: String {
+        [title, statusReason.map {"Reason: " + $0.text}, key, projectName, kind.capitalized,
+         human ? "You" : nil, waiting.isEmpty ? nil : waiting,
+         showsStatus ? statusName : nil, draft ? "Draft" : nil, age]
+            .compactMap {$0}.filter {!$0.isEmpty}.joined(separator: ", ")
+    }
     init(task: Record, selected: Bool, projectName: String?, age: String) {
         identity = RecordIdentity(task.id);self.selected = selected
         title = task.string("title");key = task.string("key");kind = task.string("kind",fallback:"Work")

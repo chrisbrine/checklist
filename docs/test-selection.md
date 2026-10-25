@@ -108,16 +108,21 @@ keeps its 70-item accepted-history pagination fixture, in qualification too.
 `ChecklistCoreTests.TicketCleanupReceiptReadTests/testLatestSummaryPagesRetainFirstReceiptAndAreBoundedWithLargeItems`
 retains all 52 receipts, 250 items per receipt and its one-second read assertion
 in that same single-worker group. Small receipt paging/cursor cases stay default.
-`REAL_SIZE_TESTS` also keeps the unchanged 200,000-object compact-manifest
-encode/decode/descriptor round trip in the single-worker timing invocation.
+`REAL_SIZE_TESTS` keeps the unchanged 200,000-object compact-manifest
+encode/decode/descriptor round trip in the single-worker qualification invocation.
 It took 66.9 s in a warm 64-worker pass and left a measured 28.3 s last-case
 tail at 32 workers. Smaller compact Unicode/malformed-index and legacy-format
-correctness cases remain default. Full qualification and an edit to this fixture
-execute its original assertions; ordinary default plans defer it with the timing
-checks. No source or test file needs to change for this selection.
-`QUALIFICATION_TESTS` lists exact XCTest identifiers across Core, App and IPC. Their original fixtures and
-assertions stay in place; the shared `QualificationSuite.requireEnabled()` makes a direct
-`swift test` skip them unless `CHECKLIST_QUALIFICATION=1`. The planner's single
+correctness cases remain default. Full qualification, a change to
+`Sources/ChecklistCore/StorageCompactManifest.swift`, and an edit to this fixture
+all emit its original assertions in `qualification_commands`. It stays out of
+`timing_tests`: timing deferral never removes a selected real-size fixture.
+`QUALIFICATION_CASES` combines `REAL_SIZE_TESTS` and `QUALIFICATION_TESTS`, so the
+qualification selection, fast-pass skips and aggregate `skip` report agree.
+`QUALIFICATION_TESTS` lists the gated XCTest identifiers across Core, App and IPC.
+Their original fixtures and assertions stay in place; the shared
+`QualificationSuite.requireEnabled()` makes a direct `swift test` skip those gated
+cases unless `CHECKLIST_QUALIFICATION=1`. The real-size manifest fixture is ungated;
+use the planner to keep it out of a fast default run. The planner's single
 `--qualification` switch adds a separate single-worker qualification invocation
 with this variable enabled. Scale/soak probes therefore do not compete with the
 default unit workers. The historical `default_swift_commands`/`swift_commands` fields contain the
@@ -134,8 +139,8 @@ qualifiers additionally require their existing explicitly selected private-copy
 inputs; the switch never selects a live store or fabricates those inputs.
 
 Affected plans include qualification for selected test targets when their Core,
-App or IPC production dependencies, or unknown/package/build inputs change. Editing a gated
-qualification fixture selects its registered cases; editing the gate helper
+App or IPC production dependencies, or unknown/package/build inputs change. Editing a
+qualification or real-size fixture selects its registered cases; editing the gate helper
 selects all registered cases in the selected targets. JSON `qualification_tests` gives the exact included IDs. Full default mode
 always omits qualification; full qualification mode always includes it. This
 keeps the default budget separate from scale and soak coverage without dropping
@@ -145,6 +150,55 @@ After affected checks pass, use the existing installation/storage gates. A bound
 full qualification job on the exact immutable source can run in the background;
 retain its PID/job receipt, source fingerprint and logs. Map failures to their
 own tickets. A previous failure is never a passing result for this ticket.
+
+### Qualification source-area audit
+
+Every entry is listed below with a concrete source area that selects it. These
+are examples within the existing conservative dependency closure, not a narrower
+map: any Core source selects all 28 registered qualification cases across its
+transitive test targets; App source selects its one App qualifier, and IPC source
+selects qualifiers in the targets reached by its actual package dependencies.
+`Tests/ChecklistTestSupport/` changes also select qualification in consuming targets.
+Fast class narrowing (including `OrdinaryMentionTokens.swift`) never narrows this
+qualification closure. The actual-graph selector regression checks runnable
+qualification commands for Core, mapped Core, App and IPC production paths.
+
+| Registered test | Selecting source area |
+| --- | --- |
+| `ChecklistCoreTests.TicketCleanupReceiptReadTests/testLatestSummaryPagesRetainFirstReceiptAndAreBoundedWithLargeItems` | `Sources/ChecklistCore/TicketCleanupReceiptRead.swift` |
+| `ChecklistCoreTests.TestStoreTests/testWarmStoreSetupReportsPairedMedians` | `Tests/ChecklistTestSupport/TestStore.swift` |
+| `ChecklistCoreTests.MediaListQueryTests/testExamplesStayCollapsedUntilShowThenCapPageAndNeverGrantApproval` | `Sources/ChecklistCore/MediaListQueries.swift` |
+| `ChecklistIPCTests.LongCommandTests/testCommandLongerThanOldDeadlineReturnsCommittedResultThroughRealClient` | `Sources/ChecklistIPC/ChecklistClient.swift` |
+| `ChecklistAppTests.IsolatedDefaultsTests/testPreferencesRemainAbsentAfterChildProcessExit` | `Sources/ChecklistApp/Stores/ChecklistStore.swift` |
+| `ChecklistCoreTests.StorageSnapshotCapacityTests/testMoreThanThirtyThousandObjectsAndEightMiBManifestRoundTripWithoutPruning` | `Sources/ChecklistCore/StorageSnapshot.swift` |
+| `ChecklistCoreTests.MediaFrozenIntakeTests/test300SourcePreviewExactConfirmationStop200Resume96AndPlanRevision` | `Sources/ChecklistCore/MediaIntake.swift` |
+| `ChecklistCoreTests.MediaDecisionTests/test450SelectionLostReplyFailedMiddleOnlyRefreshAndLaterReversal` | `Sources/ChecklistCore/MediaDecisions.swift` |
+| `ChecklistCoreTests.EvidenceAuthorityTests/testWorkHealthLargeProjectDecodesOnlyCandidatePage` | `Sources/ChecklistCore/WorkHealth.swift` |
+| `ChecklistCoreTests.TicketLifecycleCleanupTests/testPreparationProgressUnderConstantUnrelatedWritesAndBoundsMemory` | `Sources/ChecklistCore/TicketLifecycleCleanup.swift` |
+| `ChecklistCoreTests.TicketLifecycleCleanupTests/testBackupDescriptorStreamingHasBoundedAllocations` | `Sources/ChecklistCore/TicketLifecycleCleanup.swift` |
+| `ChecklistCoreTests.TicketLifecycleCleanupTests/testProjectedReferenceScanBoundsWorkWithManyOwnedTokens` | `Sources/ChecklistCore/TicketLifecycleCleanup.swift` |
+| `ChecklistCoreTests.TicketLifecycleCleanupTests/testSustainedWritersBoundRSSCPUAndBackoff` | `Sources/ChecklistCore/TicketLifecycleCleanup.swift` |
+| `ChecklistCoreTests.TicketLifecycleCleanupTests/testSelectedPayloadAndHistoryPreparationHasBoundedPeak` | `Sources/ChecklistCore/TicketLifecycleCleanup.swift` |
+| `ChecklistCoreTests.CoreTests/testEpicDeleteRealSizeBackfillResumesExpiredSlices` | `Sources/ChecklistCore/EpicDeletion.swift` |
+| `ChecklistCoreTests.CoreTests/testEpicDeleteIndexedThirtyThousandRecordsAndEventsAndConcurrentRead` | `Sources/ChecklistCore/EpicDeletion.swift` |
+| `ChecklistCoreTests.MediaListQueryTests/testThousandItemBoundedGroupedPagesFreezeOrderAcrossInsertsAndUpdates` | `Sources/ChecklistCore/MediaListQueries.swift` |
+| `ChecklistCoreTests.ScreenReadPerformanceTests/testRealSizeScreenReads` | `Sources/ChecklistCore/WorkspacePageRead.swift` |
+| `ChecklistCoreTests.ScreenReadPerformanceTests/testOverviewWithRetainedReviewHistory` | `Sources/ChecklistCore/WorkspacePageRead.swift` |
+| `ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeAutomaticFirstPassKeepsConcurrentReadAndWriteUnderTwoSeconds` | `Sources/ChecklistCore/TicketLifecycleCleanup.swift` |
+| `ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeCacheAliasInventoryExhaustsOneBoundedClosureBudgetAndRetainsEntry` | `Sources/ChecklistCore/TicketLifecycleCleanup.swift` |
+| `ChecklistCoreTests.MediaRoundTests/testLargeRetainedHistoryDoesNotHoldWriterDuringPreparation` | `Sources/ChecklistCore/MediaRounds.swift` |
+| `ChecklistCoreTests.StorageReadPerformanceTests/testDeliveryPassLookupTimingAtFiveThousandRecords` | `Sources/ChecklistCore/Communication.swift` |
+| `ChecklistCoreTests.ArchivePreviewPerformanceTests/testFourFourHundredFileCapturesKeepExactPreviewUnderOneSecond` | `Sources/ChecklistCore/ArchiveCleanupObservation.swift` |
+| `ChecklistCoreTests.EvidenceAuthorityTests/testLargeSubmitBlocksOtherCommandsOnlyBriefly` | `Sources/ChecklistCore/SourceCapture.swift` |
+| `ChecklistCoreTests.EvidenceAuthorityTests/testLargeReferenceImportBlocksOtherCommandsOnlyBriefly` | `Sources/ChecklistCore/ReferenceImportPreparation.swift` |
+| `ChecklistCoreTests.EvidenceAuthorityTests/testReviewClaimValidatesTheCapturedTargetBeforeTheWriter` | `Sources/ChecklistCore/AgentReviews.swift` |
+| `ChecklistCoreTests.StorageCompactManifestTests/testTwoHundredThousandObjectTemplateFitsManifestBudgetWithoutLosingDescriptors` | `Sources/ChecklistCore/StorageCompactManifest.swift` |
+
+Both registry families are omitted by `--full` alone and included by
+`--full --qualification`. Affected production selection adds them to the separate
+qualification command without enabling the `TIMING_TESTS` / `LOAD_SENSITIVE_TESTS`
+command. Those timing cases still require `--qualification` or their own test-file
+change. No Swift fixture, assertion or private-input gate changes for this audit.
 
 ## Private template stores and finer groups
 

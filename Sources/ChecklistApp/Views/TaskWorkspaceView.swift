@@ -381,6 +381,7 @@ private struct TaskRowLabel: View, Equatable {
             if presentation.showsStatus { TicketStatusPills(name: presentation.statusName, category: presentation.statusCategory, draft: presentation.draft) }
             Text(presentation.age).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).padding(.top, Spacing.tight)
         }.padding(.horizontal, Spacing.control).padding(.vertical, Spacing.control).background(presentation.selected ? Color.checklistAccent.opacity(0.1) : .clear, in: RoundedRectangle(cornerRadius: Radius.medium)).contentShape(Rectangle())
+            .accessibilityElement(children: .ignore).accessibilityLabel(presentation.accessibilityLabel)
     }
 }
 

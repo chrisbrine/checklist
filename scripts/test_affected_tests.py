@@ -129,7 +129,7 @@ class SelectionTests(unittest.TestCase):
     def test_heavy_skip_matches_real_swift_test_identifiers(self):
         command = self.plan('Sources/ChecklistApp/ContentView.swift')['swift_commands'][0]
         patterns = [command[i + 1] for i, arg in enumerate(command) if arg == '--skip']
-        identifiers = list(selector.QUALIFICATION_TESTS)
+        identifiers = list(selector.QUALIFICATION_CASES)
         for identifier in identifiers:
             self.assertTrue(any(re.search(pattern, identifier) for pattern in patterns), identifier)
         self.assertFalse(any(re.search(pattern, 'ChecklistCoreTests.StorageSnapshotCapacityTests/testSmall')
@@ -143,7 +143,7 @@ class SelectionTests(unittest.TestCase):
                      'Sources/ChecklistCore/ManagedPaths.swift', 'Sources/ChecklistCore/FileDurability.swift']:
             with self.subTest(path=path):
                 plan = self.plan(path)
-                self.assertEqual(plan['qualification_tests'], [case for case in selector.QUALIFICATION_TESTS if case.split('.')[0] in plan['test_targets']])
+                self.assertEqual(plan['qualification_tests'], [case for case in selector.QUALIFICATION_CASES if case.split('.')[0] in plan['test_targets']])
         self.assertEqual(self.plan('Tests/ChecklistCoreTests/MediaDecisionTests.swift')['skip'], list(selector.HEAVY_TESTS))
 
     def test_shared_and_indirect_heavy_dependencies_enable_heavy_cases(self):
@@ -231,7 +231,7 @@ class SelectionTests(unittest.TestCase):
         command = plan['swift_commands'][0]
         self.assertIn('--parallel', command)
         self.assertNotIn('--filter', command)
-        self.assertEqual(plan['skip'], list(selector.QUALIFICATION_TESTS))
+        self.assertEqual(plan['skip'], list(selector.QUALIFICATION_CASES))
         self.assertIn('CHECKLIST_QUALIFICATION=0', command)
         qualified = selector.select(self.root, GRAPH, [], self.root / '.build', full=True, qualification=True)
         self.assertEqual(qualified['skip'], [])
@@ -246,7 +246,7 @@ class SelectionTests(unittest.TestCase):
         next(t for t in graph['targets'] if t['name'] == 'ChecklistCoreTests')['target_dependencies'].append('ChecklistTestSupport')
         plan = selector.select(self.root, graph, ['Tests/ChecklistTestSupport/TestStore.swift'], self.root / '.build')
         self.assertIn('ChecklistCoreTests', plan['test_targets'])
-        self.assertEqual(plan['qualification_tests'], [case for case in selector.QUALIFICATION_TESTS if case.split('.')[0] in plan['test_targets']])
+        self.assertEqual(plan['qualification_tests'], [case for case in selector.QUALIFICATION_CASES if case.split('.')[0] in plan['test_targets']])
 
     def test_changed_qualification_fixture_selects_its_case(self):
         path = self.root / 'Tests/ChecklistCoreTests/MediaDecisionTests.swift'
@@ -257,7 +257,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(plan['qualification_tests'], ['ChecklistCoreTests.MediaDecisionTests/' + method])
         self.assertTrue(plan['qualification_commands'])
         helper = self.plan('Tests/ChecklistCoreTests/QualificationSuite.swift')
-        self.assertEqual(helper['qualification_tests'], [case for case in selector.QUALIFICATION_TESTS if case.split('.')[0] in helper['test_targets']])
+        self.assertEqual(helper['qualification_tests'], [case for case in selector.QUALIFICATION_CASES if case.split('.')[0] in helper['test_targets']])
 
     def test_full_default_overrides_manifest_auto_qualification(self):
         plan = self.plan('Package.swift', full=True)
@@ -272,7 +272,7 @@ class SelectionTests(unittest.TestCase):
         self.assertIn('CHECKLIST_QUALIFICATION=1', command)
         self.assertEqual(command[command.index('--num-workers') + 1], '1')
         patterns = [command[i + 1] for i, arg in enumerate(command) if arg == '--filter']
-        for case in selector.QUALIFICATION_TESTS:
+        for case in selector.QUALIFICATION_CASES:
             self.assertTrue(any(re.search(pattern, case) for pattern in patterns), case)
         self.assertFalse(any(re.search(pattern, 'ChecklistCoreTests.CoreTests/testSmall') for pattern in patterns))
 
@@ -412,19 +412,71 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(narrowed['timing_tests'], [])
         self.assertEqual(narrowed['timing_commands'], [])
 
+    def assert_case_runs(self, plan, case, commands_key='qualification_commands'):
+        for command in plan[commands_key]:
+            filters = [command[i + 1] for i, arg in enumerate(command) if arg == '--filter']
+            skips = [command[i + 1] for i, arg in enumerate(command) if arg == '--skip']
+            if any(re.search(pattern, case) for pattern in filters) and not any(
+                    re.search(pattern, case) for pattern in skips):
+                self.assertIn(command, plan['commands'])
+                return
+        self.fail(f'{case} has no runnable command in {commands_key}')
+
     def test_real_size_manifest_fixture_keeps_coverage_in_qualification(self):
         case, = selector.REAL_SIZE_TESTS
         default = self.plan(full=True)
         self.assertIn('^' + re.escape(case) + '(?:/|$)', default['default_swift_commands'][0])
-        self.assertIn(case, default['timing_tests'])
-        self.assertTrue(default['timing_deferred'])
+        self.assertIn(case, default['skip'])
+        self.assertNotIn(case, default['timing_tests'])
+        self.assertEqual(default['qualification_commands'], [])
         qualified = self.plan(full=True, qualification=True)
-        self.assertIn('^' + re.escape(case) + '$', qualified['timing_commands'][0])
-        # Editing this fixture itself also executes it, without an opt-in switch.
-        path = 'Tests/ChecklistCoreTests/StorageCompactManifestTests.swift'
-        self.assertIn('^' + re.escape(case) + '$', self.plan(path)['timing_commands'][0])
+        self.assert_case_runs(qualified, case)
+        # This ungated real-size fixture also runs when its own source changes.
+        path = self.root / 'Tests/ChecklistCoreTests/StorageCompactManifestTests.swift'
+        path.parent.mkdir(parents=True)
+        path.write_text('final class StorageCompactManifestTests: XCTestCase { func ' + case.split('/')[1] + '() throws {} }')
+        self.assert_case_runs(self.plan(path.relative_to(self.root).as_posix()), case)
         self.assertEqual(len(set(selector.ISOLATED_TESTS)), len(selector.ISOLATED_TESTS))
-        self.assertFalse(set(selector.ISOLATED_TESTS) & set(selector.QUALIFICATION_TESTS))
+        self.assertFalse(set(selector.ISOLATED_TESTS) & set(selector.QUALIFICATION_CASES))
+
+    def test_manifest_production_change_runs_real_size_qualification(self):
+        case, = selector.REAL_SIZE_TESTS
+        plan = self.plan('Sources/ChecklistCore/StorageCompactManifest.swift')
+        self.assertTrue(plan['qualification'])
+        self.assertIn(case, plan['qualification_tests'])
+        self.assertNotIn(case, plan['skip'])
+        self.assert_case_runs(plan, case)
+        self.assertIn('^' + re.escape(case) + '(?:/|$)', plan['default_swift_commands'][0])
+        self.assertTrue(plan['timing_deferred'])
+        self.assertEqual(plan['timing_commands'], [])
+
+    def test_app_only_change_still_defers_timing_and_load_sensitive_budgets(self):
+        plan = self.plan('Sources/ChecklistApp/Support/Canceled.swift')
+        self.assertTrue(plan['timing_deferred'])
+        self.assertEqual(plan['timing_commands'], [])
+        expected = [case for case in selector.TIMING_TESTS + selector.LOAD_SENSITIVE_TESTS
+                    if case.startswith('ChecklistAppTests.')]
+        self.assertEqual(plan['timing_tests'], expected)
+        for case in expected:
+            self.assertIn('^' + re.escape(case) + '(?:/|$)', plan['default_swift_commands'][0])
+            self.assertNotIn(case, plan['qualification_tests'])
+        for path in ['Tests/ChecklistAppTests/ScreenTimingTests.swift',
+                     'Tests/ChecklistAppTests/PreviewAvailabilityTests.swift']:
+            changed = self.plan(path)
+            self.assertFalse(changed['timing_deferred'])
+            for case in expected:
+                self.assert_case_runs(changed, case, 'timing_commands')
+
+    def test_every_qualification_case_runs_for_production_dependencies(self):
+        for path in ['Sources/ChecklistCore/StorageCompactManifest.swift',
+                     'Sources/ChecklistCore/OrdinaryMentionTokens.swift',
+                     'Sources/ChecklistIPC/ChecklistClient.swift',
+                     'Sources/ChecklistApp/Support/Canceled.swift']:
+            plan = self.plan(path)
+            for case in selector.QUALIFICATION_CASES:
+                if case.split('.')[0] in plan['test_targets']:
+                    with self.subTest(path=path, case=case):
+                        self.assert_case_runs(plan, case)
 
     def test_wall_clock_budget_scanner_follows_helpers_and_all_sizes(self):
         directory = self.root / 'Tests/ChecklistAppTests'
@@ -624,6 +676,25 @@ class RepositoryDependencyTests(unittest.TestCase):
 
     def owner(self, path):
         return next(t for t in self.targets if path.startswith(t['path'] + '/'))
+
+    def test_actual_graph_keeps_qualification_cases_runnable_for_source_changes(self):
+        for path in ['Sources/ChecklistCore/StorageCompactManifest.swift',
+                     'Sources/ChecklistCore/OrdinaryMentionTokens.swift',
+                     'Sources/ChecklistIPC/ChecklistClient.swift',
+                     'Sources/ChecklistApp/Support/Canceled.swift']:
+            plan = selector.select(self.root, self.graph, [path], self.scratch)
+            for case in selector.QUALIFICATION_CASES:
+                if case.split('.')[0] in plan['test_targets']:
+                    with self.subTest(path=path, case=case):
+                        self.assertIn(case, plan['qualification_tests'])
+                        self.assertNotIn(case, plan['skip'])
+                        self.assertTrue(any('^' + re.escape(case) + '$' in command
+                                            and '--skip' not in command
+                                            and 'CHECKLIST_QUALIFICATION=1' in command
+                                            and command in plan['commands']
+                                            for command in plan['qualification_commands']))
+            self.assertEqual(plan['timing_commands'], [])
+            self.assertTrue(plan['timing_deferred'])
 
     def test_repository_input_map_covers_swift_literals(self):
         found = {}

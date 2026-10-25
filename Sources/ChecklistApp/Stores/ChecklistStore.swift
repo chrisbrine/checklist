@@ -1378,7 +1378,18 @@ final class ChecklistStore: ObservableObject {
             replaceDetail(detail)
         }
     }
-    func closeDetail() { screenTiming.cancel(.ticketDetail); screenTiming.cancel(.cleanup); withAnimation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration: 0.2)) { detail = nil; detailBackStack = [] } }
+    func closeDetail() {
+        screenTiming.cancel(.ticketDetail); screenTiming.cancel(.cleanup)
+        switch detail {
+        case .task, .project:
+            // Match their immediate presentation: a closing detail must not keep
+            // its native/AX subtree participating in the next workspace frame.
+            var transaction = Transaction(animation:nil);transaction.disablesAnimations = true
+            withTransaction(transaction) {detail = nil;detailBackStack = []}
+        default:
+            withAnimation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration:0.2)) {detail = nil;detailBackStack = []}
+        }
+    }
     func goBack() { if let prior = detailBackStack.popLast() { screenTiming.cancel(.ticketDetail);screenTiming.cancel(.cleanup);if case .task = prior {screenTiming.begin(.ticketDetail)};if case .project = prior {screenTiming.begin(.cleanup)};replaceDetail(prior) } else { closeDetail() } }
     private func replaceDetail(_ detail: Detail) {
         // The panel animates when presented or closed. Replacing its item commits

@@ -39,8 +39,6 @@ QUALIFICATION_TESTS = (
     'ChecklistCoreTests.EvidenceAuthorityTests/testLargeReferenceImportBlocksOtherCommandsOnlyBriefly',
     'ChecklistCoreTests.EvidenceAuthorityTests/testReviewClaimValidatesTheCapturedTargetBeforeTheWriter',
 )
-# Compatibility name for consumers of the original selector plan.
-HEAVY_TESTS = QUALIFICATION_TESTS
 # Methods that assert a wall-clock budget, regardless of its size.
 # They keep their assertions unchanged but leave the parallel default pass and run in
 # one separate single-worker SwiftPM invocation, without sibling test work
@@ -93,7 +91,10 @@ LOAD_SENSITIVE_TESTS = (
 REAL_SIZE_TESTS = (
     'ChecklistCoreTests.StorageCompactManifestTests/testTwoHundredThousandObjectTemplateFitsManifestBudgetWithoutLosingDescriptors',
 )
-ISOLATED_TESTS = TIMING_TESTS + LOAD_SENSITIVE_TESTS + REAL_SIZE_TESTS
+QUALIFICATION_CASES = QUALIFICATION_TESTS + REAL_SIZE_TESTS
+# Compatibility name for consumers of the original selector plan.
+HEAVY_TESTS = QUALIFICATION_CASES
+ISOLATED_TESTS = TIMING_TESTS + LOAD_SENSITIVE_TESTS
 # macOS Seatbelt positive controls fail with SIGKILL when Git probes overlap.
 # Keep native guards intact and isolate this class from all other test work.
 ISOLATED_TEST_GROUPS = ('ChecklistCoreTests.SourceGitConfinementTests',
@@ -365,15 +366,16 @@ def wall_clock_budget_cases(root):
 
 
 def changed_qualification_tests(root, paths):
+    # Registered real-size fixtures need not call the opt-in gate themselves.
     selected = set()
     for path in paths:
         if path == 'Tests/ChecklistCoreTests/QualificationSuite.swift':
-            return list(QUALIFICATION_TESTS)
+            return list(QUALIFICATION_CASES)
         source = root / path
         if path.startswith('Tests/') and source.suffix == '.swift' and source.is_file():
-            methods = re.findall(r'func (test\w+)\(\) throws \{\s+try QualificationSuite.requireEnabled\(\)', source.read_text())
-            selected.update(case for case in QUALIFICATION_TESTS if case.split('/')[1] in methods)
-    return [case for case in QUALIFICATION_TESTS if case in selected]
+            methods = re.findall(r'func (test\w+)\(', source.read_text())
+            selected.update(case for case in QUALIFICATION_CASES if case.split('/')[1] in methods)
+    return [case for case in QUALIFICATION_CASES if case in selected]
 
 
 def select(root, graph, paths, scratch, full=False, qualification=False):
@@ -475,11 +477,11 @@ def select(root, graph, paths, scratch, full=False, qualification=False):
     # Group narrowing applies to the fast unit suite. Qualification retains
     # the production dependency closure: ordinary-note parsing also runs in
     # the writer-traffic and scale fixtures.
-    qualification_tests = (list(QUALIFICATION_TESTS) if qualification and
+    qualification_tests = (list(QUALIFICATION_CASES) if qualification and
                            (explicitly_qualified or heavy_changed or unknown or full) else
                            changed_qualifiers if qualification else [])
     qualification_tests = [case for case in qualification_tests if case.split('.')[0] in tests]
-    skip = [case for case in QUALIFICATION_TESTS if case not in qualification_tests] if tests else []
+    skip = [case for case in QUALIFICATION_CASES if case not in qualification_tests] if tests else []
     swift = []
     isolated = []
     qualification_commands = []
@@ -492,7 +494,7 @@ def select(root, graph, paths, scratch, full=False, qualification=False):
             for target in tests:
                 suffix = '(?:' + '|'.join(re.escape(group) for group in groups[target]) + r')(?:/|$)' if target in groups else ''
                 command.extend(['--filter', '^' + re.escape(target) + r'\.' + suffix])
-        for case in QUALIFICATION_TESTS + ISOLATED_TESTS:
+        for case in QUALIFICATION_CASES + ISOLATED_TESTS:
             command.extend(['--skip', '^' + re.escape(case) + r'(?:/|$)'])
         if 'ChecklistCoreTests' in tests:
             command = ['env', 'CHECKLIST_STORAGE_PROBE=' + str(scratch / 'out/Products/Debug/StorageCrashProbe')] + command

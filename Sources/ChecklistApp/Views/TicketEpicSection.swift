@@ -11,6 +11,10 @@ struct TicketEpicSection: View {
     @State private var loading = false
     @State private var failure: String?
     @State private var read = UUID()
+    private struct ChoiceScope: Equatable {
+        let task: String
+        let current: Bool
+    }
     var current: Record? { store.detailRecords("groups",task:task).first {$0.id == task.string("epic_id") && $0.string("kind") == "epic"} }
     var body: some View {
         DetailSection(title: "Epic · required") {
@@ -33,17 +37,26 @@ struct TicketEpicSection: View {
                     .checklistDisabled([(selection.isEmpty,"Choose an Epic first."),(selection == task.string("epic_id"),"This is already the primary Epic."),(loading,"Epics are still loading."),(!store.connected,DisabledReasons.offline),(store.busy,DisabledReasons.saving),(!store.selectedTicketCurrent(task.id),DisabledReasons.ticketLoading),(!task.string("epic_id").isEmpty && current == nil,"Refresh the current Epic before moving this ticket.")])
             }.checklistFont(.micro)
             if let failure {Text(failure).checklistFont(.micro).foregroundStyle(.orange);Button("Retry Epics") {Task {await load()}}}
-        }.task(id:task.id) {selection=task.string("epic_id");await load()}
+        }.task(id:task.id) {selection=task.string("epic_id")}
+            .task(id:ChoiceScope(task:task.id,current:store.selectedTicketCurrent(task.id))) {
+                // The cached display is readable while its authoritative context
+                // refreshes. A choice-page snapshot must not retire it mid-frame.
+                guard store.selectedTicketCurrent(task.id) else {return}
+                await load()
+            }
             .onDisappear {read=UUID()}
     }
     func load(cursor:String? = nil) async {
+        guard store.selectedTicketCurrent(task.id) else {return}
         let token=UUID(),project=task.string("project_id"),incarnation=store.storeIncarnation;read=token;loading=true;failure=nil
         do {
             let query=WorkspacePageQuery(surface:"epics",project:project)
-            let page=try WorkspacePage(await store.request("workspace_page",query.parameters(cursor:cursor)),query:query)
+            let page=try WorkspacePage(await store.request("workspace_page",query.parameters(cursor:cursor),ifCurrent: {
+                read==token && store.storeIncarnation==incarnation && store.selectedTicketCurrent(task.id)
+            }),query:query)
             guard !Task.isCancelled,read==token,store.storeIncarnation==incarnation else {return}
             choices=page.rows;next=page.next;previous=page.previous;loading=false
-        } catch {if read==token {loading=false;failure="Could not load Epic choices. The current Epic is kept."}}
+        } catch {if read==token {loading=false;if !Task.isCancelled,store.selectedTicketCurrent(task.id) {failure="Could not load Epic choices. The current Epic is kept."}}}
     }
     func save() {
         guard let target=choices.first(where: {$0.id == selection}) else {return}
