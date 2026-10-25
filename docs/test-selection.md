@@ -43,10 +43,15 @@ The full **default** Swift suite runs with `--parallel`. Its budget on this Mac 
 run has a 60-second budget. Record the load average at execution start and end, and the command with each timing.
 For CL-266 margin checks, aim for 120 seconds default and 40 seconds affected App
 under the recorded load; the acceptance limits remain 180 and 60 seconds.
-All 13 targets share 64 process-isolated SwiftPM test workers (`--num-workers 64`).
+All 13 targets share 10 process-isolated SwiftPM test workers (`--num-workers 10`).
 SwiftPM launches a test host for each selected XCTest method; these are not
-64 workers per target. The count overlaps repeated host startup; splitting a
+10 workers per target. The count overlaps repeated host startup; splitting a
 test class does not reduce the number of host launches. The worker count does not change the build-slot cap.
+T266d measured two warm parallel passes per count on this 10-core Mac:
+64 workers took 126.6/130.4 s, 32 took 126.3/126.7 s, 16 took
+124.5/120.0 s and 10 took 110.6/110.3 s. These measurements preceded
+the real-size fixture move and exclude the separate native tail. More workers
+therefore did not buy a faster default suite on this host.
 Long App recovery and MCP archive-reason matrices expose their variants as
 separate XCTest methods, retaining all original combinations and assertions so
 one method does not leave a worker running the whole matrix at the end. The native
@@ -62,14 +67,21 @@ the direct class selector avoids both 12 separate single-worker hosts and
 and exec observation off the concurrent unit queue. Its four cases and their
 assertions remain in every applicable default plan. Neither isolated host runs
 alongside the parallel pass. `TIMING_TESTS` lists the ungated default-suite methods
-that assert a wall-clock budget below 5 seconds (`WALL_CLOCK_FLOOR_SECONDS`): the
+that assert a wall-clock budget of any size: the
 parallel pass skips them, and one separate `--num-workers 1` SwiftPM invocation
 (JSON `timing_commands` and `timing_tests`) runs them with unchanged assertions in
 qualification runs (`--qualification`, which every round commit uses) and whenever a
 changed path is the test file of one of those classes. Ordinary default and affected
 plans skip them and report `timing_deferred: true`, because wall-clock budgets are
 performance checks that belong with the opt-in qualification level (CL-266 item 2); `scripts/test_affected_tests.py` fails when such a
-test is in neither `TIMING_TESTS` nor the gated `QUALIFICATION_TESTS` (CL-275). Core and MCPServer retain parallel workers for
+test is in neither `TIMING_TESTS` nor the gated `QUALIFICATION_TESTS` (CL-275).
+The guard follows same-file helpers and local clock-derived values/sample arrays,
+including `XCTAssertTrue` upper bounds. It has no size floor: 5-second termination,
+8-second Git timeout and 300 ms cached-return assertions are isolated too.
+The owned-copy preview/screen measurements also stay isolated and keep their
+explicit private-input gates. Two cleanup-deadline checks are conservatively
+isolated because they compare a deadline with the real current time; injected
+clock/configuration assertions stay in the default suite. Core and MCPServer retain parallel workers for
 their other methods, as do all other test targets. The selector supplies the
 shared SwiftPM dependency cache flags. Keep the build-slot concurrency wrapper. Run independent Python checks concurrently
 with the Swift pipeline (up to three Python processes), keeping Swift invocations
@@ -96,6 +108,13 @@ keeps its 70-item accepted-history pagination fixture, in qualification too.
 `ChecklistCoreTests.TicketCleanupReceiptReadTests/testLatestSummaryPagesRetainFirstReceiptAndAreBoundedWithLargeItems`
 retains all 52 receipts, 250 items per receipt and its one-second read assertion
 in that same single-worker group. Small receipt paging/cursor cases stay default.
+`REAL_SIZE_TESTS` also keeps the unchanged 200,000-object compact-manifest
+encode/decode/descriptor round trip in the single-worker timing invocation.
+It took 66.9 s in a warm 64-worker pass and left a measured 28.3 s last-case
+tail at 32 workers. Smaller compact Unicode/malformed-index and legacy-format
+correctness cases remain default. Full qualification and an edit to this fixture
+execute its original assertions; ordinary default plans defer it with the timing
+checks. No source or test file needs to change for this selection.
 `QUALIFICATION_TESTS` lists exact XCTest identifiers across Core, App and IPC. Their original fixtures and
 assertions stay in place; the shared `QualificationSuite.requireEnabled()` makes a direct
 `swift test` skip them unless `CHECKLIST_QUALIFICATION=1`. The planner's single

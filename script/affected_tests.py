@@ -41,14 +41,20 @@ QUALIFICATION_TESTS = (
 )
 # Compatibility name for consumers of the original selector plan.
 HEAVY_TESTS = QUALIFICATION_TESTS
-# Default-suite methods that assert a wall-clock budget below the floor.
-# They keep their assertions unchanged but leave the 64-worker pass and run in
-# one separate single-worker SwiftPM invocation, so host or parallel load
-# cannot push a frame or deadline budget over its limit (CL-275).
+# Methods that assert a wall-clock budget, regardless of its size.
+# They keep their assertions unchanged but leave the parallel default pass and run in
+# one separate single-worker SwiftPM invocation, without sibling test work
+# competing for a frame or deadline budget (CL-275).
 # scripts/test_affected_tests.py fails when wall_clock_budget_cases finds an
 # ungated case missing here or in QUALIFICATION_TESTS.
-WALL_CLOCK_FLOOR_SECONDS = 5
 TIMING_TESTS = (
+    'ChecklistAppTests.ApplicationTerminationTests/testOpenFloatingCaptureQuitsAndRestoresBlankTextAndFiles',
+    'ChecklistAppTests.CachedScreenReturnTests/testTemplateCatalogOverviewReturnNeedsNoReadOrCatalogReplay',
+    'ChecklistCoreTests.EvidenceAuthorityTests/testGitCallsAreBoundedAndReadBothPipes',
+    'ChecklistCoreTests.ArchivePreviewStoreCopyTests/testCL24PreviewOnOwnedStoreCopy',
+    'ChecklistCoreTests.ScreenReadPerformanceTests/testOwnedStoreMeasurements',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testDefaultsStartAutomaticallyWithoutPreviewOrActivationIncludingRestart',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testSchemaThreeStartupWithProtectedSnapshotsSeveralProjectsAndCacheArmsWithoutOtherWork',
     'ChecklistCoreTests.TriageListTimingTests/testProjectedRealSizeTriagesWithinServiceBudget',
     'ChecklistAppTests.HumanClaimsKeychainTests/testForeignACLReadReturnsNilWithinTwoSecondsInTemporaryKeychain',
     'ChecklistAppTests.OverviewReadRecoveryTests/testCachedOverviewReturnRestoresMatchingGroupsSynchronously',
@@ -82,7 +88,12 @@ LOAD_SENSITIVE_TESTS = (
     # Ordering checks on 50 ms fake replies race at load ~150 (O177 run, 24 Oct 2026; CL-275).
     'ChecklistAppTests.ScreenTimingTests/testAutomaticOverviewRefreshRetainsValidRowsAndCountsUntilEachReply',
 )
-ISOLATED_TESTS = TIMING_TESTS + LOAD_SENSITIVE_TESTS
+# Real-size fixtures without a timing assertion also belong at qualification
+# level. Keep their original source and coverage out of ordinary unit runs.
+REAL_SIZE_TESTS = (
+    'ChecklistCoreTests.StorageCompactManifestTests/testTwoHundredThousandObjectTemplateFitsManifestBudgetWithoutLosingDescriptors',
+)
+ISOLATED_TESTS = TIMING_TESTS + LOAD_SENSITIVE_TESTS + REAL_SIZE_TESTS
 # macOS Seatbelt positive controls fail with SIGKILL when Git probes overlap.
 # Keep native guards intact and isolate this class from all other test work.
 ISOLATED_TEST_GROUPS = ('ChecklistCoreTests.SourceGitConfinementTests',
@@ -294,32 +305,45 @@ def _functions(text):
 
 
 def _budget(body):
-    for match in re.finditer(r'XCTAssertLessThan(?:OrEqual)?\(', body):
+    # Conservative source audit, not a Swift interpreter. Follow simple local
+    # assignments and sample arrays, then inspect both comparison assertion forms.
+    # Keep clock/configuration equality tests and injected clocks in the unit suite.
+    clock = re.compile(CLOCK_READ.pattern + r'|timeIntervalSinceNow|Duration\b')
+    timed = set()
+    expressions = re.findall(r'\b(?:let|var)\s+(\w+)\s*(?::[^=\n]+)?=\s*([^;,\n]+)', body)
+    expressions += re.findall(r'\b(\w+)\.append\(([^\n]+)', body)
+
+    def is_time(expression):
+        return bool(clock.search(expression) or TIME_NAME.search(expression) or
+                    any(re.search(r'\b' + re.escape(name) + r'\b', expression) for name in timed))
+
+    for _ in range(len(expressions) + 1):
+        previous = set(timed)
+        timed.update(name for name, value in expressions
+                     if clock.search(value) or any(re.search(r'\b' + re.escape(other) + r'\b', value)
+                                                   for other in timed))
+        if previous == timed:
+            break
+    for match in re.finditer(r'XCTAssert(LessThan(?:OrEqual)?|True)\s*\(', body):
         args = _arguments(body, match.end() - 1)
-        if len(args) < 2:
-            continue
-        measured, bound = args[0], args[1]
-        unit = 1.0
-        seconds = re.fullmatch(r'\.(seconds|milliseconds)\((\d[\d_.]*)\)', bound)
-        if seconds:
-            values = [float(seconds.group(2).replace('_', ''))]
-            unit = 1.0 if seconds.group(1) == 'seconds' else 0.001
-        elif re.search(r'[*+/(\[]', bound):
-            continue  # relative or computed bound
-        else:
-            values = [float(value.replace('_', '')) for value in re.findall(r'(?<![\w.])\d[\d_]*(?:\.\d+)?', bound)]
-            if not values:
+        if match.group(1) == 'True':
+            if not args:
                 continue
-            if re.search(r'(?i)millis|(?<![a-z])ms(?![a-z])', measured):
-                unit = 0.001
-        name = re.fullmatch(r'(?:try\s+)?(\w+)', measured)
-        derived = bool(CLOCK_READ.search(measured)) or bool(name and re.search(
-            r'\b(?:let|var)\s+' + re.escape(name.group(1)) + r'\s*=\s*[^\n]*(?:' + CLOCK_READ.pattern + ')', body))
-        if (derived or TIME_NAME.search(measured)) and min(values) * unit < WALL_CLOCK_FLOOR_SECONDS:
-            yield body[:match.start()].count('\n'), measured + ' < ' + bound
+            measured = args[0]
+            # Arrays put the measured variable outside the closure's comparison.
+            if not re.search(r'<(?:=)?', measured):
+                reverse = re.search(r'>=?\s*(.+)', measured)
+                if not reverse or not is_time(reverse.group(1)):
+                    continue
+        else:
+            if len(args) < 2:
+                continue
+            measured = args[0]
+        if is_time(measured):
+            yield body[:match.start()].count('\n'), ' | '.join(args[:2])
 
 def wall_clock_budget_cases(root):
-    """Map XCTest IDs to wall-clock assertions below the floor, including via same-file helpers."""
+    """Map XCTest IDs to wall-clock budget assertions of any size, including via same-file helpers."""
     cases = {}
     for source in sorted((root / 'Tests').rglob('*.swift')):
         text = source.read_text()
@@ -461,7 +485,7 @@ def select(root, graph, paths, scratch, full=False, qualification=False):
     qualification_commands = []
     timing_tests, timing_commands, timing_deferred = [], [], False
     if tests or full:
-        command = ['swift', 'test', '--parallel', '--num-workers', '64', '--cache-path',
+        command = ['swift', 'test', '--parallel', '--num-workers', '10', '--cache-path',
                    str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
                    '--enable-dependency-cache', '--scratch-path', str(scratch)]
         if not full:

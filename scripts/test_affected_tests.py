@@ -60,7 +60,7 @@ class SelectionTests(unittest.TestCase):
         self.assertIn('^ChecklistAppTests\\.', plan['swift_commands'][0])
         self.assertIn('--parallel', plan['swift_commands'][0])
         command = plan['swift_commands'][0]
-        self.assertEqual(command[command.index('--num-workers') + 1], '64')
+        self.assertEqual(command[command.index('--num-workers') + 1], '10')
         self.assertIn('--enable-dependency-cache', plan['swift_commands'][0])
 
     def test_core_includes_transitive_dependents(self):
@@ -412,7 +412,21 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(narrowed['timing_tests'], [])
         self.assertEqual(narrowed['timing_commands'], [])
 
-    def test_wall_clock_budget_scanner_follows_helpers_and_floor(self):
+    def test_real_size_manifest_fixture_keeps_coverage_in_qualification(self):
+        case, = selector.REAL_SIZE_TESTS
+        default = self.plan(full=True)
+        self.assertIn('^' + re.escape(case) + '(?:/|$)', default['default_swift_commands'][0])
+        self.assertIn(case, default['timing_tests'])
+        self.assertTrue(default['timing_deferred'])
+        qualified = self.plan(full=True, qualification=True)
+        self.assertIn('^' + re.escape(case) + '$', qualified['timing_commands'][0])
+        # Editing this fixture itself also executes it, without an opt-in switch.
+        path = 'Tests/ChecklistCoreTests/StorageCompactManifestTests.swift'
+        self.assertIn('^' + re.escape(case) + '$', self.plan(path)['timing_commands'][0])
+        self.assertEqual(len(set(selector.ISOLATED_TESTS)), len(selector.ISOLATED_TESTS))
+        self.assertFalse(set(selector.ISOLATED_TESTS) & set(selector.QUALIFICATION_TESTS))
+
+    def test_wall_clock_budget_scanner_follows_helpers_and_all_sizes(self):
         directory = self.root / 'Tests/ChecklistAppTests'
         directory.mkdir(parents=True)
         (directory / 'BudgetTests.swift').write_text('''final class BudgetTests: XCTestCase {
@@ -425,7 +439,17 @@ class SelectionTests(unittest.TestCase):
     func testViaHelper() { measure() }
     func testMilliseconds() { XCTAssertLessThan(milliseconds, cached ? 300 : 1_000) }
     func testAtFloor() { XCTAssertLessThan(ContinuousClock.now - start, .seconds(5)) }
+    func testEightSeconds() { XCTAssertLessThan(Date().timeIntervalSince(started), 8) }
+    func testLargeDuration() { XCTAssertLessThanOrEqual(ContinuousClock.now - start, .seconds(120)) }
+    func testTrueSamples() {
+        var samples: [Double] = []
+        samples.append(DispatchTime.now().uptimeNanoseconds - start)
+        XCTAssertTrue(samples.allSatisfy { $0 < 300 })
+    }
+    func testDuration() { XCTAssertTrue(ContinuousClock.now - start < Duration.seconds(8)) }
     func testRelative() { XCTAssertLessThan(elapsed, total * 0.5) }
+    func testReversed() { XCTAssertTrue(.seconds(90) >= ContinuousClock.now - start) }
+    func testLowerBound() { XCTAssertTrue(elapsed > 0) }
     func testCount() { XCTAssertLessThan(pages, 3) }
     func testGated() throws {
         try QualificationSuite.requireEnabled()
@@ -434,15 +458,15 @@ class SelectionTests(unittest.TestCase):
 }
 ''')
         cases = selector.wall_clock_budget_cases(self.root)
-        self.assertEqual(sorted(cases), ['ChecklistAppTests.BudgetTests/testGated', 'ChecklistAppTests.BudgetTests/testMilliseconds',
-                                         'ChecklistAppTests.BudgetTests/testViaHelper'])
+        self.assertEqual(sorted(cases), ['ChecklistAppTests.BudgetTests/' + name for name in
+                                         ['testAtFloor', 'testDuration', 'testEightSeconds', 'testGated', 'testLargeDuration',
+                                          'testMilliseconds', 'testRelative', 'testReversed', 'testTrueSamples', 'testViaHelper']])
         self.assertTrue(cases['ChecklistAppTests.BudgetTests/testGated'][1])
         self.assertFalse(cases['ChecklistAppTests.BudgetTests/testViaHelper'][1])
 
     def test_default_suite_wall_clock_budgets_are_in_timing_group(self):
-        # Guard (CL-275): an ungated test asserting an elapsed-time budget below
-        # WALL_CLOCK_FLOOR_SECONDS must be registered in TIMING_TESTS, or be a
-        # gated QUALIFICATION_TESTS case, so it never runs in the 64-worker pass.
+        # Guard (CL-275): every elapsed-time budget, regardless of size or
+        # assertion form, must leave the parallel default pass.
         root = Path(__file__).resolve().parents[1]
         cases = selector.wall_clock_budget_cases(root)
         unregistered = sorted(case for case, (_, gated) in cases.items()
