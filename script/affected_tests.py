@@ -41,6 +41,48 @@ QUALIFICATION_TESTS = (
 )
 # Compatibility name for consumers of the original selector plan.
 HEAVY_TESTS = QUALIFICATION_TESTS
+# Default-suite methods that assert a wall-clock budget below the floor.
+# They keep their assertions unchanged but leave the 64-worker pass and run in
+# one separate single-worker SwiftPM invocation, so host or parallel load
+# cannot push a frame or deadline budget over its limit (CL-275).
+# scripts/test_affected_tests.py fails when wall_clock_budget_cases finds an
+# ungated case missing here or in QUALIFICATION_TESTS.
+WALL_CLOCK_FLOOR_SECONDS = 5
+TIMING_TESTS = (
+    'ChecklistCoreTests.TriageListTimingTests/testProjectedRealSizeTriagesWithinServiceBudget',
+    'ChecklistAppTests.HumanClaimsKeychainTests/testForeignACLReadReturnsNilWithinTwoSecondsInTemporaryKeychain',
+    'ChecklistAppTests.OverviewReadRecoveryTests/testCachedOverviewReturnRestoresMatchingGroupsSynchronously',
+    'ChecklistAppTests.OwnedStoreScreenCacheTests/testRealBackupColdOverviewAndCachedNavigation',
+    'ChecklistAppTests.RecordOrderingTests/testFiftyCoarseMessagesSortWithinFrameBudget',
+    'ChecklistAppTests.ScopedWorkspaceReadTests/testCachedProjectSwitchRestoresTicketsBeforeBackgroundReply',
+    'ChecklistAppTests.ScreenTimingTests/testCachedCleanupNativeFrame',
+    'ChecklistAppTests.ScreenTimingTests/testCachedEpicsNativeFrame',
+    'ChecklistAppTests.ScreenTimingTests/testCachedOverviewNativeFrame',
+    'ChecklistAppTests.ScreenTimingTests/testCachedProjectSwitchNativeFrame',
+    'ChecklistAppTests.ScreenTimingTests/testCachedTicketDetailNativeFrame',
+    'ChecklistAppTests.ScreenTimingTests/testCachedTicketsWithTriagesNativeFrame',
+    'ChecklistAppTests.ScreenTimingTests/testColdCleanupNativeFrame',
+    'ChecklistCoreTests.CoreTests/testReadMethodsDoNotWaitForTheWriteLock',
+    'ChecklistCoreTests.ScreenReadPerformanceTests/testReadOnlyBackupScreenMeasurements',
+    'ChecklistCoreTests.StorageBackupConcurrencyTests/testNotesEditsAndNewImportsFinishWhileCopyAndVerificationArePaused',
+    'ChecklistCoreTests.StorageFolderAccessTests/testBlockedBackupDestinationEndsReleasesRetentionAndSameIDRetryCompletes',
+    'ChecklistCoreTests.StorageFolderAccessTests/testBlockedBackupSourceEndsReleasesRetentionAndSameIDRetryCompletes',
+    'ChecklistCoreTests.StorageFolderAccessTests/testBlockedManagedOwnerAnswerEndsBeforeSourceObservationAndRetryCommitsOnce',
+    'ChecklistCoreTests.StorageFolderAccessTests/testBlockedRootOpenEndsAndReapsChild',
+    'ChecklistCoreTests.StorageFolderAccessTests/testFIFOIsRefusedWithoutBlockingOnFinalOpen',
+    'ChecklistCoreTests.StorageFolderAccessTests/testTimedOutUncommittedImportRetainsIntentAndSameIDRetryCommitsOnceAfterRestart',
+    'ChecklistCoreTests.TicketCleanupReceiptMeasurementTests/testOwnedStoreReceiptRead',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeFileVerificationYieldsWriterAndChangedPinnedFileIsRetained',
+    'ChecklistIPCTests.AsyncServiceCallTests/testMissingReplyReachesAsyncCallerAtItsDeadline',
+)
+# Load-sensitive cases without a wall-clock budget (a cancel-versus-copy race and an
+# idle-CPU bound); they run in the same single-worker command as TIMING_TESTS.
+LOAD_SENSITIVE_TESTS = (
+    'ChecklistAppTests.PreviewAvailabilityTests/testActiveCopyCancelButtonShowsAccessibleCanceledOutcome',
+    # Ordering checks on 50 ms fake replies race at load ~150 (O177 run, 24 Oct 2026; CL-275).
+    'ChecklistAppTests.ScreenTimingTests/testAutomaticOverviewRefreshRetainsValidRowsAndCountsUntilEachReply',
+)
+ISOLATED_TESTS = TIMING_TESTS + LOAD_SENSITIVE_TESTS
 # macOS Seatbelt positive controls fail with SIGKILL when Git probes overlap.
 # Keep native guards intact and isolate this class from all other test work.
 ISOLATED_TEST_GROUPS = ('ChecklistCoreTests.SourceGitConfinementTests',
@@ -206,6 +248,98 @@ def is_target_resource(root, target, path):
     return False
 
 
+CLOCK_READ = re.compile(r'systemUptime|ContinuousClock\.now|SuspendingClock\.now|DispatchTime\.now|CFAbsoluteTimeGetCurrent|timeIntervalSince\(|Date\(\)\s*-')
+TIME_NAME = re.compile(r'(?i)(elapsed|seconds|millis|(?<![a-z])ms(?![a-z])|wait|duration)')
+
+def _close(text, start, opening, closing):
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == opening:
+            depth += 1
+        elif text[index] == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+    return len(text)
+
+def _arguments(text, start):
+    end = _close(text, start, '(', ')')
+    args, depth, current = [], 0, ''
+    for char in text[start + 1:end]:
+        depth += char in '([{'
+        depth -= char in ')]}'
+        if char == ',' and depth == 0:
+            args.append(current.strip()); current = ''
+        else:
+            current += char
+    return args + [current.strip()]
+
+def _functions(text):
+    """Yield (name, start, end, type) for members of top-level types (brace depth 1)."""
+    depth, depths = 0, []
+    for char in text:
+        depths.append(depth)
+        depth += (char == '{') - (char == '}')
+    types = []
+    for match in re.finditer(r'\b(?:class|struct|enum|actor|extension)\s+(\w+)[^{;]*\{', text):
+        if depths[match.start()] == 0:
+            types.append((match.group(1), match.end() - 1, _close(text, match.end() - 1, '{', '}')))
+    for match in re.finditer(r'\bfunc\s+(\w+)\s*(?:<[^>]*>)?\(', text):
+        if depths[match.start()] != 1:
+            continue
+        body = text.find('{', _close(text, match.end() - 1, '(', ')'))
+        owner = next((name for name, start, end in types if start < match.start() < end), None)
+        if body >= 0 and owner:
+            yield match.group(1), match.start(), _close(text, body, '{', '}'), owner
+
+
+def _budget(body):
+    for match in re.finditer(r'XCTAssertLessThan(?:OrEqual)?\(', body):
+        args = _arguments(body, match.end() - 1)
+        if len(args) < 2:
+            continue
+        measured, bound = args[0], args[1]
+        unit = 1.0
+        seconds = re.fullmatch(r'\.(seconds|milliseconds)\((\d[\d_.]*)\)', bound)
+        if seconds:
+            values = [float(seconds.group(2).replace('_', ''))]
+            unit = 1.0 if seconds.group(1) == 'seconds' else 0.001
+        elif re.search(r'[*+/(\[]', bound):
+            continue  # relative or computed bound
+        else:
+            values = [float(value.replace('_', '')) for value in re.findall(r'(?<![\w.])\d[\d_]*(?:\.\d+)?', bound)]
+            if not values:
+                continue
+            if re.search(r'(?i)millis|(?<![a-z])ms(?![a-z])', measured):
+                unit = 0.001
+        name = re.fullmatch(r'(?:try\s+)?(\w+)', measured)
+        derived = bool(CLOCK_READ.search(measured)) or bool(name and re.search(
+            r'\b(?:let|var)\s+' + re.escape(name.group(1)) + r'\s*=\s*[^\n]*(?:' + CLOCK_READ.pattern + ')', body))
+        if (derived or TIME_NAME.search(measured)) and min(values) * unit < WALL_CLOCK_FLOOR_SECONDS:
+            yield body[:match.start()].count('\n'), measured + ' < ' + bound
+
+def wall_clock_budget_cases(root):
+    """Map XCTest IDs to wall-clock assertions below the floor, including via same-file helpers."""
+    cases = {}
+    for source in sorted((root / 'Tests').rglob('*.swift')):
+        text = source.read_text()
+        target = source.relative_to(root / 'Tests').parts[0]
+        functions = list(_functions(text))
+        direct = {name: list(_budget(text[start:end])) for name, start, end, _ in functions}
+        timed = {name for name, hits in direct.items() if hits}
+        changed = True
+        while changed:
+            changed = False
+            for name, start, end, _ in functions:
+                if name not in timed and any(re.search(r'\b' + helper + r'\s*\(', text[start:end]) for helper in timed if helper != name):
+                    timed.add(name); changed = True
+        for name, start, end, owner in functions:
+            if name.startswith('test') and name in timed:
+                gated = 'QualificationSuite.requireEnabled' in text[start:end]
+                cases[target + '.' + owner + '/' + name] = (str(source.relative_to(root)), gated)
+    return cases
+
+
 def changed_qualification_tests(root, paths):
     selected = set()
     for path in paths:
@@ -325,6 +459,7 @@ def select(root, graph, paths, scratch, full=False, qualification=False):
     swift = []
     isolated = []
     qualification_commands = []
+    timing_tests, timing_commands, timing_deferred = [], [], False
     if tests or full:
         command = ['swift', 'test', '--parallel', '--num-workers', '64', '--cache-path',
                    str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
@@ -333,7 +468,7 @@ def select(root, graph, paths, scratch, full=False, qualification=False):
             for target in tests:
                 suffix = '(?:' + '|'.join(re.escape(group) for group in groups[target]) + r')(?:/|$)' if target in groups else ''
                 command.extend(['--filter', '^' + re.escape(target) + r'\.' + suffix])
-        for case in QUALIFICATION_TESTS:
+        for case in QUALIFICATION_TESTS + ISOLATED_TESTS:
             command.extend(['--skip', '^' + re.escape(case) + r'(?:/|$)'])
         if 'ChecklistCoreTests' in tests:
             command = ['env', 'CHECKLIST_STORAGE_PROBE=' + str(scratch / 'out/Products/Debug/StorageCrashProbe')] + command
@@ -352,6 +487,25 @@ def select(root, graph, paths, scratch, full=False, qualification=False):
             single.extend(['xcrun', 'xctest', '-XCTest', ','.join(group for group in isolated if group.startswith(target + '.')),
                            str(scratch / 'debug' / (target + '.xctest'))])
             swift.append(single)
+        timing_tests = [case for case in ISOLATED_TESTS if case.split('.')[0] in tests and (
+            case.split('.')[0] not in groups or case.split('.')[1].split('/')[0] in groups[case.split('.')[0]])]
+        # Wall-clock budgets are performance checks (CL-266 item 2): they run in
+        # qualification runs (--qualification, every round commit) or when a
+        # timing test file itself changes; ordinary affected runs defer them.
+        timing_classes = {case.split('.')[1].split('/')[0] for case in timing_tests}
+        timing_changed = any(path.startswith('Tests/') and Path(path).stem in timing_classes for path in normalized)
+        timing_deferred = bool(timing_tests) and not (explicitly_qualified or timing_changed)
+        if timing_tests and not timing_deferred:
+            # Same environment and process-per-test isolation as the parallel
+            # pass, but one worker: each budget is measured with no sibling test.
+            timed = command[:command.index('swift') + 2]
+            timed.extend(['--parallel', '--num-workers', '1', '--cache-path',
+                          str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
+                          '--enable-dependency-cache', '--scratch-path', str(scratch)])
+            for case in timing_tests:
+                timed.extend(['--filter', '^' + re.escape(case) + '$'])
+            timing_commands.append(timed)
+            swift.append(timed)
         if qualification_tests:
             qualified = command[:command.index('swift') + 2]
             qualified = ['CHECKLIST_QUALIFICATION=1' if arg == 'CHECKLIST_QUALIFICATION=0' else arg for arg in qualified]
@@ -367,8 +521,9 @@ def select(root, graph, paths, scratch, full=False, qualification=False):
     return {'paths': normalized, 'affected_targets': sorted(affected), 'test_targets': tests,
             'python_tests': sorted(python), 'fallback_paths': unknown, 'skip': skip, 'full': full, 'qualification': qualification,
             'isolated_test_groups': isolated, 'test_groups': groups,
-            'default_swift_commands': [command for command in swift if command not in qualification_commands],
+            'default_swift_commands': [command for command in swift if command not in qualification_commands and command not in timing_commands],
             'qualification_commands': qualification_commands, 'qualification_tests': qualification_tests,
+            'timing_commands': timing_commands, 'timing_tests': timing_tests, 'timing_deferred': timing_deferred,
             'swift_commands': swift, 'commands': swift + python_commands + [VALIDATE]}
 
 
@@ -404,6 +559,10 @@ def main(argv=None):
                 print('Full selection for: ' + ', '.join(plan['fallback_paths']))
             for target, groups in plan['test_groups'].items():
                 print('Test groups: ' + target + ': ' + ', '.join(groups))
+            if plan['timing_commands']:
+                print('Timing group: separate single-worker invocation')
+            elif plan['timing_deferred']:
+                print('Timing group: deferred to qualification runs (--qualification)')
             if plan['qualification_commands']:
                 print('Qualification suite: separate single-worker invocation')
             if plan['skip']:

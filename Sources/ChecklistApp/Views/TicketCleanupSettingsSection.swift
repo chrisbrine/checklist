@@ -19,7 +19,11 @@ struct TicketCleanupSettingsSection: View {
             TicketCleanupReceiptRows(observation:store.ticketCleanupReceipts,scope:receiptScope)
             Button("Refresh cleanup receipts") { loadReceipts() }
         }.onAppear {load()}
-        .task(id:receiptScope + refreshID.uuidString) {
+        .task(id:receiptScope + refreshID.uuidString + (showsCurrentSettings ? "" : ":inactive")) {
+            // A closing panel (or one whose settings record is not installed) has
+            // only a generation scope; it must not take over the receipt
+            // observation or evict the retained receipts (CL-260).
+            guard showsCurrentSettings else {return}
             await store.ticketCleanupReceipts.load(scope:receiptScope) {
                 try await store.request("ticket_cleanup_receipts",["project_id":project.id,"limit":50])
             }
@@ -31,6 +35,9 @@ struct TicketCleanupSettingsSection: View {
         done = value["done_evidence_enabled"] as? Bool ?? true;purge = value["closed_purge_enabled"] as? Bool ?? true;days = value["closed_days"] as? Int ?? 15
     }
     private var receiptScope: String {store.cleanupReceiptScope(project.id)}
+    private var showsCurrentSettings: Bool {
+        store.detail == .project(project.id) && store.selectedOther.map {RecordIdentity($0.id) == RecordIdentity(project.id)} == true
+    }
     private func loadReceipts() {
         store.ticketCleanupReceipts.invalidate(scope:receiptScope)
         refreshID = UUID()
@@ -50,24 +57,41 @@ struct TicketCleanupSettingsSection: View {
     private var cache: [String:[Record]] = [:]
     private var generation = UUID()
     func isCached(scope: String) -> Bool {cache[scope] != nil}
+    /// Navigation installs the retained receipts of this exact scope before the
+    /// first display pass; the section's background read then refreshes them.
+    @discardableResult func install(scope: String) -> Bool {
+        guard let cached = cache[scope] else {return false}
+        if self.scope != scope || !loaded {
+            // Fence a read started for another scope; it cannot replace these rows.
+            generation = UUID();self.scope = scope;loaded = true
+        }
+        if !error.isEmpty {error = ""}
+        if !DisplayValueEquality.records(receipts,cached) {receipts = cached}
+        return true
+    }
     func invalidate(scope: String) {
         cache.removeValue(forKey:scope)
         if self.scope == scope {generation = UUID()}
     }
     func load(scope: String,fetch: () async throws -> [String:Any]) async {
         guard !Task.isCancelled else {return}
+        // Retained rows stay displayed while the background read runs.
+        let cached = install(scope:scope)
         let token = UUID();generation = token
-        if self.scope != scope {receipts = [];loaded = false}
-        self.scope = scope;error = ""
-        if let cached = cache[scope] {receipts = cached;loaded = true;return}
+        if !cached {
+            if self.scope != scope {receipts = [];loaded = false}
+            self.scope = scope;error = ""
+        }
         do {
             let reply = try await fetch()
             guard generation == token,!Task.isCancelled else {return}
-            receipts = (reply["receipts"] as? [[String:Any]] ?? []).map(Record.init)
-            if cache.count >= 5 {cache.removeAll()}
-            cache[scope] = receipts;loaded = true
+            let fresh = (reply["receipts"] as? [[String:Any]] ?? []).map(Record.init)
+            if !DisplayValueEquality.records(receipts,fresh) {receipts = fresh}
+            if cache[scope] == nil,cache.count >= 5 {cache.removeAll()}
+            cache[scope] = fresh;loaded = true
         } catch {
-            guard generation == token,!Task.isCancelled,!(error is CancellationError) else {return}
+            // A failed background read keeps the retained rows of this exact scope.
+            guard generation == token,!Task.isCancelled,!(error is CancellationError),!cached else {return}
             self.error = PlainError.text(error)
         }
     }

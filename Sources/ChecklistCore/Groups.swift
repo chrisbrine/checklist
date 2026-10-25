@@ -149,7 +149,9 @@ extension CommandRouter {
     func taskTriages(_ db: Database,_ task: JSON) throws -> [JSON] {
         try records(db,type:"group",project:task["project_id"] as? String).filter {$0["kind"] as? String == "triage" && triageMemberIDs($0).contains(task["id"] as! String)}.map {try groupProjection(db,$0)}
     }
-    func groupProjection(_ db: Database,_ source: JSON) throws -> JSON {
+    /// Empty fields retains the full legacy projection. List summaries avoid loading
+    /// histories and lifecycle records that would be discarded by listProjection.
+    func groupProjection(_ db: Database,_ source: JSON,fields: Set<String> = []) throws -> JSON {
         var group = source
         if source["kind"] as? String == "triage" {
             let ids = triageMemberIDs(source)
@@ -163,22 +165,26 @@ extension CommandRouter {
             group["phase_source"] = source["phase"] == nil ? "legacy_membership" : "explicit"
             group["status_id"] = uniformStatus?["id"] ?? NSNull();group["status_name"] = label;group["status_category"] = uniformStatus?["category"] ?? state
             group["derived_status"] = ["kind":state,"label":label,"status_id":uniformStatus?["id"] ?? NSNull(),"member_count":ids.count]
-            group["active_attention"] = try triageActiveAttention(db,source)
+            if fields.isEmpty || fields.contains("active_attention") { group["active_attention"] = try triageActiveAttention(db,source) }
             // CL-43: the coordinator sees each member's repeated-cause warning.
-            group["member_warnings"] = try tasks.flatMap { try reviewWarnings(db,task:$0) }
+            if fields.isEmpty || fields.contains("member_warnings") { group["member_warnings"] = try tasks.flatMap { try reviewWarnings(db,task:$0) } }
             group["active_navigation"] = !bool(source,"archived") && !ids.isEmpty
-            if let orchestration = source["orchestration"] as? JSON,orchestration["state"] as? String == "active" {
+            if fields.isEmpty || fields.contains("orchestration_connection"),let orchestration = source["orchestration"] as? JSON,orchestration["state"] as? String == "active" {
                 let session = try? scoped(db,orchestration["session_id"] as? String ?? "",source["project_id"] as! String,type:"session")
                 let current = session.map {canReceive($0,project:source["project_id"] as! String) && sessionGeneration($0) == orchestration["session_authorization_generation"] as? String} ?? false
                 group["orchestration_connection"] = current ? "current" : "recovery_required"
             }
-            let exits = try groupRelatedRecords(db,source,type:"triage_membership_exit",field:"triage_id")
-            group["membership_history"] = try groupRelatedRecords(db,source,type:"triage_membership_interval",field:"triage_id").map { interval -> JSON in
-                var interval = interval;interval["exit"] = exits.first {$0["membership_id"] as? String == interval["id"] as? String} ?? NSNull();return interval
+            if fields.isEmpty || fields.contains("membership_history") {
+                let exits = try groupRelatedRecords(db,source,type:"triage_membership_exit",field:"triage_id")
+                group["membership_history"] = try groupRelatedRecords(db,source,type:"triage_membership_interval",field:"triage_id").map { interval -> JSON in
+                    var interval = interval;interval["exit"] = exits.first {$0["membership_id"] as? String == interval["id"] as? String} ?? NSNull();return interval
+                }
             }
-            group["batches"] = try groupRelatedRecords(db,source,type:"batch",field:"triage_id").map { batch -> JSON in
-                var summary: JSON = ["id":batch["id"]!,"phase":batch["phase"]!,"created_at":batch["created_at"]!,"triage_revision":batch["triage_revision"]!,"member_count":(batch["members"] as? [JSON] ?? []).count,"digest":batch["digest"]!]
-                summary.merge(try batchLifecycle(db,batch)) { _,new in new };return summary
+            if fields.isEmpty || fields.contains("batches") {
+                group["batches"] = try groupRelatedRecords(db,source,type:"batch",field:"triage_id").map { batch -> JSON in
+                    var summary: JSON = ["id":batch["id"]!,"phase":batch["phase"]!,"created_at":batch["created_at"]!,"triage_revision":batch["triage_revision"]!,"member_count":(batch["members"] as? [JSON] ?? []).count,"digest":batch["digest"]!]
+                    summary.merge(try batchLifecycle(db,batch)) { _,new in new };return summary
+                }
             }
             return group
         }
@@ -229,7 +235,7 @@ extension CommandRouter {
             groups = groups.filter {($0["key"] as? String ?? "").caseInsensitiveCompare(key) == .orderedSame}
             guard groups.count <= 1 else { throw CoreError("AMBIGUOUS_GROUP","More than one \(kind) uses display key \(AgentReference.quoted(key)). Select its stable internal ID.",details:["matches":groups.map {["id":$0["id"]!,"key":$0["key"]!,"title":$0["name"] ?? ""]}]) }
         }
-        return ["groups":listProjection(try groups.map {try groupProjection(db,$0)},fields:fields)]
+        return ["groups":listProjection(try groups.map {try groupProjection(db,$0,fields:fields)},fields:fields)]
     }
     func groupWrite(_ db: Database,_ p: JSON,_ c: Caller,_ method: String) throws -> JSON {
         try worker(c);let pid = try scope(db,p,c,write:true)

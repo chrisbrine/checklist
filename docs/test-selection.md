@@ -61,7 +61,15 @@ the direct class selector avoids both 12 separate single-worker hosts and
 `<scratch>/debug/ChecklistMCPServerTests.xctest`, keeping suspended-child signing
 and exec observation off the concurrent unit queue. Its four cases and their
 assertions remain in every applicable default plan. Neither isolated host runs
-alongside the parallel pass. Core and MCPServer retain parallel workers for
+alongside the parallel pass. `TIMING_TESTS` lists the ungated default-suite methods
+that assert a wall-clock budget below 5 seconds (`WALL_CLOCK_FLOOR_SECONDS`): the
+parallel pass skips them, and one separate `--num-workers 1` SwiftPM invocation
+(JSON `timing_commands` and `timing_tests`) runs them with unchanged assertions in
+qualification runs (`--qualification`, which every round commit uses) and whenever a
+changed path is the test file of one of those classes. Ordinary default and affected
+plans skip them and report `timing_deferred: true`, because wall-clock budgets are
+performance checks that belong with the opt-in qualification level (CL-266 item 2); `scripts/test_affected_tests.py` fails when such a
+test is in neither `TIMING_TESTS` nor the gated `QUALIFICATION_TESTS` (CL-275). Core and MCPServer retain parallel workers for
 their other methods, as do all other test targets. The selector supplies the
 shared SwiftPM dependency cache flags. Keep the build-slot concurrency wrapper. Run independent Python checks concurrently
 with the Swift pipeline (up to three Python processes), keeping Swift invocations

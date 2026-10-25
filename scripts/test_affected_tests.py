@@ -49,8 +49,8 @@ class SelectionTests(unittest.TestCase):
         for name in ['test_affected_tests.py', 'test_test_instances.py', 'test_prepare_public_source.py']:
             (self.root / 'scripts' / name).touch()
 
-    def plan(self, *paths, full=False):
-        return selector.select(self.root, GRAPH, paths, self.root / '.build', full)
+    def plan(self, *paths, full=False, qualification=False):
+        return selector.select(self.root, GRAPH, paths, self.root / '.build', full, qualification)
 
     def test_app_only(self):
         plan = self.plan('Sources/ChecklistApp/ContentView.swift')
@@ -280,7 +280,11 @@ class SelectionTests(unittest.TestCase):
         plan = self.plan('Sources/ChecklistCore/OrdinaryMentionTokens.swift')
         self.assertEqual(plan['test_groups']['ChecklistCoreTests'], ['OrdinaryMentionPublicBoundaryTests'])
         self.assertTrue(plan['qualification'])
+        # Parallel pass and MCPServer serial host; wall-clock budgets wait for qualification runs.
         self.assertEqual(len(plan['default_swift_commands']), 2)
+        self.assertEqual(plan['timing_commands'], [])
+        self.assertTrue(plan['timing_deferred'])
+        self.assertFalse(any(case.startswith('ChecklistCoreTests.') for case in plan['timing_tests']))
         self.assertEqual(plan['isolated_test_groups'], ['ChecklistMCPServerTests.DelegateChildBindingTests'])
         self.assertIn('^ChecklistCoreTests\\.(?:OrdinaryMentionPublicBoundaryTests)(?:/|$)', plan['swift_commands'][0])
         self.assertIn('CHECKLIST_TEST_TEMPLATE_ROOT=' + str(self.root / '.build/test-store-templates'), plan['swift_commands'][0])
@@ -332,6 +336,10 @@ class SelectionTests(unittest.TestCase):
         plan = self.plan(full=True)
         self.assertEqual(len(plan['swift_commands']), 3)
         parallel, isolated, signed_child = plan['swift_commands']
+        self.assertEqual(plan['timing_commands'], [])
+        self.assertTrue(plan['timing_deferred'])
+        timing = self.plan(full=True, qualification=True)['timing_commands'][0]
+        self.assertEqual(timing[timing.index('--num-workers') + 1], '1')
         self.assertIn('^ChecklistCoreTests\\.SourceGitConfinementTests(?:/|$)', parallel)
         self.assertIn('xcrun', isolated)
         self.assertIn('xctest', isolated)
@@ -371,6 +379,79 @@ class SelectionTests(unittest.TestCase):
         path.write_text('func ' + method + '() throws {\n try QualificationSuite.requireEnabled()\n}')
         plan = self.plan(str(path.relative_to(self.root)))
         self.assertEqual(plan['qualification_tests'], ['ChecklistAppTests.IsolatedDefaultsTests/' + method])
+
+    def test_timing_group_is_a_separate_single_worker_invocation(self):
+        default = self.plan('Sources/ChecklistApp/ContentView.swift')
+        expected = [case for case in selector.ISOLATED_TESTS if case.startswith('ChecklistAppTests.')]
+        self.assertIn('ChecklistAppTests.ScreenTimingTests/testCachedCleanupNativeFrame', expected)
+        # An ordinary affected run lists the budgets but defers them (CL-266 item 2).
+        self.assertEqual(default['timing_tests'], expected)
+        self.assertEqual(default['timing_commands'], [])
+        self.assertTrue(default['timing_deferred'])
+        plan = self.plan('Sources/ChecklistApp/ContentView.swift', qualification=True)
+        self.assertEqual(plan['timing_tests'], expected)
+        self.assertFalse(plan['timing_deferred'])
+        self.assertEqual(len(plan['timing_commands']), 1)
+        command = plan['timing_commands'][0]
+        self.assertNotIn(command, plan['default_swift_commands'])
+        self.assertNotIn(command, plan['qualification_commands'])
+        self.assertIn(command, plan['swift_commands'])
+        self.assertIn('CHECKLIST_QUALIFICATION=0', command)
+        self.assertEqual(command[command.index('--num-workers') + 1], '1')
+        self.assertEqual([command[i + 1] for i, arg in enumerate(command) if arg == '--filter'],
+                         ['^' + re.escape(case) + '$' for case in expected])
+        parallel = plan['swift_commands'][0]
+        for case in selector.ISOLATED_TESTS:
+            self.assertIn('^' + re.escape(case) + '(?:/|$)', parallel)
+            self.assertNotIn(case, plan['skip'])
+        other = self.root / 'Tests/ChecklistAppTests/OtherTests.swift'
+        other.parent.mkdir(parents=True)
+        other.write_text('final class OtherTests: XCTestCase { func testOne() {} }')
+        narrowed = self.plan('Tests/ChecklistAppTests/OtherTests.swift')
+        self.assertEqual(narrowed['test_groups']['ChecklistAppTests'], ['OtherTests'])
+        self.assertEqual(narrowed['timing_tests'], [])
+        self.assertEqual(narrowed['timing_commands'], [])
+
+    def test_wall_clock_budget_scanner_follows_helpers_and_floor(self):
+        directory = self.root / 'Tests/ChecklistAppTests'
+        directory.mkdir(parents=True)
+        (directory / 'BudgetTests.swift').write_text('''final class BudgetTests: XCTestCase {
+    private final class Fixture { func ignored() {} }
+    private func measure() {
+        let start = ProcessInfo.processInfo.systemUptime
+        let spent = ProcessInfo.processInfo.systemUptime - start
+        XCTAssertLessThan(spent, 0.3)
+    }
+    func testViaHelper() { measure() }
+    func testMilliseconds() { XCTAssertLessThan(milliseconds, cached ? 300 : 1_000) }
+    func testAtFloor() { XCTAssertLessThan(ContinuousClock.now - start, .seconds(5)) }
+    func testRelative() { XCTAssertLessThan(elapsed, total * 0.5) }
+    func testCount() { XCTAssertLessThan(pages, 3) }
+    func testGated() throws {
+        try QualificationSuite.requireEnabled()
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2)
+    }
+}
+''')
+        cases = selector.wall_clock_budget_cases(self.root)
+        self.assertEqual(sorted(cases), ['ChecklistAppTests.BudgetTests/testGated', 'ChecklistAppTests.BudgetTests/testMilliseconds',
+                                         'ChecklistAppTests.BudgetTests/testViaHelper'])
+        self.assertTrue(cases['ChecklistAppTests.BudgetTests/testGated'][1])
+        self.assertFalse(cases['ChecklistAppTests.BudgetTests/testViaHelper'][1])
+
+    def test_default_suite_wall_clock_budgets_are_in_timing_group(self):
+        # Guard (CL-275): an ungated test asserting an elapsed-time budget below
+        # WALL_CLOCK_FLOOR_SECONDS must be registered in TIMING_TESTS, or be a
+        # gated QUALIFICATION_TESTS case, so it never runs in the 64-worker pass.
+        root = Path(__file__).resolve().parents[1]
+        cases = selector.wall_clock_budget_cases(root)
+        unregistered = sorted(case for case, (_, gated) in cases.items()
+                              if not gated and case not in selector.TIMING_TESTS and case not in selector.QUALIFICATION_TESTS)
+        self.assertEqual(unregistered, [], 'register these in TIMING_TESTS (docs/test-selection.md)')
+        self.assertEqual(sorted(case for case in selector.TIMING_TESTS if case not in cases), [], 'stale TIMING_TESTS entries')
+        self.assertEqual(len(set(selector.TIMING_TESTS)), len(selector.TIMING_TESTS))
+        self.assertFalse(set(selector.LOAD_SENSITIVE_TESTS) & set(selector.TIMING_TESTS))
+        self.assertFalse(set(selector.TIMING_TESTS) & set(selector.QUALIFICATION_TESTS))
 
     def test_qualification_registry_matches_gated_methods(self):
         root = Path(__file__).resolve().parents[1]

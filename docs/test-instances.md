@@ -81,6 +81,18 @@ The GUI window title identifies `Checklist Test N` and a persistent strip says *
 3. Start headless with `./script/test_instances.py start --slot N --headless`; this command takes no `--session-id`. Identify the separate test app/data before a GUI start. The slot creator's marker is retained; starting a slot does not transfer ownership.
 4. Give the runner the exact build, slot CLI, authorized synthetic workspace and external evidence path. Capture evidence before destroying the owned slot through `destroy --slot N`; report incomplete cleanup and restore the real Checklist window after closing its GUI.
 
+## Overview load notices (CL-177)
+
+Every app writes content-free unified-log notices with subsystem `org.checklist.app` and category `OverviewLoad`: `combined visit=V request=R start_uptime_ms=S outcome=O surfaces=N duration_ms=D` for each combined Overview read (`success`, `timeout` for the typed 30-second read deadline, `error:CODE`, `canceled` or `superseded`), `attempt visit=V surface=S attempt=A mode=fallback|single|independent outcome=O rows=R total=T duration_ms=D` for each single-surface read (`independent` marks the bounded per-group reads that apply complete live change coverage, CL-254; count only `mode=fallback` lines for the timeout fallback; outcomes `installed`, `timeout`, `error:CODE`, `rejected`, `canceled` or `superseded`; `none` when no page was installed), and `fallback_settled visit=V outcome=complete|partial|retired attempts=N installed=I failed=F duration_ms=D` when a fallback pass ends. The window-local visit number changes with each page, project or Overview visit change; attempt numbers count per surface within one visit. Start the stream before a `kill -STOP`/`kill -CONT` hold of the slot's `ChecklistService` PID (match its path first), filter by the slot app path because the live app logs the same category, and count per visit: one `combined … outcome=timeout`, no later `combined` line with that visit, one `attempt=1` line per due surface and one `fallback_settled`.
+
+The `LiveUpdates` notice `watchdog path=defer_combined_overview surface=overview lag_ms=N` means the current combined loader still owns its request or sequential timeout fallback. The freshness watchdog leaves that loader intact through settlement; it does not restart the combined request or a held fallback surface. Other Overview watchdog recoveries use small independent group reads (sequential after a timeout), even without complete live coverage, and never introduce a combined request. Accepted sibling groups carry into recovery. Tickets and selected-detail watchdog replacement remain independent.
+
+```sh
+log stream --style compact --predicate 'subsystem == "org.checklist.app" AND category == "OverviewLoad" AND processImagePath CONTAINS "Checklist Test Instances/slot-4/"' | tee overview-load.log
+grep -o 'combined visit=[0-9]* request=[0-9]* start_uptime_ms=[0-9]* outcome=[a-z:_A-Z]*' overview-load.log
+grep -o 'attempt visit=[0-9]* surface=[a-z_]* attempt=[0-9]*' overview-load.log | sort | uniq -c
+```
+
 ## Selected-record qualification faults (CL-205)
 
 Only a GUI app with a valid `ChecklistInstanceSlot` reads `checklistQualificationFaults`, and it reads exactly its own preference domain (`org.checklist.app.testN`). Live apps never read this key. Global defaults, command-line defaults and secondary-window suites cannot arm it. This is an app-client fault; the service, SQLite store, CLI and MCP are unaffected.

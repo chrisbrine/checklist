@@ -90,6 +90,66 @@ import ChecklistIPC
         }
         XCTFail("More than the bounded ten surface reads")
     }
+    func testWatchdogDefersCombinedOverviewThroughTimeoutAndSequentialFallback() async throws {
+        let f = fixture(); f.hold = true
+        let store = f.store()
+        var now: TimeInterval = 1802.7
+        store.liveNow = { now }
+        var notices: [String] = []
+        store.overviewLoadLog = { notices.append($0) }
+        // Unknown coverage owns a full combined read, as initial navigation does.
+        let read = Task { await store.applyChangeCoverage(["event_cursor":"held-coverage"]) }
+        defer { read.cancel(); store.stopWindowReads(); f.cleanup() }
+        try await until { f.held.count == 1 }
+        XCTAssertEqual(f.calls.map(\.surface), ["overview"])
+        now += 1.5
+        var tickFinished = false
+        let tick = Task { await store.checkLiveFreshness(selected:false); tickFinished = true }
+        defer { tick.cancel() }
+        try await until { tickFinished || f.calls.count > 1 }
+        XCTAssertEqual(f.calls.count, 1, "The watchdog must preserve the current combined request")
+        XCTAssertTrue(tickFinished, "Deferral returns without awaiting the held transport")
+        guard tickFinished, f.calls.count == 1 else { return }
+        XCTAssertTrue(store.overviewObservations.values.allSatisfy { $0.loading && $0.error == nil })
+
+        now += 28.5 // The transport now supplies its typed 30-second timeout.
+        f.release(error:timeout)
+        try await until { f.held.count == 1 }
+        XCTAssertEqual(f.calls.map(\.surface), ["overview",surfaces[0]])
+        // The service remains stopped until 40 seconds. Do not restart the
+        // first fallback attempt (or turn the fallback into concurrent lanes).
+        now += 10
+        tickFinished = false
+        let fallbackTick = Task { await store.checkLiveFreshness(selected:false); tickFinished = true }
+        defer { fallbackTick.cancel() }
+        try await until { tickFinished || f.calls.count > 2 }
+        XCTAssertTrue(tickFinished)
+        XCTAssertEqual(f.calls.count, 2)
+        guard tickFinished, f.calls.count == 2 else { return }
+        for (index,surface) in surfaces.enumerated() {
+            try await until { f.held.count == 1 }
+            XCTAssertEqual(f.held[0].call.surface, surface)
+            f.release()
+            try await until { store.overviewObservations[surface]?.page != nil }
+            XCTAssertEqual(store.overviewObservations[surface]?.page?.total, 37)
+            XCTAssertEqual(store.overviewObservations[surface]?.rows.count, 1)
+            XCTAssertEqual(f.calls.count, min(index + 3, 11))
+        }
+        let accepted = await read.value
+        XCTAssertTrue(accepted)
+        XCTAssertEqual(f.maximumActive, 1)
+        XCTAssertEqual(f.calls.map(\.surface), ["overview"] + surfaces)
+        XCTAssertTrue(store.overviewObservations.values.allSatisfy { !$0.loading && $0.error == nil })
+        XCTAssertEqual(notices.filter { $0.hasPrefix("combined ") }.count, 1)
+        XCTAssertTrue(notices[0].contains("request=1") && notices[0].contains("outcome=timeout"))
+        let attempts = notices.filter { $0.hasPrefix("attempt ") }
+        XCTAssertEqual(attempts.count, 10)
+        for (line,surface) in zip(attempts,surfaces) {
+            XCTAssertTrue(line.contains("surface=\(surface) attempt=1 mode=fallback outcome=installed rows=1 total=37"))
+        }
+        XCTAssertTrue(notices.last?.contains("outcome=complete attempts=10 installed=10 failed=0") == true)
+    }
+
     func testCachedOverviewReturnRestoresMatchingGroupsSynchronously() async throws {
         let f = fixture(); defer { f.cleanup() }
         let store = f.store(), live = Task { await store.startLiveUpdates() }
@@ -134,6 +194,72 @@ import ChecklistIPC
         }
         XCTAssertEqual(store.needsCount, 91, "Global sidebar count is never an Overview group total")
 
+    }
+    /// Parses OverviewLoad notices ("kind key=value ...") of one kind.
+    private func notices(_ logs: [String], _ kind: String) -> [[String: String]] {
+        logs.filter { $0.hasPrefix(kind + " ") }.map { line in
+            Dictionary(uniqueKeysWithValues: line.split(separator: " ").dropFirst().map { pair -> (String, String) in
+                let parts = pair.split(separator: "=", maxSplits: 1); return (String(parts[0]), parts.count > 1 ? String(parts[1]) : "")
+            })
+        }
+    }
+    func testTimeoutNoticesShowOneCombinedRequestAndOneSequentialAttemptPerDueSurface() async throws {
+        let f = fixture(); defer { f.cleanup() }; f.combinedError = timeout; let store = f.store()
+        var logs: [String] = []; store.overviewLoadLog = { logs.append($0) }
+        await store.refresh()
+        let combined = notices(logs, "combined"), attempts = notices(logs, "attempt"), settled = notices(logs, "fallback_settled")
+        XCTAssertEqual(combined.count, 1)
+        XCTAssertEqual(combined.first?["outcome"], "timeout"); XCTAssertEqual(combined.first?["request"], "1"); XCTAssertEqual(combined.first?["surfaces"], "10")
+        XCTAssertEqual(attempts.map { $0["surface"] ?? "" }, surfaces, "Exactly one sequential attempt per due surface")
+        for attempt in attempts {
+            XCTAssertEqual(attempt["visit"], combined.first?["visit"]); XCTAssertEqual(attempt["attempt"], "1"); XCTAssertEqual(attempt["mode"], "fallback")
+            XCTAssertEqual(attempt["outcome"], "installed"); XCTAssertEqual(attempt["rows"], "1"); XCTAssertEqual(attempt["total"], "37")
+        }
+        XCTAssertEqual(settled.count, 1)
+        XCTAssertEqual(settled.first?["outcome"], "complete"); XCTAssertEqual(settled.first?["attempts"], "10")
+        XCTAssertEqual(settled.first?["installed"], "10"); XCTAssertEqual(settled.first?["failed"], "0")
+        XCTAssertEqual(logs.count, 12); XCTAssertTrue(logs.first?.hasPrefix("combined ") == true); XCTAssertTrue(logs.last?.hasPrefix("fallback_settled ") == true)
+        XCTAssertEqual(f.calls.map(\.surface), ["overview"] + surfaces, "Notices match the transport calls")
+        XCTAssertFalse(logs.joined().contains("-first") || logs.joined().contains("p-"), "Notices are content-free")
+        // A later refresh in the same visit stays sequential: second attempts, never a second combined request.
+        logs = []; await store.refresh()
+        XCTAssertEqual(notices(logs, "combined").count, 0)
+        XCTAssertEqual(notices(logs, "attempt").map { $0["attempt"] ?? "" }, Array(repeating: "2", count: surfaces.count))
+        XCTAssertEqual(notices(logs, "fallback_settled").map { $0["outcome"] ?? "" }, ["complete"])
+        XCTAssertEqual(f.calls.filter { $0.surface == "overview" }.count, 1)
+    }
+    func testFastCombinedNoticeIsOneRequestWithoutFallbackAndOtherOutcomesStartNone() async throws {
+        let f = fixture(); defer { f.cleanup() }; let store = f.store()
+        var logs: [String] = []; store.overviewLoadLog = { logs.append($0) }
+        await store.refresh()
+        XCTAssertEqual(logs.count, 1)
+        XCTAssertEqual(notices(logs, "combined").first?["outcome"], "success"); XCTAssertEqual(notices(logs, "combined").first?["request"], "1")
+        XCTAssertEqual(f.calls.map(\.surface), ["overview"])
+        for (error, outcome) in [(ChecklistError("DENIED", "denied") as Error, "error:DENIED"), (CancellationError() as Error, "canceled")] {
+            let f = fixture(); defer { f.cleanup() }; f.combinedError = error; let store = f.store()
+            var logs: [String] = []; store.overviewLoadLog = { logs.append($0) }
+            await store.refresh()
+            XCTAssertEqual(logs.count, 1, outcome); XCTAssertEqual(notices(logs, "combined").first?["outcome"], outcome)
+            XCTAssertEqual(f.calls.map(\.surface), ["overview"])
+        }
+    }
+    func testFailedFallbackSurfaceNoticeAndPartialSettlement() async throws {
+        let f = fixture(); defer { f.cleanup() }; f.combinedError = timeout; f.failingSurface = "needs_active"; let store = f.store()
+        var logs: [String] = []; store.overviewLoadLog = { logs.append($0) }
+        await store.refresh()
+        XCTAssertEqual(notices(logs, "combined").map { $0["outcome"] ?? "" }, ["timeout"])
+        let attempts = notices(logs, "attempt")
+        XCTAssertEqual(attempts.map { $0["surface"] ?? "" }, surfaces)
+        XCTAssertTrue(attempts.allSatisfy { $0["attempt"] == "1" })
+        for attempt in attempts {
+            if attempt["surface"] == "needs_active" {
+                XCTAssertEqual(attempt["outcome"], "error:DENIED"); XCTAssertEqual(attempt["rows"], "none"); XCTAssertEqual(attempt["total"], "none")
+            } else { XCTAssertEqual(attempt["outcome"], "installed") }
+        }
+        let settled = notices(logs, "fallback_settled")
+        XCTAssertEqual(settled.count, 1); XCTAssertEqual(settled.first?["outcome"], "partial")
+        XCTAssertEqual(settled.first?["installed"], "9"); XCTAssertEqual(settled.first?["failed"], "1")
+        XCTAssertNotNil(store.overviewObservations["needs_active"]?.error)
     }
     func testTimeoutPublishesEachPageImmediatelyAndReadsOnlyOneSurfaceAtATime() async throws {
         let f = fixture(); defer { f.cleanup() }; f.hold = true; let store = f.store()

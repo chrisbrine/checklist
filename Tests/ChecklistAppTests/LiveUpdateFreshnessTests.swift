@@ -11,12 +11,16 @@ import ChecklistIPC
         init(_ preferences:UserDefaults, page:Page = .tasks) {self.preferences = preferences;self.page = page}
         var status = "In progress", version = "v1"
         var calls: [String] = []
+        var pageReads: [String] = []
         var failNext = false, ignoreNext = false, holdList = false, holdContext = false
         var failMethod = "task_list"
         var held: [(String, CheckedContinuation<[String:Any],Error>, [String:Any])] = []
         var wait: CheckedContinuation<[String:Any],Error>?
         var cursors: [String?] = []
         var replayChanges = false
+        var contextVersion: String?
+        var holdSurface = "needs_review"
+        var inTriage = false
         var service: [String:Any] { ["store_incarnation":"fixture", "read_version":version] }
         func task(_ id:String = "a", project:String = "p") -> [String:Any] {
             ["id":id,"project_id":project,"title":"Fixture", "revision":version == "v1" ? 1 : 2,"status_name":status,"status_category":status == "Review" ? "review" : "active","status_id":status]
@@ -27,7 +31,8 @@ import ChecklistIPC
                     "counts":["messages":0,"attachments":0,"attempts":0,"requests":0],"full_record_loaded":false,"next_history_cursor":NSNull(),"previous_history_cursor":NSNull(),"has_more_messages":false]
         }
         func list(_ project:String = "p") -> [String:Any] {
-            ["schema_version":1,"event_cursor":"c0","tickets_page":["query_key":"query","content_cursor":"content","tasks":[task(project:project)],"ordinary_ids":["a"],"triages":[],"projects":[["id":"p"]],"statuses":[],"tags":[],"epics":[],"scoped_count":1,"matched_count":1,"has_more":false,"next_cursor":NSNull(),"previous_cursor":NSNull(),"outstanding_request_count":0,"human_task_count":0,"overview_requests":[],"overview_request_count":0,"service":service]]
+            let triages: [[String:Any]] = inTriage ? [["id":"triage","project_id":project,"revision":1,"name":"Fixture triage","purpose":"Status timing","kind":"triage","phase":"implementation","archived":false,"active_attention":false,"status_state":"uniform","status_id":status,"status_name":status,"status_category":status == "Review" ? "review" : "active","member_count":2,"matching_count":1,"page_member_ids":["a"],"members_complete":false]] : []
+            return ["schema_version":1,"event_cursor":"c0","tickets_page":["query_key":"query","content_cursor":"content","tasks":[task(project:project)],"ordinary_ids":inTriage ? [] : ["a"],"triages":triages,"projects":[["id":"p"]],"statuses":[],"tags":[],"epics":[],"scoped_count":1,"matched_count":1,"has_more":false,"next_cursor":NSNull(),"previous_cursor":NSNull(),"outstanding_request_count":0,"human_task_count":0,"overview_requests":[],"overview_request_count":0,"service":service]]
         }
         func workspace(_ params:[String:Any], invalid:Bool = false) -> [String:Any] {
             let surface = params["surface"] as! String
@@ -47,16 +52,20 @@ import ChecklistIPC
                 return try await withCheckedThrowingContinuation { wait = $0 }
             }
             calls.append(method)
+            if method == "workspace_page" {pageReads.append(params["surface"] as? String ?? "")}
             if method == "task_get" { return task(params["task_id"] as? String ?? "a") }
             if failNext, method == failMethod {failNext = false;throw ChecklistError("FIXTURE_FAILURE","Expected mock failure")}
             let reply: [String:Any]
-            if method == "task_context" { reply = context(params["task_id"] as! String) }
+            if method == "task_context" {
+                let saved = version;version = contextVersion ?? version
+                reply = context(params["task_id"] as! String);version = saved
+            }
             else {
                 let ignored = ignoreNext; ignoreNext = false
                 if method == "workspace_page" { reply = workspace(params,invalid:ignored) }
                 else { XCTAssertEqual(method,"task_list");reply = list(ignored ? "foreign" : "p") }
             }
-            if (method == "task_list" || method == "workspace_page") && holdList || method == "task_context" && holdContext {
+            if holdList && (method == "task_list" || method == "workspace_page" && (page != .overview || ["overview",holdSurface].contains(params["surface"] as? String ?? ""))) || method == "task_context" && holdContext {
                 return try await withCheckedThrowingContinuation { held.append((method,$0,reply)) }
             }
             return reply
@@ -68,6 +77,7 @@ import ChecklistIPC
             preferences.set(page.rawValue,forKey:"lastPage");preferences.set("p",forKey:"lastProject")
             let store = ChecklistStore(draftJournal:LocalDraftJournal(directory:root),preferences:preferences,restorePendingCommand:false,
                 desktopAlerts:DesktopAlertCoordinator(sink:FreshnessAlertSink()),requestTransport:{ [self] in try await transport($0,$1) },navigationMemory:DetailItemNavigationMemory())
+            if inTriage {store.updateTicketWorkspaceExpansion(.init(expandedIDValues:["triage"]))}
             store.liveWaitPause = 5_000_000;store.liveRetryPause = 100_000_000
             return store
         }
@@ -84,7 +94,11 @@ import ChecklistIPC
     }
     private func cursor(_ store:ChecklistStore) -> String? { Mirror(reflecting:store).children.first {$0.label == "eventCursor"}?.value as? String }
     private func shownStatus(_ store:ChecklistStore, page:Page) -> String? {
-        if page == .tasks {return store.preparedTicketWorkspace?.list.ordinaryTickets.first?.string("status_name")}
+        if page == .tasks {
+            return store.preparedTicketWorkspace?.rows.compactMap { row -> Record? in
+                switch row.content {case .ticket(let task),.triageMember(let task):return task;default:return nil}
+            }.first?.string("status_name")
+        }
         if page == .overview {return store.overviewObservations["needs_review"]?.rows.first?.string("status_name")}
         return store.workspaceRows.first?.string("status_name")
     }
@@ -111,16 +125,17 @@ import ChecklistIPC
             let f = Fixture(isolatedDefaults("LiveFreshness").preferences,page:page),store = f.store(),live = Task {await store.startLiveUpdates()}
             defer {live.cancel();store.stopWindowReads();f.cleanup()}
             try await until {f.wait != nil};f.commit();f.ignoreNext = true
-            // No new subscription response arrives: recovery is independent of changes_wait.
-            let start = ProcessInfo.processInfo.systemUptime
+            // Thirty idle minutes and the watchdog deadline are virtual time.
+            // No new subscription response arrives; no wall-clock budget assertion.
+            var now: TimeInterval = 1802.7
+            store.liveNow = {now}
             let before = f.calls.count
             await store.applyChangeCoverage(f.changes())
             XCTAssertEqual(cursor(store),"c0")
-            try await until({self.shownStatus(store,page:page) == "Review"},seconds:2)
-            let elapsed = ProcessInfo.processInfo.systemUptime - start
-            XCTAssertLessThan(elapsed,2)
-            XCTAssertEqual(f.calls.count - before,2,"Recovery coalesces reads and carries successful Overview groups")
-            print("FIX7 watchdog surface=\(page.rawValue) installed_ms=\(Int(elapsed * 1000))")
+            now += 1.5
+            await store.checkLiveFreshness(selected:false)
+            XCTAssertEqual(shownStatus(store,page:page),"Review")
+            XCTAssertEqual(f.calls.count - before,page == .overview ? 11 : 2,"Recovery carries successful Overview groups")
         }
     }
     func testSelectedDetailInstallsBeforeHeldListAndDoesNotRestart() async throws {
@@ -135,6 +150,97 @@ import ChecklistIPC
         f.holdList = false;f.release("task_list");await apply.value
         XCTAssertEqual(cursor(store),"c1");XCTAssertEqual(f.calls.filter {$0 == "task_context"}.count,1)
     }
+    func testParallelSnapshotsDoNotDiscardStatusBehindNoteTraffic() async throws {
+        for page in [Page.overview,.tasks] {
+            let f = Fixture(isolatedDefaults("LiveSnapshotRace").preferences,page:page)
+            f.inTriage = page == .tasks
+            let store = f.store(),live = Task {await store.startLiveUpdates()}
+            defer {live.cancel();store.stopWindowReads();f.cleanup()}
+            try await until {f.wait != nil}
+            store.open(.task("a"));try await until {store.selectedTicketCurrent("a")}
+            f.commit();f.contextVersion = "v3";f.holdList = true;f.calls = [];f.pageReads = []
+            // Both reads begin after the status commit. An unrelated note commits
+            // between their pinned snapshots: detail v3, slow list v2.
+            let apply = Task {await store.applyChangeCoverage(f.changes())}
+            defer {apply.cancel()}
+            try await until {f.held.count == 1 && store.selectedTask("a")?.string("status_name") == "Review"}
+            f.holdList = false;f.release(page == .tasks ? "task_list" : "workspace_page")
+            let accepted = await apply.value
+            XCTAssertTrue(accepted,"Concurrent post-change snapshots must cover the status interval")
+            XCTAssertEqual(shownStatus(store,page:page),"Review","The first slow reply must install, without a second service round trip")
+            XCTAssertEqual(f.calls.filter {$0 == "task_context"}.count,1,"A different note snapshot must not restart selected status")
+            XCTAssertEqual(page == .tasks ? f.calls.filter {$0 == "task_list"}.count : f.pageReads.filter {["overview","needs_review"].contains($0)}.count,1)
+        }
+    }
+
+    func testIdleWatchdogReplacesHeldReadWithoutWaitingForItsReply() async throws {
+        for (page,selected) in [(Page.overview,false),(.tasks,false),(.overview,true)] {
+            let f = Fixture(isolatedDefaults("IdleWatchdog").preferences,page:page)
+            f.inTriage = page == .tasks
+            let store = f.store(),live = Task {await store.startLiveUpdates()}
+            defer {live.cancel();store.stopWindowReads();f.cleanup()}
+            try await until {f.wait != nil}
+            store.open(.task("a"));try await until {store.selectedTicketCurrent("a")}
+            var now: TimeInterval = 1802.7;store.liveNow = {now}
+            f.commit();f.holdList = !selected;f.holdContext = selected
+            let apply = Task {await store.applyChangeCoverage(f.changes())};defer {apply.cancel()}
+            try await until {f.held.count == 1}
+            // The stalled transport deliberately ignores cancellation. Recovery
+            // must install while its original reply is still withheld.
+            now += 1.5;f.holdList = false;f.holdContext = false
+            await store.checkLiveFreshness(selected:selected)
+            XCTAssertEqual(f.held.count,1)
+            if page == .overview, !selected {
+                XCTAssertEqual(f.pageReads.filter { $0 == "overview" }.count,1,"An independent-lane watchdog must not issue a combined read")
+                XCTAssertEqual(f.pageReads.filter { $0 == "needs_review" }.count,2,"Only the held group needs replacement")
+                for surface in Set(f.pageReads).subtracting(["overview","needs_review"]) {
+                    XCTAssertEqual(f.pageReads.filter { $0 == surface }.count,1,"Accepted sibling groups carry into recovery")
+                }
+            }
+            if selected {XCTAssertEqual(store.selectedTask("a")?.string("status_name"),"Review")}
+            else {XCTAssertEqual(shownStatus(store,page:page),"Review")}
+            f.release(selected ? "task_context" : page == .tasks ? "task_list" : "workspace_page")
+            _ = await apply.value
+            XCTAssertEqual(shownStatus(store,page:page),"Review")
+            XCTAssertEqual(store.selectedTask("a")?.string("status_name"),"Review")
+        }
+    }
+
+    func testLiveOverviewPublishesStatusWhileQuietGroupIsHeld() async throws {
+        let f = Fixture(isolatedDefaults("LiveOverviewLanes").preferences,page:.overview)
+        let store = f.store(),live = Task {await store.startLiveUpdates()}
+        defer {live.cancel();store.stopWindowReads();f.cleanup()}
+        try await until {f.wait != nil}
+        f.commit();f.holdList = true;f.holdSurface = "needs_quiet"
+        let apply = Task {await store.applyChangeCoverage(f.changes())};defer {apply.cancel()}
+        try await until {f.held.count == 1}
+        XCTAssertEqual(shownStatus(store,page:.overview),"Review","Status is independent of a slow quiet/digest page")
+        f.holdList = false;f.release("workspace_page")
+        let accepted = await apply.value;XCTAssertTrue(accepted)
+    }
+
+    func testNewCoverageStillFencesHeldReplyFromEarlierStatus() async throws {
+        for page in [Page.tasks,.overview] {
+            let f = Fixture(isolatedDefaults("LiveCoverageFence").preferences,page:page)
+            f.inTriage = page == .tasks
+            let store = f.store(),live = Task {await store.startLiveUpdates()}
+            defer {live.cancel();store.stopWindowReads();f.cleanup()}
+            try await until {f.wait != nil}
+            store.open(.task("a"));try await until {store.selectedTicketCurrent("a")}
+            f.commit();f.holdList = true
+            let old = Task {await store.applyChangeCoverage(f.changes())};defer {old.cancel()}
+            try await until {f.held.count == 1}
+            f.status = "Queued";f.version = "v3";f.holdList = false
+            var newer = f.changes();newer["event_cursor"] = "c2"
+            let accepted = await store.applyChangeCoverage(newer);XCTAssertTrue(accepted)
+            f.release(page == .tasks ? "task_list" : "workspace_page")
+            _ = await old.value
+            XCTAssertEqual(shownStatus(store,page:page),"Queued")
+            XCTAssertEqual(store.selectedTask("a")?.string("status_name"),"Queued")
+            XCTAssertEqual(cursor(store),"c2","The earlier interval cannot cover a later commit")
+        }
+    }
+
     func testDelayedOlderReplyAndSelectionSwitchRemainFenced() async throws {
         let f = Fixture(isolatedDefaults("LiveFreshness").preferences),store = f.store(),live = Task {await store.startLiveUpdates()}
         defer {live.cancel();store.stopWindowReads();f.cleanup()}

@@ -9,15 +9,38 @@ import XCTest
             return ["receipts":[["id":"r","created_at":"today","summary":["removed_bytes":42,"retained_count":3],"bytes_state":"pending"]]]
         }
         await model.load(scope:"project:store:epoch",fetch:fetch)
-        let start = ProcessInfo.processInfo.systemUptime
+        // A cached opening still refreshes in the background (CL-260); it never skips the read.
         await model.load(scope:"project:store:epoch",fetch:fetch)
-        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime-start,0.3)
-        XCTAssertEqual(calls,1);XCTAssertEqual(model.receipts.first?.string("bytes_state"),"pending")
+        XCTAssertEqual(calls,2);XCTAssertEqual(model.receipts.first?.string("bytes_state"),"pending")
         XCTAssertEqual(model.receipts.first?.object("summary")["removed_bytes"] as? Int,42)
         model.invalidate(scope:"project:store:epoch")
-        await model.load(scope:"project:store:epoch",fetch:fetch);XCTAssertEqual(calls,2)
-        await model.load(scope:"project:new-store:epoch",fetch:fetch);XCTAssertEqual(calls,3)
-        await model.load(scope:"project:new-store:new-epoch",fetch:fetch);XCTAssertEqual(calls,4)
+        XCTAssertFalse(model.install(scope:"project:store:epoch"),"Invalidated receipts cannot be installed")
+        await model.load(scope:"project:store:epoch",fetch:fetch);XCTAssertEqual(calls,3)
+        await model.load(scope:"project:new-store:epoch",fetch:fetch);XCTAssertEqual(calls,4)
+        await model.load(scope:"project:new-store:new-epoch",fetch:fetch);XCTAssertEqual(calls,5)
+    }
+    /// CL-260 item 2: the retained rows of an exact scope install synchronously
+    /// and stay visible while the background read is pending or fails.
+    func testCachedInstallPrecedesBackgroundReadAndKeepsRowsOnFailure() async {
+        let model = TicketCleanupReceiptObservation()
+        await model.load(scope:"p") {["receipts":[["id":"cached","summary":["removed_bytes":42]]]]}
+        await model.load(scope:"q") {["receipts":[["id":"other"]]]}
+        XCTAssertEqual(model.receipts.map(\.id),["other"])
+        XCTAssertTrue(model.install(scope:"p"))
+        XCTAssertEqual(model.scope,"p");XCTAssertTrue(model.loaded);XCTAssertEqual(model.receipts.map(\.id),["cached"])
+        XCTAssertFalse(model.install(scope:"unknown"),"No receipts are installed for a scope without retained rows")
+        XCTAssertEqual(model.scope,"p")
+        var continuation: CheckedContinuation<[String:Any],Error>?
+        let refresh = Task {await model.load(scope:"p") {try await withCheckedThrowingContinuation {continuation = $0}}}
+        for _ in 0..<100 {if continuation != nil {break};await Task.yield()}
+        XCTAssertNotNil(continuation,"A cached opening issues its background read")
+        XCTAssertEqual(model.receipts.map(\.id),["cached"]);XCTAssertTrue(model.loaded)
+        continuation?.resume(throwing:NSError(domain:"refresh",code:1))
+        await refresh.value
+        XCTAssertEqual(model.receipts.map(\.id),["cached"]);XCTAssertTrue(model.error.isEmpty,"A failed background read keeps the retained rows of this exact scope")
+        await model.load(scope:"p") {["receipts":[["id":"fresh"]]]}
+        XCTAssertEqual(model.receipts.map(\.id),["fresh"])
+        XCTAssertTrue(model.install(scope:"p"));XCTAssertEqual(model.receipts.map(\.id),["fresh"],"The fresh reply replaces the retained rows")
     }
     func testLateProjectReplyDoesNotReplaceCurrentProject() async {
         let model = TicketCleanupReceiptObservation()
