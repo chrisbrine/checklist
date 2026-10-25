@@ -1491,6 +1491,128 @@ class SeedIsolationTests(unittest.TestCase):
             summary.update(verification='copy_integrity_and_authority_fencing', native_startup_verified=False)
         return summary
 
+    def live_summary_fixture(self, base, key, overrides=None, records=()):
+        source, destination, manifest = self.fixture(base, 3, records)
+        live = base / 'Checklist'
+        (live / 'backups').mkdir(parents=True)
+        published = live / 'backups/snapshot-fixture';source.rename(published)
+        summary = self.storage_copy_summary(key, live / 'backups/snapshot-earlier', live)
+        summary.update(overrides or {})
+        with closing(sqlite3.connect(published / 'database.sqlite')) as db, db:
+            db.create_collation('checklist_storage_v2', lambda a, b: (a.encode() > b.encode()) - (a.encode() < b.encode()))
+            db.execute('INSERT INTO metadata VALUES (?,?)', (key, json.dumps(summary)))
+        manifest.update(sourceRoot=str(live), databaseSHA256=harness.sha(published / 'database.sqlite'),
+                        databaseSize=(published / 'database.sqlite').stat().st_size)
+        (published / 'manifest.json').write_text(json.dumps(manifest))
+        (published / 'intent.json').write_text(json.dumps({'format': '1', 'kind': manifest['kind'],
+            'operation_id': manifest['operationID'], 'store_id': manifest['storeID'], 'source_root': manifest['sourceRoot']}))
+        data = base / 'slots/slot-4/data'
+        return published, destination, live, data, summary
+
+    def test_live_backup_summary_seed_and_restart_keep_only_recorded_source_paths(self):
+        for key in ['storage-last-verified-backup', 'storage-last-verified-rehearsal']:
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve()
+                source, destination, live, data, summary = self.live_summary_fixture(base, key)
+                with patch.object(harness, 'LIVE', live), patch.object(harness, 'DEFAULT_LIVE', live), patch.object(harness, 'BASE', data.parent.parent):
+                    seed = harness.snapshot_seed(source, destination, destination_root=data)
+                    self.assertTrue(seed['live_snapshot'])
+                    self.assertEqual(seed['source_summary_paths'], {key: {field: summary[field] for field in ['path', 'source_root']}})
+                    self.assertEqual(seed['path_inspection']['inert_metadata_path_occurrences'], 2)
+                    self.assertEqual(harness.sha(destination / 'checklist.sqlite'), harness.sha(source / 'database.sqlite'))
+                    p = harness.checked(4);p['folder'].mkdir(parents=True)
+                    destination.rename(data)
+                    metadata = {'slot': 4, 'stage_path': str(base / 'stage'), 'build_id': 'fixture',
+                                'source_fingerprint': 'fixture', 'seed': seed, 'mode': 'stopped'}
+                    harness.save(p, metadata)
+                    healthy = {'data': {'name': 'Checklist', 'version': 'fixture', 'capabilities': ['durable_store']}}
+                    with patch.object(harness, 'bundle_check', return_value={}), patch.object(harness, 'require_managed_path_support'), \
+                         patch.object(harness, 'launch_state', return_value={'registered': True}), \
+                         patch.object(harness, 'service_status', return_value=healthy), \
+                         patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}), \
+                         patch.object(harness, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run, \
+                         redirect_stdout(io.StringIO()):
+                        harness.start(SimpleNamespace(slot=4, gui=False), p)
+                        harness.check(p)
+                        # A later summary may use its own slot, but cannot introduce
+                        # another origin path, move a source value or invent a key.
+                        for case in ['own_slot', 'new_source', 'moved_field', 'new_key', 'missing_provenance']:
+                            changed = dict(summary, path=str(p['folder'] / 'backup'), source_root=str(data))
+                            changed_key = key
+                            if case == 'new_source': changed['path'] = str(live / 'backups/snapshot-new')
+                            if case == 'moved_field': changed['path'] = summary['source_root']
+                            if case == 'new_key': changed_key = 'storage-last-verified-other';changed = summary
+                            if case == 'missing_provenance':
+                                changed = summary
+                                metadata['seed'] = dict(seed, source_summary_paths={});harness.save(p, metadata)
+                            with closing(sqlite3.connect(data / 'checklist.sqlite')) as db, db:
+                                db.create_collation('checklist_storage_v2', lambda a, b: (a.encode() > b.encode()) - (a.encode() < b.encode()))
+                                db.execute('DELETE FROM metadata WHERE key=?', (key,))
+                                db.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)', (changed_key, json.dumps(changed)))
+                            if case == 'own_slot': harness.start(SimpleNamespace(slot=4, gui=False), p)
+                            else:
+                                with self.assertRaisesRegex(ValueError, 'outside the destination slot root'):
+                                    harness.start(SimpleNamespace(slot=4, gui=False), p)
+                            if changed_key != key:
+                                with closing(sqlite3.connect(data / 'checklist.sqlite')) as db, db:
+                                    db.create_collation('checklist_storage_v2', lambda a, b: (a.encode() > b.encode()) - (a.encode() < b.encode()))
+                                    db.execute('DELETE FROM metadata WHERE key=?', (changed_key,))
+                        self.assertEqual(run.call_count, 2)  # Mocked CLI/MCP only.
+
+    def test_live_backup_summary_refusals_keep_exact_errors_before_copy(self):
+        for key, field, case in itertools.product(
+                ['storage-last-verified-backup', 'storage-last-verified-rehearsal'], ['path', 'source_root'],
+                ['outside', 'sibling', 'other_slot', 'source_object', 'relative', 'traversing', 'dot', 'empty_component', 'nul', 'url']):
+            with self.subTest(key=key, field=field, case=case), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve();live = base / 'Checklist'
+                value = {'outside': str(base / 'outside/backup'), 'sibling': str(base / 'Checklist-old/backups/file'),
+                         'other_slot': str(base / 'slots/slot-3/data'), 'source_object': str(live / 'objects/file'),
+                         'relative': 'backups/file', 'traversing': str(live) + '/backups/../file',
+                         'dot': str(live) + '/backups/./file', 'empty_component': str(live) + '//backups/file',
+                         'nul': str(live / 'backups/file') + '\0', 'url': (live / 'backups/file').as_uri()}[case]
+                source, destination, live, data, _ = self.live_summary_fixture(base, key, {field: value})
+                cause = ('a stored absolute path outside the destination slot root' if case in ['outside', 'sibling', 'other_slot', 'source_object'] else
+                         'a stored file URL' if case == 'url' else 'a relative, malformed or traversing stored file path')
+                with patch.object(harness, 'LIVE', live), self.assertRaises(ValueError) as raised:
+                    harness.snapshot_seed(source, destination, destination_root=data)
+                self.assertEqual(str(raised.exception), 'Seed contains ' + cause + ' (metadata.value.' + field + '). ' + harness.RELOCATION_REQUIRED)
+                self.assertEqual(list(destination.iterdir()), [])
+
+    def test_live_summary_exception_requires_published_origin_and_stays_top_level(self):
+        for case in ['unpublished', 'different_origin', 'unknown_metadata', 'other_field', 'nested', 'record']:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve();live = base / 'Checklist'
+                key = 'unknown' if case == 'unknown_metadata' else 'storage-last-verified-backup'
+                overrides = {'database_path': str(live / 'backups/file')} if case == 'other_field' else {}
+                if case == 'nested': overrides = {'nested': {'path': str(live / 'backups/file')}}
+                records = [('fixture', {'id': 'fixture', 'path': str(live / 'backups/file')})] if case == 'record' else ()
+                source, destination, live, data, _ = self.live_summary_fixture(base, key, overrides, records)
+                if case == 'unpublished':
+                    moved = base / 'snapshot-moved';source.rename(moved);source = moved
+                if case == 'different_origin':
+                    for name, field in [('manifest.json', 'sourceRoot'), ('intent.json', 'source_root')]:
+                        file = source / name;value = json.loads(file.read_text());value[field] = str(base / 'other-origin');file.write_text(json.dumps(value))
+                with patch.object(harness, 'LIVE', live), self.assertRaisesRegex(ValueError, 'outside the destination slot root'):
+                    harness.snapshot_seed(source, destination, destination_root=data)
+                self.assertEqual(list(destination.iterdir()), [])
+
+    def test_live_summary_source_paths_are_display_only_without_filesystem_access(self):
+        for immutable in [True, False]:
+            with self.subTest(immutable=immutable), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve();live = base / 'Checklist'
+                key = 'storage-last-verified-backup'
+                summary = self.storage_copy_summary(key, live / 'backups/file', live)
+                database, data = self.storage_summary_fixture(base, key, summary)
+                live.symlink_to(base / 'outside')
+                recorded = {key: {field: summary[field] for field in ['path', 'source_root']}}
+                with ExitStack() as stack:
+                    for name in ['stat', 'lstat', 'resolve', 'open']:
+                        stack.enter_context(patch.object(Path, name, side_effect=AssertionError('source summary accessed')))
+                    stack.enter_context(patch.object(harness, 'contained', side_effect=AssertionError('source summary inspected')))
+                    result = harness.require_local_paths(database, data, immutable=immutable, summary_source_root=live)
+                    self.assertEqual(result['source_summary_paths'], recorded)
+                    harness.require_local_paths(database, data, immutable=immutable, summary_source_root=live, summary_source_paths=recorded)
+
     def test_storage_summary_inside_slot_is_inert_without_filesystem_access(self):
         for key, immutable, source in itertools.product(
                 ['storage-last-verified-backup', 'storage-last-verified-rehearsal'], [True, False], ['data', 'source']):

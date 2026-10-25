@@ -449,3 +449,19 @@ record and 1,800-second bounds remain. No SQLite protocol migration is introduce
 Package B270 retains measurements, template tests and private-copy qualification;
 exact composed installed startup/protected-copy/restore qualification and a fresh
 live agent backup remain orchestrator runner work.
+
+### Restore preview controls and lazy-list accessibility actions (CL-273 / CL-272 source)
+
+The Storage restore preview keeps Cancel, Prepare restored copy and the recovery
+warning outside its scroll view. The scroll view is a plain stack: record
+families with records, exact unavailable totals per reason and the first 50
+unavailable entries ("The first 50 of N"), each row with a unique key. On this
+macOS release SwiftUI traps in `ForEachState.item(at:offset:)` when an
+accessibility client performs AXScrollToTop or AXScrollToBottom on any
+`LazyVStack` whose rows are not all created, also with static data and unique
+IDs. `LazyListAccessibilityGuard`, installed at launch, answers only those two
+actions on SwiftUI's lazy accessibility node by scrolling the enclosing scroll
+view; other actions keep SwiftUI's handling. App tests cover a synthetic lazy
+list, Needs You requests, Activity, Epics and the preview at 931 and 160,000
+unavailable entries. A signed test-slot restore from a real-size backup remains
+runner work.

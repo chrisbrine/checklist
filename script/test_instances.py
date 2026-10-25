@@ -344,13 +344,16 @@ class ManagedPathMapping:
         return None
 
 
-def require_local_paths(database, destination, immutable=True, source_root=None):
+def require_local_paths(database, destination, immutable=True, source_root=None,
+                        summary_source_root=None, summary_source_paths=None):
     """Read-only seed inspection. Never open a stored managed absolute path.
 
     source_root is the verified snapshot manifest's origin or the stopped source
     slot's root. Legacy managed descriptors from that root are admitted for Core's
     protected relocation, not redirected by this harness. Other Checklist roots
-    remain forbidden. Counts are occurrences, including repeated project refs.
+    remain forbidden. Verified live snapshots may admit display-only source
+    summaries; startup restricts those to the exact recorded metadata fields.
+    Counts are occurrences, including repeated project refs.
     """
     database = Path(database).absolute()
     destination = Path(os.path.normpath(destination)).absolute()
@@ -360,6 +363,8 @@ def require_local_paths(database, destination, immutable=True, source_root=None)
                            'relative_capture_paths', 'inert_history_path_occurrences', 'inert_metadata_path_occurrences',
                            'capture_git_provenance'], 0)
     mapping = ManagedPathMapping()
+    summary_source_root = Path(summary_source_root) if summary_source_root is not None else None
+    source_summaries = {}
 
     def refuse(location, cause):
         raise ValueError(f'Seed contains {cause} ({location}). ' + RELOCATION_REQUIRED)
@@ -532,7 +537,13 @@ def require_local_paths(database, destination, immutable=True, source_root=None)
                 # the referenced backup/restore path or any symlink there.
                 path = check_absolute(value, location)
                 if not path.is_relative_to(destination.parent):
-                    refuse(location, 'a stored absolute path outside the destination slot root')
+                    field = location.rsplit('.', 1)[-1]
+                    source_summary = summary_source_root is not None and (
+                        path == summary_source_root or path.is_relative_to(summary_source_root / 'backups'))
+                    recorded = summary_source_paths is None or summary_source_paths.get(metadata_key, {}).get(field) == value
+                    if not source_summary or not recorded:
+                        refuse(location, 'a stored absolute path outside the destination slot root')
+                    source_summaries.setdefault(metadata_key, {})[field] = value
                 counts['inert_metadata_path_occurrences'] += 1
             elif kind == 'managed': check_managed(value, family, location)
             elif kind == 'lookup':
@@ -590,7 +601,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None)
                 metadata_key = row[columns.index('key')] if table == 'metadata' and 'key' in columns else None
                 if metadata_key == 'managed-capture-paths-v3': record_kind = 'capture_bindings'
                 # Unlike older inert receipts below, summaries allow only their
-                # top-level copy/source paths under this slot folder; other fields stay strict.
+                # top-level copy/source observations; other fields stay strict.
                 if metadata_key is not None and metadata_key.startswith('storage-last-verified-'):
                     record_kind = 'storage_summary'
                 for column, value in zip(columns, row):
@@ -602,6 +613,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None)
         raise ValueError('Seed values cannot be safely inspected. ' + RELOCATION_REQUIRED) from error
     finally:
         connection.close()
+    if source_summaries: counts['source_summary_paths'] = source_summaries
     return counts
 
 
@@ -730,7 +742,11 @@ def snapshot_seed(source, destination, destination_root=None):
             raise ValueError('Snapshot canonical family counts mismatch.')
     if 'tableRows' in manifest and manifest['tableRows'] != observation['table_rows']:
         raise ValueError('Snapshot table counts mismatch.')
-    inspection = require_local_paths(source / 'database.sqlite', destination_root or destination, source_root=manifest['sourceRoot'])
+    live_snapshot = is_live_snapshot(source, manifest['sourceRoot'])
+    summary_source_root = manifest['sourceRoot'] if live_snapshot else None
+    inspection = require_local_paths(source / 'database.sqlite', destination_root or destination,
+                                     source_root=manifest['sourceRoot'], summary_source_root=summary_source_root)
+    source_summary_paths = inspection.pop('source_summary_paths', {})
     # Verification finishes before any source byte is used in the new store.
     shutil.copyfile(source / 'database.sqlite', destination / 'checklist.sqlite')
     (destination / 'checklist.sqlite').chmod(0o600)
@@ -746,7 +762,9 @@ def snapshot_seed(source, destination, destination_root=None):
             if sha(target) != digest or target.stat().st_size != size: raise ValueError('Copy verification failed.')
     if sha(destination / 'checklist.sqlite') != manifest['databaseSHA256']:
         raise ValueError('Database copy verification failed.')
-    require_local_paths(destination / 'checklist.sqlite', destination_root or destination, source_root=manifest['sourceRoot'])
+    require_local_paths(destination / 'checklist.sqlite', destination_root or destination,
+                        source_root=manifest['sourceRoot'], summary_source_root=summary_source_root,
+                        summary_source_paths=source_summary_paths)
     if observation['schema'] > 0:
         identity = observation['identity']
         if not identity or identity['logical_store_id'] != manifest['storeID'] or identity['state'] != 'ready':
@@ -757,7 +775,7 @@ def snapshot_seed(source, destination, destination_root=None):
     print(f'Snapshot age: {age / 86400:.2f} days; schema {observation["schema"]}; quick_check {observation["quick_check"]}')
     return {'kind': 'backup', 'source': str(source), 'source_hash': hashlib.sha256(raw).hexdigest(),
             'age_seconds_at_create': age, 'source_root': manifest['sourceRoot'], 'before_start': observation,
-            'live_snapshot': is_live_snapshot(source, manifest['sourceRoot']), 'path_inspection': inspection,
+            'live_snapshot': live_snapshot, 'path_inspection': inspection, 'source_summary_paths': source_summary_paths,
             'current_schema_no_migration': observation['schema'] == 3}
 
 
@@ -1083,7 +1101,10 @@ def start(arguments, p):
     manifest = bundle_check(p, metadata)
     if metadata['seed']['kind'] != 'empty':
         require_managed_path_support(Path(metadata['stage_path']), manifest)
-        require_local_paths(p['data'] / 'checklist.sqlite', p['data'], immutable=False, source_root=metadata['seed'].get('source_root'))
+        seed = metadata['seed']
+        summary_source_root = seed.get('source_root') if seed['kind'] == 'backup' and seed.get('live_snapshot') else None
+        require_local_paths(p['data'] / 'checklist.sqlite', p['data'], immutable=False, source_root=seed.get('source_root'),
+                            summary_source_root=summary_source_root, summary_source_paths=seed.get('source_summary_paths', {}))
     logs = contained(p['folder'] / 'logs', p['folder']); logs.mkdir(mode=0o700, exist_ok=True)
     plist = contained(p['folder'] / 'service.plist', p['folder'])
     contents = {'Label': p['label'], 'MachServices': {p['label']: True},

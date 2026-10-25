@@ -26,6 +26,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainActor.assumeIsolated {
             // Set the app-wide appearance before any window or panel is shown.
             if let name = TestInstanceAppearance.resolve() { NSApp.appearance = NSAppearance(named: name) }
+            // CL-272: before any lazy list can receive an accessibility scroll action.
+            LazyListAccessibilityGuard.install()
             _ = DesktopAlertCoordinator.shared
         }
     }

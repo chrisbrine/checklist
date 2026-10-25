@@ -95,25 +95,7 @@ struct StorageSettingsView: View {
                 if !observation.result.isEmpty { Text(observation.result).checklistFont(.micro).textSelection(.enabled) }
             }
         }.formStyle(.grouped).sheet(isPresented:$observation.showingRestorePreview) {
-            ScrollView { LazyVStack(alignment:.leading,spacing:Spacing.control) {
-                Text("Restore backup to a separate data root").font(.headline)
-                Text("The complete database and managed files passed verification. This installation stays available. Credentials and native connections are not restored.")
-                ForEach(StorageSettingsSummary.preview(restorePreview)) {row in LabeledContent(row.label,value:row.value)}
-                Text("Projects: \(restorePreview["project_count"] as? Int ?? 0). " + ((restorePreview["projects"] as? [[String:Any]] ?? []).prefix(10).compactMap {$0["name"] as? String}.joined(separator:", ")))
-                Text("Managed files: \(restorePreview["managed_files"] as? Int ?? 0). Unavailable managed content: \((restorePreview["unavailable"] as? [[String:Any]])?.count ?? 0). External references: \((restorePreview["external_references"] as? [String])?.count ?? 0).")
-                ForEach((restorePreview["record_families"] as? [String:Int] ?? [:]).keys.sorted(),id:\.self) {family in
-                    let count = (restorePreview["record_families"] as? [String:Int])?[family] ?? 0
-                    if count > 0 {LabeledContent(GlossaryText.humanize(family).capitalized,value:String(count))}
-                }
-                if let unavailable = restorePreview["unavailable"] as? [[String:Any]],!unavailable.isEmpty {
-                    Text("Unavailable content").font(.headline)
-                    ForEach(Array(unavailable.enumerated()),id:\.offset) {entry in
-                        Text("\(entry.element["authority"] as? String ?? "Unknown original"): \(GlossaryText.humanize(entry.element["reason"] as? String ?? "Unavailable"))").checklistFont(.micro)
-                    }
-                }
-                Text("Active work requires explicit recovery. Pending or uncertain messages will not be resent.")
-                HStack { Button("Cancel") {observation.showingRestorePreview = false}; Spacer(); Button("Prepare restored copy") {restoreCopy()} }
-            }.padding() }.frame(width:560,height:620)
+            RestorePreviewSheet(preview:restorePreview,cancel:{observation.showingRestorePreview = false},confirm:{restoreCopy()})
         }.task(id:store.storeIncarnation) {await refreshStorageStatus()}
         .onChange(of:store.storeIncarnation) {_,scope in observation.changeScope(scope)}
     }
@@ -161,5 +143,40 @@ struct StorageSettingsView: View {
                 try await store.request("backup_create",["command_id":UUID().uuidString,"path":url.path],ifCurrent:{store.storeIncarnation == scope})
             },status:{try await store.request("storage_status",ifCurrent:{store.storeIncarnation == scope})})
         }
+    }
+}
+
+/// The verified restore preview. Cancel and Prepare restored copy only report
+/// the owner's choice; StorageSettingsView owns the restore command.
+///
+/// CL-273: the decision stays outside the scrolling content, so it is visible
+/// for any backup size. CL-272: the content is a plain stack of bounded rows
+/// (at most `StorageSettingsSummary.unavailableShown` unavailable entries, with
+/// exact totals), so no lazy list can change under an accessibility action.
+struct RestorePreviewSheet: View {
+    let preview: [String:Any]
+    let cancel: () -> Void
+    let confirm: () -> Void
+    var body: some View {
+        let unavailable = StorageSettingsSummary.unavailable(preview)
+        VStack(alignment:.leading,spacing:Spacing.control) {
+            Text("Restore backup to a separate data root").font(.headline)
+            Text("The complete database and managed files passed verification. This installation stays available. Credentials and native connections are not restored.")
+            ScrollView { VStack(alignment:.leading,spacing:Spacing.control) {
+                ForEach(StorageSettingsSummary.preview(preview)) {row in LabeledContent(row.label,value:row.value)}
+                Text("Projects: \(preview["project_count"] as? Int ?? 0). " + ((preview["projects"] as? [[String:Any]] ?? []).prefix(10).compactMap {$0["name"] as? String}.joined(separator:", ")))
+                Text("Managed files: \(preview["managed_files"] as? Int ?? 0). Unavailable managed content: \(unavailable.total). External references: \((preview["external_references"] as? [String])?.count ?? 0).")
+                ForEach(StorageSettingsSummary.recordFamilies(preview)) {row in LabeledContent(row.label,value:row.value)}
+                if unavailable.total > 0 {
+                    Text("Unavailable content").font(.headline)
+                    ForEach(unavailable.reasons) {row in LabeledContent(row.label,value:row.value)}
+                    Text(unavailable.shown.count < unavailable.total ? "The first \(unavailable.shown.count) of \(unavailable.total) unavailable entries:" : "All \(unavailable.total) unavailable entries:").checklistFont(.micro)
+                    ForEach(unavailable.shown) {row in Text("\(row.label): \(row.value)").checklistFont(.micro)}
+                }
+            }.frame(maxWidth:.infinity,alignment:.leading) }
+            Divider()
+            Text("Active work requires explicit recovery. Pending or uncertain messages will not be resent.")
+            HStack { Button("Cancel") {cancel()}; Spacer(); Button("Prepare restored copy") {confirm()} }
+        }.padding().frame(width:560,height:620)
     }
 }

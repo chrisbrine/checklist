@@ -26,4 +26,20 @@ final class StorageSettingsSummaryTests: XCTestCase {
         XCTAssertEqual(rows.first {$0.label == "Logical file lengths"}?.value,"Not measured")
         XCTAssertEqual(StorageSettingsSummary.observation(nil),[.init(label:"Verification",value:"None recorded")])
     }
+    func testRestorePreviewListsBoundedUnavailableEntriesWithExactTotals() {
+        let entries: [[String:Any]] = (0..<160_000).map {["authority":"source_capture:\($0)","reason":$0 % 4 == 0 ? "rebuildable_source_build_cache" : "evidence_cleaned"]}
+        let summary = StorageSettingsSummary.unavailable(["unavailable":entries])
+        XCTAssertEqual(summary.total,160_000)
+        XCTAssertEqual(summary.shown.count,StorageSettingsSummary.unavailableShown)
+        XCTAssertEqual(summary.shown.first,.init(id:"0:source_capture:0",label:"source_capture:0",value:"rebuildable source build cache"))
+        XCTAssertEqual(Set(summary.shown.map(\.id)).count,summary.shown.count)
+        XCTAssertEqual(summary.reasons,[.init(id:"evidence_cleaned",label:"Evidence Cleaned",value:"120000"),.init(id:"rebuildable_source_build_cache",label:"Rebuildable Source Build Cache",value:"40000")])
+        XCTAssertEqual(StorageSettingsSummary.unavailable([:]),.init(total:0,reasons:[],shown:[]))
+    }
+    func testRestorePreviewFamiliesOmitEmptyFamiliesAndKeepUniqueKeys() {
+        let rows = StorageSettingsSummary.recordFamilies(["record_families":["task":3,"cleanup_job":0,"media_item":2,"media item":1]])
+        XCTAssertEqual(rows.map(\.id),["media item","media_item","task"])
+        XCTAssertEqual(rows.map(\.label),["Media Item","Media Item","Ticket"])
+        XCTAssertEqual(rows.map(\.value),["1","2","3"])
+    }
 }
