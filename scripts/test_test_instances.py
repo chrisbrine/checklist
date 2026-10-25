@@ -23,6 +23,12 @@ spec.loader.exec_module(harness)
 import verify_install
 
 
+def test_directory():
+    # Fixture session IDs must not inherit the caller's scratchpad binding.
+    # Keep real marker writes (and their ownership checks) in marking cases.
+    return tempfile.TemporaryDirectory(dir='/private/tmp')
+
+
 def store_fixture(path, schema=0, records=()):
     # Exact table definitions used by SchemaMigrations.baselineSQL/currentSQL.
     sql = """CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -121,7 +127,7 @@ class TestInstancesTests(unittest.TestCase):
         self.assertNotIn('ChecklistInstanceSlot', original)
 
     def test_refuses_outside_slot_and_symlinks(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             root = Path(directory).resolve() / 'slot-1'; root.mkdir()
             outside = root.parent / 'live'; outside.mkdir()
             self.assertEqual(harness.contained(root / 'data', root), root / 'data')
@@ -131,7 +137,7 @@ class TestInstancesTests(unittest.TestCase):
             with self.assertRaises(ValueError): harness.contained(root / 'data/file', root)
 
     def test_refuses_symlinked_slot_parent(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve()
             (base / 'real').mkdir(); (base / 'alias').symlink_to(base / 'real')
             with self.assertRaises(ValueError): harness.contained(base / 'alias/slot-1', base / 'alias')
@@ -173,7 +179,7 @@ class TestInstancesTests(unittest.TestCase):
             with self.assertRaises(ValueError): harness.snapshot_seed(source, Path('unused'))
 
     def test_lock_is_per_slot_and_never_removed_on_contention(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
+        with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
             with harness.locked(1):
                 with self.assertRaises(ValueError):
                     with harness.locked(1): pass
@@ -181,7 +187,7 @@ class TestInstancesTests(unittest.TestCase):
             self.assertFalse((harness.BASE / '.slot-1.lock').exists())
 
     def test_metadata_cannot_select_another_slot(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
+        with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
             p = harness.checked(1); p['folder'].mkdir()
             (p['folder'] / 'slot.json').write_text(json.dumps({'slot': 2}))
             with self.assertRaises(ValueError): harness.load(p)
@@ -214,7 +220,7 @@ class AdditionalGuardsTests(unittest.TestCase):
             with self.assertRaises(ValueError): harness.launch_state(p)
 
     def test_slot_seed_refuses_an_aliased_data_root(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
+        with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
             other = harness.checked(2); other['folder'].mkdir()
             outside = harness.BASE / 'outside'; outside.mkdir()
             other['data'].symlink_to(outside)
@@ -223,7 +229,7 @@ class AdditionalGuardsTests(unittest.TestCase):
                 with self.assertRaises(ValueError): harness.slot_seed(other, harness.BASE / 'destination')
 
     def test_slot_seed_copies_bytes_and_excludes_connections(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
+        with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
             other = harness.checked(2); other['data'].mkdir(parents=True)
             (other['data'] / 'connections.json').write_text('credential-reference')
             store_fixture(other['data'] / 'checklist.sqlite', schema=2)
@@ -237,7 +243,7 @@ class AdditionalGuardsTests(unittest.TestCase):
 
     def test_log_alias_is_refused_before_bootstrap(self):
         from types import SimpleNamespace
-        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
+        with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
             p = harness.checked(1); (p['folder'] / 'logs').mkdir(parents=True)
             (p['folder'] / 'logs/service.stdout.log').symlink_to(harness.BASE / 'outside')
             with patch.object(harness, 'load', return_value={'seed': {'kind': 'empty'}, 'mode': 'stopped'}), patch.object(harness, 'bundle_check'), patch.object(harness, 'run') as run:
@@ -248,7 +254,7 @@ class AdditionalGuardsTests(unittest.TestCase):
 class StopWaitTests(unittest.TestCase):
     @contextmanager
     def stopping(self, launches, observations):
-        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+        with test_directory() as directory, ExitStack() as stack:
             stack.enter_context(patch.object(harness, 'BASE', Path(directory).resolve()))
             p = harness.paths(4); p['folder'].mkdir()
             (p['folder'] / 'slot.json').write_text(json.dumps({'slot': 4, 'mode': 'headless'}))
@@ -315,7 +321,7 @@ class DestroyCleanupTests(unittest.TestCase):
 
     @contextmanager
     def slot(self, number=4, populated=True):
-        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+        with test_directory() as directory, ExitStack() as stack:
             home = Path(directory).resolve()
             stack.enter_context(patch.object(harness.Path, 'home', return_value=home))
             stack.enter_context(patch.object(harness, 'BASE', home / 'slots'))
@@ -601,7 +607,7 @@ class SnapshotLogicTests(unittest.TestCase):
         return source, destination, manifest
 
     def test_verified_snapshot_maps_layout_without_editing_database(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             source, destination, manifest = self.fixture(Path(directory).resolve())
             seed = harness.snapshot_seed(source, destination)
             self.assertEqual((destination / 'checklist.sqlite').read_bytes(), (source / 'database.sqlite').read_bytes())
@@ -613,7 +619,7 @@ class SnapshotLogicTests(unittest.TestCase):
     def test_compact_format_two_seed_and_invalid_tables(self):
         # Same wire rows as the Swift codec: content is shared, paths/authority
         # are reconstructed exactly before ordinary hash/membership validation.
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             source, destination, manifest = self.fixture(Path(directory).resolve(), schema=3)
             entry = manifest['objects'][0]
             strings = [entry['descriptor']['relativePath'], 'file', entry['sha256']]
@@ -635,7 +641,7 @@ class SnapshotLogicTests(unittest.TestCase):
                     with self.assertRaises(ValueError): harness.snapshot_objects(dict(format=2, objects=bad))
 
     def test_agent_current_snapshot_family_counts_and_no_migration_seed(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             source, destination, manifest = self.fixture(Path(directory).resolve(), schema=3)
             observation = harness.database_observation(source / 'database.sqlite')
             manifest.update(recordFamilies={'project': 0, 'task': 0}, tableRows=observation['table_rows'])
@@ -647,7 +653,7 @@ class SnapshotLogicTests(unittest.TestCase):
 
     def test_manifest_count_mismatch_refuses_before_seed_bytes(self):
         for field, value in [('recordFamilies', {'task': 1}), ('tableRows', {'records': 99})]:
-            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(field=field), test_directory() as directory:
                 source, destination, manifest = self.fixture(Path(directory).resolve(), schema=3)
                 manifest[field] = value
                 (source / 'manifest.json').write_text(json.dumps(manifest))
@@ -657,7 +663,7 @@ class SnapshotLogicTests(unittest.TestCase):
 
     def test_bad_hash_and_extra_file_refuse_before_materialization(self):
         for fault in ['hash', 'extra']:
-            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(fault=fault), test_directory() as directory:
                 source, destination, manifest = self.fixture(Path(directory).resolve())
                 if fault == 'hash': (source / 'managed/objects/file').write_bytes(b'changed')
                 else: (source / 'connections.json').write_text('must not copy')
@@ -665,7 +671,7 @@ class SnapshotLogicTests(unittest.TestCase):
                 self.assertEqual(list(destination.iterdir()), [])
 
     def test_current_identity_comes_from_copied_database(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             source, destination, manifest = self.fixture(Path(directory).resolve(), schema=2)
             identity = harness.database_observation(source / 'database.sqlite')['identity']
             harness.snapshot_seed(source, destination)
@@ -675,7 +681,7 @@ class SnapshotLogicTests(unittest.TestCase):
 class RestoredSeedTests(unittest.TestCase):
     def setUp(self):
         # Origin discovery must never enumerate the developer's real backups.
-        directory = tempfile.TemporaryDirectory();self.addCleanup(directory.cleanup)
+        directory = test_directory();self.addCleanup(directory.cleanup)
         for name in ['LIVE', 'DEFAULT_LIVE']:
             patched = patch.object(harness, name, Path(directory.name).resolve() / name)
             patched.start();self.addCleanup(patched.stop)
@@ -728,7 +734,7 @@ class RestoredSeedTests(unittest.TestCase):
 
     def test_restored_source_backup_summary_is_receipt_bound_and_byte_preserving(self):
         for snapshot_format in [1, 2]:
-            with self.subTest(format=snapshot_format), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(format=snapshot_format), test_directory() as directory:
                 base = Path(directory).resolve()
                 source, destination, receipt, origin, manifest = self.origin_fixture(base, snapshot_format)
                 key = 'storage-last-verified-backup'
@@ -747,7 +753,7 @@ class RestoredSeedTests(unittest.TestCase):
         # CL-276 review 18111a9a: a receipt-matching manifest from a non-live origin
         # (for example another test slot) keeps managed-origin checks but no summary exception.
         for snapshot_format in [1, 2]:
-            with self.subTest(format=snapshot_format), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(format=snapshot_format), test_directory() as directory:
                 base = Path(directory).resolve()
                 source, destination, receipt, origin, manifest = self.origin_fixture(base, snapshot_format)
                 live = base / 'live-elsewhere'
@@ -771,7 +777,7 @@ class RestoredSeedTests(unittest.TestCase):
 
     def test_restored_source_capture_paths_use_verified_origin_and_local_copy(self):
         for snapshot_format in [1, 2]:
-            with self.subTest(format=snapshot_format), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(format=snapshot_format), test_directory() as directory:
                 base = Path(directory).resolve()
                 source, destination, receipt, origin, _ = self.origin_fixture(base, snapshot_format)
                 relative = 'source-captures/project/capture/source'
@@ -789,7 +795,7 @@ class RestoredSeedTests(unittest.TestCase):
 
     def test_restored_origin_does_not_admit_unrelated_roots_or_unsafe_local_links(self):
         for case in ['managed', 'summary', 'local_link']:
-            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(case=case), test_directory() as directory:
                 base = Path(directory).resolve()
                 source, destination, receipt, origin, _ = self.origin_fixture(base)
                 unrelated = base / 'Checklist Test Instances/slot-2/data'
@@ -816,7 +822,7 @@ class RestoredSeedTests(unittest.TestCase):
 
     def test_restored_source_manifest_requires_matching_hash_store_schema_and_safe_root(self):
         for case in ['hash', 'missing', 'symlink', 'unpublished', 'store', 'schema', 'relative', 'traversal']:
-            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(case=case), test_directory() as directory:
                 base = Path(directory).resolve()
                 source, destination, receipt, origin, manifest = self.origin_fixture(base)
                 summary = {'path': str(origin / 'backups/snapshot-earlier'), 'source_root': str(origin)}
@@ -840,7 +846,7 @@ class RestoredSeedTests(unittest.TestCase):
                 self.assertEqual(harness.restored_inventory(source), before)
 
     def test_restoring_installation_qualification_manifest_supplies_origin(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve()
             source, destination, _, origin, manifest = self.origin_fixture(base)
             target = base / 'backups/qualification-fixture/snapshot-fixture/manifest.json'
@@ -851,7 +857,7 @@ class RestoredSeedTests(unittest.TestCase):
             self.assertEqual(seed['source_manifest'], str(target))
 
     def test_restored_summary_start_retains_exact_source_values_without_reopening_manifest(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve()
             source, destination, receipt, origin, manifest = self.origin_fixture(base)
             key = 'storage-last-verified-backup'
@@ -879,7 +885,7 @@ class RestoredSeedTests(unittest.TestCase):
                     self.assertEqual(health.call_count, 2);run.assert_not_called()
 
     def test_valid_seed_preserves_bytes_incarnation_fences_and_receipt(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             source, destination, receipt = self.fixture(Path(directory).resolve())
             original = harness.restored_inventory(source)
             seed = harness.restored_seed(source, destination)
@@ -901,7 +907,7 @@ class RestoredSeedTests(unittest.TestCase):
 
     def test_unvalidated_and_non_restore_folders_refuse(self):
         for fault in ['no_receipt', 'incomplete', 'non_restore', 'staging', 'identity', 'database', 'db_receipt']:
-            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(fault=fault), test_directory() as directory:
                 base = Path(directory).resolve(); source, destination, receipt = self.fixture(base)
                 if fault == 'no_receipt': (source / 'restore-receipt.json').unlink()
                 elif fault == 'incomplete':
@@ -918,7 +924,7 @@ class RestoredSeedTests(unittest.TestCase):
                 self.assertEqual(list(destination.iterdir()), [])
 
     def test_live_default_live_traversal_and_alias_refuse_before_read(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();live = base / 'live';default = base / 'default';live.mkdir();default.mkdir()
             (base / 'alias').symlink_to(live)
             with patch.object(harness, 'LIVE', live), patch.object(harness, 'DEFAULT_LIVE', default), patch.object(harness, 'restored_inventory') as inventory:
@@ -928,7 +934,7 @@ class RestoredSeedTests(unittest.TestCase):
 
     def test_runtime_credentials_wal_unsafe_paths_and_special_files_refuse(self):
         for fault in ['connections.json', 'checklist.sqlite-wal', 'symlink', 'directory_link', 'fifo']:
-            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(fault=fault), test_directory() as directory:
                 source, destination, _ = self.fixture(Path(directory).resolve())
                 if fault == 'symlink': (source / 'objects/link').symlink_to('/etc/passwd')
                 elif fault == 'directory_link': (source / 'objects/alias').symlink_to(destination, target_is_directory=True)
@@ -938,7 +944,7 @@ class RestoredSeedTests(unittest.TestCase):
                 self.assertEqual(list(destination.iterdir()), [])
 
     def test_capture_links_are_copied_without_following(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             source, destination, _ = self.fixture(Path(directory).resolve())
             capture = source / 'source-captures/project/capture/source';capture.mkdir(parents=True)
             (capture / 'file').write_bytes(b'capture');(capture / 'link').symlink_to('file')
@@ -947,7 +953,7 @@ class RestoredSeedTests(unittest.TestCase):
 
     def test_capture_links_cannot_escape_cycle_or_target_missing_bytes(self):
         for target in ['../../../../outside', 'missing', 'link']:
-            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(target=target), test_directory() as directory:
                 source, destination, _ = self.fixture(Path(directory).resolve())
                 capture = source / 'source-captures/project/capture/source';capture.mkdir(parents=True)
                 (capture / 'link').symlink_to(target)
@@ -955,7 +961,7 @@ class RestoredSeedTests(unittest.TestCase):
                 self.assertEqual(list(destination.iterdir()), [])
 
     def test_restored_start_uses_normal_signed_preflight_and_service(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve() / 'slots'):
+        with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve() / 'slots'):
             base = Path(directory).resolve();p = harness.checked(4);p['data'].mkdir(parents=True)
             source, destination, _ = self.fixture(base)
             seed = harness.restored_seed(source, destination, p['data'])
@@ -970,7 +976,7 @@ class RestoredSeedTests(unittest.TestCase):
             self.assertEqual(harness.load(p)['mode'], 'headless')
 
     def test_copy_corruption_is_refused(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             source, destination, _ = self.fixture(Path(directory).resolve())
             copytree = harness.shutil.copytree
             def corrupt(*args, **kwargs):
@@ -981,7 +987,7 @@ class RestoredSeedTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'copy verification'): harness.restored_seed(source, destination)
 
     def test_existing_path_checks_still_apply(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             source, destination, receipt = self.fixture(Path(directory).resolve())
             with closing(sqlite3.connect(source / 'checklist.sqlite')) as db, db:
                 db.create_collation('checklist_storage_v2', lambda a, b: (a.encode() > b.encode()) - (a.encode() < b.encode()))
@@ -991,7 +997,7 @@ class RestoredSeedTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'malformed root-relative'): harness.restored_seed(source, destination)
 
     def test_same_slot_replacement_verifies_copy_before_destroy(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve() / 'slots'):
+        with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve() / 'slots'):
             base = Path(directory).resolve();p = harness.checked(4);p['data'].mkdir(parents=True)
             source, _, receipt = self.fixture(p['data'])
             original = harness.restored_inventory(source)
@@ -1021,7 +1027,7 @@ class RestoredSeedTests(unittest.TestCase):
             self.assertEqual(list(harness.BASE.glob('.restored-seed-*')), [])
 
     def test_refused_restore_preserves_existing_slot(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve() / 'slots'):
+        with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve() / 'slots'):
             base = Path(directory).resolve();p = harness.checked(4);p['folder'].mkdir(parents=True)
             harness.save(p, {'slot': 4, 'build_id': 'old'})
             selected = {'source_fingerprint': 'b' * 64}
@@ -1042,7 +1048,7 @@ class SeedIsolationTests(unittest.TestCase):
 
     def test_traversing_managed_attachment_refuses_snapshot_and_slot_copy_without_rewriting(self):
         for schema in [0, 2, 3]:
-            with self.subTest(schema=schema), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(schema=schema), test_directory() as directory:
                 source, destination, _ = self.fixture(Path(directory).resolve(), schema,
                     [('attachment', attachment('../../private/synthetic-outside/file'))])
                 before = harness.sha(source / 'database.sqlite')
@@ -1050,7 +1056,7 @@ class SeedIsolationTests(unittest.TestCase):
                     harness.snapshot_seed(source, destination)
                 self.assertEqual(list(destination.iterdir()), [])
                 self.assertEqual(harness.sha(source / 'database.sqlite'), before)
-        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
+        with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
             source = harness.checked(2);source['data'].mkdir(parents=True)
             store_fixture(source['data'] / 'checklist.sqlite', 2, [('attachment', attachment('../../outside/file'))])
             harness.save(source, {'slot': 2, 'build_id': 'fixture'})
@@ -1064,7 +1070,7 @@ class SeedIsolationTests(unittest.TestCase):
         cases += [{'root_path': '../file'}, {'paths': ['../file']}, {'additional_paths': ['src/file']},
                   {'path_sha256': {'../file': 'digest'}}]
         for record in cases:
-            with self.subTest(record=record), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(record=record), test_directory() as directory:
                 with self.assertRaises(ValueError):
                     self.inspect(Path(directory).resolve(), [('fixture', dict(record, id='fixture'))])
 
@@ -1076,25 +1082,25 @@ class SeedIsolationTests(unittest.TestCase):
                        ('task', {'id': 'ticket', 'brief': value}),
                        ('attempt', {'id': 'attempt', 'reason': value}),
                        ('handoff', {'id': 'handoff', 'summary': value})]
-            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(value=value), test_directory() as directory:
                 counts = self.inspect(Path(directory).resolve(), records)
                 self.assertEqual(counts['inert_history_path_occurrences'], 5)
                 self.assertEqual(sum(counts.values()), 5)
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             counts = self.inspect(Path(directory).resolve(), [('message', {'id': 'note', 'body': 'ordinary prose'})])
             self.assertEqual(counts['inert_history_path_occurrences'], 0)
 
     def test_unknown_leading_slash_text_keeps_strict_path_refusals(self):
         for value in ['/outside/evidence/', '/usr/bin/trash --stopOnError printed success', '/outside/../evidence', '/outside/evidence']:
-            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(value=value), test_directory() as directory:
                 with self.assertRaises(ValueError):
                     self.inspect(Path(directory).resolve(), [('fixture', {'id': 'fixture', 'unknown': value})])
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             with self.assertRaises(ValueError):
                 self.inspect(Path(directory).resolve(), [('fixture', {'id': 'fixture', 'evidence': '/outside/evidence/'})])
 
     def test_declared_file_scope_paths_use_project_binding_checks(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();live = base / 'Checklist';live.mkdir();slots = base / 'slots'
             with patch.object(harness, 'LIVE', live), patch.object(harness, 'DEFAULT_LIVE', live), patch.object(harness, 'BASE', slots):
                 counts = self.inspect(base, [('attempt', {'id': 'attempt', 'file_scopes': [
@@ -1110,30 +1116,30 @@ class SeedIsolationTests(unittest.TestCase):
     def test_retained_recovery_references_are_inert_not_file_authority(self):
         values = ['/outside/evidence/', '/usr/bin/trash --stopOnError printed success', '/outside/../evidence']
         for kind in ['attempt', 'source_execution']:
-            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(kind=kind), test_directory() as directory:
                 counts = self.inspect(Path(directory).resolve(), [(kind, {'id': 'record',
                     'file_state_refs': values, 'stop_observation_refs': values})])
                 self.assertEqual(counts['inert_history_path_occurrences'], 6)
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             with self.assertRaises(ValueError):
                 self.inspect(Path(directory).resolve(), [('fixture', {'id': 'record', 'file_state_refs': ['/outside/file']})])
         for kind in ['attempt', 'source_execution']:
-            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(kind=kind), test_directory() as directory:
                 with self.assertRaises(ValueError):
                     self.inspect(Path(directory).resolve(), [(kind, {'id': 'record', 'file_state_refs': ['FiLe:///outside/file']})])
 
     def test_human_command_directory_is_instruction_text_with_file_url_refusals(self):
         for value in ['/outside/evidence/', '/usr/bin/trash --stopOnError printed success', '/outside/../evidence']:
-            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(value=value), test_directory() as directory:
                 counts = self.inspect(Path(directory).resolve(), [('request', {'id': 'request',
                     'command': {'working_directory': value}})])
                 self.assertEqual(counts['inert_history_path_occurrences'], 1)
         for value in ['FiLe:///outside/file', 'Quoted file:///outside/file']:
-            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(value=value), test_directory() as directory:
                 with self.assertRaisesRegex(ValueError, 'stored file URL'):
                     self.inspect(Path(directory).resolve(), [('request', {'id': 'request',
                         'command': {'working_directory': value}})])
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             with self.assertRaises(ValueError):
                 self.inspect(Path(directory).resolve(), [('source_execution', {'id': 'execution',
                     'working_directory': '/outside/evidence/'})])
@@ -1144,10 +1150,10 @@ class SeedIsolationTests(unittest.TestCase):
                  {'brief': {'root_path': str(harness.LIVE / 'objects/file')}},
                  {'summary': {'path': 'objects/file', 'mode': 'managed'}}]
         for record in cases[:-1]:
-            with self.subTest(record=record), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(record=record), test_directory() as directory:
                 with self.assertRaises(ValueError):
                     self.inspect(Path(directory).resolve(), [('manifest', dict(record, id='manifest'))])
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             counts = self.inspect(Path(directory).resolve(), [('manifest', dict(cases[-1], id='manifest'))])
             self.assertEqual(counts['managed_relative'], 1)
             self.assertEqual(counts['inert_history_path_occurrences'], 0)
@@ -1169,7 +1175,7 @@ class SeedIsolationTests(unittest.TestCase):
                        'contract': {'project_instruction_refs': [{'path': 'AGENTS.md', 'resolved_path': 'docs/AGENTS.md',
                            'link_chain': [{'path': 'AGENTS.md', 'target': 'docs/AGENTS.md', 'sha256': 'hash'}]}]},
                        'instruction_coverage': [{'path': 'AGENTS.md'}]}})]
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             counts = self.inspect(Path(directory).resolve(), records)
             self.assertEqual(counts['managed_relative'], 11)
             self.assertEqual(counts['capture_git_provenance'], 2)
@@ -1178,17 +1184,17 @@ class SeedIsolationTests(unittest.TestCase):
 
     def test_managed_relative_paths_keep_family_traversal_and_nul_refusals(self):
         for value in ['icons/file', 'objects/../file', 'objects//file', 'objects/./file', 'objects/file\0bad', 'objects']:
-            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(value=value), test_directory() as directory:
                 with self.assertRaises(ValueError):
                     self.inspect(Path(directory).resolve(), [('attachment', attachment(value))])
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             with self.assertRaisesRegex(ValueError, 'wrong family'):
                 self.inspect(Path(directory).resolve(), [('attachment', attachment('/owned/source/icons/file'))], '/owned/source')
 
     def test_whole_external_file_urls_are_refused_in_text_history_and_json_dictionary_keys(self):
         for value in ['file:///outside/file', 'FILE:///outside/file', 'FiLe:///outside/file', ' \tfile:///outside/file\n']:
             for table in ['records', 'commands', 'events']:
-                with self.subTest(value=value, table=table), tempfile.TemporaryDirectory() as directory:
+                with self.subTest(value=value, table=table), test_directory() as directory:
                     base = Path(directory).resolve();database = base / 'fixture.sqlite'
                     store_fixture(database, 2, [('ticket', {'id': 'ticket', 'body': value})] if table == 'records' else [])
                     if table != 'records':
@@ -1197,7 +1203,7 @@ class SeedIsolationTests(unittest.TestCase):
                             if table == 'commands': db.execute('INSERT INTO commands VALUES (?,?,?,?)', ('fixture', 'command', 'digest', json.dumps({value: 'text'})))
                             else: db.execute('INSERT INTO events(id,actor,kind,occurred_at,data) VALUES (?,?,?,?,?)', ('event', 'fixture', 'fixture', 'now', json.dumps({'text': value})))
                     with self.assertRaisesRegex(ValueError, 'absolute path outside'): harness.require_local_paths(database, base / 'data')
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             self.inspect(Path(directory).resolve(), [('ticket', {'id': 'ticket', 'body': 'Explain ../ and ../../src; do not open them.', 'stage': 'acknowledged'})])
 
     def test_file_urls_in_every_path_rule_still_refuse(self):
@@ -1214,18 +1220,18 @@ class SeedIsolationTests(unittest.TestCase):
                           ('source_capture', {'files': [{'kind': 'symlink', 'path': 'dir/link', 'target': value}]}),
                           ('source_capture', {'git_path': value})]
                 for kind, record in cases:
-                    with self.subTest(kind=kind, record=record), tempfile.TemporaryDirectory() as directory:
+                    with self.subTest(kind=kind, record=record), test_directory() as directory:
                         with self.assertRaisesRegex(ValueError, 'stored file URL'):
                             self.inspect(Path(directory).resolve(), [(kind, dict(record, id='fixture'))])
 
     def test_whole_local_file_urls_decode_and_keep_slot_containment(self):
         for scheme in ['file', 'FILE', 'FiLe']:
-            with self.subTest(scheme=scheme), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(scheme=scheme), test_directory() as directory:
                 base = Path(directory).resolve();destination = base / 'data'
                 url = (destination / 'objects/caf\u00e9 file').as_uri().replace('file:', scheme + ':', 1)
                 counts = self.inspect(base, [('message', {'id': 'note', 'body': ' \t' + url + '\n'})])
                 self.assertEqual(counts['inert_history_path_occurrences'], 0)
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();destination = base / 'data';destination.mkdir()
             # The inspected copy lives at database.parent, before publication at destination.
             (base / 'alias').symlink_to(base / 'outside')
@@ -1241,7 +1247,7 @@ class SeedIsolationTests(unittest.TestCase):
 
     def test_path_field_file_urls_still_refuse_in_inert_history(self):
         for table in ['commands', 'events']:
-            with self.subTest(table=table), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(table=table), test_directory() as directory:
                 base = Path(directory).resolve();database = base / 'fixture.sqlite';store_fixture(database, 3)
                 payload = json.dumps({'path': 'Error contains FiLe:///outside/file'})
                 with closing(sqlite3.connect(database)) as db, db:
@@ -1268,7 +1274,7 @@ class SeedIsolationTests(unittest.TestCase):
                        {'evidence': '/outside/evidence/'},
                        {'evidence': '/usr/bin/trash --stopOnError printed success'},
                        {'evidence': '/outside/../evidence'}]}})]
-        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve() / 'slots'):
+        with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve() / 'slots'):
             base = Path(directory).resolve();source, _, manifest = self.fixture(base, 3, records)
             with closing(sqlite3.connect(source / 'database.sqlite')) as db, db:
                 db.create_collation('checklist_storage_v2', lambda a, b: (a.encode() > b.encode()) - (a.encode() < b.encode()))
@@ -1296,7 +1302,7 @@ class SeedIsolationTests(unittest.TestCase):
 
     def test_schema_zero_two_and_three_seeds_preserve_database_bytes(self):
         for schema in [0, 2, 3]:
-            with self.subTest(schema=schema), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(schema=schema), test_directory() as directory:
                 value = 'objects/file' if schema == 3 else '/owned/source/objects/file'
                 source, destination, _ = self.fixture(Path(directory).resolve(), schema, [('attachment', attachment(value))])
                 before = harness.sha(source / 'database.sqlite')
@@ -1309,7 +1315,7 @@ class SeedIsolationTests(unittest.TestCase):
                     self.assertEqual(json.loads((destination / 'checklist-store.identity.json').read_text())['schema_revision'], schema)
 
     def test_only_verified_origin_managed_paths_can_name_a_checklist_root(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();live = base / 'Checklist';slots = base / 'Checklist Test Instances'
             destination = slots / 'slot-1/data';origin = slots / 'slot-2/data'
             with patch.object(harness, 'LIVE', live), patch.object(harness, 'DEFAULT_LIVE', live), patch.object(harness, 'BASE', slots):
@@ -1328,7 +1334,7 @@ class SeedIsolationTests(unittest.TestCase):
         # CL-193 persists retained cache directories and cleanup file descriptors.
         # Start uses the same inspection with immutable=False to include the WAL.
         for immutable in [True, False]:
-            with self.subTest(immutable=immutable), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(immutable=immutable), test_directory() as directory:
                 base = Path(directory).resolve();slots = base / 'slots';live = base / 'live'
                 destination = slots / 'slot-1/data';destination.mkdir(parents=True)
                 cache = 'source-build-cache/' + 'a' * 64
@@ -1360,7 +1366,7 @@ class SeedIsolationTests(unittest.TestCase):
                     harness.require_local_paths(database, destination, immutable=immutable)
 
     def test_unproved_outside_managed_descriptor_is_never_inspected(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();outside = base / 'outside/objects/file';outside.parent.mkdir(parents=True)
             outside.write_bytes(b'sentinel')
             database = base / 'fixture.sqlite';store_fixture(database, 2, [('attachment', attachment(outside))])
@@ -1379,7 +1385,7 @@ class SeedIsolationTests(unittest.TestCase):
             self.assertEqual(before[1].st_mtime_ns, after[1].st_mtime_ns)
 
     def test_project_bindings_are_counted_and_checklist_roots_are_refused(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();live = base / 'Checklist';slots = base / 'Checklist Test Instances';project = base / 'project'
             records = [('project', {'id': 'project', 'root_path': str(project)}),
                        ('session', {'id': 'session', 'workspace': str(project)}),
@@ -1399,7 +1405,7 @@ class SeedIsolationTests(unittest.TestCase):
                     harness.require_local_paths(database, slots / 'slot-1/data')
 
     def test_recursive_bindings_refuse_ancestors_and_descendants_of_each_checklist_root(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();live = base / 'live';default = base / 'default';slots = base / 'slots'
             for root in [live, default, slots]: root.mkdir()
             records = [lambda value: ('project', {'id': 'project', 'root_path': value}),
@@ -1421,7 +1427,7 @@ class SeedIsolationTests(unittest.TestCase):
                                     harness.require_local_paths(database, slots / 'slot-1/data')
 
     def test_project_relative_additions_refuse_aliases_to_ancestors_and_descendants(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();project = base / 'project';project.mkdir()
             live = base / 'store-parent/Checklist';live.mkdir(parents=True)
             (project / 'alias').symlink_to(live.parent)
@@ -1436,7 +1442,7 @@ class SeedIsolationTests(unittest.TestCase):
                                 harness.require_local_paths(database, base / 'slots/slot-1/data')
 
     def test_unicode_filesystem_aliases_refuse_roots_and_managed_values(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();parent = base / 'Caf\u00e9';live = parent / 'Checklist';live.mkdir(parents=True)
             alias_parent = base / unicodedata.normalize('NFD', parent.name)
             self.assertNotEqual(str(alias_parent).encode(), str(parent).encode())
@@ -1461,7 +1467,7 @@ class SeedIsolationTests(unittest.TestCase):
                     harness.require_local_paths(database, slots / 'slot-1/data', source_root=live)
 
     def test_symlink_and_system_directory_aliases_preserve_managed_origin_boundary(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();origin = base / 'origin';origin.mkdir();slots = base / 'slots'
             foreign = slots / 'slot-2/data';(foreign / 'objects').mkdir(parents=True)
             (base / 'origin-alias').symlink_to(origin)
@@ -1482,7 +1488,7 @@ class SeedIsolationTests(unittest.TestCase):
                             harness.require_local_paths(database, slots / 'slot-1/data', source_root=base / 'unrelated')
 
     def test_missing_case_and_nfd_binding_paths_use_cl169_overlap(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();slots = base / 'slots'
             for number, (live, alias) in enumerate([(base / 'Checklist', base / 'checklist'),
                     (base / 'Missing-Caf\u00e9', base / unicodedata.normalize('NFD', 'Missing-Caf\u00e9')),
@@ -1495,7 +1501,7 @@ class SeedIsolationTests(unittest.TestCase):
                     overlap.assert_any_call(alias)
 
     def test_binding_refusals_call_the_shared_overlap_helpers(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();live = base / 'Checklist';live.mkdir();slots = base / 'slots'
             values = [('project', {'id': 'project', 'root_path': str(base)}),
                       ('attachment', dict(attachment(live / 'objects/missing'), mode='external_reference')),
@@ -1511,7 +1517,7 @@ class SeedIsolationTests(unittest.TestCase):
                         self.assertTrue(paths_overlap.called)
 
     def test_normal_outside_roots_and_regular_file_bindings_remain_allowed(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();live = base / 'Checklist';live.mkdir();slots = base / 'slots'
             project = base / 'project';project.mkdir();leaf = base / 'README.md';leaf.write_text('outside')
             records = [('project', {'id': 'project', 'root_path': str(project)}),
@@ -1524,14 +1530,14 @@ class SeedIsolationTests(unittest.TestCase):
                 self.assertEqual(harness.require_local_paths(database, slots / 'slot-1/data')['external_project_path_occurrences'], 1)
 
     def test_path_comparison_failure_refuses_the_seed(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve()
             with patch.object(harness, 'LIVE', base / 'Checklist'), patch.object(harness, 'checklist_root_overlap', side_effect=OSError('unavailable')):
                 with self.assertRaisesRegex(ValueError, 'filesystem ancestry cannot be safely compared'):
                     self.inspect(base, [('project', {'id': 'project', 'root_path': str(base / 'outside')})])
 
     def test_inert_command_and_event_paths_are_not_file_authority(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();database = base / 'fixture.sqlite';store_fixture(database, 2)
             payload = {'path': str(harness.LIVE / 'objects/file'), 'workspace': '/project',
                        'files': [{'path': 'src/file'}], 'root_path': '../../old'}
@@ -1546,7 +1552,7 @@ class SeedIsolationTests(unittest.TestCase):
 
     def test_local_stored_path_cannot_follow_a_symlink_in_pending_or_published_data(self):
         for relative in [False, True, 'origin', 'destination-alias']:
-            with tempfile.TemporaryDirectory() as directory:
+            with test_directory() as directory:
                 base = Path(directory).resolve();destination = base / 'data';outside = base / 'outside';outside.mkdir()
                 alias = base / 'destination-alias';alias.symlink_to(destination)
                 for name in ['.seed-data', 'data']:
@@ -1557,7 +1563,7 @@ class SeedIsolationTests(unittest.TestCase):
                         harness.require_local_paths(database, destination, source_root='/origin')
 
     def test_source_additional_paths_are_project_relative_and_refuse_checklist_aliases(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();project = base / 'project';project.mkdir();live = base / 'live';live.mkdir()
             (project / 'alias').symlink_to(live)
             for number, value in enumerate(['../live/file', '/outside/file', 'alias/file']):
@@ -1571,20 +1577,20 @@ class SeedIsolationTests(unittest.TestCase):
 
     def test_captured_links_cannot_escape_the_captured_tree(self):
         for value in ['../../outside', '/outside', 'file\0bad']:
-            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(value=value), test_directory() as directory:
                 with self.assertRaises(ValueError):
                     self.inspect(Path(directory).resolve(), [('source_capture', {'id': 'capture', 'files': [{'kind': 'symlink', 'path': 'dir/link', 'target': value}]})])
 
     def test_unknown_external_references_are_still_refused(self):
         for kind, record in [('project', {'id': 'project', 'icon': {'path': '/outside/icons/icon.png'}}),
                              ('source_capture', {'id': 'capture', 'root': '/outside/source-captures/one/source'})]:
-            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(kind=kind), test_directory() as directory:
                 with self.assertRaisesRegex(ValueError, 'stored absolute path outside'):
                     self.inspect(Path(directory).resolve(), [(kind, record)])
 
     def test_slot_copy_inspection_includes_committed_wal_for_allowed_and_refused_paths(self):
         for bad in [False, True]:
-            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
+            with self.subTest(bad=bad), test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
                 source = harness.checked(2);source['data'].mkdir(parents=True)
                 database = source['data'] / 'checklist.sqlite';store_fixture(database, 2)
                 harness.save(source, {'slot': 2, 'build_id': 'fixture'})
@@ -1604,7 +1610,7 @@ class SeedIsolationTests(unittest.TestCase):
                 finally: connection.close()
 
     def test_refused_create_publishes_neither_data_nor_app_and_cannot_start(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
+        with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
             base = harness.BASE;source, _, _ = self.fixture(base, 2, [('attachment', attachment('../../external/objects/file'))])
             p = harness.checked(1)
             manifest = {'build_id': 'fixture', 'source_fingerprint': 'b' * 64}
@@ -1619,8 +1625,25 @@ class SeedIsolationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'managed.path contract'): harness.start(SimpleNamespace(gui=False, slot=1), p)
                 run.assert_not_called()
 
+    def test_create_with_tmpdir_in_another_marked_scratch_session(self):
+        with test_directory() as directory, patch.dict(os.environ,
+                {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}):
+            scratch = Path(directory) / 'other-session/scratchpad'
+            scratch.mkdir(parents=True)
+            harness.mark_qualification(scratch, 'b' * 64, 'fake caller scratch',
+                                       session_id='other-session')
+            with patch.dict(os.environ, TMPDIR=str(scratch)), \
+                 patch.object(tempfile, 'tempdir', str(scratch)):
+                # Runs create and inspects its real marker, without borrowing
+                # this unrelated scratch session for the slot fixture.
+                self.test_refused_create_publishes_neither_data_nor_app_and_cannot_start()
+            child = scratch / 'foreign-slot'; child.mkdir()
+            with self.assertRaisesRegex(ValueError, 'another scratch session'):
+                harness.mark_qualification(child, 'b' * 64, 'foreign fixture',
+                                           session_id='slot-fixture')
+
     def test_refused_seed_still_exposes_the_promotion_gate(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
+        with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
             selected = {'slot': 1, 'build_id': 'build', 'source_fingerprint': 'fingerprint', 'stage_path': '/synthetic/stage',
                         'seed': {'kind': 'empty'}, 'checks': {'build_id': 'build', 'source_fingerprint': 'fingerprint', 'passed': True}}
             other = harness.checked(2);other['folder'].mkdir()
@@ -1636,7 +1659,7 @@ class SeedIsolationTests(unittest.TestCase):
             self.assertIn('live_snapshot_check_same_build: FAIL', output.getvalue())
 
     def test_schema_three_copy_accepts_inert_receipts_and_local_capture_lookup(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve()
             source, destination, manifest = self.fixture(base, 3)
             with closing(sqlite3.connect(source / 'database.sqlite')) as db, db:
@@ -1697,7 +1720,7 @@ class SeedIsolationTests(unittest.TestCase):
 
     def test_live_backup_summary_seed_and_restart_keep_only_recorded_source_paths(self):
         for key in ['storage-last-verified-backup', 'storage-last-verified-rehearsal']:
-            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(key=key), test_directory() as directory:
                 base = Path(directory).resolve()
                 source, destination, live, data, summary = self.live_summary_fixture(base, key)
                 with patch.object(harness, 'LIVE', live), patch.object(harness, 'DEFAULT_LIVE', live), patch.object(harness, 'BASE', data.parent.parent):
@@ -1749,7 +1772,7 @@ class SeedIsolationTests(unittest.TestCase):
         for key, field, case in itertools.product(
                 ['storage-last-verified-backup', 'storage-last-verified-rehearsal'], ['path', 'source_root'],
                 ['outside', 'sibling', 'other_slot', 'source_object', 'relative', 'traversing', 'dot', 'empty_component', 'nul', 'url']):
-            with self.subTest(key=key, field=field, case=case), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(key=key, field=field, case=case), test_directory() as directory:
                 base = Path(directory).resolve();live = base / 'Checklist'
                 value = {'outside': str(base / 'outside/backup'), 'sibling': str(base / 'Checklist-old/backups/file'),
                          'other_slot': str(base / 'slots/slot-3/data'), 'source_object': str(live / 'objects/file'),
@@ -1766,7 +1789,7 @@ class SeedIsolationTests(unittest.TestCase):
 
     def test_live_summary_exception_requires_published_origin_and_stays_top_level(self):
         for case in ['unpublished', 'different_origin', 'unknown_metadata', 'other_field', 'nested', 'record']:
-            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(case=case), test_directory() as directory:
                 base = Path(directory).resolve();live = base / 'Checklist'
                 key = 'unknown' if case == 'unknown_metadata' else 'storage-last-verified-backup'
                 overrides = {'database_path': str(live / 'backups/file')} if case == 'other_field' else {}
@@ -1784,7 +1807,7 @@ class SeedIsolationTests(unittest.TestCase):
 
     def test_live_summary_source_paths_are_display_only_without_filesystem_access(self):
         for immutable in [True, False]:
-            with self.subTest(immutable=immutable), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(immutable=immutable), test_directory() as directory:
                 base = Path(directory).resolve();live = base / 'Checklist'
                 key = 'storage-last-verified-backup'
                 summary = self.storage_copy_summary(key, live / 'backups/file', live)
@@ -1802,7 +1825,7 @@ class SeedIsolationTests(unittest.TestCase):
     def test_storage_summary_inside_slot_is_inert_without_filesystem_access(self):
         for key, immutable, source in itertools.product(
                 ['storage-last-verified-backup', 'storage-last-verified-rehearsal'], [True, False], ['data', 'source']):
-            with self.subTest(key=key, immutable=immutable, source=source), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(key=key, immutable=immutable, source=source), test_directory() as directory:
                 base = Path(directory).resolve()
                 summary = base / 'slot-4/backup'
                 source_root = base / 'slot-4' / source
@@ -1823,7 +1846,7 @@ class SeedIsolationTests(unittest.TestCase):
         for key, immutable, field, case in itertools.product(
                 ['storage-last-verified-backup', 'storage-last-verified-rehearsal'], [True, False], ['path', 'source_root'],
                 ['outside', 'sibling', 'live', 'other_slot', 'relative', 'traversing', 'dot', 'empty_component', 'nul', 'url']):
-            with self.subTest(key=key, immutable=immutable, field=field, case=case), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(key=key, immutable=immutable, field=field, case=case), test_directory() as directory:
                 base = Path(directory).resolve()
                 value = {'outside': str(base / 'outside/backup'), 'sibling': str(base / 'slot-40/backup'),
                          'live': str(harness.LIVE), 'other_slot': str(base / 'slot-3/data'),
@@ -1841,7 +1864,7 @@ class SeedIsolationTests(unittest.TestCase):
 
     def test_storage_summary_exception_does_not_relax_other_strict_fields(self):
         for case in ['unknown_metadata', 'other_field', 'nested_path', 'record_path']:
-            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(case=case), test_directory() as directory:
                 base = Path(directory).resolve();value = str(base / 'slot-4/backup')
                 key = 'unknown' if case == 'unknown_metadata' else 'storage-last-verified-backup'
                 summary = {'path': value}
@@ -1856,7 +1879,7 @@ class SeedIsolationTests(unittest.TestCase):
 
     def test_storage_summary_source_root_exception_stays_top_level_and_metadata_only(self):
         for case in ['unknown_metadata', 'nested', 'record']:
-            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(case=case), test_directory() as directory:
                 base = Path(directory).resolve()
                 key = 'unknown' if case == 'unknown_metadata' else 'storage-last-verified-backup'
                 summary = {'source_root': str(harness.LIVE)}
@@ -1871,7 +1894,7 @@ class SeedIsolationTests(unittest.TestCase):
 
     def test_start_and_check_accept_inside_slot_storage_summary(self):
         for key in ['storage-last-verified-backup', 'storage-last-verified-rehearsal']:
-            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(key=key), test_directory() as directory:
                 base = Path(directory).resolve()
                 self.storage_summary_fixture(base, key, self.storage_copy_summary(key, base / 'slot-4/backup', base / 'slot-4/data'))
                 with patch.object(harness, 'BASE', base):
@@ -1901,7 +1924,7 @@ class SeedIsolationTests(unittest.TestCase):
             ('unknown', {'path': str(harness.LIVE / 'objects/file')}),
             ('preupgrade_snapshot', {'path': 'file:///old/backups/snapshot'}),
             ('backup-generation:old', {'objects': [{'path': 'FILE:///old/objects/file'}]})]):
-            with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(key=key, value=value), test_directory() as directory:
                 base = Path(directory).resolve();database = base / 'fixture.sqlite';store_fixture(database, 3)
                 with closing(sqlite3.connect(database)) as db, db:
                     db.create_collation('checklist_storage_v2', lambda a, b: (a.encode() > b.encode()) - (a.encode() < b.encode()))
@@ -1909,7 +1932,7 @@ class SeedIsolationTests(unittest.TestCase):
                 with self.assertRaises(ValueError): harness.require_local_paths(database, base / 'data', source_root='/owned/source')
 
     def test_old_staged_binary_cannot_start_a_relaxed_seed(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();p = harness.paths(1)
             metadata = {'seed': {'kind': 'backup', 'source_root': str(harness.LIVE)}, 'mode': 'stopped', 'stage_path': str(base)}
             with patch.object(harness, 'load', return_value=metadata), patch.object(harness, 'bundle_check', return_value={'inputs': []}), patch.object(harness, 'run') as run:
@@ -1918,7 +1941,7 @@ class SeedIsolationTests(unittest.TestCase):
                 run.assert_not_called()
 
     def test_seed_requires_hash_bound_schema_three_migration_in_stage(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();migration = base / 'source/Sources/ChecklistCore/SchemaMigrations.swift'
             migration.parent.mkdir(parents=True);migration.write_text('static var managedPathsLedger = "schema3"')
             manifest = {'inputs': [{'path': 'Sources/ChecklistCore/ManagedPaths.swift', 'sha256': 'resolver'},
@@ -1937,7 +1960,7 @@ class LiveRootTests(unittest.TestCase):
         identity.start();self.addCleanup(identity.stop)
 
     def test_checked_refuses_another_slots_aliased_root(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             fixture = Path(directory).resolve()
             with patch.object(harness, 'BASE', fixture / 'instances'), patch.object(harness, 'LIVE', fixture / 'live'):
                 first, second = harness.paths(1), harness.paths(2)
@@ -1947,7 +1970,7 @@ class LiveRootTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'Checklist root slot-1'): harness.checked(2)
 
     def test_checklist_root_overlap_labels_and_exclusions(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             fixture = Path(directory).resolve()
             with patch.object(harness, 'BASE', fixture / 'Café/Test Instances'), patch.object(harness, 'LIVE', fixture / 'Live'):
                 harness.LIVE.mkdir()
@@ -1968,7 +1991,7 @@ class LiveRootTests(unittest.TestCase):
     def test_slot_commands_refuse_folded_live_aliases_before_actions(self):
         commands = [['create', '--replace'], ['create', '--seed', 'slot:2'], ['start'], ['stop'],
                     ['destroy'], ['check'], ['promote'], ['promote', '--dry-run'], ['status']]
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve() / 'Café/Library/Application Support/Checklist Test Instances'
             data = base / 'slot-1/data'; data.mkdir(parents=True)
             variants = [Path(str(data).lower()), Path(unicodedata.normalize('NFD', str(data))),
@@ -1989,7 +2012,7 @@ class LiveRootTests(unittest.TestCase):
 
     def test_shared_path_overlap_vectors(self):
         table = json.loads((harness.REPO / 'Tests/Fixtures/path-overlap-vectors.json').read_text())
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             fixture = Path(directory)
             for path in table['directories']: (fixture / path).mkdir(parents=True, exist_ok=True)
             for link in table['symlinks']: (fixture / link['path']).symlink_to(link['target'])
@@ -2011,7 +2034,7 @@ class LiveRootTests(unittest.TestCase):
                 folder / 'data/../data', alias, alias / 'nested']
 
     def test_checked_reviewer_probe_refuses_every_canonical_overlap(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve() / 'Library/Application Support/Checklist Test Instances'
             for number in range(1, 5):
                 (base / f'slot-{number}/data').mkdir(parents=True)
@@ -2024,7 +2047,7 @@ class LiveRootTests(unittest.TestCase):
     def test_slot_subcommands_refuse_overlap_before_any_action(self):
         commands = [['create', '--replace'], ['create', '--seed', 'slot:2'], ['start'], ['stop'],
                     ['destroy'], ['check'], ['promote'], ['promote', '--dry-run'], ['status']]
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve() / 'Library/Application Support/Checklist Test Instances'
             data = base / 'slot-1/data'; data.mkdir(parents=True)
             (data / 'live-sentinel').write_bytes(b'never move or modify')
@@ -2048,7 +2071,7 @@ class LiveRootTests(unittest.TestCase):
         commands = [['create', '--slot', '1', '--replace', '--seed', 'slot:2'],
                     ['stop', '--all'], ['destroy', '--all'], ['promote', '--slot', '1'],
                     ['promote', '--slot', '1', '--dry-run']]
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve() / 'Library/Application Support/Checklist Test Instances'
             (base / 'slot-2/data').mkdir(parents=True)
             for live in self.overlaps(base, 2):
@@ -2067,7 +2090,7 @@ class LiveRootTests(unittest.TestCase):
                         self.assertFalse((base / 'slot-1').exists())
 
     def test_component_siblings_remain_admitted(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             support = Path(directory).resolve() / 'Library/Application Support'
             base = support / 'Checklist Test Instances'
             for live in [support / 'Checklist', support / 'Checklist Test Instances2', base / 'slot-10/data']:
@@ -2083,7 +2106,7 @@ class LiveRootTests(unittest.TestCase):
         self.assertEqual(harness.paths(1)['data'], harness.BASE / 'slot-1/data')
 
     def test_parent_aliases_match_store_bootstrap_but_final_entry_is_not_followed(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();real = base / 'real';real.mkdir()
             alias = base / 'alias';alias.symlink_to(real)
             self.assertEqual(harness.live_root({'CHECKLIST_DATA_ROOT': str(alias / 'live')}), real / 'live')
@@ -2091,7 +2114,7 @@ class LiveRootTests(unittest.TestCase):
             self.assertEqual(harness.live_root({'CHECKLIST_DATA_ROOT': str(alias / 'live')}), real / 'live')
 
     def test_custom_live_root_controls_lookup_restriction_and_provenance(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             custom = Path(directory).resolve() / 'configured-live'
             snapshot = custom / 'backups/snapshot-fixture';snapshot.mkdir(parents=True)
             (snapshot / 'manifest.json').write_text('{}')
@@ -2115,7 +2138,7 @@ class SlotStartupTests(unittest.TestCase):
 
     @contextmanager
     def fixture(self, responses, registered=False, environment=None):
-        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+        with test_directory() as directory, ExitStack() as stack:
             base = Path(directory).resolve();stack.enter_context(patch.object(harness, 'BASE', base / 'slots'))
             p = harness.checked(4);p['data'].mkdir(parents=True)
             metadata = {'slot': 4, 'stage_path': str(base), 'build_id': 'fixture', 'source_fingerprint': 'fingerprint',
@@ -2322,7 +2345,7 @@ class InstalledVerificationTests(unittest.TestCase):
             self.assertEqual(runner.call_count, 1)
 
     def test_guidance_names_only_newest_completed_snapshot_created_since_install(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             data = Path(directory);snapshots = []
             for name in ['old', 'middle', 'latest', 'incomplete']:
                 snapshot = data / 'backups' / ('snapshot-' + name);snapshot.mkdir(parents=True)
@@ -2356,7 +2379,7 @@ class InstalledVerificationTests(unittest.TestCase):
         start = script.index('# Installed verification is mandatory')
         end = script.index('\nif [ "$HAD_PREVIOUS" = 1 ]; then echo "Previous bundle retained', start)
         block = script[start:end]
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();binary = base / 'bin';binary.mkdir()
             stub = binary / 'python3'
             stub.write_text('#!' + sys.executable + '\n' + """import json,os,sys
@@ -2382,7 +2405,7 @@ raise SystemExit(int(os.environ['VERIFY_EXIT']))
     def test_verifier_invocation_failure_is_fatal_in_both_required_modes(self):
         script = (harness.REPO / 'script/build_and_run.sh').read_text()
         block = script[script.index('# Installed verification is mandatory'):]
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             base = Path(directory).resolve();previous = base / 'previous.app';previous.mkdir()
             for mode in ['--verify', '--install-stage']:
                 with self.subTest(mode=mode):
@@ -2397,7 +2420,7 @@ raise SystemExit(int(os.environ['VERIFY_EXIT']))
 
     def test_promotion_never_reports_success_after_installed_verification_failure(self):
         selected = {'build_id': 'build', 'source_fingerprint': 'fingerprint', 'stage_path': '/synthetic/stage', 'seed': {'kind': 'empty'}}
-        with tempfile.TemporaryDirectory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()), \
+        with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()), \
              patch.object(harness, 'load', return_value=selected), patch.object(harness, 'bundle_check'), \
              patch.object(harness, 'promotion_gates', return_value={'selected_build_check': True, 'live_snapshot_check_same_build': True}), \
              patch.object(harness.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'stub installed verification')), \

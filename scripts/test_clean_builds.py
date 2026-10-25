@@ -315,6 +315,55 @@ class CleanupTests(unittest.TestCase):
             self.run_clean(self.cleaner.evidence,True)
         self.assertEqual(self.moves,[])
 
+    def test_evidence_batch_uses_two_snapshots_and_rechecks_only_selected_paths(self):
+        handins = sorted(self.handin('round/package-' + str(n)) for n in range(12))
+        kept = self.evidence / 'unscoped'; kept.mkdir()
+        (kept / 'log').write_text('keep')
+        with patch.object(self.cleaner, 'process_reader', return_value=[]) as reader, \
+             patch.object(clean, 'inventory', wraps=clean.inventory) as inventories, \
+             patch.object(self.cleaner, 'batch_mover', wraps=self.move_batch) as mover:
+            reports = self.run_clean(self.cleaner.evidence, True)
+        self.assertEqual(reader.call_count, 2)
+        mover.assert_called_once_with(handins)
+        self.assertEqual([call.args[0] for call in inventories.call_args_list],
+                         [handins[0].parent, kept] + handins)
+        self.assertEqual(sum(r['action'] == 'trashed' for r in reports), 12)
+        self.assertTrue(kept.exists())
+
+    def test_evidence_batch_new_use_keeps_only_the_used_handin(self):
+        used = self.handin('round/used'); idle = self.handin('round/idle')
+        with patch.object(self.cleaner, 'process_reader', side_effect=[[], [used / 'report']]) as reader:
+            reports = self.run_clean(self.cleaner.evidence, True)
+        self.assertEqual(reader.call_count, 2)
+        self.assertTrue(used.exists()); self.assertFalse(idle.exists())
+        self.assertIn('uses this path', next(r for r in reports if r['path'] == str(used))['reason'])
+
+    def test_deep_store_copy_is_sized_once_and_reported_as_one_retained_container(self):
+        store = self.evidence / 'round/copy'
+        deep = store / 'managed/source-captures' / '/'.join('level-' + str(n) for n in range(40))
+        deep.mkdir(parents=True)
+        (store / 'checklist.sqlite').write_bytes(b'store')
+        # Internal file names and manifests are not cleanup hand-ins.
+        (deep / 'files.json').write_text('[{"ticket":"CL-1"}]')
+        (deep / 'CL-1').mkdir(); (deep / 'CL-1/log').write_bytes(b'retain')
+        handin = self.handin('round/handin')
+        expected = clean.size_of(clean.inventory(store))
+        with patch.object(clean, 'inventory', wraps=clean.inventory) as inventories:
+            reports = self.run_clean(self.cleaner.evidence, True)
+        self.assertEqual([c.args[0] for c in inventories.call_args_list], [store.parent, handin])
+        retained = [r for r in reports if r['action'] == 'kept']
+        self.assertEqual({r['path'] for r in retained}, {str(store.parent), str(store)})
+        report = next(r for r in retained if r['path'] == str(store))
+        self.assertEqual(report['bytes'], expected)
+        self.assertIn('store/source tree retained', report['reason'])
+        self.assertTrue((deep / 'CL-1/log').exists())
+
+    def test_kept_evidence_needs_no_process_observation(self):
+        self.handin('CL-2')
+        with patch.object(self.cleaner, 'process_reader', side_effect=AssertionError('retained item scanned')):
+            self.run_clean(self.cleaner.evidence, True)
+        self.assertEqual(self.moves, [])
+
     def test_ticket_reopened_between_plan_and_move_retains_evidence(self):
         self.handin()
         with patch.object(self.cleaner,'status_reader',side_effect=[{'CL-1':'done'},{'CL-1':'active'}]):

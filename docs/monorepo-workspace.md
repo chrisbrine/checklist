@@ -211,7 +211,17 @@ observations. Preview caches one process snapshot for the pass; build apply
 refreshes it once before the batch, then rechecks inventories and installation
 identity under the build lease. Process paths are deduplicated before resolution
 and indexed by ancestors once, rather than resolved/scanned for every item.
-Evidence apply still refreshes ticket statuses and process use before each move.
+Evidence apply takes one initial process snapshot for eligible items and one
+fresh snapshot before its Trash batch, rechecking only selected trees, markers
+and current ticket statuses. Retained containers and policy refusals need no
+process observation. Each top-level evidence tree is inventoried once for
+inspection; container sizes are summed bottom-up. Hand-in discovery stops at
+store roots (directories containing `checklist.sqlite` or `database.sqlite`),
+`managed`, `source-captures`, `source`, `src` and `.build` trees, and unscoped
+containers with no ticket hand-ins. Those containers stay and report their full
+logical size and retention reason; their contents are never independent cleanup
+candidates. Scoped hand-ins still inspect every descendant for ownership and
+protection, and selected trees are inventoried again before moving.
 Live data, installed/rollback apps, in-use paths, links outside the SwiftPM
 exception above and unknown ownership are retained. Process inspection failure
 refuses retirement. Every item reports its path, logical byte count and reason; successful moves report a

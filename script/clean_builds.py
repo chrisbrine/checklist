@@ -137,22 +137,22 @@ class Cleaner:
 
     def processes(self):
         if self.process_snapshot is not None: return self.process_snapshot
-        if self.apply: return process_ancestors(self.process_reader())
         if self.preview_process_snapshot is None:
             self.preview_process_snapshot = process_ancestors(self.process_reader())
         return self.preview_process_snapshot
 
     def item(self, path, kind, reason=None, eligible=None, eligible_reason="eligible for Trash",
-             internal_links=False, before_move=None):
+             internal_links=False, before_move=None, entries=None):
         """Recheck identity, policy and use before each move; no cached apply plan."""
         try:
             safe(path)
-            before = inventory(path)
-            protected = self.protected()
-            processes = self.processes()
-            why = reason or protected_reason(path, before, protected, processes, internal_links)
+            before = inventory(path) if entries is None else entries
+            # Retained containers and policy refusals need no process scan.
+            why = reason or protected_reason(path, before, self.protected(), frozenset(), internal_links)
             if not why and eligible:
                 why = eligible()
+            if not why:
+                why = protected_reason(path, before, self.protected(), self.processes(), internal_links)
             report = {'path': str(path), 'kind': kind, 'bytes': size_of(before),
                       'action': 'kept' if why else 'eligible',
                       'reason': why or eligible_reason}
@@ -177,7 +177,7 @@ class Cleaner:
             print(json.dumps({'path': str(path), 'kind': kind, 'action': 'kept_error', 'bytes': None, 'reason': str(error)}))
 
     def flush_builds(self):
-        """One fresh process observation for the whole batch, under the build lease."""
+        """One fresh process observation for the batch; builds also hold their lease."""
         try:
             processes = process_ancestors(self.process_reader())
         except (OSError, ValueError, subprocess.SubprocessError) as error:
@@ -289,32 +289,71 @@ class Cleaner:
         finally:
             self.pending = None
             self.process_snapshot = None
+            self.preview_process_snapshot = None
             self.keep = old_keep
 
     def evidence(self):
         root = safe(self.repo / '.local/evidence')
         if not root.exists(): return
-        def visit(folder):
-            if folder.is_symlink():
-                self.item(folder, 'evidence', reason='symbolic link retained')
-                return
-            # Untagged round containers are not presumed to own every log. Walk
-            # their ticket hand-ins independently and retain the container.
-            if TICKET.search(folder.name) or (folder / 'cleanup.json').exists() or (folder / 'files.json').exists():
-                def eligible():
-                    keys = evidence_keys(folder)
-                    values = self.status_reader(keys)
-                    unresolved = sorted(k for k in keys if values.get(k) != 'done')
-                    return 'open or unknown ticket status: ' + ', '.join(unresolved) if unresolved else None
-                self.item(folder, 'evidence', eligible=eligible,
-                          eligible_reason='all owning tickets are Done')
-            else:
-                self.item(folder, 'evidence_container', reason='unscoped container retained; inspect ticket children')
-                for child in sorted(folder.iterdir()):
-                    if child.is_dir() and not child.is_symlink(): visit(child)
-        for folder in sorted(root.iterdir()):
-            if folder.is_dir() or folder.is_symlink(): visit(folder)
-            else: self.item(folder, 'evidence', reason='unscoped evidence retained')
+        # Inventory each top-level tree once. Aggregate container sizes bottom-up
+        # instead of inventorying the full subtree again at every ancestor.
+        self.pending = [] if self.apply else None
+        self.preview_process_snapshot = None
+        try:
+            for folder in sorted(root.iterdir()):
+                try:
+                    entries = inventory(folder)
+                    children = {}
+                    sizes = {}
+                    scoped = set()
+                    opaque = set()
+                    for path, metadata in entries.items():
+                        children.setdefault(path.parent, []).append(path)
+                        sizes[path] = 0 if stat.S_ISDIR(metadata[2]) else metadata[3]
+                    for path in reversed(entries):
+                        names = {p.name for p in children.get(path, [])}
+                        if path.name in {'managed', 'source-captures', 'source', 'src', '.build'} or names & {'checklist.sqlite', 'database.sqlite'}:
+                            opaque.add(path)
+                        owns = bool(TICKET.search(path.name) or names & {'cleanup.json', 'files.json'})
+                        if stat.S_ISDIR(entries[path][2]) and path not in opaque and (owns or any(p in scoped for p in children.get(path, []))):
+                            scoped.add(path)
+                        if path != folder: sizes[path.parent] += sizes[path]
+                    def subtree(path):
+                        yield path
+                        for child in children.get(path, []):
+                            yield from subtree(child)
+                    def visit(path):
+                        names = {p.name for p in children.get(path, [])}
+                        if stat.S_ISLNK(entries[path][2]):
+                            self.item(path, 'evidence', reason='symbolic link retained', entries={path: entries[path]})
+                        elif stat.S_ISDIR(entries[path][2]) and path not in opaque and (TICKET.search(path.name) or names & {'cleanup.json', 'files.json'}):
+                            before = {p: entries[p] for p in subtree(path)}
+                            def eligible(path=path, before=before):
+                                keys = evidence_keys(path, before)
+                                values = self.status_reader(keys)
+                                unresolved = sorted(k for k in keys if values.get(k) != 'done')
+                                return 'open or unknown ticket status: ' + ', '.join(unresolved) if unresolved else None
+                            self.item(path, 'evidence', eligible=eligible, entries=before,
+                                      eligible_reason='all owning tickets are Done')
+                        else:
+                            directory = stat.S_ISDIR(entries[path][2])
+                            reason = ('store/source tree retained; no hand-in discovery' if path in opaque else
+                                      'unscoped container retained; inspect ticket children' if path in scoped else
+                                      'unscoped container retained; no ticket hand-ins' if directory else
+                                      'unscoped evidence retained')
+                            print(json.dumps({'path': str(path), 'kind': 'evidence_container' if directory else 'evidence',
+                                              'bytes': sizes[path], 'action': 'kept', 'reason': reason}, sort_keys=True))
+                            if path in scoped:
+                                for child in children.get(path, []):
+                                    if stat.S_ISDIR(entries[child][2]) or stat.S_ISLNK(entries[child][2]): visit(child)
+                    visit(folder)
+                except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+                    self.failed = True
+                    print(json.dumps({'path': str(folder), 'kind': 'evidence', 'action': 'kept_error', 'bytes': None, 'reason': str(error)}))
+            if self.apply and self.pending: self.flush_builds()
+        finally:
+            self.pending = None
+            self.preview_process_snapshot = None
 
     def test_slots(self):
         for number in range(1, 5):
@@ -350,9 +389,9 @@ class Cleaner:
                 finally: self.mover = original
 
 
-def evidence_keys(folder):
+def evidence_keys(folder, entries=None):
     keys = set()
-    for path, entry in inventory(folder).items():
+    for path, entry in (inventory(folder) if entries is None else entries).items():
         keys.update(TICKET.findall(path.name))
         if path.name == 'files.json':
             records = read_json(path)
