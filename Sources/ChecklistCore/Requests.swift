@@ -7,14 +7,17 @@ extension CommandRouter {
         if method == "human_request_create" {
             try worker(c)
             var t = try task(db,p,pid)
-            var r: JSON = ["id":uuid(),"project_id":pid,"task_id":t["id"]!,"title":"Needs your input","questions":[],"file_requests":[],"blocking":true,"state":"pending","requester":c.principal,"requester_session_id":c.sessionID ?? "human","requester_authorization_generation":try callerSessionGeneration(db,c,project:pid),"revision":1,"form_revision":1,"created_at":now(),"responses":[]]
+            var r: JSON = ["id":uuid(),"project_id":pid,"task_id":(try StoredRecord(t, family: "Requests").requiredValue("id")),"title":"Needs your input",
+                "questions":[],"file_requests":[],"blocking":true,"state":"pending","requester":c.principal,"requester_session_id":c.sessionID ?? "human",
+                "requester_authorization_generation":try callerSessionGeneration(db,c,project:pid),"revision":1,"form_revision":1,"created_at":now(),"responses":[]]
             try applyRequestForm(db,request:&r,params:p)
             try validateCoveredAnswers(db,request:&r,params:p)
             try ensureSingleBlockingRequest(db,request:r)
             try bindHumanGate(db,request:&r,task:&t,params:p)
             r["form_identity"] = try requestFormIdentity(r)
             try save(db,r,type:"request")
-            try event(db,caller:c,project:pid,entity:t["id"] as? String,kind:"human_request_created",data:["request_id":r["id"]!,"form_revision":1])
+            try event(db,caller:c,project:pid,entity:t["id"] as? String,kind:"human_request_created",data:["request_id":(try StoredRecord(r,
+                family: "Requests").requiredValue("id")),"form_revision":1])
             return r
         }
         var r = try scoped(db,try text(p,"request_id"),pid,type:"request")
@@ -25,7 +28,8 @@ extension CommandRouter {
             // A personal inbox preference, with no due time, task transition or scheduled pickup.
             r["owner_snoozed"] = bool(p,"snoozed",default:true)
             r = revised(r); try save(db,r,type:"request")
-            try event(db,caller:c,project:pid,entity:r["task_id"] as? String,kind:"human_request_visibility_changed",data:["request_id":r["id"]!,"snoozed":r["owner_snoozed"]!,"origin":c.isOwner ? "human_ui" : "agent"])
+            try event(db,caller:c,project:pid,entity:r["task_id"] as? String,kind:"human_request_visibility_changed",data:["request_id":(try StoredRecord(r,
+                family: "Requests").requiredValue("id")),"snoozed":(try StoredRecord(r, family: "Requests").requiredValue("owner_snoozed")),"origin":c.isOwner ? "human_ui" : "agent"])
             return r
         }
         if method == "human_request_cancel" || method == "human_request_revise" {
@@ -34,7 +38,7 @@ extension CommandRouter {
                 try cancelHumanGate(db,request:r)
                 r["state"] = "canceled"; r["cancellation_reason"] = try text(p,"reason",max:8000,required:false)
                 r = revised(r); try save(db,r,type:"request")
-                try event(db,caller:c,project:pid,entity:r["task_id"] as? String,kind:"human_request_canceled",data:["request_id":r["id"]!])
+                try event(db,caller:c,project:pid,entity:r["task_id"] as? String,kind:"human_request_canceled",data:["request_id":(try StoredRecord(r, family: "Requests").requiredValue("id"))])
                 return r
             }
             let patch = p["patch"] as? JSON ?? [:]
@@ -49,7 +53,7 @@ extension CommandRouter {
             // Release and rebind inside the same store transaction. A failed new binding rolls
             // back both the old gate release and the form, so verification is never lost.
             try cancelHumanGate(db,request:r)
-            var t = try scoped(db,r["task_id"] as! String,pid,type:"task")
+            var t = try scoped(db,StoredRecord(r, family: "request").string("task_id"),pid,type:"task")
             var binding: JSON = [:]
             if let explicit = patch["review_request_id"] as? String { binding["review_request_id"] = explicit }
             else if let existing = r["review_request_id"] as? String,patch["target_attachment_id"] == nil,patch["target_manifest_id"] == nil { binding["review_request_id"] = existing }
@@ -60,9 +64,18 @@ extension CommandRouter {
             candidate["form_identity"] = try requestFormIdentity(candidate)
             candidate["owner_snoozed"] = false
             candidate = revised(candidate); try save(db,candidate,type:"request")
-            try event(db,caller:c,project:pid,entity:r["task_id"] as? String,kind:"human_request_revised",data:["request_id":r["id"]!,"form_revision":candidate["form_revision"]!,"prior_form_identity":old["form_identity"]!,"form_identity":candidate["form_identity"]!])
+            try event(db,caller:c,project:pid,entity:r["task_id"] as? String,kind:"human_request_revised",data:["request_id":(try StoredRecord(r,
+                family: "Requests").requiredValue("id")),"form_revision":(try StoredRecord(candidate, family: "Requests").requiredValue("form_revision")),
+                "prior_form_identity":(try StoredRecord(old, family: "Requests").requiredValue("form_identity")),"form_identity":(try StoredRecord(candidate,
+                family: "Requests").requiredValue("form_identity"))])
             return candidate
         }
+        return try answerHumanRequest(db, params: p, caller: c, projectID: pid, request: r)
+    }
+
+    private func answerHumanRequest(_ db: Database, params p: JSON, caller c: Caller,
+                                    projectID pid: String, request: JSON) throws -> JSON {
+        var r = request
         try owner(c)
         let action = p["response"] as? String ?? p["action"] as? String ?? "answered"
         guard ["answered","send","clarification","clarify","cannot_do"].contains(action) else { throw CoreError("INVALID_INPUT","Choose Answer, Clarify or Cannot do.") }
@@ -75,7 +88,7 @@ extension CommandRouter {
         let complete = isAnswer && !answers.contains { $0["result"] as? String == "not_checked" }
         if complete,let target = r["target_attachment_id"] as? String {
             if let mid = r["target_manifest_id"] as? String {
-                let currentTask = try scoped(db,r["task_id"] as! String,pid,type:"task")
+                let currentTask = try scoped(db,StoredRecord(r, family: "request").string("task_id"),pid,type:"task")
                 _ = try validateManifestTarget(db,task:currentTask,manifestID:mid)
             }
             let artifact = try scoped(db,target,pid,type:"attachment")
@@ -92,7 +105,8 @@ extension CommandRouter {
                 var refs: [JSON] = []
                 for path in strings(file,"paths") {
                     let attachment = try commitHumanAnswerImport(db,params:p,request:r,file:file,path:path,caller:c)
-                    refs.append(["artifact_id":attachment["id"]!,"sha256":attachment["sha256"]!])
+                    refs.append(["artifact_id":(try StoredRecord(attachment, family: "Requests").requiredValue("id")),"sha256":(try StoredRecord(attachment,
+                        family: "Requests").requiredValue("sha256"))])
                 }
                 file["artifact_refs"] = refs
             }
@@ -100,7 +114,7 @@ extension CommandRouter {
         }
         var response: JSON = ["id":uuid(),"origin":"human_ui","author_display":"You","source_session_id":"human","source_authorization_generation":"human","form_revision":int(r,"form_revision",default:1),"form_identity":currentIdentity,"answers":answers,"files":recordedFiles,"explanation":try text(p,"explanation",max:16000,required:false),"action":action,"complete":complete,"created_at":now()]
         response["inspected_images"] = inspectedImages
-        if complete,var gate = try recordHumanGate(db,request:r,answers:answers,responseID:response["id"] as! String,params:p,caller:c) {
+        if complete,var gate = try recordHumanGate(db,request:r,answers:answers,responseID:StoredRecord(response, family: "human_response").string("id"),params:p,caller:c) {
             gate["inspected_images"] = inspectedImages
             var checks = gate["checks"] as? [JSON] ?? []
             for i in checks.indices where checks[i]["label"] as? String == "Owner inspected exact original" { checks[i]["label"] = "Owner decision on exact original" }
@@ -114,8 +128,10 @@ extension CommandRouter {
         r["continuation_deliveries"] = message["deliveries"] ?? []
         r["continuation_delivery"] = (message["deliveries"] as? [JSON] ?? []).isEmpty ? "available_for_current_handlers_or_next_pickup" : "queued_for_pickup"
         try save(db,r,type:"request")
-        try event(db,caller:c,project:pid,entity:r["task_id"] as? String,kind:"human_request_answered",data:["request_id":r["id"]!,"complete":complete,"response_id":response["id"]!,"form_revision":int(r,"form_revision",default:1)])
-        try db.execute(sql:"DELETE FROM metadata WHERE key=?",arguments:[try pendingStorageCommandKey(principal:c.principal,command:p["command_id"] as! String)])
+        try event(db,caller:c,project:pid,entity:r["task_id"] as? String,kind:"human_request_answered",data:["request_id":(try StoredRecord(r,
+            family: "Requests").requiredValue("id")),"complete":complete,"response_id":(try StoredRecord(response, family: "Requests").requiredValue("id")),
+            "form_revision":int(r,"form_revision",default:1)])
+        try db.execute(sql:"DELETE FROM metadata WHERE key=?",arguments:[try pendingStorageCommandKey(principal:c.principal,command:text(p,"command_id"))])
         r["message"] = message
         let counts = try ownerNeedsYouCounts(db)
         r["needs_you_count"] = counts.requests + counts.tasks
@@ -154,12 +170,13 @@ extension CommandRouter {
                     (approval && earlier["task_id"] as? String == request["task_id"] as? String && $0["type"] as? String == "approval")
                 }
                 guard titleMatch || !matchingQuestions.isEmpty else { continue }
-                let task = try scoped(db,earlier["task_id"] as! String,request["project_id"] as! String,type:"task")
+                let task = try scoped(db,StoredRecord(earlier, family: "request").string("task_id"),StoredRecord(request, family: "request").string("project_id"),type:"task")
                 let coveredQuestions = titleMatch ? answeredQuestions : matchingQuestions
                 let coveredIDs = Set(coveredQuestions.compactMap {$0["id"] as? String})
                 let answers = responseAnswers.filter { coveredIDs.contains($0["question_id"] as? String ?? "") }
                 let summary = String((try jsonString(["answers":answers,"files":response["files"] ?? [],"explanation":response["explanation"] ?? ""])).prefix(1000))
-                matches.append(["request_id":earlier["id"]!,"answer_id":response["id"] ?? NSNull(),"task_id":task["id"]!,"key":task["key"] ?? "","title":form["title"] ?? "",
+                matches.append(["request_id":(try StoredRecord(earlier, family: "Requests").requiredValue("id")),"answer_id":response["id"] ?? NSNull(),
+                    "task_id":(try StoredRecord(task, family: "Requests").requiredValue("id")),"key":task["key"] ?? "","title":form["title"] ?? "",
                     "matching_question_text":coveredQuestions.compactMap {$0["prompt"] as? String}.joined(separator:"; "),"answers":answers,"answer_summary":summary,"answered_at":response["created_at"] ?? ""])
             }
         }
@@ -170,9 +187,23 @@ extension CommandRouter {
             return
         }
         guard matches.isEmpty else {
-            let descriptions = matches.map { "Request \($0["request_id"]!), answer \($0["answer_id"]!), ticket \($0["task_id"]!) \($0["key"]!) \"\($0["title"]!)\": \($0["matching_question_text"]!); answer \($0["answer_summary"]!); answered \($0["answered_at"]!)." }
+            let descriptions = try matches.map(coveredAnswerDescription)
             throw CoreError("COVERED_BY_EARLIER_ANSWER","Earlier owner answers cover this request. " + descriptions.joined(separator:" ") + " Supply supersedes_answer_id and a non-empty supersede_reason explaining what changed.",details:["matches":matches])
         }
+    }
+
+    private func coveredAnswerDescription(_ value: JSON) throws -> String {
+        let record = StoredRecord(value, family: "covered_answer")
+        let requestID = try record.requiredValue("request_id")
+        let answerID = try record.requiredValue("answer_id")
+        let taskID = try record.requiredValue("task_id")
+        let key = try record.requiredValue("key")
+        let title = try record.requiredValue("title")
+        let question = try record.requiredValue("matching_question_text")
+        let summary = try record.requiredValue("answer_summary")
+        let answeredAt = try record.requiredValue("answered_at")
+        return "Request \(requestID), answer \(answerID), ticket \(taskID) \(key) \"\(title)\": \(question); " +
+            "answer \(summary); answered \(answeredAt)."
     }
 
     static let requestFormKeys = ["title","explanation","questions","file_requests","command","blocking","target_attachment_id"]
@@ -185,7 +216,12 @@ extension CommandRouter {
     func requestEditor(_ db: Database,request: JSON,caller: Caller) throws {
         try worker(caller)
         guard !caller.isOwner else { return }
-        guard request["requester"] as? String == caller.principal,request["requester_session_id"] as? String == caller.sessionID,request["requester_authorization_generation"] as? String == (try callerSessionGeneration(db,caller,project:request["project_id"] as! String)) else { throw CoreError("FORBIDDEN","Only the current original requester or the owner can revise or cancel this request.") }
+        guard request["requester"] as? String == caller.principal,
+              request["requester_session_id"] as? String == caller.sessionID,
+              request["requester_authorization_generation"] as? String ==
+                (try callerSessionGeneration(db, caller, project: StoredRecord(request, family: "request").string("project_id"))) else {
+            throw CoreError("FORBIDDEN", "Only the current original requester or the owner can revise or cancel this request.")
+        }
     }
     func ensureSingleBlockingRequest(_ db: Database,request: JSON) throws {
         if bool(request,"blocking"),try records(db,type:"request",project:request["project_id"] as? String).contains(where: {$0["id"] as? String != request["id"] as? String && $0["task_id"] as? String == request["task_id"] as? String && bool($0,"blocking") && $0["state"] as? String == "pending"}) { throw CoreError("BLOCKING_REQUEST_EXISTS","Revise the existing pending request instead of creating another blocker.") }
@@ -195,8 +231,8 @@ extension CommandRouter {
         request["title"] = try text(request,"title",max:4000)
         try requestBooleans(request,keys:["blocking"])
         _ = try text(request,"explanation",max:16000,required:false)
-        guard request["questions"] is [JSON],request["file_requests"] is [JSON] else { throw CoreError("INVALID_INPUT","Questions and file requests must be typed lists.") }
-        let questions = request["questions"] as! [JSON],files = request["file_requests"] as! [JSON]
+        guard let questions = request["questions"] as? [JSON], let files = request["file_requests"] as? [JSON] else { throw CoreError("INVALID_INPUT",
+            "Questions and file requests must be typed lists.") }
         guard !questions.isEmpty || !files.isEmpty,questions.count <= 30,files.count <= 30 else { throw CoreError("INVALID_INPUT","Add at least one question or file request, with at most 30 of each.") }
         try uniqueRequestIDs(questions,key:"id"); try uniqueRequestIDs(files,key:"id")
         for q in questions {
@@ -221,7 +257,7 @@ extension CommandRouter {
             if value is NSNull || (value as? String) == "" { request.removeValue(forKey:"target_attachment_id"); request.removeValue(forKey:"target_sha256") }
             else {
                 guard let id = value as? String else { throw CoreError("INVALID_INPUT","The approval target must be an attachment ID.") }
-                let attachment = try scoped(db,id,request["project_id"] as! String,type:"attachment")
+                let attachment = try scoped(db,id,StoredRecord(request, family: "request").string("project_id"),type:"attachment")
                 guard attachment["task_id"] as? String == request["task_id"] as? String,attachment["availability"] as? String == "available",attachment["mode"] as? String == "managed" else { throw CoreError("TARGET_CHANGED","Choose an available immutable attachment on this ticket.") }
                 request["target_sha256"] = attachment["sha256"]
             }
@@ -257,7 +293,7 @@ extension CommandRouter {
             if type == "text" {
                 let value = try requestAnswerString(answer,keys:["text","value"],max:16000)
                 guard !value.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else { throw incompleteRequestItem(q) }
-                answer = ["question_id":q["id"]!,"text":value]
+                answer = ["question_id":(try StoredRecord(q, family: "Requests").requiredValue("id")),"text":value]
             } else if type == "choice" {
                 if answer["option_ids"] != nil && !(answer["option_ids"] is [String]) { throw CoreError("INVALID_INPUT","Selected options must be a list of IDs.") }
                 let value = try requestAnswerString(answer,keys:["value"],max:4000)
@@ -266,7 +302,7 @@ extension CommandRouter {
                 let customPresent = !custom.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty
                 let options = Set((q["options"] as? [JSON] ?? []).compactMap {$0["id"] as? String})
                 guard Set(ids).isSubset(of:options),Set(ids).count == ids.count,ids.count + (customPresent ? 1 : 0) <= (bool(q,"multiple") ? 100 : 1),!ids.isEmpty || customPresent,custom.isEmpty || (bool(q,"allow_custom") && customPresent) else { throw incompleteRequestItem(q) }
-                answer = ["question_id":q["id"]!,"option_ids":ids,"custom_text":custom]
+                answer = ["question_id":(try StoredRecord(q, family: "Requests").requiredValue("id")),"option_ids":ids,"custom_text":custom]
             } else {
                 let result = try requestAnswerString(answer,keys:["result","value"],max:100)
                 guard (type == "approval" ? ["approved","changes_requested","declined","not_checked"] : ["passed","failed","declined","not_checked"]).contains(result) else { throw incompleteRequestItem(q) }
@@ -274,7 +310,7 @@ extension CommandRouter {
                     let explanation = try requestAnswerString(params,keys:["explanation"],max:16000)
                     if explanation.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty { throw incompleteRequestItem(q) }
                 }
-                answer = ["question_id":q["id"]!,"result":result]
+                answer = ["question_id":(try StoredRecord(q, family: "Requests").requiredValue("id")),"result":result]
             }
             normalized.append(answer)
         }
@@ -326,17 +362,21 @@ extension CommandRouter {
                     hashes[path] = digest
                 }
             }
-            result.append(["file_request_id":spec["id"]!,"paths":paths,"mode":mode,"path_sha256":hashes,"explanation":try requestAnswerString(file,keys:["explanation"],max:16000)])
+            result.append(["file_request_id":(try StoredRecord(spec, family: "Requests").requiredValue("id")),"paths":paths,"mode":mode,"path_sha256":hashes,
+                "explanation":try requestAnswerString(file,keys:["explanation"],max:16000)])
         }
         return result
     }
     func notifyHumanResponse(_ db: Database,request: JSON,response: JSON,caller: Caller) throws -> JSON {
-        let pid = request["project_id"] as! String,tid = request["task_id"] as! String
+        let storedRequest = StoredRecord(request, family: "request")
+        let pid = try storedRequest.string("project_id"), tid = try storedRequest.string("task_id")
         let task = try scoped(db,tid,pid,type:"task")
         var message = try messageWrite(db,["project_id":pid,"task_id":tid,"body":"Ticket metadata: \(try agentReference(db,task)). Human response saved for form \(int(request,"form_revision",default:1)): \(response["action"] as? String ?? "answered"). \(response["explanation"] as? String ?? "")","kind":"note"],caller,"message_send",purpose:.trustedHumanResponse)
         var deliveries = message["deliveries"] as? [JSON] ?? []
         if let sid = request["requester_session_id"] as? String,sid != "human",!deliveries.contains(where: {$0["recipient_session_id"] as? String == sid}),let session = try? scoped(db,sid,pid,type:"session"),canReceive(session,project:pid),request["requester_authorization_generation"] as? String == sessionGeneration(session) {
-            let delivery: JSON = ["id":uuid(),"project_id":pid,"message_id":message["id"]!,"recipient_session_id":sid,"recipient_authorization_generation":sessionGeneration(session),"state":"queued","push_state":"unavailable","push_reason":"Available through authenticated MCP pickup; no native acknowledgment yet.","revision":1,"created_at":now()]
+            let delivery: JSON = ["id":uuid(),"project_id":pid,"message_id":(try StoredRecord(message, family: "Requests").requiredValue("id")),
+                "recipient_session_id":sid,"recipient_authorization_generation":sessionGeneration(session),"state":"queued","push_state":"unavailable",
+                "push_reason":"Available through authenticated MCP pickup; no native acknowledgment yet.","revision":1,"created_at":now()]
             try save(db,delivery,type:"delivery"); deliveries.append(delivery)
         }
         message["human_request_id"] = request["id"]; message["human_response_id"] = response["id"]; message["form_revision"] = int(request,"form_revision",default:1)

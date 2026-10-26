@@ -5,9 +5,10 @@ import GRDB
 /// Lifecycle policy only. CL-24 owns record removal; CL-154 owns every unlink.
 /// All state uses project JSON, metadata and existing ticket_object_delete jobs.
 extension CommandRouter {
-    static let ticketCleanupSchema: JSON = ["type":"object","additionalProperties":false,
+    // Return a fresh schema value; no shared Any payload crosses concurrent reads.
+    static var ticketCleanupSchema: JSON { ["type":"object","additionalProperties":false,
         "required":["done_evidence_enabled","closed_purge_enabled","closed_days"],
-        "properties":["done_evidence_enabled":["type":"boolean"],"closed_purge_enabled":["type":"boolean"],"closed_days":["type":"integer","minimum":1,"maximum":36500]]]
+        "properties":["done_evidence_enabled":["type":"boolean"],"closed_purge_enabled":["type":"boolean"],"closed_days":["type":"integer","minimum":1,"maximum":36500]]] }
 
     func ticketCleanupSettings(_ project: JSON) -> JSON {
         guard let raw = project["ticket_cleanup"] else {return ["done_evidence_enabled":true,"closed_purge_enabled":true,"closed_days":15]}
@@ -65,7 +66,7 @@ extension CommandRouter {
     /// Read-snapshot preparation only: 32 tickets, at most one semantic action.
     /// The maintenance lane yields the writer and service queue between chunks.
     func ticketCleanupSelection(_ db: Database,project: JSON,at time: Date = Date()) throws -> TicketCleanupPreparedPass {
-        let pid = project["id"] as! String,settings = ticketCleanupSettings(project),cursor = try ticketCleanupCursor(db,pid)
+        let pid = (try StoredRecord(project, family: "project").string("id")), settings = ticketCleanupSettings(project), cursor = try ticketCleanupCursor(db, pid)
         let rows = try Row.fetchAll(db,sql:"SELECT rowid AS cleanup_row," + Self.canonicalRecordColumns + " FROM records WHERE type='task' AND project_id=? AND rowid>? ORDER BY rowid LIMIT 32",arguments:[pid,cursor])
         var items: [JSON] = [],plans: [String:TicketPurgePlan] = [:],expired: [String:[Row]] = [:],admitted = 0
         var inventory: TicketCleanupInventory?,planningAttempted = false
@@ -75,8 +76,11 @@ extension CommandRouter {
             return try ticketPurgePlan(db,task:task,inventory:inventory)
         }
         for row in rows {
-            let task = try GRDBRecordEnvelopeAdapter.decode(row).object,tid = task["id"] as! String
-            var item: JSON = ["task_id":tid,"key":task["key"] ?? "","task_revision":task["revision"]!,"action":"keep","reason":"open_ticket"]
+            let task = try GRDBRecordEnvelopeAdapter.decode(row).object, tid = (try StoredRecord(task, family: "task").string("id"))
+            var item: JSON = [
+                "task_id": tid, "key": task["key"] ?? "", "task_revision": (try StoredRecord(task, family: "task").requiredValue("revision")), "action": "keep",
+                "reason": "open_ticket",
+            ]
             let category = (try? record(db,task["status_id"] as? String ?? "",type:"status"))?["category"] as? String ?? "unknown"
             if bool(task,"purged") {item["reason"] = "already_purged"}
             else if ["done","canceled"].contains(category) {
@@ -126,8 +130,8 @@ extension CommandRouter {
             "selected_bytes":items.reduce(Int64(0)) {$0 + (((($1["summary"] as? JSON)?["pending_bytes"]) as? NSNumber)?.int64Value ?? 0)},"physical_reclamation":"unmeasured","source_build_cache":try sourceBuildCacheRetainedEntries(db,project:pid)]
         var observation = inventory ?? TicketCleanupInventory()
         for plan in plans.values {observation.objects(plan.byteDeletion.objects,root:root)}
-        let ids = [pid] + items.flatMap {item -> [String] in
-            let tid = item["task_id"] as! String
+        let ids = try [pid] + items.flatMap {item -> [String] in
+            let tid = try StoredRecord(item, family: "cleanup_selection_item").string("task_id")
             let task = try? record(db,tid,type:"task")
             return [tid,task?["status_id"] as? String ?? ""]
         }
@@ -139,10 +143,14 @@ extension CommandRouter {
         for project in try records(db,type:"project") {
             let settings = ticketCleanupSettings(project)
             guard bool(settings,"done_evidence_enabled") || bool(settings,"closed_purge_enabled") else {continue}
-            let next = Double(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-next:" + (project["id"] as! String)]) ?? "0") ?? 0
-            if let retry = try ticketCleanupProjectRetry(db,project:project["id"] as! String),retry > time {continue}
+            let next =
+                Double(
+                    try String.fetchOne(
+                        db, sql: "SELECT value FROM metadata WHERE key=?", arguments: ["ticket-cleanup-next:" + ((try StoredRecord(project, family: "project").string("id")))])
+                        ?? "0") ?? 0
+            if let retry = try ticketCleanupProjectRetry(db, project: (try StoredRecord(project, family: "project").string("id"))), retry > time { continue }
             if time.timeIntervalSince1970 >= next {
-                try beginTicketCleanupPreparation(project:project["id"] as! String)
+                try beginTicketCleanupPreparation(project: (try StoredRecord(project, family: "project").string("id")))
                 return try ticketCleanupSelection(db,project:project,at:time)
             }
         }
@@ -152,31 +160,40 @@ extension CommandRouter {
     /// Only fresh preparation reaches this short semantic transaction. The pass
     /// receipt, cursor, purge and byte intents commit together before any unlink.
     func commitTicketLifecycleCleanup(_ db: Database,prepared: TicketCleanupPreparedPass,at time: Date) throws {
-        let project = prepared.project,pid = project["id"] as! String,selection = prepared.selection,settings = ticketCleanupSettings(project)
+        let project = prepared.project, pid = (try StoredRecord(project, family: "project").string("id")), selection = prepared.selection, settings = ticketCleanupSettings(project)
         try withValidatedDomainTransaction(db) {
-            var items = selection["items"] as! [JSON]
+            var items = try StoredRecord(selection, family: "cleanup_selection").objects("items")
             for index in items.indices {
                 let action = items[index]["action"] as? String ?? "keep"
                 guard action != "keep" else {continue}
-                let tid = items[index]["task_id"] as! String,task = try self.record(db,tid,type:"task"),plan = prepared.plans[tid]!
+                let tid = try StoredRecord(items[index], family: "cleanup_selection_item").string("task_id"), task = try self.record(db, tid, type: "task"),
+                    plan = prepared.plans[tid]
+                guard let plan else {
+                    throw CoreError("CANONICAL_RECORD_INVALID", "A stored record is malformed.")
+                }
                 let deletion: JSON
                 if action == "purge" {
-                    let result = try self.taskPurge(db,["project_id":pid,"task_id":tid,"expected_revision":task["revision"]!,"preview_digest":plan.digest],Caller(role:"owner",installation:"storage",projectIDs:[]),automatic:true,prepared:plan,expiredCommands:prepared.expiredCommands[tid])
-                    deletion = result["byte_deletion"] as! JSON
+                    let result = try self.taskPurge(
+                        db,
+                        [
+                            "project_id": pid, "task_id": tid, "expected_revision": (try StoredRecord(task, family: "task").requiredValue("revision")),
+                            "preview_digest": plan.digest,
+                        ], Caller(role: "owner", installation: "storage", projectIDs: []), automatic: true, prepared: plan, expiredCommands: prepared.expiredCommands[tid])
+                    deletion = try StoredRecord(result, family: "purge_result").object("byte_deletion")
                 } else {
                     var receipt = try self.enqueueTicketObjectDeletion(db,project:pid,task:tid,cause:"done_evidence",plan:plan.byteDeletion)
                     receipt["owned_record_fingerprints"] = Dictionary(uniqueKeysWithValues:try plan.removed.map {($0.id,try self.ticketCleanupOwnerFingerprint($0.value,type:$0.type))})
-                    receipt["task_revision"] = task["revision"]!
+                    receipt["task_revision"] = (try StoredRecord(task, family: "task").requiredValue("revision"))
                     try self.save(db,receipt,type:"storage_job");deletion = receipt
                 }
-                items[index]["byte_deletion_receipt_id"] = deletion["id"]!
+                items[index]["byte_deletion_receipt_id"] = (try StoredRecord(deletion, family: "deletion").requiredValue("id"))
             }
             let id = uuid()
-            let receipt: JSON = ["id":id,"project_id":pid,"kind":Self.ticketObjectDeletionKind,"cause":"ticket_cleanup_pass","origin":"automatic_cleanup","state":"completed","revision":1,"created_at":now(),"selected_bytes":selection["selected_bytes"]!,"settings":settings,"items":items.map {item -> JSON in
-                var item = item
-                for field in ["scan_row","objects","plan_digest","purge_digest","record_impact"] {item.removeValue(forKey:field)}
-                return item
-            },"objects":[],"summary":Self.ticketObjectDeletionSummary([]),"source_build_cache":selection["source_build_cache"] ?? []]
+            let receipt: JSON = [
+                "id": id, "project_id": pid, "kind": Self.ticketObjectDeletionKind, "cause": "ticket_cleanup_pass", "origin": "automatic_cleanup", "state": "completed",
+                "revision": 1, "created_at": now(), "selected_bytes": (try StoredRecord(selection, family: "selection").requiredValue("selected_bytes")), "settings": settings,
+                "items": ticketCleanupPassItems(items), "objects": [], "summary": Self.ticketObjectDeletionSummary([]), "source_build_cache": selection["source_build_cache"] ?? [],
+            ]
             try self.save(db,receipt,type:"storage_job")
             try self.event(db,caller:Caller(role:"owner",installation:"storage",projectIDs:[]),project:pid,entity:pid,kind:"ticket_cleanup_pass",data:["origin":"automatic_cleanup","receipt_id":id,"admitted_count":items.filter {$0["action"] as? String != "keep"}.count])
             try db.execute(sql:"INSERT OR IGNORE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-first:" + pid,id])
@@ -188,13 +205,28 @@ extension CommandRouter {
         }
     }
 
+    private func ticketCleanupPassItems(_ items: [JSON]) -> [JSON] {
+        items.map { item in
+            var item = item
+            for field in ["scan_row", "objects", "plan_digest", "purge_digest", "record_impact"] {
+                item.removeValue(forKey: field)
+            }
+            return item
+        }
+    }
+
     func nextTicketCleanupDeadline(_ db: Database) throws -> Date? {
         var dates: [Date] = []
         for project in try records(db,type:"project") {
             let settings = ticketCleanupSettings(project)
             guard bool(settings,"done_evidence_enabled") || bool(settings,"closed_purge_enabled") else {continue}
-            let next = Double(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-next:" + (project["id"] as! String)]) ?? "0") ?? 0
-            dates.append(max(Date(timeIntervalSince1970:next),try ticketCleanupProjectRetry(db,project:project["id"] as! String) ?? .distantPast))
+            let next =
+                Double(
+                    try String.fetchOne(
+                        db, sql: "SELECT value FROM metadata WHERE key=?", arguments: ["ticket-cleanup-next:" + ((try StoredRecord(project, family: "project").string("id")))])
+                        ?? "0") ?? 0
+            dates.append(
+                max(Date(timeIntervalSince1970: next), try ticketCleanupProjectRetry(db, project: (try StoredRecord(project, family: "project").string("id"))) ?? .distantPast))
         }
         return dates.min()
     }
@@ -203,7 +235,7 @@ extension CommandRouter {
         var value = receipt,items = receipt["items"] as? [JSON] ?? [],objects: [JSON] = []
         for index in items.indices {
             if let id = items[index]["byte_deletion_receipt_id"] as? String {
-                let deletion = try scoped(db,id,receipt["project_id"] as! String,type:"storage_job")
+                let deletion = try scoped(db, id, (try StoredRecord(receipt, family: "receipt").string("project_id")), type: "storage_job")
                 items[index]["byte_deletion"] = deletion;objects += deletion["objects"] as? [JSON] ?? []
             }
         }
@@ -214,7 +246,8 @@ extension CommandRouter {
 
     func ticketCleanupDeletionBlocker(_ db: Database,receipt: JSON) throws -> String? {
         guard receipt["cause"] as? String == "done_evidence" else {return nil}
-        let task = try record(db,receipt["task_id"] as! String,type:"task"),project = try record(db,receipt["project_id"] as! String,type:"project")
+        let task = try record(db, (try StoredRecord(receipt, family: "receipt").string("task_id")), type: "task"),
+            project = try record(db, (try StoredRecord(receipt, family: "receipt").string("project_id")), type: "project")
         guard bool(ticketCleanupSettings(project),"done_evidence_enabled") else {return "rule_disabled"}
         guard !bool(task,"purged"),(try? record(db,task["status_id"] as? String ?? "",type:"status"))?["category"] as? String == "done",int(task,"revision") == int(receipt,"task_revision") else {return "ticket_changed"}
         do {try requirePurgeSafe(db,task:task,automatic:true)} catch let error as CoreError {return error.code}
@@ -246,12 +279,19 @@ extension CommandRouter {
 
     func recordTicketCleanupAvailability(_ db: Database,receipt: JSON,object: JSON) throws {
         guard receipt["cause"] as? String == "done_evidence",["removed","already_missing"].contains(object["state"] as? String ?? "") else {return}
-        try event(db,caller:Caller(role:"owner",installation:"storage",projectIDs:[]),project:receipt["project_id"] as? String,entity:receipt["project_id"] as? String,kind:"ticket_evidence_cleanup_outcome",data:["origin":"automatic_cleanup","task_id":receipt["task_id"]!,"receipt_id":receipt["id"]!,"state":object["state"]!,"removed_bytes":object["state"] as? String == "removed" ? object["size"] ?? 0 : 0])
+        try event(
+            db, caller: Caller(role: "owner", installation: "storage", projectIDs: []), project: receipt["project_id"] as? String, entity: receipt["project_id"] as? String,
+            kind: "ticket_evidence_cleanup_outcome",
+            data: [
+                "origin": "automatic_cleanup", "task_id": (try StoredRecord(receipt, family: "receipt").requiredValue("task_id")),
+                "receipt_id": (try StoredRecord(receipt, family: "receipt").requiredValue("id")), "state": (try StoredRecord(object, family: "object").requiredValue("state")),
+                "removed_bytes": object["state"] as? String == "removed" ? object["size"] ?? 0 : 0,
+            ])
         guard object["representation"] as? String == "original" else {return}
         for id in strings(object,"owner_ids") {
             if var attachment = try? record(db,id,type:"attachment"),attachment["sha256"] as? String == object["sha256"] as? String {
                 attachment["availability"] = object["state"] as? String == "removed" ? "original_cleaned" : "original_missing"
-                attachment["cleanup_receipt_id"] = receipt["id"]!
+                attachment["cleanup_receipt_id"] = (try StoredRecord(receipt, family: "receipt").requiredValue("id"))
                 try save(db,revised(attachment),type:"attachment")
             }
         }

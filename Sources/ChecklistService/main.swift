@@ -204,7 +204,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     func owner(_ connection: NSXPCConnection) -> Bool {
         var buffer = [CChar](repeating: 0, count: 4096)
         guard proc_pidpath(connection.processIdentifier, &buffer, UInt32(buffer.count)) > 0 else { return false }
-        let path = String(cString: buffer)
+        let path = String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
         guard URL(fileURLWithPath:path).resolvingSymlinksInPath().path == expectedOwnerPath, path.hasSuffix(ChecklistInstance.current.ownerPathSuffix) else { return false }
         var guest: SecCode?
         let attrs = [kSecGuestAttributePid as String: NSNumber(value: connection.processIdentifier)] as CFDictionary

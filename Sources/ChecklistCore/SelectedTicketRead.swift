@@ -20,7 +20,8 @@ extension CommandRouter {
         return value
     }
     func selectedTaskProjectionWithoutHealth(_ db: Database, task: JSON, cleanedOriginalCount: Int? = nil) throws -> JSON {
-        let pid = task["project_id"] as! String,tid = task["id"] as! String
+        let storedTask = try StoredTaskRecord(task)
+        let pid = storedTask.projectID, tid = storedTask.id
         let status = try? scoped(db,task["status_id"] as? String ?? "",pid,type:"status")
         let prerequisites = try selectedTaskPrerequisites(db,task:task)
         let relation = projectedRelationTask(task:task,prerequisites:prerequisites,category:status?["category"] as? String ?? "unknown",canonicalID:try canonicalTaskID(db,task:task))
@@ -32,9 +33,14 @@ extension CommandRouter {
         return try withStatusReason(db,task:result)
     }
     func selectedTaskPrerequisites(_ db: Database, task: JSON) throws -> [JSON] {
-        let pid = task["project_id"] as! String, tid = task["id"] as! String
+        let storedTask = try StoredTaskRecord(task)
+        let pid = storedTask.projectID, tid = storedTask.id
         let edges = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='relation' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.source_task_id')=CAST(? AS TEXT) COLLATE BINARY AND COALESCE(json_extract(data,'$.state'),'')<>'removed' ORDER BY rowid",arguments:[Data(pid.utf8),Data(tid.utf8)]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
-        return projectedPrerequisites(task:task,relations:edges,taskLookup:{try self.scoped(db,$0,pid,type:"task")},statusLookup:{try self.scoped(db,$0,pid,type:"status")})
+        return try projectedPrerequisites(
+            task: task, relations: edges,
+            taskLookup: { try self.scoped(db, $0, pid, type: "task") },
+            statusLookup: { try self.scoped(db, $0, pid, type: "status") }
+        )
     }
     /// Health consumes only these exact dependency/attention facts. Retain the
     /// duplicate-reference guard without constructing unrelated display fields.
@@ -46,7 +52,8 @@ extension CommandRouter {
     /// Exact attention facts shared with supervision; no attachment, tag or
     /// prerequisite display projection is needed to decide whether to inspect.
     func selectedTaskActiveAttention(_ db: Database, task: JSON) throws -> Bool {
-        let pid = task["project_id"] as! String, tid = task["id"] as! String
+        let storedTask = try StoredTaskRecord(task)
+        let pid = storedTask.projectID, tid = storedTask.id
         return try projectedTaskAttention(task,statusLookup:{try self.scoped(db,$0,pid,type:"status")}) {
             let triages = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records g WHERE type='group' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.kind')='triage' AND COALESCE(json_extract(data,'$.archived'),0)=0 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_array_length(json_extract(g.data,'$.members'))>0 THEN json_extract(g.data,'$.members') ELSE json_extract(g.data,'$.task_ids') END) member WHERE (CASE WHEN member.type='object' THEN json_extract(member.value,'$.task_id') ELSE member.value END)=CAST(? AS TEXT) COLLATE BINARY) ORDER BY rowid",arguments:[Data(pid.utf8),Data(tid.utf8)])
             for row in triages {
@@ -65,7 +72,7 @@ extension CommandRouter {
             let selected = try record(db,try text(p,"task_id"),type:"task")
             scopedInput["project_id"] = selected["project_id"]
         }
-        let pid = try scope(db,scopedInput,c), task = try self.task(db,scopedInput,pid), tid = task["id"] as! String
+        let pid = try scope(db,scopedInput,c), task = try self.task(db,scopedInput,pid), tid = (try StoredRecord(task, family: "task").string("id"))
         // Offset history depends on this conversation's membership, not unrelated
         // project events. Current work/review authority keeps its separate scope.
         let history = try Row.fetchOne(db,sql:"SELECT COUNT(*) AS total,COALESCE(MAX(rowid),0) AS frontier FROM records WHERE type='message' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY",arguments:[Data(pid.utf8),Data(tid.utf8)])!
@@ -123,7 +130,7 @@ extension CommandRouter {
         try owner(c)
         var input = p
         if input["project_id"] == nil {input["project_id"] = try record(db,try text(p,"task_id"),type:"task")["project_id"]}
-        let pid = try scope(db,input,c), task = try self.task(db,input,pid), tid = task["id"] as! String
+        let pid = try scope(db,input,c), task = try self.task(db,input,pid), tid = (try StoredRecord(task, family: "task").string("id"))
         guard let observed = p["selected_context_cursor"] as? String else {throw CoreError("CONTEXT_CURSOR_REQUIRED","Read the selected ticket before expanding its work/review records.")}
         _ = try cursorSequence(db,["cursor":observed],caller:c,scope:selectedContextScope(db,project:pid,task:tid,caller:c))
         var collections: JSON = [:], counts: JSON = [:], historyCounts: JSON = [:]
@@ -208,7 +215,7 @@ extension CommandRouter {
         try owner(c)
         var input=p
         if input["project_id"] == nil {input["project_id"]=try record(db,try text(p,"task_id"),type:"task")["project_id"]}
-        let pid=try scope(db,input,c),task=try self.task(db,input,pid),tid=task["id"] as! String
+        let pid=try scope(db,input,c),task=try self.task(db,input,pid),tid=(try StoredRecord(task, family: "task").string("id"))
         guard let observed=p["selected_context_cursor"] as? String else {throw CoreError("CONTEXT_CURSOR_REQUIRED","Read this selected ticket before its history.")}
         _=try cursorSequence(db,["cursor":observed],caller:c,scope:selectedContextScope(db,project:pid,task:tid,caller:c))
         let family=try text(p,"records_family",max:40)

@@ -62,7 +62,7 @@ struct SnapshotReadProjection {
         let taskIndex = tasksByID, statusIndex = statusesByID
         var attention: [TaskKey: [Result<Bool, Error>]] = [:]
         for group in loaded["group"] ?? [] where group["kind"] as? String == "triage" && !bool(group, "archived") {
-            let project = group["project_id"] as! String
+            let project = (try StoredRecord(group, family: "group").string("project_id"))
             let members = Self.exactMemberIDs(group)
             // Keep a failure deferred until a member actually needs triage attention:
             // an active attempt or active status retains the existing short circuit.
@@ -77,8 +77,9 @@ struct SnapshotReadProjection {
     }
 
     func project(_ router: CommandRouter, database: Database, task: JSON) throws -> JSON {
-        let project = task["project_id"] as! String, key = TaskKey(project: project, task: task["id"] as! String)
-        let prerequisites = router.projectedPrerequisites(task: task, relations: prerequisitesByTask[key] ?? [],
+        let storedTask = try StoredTaskRecord(task)
+        let project = storedTask.projectID, key = TaskKey(project: project, task: storedTask.id)
+        let prerequisites = try router.projectedPrerequisites(task: task, relations: prerequisitesByTask[key] ?? [],
             taskLookup: { try Self.scoped(tasksByID, id: $0, project: project) },
             statusLookup: { try Self.scoped(statusesByID, id: $0, project: project) })
         let attention = try router.projectedTaskAttention(task,

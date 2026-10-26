@@ -2,6 +2,30 @@ import Foundation
 import GRDB
 
 extension CommandRouter {
+    /// Retain descendant-first release order while checking the mandatory attempt identity.
+    func nativeAttemptsDeepestFirst(_ attempts: [JSON]) throws -> [JSON] {
+        let indexed = try attempts.map { attempt in
+            (record: attempt, id: try StoredRecord(attempt, family: "attempt").string("id"))
+        }
+        var parents: [String: String] = [:]
+        for entry in indexed {
+            if let parent = entry.record["parent_attempt_id"] as? String {
+                guard parents.updateValue(parent, forKey: entry.id) == nil else {
+                    throw CoreError("CANONICAL_RECORD_INVALID", "A stored record is malformed.")
+                }
+            }
+        }
+        func depth(_ id: String) -> Int {
+            var cursor = id, result = 0
+            while let parent = parents[cursor], result < 32 {
+                result += 1
+                cursor = parent
+            }
+            return result
+        }
+        return indexed.sorted { depth($0.id) > depth($1.id) }.map(\.record)
+    }
+
     /// Owner intent revokes authorization immediately; it is not OS stop evidence.
     func ownerConversationAccess(_ db: Database, _ p: JSON, _ c: Caller, _ method: String) throws -> JSON {
         try owner(c)
@@ -40,12 +64,8 @@ extension CommandRouter {
         session["owner_disconnected_at"] = now()
         var released: [String] = [], pending: [String] = []
         // Descendants held by this same conversation release before their parent.
-        let parents = Dictionary(uniqueKeysWithValues:attempts.compactMap { a in
-            (a["parent_attempt_id"] as? String).map { (a["id"] as! String,$0) }
-        })
-        func depth(_ id: String) -> Int { var id=id, count=0; while let parent=parents[id],count<32 { count += 1; id=parent }; return count }
-        for var attempt in attempts.sorted(by: { depth($0["id"] as! String) > depth($1["id"] as! String) }) {
-            let aid = attempt["id"] as! String, tid = attempt["task_id"] as! String
+        for var attempt in try nativeAttemptsDeepestFirst(attempts) {
+            let aid = (try StoredRecord(attempt, family: "native_record").string("id")), tid = (try StoredRecord(attempt, family: "native_record").string("task_id"))
             do { try requireNoSourceExecutions(db,attempt:attempt); try requireNoWritableChildren(db,attempt:attempt) }
             catch let error as CoreError where ["SOURCE_EXECUTION_ACTIVE","CHILD_WRITERS_ACTIVE"].contains(error.code) {
                 pending.append(aid)
@@ -67,24 +87,38 @@ extension CommandRouter {
                 task = revised(task); try save(db,task,type:"task")
                 try recordTicketStatusAction(db,task:task,caller:c)
             }
-            try event(db,caller:c,project:pid,entity:tid,kind:"work_released",data:["session_id":sid,"attempt_id":aid,"reason":attempt["reason"]!,"owner_disconnect":true])
+            try event(db,caller:c,project:pid,entity:tid,kind:"work_released",
+            data:["session_id":sid,"attempt_id":aid,"reason":(try StoredRecord(attempt,
+             family: "native_record").requiredValue("reason")),"owner_disconnect":true])
             released.append(aid)
         }
-        let deliveries = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='delivery' AND project_id=? AND json_extract(data,'$.recipient_session_id')=? COLLATE BINARY",arguments:[pid,sid])
+        try fenceOwnerDisconnectedDeliveries(db, params: p, caller: c, projectID: pid, sessionID: sid)
+        session["owner_disconnect_pending_attempt_ids"] = pending
+        try save(db,revised(session),type:"session")
+        try event(db,caller:c,project:pid,entity:historyEntity,kind:"owner_conversation_disconnected",data:["session_id":sid,"released_attempt_ids":released,"pending_attempt_ids":pending])
+        return ["disconnected":true,"session_id":sid,"released_attempt_ids":released,"pending_attempt_ids":pending]
+    }
+
+    private func fenceOwnerDisconnectedDeliveries(
+        _ db: Database, params p: JSON, caller c: Caller, projectID pid: String, sessionID sid: String
+    ) throws {
+        let sql = "SELECT " + Self.canonicalRecordColumns
+            + " FROM records WHERE type='delivery' AND project_id=?"
+            + " AND json_extract(data,'$.recipient_session_id')=? COLLATE BINARY"
+        let deliveries = try Row.fetchAll(db, sql: sql, arguments: [pid, sid])
         for row in deliveries {
             var delivery = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"delivery").object
             guard !["acknowledged","addressed"].contains(delivery["state"] as? String ?? ""), delivery["owner_disconnect_ref"] == nil else { continue }
             delivery["owner_disconnect_ref"] = p["command_id"]; delivery["owner_disconnected_at"] = now()
             try save(db,revised(delivery),type:"delivery")
-            let message = try scoped(db,delivery["message_id"] as! String,pid,type:"message")
+            let message = try scoped(db,(try StoredRecord(delivery, family: "native_record").string("message_id")),pid,type:"message")
             try event(db,caller:c,project:pid,entity:message["task_id"] as? String ?? message["conversation_id"] as? String ?? message["id"] as? String,
-                      kind:"message_delivery_fenced",data:["delivery_id":delivery["id"]!,"message_id":delivery["message_id"]!,"recipient_session_id":sid,
-                      "recipient_authorization_generation":delivery["recipient_authorization_generation"] ?? "","owner_disconnect_ref":p["command_id"]!])
+                      kind:"message_delivery_fenced",data:["delivery_id":(try StoredRecord(delivery,
+                       family: "native_record").requiredValue("id")),"message_id":(try StoredRecord(delivery,
+                       family: "native_record").requiredValue("message_id")),"recipient_session_id":sid,
+                      "recipient_authorization_generation":delivery["recipient_authorization_generation"] ?? "",
+                      "owner_disconnect_ref":(try StoredRecord(p, family: "native_record").requiredValue("command_id"))])
         }
-        session["owner_disconnect_pending_attempt_ids"] = pending
-        try save(db,revised(session),type:"session")
-        try event(db,caller:c,project:pid,entity:historyEntity,kind:"owner_conversation_disconnected",data:["session_id":sid,"released_attempt_ids":released,"pending_attempt_ids":pending])
-        return ["disconnected":true,"session_id":sid,"released_attempt_ids":released,"pending_attempt_ids":pending]
     }
 
     /// Explicit Allow again permits a verified native bootstrap, including the

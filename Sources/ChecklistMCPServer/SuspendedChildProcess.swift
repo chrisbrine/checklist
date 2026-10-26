@@ -71,7 +71,7 @@ enum ShimChildProcess {
     private static func executable(_ pid: pid_t) -> URL? {
         var buffer = [CChar](repeating: 0, count: 4096)
         guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { return nil }
-        return URL(fileURLWithPath: String(cString: buffer)).resolvingSymlinksInPath()
+        return URL(fileURLWithPath: String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)).resolvingSymlinksInPath()
     }
 
     static func run(path: String, arguments: [String], directory: String, environment: [String: String],

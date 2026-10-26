@@ -1,8 +1,17 @@
-"""Owned-fixture checks for the unpublished public export boundary."""
+"""Owned-fixture checks for the unpublished public export boundary.
+
+Opt in to compiling all shipping executables from the actual export with
+CHECKLIST_PUBLIC_SOURCE_BUILD=1 and CHECKLIST_PUBLIC_SOURCE_SCRATCH_PATH set to
+an existing warm SwiftPM scratch directory. Shared-slot users also set
+CHECKLIST_PUBLIC_SOURCE_BUILD_WRAPPER to their build-slot shell script.
+"""
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
+import signal
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -160,6 +169,69 @@ class PublicSourceTests(unittest.TestCase):
                                         cwd=self.target, text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)['errors'], [])
+
+    def test_actual_export_has_local_package_and_source_dependency_closure(self):
+        prepare.prepare(prepare.ROOT, self.target)
+        pending = [self.target.resolve()]
+        visited = set()
+        while pending:
+            package = pending.pop()
+            if package in visited:
+                continue
+            visited.add(package)
+            result = subprocess.run(['swift', 'package', 'dump-package'], cwd=package,
+                                    text=True, capture_output=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = json.loads(result.stdout)
+            for dependency in manifest['dependencies']:
+                for local in dependency.get('fileSystem', []):
+                    path = (package / local['path']).resolve()
+                    self.assertTrue(path.is_relative_to(self.target.resolve()), local)
+                    self.assertTrue((path / 'Package.swift').is_file(), local)
+                    pending.append(path)
+            source_package = prepare.ROOT / package.relative_to(self.target.resolve())
+            for target in manifest['targets']:
+                relative = target.get('path', ('Tests/' if target['type'] == 'test'
+                                               else 'Sources/') + target['name'])
+                exported = package / relative
+                self.assertTrue(exported.is_dir(), relative)
+                # Root tests deliberately omit private qualification cases. Check
+                # production inputs and all portable-package tests, including headers.
+                if target['type'] == 'test' and package == self.target.resolve():
+                    continue
+                authored = source_package / relative
+                excluded = [authored / path for path in target['exclude']]
+                for path in authored.rglob('*'):
+                    if path.suffix not in {'.swift', '.c', '.h'} or any(
+                            path.is_relative_to(exclude) for exclude in excluded):
+                        continue
+                    copied = exported / path.relative_to(authored)
+                    with self.subTest(path=str(path.relative_to(prepare.ROOT))):
+                        self.assertTrue(copied.is_file())
+                        self.assertEqual(copied.read_bytes(), path.read_bytes())
+
+    @unittest.skipUnless(os.environ.get('CHECKLIST_PUBLIC_SOURCE_BUILD') == '1',
+                         'opt-in export build requires an assigned warm scratch directory')
+    def test_actual_export_builds(self):
+        prepare.prepare(prepare.ROOT, self.target)
+        scratch = Path(os.environ['CHECKLIST_PUBLIC_SOURCE_SCRATCH_PATH']).resolve()
+        self.assertTrue(scratch.is_dir(), 'Use an existing warm SwiftPM scratch directory')
+        command = ['swift', 'build', '--target', 'ChecklistProducts', '--cache-path',
+                   str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
+                   '--enable-dependency-cache', '--scratch-path', str(scratch)]
+        wrapper = os.environ.get('CHECKLIST_PUBLIC_SOURCE_BUILD_WRAPPER')
+        if wrapper:
+            command = ['bash', wrapper] + command
+        with subprocess.Popen(command, cwd=self.target, text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, start_new_session=True) as process:
+            try:
+                output, _ = process.communicate(timeout=300)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                output, _ = process.communicate()
+                self.fail('Export build exceeded five minutes:\n' + output)
+            print(output)
+            self.assertEqual(process.returncode, 0, output)
 
     def test_actual_export_is_complete_reproducible_and_validated(self):
         report = prepare.prepare(prepare.ROOT, self.target)

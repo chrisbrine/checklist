@@ -114,52 +114,17 @@ enum SourceGit {
     }
 
     static func run(_ path: String, _ args: [String], protectedRoots: [String], executable: String? = nil, timeout: TimeInterval = defaultTimeout,
-                    acceptedExitCodes: Set<Int32> = [0], additionalOwnerHome: String? = nil, inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment) throws -> Data {
+                    acceptedExitCodes: Set<Int32> = [0], additionalOwnerHome: String? = nil, inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment,
+                    processAdapter: any SourceGitProcessAdapter = MacOSSourceGitProcessAdapter()) throws -> Data {
         let confinement = try Confinement(protectedRoots: protectedRoots, additionalOwnerHome: additionalOwnerHome)
         let executable = try executable.map { try trustedExecutable($0) } ?? resolve()
         do { _ = try trustedExecutable(Confinement.launcher) }
         catch { throw Confinement.unavailable() }
-        let process = Process(), out = Pipe(), err = Pipe(), exited = DispatchSemaphore(value: 0)
-        process.executableURL = URL(fileURLWithPath: Confinement.launcher)
-        process.arguments = ["-p", confinement.profile, executable, "-c", "core.fsmonitor=false", "-C", path] + args
-        process.environment = environment(inheritedEnvironment)
-        process.standardOutput = out; process.standardError = err; process.standardInput = FileHandle.nullDevice
-        process.terminationHandler = { _ in exited.signal() }
-        let readers = DispatchGroup(), lock = NSLock()
-        var output = Data(), errors = Data()
-        do { try process.run() }
-        catch { throw Confinement.unavailable() }
-        for (handle, isOutput) in [(out.fileHandleForReading, true), (err.fileHandleForReading, false)] {
-            readers.enter()
-            DispatchQueue.global(qos: .userInitiated).async {
-                let data = handle.readDataToEndOfFile()
-                lock.lock(); if isOutput { output = data } else { errors = data }; lock.unlock()
-                readers.leave()
-            }
-        }
-        let deadline = DispatchTime.now() + timeout
-        guard exited.wait(timeout: deadline) == .success else {
-            process.terminate()
-            if exited.wait(timeout: .now() + 2) == .timedOut { kill(process.processIdentifier, SIGKILL); _ = exited.wait(timeout: .now() + 2) }
-            _ = readers.wait(timeout: .now() + 2)
-            throw CoreError("SOURCE_CAPTURE_INCOMPLETE", "Git did not finish the source inventory within \(Int(timeout)) seconds.", details: ["reason": "git_timeout"])
-        }
-        // The child has exited; its pipes reach end of file unless a grandchild still holds them.
-        guard readers.wait(timeout: .now() + 5) == .success else { throw CoreError("SOURCE_CAPTURE_INCOMPLETE", "Git output did not close after git exited.", details: ["reason": "git_pipe_open"]) }
-        lock.lock(); defer { lock.unlock() }
-        guard process.terminationReason == .exit else {
-            throw CoreError("SOURCE_GIT_CONFINED", "Source Git was terminated by protected-root or helper confinement (or an external signal); no source inventory was accepted.", details: ["signal": process.terminationStatus])
-        }
-        let reason = String(data: errors.prefix(4096), encoding: .utf8) ?? "git failed"
-        if reason.contains("sandbox-exec:") { throw Confinement.unavailable() }
-        guard acceptedExitCodes.contains(process.terminationStatus) else {
-            let diagnostic = reason.lowercased()
-            if diagnostic.contains("xcode") && diagnostic.contains("license") {
-                throw CoreError("SOURCE_GIT_LICENSE_REQUIRED", "Git could not run because the Xcode license has not been accepted. The owner must run sudo xcodebuild -license accept in Terminal, then retry.", details: ["git_path": executable, "reason": "xcode_license_not_accepted"])
-            }
-            throw CoreError("SOURCE_CAPTURE_INCOMPLETE", "Git could not inventory the complete enrolled source tree.", details: ["reason": reason, "git_path": executable])
-        }
-        return output
+        return try processAdapter.run(SourceGitProcessRequest(
+            launcher: Confinement.launcher,
+            arguments: ["-p", confinement.profile, executable, "-c", "core.fsmonitor=false", "-C", path] + args,
+            environment: environment(inheritedEnvironment), timeout: timeout,
+            acceptedExitCodes: acceptedExitCodes, gitExecutable: executable))
     }
 }
 
@@ -277,8 +242,12 @@ extension CommandRouter {
             files.append(["path":relative,"kind":"file","sha256":hash(bytes),"size":bytes.count,"executable":executable & 0o111 != 0])
         }
         for file in files where file["kind"] as? String == "symlink" {
-            let destination = reservationKey(URL(fileURLWithPath:path).appendingPathComponent(file["path"] as! String).path)
-            guard files.contains(where: {$0["kind"] as? String == "file" && reservationKey(URL(fileURLWithPath:path).appendingPathComponent($0["path"] as! String).path) == destination}) else { throw CoreError("SOURCE_CAPTURE_INCOMPLETE","A source symlink must resolve to a regular file included in this exact capture.") }
+            let destination = reservationKey(URL(fileURLWithPath:path).appendingPathComponent((try StoredRecord(file, family: "SourceCapture").string("path"))).path)
+            guard try files.contains(where: { candidate in
+                guard candidate["kind"] as? String == "file" else { return false }
+                return reservationKey(URL(fileURLWithPath:path).appendingPathComponent((try StoredRecord(candidate,
+                    family: "source_file").string("path"))).path) == destination}) else { throw CoreError("SOURCE_CAPTURE_INCOMPLETE",
+                    "A source symlink must resolve to a regular file included in this exact capture.") }
         }
         guard !files.isEmpty else { throw CoreError("SOURCE_CAPTURE_INCOMPLETE","The source capture is empty.") }
         let identity: JSON = ["base_revision":base,"index_sha256":index,"files":files]
@@ -290,7 +259,7 @@ extension CommandRouter {
     /// hashed and checked before the object gate and the SQL writer (CL-71). A path with no
     /// prepared capture (for example a direct internal call) copies here as before.
     func captureSource(_ db: Database, request: JSON, task: JSON, attempt: JSON) throws -> JSON {
-        let pid = task["project_id"] as! String,project = try record(db,pid,type:"project"),path = project["root_path"] as? String ?? ""
+        let pid = (try StoredRecord(task, family: "SourceCapture").string("project_id")),project = try record(db,pid,type:"project"),path = project["root_path"] as? String ?? ""
         guard !path.isEmpty else { throw CoreError("ROOT_MISMATCH","Source review needs an enrolled writable project root.") }
         try requireSourceOutsideStore(path, recursive: true)
         if let supplied = request["root_path"] as? String,reservationKey(supplied) != reservationKey(path) { throw CoreError("ROOT_MISMATCH","Source capture always inventories the complete enrolled root.") }
@@ -331,10 +300,10 @@ extension CommandRouter {
         do {
             let (captureParent,_) = try durable.parent(pending.directory + "/source/.admission",create:true);Darwin.close(captureParent)
             for file in before["files"] as? [JSON] ?? [] {
-                let relative = file["path"] as! String
+                let relative = (try StoredRecord(file, family: "SourceCapture").string("path"))
                 if file["kind"] as? String == "deleted" { continue }
                 try requireSourceOutsideStore(URL(fileURLWithPath:path).appendingPathComponent(relative).path, recursive: false)
-                if file["kind"] as? String == "symlink" { try durable.writeLink(pending.directory + "/source/" + relative,target:file["target"] as! String) }
+                if file["kind"] as? String == "symlink" { try durable.writeLink(pending.directory + "/source/" + relative,target:(try StoredRecord(file, family: "SourceCapture").string("target"))) }
                 else { let bytes = try Data(contentsOf:URL(fileURLWithPath:path).appendingPathComponent(relative),options:.mappedIfSafe);guard hash(bytes) == file["sha256"] as? String else { throw CoreError("SOURCE_CHANGED","Source changed while capturing.") };try durable.writeNew(pending.directory + "/source/" + relative,bytes:bytes,permissions:bool(file,"executable") ? 0o555 : 0o444) }
             }
             let after = try sourceInventory(path,additional:additional,useCache:false)
@@ -483,7 +452,7 @@ extension CommandRouter {
             var identity = file.filter {["kind","sha256","executable","target"].contains($0.key)}
             if file["kind"] as? String == "symlink" {
                 var resolved = try capturedSourceInput(path,entries:captured)
-                resolved["executable"] = captured[resolved["resolved_path"] as! String]?["executable"]
+                resolved["executable"] = captured[(try StoredRecord(resolved, family: "SourceCapture").string("resolved_path"))]?["executable"]
                 identity["resolved_input"] = resolved
             }
             entries[key] = identity
@@ -492,7 +461,7 @@ extension CommandRouter {
     }
     func validateSourceTarget(_ db: Database, evidence: JSON, task: JSON) throws -> JSON? {
         guard let ref = evidence["source_capture"] as? JSON else { return nil }
-        let capture = try scoped(db,try text(ref,"id"),task["project_id"] as! String,type:"source_capture")
+        let capture = try scoped(db,try text(ref,"id"),(try StoredRecord(task, family: "SourceCapture").string("project_id")),type:"source_capture")
         guard capture["task_id"] as? String == task["id"] as? String,capture["sha256"] as? String == ref["sha256"] as? String else { throw CoreError("REVIEW_TARGET_MISMATCH","Source evidence belongs to another target.") }
         // Captured bytes were validated before the writer for this command (CL-71). The same
         // content observation of every entry stands for them. A changed observation or an
@@ -547,12 +516,23 @@ extension CommandRouter {
         guard try unresolvedSourceExecutions(db,attemptID:attempt["id"] as? String).isEmpty else { throw CoreError("SOURCE_EXECUTION_ACTIVE","A queued, running or interrupted source process retains its attempt reservations. Await actual completion, or record explicit stop verification before recovery.") }
     }
     func recoverSourceExecutions(_ db: Database, attempt: JSON, params: JSON, caller: Caller) throws {
-        try requireAgentEditAuthority(db,project:try record(db,attempt["project_id"] as! String,type:"project"),caller:caller)
+        try requireAgentEditAuthority(db,project:try record(db,(try StoredRecord(attempt, family: "SourceCapture").string("project_id")),type:"project"),caller:caller)
         let runs = try unresolvedSourceExecutions(db,attemptID:attempt["id"] as? String)
         guard !runs.isEmpty else {return}
         guard Set(strings(params,"source_execution_ids")) == Set(runs.compactMap {$0["id"] as? String}) else { throw CoreError("RECOVERY_REQUIRED","Explicitly name every source execution whose external process stop was verified.",details:["source_execution_ids":runs.compactMap {$0["id"] as? String}]) }
         let expected = params["expected_source_execution_revisions"] as? JSON ?? [:]
-        guard Set(expected.keys) == Set(runs.compactMap {$0["id"] as? String}),runs.allSatisfy({int(expected,$0["id"] as! String,default:-1) == int($0,"revision")}) else { throw CoreError("REVISION_CONFLICT","Source process state changed after the stop observation. Inspect the current launch/stop receipt before recovery.",details:["source_execution_revisions":Dictionary(uniqueKeysWithValues:runs.map {($0["id"] as! String,int($0,"revision"))})]) }
+        let revisions = try runs.map { run in
+            (try StoredRecord(run, family: "source_execution").string("id"), int(run, "revision"))
+        }
+        let revisionsMatch = revisions.allSatisfy { id, revision in
+            int(expected, id, default: -1) == revision
+        }
+        guard Set(expected.keys) == Set(runs.compactMap { $0["id"] as? String }), revisionsMatch else {
+            throw CoreError(
+                "REVISION_CONFLICT",
+                "Source process state changed after the stop observation. Inspect the current launch/stop receipt before recovery.",
+                details: ["source_execution_revisions": Dictionary(uniqueKeysWithValues: revisions)])
+        }
         for var run in runs { run["state"] = "stopped";run["process_stop_unverified"] = false;run["stop_verified_by"] = caller.principal;run["stop_verification_origin"] = caller.isOwner ? "human_ui" : "agent";run["stop_verification_session_id"] = caller.sessionID ?? "human";run["stop_observation_refs"] = params["observation_refs"];run["file_state_refs"] = params["file_state_refs"];run["stop_reason"] = params["reason"];run["finished_at"] = now();try save(db,revised(run),type:"source_execution") }
     }
 }

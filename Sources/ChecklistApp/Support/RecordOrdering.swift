@@ -5,14 +5,14 @@ enum RecordOrdering {
     /// Only immutable timestamp parsing is cached, never relative ages, records,
     /// project state or authority. Bound retained key bytes and formatter access.
     private final class TimestampCache: @unchecked Sendable {
-        let lock = NSLock()
-        let fractional: ISO8601DateFormatter = {
+        private let lock = NSLock()
+        private let fractional: ISO8601DateFormatter = {
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             return formatter
         }()
-        let standard = ISO8601DateFormatter()
-        var values: [String:Date] = [:]
+        private let standard = ISO8601DateFormatter()
+        private var values: [String:Date] = [:]
         func date(_ value: String) -> Date {
             lock.lock();defer {lock.unlock()}
             if let date = values[value] {return date}

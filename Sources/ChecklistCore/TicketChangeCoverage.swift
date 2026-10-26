@@ -22,7 +22,7 @@ extension CommandRouter {
             guard let bytes=row["project_bytes"] as Data?,let project=String(data:bytes,encoding:.utf8) else { reset = true; continue }
             let key=SnapshotRecordIdentity(project)
             if projects[key] == nil {projects[key]=Coverage(project:project);order.append(key)}
-            var coverage=projects[key]!
+            var coverage = projects[key] ?? Coverage(project: project)
             let kind=row["kind"] as String
             let family:Set<String>
             if ["work_checkpoint","checkpoint_recorded","work_scopes_adjusted","review_evidence_added"].contains(kind) {family=["work"]}
@@ -50,7 +50,8 @@ extension CommandRouter {
             projects[key]=coverage
         }
         let changes:[JSON]=order.compactMap {key in guard let value=projects[key] else{return nil};return ["project_id":value.project,"families":value.families.sorted(),"task_ids":value.tasks,"all_tasks":value.allTasks]}
-        var result: JSON = ["schema_version":2,"complete":true,"reset":reset,"project_ids":reset ? [] : changes.map {$0["project_id"]!},"changes":reset ? [] : changes]
+        var result: JSON = ["schema_version":2,"complete":true,"reset":reset,"project_ids":reset ? [] : try changes.map {(try StoredRecord($0, family: "record").requiredValue("project_id"))},
+            "changes":reset ? [] : changes]
         // A bounded status-only projection shares this read transaction and its
         // authority with coverage. No task text/history or global sequence escapes.
         let affected = changes.filter { !Set($0["families"] as? [String] ?? []).isDisjoint(with:["tasks","all"]) && !($0["task_ids"] as? [String] ?? []).isEmpty }
@@ -59,7 +60,7 @@ extension CommandRouter {
             var updates: [JSON] = []
             var membershipLinks = 0
             for change in affected {
-                let project = change["project_id"] as! String
+                let project = (try StoredRecord(change, family: "change").string("project_id"))
                 let tasks = change["task_ids"] as? [String] ?? []
                 let projects = try jsonString([project])
                 let arguments: StatementArguments = ["projects":projects,"ids":try jsonString(tasks),

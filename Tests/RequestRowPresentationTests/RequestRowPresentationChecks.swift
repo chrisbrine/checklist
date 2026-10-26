@@ -1,6 +1,7 @@
 import Foundation
 #if canImport(ChecklistApp)
 import XCTest
+import os
 @testable import ChecklistApp
 #endif
 
@@ -67,6 +68,21 @@ struct RequestRowPresentationChecks {
 
 #if canImport(ChecklistApp)
 final class RequestRowPresentationTests: XCTestCase {
+    func testConcurrentTimestampParsingKeepsFractionalOffsetsAndInvalidFallback() {
+        let failures = OSAllocatedUnfairLock(initialState: 0)
+        DispatchQueue.concurrentPerform(iterations: 128) { _ in
+            let first = RequestRowPresentationChecks.request("fractional", "2026-10-17T12:00:00.125Z")
+            let sameInstant = RequestRowPresentationChecks.request("offset", "2026-10-17T14:00:00.125+02:00")
+            let invalid = RequestRowPresentationChecks.request("invalid", "bad")
+            if RequestRowPresentation.createdAt(first) != RequestRowPresentation.createdAt(sameInstant)
+                || RequestRowPresentation.createdAt(first) == nil
+                || RequestRowPresentation.createdAt(invalid) != nil {
+                failures.withLock { $0 += 1 }
+            }
+        }
+        XCTAssertEqual(failures.withLock { $0 }, 0)
+    }
+
     func testStandaloneChecks() throws {
         try RequestRowPresentationChecks.main()
     }

@@ -24,7 +24,7 @@ final class NativeCodeIdentity {
         init?(_ pid: pid_t) {
             var bsd = proc_bsdinfo(), path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
             guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsd, Int32(MemoryLayout.size(ofValue:bsd))) == MemoryLayout.size(ofValue:bsd), bsd.pbi_uid == getuid(),
-                  proc_pidpath(pid, &path, UInt32(path.count)) > 0, let file = FileStamp(String(cString:path)) else { return nil }
+                  proc_pidpath(pid, &path, UInt32(path.count)) > 0, let file = FileStamp(String(decoding: path.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)) else { return nil }
             generation = [UInt64(bsd.pbi_pid), bsd.pbi_start_tvsec, bsd.pbi_start_tvusec, UInt64(bsd.pbi_uid)]
             self.file = file
         }

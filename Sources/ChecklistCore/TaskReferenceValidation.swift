@@ -118,14 +118,14 @@ extension CommandRouter {
         guard !frame.projects.isEmpty else { return }
         var selected: [TaskReferenceKey: DecodedEnvelope] = [:]
         var seenRows: Set<Int64> = []
-        for projectKey in frame.projects.keys.sorted(by: { $0.lexicographicallyPrecedes($1) }) {
-            let work = frame.projects[projectKey]!
+        for (projectKey, work) in frame.projects.sorted(by: { $0.key.lexicographicallyPrecedes($1.key) }) {
             func consume(_ rows: [Row]) throws {
                 for row in rows {
                     let position: Int64 = row["_reference_position"]
                     guard seenRows.insert(position).inserted else { continue }
                     let task = try GRDBRecordEnvelopeAdapter.decode(row, expectedType: "task")
-                    selected[.init(project: Data(task.projectID!.utf8), type: "task", id: Data(task.id.utf8))] = task
+                    let project = try StoredRecord(task.object, family: "task").string("project_id")
+                    selected[.init(project: Data(project.utf8), type: "task", id: Data(task.id.utf8))] = task
                 }
             }
             for ids in referenceChunks(referenceOrder(work.tasks)) {
@@ -150,22 +150,20 @@ extension CommandRouter {
         // Bulk target reads are grouped by exact project/type, in bounded chunks.
         // No per-save FK walk, global scan or per-task target refetch is added.
         var groups: [TaskReferenceScope: [Data: String]] = [:]
-        var scopes: [TaskReferenceScope: CurrentTaskReference] = [:]
         for reference in references.values {
             let group = TaskReferenceScope(project: Data(reference.project.utf8), type: reference.type)
-            scopes[group] = reference
             groups[group, default: [:]][Data(reference.id.utf8)] = reference.id
         }
         var targets: [TaskReferenceKey: DecodedEnvelope] = [:]
         for (group, ids) in groups {
-            let scope = scopes[group]!
             for chunk in referenceChunks(referenceOrder(ids)) {
-                var values: [DatabaseValueConvertible] = [Data(scope.project.utf8), Data(scope.type.utf8)]
+                var values: [DatabaseValueConvertible] = [group.project, Data(group.type.utf8)]
                 values += chunk.map { Data($0.utf8) as DatabaseValueConvertible }
                 let sql = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE project_id=CAST(? AS TEXT) AND type=CAST(? AS TEXT) AND id IN (" + referencePlaceholders(chunk.count) + ") ORDER BY rowid"
                 for row in try Row.fetchAll(db, sql: sql, arguments: StatementArguments(values)) {
-                    let target = try GRDBRecordEnvelopeAdapter.decode(row, expectedType: scope.type)
-                    targets[.init(project: Data(target.projectID!.utf8), type: target.type, id: Data(target.id.utf8))] = target
+                    let target = try GRDBRecordEnvelopeAdapter.decode(row, expectedType: group.type)
+                    let project = try StoredRecord(target.object, family: "reference_target").string("project_id")
+                    targets[.init(project: Data(project.utf8), type: target.type, id: Data(target.id.utf8))] = target
                 }
             }
         }
@@ -176,7 +174,8 @@ extension CommandRouter {
     }
 
     private func currentReferences(_ task: DecodedEnvelope) throws -> [CurrentTaskReference] {
-        let value = task.object, project = task.projectID!
+        let value = task.object
+        let project = try StoredRecord(value, family: "task").string("project_id")
         if bool(value,"purged") {
             let allowed: Set<String> = ["id","project_id","key","title","revision","purged","purged_at","purged_by","trashed","archived"]
             guard Set(value.keys).isSubset(of:allowed),value["title"] as? String == "Purged ticket",
@@ -213,7 +212,7 @@ extension CommandRouter {
     }
 
     private func referenceOrder(_ values: [Data: String]) -> [String] {
-        values.keys.sorted(by: { $0.lexicographicallyPrecedes($1) }).map { values[$0]! }
+        values.sorted(by: { $0.key.lexicographicallyPrecedes($1.key) }).map(\.value)
     }
     private func referenceChunks(_ values: [String]) -> [[String]] {
         stride(from: 0, to: values.count, by: 128).map { Array(values[$0..<min($0 + 128, values.count)]) }

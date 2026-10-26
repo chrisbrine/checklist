@@ -37,21 +37,41 @@ extension CommandRouter {
             let mode: ArchiveAttachmentFact.Mode = a["mode"] as? String == "managed" ? .managed : .externalReference
             let availability: ArchiveAttachmentFact.Availability = a["availability"] as? String == "available" ? .available : (a["availability"] as? String == "original_cleaned" ? .originalCleaned : .missing)
             let holds = try completeArchiveCleanupHolds(db,attachment:a,task:task,considerArchiving:considerArchiving,currentGraph:graph,currentIndex:index)
-            return try .init(id:a["id"] as! String,logicalOriginalBytes:ArchiveCleanupJob.integer(a["size"]),mode:mode,availability:availability,protectionReasons:Set(holds.map { ArchiveProtectionReason(rawValue:$0.rawValue) ?? .otherAuthoritativeHold }))
+            return try .init(
+                id: (try StoredRecord(a, family: "a").string("id")), logicalOriginalBytes: ArchiveCleanupJob.integer(a["size"]), mode: mode, availability: availability,
+                protectionReasons: Set(holds.map { ArchiveProtectionReason(rawValue: $0.rawValue) ?? .otherAuthoritativeHold }))
         }
     }
     func archiveRetentionPreview(_ db: Database,task: JSON) throws -> JSON {
-        let pid = task["project_id"] as! String,tid = task["id"] as! String,project = try record(db,pid,type:"project")
+        let pid = (try StoredRecord(task, family: "task").string("project_id")), tid = (try StoredRecord(task, family: "task").string("id")),
+            project = try record(db, pid, type: "project")
         let config = try archiveRetentionConfiguration(project)
         let plan = try ArchiveRetentionPlanner.make(configuration:config,facts:archiveRetentionFacts(db,task:task,considerArchiving:true))
         guard plan.selected.count <= ArchiveCleanupJob.maximumItems else { throw CoreError("CLEANUP_JOB_TOO_LARGE", "This ticket exceeds the bounded cleanup selection. Keep its originals; no cleanup was queued.") }
         let previewID = uuid()
         let originals: [JSON] = try plan.selected.map { item in
             let a = try scoped(db,item.id.text,pid,type:"attachment")
-            return ["attachment_id":item.id.text,"sha256":a["sha256"]!,"logical_bytes":item.logicalBytes,"attachment_revision":a["revision"]!]
+            return [
+                "attachment_id": item.id.text, "sha256": (try StoredRecord(a, family: "a").requiredValue("sha256")), "logical_bytes": item.logicalBytes,
+                "attachment_revision": (try StoredRecord(a, family: "a").requiredValue("revision")),
+            ]
         }
-        let basis: JSON = ["project_id":pid,"task_id":tid,"task_revision":task["revision"]!,"settings_revision":project["settings_revision"]!,"preview_id":previewID,"originals":originals]
-        let value: JSON = ["id":uuid(),"project_id":pid,"task_id":tid,"record_type":"cleanup_preview","revision":1,"cleanup_preview_id":previewID,"task_revision":task["revision"]!,"settings_revision":project["settings_revision"]!,"archive_storage":config.jsonValue,"cleanup_job_plan_sha256":hash(Data(try jsonString(basis).utf8)),"attachment_ids":plan.selected.map { $0.id.text },"clean_bytes":plan.selectedLogicalBytes,"retained_bytes":plan.retainedLogicalBytes,"held_bytes":plan.protectedLogicalBytes,"budget_excess_bytes":plan.retainedBudgetExcessBytes,"holds":plan.protected.map { ["attachment_id":$0.id.text,"logical_bytes":$0.logicalBytes,"reasons":$0.reasons.map(\.rawValue)] },"grace_seconds":Self.archiveCleanupGraceMS / 1000,"physical_reclamation":"unmeasured","backup_retained_physical_bytes":NSNull(),"reason":"Only eligible managed originals are queued, with a 30-second Undo window. Current references and holds are checked again before deletion. Logical bytes are not measured physical savings."]
+        let basis: JSON = [
+            "project_id": pid, "task_id": tid, "task_revision": (try StoredRecord(task, family: "task").requiredValue("revision")),
+            "settings_revision": (try StoredRecord(project, family: "project").requiredValue("settings_revision")), "preview_id": previewID, "originals": originals,
+        ]
+        let value: JSON = [
+            "id": uuid(), "project_id": pid, "task_id": tid, "record_type": "cleanup_preview", "revision": 1, "cleanup_preview_id": previewID,
+            "task_revision": (try StoredRecord(task, family: "task").requiredValue("revision")),
+            "settings_revision": (try StoredRecord(project, family: "project").requiredValue("settings_revision")), "archive_storage": config.jsonValue,
+            "cleanup_job_plan_sha256": hash(Data(try jsonString(basis).utf8)), "attachment_ids": plan.selected.map { $0.id.text }, "clean_bytes": plan.selectedLogicalBytes,
+            "retained_bytes": plan.retainedLogicalBytes, "held_bytes": plan.protectedLogicalBytes, "budget_excess_bytes": plan.retainedBudgetExcessBytes,
+            "holds": plan.protected.map { ["attachment_id": $0.id.text, "logical_bytes": $0.logicalBytes, "reasons": $0.reasons.map(\.rawValue)] },
+            "grace_seconds": Self.archiveCleanupGraceMS / 1000, "physical_reclamation": "unmeasured", "backup_retained_physical_bytes": NSNull(),
+            "reason":
+                "Only eligible managed originals are queued, with a 30-second Undo window. "
+                    + "Current references and holds are checked again before deletion. Logical bytes are not measured physical savings.",
+        ]
         // CL-72: a repeated preview of the same ticket revision, settings and plan reuses the
         // existing record instead of adding one per call.
         var basisWithoutID = basis; basisWithoutID.removeValue(forKey:"preview_id")
@@ -62,7 +82,7 @@ extension CommandRouter {
     }
     /// Called before the archive mutation, in that command's transaction.
     func queueArchiveRetentionCleanup(_ db: Database,task: JSON,previewID: String?,caller: Caller) throws {
-        let project = try record(db,task["project_id"] as! String,type:"project")
+        let project = try record(db, (try StoredRecord(task, family: "task").string("project_id")), type: "project")
         let plan = try ArchiveRetentionPlanner.make(configuration:archiveRetentionConfiguration(project),facts:archiveRetentionFacts(db,task:task,considerArchiving:true))
         guard !plan.selected.isEmpty else { return }
         guard let previewID else { throw CoreError("CLEANUP_PREVIEW_REQUIRED", "Read the current storage summary before archiving with cleanup.") }

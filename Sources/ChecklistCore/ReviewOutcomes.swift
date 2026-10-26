@@ -48,7 +48,7 @@ extension CommandRouter {
     func normalizedReviewChecks(_ db: Database, _ p: JSON, task: JSON) throws -> [Any] {
         let checks = p["checks"] as? [Any] ?? []
         guard checks.count <= 100 else { throw CoreError("INVALID_INPUT", "Report at most 100 checks.") }
-        let pid = task["project_id"] as! String
+        let pid = (try StoredRecord(task, family: "task").string("project_id"))
         return try checks.map { item -> Any in
             guard var check = item as? JSON else { return item }
             if let cause = check["failure_cause"] {
@@ -136,10 +136,10 @@ extension CommandRouter {
         let findings = try scopedTaskRows(db, type: "finding", task: task)
         var causes: [String: [JSON]] = [:]
         for finding in findings { causes[finding["cause_id"] as? String ?? finding["id"] as? String ?? "", default: []].append(finding) }
-        return causes.keys.sorted().compactMap { cause -> JSON? in
+        return try causes.keys.sorted().compactMap { cause -> JSON? in
             let group = causes[cause]!
             guard group.count >= 3 else { return nil }
-            return ["kind": "repeated_finding", "task_id": task["id"]!, "task_key": task["key"] ?? NSNull(), "cause_id": cause, "occurrences": group.count,
+            return ["kind": "repeated_finding", "task_id": (try StoredRecord(task, family: "task").string("id")), "task_key": task["key"] ?? NSNull(), "cause_id": cause, "occurrences": group.count,
                     "finding_ids": group.compactMap { $0["id"] as? String },
                     "message": "The same cause returned for the second time. Change the approach: split the ticket or write a new brief before another round."]
         }
@@ -167,7 +167,8 @@ extension CommandRouter {
         history.append(["from": previous, "to": severity, "reason": reason, "actor": c.principal, "actor_display": author(db, c), "origin": c.isOwner ? "human_ui" : "agent", "changed_at": now()])
         finding["severity"] = severity; finding["severity_history"] = history; finding = revised(finding)
         try save(db, finding, type: "finding")
-        try event(db, caller: c, project: pid, entity: finding["task_id"] as? String, kind: "finding_severity_changed", data: ["finding_id": finding["id"]!, "from": previous, "to": severity])
+        try event(db, caller: c, project: pid, entity: finding["task_id"] as? String, kind: "finding_severity_changed", data: ["finding_id": (try StoredRecord(finding,
+            family: "finding").string("id")), "from": previous, "to": severity])
         return finding
     }
 
@@ -179,8 +180,9 @@ extension CommandRouter {
         let held = try records(db, type: "task", project: pid).filter { ($0["release_hold"] as? JSON)?["release_set"] as? String == name }
         guard !held.isEmpty else { throw CoreError("NOT_FOUND", "No ticket waits for release set \(name).") }
         if let expected = p["expected_task_revisions"] as? JSON {
-            for task in held where expected[task["id"] as! String] != nil {
-                guard int(expected, task["id"] as! String) == int(task, "revision") else { throw CoreError("REVISION_CONFLICT", "A held ticket changed. Read the release set again.", details: ["task_id": task["id"]!]) }
+            for task in held where expected[(try StoredRecord(task, family: "task").string("id"))] != nil {
+                guard int(expected, (try StoredRecord(task, family: "task").string("id"))) == int(task, "revision") else { throw CoreError("REVISION_CONFLICT",
+                    "A held ticket changed. Read the release set again.", details: ["task_id": (try StoredRecord(task, family: "task").string("id"))]) }
             }
         }
         let done = try status(db, pid, "done")
@@ -192,7 +194,8 @@ extension CommandRouter {
                 guard task["current_manifest_id"] as? String == hold["manifest_id"] as? String else { throw CoreError("EVIDENCE_STALE", "The ticket has a new target since its accepted review.") }
                 try requirePrerequisitesSatisfied(db, task: task)
                 try requireCompletable(db, task: task, pid: pid, releasingHold: true)
-            } catch let error as CoreError { refusals.append(["task_id": task["id"]!, "task_key": task["key"] ?? NSNull(), "code": error.code, "reason": error.message]) }
+            } catch let error as CoreError { refusals.append(["task_id": (try StoredRecord(task, family: "task").string("id")), "task_key": task["key"] ?? NSNull(),
+                "code": error.code, "reason": error.message]) }
         }
         guard refusals.isEmpty else { throw CoreError("RELEASE_SET_NOT_READY", "Every ticket in the release set must pass its fresh completion checks; none was completed.", details: ["release_set": name, "not_ready": refusals]) }
         var completed: [JSON] = []

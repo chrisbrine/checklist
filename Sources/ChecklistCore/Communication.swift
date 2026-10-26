@@ -29,15 +29,21 @@ extension CommandRouter {
         var candidates: [JSON] = []
         for profile in profiles {
             for session in sessions where session["profile_id"] as? String == profile["id"] as? String && canReceive(session,project:pid) && qualifiedPersonalAssistant(profile,session) {
-                candidates.append(["agent_profile_id":profile["id"]!,"display_name":profile["display_name"]!,"session_id":session["id"]!,"provider":session["provider"] ?? "unknown","surface":"MCP","access_mode":session["role"] as? String == "assistant" ? "observer_messenger" : "worker","availability":session["state"] ?? "unknown","push_available":false])
+                candidates.append(["agent_profile_id":(try StoredRecord(profile, family: "Communication").requiredValue("id")),
+                    "display_name":(try StoredRecord(profile, family: "Communication").requiredValue("display_name")),"session_id":(try StoredRecord(session,
+                    family: "Communication").requiredValue("id")),"provider":session["provider"] ?? "unknown","surface":"MCP",
+                    "access_mode":session["role"] as? String == "assistant" ? "observer_messenger" : "worker","availability":session["state"] ?? "unknown","push_available":false])
             }
         }
         guard candidates.count == 1 else {
             let unqualified = profiles.contains { profile in sessions.contains { $0["profile_id"] as? String == profile["id"] as? String && $0["role"] as? String == "assistant" && canReceive($0,project:pid) && !qualifiedPersonalAssistant(profile,$0) } }
             return ["state":candidates.isEmpty ? (unqualified ? "unavailable" : "not_found") : "ambiguous","candidates":candidates,"reason":unqualified ? "This setup record is not a verified connected personal assistant identity. Worker sessions are contacted by their actual session reference." : ""]
         }
-        let target = uuid()+uuid(); let candidate = candidates[0]; let session = try record(db,candidate["session_id"] as! String,type:"session")
-        let r: JSON = ["id":target,"project_id":pid,"principal":c.principal,"session_id":candidate["session_id"]!,"session_revision":session["revision"]!,"profile_id":candidate["agent_profile_id"]!,"expires_at":Date().timeIntervalSince1970 + 300,"incarnation":incarnation,"task_id":p["task_id"] ?? NSNull(),"revision":1,"sender_authorization_scope":try authorizationScope(db,c)]
+        let target = uuid()+uuid(); let candidate = candidates[0]; let session = try record(db,StoredRecord(candidate, family: "recipient_candidate").string("session_id"),type:"session")
+        let r: JSON = ["id":target,"project_id":pid,"principal":c.principal,"session_id":(try StoredRecord(candidate,
+            family: "Communication").requiredValue("session_id")),"session_revision":(try StoredRecord(session, family: "Communication").requiredValue("revision")),
+            "profile_id":(try StoredRecord(candidate, family: "Communication").requiredValue("agent_profile_id")),"expires_at":Date().timeIntervalSince1970 + 300,
+            "incarnation":incarnation,"task_id":p["task_id"] ?? NSNull(),"revision":1,"sender_authorization_scope":try authorizationScope(db,c)]
         try save(db,r,type:"recipient_target")
         return ["state":"resolved","recipient_target":target,"candidate":candidate,"delivery_capability":"pickup_only","push_available":false]
     }
@@ -57,33 +63,8 @@ extension CommandRouter {
                 throw CoreError("INVALID_INPUT","Trusted human continuations retain their protected internal route.")
             }
         }
-        if method == "message_ack" {
-            try assistantPermission(c,pid,"receive_messages")
-            var delivery = try scoped(db,try text(p,"delivery_id"),pid,type:"delivery")
-            guard try deliveryCurrent(db,delivery),c.sessionID != nil,delivery["recipient_session_id"] as? String == c.sessionID else { throw CoreError("FORBIDDEN","Only the exact recipient can acknowledge this delivery.") }
-            let stage = p["stage"] as? String ?? "acknowledged"
-            guard ["acknowledged","addressed"].contains(stage) else { throw CoreError("INVALID_INPUT","Invalid receipt stage.") }
-            // A reaction shows the owner what this recipient did with the note. It is an acknowledgment
-            // marker only: it never addresses a direction, grants authority or carries human provenance.
-            let reaction = p["reaction"] as? String
-            if let reaction { guard Self.noteReactions.contains(reaction) else { throw CoreError("INVALID_INPUT","Use one reaction: thumbs_up, thumbs_down, done, looking or question.") } }
-            var disposition: JSON?
-            if stage == "addressed" {
-                guard c.role != "assistant" else { throw CoreError("FORBIDDEN","Assistants can acknowledge their own copy only.") }
-                disposition = try validateDirectionDisposition(db,delivery:delivery,params:p,caller:c)
-            }
-            let reactionData: JSON = reaction.map { ["reaction":$0] } ?? [:]
-            if delivery["state"] as? String == "addressed",stage == "acknowledged" {
-                guard let reaction,delivery["reaction"] as? String != reaction else { return delivery }
-                delivery["reaction"] = reaction; delivery["reaction_at"] = now(); delivery = revised(delivery); try save(db,delivery,type:"delivery")
-                try event(db,caller:c,project:pid,entity:delivery["message_id"] as? String,kind:"message_reaction",data:reactionData); return delivery
-            }
-            delivery["state"] = stage; delivery[stage+"_at"] = now()
-            if let reaction { delivery["reaction"] = reaction; delivery["reaction_at"] = now() }
-            delivery = revised(delivery); try save(db,delivery,type:"delivery")
-            if let disposition { var message = try scoped(db,delivery["message_id"] as! String,pid,type:"message"); message["addressed"] = true; message["disposition_id"] = disposition["id"]; message["disposition_state"] = "addressed"; delivery["disposition_id"] = disposition["id"]; try save(db,delivery,type:"delivery"); try save(db,revised(message),type:"message") }
-            try event(db,caller:c,project:pid,entity:delivery["message_id"] as? String,kind:"message_"+stage,data:reactionData); return delivery
-        }
+        if method == "message_ack" { return try acknowledgeMessage(db, params: p, caller: c, projectID: pid) }
+
         guard p["triage_id"] == nil || p["epic_id"] == nil else { throw CoreError("INVALID_INPUT","Select at most one Triage or Epic subject.") }
         let explicitSessionID = method == "message_send" ? try explicitMessageRecipient(p) : nil
         let mentionTarget = p["mention_target"] != nil ? try text(p,"mention_target",max:4000) : nil
@@ -110,9 +91,10 @@ extension CommandRouter {
         } else if method == "agent_message_send" {
             let target = try scoped(db,try text(p,"recipient_target"),pid,type:"recipient_target")
             guard target["sender_authorization_scope"] as? String == (try authorizationScope(db,c)),target["principal"] as? String == c.principal,target["incarnation"] as? String == incarnation,(target["expires_at"] as? Double ?? 0) > Date().timeIntervalSince1970 else { throw CoreError("RECIPIENT_CHANGED","Resolve this named agent again before sending.") }
-            let sid = target["session_id"] as! String; let session = try scoped(db,sid,pid,type:"session")
+            let sid = try StoredRecord(target, family: "recipient_target").string("session_id"); let session = try scoped(db,sid,pid,type:"session")
             guard canReceive(session,project:pid),session["profile_id"] as? String == target["profile_id"] as? String,int(session,"revision") == int(target,"session_revision") else { throw CoreError("RECIPIENT_CHANGED","The connection changed; resolve it again.") }
-            recipients = [sid]; let profile = try record(db,target["profile_id"] as! String,type:"profile"); profileSnapshot = ["display_name":profile["display_name"] ?? "Agent","provider":session["provider"] ?? "unknown"]
+            recipients = [sid]; let profile = try record(db,StoredRecord(target, family: "recipient_target").string("profile_id"),type:"profile");
+                profileSnapshot = ["display_name":profile["display_name"] ?? "Agent","provider":session["provider"] ?? "unknown"]
             if let targetTask = target["task_id"] as? String { guard taskID == targetTask else { throw CoreError("RECIPIENT_CHANGED","This route is bound to a different ticket context.") } }
             if let replyID = p["reply_to"] as? String {
                 var original = try scoped(db,replyID,pid,type:"message")
@@ -145,7 +127,12 @@ extension CommandRouter {
         }
         if c.isOwner,bool(p,"requires_action"),let tid = taskID {
             let relevant = try relevantHandlerRecipients(db,task:scoped(db,tid,pid,type:"task"))
-            for recipient in relevant where !recipients.contains(recipient["session_id"] as! String) { recipients.append(recipient["session_id"] as! String); recipientDetails.append(recipient) }
+            for recipient in relevant {
+                let sessionID = try StoredRecord(recipient, family: "handler_recipient").string("session_id")
+                guard !recipients.contains(sessionID) else { continue }
+                recipients.append(sessionID)
+                recipientDetails.append(recipient)
+            }
         }
         if p["correction_of"] != nil,let tid = taskID {
             guard method == "message_send",explicitSessionID == nil,mentionTarget == nil else { throw CoreError("INVALID_INPUT","Note corrections use the current ticket handlers; omit recipient and mention_target.") }
@@ -185,6 +172,37 @@ extension CommandRouter {
         try event(db,caller:c,project:pid,entity:taskID ?? conversationID,kind:"message_saved",data:["message_id":mid,"origin":origin])
         m["subject"] = try subject(db,message:m);m["deliveries"] = deliveries; m["delivery_status"] = recipients.isEmpty ? "saved_for_pickup" : "queued"; m["native_push"] = false; return m
     }
+    private func acknowledgeMessage(_ db: Database, params p: JSON, caller c: Caller, projectID pid: String) throws -> JSON {
+        try assistantPermission(c,pid,"receive_messages")
+        var delivery = try scoped(db,try text(p,"delivery_id"),pid,type:"delivery")
+        guard try deliveryCurrent(db,delivery),c.sessionID != nil,delivery["recipient_session_id"] as? String == c.sessionID else { throw CoreError("FORBIDDEN",
+            "Only the exact recipient can acknowledge this delivery.") }
+        let stage = p["stage"] as? String ?? "acknowledged"
+        guard ["acknowledged","addressed"].contains(stage) else { throw CoreError("INVALID_INPUT","Invalid receipt stage.") }
+        // A reaction shows the owner what this recipient did with the note. It is an acknowledgment
+        // marker only: it never addresses a direction, grants authority or carries human provenance.
+        let reaction = p["reaction"] as? String
+        if let reaction { guard Self.noteReactions.contains(reaction) else { throw CoreError("INVALID_INPUT","Use one reaction: thumbs_up, thumbs_down, done, looking or question.") } }
+        var disposition: JSON?
+        if stage == "addressed" {
+            guard c.role != "assistant" else { throw CoreError("FORBIDDEN","Assistants can acknowledge their own copy only.") }
+            disposition = try validateDirectionDisposition(db,delivery:delivery,params:p,caller:c)
+        }
+        let reactionData: JSON = reaction.map { ["reaction":$0] } ?? [:]
+        if delivery["state"] as? String == "addressed",stage == "acknowledged" {
+            guard let reaction,delivery["reaction"] as? String != reaction else { return delivery }
+            delivery["reaction"] = reaction; delivery["reaction_at"] = now(); delivery = revised(delivery); try save(db,delivery,type:"delivery")
+            try event(db,caller:c,project:pid,entity:delivery["message_id"] as? String,kind:"message_reaction",data:reactionData); return delivery
+        }
+        delivery["state"] = stage; delivery[stage+"_at"] = now()
+        if let reaction { delivery["reaction"] = reaction; delivery["reaction_at"] = now() }
+        delivery = revised(delivery); try save(db,delivery,type:"delivery")
+        if let disposition { var message = try scoped(db,StoredRecord(delivery, family: "delivery").string("message_id"),pid,type:"message"); message["addressed"] = true;
+            message["disposition_id"] = disposition["id"]; message["disposition_state"] = "addressed"; delivery["disposition_id"] = disposition["id"]; try save(db,delivery,type:"delivery");
+            try save(db,revised(message),type:"message") }
+        try event(db,caller:c,project:pid,entity:delivery["message_id"] as? String,kind:"message_"+stage,data:reactionData); return delivery
+    }
+
     /// Ticket-scoped receipt metadata only: this is never a recipient inbox read.
     func messageDeliveryList(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         let pid = try scope(db,p,c), tid = try text(p,"task_id"), mid = try text(p,"message_id")
@@ -238,7 +256,7 @@ extension CommandRouter {
         var deliveries: [JSON] = []
         for pid in pids { try assistantPermission(c,pid,"receive_messages"); for var d in try records(db,type:"delivery",project:pid) where d["recipient_session_id"] as? String == sid {
             guard try deliveryCurrent(db,d) else { continue }
-            var message = try scoped(db,d["message_id"] as! String,pid,type:"message")
+            var message = try scoped(db,StoredRecord(d, family: "delivery").string("message_id"),pid,type:"message")
             let subject = try subject(db,message:message);message["subject"] = subject;d["subject"] = subject
             d["message"] = message; deliveries.append(d)
         } }
@@ -290,7 +308,8 @@ extension CommandRouter {
         let rows = Array(fetched.prefix(limit))
         let events: [JSON] = try rows.map { row in
             let data = backup ? try backupHistoryData(db,row) : jsonObject(row["data"])
-            return ["subject":["id":r["id"]!,"key":r["key"] ?? NSNull(),"title":r["title"] ?? r["name"] ?? ""],"id":row["id"] as String,"actor":row["actor"] as String,"kind":row["kind"] as String,"occurred_at":row["occurred_at"] as String,"data":data] }
+            return ["subject":["id":(try StoredRecord(r, family: "Communication").requiredValue("id")),"key":r["key"] ?? NSNull(),
+                "title":r["title"] ?? r["name"] ?? ""],"id":row["id"] as String,"actor":row["actor"] as String,"kind":row["kind"] as String,"occurred_at":row["occurred_at"] as String,"data":data] }
         var seenMessageIDs = Set<SnapshotRecordIdentity>()
         let messageIDs = events.flatMap {entry -> [String] in let data = entry["data"] as? JSON ?? [:]; return [data["message_id"] as? String,data["reply_id"] as? String].compactMap {$0}}.filter {seenMessageIDs.insert(SnapshotRecordIdentity($0)).inserted}
         // Hydrate only IDs named by this authorized event page, never every project message.

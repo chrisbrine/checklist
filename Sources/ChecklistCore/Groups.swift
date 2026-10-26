@@ -10,7 +10,11 @@ extension CommandRouter {
     }
     func validateTriageTaskPhase(_ db: Database,task: JSON,phase: String) throws {
         let category: String
-        if let sid = task["status_id"] as? String { category = try scoped(db,sid,task["project_id"] as! String,type:"status")["category"] as? String ?? "queued" } else { category = "queued" }
+        if let sid = task["status_id"] as? String {
+            category = try scoped(db, sid, (try StoredRecord(task, family: "task").string("project_id")), type: "status")["category"] as? String ?? "queued"
+        } else {
+            category = "queued"
+        }
         if phase == "review" {
             guard category == "review",task["current_manifest_id"] != nil else { throw CoreError("TRIAGE_PHASE_CONFLICT","A review Triage accepts only tickets currently in review with a submitted exact target. Create a separate implementation Triage for further fixes.") }
         } else { guard !["review","done","canceled"].contains(category) else { throw CoreError("TRIAGE_PHASE_CONFLICT","An implementation Triage accepts implementation work, including In Progress tickets. Submitted targets go into a separate review Triage; completed tickets remain outside active handling.") } }
@@ -18,7 +22,7 @@ extension CommandRouter {
     /// Legacy advisory handling signal: orchestration and member attempts count here.
     /// It is not the Active section predicate; that uses each ticket's status category.
     func triageActiveAttention(_ db: Database,_ group: JSON) throws -> Bool {
-        let pid = group["project_id"] as! String
+        let pid = (try StoredRecord(group, family: "group").string("project_id"))
         return try projectedTriageAttention(group,taskLookup:{try self.scoped(db,$0,pid,type:"task")},statusLookup:{try self.scoped(db,$0,pid,type:"status")})
     }
     func projectedTriageAttention(_ group: JSON, memberIDs: [String]? = nil, taskLookup: (String) throws -> JSON, statusLookup: (String) throws -> JSON) throws -> Bool {
@@ -32,9 +36,11 @@ extension CommandRouter {
     }
     /// Kept for agent compatibility and work health, including unclaimed Triage members.
     func taskActiveAttention(_ db: Database,_ task: JSON) throws -> Bool {
-        let pid = task["project_id"] as! String
+        let taskRecord = try StoredTaskRecord(task)
+        let pid = taskRecord.projectID
         return try projectedTaskAttention(task,statusLookup:{try self.scoped(db,$0,pid,type:"status")}) {
-            for group in try self.records(db,type:"group",project:pid) where group["kind"] as? String == "triage" && !bool(group,"archived") && self.triageMemberIDs(group).contains(task["id"] as! String) {
+            for group in try self.records(db, type: "group", project: pid)
+            where group["kind"] as? String == "triage" && !bool(group, "archived") && self.triageMemberIDs(group).contains(taskRecord.id) {
                 if try self.triageActiveAttention(db,group) { return true }
             }
             return false
@@ -66,7 +72,8 @@ extension CommandRouter {
                   closure["execution_domain"] as? String == orchestration["execution_domain"] as? String,
                   closure["old_authorization_generation"] as? String == orchestration["session_authorization_generation"] as? String,
                   let installation = closure["installation"] as? String,
-                  orchestration["principal"] as? String == installation + ":" + (session["id"] as! String) else { continue }
+                orchestration["principal"] as? String == installation + ":" + ((try StoredRecord(session, family: "session").string("id")))
+            else { continue }
             return id
         }
         return nil
@@ -74,20 +81,25 @@ extension CommandRouter {
     // A Triage notice is independent of member tickets (including an empty Triage).
     // Retain history when the earlier session cannot receive; never reroute to members.
     func triageTakeoverNotice(_ db: Database,group: JSON,old: JSON,new: JSON,reason: String,caller: Caller) throws -> JSON {
-        let pid = group["project_id"] as! String,gid = group["id"] as! String
+        let pid = (try StoredRecord(group, family: "group").string("project_id")), gid = (try StoredRecord(group, family: "group").string("id"))
         let sid = old["session_id"] as? String ?? ""
         let target = try? scoped(db,sid,pid,type:"session")
         let recipients: [JSON] = target.map {canReceive($0,project:pid) ? [["session_id":sid,"recipient_role":"prior_orchestrator"]] : []} ?? []
         let message: JSON = ["id":uuid(),"project_id":pid,"triage_id":gid,"kind":"note","origin":"agent",
             "author":caller.principal,"author_display":author(db,caller),"author_session_id":caller.sessionID!,
             "requires_action":false,"addressed":false,"revision":1,"created_at":now(),
-            "from_orchestration_id":old["id"]!,"to_orchestration_id":new["id"]!,
+            "from_orchestration_id": (try StoredRecord(old, family: "old").requiredValue("id")), "to_orchestration_id": (try StoredRecord(new, family: "new").requiredValue("id")),
             "prior_orchestrator_session_id":sid,"orchestrator_session_id":caller.sessionID!,
             "body":"Triage metadata: \(try agentReference(db,group)). \(AgentReference.quoted(author(db,caller))) (session \(caller.sessionID!)) took over orchestration. Reason: \(reason)\nYour orchestration record ended. Member ticket claims and Triage memberships are unchanged."]
         try save(db,message,type:"message")
         let deliveries = try queueDirectionDeliveries(db,message:message,recipients:recipients)
-        try event(db,caller:caller,project:pid,entity:gid,kind:"message_saved",data:["message_id":message["id"]!,"origin":"agent"])
-        return ["message_id":message["id"]!,"recipient_session_id":sid,"deliveries":deliveries,"delivery_status":recipients.isEmpty ? "saved_for_pickup" : "queued","native_push":false]
+        try event(
+            db, caller: caller, project: pid, entity: gid, kind: "message_saved",
+            data: ["message_id": (try StoredRecord(message, family: "message").requiredValue("id")), "origin": "agent"])
+        return [
+            "message_id": (try StoredRecord(message, family: "message").requiredValue("id")), "recipient_session_id": sid, "deliveries": deliveries,
+            "delivery_status": recipients.isEmpty ? "saved_for_pickup" : "queued", "native_push": false,
+        ]
     }
     func triageOrchestrate(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         try worker(c);let pid = try scope(db,p,c,write:true),gid = try text(p,"triage_id")
@@ -105,13 +117,18 @@ extension CommandRouter {
                 guard previous["state"] as? String == "active" else { throw CoreError("INVALID_TRANSITION","This Triage has no active orchestration to take over. Use start.") }
                 guard previous["session_id"] as? String != c.sessionID else { throw CoreError("INVALID_INPUT","This conversation already records the orchestration. Finish it before starting again; a verified resumed conversation can finish with a reason.") }
             } else if previous["state"] as? String == "active" { throw CoreError("CLAIM_CONFLICT","This Triage already records an active orchestration. Checkpoint, explicitly finish or take over that recorded coordination with a reason.") }
-            orchestration = ["id":uuid(),"session_id":c.sessionID!,"principal":c.principal,"session_authorization_generation":sessionGeneration(session),"execution_domain":c.executionDomain!,"provider":session["provider"]!,"actor_display":author(db,c),"state":"active","started_at":now(),"revision":1]
+            orchestration = [
+                "id": uuid(), "session_id": c.sessionID!, "principal": c.principal, "session_authorization_generation": sessionGeneration(session),
+                "execution_domain": c.executionDomain!,
+                "provider": (try StoredRecord(session, family: "session").requiredValue("provider")), "actor_display": author(db, c), "state": "active", "started_at": now(),
+                "revision": 1,
+            ]
             if let previousID = previous["id"] { orchestration["previous_orchestration_id"] = previousID }
             if let reason {
                 var ended = revised(previous);ended["state"] = "taken_over";ended["finished_at"] = now()
                 ended["takeover_reason"] = reason;ended["taken_over_by_orchestration_id"] = orchestration["id"]
                 ended["taken_over_by_session_id"] = c.sessionID!
-                orchestration["takeover_from_orchestration_id"] = previous["id"]!;orchestration["takeover_reason"] = reason
+                orchestration["takeover_from_orchestration_id"] = (try StoredRecord(previous, family: "previous").requiredValue("id")); orchestration["takeover_reason"] = reason
                 if let progress = previous["progress"] { orchestration["takeover_context"] = progress }
                 try event(db,caller:c,project:pid,entity:gid,kind:"triage_orchestration_taken_over",data:["orchestration":ended,"member_claims_unchanged":true,"memberships_unchanged":true])
                 notice = try triageTakeoverNotice(db,group:group,old:ended,new:orchestration,reason:reason,caller:c)
@@ -144,19 +161,25 @@ extension CommandRouter {
         return result
     }
     func taskEpicContext(_ db: Database,_ task: JSON) throws -> Any {
-        guard let id = task["epic_id"] as? String,let source = try? scoped(db,id,task["project_id"] as! String,type:"group"),source["kind"] as? String == "epic" else { return NSNull() }
+        guard let id = task["epic_id"] as? String else { return NSNull() }
+        let projectID = try StoredRecord(task, family: "task").string("project_id")
+        guard let source = try? scoped(db,id,projectID,type:"group"),source["kind"] as? String == "epic" else { return NSNull() }
         return try groupProjection(db,source)
     }
     func taskTriages(_ db: Database,_ task: JSON) throws -> [JSON] {
-        try records(db,type:"group",project:task["project_id"] as? String).filter {$0["kind"] as? String == "triage" && triageMemberIDs($0).contains(task["id"] as! String)}.map {try groupProjection(db,$0)}
+        let record = try StoredTaskRecord(task)
+        return try records(db, type: "group", project: task["project_id"] as? String)
+            .filter { $0["kind"] as? String == "triage" && triageMemberIDs($0).contains(record.id) }
+            .map { try groupProjection(db, $0) }
     }
     /// Empty fields retains the full legacy projection. List summaries avoid loading
     /// histories and lifecycle records that would be discarded by listProjection.
     func groupProjection(_ db: Database,_ source: JSON,fields: Set<String> = []) throws -> JSON {
         var group = source
         if source["kind"] as? String == "triage" {
+            let projectID = try StoredRecord(source, family: "group").string("project_id")
             let ids = triageMemberIDs(source)
-            let tasks = try ids.map {try scoped(db,$0,source["project_id"] as! String,type:"task")}
+            let tasks = try ids.map { try scoped(db, $0, projectID, type: "task") }
             let statuses = Set(tasks.compactMap {$0["status_id"] as? String})
             let state = tasks.isEmpty ? "empty" : (statuses.count == 1 ? "uniform" : "mixed")
             let uniformStatus = try statuses.count == 1 ? record(db,statuses.first!,type:"status") : nil
@@ -171,8 +194,8 @@ extension CommandRouter {
             if fields.isEmpty || fields.contains("member_warnings") { group["member_warnings"] = try tasks.flatMap { try reviewWarnings(db,task:$0) } }
             group["active_navigation"] = !bool(source,"archived") && !ids.isEmpty
             if fields.isEmpty || fields.contains("orchestration_connection"),let orchestration = source["orchestration"] as? JSON,orchestration["state"] as? String == "active" {
-                let session = try? scoped(db,orchestration["session_id"] as? String ?? "",source["project_id"] as! String,type:"session")
-                let current = session.map {canReceive($0,project:source["project_id"] as! String) && sessionGeneration($0) == orchestration["session_authorization_generation"] as? String} ?? false
+                let session = try? scoped(db, orchestration["session_id"] as? String ?? "", projectID, type: "session")
+                let current = session.map { canReceive($0, project: projectID) && sessionGeneration($0) == orchestration["session_authorization_generation"] as? String } ?? false
                 group["orchestration_connection"] = current ? "current" : "recovery_required"
             }
             if fields.isEmpty || fields.contains("membership_history") {
@@ -183,8 +206,7 @@ extension CommandRouter {
             }
             if fields.isEmpty || fields.contains("batches") {
                 group["batches"] = try groupRelatedRecords(db,source,type:"batch",field:"triage_id").map { batch -> JSON in
-                    var summary: JSON = ["id":batch["id"]!,"phase":batch["phase"]!,"created_at":batch["created_at"]!,"triage_revision":batch["triage_revision"]!,"member_count":(batch["members"] as? [JSON] ?? []).count,"digest":batch["digest"]!]
-                    summary.merge(try batchLifecycle(db,batch)) { _,new in new };return summary
+                    try batchGroupSummary(db, batch)
                 }
             }
             return group
@@ -192,38 +214,62 @@ extension CommandRouter {
         guard source["kind"] as? String == "epic" else { return group }
         let assigned = try groupRelatedRecords(db,source,type:"task",field:"epic_id")
         let previous = source["members"] as? [JSON] ?? []
-        group["members"] = assigned.map { task -> JSON in ["task_id":task["id"]!,"joined_at":previous.first(where: {$0["task_id"] as? String == task["id"] as? String})?["joined_at"] ?? task["updated_at"] ?? task["created_at"] ?? ""] }
+        group["members"] = try assigned.map { task -> JSON in
+            [
+                "task_id": (try StoredRecord(task, family: "task").requiredValue("id")),
+                "joined_at": previous.first(where: { $0["task_id"] as? String == task["id"] as? String })?["joined_at"] ?? task["updated_at"] ?? task["created_at"] ?? "",
+            ]
+        }
         group["task_ids"] = assigned.compactMap {$0["id"] as? String}
         group["brief"] = source["brief"] ?? source["description"] ?? source["purpose"] ?? ""
         group["description"] = group["brief"]
         return group
     }
+    private func batchGroupSummary(_ db: Database, _ batch: JSON) throws -> JSON {
+        let record = StoredRecord(batch, family: "batch")
+        var summary: JSON = [
+            "id": try record.requiredValue("id"), "phase": try record.requiredValue("phase"),
+            "created_at": try record.requiredValue("created_at"), "triage_revision": try record.requiredValue("triage_revision"),
+            "member_count": (batch["members"] as? [JSON] ?? []).count, "digest": try record.requiredValue("digest"),
+        ]
+        summary.merge(try batchLifecycle(db, batch)) { _, new in new }
+        return summary
+    }
     /// Existing scope index selects the record family; unrelated rich histories
     /// never cross the canonical decoding boundary for each individual group.
     private func groupRelatedRecords(_ db: Database,_ group: JSON,type: String,field: String) throws -> [JSON] {
-        let pid = group["project_id"] as! String,gid = group["id"] as! String
+        let pid = (try StoredRecord(group, family: "group").string("project_id")), gid = (try StoredRecord(group, family: "group").string("id"))
         return try readSnapshotCache.records(db,key:["group-related",pid,gid,type,field]) {
             try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND json_extract(data,'$."+field+"')=CAST(? AS TEXT) COLLATE BINARY ORDER BY rowid",arguments:[Data(type.utf8),Data(pid.utf8),Data(gid.utf8)])
         }
     }
     func syncEpic(_ db: Database,_ source: JSON,taskOverride: JSON? = nil) throws -> JSON {
         guard source["kind"] as? String == "epic" else { throw CoreError("INVALID_INPUT","Persistent membership synchronization applies only to Epics.") }
-        let pid = source["project_id"] as! String,gid = source["id"] as! String
+        let pid = (try StoredRecord(source, family: "source").string("project_id")), gid = (try StoredRecord(source, family: "source").string("id"))
         var group = source;let previous = source["members"] as? [JSON] ?? []
         var tasks = try records(db,type:"task",project:pid)
         if let override = taskOverride { tasks.removeAll {$0["id"] as? String == override["id"] as? String};tasks.append(override) }
         let assigned = tasks.filter {$0["epic_id"] as? String == gid}
         // Retain membership evidence even after removal, ticket purge or receipt expiry.
         if !assigned.isEmpty || !previous.isEmpty { group["has_held_ticket"] = true }
-        group["members"] = assigned.map { task -> JSON in ["task_id":task["id"]!,"joined_at":previous.first(where: {$0["task_id"] as? String == task["id"] as? String})?["joined_at"] ?? now()] }
+        group["members"] = try assigned.map { task -> JSON in
+            [
+                "task_id": (try StoredRecord(task, family: "task").requiredValue("id")),
+                "joined_at": previous.first(where: { $0["task_id"] as? String == task["id"] as? String })?["joined_at"] ?? now(),
+            ]
+        }
         group["task_ids"] = assigned.compactMap {$0["id"] as? String};group = revised(group);try save(db,group,type:"group");return group
     }
     func editTaskEpic(_ db: Database,task: inout JSON,value: Any) throws {
-        let pid = task["project_id"] as! String,old = task["epic_id"] as? String
+        let pid = (try StoredRecord(task, family: "task").string("project_id")), old = task["epic_id"] as? String
         let destination = try requiredEpicID(value)
         let epic = try scoped(db,destination,pid,type:"group");guard epic["kind"] as? String == "epic" else { throw CoreError("INVALID_INPUT","An Epic must be a persistent subproject, not a Triage.") }
         guard old == destination || !bool(epic,"archived") else { throw CoreError("INVALID_INPUT","Restore this Epic before adding tickets.") }
-        guard old == nil || old == destination else { throw CoreError("EPIC_MOVE_REQUIRED","Use an explicit Epic move so the source and destination are reviewed together.",details:["from_epic_id":old!,"task_revision":task["revision"]!]) }
+        guard old == nil || old == destination else {
+            throw CoreError(
+                "EPIC_MOVE_REQUIRED", "Use an explicit Epic move so the source and destination are reviewed together.",
+                details: ["from_epic_id": old!, "task_revision": (try StoredRecord(task, family: "task").requiredValue("revision"))])
+        }
         task["epic_id"] = destination;_ = try syncEpic(db,epic,taskOverride:task)
     }
     func groupList(_ db: Database,_ p: JSON,_ c: Caller,_ method: String) throws -> JSON {
@@ -234,7 +280,18 @@ extension CommandRouter {
         if p["key"] != nil {
             let key = try text(p,"key")
             groups = groups.filter {($0["key"] as? String ?? "").caseInsensitiveCompare(key) == .orderedSame}
-            guard groups.count <= 1 else { throw CoreError("AMBIGUOUS_GROUP","More than one \(kind) uses display key \(AgentReference.quoted(key)). Select its stable internal ID.",details:["matches":groups.map {["id":$0["id"]!,"key":$0["key"]!,"title":$0["name"] ?? ""]}]) }
+            guard groups.count <= 1 else {
+                throw CoreError(
+                    "AMBIGUOUS_GROUP", "More than one \(kind) uses display key \(AgentReference.quoted(key)). Select its stable internal ID.",
+                    details: [
+                        "matches": try groups.map {
+                            [
+                                "id": (try StoredRecord($0, family: "member").requiredValue("id")), "key": (try StoredRecord($0, family: "member").requiredValue("key")),
+                                "title": $0["name"] ?? "",
+                            ]
+                        }
+                    ])
+            }
         }
         return ["groups":listProjection(try groups.map {try groupProjection(db,$0,fields:fields)},fields:fields)]
     }
@@ -277,7 +334,7 @@ extension CommandRouter {
             group = revised(group);try save(db,group,type:"group");try event(db,caller:c,project:pid,entity:gid,kind:"group_edited");return try groupProjection(db,group)
         }
         let tid = try text(p,"task_id");var task = try scoped(db,tid,pid,type:"task")
-        if p["expected_task_revision"] != nil { try revision(["expected_revision":p["expected_task_revision"]!],task) }
+        if p["expected_task_revision"] != nil { try revision(["expected_revision": (try StoredRecord(p, family: "p").requiredValue("expected_task_revision"))], task) }
         let action = p["action"] as? String ?? "add"
         if group["kind"] as? String == "epic" {
             guard ["add","remove","move"].contains(action) else { throw CoreError("INVALID_INPUT","Epic membership supports add, remove or explicit move.") }
@@ -287,8 +344,15 @@ extension CommandRouter {
             } else {
                 guard old == gid || !bool(group,"archived") else { throw CoreError("INVALID_INPUT","Restore this Epic before adding tickets.") }
                 if let old = old,old != gid {
-                    guard action == "move",p["expected_task_revision"] != nil,p["from_epic_id"] as? String == old else { throw CoreError("EPIC_MOVE_REQUIRED","This task already belongs to another Epic. Confirm an explicit move.",details:["from_epic_id":old,"task_revision":task["revision"]!]) }
-                    let source = try scoped(db,old,pid,type:"group");guard source["kind"] as? String == "epic" else { throw CoreError("INVALID_INPUT","The source Epic link requires repair.") };guard p["from_epic_revision"] != nil else { throw CoreError("REVISION_REQUIRED","Read the source Epic before moving this task.") };try revision(["expected_revision":p["from_epic_revision"]!],source)
+                    guard action == "move", p["expected_task_revision"] != nil, p["from_epic_id"] as? String == old else {
+                        throw CoreError(
+                            "EPIC_MOVE_REQUIRED", "This task already belongs to another Epic. Confirm an explicit move.",
+                            details: ["from_epic_id": old, "task_revision": (try StoredRecord(task, family: "task").requiredValue("revision"))])
+                    }
+                    let source = try scoped(db, old, pid, type: "group");
+                    guard source["kind"] as? String == "epic" else { throw CoreError("INVALID_INPUT", "The source Epic link requires repair.") };
+                    guard p["from_epic_revision"] != nil else { throw CoreError("REVISION_REQUIRED", "Read the source Epic before moving this task.") };
+                    try revision(["expected_revision": (try StoredRecord(p, family: "p").requiredValue("from_epic_revision"))], source)
                     task["epic_id"] = gid;task = revised(task);try save(db,task,type:"task");_ = try syncEpic(db,source,taskOverride:task)
                     try event(db,caller:c,project:pid,entity:old,kind:"epic_task_moved_out",data:["task_id":tid,"to_epic_id":gid])
                 } else if old != gid { task["epic_id"] = gid;task = revised(task);try save(db,task,type:"task") }

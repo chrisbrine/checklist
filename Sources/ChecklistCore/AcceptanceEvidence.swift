@@ -31,7 +31,7 @@ extension CommandRouter {
             guard Set(entry.keys).isSubset(of:["item","evidence_refs","limitation","observation"]),let item = entry["item"] as? NSNumber,CFGetTypeID(item) != CFBooleanGetTypeID(),item.doubleValue.rounded() == item.doubleValue,item.doubleValue >= 0,item.doubleValue < Double(acceptance.count),indexed[item.intValue] == nil else { throw CoreError("INVALID_INPUT","Each acceptance evidence item needs a unique 0-based index within the ticket's acceptance list.") }
             indexed[item.intValue] = entry
         }
-        let pid = task["project_id"] as! String,contributors = try contributionHistory(db,attempt:attempt)
+        let pid = (try StoredRecord(task, family: "AcceptanceEvidence").string("project_id")),contributors = try contributionHistory(db,attempt:attempt)
         var normalized: [JSON] = [],missing: [JSON] = []
         for (index,itemText) in acceptance.enumerated() {
             let entry = indexed[index] ?? [:]
@@ -92,7 +92,13 @@ extension CommandRouter {
             if !covered { missing.append(["item":index+1,"text":String(itemText.prefix(80)),"reason":reasons.joined(separator:"; ")]) }
         }
         guard missing.isEmpty else {
-            let summary = missing.map { "\($0["item"]!): \($0["text"]!) — \($0["reason"]!)" }.joined(separator:"; ")
+            let summary = try missing.map { row in
+                let record = StoredRecord(row, family: "acceptance_evidence")
+                let item = try record.requiredValue("item")
+                let text = try record.requiredValue("text")
+                let reason = try record.requiredValue("reason")
+                return "\(item): \(text) — \(reason)"
+            }.joined(separator:"; ")
             throw CoreError("ACCEPTANCE_EVIDENCE_MISSING","Uncovered acceptance items: " + summary,details:["uncovered_items":missing])
         }
         return normalized

@@ -105,7 +105,14 @@ extension CommandRouter {
                     var validationBytes: Data? = size <= TicketCleanupInventory.rowByteLimit ? Data() : nil
                     var tail = Data(),offset = 1
                     while offset <= size {
-                        let chunk = try Data.fetchOne(db,sql:"SELECT substr(CAST(data AS BLOB),?,65536) FROM records WHERE id=CAST(? AS TEXT)",arguments:[offset,Data(id.utf8)])!
+                        guard
+                            let chunk = try Data.fetchOne(
+                                db, sql: "SELECT substr(CAST(data AS BLOB),?,65536) FROM records WHERE id=CAST(? AS TEXT)",
+                                arguments: [offset, Data(id.utf8)]
+                            ), !chunk.isEmpty
+                        else {
+                            throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.sqlData))
+                        }
                         validationBytes?.append(chunk)
                         tail.append(chunk);offset += chunk.count
                         var split = tail.count
@@ -131,7 +138,7 @@ extension CommandRouter {
         }
     }
     func ticketCleanupInventory(_ db: Database,task: JSON) throws -> TicketCleanupInventory {
-        let tid = task["id"] as! String,pid = task["project_id"] as! String
+        let tid = (try StoredRecord(task, family: "task").string("id")), pid = (try StoredRecord(task, family: "task").string("project_id"))
         let containers: Set<String> = ["project","session","profile","status","tag","policy_revision","project_context_revision","taxonomy_revision","group","batch","batch_claim","relation","task"]
         let parents = ["message_id","attempt_id","parent_attempt_id","request_id","review_request_id","manifest_id","membership_id","delegation_id","conversation_id","source_capture_id"]
         var result = TicketCleanupInventory(),owned = Set<Data>()

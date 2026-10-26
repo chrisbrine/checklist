@@ -32,6 +32,7 @@ QUALIFICATION_TESTS = (
     'ChecklistCoreTests.ScreenReadPerformanceTests/testOverviewWithRetainedReviewHistory',
     'ChecklistCoreTests.ScreenReadQueryPlanTests/testRealSizeScreenReadQueryPlans',
     'ChecklistCoreTests.OverviewReadOptimizationTests/testReadOnlyBatchClaimProjectionProfile',
+    'ChecklistCoreTests.ClaimPathOptimizationTests/testReadOnlyClaimComponentProfile',
     'ChecklistCoreTests.OverviewReadOptimizationTests/testReadOnlyOverviewQueryProfile',
     'ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeAutomaticFirstPassKeepsConcurrentReadAndWriteUnderTwoSeconds',
     'ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeCacheAliasInventoryExhaustsOneBoundedClosureBudgetAndRetainsEntry',

@@ -4,7 +4,7 @@ import GRDB
 extension CommandRouter {
     /// A status edit has no authority to stop a native process or its accepted children.
     func requireRetirementSafe(_ db: Database, task: JSON) throws {
-        let pid = task["project_id"] as! String, tid = task["id"] as! String
+        let pid = (try StoredRecord(task, family: "task").string("project_id")), tid = (try StoredRecord(task, family: "task").string("id"))
         let live = try Bool.fetchOne(db, sql: """
         SELECT EXISTS(SELECT 1 FROM records WHERE project_id=? AND
           ((type='attempt' AND json_extract(data,'$.task_id')=? AND json_extract(data,'$.state')='active')
@@ -19,7 +19,12 @@ extension CommandRouter {
     }
 
     func requireArchiveUndoSafe(_ db: Database, task: JSON) throws {
-        let cleaned = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE type='attachment' AND project_id=? AND json_extract(data,'$.task_id')=? AND json_extract(data,'$.availability')='original_cleaned')",arguments:[task["project_id"] as! String,task["id"] as! String]) ?? false
+        let cleaned =
+            try Bool.fetchOne(
+                db,
+                sql:
+                    "SELECT EXISTS(SELECT 1 FROM records WHERE type='attachment' AND project_id=? AND json_extract(data,'$.task_id')=? AND json_extract(data,'$.availability')='original_cleaned')",
+                arguments: [(try StoredRecord(task, family: "task").string("project_id")), (try StoredRecord(task, family: "task").string("id"))]) ?? false
         guard !cleaned else { throw CoreError("UNDO_UNAVAILABLE","Archive cleanup removed original bytes. Unarchive can restore ticket visibility, but cannot restore those files.") }
     }
 

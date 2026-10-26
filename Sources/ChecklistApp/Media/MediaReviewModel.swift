@@ -69,7 +69,7 @@ typealias MediaValues = [String: Any]
         var params=params;params["project_id"]=projectID
         return try await store.request(method,params)
     }
-    func mutate(_ method: String,_ params: MediaValues,then: @escaping (MediaValues)->Void = {_ in}) {
+    func mutate(_ method: String,_ params: MediaValues,then: @escaping (MediaValues) throws -> Void = {_ in}) {
         guard let store else {return}
         var params=params;params["project_id"]=projectID
         let project = projectID
@@ -79,8 +79,12 @@ typealias MediaValues = [String: Any]
             if ["MEDIA_CONTEXT_CHANGED","MEDIA_CONTEXT_ATTENTION","MEDIA_BASIS_CHANGED","REVISION_CONFLICT"].contains((error as? ChecklistError)?.code ?? "") {self.contextConflict=true}
         }) { [weak self] result in
             guard let self,self.projectID == project else {return}
-            then(result)
-            Task {await self.refresh()}
+            do {
+                try then(result)
+                Task {await self.refresh()}
+            } catch {
+                self.error = PlainError.text(error)
+            }
         }
     }
     // Capture the displayed object/revision/reason before the native dialog opens.
@@ -127,9 +131,18 @@ typealias MediaValues = [String: Any]
     func createRound(title: String, then: @escaping () -> Void = {}) {
         mutate("media_round_create", ["type_id":typeID,"title":title]) { [weak self] result in
             guard let self else { return }
+            let reply = try TypedReplyRecord(result)
             then()
-            self.roundState="draft";self.roundOffset=0
-            self.chooseRound(result["id"] as! String)
+            self.roundState = "draft"
+            self.roundOffset = 0
+            self.chooseRound(reply.id)
+        }
+    }
+    func createItem(title: String, then: @escaping () -> Void = {}) {
+        mutate("media_item_create", ["round_id": roundID, "title": title]) { [weak self] result in
+            let reply = try TypedReplyRecord(result)
+            then()
+            Task { await self?.select(reply.id) }
         }
     }
     func chooseType(_ id: String) {saveDraft();roundOffset=0;typeID=id;list=[:];roundID="";selectedID="";rows=[];header=Record(values:[:]);item=Record(values:[:]);intake=Record(values:[:]);publication=[];Task {await refresh()}}

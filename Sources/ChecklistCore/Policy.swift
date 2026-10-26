@@ -97,7 +97,7 @@ extension CommandRouter {
     func requireAgentEditAuthority(_ db: Database, project: JSON, caller: Caller, proposedPolicy: JSON? = nil) throws {
         if caller.isOwner { return }
         try worker(caller)
-        let pid = project["id"] as! String
+        let pid = (try StoredRecord(project, family: "project").string("id"))
         guard let sid = caller.sessionID, let session = try? scoped(db,sid,pid,type:"session"), session["role"] as? String == "worker", !["revoked", "ended"].contains(session["state"] as? String ?? "") else { throw CoreError("FORBIDDEN", "An actual enrolled worker session is required to change this project.") }
         let current = effectivePolicy(project["policy"] as? JSON ?? [:],kind:"")["agent_rule_changes"] as? String ?? "allowed"
         guard current == "allowed" else { throw CoreError("HUMAN_CHANNEL_REQUIRED", "The owner limited changes in this project to the app.") }
@@ -107,10 +107,10 @@ extension CommandRouter {
     func validatePolicySelection(_ db: Database, project: JSON, task: JSON, caller: Caller, phase: String, policy: JSON) throws {
         guard !caller.isOwner else { return }
         guard let sid = caller.sessionID else { throw CoreError("FORBIDDEN", "An actual enrolled worker session is required.") }
-        let session = try scoped(db,sid,project["id"] as! String,type:"session")
+        let session = try scoped(db,sid,(try StoredRecord(project, family: "project").string("id")),type:"session")
         let provider = session["provider"] as? String ?? ""
         let current = effectivePolicy(project["policy"] as? JSON ?? [:],kind:task["kind"] as? String ?? "work")
-        let role = phase == "review" ? "reviewer" : "implementer"
+        let role = (AttemptPhase(rawValue: phase) ?? .implementation).workflowRole.rawValue
         let rule = (current["roles"] as? JSON)?[role] as? JSON ?? [:]
         guard session["role"] as? String == "worker", !["revoked", "ended"].contains(session["state"] as? String ?? ""), providerPlugins.plugin(provider, requiring: .workSession) != nil, strings(current,"allowed_providers").contains(provider), strings(rule,"providers").contains(provider) else { throw CoreError("POLICY_DENIED", "The current project policy does not grant this provider the requested role.",details:["policy_revision":project["policy_revision"] ?? 1,"role":role,"eligible_providers":strings(rule,"providers"),"external_process_stopped":false]) }
         // An agent planned assignee is a preference, not a lock: any eligible AI may claim an
@@ -127,7 +127,7 @@ extension CommandRouter {
         let eligible = strings((policy["roles"] as? JSON)?["implementer"] as? JSON ?? [:],"providers")
         var provider = assignment["provider"] as? String
         if let sid = assignment["session_id"] as? String {
-            let session = try scoped(db,sid,project["id"] as! String,type:"session")
+            let session = try scoped(db,sid,(try StoredRecord(project, family: "project").string("id")),type:"session")
             guard session["role"] as? String == "worker", !["revoked", "ended"].contains(session["state"] as? String ?? "") else { throw CoreError("FORBIDDEN", "Only a currently enrolled worker can be assigned.") }
             if let requested = provider, requested != session["provider"] as? String { throw CoreError("POLICY_DENIED", "Assignment provider does not match its actual session.") }
             provider = session["provider"] as? String
@@ -141,7 +141,7 @@ extension CommandRouter {
 
     func policyPreview(_ db: Database, project: JSON, policy: JSON, mode: String) throws -> JSON {
         guard ["future_attempts", "checkpoint_active"].contains(mode) else { throw CoreError("INVALID_INPUT", "Choose future attempts or checkpoint active work.") }
-        let pid = project["id"] as! String
+        let pid = (try StoredRecord(project, family: "project").string("id"))
         if mode == "checkpoint_active",
            try jsonString(canonicalReviewRequirements((project["policy"] as? JSON)?["review_requirements"])) != jsonString(canonicalReviewRequirements(policy["review_requirements"])) {
             throw CoreError("REVIEW_REQUIREMENT_RECONCILIATION_UNSUPPORTED","Use future work rounds for review-requirement changes. Same-gate active reconciliation requires a fresh explicit review path.")
@@ -215,7 +215,7 @@ extension CommandRouter {
 
     func applyPolicy(_ db: Database, project: JSON, policy: JSON, mode: String, caller: Caller, reason: String? = nil) throws -> JSON {
         try requireAgentEditAuthority(db,project:project,caller:caller,proposedPolicy:policy)
-        let pid = project["id"] as! String
+        let pid = (try StoredRecord(project, family: "project").string("id"))
         // An agent never revises the contract of work it currently holds; its rule changes apply to future attempts.
         if !caller.isOwner, mode == "checkpoint_active", let sid = caller.sessionID,
            try records(db,type:"attempt",project:pid).contains(where: { $0["state"] as? String == "active" && $0["session_id"] as? String == sid }) {
@@ -227,8 +227,10 @@ extension CommandRouter {
         updated = revised(updated); try save(db,updated,type:"project"); _ = try retainPolicy(db,project:updated)
         let attempts = try records(db,type:"attempt",project:pid).filter { $0["state"] as? String == "active" }
         for var attempt in attempts {
-            let task = try scoped(db,attempt["task_id"] as! String,pid,type:"task"), effective = effectivePolicy(policy,kind:task["kind"] as? String ?? "work")
-            let role = attempt["phase"] as? String == "review" ? "reviewer" : "implementer", rule = (effective["roles"] as? JSON)?[role] as? JSON ?? [:]
+            let task = try scoped(db,(try StoredRecord(attempt, family: "attempt").string("task_id")),pid,type:"task"), effective = effectivePolicy(policy,kind:task["kind"] as? String ?? "work")
+            let phase = AttemptPhase(rawValue: attempt["phase"] as? String ?? "") ?? .implementation
+            let role = phase.workflowRole.rawValue
+            let rule = (effective["roles"] as? JSON)?[role] as? JSON ?? [:]
             if let session = try? scoped(db,attempt["session_id"] as? String ?? "",pid,type:"session"), !strings(rule,"providers").contains(session["provider"] as? String ?? "") { attempt["policy_authority_revoked"] = true; attempt["filesystem_recovery_warning"] = "Authority revoked. Verify the external process before releasing its reservations." }
             if mode == "checkpoint_active" {
                 attempt["pending_policy_snapshot"] = effective; attempt["pending_policy_revision"] = number
@@ -258,15 +260,15 @@ extension CommandRouter {
         if requireAcknowledgment, attempt["pending_policy_revision"] != nil { throw CoreError("POLICY_ACK_REQUIRED", "Checkpoint and explicitly acknowledge the revised policy before submission or verdict.",details:["policy_revision":attempt["pending_policy_revision"]!]) }
         if requireAcknowledgment, bool(attempt,"policy_authority_revoked") { throw CoreError("POLICY_DENIED", "Service work authority was revoked. External process status and reservations require explicit recovery.") }
         if requireAcknowledgment {
-            let pid = attempt["project_id"] as! String, project = try record(db,pid,type:"project")
-            var task = try scoped(db,attempt["task_id"] as! String,pid,type:"task")
+            let pid = (try StoredRecord(attempt, family: "attempt").string("project_id")), project = try record(db,pid,type:"project")
+            var task = try scoped(db,(try StoredRecord(attempt, family: "attempt").string("task_id")),pid,type:"task")
             if attempt["parent_attempt_id"] != nil { task.removeValue(forKey:"planned_assignee") }
             try validatePolicySelection(db,project:project,task:task,caller:caller,phase:attempt["phase"] as? String ?? "implementation",policy:try attemptPolicy(db,attempt))
         }
     }
 
     func acknowledgePolicy(_ db: Database,_ p: JSON,_ c: Caller,project: JSON) throws -> JSON {
-        let pid = project["id"] as! String
+        let pid = (try StoredRecord(project, family: "project").string("id"))
         var attempt: JSON?, task: JSON
         if p["attempt_id"] != nil {
             var active = try claimAttempt(db,p,c,pid)
@@ -274,7 +276,7 @@ extension CommandRouter {
             guard let snapshot = active["pending_policy_snapshot"] as? JSON, active["pending_policy_revision"] != nil else { throw CoreError("INVALID_TRANSITION", "This attempt has no pending policy reconciliation.") }
             let checkpoint = try records(db,type:"checkpoint",project:pid).last(where: { $0["attempt_id"] as? String == active["id"] as? String && $0["principal"] as? String == c.principal })
             guard active["last_checkpoint"] != nil, int(active,"revision") > int(active,"pending_policy_checkpoint_revision"), let checkpointID = checkpoint?["id"] as? String, checkpointID != active["pending_policy_checkpoint_id"] as? String else { throw CoreError("CHECKPOINT_REQUIRED", "Save a fresh checkpoint after the policy change before acknowledging the changed completion contract.") }
-            task = try scoped(db,active["task_id"] as! String,pid,type:"task")
+            task = try scoped(db,(try StoredRecord(active, family: "attempt").string("task_id")),pid,type:"task")
             try validatePolicySelection(db,project:project,task:task,caller:c,phase:active["phase"] as? String ?? "implementation",policy:snapshot)
             active["policy_snapshot"] = snapshot; active["policy_revision"] = active["pending_policy_revision"]
             active.removeValue(forKey:"pending_policy_snapshot"); active.removeValue(forKey:"pending_policy_revision"); active.removeValue(forKey:"pending_policy_checkpoint_revision"); active.removeValue(forKey:"pending_policy_checkpoint_id"); active["policy_acknowledged_at"] = now()

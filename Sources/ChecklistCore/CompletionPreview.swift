@@ -4,15 +4,22 @@ import GRDB
 extension CommandRouter {
     /// Run the real completion guards without retaining a status, departure or event.
     func completionPreview(_ db: Database, task: JSON, caller: Caller) throws -> JSON {
-        let pid = task["project_id"] as! String
+        let record = try StoredTaskRecord(task)
+        let revision = try StoredRecord(task, family: "task").requiredValue("revision")
+        let manifestID = task["current_manifest_id"] ?? NSNull()
         do {
             try db.inSavepoint {
-                _ = try work(db,["project_id":pid,"task_id":task["id"]!,"expected_revision":task["revision"]!,"direction_cursor":try cursor(db,caller:caller,scope:directionCursorScope(db,task:task,caller:caller))],caller,"task_complete",operation:.triage)
+                let input: JSON = [
+                    "project_id":record.projectID,"task_id":record.id,"expected_revision":revision,
+                    "direction_cursor":try cursor(db,caller:caller,scope:directionCursorScope(db,task:task,caller:caller))
+                ]
+                _ = try work(db,input,caller,"task_complete",operation:.triage)
                 return .rollback
             }
-            return ["eligible":true,"blockers":[],"task_revision":task["revision"]!,"manifest_id":task["current_manifest_id"] ?? NSNull()]
+            return ["eligible":true,"blockers":[],"task_revision":revision,"manifest_id":manifestID]
         } catch let failure as CoreError {
-            return ["eligible":false,"blockers":[["code":failure.code,"message":failure.message,"details":failure.details]],"task_revision":task["revision"]!,"manifest_id":task["current_manifest_id"] ?? NSNull()]
+            let blocker: JSON = ["code":failure.code,"message":failure.message,"details":failure.details]
+            return ["eligible":false,"blockers":[blocker],"task_revision":revision,"manifest_id":manifestID]
         }
     }
 }

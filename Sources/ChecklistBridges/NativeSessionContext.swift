@@ -91,7 +91,7 @@ public struct NativeSessionContext: Equatable, Sendable {
             guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) == Int32(MemoryLayout<proc_bsdinfo>.size), info.pbi_uid == getuid() else { return nil }
             var path = [CChar](repeating: 0, count: 4096)
             if proc_pidpath(pid, &path, UInt32(path.count)) > 0 {
-                let executable = URL(fileURLWithPath: String(cString: path)).lastPathComponent.lowercased()
+                let executable = URL(fileURLWithPath: String(decoding: path.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)).lastPathComponent.lowercased()
                 if let provider = providerRegistry.workProviders.first(where: {
                     providerRegistry.plugin($0, requiring: .workSession)?.nativeHost?.executable == executable
                 }) { return (provider, pid) }

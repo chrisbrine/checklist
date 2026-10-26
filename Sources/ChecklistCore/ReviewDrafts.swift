@@ -9,7 +9,7 @@ extension CommandRouter {
     /// back and keeps the input on the claim. The claim stays active; a new save replaces the draft.
     func reviewDraftSave(_ db: Database, _ p: JSON, _ c: Caller) throws -> JSON {
         try worker(c); let pid = try scope(db, p, c, write: true)
-        var a = try claimAttempt(db, p, c, pid); let t = try scoped(db, a["task_id"] as! String, pid, type: "task")
+        var a = try claimAttempt(db, p, c, pid); let t = try scoped(db, (try StoredRecord(a, family: "attempt").string("task_id")), pid, type: "task")
         guard a["phase"] as? String == "review", a["parent_attempt_id"] == nil else { throw CoreError("INVALID_TRANSITION", "Only the holder of a review claim saves a draft verdict.") }
         try verifyPolicyAuthority(db, attempt: a, caller: c)
         try db.inSavepoint {
@@ -20,9 +20,11 @@ extension CommandRouter {
         var params = p
         for key in ["attempt_id", "claim_token", "direction_cursor", "project_id", "command_id", "expected_revision"] { params.removeValue(forKey: key) }
         a["draft_verdict"] = ["params": params, "verdict": p["verdict"]!, "saved_at": now(), "author": c.principal, "author_display": author(db, c),
-                              "author_session_id": c.sessionID ?? NSNull(), "review_request_id": a["review_request_id"]!, "manifest_id": a["manifest_id"]!, "gate": a["gate"]!]
+                              "author_session_id": c.sessionID ?? NSNull(), "review_request_id": (try StoredRecord(a, family: "attempt").string("review_request_id")),
+                                  "manifest_id": (try StoredRecord(a, family: "attempt").string("manifest_id")), "gate": (try StoredRecord(a, family: "attempt").string("gate"))]
         a = revised(a); try save(db, a, type: "attempt")
-        try event(db, caller: c, project: pid, entity: t["id"] as? String, kind: "review_draft_saved", data: ["attempt_id": a["id"]!, "verdict": p["verdict"]!])
+        try event(db, caller: c, project: pid, entity: t["id"] as? String, kind: "review_draft_saved", data: ["attempt_id": (try StoredRecord(a, family: "attempt").string("id")),
+            "verdict": p["verdict"]!])
         return contextRecord(a, type: "attempt", caller: c)
     }
 
@@ -39,7 +41,8 @@ extension CommandRouter {
         guard a["principal"] as? String != c.principal else { throw CoreError("INVALID_TRANSITION", "Record your own verdict with review_record.") }
         if !c.isOwner {
             let coordinates = try records(db, type: "group", project: pid).contains { group in
-                guard group["kind"] as? String == "triage", triageMemberIDs(group).contains(t["id"] as! String), let orchestration = group["orchestration"] as? JSON else { return false }
+                guard group["kind"] as? String == "triage", triageMemberIDs(group).contains((try StoredRecord(t, family: "task").string("id"))),
+                    let orchestration = group["orchestration"] as? JSON else { return false }
                 // The orchestration must belong to the submitter's current session generation (finding 6c13b7ee).
                 return orchestration["state"] as? String == "active" && orchestration["principal"] as? String == c.principal && orchestration["session_id"] as? String == c.sessionID
                     && orchestration["session_authorization_generation"] as? String == (try? callerSessionGeneration(db, c, project: pid))
@@ -55,7 +58,7 @@ extension CommandRouter {
         guard a["incarnation"] as? String == incarnation, a["session_authorization_generation"] as? String == (try? callerSessionGeneration(db, reviewer, project: pid)) else {
             throw CoreError("STALE_CLAIM", "The draft's review claim is no longer current. A reviewer must claim the review again.")
         }
-        let manifest = try validateManifestTarget(db, task: t, manifestID: a["manifest_id"] as! String)
+        let manifest = try validateManifestTarget(db, task: t, manifestID: (try StoredRecord(a, family: "attempt").string("manifest_id")))
         try validateContributorIndependence(manifest: manifest, caller: reviewer)
         try verifyPolicyAuthority(db, attempt: a, caller: reviewer)
         let submittedBy: JSON = ["principal": c.principal, "session_id": c.sessionID ?? NSNull(), "actor_display": author(db, c), "origin": c.isOwner ? "human_ui" : "agent", "submitted_at": now()]

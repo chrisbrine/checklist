@@ -35,10 +35,17 @@ extension CommandRouter {
         return SealedCursor.binding(principal:c.principal,scope:try MediaCanonical.signature(identity),incarnation:incarnation)
     }
     private func mediaQuerySchema(_ db: Database,_ round: JSON) throws -> MediaReviewSchema {
-        let revision = try scoped(db,round["type_revision_id"] as! String,round["project_id"] as! String,type:"media_review_type_revision")
-        return try MediaReviewSchema.parse(revision["schema"] as! JSON)
+        let revision = try scoped(db,(try StoredRecord(round, family: "media").string("type_revision_id")),
+            (try StoredRecord(round, family: "media").string("project_id")),type:"media_review_type_revision")
+        return try MediaReviewSchema.parse((try StoredRecord(revision, family: "media").object("schema")))
     }
     // Field IDs are data, including quotes/Unicode. A hex literal cannot become SQL or JSONPath.
+    private func mediaWindowOffset(_ window: JSON, count: Int) throws -> Int {
+        guard let offset = window["offset"] as? Int, (0...count).contains(offset) else {
+            throw CoreError("CURSOR_RESET", "Refresh this media view.")
+        }
+        return offset
+    }
     private func mediaSQLBytes(_ value: String) -> String { "X'" + Data(value.utf8).map {String(format:"%02x",$0)}.joined() + "'" }
     private func mediaFieldSQL(_ id: MediaReviewID,alias: String = "t") -> String {
         "(SELECT value FROM json_each(\(alias).data,'$.metadata') WHERE CAST(key AS BLOB)=\(mediaSQLBytes(id.rawValue)))"
@@ -85,7 +92,8 @@ extension CommandRouter {
         let metadata = filter["metadata"] as? JSON ?? [:]
         guard metadata.count <= 3 else {throw CoreError("INVALID_INPUT","Filter at most three metadata fields.")}
         var predicates = ["i.type='media_item'","i.project_id=:project","json_extract(i.data,'$.round_id')=:round"]
-        var args: StatementArguments = ["project":round["project_id"] as! String,"round":round["id"] as! String,"manifest":round["manifest_id"] as? String ?? ""]
+        var args: StatementArguments = ["project":(try StoredRecord(round, family: "media").string("project_id")),
+            "round":(try StoredRecord(round, family: "media").string("id")),"manifest":round["manifest_id"] as? String ?? ""]
         for (index,entry) in metadata.sorted(by: {Data($0.key.utf8).lexicographicallyPrecedes(Data($1.key.utf8))}).enumerated() {
             let field = try MediaReviewID(entry.key);_ = try schema.validateValue(entry.value,fieldID:field)
             let name = "filter\(index)",value = mediaFieldSQL(field)
@@ -120,9 +128,10 @@ extension CommandRouter {
             guard let token = token as? String else {throw CoreError("CURSOR_RESET","Refresh this media view.")}
             window = try MediaQueryCursor.open(token,binding:binding,key:cursorKey)
         } else {window = ["created":Date().timeIntervalSince1970,"offset":0,"index":try mediaListIndex(db,p,round:round,list:list,schema:schema)]}
-        let index = window["index"] as! [JSON],offset = window["offset"] as! Int
-        var counts: [String:Int] = [:];for entry in index {counts[entry["disposition"] as! String,default:0] += 1}
-        var result: JSON = ["round_id":round["id"]!,"total":index.count,"counts":counts,"snapshot":true,"requires_current_observation":true]
+        let index = try StoredRecord(window, family: "media").objects("index")
+        let offset = try mediaWindowOffset(window, count:index.count)
+        var counts: [String:Int] = [:];for entry in index {counts[(try StoredRecord(entry, family: "media").string("disposition")),default:0] += 1}
+        var result: JSON = ["round_id":(try StoredRecord(round, family: "media").requiredValue("id")),"total":index.count,"counts":counts,"snapshot":true,"requires_current_observation":true]
         if method == "media_item_counts" {return result}
         let columns = list.visibleColumns.map {id in "\(sqlQuote(id.rawValue)),\(mediaFieldProjectionSQL(id,schema:schema))"}.joined(separator:",")
         let groupValues = list.groupBy.map {mediaFieldProjectionSQL($0,schema:schema)}
@@ -160,13 +169,17 @@ extension CommandRouter {
     /// Explicitly adopted material is immutable historical context, so a later source
     /// reversal does not rewrite it. Its managed originals must still be available.
     /// Walk only declared target references, with bounded metadata work and no blob reads.
+    /// Historical absence remains optional; malformed required relationships fail before this lookup.
+    private func mediaHistoricalRecord(_ db: Database,_ id: String,_ project: String,type: String) -> JSON? {
+        try? scoped(db,id,project,type:type)
+    }
     private func mediaMaterialOriginalsAvailable(_ db: Database,target: JSON,project: String,typeID: String,caller: Caller) throws -> Bool {
         var pending = target["material_references"] as? [JSON] ?? [],seen = Set<Data>()
         while let reference = pending.popLast() {
             guard let id = reference["target_id"] as? String else {return false}
             if !seen.insert(Data(id.utf8)).inserted {continue}
             guard seen.count <= 64,let source = try? scoped(db,id,project,type:"media_item_target"),bool(source,"publication_ready"),
-                  let revision = try? scoped(db,source["type_revision_id"] as! String,project,type:"media_review_type_revision"),
+                  let revision = mediaHistoricalRecord(db,(try StoredRecord(source, family: "media").string("type_revision_id")),project,type:"media_review_type_revision"),
                   EnvelopeStorageIdentity.equal(revision["type_id"] as? String,typeID),
                   let encoded = source["review_basis_base64"] as? String,let basis = Data(base64Encoded:encoded),
                   hash(basis) == source["review_basis_signature"] as? String else {return false}
@@ -193,8 +206,8 @@ extension CommandRouter {
     /// No raw digest lookup; every dependency is scoped before content is returned.
     private func mediaApprovedExample(_ db: Database,targetID: String,decisionID: String? = nil,project: String,typeID: String,caller: Caller) throws -> JSON? {
         guard let target = try? scoped(db,targetID,project,type:"media_item_target"),
-              let item = try? scoped(db,target["item_id"] as! String,project,type:"media_item"),
-              let round = try? scoped(db,item["round_id"] as! String,project,type:"media_round"),
+              let item = mediaHistoricalRecord(db,(try StoredRecord(target, family: "media").string("item_id")),project,type:"media_item"),
+              let round = mediaHistoricalRecord(db,(try StoredRecord(item, family: "media").string("round_id")),project,type:"media_round"),
               EnvelopeStorageIdentity.equal(round["type_id"] as? String,typeID),strings(round,"attention_ids").isEmpty,
               let head = item["last_decision_id"] as? String,decisionID == nil || EnvelopeStorageIdentity.equal(head,decisionID),
               let decision = try? scoped(db,head,project,type:"media_owner_decision"),
@@ -230,21 +243,35 @@ extension CommandRouter {
                       (try? StorageObjectFiles(root:root).openRegular(relative, { fd -> Bool in
                           var info = stat();return fstat(fd,&info) == 0 && info.st_size == int(pair.1,"size")
                       })) == true else {return nil}
-                attachments[Data((pair.1["id"] as! String).utf8)] = pair
+                attachments[Data(((try StoredRecord(pair.1, family: "media").string("id"))).utf8)] = pair
             }
             for slot in managedSlots {
-                guard let pair = attachments[Data((slot["attachment_id"] as! String).utf8)],pair.1["sha256"] as? String == slot["sha256"] as? String else {return nil}
+                guard let pair = attachments[Data(((try StoredRecord(slot, family: "media").string("attachment_id"))).utf8)],pair.1["sha256"] as? String == slot["sha256"] as? String else {return nil}
             }
             for slot in candidate["slots"] as? [JSON] ?? [] where slot["attachment_id"] is String {
-                let pair = attachments[Data((slot["attachment_id"] as! String).utf8)]!
-                references.append(["reference_id":pair.0["id"]!,"attachment_id":pair.1["id"]!,"slot_id":slot["slot_id"]!,"sha256":pair.1["sha256"]!,"size":pair.1["size"]!])
+                let pair = attachments[Data(((try StoredRecord(slot, family: "media").string("attachment_id"))).utf8)]!
+                references.append(["reference_id":(try StoredRecord(pair.0, family: "media").requiredValue("id")),
+                    "attachment_id":(try StoredRecord(pair.1, family: "media").requiredValue("id")),
+                    "slot_id":(try StoredRecord(slot, family: "media").requiredValue("slot_id")),
+                    "sha256":(try StoredRecord(pair.1, family: "media").requiredValue("sha256")),
+                    "size":(try StoredRecord(pair.1, family: "media").requiredValue("size"))])
             }
         }
-        return ["target_id":targetID,"item_id":item["id"]!,"round_id":round["id"]!,"type_id":typeID,"decision_id":head,
-            "title":target["title"]!,"metadata":target["metadata"]!,"winner_id":winner,"slots":candidate["slots"]!,
+        return ["target_id":targetID,"item_id":(try StoredRecord(item, family: "media").requiredValue("id")),
+            "round_id":(try StoredRecord(round, family: "media").requiredValue("id")),"type_id":typeID,
+            "decision_id":head,
+            "title":(try StoredRecord(target, family: "media").requiredValue("title")),"metadata":(try StoredRecord(target,
+                 family: "media").requiredValue("metadata")),"winner_id":winner,"slots":(try StoredRecord(candidate,
+                 family: "media").requiredValue("slots")),
             "review_basis_signature":basis,"historical_context_label":"Historical owner-accepted example — no current approval",
-            "context_id":target["context_id"]!,"type_revision_id":target["type_revision_id"]!,"display_only":true,"grants_current_approval":false,
-            "original_references":references,"decision_created_at":decision["created_at"]!,"decision_origin":decision["origin"]!,"decision_author_session_id":decision["author_session_id"]!,"round_title":round["title"]!,"source_name":candidate["source_name"] ?? "Captured text"]
+            "context_id":(try StoredRecord(target, family: "media").requiredValue("context_id")),
+                "type_revision_id":(try StoredRecord(target, family: "media").requiredValue("type_revision_id")),
+                "display_only":true,"grants_current_approval":false,
+            "original_references":references,"decision_created_at":(try StoredRecord(decision,
+                 family: "media").requiredValue("created_at")),"decision_origin":(try StoredRecord(decision,
+                 family: "media").requiredValue("origin")),"decision_author_session_id":(try StoredRecord(decision,
+                 family: "media").requiredValue("author_session_id")),"round_title":(try StoredRecord(round,
+                 family: "media").requiredValue("title")),"source_name":candidate["source_name"] ?? "Captured text"]
     }
     func mediaExampleQuery(_ db: Database,p: JSON,c: Caller,project: String) throws -> JSON {
         let round = try scoped(db,try text(p,"round_id"),project,type:"media_round"),schema = try mediaQuerySchema(db,round)
@@ -265,15 +292,15 @@ extension CommandRouter {
             window = try MediaQueryCursor.open(cursor,binding:binding,key:cursorKey)
         } else {
             var predicates = ["i.type='media_item'","i.project_id=:project","r.type='media_round'","r.project_id=i.project_id","json_extract(r.data,'$.type_id')=:type","r.id<>:round","d.type='media_owner_decision'","d.project_id=i.project_id","json_extract(d.data,'$.disposition')='accepted'","json_extract(d.data,'$.origin')='human_ui'","t.type='media_item_target'","t.project_id=i.project_id"]
-            var args: StatementArguments = ["project":project,"type":schema.id.rawValue,"round":round["id"] as! String]
+            var args: StatementArguments = ["project":project,"type":schema.id.rawValue,"round":(try StoredRecord(round, family: "media").string("id"))]
             switch request.selection {
             case .explicitTargets(let targets):
                 predicates.append("t.id IN (SELECT value FROM json_each(:targets))");args += ["targets":try jsonString(targets.map(\.rawValue))]
             case .matching(let fields):
                 let manifest = try (round["manifest_id"] as? String).map {try scoped(db,$0,project,type:"media_round_manifest")}
                 let member = (manifest?["items"] as? [JSON] ?? []).first {EnvelopeStorageIdentity.equal($0["item_id"] as? String,item["id"] as? String)}
-                let source = try scoped(db,member?["target_id"] as? String ?? item["draft_target_id"] as! String,project,type:"media_item_target")
-                let metadata = source["metadata"] as! JSON
+                let source = try scoped(db,member?["target_id"] as? String ?? (try StoredRecord(item, family: "media").string("draft_target_id")),project,type:"media_item_target")
+                let metadata = (try StoredRecord(source, family: "media").object("metadata"))
                 for id in fields {
                     guard let entry = metadata.first(where:{Data($0.key.utf8) == id.bytes}) else {return ["collapsed":false,"examples":[JSON](),"has_more":false,"next_cursor":NSNull()]}
                     let value = mediaFieldSQL(id)
@@ -291,12 +318,18 @@ extension CommandRouter {
             window = ["created":Date().timeIntervalSince1970,"offset":0,"capped":rows.count > 64,
                 "index":rows.prefix(64).map {["target_id":$0["id"] as String,"decision_id":$0["decision_id"] as String]}]
         }
-        let index = window["index"] as! [JSON],offset = window["offset"] as! Int,end = min(index.count,offset + request.pageSize)
+        let index = try StoredRecord(window, family: "media").objects("index")
+        let offset = try mediaWindowOffset(window, count:index.count)
+        let end = min(index.count,offset + request.pageSize)
         var examples: [JSON] = []
         for ref in index[offset..<end] {
-            if let value = try mediaApprovedExample(db,targetID:ref["target_id"] as! String,decisionID:ref["decision_id"] as? String,project:project,typeID:schema.id.rawValue,caller:c) {examples.append(value)}
+            if let value = try mediaApprovedExample(db,targetID:(try StoredRecord(ref, family: "media").string("target_id")),
+                decisionID:ref["decision_id"] as? String,project:project,typeID:schema.id.rawValue,
+                caller:c) {examples.append(value)}
         }
-        var result: JSON = ["collapsed":false,"examples":examples,"has_more":end < index.count,"capped":window["capped"]!,"candidate_cap":64,"display_only":true,"grants_current_approval":false]
+        var result: JSON = ["collapsed":false,"examples":examples,"has_more":end < index.count,
+            "capped":(try StoredRecord(window, family: "media").requiredValue("capped")),"candidate_cap":64,
+            "display_only":true,"grants_current_approval":false]
         if end < index.count {window["offset"] = end;result["next_cursor"] = try MediaQueryCursor.seal(window,binding:binding,key:cursorKey)}
         else {result["next_cursor"] = NSNull()}
         return result
@@ -318,10 +351,13 @@ extension CommandRouter {
         let prepared = try dbQueue.read {db -> (String,JSON,JSON,String,String) in
             let project = try self.mediaAccess(db,p,c)
             let round = try self.scoped(db,text(p,"round_id"),project,type:"media_round")
-            guard let example = try self.mediaApprovedExample(db,targetID:text(p,"target_id"),decisionID:text(p,"decision_id"),project:project,typeID:round["type_id"] as! String,caller:c),
+            guard let example = try self.mediaApprovedExample(db,targetID:text(p,"target_id"),
+                decisionID:text(p,"decision_id"),project:project,typeID:(try StoredRecord(round,
+                 family: "media").string("type_id")),caller:c),
                   !EnvelopeStorageIdentity.equal(example["round_id"] as? String,round["id"] as? String),
-                  let selected = (example["original_references"] as! [JSON]).first(where:{EnvelopeStorageIdentity.equal($0["reference_id"] as? String,p["reference_id"] as? String)}) else {throw CoreError("NOT_FOUND","This approved example reference is unavailable.")}
-            let source = try self.scoped(db,example["round_id"] as! String,project,type:"media_round")
+                  let selected = ((try StoredRecord(example, family: "media").objects("original_references"))).first(where:{EnvelopeStorageIdentity.equal($0["reference_id"] as? String,
+                      p["reference_id"] as? String)}) else {throw CoreError("NOT_FOUND","This approved example reference is unavailable.")}
+            let source = try self.scoped(db,(try StoredRecord(example, family: "media").string("round_id")),project,type:"media_round")
             return (project,example,selected,try self.mediaToken(db,round:source,caller:c),try self.callerSessionGeneration(db,c,project:project))
         }
         let seconds = try MediaConfigurationValue.integer(p["seconds"] ?? 300,min:1,max:300,"seconds")
@@ -329,23 +365,27 @@ extension CommandRouter {
             try dbQueue.write {db in
                 let (project,example,selected,token,generation) = prepared
                 _ = try self.mediaAccess(db,p,c)
-                let item = try self.scoped(db,example["item_id"] as! String,project,type:"media_item")
-                let source = try self.scoped(db,example["round_id"] as! String,project,type:"media_round")
+                let item = try self.scoped(db,(try StoredRecord(example, family: "media").string("item_id")),project,type:"media_item")
+                let source = try self.scoped(db,(try StoredRecord(example, family: "media").string("round_id")),project,type:"media_round")
                 guard EnvelopeStorageIdentity.equal(item["last_decision_id"] as? String,example["decision_id"] as? String),
                       token == (try self.mediaToken(db,round:source,caller:c)),generation == (try self.callerSessionGeneration(db,c,project:project)) else {throw CoreError("NOT_FOUND","This approved example reference is unavailable.")}
-                let target = try self.scoped(db,example["target_id"] as! String,project,type:"media_item_target")
-                let owner = try self.mediaOwnerValue(db,id:target["attachment_owner_id"] as! String,project:project)
-                let (_,attachment) = try self.mediaAttachmentReference(db,project:project,id:selected["reference_id"] as! String,owner:owner,caller:c)
-                let path = attachment["path"] as! String
+                let target = try self.scoped(db,(try StoredRecord(example, family: "media").string("target_id")),project,type:"media_item_target")
+                let owner = try self.mediaOwnerValue(db,id:(try StoredRecord(target, family: "media").string("attachment_owner_id")),project:project)
+                let (_,attachment) = try self.mediaAttachmentReference(db,project:project,id:(try StoredRecord(selected, family: "media").string("reference_id")),owner:owner,caller:c)
+                let path = (try StoredRecord(attachment, family: "media").string("path"))
                 let relative = try self.managedRelative(path,family:"objects")
                 guard try StorageObjectFiles(root:self.root).openRegular(relative,{fd in
                           var info = stat();return fstat(fd,&info) == 0 && info.st_size == int(attachment,"size")
                       }) else {throw CoreError("NOT_FOUND","This approved example reference is unavailable.")}
                 let id = uuid(),expiry = Date().addingTimeInterval(Double(seconds))
-                try self.save(db,["id":id,"project_id":project,"kind":"reader","attachment_id":attachment["id"]!,"owner_reference_id":selected["reference_id"]!,
+                try self.save(db,["id":id,"project_id":project,"kind":"reader","attachment_id":(try StoredRecord(attachment,
+                     family: "media").requiredValue("id")),"owner_reference_id":(try StoredRecord(selected,
+                     family: "media").requiredValue("reference_id")),
                     "state":"active","expires_at":expiry.timeIntervalSince1970,"author":c.principal,"incarnation":self.incarnation,
                     "session_generation":generation,"revision":1,"created_at":now()],type:"storage_hold")
-                return ["lease_id":id,"expires_at":expiry.timeIntervalSince1970,"attachment":self.ownerManagedPathProjection(attachment,caller:c),"target_id":example["target_id"]!,"decision_id":example["decision_id"]!]
+                return ["lease_id":id,"expires_at":expiry.timeIntervalSince1970,"attachment":self.ownerManagedPathProjection(attachment,
+                    caller:c),"target_id":(try StoredRecord(example, family: "media").requiredValue("target_id")),
+                    "decision_id":(try StoredRecord(example, family: "media").requiredValue("decision_id"))]
             }
         }
     }
@@ -356,35 +396,49 @@ extension CommandRouter {
         var item = try scoped(db,try text(p,"item_id"),project,type:"media_item")
         try mediaRevision(["expected_revision":p["expected_item_revision"] ?? NSNull()],item)
         guard EnvelopeStorageIdentity.equal(item["round_id"] as? String,round["id"] as? String),
-              let example = try mediaApprovedExample(db,targetID:text(p,"reference_target_id"),decisionID:text(p,"reference_decision_id"),project:project,typeID:round["type_id"] as! String,caller:c),
+              let example = try mediaApprovedExample(db,targetID:text(p,"reference_target_id"),
+                  decisionID:text(p,"reference_decision_id"),project:project,typeID:(try StoredRecord(round,
+                   family: "media").string("type_id")),caller:c),
               !EnvelopeStorageIdentity.equal(example["round_id"] as? String,round["id"] as? String) else {throw CoreError("NOT_FOUND","This approved material reference is unavailable.")}
-        let (type,context) = try mediaRoundParts(db,round),schema = try MediaReviewSchema.parse(type["schema"] as! JSON)
+        let (type,context) = try mediaRoundParts(db,round),schema = try MediaReviewSchema.parse((try StoredRecord(type, family: "media").object("schema")))
         let slotID = try text(p,"slot_id"),sourceSlot = try text(p,"reference_slot_id")
         guard let destination = schema.slots.first(where:{Data($0.id.rawValue.utf8) == Data(slotID.utf8) && $0.material}),
-              let slot = (example["slots"] as! [JSON]).first(where:{EnvelopeStorageIdentity.equal($0["slot_id"] as? String,sourceSlot)}),
+              let slot = ((try StoredRecord(example, family: "media").objects("slots"))).first(where:{EnvelopeStorageIdentity.equal($0["slot_id"] as? String,sourceSlot)}),
               (slot["text"] is String ? MediaSlotKind.text : MediaSlotKind(rawValue:slot["media_kind"] as? String ?? "")) == destination.kind else {throw CoreError("INVALID_INPUT","Adopt an exact compatible material slot.")}
-        let manifest = try scoped(db,round["manifest_id"] as! String,project,type:"media_round_manifest")
-        guard let member = (manifest["items"] as! [JSON]).first(where:{EnvelopeStorageIdentity.equal($0["item_id"] as? String,item["id"] as? String)}) else {throw CoreError("MEDIA_MANIFEST_CHANGED","Adopt material into a published item.")}
-        let old = try scoped(db,member["target_id"] as! String,project,type:"media_item_target")
+        let manifest = try scoped(db,(try StoredRecord(round, family: "media").string("manifest_id")),project,type:"media_round_manifest")
+        guard let member = ((try StoredRecord(manifest, family: "media").objects("items"))).first(where:{EnvelopeStorageIdentity.equal($0["item_id"] as? String,
+            item["id"] as? String)}) else {throw CoreError("MEDIA_MANIFEST_CHANGED","Adopt material into a published item.")}
+        let old = try scoped(db,(try StoredRecord(member, family: "media").string("target_id")),project,type:"media_item_target")
         // Do not discard unpublished successor work during an owner material edit.
         guard EnvelopeStorageIdentity.equal(item["draft_target_id"] as? String,old["id"] as? String) else {throw CoreError("MEDIA_MANIFEST_CHANGED","Publish or reconcile the existing Draft successor first.")}
         var references = old["material_references"] as? [JSON] ?? []
         references.removeAll {EnvelopeStorageIdentity.equal($0["slot_id"] as? String,slotID)}
-        references.append(["project_id":project,"type_id":round["type_id"]!,"target_id":example["target_id"]!,"decision_id":example["decision_id"]!,
-            "candidate_id":example["winner_id"]!,"source_slot_id":sourceSlot,"slot_id":slotID,"kind":destination.kind.rawValue,"sha256":slot["sha256"]!])
-        references.sort {Data(($0["slot_id"] as! String).utf8).lexicographicallyPrecedes(Data(($1["slot_id"] as! String).utf8))}
+        references.append(["project_id":project,"type_id":(try StoredRecord(round, family: "media").requiredValue("type_id")),
+            "target_id":(try StoredRecord(example, family: "media").requiredValue("target_id")),
+            "decision_id":(try StoredRecord(example, family: "media").requiredValue("decision_id")),
+            "candidate_id":(try StoredRecord(example, family: "media").requiredValue("winner_id")),
+                "source_slot_id":sourceSlot,"slot_id":slotID,"kind":destination.kind.rawValue,
+                "sha256":(try StoredRecord(slot, family: "media").requiredValue("sha256"))])
+        try references.sort {Data(((try StoredRecord($0, family: "media").string("slot_id"))).utf8).lexicographicallyPrecedes(Data(((try StoredRecord($1, family: "media").string("slot_id"))).utf8))}
         let candidates = try strings(old,"candidate_ids").map {try scoped(db,$0,project,type:"media_candidate")}
-        var shape = try mediaTargetShape(db,item:item,title:old["title"] as! String,metadata:old["metadata"] as! JSON,candidates:candidates,typeRevision:type,context:context,materialReferences:references)
+        var shape = try mediaTargetShape(db,item:item,title:(try StoredRecord(old, family: "media").string("title")),
+            metadata:(try StoredRecord(old, family: "media").object("metadata")),candidates:candidates,
+            typeRevision:type,context:context,materialReferences:references)
         for key in ["attachment_owner_id","attachment_reference_ids"] {shape[key] = old[key]}
         let target = try mediaTarget(db,item:item,shape:shape,caller:c,previous:old)
-        item["draft_target_id"] = target["id"];item["record_references"] = (item["record_references"] as! [JSON]) + [mediaRef("media_item_target",target)]
+        item["draft_target_id"] = target["id"];item["record_references"] = ((try StoredRecord(item, family: "media").objects("record_references"))) + [try mediaRef("media_item_target",target)]
         item = revised(item);try mediaWrite(db,item,type:"media_item")
-        let members = try (manifest["items"] as! [JSON]).map { entry -> (JSON,JSON) in
+        let members = try ((try StoredRecord(manifest, family: "media").objects("items"))).map { entry -> (JSON,JSON) in
             if EnvelopeStorageIdentity.equal(entry["item_id"] as? String,item["id"] as? String) {return (item,target)}
-            return (try scoped(db,entry["item_id"] as! String,project,type:"media_item"),try scoped(db,entry["target_id"] as! String,project,type:"media_item_target"))
+            return (try scoped(db,(try StoredRecord(entry, family: "media").string("item_id")),
+                project,type:"media_item"),try scoped(db,(try StoredRecord(entry, family: "media").string("target_id")),
+                project,type:"media_item_target"))
         }
         let next = try mediaManifest(db,round:&round,targets:members,typeRevision:type,context:context,caller:c)
         round = revised(round);try mediaWrite(db,round,type:"media_round")
-        return ["item_id":item["id"]!,"target_id":target["id"]!,"manifest_id":next["id"]!,"material_reference":references.first(where:{$0["slot_id"] as? String == slotID})!,"decision_stale":old["review_basis_signature"] as? String != target["review_basis_signature"] as? String]
+        return ["item_id":(try StoredRecord(item, family: "media").requiredValue("id")),"target_id":(try StoredRecord(target,
+             family: "media").requiredValue("id")),"manifest_id":(try StoredRecord(next, family: "media").requiredValue("id")),
+            "material_reference":references.first(where:{$0["slot_id"] as? String == slotID})!,
+            "decision_stale":old["review_basis_signature"] as? String != target["review_basis_signature"] as? String]
     }
 }

@@ -20,7 +20,11 @@ extension CommandRouter {
             guard !open.isEmpty else { notReady.append(unavailable("no open review request"));continue }
             var selected: String? = nil
             for request in open {
-                if let selected { notReady.append(unavailable("batch_prepare accepts one request per task; chose oldest ready request \(selected), omitted \(request["id"]!)"));continue }
+                if let selected {
+                    let requestID = try StoredRecord(request,family:"review_request").requiredValue("id")
+                    notReady.append(unavailable("batch_prepare accepts one request per task; chose oldest ready request \(selected), omitted \(requestID)"))
+                    continue
+                }
                 if request["gate"] as? String == "human_approval" { notReady.append(unavailable("human approval requires the owner channel"));continue }
                 let manifest: JSON
                 do { manifest = try validateManifestTarget(db,task:task,manifestID:try text(request,"manifest_id")) }
@@ -28,9 +32,22 @@ extension CommandRouter {
                 let author: JSON = ["session_id":manifest["author_session_id"] ?? NSNull()]
                 let contributors = Set(([author] + (manifest["contributors"] as? [JSON] ?? [])).compactMap {$0["session_id"] as? String}).sorted()
                 selected = request["id"] as? String
-                tasks.append(["task_id":id,"key":task["key"] ?? "","expected_revision":task["revision"]!,"review_request_id":request["id"]!,"target_manifest_id":manifest["id"]!,"gate":request["gate"]!,"contributor_session_ids":contributors])
+                tasks.append(try reviewBatchSelector(task:task,request:request,manifest:manifest,contributors:contributors))
             }
         }
-        return ["triage_id":group["id"]!,"triage_key":group["key"] ?? "","triage_name":group["name"] ?? "","triage_revision":group["revision"]!,"phase":"review","tasks":tasks,"not_ready":notReady]
+        let groupRecord = StoredRecord(group,family:"group")
+        return ["triage_id":try groupRecord.requiredValue("id"),"triage_key":group["key"] ?? "",
+            "triage_name":group["name"] ?? "","triage_revision":try groupRecord.requiredValue("revision"),
+            "phase":"review","tasks":tasks,"not_ready":notReady]
+    }
+
+    func reviewBatchSelector(task: JSON,request: JSON,manifest: JSON,contributors: [String]) throws -> JSON {
+        let taskRecord = StoredRecord(task,family:"task")
+        let requestRecord = StoredRecord(request,family:"review_request")
+        return ["task_id":try taskRecord.requiredValue("id"),"key":task["key"] ?? "",
+            "expected_revision":try taskRecord.requiredValue("revision"),
+            "review_request_id":try requestRecord.requiredValue("id"),
+            "target_manifest_id":try StoredRecord(manifest,family:"manifest").requiredValue("id"),
+            "gate":try requestRecord.requiredValue("gate"),"contributor_session_ids":contributors]
     }
 }

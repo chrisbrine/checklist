@@ -64,7 +64,7 @@ extension CommandRouter {
                            try jsonString(self.ticketCleanupSettings(self.record(db,pass.fence.projectID,type:"project"))) == jsonString(self.ticketCleanupSettings(pass.project)),
                            (pass.selection["items"] as? [JSON] ?? []).contains(where: {$0["action"] as? String != "keep"}) {
                             var selection = pass.selection
-                            selection["items"] = (selection["items"] as! [JSON]).map {item -> JSON in
+                            selection["items"] = (try StoredRecord(selection, family: "cleanup_selection").objects("items")).map { item -> JSON in
                                 var item = item
                                 if item["action"] as? String != "keep" {item["action"] = "keep";item["reason"] = "fenced_by_concurrent_write"}
                                 return item
@@ -139,7 +139,7 @@ extension CommandRouter {
     func prepareTicketObjectDeletion(_ db: Database) throws -> TicketCleanupPreparedDeletion? {
         guard let raw = try Row.fetchOne(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND json_valid(data) AND json_extract(data,'$.kind')='ticket_object_delete' AND json_extract(data,'$.state')='pending' AND NOT EXISTS(SELECT 1 FROM metadata m WHERE m.key='ticket-cleanup-preparation:'||records.project_id AND json_valid(m.value) AND json_extract(m.value,'$.next_attempt_at')>?) ORDER BY rowid LIMIT 1",arguments:[now()]) else {return nil}
         let receipt = try GRDBRecordEnvelopeAdapter.decode(raw).object
-        try beginTicketCleanupPreparation(project:receipt["project_id"] as! String)
+        try beginTicketCleanupPreparation(project: (try StoredRecord(receipt, family: "receipt").string("project_id")))
         let inventory = try ticketCleanupInventory(db,receipt:receipt)
         let graph = try ticketCleanupDeletionReferences(db,receipt:receipt,inventory:inventory)
         let references = try TicketObjectDeletionReferenceIndex(graph,tokens:inventory.tokens)
@@ -157,7 +157,12 @@ extension CommandRouter {
            let path = candidate["relative_path"] as? String,let sha = candidate["sha256"] as? String,let size = (candidate["size"] as? NSNumber)?.int64Value {
             do {verification = try TicketObjectRemovalVerification(root:root,relative:path,sha256:sha,size:size)} catch {failure = error}
         }
-        let fence = try TicketCleanupFence(db,inventory:inventory,project:receipt["project_id"] as! String,ids:[receipt["id"] as! String,receipt["task_id"] as! String,receipt["project_id"] as! String])
+        let fence = try TicketCleanupFence(
+            db, inventory: inventory, project: (try StoredRecord(receipt, family: "receipt").string("project_id")),
+            ids: [
+                (try StoredRecord(receipt, family: "receipt").string("id")), (try StoredRecord(receipt, family: "receipt").string("task_id")),
+                (try StoredRecord(receipt, family: "receipt").string("project_id")),
+            ])
         return TicketCleanupPreparedDeletion(fence:fence,receipt:receipt,references:references,backup:backup,mediaAuthorityComplete:mediaComplete,candidatePath:candidate?["relative_path"] as? String,verification:verification,verificationFailure:failure)
     }
 }

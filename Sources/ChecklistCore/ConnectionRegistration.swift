@@ -118,10 +118,16 @@ extension CommandRouter {
                           registration.hasPrefix(preparation.installation + "/"),
                           registration.count > preparation.installation.count + 1 else { throw CoreError("INVALID_INPUT", "Pairing preparation has an invalid registration shape.") }
                     let session = try self.sessionWrite(db, params, caller, "session_register")
-                    let data: JSON = ["installation": preparation.installation, "session_id": session["id"]!, "role": session["role"]!, "paired": true, "workspace": session["workspace"] ?? "", "mcp_executable": preparation.mcpExecutable]
+                    let data: JSON = ["installation": preparation.installation, "session_id": (try StoredRecord(session,
+                        family: "ConnectionRegistration").requiredValue("id")), "role": (try StoredRecord(session, family: "ConnectionRegistration").requiredValue("role")), "paired": true,
+                        "workspace": session["workspace"] ?? "", "mcp_executable": preparation.mcpExecutable]
                     stored = ["data": data, "command_id": command,
                         "event_cursor": try self.cursor(db, caller: caller, scope: try self.authorizationScope(db, caller)),
-                        "_connection_registration": ["session_id": session["id"]!, "installation": session["installation"]!, "authorization_generation": session["authorization_generation"]!, "role": session["role"]!, "provider": session["provider"]!, "project_ids": session["project_ids"] ?? [session["project_id"]!]]]
+                        "_connection_registration": ["session_id": (try StoredRecord(session, family: "ConnectionRegistration").requiredValue("id")),
+                            "installation": (try StoredRecord(session, family: "ConnectionRegistration").requiredValue("installation")), "authorization_generation": (try StoredRecord(session,
+                            family: "ConnectionRegistration").requiredValue("authorization_generation")), "role": (try StoredRecord(session,
+                            family: "ConnectionRegistration").requiredValue("role")), "provider": (try StoredRecord(session, family: "ConnectionRegistration").requiredValue("provider")),
+                            "project_ids": (try (session["project_ids"] ?? [StoredRecord(session, family: "ConnectionRegistration").requiredValue("project_id")]))]]
                     try db.execute(sql: "INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)", arguments: [caller.principal, command, digest, try jsonString(stored)])
                     return .commit
                 }

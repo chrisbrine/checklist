@@ -64,7 +64,7 @@ extension CommandRouter {
         return try observer.read { source in
             let version = try Int64.fetchOne(source,sql:"PRAGMA data_version")!
             let pid = try self.mediaAccess(source,p,c,write:true)
-            let command = p["command_id"] as! String
+            let command = (try StoredRecord(p, family: "media").string("command_id"))
             let digest = hash(Data((method + (try jsonString(p))).utf8))
             try self.requirePendingCommandIntent(source,command:command,digest:digest,caller:c)
             // Preserve replay behavior even if the original command's target changed.

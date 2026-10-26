@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 enum RequestRowCapability: String, CaseIterable, Identifiable {
     case choice = "Choice", text = "Text", file = "File", check = "Check", approval = "Approval"
@@ -16,16 +17,17 @@ enum RequestRowCapability: String, CaseIterable, Identifiable {
 
 /// Read-only presentation. It never turns a nonblocking request into a task dependency.
 enum RequestRowPresentation {
-    private static let fractional: ISO8601DateFormatter = {
+    // Parser instances never leave the lock. Only immutable dates are shared.
+    private static let parsers = OSAllocatedUnfairLock(uncheckedState: (fractional: makeFractional(), standard: ISO8601DateFormatter()))
+    private static func makeFractional() -> ISO8601DateFormatter {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime,.withFractionalSeconds]
         return formatter
-    }()
-    private static let standard = ISO8601DateFormatter()
+    }
 
     static func createdAt(_ request: Record) -> Date? {
         let value = request.string("created_at")
-        return fractional.date(from:value) ?? standard.date(from:value)
+        return parsers.withLock { $0.fractional.date(from:value) ?? $0.standard.date(from:value) }
     }
 
     static func ordered(_ requests: [Record]) -> [Record] {

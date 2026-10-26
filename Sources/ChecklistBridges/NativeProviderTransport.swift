@@ -25,25 +25,27 @@ public enum NativeProviderTransport {
     public static func send(provider: String, content: String, messageID: String, replyAddress: String, displayName: String,
                             endpoint: String, expectedPeerPID: Int32? = nil,
                             expectedRegistration: NativeLifecycleRegistration? = nil,
-                            timeout: TimeInterval = 5, registry: ProviderPluginRegistry = .bundled) throws -> NativeWriteReceipt {
+                            timeout: TimeInterval = 5, registry: ProviderPluginRegistry = .bundled,
+                            effects: any NativePeerTransportEffects = NativePeerTransportAdapters.current) throws -> NativeWriteReceipt {
         try send(provider: provider, content: content, messageID: messageID,
                  sender: ClaudePeerSender(replyAddress: replyAddress, displayName: displayName, permissionClass: .prompting),
                  endpoint: endpoint, expectedPeerPID: expectedPeerPID, expectedRegistration: expectedRegistration,
-                 timeout: timeout, registry: registry)
+                 timeout: timeout, registry: registry, effects: effects)
     }
 
     /// Compatibility entrypoint for the existing provider-specific bridge API.
     public static func send(provider: String, content: String, messageID: String, sender: ClaudePeerSender,
                             endpoint: String, expectedPeerPID: Int32? = nil,
                             expectedRegistration: NativeLifecycleRegistration? = nil,
-                            timeout: TimeInterval = 5, registry: ProviderPluginRegistry = .bundled) throws -> NativeWriteReceipt {
+                            timeout: TimeInterval = 5, registry: ProviderPluginRegistry = .bundled,
+                            effects: any NativePeerTransportEffects = NativePeerTransportAdapters.current) throws -> NativeWriteReceipt {
         guard nativePlugin(provider: provider, registry: registry) != nil else {
             throw NativeBridgeError.invalid("ADAPTER_UNAVAILABLE: No qualified bundled native peer transport is available for this provider.")
         }
         guard expectedRegistration == nil || expectedRegistration?.provider == provider else {
             throw NativeBridgeError.invalid("RECIPIENT_CHANGED: native registration belongs to another provider.")
         }
-        return try ClaudeLocalBridge.send(content: content, messageID: messageID, sender: sender,
+        return try effects.send(content: content, messageID: messageID, sender: sender,
             endpoint: endpoint, expectedPeerPID: expectedPeerPID, expectedRegistration: expectedRegistration, timeout: timeout, providerRegistry:registry)
     }
 

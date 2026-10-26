@@ -133,7 +133,7 @@ extension CommandRouter {
                 let namespace = "project-" + hash(Data(pid.utf8))
                 job = ["id":key,"project_id":pid,"kind":"attachment_import","parent_principal":c.principal,"parent_command_id":command,"intent_digest":digest,"incarnation":self.incarnation,"session_generation":generation,"attachment_id":id,"object_relative_path":"objects/" + namespace + "/" + id + suffix,"state":"reserved","revision":1,"created_at":now()]
                 if let mediaOwner { job["attachment_owner_id"] = mediaOwner.id;job["attachment_owner_kind"] = mediaOwner.kind.rawValue }
-                else { job["task_id"] = task["id"]! }
+                else { job["task_id"] = (try StoredRecord(task, family: "ManagedAttachmentImport").requiredValue("id")) }
                 try self.save(db,job,type:"storage_job")
             }
             return .commit
@@ -160,15 +160,35 @@ extension CommandRouter {
         var verifiedFinal: [String:FileIdentity] = [:]
         func preparedValue(_ value: JSON) throws -> ManagedAttachmentPreparation {
             let objects = try managedImportObjects(value)
-            let originalObject = objects.first(where: {$0["representation"] as? String == "original"})!
-            var attachment: JSON = ["id":attachmentID,"project_id":pid,"artifact_id":attachmentID,"name":p["name"] ?? sourceURL.lastPathComponent,"description":p["description"] ?? "","mode":"managed","path":original,"sha256":originalObject["sha256"]!,"size":originalObject["size"]!,"availability":"available","keep_original":false,"unlinked":false,"revision":1,"created_at":created,"author":c.principal,"origin":c.isOwner ? "human_ui" : c.role,"storage_job_id":key]
+            guard let originalObject = objects.first(where: {$0["representation"] as? String == "original"}) else {
+                throw managedImportFailure("original_descriptor_missing")
+            }
+            var attachment: JSON = ["id":attachmentID,
+                "project_id":pid,
+                "artifact_id":attachmentID,
+                "name":p["name"] ?? sourceURL.lastPathComponent,
+                "description":p["description"] ?? "",
+                "mode":"managed",
+                "path":original,
+                "sha256":(try StoredRecord(originalObject,
+                family: "ManagedAttachmentImport").requiredValue("sha256")),
+                "size":(try StoredRecord(originalObject,
+                family: "ManagedAttachmentImport").requiredValue("size")),
+                "availability":"available",
+                "keep_original":false,
+                "unlinked":false,
+                "revision":1,
+                "created_at":created,
+                "author":c.principal,
+                "origin":c.isOwner ? "human_ui" : c.role,
+                "storage_job_id":key]
             if let mediaOwner { attachment["attachment_owner_id"] = mediaOwner.id }
-            else { attachment["task_id"] = task["id"]! }
+            else { attachment["task_id"] = (try StoredRecord(task, family: "ManagedAttachmentImport").requiredValue("id")) }
             if value["preview_available"] as? Bool == true, let preview = objects.first(where: {$0["representation"] as? String == "preview"}) { attachment["preview_path"] = preview["final"] }
             else if objects.contains(where: {$0["representation"] as? String == "preview"}) { attachment["preview_availability"] = "unavailable" }
             var prepared = ManagedAttachmentPreparation(job:value,attachment:attachment,principal:c.principal,command:command,digest:digest)
             for object in objects where object["representation"] as? String == "original" || value["preview_available"] as? Bool == true {
-                let final = object["final"] as! String
+                let final = (try StoredRecord(object, family: "ManagedAttachmentImport").string("final"))
                 guard let identity = verifiedFinal[final],(try? managedIdentity(final)) == identity else { throw managedImportFailure("prepared_original_missing_or_changed") }
                 prepared.observations[final] = identity
             }
@@ -178,8 +198,10 @@ extension CommandRouter {
         if job["state"] as? String == "finalized", job["objects"] == nil { throw managedImportFailure("invalid_finalized_authority") }
         if job["objects"] != nil {
             let objects = try managedImportObjects(job)
-            let originalObject = objects.first(where: {$0["representation"] as? String == "original"})!
-            let final = originalObject["final"] as! String
+            guard let originalObject = objects.first(where: {$0["representation"] as? String == "original"}) else {
+                throw managedImportFailure("original_descriptor_missing")
+            }
+            let final = (try StoredRecord(originalObject, family: "ManagedAttachmentImport").string("final"))
             let retained = try managedImportExists(files,final)
             if job["state"] as? String == "finalized" || retained {
                 guard retained else { throw managedImportFailure("finalized_original_missing") }
@@ -188,8 +210,12 @@ extension CommandRouter {
                 try synchronizeManagedImportPublication(files,path:final)
                 if let preview = objects.first(where: {$0["representation"] as? String == "preview"}) {
                     do {
-                        verifiedFinal[preview["final"] as! String] = try verifyManagedImportFile(files,preview["final"] as! String,preview)
-                        try synchronizeManagedImportPublication(files,path:preview["final"] as! String)
+                        verifiedFinal[(try StoredRecord(preview,
+                            family: "ManagedAttachmentImport").string("final"))] = try verifyManagedImportFile(files,
+                            (try StoredRecord(preview,
+                            family: "ManagedAttachmentImport").string("final")),
+                            preview)
+                        try synchronizeManagedImportPublication(files,path:(try StoredRecord(preview, family: "ManagedAttachmentImport").string("final")))
                         job["preview_available"] = true
                     } catch { job["preview_available"] = false }
                 }
@@ -204,18 +230,7 @@ extension CommandRouter {
         // Open before any Foundation file observation can enter the protected
         // source folder. Descriptor validation/read below supplies type and size.
         let sourceFiles = try StorageObjectFiles(root:sourceURL.deletingLastPathComponent(),folderAccess:access.folderAccess)
-        let bytes: Data
-        do {
-            let size = try sourceFiles.openRegular(sourceURL.lastPathComponent) { descriptor -> Int64 in
-                guard let identity = FileIdentity(descriptor:descriptor) else { throw StorageSnapshotFailure.unsupportedAuthority }
-                access.observeSourceIdentity(identity)
-                return identity.size
-            }
-            guard size <= 500 * 1024 * 1024 else { throw CoreError("FILE_TOO_LARGE", "This local importer accepts files up to 500 MiB.") }
-            bytes = try sourceFiles.read(sourceURL.lastPathComponent,maximum:500 * 1024 * 1024)
-        } catch StorageSnapshotFailure.io { throw CoreError("FILE_ACCESS_REQUIRED", "The selected original ‘\(sourceURL.path)’ cannot be read. Check folder access or privacy/sync availability and retry the original command ID.") }
-        catch StorageSnapshotFailure.unsupportedAuthority { throw CoreError("INVALID_INPUT", "Attach a regular file.") }
-        catch StorageSnapshotFailure.limit { throw CoreError("FILE_TOO_LARGE", "This local importer accepts files up to 500 MiB.") }
+        let bytes = try readManagedImportSource(sourceFiles, sourceURL:sourceURL, access:access)
         let sha = hash(bytes)
         guard bytes.count <= 500 * 1024 * 1024 else { throw CoreError("FILE_TOO_LARGE", "This local importer accepts files up to 500 MiB.") }
         if let expected = p["expected_sha256"] as? String, expected != sha { throw CoreError("SOURCE_CHANGED", "The file changed before import.") }
@@ -233,7 +248,7 @@ extension CommandRouter {
         let objects = try managedImportObjects(job)
         for object in objects {
             do {
-            let stage = object["stage"] as! String, final = object["final"] as! String
+            let stage = (try StoredRecord(object, family: "ManagedAttachmentImport").string("stage")), final = (try StoredRecord(object, family: "ManagedAttachmentImport").string("final"))
             if try managedImportExists(files,final) {
                 verifiedFinal[final] = try verifyManagedImportFile(files,final,object)
                 // A previous publication may have stopped before parent flush.
@@ -241,45 +256,9 @@ extension CommandRouter {
                 if object["representation"] as? String == "preview" { job["preview_available"] = true }
                 continue
             }
-            if try managedImportExists(files,stage) {
-                do { try verifyManagedImportFile(files,stage,object) }
-                catch {
-                    // Only an unpublished, job-owned stage may be replaced.
-                    // A reference from any canonical attachment wins over cleanup.
-                    try access.write { db in
-                        try requireCurrentPreparation(db)
-                        try self.removeManagedImportStage(db,files:files,path:stage)
-                    }
-                }
-            }
-            if !(try managedImportExists(files,stage)) {
-                let representation = object["representation"] as! String
-                if payloads[representation] == nil, representation == "preview" { payloads[representation] = managedImportPreview(bytes) }
-                guard let data = payloads[representation], hash(data) == object["sha256"] as? String, data.count == int(object,"size") else { throw managedImportFailure("staged_representation_not_reproducible") }
-                // A backup verifies a recorded stage when it exists, so the stage name
-                // appears only complete: written under a private name, renamed under the gate.
-                let partial = stage + ".partial-" + uuid()
-                do {
-                    var file: Int32 = -1
-                    try access.underGate {
-                        try requireCurrentUnderGate()
-                        file = try self.createManagedImportPartial(files,path:partial)
-                    }
-                    // Cancellation can unlink this private entry while its open inode is
-                    // written. No writer or object gate is held during the large copy.
-                    do {
-                        defer { Darwin.close(file) }
-                        try self.writeManagedImportPartial(file,bytes:data)
-                    }
-                    try access.underGate {
-                        try requireCurrentUnderGate()
-                        try self.renameManagedImportStage(files,from:partial,to:stage)
-                    }
-                } catch {
-                    try? access.underGate { _ = try self.removeManagedFile(files,relative:partial) }
-                    throw error
-                }
-            }
+            try stageManagedImportObject(
+                files, object:object, stage:stage, bytes:bytes, payloads:&payloads, access:access,
+                requireCurrentPreparation:requireCurrentPreparation, requireCurrentUnderGate:requireCurrentUnderGate)
             try verifyManagedImportFile(files,stage,object)
             // Links share the object gate order with reader grants, backups and cleanup unlinks.
             try access.underGate {
@@ -301,6 +280,77 @@ extension CommandRouter {
         job.removeValue(forKey:"last_error_code"); job.removeValue(forKey:"last_error_at")
         try saveProgress(job)
         return try preparedValue(job)
+    }
+
+    /// Reads through the already opened source authority; the caller retains it for the final reread.
+    private func readManagedImportSource(
+        _ sourceFiles: StorageObjectFiles, sourceURL: URL, access: ManagedImportAccess
+    ) throws -> Data {
+        do {
+            let size = try sourceFiles.openRegular(sourceURL.lastPathComponent) { descriptor -> Int64 in
+                guard let identity = FileIdentity(descriptor:descriptor) else { throw StorageSnapshotFailure.unsupportedAuthority }
+                access.observeSourceIdentity(identity)
+                return identity.size
+            }
+            guard size <= 500 * 1024 * 1024 else { throw CoreError("FILE_TOO_LARGE", "This local importer accepts files up to 500 MiB.") }
+            return try sourceFiles.read(sourceURL.lastPathComponent,maximum:500 * 1024 * 1024)
+        } catch StorageSnapshotFailure.io {
+            throw CoreError("FILE_ACCESS_REQUIRED",
+                "The selected original ‘\(sourceURL.path)’ cannot be read. Check folder access or privacy/sync availability and retry the original command ID.")
+        }
+        catch StorageSnapshotFailure.unsupportedAuthority { throw CoreError("INVALID_INPUT", "Attach a regular file.") }
+        catch StorageSnapshotFailure.limit { throw CoreError("FILE_TOO_LARGE", "This local importer accepts files up to 500 MiB.") }
+    }
+
+    /// Repairs or creates only the recorded unpublished stage. The caller owns final publication.
+    private func stageManagedImportObject(
+        _ files: StorageObjectFiles, object: JSON, stage: String, bytes: Data,
+        payloads: inout [String:Data], access: ManagedImportAccess,
+        requireCurrentPreparation: (Database) throws -> Void,
+        requireCurrentUnderGate: () throws -> Void
+    ) throws {
+        if try managedImportExists(files,stage) {
+            do { try verifyManagedImportFile(files,stage,object) }
+            catch {
+                // Only an unpublished, job-owned stage may be replaced.
+                // A reference from any canonical attachment wins over cleanup.
+                try access.write { db in
+                    try requireCurrentPreparation(db)
+                    try self.removeManagedImportStage(db,files:files,path:stage)
+                }
+            }
+        }
+        if !(try managedImportExists(files,stage)) {
+            let representation = (try StoredRecord(object, family: "ManagedAttachmentImport").string("representation"))
+            if payloads[representation] == nil, representation == "preview" { payloads[representation] = managedImportPreview(bytes) }
+            guard let data = payloads[representation], hash(data) == object["sha256"] as? String,
+                  data.count == int(object,"size") else {
+                throw managedImportFailure("staged_representation_not_reproducible")
+            }
+            // A backup verifies a recorded stage when it exists, so the stage name
+            // appears only complete: written under a private name, renamed under the gate.
+            let partial = stage + ".partial-" + uuid()
+            do {
+                var file: Int32 = -1
+                try access.underGate {
+                    try requireCurrentUnderGate()
+                    file = try self.createManagedImportPartial(files,path:partial)
+                }
+                // Cancellation can unlink this private entry while its open inode is
+                // written. No writer or object gate is held during the large copy.
+                do {
+                    defer { Darwin.close(file) }
+                    try self.writeManagedImportPartial(file,bytes:data)
+                }
+                try access.underGate {
+                    try requireCurrentUnderGate()
+                    try self.renameManagedImportStage(files,from:partial,to:stage)
+                }
+            } catch {
+                try? access.underGate { _ = try self.removeManagedFile(files,relative:partial) }
+                throw error
+            }
+        }
     }
 
     private func createManagedImportPartial(_ files: StorageObjectFiles,path: String) throws -> Int32 {
@@ -351,18 +401,38 @@ extension CommandRouter {
 
     func commitManagedAttachmentImport(_ db: Database,_ p: JSON,_ c: Caller,task: JSON) throws -> JSON {
         guard let prepared = managedAttachmentPreparation, EnvelopeStorageIdentity.equal(prepared.principal,c.principal), EnvelopeStorageIdentity.equal(prepared.command,p["command_id"] as? String), prepared.digest == hash(Data(("attachment_add" + (try jsonString(p))).utf8)) else { throw managedImportFailure("missing_preparation") }
-        let pid = task["project_id"] as! String
-        var job = try scoped(db,prepared.job["id"] as! String,pid,type:"storage_job")
-        try validateManagedImportOwner(job,principal:c.principal,command:prepared.command,digest:prepared.digest,project:pid,task:(task["id"] as! String),generation:try callerSessionGeneration(db,c,project:pid))
+        let pid = (try StoredRecord(task, family: "ManagedAttachmentImport").string("project_id"))
+        var job = try scoped(db,(try StoredRecord(prepared.job, family: "ManagedAttachmentImport").string("id")),pid,type:"storage_job")
+        try validateManagedImportOwner(job,
+            principal:c.principal,
+            command:prepared.command,
+            digest:prepared.digest,
+            project:pid,
+            task:((try StoredRecord(task,
+            family: "ManagedAttachmentImport").string("id"))),
+            generation:try callerSessionGeneration(db,
+            c,
+            project:pid))
         let objects = try managedImportObjects(job)
         guard let relativePath = job["object_relative_path"] as? String, int(job,"revision") == int(prepared.job,"revision"), job["state"] as? String == "finalized", EnvelopeStorageIdentity.equal(job["attachment_id"] as? String,prepared.attachment["id"] as? String), job["sha256"] as? String == prepared.attachment["sha256"] as? String, (try? managedRelative(prepared.attachment["path"] as? String ?? "",family:"objects")) == relativePath, try managedImportReceipt(db,principal:c.principal,command:prepared.command,digest:prepared.digest) == nil else { throw managedImportFailure("final_ownership_or_receipt_changed") }
         let files = try StorageObjectFiles(root:root)
         // The bytes were hashed after publication, before this transaction (CL-71). Here only
         // their presence and size are checked, so the transaction commits metadata only.
-        for object in objects where object["representation"] as? String == "original" || job["preview_available"] as? Bool == true { try verifyManagedImportPresence(files,object["final"] as! String,object) }
+        for object in objects where object["representation"] as? String == "original" || job["preview_available"] as? Bool == true { try verifyManagedImportPresence(files,
+            (try StoredRecord(object,
+            family: "ManagedAttachmentImport").string("final")),
+            object) }
         let attachment = prepared.attachment
         try save(db,attachment,type:"attachment")
-        try event(db,caller:c,project:pid,entity:task["id"] as? String,kind:"attachment_added",data:["attachment_id":attachment["id"]!,"name":attachment["name"]!])
+        try event(db,
+            caller:c,
+            project:pid,
+            entity:task["id"] as? String,
+            kind:"attachment_added",
+            data:["attachment_id":(try StoredRecord(attachment,
+            family: "ManagedAttachmentImport").requiredValue("id")),
+            "name":(try StoredRecord(attachment,
+            family: "ManagedAttachmentImport").requiredValue("name"))])
         job["state"] = "committed"; job["completed_at"] = now(); try saveManagedImportProgress(db,revised(job))
         // The enclosing unchanged handle callback adds event cursor and command
         // receipt in THIS transaction. Any late failure rolls all three back.
@@ -375,7 +445,7 @@ extension CommandRouter {
     /// cooperative router cannot replace a pending parent's object identity or
     /// overwrite a newer preparation/recovery outcome with an equal revision.
     private func saveManagedImportProgress(_ db: Database,_ next: JSON) throws {
-        let current = try record(db,next["id"] as! String,type:"storage_job")
+        let current = try record(db,(try StoredRecord(next, family: "ManagedAttachmentImport").string("id")),type:"storage_job")
         try requireManagedImportNotCanceled(current)
         guard db.isInsideTransaction, int(current,"revision") + 1 == int(next,"revision"), EnvelopeStorageIdentity.equal(current["attachment_id"] as? String,next["attachment_id"] as? String), EnvelopeStorageIdentity.equal(current["parent_principal"] as? String,next["parent_principal"] as? String), current["parent_command_id"] as? String == next["parent_command_id"] as? String, current["intent_digest"] as? String == next["intent_digest"] as? String else { throw CoreError("REVISION_CONFLICT", "The pending import changed. Reconcile the original command ID.") }
         try save(db,next,type:"storage_job")
@@ -517,13 +587,19 @@ extension CommandRouter {
         var job = initial
         guard job["kind"] as? String == "attachment_import" else { return }
         guard ["committed","repair_required"].contains(job["state"] as? String ?? "") else { return }
-        let objects = try managedImportObjects(job), pid = job["project_id"] as! String, aid = job["attachment_id"] as! String
+        let objects = try managedImportObjects(job),
+            pid = (try StoredRecord(job,
+            family: "ManagedAttachmentImport").string("project_id")),
+            aid = (try StoredRecord(job,
+            family: "ManagedAttachmentImport").string("attachment_id"))
         guard let principal = job["parent_principal"] as? String, let command = job["parent_command_id"] as? String, let digest = job["intent_digest"] as? String, let receipt = try managedImportReceipt(db,principal:principal,command:command,digest:digest), let result = receipt["data"] as? JSON, EnvelopeStorageIdentity.equal(result["id"] as? String,aid) else { throw managedImportFailure("committed_receipt_missing") }
         var attachment = try scoped(db,aid,pid,type:"attachment")
         guard attachment["storage_job_id"] as? String == job["id"] as? String, attachment["sha256"] as? String == job["sha256"] as? String, (try? managedRelative(attachment["path"] as? String ?? "",family:"objects")) == job["object_relative_path"] as? String else { throw managedImportFailure("committed_reference_changed") }
         let files = try StorageObjectFiles(root:root)
-        let original = objects.first(where: {$0["representation"] as? String == "original"})!
-        do { try verifyManagedImportFile(files,original["final"] as! String,original) }
+        guard let original = objects.first(where: {$0["representation"] as? String == "original"}) else {
+            throw managedImportFailure("original_descriptor_missing")
+        }
+        do { try verifyManagedImportFile(files,(try StoredRecord(original, family: "ManagedAttachmentImport").string("final")),original) }
         catch {
             try withValidatedDomainTransaction(db) {
                 attachment["availability"] = "unavailable"; try self.save(db,self.revised(attachment),type:"attachment")
@@ -533,10 +609,10 @@ extension CommandRouter {
         }
         var previewUnavailable = false
         if job["preview_available"] as? Bool == true, let preview = objects.first(where: {$0["representation"] as? String == "preview"}) {
-            do { try verifyManagedImportFile(files,preview["final"] as! String,preview) }
+            do { try verifyManagedImportFile(files,(try StoredRecord(preview, family: "ManagedAttachmentImport").string("final")),preview) }
             catch { previewUnavailable = true }
         }
-        for object in objects { try removeManagedImportStage(db,files:files,path:object["stage"] as! String) }
+        for object in objects { try removeManagedImportStage(db,files:files,path:(try StoredRecord(object, family: "ManagedAttachmentImport").string("stage"))) }
         try withValidatedDomainTransaction(db) {
             let restoreOriginal = attachment["availability"] as? String == "unavailable"
             if restoreOriginal { attachment["availability"] = "available"; attachment.removeValue(forKey:"availability_error") }

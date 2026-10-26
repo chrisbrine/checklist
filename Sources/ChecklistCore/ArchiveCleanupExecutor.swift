@@ -324,8 +324,9 @@ extension CommandRouter {
                 var result = object
                 let failures = int(object,"failures") + 1
                 result["failures"] = failures
-                result["last_failure"] = (error as? CoreError)?.code ?? "CLEANUP_UNAVAILABLE"
-                if failures >= 2 {result["state"] = "retained";result["reasons"] = [result["last_failure"]!]}
+                let failureCode = (error as? CoreError)?.code ?? "CLEANUP_UNAVAILABLE"
+                result["last_failure"] = failureCode
+                if failures >= 2 { result["state"] = "retained"; result["reasons"] = [failureCode] }
                 objects[index] = result
                 _ = Self.retainTicketObjectDeletionLinkTargets(&objects)
                 try self.recordTicketCleanupAvailability(db,receipt:receipt,object:result)

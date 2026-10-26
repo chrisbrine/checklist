@@ -122,6 +122,7 @@ extension CommandRouter {
             guard let created = (job["created_at"] as? String).flatMap(formatter.date(from:)), current.timeIntervalSince(created) >= Self.abandonedImportGrace,
                   let principal = job["parent_principal"] as? String, let command = job["parent_command_id"] as? String, let digest = job["intent_digest"] as? String,
                   let attachmentID = job["attachment_id"] as? String, let pid = job["project_id"] as? String else { continue }
+            let jobID = try StoredRecord(job, family: "storage_job").string("id")
             do {
                 guard try managedImportReceipt(db, principal: principal, command: command, digest: digest) == nil,
                       (try? scoped(db, attachmentID, pid, type: "attachment")) == nil else { continue }
@@ -132,12 +133,12 @@ extension CommandRouter {
                     }
                 }
                 // Job-owned partial stages from an interrupted rename.
-                let stageDirectory = "staging/attachment-imports/" + (job["id"] as! String)
+                let stageDirectory = "staging/attachment-imports/" + (jobID)
                 for name in (try? managedDirectoryEntries(files, relative: stageDirectory)) ?? [] where name.contains(".partial-") {
                     _ = try removeManagedFile(files, relative: stageDirectory + "/" + name)
                 }
                 try withValidatedDomainTransaction(db) {
-                    let latest = try self.record(db, job["id"] as! String, type: "storage_job")
+                    let latest = try self.record(db, jobID, type: "storage_job")
                     guard int(latest, "revision") == int(job, "revision") else { return .rollback }
                     job["state"] = "settled"; job["settled_reason"] = "abandoned_without_receipt"; job["settled_at"] = now()
                     try self.save(db, self.revised(job), type: "storage_job"); return .commit

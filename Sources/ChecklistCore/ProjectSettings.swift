@@ -53,7 +53,7 @@ extension CommandRouter {
         if p["policy"] != nil { guard p["policy_proposal_id"] == nil else { throw CoreError("INVALID_INPUT","Use a policy object or its unchanged proposal, not both.") }; _ = try normalizedPolicy(p["policy"] as? JSON ?? [:]) }
         var updated: JSON
         if p["policy"] != nil || p["policy_proposal_id"] != nil {
-            var params: JSON = ["project_id":pid,"expected_revision":current["revision"]!,"mode":p["mode"] ?? "future_attempts"]
+            var params: JSON = ["project_id":pid,"expected_revision":(try StoredRecord(current, family: "ProjectSettings").requiredValue("revision")),"mode":p["mode"] ?? "future_attempts"]
             if let reason = p["reason"] { params["reason"] = reason }
             if let policy = p["policy"] { params["policy"] = policy }
             if let proposal = p["policy_proposal_id"] { params["proposal_id"] = proposal; params["digest"] = p["policy_digest"] }

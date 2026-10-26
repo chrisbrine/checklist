@@ -45,11 +45,13 @@ extension CommandRouter {
     // Only actual current attempts/accepted children; the project coordinator is
     // deliberately retained only by the separate protected direction contract.
     func ordinaryHandlerRecipients(_ db: Database, task: JSON) throws -> [JSON] {
-        let pid = task["project_id"] as! String, tid = task["id"] as! String
+        let storedTask = try StoredTaskRecord(task)
+        let pid = storedTask.projectID, tid = storedTask.id
         guard let rootID = task["active_attempt_id"] as? String,
               let root = try? scoped(db, rootID, pid, type: "attempt"), root["state"] as? String == "active" else { return [] }
         let attempts = [root] + (try activeDescendants(db, attempt: root))
-        var result: [JSON] = [], seen: Set<Mention.Recipient> = []
+        var result: [(sessionID: String, value: JSON)] = []
+        var seen: Set<Mention.Recipient> = []
         for attempt in attempts {
             guard let sid = attempt["session_id"] as? String, let aid = attempt["id"] as? String,
                   mentionEqual(attempt["project_id"] as? String, pid), mentionEqual(attempt["task_id"] as? String, tid),
@@ -58,12 +60,18 @@ extension CommandRouter {
                   let route = mentionRecipient(session, project: pid),
                   mentionEqual(attempt["session_authorization_generation"] as? String, mentionString(route.authorizationGeneration)),
                   seen.insert(route).inserted else { continue }
-            result.append(["project_id": pid, "session_id": sid, "attempt_id": aid,
+            result.append((sid, ["project_id": pid, "session_id": sid, "attempt_id": aid,
                            "recipient_role": mentionEqual(aid, rootID) ? "handler" : "registered_child",
                            "display_name": session["label"] ?? "Worker",
-                           "authorization_generation": mentionString(route.authorizationGeneration)])
+                           "authorization_generation": mentionString(route.authorizationGeneration)]))
         }
-        return result.sorted { ($0["session_id"] as! String).utf8.lexicographicallyPrecedes(($1["session_id"] as! String).utf8) }
+        return result.sorted { $0.sessionID.utf8.lexicographicallyPrecedes($1.sessionID.utf8) }.map(\.value)
+    }
+
+    private func storedMentionRecipient(_ value: JSON, project: String) throws -> Mention.Recipient {
+        let record = StoredRecord(value, family: "mention_recipient")
+        return try Mention.Recipient(projectID: .init(project), sessionID: .init(record.string("session_id")),
+                                     authorizationGeneration: .init(record.string("authorization_generation")))
     }
 
     private func mentionMatches(_ lookups: [Mention.Lookup], target: Mention.Target, aliases: [Mention.Lookup]) -> Bool {
@@ -88,9 +96,8 @@ extension CommandRouter {
                   let tid = task["id"] as? String, let key = task["key"] as? String else { continue }
             let target = Mention.Target.ticket(.init(tid)), aliases = [Mention.Lookup.ticketKey(.init(key))]
             guard mentionMatches(lookups, target: target, aliases: aliases) else { continue }
-            let recipients = try ordinaryHandlerRecipients(db, task: task).map { detail in
-                Mention.Recipient(projectID: pid, sessionID: .init(detail["session_id"] as! String),
-                                  authorizationGeneration: .init(detail["authorization_generation"] as! String))
+            let recipients = try ordinaryHandlerRecipients(db, task: task).map {
+                try storedMentionRecipient($0, project: project)
             }
             result.append(.init(projectID: pid, aliases: aliases, target: target, recipients: recipients))
         }
@@ -129,9 +136,9 @@ extension CommandRouter {
     private func mentionProjection(_ db: Database, project: String, task: JSON, messageID: String,
                                    replyTo: String?, lookups: [Mention.Lookup], caller: Caller) throws -> Mention.Projection {
         let handlers = try ordinaryHandlerRecipients(db, task: task).filter { !mentionEqual($0["session_id"] as? String, caller.sessionID) }
-        let current = handlers.map { Mention.Recipient(projectID: .init(project), sessionID: .init($0["session_id"] as! String),
-                                                       authorizationGeneration: .init($0["authorization_generation"] as! String)) }
-        let context = Mention.Context(projectID: .init(project), taskID: .init(task["id"] as! String), messageID: .init(messageID))
+        let current = try handlers.map { try storedMentionRecipient($0, project: project) }
+        let taskID = try StoredRecord(task, family: "task").string("id")
+        let context = Mention.Context(projectID: .init(project), taskID: .init(taskID), messageID: .init(messageID))
         switch Mention.project(context: context, form: replyTo == nil ? .topLevel : .reply,
                                currentHandlers: current, tags: lookups, candidates: try mentionCandidates(db, project: project, lookups: lookups)) {
         case .success(let result): return result
@@ -182,14 +189,15 @@ extension CommandRouter {
                           "expires_at": Date().timeIntervalSince1970 + 300, "revision": 1, "created_at": now()]
         if let replyTo { plan["reply_to"] = replyTo }
         try save(db, plan, type: "ordinary_mention_plan")
-        return ["mention_target": token, "expires_at": plan["expires_at"]!, "references": snapshot["targets"]!,
+        return ["mention_target": token, "expires_at": (try StoredRecord(plan, family: "OrdinaryMentions").requiredValue("expires_at")),
+            "references": (try StoredRecord(snapshot, family: "OrdinaryMentions").requiredValue("targets")),
                 "delivery_capability": "pickup_only", "push_available": false]
     }
 
     func ordinaryMessageRoute(_ db: Database, project: String, task: JSON, replyTo: String?,
                               mentionTarget: String?, caller: Caller) throws -> OrdinaryMentionRoute {
         try mentionTransaction(db); try mentionCaller(db, caller: caller, project: project)
-        let tid = task["id"] as! String
+        let tid = try StoredRecord(task, family: "task").string("id")
         let handlers = try ordinaryHandlerRecipients(db, task: task)
         guard let mentionTarget else {
             return .init(messageID: nil, mode: "handlers", references: [],
@@ -235,7 +243,8 @@ extension CommandRouter {
     // direction/human-answer queueing is unchanged. No process/liveness assertion.
     func queueOrdinaryDeliveries(_ db: Database, message: JSON, recipients: [JSON]) throws -> [JSON] {
         try mentionTransaction(db)
-        let pid = message["project_id"] as! String, mid = message["id"] as! String
+        let storedMessage = StoredRecord(message, family: "message")
+        let pid = try storedMessage.string("project_id"), mid = try storedMessage.string("id")
         // A new note must not decode the project's entire retained outbox.
         // Malformed JSON remains selected so canonical validation still refuses it.
         let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='delivery' AND project_id=CAST(? AS TEXT) AND CASE WHEN json_valid(data) THEN json_type(data,'$.message_id')='text' AND json_extract(data,'$.message_id')=CAST(? AS TEXT) COLLATE BINARY ELSE 1 END ORDER BY rowid",arguments:[Data(pid.utf8),Data(mid.utf8)])

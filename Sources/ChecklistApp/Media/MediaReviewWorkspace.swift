@@ -144,7 +144,12 @@ struct MediaReviewWorkspace: View {
             if model.writable {
                 HStack {
                     TextField("New item title",text:$itemTitle)
-                    Button("Add Draft item") {model.mutate("media_item_create",["round_id":model.roundID,"title":itemTitle]) {result in itemTitle="";Task {await model.select(result["id"] as! String)}}}.checklistDisabled([(itemTitle.isEmpty,"Enter an item title."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
+                    Button("Add Draft item") {
+                        model.createItem(title: itemTitle) { itemTitle = "" }
+                    }.checklistDisabled([
+                        (itemTitle.isEmpty, "Enter an item title."),
+                        (store.writeBlockReason != nil, store.writeBlockReason ?? DisabledReasons.saving)
+                    ])
                 }
                 ScrollView(.horizontal) {HStack {
                     Button("Add files…",action:addFiles)

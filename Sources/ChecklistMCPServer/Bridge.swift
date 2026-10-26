@@ -19,7 +19,26 @@ func responseData(_ response: [String: Any]) -> [String: Any] {
     response["data"] as? [String: Any] ?? response
 }
 
+/// The synchronous IPC and installed-shim paths may wait on semaphores or child
+/// processes. Keep the actor's serial jobs on a dispatch worker rather than the
+/// cooperative executor. Actor isolation still owns all JSON and client state;
+/// only the runtime's Sendable job handle crosses to the queue.
+final class BridgeBlockingExecutor: SerialExecutor {
+    let queue = DispatchQueue(label: "org.checklist.mcp.bridge-blocking")
+
+    func enqueue(_ job: consuming ExecutorJob) {
+        let job = UnownedJob(job)
+        let executor = asUnownedSerialExecutor()
+        queue.async { job.runSynchronously(on: executor) }
+    }
+}
+
 public actor Bridge {
+    nonisolated let blockingExecutor = BridgeBlockingExecutor()
+    nonisolated public var unownedExecutor: UnownedSerialExecutor {
+        blockingExecutor.asUnownedSerialExecutor()
+    }
+
     private var client: any BridgeClient
     private let environment: BridgeEnvironment
     private let expectedSession: String?

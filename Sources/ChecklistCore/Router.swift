@@ -146,7 +146,7 @@ extension CommandRouter {
         let projection = try SnapshotReadProjection(router:self,database:db,tasks:taskRows)
         var pp = try projects(db,c)
         for i in pp.indices {
-            let id = pp[i]["id"] as! String
+            let id = try StoredRecord(pp[i], family: "project").string("id")
             pp[i]["statuses"] = (projection.collections["status"] ?? []).filter { row in guard let pid = row["project_id"] as? String else { return false }; return SnapshotRecordIdentity(pid) == SnapshotRecordIdentity(id) }
             pp[i]["tags"] = (projection.collections["tag"] ?? []).filter { row in guard let pid = row["project_id"] as? String else { return false }; return SnapshotRecordIdentity(pid) == SnapshotRecordIdentity(id) }
         }
@@ -232,7 +232,7 @@ extension CommandRouter {
                 let revisions = p["expected_task_revisions"] as? JSON ?? [:]
                 guard Set(revisions.keys) == Set(affected.compactMap {$0["id"] as? String}) else { throw CoreError("REVISION_CONFLICT","Preview every affected ticket revision before retiring and remapping a status.") }
                 for var task in affected {
-                    try revision(["expected_revision":revisions[task["id"] as! String] ?? NSNull()],task)
+                    try revision(["expected_revision":revisions[(try StoredRecord(task, family: "task").string("id"))] ?? NSNull()],task)
                     guard task["active_attempt_id"] == nil,task["active_verification_request_id"] == nil else { throw CoreError("CLAIM_CONFLICT","A status retirement cannot move active work.") }
                     task["status_id"] = target["id"]; task = revised(task); try save(db,task,type:"task")
                     try recordTicketStatusAction(db,task:task,caller:c)
@@ -317,7 +317,7 @@ extension CommandRouter {
         else { let action = p["action"] as? String ?? "queue"; let map = ["queue":"queued","reopen":"queued","defer":"parked","block":"blocked","cancel":"canceled"]; guard let category = map[action] else { throw CoreError("INVALID_TRANSITION","Use claim, submit and completion handlers for protected work states.") }; target = try status(db,pid,category) }
         guard !bool(target,"retired"),!["active","review","done"].contains(target["category"] as? String ?? "") else { throw CoreError("INVALID_TRANSITION","This status requires a real work claim, review submission or completion gate.") }
         try requireRetirementSafe(db,task:r)
-        let previous = try scoped(db,r["status_id"] as! String,pid,type:"status")
+        let previous = try scoped(db,(try StoredRecord(r, family: "task").string("status_id")),pid,type:"status")
         let isReopen = p["action"] as? String == "reopen" || (["done","canceled"].contains(previous["category"] as? String ?? "") && target["category"] as? String != previous["category"] as? String)
         let reason = (isReopen || target["category"] as? String == "canceled") ? try text(p,"reason",max:4000) : try text(p,"reason",max:4000,required:false)
         if isReopen && target["category"] as? String != "queued" { throw CoreError("INVALID_TRANSITION","Reopen a finished or canceled ticket to Queued with a reason.") }
@@ -327,7 +327,17 @@ extension CommandRouter {
             r["reopened_at"] = now()
         }
         if target["category"] as? String == "queued" { try requireQueueEligibility(db,task:r) }
-        r["status_id"] = target["id"]; r = revised(r); try save(db,r,type:"task"); try recordTicketStatusAction(db,task:r,caller:c,operation:operation); try event(db,caller:c,project:pid,entity:r["id"] as? String,kind:"task_transitioned",data:["status":target["name"]!,"from_status_id":previous["id"]!,"to_status_id":target["id"]!,"reason":reason]); return try taskProjection(db,r)
+        r["status_id"] = target["id"]
+        r = revised(r)
+        try save(db,r,type:"task")
+        try recordTicketStatusAction(db,task:r,caller:c,operation:operation)
+        let transitionData: JSON = [
+            "status":try StoredRecord(target, family: "status").requiredValue("name"),
+            "from_status_id":try StoredRecord(previous, family: "status").requiredValue("id"),
+            "to_status_id":try StoredRecord(target, family: "status").requiredValue("id"), "reason":reason
+        ]
+        try event(db,caller:c,project:pid,entity:r["id"] as? String,kind:"task_transitioned",data:transitionData)
+        return try taskProjection(db,r)
     }
     func taskArchive(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         let pid = try scope(db,p,c,write:true); try requireAgentEditAuthority(db,project:try record(db,pid,type:"project"),caller:c); var r = try task(db,p,pid); try revision(p,r); try requireRetirementSafe(db,task:r)
@@ -344,7 +354,8 @@ extension CommandRouter {
         r = revised(r); try save(db,r,type:"task"); try event(db,caller:c,project:pid,entity:r["id"] as? String,kind:"task_"+action,data:eventData)
         var result = try taskProjection(db,r)
         if ["archive","unarchive"].contains(action) {
-            result["cleaned_original_count"] = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type='attachment' AND project_id=? AND json_extract(data,'$.task_id')=? AND json_extract(data,'$.availability')='original_cleaned'",arguments:[pid,r["id"] as! String]) ?? 0
+            result["cleaned_original_count"] = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type='attachment' AND project_id=? AND json_extract(data,'$.task_id')=? AND " +
+                "json_extract(data,'$.availability')='original_cleaned'",arguments:[pid,(try StoredRecord(r, family: "task").string("id"))]) ?? 0
         }
         return result
     }

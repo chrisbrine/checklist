@@ -52,3 +52,13 @@ let package = Package(
         .testTarget(name: "ChecklistMCPServerTests", dependencies: ["ChecklistMCPServer", "ChecklistBridges", "ChecklistIPC", .product(name: "MCP", package: "swift-sdk")])
     ], swiftLanguageModes: [.v5]
 )
+
+// Legacy adapters stay in Swift 5 while every root Swift target reports complete
+// concurrency findings. See docs/swift-concurrency.md for the remaining boundaries.
+// Portable shared targets keep their own Swift 6 manifest.
+for target in package.targets where target.name != "ChecklistFileAccess" {
+    let strict: [SwiftSetting] = [.enableExperimentalFeature("StrictConcurrency")]
+    let converted = ["ChecklistProviders", "ChecklistIPC", "ChecklistBridges", "ChecklistMCPServer", "ChecklistService", "ChecklistCLI", "ChecklistProducts"]
+    target.swiftSettings = (target.swiftSettings ?? []) + strict
+        + (converted.contains(target.name) ? [.swiftLanguageMode(.v6)] : [])
+}

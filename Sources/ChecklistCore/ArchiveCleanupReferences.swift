@@ -47,7 +47,7 @@ extension CommandRouter {
     /// links to the same physical object. Only bounded reason codes leave here.
     /// Unknown/corrupt rows throw; absence of knowledge never authorizes unlink.
     func completeArchiveCleanupHolds(_ db: Database,attachment a: JSON,task: JSON,considerArchiving: Bool = false,currentGraph: [JSON]? = nil, currentIndex: ArchiveCleanupReferenceIndex? = nil) throws -> Set<ArchiveCleanupJob.Hold> {
-        let aid = a["id"] as! String,tid = task["id"] as! String
+        let aid = (try StoredRecord(a, family: "a").string("id")), tid = (try StoredRecord(task, family: "task").string("id"))
         var holds = Set<ArchiveCleanupJob.Hold>()
         if try StorageSnapshotRetention.isActive(root:root) {holds.insert(.backupCapture)}
         if a["mode"] as? String != "managed" { holds.insert(.externalOriginal) }

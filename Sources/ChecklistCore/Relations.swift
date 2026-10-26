@@ -10,33 +10,40 @@ extension CommandRouter {
 
     /// The relation is authoritative; this array is a derived view, never another editable dependency store.
     func taskPrerequisites(_ db: Database, task: JSON) throws -> [JSON] {
-        let pid = task["project_id"] as! String
-        return projectedPrerequisites(task:task,relations:try activeRelations(db,project:pid),taskLookup:{try self.scoped(db,$0,pid,type:"task")},statusLookup:{try self.scoped(db,$0,pid,type:"status")})
+        let pid = (try StoredRecord(task, family: "task").string("project_id"))
+        return try projectedPrerequisites(task:task,relations:try activeRelations(db,project:pid),taskLookup:{try self.scoped(db,$0,pid,type:"task")},
+            statusLookup:{try self.scoped(db,$0,pid,type:"status")})
     }
 
     /// Shared semantics for fresh database guards and a request-local read projection.
-    func projectedPrerequisites(task: JSON, relations: [JSON], taskLookup: (String) throws -> JSON, statusLookup: (String) throws -> JSON) -> [JSON] {
-        let tid = task["id"] as! String
-        return relations.filter {
+    func projectedPrerequisites(task: JSON, relations: [JSON], taskLookup: (String) throws -> JSON, statusLookup: (String) throws -> JSON) throws -> [JSON] {
+        let tid = (try StoredRecord(task, family: "task").string("id"))
+        return try relations.filter {
             $0["source_task_id"] as? String == tid && $0["relation"] as? String == "depends_on"
-        }.map { edge -> JSON in
-            var result: JSON = ["relation_id":edge["id"]!,"required":bool(edge,"required",default:true),"state":edge["state"] ?? "active","resolved":false,"satisfied":false]
-            guard edge["state"] as? String != "unresolved", let targetID = edge["target_task_id"] as? String,
-                  let target = try? taskLookup(targetID) else {
-                let reference = edge["target_legacy_ref"] as? String ?? edge["original_target_task_id"] as? String ?? "unknown ticket"
-                result["legacy_reference"] = reference;result["reason"] = "Unresolved prerequisite: \(reference).";return result
-            }
-            let status = try? statusLookup(target["status_id"] as? String ?? "")
-            let category = bool(target,"purged") ? "purged" : status?["category"] as? String ?? "unknown"
-            let satisfied = category == "done" && !bool(target,"trashed") && target["disposition"] as? String != "superseded"
-            let key = target["key"] as? String ?? targetID
-            let condition = bool(target,"purged") ? "purged" : bool(target, "trashed") ? "trashed" : (target["disposition"] as? String == "superseded" ? "superseded duplicate" : category)
-            result["task_id"] = targetID;result["key"] = key;result["title"] = target["title"] ?? "";result["task_revision"] = target["revision"] ?? 1
-            result["status_category"] = category;result["status_name"] = bool(target,"purged") ? "Purged ticket" : status?["name"] ?? "Unknown";result["resolved"] = true;result["satisfied"] = satisfied
-            result["archived"] = bool(target,"archived");result["trashed"] = bool(target,"trashed");result["disposition"] = target["disposition"] ?? "open"
-            if !satisfied { result["reason"] = "Prerequisite \(AgentReference.text(target)) must be Done (currently \(condition)). Canceled work does not satisfy a prerequisite." }
-            return result
+        }.map { edge in
+            try projectedPrerequisite(edge, taskLookup: taskLookup, statusLookup: statusLookup)
         }
+    }
+
+    func projectedPrerequisite(_ edge: JSON, taskLookup: (String) throws -> JSON,
+                               statusLookup: (String) throws -> JSON) throws -> JSON {
+        var result: JSON = ["relation_id":(try StoredRecord(edge, family: "relation").string("id")),"required":bool(edge,"required",default:true),"state":edge["state"] ?? "active",
+            "resolved":false,"satisfied":false]
+        guard edge["state"] as? String != "unresolved", let targetID = edge["target_task_id"] as? String,
+              let target = try? taskLookup(targetID) else {
+            let reference = edge["target_legacy_ref"] as? String ?? edge["original_target_task_id"] as? String ?? "unknown ticket"
+            result["legacy_reference"] = reference;result["reason"] = "Unresolved prerequisite: \(reference).";return result
+        }
+        let status = try? statusLookup(target["status_id"] as? String ?? "")
+        let category = bool(target,"purged") ? "purged" : status?["category"] as? String ?? "unknown"
+        let satisfied = category == "done" && !bool(target,"trashed") && target["disposition"] as? String != "superseded"
+        let key = target["key"] as? String ?? targetID
+        let condition = bool(target,"purged") ? "purged" : bool(target, "trashed") ? "trashed" : (target["disposition"] as? String == "superseded" ? "superseded duplicate" : category)
+        result["task_id"] = targetID;result["key"] = key;result["title"] = target["title"] ?? "";result["task_revision"] = target["revision"] ?? 1
+        result["status_category"] = category;result["status_name"] = bool(target,"purged") ? "Purged ticket" : status?["name"] ?? "Unknown";result["resolved"] = true;result["satisfied"] = satisfied
+        result["archived"] = bool(target,"archived");result["trashed"] = bool(target,"trashed");result["disposition"] = target["disposition"] ?? "open"
+        if !satisfied { result["reason"] = "Prerequisite \(AgentReference.text(target)) must be Done (currently \(condition)). Canceled work does not satisfy a prerequisite." }
+        return result
     }
 
     func prerequisiteBlockers(_ prerequisites: [JSON]) -> [JSON] {
@@ -68,16 +75,16 @@ extension CommandRouter {
     }
 
     func canonicalTaskID(_ db: Database, task: JSON) throws -> String {
-        let pid = task["project_id"] as! String
+        let pid = (try StoredRecord(task, family: "task").string("project_id"))
         return try projectedCanonicalTaskID(task:task,taskLookup:{try self.scoped(db,$0,pid,type:"task")})
     }
     func projectedCanonicalTaskID(task: JSON, taskLookup: (String) throws -> JSON) throws -> String {
         var current = task, seen: Set<String> = []
         while let target = current["duplicate_of_task_id"] as? String {
-            guard seen.insert(current["id"] as! String).inserted else { throw CoreError("RELATION_CYCLE", "Duplicate redirects contain a cycle.") }
+            guard seen.insert((try StoredRecord(current, family: "task").string("id"))).inserted else { throw CoreError("RELATION_CYCLE", "Duplicate redirects contain a cycle.") }
             current = try taskLookup(target)
         }
-        return current["id"] as! String
+        return (try StoredRecord(current, family: "task").string("id"))
     }
 
     func relationTaskProjection(_ db: Database, task: JSON) throws -> JSON {
@@ -99,7 +106,7 @@ extension CommandRouter {
     }
 
     func relationContext(_ db: Database, task: JSON) throws -> JSON {
-        let pid = task["project_id"] as! String, tid = task["id"] as! String
+        let pid = (try StoredRecord(task, family: "task").string("project_id")), tid = (try StoredRecord(task, family: "task").string("id"))
         return ["relations": try activeRelations(db, project: pid).filter { $0["source_task_id"] as? String == tid || $0["target_task_id"] as? String == tid },
                 "aliases": try records(db, type: "task_alias", project: pid).filter { $0["task_id"] as? String == tid },
                 "eligibility": try relationTaskProjection(db, task: task)]
@@ -136,7 +143,7 @@ extension CommandRouter {
             }
             if kind == "duplicate_of" {
                 for t in try records(db, type: "task", project: project) {
-                    if let target = t["duplicate_of_task_id"] as? String { adjacency[t["id"] as! String, default: []].append(target) }
+                    if let target = t["duplicate_of_task_id"] as? String { adjacency[(try StoredRecord(t, family: "task").string("id")), default: []].append(target) }
                 }
                 let source = try scoped(db, sourceID, project, type: "task")
                 guard source["duplicate_of_task_id"] == nil || source["duplicate_of_task_id"] as? String == targetID else { throw CoreError("ALIAS_CONFLICT", "Reopen this duplicate before selecting a different canonical ticket.") }
@@ -153,7 +160,10 @@ extension CommandRouter {
         guard task["active_attempt_id"] == nil, task["active_verification_request_id"] == nil else { throw CoreError("CLAIM_CONFLICT", "Release or recover active work before marking this ticket as a duplicate.") }
         task["disposition"] = "superseded"; task["duplicate_of_task_id"] = edge["target_task_id"]
         if createAlias {
-            let alias: JSON = ["id": uuid(), "project_id": task["project_id"]!, "task_id": task["id"]!, "namespace": "duplicate_redirect", "alias": task["key"]!, "target_task_id": edge["target_task_id"]!, "relation_id": edge["id"]!, "state": "active", "revision": 1, "created_at": now()]
+            let alias: JSON = ["id": uuid(), "project_id": (try StoredRecord(task, family: "task").string("project_id")), "task_id": (try StoredRecord(task,
+                family: "task").string("id")), "namespace": "duplicate_redirect", "alias": (try StoredRecord(task, family: "task").string("key")),
+                "target_task_id": (try StoredRecord(edge, family: "relation").string("target_task_id")), "relation_id": (try StoredRecord(edge, family: "relation").string("id")),
+                "state": "active", "revision": 1, "created_at": now()]
             try save(db, alias, type: "task_alias")
         }
         try recordTicketStatusAction(db, task: task, caller: caller, operation: .individual)
@@ -162,7 +172,7 @@ extension CommandRouter {
     // Removing a link alone cannot undo an already superseded disposition. Reopen is explicit.
     func reopenRelationDisposition(_ db: Database, task: inout JSON, caller: Caller) throws {
         guard task["disposition"] as? String == "superseded" else { return }
-        let pid = task["project_id"] as! String, tid = task["id"] as! String
+        let pid = (try StoredRecord(task, family: "task").string("project_id")), tid = (try StoredRecord(task, family: "task").string("id"))
         task["disposition"] = "open"; task.removeValue(forKey: "duplicate_of_task_id")
         for var edge in try activeRelations(db, project: pid) where edge["source_task_id"] as? String == tid && edge["relation"] as? String == "duplicate_of" {
             edge["state"] = "removed"; edge["removed_at"] = now(); try save(db, revised(edge), type: "relation")
@@ -191,17 +201,18 @@ extension CommandRouter {
             }) else { throw CoreError("NOT_FOUND", "This active relation is unavailable.") }
             edge["state"] = "removed"; edge["removed_at"] = now(); try save(db, revised(edge), type: "relation")
             source = revised(source); try save(db, source, type: "task")
-            try event(db, caller: c, project: pid, entity: source["id"] as? String, kind: "relation_removed", data: ["relation_id": edge["id"]!])
+            try event(db, caller: c, project: pid, entity: source["id"] as? String, kind: "relation_removed", data: ["relation_id": (try StoredRecord(edge, family: "relation").string("id"))])
             return ["relation": edge, "task": try taskProjection(db, source)]
         }
         let kind = try text(p, "relation", max: 40), targetID = try text(p, "target_task_id", max: 100)
         _ = try scoped(db, targetID, pid, type: "task")
-        let edge: JSON = ["id": uuid(), "project_id": pid, "source_task_id": source["id"]!, "target_task_id": targetID,
+        let edge: JSON = ["id": uuid(), "project_id": pid, "source_task_id": (try StoredRecord(source, family: "task").string("id")), "target_task_id": targetID,
                           "relation": kind, "required": bool(p, "required", default: true), "state": "active", "revision": 1, "created_at": now()]
         try validateRelation(db, edge, project: pid)
         if kind == "duplicate_of" { try markDuplicate(db, task: &source, edge: edge, caller: c) }
         try save(db, edge, type: "relation"); source = revised(source); try save(db, source, type: "task")
-        try event(db, caller: c, project: pid, entity: source["id"] as? String, kind: "relation_added", data: ["relation_id": edge["id"]!, "relation": kind, "target_task_id": targetID])
+        try event(db, caller: c, project: pid, entity: source["id"] as? String, kind: "relation_added", data: ["relation_id": (try StoredRecord(edge,
+            family: "relation").string("id")), "relation": kind, "target_task_id": targetID])
         return ["relation": edge, "task": try taskProjection(db, source)]
     }
 

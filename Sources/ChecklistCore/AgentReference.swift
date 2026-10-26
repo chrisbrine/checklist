@@ -31,11 +31,11 @@ public enum AgentReference {
 
 extension CommandRouter {
     func agentReference(_ db: Database, _ record: JSON) throws -> String {
-        let project = try self.record(db,record["project_id"] as! String,type:"project")
+        let project = try self.record(db,(try StoredRecord(record, family: "AgentReference").string("project_id")),type:"project")
         return AgentReference.text(record,projectName:project["name"] as? String)
     }
     func subject(_ db: Database, message: JSON) throws -> JSON {
-        let pid = message["project_id"] as! String, project = try record(db,pid,type:"project")
+        let pid = (try StoredRecord(message, family: "AgentReference").string("project_id")), project = try record(db,pid,type:"project")
         var source = project, kind = "project", subjectID = pid
         if let id = message["triage_id"] as? String ?? message["epic_id"] as? String {
             subjectID = id;kind = message["triage_id"] is String ? "triage" : "epic"

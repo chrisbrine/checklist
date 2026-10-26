@@ -1,7 +1,6 @@
 import ChecklistIPC
 import Foundation
 import CryptoKit
-import Darwin
 
 struct DraftScope: Codable, Equatable {
     var storeIncarnation: String
@@ -64,29 +63,21 @@ final class LocalDraftJournal {
         LocalDraftJournal(directory: baseDirectory.appendingPathComponent("Windows", isDirectory: true).appendingPathComponent(id.uuidString.lowercased(), isDirectory: true))
     }
     let directory: URL
-    init(directory: URL = LocalDraftJournal.defaultDirectory) {
+    private let files: any DraftFileStorage
+    init(directory: URL = LocalDraftJournal.defaultDirectory, files: any DraftFileStorage = MacOSDraftFileStorage()) {
         self.directory = directory
+        self.files = files
     }
-    func contains(kind: String, key: String) -> Bool { (try? file(kind: kind, key: key)).map { FileManager.default.fileExists(atPath: $0.path) } ?? false }
+    func contains(kind: String, key: String) -> Bool { (try? files.exists(try file(kind: kind, key: key))) ?? false }
 
     func save<Value: Codable>(_ value: Value, kind: String, key: String) throws {
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         let bytes = try JSONEncoder().encode(Envelope(schemaVersion: 1, kind: kind, key: key, value: value))
-        let target = try file(kind: kind, key: key)
-        try bytes.write(to: target, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
-        let handle = try FileHandle(forWritingTo: target)
-        do { try handle.synchronize(); try handle.close() } catch { try? handle.close(); throw error }
-        let descriptor = open(directory.path, O_RDONLY)
-        guard descriptor >= 0 else { throw POSIXError(.EIO) }
-        defer { close(descriptor) }
-        guard fsync(descriptor) == 0, try Data(contentsOf: target) == bytes else { throw POSIXError(.EIO) }
+        try files.replace(bytes, at: file(kind: kind, key: key), directory: directory)
     }
 
     /// A read-only quit check of the snapshot already synchronized by save().
     func checkSaved<Value: Codable & Equatable>(_ value: Value, kind: String, key: String) throws {
-        let envelope = try JSONDecoder().decode(Envelope<Value>.self, from: Data(contentsOf: file(kind: kind, key: key)))
+        let envelope = try JSONDecoder().decode(Envelope<Value>.self, from: files.read(file(kind: kind, key: key)))
         guard envelope.schemaVersion == 1, envelope.kind == kind, envelope.key == key, envelope.value == value else {
             throw CocoaError(.fileReadCorruptFile)
         }
@@ -99,13 +90,13 @@ final class LocalDraftJournal {
     }
 
     func recover<Value: Codable>(_ type: Value.Type, kind: String) throws -> (values: [String: Value], errors: [String]) {
-        guard FileManager.default.fileExists(atPath: directory.path) else { return ([:], []) }
+        guard try files.exists(directory) else { return ([:], []) }
         let prefix = try checkedKind(kind) + "-"
         var values: [String: Value] = [:]
         var errors: [String] = []
-        for path in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).filter({ $0.lastPathComponent.hasPrefix(prefix) && $0.pathExtension == "json" }) {
+        for path in try files.contents(of: directory).filter({ $0.lastPathComponent.hasPrefix(prefix) && $0.pathExtension == "json" }) {
             do {
-                let envelope = try JSONDecoder().decode(Envelope<Value>.self, from: Data(contentsOf: path))
+                let envelope = try JSONDecoder().decode(Envelope<Value>.self, from: files.read(path))
                 guard envelope.schemaVersion == 1, envelope.kind == kind, path.lastPathComponent == (try file(kind: kind, key: envelope.key)).lastPathComponent else { throw CocoaError(.fileReadCorruptFile) }
                 values[envelope.key] = envelope.value
             } catch { errors.append(error.localizedDescription) }

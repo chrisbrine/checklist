@@ -3,7 +3,7 @@ import Darwin
 import CoreFoundation
 
 /// Identity comes only from the executable's containing bundle, including for helpers.
-public struct ChecklistInstance {
+public struct ChecklistInstance: Sendable {
     public let slot: Int?
     public let bundleURL: URL?
     public let bundleIdentifier: String
@@ -129,7 +129,7 @@ public struct ChecklistInstance {
               fcntl(descriptor,F_GETPATH,&spelling) == 0 else {
             throw ChecklistError("INSTANCE_COLLISION", "Cannot verify the canonical instance root spelling and identity.")
         }
-        return CanonicalRoot(existing:URL(fileURLWithPath:String(cString:spelling)),missing:missing,device:actual.st_dev,inode:actual.st_ino)
+        return CanonicalRoot(existing:URL(fileURLWithPath:String(decoding: spelling.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)),missing:missing,device:actual.st_dev,inode:actual.st_ino)
     }
 
     private static func resolvingLinks(_ url: URL) throws -> URL {
@@ -156,7 +156,7 @@ public struct ChecklistInstance {
 
     public static var executableURL: URL {
         var bytes = [CChar](repeating:0,count:4096)
-        let path = proc_pidpath(getpid(),&bytes,UInt32(bytes.count)) > 0 ? String(cString:bytes) : CommandLine.arguments[0]
+        let path = proc_pidpath(getpid(),&bytes,UInt32(bytes.count)) > 0 ? String(decoding: bytes.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self) : CommandLine.arguments[0]
         return URL(fileURLWithPath:path).standardizedFileURL.resolvingSymlinksInPath()
     }
     public static func read(executable: URL) throws -> ChecklistInstance {

@@ -27,7 +27,7 @@ extension CommandRouter {
             projectID: pid, keyPrefix: project["key_prefix"] as? String ?? "TASK",
             nextNumber: int(project, "next_number", default: 1),
             existingKeys: Set(try records(db, type: "task", project: pid).compactMap { $0["key"] as? String }),
-            queuedStatusID: queued["id"] as! String, ticketID: uuid(), timestamp: now()
+            queuedStatusID: try StoredRecord(queued, family: "status").string("id"), ticketID: uuid(), timestamp: now()
         )
         let plan = try captureOperation { try TicketCapture.plan(input, state: state) }
         // Preserve legacy optional/null and open owner-input behavior. No codec or digest changes.

@@ -1,4 +1,5 @@
 import Foundation
+import ChecklistIPC
 
 struct Record: Identifiable {
     let values: [String: Any]
@@ -12,6 +13,21 @@ struct Record: Identifiable {
     func records(_ key: String) -> [Record] { (values[key] as? [[String: Any]] ?? []).map(Record.init) }
     func strings(_ key: String) -> [String] { values[key] as? [String] ?? [] }
     func object(_ key: String) -> [String: Any] { values[key] as? [String: Any] ?? [:] }
+}
+
+/// Required identity at a command reply boundary. Other fields remain open JSON;
+/// display records may still use their existing missing-field fallbacks.
+struct TypedReplyRecord {
+    let id: String
+    let record: Record
+
+    init(_ values: [String: Any]) throws {
+        guard let id = values["id"] as? String, !id.isEmpty else {
+            throw ChecklistError("INVALID_RESPONSE", "The saved record reply has an invalid id. Refresh the current view.")
+        }
+        self.id = id
+        record = Record(values: values)
+    }
 }
 
 enum Page: String, CaseIterable, Identifiable {

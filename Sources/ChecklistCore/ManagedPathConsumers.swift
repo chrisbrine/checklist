@@ -37,7 +37,11 @@ extension CommandRouter {
         guard caller.isOwner else { return source }
         func project(_ value: Any) -> Any {
             if let values = value as? [Any] { return values.map(project) }
-            guard var row = value as? JSON else { return value }
+            guard let row = value as? JSON else { return value }
+            return projectRow(row)
+        }
+        func projectRow(_ source: JSON) -> JSON {
+            var row = source
             // Event history is provenance, never an authority to open a managed file.
             if row["occurred_at"] != nil && row["actor"] != nil { return row }
             let immutableEvidence = row["digest"] != nil && row["evidence"] is JSON
@@ -61,6 +65,6 @@ extension CommandRouter {
             }
             return row
         }
-        return project(source) as! JSON
+        return projectRow(source)
     }
 }

@@ -366,7 +366,7 @@ extension Coordinator {
     private func bundledCLI(_ pid:pid_t)->Bool {
         let expected=ChecklistPaths.serviceExecutable.deletingLastPathComponent().appendingPathComponent("checklist")
         var buffer=[CChar](repeating:0,count:4096)
-        guard proc_pidpath(pid,&buffer,UInt32(buffer.count)) > 0,canonical(String(cString:buffer)) == canonical(expected.path) else { return false }
+        guard proc_pidpath(pid,&buffer,UInt32(buffer.count)) > 0,canonical(String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)) == canonical(expected.path) else { return false }
         guard let expectedIdentity=nativeCodeIdentity.executable(expected),
               let actual=signingInfo(pid),actual[kSecCodeInfoIdentifier as String] as? String == "org.checklist.checklist",
               let actualHash=actual[kSecCodeInfoUnique as String] as? Data else { return false }

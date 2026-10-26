@@ -79,8 +79,12 @@ extension CommandRouter {
                 "last_verified_rehearsal":try summary("storage-last-verified-rehearsal"),"retained_usage":usage]
     }
     func recordStorageCopyObservation(_ db: Database,key: String,summary: JSON) throws {
-        try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:["storage-last-verified-" + key,try jsonString(summary)])
+        let record = StoredRecord(summary,family:"storage_copy_observation")
+        let operationID = try record.string("operation_id")
+        let usage = try record.object("usage")
+        let sql = "INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        try db.execute(sql:sql,arguments:["storage-last-verified-" + key,try jsonString(summary)])
         let kind = key == "backup" ? "backup" : "restore"
-        try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:["storage-copy-usage:" + kind + ":" + (summary["operation_id"] as! String),try jsonString(summary["usage"] as! JSON)])
+        try db.execute(sql:sql,arguments:["storage-copy-usage:" + kind + ":" + operationID,try jsonString(usage)])
     }
 }

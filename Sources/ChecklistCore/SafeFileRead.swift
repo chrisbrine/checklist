@@ -14,29 +14,8 @@ enum SafeFileRead {
 
     /// `allowedRoots` are trusted canonical directories (enrolled workspace, project
     /// root or the managed store). An empty list refuses every path.
-    static func read(_ path: String, maximum: Int, allowedRoots: [String]) throws -> Opened {
-        let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
-        guard fd >= 0 else {
-            if errno == ELOOP { throw CoreError("FILE_ACCESS_REQUIRED", "A symlink cannot be read through this route. Choose the file itself.") }
-            throw CoreError("FILE_ACCESS_REQUIRED", "The file could not be opened.")
-        }
-        defer { Darwin.close(fd) }
-        var info = stat()
-        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { throw CoreError("INVALID_INPUT", "Attach a regular file. Directories can be provided as human-request references.") }
-        guard info.st_size <= off_t(maximum) else { throw CoreError("FILE_TOO_LARGE", "This file exceeds the read limit.") }
-        let resolved = try descriptorPath(fd)
-        guard allowedRoots.contains(where: { containsPath($0, resolved) }) else { throw CoreError("FILE_ACCESS_REQUIRED", "Agent file reads must stay inside the enrolled workspace.") }
-        var bytes = Data(capacity: Int(info.st_size))
-        var buffer = [UInt8](repeating: 0, count: 1 << 20)
-        while true {
-            let count = Darwin.read(fd, &buffer, buffer.count)
-            if count < 0, errno == EINTR { continue }
-            guard count >= 0 else { throw CoreError("FILE_ACCESS_REQUIRED", "The file could not be read.") }
-            if count == 0 { break }
-            guard bytes.count + count <= maximum else { throw CoreError("FILE_TOO_LARGE", "This file exceeds the read limit.") }
-            bytes.append(contentsOf: buffer.prefix(count))
-        }
-        return Opened(bytes: bytes, resolvedPath: resolved)
+    static func read(_ path: String, maximum: Int, allowedRoots: [String], reader: any AuthorizedFileReading = MacOSAuthorizedFileReader()) throws -> Opened {
+        try reader.read(path, maximum: maximum, allowedRoots: allowedRoots)
     }
 
     /// F_GETPATH reports the vnode's current path. Foundation's canonical form drops

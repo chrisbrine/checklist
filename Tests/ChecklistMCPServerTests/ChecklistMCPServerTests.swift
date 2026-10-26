@@ -110,6 +110,33 @@ final class ChecklistMCPServerTests: XCTestCase {
         }
     }
 
+    func testBridgeBlockingIPCUsesDedicatedDispatchExecutor() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        let bridge = Bridge(configuration: .init(workspace: fixture.context.workspacePath, command: "call"),
+                            environment: fixture.environment)
+        let queue = bridge.blockingExecutor.queue
+        fixture.bootstrapHandler = { _ in
+            dispatchPrecondition(condition: .onQueue(queue))
+        }
+        _ = try await bridge.connect()
+
+        let entered = expectation(description: "synchronous client is waiting")
+        let release = DispatchSemaphore(value: 0)
+        fixture.callHandler = { _ in
+            dispatchPrecondition(condition: .onQueue(queue))
+            entered.fulfill()
+            // This is only a deadlock escape, not a performance threshold.
+            XCTAssertEqual(release.wait(timeout: .now() + 10), .success)
+        }
+        let request = Task { try await bridge.serviceInfo() }
+        await fulfillment(of: [entered], timeout: 10)
+        // A separate Swift task must progress while the client's synchronous
+        // operation remains blocked. It is the only successful release path.
+        _ = await Task.detached { release.signal() }.value
+        _ = try await request.value
+    }
+
     func testDirectCLICommandsSkipCatalogAndPreserveServiceRefusals() async throws {
         let fixture = try Fixture(provider:"codex")
         fixture.setDiscoveries([.available(fixture.context)])

@@ -28,13 +28,17 @@ final class MediaListQueryTests: XCTestCase {
             let (type,context) = try f.router.mediaRoundParts(db,round)
             for index in 0..<count {
                 let id = ids?[index] ?? String(format:"item-%04d",index)
-                var item = f.router.mediaRecord(["round_id":round["id"]!,"title":"Item \(index)","state":"draft","order":index],project:f.project,caller:f.worker,references:[f.router.mediaRef("media_round",round)])
+                var item = f.router.mediaRecord(
+                    ["round_id":round["id"]!,"title":"Item \(index)","state":"draft","order":index],
+                    project:f.project,caller:f.worker,references:[try f.router.mediaRef("media_round",round)])
                 item["id"] = id
                 // Canonical owned fixture; the deliberately unreadable candidate below makes
                 // decoding any candidate/original in the query an observable test failure.
                 let shape = try f.router.mediaTargetShape(db,item:item,title:"Item \(index)",metadata:["character":index < count/2 ? "hero":"villain","animation_label":"walk","direction":["E","N","NE"][index%3],"number":index,"flag":index%2 == 0],candidates:[],typeRevision:type,context:context)
                 let target = try f.router.mediaTarget(db,item:item,shape:shape,caller:f.worker)
-                item["draft_target_id"] = target["id"];item["record_references"] = (item["record_references"] as! [JSON]) + [f.router.mediaRef("media_item_target",target)]
+                item["draft_target_id"] = target["id"]
+                item["record_references"] = (item["record_references"] as! [JSON])
+                    + [try f.router.mediaRef("media_item_target",target)]
                 try f.router.mediaWrite(db,item,type:"media_item")
             }
         }

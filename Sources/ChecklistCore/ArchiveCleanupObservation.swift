@@ -46,7 +46,7 @@ extension CommandRouter {
         }
         var pending = Set<Data>()
         for a in attachments {
-            pending.insert(Data((a["id"] as! String).utf8))
+            pending.insert(Data(((try StoredRecord(a, family: "a").string("id"))).utf8))
             if let path = a["path"] as? String,!path.isEmpty {
                 pending.insert(Data(path.utf8))
                 if let relative = try? ManagedPaths.relative(path,family:"objects",root:root) {

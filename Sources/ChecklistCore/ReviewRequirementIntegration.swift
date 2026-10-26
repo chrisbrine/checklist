@@ -31,7 +31,7 @@ extension CommandRouter {
             if let overrides = value["kind_overrides"] as? [JSON] {
                 result["kind_overrides"] = try ReviewRequirementKind.allCases.compactMap { kind -> JSON? in
                     guard let entry = overrides.first(where: {$0["kind"] as? String == kind.rawValue}) else {return nil}
-                    return ["kind":kind.rawValue,"requirement":try ReviewRequirement.parse(entry["requirement"]!).jsonValue]
+                    return ["kind":kind.rawValue,"requirement":try ReviewRequirement.parse(try StoredRecord(entry, family: "review requirement").requiredValue("requirement")).jsonValue]
                 }
             }
             return result
@@ -58,7 +58,8 @@ extension CommandRouter {
         return snapshot
     }
     func reviewRequirementState(_ db: Database,task: JSON) throws -> JSON {
-        let pid = task["project_id"] as! String,project = try record(db,pid,type:"project")
+        let taskRecord = try StoredTaskRecord(task)
+        let pid = taskRecord.projectID,project = try record(db,taskRecord.projectID,type:"project")
         if let aid = task["active_attempt_id"] as? String {
             let attempt = try scoped(db,aid,pid,type:"attempt")
             if attempt["phase"] as? String == "review",attempt["state"] as? String == "active" {
@@ -73,23 +74,33 @@ extension CommandRouter {
                     throw CoreError("REVIEW_REQUIREMENT_STALE","The applied review requirement identity changed.")
                 }
                 let revision = try reviewRequirementRevision(snapshot["policy_revision"])
-                let retained = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='policy_revision' AND project_id=CAST(? AS TEXT) AND json_type(data,'$.policy_revision') IN ('integer','real') AND json_extract(data,'$.policy_revision')=? LIMIT 2",arguments:[Data(pid.utf8),revision]).map {try GRDBRecordEnvelopeAdapter.decode($0,expectedType:"policy_revision").object}
-                guard retained.count == 1,let rawPolicy = retained[0]["policy"] as? JSON,
-                      reviewIDEqual(retained[0]["project_id"],pid) else {
-                    throw CoreError("REVIEW_REQUIREMENT_STALE","The applied policy revision is unavailable; do not guess it from current settings.")
-                }
+                let rawPolicy = try retainedReviewRequirementPolicy(db,projectID:pid,revision:revision)
                 var original = project;original["policy"] = rawPolicy;original["policy_revision"] = revision
                 let expected = try currentReviewRequirementSnapshot(project:original,task:task)
                 guard hash(Data(try jsonString(snapshot).utf8)) == hash(Data(try jsonString(expected).utf8)) else {
                     throw CoreError("REVIEW_REQUIREMENT_STALE","The applied requirement does not match its immutable policy revision.")
                 }
-                return ["state":"applied","snapshot":snapshot,"latest_policy_revision":project["policy_revision"]!]
+                return ["state":"applied","snapshot":snapshot,"latest_policy_revision":try StoredRecord(project, family: "project").requiredValue("policy_revision")]
             }
         }
-        return ["state":"preview","snapshot":try currentReviewRequirementSnapshot(project:project,task:task),"latest_policy_revision":project["policy_revision"]!]
+        return ["state":"preview","snapshot":try currentReviewRequirementSnapshot(project:project,
+            task:task),"latest_policy_revision":try StoredRecord(project, family: "project").requiredValue("policy_revision")]
     }
+    private func retainedReviewRequirementPolicy(_ db: Database,projectID pid: String,revision: Int) throws -> JSON {
+        let retained = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns +
+            " FROM records WHERE type='policy_revision' AND project_id=CAST(? AS TEXT) AND json_type(data,'$.policy_revision') IN " +
+            "('integer','real') AND json_extract(data,'$.policy_revision')=? LIMIT 2",
+            arguments:[Data(pid.utf8),revision]).map {try GRDBRecordEnvelopeAdapter.decode($0,
+            expectedType:"policy_revision").object}
+        guard retained.count == 1,let rawPolicy = retained[0]["policy"] as? JSON,
+              reviewIDEqual(retained[0]["project_id"],pid) else {
+            throw CoreError("REVIEW_REQUIREMENT_STALE","The applied policy revision is unavailable; do not guess it from current settings.")
+        }
+        return rawPolicy
+    }
+
     func reviewRequirementRows(_ snapshot: JSON) throws -> [JSON] {
-        let rule = try ReviewRequirement.parse(snapshot["requirement"]!)
+        let rule = try ReviewRequirement.parse(try StoredRecord(snapshot, family: "review requirement snapshot").requiredValue("requirement"))
         var rows: [JSON] = rule.checks.map {
             ["id":"project:review-check:"+hash(Data($0.id.text.utf8)),"text":$0.text,
              "kind":"review_check","sha256":hash(Data($0.text.utf8))]
@@ -98,19 +109,23 @@ extension CommandRouter {
         return rows
     }
     func reviewRequirementScope(task: JSON,manifest: JSON,attempt: JSON) throws -> ReviewRequirementEvidenceScope {
-        try .init(projectID:ReviewRequirementID(task["project_id"] as! String),taskID:ReviewRequirementID(task["id"] as! String),
-                  manifestID:ReviewRequirementID(manifest["id"] as! String),reviewAttemptID:ReviewRequirementID(attempt["id"] as! String))
+        let taskRecord = try StoredTaskRecord(task)
+        let attemptRecord = try StoredAttemptRecord(attempt)
+        let manifestID = try StoredRecord(manifest, family: "manifest").string("id")
+        return try .init(projectID:ReviewRequirementID(taskRecord.projectID),taskID:ReviewRequirementID(taskRecord.id),
+                         manifestID:ReviewRequirementID(manifestID),reviewAttemptID:ReviewRequirementID(attemptRecord.id))
     }
     /// The only service adapter to pure descriptors: existing scope/ownership/hash
     /// validation runs first, followed by exact-byte identities and actual bytes.
     func classifiedReviewEvidence(_ db: Database,refs: [JSON],task: JSON,manifest: JSON,attempt: JSON,caller: Caller) throws
         -> (refs:[JSON],owned:Bool,descriptors:[ReviewRequirementEvidenceDescriptor]) {
+        let taskRecord = try StoredTaskRecord(task)
         let validated = try validateReviewEvidence(db,refs:refs,task:task,manifest:manifest,caller:caller)
         let scope = try reviewRequirementScope(task:task,manifest:manifest,attempt:attempt)
         var descriptors: [ReviewRequirementEvidenceDescriptor] = []
         for ref in refs {
             if let id = ref["artifact_id"] as? String {
-                let artifact = try scoped(db,id,task["project_id"] as! String,type:"attachment")
+                let artifact = try scoped(db,id,taskRecord.projectID,type:"attachment")
                 guard reviewIDEqual(artifact["id"],id),reviewIDEqual(artifact["project_id"],task["project_id"]),
                       reviewIDEqual(artifact["task_id"],task["id"]),let path = artifact["path"] as? String else {throw CoreError("EVIDENCE_STALE","Selected evidence bytes or exact identity changed.")}
                 // Types need the bytes only up to 16 MiB. A larger object that this command hashed
@@ -119,7 +134,9 @@ extension CommandRouter {
                 if let size = verifiedObjectSize(path,sha256:ref["sha256"] as? String ?? ""),size > 16 * 1024 * 1024 { bytes = Data(); classified = false }
                 else {
                     classified = true
-                    guard let read = try? managedRead(path,family:"objects",maximum:500 * 1024 * 1024),hash(read) == ref["sha256"] as? String else {throw CoreError("EVIDENCE_STALE","Selected evidence bytes or exact identity changed.")}
+                    guard let read = try? managedRead(path,family:"objects",maximum:500 * 1024 * 1024),
+                        hash(read) == ref["sha256"] as? String else {throw CoreError("EVIDENCE_STALE",
+                        "Selected evidence bytes or exact identity changed.")}
                     bytes = read
                 }
                 var types = Set<ReviewRequirementEvidenceType>()
@@ -140,30 +157,35 @@ extension CommandRouter {
                 guard reviewIDEqual(source["id"],id),source["sha256"] as? String == ref["sha256"] as? String else {
                     throw CoreError("REVIEW_TARGET_MISMATCH","Selected source identity differs from the validated exact target.")
                 }
-                descriptors.append(try .init(scope:scope,reference:.init(namespace:.sourceCapture,id:ReviewRequirementID(id)),digest:ref["sha256"] as! String,types:[.sourceCapture]))
+                descriptors.append(try .init(scope:scope,reference:.init(namespace:.sourceCapture,
+                    id:ReviewRequirementID(id)),digest:try StoredRecord(ref, family: "evidence reference").string("sha256"),
+                    types:[.sourceCapture]))
             }
         }
         return (validated.refs,validated.owned,descriptors)
     }
     func reviewRequirementGapSummary(_ db: Database,task: JSON,manifest: JSON,attempt: JSON,
                                     selected: [JSON],caller: Caller) throws -> JSON {
-        let state = try reviewRequirementState(db,task:task),snapshot = state["snapshot"] as! JSON
+        let state = try reviewRequirementState(db,task:task)
+        let snapshot = try StoredRecord(state, family: "review requirement state").object("snapshot")
         let classified = selected.isEmpty ? nil : try classifiedReviewEvidence(db,refs:selected,task:task,manifest:manifest,attempt:attempt,caller:caller)
         return try reviewRequirementGapResult(snapshot:snapshot,task:task,manifest:manifest,attempt:attempt,
                                               selectedCount:selected.count,descriptors:classified?.descriptors ?? [])
     }
     func reviewRequirementGapResult(snapshot: JSON,task: JSON,manifest: JSON,attempt: JSON,
                                     selectedCount: Int,descriptors: [ReviewRequirementEvidenceDescriptor]) throws -> JSON {
-        let rule = try ReviewRequirement.parse(snapshot["requirement"]!)
+        let rule = try ReviewRequirement.parse(try StoredRecord(snapshot, family: "review requirement snapshot").requiredValue("requirement"))
         let gaps = ReviewRequirementEvidenceGaps.project(rule,scope:try reviewRequirementScope(task:task,manifest:manifest,attempt:attempt),selected:descriptors)
-        return ["state":"selected_validated","policy_revision":snapshot["policy_revision"]!,"requirement_sha256":snapshot["sha256"]!,
+        return ["state":"selected_validated","policy_revision":try StoredRecord(snapshot, family: "review requirement snapshot").requiredValue("policy_revision"),
+            "requirement_sha256":try StoredRecord(snapshot, family: "review requirement snapshot").requiredValue("sha256"),
                 "required_evidence_types":ReviewRequirementEvidenceType.allCases.filter {rule.requiredEvidenceTypes.contains($0)}.map(\.rawValue),
                 "missing_evidence_types":gaps.missing.map(\.rawValue),"selected_reference_count":selectedCount,
                 "ambiguous_reference_count":gaps.ambiguousReferences.count,"qualification":"Byte/provenance classes only; never execution success, native observation or approval."]
     }
     func reviewRequirementPreflight(_ db: Database,params: JSON,task: JSON,manifest: JSON,caller: Caller) throws -> JSON {
-        let state = try reviewRequirementState(db,task:task),snapshot = state["snapshot"] as! JSON
-        let rule = try ReviewRequirement.parse(snapshot["requirement"]!)
+        let state = try reviewRequirementState(db,task:task)
+        let snapshot = try StoredRecord(state, family: "review requirement state").object("snapshot")
+        let rule = try ReviewRequirement.parse(try StoredRecord(snapshot, family: "review requirement snapshot").requiredValue("requirement"))
         let required = ReviewRequirementEvidenceType.allCases.filter {rule.requiredEvidenceTypes.contains($0)}.map(\.rawValue)
         guard let raw = params["evidence_refs"] else {
             return ["state":state["state"] as? String == "preview" ? "claim_required" : "selection_required",
@@ -171,7 +193,7 @@ extension CommandRouter {
         }
         guard let refs = raw as? [JSON],refs.count <= 100 else {throw CoreError("INVALID_INPUT","Select at most 100 evidence references.")}
         guard let aid = task["active_attempt_id"] as? String else {throw CoreError("REVIEW_CLAIM_REQUIRED","Claim this exact review before validating selected evidence.")}
-        let attempt = try scoped(db,aid,task["project_id"] as! String,type:"attempt")
+        let attempt = try scoped(db,aid,try StoredTaskRecord(task).projectID,type:"attempt")
         guard state["state"] as? String == "applied",reviewIDEqual(attempt["principal"],caller.principal),
               reviewIDEqual(attempt["manifest_id"],manifest["id"]) else {throw CoreError("FORBIDDEN","Only this exact active reviewer selects its review evidence.")}
         return try reviewRequirementGapSummary(db,task:task,manifest:manifest,attempt:attempt,selected:refs,caller:caller)

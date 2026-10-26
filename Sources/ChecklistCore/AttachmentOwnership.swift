@@ -83,7 +83,7 @@ extension CommandRouter {
     }
     func validatePreparedAttachment(_ db: Database,project: String,prepared: PreparedAttachmentOriginal) throws -> JSON {
         let previous = prepared.attachment
-        let a = try scoped(db,previous["id"] as! String,project,type:"attachment")
+        let a = try scoped(db,(try StoredRecord(previous, family: "AttachmentOwnership").string("id")),project,type:"attachment")
         guard a["mode"] as? String == "managed",a["availability"] as? String == "available",
               int(a,"revision") == int(previous,"revision"),EnvelopeStorageIdentity.equal(a["path"] as? String,previous["path"] as? String),
               a["sha256"] as? String == previous["sha256"] as? String,let path = a["path"] as? String,let identity = try? managedIdentity(path),identity == prepared.identity else { throw CoreError("MANAGED_ORIGINAL_UNAVAILABLE","The prepared original is unavailable or changed; nothing was published.") }
@@ -101,7 +101,16 @@ extension CommandRouter {
     func addMediaAttachmentReference(_ db: Database,project: String,owner: MediaAttachmentOwner,attachment: JSON,caller: Caller) throws -> JSON {
         let id = uuid()
         let reference: JSON = ["id":id,"project_id":project,"kind":"media_reference","owner_id":owner.id,"owner_kind":owner.kind.rawValue,
-            "attachment_id":attachment["id"]!,"sha256":attachment["sha256"]!,"size":attachment["size"]!,"state":"active","revision":1,"author":caller.principal,"created_at":now()]
+            "attachment_id":(try StoredRecord(attachment,
+                family: "AttachmentOwnership").requiredValue("id")),
+                "sha256":(try StoredRecord(attachment,
+                family: "AttachmentOwnership").requiredValue("sha256")),
+                "size":(try StoredRecord(attachment,
+                family: "AttachmentOwnership").requiredValue("size")),
+                "state":"active",
+                "revision":1,
+                "author":caller.principal,
+                "created_at":now()]
         try save(db,reference,type:"storage_hold");return reference
     }
     func adoptTaskAttachments(_ db: Database,permit: ArchiveStoragePermit,project: String,owner: MediaAttachmentOwner,
@@ -167,7 +176,14 @@ extension CommandRouter {
                 let (_,a) = try self.mediaAttachmentReference(db,project:project,id:referenceID,owner:owner,caller:caller)
                 guard let path = a["path"] as? String,(try? self.managedIdentity(path)) != nil else { throw CoreError("MANAGED_ORIGINAL_UNAVAILABLE","The original is unavailable.") }
                 let id = uuid(),expiry = Date().addingTimeInterval(Double(seconds))
-                try self.save(db,["id":id,"project_id":project,"kind":"reader","attachment_id":a["id"]!,"owner_reference_id":referenceID,
+                try self.save(db,
+                    ["id":id,
+                    "project_id":project,
+                    "kind":"reader",
+                    "attachment_id":(try StoredRecord(a,
+                    family: "AttachmentOwnership").requiredValue("id")),
+                    "owner_reference_id":referenceID,
+
                     "state":"active","expires_at":expiry.timeIntervalSince1970,"author":caller.principal,"incarnation":self.incarnation,"session_generation":try self.callerSessionGeneration(db,caller,project:project),"revision":1,"created_at":now()],type:"storage_hold")
                 return .init(id:id,attachment:self.ownerManagedPathProjection(a,caller:caller),expiresAt:expiry)
             }
@@ -188,7 +204,7 @@ extension CommandRouter {
         let lease = try acquireMediaAttachmentReadLease(project:project,referenceID:referenceID,owner:owner,caller:caller)
         defer { try? ArchiveStorageGate.withExclusive(root:root) { permit in try dbQueue.write { db in try self.releaseMediaReadHold(db,permit:permit,project:project,id:lease.id,caller:caller) } } }
         let a = lease.attachment
-        let bytes = try managedRead(a["path"] as! String,family:"objects",maximum:maximum)
+        let bytes = try managedRead((try StoredRecord(a, family: "AttachmentOwnership").string("path")),family:"objects",maximum:maximum)
         guard bytes.count == int(a,"size"),hash(bytes) == a["sha256"] as? String else { throw CoreError("SOURCE_CHANGED","The original no longer matches this reference.") }
         return bytes
     }
@@ -217,7 +233,7 @@ extension CommandRouter {
                                       prepared: ManagedAttachmentPreparation,caller: Caller) throws {
         let anchor = try mediaAttachmentOwner(db,project:project,owner:owner,caller:caller,write:true)
         guard owner.kind != .target,anchor["state"] as? String == "active" else { throw CoreError("ATTACHMENT_OWNER_STALE","Capture owner changed.") }
-        let job = try scoped(db,prepared.job["id"] as! String,project,type:"storage_job")
+        let job = try scoped(db,(try StoredRecord(prepared.job, family: "AttachmentOwnership").string("id")),project,type:"storage_job")
         try validateManagedImportOwner(job,principal:caller.principal,command:prepared.command,digest:prepared.digest,project:project,task:nil,
                                       generation:callerSessionGeneration(db,caller,project:project),mediaOwner:owner)
         guard int(job,"revision") == int(prepared.job,"revision"),job["state"] as? String == "finalized",
@@ -225,7 +241,7 @@ extension CommandRouter {
               prepared.attachment["attachment_owner_id"] as? String == owner.id,prepared.attachment["task_id"] == nil else { throw managedImportFailure("final_ownership_changed") }
         let files = try StorageObjectFiles(root:root)
         for object in try managedImportObjects(job) where object["representation"] as? String == "original" || job["preview_available"] as? Bool == true {
-            let final = object["final"] as! String
+            let final = (try StoredRecord(object, family: "AttachmentOwnership").string("final"))
             guard let observed = prepared.observations[final],(try? managedIdentity(final)) == observed else { throw managedImportFailure("prepared_original_changed") }
             try verifyManagedImportPresence(files,final,object)
         }
@@ -275,7 +291,7 @@ extension CommandRouter {
             }
         }
         for object in objects {
-            let stage = object["stage"] as! String,final = object["final"] as! String
+            let stage = (try StoredRecord(object, family: "AttachmentOwnership").string("stage")),final = (try StoredRecord(object, family: "AttachmentOwnership").string("final"))
             if try managedImportExists(files,stage) {
                 let bytes = try length(stage)
                 try removeManagedImportStage(db,files:files,path:stage);reclaimed += bytes
@@ -284,13 +300,13 @@ extension CommandRouter {
             else { unavailableFinal += 1 }
         }
         if let first = objects.first {
-            let directory = (first["stage"] as! String).split(separator:"/").dropLast().joined(separator:"/")
+            let directory = ((try StoredRecord(first, family: "AttachmentOwnership").string("stage"))).split(separator:"/").dropLast().joined(separator:"/")
             let entries: [String]
             do { entries = try managedDirectoryEntries(files,relative:directory) }
             catch { if StorageFolderAccess.isMissing(error) { entries = [] } else { throw error } }
             for name in entries {
-                guard objects.contains(where: { object in
-                    let prefix = (object["representation"] as! String) + ".partial-"
+                guard try objects.contains(where: { object in
+                    let prefix = ((try StoredRecord(object, family: "AttachmentOwnership").string("representation"))) + ".partial-"
                     return name.hasPrefix(prefix) && UUID(uuidString:String(name.dropFirst(prefix.count))) != nil
                 }) else { continue }
                 let partial = directory + "/" + name,bytes = try length(partial)

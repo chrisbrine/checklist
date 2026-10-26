@@ -3,7 +3,8 @@ import GRDB
 
 extension CommandRouter {
     func retainPolicy(_ db: Database,project: JSON) throws -> JSON {
-        let pid = project["id"] as! String,number = int(project,"policy_revision",default:1),policy = project["policy"] as? JSON ?? [:]
+        let pid = try StoredRecord(project, family: "project").string("id")
+        let number = int(project,"policy_revision",default:1),policy = project["policy"] as? JSON ?? [:]
         if let existing = try records(db,type:"policy_revision",project:pid).first(where: {int($0,"policy_revision") == number}) { return existing }
         let snapshot: JSON = ["id":uuid(),"project_id":pid,"policy_revision":number,"policy":policy,"revision":1,"created_at":now()]
         try save(db,snapshot,type:"policy_revision"); return snapshot
@@ -21,7 +22,8 @@ extension CommandRouter {
     }
     func attemptPolicy(_ db: Database,_ attempt: JSON) throws -> JSON {
         if let policy = attempt["policy_snapshot"] as? JSON { return policy }
-        return try policyAtRevision(db,projectID:attempt["project_id"] as! String,revision:int(attempt,"policy_revision",default:1))
+        let record = try StoredAttemptRecord(attempt)
+        return try policyAtRevision(db,projectID:record.projectID,revision:int(attempt,"policy_revision",default:1))
     }
     func manifestGates(_ db: Database,_ manifest: JSON) throws -> [String] {
         if let tid = manifest["task_id"] as? String, let task = try? record(db,tid,type:"task") {

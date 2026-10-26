@@ -33,7 +33,10 @@ extension CommandRouter {
                     let state = p["state"] as? String ?? "draft"
                     guard ["draft", "open", "closed", "archived", "canceled"].contains(state) else { throw CoreError("INVALID_INPUT", "Choose a round state.") }
                     let offset = try MediaConfigurationValue.integer(p["offset"] ?? 0, max:10000, "offset")
-                    let values = try self.mediaOwnerRecords(db,project:project,family:"media_round",predicate:" AND json_extract(data,'$.type_id')=? AND json_extract(data,'$.state')=?",arguments:[type["id"] as! String,state],limit:101,offset:offset)
+                    let values = try self.mediaOwnerRecords(db,project:project,family:"media_round",
+                        predicate:" AND json_extract(data,'$.type_id')=? AND json_extract(data,'$.state')=?",
+                        arguments:[(try StoredRecord(type, family: "media").string("id")),state],
+                        limit:101,offset:offset)
                     return ["rows": Array(values.prefix(100)), "has_more": values.count > 100, "offset":offset]
                 }
                 let round = try self.scoped(db,text(p,"round_id"),project,type:"media_round")
@@ -41,9 +44,14 @@ extension CommandRouter {
                 if method == "media_publication_preview" {
                     let (type,context) = try self.mediaRoundParts(db,round)
                     let items = try self.mediaItems(db,round:round).map { item -> JSON in
-                        let target = try self.scoped(db,item["draft_target_id"] as! String,project,type:"media_item_target")
+                        let target = try self.scoped(db,(try StoredRecord(item, family: "media").string("draft_target_id")),project,type:"media_item_target")
                         let shape = try self.mediaShapeForTarget(db,item:item,target:target,typeRevision:type,context:context)
-                        return ["item_id":item["id"]!,"expected_revision":item["revision"]!,"target_id":target["id"]!,"review_basis_signature":shape["review_basis_signature"]!,"publication_ready":shape["publication_ready"]!,"title":target["title"]!]
+                        return ["item_id":(try StoredRecord(item, family: "media").requiredValue("id")),
+                            "expected_revision":(try StoredRecord(item, family: "media").requiredValue("revision")),
+                            "target_id":(try StoredRecord(target, family: "media").requiredValue("id")),
+                            "review_basis_signature":(try StoredRecord(shape, family: "media").requiredValue("review_basis_signature")),
+                            "publication_ready":(try StoredRecord(shape, family: "media").requiredValue("publication_ready")),
+                            "title":(try StoredRecord(target, family: "media").requiredValue("title"))]
                     }
                     return ["round":try self.mediaOwnerHeader(db,round,c),"items":items]
                 }
@@ -61,22 +69,26 @@ extension CommandRouter {
         let (type,context) = try mediaRoundParts(db,round)
         result["type_revision"] = type; result["context"] = context
         result["observed_context_token"] = try mediaToken(db,round:round,caller:caller)
-        result["attention"] = try strings(round,"attention_ids").map {try scoped(db,$0,round["project_id"] as! String,type:"media_context_attention")}
-        result["context_sources"] = try strings(context,"source_ids").map {try scoped(db,$0,round["project_id"] as! String,type:"media_review_context")}
-        result["attention_sources"] = try (result["attention"] as! [JSON]).map {attention in
-            try scoped(db,attention["source_id"] as! String,round["project_id"] as! String,type:attention["proposed_type_revision_id"] is String ? "media_review_type_revision" : "media_review_context")
+        result["attention"] = try strings(round,"attention_ids").map {try scoped(db,$0,(try StoredRecord(round, family: "media").string("project_id")),type:"media_context_attention")}
+        result["context_sources"] = try strings(context,"source_ids").map {try scoped(db,$0,(try StoredRecord(round, family: "media").string("project_id")),type:"media_review_context")}
+        result["attention_sources"] = try ((try StoredRecord(result, family: "media").objects("attention"))).map {attention in
+            try scoped(db,(try StoredRecord(attention, family: "media").string("source_id")),
+                (try StoredRecord(round, family: "media").string("project_id")),type:attention["proposed_type_revision_id"] is String ? "media_review_type_revision" : "media_review_context")
         }
-        result["manifest"] = try (round["manifest_id"] as? String).map {try scoped(db,$0,round["project_id"] as! String,type:"media_round_manifest")} ?? [:]
-        result["intakes"] = try mediaOwnerRecords(db,project:round["project_id"] as! String,family:"media_intake",predicate:" AND json_extract(data,'$.round_id')=?",arguments:[round["id"] as! String],limit:100).map { ["id":$0["id"]!,"state":$0["state"]!] }
+        result["manifest"] = try (round["manifest_id"] as? String).map {try scoped(db,$0,(try StoredRecord(round, family: "media").string("project_id")),type:"media_round_manifest")} ?? [:]
+        result["intakes"] = try mediaOwnerRecords(db,project:(try StoredRecord(round, family: "media").string("project_id")),
+            family:"media_intake",predicate:" AND json_extract(data,'$.round_id')=?",arguments:[(try StoredRecord(round,
+             family: "media").string("id"))],limit:100).map { ["id":(try StoredRecord($0, family: "media").requiredValue("id")),
+            "state":(try StoredRecord($0, family: "media").requiredValue("state"))] }
         return result
     }
     func mediaOwnerItem(_ db: Database,round: JSON,itemID: String,caller: Caller) throws -> JSON {
-        let project = round["project_id"] as! String
+        let project = (try StoredRecord(round, family: "media").string("project_id"))
         var item = try scoped(db,itemID,project,type:"media_item")
         guard EnvelopeStorageIdentity.equal(item["round_id"] as? String,round["id"] as? String) else {throw CoreError("NOT_FOUND","This item is unavailable in this round.")}
         let manifest = try (round["manifest_id"] as? String).map {try scoped(db,$0,project,type:"media_round_manifest")}
         let member = (manifest?["items"] as? [JSON] ?? []).first {EnvelopeStorageIdentity.equal($0["item_id"] as? String,itemID)}
-        let target = try scoped(db,member?["target_id"] as? String ?? item["draft_target_id"] as! String,project,type:"media_item_target")
+        let target = try scoped(db,member?["target_id"] as? String ?? (try StoredRecord(item, family: "media").string("draft_target_id")),project,type:"media_item_target")
         item["published"] = member != nil
         item["target"] = target
         item["candidates"] = try strings(target,"candidate_ids").map {try scoped(db,$0,project,type:"media_candidate")}
@@ -84,15 +96,20 @@ extension CommandRouter {
         if let id = item["last_decision_id"] as? String {
             let decision = try scoped(db,id,project,type:"media_owner_decision")
             item["decision"] = decision
-            item["disposition"] = decision["review_basis_signature"] as? String == target["review_basis_signature"] as? String ? decision["disposition"]! : "stale"
+            item["disposition"] = decision["review_basis_signature"] as? String == target["review_basis_signature"] as? String ? (try StoredRecord(decision,
+                 family: "media").requiredValue("disposition")) : "stale"
         }
         item["originals"] = try strings(target,"attachment_reference_ids").map { id -> JSON in
-            let owner = try mediaOwnerValue(db,id:target["attachment_owner_id"] as! String,project:project)
+            let owner = try mediaOwnerValue(db,id:(try StoredRecord(target, family: "media").string("attachment_owner_id")),project:project)
             do {
                 let (reference,attachment) = try mediaAttachmentReference(db,project:project,id:id,owner:owner,caller:caller)
                 let identity = (attachment["path"] as? String).flatMap {try? self.managedIdentity($0)}
                 let available = attachment["availability"] as? String == "available" && identity?.size == Int64(int(attachment,"size"))
-                return ["reference_id":reference["id"]!,"attachment_id":attachment["id"]!,"sha256":attachment["sha256"]!,"availability":available ? "available" : "unavailable","size":attachment["size"]!,"name":attachment["name"] ?? "Original"]
+                return ["reference_id":(try StoredRecord(reference, family: "media").requiredValue("id")),
+                    "attachment_id":(try StoredRecord(attachment, family: "media").requiredValue("id")),
+                    "sha256":(try StoredRecord(attachment, family: "media").requiredValue("sha256")),
+                    "availability":available ? "available" : "unavailable","size":(try StoredRecord(attachment,
+                     family: "media").requiredValue("size")),"name":attachment["name"] ?? "Original"]
             } catch {return ["reference_id":id,"availability":"unavailable"]}
         }
         return item
@@ -102,10 +119,10 @@ extension CommandRouter {
             let project = try self.mediaAccess(db,p,c)
             let round = try self.scoped(db,text(p,"round_id"),project,type:"media_round")
             let item = try self.mediaOwnerItem(db,round:round,itemID:text(p,"item_id"),caller:c)
-            let target = item["target"] as! JSON
+            let target = (try StoredRecord(item, family: "media").object("target"))
             let reference = try text(p,"reference_id")
             guard EnvelopeStorageIdentity.equal(target["id"] as? String,p["target_id"] as? String),strings(target,"attachment_reference_ids").contains(reference) else {throw CoreError("MEDIA_BASIS_CHANGED","Refresh the selected original.")}
-            return (project,try self.mediaOwnerValue(db,id:target["attachment_owner_id"] as! String,project:project),reference)
+            return (project,try self.mediaOwnerValue(db,id:(try StoredRecord(target, family: "media").string("attachment_owner_id")),project:project),reference)
         }
         let bytes = try readMediaAttachment(project:selected.0,referenceID:selected.2,owner:selected.1,caller:c,maximum:8 * 1024 * 1024)
         return ["base64":bytes.base64EncodedString(),"reference_id":selected.2,"verified_original":true]

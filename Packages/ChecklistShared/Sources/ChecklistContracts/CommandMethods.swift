@@ -1,6 +1,11 @@
 /// Request/receipt classification only; this metadata never grants access.
 /// Keep service-owned connection reads out of Core's dispatch set.
 public enum CommandMethods {
+    /// Internal media dispatcher reads. Owner projection and lease routes have their own classification.
+    public static let mediaInternalReads: Set<String> = [
+        "media_type_get", "media_round_get", "media_intake_get", "media_bulk_get",
+        "media_item_page", "media_item_counts", "media_approved_examples",
+    ]
     public static let mediaOwnerReads: Set<String> = [
         "media_navigation",
         "media_round_page",

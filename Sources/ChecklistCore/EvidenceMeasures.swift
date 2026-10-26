@@ -69,17 +69,34 @@ extension CommandRouter {
         var snapshots: [JSON] = []
         for manifest in manifests.prefix(100) {
             let measures = (manifest["evidence"] as? JSON)?["measures"] as? [JSON] ?? []
-            if !measures.isEmpty { snapshots.append(["source":"submission","manifest_id":manifest["id"]!,"source_id":manifest["id"]!,"created_at":manifest["created_at"] ?? "","measures":measures]) }
+            if !measures.isEmpty {
+                snapshots.append([
+                    "source": "submission", "manifest_id": (try StoredRecord(manifest, family: "manifest").requiredValue("id")),
+                    "source_id": (try StoredRecord(manifest, family: "manifest").requiredValue("id")), "created_at": manifest["created_at"] ?? "", "measures": measures,
+                ])
+            }
         }
         for report in reports.prefix(100) {
             guard let mid = report["target_manifest_id"] as? String,report["review_attempt_id"] is String else { continue }
-            snapshots.append(["source":"review_report","manifest_id":mid,"source_id":report["id"]!,"name":report["name"] ?? "","author":report["author"] ?? "","review_attempt_id":report["review_attempt_id"]!,"sha256":report["sha256"] ?? "","created_at":report["created_at"] ?? "","measures":report["measures"] ?? []])
+            snapshots.append([
+                "source": "review_report", "manifest_id": mid, "source_id": (try StoredRecord(report, family: "report").requiredValue("id")), "name": report["name"] ?? "",
+                "author": report["author"] ?? "", "review_attempt_id": (try StoredRecord(report, family: "report").requiredValue("review_attempt_id")),
+                "sha256": report["sha256"] ?? "", "created_at": report["created_at"] ?? "", "measures": report["measures"] ?? [],
+            ])
         }
-        let warnings = snapshots.filter { $0["manifest_id"] as? String == current }.flatMap { snapshot -> [JSON] in
-            ((try? EvidenceMeasure.parse(snapshot["measures"])) ?? []).filter(\.overLimit).map { measure in
-                ["name":measure.name,"unit":measure.unit,"after":measure.after,"limit":measure.limit,"source_id":snapshot["source_id"]!,"manifest_id":snapshot["manifest_id"]!]
+        let warnings = try evidenceMeasureWarnings(snapshots, current: current)
+        return ["snapshots": snapshots, "warnings": warnings, "truncated": manifests.count > 100 || reports.count > 100, "advisory_only": true]
+    }
+    private func evidenceMeasureWarnings(_ snapshots: [JSON], current: String?) throws -> [JSON] {
+        try snapshots.filter { $0["manifest_id"] as? String == current }.flatMap { snapshot -> [JSON] in
+            try ((try? EvidenceMeasure.parse(snapshot["measures"])) ?? []).filter(\.overLimit).map { measure in
+                [
+                    "name": measure.name, "unit": measure.unit, "after": measure.after, "limit": measure.limit,
+                    "source_id": (try StoredRecord(snapshot, family: "snapshot").requiredValue("source_id")),
+                    "manifest_id": (try StoredRecord(snapshot, family: "snapshot").requiredValue("manifest_id")),
+                ]
             }
         }
-        return ["snapshots":snapshots,"warnings":warnings,"truncated":manifests.count > 100 || reports.count > 100,"advisory_only":true]
     }
+
 }

@@ -4,14 +4,21 @@ import ChecklistProviders
 import GRDB
 import CryptoKit
 
+/// Synchronous entry points may run concurrently. GRDB serializes writer-owned
+/// state; pure reads use connection-local frames and internally locked caches.
+/// Preparation and maintenance deadline state have their own locks below, while
+/// cleanup preparation is serialized by ticketCleanupMaintenanceLock. This
+/// unchecked conformance relies on those boundaries, not compiler isolation.
+/// Command lifecycle callbacks belong to the service coordinator, not this object.
 public final class CommandRouter: @unchecked Sendable {
     let epicReferenceIndex = EpicReferenceIndex()
     let readSnapshotCache = ReadSnapshotCache()
-    let dbQueue: DatabaseQueue
+    let dbQueue: any TransactionStorage
     /// Read-only connections for pure reads (CL-72). Nil when the store cannot open them;
     /// reads then use the writer path.
     let readers: DatabasePool?
     let cursorKey: SymmetricKey
+    // Writer connection only, including startup and maintenance callbacks.
     var lastRoutinePrune: Date?
     var workHealthScanPosition: Int64 = 0
     private let preparationLock = NSLock()
@@ -23,11 +30,13 @@ public final class CommandRouter: @unchecked Sendable {
     let cliCommand: String
     let serviceLease: StorageServiceLease?
     let storageAdmission = StorageAdmission()
+    // Per-command/transaction state, accessed only on the sole writer connection.
     var taskReferenceFrame: TaskReferenceFrame?
     var managedAttachmentPreparation: ManagedAttachmentPreparation?
     var managedImportRecoveryFailures: [Data:Int] = [:]
     var managedImportMaintenanceAfterRow: Int64 = 0
     var storageMaintenanceFallbackFailures = 0
+    // Deadlines are also observed outside the writer by the maintenance planner.
     private let maintenanceStateLock = NSLock()
     private var routineRetry: Date?
     private var cleanupRetry: Date?
@@ -77,7 +86,7 @@ public final class CommandRouter: @unchecked Sendable {
         let gateFiles = try StorageObjectFiles(root:root,pinRootForGates:true)
         self.gateFiles = gateFiles
         self.managedCapturePaths = try opened.queue.read { try ManagedPathRelocation.captureBindings($0, root: root) }
-        self.dbQueue = opened.queue
+        self.dbQueue = GRDBTransactionAdapter(queue: opened.queue)
         self.incarnation = opened.incarnation
         self.cursorKey = (try? ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { _ in try opened.queue.write { db in try SealedCursor.storeKey(db) } }) ?? SymmetricKey(size: .bits256)
         var readerConfiguration = Configuration()
@@ -358,14 +367,15 @@ public final class CommandRouter: @unchecked Sendable {
                         output = jsonObject(row["result"])
                         if Self.isPrunedResult(output) { throw Self.expiredCommandError(command) }
                         output["replayed"] = true
-                        if ["work_claim","work_child_accept","work_handoff_accept","work_takeover"].contains(method),var d = output["data"] as? JSON,let aid = d["id"] as? String,var a = try? self.record(db,aid,type:"attempt"),a["state"] as? String == "active",a["principal"] as? String == caller.principal,a["incarnation"] as? String == self.incarnation,a["session_authorization_generation"] as? String == (try self.callerSessionGeneration(db,caller,project:a["project_id"] as! String)) {
-                            let token = uuid()+uuid(); a["token_hash"] = hash(Data(token.utf8)); try self.save(db,a,type:"attempt"); d["claim_token"] = token; output["data"] = d
-                        }
+                        try self.refreshReplayedClaim(db,method:method,output:&output,caller:caller)
                         if method == "batch_claim",let data = output["data"] as? JSON { output["data"] = try self.replayBatchClaims(db,data,caller) }
                         return .commit
                     }
                 }
-                let membershipBefore = Self.triageStatusMethods.contains(method) && params["project_id"] is String ? try self.currentTriageMemberships(db,project:params["project_id"] as! String) : []
+                var membershipBefore: [JSON] = []
+                if Self.triageStatusMethods.contains(method),let pid = params["project_id"] as? String {
+                    membershipBefore = try self.currentTriageMemberships(db,project:pid)
+                }
                 var data = try self.dispatch(db,method:method,p:params,c:caller)
                 if Self.triageStatusMethods.contains(method),let pid = params["project_id"] as? String { data["triage_effect"] = try self.triageCommandEffect(db,before:membershipBefore,project:pid,method:method) }
                 output = ["data":data,"event_cursor":try self.cursor(db,caller:caller,scope:try self.authorizationScope(db,caller))]
@@ -404,8 +414,24 @@ public final class CommandRouter: @unchecked Sendable {
         }}
     }
     }
+    private func refreshReplayedClaim(_ db: Database,method: String,output: inout JSON,caller: Caller) throws {
+        guard ["work_claim","work_child_accept","work_handoff_accept","work_takeover"].contains(method),
+              var data = output["data"] as? JSON,let id = data["id"] as? String,
+              var attempt = try? record(db,id,type:"attempt"),attempt["state"] as? String == "active",
+              attempt["principal"] as? String == caller.principal,
+              attempt["incarnation"] as? String == incarnation else { return }
+        let projectID = try StoredRecord(attempt,family:"attempt").string("project_id")
+        guard attempt["session_authorization_generation"] as? String == (try callerSessionGeneration(db,caller,project:projectID)) else { return }
+        let token = uuid()+uuid()
+        attempt["token_hash"] = hash(Data(token.utf8))
+        try save(db,attempt,type:"attempt")
+        data["claim_token"] = token
+        output["data"] = data
+    }
     /// Closes the read-only connections before the writer, so the writer's close can
-    /// checkpoint the WAL as the store's last connection.
+    /// checkpoint the WAL as the store's last connection. The lifecycle owner must
+    /// first stop new work and finish all active commands/maintenance; this method
+    /// does not establish that drain itself.
     public func closeStore() throws {
         epicReferenceIndex.stop()
         try ticketCleanupReaders?.close()

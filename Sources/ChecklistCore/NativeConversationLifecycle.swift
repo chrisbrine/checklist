@@ -100,6 +100,28 @@ extension CommandRouter {
         }
     }
 
+    private func fenceNativeClosureDeliveries(
+        _ db: Database, proof: VerifiedNativeClosure, caller: Caller, originalGeneration: String, observationID: String
+    ) throws {
+        let sql = "SELECT " + Self.canonicalRecordColumns
+            + " FROM records WHERE type='delivery' AND project_id=?"
+            + " AND json_extract(data,'$.recipient_session_id')=? COLLATE BINARY"
+            + " AND json_extract(data,'$.recipient_authorization_generation')=? COLLATE BINARY"
+        let deliveries = try Row.fetchAll(db, sql: sql, arguments: [proof.projectID, proof.sessionID, originalGeneration])
+        for row in deliveries {
+            let delivery = try GRDBRecordEnvelopeAdapter.decode(row, expectedType: "delivery").object
+            guard !["acknowledged", "addressed"].contains(delivery["state"] as? String ?? "") else { continue }
+            let message = try scoped(db, (try StoredRecord(delivery, family: "native_record").string("message_id")), proof.projectID, type: "message")
+            try event(db, caller: caller, project: proof.projectID,
+                      entity: message["task_id"] as? String ?? message["conversation_id"] as? String ?? message["id"] as? String,
+                      kind: "message_delivery_fenced", data: ["delivery_id": (try StoredRecord(delivery,
+                       family: "native_record").requiredValue("id")), "message_id": (try StoredRecord(message,
+                       family: "native_record").requiredValue("id")),
+                          "recipient_session_id": proof.sessionID, "recipient_authorization_generation": originalGeneration,
+                          "native_closure_ref": observationID])
+        }
+    }
+
     public func reconcileVerifiedNativeClosure(_ proof: VerifiedNativeClosure, caller: Caller) throws -> [String: Any] {
         try owner(caller)
         guard caller.installation == "native-lifecycle",
@@ -153,17 +175,15 @@ extension CommandRouter {
                     throw CoreError("RECIPIENT_CHANGED", "A newer session authorization cannot inherit or replay this native closure.")
                 }
             }
-            let originalGeneration = observation["old_authorization_generation"] as! String
+            let originalGeneration = (try StoredRecord(observation, family: "native_record").string("old_authorization_generation"))
             let sql = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='attempt' AND project_id=CAST(? AS TEXT) AND CASE WHEN json_valid(data) THEN json_extract(data,'$.state') END='active' AND CASE WHEN json_valid(data) THEN json_extract(data,'$.session_id') END=CAST(? AS TEXT) COLLATE BINARY AND CASE WHEN json_valid(data) THEN json_extract(data,'$.installation') END=CAST(? AS TEXT) COLLATE BINARY AND CASE WHEN json_valid(data) THEN json_extract(data,'$.session_authorization_generation') END=CAST(? AS TEXT) COLLATE BINARY"
             var attempts = try Row.fetchAll(db, sql: sql, arguments: [Data(proof.projectID.utf8), Data(proof.sessionID.utf8), Data(proof.installation.utf8), Data(originalGeneration.utf8)])
                 .map { try GRDBRecordEnvelopeAdapter.decode($0, expectedType: "attempt").object }
             // Same-session descendants, if any, relinquish before their parent.
-            let parents = Dictionary(uniqueKeysWithValues: attempts.compactMap { a in (a["parent_attempt_id"] as? String).map { (a["id"] as! String, $0) } })
-            func depth(_ id: String) -> Int { var id = id, result = 0; while let parent = parents[id], result < 32 { result += 1; id = parent }; return result }
-            attempts.sort { depth($0["id"] as! String) > depth($1["id"] as! String) }
+            attempts = try nativeAttemptsDeepestFirst(attempts)
             var released: [String] = [], pending: [String] = []
             for var attempt in attempts {
-                let aid = attempt["id"] as! String
+                let aid = (try StoredRecord(attempt, family: "native_record").string("id"))
                 do { try requireNoSourceExecutions(db, attempt: attempt); try requireNoWritableChildren(db, attempt: attempt) }
                 catch let error as CoreError where ["SOURCE_EXECUTION_ACTIVE", "CHILD_WRITERS_ACTIVE"].contains(error.code) {
                     if attempt["native_closure_pending"] as? String != observationID || attempt["native_closure_blocker"] as? String != error.code {
@@ -182,7 +202,7 @@ extension CommandRouter {
                 attempt["native_closure_ref"] = observationID; attempt.removeValue(forKey: "token_hash")
                 attempt.removeValue(forKey: "native_closure_pending"); attempt.removeValue(forKey: "native_closure_blocker")
                 try save(db, revised(attempt), type: "attempt")
-                var task = try scoped(db, attempt["task_id"] as! String, proof.projectID, type: "task")
+                var task = try scoped(db, (try StoredRecord(attempt, family: "native_record").string("task_id")), proof.projectID, type: "task")
                 if task["active_attempt_id"] as? String == aid {
                     task.removeValue(forKey: "active_attempt_id"); task["status_id"] = try status(db, proof.projectID, "queued")["id"]
                     task = revised(task); try save(db, task, type: "task")
@@ -200,17 +220,9 @@ extension CommandRouter {
                 try save(db, revised(observation), type: "native_closure")
             }
             if firstObservation {
-                let deliveries = try Row.fetchAll(db, sql: "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='delivery' AND project_id=? AND json_extract(data,'$.recipient_session_id')=? COLLATE BINARY AND json_extract(data,'$.recipient_authorization_generation')=? COLLATE BINARY", arguments: [proof.projectID, proof.sessionID, originalGeneration])
-                for row in deliveries {
-                    let delivery = try GRDBRecordEnvelopeAdapter.decode(row, expectedType: "delivery").object
-                    guard !["acknowledged", "addressed"].contains(delivery["state"] as? String ?? "") else { continue }
-                    let message = try scoped(db, delivery["message_id"] as! String, proof.projectID, type: "message")
-                    try event(db, caller: caller, project: proof.projectID,
-                              entity: message["task_id"] as? String ?? message["conversation_id"] as? String ?? message["id"] as? String,
-                              kind: "message_delivery_fenced", data: ["delivery_id": delivery["id"]!, "message_id": message["id"]!,
-                                  "recipient_session_id": proof.sessionID, "recipient_authorization_generation": originalGeneration,
-                                  "native_closure_ref": observationID])
-                }
+                try fenceNativeClosureDeliveries(
+                    db, proof: proof, caller: caller, originalGeneration: originalGeneration, observationID: observationID
+                )
             }
             result = ["session_id": proof.sessionID, "state": "ended", "observation_ref": observationID,
                     "released_attempt_ids": released, "pending_attempt_ids": pending]

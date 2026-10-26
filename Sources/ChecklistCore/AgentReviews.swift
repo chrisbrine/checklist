@@ -41,13 +41,13 @@ extension CommandRouter {
             entries[path] = file
         }
         return try files.filter {($0["path"] as? String ?? "").split(separator:"/").last == "AGENTS.md" && ["file","symlink"].contains($0["kind"] as? String ?? "")}.map { instruction in
-            var ref = try capturedSourceInput(instruction["path"] as! String,entries:entries)
+            var ref = try capturedSourceInput((try StoredRecord(instruction, family: "AgentReviews").string("path")),entries:entries)
             ref["source_capture_id"] = captureID;ref["source_sha256"] = sourceHash
             return ref
         }
     }
     func reviewContract(_ db: Database, task: JSON, manifest: JSON) throws -> JSON {
-        let project = try record(db,task["project_id"] as! String,type:"project")
+        let project = try record(db,(try StoredRecord(task, family: "AgentReviews").string("project_id")),type:"project")
         func requirement(_ id: String,_ body: String,_ kind: String) -> JSON { ["id":id,"text":body,"kind":kind,"sha256":hash(Data(body.utf8))] }
         let acceptance = strings(task,"acceptance").enumerated().map { requirement("acceptance:\($0.offset)",$0.element,"acceptance") }
         var requirements: [JSON] = []
@@ -55,17 +55,23 @@ extension CommandRouter {
         for pin in applicableDecisions(project,task:task) { requirements.append(requirement("project:decision:"+(pin["id"] as? String ?? hash(Data((pin["body"] as? String ?? "").utf8))),pin["body"] as? String ?? "","approved_project_decision")) }
         let capture = (manifest["evidence"] as? JSON)?["source_capture"] as? JSON ?? [:]
         let instructions = try capturedReviewInstructions(capture)
-        let rubric = try reviewRequirementState(db,task:task),snapshot = rubric["snapshot"] as! JSON
+        let rubric = try reviewRequirementState(db,task:task),snapshot = (try StoredRecord(rubric, family: "AgentReviews").object("snapshot"))
         requirements += try reviewRequirementRows(snapshot)
         // Current authority stays current; only the separately pinned rubric governs checks.
         let policy = effectivePolicy(project["policy"] as? JSON ?? [:],kind:task["kind"] as? String ?? "work").filter {$0.key != "review_requirements"}
-        var contract: JSON = ["version":2,"review_requirements":snapshot,"review_requirements_state":rubric["state"]!,"task_id":task["id"]!,"manifest_id":manifest["id"]!,"acceptance_revision":int(task,"acceptance_revision",default:1),"acceptance":acceptance,"project_requirements":requirements,"project_instruction_refs":instructions,"review_policy":policy,"project_brief_revision":int(project,"brief_revision"),"project_decisions_revision":int(project,"decisions_revision")]
+        var contract: JSON = ["version":2,"review_requirements":snapshot,"review_requirements_state":(try StoredRecord(rubric,
+         family: "AgentReviews").requiredValue("state")),"task_id":(try StoredRecord(task,
+         family: "AgentReviews").requiredValue("id")),"manifest_id":(try StoredRecord(manifest,
+         family: "AgentReviews").requiredValue("id")),"acceptance_revision":int(task,
+        "acceptance_revision",default:1),"acceptance":acceptance,"project_requirements":requirements,
+        "project_instruction_refs":instructions,"review_policy":policy,"project_brief_revision":int(project,
+        "brief_revision"),"project_decisions_revision":int(project,"decisions_revision")]
         contract["sha256"] = hash(Data((try jsonString(contract)).utf8));return contract
     }
     func exactAgentReview(_ db: Database,_ p: JSON,_ c: Caller) throws -> (JSON,JSON,JSON) {
         try worker(c);let pid = try scope(db,p,c),task = try self.task(db,p,pid),request = try scoped(db,try text(p,"review_request_id"),pid,type:"review_request")
         guard request["task_id"] as? String == task["id"] as? String,request["manifest_id"] as? String == p["target_manifest_id"] as? String,request["gate"] as? String == p["gate"] as? String,["queued","active","blocked"].contains(request["state"] as? String ?? ""),request["gate"] as? String != "human_approval" else { throw CoreError("REVIEW_TARGET_MISMATCH","Select the exact queued or active agent review request, gate and current target.") }
-        return (task,request,try validateManifestTarget(db,task:task,manifestID:request["manifest_id"] as! String))
+        return (task,request,try validateManifestTarget(db,task:task,manifestID:(try StoredRecord(request, family: "AgentReviews").string("manifest_id"))))
     }
     func agentReviewContext(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         let (task,request,manifest) = try exactAgentReview(db,p,c)
@@ -79,14 +85,24 @@ extension CommandRouter {
         return context
     }
     func prepareAgentReview(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
-        let (task,request,manifest) = try exactAgentReview(db,p,c),pid = task["project_id"] as! String,project = try record(db,pid,type:"project")
+        let (task,request,manifest) = try exactAgentReview(db,p,c),pid = (try StoredRecord(task, family: "AgentReviews").string("project_id")),project = try record(db,pid,type:"project")
         guard request["state"] as? String == "queued",task["active_attempt_id"] == nil,task["active_verification_request_id"] == nil else { throw CoreError("REVIEW_ALREADY_ACTIVE","Release the existing review before preparing another fresh reviewer.") }
         let provider = p["provider"] as? String ?? ProviderPolicyDefaults.defaultReviewProvider,policy = effectivePolicy(project["policy"] as? JSON ?? [:],kind:task["kind"] as? String ?? "work"),reviewers = strings((policy["roles"] as? JSON)?["reviewer"] as? JSON ?? [:],"providers")
         guard providerPlugins.plugin(provider, requiring: .workSession) != nil,strings(policy,"allowed_providers").contains(provider),reviewers.contains(provider) else { throw CoreError("POLICY_DENIED","The selected provider is not currently eligible for this project's review role.") }
-        let selectors: JSON = ["project_id":pid,"task_id":task["id"]!,"review_request_id":request["id"]!,"target_manifest_id":manifest["id"]!,"gate":request["gate"]!]
+        let selectors: JSON = ["project_id":pid,"task_id":(try StoredRecord(task,
+         family: "AgentReviews").requiredValue("id")),"review_request_id":(try StoredRecord(request,
+         family: "AgentReviews").requiredValue("id")),"target_manifest_id":(try StoredRecord(manifest,
+         family: "AgentReviews").requiredValue("id")),"gate":(try StoredRecord(request,
+         family: "AgentReviews").requiredValue("gate"))]
         let root = project["root_path"] as? String ?? "",json = try jsonString(selectors)
         let instruction = agentReviewInstruction(provider:provider,task:task,root:root,json:json,reference:try agentReference(db,task))
-        var response: JSON = ["task_id":task["id"]!,"key":task["key"] ?? "","title":task["title"] ?? "","project_name":project["name"] ?? "","provider":provider,"instruction":instruction,"review_request_id":request["id"]!,"target_manifest_id":manifest["id"]!,"review_contract":try reviewContract(db,task:task,manifest:manifest),"launch_available":false,"session_connected":false,"claim_acquired":false,"state":"prepared_copy","limitation":"Open a fresh conversation and paste this instruction. Native creation/connection/claim has not occurred."]
+        var response: JSON = ["task_id":(try StoredRecord(task, family: "AgentReviews").requiredValue("id")),
+        "key":task["key"] ?? "","title":task["title"] ?? "","project_name":project["name"] ?? "",
+        "provider":provider,"instruction":instruction,"review_request_id":(try StoredRecord(request,
+         family: "AgentReviews").requiredValue("id")),"target_manifest_id":(try StoredRecord(manifest,
+         family: "AgentReviews").requiredValue("id")),"review_contract":try reviewContract(db,
+        task:task,manifest:manifest),"launch_available":false,"session_connected":false,
+        "claim_acquired":false,"state":"prepared_copy","limitation":"Open a fresh conversation and paste this instruction. Native creation/connection/claim has not occurred."]
         if let url = providerPlugins.plugin(provider, requiring: .composer)?.composeURL(instruction:instruction,workspace:root) {
             response["compose_url"] = url.absoluteString;response["state"] = "prepared_composer"
             response["limitation"] = "Open the prepared fresh composer and press Send. A draft is not a created/connected reviewer or a review claim."
@@ -95,24 +111,49 @@ extension CommandRouter {
         return response
     }
     func agentReviewInstruction(provider: String,task: JSON,root: String,json: String,reference: String) -> String {
-        return "Start a fresh independent \(providerPlugins.plugin(provider, requiring: .workSession)?.manifest.displayName ?? provider) reviewer conversation for ticket metadata \(reference). Do not reuse an implementation contributor or its delegated/prior identity. Work in \(root). Run \(cliCommand) connect --task \(task["id"]!) from that workspace. Discover checklist tools, then call review_context with this exact JSON: \(json). Read the complete brief, acceptance, findings, immutable target and current review_contract; fetch captured AGENTS.md and its linked project rules. Claim this exact request with phase review, current task revision, gate and manifest before review. Refresh review_context after claiming to obtain the applied requirement revision and contract SHA; pre-claim preparation is a preview. Assess every acceptance and project requirement critically; choose meaningful checks in your own session, attach your own hashed report/log/screenshots with attachment_add, and record review_assessment against the fresh contract SHA-256. No swift_test or validate-plan receipt is required. On rework, follow the case-level failed-only guidance in review_context: carry input-valid passes with original provenance, run only failed/inconclusive/materially affected checks, explain broader selection by named changed inputs or an applicable explicit effective project workflow/context instruction, and report carried versus newly executed evidence. A fixture-only repair needs no all-green rerun; no prior verdict or approval transfers and all fresh gates remain required. Report pass, changes or blocked honestly, preserving stable finding IDs. Preparing this prompt starts no turn and acquires no claim."
+        return """
+        Start a fresh independent \(providerPlugins.plugin(provider, requiring: .workSession)?.manifest.displayName ?? provider) reviewer conversation for ticket metadata \(reference). \
+        Do not reuse an implementation contributor or its delegated/prior identity. Work in \(root). \
+        Run \(cliCommand) connect --task \(task["id"] ?? "") from that workspace. \
+        Discover checklist tools, then call review_context with this exact JSON: \(json). \
+        Read the complete brief, acceptance, findings, immutable target and current review_contract; fetch captured AGENTS.md and its linked project rules. \
+        Claim this exact request with phase review, current task revision, gate and manifest before review. \
+        Refresh review_context after claiming to obtain the applied requirement revision and contract SHA; pre-claim preparation is a preview. \
+        Assess every acceptance and project requirement critically; choose meaningful checks in your own session, attach your own hashed report/log/screenshots with attachment_add, \
+        and record review_assessment against the fresh contract SHA-256. \
+        No swift_test or validate-plan receipt is required. \
+        On rework, follow the case-level failed-only guidance in review_context: carry input-valid passes with original provenance, run only failed/inconclusive/materially affected \
+        checks, explain broader selection by named changed inputs or an applicable explicit effective project workflow/context instruction, and report carried versus newly executed \
+        evidence. \
+        A fixture-only repair needs no all-green rerun; no prior verdict or approval transfers and all fresh gates remain required. \
+        Report pass, changes or blocked honestly, preserving stable finding IDs. Preparing this prompt starts no turn and acquires no claim.
+        """
     }
     func addAgentReviewEvidence(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         try worker(c);let pid = try scope(db,p,c,write:true),attempt = try claimAttempt(db,p,c,pid)
         guard attempt["phase"] as? String == "review",let mid = attempt["manifest_id"] as? String else {throw CoreError("INVALID_TRANSITION","Reviewer evidence requires the exact active review claim.")}
         try verifyPolicyAuthority(db,attempt:attempt,caller:c)
-        let task = try scoped(db,attempt["task_id"] as! String,pid,type:"task");_ = try validateManifestTarget(db,task:task,manifestID:mid)
+        let task = try scoped(db,(try StoredRecord(attempt, family: "AgentReviews").string("task_id")),pid,type:"task");_ = try validateManifestTarget(db,task:task,manifestID:mid)
         let measures = try EvidenceMeasure.parse(p["measures"])
         let title = try text(p,"title",max:1000),body = try measuredReportBody(text(p,"body",max:65536),measures:measures),bytes = Data(body.utf8),id = uuid(),relative = "objects/" + pid + "/" + id + ".md"
         let report = try UncommittedReviewReport(root:root,relative:relative,bytes:bytes)
         db.afterNextTransaction(onCommit:{_ in},onRollback:{_ in report.rollback()})
-        var artifact: JSON = ["id":id,"artifact_id":id,"project_id":pid,"task_id":task["id"]!,"name":title,"description":"Reviewer-authored evidence for exact target "+mid,"mode":"managed","path":relative,"sha256":hash(bytes),"size":bytes.count,"availability":"available","keep_original":false,"unlinked":false,"author":c.principal,"origin":c.isOwner ? "human_ui" : c.role,"review_attempt_id":attempt["id"]!,"target_manifest_id":mid,"revision":1,"created_at":now()]
+        var artifact: JSON = ["id":id,"artifact_id":id,"project_id":pid,"task_id":(try StoredRecord(task,
+         family: "AgentReviews").requiredValue("id")),"name":title,"description":"Reviewer-authored evidence for exact target "+mid,
+        "mode":"managed","path":relative,"sha256":hash(bytes),"size":bytes.count,
+        "availability":"available","keep_original":false,"unlinked":false,
+        "author":c.principal,"origin":c.isOwner ? "human_ui" : c.role,"review_attempt_id":(try StoredRecord(attempt,
+         family: "AgentReviews").requiredValue("id")),"target_manifest_id":mid,
+        "revision":1,"created_at":now()]
         if p["measures"] != nil { artifact["measures"] = measures.map(\.json) }
-        try save(db,artifact,type:"attachment");try event(db,caller:c,project:pid,entity:task["id"] as? String,kind:"review_evidence_added",data:["artifact_id":id,"manifest_id":mid,"attempt_id":attempt["id"]!])
+        try save(db,artifact,type:"attachment");try event(db,caller:c,project:pid,
+        entity:task["id"] as? String,kind:"review_evidence_added",data:["artifact_id":id,
+        "manifest_id":mid,"attempt_id":(try StoredRecord(attempt, family: "AgentReviews").requiredValue("id"))])
         var response = artifact;if !c.isOwner {response.removeValue(forKey:"path")};return response
     }
     func validateReviewEvidence(_ db: Database, refs: [JSON], task: JSON, manifest: JSON, caller: Caller) throws -> (refs:[JSON],owned:Bool) {
-        let pid = task["project_id"] as! String,evidence = manifest["evidence"] as? JSON ?? [:],targetArtifacts = (evidence["artifact_refs"] as? [JSON] ?? []) + acceptanceArtifactRefs(evidence)
+        let pid = (try StoredRecord(task, family: "AgentReviews").string("project_id")),
+        evidence = manifest["evidence"] as? JSON ?? [:],targetArtifacts = (evidence["artifact_refs"] as? [JSON] ?? []) + acceptanceArtifactRefs(evidence)
         var validated: [JSON] = [],owned = false
         guard !refs.isEmpty,refs.count <= 100 else {throw CoreError("REVIEW_ASSESSMENT_INCOMPLETE","Assessments need reviewer-chosen evidence references.")}
         // Legacy CL-41 supplemental evidence retained on a review request of
@@ -127,25 +168,49 @@ extension CommandRouter {
                 let isTarget = targetArtifacts.contains {$0["artifact_id"] as? String == id && $0["sha256"] as? String == ref["sha256"] as? String}
                 let isSupplemental = supplemental.contains {$0["artifact_id"] as? String == id && $0["sha256"] as? String == ref["sha256"] as? String}
                 guard artifact["task_id"] as? String == task["id"] as? String,isOwned || isTarget || isSupplemental,artifact["mode"] as? String == "managed",artifact["availability"] as? String == "available",artifact["sha256"] as? String == ref["sha256"] as? String,let path = artifact["path"] as? String,objectBytesMatch(path,sha256:ref["sha256"] as? String ?? "") else {throw CoreError("EVIDENCE_STALE","Review evidence must be an available hash-verified own review artifact or this exact submitted target.")}
-                validated.append(["artifact_id":id,"sha256":artifact["sha256"]!,"role":isOwned ? "reviewer_artifact" : (isTarget ? "submitted_target" : "supplemental_evidence")]);owned = owned || isOwned
+                validated.append(["artifact_id":id,"sha256":(try StoredRecord(artifact,
+                 family: "AgentReviews").requiredValue("sha256")),"role":isOwned ? "reviewer_artifact" : (isTarget ? "submitted_target" : "supplemental_evidence")]);
+                owned = owned || isOwned
             } else {
-                try findingEvidence(db,refs:[ref],task:task,manifestID:manifest["id"] as! String);validated.append(ref)
+                try findingEvidence(db,refs:[ref],task:task,manifestID:(try StoredRecord(manifest, family: "AgentReviews").string("id")));validated.append(ref)
             }
         }
         return (validated,owned)
     }
+    private func reviewRequirementAssessment(
+        _ db: Database, row: JSON, task: JSON, manifest: JSON, verdict: String, caller: Caller
+    ) throws -> JSON {
+        guard Set(row.keys) == ["requirement_id","result","rationale","evidence_refs"] else {throw CoreError("INVALID_INPUT","Requirement assessments have unsupported or missing fields.")}
+        let result = try text(row,"result",max:100),rationale = try text(row,"rationale",max:16000)
+        guard ["pass","fail","blocked","not_applicable"].contains(result),
+        verdict != "pass" || ["pass","not_applicable"].contains(result) else {throw CoreError("REVIEW_ASSESSMENT_INCOMPLETE",
+        "A passing review cannot leave an acceptance/project requirement failed or blocked.")}
+        return ["requirement_id":(try StoredRecord(row, family: "AgentReviews").requiredValue("requirement_id")),
+        "result":result,"rationale":rationale,"evidence_refs":try validateReviewEvidence(db,
+        refs:row["evidence_refs"] as? [JSON] ?? [],task:task,manifest:manifest,
+        caller:caller).refs]
+    }
+
     func validateReviewAssessment(_ db: Database, params: JSON, task: JSON, attempt: JSON, verdict: String, caller: Caller) throws -> JSON? {
-        let target = try scoped(db,attempt["manifest_id"] as! String,task["project_id"] as! String,type:"manifest")
+        let target = try scoped(db,(try StoredRecord(attempt, family: "AgentReviews").string("manifest_id")),(try StoredRecord(task, family: "AgentReviews").string("project_id")),type:"manifest")
         try requirePlaytestAssessment(params:params,manifest:target,verdict:verdict)
         guard verdict == "pass" || params["review_assessment"] != nil else {return nil}
-        let manifest = try validateManifestTarget(db,task:task,manifestID:attempt["manifest_id"] as! String),contract = try reviewContract(db,task:task,manifest:manifest)
+        let manifest = try validateManifestTarget(db,task:task,manifestID:(try StoredRecord(attempt,
+         family: "AgentReviews").string("manifest_id"))),contract = try reviewContract(db,
+        task:task,manifest:manifest)
         guard let input = params["review_assessment"] as? JSON,input["contract_sha256"] as? String == contract["sha256"] as? String,input["target_manifest_id"] as? String == manifest["id"] as? String else {throw CoreError("REVIEW_ASSESSMENT_REQUIRED","Read current review_context and assess its exact acceptance and project requirements before passing.")}
         guard Set(input.keys) == ["contract_sha256","target_manifest_id","acceptance","project_requirements","evidence_refs","instruction_coverage","all_applicable_project_requirements_assessed","additional_requirements"] else {throw CoreError("INVALID_INPUT","Review assessment contains unsupported or missing fields.")}
-        var output: JSON = ["version":1,"contract_sha256":contract["sha256"]!,"target_manifest_id":manifest["id"]!,"contract":contract,"actor":caller.principal,"recorded_at":now()]
+        var output: JSON = ["version":1,"contract_sha256":(try StoredRecord(contract,
+         family: "AgentReviews").requiredValue("sha256")),"target_manifest_id":(try StoredRecord(manifest,
+         family: "AgentReviews").requiredValue("id")),"contract":contract,
+        "actor":caller.principal,"recorded_at":now()]
         let overall = try classifiedReviewEvidence(db,refs:input["evidence_refs"] as? [JSON] ?? [],task:task,manifest:manifest,attempt:attempt,caller:caller)
         guard verdict != "pass" || overall.owned else {throw CoreError("REVIEW_ASSESSMENT_INCOMPLETE","Attach your own managed hashed review report or chosen check artifact; an implementation contributor's file is not your review result.")}
         output["evidence_refs"] = overall.refs
-        let rubricGaps = try reviewRequirementGapResult(snapshot:contract["review_requirements"] as! JSON,task:task,manifest:manifest,attempt:attempt,selectedCount:overall.refs.count,descriptors:overall.descriptors)
+        let rubricGaps = try reviewRequirementGapResult(snapshot:(try StoredRecord(contract,
+         family: "AgentReviews").object("review_requirements")),task:task,
+        manifest:manifest,attempt:attempt,selectedCount:overall.refs.count,
+        descriptors:overall.descriptors)
         if verdict == "pass",!(strings(rubricGaps,"missing_evidence_types").isEmpty) || int(rubricGaps,"ambiguous_reference_count") > 0 {
             throw CoreError("REVIEW_EVIDENCE_MISSING","Required selected evidence classes are missing before this verdict can be recorded.",details:rubricGaps)
         }
@@ -157,11 +222,8 @@ extension CommandRouter {
         for section in ["acceptance","project_requirements"] {
             let requirements = contract[section] as? [JSON] ?? [],rows = input[section] as? [JSON] ?? []
             guard rows.count == requirements.count,Set(rows.compactMap {$0["requirement_id"] as? String}) == Set(requirements.compactMap {$0["id"] as? String}) else {throw CoreError("REVIEW_ASSESSMENT_INCOMPLETE","Assess every current \(section) item exactly once.")}
-            output[section] = try rows.map { row -> JSON in
-                guard Set(row.keys) == ["requirement_id","result","rationale","evidence_refs"] else {throw CoreError("INVALID_INPUT","Requirement assessments have unsupported or missing fields.")}
-                let result = try text(row,"result",max:100),rationale = try text(row,"rationale",max:16000)
-                guard ["pass","fail","blocked","not_applicable"].contains(result),verdict != "pass" || ["pass","not_applicable"].contains(result) else {throw CoreError("REVIEW_ASSESSMENT_INCOMPLETE","A passing review cannot leave an acceptance/project requirement failed or blocked.")}
-                return ["requirement_id":row["requirement_id"]!,"result":result,"rationale":rationale,"evidence_refs":try validateReviewEvidence(db,refs:row["evidence_refs"] as? [JSON] ?? [],task:task,manifest:manifest,caller:caller).refs]
+            output[section] = try rows.map { row in
+                try reviewRequirementAssessment(db, row: row, task: task, manifest: manifest, verdict: verdict, caller: caller)
             }
         }
         let instructions = contract["project_instruction_refs"] as? [JSON] ?? [],coverage = input["instruction_coverage"] as? [JSON] ?? []

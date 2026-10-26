@@ -43,7 +43,7 @@ public struct ShimUpdateEnvironment: Sendable {
         var size: UInt32 = 0
         _ = _NSGetExecutablePath(nil, &size)
         var buffer = [CChar](repeating: 0, count: Int(size))
-        let path = _NSGetExecutablePath(&buffer, &size) == 0 ? String(cString: buffer) : CommandLine.arguments[0]
+        let path = _NSGetExecutablePath(&buffer, &size) == 0 ? String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self) : CommandLine.arguments[0]
         let launchPath = URL(fileURLWithPath: path).standardizedFileURL.path
         var code: SecCode?
         let own = SecCodeCopySelf([], &code) == errSecSuccess ? code.flatMap(ClientBuildIdentity.running) : nil

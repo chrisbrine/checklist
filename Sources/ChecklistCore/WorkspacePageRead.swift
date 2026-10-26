@@ -64,7 +64,7 @@ extension CommandRouter {
                 guard !recordID.isEmpty else {throw CoreError("INVALID_INPUT","Select an Epic.")}
                 let group = try record(db,recordID,type:"group")
                 guard projectIDs.contains(where:{SnapshotRecordIdentity($0)==SnapshotRecordIdentity(group["project_id"] as? String ?? "")}),["epic","triage"].contains(group["kind"] as? String ?? "") else {throw CoreError("NOT_FOUND","This Epic is outside the selected scope.")}
-                let groupProject = group["project_id"] as! String
+                let groupProject = (try StoredRecord(group, family: "group").string("project_id"))
                 args += ["groupProject":Data(groupProject.utf8)]
                 guard group["kind"] as? String == (surface.hasPrefix("triage") ? "triage" : "epic") else {throw CoreError("INVALID_INPUT","Choose the corresponding container kind.")}
                 filter += " AND r.project_id=CAST(:groupProject AS TEXT) AND r.type='task' AND COALESCE(json_extract(r.data,'$.trashed'),0)=0"
@@ -115,16 +115,20 @@ extension CommandRouter {
             let raw = envelope.object,type = envelope.type
             let taskKey = WorkspaceTaskIdentity(project:raw["project_id"] as? String ?? "",task:raw["id"] as? String ?? "")
             var value = type == "task" ? try selectedTaskProjection(db,task:raw,cleanedOriginalCount:cleanedCounts[taskKey] ?? 0) : contextRecord(raw,type:type,caller:c)
-            if type == "request",let taskID = raw["task_id"] as? String,let task = try? scoped(db,taskID,raw["project_id"] as! String,type:"task") {
+            let linkedProject = ["request", "review"].contains(type)
+                ? try StoredRecord(raw, family: type).string("project_id") : ""
+            if type == "request",let taskID = raw["task_id"] as? String,let task = try? scoped(db,taskID,linkedProject,type:"task") {
                 value["task_key"] = task["key"];value["task_title"] = task["title"];value["selected_task"] = try selectedTaskProjection(db,task:task)
                 if surface == "record" {value=try workspaceRequestDetail(db,value,task:task,caller:c)}
             }
             if type == "task",Self.needSurfaces.contains(surface),let work = try activeWork(db,task:raw) {value["active_work"] = work}
             if type == "review" {
                 // A verdict row names its ticket and reviewer; the full review stays in the ticket.
-                value = ["id":raw["id"]!,"project_id":raw["project_id"]!,"task_id":raw["task_id"] ?? NSNull(),"gate":raw["gate"] ?? "review","verdict":raw["verdict"] ?? NSNull(),
+                value = ["id":(try StoredRecord(raw, family: "record").requiredValue("id")),"project_id":(try StoredRecord(raw, family: "record").requiredValue("project_id")),
+                    "task_id":raw["task_id"] ?? NSNull(),"gate":raw["gate"] ?? "review","verdict":raw["verdict"] ?? NSNull(),
                          "reviewer":raw["actor_display"] ?? raw["actor"] ?? NSNull(),"created_at":raw["created_at"] ?? NSNull()]
-                if let taskID = raw["task_id"] as? String,let task = try? scoped(db,taskID,raw["project_id"] as! String,type:"task") {value["task_key"] = task["key"];value["task_title"] = task["title"]}
+                if let taskID = raw["task_id"] as? String,let task = try? scoped(db,taskID,linkedProject,
+                    type:"task") {value["task_key"] = task["key"];value["task_title"] = task["title"]}
             }
             if type == "session",let project=projectIDs.first {value["project_id"]=project;value["project_ids"]=projectIDs}
             if type == "project" {
@@ -133,7 +137,7 @@ extension CommandRouter {
                 value["detail_tags"]=try records(db,type:"tag",project:value["id"] as? String)
             }
             if type == "group" {
-                let pid = raw["project_id"] as! String,gid = raw["id"] as! String
+                let pid = (try StoredRecord(raw, family: "record").string("project_id")),gid = (try StoredRecord(raw, family: "record").string("id"))
                 value["ticket_count"] = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type='task' AND project_id=? AND json_extract(data,'$.epic_id')=? COLLATE BINARY AND COALESCE(json_extract(data,'$.trashed'),0)=0",arguments:[pid,gid]) ?? 0
                 value["done_count"] = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records t JOIN records s ON s.type='status' AND s.project_id=t.project_id AND s.id=json_extract(t.data,'$.status_id') WHERE t.type='task' AND t.project_id=? AND json_extract(t.data,'$.epic_id')=? COLLATE BINARY AND COALESCE(json_extract(t.data,'$.trashed'),0)=0 AND json_extract(s.data,'$.category')='done'",arguments:[pid,gid]) ?? 0
             }
@@ -262,7 +266,7 @@ extension CommandRouter {
 
     private func workspaceRequestDetail(_ db:Database,_ source:JSON,task:JSON,caller:Caller)throws->JSON {
         var result=source
-        let pid=task["project_id"] as! String,rid=source["id"] as! String
+        let pid=(try StoredRecord(task, family: "task").string("project_id")),rid=(try StoredRecord(source, family: "record").string("id"))
         let messages=try scopedTaskRows(db,type:"message",task:task,predicate:"json_extract(data,'$.human_request_id')=CAST(? AS TEXT) COLLATE BINARY",arguments:[Data(rid.utf8)],limit:25,descending:true)
         let ids=try jsonString(messages.compactMap{$0["id"] as? String})
         let deliveries=try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='delivery' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.message_id') IN (SELECT value FROM json_each(?)) ORDER BY rowid DESC LIMIT 201",arguments:[Data(pid.utf8),ids]).map {try deliveryReceiptProjection(db,GRDBRecordEnvelopeAdapter.decode($0,expectedType:"delivery").object)}

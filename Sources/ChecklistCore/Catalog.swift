@@ -7,10 +7,27 @@ extension CommandRouter {
         let common = ["project_id","command_id","expected_revision"]
         var fields: [String:[String]] = [
             "service_info":[],"project_list":["include_archived"],"project_resolve":["workspace_path"],"project_settings_get":[],"policy_get":["revision","task_id"],"taxonomy_get":["revision"],
-            "session_attach_task":["task_id"],"session_register":["label","provider","workspace_path"],"session_update":["state","observation"],"session_list":["task_id","include_ended","cursor","limit"],"session_inbox":["cursor","attempt_id","limit"],"assistant_inbox":["task_id","cursor","limit"],"assistant_projects":[],
-            "task_create":["title","brief","acceptance","kind","planned_assignee","assignment_reason","tag_ids","epic_id","owner_request_ref"],"task_get":["task_id","key"],"task_list":["text","status_ids","archived","triage_id","epic_id","keys","fields","cursor","limit"],"task_context":["task_id","history_cursor","detail_level"],"task_edit":["task_id","patch"],"task_transition":["task_id","action","reason","target_status_id"],
-            "work_claim":["task_id","phase","policy_revision","file_scopes","lane_scopes","review_request_id","target_manifest_id","gate"],"work_checkpoint":["attempt_id","claim_token","progress","direction_cursor"],"work_release":["attempt_id","claim_token","reason","continuation","direction_cursor","final_report"],"work_submit":["attempt_id","claim_token","acceptance_revision","evidence_manifest","acceptance_evidence","direction_cursor","final_report"],"review_record":["attempt_id","claim_token","review_request_id","target_manifest_id","gate","verdict","checks","review_assessment","findings","finding_resolutions","supersedes_verdict_id","direction_cursor","reason","blocked_on","check","final_report","release_set","hold_reason"],"review_request":["task_id","target_manifest_id","gate","supersedes_request_id","reason","supplemental_evidence_refs"],"task_complete":["task_id","current_manifest_id","accepted_verdict_ids","direction_cursor","target_status_id"],
-            "message_send":["task_id","body","kind","recipient","reply_to","owner_request_ref","triage_id","epic_id"],"message_delivery_list":["task_id","message_id"],"message_ack":["delivery_id","stage","response_ref","reaction"],"history_list":["entity","task_id","triage_id","epic_id","conversation_id","cursor","limit"],"agent_resolve":["name","agent_profile_id","task_id"],"agent_message_send":["recipient_target","body","expects_reply","task_id","reply_to","owner_request_ref"],"human_request_create":["task_id","title","blocking","questions","file_requests","target_attachment_id","review_request_id","target_manifest_id"],"attachment_add":["task_id","source","path","name","expected_sha256","description","mode"],"attachment_list":["task_id","cursor","limit"],"attachment_read":["attachment_id","representation"],"attachment_cleanup_preview":["task_id"],"triage_list":["key","triage_id","fields"],"epic_list":["key"],"epic_delete":["epic_id"],"epic_create":["name","brief","description"],"triage_create":["name","purpose"],"triage_transition":["triage_id","group_id","target_status_id","action","reason","expected_member_revisions"],"epic_edit":["group_id","epic_id","name","brief","description"],"triage_edit":["group_id","triage_id","name","purpose"],"group_membership":["group_id","task_id","action","expected_task_revision","from_epic_id","from_epic_revision","handling_phase","exit_milestone"]]
+            "session_attach_task":["task_id"],"session_register":["label","provider","workspace_path"],"session_update":["state","observation"],"session_list":["task_id",
+                "include_ended","cursor","limit"],"session_inbox":["cursor","attempt_id","limit"],"assistant_inbox":["task_id","cursor","limit"],"assistant_projects":[],
+            "task_create":["title","brief","acceptance","kind","planned_assignee","assignment_reason","tag_ids","epic_id","owner_request_ref"],"task_get":["task_id","key"],
+                "task_list":["text","status_ids","archived","triage_id","epic_id","keys","fields","cursor","limit"],"task_context":["task_id","history_cursor","detail_level"],
+                "task_edit":["task_id","patch"],"task_transition":["task_id","action","reason","target_status_id"],
+            "work_claim":["task_id","phase","policy_revision","file_scopes","lane_scopes","review_request_id","target_manifest_id","gate"],"work_checkpoint":["attempt_id",
+                "claim_token","progress","direction_cursor"],"work_release":["attempt_id","claim_token","reason","continuation","direction_cursor","final_report"],
+                "work_submit":["attempt_id","claim_token","acceptance_revision","evidence_manifest","acceptance_evidence","direction_cursor","final_report"],
+                "review_record":["attempt_id","claim_token","review_request_id","target_manifest_id","gate","verdict","checks","review_assessment","findings","finding_resolutions",
+                "supersedes_verdict_id","direction_cursor","reason","blocked_on","check","final_report","release_set","hold_reason"],"review_request":["task_id",
+                "target_manifest_id","gate","supersedes_request_id","reason","supplemental_evidence_refs"],"task_complete":["task_id","current_manifest_id","accepted_verdict_ids",
+                "direction_cursor","target_status_id"],
+            "message_send":["task_id","body","kind","recipient","reply_to","owner_request_ref","triage_id","epic_id"],"message_delivery_list":["task_id","message_id"],
+                "message_ack":["delivery_id","stage","response_ref","reaction"],"history_list":["entity","task_id","triage_id","epic_id","conversation_id","cursor","limit"],
+                "agent_resolve":["name","agent_profile_id","task_id"],"agent_message_send":["recipient_target","body","expects_reply","task_id","reply_to","owner_request_ref"],
+                "human_request_create":["task_id","title","blocking","questions","file_requests","target_attachment_id","review_request_id","target_manifest_id"],
+                "attachment_add":["task_id","source","path","name","expected_sha256","description","mode"],"attachment_list":["task_id","cursor","limit"],
+                "attachment_read":["attachment_id","representation"],"attachment_cleanup_preview":["task_id"],"triage_list":["key","triage_id","fields"],"epic_list":["key"],
+                "epic_delete":["epic_id"],"epic_create":["name","brief","description"],"triage_create":["name","purpose"],"triage_transition":["triage_id","group_id",
+                "target_status_id","action","reason","expected_member_revisions"],"epic_edit":["group_id","epic_id","name","brief","description"],"triage_edit":["group_id",
+                "triage_id","name","purpose"],"group_membership":["group_id","task_id","action","expected_task_revision","from_epic_id","from_epic_revision","handling_phase","exit_milestone"]]
         let workflowFields: [String:[String]] = [
             "work_scope_adjust":["attempt_id","claim_token","file_scopes","lane_scopes"],
             "work_delegate":["attempt_id","claim_token","child_session_id","file_scopes","lane_scopes","brief"],
@@ -31,7 +48,8 @@ extension CommandRouter {
             "policy_apply":["policy","mode","proposal_id","digest","reason"],
             "project_edit":["name","key_prefix","icon","accent","brief","pinned_decisions","default_view","alert_override","capture_defaults"],
             "project_archive":["archived","reason"],
-            "project_settings_save":["name","key_prefix","icon","accent","brief","pinned_decisions","default_view","alert_override","capture_defaults","policy","mode","policy_proposal_id","policy_digest","reason"],
+            "project_settings_save":["name","key_prefix","icon","accent","brief","pinned_decisions","default_view","alert_override","capture_defaults","policy","mode",
+                "policy_proposal_id","policy_digest","reason"],
             "status_create":["name","color","category","sort_order"],"status_edit":["status_id","name","color","category","sort_order"],
             "status_retire":["status_id","remap_target_status_id","expected_task_revisions"],
             "tag_create":["name","color","sort_order"],"tag_edit":["tag_id","name","color","sort_order"],"tag_retire":["tag_id"],
@@ -103,7 +121,9 @@ extension CommandRouter {
         fields["archive_storage_settings"] = ["settings_revision","archive_storage"]
         fields["cleanup_job_list"] = ["task_id"]
         for command in ["cleanup_job_get","cleanup_job_cancel","cleanup_job_retry"] {fields[command] = ["cleanup_job_id"]}
-        let reader: Set<String> = ["service_info","project_list","project_resolve","project_settings_get","policy_get","taxonomy_get","session_list","task_create","task_get","task_list","task_context","message_send","message_ack","message_delivery_list","history_list","agent_resolve","agent_message_send","attachment_list","attachment_read","attachment_add","review_batch_inputs"]
+        let reader: Set<String> = ["service_info","project_list","project_resolve","project_settings_get","policy_get","taxonomy_get","session_list","task_create","task_get",
+            "task_list","task_context","message_send","message_ack","message_delivery_list","history_list","agent_resolve","agent_message_send","attachment_list","attachment_read",
+            "attachment_add","review_batch_inputs"]
         let assistants = reader.union(["assistant_projects","assistant_inbox"])
         var allowed = c.role == "assistant" ? assistants : Set(fields.keys).subtracting(["assistant_inbox","assistant_projects"])
         if c.role == "assistant" {
@@ -115,66 +135,111 @@ extension CommandRouter {
         }
         return allowed.sorted().compactMap { name in
             guard let extra = fields[name] else { return nil }
-            var properties: JSON = [:]
-            let keys = Set(extra + (name == "project_create" ? ["command_id"] : (name == "service_info" || name == "project_list" || name == "assistant_projects" ? [] : common)))
-            for key in keys {
-                if ["limit","expected_revision","expected_task_revision","from_epic_revision","policy_revision","acceptance_revision","revision","settings_revision","sort_order"].contains(key) { properties[key] = ["type":"integer","minimum":0] }
-                else if ["archived","blocking","expects_reply","include_archived","include_ended","required","include_completion_eligibility","cleanup","preview","undo","retain_cited_files","snoozed"].contains(key) { properties[key] = ["type":"boolean"] }
-                else if key == "ticket_cleanup" { properties[key] = Self.ticketCleanupSchema }
-                else if key == "command_id" { properties[key] = ["type":"string","format":"uuid","maxLength":4000,"description":"A new random UUID for each distinct command. Reuse the same UUID only to retry the same command with the same input."] }
-                else if ["keys","fields"].contains(key) { properties[key] = ["type":"array","items":["type":"string"],"maxItems":200] }
-                else if key == "pinned_decisions" { properties[key] = ["type":"array","maxItems":25] }
-                else if ["work_health_settings","default_view","capture_defaults","expected_task_revisions","expected_source_execution_revisions"].contains(key) { properties[key] = ["type":"object"] }
-                else if key == "selections" { properties[key] = Self.ordinaryMentionSelectionsSchema }
-                else if key == "evidence_refs" { properties[key] = ["type":"array","maxItems":100] }
-                else if key == "acceptance_evidence" { properties[key] = AcceptanceEvidence.schema }
-                else if key == "measures" { properties[key] = EvidenceMeasure.schema }
-                else if key == "supplemental_evidence_refs" { properties[key] = ["type":"array","maxItems":50] }
-                else if key == "inspected_images" { properties[key] = ["type":"array","maxItems":ImageInspectionIdentity.maximumImages,"items":["type":"object","required":["artifact_id","sha256","target_manifest_id"],"properties":["artifact_id":["type":"string"],"sha256":["type":"string"],"target_manifest_id":["type":"string"]],"additionalProperties":false],"description":"Explicit image inspection marks for this exact attachment/hash/manifest. A pass on image artifacts requires every candidate image; viewing or opening does not create a mark."] }
-                else if key == "final_report" { properties[key] = ["type":"string","maxLength":Self.finalReportLimit,"description":"Optional final report on this attempt (agent text, at most 64,000 bytes). It is stored on the attempt and shown on the ticket; it is never an owner note or direction."] }
-                else if name == "history_list" && key == "entity" { properties[key] = ["type":"string","enum":c.role == "assistant" ? ["project"] : ["project","backup"],"description":"Read the scoped project entity or backup receipts; mutually exclusive with task/group/conversation selectors."] }
-                else if key == "blocked_on" { properties[key] = ["type":"string","enum":["implementation","reviewer"]] }
-                else if key == "verdict" { properties[key] = ["type":"string","enum":Self.reviewVerdicts.sorted()] }
-                else if key == "severity" { properties[key] = ["type":"string","enum":Self.findingSeverities.sorted()] }
-                else if ["questions","file_requests","checks","findings","finding_resolutions","file_scopes","lane_scopes","acceptance","accepted_verdict_ids","tag_ids","status_ids","args","tasks","submissions","verdicts","members","direction_ids","submission_receipt_ids","observation_refs","file_state_refs","source_execution_ids","relations","aliases"].contains(key) { properties[key] = ["type":"array","maxItems":200] }
-                else if key == "expected_direction_cursors" { properties[key] = ["type":"object","maxProperties":1000,"additionalProperties":["type":"string"]] }
-                else if key == "expected_member_revisions" { properties[key] = ["type":"object","maxProperties":1000,"additionalProperties":["type":"integer","minimum":1]] }
-                else if key == "reaction" { properties[key] = ["type":"string","enum":Self.noteReactions.sorted()] }
-                else if key == "starter_fields" { properties[key] = ["type":"object","description":"Optional starter fields. Bug: reproduction, expected, actual. Playtest: build, platform, clip (a link or file name; attach the file itself with attachment_add).","properties":["reproduction":["type":"string","maxLength":16000],"expected":["type":"string","maxLength":4000],"actual":["type":"string","maxLength":4000],"build":["type":"string","maxLength":500],"platform":["type":"string","maxLength":200],"clip":["type":"string","maxLength":2000]],"additionalProperties":false] }
-                else if key == "recipient" { properties[key] = ["type":"object","properties":["kind":["type":"string","enum":["session"]],"session_id":["type":"string","minLength":1,"maxLength":4000,"pattern":"\\S"]],"required":["kind","session_id"],"additionalProperties":false] }
-                else if key == "view" { properties[key] = ["type":"object","properties":["surface":["type":"string","enum":["tickets","overview","archived","trash"]],"status_filter":["type":"string","maxLength":4000],"tag_filter":["type":"string","maxLength":4000],"tag_ids":["type":"array","items":["type":"string","minLength":1,"maxLength":4000],"maxItems":100,"uniqueItems":true],"tag_mode":["type":"string","enum":["any","all","none"]],"planned_assignee":["type":"string","minLength":1,"maxLength":4000],"actual_assignee":["type":"string","minLength":1,"maxLength":4000],"epic_id":["type":"string","minLength":1,"maxLength":4000],"triage_id":["type":"string","minLength":1,"maxLength":4000],"group_by":["type":"string","enum":["status","epic","none"]],"order_by":["type":"string","enum":["manual","priority","updated_desc"]]],"required":["surface","status_filter","tag_filter","group_by","order_by"],"additionalProperties":false] }
-                else if ["patch","source","evidence_manifest","owner_request_ref","planned_assignee","policy","command","response_ref","review_assessment","archive_storage","changes"].contains(key) { properties[key] = ["type":"object"] }
-                else { properties[key] = ["type":"string","maxLength":key == "body" || key == "brief" ? 65536 : 4000] }
-            }
-            if name == "task_edit" { properties["patch"] = ["type":"object","description":"Fields to change: title, brief, acceptance, kind (work|bug|asset|playtest|question), readiness (draft|ready), priority (none|low|normal|high|urgent), order, planned_assignee, assignment_reason, epic_id, tag_ids, starter_fields (Bug: reproduction, expected, actual; Playtest: build, platform, clip; replaces the whole set). readiness=ready needs a non-empty brief; open prerequisites do not block it."] }
-            if name == "work_submit" { properties["evidence_manifest"] = ["type":"object","description":"Immutable source, artifact or decision evidence. Optional measures record named upper budgets; they are advisory. Playtest tickets can include a hashed playtest_bundle; its files join artifact_refs and bind to the exact build.","properties":["measures":EvidenceMeasure.schema,"playtest_bundle":PlaytestBundle.schema,"installed_build_id":["type":"string","minLength":1,"maxLength":4000]]] }
-            if name == "batch_submit" { properties["members"] = ["type":"array","maxItems":200,"items":["type":"object","properties":["acceptance_evidence":AcceptanceEvidence.schema]],"description":"Every active member supplies its own work_submit claim, acceptance_revision, evidence_manifest, direction_cursor and acceptance_evidence. Any uncovered item refuses the entire batch before source copying or submission."] }
-            if ["policy_apply","project_settings_save"].contains(name) { properties["policy"] = ["type":"object","description":"The complete project policy (read policy_get first, change only what you need): routing_preset, allowed_providers (enabled qualified plugin IDs from service_info), roles {coordinator, implementer, reviewer: {providers, preferred_provider, preferred_models}}, required_gates, task_kind_overrides, review_batch_policy, lane_capacities, coordinator_session_id, allow_human_decision_evidence, review_requirements, agent_rule_changes (owner-only switch)."] }
-            if name == "ticket_cleanup_receipts" {
-                properties["section"] = ["type":"string","enum":["items","objects","source_build_cache"]]
-                properties["limit"] = ["type":"integer","minimum":1,"maximum":50]
-            }
-            var required: [String] = []
-            if !Self.readMethods.contains(name) { required.append("command_id") }
-            if name == "policy_apply" && !c.isOwner { required.append("reason") }
-            if name == "project_create" { required.append("name") }
-            if !["service_info","project_list","assistant_projects","assistant_inbox","project_resolve","project_create"].contains(name) && !(c.isOwner && ["task_list","task_context"].contains(name)) { required.append("project_id") }
-            if name == "batch_claim" { required.append("policy_revision");properties["policy_revision"] = ["type":"integer","minimum":1,"maximum":Int.max,"description":"Required positive policy_revision returned by batch_prepare."] }
-            if name == "epic_delete" { required += ["epic_id","expected_revision"] }
-            if name == "task_create" { required += ["title","epic_id"];properties["epic_id"] = ["type":"string","minLength":1,"maxLength":4000,"pattern":"\\S","description":"Required primary Epic in this project."] }
-            if name == "batch_discard" { required += ["batch_id","expected_revision","reason"] }
-            if name == "triage_transition" { required += ["expected_revision","expected_member_revisions"] }
-            if name == "task_bulk_edit" { required += ["tasks","changes"];properties["changes"] = Self.ticketBulkChangesSchema;properties["tasks"] = Self.ticketBulkTasksSchema }
-            if name == "task_bulk_undo" { required += ["tasks","original_command_id"];properties["tasks"] = Self.ticketBulkTasksSchema }
-            if name == "message_delivery_list" { required += ["task_id","message_id"] }
-            if name == "message_mentions_prepare" { required += ["task_id","body"] }
-            var schema: JSON = ["type":"object","properties":properties,"required":required,"additionalProperties":false]
-            if name == "triage_transition" {
-                schema["allOf"] = [["oneOf":[["required":["triage_id"],"not":["required":["group_id"]]],["required":["group_id"],"not":["required":["triage_id"]]]]],["oneOf":[["required":["target_status_id"],"not":["required":["action"]]],["required":["action"],"not":["required":["target_status_id"]]]]]]
-            }
-            return ["name":name,"description":description(name),"inputSchema":schema,"annotations":["readOnlyHint":Self.readMethods.contains(name),"idempotentHint":true,"openWorldHint":false]]
+            return catalogEntry(name: name, extra: extra, caller: c, common: common)
         }
     }
+    func catalogEntry(name: String, extra: [String], caller c: Caller, common: [String]) -> JSON {
+        var properties: JSON = [:]
+        let keys = Set(extra + (name == "project_create" ? ["command_id"] : (name == "service_info" || name == "project_list" || name == "assistant_projects" ? [] : common)))
+        for key in keys {
+            if ["limit","expected_revision","expected_task_revision","from_epic_revision","policy_revision","acceptance_revision","revision","settings_revision",
+                "sort_order"].contains(key) { properties[key] = ["type":"integer","minimum":0] }
+            else if ["archived","blocking","expects_reply","include_archived","include_ended","required","include_completion_eligibility","cleanup","preview","undo",
+                "retain_cited_files","snoozed"].contains(key) { properties[key] = ["type":"boolean"] }
+            else if key == "ticket_cleanup" { properties[key] = Self.ticketCleanupSchema }
+            else if key == "command_id" { properties[key] = ["type":"string","format":"uuid","maxLength":4000,
+                "description":"A new random UUID for each distinct command. Reuse the same UUID only to retry the same command with the same input."] }
+            else if ["keys","fields"].contains(key) { properties[key] = ["type":"array","items":["type":"string"],"maxItems":200] }
+            else if key == "pinned_decisions" { properties[key] = ["type":"array","maxItems":25] }
+            else if ["work_health_settings","default_view","capture_defaults","expected_task_revisions","expected_source_execution_revisions"].contains(key) { properties[key] = ["type":"object"] }
+            else if key == "selections" { properties[key] = Self.ordinaryMentionSelectionsSchema }
+            else if key == "evidence_refs" { properties[key] = ["type":"array","maxItems":100] }
+            else if key == "acceptance_evidence" { properties[key] = AcceptanceEvidence.schema }
+            else if key == "measures" { properties[key] = EvidenceMeasure.schema }
+            else if key == "supplemental_evidence_refs" { properties[key] = ["type":"array","maxItems":50] }
+            else if key == "inspected_images" { properties[key] = ["type":"array","maxItems":ImageInspectionIdentity.maximumImages,"items":["type":"object",
+                "required":["artifact_id","sha256","target_manifest_id"],"properties":["artifact_id":["type":"string"],"sha256":["type":"string"],
+                "target_manifest_id":["type":"string"]],"additionalProperties":false],
+                "description":"Explicit image inspection marks for this exact attachment/hash/manifest. A pass on image artifacts requires every candidate image; viewing " +
+                "or opening does not create a mark."] }
+            else if key == "final_report" { properties[key] = ["type":"string","maxLength":Self.finalReportLimit,
+                "description":"Optional final report on this attempt (agent text, at most 64,000 bytes). It is stored on the attempt and shown on the ticket; it is never " +
+                "an owner note or direction."] }
+            else if name == "history_list" && key == "entity" { properties[key] = ["type":"string","enum":c.role == "assistant" ? ["project"] : ["project","backup"],
+                "description":"Read the scoped project entity or backup receipts; mutually exclusive with task/group/conversation selectors."] }
+            else if key == "blocked_on" { properties[key] = ["type":"string","enum":["implementation","reviewer"]] }
+            else if key == "verdict" { properties[key] = ["type":"string","enum":Self.reviewVerdicts.sorted()] }
+            else if key == "severity" { properties[key] = ["type":"string","enum":Self.findingSeverities.sorted()] }
+            else if ["questions","file_requests","checks","findings","finding_resolutions","file_scopes","lane_scopes","acceptance","accepted_verdict_ids","tag_ids",
+                "status_ids","args","tasks","submissions","verdicts","members","direction_ids","submission_receipt_ids","observation_refs","file_state_refs",
+                "source_execution_ids","relations","aliases"].contains(key) { properties[key] = ["type":"array","maxItems":200] }
+            else if key == "expected_direction_cursors" { properties[key] = ["type":"object","maxProperties":1000,"additionalProperties":["type":"string"]] }
+            else if key == "expected_member_revisions" { properties[key] = ["type":"object","maxProperties":1000,"additionalProperties":["type":"integer","minimum":1]] }
+            else if key == "reaction" { properties[key] = ["type":"string","enum":Self.noteReactions.sorted()] }
+            else if key == "starter_fields" { properties[key] = ["type":"object",
+                "description":"Optional starter fields. Bug: reproduction, expected, actual. Playtest: build, platform, clip (a link or file name; attach the file itself " +
+                "with attachment_add).","properties":["reproduction":["type":"string","maxLength":16000],"expected":["type":"string","maxLength":4000],
+                "actual":["type":"string","maxLength":4000],"build":["type":"string","maxLength":500],"platform":["type":"string","maxLength":200],"clip":["type":"string",
+                "maxLength":2000]],"additionalProperties":false] }
+            else if key == "recipient" { properties[key] = ["type":"object","properties":["kind":["type":"string","enum":["session"]],"session_id":["type":"string",
+                "minLength":1,"maxLength":4000,"pattern":"\\S"]],"required":["kind","session_id"],"additionalProperties":false] }
+            else if key == "view" { properties[key] = ["type":"object","properties":["surface":["type":"string","enum":["tickets","overview","archived","trash"]],
+                "status_filter":["type":"string","maxLength":4000],"tag_filter":["type":"string","maxLength":4000],"tag_ids":["type":"array","items":["type":"string",
+                "minLength":1,"maxLength":4000],"maxItems":100,"uniqueItems":true],"tag_mode":["type":"string","enum":["any","all","none"]],"planned_assignee":["type":"string",
+                "minLength":1,"maxLength":4000],"actual_assignee":["type":"string","minLength":1,"maxLength":4000],"epic_id":["type":"string","minLength":1,"maxLength":4000],
+                "triage_id":["type":"string","minLength":1,"maxLength":4000],"group_by":["type":"string","enum":["status","epic","none"]],"order_by":["type":"string",
+                "enum":["manual","priority","updated_desc"]]],"required":["surface","status_filter","tag_filter","group_by","order_by"],"additionalProperties":false] }
+            else if ["patch","source","evidence_manifest","owner_request_ref","planned_assignee","policy","command","response_ref","review_assessment","archive_storage",
+                "changes"].contains(key) { properties[key] = ["type":"object"] }
+            else { properties[key] = ["type":"string","maxLength":key == "body" || key == "brief" ? 65536 : 4000] }
+        }
+        if name == "task_edit" { properties["patch"] = ["type":"object",
+            "description":"Fields to change: title, brief, acceptance, kind (work|bug|asset|playtest|question), readiness (draft|ready), priority " +
+            "(none|low|normal|high|urgent), order, planned_assignee, assignment_reason, epic_id, tag_ids, starter_fields (Bug: reproduction, expected, " +
+            "actual; Playtest: build, platform, clip; replaces the whole set). readiness=ready needs a non-empty brief; open prerequisites do not block " +
+            "it."] }
+        if name == "work_submit" { properties["evidence_manifest"] = ["type":"object",
+            "description":"Immutable source, artifact or decision evidence. Optional measures record named upper budgets; they are advisory. Playtest tickets can " +
+            "include a hashed playtest_bundle; its files join artifact_refs and bind to the exact build.","properties":["measures":EvidenceMeasure.schema,
+            "playtest_bundle":PlaytestBundle.schema,"installed_build_id":["type":"string","minLength":1,"maxLength":4000]]] }
+        if name == "batch_submit" { properties["members"] = ["type":"array","maxItems":200,"items":["type":"object",
+            "properties":["acceptance_evidence":AcceptanceEvidence.schema]],
+            "description":"Every active member supplies its own work_submit claim, acceptance_revision, evidence_manifest, direction_cursor and acceptance_evidence. " +
+            "Any uncovered item refuses the entire batch before source copying or submission."] }
+        if ["policy_apply","project_settings_save"].contains(name) { properties["policy"] = ["type":"object",
+            "description":"The complete project policy (read policy_get first, change only what you need): routing_preset, allowed_providers (enabled qualified plugin " +
+            "IDs from service_info), roles {coordinator, implementer, reviewer: {providers, preferred_provider, preferred_models}}, required_gates, " +
+            "task_kind_overrides, review_batch_policy, lane_capacities, coordinator_session_id, allow_human_decision_evidence, review_requirements, " +
+            "agent_rule_changes (owner-only switch)."] }
+        if name == "ticket_cleanup_receipts" {
+            properties["section"] = ["type":"string","enum":["items","objects","source_build_cache"]]
+            properties["limit"] = ["type":"integer","minimum":1,"maximum":50]
+        }
+        var required: [String] = []
+        if !Self.readMethods.contains(name) { required.append("command_id") }
+        if name == "policy_apply" && !c.isOwner { required.append("reason") }
+        if name == "project_create" { required.append("name") }
+        if !["service_info","project_list","assistant_projects","assistant_inbox","project_resolve","project_create"].contains(name) && !(c.isOwner && ["task_list",
+            "task_context"].contains(name)) { required.append("project_id") }
+        if name == "batch_claim" { required.append("policy_revision");properties["policy_revision"] = ["type":"integer","minimum":1,"maximum":Int.max,
+            "description":"Required positive policy_revision returned by batch_prepare."] }
+        if name == "epic_delete" { required += ["epic_id","expected_revision"] }
+        if name == "task_create" { required += ["title","epic_id"];properties["epic_id"] = ["type":"string","minLength":1,"maxLength":4000,"pattern":"\\S",
+            "description":"Required primary Epic in this project."] }
+        if name == "batch_discard" { required += ["batch_id","expected_revision","reason"] }
+        if name == "triage_transition" { required += ["expected_revision","expected_member_revisions"] }
+        if name == "task_bulk_edit" { required += ["tasks","changes"];properties["changes"] = Self.ticketBulkChangesSchema;properties["tasks"] = Self.ticketBulkTasksSchema }
+        if name == "task_bulk_undo" { required += ["tasks","original_command_id"];properties["tasks"] = Self.ticketBulkTasksSchema }
+        if name == "message_delivery_list" { required += ["task_id","message_id"] }
+        if name == "message_mentions_prepare" { required += ["task_id","body"] }
+        var schema: JSON = ["type":"object","properties":properties,"required":required,"additionalProperties":false]
+        if name == "triage_transition" {
+            schema["allOf"] = [["oneOf":[["required":["triage_id"],"not":["required":["group_id"]]],["required":["group_id"],"not":["required":["triage_id"]]]]],
+                ["oneOf":[["required":["target_status_id"],"not":["required":["action"]]],["required":["action"],"not":["required":["target_status_id"]]]]]]
+        }
+        return ["name":name,"description":description(name),"inputSchema":schema,"annotations":["readOnlyHint":Self.readMethods.contains(name),"idempotentHint":true,"openWorldHint":false]]
+    }
+
     func validateInput(_ method: String,_ p: JSON,_ c: Caller) throws {
         if method == "task_get" { _ = try ownerCompletionEligibilityRequested(p,caller:c) }
         if method == "task_context", ["ui","ui_records","ui_history"].contains(p["detail_level"] as? String ?? "") || p["selected_context_cursor"] != nil {try owner(c)}
@@ -271,69 +336,93 @@ extension CommandRouter {
         default:return method.replacingOccurrences(of:"_",with:" ").capitalized + " in the authenticated project scope."
         }
     }
+    func pendingNativeDeliveries(_ db: Database, _ p: JSON) throws -> JSON {
+        let includeAcknowledged = bool(p,"include_acknowledged")
+        let nativeSessions: [String]?
+        if let value = p["native_session_ids"] {
+            guard let ids = value as? [String],ids.count <= 4096,
+                  ids.allSatisfy({!$0.isEmpty && $0.utf8.count <= 4000}),!includeAcknowledged else {
+                throw CoreError("INVALID_INPUT","Native dispatch needs bounded exact session IDs, without acknowledged history.")
+            }
+            nativeSessions = ids
+        } else {nativeSessions = nil}
+        // Native dispatch can reach only current enrolled endpoints. Narrow its
+        // read before expanding retained messages/tickets. General pending/history
+        // reads keep their previous scope. This is not a grant or cached verdict.
+        let nativeSelection = try nativeSessions.map {try jsonString($0)}
+        let nativeCandidates = bool(p,"native_dispatch_candidates")
+        guard !nativeCandidates || nativeSessions != nil else {throw CoreError("INVALID_INPUT","Native candidates require exact session selection.")}
+        let deliveries = try readSnapshotCache.records(db,key:["pending-deliveries",includeAcknowledged ? "all":"open",nativeSelection,nativeCandidates ? "candidates":"pending"]) {
+            var sql = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='delivery'"
+            var arguments = StatementArguments()
+            if !includeAcknowledged {
+                sql += " AND CASE WHEN json_valid(data) THEN COALESCE(json_extract(data,'$.state') NOT IN ('acknowledged','addressed'),1) ELSE 1 END"
+            }
+            if let nativeSelection {
+                // Bind bytes to preserve NUL and Unicode identity. Every duplicate
+                // recipient key is considered; canonical/session checks still run.
+                sql += " AND CASE WHEN json_valid(data) THEN EXISTS (SELECT 1 FROM json_each(records.data) recipient JOIN json_each(CAST(? AS TEXT)) selected ON " +
+                    "CAST(recipient.value AS BLOB)=CAST(selected.value AS BLOB) WHERE recipient.key='recipient_session_id' AND recipient.type='text') ELSE 1 END"
+                arguments += [Data(nativeSelection.utf8)]
+            }
+            if nativeCandidates {
+                sql += " AND CASE WHEN json_valid(data) THEN EXISTS (SELECT 1 FROM json_each(records.data) WHERE key='push_state' AND type='text' AND CAST(value AS " +
+                    "BLOB)=CAST('unavailable' AS BLOB)) ELSE 1 END"
+            }
+            return try Row.fetchAll(db,sql:sql + " ORDER BY rowid",arguments:arguments)
+        }
+        let selectedSessions = nativeSessions.map {Set($0.map {Data($0.utf8)})}
+        let eligible = try deliveries.filter { d in
+            if nativeCandidates && d["push_state"] as? String != "unavailable" {return false}
+            if let selectedSessions,let sid = d["recipient_session_id"] as? String,!selectedSessions.contains(Data(sid.utf8)) {return false}
+            if bool(p,"include_acknowledged") { return true }; let session = try record(db,(try StoredRecord(d, family: "delivery").string("recipient_session_id")),type:"session");
+                return canReceive(session,project:(try StoredRecord(d, family: "delivery").string("project_id"))) && d["recipient_authorization_generation"] as? String == sessionGeneration(session) }
+        return ["deliveries":try eligible.map { d -> JSON in var d = d; var message = try record(db,(try StoredRecord(d, family: "delivery").string("message_id")),type:"message");
+            let subject = try subject(db,message:message);message["subject"] = subject;d["subject"] = subject
+            if let tid = message["task_id"] as? String { d["ticket"] = try scoped(db,tid,(try StoredRecord(message, family: "message").string("project_id")),type:"task") }
+            d["message"] = message; d["session"] = try record(db,(try StoredRecord(d, family: "delivery").string("recipient_session_id")),type:"session"); return d }]
+    }
+
     func bridge(_ db: Database,_ p: JSON,_ c: Caller,_ method: String) throws -> JSON {
         try owner(c); guard c.installation == "native-bridge" else { throw CoreError("FORBIDDEN","This command is reserved for the bundled delivery service.") }
-        if method == "delivery_pending" {
-            let includeAcknowledged = bool(p,"include_acknowledged")
-            let nativeSessions: [String]?
-            if let value = p["native_session_ids"] {
-                guard let ids = value as? [String],ids.count <= 4096,
-                      ids.allSatisfy({!$0.isEmpty && $0.utf8.count <= 4000}),!includeAcknowledged else {
-                    throw CoreError("INVALID_INPUT","Native dispatch needs bounded exact session IDs, without acknowledged history.")
-                }
-                nativeSessions = ids
-            } else {nativeSessions = nil}
-            // Native dispatch can reach only current enrolled endpoints. Narrow its
-            // read before expanding retained messages/tickets. General pending/history
-            // reads keep their previous scope. This is not a grant or cached verdict.
-            let nativeSelection = try nativeSessions.map {try jsonString($0)}
-            let nativeCandidates = bool(p,"native_dispatch_candidates")
-            guard !nativeCandidates || nativeSessions != nil else {throw CoreError("INVALID_INPUT","Native candidates require exact session selection.")}
-            let deliveries = try readSnapshotCache.records(db,key:["pending-deliveries",includeAcknowledged ? "all":"open",nativeSelection,nativeCandidates ? "candidates":"pending"]) {
-                var sql = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='delivery'"
-                var arguments = StatementArguments()
-                if !includeAcknowledged {
-                    sql += " AND CASE WHEN json_valid(data) THEN COALESCE(json_extract(data,'$.state') NOT IN ('acknowledged','addressed'),1) ELSE 1 END"
-                }
-                if let nativeSelection {
-                    // Bind bytes to preserve NUL and Unicode identity. Every duplicate
-                    // recipient key is considered; canonical/session checks still run.
-                    sql += " AND CASE WHEN json_valid(data) THEN EXISTS (SELECT 1 FROM json_each(records.data) recipient JOIN json_each(CAST(? AS TEXT)) selected ON CAST(recipient.value AS BLOB)=CAST(selected.value AS BLOB) WHERE recipient.key='recipient_session_id' AND recipient.type='text') ELSE 1 END"
-                    arguments += [Data(nativeSelection.utf8)]
-                }
-                if nativeCandidates {
-                    sql += " AND CASE WHEN json_valid(data) THEN EXISTS (SELECT 1 FROM json_each(records.data) WHERE key='push_state' AND type='text' AND CAST(value AS BLOB)=CAST('unavailable' AS BLOB)) ELSE 1 END"
-                }
-                return try Row.fetchAll(db,sql:sql + " ORDER BY rowid",arguments:arguments)
-            }
-            let selectedSessions = nativeSessions.map {Set($0.map {Data($0.utf8)})}
-            let eligible = try deliveries.filter { d in
-                if nativeCandidates && d["push_state"] as? String != "unavailable" {return false}
-                if let selectedSessions,let sid = d["recipient_session_id"] as? String,!selectedSessions.contains(Data(sid.utf8)) {return false}
-                if bool(p,"include_acknowledged") { return true }; let session = try record(db,d["recipient_session_id"] as! String,type:"session"); return canReceive(session,project:d["project_id"] as! String) && d["recipient_authorization_generation"] as? String == sessionGeneration(session) }
-            return ["deliveries":try eligible.map { d -> JSON in var d = d; var message = try record(db,d["message_id"] as! String,type:"message");let subject = try subject(db,message:message);message["subject"] = subject;d["subject"] = subject
-                if let tid = message["task_id"] as? String { d["ticket"] = try scoped(db,tid,message["project_id"] as! String,type:"task") }
-                d["message"] = message; d["session"] = try record(db,d["recipient_session_id"] as! String,type:"session"); return d }]
-        }
+        if method == "delivery_pending" { return try pendingNativeDeliveries(db,p) }
         if method == "delivery_record" {
             var d = try record(db,try text(p,"delivery_id"),type:"delivery")
-            let state = try text(p,"state"); if state == "uncertain",!(try deliveryCurrent(db,d)) { throw CoreError("RECIPIENT_CHANGED","The recipient authorization changed before native submission.") }; guard ["transport_written","held","failed","uncertain","provider_accepted","unavailable"].contains(state) else { throw CoreError("INVALID_INPUT","A bridge cannot fabricate recipient acknowledgment.") }
+            let state = try text(p,"state"); if state == "uncertain",!(try deliveryCurrent(db,d)) { throw CoreError("RECIPIENT_CHANGED",
+                "The recipient authorization changed before native submission.") }; guard ["transport_written","held","failed","uncertain","provider_accepted",
+                "unavailable"].contains(state) else { throw CoreError("INVALID_INPUT","A bridge cannot fabricate recipient acknowledgment.") }
             // Actual transport evidence is retained independently from recipient acknowledgment.
             d["push_state"] = state; d["transport_receipt"] = p["receipt"] ?? [:]
-            if !["acknowledged","addressed"].contains(d["state"] as? String ?? "") { d["state"] = ["held":"held_for_approval","failed":"unavailable","uncertain":"delivery_uncertain","provider_accepted":"provider_accepted","unavailable":"unavailable"][state] ?? "queued" }
-            d = revised(d); try save(db,d,type:"delivery"); try event(db,caller:c,project:d["project_id"] as? String,entity:d["message_id"] as? String,kind:"delivery_recorded",data:["state":state]); return d
+            if !["acknowledged","addressed"].contains(d["state"] as? String ?? "") { d["state"] = ["held":"held_for_approval","failed":"unavailable",
+                "uncertain":"delivery_uncertain","provider_accepted":"provider_accepted","unavailable":"unavailable"][state] ?? "queued" }
+            d = revised(d); try save(db,d,type:"delivery"); try event(db,caller:c,project:d["project_id"] as? String,entity:d["message_id"] as? String,kind:"delivery_recorded",
+                data:["state":state]); return d
         }
-        let pid = try text(p,"project_id"); var original = try scoped(db,try text(p,"reply_to"),pid,type:"message"); let sid = try text(p,"recipient_session_id"); let session = try scoped(db,sid,pid,type:"session")
-        guard try records(db,type:"delivery",project:pid).contains(where: {$0["message_id"] as? String == original["id"] as? String && $0["recipient_session_id"] as? String == sid && $0["recipient_authorization_generation"] as? String == sessionGeneration(session)}) else { throw CoreError("FORBIDDEN","The native reply does not match this recipient delivery.") }
-        guard original["reply_recipient_authorization_generation"] as? String == sessionGeneration(session),bool(original,"reply_allowed"),!bool(original,"reply_used"),original["reply_recipient_session_id"] as? String == sid,canReceive(session,project:pid) else { throw CoreError("FORBIDDEN","This exact native reply allowance is absent, used or revoked.") }
-        if session["role"] as? String == "assistant",(session["assistant_grants"] as? [String:[String:Bool]])?[pid]?["post_notes_on_request"] != true { throw CoreError("FORBIDDEN","This assistant's current grant does not permit requested replies.") }
+        let pid = try text(p,"project_id"); var original = try scoped(db,try text(p,"reply_to"),pid,type:"message"); let sid = try text(p,"recipient_session_id");
+            let session = try scoped(db,sid,pid,type:"session")
+        guard try records(db,type:"delivery",
+            project:pid).contains(where: {
+                $0["message_id"] as? String == original["id"] as? String && $0["recipient_session_id"] as? String == sid &&
+                $0["recipient_authorization_generation"] as? String == sessionGeneration(session)
+            }) else { throw CoreError("FORBIDDEN","The native reply does not match this recipient delivery.") }
+        guard original["reply_recipient_authorization_generation"] as? String == sessionGeneration(session),bool(original,"reply_allowed"),!bool(original,"reply_used"),
+            original["reply_recipient_session_id"] as? String == sid,canReceive(session,project:pid) else { throw CoreError("FORBIDDEN",
+            "This exact native reply allowance is absent, used or revoked.") }
+        if session["role"] as? String == "assistant",(session["assistant_grants"] as? [String:[String:Bool]])?[pid]?["post_notes_on_request"] != true { throw CoreError("FORBIDDEN",
+            "This assistant's current grant does not permit requested replies.") }
         guard providerPlugins.plugin(session["provider"] as? String ?? "", requiring: .nativePeer) != nil else {
-            throw CoreError("ADAPTER_UNAVAILABLE","This provider has no enabled qualified native reply adapter. The saved note and reply allowance remain available for recovery or authenticated pickup.")
+            throw CoreError("ADAPTER_UNAVAILABLE",
+                "This provider has no enabled qualified native reply adapter. The saved note and reply allowance remain available for recovery or authenticated pickup.")
         }
         original["reply_used"] = true; try save(db,revised(original),type:"message")
-        for var delivery in try records(db,type:"delivery",project:pid) where delivery["message_id"] as? String == original["id"] as? String && delivery["recipient_session_id"] as? String == sid { delivery["state"] = "acknowledged"; delivery["acknowledged_at"] = now(); delivery["acknowledgment_evidence"] = p["source_evidence"] ?? [:]; try save(db,revised(delivery),type:"delivery") }
-        var reply: JSON = ["id":uuid(),"project_id":pid,"body":try text(p,"body"),"origin":"agent","kind":"reply","author":"native:"+sid,"author_session_id":sid,"author_display":session["label"] ?? "Native agent","reply_to":original["id"]!,"source_evidence":p["source_evidence"] ?? [:],"verification_source":"same_user_native_peer","revision":1,"created_at":now()]
+        for var delivery in try records(db,type:"delivery",
+            project:pid) where delivery["message_id"] as? String == original["id"] as? String && delivery["recipient_session_id"] as? String == sid {
+            delivery["state"] = "acknowledged"; delivery["acknowledged_at"] = now(); delivery["acknowledgment_evidence"] = p["source_evidence"] ?? [:]; try save(db,revised(delivery),type:"delivery") }
+        var reply: JSON = ["id":uuid(),"project_id":pid,"body":try text(p,"body"),"origin":"agent","kind":"reply","author":"native:"+sid,"author_session_id":sid,
+            "author_display":session["label"] ?? "Native agent","reply_to":original["id"]!,"source_evidence":p["source_evidence"] ?? [:],
+            "verification_source":"same_user_native_peer","revision":1,"created_at":now()]
         for key in ["task_id","conversation_id","triage_id","epic_id"] { if let value = original[key] { reply[key] = value } }
-        try save(db,reply,type:"message"); if let health = try reconcileHealthReply(db,reply:reply,caller:c) { reply["health_reconciliation"] = health }; try event(db,caller:c,project:pid,entity:original["task_id"] as? String ?? original["conversation_id"] as? String,kind:"native_reply_received",data:["reply_id":reply["id"]!]); return reply
+        try save(db,reply,type:"message"); if let health = try reconcileHealthReply(db,reply:reply,caller:c) { reply["health_reconciliation"] = health }; try event(db,caller:c,
+            project:pid,entity:original["task_id"] as? String ?? original["conversation_id"] as? String,kind:"native_reply_received",data:["reply_id":reply["id"]!]); return reply
     }
 }

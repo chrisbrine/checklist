@@ -1,8 +1,10 @@
 # Shared module extraction (CL-98)
 
 `Packages/ChecklistShared` is the first real portable package. Its targets use
-Swift 6 language mode (complete concurrency checking); the existing macOS root
-retains its current language mode and product identities. The shared package
+Swift 6 language mode (complete concurrency checking). The macOS root enables
+complete checking and converts bounded targets to Swift 6; remaining adapter
+and fixture boundaries are recorded in [the concurrency audit](swift-concurrency.md).
+Product identities are unchanged. The shared package
 has no external dependencies or platform minimum, and does not depend on the
 root package. This source boundary is not a claim of qualified non-macOS products.
 
@@ -16,6 +18,8 @@ The package has no GRDB, AppKit, SwiftUI, Security, XPC, credential, process or
 filesystem effects. Native code supplies authenticated scope and transactional
 state. Metadata classifies request/receipt behavior; it never authorizes a call.
 `coreReads` excludes the service-only `connection_list` and `task_handoff_prepare`.
+`mediaInternalReads` classifies the internal media dispatcher; it intentionally
+differs from the owner-channel media reads. Both sets live in `CommandMethods`.
 Owner media lease reads retain their existing writer fallback in Core.
 
 ## Capture transaction
@@ -86,9 +90,32 @@ combined target; unit tests do not establish native UI/transport qualification.
    state, membership, events and principal-scoped receipt in one transaction. A
    rollback restores the previous code/manifest together; it never resets data.
 
+## Checked record consumers (CL-88)
+
+Core's `StoredRecord` is a field-on-demand compatibility view of open JSON.
+Mandatory string, object and object-array access throws `CANONICAL_RECORD_INVALID`
+for a missing, null or wrongly typed field. Presence-only access retains every
+present dynamic value, including null. Optional fields keep the existing helper
+defaults and Foundation Boolean/number bridging. `StoredTaskRecord` and
+`StoredAttemptRecord` expose checked identities and the shared Domain enum views;
+an unknown enum spelling remains in the raw record and is not silently rewritten.
+
+These consumer views do not replace the canonical storage envelope, revise the
+schema, authorize work or close extensible records with synthesized Codable.
+The existing JSON serializer and hash producers retain their legacy bytes.
+Core command, read, review, group, media and managed-file consumers use the checked
+views at mandatory field access. App command replies validate required identity
+before applying navigation or clearing capture text; display-only optional fields
+retain their established fallbacks. CLI continues through typed MCP values and
+IPC's authoritative read-method classification.
+
 The root's former blanket `Packages/` ignore is removed now that the first authored
 package exists. Package-local `.build`/`.swiftpm` remain ignored. CL-97's complete
 local-package inventory includes manifests, sources, tests and resources in
 immutable captures, including nonignored untracked package inputs. Do not ship
 package code that is absent from that capture. Staging/helper/signing paths and
 all executable identifiers stay unchanged.
+
+The implemented native/storage seams and retained authority owners are documented
+in [platform adapters](platform-adapters.md). Their interfaces stay in native root
+targets; ChecklistShared gains no OS, SQL, process or credential dependency.

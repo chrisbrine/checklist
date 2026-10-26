@@ -74,7 +74,7 @@ struct TransferBundle {
             guard let rows = raw as? [JSON],rows.count <= 20_000 else {throw CoreError("IMPORT_SHAPE_INVALID","Invalid or oversized \(key) array.")};return rows
         }
         if format == "checklist-project/1" {
-            add("project",doc["project"] as! JSON,"/project")
+            add("project",try exportedProject(doc),"/project")
             for family in CommandRouter.projectExportTypes + ["profiles","import_record","import_receipt"] where doc[family] != nil {
                 // projectExportTypes may already include transfer families.
                 if entries.contains(where:{$0.family == family}) {continue}
@@ -153,6 +153,13 @@ struct TransferBundle {
         return Self(schema:format,namespace:namespace,document:doc,entries:entries,files:files,sourceHash:sourceHash,diagnostics:diagnostics,blockers:blockers,source:source,identities:identities,sourceHashes:sourceHashes)
     }
 
+    private static func exportedProject(_ document: JSON) throws -> JSON {
+        guard let project = document["project"] as? JSON else {
+            throw CoreError("IMPORT_SHAPE_INVALID", "Expected a version-1 Checklist project export.")
+        }
+        return project
+    }
+
     static func verdicts(_ payload: Any,shape: String) throws -> [JSON] {
         func invalid() -> CoreError {CoreError("IMPORT_SHAPE_INVALID","Verdict payload does not match its selected version-1 layout.")}
         switch shape {
@@ -161,7 +168,10 @@ struct TransferBundle {
         case "verdict-list":guard let rows = payload as? [JSON],rows.allSatisfy({$0["task"] is String && ($0["result"] is String || $0["verdict"] is String)}) else {throw invalid()};return rows
         case "keyed-verdicts":
             guard let rows = payload as? [String:JSON] else {throw invalid()}
-            return try rows.keys.sorted().map {key in guard rows[key]?["review"] is String else {throw invalid()};return ["task":key,"raw":rows[key]!]}
+            return try rows.keys.sorted().map { key in
+                guard let row = rows[key],row["review"] is String else { throw invalid() }
+                return ["task":key,"raw":row]
+            }
         case "round-envelope":
             guard let object = payload as? JSON,let rounds = object["rounds"] as? [JSON],rounds.allSatisfy({$0["round"] is NSNumber && $0["verdicts"] is [JSON]}) else {throw invalid()};return rounds
         case "direction-verdicts":

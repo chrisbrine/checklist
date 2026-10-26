@@ -22,13 +22,12 @@ struct TicketPageQuery: Equatable {
     }
 
     func parameters(cursor: String? = nil) -> [String: Any] {
-        var result: [String: Any] = [
-            "view": ["surface": surface, "status_filter": statusFilter,
-                     "tag_filter": tagFilter, "group_by": groupBy, "order_by": orderBy],
-            "text": text, "limit": 200
+        var view: [String: Any] = [
+            "surface": surface, "status_filter": statusFilter,
+            "tag_filter": tagFilter, "group_by": groupBy, "order_by": orderBy
         ]
-        var view = result["view"] as! [String: Any]
-        view.merge(filters.parameters) { _, new in new }; result["view"] = view
+        view.merge(filters.parameters) { _, new in new }
+        var result: [String: Any] = ["view": view, "text": text, "limit": 200]
         if let projectID { result["project_id"] = projectID }
         if let cursor { result["cursor"] = cursor }
         return result

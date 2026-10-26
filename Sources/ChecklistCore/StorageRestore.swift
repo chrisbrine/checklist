@@ -167,7 +167,8 @@ extension CommandRouter {
             while let row = try rows.next() {
                 try budget.check()
                 try autoreleasepool {
-                var value = try GRDBRecordEnvelopeAdapter.decode(row).object
+                let decoded = try GRDBRecordEnvelopeAdapter.decode(row)
+                var value = decoded.object
                 let type: String = row["type"]
                 switch type {
                 case "session":
@@ -188,7 +189,7 @@ extension CommandRouter {
                 }
                 let envelope = try GRDBRecordEnvelopeAdapter.incoming(value,type:type)
                 _ = try GRDBRecordEnvelopeAdapter.compareSave(incoming:envelope,previous:row)
-                try db.execute(sql:"UPDATE records SET data=? WHERE id=CAST(? AS TEXT)",arguments:[try jsonString(value),Data((value["id"] as! String).utf8)])
+                try db.execute(sql:"UPDATE records SET data=? WHERE id=CAST(? AS TEXT)",arguments:[try jsonString(value),Data(decoded.id.utf8)])
                 }
             }
             _ = try SchemaMigrations.inspect(db)

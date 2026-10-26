@@ -54,8 +54,36 @@ extension CommandRouter {
         if let expected = p["expected_sha256"] as? String,expected != digest { throw CoreError("SOURCE_CHANGED","The file changed before import.") }
         let modeInput = p["mode"] as? String ?? "managed"; let mode = ["reference","external_reference"].contains(modeInput) ? "external_reference" : "managed"
         let id = uuid()
-        let a: JSON = ["id":id,"project_id":pid,"task_id":task["id"]!,"artifact_id":id,"name":p["name"] ?? url.lastPathComponent,"description":p["description"] ?? "","mode":mode,"path":path,"sha256":digest,"size":size,"availability":"available","keep_original":false,"unlinked":false,"revision":1,"created_at":now(),"author":c.principal,"origin":c.isOwner ? "human_ui" : c.role]
-        try save(db,a,type:"attachment"); try event(db,caller:c,project:pid,entity:task["id"] as? String,kind:"attachment_added",data:["attachment_id":id,"name":a["name"]!]); var response = a
+        let a: JSON = ["id":id,
+            "project_id":pid,
+            "task_id":(try StoredRecord(task,
+            family: "Attachments").requiredValue("id")),
+            "artifact_id":id,
+            "name":p["name"] ?? url.lastPathComponent,
+            "description":p["description"] ?? "",
+            "mode":mode,
+            "path":path,
+            "sha256":digest,
+            "size":size,
+            "availability":"available",
+            "keep_original":false,
+            "unlinked":false,
+            "revision":1,
+            "created_at":now(),
+            "author":c.principal,
+            "origin":c.isOwner ? "human_ui" : c.role]
+        try save(db,
+            a,
+            type:"attachment");
+            try event(db,
+            caller:c,
+            project:pid,
+            entity:task["id"] as? String,
+            kind:"attachment_added",
+            data:["attachment_id":id,
+            "name":(try StoredRecord(a,
+            family: "Attachments").requiredValue("name"))]);
+            var response = a
         if !c.isOwner { response.removeValue(forKey:"path"); response.removeValue(forKey:"preview_path") }; return response
     }
     func attachmentRead(_ db: Database,_ p: JSON,_ c: Caller,_ method: String) throws -> JSON {
@@ -67,18 +95,25 @@ extension CommandRouter {
             if representation == "metadata" { if !c.isOwner { a.removeValue(forKey:"path"); a.removeValue(forKey:"preview_path") }; return a }
             let selected = representation == "preview" ? (a["preview_path"] as? String ?? a["path"] as? String) : a["path"] as? String
             let managedOriginal = representation == "original" && a["mode"] as? String == "managed"
-            func observed(_ failure: CoreError,path: String) -> Error {
+            func observed(_ failure: CoreError,path: String) throws -> Error {
                 guard managedOriginal else { return failure }
-                return ManagedOriginalReadFailure(projectID:pid,attachmentID:a["id"] as! String,revision:int(a,"revision"),path:selected ?? path,sha256:a["sha256"] as? String,failure:failure)
+                return ManagedOriginalReadFailure(projectID:pid,
+                    attachmentID:(try StoredRecord(a,
+                    family: "Attachments").string("id")),
+                    revision:int(a,
+                    "revision"),
+                    path:selected ?? path,
+                    sha256:a["sha256"] as? String,
+                    failure:failure)
             }
             guard let stored = selected else { throw CoreError("ORIGINAL_CLEANED","The original is unavailable; its metadata is retained.") }
             let readsManaged = a["mode"] as? String == "managed" || representation == "preview" && a["preview_path"] != nil
             let path: String
             if readsManaged {
                 do { path = try managedURL(stored,family:"objects").path }
-                catch let failure as CoreError { throw observed(failure,path:stored) }
+                catch let failure as CoreError { throw try observed(failure,path:stored) }
             } else { path = stored }
-            if !readsManaged,!FileManager.default.fileExists(atPath:path) { throw observed(CoreError("ORIGINAL_CLEANED","The original is unavailable; its metadata is retained."),path:path) }
+            if !readsManaged,!FileManager.default.fileExists(atPath:path) { throw try observed(CoreError("ORIGINAL_CLEANED","The original is unavailable; its metadata is retained."),path:path) }
             if representation != "metadata" {
                 let bytes: Data
                 do {
@@ -98,12 +133,14 @@ extension CommandRouter {
                     guard managedOriginal else { throw error }
                     // Attribute only the actual managed-original open/read. Raw
                     // Cocoa descriptions can contain paths and are not public.
-                    throw observed(CoreError("MANAGED_ORIGINAL_UNAVAILABLE","The managed original could not be read.",details:["reason":"original_open_or_read_failed"]),path:path)
+                    throw try observed(CoreError("MANAGED_ORIGINAL_UNAVAILABLE","The managed original could not be read.",details:["reason":"original_open_or_read_failed"]),path:path)
                 }
                 // Without a separate preview file, a "preview" read returns the original's
                 // bytes and so needs the same immutable identity check.
                 let separatePreview = representation == "preview" && a["preview_path"] is String
-                guard separatePreview || hash(bytes) == a["sha256"] as? String else { throw observed(CoreError("SOURCE_CHANGED","The original no longer matches its immutable identity."),path:path) }
+                guard separatePreview || hash(bytes) == a["sha256"] as? String else { throw try observed(CoreError("SOURCE_CHANGED",
+                    "The original no longer matches its immutable identity."),
+                    path:path) }
                 if representation == "original", a["mode"] as? String == "managed", a["availability"] as? String == "unavailable" {
                     a["availability"] = "available"; a.removeValue(forKey:"availability_error"); a = revised(a); try save(db,a,type:"attachment")
                     if let job = a["storage_job_id"] as? String { managedImportRecoveryFailures.removeValue(forKey:Data(job.utf8)) }
@@ -112,7 +149,18 @@ extension CommandRouter {
                     a["url"] = path
                     if representation == "original",a["mode"] as? String == "managed" {
                         let holdID = uuid(),expiry = Date().addingTimeInterval(300)
-                        try save(db,["id":holdID,"project_id":pid,"kind":"reader","attachment_id":a["id"]!,"state":"active","expires_at":expiry.timeIntervalSince1970,"author":c.principal,"revision":1,"created_at":now()],type:"storage_hold")
+                        try save(db,
+                            ["id":holdID,
+                            "project_id":pid,
+                            "kind":"reader",
+                            "attachment_id":(try StoredRecord(a,
+                            family: "Attachments").requiredValue("id")),
+                            "state":"active",
+                            "expires_at":expiry.timeIntervalSince1970,
+                            "author":c.principal,
+                            "revision":1,
+                            "created_at":now()],
+                            type:"storage_hold")
                         a["read_hold_id"] = holdID;a["read_hold_expires_at"] = ISO8601DateFormatter().string(from:expiry)
                     }
                 } else { guard bytes.count <= 8 * 1024 * 1024 else { throw CoreError("FILE_TOO_LARGE","This file exceeds the bounded MCP read limit.") }; a["content_base64"] = bytes.base64EncodedString() }
@@ -134,7 +182,12 @@ extension CommandRouter {
         try archiveRetentionPreview(db,task:task)
     }
     func cleanupHoldReasons(_ db: Database,attachment: JSON,task: JSON) throws -> [String] {
-        let pid = task["project_id"] as! String,tid = task["id"] as! String,id = attachment["id"] as! String
+        let pid = (try StoredRecord(task,
+            family: "Attachments").string("project_id")),
+            tid = (try StoredRecord(task,
+            family: "Attachments").string("id")),
+            id = (try StoredRecord(attachment,
+            family: "Attachments").string("id"))
         var reasons: [String] = []
         if bool(attachment,"keep_original") { reasons.append("Keep original") }
         if task["active_attempt_id"] != nil || task["active_verification_request_id"] != nil { reasons.append("Active work or verification") }
@@ -178,8 +231,14 @@ extension CommandRouter {
             captured = try self.projectExportRecords(db,pid:pid)
             for attachment in captured["attachment"] as? [JSON] ?? [] where attachment["mode"] as? String == "managed" && attachment["availability"] as? String == "available" {
                 let id = uuid();holds.append(id)
-                try self.save(db,["id":id,"project_id":pid,"kind":"reader","purpose":"project_export","attachment_id":attachment["id"]!,
-                    "sha256":attachment["sha256"]!,"size":attachment["size"]!,"state":"active","author":c.principal,
+                try self.save(db,["id":id,"project_id":pid,"kind":"reader","purpose":"project_export","attachment_id":(try StoredRecord(attachment, family: "Attachments").requiredValue("id")),
+                    "sha256":(try StoredRecord(attachment,
+                        family: "Attachments").requiredValue("sha256")),
+                        "size":(try StoredRecord(attachment,
+                        family: "Attachments").requiredValue("size")),
+                        "state":"active",
+                        "author":c.principal,
+
                     "expires_at":Date().addingTimeInterval(300).timeIntervalSince1970,"revision":1,"created_at":now()],type:"storage_hold")
             }
             return .commit
@@ -324,7 +383,14 @@ extension CommandRouter {
         var exported = captured
         if var project = exported["project"] as? JSON,let iconPath = project["icon_path"] as? String,let asset = project["icon_asset"] as? JSON {
             let bytes = try managedRead(iconPath,family:"icons",maximum:5 * 1024 * 1024);guard hash(bytes) == asset["sha256"] as? String else { throw CoreError("SOURCE_CHANGED","The project icon failed checksum validation.") }
-            let relative = "icons/"+(asset["id"] as! String)+".png";try FileManager.default.createDirectory(at:directory.appendingPathComponent("icons"),withIntermediateDirectories:true);try bytes.write(to:directory.appendingPathComponent(relative),options:.atomic);project["icon_path"] = relative;exported["project"] = project
+            let relative = "icons/"+((try StoredRecord(asset,
+                family: "Attachments").string("id")))+".png";
+                try FileManager.default.createDirectory(at:directory.appendingPathComponent("icons"),
+                withIntermediateDirectories:true);
+                try bytes.write(to:directory.appendingPathComponent(relative),
+                options:.atomic);
+                project["icon_path"] = relative;
+                exported["project"] = project
         }
         for type in Self.projectExportTypes {
             var values = exported[type] as? [JSON] ?? []
@@ -332,11 +398,23 @@ extension CommandRouter {
                 if type == "attachment",values[i]["mode"] as? String == "managed",values[i]["availability"] as? String == "available",let original = values[i]["path"] as? String {
                     let bytes = try managedRead(original,family:"objects",maximum:500 * 1024 * 1024)
                     guard hash(bytes) == values[i]["sha256"] as? String,bytes.count == int(values[i],"size") else { throw CoreError("SOURCE_CHANGED","An export object failed checksum validation.") }
-                    let relative = "objects/"+(values[i]["id"] as! String);try FileManager.default.createDirectory(at:directory.appendingPathComponent("objects"),withIntermediateDirectories:true);try bytes.write(to:directory.appendingPathComponent(relative),options:.atomic);values[i]["path"] = relative
+                    let relative = "objects/"+((try StoredRecord(values[i],
+                        family: "Attachments").string("id")));
+                        try FileManager.default.createDirectory(at:directory.appendingPathComponent("objects"),
+                        withIntermediateDirectories:true);
+                        try bytes.write(to:directory.appendingPathComponent(relative),
+                        options:.atomic);
+                        values[i]["path"] = relative
                 }
                 if type == "attachment",let path = values[i]["preview_path"] as? String {
                     let bytes = try managedRead(path,family:"objects",maximum:500 * 1024 * 1024)
-                    let relative = "previews/"+(values[i]["id"] as! String)+".png";try FileManager.default.createDirectory(at:directory.appendingPathComponent("previews"),withIntermediateDirectories:true);try bytes.write(to:directory.appendingPathComponent(relative),options:.atomic);values[i]["preview_path"] = relative
+                    let relative = "previews/"+((try StoredRecord(values[i],
+                        family: "Attachments").string("id")))+".png";
+                        try FileManager.default.createDirectory(at:directory.appendingPathComponent("previews"),
+                        withIntermediateDirectories:true);
+                        try bytes.write(to:directory.appendingPathComponent(relative),
+                        options:.atomic);
+                        values[i]["preview_path"] = relative
                 }
                 if type == "source_capture" { values[i] = try exportSourceCapture(values[i],directory:directory) }
                 if type == "source_execution" { values[i] = try exportSourceExecution(values[i],directory:directory) }

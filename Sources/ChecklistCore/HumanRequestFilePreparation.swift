@@ -24,11 +24,21 @@ extension CommandRouter {
     /// a failed transaction, restart or lost reply. Neither the digest nor a new UUID
     /// can turn a changed enclosing intent into another import.
     func humanAnswerImportParams(_ p: JSON,request: JSON,file: JSON,path: String) throws -> JSON {
-        let seed = try jsonString(["kind":"human_request_answer_file","command_id":p["command_id"]!,
-            "request_id":request["id"]!,"file_request_id":file["file_request_id"]!,"path":path])
+        let seed = try jsonString(["kind":"human_request_answer_file","command_id":(try StoredRecord(p, family: "HumanRequestFilePreparation").requiredValue("command_id")),
+            "request_id":(try StoredRecord(request,
+                family: "HumanRequestFilePreparation").requiredValue("id")),
+                "file_request_id":(try StoredRecord(file,
+                family: "HumanRequestFilePreparation").requiredValue("file_request_id")),
+                "path":path])
         let chars = Array(hash(Data(seed.utf8)).prefix(32))
         let command = String(chars[0..<8]) + "-" + String(chars[8..<12]) + "-" + String(chars[12..<16]) + "-" + String(chars[16..<20]) + "-" + String(chars[20..<32])
-        var input: JSON = ["project_id":request["project_id"]!,"task_id":request["task_id"]!,"path":path,"mode":"managed","command_id":command]
+        var input: JSON = ["project_id":(try StoredRecord(request,
+            family: "HumanRequestFilePreparation").requiredValue("project_id")),
+            "task_id":(try StoredRecord(request,
+            family: "HumanRequestFilePreparation").requiredValue("task_id")),
+            "path":path,
+            "mode":"managed",
+            "command_id":command]
         input["expected_sha256"] = (file["path_sha256"] as? [String:String])?[path]
         return input
     }
@@ -66,10 +76,15 @@ extension CommandRouter {
                 if !reserved {
                     try ArchiveStorageGate.withExclusive(root:self.root) { _ in try self.dbQueue.write { db in
                         _ = try self.scope(db,p,c,write:true);try self.owner(c)
-                        let current = try self.scoped(db,plan.request["id"] as! String,plan.request["project_id"] as! String,type:"request")
+                        let current = try self.scoped(db,
+                            (try StoredRecord(plan.request,
+                            family: "HumanRequestFilePreparation").string("id")),
+                            (try StoredRecord(plan.request,
+                            family: "HumanRequestFilePreparation").string("project_id")),
+                            type:"request")
                         try self.revision(p,current)
                         if current["review_request_id"] != nil { try self.validateHumanGateDirection(db,request:current,params:p,caller:c) }
-                        let command = p["command_id"] as! String
+                        let command = (try StoredRecord(p, family: "HumanRequestFilePreparation").string("command_id"))
                         try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:c)
                         let key = try self.pendingStorageCommandKey(principal:c.principal,command:command)
                         try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[key,try jsonString(["kind":"human_request_answer","intent_digest":digest])])
@@ -79,7 +94,11 @@ extension CommandRouter {
                 let input = try self.humanAnswerImportParams(p,request:plan.request,file:file,path:path)
                 attempted.append(input)
                 try ArchiveStorageGate.withExclusive(root:self.root) { _ in try self.dbQueue.write { db in
-                    try self.requirePendingCommandIntent(db,command:input["command_id"] as! String,digest:hash(Data(("attachment_add" + (try jsonString(input))).utf8)),caller:c)
+                    try self.requirePendingCommandIntent(db,
+                        command:(try StoredRecord(input,
+                        family: "HumanRequestFilePreparation").string("command_id")),
+                        digest:hash(Data(("attachment_add" + (try jsonString(input))).utf8)),
+                        caller:c)
                 } }
                 let resolved = try StorageFolderAccess.lexicalPath(path)
                 let prepared: ManagedAttachmentPreparation
@@ -104,15 +123,22 @@ extension CommandRouter {
                     guard try self.managedAnswerSelectionIdentity(resolved,folderAccess:folderAccess) == before else { throw CoreError("SOURCE_CHANGED","A selected original changed during import. Your draft remains saved.") }
                     selections[path] = .init(path:resolved,identity:before,managed:true)
                 }
-                imports[input["command_id"] as! String] = .init(params:input,prepared:prepared)
-                return prepared.attachment["sha256"] as! String
+                imports[(try StoredRecord(input, family: "HumanRequestFilePreparation").string("command_id"))] = .init(params:input,prepared:prepared)
+                return (try StoredRecord(prepared.attachment, family: "HumanRequestFilePreparation").string("sha256"))
             } : nil,observe: { path,identity in
                 selections[path] = .init(path:canonical(path),identity:identity)
             })
             for file in files where file["mode"] as? String == "reference" {
                 for path in strings(file,"paths") where selections[path] == nil { selections[path] = .init(path:canonical(path),identity:nil) }
             }
-            return .init(digest:digest,requestID:plan.request["id"] as! String,revision:int(plan.request,"revision"),files:files,selections:selections,imports:imports)
+            return .init(digest:digest,
+                requestID:(try StoredRecord(plan.request,
+                family: "HumanRequestFilePreparation").string("id")),
+                revision:int(plan.request,
+                "revision"),
+                files:files,
+                selections:selections,
+                imports:imports)
         } catch {
             finishHumanAnswerImportStages(attempted,caller:c)
             throw error
@@ -150,7 +176,8 @@ extension CommandRouter {
 
     func commitHumanAnswerImport(_ db: Database,params p: JSON,request: JSON,file: JSON,path: String,caller c: Caller) throws -> JSON {
         let input = try humanAnswerImportParams(p,request:request,file:file,path:path)
-        guard let capture = commandPreparation.humanRequestFiles?.imports[input["command_id"] as! String] else { throw managedImportFailure("missing_answer_import") }
+        guard let capture = commandPreparation.humanRequestFiles?.imports[(try StoredRecord(input,
+            family: "HumanRequestFilePreparation").string("command_id"))] else { throw managedImportFailure("missing_answer_import") }
         let prepared = capture.prepared
         for (relative,identity) in prepared.observations {
             guard (try? managedIdentity(relative)) == identity else { throw managedImportFailure("prepared_original_changed") }
@@ -173,11 +200,14 @@ extension CommandRouter {
         try? ArchiveStorageGate.withExclusive(root:root) { _ in try dbQueue.writeWithoutTransaction { db in
             let files = try StorageObjectFiles(root:self.root)
             for input in inputs {
-                let command = input["command_id"] as! String,digest = hash(Data(("attachment_add" + (try jsonString(input))).utf8))
+                let command = (try StoredRecord(input, family: "HumanRequestFilePreparation").string("command_id")),digest = hash(Data(("attachment_add" + (try jsonString(input))).utf8))
                 let key = try self.managedImportKey(principal:c.principal,command:command)
                 guard let job = try? self.record(db,key,type:"storage_job"),job["parent_principal"] as? String == c.principal,job["intent_digest"] as? String == digest,
                       ["reserved","staging","finalized"].contains(job["state"] as? String ?? ""),try self.managedImportReceipt(db,principal:c.principal,command:command,digest:digest) == nil,job["objects"] != nil else { continue }
-                for object in try self.managedImportObjects(job) { try self.removeManagedImportStage(db,files:files,path:object["stage"] as! String) }
+                for object in try self.managedImportObjects(job) { try self.removeManagedImportStage(db,
+                    files:files,
+                    path:(try StoredRecord(object,
+                    family: "HumanRequestFilePreparation").string("stage"))) }
             }
         } }
     }

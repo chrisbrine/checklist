@@ -45,16 +45,16 @@ extension CommandRouter {
             totals[state + "_count"] = selected.count
             totals[state + "_bytes"] = selected.reduce(Int64(0)) { $0 + (($1["size"] as? NSNumber)?.int64Value ?? 0) }
         }
-        var reasons: [String:JSON] = [:]
+        var reasons: [String: (count: Int, bytes: Int64)] = [:]
         for object in objects where object["state"] as? String == "retained" {
             for reason in object["reasons"] as? [String] ?? [] {
-                var count = reasons[reason] ?? ["count":0,"bytes":Int64(0)]
-                count["count"] = (count["count"] as! Int) + 1
-                count["bytes"] = (count["bytes"] as! Int64) + ((object["size"] as? NSNumber)?.int64Value ?? 0)
+                var count = reasons[reason] ?? (count: 0, bytes: 0)
+                count.count += 1
+                count.bytes += (object["size"] as? NSNumber)?.int64Value ?? 0
                 reasons[reason] = count
             }
         }
-        totals["retained_reasons"] = reasons
+        totals["retained_reasons"] = reasons.mapValues { ["count": $0.count, "bytes": $0.bytes] as JSON }
         totals["physical_reclamation"] = "unmeasured"
         return totals
     }
@@ -177,7 +177,7 @@ extension CommandRouter {
             if !reasons.isEmpty {item["state"] = "retained";item["reasons"] = reasons}
             let key = item["relative_path"] as? String ?? "unavailable:" + owner + ":" + representation
             if var prior = objects[key] {
-                prior["owner_ids"] = Array(Set((prior["owner_ids"] as! [String]) + [owner])).sorted()
+                prior["owner_ids"] = Array(Set((prior["owner_ids"] as? [String] ?? []) + [owner])).sorted()
                 if prior["sha256"] as? String != item["sha256"] as? String || (prior["size"] as? NSNumber) != (item["size"] as? NSNumber) {prior["state"] = "retained";prior["reasons"] = ["ambiguous_identity"]}
                 let retained = Set((prior["reasons"] as? [String] ?? []) + (item["reasons"] as? [String] ?? []))
                 if !retained.isEmpty {prior["state"] = "retained";prior["reasons"] = retained.sorted()}
@@ -199,13 +199,13 @@ extension CommandRouter {
             }
             try add(path:String(relative.dropLast("/source".count)) + "/manifest.json",family:"source-captures",owner:owner,representation:"capture_manifest",capture:relative)
             for key in Array(objects.keys) where objects[key]?["capture_path"] as? String == relative {
-                var object = objects[key]!
+                guard var object = objects[key] else { continue }
                 object["owner_ids"] = Array(Set((object["owner_ids"] as? [String] ?? []) + [cid,owner])).sorted()
                 objects[key] = object
             }
         }
         for (type,value) in owned {
-            let id = value["id"] as! String
+            let id = (try StoredRecord(value, family: "value").string("id"))
             if type == "attachment" {
                 try add(path:value["path"] as? String,family:"objects",owner:id,representation:"original",sha:value["sha256"] as? String,size:(value["size"] as? NSNumber)?.int64Value,reason:value["mode"] as? String == "managed" ? (bool(value,"keep_original") ? "keep_original" : nil) : "external_original")
                 if let path = value["preview_path"] as? String {try add(path:path,family:"objects",owner:id,representation:"preview",reason:value["mode"] as? String == "managed" ? nil : "external_original")}

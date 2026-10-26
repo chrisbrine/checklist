@@ -61,7 +61,10 @@ extension CommandRouter {
                 let action = response["action"] as? String ?? "answered"
                 guard ["answered","send","clarification","clarify","cannot_do"].contains(action) else { continue }
                 let project = try record(db,pid,type:"project")
-                let item: JSON = ["project_name":project["name"] ?? "","task_key":task["key"] ?? "","task_title":task["title"] ?? "","project_id":pid,"task_id":tid,"request_id":requestID,"response_id":responseID,"form_revision":int(response,"form_revision",default:1),"current_form_revision":int(request,"form_revision",default:1),"current_request_state":request["state"] ?? "unknown","response_action":action,"response_complete":bool(response,"complete"),"message_id":mid,"delivery_id":delivery["id"]!,"delivery_state":delivery["state"] ?? "queued"]
+                let item: JSON = ["project_name":project["name"] ?? "","task_key":task["key"] ?? "","task_title":task["title"] ?? "","project_id":pid,"task_id":tid,
+                    "request_id":requestID,"response_id":responseID,"form_revision":int(response,"form_revision",default:1),"current_form_revision":int(request,"form_revision",
+                    default:1),"current_request_state":request["state"] ?? "unknown","response_action":action,"response_complete":bool(response,"complete"),"message_id":mid,
+                    "delivery_id":(try StoredRecord(delivery, family: "HumanAnswerNotices").requiredValue("id")),"delivery_state":delivery["state"] ?? "queued"]
                 pending.append(item)
             }
         }

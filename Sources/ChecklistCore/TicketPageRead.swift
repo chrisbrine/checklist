@@ -331,8 +331,8 @@ extension CommandRouter {
                 try preloadTasks(groups.flatMap {self.triageMemberIDs($0)},project:project)
                 groupsByProject[projectKey] = groups
             }
-            for group in groupsByProject[projectKey] ?? [] where self.triageMemberIDs(group).contains(task["id"] as! String) {
-                let key = TicketPageLookupKey(project:project,type:"group",id:group["id"] as! String)
+            for group in groupsByProject[projectKey] ?? [] where self.triageMemberIDs(group).contains(try StoredRecord(task, family: "task").string("id")) {
+                let key = TicketPageLookupKey(project:project,type:"group",id:(try StoredRecord(group, family: "group").string("id")))
                 let value: Result<Bool,Error>
                 if let cached = groupResults[key] { value = cached }
                 else {
@@ -344,9 +344,16 @@ extension CommandRouter {
             return false
         }
         return try rows.map { row in
-            let task = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"task").object, pid = task["project_id"] as! String
+            let task = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"task").object, pid = (try StoredRecord(task, family: "task").string("project_id"))
             let status = try lookup(task["status_id"] as? String ?? "",pid,"status")
-            let prerequisites = projectedPrerequisites(task:task,relations:relations.filter {SnapshotRecordIdentity($0["project_id"] as? String ?? "")==SnapshotRecordIdentity(pid) && SnapshotRecordIdentity($0["source_task_id"] as? String ?? "")==SnapshotRecordIdentity(task["id"] as? String ?? "")},taskLookup:{try lookup($0,pid,"task")},statusLookup:{try lookup($0,pid,"status")})
+            let taskRelations = relations.filter {
+                SnapshotRecordIdentity($0["project_id"] as? String ?? "") == SnapshotRecordIdentity(pid)
+                && SnapshotRecordIdentity($0["source_task_id"] as? String ?? "") == SnapshotRecordIdentity(task["id"] as? String ?? "")
+            }
+            let prerequisites = try projectedPrerequisites(
+                task: task, relations: taskRelations,
+                taskLookup: { try lookup($0, pid, "task") }, statusLookup: { try lookup($0, pid, "status") }
+            )
             let relation = projectedRelationTask(task:task,prerequisites:prerequisites,category:status["category"] as? String ?? "unknown",canonicalID:try projectedCanonicalTaskID(task:task,taskLookup:{try lookup($0,pid,"task")}))
             let wanted = Set(strings(task,"tag_ids").map(SnapshotRecordIdentity.init))
             let selectedTags = tags.filter {SnapshotRecordIdentity($0["project_id"] as? String ?? "")==SnapshotRecordIdentity(pid) && wanted.contains(SnapshotRecordIdentity($0["id"] as? String ?? ""))}
@@ -399,7 +406,8 @@ extension CommandRouter {
         let groupIDs = rows.map { $0["summary_group_id"] as String }
         let sourceRows=try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='group' AND id IN (SELECT value FROM json_each(?))",arguments:[try jsonStringArray(groupIDs)])
         var sources:[SnapshotRecordIdentity:JSON]=[:]
-        for row in sourceRows {let source=try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"group").object;sources[SnapshotRecordIdentity(source["id"] as! String)]=source}
+        for row in sourceRows {let source=try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"group").object;sources[SnapshotRecordIdentity((try StoredRecord(source,
+            family: "record").string("id")))]=source}
         var byID: [SnapshotRecordIdentity:JSON] = [:]
         for row in rows {
             guard (row["summary_missing_count"] as Int) == 0 else { throw CoreError("NOT_FOUND", "A current Triage member is not available in this project.") }

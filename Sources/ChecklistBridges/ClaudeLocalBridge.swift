@@ -83,60 +83,9 @@ public enum ClaudeLocalBridge {
                             endpoint: String, expectedPeerPID: Int32? = nil,
                             expectedRegistration: NativeLifecycleRegistration? = nil,
                             timeout: TimeInterval = 5, providerRegistry: ProviderPluginRegistry = .bundled) throws -> NativeWriteReceipt {
-        let frame = try envelope(content: content, messageID: messageID, sender: sender)
-        let before = try checkedSocket(endpoint)
-        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard descriptor >= 0 else { throw NativeBridgeError.system("socket", errno) }
-        defer { Darwin.close(descriptor) }
-        var noSignal: Int32 = 1
-        _ = setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout.size(ofValue: noSignal)))
-        guard fcntl(descriptor, F_SETFL, O_NONBLOCK) == 0 else { throw NativeBridgeError.system("fcntl", errno) }
-        var address = try socketAddress(endpoint)
-        let result = withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
-        }
-        let deadline = Date().addingTimeInterval(min(max(timeout, 0.05), 10))
-        if result != 0 {
-            guard errno == EINPROGRESS else { throw NativeBridgeError.system("connect", errno) }
-            try waitFor(descriptor, events: Int16(POLLOUT), deadline: deadline)
-            var failure: Int32 = 0
-            var length = socklen_t(MemoryLayout<Int32>.size)
-            guard getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &failure, &length) == 0 else { throw NativeBridgeError.system("getsockopt", errno) }
-            guard failure == 0 else { throw NativeBridgeError.system("connect", failure) }
-        }
-        try checkPeer(descriptor)
-        let connectedPID = try peerProcessID(descriptor)
-        if let expectedPeerPID, connectedPID != expectedPeerPID {
-            throw NativeBridgeError.invalid("RECIPIENT_CHANGED: native socket process does not match the explicitly enrolled recipient.")
-        }
-        let after = try checkedSocket(endpoint)
-        guard before.st_dev == after.st_dev, before.st_ino == after.st_ino else { throw NativeBridgeError.invalid("RECIPIENT_CHANGED: enrolled socket changed during connection.") }
-        if let expectedRegistration {
-            let current = NativeLifecycleInspector.inspect(expectedRegistration, providerRegistry:providerRegistry)
-            guard connectedPID == expectedRegistration.processID,
-                  current.process == .running, current.registry == .matching else {
-                throw NativeBridgeError.invalid("RECIPIENT_CHANGED: connected peer no longer matches the exact native process and conversation registry.")
-            }
-        }
-        var sent = 0
-        do { try frame.withUnsafeBytes { bytes in
-            while sent < bytes.count {
-                try waitFor(descriptor, events: Int16(POLLOUT), deadline: deadline)
-                let count = Darwin.send(descriptor, bytes.baseAddress!.advanced(by: sent), bytes.count - sent, 0)
-                if count < 0 {
-                    if errno == EINTR || errno == EAGAIN { continue }
-                    throw NativeBridgeError.system("send", errno)
-                }
-                guard count > 0 else { throw NativeBridgeError.invalid("Socket closed before complete message write; delivery is uncertain.") }
-                sent += count
-            }
-        } } catch {
-            if sent > 0 { throw NativeBridgeError.outcomeUnknown(error.localizedDescription) }
-            throw error
-        }
-        // Completing a write proves neither provider acceptance nor model consumption.
-        return NativeWriteReceipt(status: "transport_written", byteCount: frame.count,
-                                  socketDevice: UInt64(after.st_dev), socketInode: UInt64(after.st_ino), peerPID: connectedPID, recordedAt: Date())
+        try NativePeerTransportAdapters.current.send(content: content, messageID: messageID, sender: sender,
+            endpoint: endpoint, expectedPeerPID: expectedPeerPID, expectedRegistration: expectedRegistration,
+            timeout: timeout, providerRegistry: providerRegistry)
     }
 }
 
@@ -222,13 +171,13 @@ public final class NativeReplyListener: @unchecked Sendable {
         let socketFD = socket(AF_UNIX, SOCK_STREAM, 0)
         guard socketFD >= 0 else { throw NativeBridgeError.system("socket", errno) }
         do {
-            var address = try socketAddress(path)
+            var address = try NativeSocketIO.socketAddress(path)
             let result = withUnsafePointer(to: &address) { pointer in
                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(socketFD, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
             }
             guard result == 0 else { throw NativeBridgeError.system("bind", errno) }
             guard chmod(path, 0o600) == 0, listen(socketFD, 8) == 0 else { throw NativeBridgeError.system("listen", errno) }
-            let created = try checkedSocket(path)
+            let created = try NativeSocketIO.checkedSocket(path)
             createdDevice = created.st_dev; createdInode = created.st_ino
             descriptor = socketFD
         } catch {
@@ -249,12 +198,12 @@ public final class NativeReplyListener: @unchecked Sendable {
 
     public func receiveFrame(timeout: TimeInterval = 5) throws -> NativeReplyFrame {
         let deadline = Date().addingTimeInterval(min(max(timeout, 0.05), 60))
-        try waitFor(descriptor, events: Int16(POLLIN), deadline: deadline)
+        try NativeSocketIO.waitFor(descriptor, events: Int16(POLLIN), deadline: deadline)
         let peer = accept(descriptor, nil, nil)
         guard peer >= 0 else { throw NativeBridgeError.system("accept", errno) }
         defer { Darwin.close(peer) }
-        try checkPeer(peer)
-        let peerPID = (try? peerProcessID(peer)) ?? 0
+        try NativeSocketIO.checkPeer(peer)
+        let peerPID = (try? NativeSocketIO.peerProcessID(peer)) ?? 0
         var peerUID: uid_t = 0; var peerGID: gid_t = 0
         guard getpeereid(peer, &peerUID, &peerGID) == 0, peerUID == getuid() else {
             throw NativeBridgeError.invalid("Reply peer identity changed or is unavailable.")
@@ -262,7 +211,7 @@ public final class NativeReplyListener: @unchecked Sendable {
         var data = Data()
         var buffer = [UInt8](repeating: 0, count: 8192)
         while data.count < ClaudeLocalBridge.maximumFrameBytes {
-            try waitFor(peer, events: Int16(POLLIN), deadline: deadline)
+            try NativeSocketIO.waitFor(peer, events: Int16(POLLIN), deadline: deadline)
             let count = recv(peer, &buffer, buffer.count, 0)
             if count < 0 {
                 if errno == EINTR { continue }
@@ -280,55 +229,5 @@ public final class NativeReplyListener: @unchecked Sendable {
             }
         }
         throw NativeBridgeError.invalid("Native reply exceeded the 256 KiB frame cap.")
-    }
-}
-
-private func socketAddress(_ path: String) throws -> sockaddr_un {
-    guard path.hasPrefix("/"), !path.utf8.contains(0) else { throw NativeBridgeError.invalid("Socket path must be absolute and contain no NUL.") }
-    var address = sockaddr_un()
-    let capacity = MemoryLayout.size(ofValue: address.sun_path)
-    let bytes = Array(path.utf8) + [UInt8(0)]
-    guard bytes.count <= capacity else { throw NativeBridgeError.invalid("Unix socket path is too long.") }
-    address.sun_family = sa_family_t(AF_UNIX)
-    address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-    withUnsafeMutableBytes(of: &address.sun_path) { raw in raw.copyBytes(from: bytes) }
-    return address
-}
-
-private func checkedSocket(_ path: String) throws -> stat {
-    var attributes = stat()
-    guard lstat(path, &attributes) == 0 else { throw NativeBridgeError.system("lstat socket", errno) }
-    guard attributes.st_mode & S_IFMT == S_IFSOCK, attributes.st_uid == getuid(), attributes.st_mode & 0o077 == 0 else {
-        throw NativeBridgeError.invalid("Endpoint must be a same-user private Unix socket, with no symlink or group/world access.")
-    }
-    return attributes
-}
-
-private func checkPeer(_ descriptor: Int32) throws {
-    var uid: uid_t = 0; var gid: gid_t = 0
-    guard getpeereid(descriptor, &uid, &gid) == 0 else { throw NativeBridgeError.system("getpeereid", errno) }
-    guard uid == getuid() else { throw NativeBridgeError.invalid("Native peer belongs to another user.") }
-}
-
-private func peerProcessID(_ descriptor: Int32) throws -> Int32 {
-    var pid: pid_t = 0
-    var length = socklen_t(MemoryLayout<pid_t>.size)
-    guard getsockopt(descriptor, SOL_LOCAL, LOCAL_PEERPID, &pid, &length) == 0, pid > 0 else {
-        throw NativeBridgeError.system("LOCAL_PEERPID", errno)
-    }
-    return pid
-}
-
-private func waitFor(_ descriptor: Int32, events: Int16, deadline: Date) throws {
-    while true {
-        let remaining = deadline.timeIntervalSinceNow
-        guard remaining > 0 else { throw NativeBridgeError.timedOut }
-        var descriptor = pollfd(fd: descriptor, events: events, revents: 0)
-        let result = poll(&descriptor, 1, Int32(min(remaining * 1000, Double(Int32.max)).rounded(.up)))
-        if result < 0 { if errno == EINTR { continue }; throw NativeBridgeError.system("poll", errno) }
-        guard result != 0 else { throw NativeBridgeError.timedOut }
-        guard descriptor.revents & (Int16(POLLERR) | Int16(POLLNVAL)) == 0 else { throw NativeBridgeError.invalid("Native socket became unavailable.") }
-        if descriptor.revents & events != 0 { return }
-        if descriptor.revents & Int16(POLLHUP) != 0 { throw NativeBridgeError.invalid("Native socket closed.") }
     }
 }

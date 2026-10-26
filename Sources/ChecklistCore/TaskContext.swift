@@ -35,8 +35,9 @@ extension CommandRouter {
     }
 
     func directionCursorScope(_ db: Database, task: JSON, caller: Caller, attempt: JSON? = nil) throws -> String {
-        let pid = task["project_id"] as! String, project = try record(db,pid,type:"project")
-        let directions = try ownerDirections(db,task:task).map { ["id":$0["id"]!,"revision":int($0,"revision"),"addressed":bool($0,"addressed")] as JSON }
+        let pid = (try StoredRecord(task, family: "task").string("project_id")), project = try record(db,pid,type:"project")
+        let directions = try ownerDirections(db,task:task).map { ["id":(try StoredRecord($0, family: "record").requiredValue("id")),"revision":int($0,"revision"),"addressed":bool($0,
+            "addressed")] as JSON }
         let relevant: JSON = ["brief":project["brief"] ?? "","brief_revision":project["brief_revision"] ?? 0,"decisions":applicableDecisions(project,task:task),"directions":directions]
         let round: String
         if let explicitID = attempt?["id"] as? String {round = explicitID}
@@ -44,13 +45,14 @@ extension CommandRouter {
             let callerAttempt = try scopedTaskRows(db,type:"attempt",task:task,predicate:"json_extract(data,'$.state')='active' AND json_extract(data,'$.principal')=?",arguments:[caller.principal],limit:1,descending:true).first
             round = callerAttempt?["id"] as? String ?? task["active_attempt_id"] as? String ?? task["current_manifest_id"] as? String ?? "unclaimed"
         }
-        return pid+":directions:"+(task["id"] as! String)+":"+round+":"+hash(Data((try jsonString(relevant)).utf8))+":"+(try authorizationScope(db,caller))+":"+(try callerSessionGeneration(db,caller,project:pid))
+        return pid+":directions:"+(try StoredRecord(task, family: "task").string("id"))+":"+round+":"+hash(Data((try jsonString(relevant)).utf8))+":"+(try authorizationScope(db,
+            caller))+":"+(try callerSessionGeneration(db,caller,project:pid))
     }
 
     func validateDirectionCursor(_ db: Database, params: JSON, task: JSON, caller: Caller, attempt: JSON? = nil) throws {
         let directions = try ownerDirections(db,task:task)
         guard !directions.contains(where: {!bool($0,"addressed")}) else { throw CoreError("USER_DIRECTION_PENDING","An owner direction still needs a permitted response, checkpoint, evidence or explicit attributed waiver.") }
-        let project = try record(db,task["project_id"] as! String,type:"project")
+        let project = try record(db,(try StoredRecord(task, family: "task").string("project_id")),type:"project")
         let hasContext = !(project["brief"] as? String ?? "").isEmpty || !applicableDecisions(project,task:task).isEmpty || !directions.isEmpty
         guard let supplied = params["direction_cursor"] as? String else {
             if hasContext { throw CoreError("DIRECTION_CURSOR_REQUIRED","Refresh task context and include its direction cursor before changing the work phase.") }
@@ -60,7 +62,8 @@ extension CommandRouter {
     }
 
     func compactTaskContext(_ db: Database, task: JSON, caller: Caller, directionAttempt: JSON? = nil) throws -> JSON {
-        let pid = task["project_id"] as! String, tid = task["id"] as! String, project = try record(db,pid,type:"project")
+        let storedTask = try StoredTaskRecord(task)
+        let pid = storedTask.projectID, tid = storedTask.id, project = try record(db,pid,type:"project")
         let savedNotesMore=try deliverSavedNotesToHandler(db,task:task,caller:caller)
         let directions = try scopedTaskRows(db,type:"message",task:task,predicate:"json_extract(data,'$.origin')='human_ui' AND json_extract(data,'$.requires_action')=1 AND COALESCE(json_extract(data,'$.addressed'),0)=0 AND \(Self.unretractedDirectionSQL())",limit:26)
         let findings = try scopedTaskRows(db,type:"finding",task:task,predicate:"json_extract(data,'$.state')='open'",limit:26)
@@ -118,14 +121,14 @@ extension CommandRouter {
         result["history_ref"] = ["method":"history_list","project_id":pid,"task_id":tid]
         result["records_ref"] = ["method":"task_context","project_id":pid,"task_id":tid,"detail_level":"full"]
         result["epic"] = try scopedContextEpic(db,task:task)
-        result["triages"] = try scopedTaskGroups(db,task:task).map {scopedContextGroup($0,task:task)}
+        result["triages"] = try scopedTaskGroups(db,task:task).map {try scopedContextGroup($0,task:task)}
         if let active { result["handler"] = contextRecord(active,type:"attempt",caller:caller) }
         else { result["handler"] = NSNull() }
         result["prior_handler"] = attempts.last(where: {$0["id"] as? String != task["active_attempt_id"] as? String}).map {contextRecord($0,type:"attempt",caller:caller)} ?? NSNull()
         result["handler_recipients"] = try relevantHandlerRecipients(db,task:task)
         result["relation_context"] = try scopedRelationContext(db,task:task)
         let batches = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='batch' AND project_id=CAST(? AS TEXT) AND EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.members')) WHERE json_extract(value,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY) ORDER BY rowid DESC LIMIT 11",arguments:[Data(pid.utf8),Data(tid.utf8)]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
-        result["batches"] = batches.prefix(10).reversed().map {batch -> JSON in
+        result["batches"] = try batches.prefix(10).reversed().map {batch -> JSON in
             var reference:JSON=[:]
             for key in ["id","project_id","triage_id","triage_key","triage_name","phase","revision","created_at","digest"] {reference[key]=batch[key]}
             reference["triage_key"] = batchTriageKey(db,batch) as Any? ?? NSNull()
@@ -137,7 +140,7 @@ extension CommandRouter {
                 selected["key"] = member["key"] ?? task["key"];selected["title"] = member["title"] ?? task["title"]
                 return selected
             }
-            reference["snapshot_ref"]=["method":"batch_get","project_id":pid,"batch_id":batch["id"]!]
+            reference["snapshot_ref"]=["method":"batch_get","project_id":pid,"batch_id":(try StoredRecord(batch, family: "record").requiredValue("id"))]
             return reference
         }
         result["batch_count"] = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type='batch' AND project_id=CAST(? AS TEXT) AND EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.members')) WHERE json_extract(value,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY)",arguments:[Data(pid.utf8),Data(tid.utf8)]) ?? 0
@@ -170,31 +173,59 @@ extension CommandRouter {
         var result = try compactTaskContext(db,task:task,caller:caller)
         if let revisionID = params["context_revision_id"] as? String { result["historical_project_context"] = try scoped(db,revisionID,pid,type:"project_context_revision") }
         if detail == "full" || params["history_cursor"] != nil {
-            let scope = pid+":context-records:"+(task["id"] as! String)+":"+(try authorizationScope(db,caller))+":"+(try callerSessionGeneration(db,caller,project:pid))
-            var input: JSON = [:]; if let token = params["history_cursor"] { input["cursor"] = token }
-            let after = try cursorSequence(db,input,caller:caller,scope:scope)
-            let placeholders = contextRecordTypes.map {_ in "?"}.joined(separator:",")
-            let values: [DatabaseValueConvertible] = [Data(pid.utf8),Data((task["id"] as! String).utf8),Data((task["id"] as! String).utf8),after] + contextRecordTypes.map {$0 as DatabaseValueConvertible}
-            let rows = try Row.fetchAll(db,sql:"SELECT rowid AS position,"+Self.canonicalRecordColumns+" FROM records WHERE project_id=CAST(? AS TEXT) AND (json_extract(data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY OR (type='batch' AND EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.members')) WHERE json_extract(value,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY))) AND rowid>? AND type IN ("+placeholders+") ORDER BY rowid LIMIT 51",arguments:StatementArguments(values))
-            let page = Array(rows.prefix(50))
-            result["records"] = try page.map {let envelope=try GRDBRecordEnvelopeAdapter.decode($0);return contextRecord(envelope.object,type:envelope.type,caller:caller)}
-            result["has_more_records"] = rows.count > 50
-            result["next_history_cursor"] = try cursor(db,caller:caller,scope:scope,sequence:page.last.map {$0["position"] as Int} ?? after)
+            try appendTaskContextHistory(db, params: params, task: task, caller: caller, result: &result)
         }
         return result
     }
 
+    private func appendTaskContextHistory(
+        _ db: Database, params: JSON, task: JSON, caller: Caller, result: inout JSON
+    ) throws {
+        let storedTask = try StoredTaskRecord(task)
+        let pid = storedTask.projectID, tid = storedTask.id
+        let authorization = try authorizationScope(db, caller)
+        let generation = try callerSessionGeneration(db, caller, project: pid)
+        let scope = pid + ":context-records:" + tid + ":" + authorization + ":" + generation
+        var input: JSON = [:]
+        if let token = params["history_cursor"] { input["cursor"] = token }
+        let after = try cursorSequence(db, input, caller: caller, scope: scope)
+        let placeholders = contextRecordTypes.map { _ in "?" }.joined(separator: ",")
+        let identities: [DatabaseValueConvertible] = [Data(pid.utf8), Data(tid.utf8), Data(tid.utf8), after]
+        let values = identities + contextRecordTypes.map { $0 as DatabaseValueConvertible }
+        let sql = """
+            SELECT rowid AS position,\(Self.canonicalRecordColumns) FROM records
+            WHERE project_id=CAST(? AS TEXT)
+              AND (json_extract(data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY
+                OR (type='batch' AND EXISTS (
+                  SELECT 1 FROM json_each(json_extract(data,'$.members'))
+                  WHERE json_extract(value,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY)))
+              AND rowid>? AND type IN (\(placeholders)) ORDER BY rowid LIMIT 51
+            """
+        let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(values))
+        let page = Array(rows.prefix(50))
+        result["records"] = try page.map {
+            let envelope = try GRDBRecordEnvelopeAdapter.decode($0)
+            return contextRecord(envelope.object, type: envelope.type, caller: caller)
+        }
+        result["has_more_records"] = rows.count > 50
+        result["next_history_cursor"] = try cursor(
+            db, caller: caller, scope: scope, sequence: page.last.map { $0["position"] as Int } ?? after
+        )
+    }
+
     func recordDirectionCheckpoint(_ db: Database, params: JSON, attempt: JSON, progress: String, caller: Caller) throws -> JSON {
-        let pid = attempt["project_id"] as! String, task = try scoped(db,attempt["task_id"] as! String,pid,type:"task")
+        let pid = (try StoredRecord(attempt, family: "attempt").string("project_id")), task = try scoped(db,(try StoredRecord(attempt, family: "attempt").string("task_id")),pid,type:"task")
         let ids = strings(params,"direction_ids")
         if !ids.isEmpty {
             guard let token = params["direction_cursor"] as? String else { throw CoreError("DIRECTION_CURSOR_REQUIRED","Read current directions before binding a checkpoint to them.") }
             _ = try cursorSequence(db,["cursor":token],caller:caller,scope:directionCursorScope(db,task:task,caller:caller,attempt:attempt))
             for id in ids { let message = try scoped(db,id,pid,type:"message"); guard message["task_id"] as? String == task["id"] as? String,bool(message,"requires_action"),message["origin"] as? String == "human_ui" else { throw CoreError("INVALID_INPUT","Checkpoints can address only actual owner directions on this ticket.") } }
         }
-        let checkpoint: JSON = ["id":uuid(),"project_id":pid,"task_id":task["id"]!,"attempt_id":attempt["id"]!,"session_id":caller.sessionID ?? "human","principal":caller.principal,"progress":progress,"direction_ids":ids,"revision":1,"created_at":now()]
+        let checkpoint: JSON = ["id":uuid(),"project_id":pid,"task_id":(try StoredRecord(task, family: "record").requiredValue("id")),"attempt_id":(try StoredRecord(attempt,
+            family: "record").requiredValue("id")),"session_id":caller.sessionID ?? "human","principal":caller.principal,"progress":progress,"direction_ids":ids,"revision":1,"created_at":now()]
         try save(db,checkpoint,type:"checkpoint")
-        try event(db,caller:caller,project:pid,entity:task["id"] as? String,kind:"checkpoint_recorded",data:["checkpoint_id":checkpoint["id"]!,"direction_ids":ids])
+        try event(db,caller:caller,project:pid,entity:task["id"] as? String,kind:"checkpoint_recorded",data:["checkpoint_id":(try StoredRecord(checkpoint, family: "record").requiredValue("id")),
+            "direction_ids":ids])
         return checkpoint
     }
 }

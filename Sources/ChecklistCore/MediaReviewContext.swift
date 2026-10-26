@@ -30,9 +30,13 @@ enum MediaCanonical {
 }
 
 extension CommandRouter {
-    func mediaRef(_ family: String,_ value: JSON) -> JSON {
-        var r: JSON = ["type":family,"id":value["id"]!]
-        if MediaRecordRegistry.immutableFamilies.contains(family) { r["revision"] = value["revision"]! };return r
+    func mediaRef(_ family: String, _ value: JSON) throws -> JSON {
+        let record = StoredRecord(value, family: family)
+        var reference: JSON = ["type":family, "id":try record.requiredValue("id")]
+        if MediaRecordRegistry.immutableFamilies.contains(family) {
+            reference["revision"] = try record.requiredValue("revision")
+        }
+        return reference
     }
     func mediaRecord(_ fields: JSON, project: String, caller: Caller, references: [JSON] = []) -> JSON {
         var r = fields;r["id"] = uuid();r["project_id"] = project;r["revision"] = 1;r["record_references"] = references
@@ -67,25 +71,56 @@ extension CommandRouter {
         let sources = try mediaContextSources(db,project:project)
         let approved = sources.last { $0["kind"] as? String == "project_approval" }
         var instructions: [String:JSON] = [:]
-        for s in sources where s["kind"] as? String == "instruction" { instructions[s["instruction_id"] as! String] = s }
-        return (approved.map {[$0]} ?? []) + instructions.values.filter { mediaScopeMatches($0,type:type,round:round) }.sorted { ($0["id"] as! String) < ($1["id"] as! String) }
+        for source in sources where source["kind"] as? String == "instruction" {
+            let record = StoredRecord(source, family: "media_review_context")
+            instructions[try record.string("instruction_id")] = source
+        }
+        let scopedInstructions = instructions.values.filter { mediaScopeMatches($0,type:type,round:round) }
+        let ordered = try scopedInstructions.map { source in
+            (try StoredRecord(source, family: "media_review_context").string("id"), source)
+        }.sorted { $0.0 < $1.0 }.map { $0.1 }
+        return (approved.map {[$0]} ?? []) + ordered
     }
     func mediaSnapshot(_ db: Database,round: JSON,typeRevision: JSON,sources: [JSON],caller: Caller,previous: JSON? = nil) throws -> JSON {
-        var refs = [mediaRef("media_round",round),mediaRef("media_review_type_revision",typeRevision)] + sources.map {mediaRef("media_review_context",$0)}
-        if let previous { refs.append(mediaRef("media_review_context",previous)) }
-        let fields: JSON = ["kind":"snapshot","round_id":round["id"]!,"type_id":round["type_id"]!,"type_revision_id":typeRevision["id"]!,"source_ids":sources.map {$0["id"]!},"signature":try MediaCanonical.signature(sources.map {$0["signature"]!})]
-        let context = mediaRecord(fields,project:round["project_id"] as! String,caller:caller,references:refs)
+        let roundRecord = StoredRecord(round, family: "media_round")
+        let revisionRecord = StoredRecord(typeRevision, family: "media_review_type_revision")
+        let sourceRecords = sources.map { StoredRecord($0, family: "media_review_context") }
+        var refs = [try mediaRef("media_round",round),try mediaRef("media_review_type_revision",typeRevision)]
+        refs += try sources.map {try mediaRef("media_review_context",$0)}
+        if let previous { refs.append(try mediaRef("media_review_context",previous)) }
+        let fields: JSON = [
+            "kind":"snapshot", "round_id":try roundRecord.string("id"),
+            "type_id":try roundRecord.string("type_id"), "type_revision_id":try revisionRecord.string("id"),
+            "source_ids":try sourceRecords.map { try $0.string("id") },
+            "signature":try MediaCanonical.signature(sourceRecords.map { try $0.requiredValue("signature") })
+        ]
+        let context = mediaRecord(fields,project:try roundRecord.string("project_id"),caller:caller,references:refs)
         try mediaWrite(db,context,type:"media_review_context");return context
     }
     func mediaEffectiveContext(_ db: Database,context: JSON,itemID: String) throws -> String {
-        let sources = try strings(context,"source_ids").map { try scoped(db,$0,context["project_id"] as! String,type:"media_review_context") }
-        return try MediaCanonical.signature(sources.filter { mediaScopeMatches($0,type:context["type_id"] as! String,round:context["round_id"] as! String,item:itemID) }.compactMap {$0["signature"] as? String}.sorted())
+        let record = StoredRecord(context, family: "media_review_context")
+        let project = try record.string("project_id")
+        let type = try record.string("type_id"), round = try record.string("round_id")
+        let sources = try strings(context,"source_ids").map { try scoped(db,$0,project,type:"media_review_context") }
+        let effective = sources.filter { mediaScopeMatches($0,type:type,round:round,item:itemID) }
+        return try MediaCanonical.signature(effective.compactMap {$0["signature"] as? String}.sorted())
     }
     /// Opaque MAC binds observation, caller scope/generation and incarnation; no event sequences.
     func mediaToken(_ db: Database,round: JSON,caller: Caller) throws -> String {
-        let type = try scoped(db,round["type_id"] as! String,round["project_id"] as! String,type:"media_review_type")
-        let state: JSON = ["domain":"media-observed-context-v1","round_id":round["id"]!,"revision":round["revision"]!,"context_id":round["context_id"]!,"manifest_id":round["manifest_id"] ?? NSNull(),"attention_ids":strings(round,"attention_ids"),"type_revision_id":round["type_revision_id"]!,"adopted_type_revision_id":type["adopted_revision_id"] ?? NSNull(),"principal":caller.principal,"scope":try authorizationScope(db,caller),"workspace":caller.workspace ?? "","incarnation":incarnation,"generation":try callerSessionGeneration(db,caller,project:round["project_id"] as! String)]
-        return "mc1." + Data(HMAC<SHA256>.authenticationCode(for:try MediaCanonical.bytes(state),using:cursorKey)).base64EncodedString()
+        let record = StoredRecord(round, family: "media_round")
+        let project = try record.string("project_id")
+        let type = try scoped(db,record.string("type_id"),project,type:"media_review_type")
+        let state: JSON = [
+            "domain":"media-observed-context-v1", "round_id":try record.requiredValue("id"),
+            "revision":try record.requiredValue("revision"), "context_id":try record.requiredValue("context_id"),
+            "manifest_id":round["manifest_id"] ?? NSNull(), "attention_ids":strings(round,"attention_ids"),
+            "type_revision_id":try record.requiredValue("type_revision_id"),
+            "adopted_type_revision_id":type["adopted_revision_id"] ?? NSNull(), "principal":caller.principal,
+            "scope":try authorizationScope(db,caller), "workspace":caller.workspace ?? "", "incarnation":incarnation,
+            "generation":try callerSessionGeneration(db,caller,project:project)
+        ]
+        let authentication = HMAC<SHA256>.authenticationCode(for:try MediaCanonical.bytes(state),using:cursorKey)
+        return "mc1." + Data(authentication).base64EncodedString()
     }
     func mediaObserve(_ db: Database,_ p: JSON,round: JSON,caller: Caller,allowAttention: Bool = false) throws {
         guard let token = p["observed_context_token"] as? String,token == (try mediaToken(db,round:round,caller:caller)) else { throw CoreError("MEDIA_CONTEXT_CHANGED","Refresh the exact round, context and manifest. No records changed.") }
@@ -95,32 +130,38 @@ extension CommandRouter {
     func mediaAttention(_ db: Database,round original: JSON,source: JSON,caller: Caller,proposedType: JSON? = nil) throws {
         var round = original
         guard ["draft","open"].contains(round["state"] as? String ?? "") else { return }
-        let attention = mediaRecord(["round_id":round["id"]!,"source_id":source["id"]!,"state":"pending","proposed_type_revision_id":proposedType?["id"] ?? NSNull()],project:round["project_id"] as! String,caller:caller,references:[mediaRef(proposedType == nil ? "media_review_context" : "media_review_type_revision",source),mediaRef("media_round",round)])
+        let attention = mediaRecord(["round_id":(try StoredRecord(round, family: "media").requiredValue("id")),
+            "source_id":(try StoredRecord(source, family: "media").requiredValue("id")),"state":"pending",
+            "proposed_type_revision_id":proposedType?["id"] ?? NSNull()],project:(try StoredRecord(round,
+             family: "media").string("project_id")),caller:caller,references:[try mediaRef(proposedType == nil ? "media_review_context" : "media_review_type_revision",
+            source),try mediaRef("media_round",round)])
         try mediaWrite(db,attention,type:"media_context_attention")
-        round["attention_ids"] = strings(round,"attention_ids") + [attention["id"] as! String]
-        round["record_references"] = (round["record_references"] as? [JSON] ?? []) + [mediaRef("media_context_attention",attention)]
+        round["attention_ids"] = strings(round,"attention_ids") + [(try StoredRecord(attention, family: "media").string("id"))]
+        round["record_references"] = (round["record_references"] as? [JSON] ?? []) + [try mediaRef("media_context_attention",attention)]
         try mediaWrite(db,revised(round),type:"media_round")
     }
     /// Hook runs inside the existing project edit transaction. Agent edits are not approvals.
     func mediaProjectContextChanged(_ db: Database,old: JSON,updated: JSON,caller: Caller) throws {
-        guard caller.isOwner,!(try records(db,type:"media_review_type",project:(updated["id"] as! String))).isEmpty else { return }
+        guard caller.isOwner,!(try records(db,type:"media_review_type",project:((try StoredRecord(updated, family: "media").string("id"))))).isEmpty else { return }
         let briefChanged = old["brief"] as? String != updated["brief"] as? String
         let pinsChanged = try jsonString(old["pinned_decisions"] ?? []) != jsonString(updated["pinned_decisions"] ?? [])
         if briefChanged || pinsChanged {
-            let prior = try mediaContextSources(db,project:(updated["id"] as! String)).last {$0["kind"] as? String == "project_approval"}?["approved_context"] as? JSON
+            let prior = try mediaContextSources(db,project:((try StoredRecord(updated, family: "media").string("id")))).last {$0["kind"] as? String == "project_approval"}?["approved_context"] as? JSON
             let retainedBrief: JSON? = briefChanged ? nil : ["brief":prior?["brief"] ?? "","brief_revision":prior?["brief_revision"] ?? 0]
             _ = try mediaApproveProjectContext(db,project:updated,caller:caller,retainedBrief:retainedBrief)
         }
     }
     @discardableResult func mediaApproveProjectContext(_ db: Database,project: JSON,caller: Caller,retainedBrief: JSON? = nil) throws -> JSON {
-        try owner(caller);let pid = project["id"] as! String
+        try owner(caller);let pid = (try StoredRecord(project, family: "media").string("id"))
         let pins = (project["pinned_decisions"] as? [JSON] ?? []).filter { $0["origin"] as? String == "human_ui" && strings($0,"task_kinds").isEmpty && strings($0,"tag_ids").isEmpty }
         let payload: JSON = ["brief":retainedBrief?["brief"] ?? project["brief"] ?? "","brief_revision":retainedBrief?["brief_revision"] ?? project["brief_revision"] ?? 0,"pinned_decisions":pins]
         let signature = try MediaCanonical.signature(payload)
         let old = try mediaContextSources(db,project:pid).last {$0["kind"] as? String == "project_approval"}
         if let old,old["signature"] as? String == signature { return old }
         if old == nil,(payload["brief"] as? String ?? "").isEmpty,pins.isEmpty { return ["state":"unchanged","approved_context":payload] }
-        let source = mediaRecord(["kind":"project_approval","project_revision":project["revision"]!,"approved_context":payload,"signature":signature],project:pid,caller:caller,references:[mediaRef("project",project)])
+        let source = mediaRecord(["kind":"project_approval","project_revision":(try StoredRecord(project,
+             family: "media").requiredValue("revision")),"approved_context":payload,"signature":signature],
+            project:pid,caller:caller,references:[try mediaRef("project",project)])
         try mediaWrite(db,source,type:"media_review_context")
         for round in try records(db,type:"media_round",project:pid) { try mediaAttention(db,round:round,source:source,caller:caller) };return source
     }
@@ -129,29 +170,30 @@ extension CommandRouter {
         guard ["rubric","direction"].contains(kind) else { throw CoreError("INVALID_INPUT","Approve a rubric or requires-action direction.") }
         var f: JSON = ["kind":"instruction","instruction_kind":kind,"body":try text(p,"body",max:16000)]
         var refs: [JSON] = []
-        if let tid = p["type_id"] as? String { let t = try scoped(db,tid,project,type:"media_review_type");f["type_id"] = tid;refs.append(mediaRef("media_review_type",t)) }
+        if let tid = p["type_id"] as? String { let t = try scoped(db,tid,project,type:"media_review_type");f["type_id"] = tid;refs.append(try mediaRef("media_review_type",t)) }
         if let rid = p["round_id"] as? String {
             let r = try scoped(db,rid,project,type:"media_round")
             guard f["type_id"] == nil || f["type_id"] as? String == r["type_id"] as? String else { throw CoreError("INVALID_INPUT","Context scopes must agree.") }
-            f["round_id"] = rid;f["type_id"] = r["type_id"];refs.append(mediaRef("media_round",r));refs.append(["type":"media_review_type","id":r["type_id"]!])
+            f["round_id"] = rid;f["type_id"] = r["type_id"];refs.append(try mediaRef("media_round",
+                r));refs.append(["type":"media_review_type","id":(try StoredRecord(r, family: "media").requiredValue("type_id"))])
         }
         let items = strings(p,"item_ids")
         guard p["item_ids"] == nil || p["item_ids"] is [String],items.count <= 1000,Set(items).count == items.count else { throw CoreError("INVALID_INPUT","Use distinct scoped items.") }
         for id in items {
-            let item = try scoped(db,id,project,type:"media_item"),r = try scoped(db,item["round_id"] as! String,project,type:"media_round")
+            let item = try scoped(db,id,project,type:"media_item"),r = try scoped(db,(try StoredRecord(item, family: "media").string("round_id")),project,type:"media_round")
             guard (f["type_id"] == nil || f["type_id"] as? String == r["type_id"] as? String), (f["round_id"] == nil || f["round_id"] as? String == item["round_id"] as? String) else { throw CoreError("INVALID_INPUT","Item and context scopes must agree.") }
-            refs.append(mediaRef("media_item",item))
+            refs.append(try mediaRef("media_item",item))
         };f["item_ids"] = items
         var prior: JSON?
         if let id = p["supersedes_id"] as? String {
             prior = try scoped(db,id,project,type:"media_review_context")
             guard prior?["kind"] as? String == "instruction",!(try mediaContextSources(db,project:project)).contains(where:{$0["supersedes_id"] as? String == id}) else { throw CoreError("REVISION_CONFLICT","Refresh the current instruction.") }
-            f["instruction_id"] = prior!["instruction_id"];f["supersedes_id"] = id;refs.append(mediaRef("media_review_context",prior!))
+            f["instruction_id"] = prior!["instruction_id"];f["supersedes_id"] = id;refs.append(try mediaRef("media_review_context",prior!))
         } else { f["instruction_id"] = uuid() }
         f["signature"] = try MediaCanonical.signature(f.filter { !["instruction_id","supersedes_id"].contains($0.key) })
         let source = mediaRecord(f,project:project,caller:c,references:refs);try mediaWrite(db,source,type:"media_review_context")
         for r in try records(db,type:"media_round",project:project) {
-            let tid = r["type_id"] as! String,rid = r["id"] as! String
+            let tid = (try StoredRecord(r, family: "media").string("type_id")),rid = (try StoredRecord(r, family: "media").string("id"))
             let matches = try mediaItems(db,round:r).contains { item in
                 mediaScopeMatches(source,type:tid,round:rid,item:item["id"] as? String) || prior.map {mediaScopeMatches($0,type:tid,round:rid,item:item["id"] as? String)} == true
             }

@@ -103,7 +103,8 @@ extension CommandRouter {
         // Namespace is unique in the destination, including after rollback.
         // Different command IDs replay the same source instead of duplicating it.
         if let prior = try records(db,type:"import_receipt",project:pid).first(where:{$0["source_namespace"] as? String == bundle.namespace}) {
-            guard prior["source_sha256"] as? String == bundle.sourceHash,prior["state"] as? String == "committed" else {throw CoreError("IMPORT_SOURCE_CONFLICT","This source namespace already has a different or rolled-back import. Select an explicit new namespace after reconciliation.")}
+            guard prior["source_sha256"] as? String == bundle.sourceHash,prior["state"] as? String == "committed" else {throw CoreError("IMPORT_SOURCE_CONFLICT",
+                "This source namespace already has a different or rolled-back import. Select an explicit new namespace after reconciliation.")}
             return ["receipt_id":prior["id"]!,"source_replayed":true]
         }
         try revision(params,project)
@@ -113,10 +114,11 @@ extension CommandRouter {
         let receiptID = uuid(),sourceTasks = bundle.entries.filter {$0.family == "task"}
         let sourceProject = bundle.entries.first {$0.family == "project"}?.payload ?? [:]
         var created: [String] = [],mapping: [String:String] = [:]
-        func key(_ family: String,_ id: String) -> String {hash(Data((family + "\0" + id).utf8))}
-        for entry in bundle.entries {mapping[key(entry.family,entry.sourceID)] = uuid()}
-        func mapped(_ family: String,_ id: String?) -> String? {id.flatMap {mapping[key(family,$0)]}}
-        func store(_ value: JSON,_ family: String) throws {try save(db,value,type:family);created.append(value["id"] as! String)}
+        for entry in bundle.entries {mapping[ImportRecordContext.key(entry.family,entry.sourceID)] = uuid()}
+        func store(_ value: JSON,_ family: String) throws {
+            try save(db,value,type:family)
+            created.append(try StoredRecord(value,family:family).string("id"))
+        }
         // Existing destination authority/settings switch/root always stay local.
         // Source settings/policies/decisions remain exact in the inert archive.
         let fallbackEpic: String?
@@ -125,9 +127,63 @@ extension CommandRouter {
         else if bundle.schema == "checklist-project/1" {fallbackEpic = nil}
         else {throw CoreError("EPIC_REQUIRED","Map legacy tasks to an explicit destination Epic in both preview and commit.")}
         let time = now()
+        let context = ImportRecordContext(projectID:pid,receiptID:receiptID,namespace:bundle.namespace,time:time,mapping:mapping)
+        let taxonomy = try createImportTaxonomy(bundle.entries,context:context,store:store)
+        let number = try createImportTasks(db,sourceTasks,context:context,project:project,caller:caller,
+                                          fallbackEpic:fallbackEpic,taxonomy:taxonomy,store:store)
+        try createImportRelations(bundle.entries,context:context,store:store)
+        for relation in try records(db,type:"relation",project:pid) where relation["import_receipt_id"] as? String == receiptID {try validateRelation(db,relation,project:pid)}
+        try createImportAttachments(bundle,context:context,store:store)
+        try archiveImportRecords(bundle,context:context,store:store)
+        var nextProject = project
+        nextProject["next_number"] = number
+        if sourceProject["brief"] != nil {nextProject["brief"] = sourceProject["brief"];nextProject["imported_context_origin"] = "historical_unverified"}
+        if let path = sourceProject["icon_path"] as? String,let file = bundle.files.first(where:{$0.path == path}),let bytes = file.bytes,let asset = sourceProject["icon_asset"] as? JSON {
+            guard hash(bytes) == asset["sha256"] as? String else {throw CoreError("IMPORT_CHECKSUM_MISMATCH","Source icon differs from its export checksum.")}
+            // Managed icons have a dedicated family; copy from verified bytes.
+            let name = "icons/import-" + file.sha256! + ".png",files = try StorageObjectFiles(root:root)
+            if (try? files.read(name,maximum:TransferBundle.byteLimit)) == nil {try files.writeNew(name,bytes:bytes)}
+            nextProject["icon_path"] = name;nextProject["icon_asset"] = asset
+        }
+        nextProject = revised(nextProject);try save(db,nextProject,type:"project")
+        try event(db,caller:caller,project:pid,entity:receiptID,kind:"project_imported",
+            data:["source_namespace":bundle.namespace,"source_sha256":bundle.sourceHash,
+            "authority":"historical_unverified"])
+        let post = try importDestinationDigest(db,pid)
+        let receipt: JSON = ["id":receiptID,"project_id":pid,"revision":1,"state":"committed",
+            "source_namespace":bundle.namespace,"source_sha256":bundle.sourceHash,"source_schema":bundle.schema,
+            "created_ids":created,"previous_project":project,"post_digest":post,"diagnostics":bundle.diagnostics,
+            "files":bundle.files.map {["path":$0.path,"sha256":$0.sha256 ?? "","availability":$0.availability]},
+            "origin":caller.isOwner ? "human_ui" : "agent","created_by":caller.principal,
+            "created_at":time]
+        try save(db,receipt,type:"import_receipt")
+        return ["receipt_id":receiptID,"created_records":created.count,"task_count":sourceTasks.count,"source_sha256":bundle.sourceHash,"authority":"historical_unverified"]
+    }
+    private struct ImportRecordContext {
+        let projectID: String
+        let receiptID: String
+        let namespace: String
+        let time: String
+        let mapping: [String:String]
+
+        static func key(_ family: String,_ id: String) -> String {hash(Data((family + "\0" + id).utf8))}
+
+        func mapped(_ family: String,_ id: String?) -> String? {
+            id.flatMap {mapping[Self.key(family,$0)]}
+        }
+    }
+
+    private struct ImportTaxonomy {
+        let statusMap: [String:String]
+        let tagMap: [String:String]
+    }
+
+    private func createImportTaxonomy(_ entries: [TransferBundle.Entry],context: ImportRecordContext,
+                                      store: (JSON,String) throws -> Void) throws -> ImportTaxonomy {
+        let pid = context.projectID,receiptID = context.receiptID,time = context.time
         var statusMap: [String:String] = [:],tagMap: [String:String] = [:]
-        for entry in bundle.entries where ["status","tag","group"].contains(entry.family) {
-            let raw = entry.payload,id = mapped(entry.family,entry.sourceID)!
+        for entry in entries where ["status","tag","group"].contains(entry.family) {
+            let raw = entry.payload,id = context.mapped(entry.family,entry.sourceID)!
             var value: JSON = ["id":id,"project_id":pid,"revision":1,"name":raw["name"] ?? "Imported","import_receipt_id":receiptID,"origin":"import","created_at":time,"updated_at":time]
             if entry.family == "status" {
                 let category = raw["category"] as? String ?? "parked"
@@ -135,58 +191,130 @@ extension CommandRouter {
                 value["category"] = category;value["sort_order"] = raw["sort_order"] ?? 0;statusMap[entry.sourceID] = id
             }
             if entry.family == "tag" {tagMap[entry.sourceID] = id}
-            if entry.family == "group" {value["kind"] = raw["kind"] as? String == "epic" ? "epic" : "triage";value["task_ids"] = strings(raw,"task_ids").compactMap {mapped("task",$0)};value["brief"] = raw["brief"] ?? "";value["phase"] = raw["phase"] ?? "implementation";value["archived"] = raw["archived"] ?? false}
+            if entry.family == "group" {
+                value["kind"] = raw["kind"] as? String == "epic" ? "epic" : "triage"
+                value["task_ids"] = strings(raw,"task_ids").compactMap {context.mapped("task",$0)}
+                value["brief"] = raw["brief"] ?? ""
+                value["phase"] = raw["phase"] ?? "implementation"
+                value["archived"] = raw["archived"] ?? false
+            }
             for field in ["color","description","purpose","key"] {value[field] = raw[field]}
             try store(value,entry.family)
         }
-        var nextProject = project,number = int(project,"next_number",default:1)
+        return ImportTaxonomy(statusMap:statusMap,tagMap:tagMap)
+    }
+
+    private func createImportTasks(_ db: Database,_ sourceTasks: [TransferBundle.Entry],context: ImportRecordContext,
+                                   project: JSON,caller: Caller,fallbackEpic: String?,taxonomy: ImportTaxonomy,
+                                   store: (JSON,String) throws -> Void) throws -> Int {
+        let pid = context.projectID,receiptID = context.receiptID
+        var statusMap = taxonomy.statusMap,tagMap = taxonomy.tagMap
+        var number = int(project,"next_number",default:1)
         for entry in sourceTasks {
-            let raw = entry.payload,id = mapped("task",entry.sourceID)!
-            var sid = (raw["status_id"] as? String).flatMap {statusMap[$0]}
-            if sid == nil {
-                let state = raw["state"] as? String ?? "queued",subtype = raw["parked_subtype"] as? String ?? raw["area"] as? String ?? ""
-                let signature = state + ":" + subtype
-                if let prior = statusMap[signature] {sid = prior}
-                else {
-                    let category: String
-                    switch state {case "done":category = "done";case LegacyStoredValue.canceled,"canceled","split":category = "canceled";case "parked","later","blocked","you":category = "parked";default:category = "queued"}
-                    let newID = uuid();try store(["id":newID,"project_id":pid,"revision":1,"name":"Imported " + signature,"category":category,"sort_order":999,"origin":"import","import_receipt_id":receiptID],"status");statusMap[signature] = newID;sid = newID
-                }
-            }
-            var tags = strings(raw,"tag_ids").compactMap {tagMap[$0]}
-            for name in strings(raw,"tags") {
-                if tagMap[name] == nil {let tagID = uuid();tagMap[name] = tagID;try store(["id":tagID,"project_id":pid,"revision":1,"name":name,"origin":"import","import_receipt_id":receiptID],"tag")}
-                tags.append(tagMap[name]!)
-            }
-            let epic = mapped("group",raw["epic_id"] as? String) ?? fallbackEpic
+            let raw = entry.payload,id = context.mapped("task",entry.sourceID)!
+            let sid = try resolveImportStatus(raw,context:context,statusMap:&statusMap,store:store)
+            let tags = try resolveImportTags(raw,context:context,tagMap:&tagMap,store:store)
+            let epic = context.mapped("group",raw["epic_id"] as? String) ?? fallbackEpic
             guard let epic else {throw CoreError("EPIC_REQUIRED","Every imported task needs an explicit same-project primary Epic mapping.")}
             _ = try requiredEpicID(db,project:pid,value:epic)
-            let kind = raw["kind"] as? String ?? "work"
-            var task: JSON = ["id":id,"project_id":pid,"revision":1,"key":"\(project["key_prefix"] as? String ?? "TASK")-\(number)","title":raw["title"] ?? entry.sourceID,"brief":raw["brief"] ?? raw["detail"] ?? "","acceptance":raw["acceptance"] ?? [],"acceptance_revision":1,"kind":TicketKind.wireValues.contains(kind) ? kind : "work","readiness":"draft","status_id":sid!,"tag_ids":tags,"epic_id":epic,"priority":"normal","archived":raw["archived"] ?? false,"trashed":false,"origin":"import","created_by":caller.principal,"created_at":time,"updated_at":time,"import_receipt_id":receiptID,"source_id":entry.sourceID,"historical_unverified":true]
-            if let note = raw["note"] {task["imported_note"] = note}
-            if let state = raw["state"] {task["imported_state"] = state}
+            let task = importedTaskRecord(entry,id:id,statusID:sid,tags:tags,epic:epic,number:number,
+                                          context:context,project:project,caller:caller)
             try store(task,"task");number += 1
-            let aliasID = uuid();try store(["id":aliasID,"project_id":pid,"revision":1,"task_id":id,"namespace":bundle.namespace,"alias":raw["key"] ?? entry.sourceID,"state":"active","origin":"import","import_receipt_id":receiptID],"task_alias")
+            let aliasID = uuid();try store(["id":aliasID,"project_id":pid,"revision":1,
+                "task_id":id,"namespace":context.namespace,"alias":raw["key"] ?? entry.sourceID,
+                "state":"active","origin":"import","import_receipt_id":receiptID],"task_alias")
             for ref in strings(raw,"depends_on") {
-                var relation: JSON = ["id":uuid(),"project_id":pid,"revision":1,"source_task_id":id,"relation":"depends_on","required":true,"state":"active","origin":"import","source_reference":ref,"import_receipt_id":receiptID]
-                if let target = mapped("task",ref) {relation["target_task_id"] = target}
+                var relation: JSON = ["id":uuid(),"project_id":pid,"revision":1,"source_task_id":id,
+                    "relation":"depends_on","required":true,"state":"active","origin":"import",
+                    "source_reference":ref,"import_receipt_id":receiptID]
+                if let target = context.mapped("task",ref) {relation["target_task_id"] = target}
                 else {relation["state"] = "unresolved";relation["target_legacy_ref"] = ref}
                 try store(relation,"relation")
             }
         }
-        for entry in bundle.entries where entry.family == "relation" {
+        return number
+    }
+
+    private func resolveImportStatus(_ raw: JSON,context: ImportRecordContext,statusMap: inout [String:String],
+                                     store: (JSON,String) throws -> Void) throws -> String {
+        let pid = context.projectID,receiptID = context.receiptID
+        var sid = (raw["status_id"] as? String).flatMap {statusMap[$0]}
+        if sid == nil {
+            let state = raw["state"] as? String ?? "queued",subtype = raw["parked_subtype"] as? String ?? raw["area"] as? String ?? ""
+            let signature = state + ":" + subtype
+            if let prior = statusMap[signature] {sid = prior}
+            else {
+                let category: String
+                switch state {
+                case "done":category = "done"
+                case LegacyStoredValue.canceled,"canceled","split":category = "canceled"
+                case "parked","later","blocked","you":category = "parked"
+                default:category = "queued"
+                }
+                let newID = uuid();try store(["id":newID,"project_id":pid,"revision":1,
+                    "name":"Imported " + signature,"category":category,"sort_order":999,
+                    "origin":"import","import_receipt_id":receiptID],"status")
+                statusMap[signature] = newID
+                sid = newID
+            }
+        }
+        return sid!
+    }
+
+    private func resolveImportTags(_ raw: JSON,context: ImportRecordContext,tagMap: inout [String:String],
+                                   store: (JSON,String) throws -> Void) throws -> [String] {
+        let pid = context.projectID,receiptID = context.receiptID
+        var tags = strings(raw,"tag_ids").compactMap {tagMap[$0]}
+        for name in strings(raw,"tags") {
+            if tagMap[name] == nil {let tagID = uuid();tagMap[name] = tagID;try store(["id":tagID,"project_id":pid,"revision":1,"name":name,"origin":"import","import_receipt_id":receiptID],"tag")}
+            tags.append(tagMap[name]!)
+        }
+        return tags
+    }
+
+    private func importedTaskRecord(_ entry: TransferBundle.Entry,id: String,statusID: String,tags: [String],epic: String,
+                                    number: Int,context: ImportRecordContext,project: JSON,caller: Caller) -> JSON {
+        let raw = entry.payload,pid = context.projectID,receiptID = context.receiptID,time = context.time
+        let kind = raw["kind"] as? String ?? "work"
+        let ticketKey = "\(project["key_prefix"] as? String ?? "TASK")-\(number)"
+        var task: JSON = ["id":id,"project_id":pid,"revision":1,"key":ticketKey,"title":raw["title"] ?? entry.sourceID,
+            "brief":raw["brief"] ?? raw["detail"] ?? "","acceptance":raw["acceptance"] ?? [],
+            "acceptance_revision":1,"kind":TicketKind.wireValues.contains(kind) ? kind : "work",
+            "readiness":"draft","status_id":statusID,"tag_ids":tags,"epic_id":epic,"priority":"normal",
+            "archived":raw["archived"] ?? false,"trashed":false,"origin":"import","created_by":caller.principal,
+            "created_at":time,"updated_at":time,"import_receipt_id":receiptID,"source_id":entry.sourceID,
+            "historical_unverified":true]
+        if let note = raw["note"] {task["imported_note"] = note}
+        if let state = raw["state"] {task["imported_state"] = state}
+        return task
+    }
+
+    private func createImportRelations(_ entries: [TransferBundle.Entry],context: ImportRecordContext,
+                                       store: (JSON,String) throws -> Void) throws {
+        let pid = context.projectID,receiptID = context.receiptID
+        for entry in entries where entry.family == "relation" {
             let raw = entry.payload
-            guard let source = mapped("task",raw["source_task_id"] as? String) else {continue}
-            var relation: JSON = ["id":mapped("relation",entry.sourceID)!,"project_id":pid,"revision":1,"source_task_id":source,"relation":raw["relation"] ?? "related_to","required":raw["required"] ?? false,"state":raw["state"] ?? "active","origin":"import","import_receipt_id":receiptID]
-            if let target = mapped("task",raw["target_task_id"] as? String) {relation["target_task_id"] = target}
+            guard let source = context.mapped("task",raw["source_task_id"] as? String) else {continue}
+            var relation: JSON = ["id":context.mapped("relation",entry.sourceID)!,"project_id":pid,
+                "revision":1,"source_task_id":source,"relation":raw["relation"] ?? "related_to",
+                "required":raw["required"] ?? false,"state":raw["state"] ?? "active","origin":"import",
+                "import_receipt_id":receiptID]
+            if let target = context.mapped("task",raw["target_task_id"] as? String) {relation["target_task_id"] = target}
             else {relation["state"] = raw["state"] as? String == "removed" ? "removed" : "unresolved";relation["target_legacy_ref"] = raw["target_legacy_ref"] ?? raw["target_task_id"] ?? "missing"}
             try store(relation,"relation")
         }
-        for relation in try records(db,type:"relation",project:pid) where relation["import_receipt_id"] as? String == receiptID {try validateRelation(db,relation,project:pid)}
+    }
+
+    private func createImportAttachments(_ bundle: TransferBundle,context: ImportRecordContext,
+                                         store: (JSON,String) throws -> Void) throws {
+        let pid = context.projectID,receiptID = context.receiptID,time = context.time
         for entry in bundle.entries where entry.family == "attachment" {
             let raw = entry.payload
-            guard let tid = mapped("task",raw["task_id"] as? String) else {continue}
-            var attachment: JSON = ["id":mapped("attachment",entry.sourceID)!,"project_id":pid,"revision":1,"task_id":tid,"name":raw["name"] ?? "Imported file","mode":"managed","origin":"import","import_receipt_id":receiptID,"availability":"unavailable","created_at":time]
+            guard let tid = context.mapped("task",raw["task_id"] as? String) else {continue}
+            var attachment: JSON = ["id":context.mapped("attachment",entry.sourceID)!,"project_id":pid,
+                "revision":1,"task_id":tid,"name":raw["name"] ?? "Imported file","mode":"managed",
+                "origin":"import","import_receipt_id":receiptID,"availability":"unavailable",
+                "created_at":time]
             if let file = bundle.files.first(where:{$0.path == raw["path"] as? String}),file.bytes != nil {
                 guard raw["sha256"] as? String == file.sha256 else {throw CoreError("IMPORT_CHECKSUM_MISMATCH","An available attachment differs from its export checksum.")}
                 attachment["path"] = "objects/import-" + file.sha256!;attachment["sha256"] = file.sha256!;attachment["size"] = file.bytes!.count;attachment["availability"] = "available"
@@ -199,34 +327,32 @@ extension CommandRouter {
             for field in ["description","content_type","media_type"] {attachment[field] = raw[field]}
             try store(attachment,"attachment")
         }
+    }
+
+    private func archiveImportRecords(_ bundle: TransferBundle,context: ImportRecordContext,
+                                      store: (JSON,String) throws -> Void) throws {
+        let pid = context.projectID,receiptID = context.receiptID
         for entry in bundle.entries {
-            try store(["id":uuid(),"project_id":pid,"revision":1,"import_receipt_id":receiptID,"source_namespace":bundle.namespace,"source_family":entry.family,"source_id":entry.sourceID,"payload":entry.payload,"authority":"historical_unverified"],"import_record")
+            try store(["id":uuid(),"project_id":pid,"revision":1,"import_receipt_id":receiptID,
+                "source_namespace":bundle.namespace,"source_family":entry.family,"source_id":entry.sourceID,
+                "payload":entry.payload,"authority":"historical_unverified"],"import_record")
         }
         // Preserve the entire envelope too: unknown fields, settings, decision
         // logs and future source tags cannot disappear behind a mapping allowlist.
-        try store(["id":uuid(),"project_id":pid,"revision":1,"import_receipt_id":receiptID,"source_namespace":bundle.namespace,"source_family":"envelope","source_id":"/","payload":bundle.document,"authority":"historical_unverified"],"import_record")
-        nextProject["next_number"] = number
-        if sourceProject["brief"] != nil {nextProject["brief"] = sourceProject["brief"];nextProject["imported_context_origin"] = "historical_unverified"}
-        if let path = sourceProject["icon_path"] as? String,let file = bundle.files.first(where:{$0.path == path}),let bytes = file.bytes,let asset = sourceProject["icon_asset"] as? JSON {
-            guard hash(bytes) == asset["sha256"] as? String else {throw CoreError("IMPORT_CHECKSUM_MISMATCH","Source icon differs from its export checksum.")}
-            // Managed icons have a dedicated family; copy from verified bytes.
-            let name = "icons/import-" + file.sha256! + ".png",files = try StorageObjectFiles(root:root)
-            if (try? files.read(name,maximum:TransferBundle.byteLimit)) == nil {try files.writeNew(name,bytes:bytes)}
-            nextProject["icon_path"] = name;nextProject["icon_asset"] = asset
-        }
-        nextProject = revised(nextProject);try save(db,nextProject,type:"project")
-        try event(db,caller:caller,project:pid,entity:receiptID,kind:"project_imported",data:["source_namespace":bundle.namespace,"source_sha256":bundle.sourceHash,"authority":"historical_unverified"])
-        let post = try importDestinationDigest(db,pid)
-        let receipt: JSON = ["id":receiptID,"project_id":pid,"revision":1,"state":"committed","source_namespace":bundle.namespace,"source_sha256":bundle.sourceHash,"source_schema":bundle.schema,"created_ids":created,"previous_project":project,"post_digest":post,"diagnostics":bundle.diagnostics,"files":bundle.files.map {["path":$0.path,"sha256":$0.sha256 ?? "","availability":$0.availability]},"origin":caller.isOwner ? "human_ui" : "agent","created_by":caller.principal,"created_at":time]
-        try save(db,receipt,type:"import_receipt")
-        return ["receipt_id":receiptID,"created_records":created.count,"task_count":sourceTasks.count,"source_sha256":bundle.sourceHash,"authority":"historical_unverified"]
+        try store(["id":uuid(),"project_id":pid,"revision":1,"import_receipt_id":receiptID,
+            "source_namespace":bundle.namespace,"source_family":"envelope","source_id":"/",
+            "payload":bundle.document,"authority":"historical_unverified"],"import_record")
     }
+
     private func rollbackProjectImport(_ db: Database,_ params: JSON,_ caller: Caller,pid: String,project: JSON) throws -> JSON {
         var receipt = try scoped(db,text(params,"receipt_id"),pid,type:"import_receipt")
         try revision(params,receipt)
         guard receipt["state"] as? String == "committed",try importDestinationDigest(db,pid) == receipt["post_digest"] as? String else {throw CoreError("IMPORT_ROLLBACK_CHANGED","Destination work changed after import. Preserve it and preview compensating reconciliation instead.")}
         for id in strings(receipt,"created_ids") {try db.execute(sql:"DELETE FROM records WHERE id=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT)",arguments:[Data(id.utf8),Data(pid.utf8)])}
-        var previous = receipt["previous_project"] as! JSON;previous["revision"] = int(project,"revision")+1;previous["updated_at"] = now();try save(db,previous,type:"project")
+        var previous = try StoredRecord(receipt,family:"import_receipt").object("previous_project")
+        previous["revision"] = int(project,"revision")+1
+        previous["updated_at"] = now()
+        try save(db,previous,type:"project")
         receipt = revised(receipt);receipt["state"] = "rolled_back";receipt["rolled_back_by"] = caller.principal;try save(db,receipt,type:"import_receipt")
         try event(db,caller:caller,project:pid,entity:receipt["id"] as? String,kind:"project_import_rolled_back",data:["preserved_managed_bytes":true])
         return ["receipt_id":receipt["id"]!,"state":"rolled_back","revision":receipt["revision"]!,"preserved_managed_bytes":true]

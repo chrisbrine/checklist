@@ -54,7 +54,11 @@ extension CommandRouter {
             guard cleanupJobEqual(raw["id"],selection.id.text),cleanupJobEqual(raw["project_id"],pid),cleanupJobEqual(raw["task_id"],tid),raw["mode"] as? String == "managed",raw["availability"] as? String == "available",let digest = raw["sha256"] as? String,try ArchiveCleanupJob.integer(raw["size"]) == selection.logicalBytes else {throw CoreError("CLEANUP_PREVIEW_STALE","An eligible managed original changed. No cleanup was queued.")}
             return try .init(id:selection.id.text,sha256:digest,logicalBytes:selection.logicalBytes,attachmentRevision:ArchiveCleanupJob.integer(raw["revision"]))
         }
-        let basis: JSON = ["project_id":pid,"task_id":tid,"task_revision":current["revision"]!,"settings_revision":settingsRevision,"preview_id":previewID,"originals":originals.map {["attachment_id":$0.id.text,"sha256":$0.sha256,"logical_bytes":$0.logicalBytes,"attachment_revision":$0.attachmentRevision]}]
+        let basis: JSON = [
+            "project_id": pid, "task_id": tid, "task_revision": (try StoredRecord(current, family: "current").requiredValue("revision")), "settings_revision": settingsRevision,
+            "preview_id": previewID,
+            "originals": originals.map { ["attachment_id": $0.id.text, "sha256": $0.sha256, "logical_bytes": $0.logicalBytes, "attachment_revision": $0.attachmentRevision] },
+        ]
         let digest = hash(Data(try jsonString(basis).utf8))
         let previews = try records(db,type:"cleanup_preview",project:pid).filter {cleanupJobEqual($0["cleanup_preview_id"],previewID)}
         guard previews.count == 1,let preview = previews.first,cleanupJobEqual(preview["project_id"],pid),cleanupJobEqual(preview["task_id"],tid),try ArchiveCleanupJob.integer(preview["task_revision"]) == ArchiveCleanupJob.integer(current["revision"]),try ArchiveCleanupJob.integer(preview["settings_revision"]) == settingsRevision,preview["cleanup_job_plan_sha256"] as? String == digest else {throw CoreError("CLEANUP_PREVIEW_REQUIRED","A current settings-bound archive cleanup preview is required. No cleanup was queued.")}
@@ -72,7 +76,8 @@ extension CommandRouter {
         // must never prevent protective cancellation or invent a zero total.
         let accounting: (StorageBackupRetentionIndex,[Data:JSON])? = try? {
             let index = try storageBackupRetentionIndex(db)
-            let attachments = Dictionary(uniqueKeysWithValues:try records(db,type:"attachment",project:pid).map { (Data(($0["id"] as! String).utf8),$0) })
+            let attachments = Dictionary(
+                uniqueKeysWithValues: try records(db, type: "attachment", project: pid).map { (Data(((try StoredRecord($0, family: "record").string("id"))).utf8), $0) })
             return (index,attachments)
         }()
         func projection(_ job: ArchiveCleanupJob,_ revision: Int64) throws -> JSON {

@@ -4,7 +4,8 @@ import GRDB
 /// Advisory supervision only. The durable state lives on tickets and correlated
 /// messages, so export/backup retain it without creating another authority store.
 extension CommandRouter {
-    static let defaultWorkHealth: JSON = ["enabled": true, "inactivity_minutes": 20, "response_grace_minutes": 20]
+    // Return a fresh value; JSON contains Any and must not be stored as shared state.
+    static var defaultWorkHealth: JSON { ["enabled": true, "inactivity_minutes": 20, "response_grace_minutes": 20] }
 
     func workHealthSettings(_ project: JSON) -> JSON {
         var value = Self.defaultWorkHealth
@@ -44,7 +45,7 @@ extension CommandRouter {
 
     /// Exact task/attempt queries; no project message/event corpus is decoded.
     func workHealthTarget(_ db: Database, task: JSON) throws -> JSON {
-        let pid = task["project_id"] as! String
+        let pid = (try StoredRecord(task, family: "task").string("project_id"))
         if let aid = task["active_attempt_id"] as? String,
            let attempt = try? scoped(db, aid, pid, type: "attempt"), attempt["state"] as? String == "active" {
             return ["kind": "attempt", "id": aid, "phase": attempt["phase"] ?? "implementation",
@@ -57,7 +58,7 @@ extension CommandRouter {
         if coordinators.count == 1, let group = coordinators.first, let orchestration = group["orchestration"] as? JSON,
            let id = orchestration["id"] as? String, !id.isEmpty, let sid = orchestration["session_id"] as? String, !sid.isEmpty,
            let phase = triagePhase(group) {
-            return ["kind": "orchestration", "id": id, "triage_id": group["id"]!,
+            return ["kind": "orchestration", "id": id, "triage_id": (try StoredRecord(group, family: "record").requiredValue("id")),
                     "phase": phase, "session_id": sid,
                     "generation": orchestration["session_authorization_generation"] ?? "", "started_at": orchestration["started_at"] ?? NSNull()]
         }
@@ -68,7 +69,7 @@ extension CommandRouter {
         ["kind", "id", "phase", "session_id", "generation"].allSatisfy { (a[$0] as? String ?? "").utf8.elementsEqual((b[$0] as? String ?? "").utf8) }
     }
     private func healthProgress(_ db: Database, task: JSON, target: JSON) throws -> Date? {
-        let pid = task["project_id"] as! String
+        let pid = (try StoredRecord(task, family: "task").string("project_id"))
         if target["kind"] as? String == "attempt" {
             // The accepted tree is capped at 32 descendants by work authority.
             // Include released accepted children too: their completed work is progress.
@@ -79,7 +80,9 @@ extension CommandRouter {
                   WHERE a.type='attempt' AND a.project_id=? AND json_extract(a.data,'$.task_id')=?
                 ) SELECT data FROM tree
                 """
-            let latest = try Double.fetchOne(db, sql: "SELECT MAX(checklist_timestamp(COALESCE(json_extract(data,'$.health_progress_at'),json_extract(data,'$.last_checkpoint'),json_extract(data,'$.started_at')))) FROM (" + sql + ")", arguments: [pid, target["id"] as! String, pid, task["id"] as! String])
+            let latest = try Double.fetchOne(db,
+                sql: "SELECT MAX(checklist_timestamp(COALESCE(json_extract(data,'$.health_progress_at'),json_extract(data,'$.last_checkpoint'),json_extract(data,'$.started_at')))) FROM (" + sql +
+                    ")", arguments: [pid, (try StoredRecord(target, family: "health_target").string("id")), pid, (try StoredRecord(task, family: "task").string("id"))])
             return latest.map { Date(timeIntervalSince1970: $0) }
         }
         if let gid = target["triage_id"] as? String,
@@ -89,7 +92,7 @@ extension CommandRouter {
         return nil
     }
     private func healthProgressToken(_ db: Database, task: JSON, target: JSON) throws -> String {
-        let pid = task["project_id"] as! String
+        let pid = (try StoredRecord(task, family: "task").string("project_id"))
         if target["kind"] as? String == "attempt" {
             // Select only this accepted tree: repeated checkpoint timestamps do not
             // change the token once the substantive clock has been initialized.
@@ -100,16 +103,18 @@ extension CommandRouter {
                   WHERE a.type='attempt' AND a.project_id=? AND json_extract(a.data,'$.task_id')=?
                 ) SELECT json_group_array(json_array(id,COALESCE(json_extract(data,'$.health_progress_at'),json_extract(data,'$.last_checkpoint'),json_extract(data,'$.started_at')),json_extract(data,'$.health_progress_id'))) FROM (SELECT * FROM tree ORDER BY id)
                 """
-            return hash(Data((try String.fetchOne(db,sql:sql,arguments:[pid,target["id"] as! String,pid,task["id"] as! String]) ?? "").utf8))
+            return hash(Data((try String.fetchOne(db,sql:sql,arguments:[pid,(try StoredRecord(target, family: "health_target").string("id")),pid,(try StoredRecord(task,
+                family: "task").string("id"))]) ?? "").utf8))
         }
         if let gid = target["triage_id"] as? String, let o = try scoped(db,gid,pid,type:"group")["orchestration"] as? JSON {
-            return hash(Data(try jsonString(["id":o["id"]!,"progress_id":o["health_progress_id"] ?? "","at":o["health_progress_at"] ?? o["started_at"] ?? ""]).utf8))
+            return hash(Data(try jsonString(["id":(try StoredRecord(o, family: "record").requiredValue("id")),"progress_id":o["health_progress_id"] ?? "",
+                "at":o["health_progress_at"] ?? o["started_at"] ?? ""]).utf8))
         }
         return "missing"
     }
 
     func workHealthView(_ db: Database, task: JSON, at date: Date = Date(), selectedProjection: JSON? = nil) throws -> JSON {
-        let pid = task["project_id"] as! String, target = try workHealthTarget(db, task: task)
+        let pid = (try StoredRecord(task, family: "task").string("project_id")), target = try workHealthTarget(db, task: task)
         let settings = workHealthSettings(try record(db, pid, type: "project"))
         var value = task["work_health"] as? JSON ?? ["state": "pending_check"]
         value["settings"] = settings; value["current_target"] = target
@@ -124,7 +129,7 @@ extension CommandRouter {
             waits.append(["kind": "resource", "reason": resource, "since": a["waiting_since"] ?? NSNull()])
         }
         let requests = try scopedTaskRows(db, type: "request", task: task, predicate: "json_extract(data,'$.state')='pending' AND json_extract(data,'$.blocking')=1", limit: 25)
-        waits += requests.map { ["kind": "human", "request_id": $0["id"]!, "reason": $0["title"] ?? "Owner answer"] }
+        waits += try requests.map { ["kind": "human", "request_id": (try StoredRecord($0, family: "record").requiredValue("id")), "reason": $0["title"] ?? "Owner answer"] }
         // A selected read has already built this task's status/dependency facts
         // in the same transaction. Reuse that request-local value only; health
         // and its time-sensitive fields are still computed on every read.
@@ -151,10 +156,10 @@ extension CommandRouter {
 
     /// Queue only this message's exact recipients; never load the project outbox.
     private func queueHealthDeliveries(_ db: Database, message: JSON, recipients: [JSON]) throws -> [JSON] {
-        let pid = message["project_id"] as! String, mid = message["id"] as! String
+        let pid = (try StoredRecord(message, family: "message").string("project_id")), mid = (try StoredRecord(message, family: "message").string("id"))
         var deliveries = try Row.fetchAll(db, sql: "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='delivery' AND project_id=? AND json_extract(data,'$.message_id')=? LIMIT 33", arguments:[pid,mid]).map { try GRDBRecordEnvelopeAdapter.decode($0).object }
         for recipient in recipients {
-            let sid = recipient["session_id"] as! String, generation = recipient["authorization_generation"] as! String
+            let sid = (try StoredRecord(recipient, family: "recipient").string("session_id")), generation = (try StoredRecord(recipient, family: "recipient").string("authorization_generation"))
             let session = try scoped(db,sid,pid,type:"session")
             guard session["role"] as? String == "worker", canReceive(session,project:pid), sessionGeneration(session) == generation else { throw CoreError("RECIPIENT_CHANGED", "Health recipient authorization changed before pickup queueing.") }
             if deliveries.contains(where: { $0["recipient_session_id"] as? String == sid && $0["recipient_authorization_generation"] as? String == generation }) { continue }
@@ -166,8 +171,8 @@ extension CommandRouter {
 
     private var healthActor: Caller { Caller(role: "owner", installation: "work-health-service", projectIDs: []) }
     @discardableResult private func healthNote(_ db: Database, task: JSON, body: String, target: JSON?, request: JSON? = nil) throws -> JSON {
-        let pid = task["project_id"] as! String
-        var message: JSON = ["id": uuid(), "project_id": pid, "task_id": task["id"]!, "kind": "work_health", "origin": "system",
+        let pid = (try StoredRecord(task, family: "task").string("project_id"))
+        var message: JSON = ["id": uuid(), "project_id": pid, "task_id": (try StoredRecord(task, family: "record").requiredValue("id")), "kind": "work_health", "origin": "system",
                              "body": body, "author": "work-health-service", "author_display": "Checklist work health", "author_session_id": "service",
                              "requires_action": false, "revision": 1, "created_at": now()]
         if let request { message["health_request"] = request }
@@ -178,7 +183,8 @@ extension CommandRouter {
             recipients = [["session_id": sid, "authorization_generation": sessionGeneration(session), "recipient_role": "health_handler"]]
         }
         let deliveries = try queueHealthDeliveries(db, message: message, recipients: recipients)
-        try event(db, caller: healthActor, project: pid, entity: task["id"] as? String, kind: "work_health_note", data: ["message_id": message["id"]!])
+        try event(db, caller: healthActor, project: pid, entity: task["id"] as? String, kind: "work_health_note", data: ["message_id": (try StoredRecord(message,
+            family: "record").requiredValue("id"))])
         message["deliveries"] = deliveries
         return message
     }
@@ -200,10 +206,13 @@ extension CommandRouter {
 
     private func notifyHealthCoordinators(_ db: Database, task: JSON, request: JSON, note: JSON) throws {
         let recipients = try healthCoordinators(db, task: task, excluding: (request["target"] as? JSON)?["session_id"] as? String)
+        let pid = try StoredRecord(task, family: "task").string("project_id")
         for target in recipients {
-            guard let session = try? scoped(db, target["session_id"] as! String, task["project_id"] as! String, type: "session"),
-                  canReceive(session, project: task["project_id"] as! String), sessionGeneration(session) == target["generation"] as? String else { continue }
-            _ = try queueHealthDeliveries(db, message: note, recipients: [["session_id": session["id"]!, "authorization_generation": sessionGeneration(session), "recipient_role": "health_coordinator"]])
+            let sid = try StoredRecord(target, family: "health_target").string("session_id")
+            guard let session = try? scoped(db, sid, pid, type: "session"),
+                  canReceive(session, project: pid), sessionGeneration(session) == target["generation"] as? String else { continue }
+            _ = try queueHealthDeliveries(db, message: note, recipients: [["session_id": (try StoredRecord(session, family: "record").requiredValue("id")),
+                "authorization_generation": sessionGeneration(session), "recipient_role": "health_coordinator"]])
         }
     }
 
@@ -257,7 +266,7 @@ extension CommandRouter {
     }
     func checkWorkHealth(_ db: Database, task original: JSON, at date: Date) throws -> Bool {
         var task = original
-        let project = try record(db, task["project_id"] as! String, type: "project"), settings = workHealthSettings(project)
+        let project = try record(db, (try StoredRecord(task, family: "task").string("project_id")), type: "project"), settings = workHealthSettings(project)
         guard bool(settings, "enabled") else { return false }
         let target = try workHealthTarget(db, task: task), stamp = healthStamp(date)
         let progress = try healthProgress(db, task: task, target: target)
@@ -274,14 +283,16 @@ extension CommandRouter {
         if health.isEmpty || health["baseline_at"] == nil { health["baseline_at"] = healthStamp(max(progress ?? date, healthTime(project["work_health_changed_at"]) ?? .distantPast)) }
         if health["settings_generation"] as? String != configGeneration || rebased {
             if health["settings_generation"] != nil { health["baseline_at"] = stamp; health["next_check_at"] = healthStamp(date.addingTimeInterval(interval)) }
-            if let mid = health["request_id"] as? String, var message = try? scoped(db, mid, task["project_id"] as! String, type: "message"), var request = message["health_request"] as? JSON, request["outcome"] == nil, health["state"] as? String == "awaiting_response" {
+            if let mid = health["request_id"] as? String, var message = try? scoped(db, mid, (try StoredRecord(task, family: "task").string("project_id")), type: "message"),
+                var request = message["health_request"] as? JSON, request["outcome"] == nil, health["state"] as? String == "awaiting_response" {
                 request["deadline"] = healthStamp(date.addingTimeInterval(grace)); message["health_request"] = request; try save(db, revised(message), type: "message"); health["deadline"] = request["deadline"]; health["next_check_at"] = request["deadline"]
             }
             health["settings_generation"] = configGeneration
         }
         let baseline = max(healthTime(health["baseline_at"]) ?? date, min(progress ?? .distantPast, date))
         let due = healthTime(health["next_check_at"]) ?? baseline.addingTimeInterval(interval)
-        if let mid = health["request_id"] as? String, var message = try? scoped(db, mid, task["project_id"] as! String, type: "message"), var request = message["health_request"] as? JSON, request["outcome"] == nil {
+        if let mid = health["request_id"] as? String, var message = try? scoped(db, mid, (try StoredRecord(task, family: "task").string("project_id")), type: "message"),
+            var request = message["health_request"] as? JSON, request["outcome"] == nil {
             if let progress, let sent = healthTime(request["requested_at"]), progress > sent || (request["progress_token"] as? String).map({ $0 != progressToken }) == true {
                 try healthOutcome(db, task: task, request: &request, outcome: "progress_observed", body: "Work health resumed: substantive progress from the current attempt or accepted child answered check \(mid). Work authority is unchanged.")
                 health.removeValue(forKey: "request_id"); health.removeValue(forKey: "deadline"); health["state"] = "current"; health["attention"] = false; health["baseline_at"] = healthStamp(progress); health["next_check_at"] = healthStamp(progress.addingTimeInterval(interval))
@@ -318,7 +329,8 @@ extension CommandRouter {
         try revision(p, task)
         let mid = try text(p, "request_id"), message = try scoped(db, mid, pid, type: "message")
         guard message["task_id"] as? String == task["id"] as? String, message["health_request"] != nil else { throw CoreError("INVALID_INPUT", "Select this ticket's correlated work health request.") }
-        let reply: JSON = ["id": uuid(), "project_id": pid, "task_id": task["id"]!, "reply_to": mid, "body": try text(p, "progress"), "author_session_id": c.sessionID ?? "human", "author": c.principal, "origin": "agent", "kind": "reply", "revision": 1, "created_at": now()]
+        let reply: JSON = ["id": uuid(), "project_id": pid, "task_id": (try StoredRecord(task, family: "record").requiredValue("id")), "reply_to": mid, "body": try text(p, "progress"),
+            "author_session_id": c.sessionID ?? "human", "author": c.principal, "origin": "agent", "kind": "reply", "revision": 1, "created_at": now()]
         try save(db, reply, type: "message")
         return try reconcileHealthReply(db, reply: reply, caller: c) ?? [:]
     }
@@ -330,10 +342,10 @@ extension CommandRouter {
               var message = try? scoped(db, mid, pid, type: "message"), var request = message["health_request"] as? JSON,
               let target = request["target"] as? JSON else { return nil }
         guard reply["author_session_id"] as? String == target["session_id"] as? String else { throw CoreError("FORBIDDEN", "Only the exact requested handler may answer this work health check.") }
-        let sid = target["session_id"] as! String
+        let sid = (try StoredRecord(target, family: "health_target").string("session_id"))
         guard let session = try? scoped(db, sid, pid, type: "session"), canReceive(session, project: pid), sessionGeneration(session) == target["generation"] as? String else { throw CoreError("STALE_CLAIM", "The requested session generation is no longer eligible; use ordinary fresh claim/handoff recovery.") }
         if let outcome = request["outcome"] { return ["outcome": outcome, "request_id": mid, "replayed": true] }
-        var task = try scoped(db, message["task_id"] as! String, pid, type: "task")
+        var task = try scoped(db, (try StoredRecord(message, family: "message").string("task_id")), pid, type: "task")
         let current = try workHealthTarget(db, task: task)
         var authorized = sameHealthTarget(target, current) && int(request, "acceptance_revision") == int(task, "acceptance_revision") && (request["manifest_id"] as? String) == (task["current_manifest_id"] as? String)
         if authorized, target["kind"] as? String == "orchestration" {
@@ -342,7 +354,7 @@ extension CommandRouter {
             authorized = strings(rule,"providers").contains(session["provider"] as? String ?? "")
         }
         if authorized, target["kind"] as? String == "attempt" {
-            let a = try scoped(db, target["id"] as! String, pid, type: "attempt")
+            let a = try scoped(db, (try StoredRecord(target, family: "health_target").string("id")), pid, type: "attempt")
             let handler = Caller(role: "worker", installation: session["installation"] as? String ?? "", projectIDs: [pid], sessionID: sid, workspace: session["workspace"] as? String, executionDomain: session["execution_domain"] as? String)
             authorized = a["incarnation"] as? String == incarnation && a["principal"] as? String == handler.principal
             if authorized { do { try requireLiveAncestry(db, attempt: a); try verifyPolicyAuthority(db, attempt: a, caller: handler) } catch { authorized = false } }
@@ -364,6 +376,6 @@ extension CommandRouter {
                 health["last_response_id"] = reply["id"]; task["work_health"] = health; try save(db, revised(task), type: "task")
             }
         }
-        return ["outcome": outcome, "request_id": mid, "response_id": reply["id"]!]
+        return ["outcome": outcome, "request_id": mid, "response_id": (try StoredRecord(reply, family: "record").requiredValue("id"))]
     }
 }
