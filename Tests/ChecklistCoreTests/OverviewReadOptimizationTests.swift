@@ -503,3 +503,140 @@ extension CoreTests {
         XCTAssertEqual(refreshed.first {$0["id"] as? String == second["id"] as? String}?["cleaned_original_count"] as? Int,1)
     }
 }
+
+extension CoreTests {
+    func testTriageStatusRetentionReadsOnlyDestinationCategory() throws {
+        let p = try project("Destination category", "DC"), pid = p["id"] as! String
+        let t = try ready(p,task(p)), group = try triage(p)
+        try addTriage(p,group,t)
+        let before = try currentTriage(p,group)
+        try router.dbQueue.write { db in
+            let statuses = try router.records(db,type:"status",project:pid)
+            for status in statuses where status["category"] as? String != "done" {
+                var destination = try router.record(db,t["id"] as! String,type:"task")
+                destination["status_id"] = status["id"]
+                // The persisted fallback cannot override a present destination.
+                destination["status_category"] = "done"
+                var queries: [String] = []
+                db.trace {if case .statement(let statement) = $0 {queries.append(statement.sql)}}
+                try router.recordTicketStatusAction(db,task:destination,caller:owner,operation:.triage)
+                db.trace(options:[])
+                XCTAssertEqual(queries.count,1,"A retained status action needs only its destination status")
+                XCTAssertTrue(queries[0].contains("WHERE id = CAST(? AS TEXT)"),queries[0])
+            }
+        }
+        XCTAssertEqual(try jsonString(currentTriage(p,group)),try jsonString(before))
+        // Done still removes every current handling membership and records its exit.
+        let other = try triage(p)
+        try addTriage(p,other,t)
+        try router.dbQueue.writeWithoutTransaction {db in try router.withValidatedDomainTransaction(db) {
+            var destination = try router.record(db,t["id"] as! String,type:"task")
+            destination["status_id"] = try router.status(db,pid,"done")["id"]
+            try router.recordTicketStatusAction(db,task:destination,caller:owner,operation:.triage)
+            return .commit
+        }}
+        for value in [group,other] {XCTAssertFalse(strings(try currentTriage(p,value),"task_ids").contains(t["id"] as! String))}
+        try router.dbQueue.read {db in
+            XCTAssertEqual(try router.records(db,type:"triage_membership_exit",project:pid).filter {$0["task_id"] as? String == t["id"] as? String}.count,2)
+        }
+    }
+
+    func testRealSizeBatchClaimRetainsMembershipAndReleaseFences() throws {
+        let p = try project("Bounded batch effects", "BE"), pid = p["id"] as! String
+        let tasks = try [ready(p,task(p,"One")),ready(p,task(p,"Two"))], group = try triage(p)
+        for t in tasks {try addTriage(p,group,t)}
+        // Template records model a project with retained history and many other
+        // containers. These are owned fixtures, never a live-store dependency.
+        try router.dbQueue.writeWithoutTransaction { db in try router.withValidatedDomainTransaction(db) {
+            for index in 0..<250 {
+                let tid = "unrelated-batch-task-\(index)"
+                try router.save(db,["id":tid,"project_id":pid,"title":"Other \(index)","epic_id":tasks[0]["epic_id"]!,"status_id":tasks[0]["status_id"]!,"revision":1],type:"task")
+                try router.save(db,["id":"unrelated-batch-group-\(index)","project_id":pid,"kind":"triage","phase":"implementation","members":[["task_id":tid]],"task_ids":[tid],"revision":1],type:"group")
+                try router.save(db,["id":"unrelated-batch-attempt-\(index)","project_id":pid,"task_id":tid,"phase":"implementation","state":"released","principal":"fixture","session_id":"human","revision":1],type:"attempt")
+                try router.save(db,["id":"unrelated-batch-relation-\(index)","project_id":pid,"source_task_id":tid,"target_task_id":tasks[0]["id"]!,"relation":"related_to","state":"active","revision":1],type:"relation")
+            }
+            return .commit
+        }}
+        func current() throws -> JSON {
+            try XCTUnwrap((try call("triage_list",["project_id":pid,"triage_id":group["id"]!,"fields":["task_ids"]])["groups"] as? [JSON])?.first)
+        }
+        let selected = try tasks.map {value -> JSON in
+            let fresh = try call("task_get",["project_id":pid,"task_id":value["id"]!])
+            return ["task_id":fresh["id"]!,"expected_revision":fresh["revision"]!]
+        }
+        let batch = try call("batch_prepare",["project_id":pid,"triage_id":group["id"]!,"expected_revision":current()["revision"]!,"phase":"implementation","tasks":selected])
+        let claimed = try claimFixedBatch(p,batch)
+        let claims = try XCTUnwrap(claimed["claims"] as? [JSON])
+        XCTAssertEqual(claims.count,2)
+        XCTAssertEqual(strings(try current(),"task_ids"),tasks.map {$0["id"] as! String})
+        for claim in claims {
+            let projected = try XCTUnwrap(claim["task"] as? JSON), context = try XCTUnwrap(claim["context"] as? JSON)
+            XCTAssertEqual(projected["status_category"] as? String,"active")
+            XCTAssertEqual(context["next_action"] as? String,"continue_implementation")
+            XCTAssertEqual((context["handler"] as? JSON)?["id"] as? String,claim["id"] as? String)
+        }
+        assertCode("CLAIM_CONFLICT") {_ = try claimFixedBatch(p,batch)}
+        let members = claims.map {["attempt_id":$0["id"]!,"claim_token":$0["claim_token"]!] as JSON}
+        var invalid = members; invalid[1]["claim_token"] = "invalid"
+        assertCode("STALE_CLAIM") {_ = try call("batch_release",["project_id":pid,"batch_id":batch["id"]!,"members":invalid,"reason":"Must be atomic"])}
+        for t in tasks {XCTAssertEqual(try call("task_get",["project_id":pid,"task_id":t["id"]!])["status_category"] as? String,"active")}
+        _ = try call("batch_release",["project_id":pid,"batch_id":batch["id"]!,"members":members,"reason":"Fixture complete"])
+        XCTAssertEqual(strings(try current(),"task_ids"),tasks.map {$0["id"] as! String})
+        for t in tasks {XCTAssertEqual(try call("task_get",["project_id":pid,"task_id":t["id"]!])["status_category"] as? String,"queued")}
+        assertCode("STALE_CLAIM") {_ = try call("work_checkpoint",["project_id":pid,"attempt_id":claims[0]["id"]!,"claim_token":claims[0]["claim_token"]!,"progress":"Released claim cannot write"])}
+    }
+}
+
+extension CoreTests {
+    func testCompactContextReusesNewestManifestWindowAtBothSectionLimits() throws {
+        let p = try project("Manifest window reuse", "MW"), pid = p["id"] as! String
+        for count in [0,25,26,27,100,101,102] {
+            let t = try task(p,"Window \(count)"), tid = t["id"] as! String
+            try router.dbQueue.writeWithoutTransaction {db in try router.withValidatedDomainTransaction(db) {
+                for index in 0..<count {
+                    try router.save(db,["id":"reused-manifest-\(count)-\(index)","project_id":pid,"task_id":tid,"revision":1,"created_at":"2026-10-25T00:00:00Z","evidence":["measures":[["name":"fixture count","unit":"count","after":index,"limit":50]]]],type:"manifest")
+                }
+                return .commit
+            }}
+            try router.dbQueue.read {db in
+                var queries:[String]=[]
+                db.trace {if case .statement(let statement) = $0 {queries.append(statement.expandedSQL)}}
+                let context = try router.compactTaskContext(db,task:t,caller:owner)
+                db.trace(options:[])
+                let history = try XCTUnwrap(context["manifests"] as? [JSON])
+                XCTAssertEqual(history.compactMap {$0["id"] as? String},(max(0,count-25)..<count).map {"reused-manifest-\(count)-\($0)"})
+                let evidence = try XCTUnwrap(context["evidence_measures"] as? JSON)
+                XCTAssertEqual(try jsonString(evidence),try jsonString(router.evidenceMeasuresContext(db,task:t)))
+                XCTAssertEqual(evidence["truncated"] as? Bool,count>100)
+                XCTAssertEqual(context["truncated"] as? Bool,count>25)
+                let reads = queries.filter {$0.contains("FROM records WHERE type='manifest'") && $0.contains("ORDER BY rowid DESC LIMIT")}
+                XCTAssertEqual(reads.count,1,"Both consumers must share the same exact newest101 window")
+            }
+        }
+    }
+
+    func testTaskProjectionHealthKeepsByteExactPrerequisiteIdentity() throws {
+        let p = try project("Projection health identity", "PH"), pid = p["id"] as! String
+        let prerequisite = try task(p,"Prerequisite"), template = try ready(p,task(p,"Dependent"))
+        let exactID = "health-é", aliasID = "health-e\u{301}"
+        try router.dbQueue.writeWithoutTransaction {db in try router.withValidatedDomainTransaction(db) {
+            for (id,key) in [(exactID,"PH-opaque-a"),(aliasID,"PH-opaque-b")] {
+                var value = template;value["id"] = id;value["key"] = key;value["revision"] = 1
+                try router.save(db,value,type:"task")
+            }
+            try router.save(db,["id":"health-alias-relation","project_id":pid,"source_task_id":aliasID,"target_task_id":prerequisite["id"]!,"relation":"depends_on","required":true,"state":"active","revision":1],type:"relation")
+            return .commit
+        }}
+        try router.dbQueue.read {db in
+            let fresh = try router.record(db,exactID,type:"task")
+            let expectedHealth = try router.workHealthView(db,task:fresh)
+            let projected = try router.taskProjection(db,fresh)
+            // The legacy full projection compares Swift strings. Health's exact
+            // selected reader must retain its distinct SQL BINARY identities.
+            XCTAssertEqual((projected["prerequisite_blockers"] as? [JSON])?.count,1)
+            let health = try XCTUnwrap(projected["work_health"] as? JSON)
+            XCTAssertEqual(try jsonString(health),try jsonString(expectedHealth))
+            XCTAssertFalse((health["known_waits"] as? [JSON] ?? []).contains {$0["kind"] as? String == "dependency"})
+        }
+    }
+}

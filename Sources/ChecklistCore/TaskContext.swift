@@ -92,7 +92,10 @@ extension CommandRouter {
         result["review_requirements"] = try reviewRequirementState(db,task:task)
         // CL-43: failed rounds per gate and repeated-cause warnings; advice only.
         result["review_summary"] = try reviewSummary(db,task:task)
-        result["evidence_measures"] = try evidenceMeasuresContext(db,task:task)
+        // The evidence summary and compatibility history need the same newest
+        // manifests in this transaction; keep the larger evidence window once.
+        let manifests = try scopedTaskRows(db,type:"manifest",task:task,limit:101,descending:true)
+        result["evidence_measures"] = try evidenceMeasuresContext(db,task:task,manifests:manifests)
         result["direction_cursor"] = try cursor(db,caller:caller,scope:directionCursorScope(db,task:task,caller:caller,attempt:directionAttempt))
         result["unresolved_directions"] = directions.prefix(limit).map(contextPreview)
         result["review_requests"] = Array(reviews.prefix(limit))
@@ -146,7 +149,10 @@ extension CommandRouter {
         // Compatibility sections are bounded; records_ref retrieves every omitted record.
         for (key,type) in [("findings","finding"),("finding_resolutions","finding_resolution"),("requests","request"),("reviews","review"),("attachments","attachment"),("attempts","attempt"),("manifests","manifest")] {
             // The newest attempt window was selected above in this same read.
-            let values = type == "attempt" ? attempts : try scopedTaskRows(db,type:type,task:task,limit:limit+1,descending:true).reversed().map {$0}
+            let values: [JSON]
+            if type == "attempt" { values = attempts }
+            else if type == "manifest" { values = manifests.prefix(limit+1).reversed().map {$0} }
+            else { values = try scopedTaskRows(db,type:type,task:task,limit:limit+1,descending:true).reversed().map {$0} }
             result[key] = values.suffix(limit).map {contextPreview(contextRecord($0,type:type,caller:caller))}
             if values.count > limit { result["truncated"] = true }
         }

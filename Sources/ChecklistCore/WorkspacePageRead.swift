@@ -11,6 +11,15 @@ private struct WorkspaceTaskIdentity: Hashable {
 }
 
 extension CommandRouter {
+    func workspaceCoverage(_ db: Database,projectsJSON: String) throws -> Int {
+        // Separate exact project/global ranges let the covering events_scope
+        // index supply coverage without the combined OR scan of event rows.
+        try Int.fetchOne(db,sql:"""
+            SELECT COALESCE(MAX(latest),0) FROM (
+              SELECT (SELECT MAX(seq) FROM events WHERE project_id=p.value) latest FROM json_each(?) p
+              UNION ALL SELECT MAX(seq) FROM events WHERE project_id IS NULL)
+            """,arguments:[projectsJSON]) ?? 0
+    }
     /// Owner workspace surfaces keep one bounded value, separate from the full
     /// snapshot index. An omitted row never means that the record was deleted.
     func workspacePage(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
@@ -32,7 +41,7 @@ extension CommandRouter {
         let since = try text(p,"since",max:40,required:false)
         let sinceDate = since.isEmpty ? nil : ISO8601DateFormatter().date(from:since)
         if surface == "completed_since" && sinceDate == nil {throw CoreError("INVALID_INPUT","Give the digest start as an ISO 8601 time.")}
-        let latest = try Int.fetchOne(db,sql:"SELECT COALESCE(MAX(seq),0) FROM events WHERE project_id IN (SELECT value FROM json_each(?)) OR project_id IS NULL",arguments:[projectsJSON]) ?? 0
+        let latest = try workspaceCoverage(db,projectsJSON:projectsJSON)
         let identity: JSON = ["surface":surface,"projects":projectIDs,"query":query,"record":recordID,"since":since,"closed":bool(p,"include_archived"),"locale":Locale.current.identifier,"authorization":try authorizationScope(db,c),"coverage":latest]
         let cursorScope = "workspace-page-v1:"+hash(Data(try jsonString(identity).utf8))
         let offset = try cursorSequence(db,p,caller:c,scope:cursorScope)

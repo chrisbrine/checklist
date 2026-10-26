@@ -94,6 +94,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     var nativeInFlight: [String: NativeInFlight] = [:]
     var workHealthWake: DispatchWorkItem?
     var workHealthFailures = 0
+    var timingDiagnosticsEnabled = CallTimingLog.enabled
     let enrollmentFile: URL
     let expectedOwnerPath: String
     let expectedOwnerHash: Data?
@@ -121,6 +122,8 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     /// One bounded page per wake; persisted deadlines survive sleep/restart.
     func runWorkHealth() {
         workHealthWake?.cancel(); workHealthWake = nil
+        let started = ProcessInfo.processInfo.systemUptime
+        defer { if timingDiagnosticsEnabled { CallTimingLog.write(["scope":"work_health_maintenance","start_uptime_s":started,"duration_ms":(ProcessInfo.processInfo.systemUptime-started)*1000]) } }
         do {
             let result = try router.runWorkHealthChecks()
             workHealthFailures = 0
@@ -144,6 +147,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         guard !storageRunning else {return}
         if storageWakePlanning {storageWakeReplan = true;return}
         storageWakePlanning = true
+        let recordTiming = diagnostics || timingDiagnosticsEnabled
         // Deadline discovery parses retained job metadata. It is a pure read,
         // not request admission work. One in-flight read and one dirty bit bound
         // repeated command wakes without losing a change made during that read.
@@ -154,7 +158,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
                 if let loadDeadline {next = try loadDeadline()}
                 else {next = try router.nextArchiveCleanupDeadline()}
             } catch {next = Date().addingTimeInterval(60)}
-            if diagnostics {CallTimingLog.write(["scope":"storage_wake_plan","duration_ms":(ProcessInfo.processInfo.systemUptime-started)*1000])}
+            if recordTiming {CallTimingLog.write(["scope":"storage_wake_plan","start_uptime_s":started,"duration_ms":(ProcessInfo.processInfo.systemUptime-started)*1000])}
             queue.async { [self] in
                 storageWakePlanning = false
                 let replan = storageWakeReplan;storageWakeReplan = false
@@ -175,7 +179,10 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return };self.storageWake = nil;self.storageWakePlan.fired()
             self.storageRunning = true
+            let recordTiming = self.timingDiagnosticsEnabled
             self.storageQueue.async {
+                let started = ProcessInfo.processInfo.systemUptime
+                defer {if recordTiming {CallTimingLog.write(["scope":"storage_maintenance","start_uptime_s":started,"duration_ms":(ProcessInfo.processInfo.systemUptime-started)*1000])}}
                 do { try self.router.runStorageMaintenance() }
                 catch { fputs("Storage maintenance deferred; its durable state was retained.\n",stderr) }
                 self.queue.async {self.storageRunning = false;self.armStorageWake()}
@@ -535,6 +542,7 @@ final class Peer: NSObject, ChecklistRPC {
             let object = (try? JSONSerialization.jsonObject(with:request)) as? [String:Any]
             let timing = object?["diagnostics_timing"] as? Bool == true ? ServiceCallTiming(received:received) : nil
             timing?.queued(since: received)
+            if let timing { coordinator.timingDiagnosticsEnabled = true;CallTimingLog.write(["scope":"service_admission","request_id":timing.requestID,"method":object?["method"] as? String ?? "","received_uptime_s":received,"start_uptime_s":ProcessInfo.processInfo.systemUptime]) }
             if let object, object["method"] as? String == "changes_wait", let connection {
                 let id = UUID()
                 let finish: () -> Void = { [self] in autoreleasepool {

@@ -128,7 +128,7 @@ extension CommandRouter {
         // A selected read has already built this task's status/dependency facts
         // in the same transaction. Reuse that request-local value only; health
         // and its time-sensitive fields are still computed on every read.
-        let selected = try selectedProjection ?? selectedTaskProjectionWithoutHealth(db, task: task)
+        let selected = try selectedProjection ?? selectedTaskHealthFacts(db,task:task)
         let blockers = selected["prerequisite_blockers"] as? [JSON] ?? []
         waits += blockers.prefix(25).map { ["kind": "dependency", "detail": $0] }
         let jobs = try scopedTaskRows(db, type: "source_execution", task: task, predicate: "json_extract(data,'$.state') IN ('queued','running')", limit: 25)
@@ -215,30 +215,33 @@ extension CommandRouter {
             try dbQueue.writeWithoutTransaction { db in
                 var result: JSON = [:]
                 var nextPosition: Int64 = 0
+                // Yield the writer/coordinator between bounded ticket pages;
+                // one advisory sweep must not consume a foreground command's budget.
+                let pageLimit = 10
                 try withValidatedDomainTransaction(db) {
                 let rows = try Row.fetchAll(db, sql: """
                     SELECT r.rowid AS position, \(Self.canonicalColumns(alias: "r"))
                     FROM records r JOIN records p ON p.id=r.project_id AND p.type='project'
-                    WHERE r.type='task' AND r.rowid>? AND COALESCE(json_extract(p.data,'$.archived'),0)=0
+                    WHERE r.rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='task') AND r.rowid>? AND COALESCE(json_extract(p.data,'$.archived'),0)=0
                     AND COALESCE(json_extract(p.data,'$.work_health_settings.enabled'),1)=1
                     AND COALESCE(json_extract(r.data,'$.archived'),0)=0 AND COALESCE(json_extract(r.data,'$.trashed'),0)=0
                     AND (json_extract(r.data,'$.active_attempt_id') IS NOT NULL
                          OR EXISTS (SELECT 1 FROM records s WHERE s.id=json_extract(r.data,'$.status_id') AND s.type='status' AND s.project_id=r.project_id AND json_extract(s.data,'$.category')='active')
                          OR EXISTS (SELECT 1 FROM records g WHERE g.type='group' AND g.project_id=r.project_id AND json_extract(g.data,'$.kind')='triage' AND COALESCE(json_extract(g.data,'$.archived'),0)=0
                            AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_array_length(json_extract(g.data,'$.members'))>0 THEN json_extract(g.data,'$.members') ELSE json_extract(g.data,'$.task_ids') END) m WHERE (CASE WHEN m.type='object' THEN json_extract(m.value,'$.task_id') ELSE m.value END)=r.id)))
-                    ORDER BY r.rowid LIMIT 100
-                    """, arguments: [workHealthScanPosition])
+                    ORDER BY r.rowid LIMIT ?
+                    """, arguments: [workHealthScanPosition,pageLimit])
                 var inspected = 0, changed = 0
                 for row in rows {
                     let task = try GRDBRecordEnvelopeAdapter.decode(row).object
                     // Advisory attention retains orchestration/sibling handling; it is not the Active filter.
-                    if try bool(selectedTaskProjectionWithoutHealth(db, task: task), "active_attention") {
+                    if try selectedTaskActiveAttention(db,task:task) {
                         if try checkWorkHealth(db, task: task, at: date) { changed += 1 }; inspected += 1
                     }
                 }
-                nextPosition = rows.count < 100 ? 0 : (rows.last?["position"] as Int64? ?? 0)
-                let enabled = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records WHERE type='project' AND COALESCE(json_extract(data,'$.archived'),0)=0 AND COALESCE(json_extract(data,'$.work_health_settings.enabled'),1)=1") ?? 0
-                result = ["scanned": rows.count, "inspected": inspected, "changed":changed, "has_more": rows.count == 100, "enabled": enabled > 0]
+                nextPosition = rows.count < pageLimit ? 0 : (rows.last?["position"] as Int64? ?? 0)
+                let enabled = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='project') AND COALESCE(json_extract(data,'$.archived'),0)=0 AND COALESCE(json_extract(data,'$.work_health_settings.enabled'),1)=1") ?? 0
+                result = ["scanned": rows.count, "inspected": inspected, "changed":changed, "has_more": rows.count == pageLimit, "enabled": enabled > 0]
                 return .commit
                 }
                 workHealthScanPosition = nextPosition

@@ -25,6 +25,7 @@ import ChecklistIPC
         var replayChanges = false
         var contextVersion: String?
         var holdSurface = "needs_review"
+        var heldSurfaces: Set<String> = []
         var inTriage = false
         var statusCoverage = false
         var service: [String:Any] { ["store_incarnation":"fixture", "read_version":version] }
@@ -73,7 +74,7 @@ import ChecklistIPC
                 if method == "workspace_page" { reply = workspace(params,invalid:ignored) }
                 else { XCTAssertEqual(method,"task_list");reply = list(ignored ? "foreign" : "p") }
             }
-            if holdList && (method == "task_list" || method == "workspace_page" && (page != .overview || (holdSurface == "all" || ["overview",holdSurface].contains(params["surface"] as? String ?? "")))) || method == "task_context" && holdContext {
+            if method == "workspace_page" && heldSurfaces.contains(params["surface"] as? String ?? "") || holdList && (method == "task_list" || method == "workspace_page" && (page != .overview || (holdSurface == "all" || ["overview",holdSurface].contains(params["surface"] as? String ?? "")))) || method == "task_context" && holdContext {
                 return try await withCheckedThrowingContinuation { held.append((method,$0,reply)) }
             }
             return reply
@@ -293,11 +294,35 @@ import ChecklistIPC
         var statusChange = f.changes();statusChange["event_cursor"] = "c2"
         if let wait = f.wait {f.wait = nil;wait.resume(returning:statusChange)}
         else {f.queuedChanges.append(statusChange)}
-        try await until {store.selectedTask("a")?.string("status_name") == "Review" && self.shownStatus(store,page:.overview) == "Review"}
-        XCTAssertEqual(f.held.count,4,"No page or context reply was released for the status")
+        try await until {store.selectedTask("a")?.string("status_name") == "Review" && self.shownStatus(store,page:.overview) == "Review" && f.held.count == 5}
+        XCTAssertEqual(f.held.count,5,"Read-ahead replaces the canceled context without releasing any held reply")
         XCTAssertEqual(cursor(store),"c0","Read-ahead is not acknowledgment of either unfinished interval")
         XCTAssertFalse(store.selectedTicketCurrent("a"))
         XCTAssertEqual(f.pageReads.filter {$0 == "overview"}.count,1)
+    }
+
+    func testReadAheadReplacesCanceledSelectedContextBeforeWatchdog() async throws {
+        let f = Fixture(isolatedDefaults("ReadAheadSelectedRecovery").preferences,page:.overview)
+        let store = f.store(),live = Task {await store.startLiveUpdates()}
+        defer {live.cancel();store.stopWindowReads();f.cleanup()}
+        try await until {f.wait != nil}
+        store.open(.task("a"));try await until {store.selectedTicketCurrent("a")}
+        f.statusCoverage = true;f.holdList = true;f.holdSurface = "all";f.holdContext = true
+        var earlier = f.changes(),coverage = earlier["coverage"] as! [String:Any]
+        coverage["changes"] = [["project_id":"p","families":["work"],"task_ids":["a"],"all_tasks":false]]
+        earlier["coverage"] = coverage
+        let wait = f.wait;f.wait = nil;wait?.resume(returning:earlier)
+        try await until {f.held.count >= 4}
+        f.commit();f.holdContext = false
+        var newer = f.changes();newer["event_cursor"] = "c2"
+        if let wait = f.wait {f.wait = nil;wait.resume(returning:newer)} else {f.queuedChanges.append(newer)}
+        try await until {store.selectedTicketCurrent("a") && store.selectedTask("a")?.string("status_name") == "Review"}
+        XCTAssertEqual(f.held.count,4,"The old context and all three old pages remain held")
+        XCTAssertEqual(cursor(store),"c0","Fresh selected context alone does not acknowledge page coverage")
+        XCTAssertEqual(f.calls.filter {$0 == "task_context"}.count,3,"Initial context, canceled context, immediate replacement")
+        f.release("task_context")
+        await Task.yield()
+        XCTAssertEqual(store.selectedTask("a")?.string("status_name"),"Review")
     }
 
     func testCommittedStatusDisplaysBeforeHeldPagesAndContextAfterIdle() async throws {
@@ -512,6 +537,26 @@ import ChecklistIPC
             XCTAssertEqual(shownStatus(store,page:page),"Review")
             XCTAssertEqual(store.selectedTask("a")?.string("status_name"),"Review")
         }
+    }
+
+    func testCommittedDoneDestinationStartsBeforeHeldUnrelatedStatusPages() async throws {
+        let f = Fixture(isolatedDefaults("LiveDoneDestination").preferences,page:.overview)
+        let store = f.store(),live = Task {await store.startLiveUpdates()}
+        defer {live.cancel();store.stopWindowReads();f.cleanup()}
+        try await until {f.wait != nil}
+        f.commit();f.status = "Done";f.statusCoverage = true
+        f.heldSurfaces = ["needs_review","needs_pickup","needs_active"]
+        f.pageReads = []
+        var changes = f.changes(),coverage = changes["coverage"] as! [String:Any]
+        coverage["status_updates"] = [["task":f.task(),"surfaces":["needs_done_today"]]]
+        changes["coverage"] = coverage
+        let apply = Task {await store.applyChangeCoverage(changes)};defer {apply.cancel()}
+        try await until {f.held.count == 3}
+        XCTAssertEqual(f.pageReads.first,"needs_done_today")
+        XCTAssertEqual(store.overviewObservations["needs_done_today"]?.rows.first?.string("status_name"),"Done")
+        f.heldSurfaces = []
+        while !f.held.isEmpty {f.release("workspace_page")}
+        let accepted = await apply.value;XCTAssertTrue(accepted)
     }
 
     func testLiveOverviewPublishesStatusWhileQuietGroupIsHeld() async throws {

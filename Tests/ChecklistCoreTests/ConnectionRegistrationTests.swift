@@ -36,6 +36,29 @@ final class ConnectionRegistrationTests: XCTestCase {
         return try router.connectionRegistrationIsCurrent(commandID: original["command_id"] as! String, digest: digest, sessionID: sid, installation: "pairtest", receiptPrincipal: owner.principal, caller: owner)
     }
 
+    func testExactConnectionSessionKeepsScopeFreshnessAndAdmission() throws {
+        let f = try fixture()
+        let initial = try XCTUnwrap(router.connectionSession(sessionID:f.sid,project:f.pid,caller:owner))
+        XCTAssertEqual(initial["id"] as? String,f.sid)
+        XCTAssertNil(try router.connectionSession(sessionID:"missing",project:f.pid,caller:owner))
+        XCTAssertThrowsError(try router.connectionSession(sessionID:f.sid,project:f.pid,caller:Caller(role:"worker",installation:"foreign",projectIDs:[f.pid]))) { error in
+            XCTAssertEqual((error as? CoreError)?.code,"HUMAN_CHANNEL_REQUIRED")
+        }
+        let other = try call("project_create",["name":"Other","key_prefix":"OT"])
+        XCTAssertNil(try router.connectionSession(sessionID:f.sid,project:other["id"] as! String,caller:owner))
+        for state in ["ended","revoked"] {
+            let current = try session(f.sid)
+            _ = try call("session_update",["project_id":f.pid,"session_id":f.sid,"expected_revision":current["revision"]!,"state":state])
+            XCTAssertEqual(try router.connectionSession(sessionID:f.sid,project:f.pid,caller:owner)?["state"] as? String,state)
+        }
+        let drain = try router.beginStorageDrain(caller:owner)
+        XCTAssertTrue(try router.waitForStorageDrain(drain,timeout:1,caller:owner))
+        XCTAssertThrowsError(try router.connectionSession(sessionID:f.sid,project:f.pid,caller:owner)) { error in
+            XCTAssertEqual((error as? CoreError)?.code,"STORAGE_DRAINING")
+        }
+        try router.cancelStorageDrain(drain,caller:owner)
+    }
+
     func testOriginalIntentReplaySkipsEveryPreparationAndKeepsExactSemanticReceipt() throws {
         let f = try fixture(), original = intent(f.pid)
         var preparations = 0, rotations = 0

@@ -3,6 +3,31 @@ import GRDB
 @testable import ChecklistCore
 
 extension CoreTests {
+    func testWorkspaceCoverageKeepsExactScopeAndUsesCoveringScopeRanges() throws {
+        let memory = try DatabaseQueue()
+        try memory.write { db in
+            try SchemaMigrations.installStorageCollation(db)
+            try db.execute(sql:"CREATE TABLE events(seq INTEGER PRIMARY KEY,project_id TEXT COLLATE checklist_storage_v2,entity_id TEXT COLLATE checklist_storage_v2); CREATE INDEX events_scope ON events(project_id,entity_id,seq)")
+            for (sequence,project) in [(1,"p"),(7,"p"),(3,"other"),(20,"foreign"),(4,"p\u{0}suffix"),(6,"é"),(9,"e\u{301}")] {
+                try db.execute(sql:"INSERT INTO events(seq,project_id) VALUES(?,CAST(? AS TEXT))",arguments:[sequence,Data(project.utf8)])
+            }
+            try db.execute(sql:"INSERT INTO events(seq,project_id) VALUES(5,NULL)")
+            for projects in [[],["p"],["other"],["missing"],["p","other"],["foreign"],["p\u{0}suffix"],["é"],["e\u{301}"]] {
+                let encoded = try jsonString(projects)
+                var statements: [String] = []
+                db.trace { if case .statement(let statement) = $0 { statements.append(statement.expandedSQL) } }
+                let actual = try router.workspaceCoverage(db,projectsJSON:encoded)
+                db.trace(options:[])
+                let previous = try Int.fetchOne(db,sql:"SELECT COALESCE(MAX(seq),0) FROM events WHERE project_id IN (SELECT value FROM json_each(?)) OR project_id IS NULL",arguments:[encoded])
+                XCTAssertEqual(actual,previous)
+                let plan = try Row.fetchAll(db,sql:"EXPLAIN QUERY PLAN " + XCTUnwrap(statements.first)).map { $0["detail"] as String }
+                XCTAssertFalse(plan.contains {$0.contains("MULTI-INDEX OR")},plan.joined(separator:"\n"))
+                XCTAssertTrue(plan.contains {$0.contains("CORRELATED SCALAR SUBQUERY")},plan.joined(separator:"\n"))
+                XCTAssertTrue(plan.contains {$0.contains("COVERING INDEX events_scope")},plan.joined(separator:"\n"))
+            }
+        }
+    }
+
     func testWorkspacePagesRetainExactScopeCountsAndFiniteContinuation()throws {
         let p=try project("Page scope"),foreign=try project("Foreign page"),t=try task(p)
         let pid=p["id"] as! String,tid=t["id"] as! String

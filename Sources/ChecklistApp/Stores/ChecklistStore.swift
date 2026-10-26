@@ -168,6 +168,7 @@ final class ChecklistStore: ObservableObject {
         let task: RecordIdentity
         init(_ row: Record) {project = RecordIdentity(row.string("project_id"));task = RecordIdentity(row.id)}
     }
+    private var coveragePrioritySurfaces: [String] = []
     private var coverageStatusFloors: [StatusIdentity:Int] = [:]
     private var coverageStatusIncarnation: String?
     private var liveSurfaceRead: Task<Bool,Never>?
@@ -961,7 +962,8 @@ final class ChecklistStore: ObservableObject {
                 Self.liveLogger.notice("read path=overview_independent_groups")
                 // Publish small status pages independently of expensive digest/quiet
                 // work. Three lanes bound service pressure and retain per-page fences.
-                let priority = ["needs_review","needs_pickup","needs_active","needs_done_today","completed_since"]
+                let usualPriority = ["needs_review","needs_pickup","needs_active","needs_done_today","completed_since"]
+                let priority = self.coveragePrioritySurfaces + usualPriority.filter { !self.coveragePrioritySurfaces.contains($0) }
                 var remaining = priority.filter { order.contains($0) } + order.filter { !priority.contains($0) }
                 let installed = await withTaskGroup(of: Bool.self) { group in
                     func enqueue(_ surface: String) {
@@ -1967,7 +1969,12 @@ final class ChecklistStore: ObservableObject {
             pagedTicketWorkspace = ticketPages.prepared(expansion:ticketExpansion)
         }
         coverageStatusFloors = floors
-        if installed > 0 {Self.liveLogger.notice("changed path=committed_status task_count=\(installed)")}
+        if installed > 0 {
+            Self.liveLogger.notice("changed path=committed_status task_count=\(installed)")
+            // Read-ahead can cancel the primary interval's selected read. Replace
+            // it now; the status overlay alone never restores context authority.
+            if retireReads, selectedStaleSince != nil {scheduleSelectedTicket(for:detail,coalesce:true)}
+        }
         return installed
     }
 
@@ -2034,6 +2041,11 @@ final class ChecklistStore: ObservableObject {
         let affected = usesTicketPages ? ticketAffected : workspaceAffected
         if newInterval {
             pendingCoverageCursor = cursor; pendingCoverageScope = scope; pendingCoverageIsComplete = !reset
+            // Read the committed destination first. A pass must not wait behind
+            // all three unrelated status lanes before its Done page can start.
+            let statusSurfaces: Set<String> = ["needs_review","needs_pickup","needs_active","needs_quiet","needs_recovery","needs_done_today"]
+            let destinations = reset ? [] : (coverage?["status_updates"] as? [[String:Any]] ?? []).flatMap { $0["surfaces"] as? [String] ?? [] }
+            coveragePrioritySurfaces = Array(Set(destinations).intersection(statusSurfaces)).sorted()
             invalidateContentCache(clearVisible:false,retireReads:affected || selectedAffected)
             // The interval already retired old replies. Its parallel readers may
             // discover the same new version without canceling one another.

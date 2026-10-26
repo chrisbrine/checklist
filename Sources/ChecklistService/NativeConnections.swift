@@ -70,10 +70,8 @@ extension Coordinator {
         guard !enrollments.values.contains(where:{$0.sessionID == boundSessionID && $0.installation != installation}) else { throw ChecklistError("BINDING_CHANGED","This reported session is already bound to another connection. Use a thread created for this project.") }
         if var existing=enrollments[installation] {
             var changed = false
-            let access = try router.handle(method:"session_list",params:["project_id":pid],caller:owner)
-            let accessBody = access["data"] as? [String:Any] ?? access
-            let sessions = accessBody["sessions"] as? [[String:Any]] ?? []
-            if let session = sessions.first(where: { $0["id"] as? String == boundSessionID }) {
+            let session = try router.connectionSession(sessionID:boundSessionID,project:pid,caller:owner)
+            if let session {
                 guard session["owner_revoked"] as? Bool != true else {
                     throw ChecklistError("CONNECTION_REVOKED","The owner disconnected this conversation in Checklist. It stays refused until the owner selects Allow again on its ticket.")
                 }
@@ -91,7 +89,7 @@ extension Coordinator {
             guard (existing.assistantRelay == true) == relay else { throw ChecklistError("CONNECTION_MODE_MISMATCH","This native thread cannot change its access role.") }
             // Ordinary MCP/client restarts do not rotate claims, deliveries or grants.
             guard let credential = try readCredential(installation), SHA256.hash(data: Data(credential.utf8)).map({ String(format: "%02x", $0) }).joined() == existing.tokenDigest else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This thread's saved credential does not match its enrollment. Repair it in Checklist.") }
-            if let session=sessions.first(where:{$0["id"] as? String == boundSessionID}) {
+            if let session {
                 guard !["revoked","ended"].contains(session["state"] as? String ?? "") else { throw ChecklistError("CONNECTION_REVOKED","This thread was ended or disconnected. Its authority cannot be resumed automatically.") }
                 guard ConnectionCommit.registrationMatches(session, sessionID: existing.sessionID, installation: existing.installation, generation: existing.generation, role: existing.role, provider: existing.provider, projects: existing.projectIDs) else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This prepared connection does not match its committed session. Repair it in Checklist.") }
             } else {
@@ -215,9 +213,8 @@ extension Coordinator {
     }
 
     func requireCommittedRegistration(_ enrollment: Enrollment, project: String, caller: Caller) throws {
-        let result = try router.handle(method: "session_list", params: ["project_id": project], caller: caller)
-        let sessions = (result["data"] as? [String: Any])?["sessions"] as? [[String: Any]] ?? []
-        guard sessions.contains(where: { ConnectionCommit.registrationMatches($0, sessionID: enrollment.sessionID, installation: enrollment.installation, generation: enrollment.generation, role: enrollment.role, provider: enrollment.provider, projects: enrollment.projectIDs) }) else {
+        guard let session = try router.connectionSession(sessionID:enrollment.sessionID,project:project,caller:caller),
+              ConnectionCommit.registrationMatches(session, sessionID: enrollment.sessionID, installation: enrollment.installation, generation: enrollment.generation, role: enrollment.role, provider: enrollment.provider, projects: enrollment.projectIDs) else {
             throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "The saved connection does not match its committed registration. No authority was resumed.")
         }
         if let command = enrollment.pairingCommandID {

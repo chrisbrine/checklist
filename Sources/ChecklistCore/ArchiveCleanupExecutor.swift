@@ -156,7 +156,7 @@ extension CommandRouter {
         guard try !StorageSnapshotRetention.isActive(root:root) else {return}
         let ids = try String.fetchAll(db,sql:"""
             SELECT j.id FROM records j LEFT JOIN records c ON c.id=('archive-cleanup-cursor:' || j.id) AND c.type='storage_job'
-            WHERE j.type='cleanup_job' AND CASE WHEN json_valid(j.data) THEN COALESCE(json_extract(j.data,'$.not_before_ms') <= ?,1) ELSE 1 END AND CASE WHEN json_valid(j.data) THEN json_extract(j.data,'$.state') NOT IN ('completed','canceled','suspended') ELSE 1 END
+            WHERE j.rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='cleanup_job') AND CASE WHEN json_valid(j.data) THEN COALESCE(json_extract(j.data,'$.not_before_ms') <= ?,1) ELSE 1 END AND CASE WHEN json_valid(j.data) THEN json_extract(j.data,'$.state') NOT IN ('completed','canceled','suspended') ELSE 1 END
             ORDER BY CASE WHEN json_valid(c.data) THEN COALESCE(json_extract(c.data,'$.checked_at_ms'),0) ELSE 0 END,j.rowid LIMIT 8
             """,arguments:[nowMS])
         var admissions = 0
@@ -251,12 +251,14 @@ extension CommandRouter {
         // Pure scheduling metadata must not occupy the writer while retained
         // storage-job JSON is inspected. Retry/yield properties are lock-backed;
         // the service coalesces a fresh plan after concurrent command activity.
+        // Enumerate each family through the covering scope index before loading
+        // JSON; a type-only table scan also touches unrelated retained payloads.
         return try readForPreparation { db in
             let nowMS = self.archiveCleanupNowMS()
-            let deadline = try Int64.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.not_before_ms') AS INTEGER)) FROM records WHERE type='cleanup_job' AND json_valid(data) AND json_extract(data,'$.state') IN ('queued','ready')")
-            let expiry = try Double.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.expires_at') AS REAL)) FROM records WHERE type='storage_hold' AND json_valid(data) AND json_extract(data,'$.state')='active' AND CAST(json_extract(data,'$.expires_at') AS REAL)>?",arguments:[Date().timeIntervalSince1970])
-            let more = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records j,json_each(j.data,'$.items') i WHERE j.type='cleanup_job' AND json_valid(j.data) AND json_extract(j.data,'$.state')='held' AND (json_extract(i.value,'$.state')='waiting' OR json_extract(i.value,'$.same_failure_count')=1))") ?? false
-            let pendingProjects = try String.fetchAll(db,sql:"SELECT DISTINCT project_id FROM records WHERE type='storage_job' AND json_valid(data) AND json_extract(data,'$.kind')='ticket_object_delete' AND json_extract(data,'$.state')='pending'")
+            let deadline = try Int64.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.not_before_ms') AS INTEGER)) FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='cleanup_job') AND json_valid(data) AND json_extract(data,'$.state') IN ('queued','ready')")
+            let expiry = try Double.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.expires_at') AS REAL)) FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='storage_hold') AND json_valid(data) AND json_extract(data,'$.state')='active' AND CAST(json_extract(data,'$.expires_at') AS REAL)>?",arguments:[Date().timeIntervalSince1970])
+            let more = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records j,json_each(j.data,'$.items') i WHERE j.rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='cleanup_job') AND json_valid(j.data) AND json_extract(j.data,'$.state')='held' AND (json_extract(i.value,'$.state')='waiting' OR json_extract(i.value,'$.same_failure_count')=1))") ?? false
+            let pendingProjects = try String.fetchAll(db,sql:"SELECT DISTINCT project_id FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='storage_job') AND json_valid(data) AND json_extract(data,'$.kind')='ticket_object_delete' AND json_extract(data,'$.state')='pending'")
             let deletionDeadline = try pendingProjects.map {max(Int64((try self.ticketCleanupProjectRetry(db,project:$0) ?? .distantPast).timeIntervalSince1970 * 1000),nowMS + 50)}.min()
             let lifecycle = try self.nextTicketCleanupDeadline(db)
             let retry = [self.ticketCleanupRetryAt,self.ticketCleanupYieldAt].compactMap {$0}.max().map {Int64($0.timeIntervalSince1970 * 1000)}

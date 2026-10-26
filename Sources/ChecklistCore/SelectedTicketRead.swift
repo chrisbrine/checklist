@@ -22,11 +22,32 @@ extension CommandRouter {
     func selectedTaskProjectionWithoutHealth(_ db: Database, task: JSON, cleanedOriginalCount: Int? = nil) throws -> JSON {
         let pid = task["project_id"] as! String,tid = task["id"] as! String
         let status = try? scoped(db,task["status_id"] as? String ?? "",pid,type:"status")
-        let edges = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='relation' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.source_task_id')=CAST(? AS TEXT) COLLATE BINARY AND COALESCE(json_extract(data,'$.state'),'')<>'removed' ORDER BY rowid",arguments:[Data(pid.utf8),Data(tid.utf8)]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
-        let prerequisites = projectedPrerequisites(task:task,relations:edges,taskLookup:{try self.scoped(db,$0,pid,type:"task")},statusLookup:{try self.scoped(db,$0,pid,type:"status")})
+        let prerequisites = try selectedTaskPrerequisites(db,task:task)
         let relation = projectedRelationTask(task:task,prerequisites:prerequisites,category:status?["category"] as? String ?? "unknown",canonicalID:try canonicalTaskID(db,task:task))
         let tags = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='tag' AND project_id=CAST(? AS TEXT) AND id IN (SELECT value FROM json_each(?)) ORDER BY rowid",arguments:[Data(pid.utf8),try jsonString(strings(task,"tag_ids"))]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
-        let attention = try projectedTaskAttention(task,statusLookup:{try self.scoped(db,$0,pid,type:"status")}) {
+        let attention = try selectedTaskActiveAttention(db,task:task)
+        var result = assembledTaskProjection(task,status:status,activeAttention:attention,tags:tags,relation:relation)
+        if let cleanedOriginalCount {result["cleaned_original_count"] = cleanedOriginalCount}
+        else {result["cleaned_original_count"] = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type='attachment' AND project_id=? AND json_extract(data,'$.task_id')=? AND json_extract(data,'$.availability')='original_cleaned'",arguments:[pid,tid]) ?? 0}
+        return try withStatusReason(db,task:result)
+    }
+    private func selectedTaskPrerequisites(_ db: Database, task: JSON) throws -> [JSON] {
+        let pid = task["project_id"] as! String, tid = task["id"] as! String
+        let edges = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='relation' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.source_task_id')=CAST(? AS TEXT) COLLATE BINARY AND COALESCE(json_extract(data,'$.state'),'')<>'removed' ORDER BY rowid",arguments:[Data(pid.utf8),Data(tid.utf8)]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
+        return projectedPrerequisites(task:task,relations:edges,taskLookup:{try self.scoped(db,$0,pid,type:"task")},statusLookup:{try self.scoped(db,$0,pid,type:"status")})
+    }
+    /// Health consumes only these exact dependency/attention facts. Retain the
+    /// duplicate-reference guard without constructing unrelated display fields.
+    func selectedTaskHealthFacts(_ db: Database, task: JSON) throws -> JSON {
+        _ = try canonicalTaskID(db,task:task)
+        return ["prerequisite_blockers":prerequisiteBlockers(try selectedTaskPrerequisites(db,task:task)),
+                "active_attention":try selectedTaskActiveAttention(db,task:task)]
+    }
+    /// Exact attention facts shared with supervision; no attachment, tag or
+    /// prerequisite display projection is needed to decide whether to inspect.
+    func selectedTaskActiveAttention(_ db: Database, task: JSON) throws -> Bool {
+        let pid = task["project_id"] as! String, tid = task["id"] as! String
+        return try projectedTaskAttention(task,statusLookup:{try self.scoped(db,$0,pid,type:"status")}) {
             let triages = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records g WHERE type='group' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.kind')='triage' AND COALESCE(json_extract(data,'$.archived'),0)=0 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_array_length(json_extract(g.data,'$.members'))>0 THEN json_extract(g.data,'$.members') ELSE json_extract(g.data,'$.task_ids') END) member WHERE (CASE WHEN member.type='object' THEN json_extract(member.value,'$.task_id') ELSE member.value END)=CAST(? AS TEXT) COLLATE BINARY) ORDER BY rowid",arguments:[Data(pid.utf8),Data(tid.utf8)])
             for row in triages {
                 let group = try GRDBRecordEnvelopeAdapter.decode(row).object
@@ -34,10 +55,6 @@ extension CommandRouter {
             }
             return false
         }
-        var result = assembledTaskProjection(task,status:status,activeAttention:attention,tags:tags,relation:relation)
-        if let cleanedOriginalCount {result["cleaned_original_count"] = cleanedOriginalCount}
-        else {result["cleaned_original_count"] = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type='attachment' AND project_id=? AND json_extract(data,'$.task_id')=? AND json_extract(data,'$.availability')='original_cleaned'",arguments:[pid,tid]) ?? 0}
-        return try withStatusReason(db,task:result)
     }
     /// Authoritative selected-ticket display data, separate from global snapshot
     /// and complete review authority. Only bounded selected rows are decoded.

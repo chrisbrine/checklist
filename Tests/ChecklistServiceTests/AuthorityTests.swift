@@ -184,6 +184,33 @@ final class AuthorityTests: XCTestCase {
         coordinator.workHealthWake?.cancel()
     }
 
+    func testBootstrapRechecksCurrentRegistrationAfterFreshCredentialRead() throws {
+        let sid = UUID().uuidString, domain = "synthetic-recheck-domain"
+        let digest = SHA256.hash(data:Data("codex|\(sid)|\(project!)".utf8)).map {String(format:"%02x",$0)}.joined()
+        var e = Enrollment(installation:"auto-codex-" + digest.prefix(40),name:"Synthetic worker",provider:"codex",role:"worker",
+                           projectIDs:[project],sessionID:sid,workspace:root.path,profileID:nil,
+                           tokenDigest:SHA256.hash(data:Data(credential.utf8)).map {String(format:"%02x",$0)}.joined(),generation:"recheck-generation")
+        e.automatic = true;e.nativeSessionID = sid;e.nativeExecutionDomain = domain
+        _ = try coordinator.router.handle(method:"session_register",params:["command_id":UUID().uuidString,"project_id":project!,
+            "project_ids":[project!],"session_id":sid,"installation":e.installation + "/" + e.generation,"provider":"codex",
+            "role":"worker","workspace":root.path,"execution_domain":domain],caller:owner)
+        coordinator.enrollments[e.installation] = e
+        let native = Coordinator.VerifiedNativeWorkspace(provider:"codex",session:sid,process:getpid(),executionDomain:domain,workspace:root.path)
+        var reads = 0
+        for _ in 0..<2 {
+            let result = try coordinator.bootstrapVerifiedWorkspace([:],native:native,readCredential:{ _ in reads += 1;return self.credential })
+            XCTAssertFalse(result.changed)
+        }
+        XCTAssertEqual(reads,2,"Each bootstrap must freshly read its credential")
+        rejects("CONNECTION_REPAIR_REQUIRED") {
+            try self.coordinator.bootstrapVerifiedWorkspace([:],native:native,readCredential:{ _ in
+                let session = try XCTUnwrap(self.coordinator.router.connectionSession(sessionID:sid,project:self.project,caller:self.owner))
+                _ = try self.coordinator.router.handle(method:"session_update",params:["command_id":UUID().uuidString,"project_id":self.project!,"session_id":sid,"expected_revision":session["revision"]!,"state":"revoked"],caller:self.owner)
+                return self.credential
+            })
+        }
+    }
+
     func testNativeBootstrapReadsArchivedAndRestoredProjectReasonsWithoutWriteAccess() throws {
         let sid = UUID().uuidString, domain = "synthetic-native-domain"
         let digest = SHA256.hash(data:Data("codex|\(sid)|\(project!)".utf8)).map {String(format:"%02x",$0)}.joined()

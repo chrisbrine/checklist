@@ -17,6 +17,19 @@ public struct ConnectionRegistrationPreparation {
 }
 
 extension CommandRouter {
+    /// Internal service authentication read. Returns one current canonical
+    /// session, including ended/revoked state, without rendering a session list.
+    /// Never caches authority or repairs a missing registration.
+    public func connectionSession(sessionID: String, project: String, caller: Caller) throws -> [String: Any]? {
+        try owner(caller)
+        let lease = try storageAdmission.acquire(); defer { lease.finish() }
+        return try readForPreparation { db in
+            let pid = try self.scope(db,["project_id":project],caller)
+            do { return try self.scoped(db,sessionID,pid,type:"session") }
+            catch let error as CoreError where error.code == "NOT_FOUND" { return nil }
+        }
+    }
+
     private func connectionReceipt(_ db: Database, command: String, digest: String, principal: String) throws -> JSON? {
         guard let row = try Row.fetchOne(db, sql: "SELECT digest,result FROM commands WHERE principal=? AND command_id=?", arguments: [principal, command]) else { return nil }
         guard row["digest"] as String == digest else { throw CoreError("IDEMPOTENCY_CONFLICT", "This pairing command ID already belongs to different original intent.") }

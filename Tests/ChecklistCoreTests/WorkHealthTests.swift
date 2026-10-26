@@ -33,6 +33,71 @@ extension EvidenceAuthorityTests {
     private func respondHealth(_ p: JSON, _ t: JSON, request: String, caller: Caller, progress: String = "Still handling this; awaiting the bounded build") throws -> JSON {
         try call("work_health_respond", ["project_id":p["id"]!, "task_id":t["id"]!, "request_id":request, "expected_revision":healthTask(p,t)["revision"]!, "progress":progress], caller)
     }
+    func testWorkHealthInspectionDoesNotReadDisplayOnlyFacts() throws {
+        let p = try project(), t = try ready(p), w = try native(p,"health-narrow",domain:"health-narrow")
+        _ = try claim(p,t,caller:w)
+        var statements: [String] = []
+        try router.dbQueue.read { db in
+            db.trace { if case .statement(let statement) = $0 { statements.append(statement.expandedSQL) } }
+        }
+        defer { try? router.dbQueue.read { $0.trace(options:[]) } }
+        let result = try router.runWorkHealthChecks()
+        XCTAssertEqual(result["inspected"] as? Int,1)
+        for family in ["attachment","tag","relation"] {
+            XCTAssertFalse(statements.contains { $0.hasPrefix("SELECT") && $0.contains("type='" + family + "'") }, "Health eligibility must not project \(family) display facts")
+        }
+        XCTAssertNotNil(try health(p,t)["current_target"])
+    }
+
+    func testWorkHealthFallbackKeepsExactFactsWithoutDisplayReads() throws {
+        let p = try project(), t = try ready(p), prerequisite = try ready(p)
+        let w = try native(p,"health-facts",domain:"health-facts")
+        _ = try claim(p,t,caller:w)
+        try healthWrite { db in
+            try router.save(db,["id":uuid(),"project_id":p["id"]!,"source_task_id":t["id"]!,"target_task_id":prerequisite["id"]!,"relation":"depends_on","required":true,"state":"active","revision":1],type:"relation")
+        }
+        try router.dbQueue.read { db in
+            let task = try router.record(db,t["id"] as! String,type:"task")
+            let selected = try router.selectedTaskProjectionWithoutHealth(db,task:task)
+            let expected = try router.workHealthView(db,task:task,selectedProjection:selected)
+            var statements: [String] = []
+            db.trace { if case .statement(let statement) = $0 { statements.append(statement.expandedSQL) } }
+            let actual = try router.workHealthView(db,task:task)
+            db.trace(options:[])
+            XCTAssertEqual(try jsonString(actual),try jsonString(expected))
+            XCTAssertTrue((actual["known_waits"] as? [JSON] ?? []).contains { $0["kind"] as? String == "dependency" })
+            for family in ["attachment","tag"] {
+                XCTAssertFalse(statements.contains { $0.hasPrefix("SELECT") && $0.contains("type='" + family + "'") }, "Health response must not render \(family) display facts")
+            }
+        }
+    }
+
+    func testWorkHealthPagesYieldAndResumeWithoutSkippingCandidates() throws {
+        let p = try project(), template = try ready(p)
+        var ids: [String] = []
+        try healthWrite { db in
+            let status = try XCTUnwrap(router.records(db,type:"status",project:p["id"] as? String).first { $0["category"] as? String == "active" })
+            for index in 0..<30 {
+                var task = template;let id = uuid();ids.append(id)
+                task["id"] = id;task["key"] = "HEALTH-PAGE-\(index)";task["revision"] = 1;task["status_id"] = status["id"]
+                try router.save(db,task,type:"task")
+            }
+        }
+        var inspected = 0
+        for _ in 0..<3 {
+            let page = try router.runWorkHealthChecks()
+            XCTAssertEqual(page["scanned"] as? Int,10)
+            XCTAssertEqual(page["has_more"] as? Bool,true)
+            inspected += page["inspected"] as? Int ?? 0
+        }
+        let end = try router.runWorkHealthChecks()
+        XCTAssertEqual(end["scanned"] as? Int,0);XCTAssertEqual(end["has_more"] as? Bool,false)
+        XCTAssertEqual(inspected,30)
+        try router.dbQueue.read { db in
+            for id in ids { XCTAssertNotNil(try router.record(db,id,type:"task")["work_health"]) }
+        }
+    }
+
     func testWorkHealthDefaultsOverridesAndInvalidSettings() throws {
         let p = try project()
         let got = try call("project_settings_get",["project_id":p["id"]!])

@@ -62,8 +62,8 @@ extension CommandRouter {
         return body + "\n\nRecorded measures (upper limits; advisory):\n" + (try jsonString(measures.map(\.json))) + "\n"
     }
 
-    func evidenceMeasuresContext(_ db: Database,task: JSON) throws -> JSON {
-        let manifests = try scopedTaskRows(db,type:"manifest",task:task,limit:101,descending:true)
+    func evidenceMeasuresContext(_ db: Database,task: JSON,manifests suppliedManifests: [JSON]? = nil) throws -> JSON {
+        let manifests = try suppliedManifests ?? scopedTaskRows(db,type:"manifest",task:task,limit:101,descending:true)
         let reports = try scopedTaskRows(db,type:"attachment",task:task,predicate:"json_type(data,'$.measures')='array'",limit:101,descending:true)
         let current = task["current_manifest_id"] as? String
         var snapshots: [JSON] = []

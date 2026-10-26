@@ -29,7 +29,11 @@ extension CommandRouter {
     }
     func recordTicketStatusAction(_ db: Database,task: JSON,caller: Caller,operation: TicketStatusOperation = .individual) throws {
         let pid = task["project_id"] as! String,tid = task["id"] as! String
-        let category = try taskProjection(db,task)["status_category"] as? String ?? ""
+        // Membership effects need only the destination category. Building a full
+        // task projection here repeats relation, health and tag reads for every
+        // member of an atomic batch, even when membership is retained.
+        let status = try? record(db,task["status_id"] as? String ?? "",type:"status")
+        let category = status.map {$0["category"] as? String ?? ""} ?? (task["status_category"] as? String ?? "")
         guard operation == .individual || category == "done" else { return }
         let reason = category == "done" ? "completed" : "individual_status_action"
         for var group in try records(db,type:"group",project:pid) where group["kind"] as? String == "triage" && triageMemberIDs(group).contains(tid) {
