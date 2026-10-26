@@ -1,4 +1,5 @@
 import Foundation
+import ChecklistDomain
 
 enum ReviewEvidenceClass: String, CaseIterable, Identifiable, Hashable {
     case reviewerReport = "reviewer_report", sourceCapture = "source_capture", image, textRecord = "text_record"
@@ -69,7 +70,7 @@ struct ReviewKindRequirementDraft: Identifiable {
 
 /// View-local editor value. It neither applies policy nor pins a review.
 struct ReviewRequirementsDraft {
-    static let kindNames = ["work","bug","asset","playtest","question"]
+    static let kindNames = TicketKind.wireValues
     var customDefault = false
     var defaultRule = ReviewRuleDraft.generic
     var kindRules = ReviewRequirementsDraft.kindNames.map {ReviewKindRequirementDraft(kind:$0)}

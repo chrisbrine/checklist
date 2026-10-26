@@ -572,7 +572,7 @@ import ChecklistIPC
         try await until { f.held.count == 1 }
         let replacement = Task { await store.refresh() }; try await until { f.held.count == 2 }
         f.release(1); await replacement.value
-        f.release(); await old.value
+        f.release(); _ = await old.value
         XCTAssertTrue(store.overviewObservations.values.allSatisfy { $0.page != nil && !$0.loading })
         f.hold = false
         let live = Task { await store.startLiveUpdates() }; defer { live.cancel(); store.stopWindowReads() }

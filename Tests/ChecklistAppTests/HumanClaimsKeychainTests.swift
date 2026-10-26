@@ -1,6 +1,7 @@
 import XCTest
 import Security
-import ChecklistIPC
+import LocalAuthentication
+@testable import ChecklistIPC
 @testable import ChecklistApp
 
 final class HumanClaimsKeychainTests: XCTestCase {
@@ -11,9 +12,10 @@ final class HumanClaimsKeychainTests: XCTestCase {
         defer { SecKeychainSetUserInteractionAllowed(original.boolValue) }
         for allowed in [false, true] {
             XCTAssertEqual(SecKeychainSetUserInteractionAllowed(allowed), errSecSuccess)
-            let result = KeychainWithoutUI.perform([kSecUseAuthenticationUI as String: kSecUseAuthenticationUIAllow]) { query in
+            let result = KeychainWithoutUI.perform([:]) { query in
                 let query = query as NSDictionary
-                XCTAssertEqual(query[kSecUseAuthenticationUI] as? String, kSecUseAuthenticationUIFail as String)
+                XCTAssertTrue((query[kSecUseAuthenticationContext] as? LAContext)?.interactionNotAllowed == true)
+                XCTAssertNil(query[kSecUseAuthenticationUI])
                 var current: DarwinBoolean = true
                 XCTAssertEqual(SecKeychainGetUserInteractionAllowed(&current), errSecSuccess)
                 XCTAssertFalse(current.boolValue)
@@ -117,6 +119,41 @@ final class HumanClaimsKeychainTests: XCTestCase {
         let elapsed = ProcessInfo.processInfo.systemUptime - start
         XCTAssertLessThan(elapsed, 2)
         print("CL-195 foreign ACL read returned nil in \(elapsed) seconds (temporary file-based keychain)")
+
+        // Write exactly the attributes used by the pre-CL-85 HumanClaims save
+        // path, without the new wrapper, and read through the production reader.
+        // The explicit keychain/search list keep the fixture out of login items.
+        var legacy = HumanClaims.query("legacy-claim-" + UUID().uuidString)
+        legacy[kSecUseKeychain as String] = keychain
+        legacy[kSecValueData as String] = Data("legacy-credential".utf8)
+        legacy[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        XCTAssertEqual(SecItemAdd(legacy as CFDictionary, nil), errSecSuccess)
+        legacy.removeValue(forKey: kSecUseKeychain as String)
+        legacy.removeValue(forKey: kSecValueData as String)
+        legacy.removeValue(forKey: kSecAttrAccessible as String)
+        legacy[kSecMatchSearchList as String] = [keychain]
+        XCTAssertEqual(try HumanClaims.readRecovery(query: legacy), "legacy-credential")
+
+        // Pairing used the same generic-password attributes plus an executable
+        // ACL. Trust this fixture's executable, without consulting login items.
+        var pairing = [kSecClass as String: kSecClassGenericPassword,
+                       kSecAttrService as String: ChecklistInstance.current.keychainService,
+                       kSecAttrAccount as String: "legacy-pairing-" + UUID().uuidString,
+                       kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+                       kSecValueData as String: Data("legacy-pairing".utf8),
+                       kSecUseKeychain as String: keychain] as [String: Any]
+        var application: SecTrustedApplication?
+        XCTAssertEqual(SecTrustedApplicationCreateFromPath(nil, &application), errSecSuccess)
+        var pairingAccess: SecAccess?
+        XCTAssertEqual(SecAccessCreate("Checklist paired local executables" as CFString,
+                                       [try XCTUnwrap(application)] as CFArray, &pairingAccess), errSecSuccess)
+        pairing[kSecAttrAccess as String] = try XCTUnwrap(pairingAccess)
+        XCTAssertEqual(SecItemAdd(pairing as CFDictionary, nil), errSecSuccess)
+        for key in [kSecUseKeychain, kSecValueData, kSecAttrAccessible, kSecAttrAccess] {
+            pairing.removeValue(forKey: key as String)
+        }
+        pairing[kSecMatchSearchList as String] = [keychain]
+        XCTAssertEqual(try ChecklistKeychain.read(query: pairing), "legacy-pairing")
 
         // The stale account can coexist with the replacement recovery account.
         var own = HumanClaims.query(WorkspaceWindowIdentity.primary.pendingCommandKey)

@@ -353,7 +353,7 @@ extension CommandRouter {
         guard let prepared = managedAttachmentPreparation, EnvelopeStorageIdentity.equal(prepared.principal,c.principal), EnvelopeStorageIdentity.equal(prepared.command,p["command_id"] as? String), prepared.digest == hash(Data(("attachment_add" + (try jsonString(p))).utf8)) else { throw managedImportFailure("missing_preparation") }
         let pid = task["project_id"] as! String
         var job = try scoped(db,prepared.job["id"] as! String,pid,type:"storage_job")
-        try validateManagedImportOwner(job,principal:c.principal,command:prepared.command,digest:prepared.digest,project:pid,task:task["id"] as! String,generation:try callerSessionGeneration(db,c,project:pid))
+        try validateManagedImportOwner(job,principal:c.principal,command:prepared.command,digest:prepared.digest,project:pid,task:(task["id"] as! String),generation:try callerSessionGeneration(db,c,project:pid))
         let objects = try managedImportObjects(job)
         guard let relativePath = job["object_relative_path"] as? String, int(job,"revision") == int(prepared.job,"revision"), job["state"] as? String == "finalized", EnvelopeStorageIdentity.equal(job["attachment_id"] as? String,prepared.attachment["id"] as? String), job["sha256"] as? String == prepared.attachment["sha256"] as? String, (try? managedRelative(prepared.attachment["path"] as? String ?? "",family:"objects")) == relativePath, try managedImportReceipt(db,principal:c.principal,command:prepared.command,digest:prepared.digest) == nil else { throw managedImportFailure("final_ownership_or_receipt_changed") }
         let files = try StorageObjectFiles(root:root)

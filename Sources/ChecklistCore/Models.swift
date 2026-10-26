@@ -1,3 +1,4 @@
+@_exported import ChecklistDomain
 import Foundation
 import CryptoKit
 import GRDB
@@ -14,7 +15,7 @@ public struct Caller: Sendable {
         self.role = role; self.installation = installation; self.projectIDs = projectIDs; self.sessionID = sessionID; self.workspace = workspace; self.assistantGrants = assistantGrants; self.executionDomain = executionDomain
     }
     var principal: String { installation + ":" + (sessionID ?? role) }
-    var isOwner: Bool { role == "owner" }
+    var isOwner: Bool { role == CallerRole.owner.rawValue }
 }
 
 public struct CoreError: Error, LocalizedError, @unchecked Sendable {

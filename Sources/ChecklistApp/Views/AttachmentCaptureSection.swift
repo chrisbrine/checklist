@@ -114,13 +114,13 @@ enum CaptureAttachmentUpload {
     /// Original IDs remain stable through known-outcome retry/reconciliation.
     static func send(_ files: [CaptureAttachment],projectID: String,taskID: String,store: ChecklistStore,accepted: @escaping (UUID) -> Void,completion: @escaping () -> Void) {
         guard let first = files.first else { completion();return }
-        guard Data(first.destination.projectID.utf8) == Data(projectID.utf8),Data(first.destination.storeIncarnation.utf8) == Data(store.storeIncarnation.utf8),first.destination.taskID == nil || first.destination.taskID.map {Data($0.utf8)} == Data(taskID.utf8) else { store.error = "The attachment destination changed. Its selection is preserved.";return }
-        store.run("attachment_add",["command_id":first.commandID,"project_id":projectID,"task_id":taskID,"path":first.url.path,"mode":first.mode],success:"File attached") { reply in
+        guard Data(first.destination.projectID.utf8) == Data(projectID.utf8),Data(first.destination.storeIncarnation.utf8) == Data(store.storeIncarnation.utf8),first.destination.taskID == nil || first.destination.taskID.map({Data($0.utf8)}) == Data(taskID.utf8) else { store.error = "The attachment destination changed. Its selection is preserved.";return }
+        store.run("attachment_add",["command_id":first.commandID,"project_id":projectID,"task_id":taskID,"path":first.url.path,"mode":first.mode],success:"File attached", completion: { reply in
             guard let id = reply["id"] as? String,!id.isEmpty,reply["sha256"] is String,
                   (reply["project_id"] as? String).map({Data($0.utf8)}) == Data(projectID.utf8),
                   (reply["task_id"] as? String).map({Data($0.utf8)}) == Data(taskID.utf8) else { store.error = "The file may already be added. Check it again; your selection is kept.";return }
             accepted(first.id);CaptureAttachmentDrafts.accepted(first,preferences:store.windowPreferences);first.removeOwnedStaging()
             send(Array(files.dropFirst()),projectID:projectID,taskID:taskID,store:store,accepted:accepted,completion:completion)
-        }
+        })
     }
 }

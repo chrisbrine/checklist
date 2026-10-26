@@ -1,4 +1,5 @@
 import SwiftUI
+import ChecklistDomain
 
 struct HumanWorkActions: View {
     @EnvironmentObject var store: ChecklistStore
@@ -46,9 +47,9 @@ struct HumanWorkActions: View {
                     if !permitsDecision { Text("Add a file or image as evidence first. Technical work follows this project's evidence and review rules.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                 } else if task.string("readiness") == "ready" && task.string("active_attempt_id").isEmpty && ["queued", "blocked"].contains(task.string("status_category")) {
                     Button("Start my work") {
-                        store.run("work_claim", ["project_id": project, "task_id": task.id, "expected_revision": task.integer("revision"), "phase": "implementation"], success: "Your work started") { result in
+                        store.run("work_claim", ["project_id": project, "task_id": task.id, "expected_revision": task.integer("revision"), "phase": AttemptPhase.implementation.rawValue], success: "Your work started", completion: { result in
                             if let id = result["id"] as? String, let token = result["claim_token"] as? String { do { try HumanClaims.save(token, attempt: id) } catch { store.error = PlainError.text(error) } }
-                        }
+                        })
                     }.buttonStyle(.checklistProminent).checklistDisabled([(store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline), (!WorkActionProjection.canStartHumanWork(task), "This ticket cannot start now. Check its requirements.")])
                     if !WorkActionProjection.canStartHumanWork(task) {
                         Text(WorkActionProjection.humanPickupBlocker(task)).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)

@@ -1,3 +1,4 @@
+import ChecklistContracts
 import Foundation
 import ChecklistProviders
 import GRDB
@@ -82,7 +83,7 @@ public final class CommandRouter: @unchecked Sendable {
         var readerConfiguration = Configuration()
         readerConfiguration.readonly = true
         readerConfiguration.prepareDatabase { db in
-            try SchemaMigrations.installStorageCollation(db); try Self.installTicketSearchFunctions(db)
+            try SchemaMigrations.installStorageCollation(db); Self.installTicketSearchFunctions(db)
             try db.execute(sql:"PRAGMA busy_timeout=5000")
         }
         self.readers = try? DatabasePool(path: root.appendingPathComponent("checklist.sqlite").path, configuration: readerConfiguration)
@@ -99,7 +100,7 @@ public final class CommandRouter: @unchecked Sendable {
             let startupLease = try storageAdmission.acquire()
             defer { startupLease.finish() }
             try ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { permit in
-                try dbQueue.writeWithoutTransaction { db in
+                dbQueue.writeWithoutTransaction { db in
                     // CL-70: files left by commands that never committed, before any new command.
                     try? self.sweepPendingSourceCaptures(db)
                     try? self.sweepPendingExports(db)
@@ -161,6 +162,8 @@ public final class CommandRouter: @unchecked Sendable {
         guard case .text(let raw) = incoming.data else { throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.sqlData)) }
         let referenceWrite = try prepareTaskReferenceWrite(db,previous:previous,next:envelope)
         try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),?,CAST(? AS TEXT)) ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,type=excluded.type,revision=excluded.revision,data=excluded.data",arguments:[Data(envelope.id.utf8),envelope.projectID.map { Data($0.utf8) },Data(envelope.type.utf8),envelope.revision,Data(raw.utf8)])
+        invalidateTaskRecordSelection(db,type:type)
+        if let previousType = previous?["type"] as String?,previousType != type {invalidateTaskRecordSelection(db,type:previousType)}
         recordTaskReferenceWrite(referenceWrite)
         if type == "task",let pid = envelope.projectID,let statusID = value["status_id"] as? String,
            let prior = previous.map({ jsonObject($0["data"]) }),prior["status_id"] as? String != statusID,
@@ -439,5 +442,5 @@ public final class CommandRouter: @unchecked Sendable {
         guard !captures.isEmpty else { return }
         try? dbQueue.read { db in _ = self.discardUncommittedSourceCaptures(db, captures) }
     }
-    static let readMethods: Set<String> = mediaOwnerReads.union(["import_preview","import_receipt_get","restore_preview","ticket_cleanup_receipts","work_health_get","cleanup_job_get","cleanup_job_list","workspace_page","service_info","tool_catalog","snapshot","changes_wait","delivery_pending","storage_status","diagnostics_summary","project_list","project_resolve","project_settings_get","policy_get","taxonomy_get","task_get","task_list","task_context","session_list","session_inbox","assistant_inbox","assistant_projects","message_delivery_list","history_list","attachment_list","attachment_read","attachment_cleanup_preview","agent_resolve","triage_list","epic_list","development_status","policy_preview","relation_list","review_batch_inputs","batch_get","batch_list","source_execution_get","review_prepare","review_context"])
+    static let readMethods = CommandMethods.coreReads
 }

@@ -1,10 +1,11 @@
+import ChecklistDomain
 import Foundation
 import ChecklistProviders
 import GRDB
 
 extension CommandRouter {
-    static let policyKinds = ["work", "bug", "asset", "playtest", "question"]
-    static let policyRoles = ["coordinator", "implementer", "reviewer"]
+    static let policyKinds = TicketKind.wireValues
+    static let policyRoles = WorkflowRole.wireValues
     static let policyGates = ["review", "human_approval"]
     static let passingReviewDefault = "complete_passing_independently"
     /// Owner decision 2026-10-18: AI agents edit project rules by default; the owner can limit a project to app-only changes.

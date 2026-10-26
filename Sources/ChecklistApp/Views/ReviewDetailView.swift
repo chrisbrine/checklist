@@ -1,4 +1,5 @@
 import SwiftUI
+import ChecklistDomain
 import AppKit
 import ChecklistProviders
 
@@ -23,8 +24,8 @@ struct ReviewDetailView: View {
             }
         }
         .onAppear { if selectedManifestID.isEmpty { selectedManifestID = task.string("current_manifest_id") } }
-        .onChange(of: task.id) { _ in selectedManifestID = task.string("current_manifest_id"); sheet = nil }
-        .onChange(of: task.string("current_manifest_id")) { value in if selectedManifestID.isEmpty { selectedManifestID = value } }
+        .onChange(of: task.id) { _, _ in selectedManifestID = task.string("current_manifest_id"); sheet = nil }
+        .onChange(of: task.string("current_manifest_id")) { _, value in if selectedManifestID.isEmpty { selectedManifestID = value } }
         .sheet(item: $sheet) { destination in
             switch destination {
             case .prepare(let request): AgentReviewPreparationSheet(task:task,request:request).environmentObject(store)
@@ -107,7 +108,7 @@ struct ReviewDetailView: View {
                 TechnicalDetails([("Policy revision", "\(task.integer("pending_policy_revision"))")], raw: [("Revised completion rules", task.object("pending_policy_snapshot"))])
                 TextField("Why this ticket can use the new rules", text: $policyReason).textFieldStyle(.roundedBorder)
                 Button("Use the new rules") {
-                    store.run("policy_acknowledge", ["project_id": task.string("project_id"), "task_id": task.id, "expected_revision": task.integer("revision"), "reason": policyReason], success: "New rules applied; evidence and remaining checks rechecked") { _ in policyReason = "" }
+                    store.run("policy_acknowledge", ["project_id": task.string("project_id"), "task_id": task.id, "expected_revision": task.integer("revision"), "reason": policyReason], success: "New rules applied; evidence and remaining checks rechecked", completion: { _ in policyReason = "" })
                 }.buttonStyle(.checklistProminent).checklistDisabled([(policyReason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write a reason first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline)])
             } else if let active = projection.activeAttempt {
                 if active.integer("pending_policy_revision", fallback: 0) > 0 {
@@ -198,7 +199,7 @@ struct ReviewDetailView: View {
         return store.detailRecords("sessions",task:task).first { $0.id == attempt.string("session_id") }?.string("provider", fallback: "Agent").capitalized ?? "Agent"
     }
     func startImplementation() {
-        store.runTaskCommand("work_claim", ["project_id": task.string("project_id"), "task_id": task.id, "expected_revision": task.integer("revision"), "phase": "implementation"], taskID: task.id, success: "Your implementation attempt started") { result in
+        store.runTaskCommand("work_claim", ["project_id": task.string("project_id"), "task_id": task.id, "expected_revision": task.integer("revision"), "phase": AttemptPhase.implementation.rawValue], taskID: task.id, success: "Your implementation attempt started") { result in
             guard let id = result["id"] as? String, let token = result["claim_token"] as? String else { store.error = "The service did not confirm that your work started. Refresh the ticket before you continue."; return }
             do { try HumanClaims.save(token, attempt: id) } catch { store.error = "The claim started, but its local credential could not be saved: \(PlainError.text(error)). Verify this attempt before recovery." }
         }
@@ -349,7 +350,7 @@ private struct FindingWaiverSheet: View {
             Text(finding.string("description")).checklistFont(.callout).textSelection(.enabled)
             Text("A waiver records your reason and identity. It does not turn a failed check into a pass or waive other gates.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             TextField("Reason for accepting this unresolved issue", text: $reason).textFieldStyle(.roundedBorder)
-            AccessibleHStack { Button("Cancel") { dismiss() }; Spacer(); Button("Record owner waiver") { store.run("finding_waive", ["project_id": finding.string("project_id"), "finding_id": finding.id, "expected_revision": finding.integer("revision"), "reason": reason], success: "Explicit owner waiver recorded") { _ in dismiss() } }.buttonStyle(.checklistProminent).checklistDisabled([(reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write a reason first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline)]) }
+            AccessibleHStack { Button("Cancel") { dismiss() }; Spacer(); Button("Record owner waiver") { store.run("finding_waive", ["project_id": finding.string("project_id"), "finding_id": finding.id, "expected_revision": finding.integer("revision"), "reason": reason], success: "Explicit owner waiver recorded", completion: { _ in dismiss() }) }.buttonStyle(.checklistProminent).checklistDisabled([(reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write a reason first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline)]) }
         }.padding(Spacing.page).checklistSheet(width: 520)
     }
 }
@@ -365,7 +366,7 @@ private struct ReviewRetrySheet: View {
             Text("Request another review").checklistFont(.sheetTitle)
             Text("The blocked verdict and stable findings remain in history. A new request names the same exact current target.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
             TextField("What changed so this review can continue?", text: $reason).textFieldStyle(.roundedBorder)
-            AccessibleHStack { Button("Cancel") { dismiss() }; Spacer(); Button("Request review") { store.run("review_request", ["project_id": task.string("project_id"), "task_id": task.id, "expected_revision": task.integer("revision"), "target_manifest_id": request.string("manifest_id"), "gate": request.string("gate"), "supersedes_request_id": request.id, "reason": reason], success: "Another exact-target review requested") { _ in dismiss() } }.buttonStyle(.checklistProminent).checklistDisabled([(reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write a reason first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline)]) }
+            AccessibleHStack { Button("Cancel") { dismiss() }; Spacer(); Button("Request review") { store.run("review_request", ["project_id": task.string("project_id"), "task_id": task.id, "expected_revision": task.integer("revision"), "target_manifest_id": request.string("manifest_id"), "gate": request.string("gate"), "supersedes_request_id": request.id, "reason": reason], success: "Another exact-target review requested", completion: { _ in dismiss() }) }.buttonStyle(.checklistProminent).checklistDisabled([(reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write a reason first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline)]) }
         }.padding(Spacing.page).checklistSheet(width: 520)
     }
 }
@@ -417,7 +418,7 @@ private struct AgentReviewPreparationSheet: View {
             }
         }.padding(Spacing.page).checklistSheet(width: 650)
             .task {if !providers.contains(provider),let first = providers.first {provider = first};await prepare()}
-            .onChange(of:provider) {_ in Task {await prepare()}}
+            .onChange(of:provider) {_,_ in Task {await prepare()}}
     }
     func prepare() async {
         let generation = UUID(), selected = selectedProvider

@@ -1,4 +1,5 @@
 import SwiftUI
+import ChecklistDomain
 import ChecklistProviders
 
 struct ProjectSettingsView: View {
@@ -103,14 +104,19 @@ struct ProjectSettingsView: View {
                 Divider()
                 DetailSection(title: "Statuses") {
                     ForEach(store.statuses(project.id).filter { !$0.bool("retired") }) { status in AccessibleHStack { StatusPill(name: status.string("name"), category: status.string("category")); Spacer(); Text(status.string("category")).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText); Menu { Button("Edit name, color or order…") { editingTaxonomy = TaxonomyEdit(record: status, kind: "status") }; Button("Retire and review affected tickets…") { retiringStatus = status } } label: { Image(systemName: "ellipsis") }.menuStyle(.button).buttonStyle(.checklistIcon).menuIndicator(.hidden).frame(width: 25).accessibilityLabel("Status actions: \(status.string("name"))").help("Edit or retire this status") } }
-                    AccessibleHStack { TextField("New status name", text: $statusName).textFieldStyle(.roundedBorder); Picker("Behaves like", selection: $statusCategory) { ForEach(["queued", "active", "review", "blocked", "parked", "done", "canceled"], id: \.self) { Text($0.capitalized).tag($0) } }.frame(maxWidth: .infinity, alignment: .leading) }
-                    Button("Add status") { store.run("status_create", ["project_id": project.id, "name": statusName, "category": statusCategory, "color": statusCategory == "parked" ? "orange" : "teal"], success: "Status added") { _ in statusName = "" } }.checklistDisabled([(!store.connected, DisabledReasons.offline), (statusName.isEmpty, "Enter a status name first."), (store.busy, DisabledReasons.saving)])
+                    AccessibleHStack {
+                        TextField("New status name", text: $statusName).textFieldStyle(.roundedBorder)
+                        Picker("Behaves like", selection: $statusCategory) {
+                            ForEach(TicketStatusCategory.wireValues, id: \.self) { Text($0.capitalized).tag($0) }
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    Button("Add status") { store.run("status_create", ["project_id": project.id, "name": statusName, "category": statusCategory, "color": statusCategory == "parked" ? "orange" : "teal"], success: "Status added", completion: { _ in statusName = "" }) }.checklistDisabled([(!store.connected, DisabledReasons.offline), (statusName.isEmpty, "Enter a status name first."), (store.busy, DisabledReasons.saving)])
                     Text("Use multiple Parked variants for different reasons. Status labels cannot bypass work or review gates.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }
                 Divider()
                 DetailSection(title: "Tags") {
                     ForEach(store.tags(project.id).filter { !$0.bool("retired") }.sorted { $0.integer("sort_order") < $1.integer("sort_order") }) { tag in AccessibleHStack { Label(tag.string("name"), systemImage: "tag").checklistFont(.callout).foregroundStyle(Color.named(tag.string("color"))); Spacer(); Menu { Button("Edit name, color or order…") { editingTaxonomy = TaxonomyEdit(record: tag, kind: "tag") }; Button("Retire…") { confirmation = Confirmations.retireTag(tag.string("name")) { store.run("tag_retire", ["project_id": project.id, "tag_id": tag.id, "expected_revision": tag.integer("revision")]) } } } label: { Image(systemName: "ellipsis") }.menuStyle(.button).buttonStyle(.checklistIcon).menuIndicator(.hidden).frame(width: 25).accessibilityLabel("Tag actions: \(tag.string("name"))").help("Edit or retire this tag") } }
-                    AccessibleHStack { TextField("New tag", text: $tagName).textFieldStyle(.roundedBorder); Picker("Color", selection: $tagColor) { ForEach(["teal", "blue", "purple", "orange", "green", "pink"], id: \.self) { Text($0.capitalized).tag($0) } }.labelsHidden().frame(maxWidth: .infinity, alignment: .leading); Button("Add") { store.run("tag_create", ["project_id": project.id, "name": tagName, "color": tagColor]) { _ in tagName = "" } }.checklistDisabled([(!store.connected, DisabledReasons.offline), (tagName.isEmpty, "Enter a tag name first."), (store.busy, DisabledReasons.saving)]) }
+                    AccessibleHStack { TextField("New tag", text: $tagName).textFieldStyle(.roundedBorder); Picker("Color", selection: $tagColor) { ForEach(["teal", "blue", "purple", "orange", "green", "pink"], id: \.self) { Text($0.capitalized).tag($0) } }.labelsHidden().frame(maxWidth: .infinity, alignment: .leading); Button("Add") { store.run("tag_create", ["project_id": project.id, "name": tagName, "color": tagColor], completion: { _ in tagName = "" }) }.checklistDisabled([(!store.connected, DisabledReasons.offline), (tagName.isEmpty, "Enter a tag name first."), (store.busy, DisabledReasons.saving)]) }
                 }
                 Divider()
                 DetailSection(title: "Workspace") { Text(project.string("root_path").isEmpty ? "No workspace bound. Agent work needs an explicit project folder." : project.string("root_path")).checklistFont(.code).textSelection(.enabled); Button("Choose workspace…") { if let url = chooseFiles(directories: true, files: false, multiple: false).first { store.run("project_edit", ["project_id": project.id, "expected_revision": project.integer("revision"), "root_path": url.path], success: "Workspace updated") } } }
@@ -174,7 +180,7 @@ struct ProjectSettingsView: View {
             }
             Picker("Apply workflow",selection:$applyMode) { Text("Future work rounds").tag("future_attempts"); Text("Active work confirms the new rules first").tag("checkpoint_active") }
             Text("Future rounds preserve completion gates and active review requirements. New review claims pin the latest requirements. Checkpoint mode requires explicit acknowledgment before further submission or verdicts. Removing service authority takes effect immediately; it cannot stop an external process.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-            Button("Preview workflow effects") { let signature = policySignature; store.run("policy_propose",["project_id":project.id,"policy":policyDraft,"mode":applyMode]) { result in preview = result; previewSignature = signature } }.checklistDisabled([(store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline), (!reviewRequirements.canPreview, "Fix the review requirements first.")])
+            Button("Preview workflow effects") { let signature = policySignature; store.run("policy_propose",["project_id":project.id,"policy":policyDraft,"mode":applyMode], completion: { result in preview = result; previewSignature = signature }) }.checklistDisabled([(store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline), (!reviewRequirements.canPreview, "Fix the review requirements first.")])
             if let preview, previewSignature == policySignature {
                 let affected = preview["affected_tasks"] as? [[String:Any]] ?? [], active = preview["active_rounds"] as? [[String:Any]] ?? []
                 Text("\(affected.count) affected tickets · \(active.count) active attempts · \(active.filter { $0["authority_revoked"] as? Bool == true }.count) authority removals").checklistFont(.microEmphasis)
@@ -223,7 +229,16 @@ struct ProjectSettingsView: View {
         var value = project.object("policy")
         value["routing_preset"] = preset; value["allowed_providers"] = allowedProviders
         let existingRoles = value["roles"] as? [String:Any] ?? [:]
-        value["roles"] = ["coordinator":role(coordinator,existing:existingRoles["coordinator"]),"implementer":role(implementer,existing:existingRoles["implementer"]),"reviewer":role(reviewer,existing:existingRoles["reviewer"])]
+        value["roles"] = Dictionary(uniqueKeysWithValues: WorkflowRole.allCases.map { workflowRole in
+            let selection: String
+            switch workflowRole {
+            case .coordinator: selection = coordinator
+            case .implementer: selection = implementer
+            case .reviewer: selection = reviewer
+            }
+            let key = workflowRole.rawValue
+            return (key, role(selection, existing: existingRoles[key]))
+        })
         value["required_gates"] = (requireReview ? ["review"] : []) + (requireHumanApproval ? ["human_approval"] : [])
         value["review_batch_policy"] = batchPolicy
         value["agent_rule_changes"] = agentsChangeRules ? "allowed" : "owner_only"
@@ -232,7 +247,11 @@ struct ProjectSettingsView: View {
         value["task_kind_overrides"] = kindDrafts.compactMap { draft -> [String:Any]? in
             var roles: [String:Any] = [:]
             let oldRoles = ((project.object("policy")["task_kind_overrides"] as? [[String:Any]] ?? []).first { $0["kind"] as? String == draft.kind })?["roles"] as? [String:Any] ?? [:]
-            for (key,choice) in [("coordinator",draft.coordinator),("implementer",draft.implementer),("reviewer",draft.reviewer)] where choice != "inherit" { roles[key] = role(choice,existing:oldRoles[key]) }
+            let selections: [WorkflowRole: String] = [.coordinator: draft.coordinator, .implementer: draft.implementer, .reviewer: draft.reviewer]
+            for workflowRole in WorkflowRole.allCases {
+                let key = workflowRole.rawValue
+                if let choice = selections[workflowRole], choice != "inherit" { roles[key] = role(choice, existing: oldRoles[key]) }
+            }
             guard !roles.isEmpty || draft.overrideGates || draft.decisionEvidence != "inherit" else { return nil }
             var result: [String:Any] = ["kind":draft.kind]
             if !roles.isEmpty { result["roles"] = roles }
@@ -291,16 +310,16 @@ struct ProjectSettingsView: View {
             params["policy_proposal_id"] = preview["id"] ?? ""
             params["policy_digest"] = preview["digest"] ?? ""
         }
-        store.run("project_settings_save",params,success:submittingWorkflow ? "Project settings and workflow saved" : "Project settings saved") { _ in
+        store.run("project_settings_save",params,success:submittingWorkflow ? "Project settings and workflow saved" : "Project settings saved", completion: { _ in
             self.savedWorkflowSignature = submittedSignature
             self.preview = nil
             self.previewSignature = ""
-        }
+        })
     }
 }
 
 struct PolicyKindSettings: Identifiable {
-    static let kinds = ["work","bug","asset","playtest","question"]
+    static let kinds = TicketKind.wireValues
     let kind: String
     var id: String { kind }
     var coordinator = "inherit"
@@ -350,7 +369,7 @@ struct TaxonomyEditor: View {
             Picker("Color", selection: $color) { ForEach(["teal", "blue", "purple", "orange", "green", "pink", "gray"], id: \.self) { Text($0.capitalized).tag($0) } }
             Stepper("Order: \(order)",value:$order,in:0...10000)
             if item.kind == "status" { Text("Behavior stays \(item.record.string("category")). Create a new status to change behavior.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
-            AccessibleHStack { Button("Cancel") { dismiss() }; Spacer(); Button("Save") { store.run(item.kind + "_edit", ["project_id": projectID, item.kind + "_id": item.record.id, "name": name, "color": color, "sort_order":order,"category": item.record.string("category"), "expected_revision": item.record.integer("revision")]) { _ in dismiss() } }.buttonStyle(.checklistProminent).checklistDisabled([(!store.connected, DisabledReasons.offline), (name.isEmpty, "Enter a name first."), (store.busy, DisabledReasons.saving)]) }
+            AccessibleHStack { Button("Cancel") { dismiss() }; Spacer(); Button("Save") { store.run(item.kind + "_edit", ["project_id": projectID, item.kind + "_id": item.record.id, "name": name, "color": color, "sort_order":order,"category": item.record.string("category"), "expected_revision": item.record.integer("revision")], completion: { _ in dismiss() }) }.buttonStyle(.checklistProminent).checklistDisabled([(!store.connected, DisabledReasons.offline), (name.isEmpty, "Enter a name first."), (store.busy, DisabledReasons.saving)]) }
         }.padding(Spacing.page).checklistSheet(width: 400).onAppear { name = item.record.string("name"); color = item.record.string("color", fallback: "teal"); order = item.record.integer("sort_order",fallback:0) }
     }
 }
@@ -378,6 +397,6 @@ struct StatusRetirementView: View {
     func retire() {
         var params: [String:Any] = ["project_id":projectID,"status_id":status.id,"expected_revision":status.integer("revision")]
         if !affected.isEmpty { params["remap_target_status_id"] = target; params["expected_task_revisions"] = Dictionary(uniqueKeysWithValues:affected.map { ($0.id,$0.integer("revision")) }) }
-        store.run("status_retire",params,success:"Status retired") { _ in dismiss() }
+        store.run("status_retire",params,success:"Status retired", completion: { _ in dismiss() })
     }
 }

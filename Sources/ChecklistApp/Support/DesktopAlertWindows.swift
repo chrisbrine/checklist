@@ -5,7 +5,7 @@ import SwiftUI
 @MainActor final class DesktopAlertWindows {
     static let shared = DesktopAlertWindows()
     private let clicks: DesktopAlertClicks
-    init(clicks: DesktopAlertClicks = .shared) { self.clicks = clicks }
+    init(clicks: DesktopAlertClicks? = nil) { self.clicks = clicks ?? .shared }
     private struct Weak { weak var store: ChecklistStore? }
     private var stores: [Weak] = []
     private var installed = false

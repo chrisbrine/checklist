@@ -53,7 +53,7 @@ final class ScreenReadQueryPlanTests: XCTestCase {
             var config = Configuration(); config.readonly = true; config.maximumReaderCount = 1
             config.prepareDatabase { db in
                 try SchemaMigrations.installStorageCollation(db)
-                try CommandRouter.installTicketSearchFunctions(db)
+                CommandRouter.installTicketSearchFunctions(db)
                 db.trace { if case .statement(let statement) = $0 { trace.append(statement.expandedSQL) } }
             }
             let pool = try DatabasePool(path:r.root.appendingPathComponent("checklist.sqlite").path, configuration:config)

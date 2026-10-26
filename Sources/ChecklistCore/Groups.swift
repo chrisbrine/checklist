@@ -1,11 +1,12 @@
+import ChecklistDomain
 import Foundation
 import GRDB
 
 extension CommandRouter {
     func triagePhase(_ group: JSON) -> String? {
-        if let phase = group["phase"] as? String,["implementation","review"].contains(phase) { return phase }
+        if let phase = group["phase"] as? String,AttemptPhase.wireValues.contains(phase) { return phase }
         let phases = Set((group["members"] as? [JSON] ?? []).compactMap {$0["handling_phase"] as? String})
-        return phases.count == 1 && phases.isSubset(of:["implementation","review"]) ? phases.first : nil
+        return phases.count == 1 && phases.isSubset(of:AttemptPhase.wireValues) ? phases.first : nil
     }
     func validateTriageTaskPhase(_ db: Database,task: JSON,phase: String) throws {
         let category: String
@@ -249,7 +250,7 @@ extension CommandRouter {
             if kind == "epic" { group["brief"] = brief;group["description"] = brief }
             else {
                 let phase = p["phase"] as? String ?? "implementation"
-                guard ["implementation","review"].contains(phase) else { throw CoreError("INVALID_INPUT","Choose an implementation or review Triage.") }
+                guard AttemptPhase.wireValues.contains(phase) else { throw CoreError("INVALID_INPUT","Choose an implementation or review Triage.") }
                 group["phase"] = phase;group["purpose"] = p["purpose"] ?? brief
             }
             try save(db,group,type:"group");try event(db,caller:c,project:pid,entity:group["id"] as? String,kind:kind+"_created");return try groupProjection(db,group)
@@ -261,7 +262,7 @@ extension CommandRouter {
             if group["kind"] as? String == "epic" { if let brief = p["brief"] ?? p["description"] ?? p["purpose"] { guard let text = brief as? String,text.utf8.count <= 65536 else { throw CoreError("INVALID_INPUT","The Epic brief must be text up to 64 KiB.") };group["brief"] = text;group["description"] = text } }
             else if let purpose = p["purpose"] ?? p["brief"] { guard let text = purpose as? String,text.utf8.count <= 65536 else { throw CoreError("INVALID_INPUT","The Triage purpose must be text up to 64 KiB.") };group["purpose"] = text }
             if group["kind"] as? String == "triage",let phase = p["phase"] as? String {
-                guard ["implementation","review"].contains(phase) else { throw CoreError("INVALID_INPUT","Choose implementation or review handling.") }
+                guard AttemptPhase.wireValues.contains(phase) else { throw CoreError("INVALID_INPUT","Choose implementation or review handling.") }
                 guard triageMemberIDs(group).isEmpty || triagePhase(group) == nil || triagePhase(group) == phase else { throw CoreError("TRIAGE_PHASE_CONFLICT","Use a separate Triage for the next phase. Only an empty Triage can change its established phase.") }
                 for memberID in triageMemberIDs(group) { try validateTriageTaskPhase(db,task:scoped(db,memberID,pid,type:"task"),phase:phase) }
                 group["phase"] = phase
@@ -306,7 +307,7 @@ extension CommandRouter {
             let milestone = p["exit_milestone"] as? String ?? prior?["exit_milestone"] as? String ?? (groupPhase == "review" ? "review_accepted" : "implementation_submitted")
             guard ["manual","implementation_submitted","review_accepted"].contains(milestone) else { throw CoreError("INVALID_INPUT","Choose implementation submission, accepted review or manual removal.") }
             let phase = groupPhase
-            guard ["implementation","review"].contains(phase) else { throw CoreError("INVALID_INPUT","Choose implementation or review handling.") }
+            guard AttemptPhase.wireValues.contains(phase) else { throw CoreError("INVALID_INPUT","Choose implementation or review handling.") }
             var member: JSON = ["task_id":tid,"exit_milestone":milestone,"handling_phase":phase,"joined_at":prior?["joined_at"] ?? now(),"updated_at":now()]
             if let prior = prior { member["membership_id"] = try ensureTriageMembershipInterval(db,group:group,member:prior,caller:c)["id"] }
             else { member["membership_id"] = try ensureTriageMembershipInterval(db,group:group,member:member,caller:c,joiningRevision:int(group,"revision")+1)["id"] }

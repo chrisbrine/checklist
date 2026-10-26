@@ -220,6 +220,13 @@ extension CommandRouter {
                 let pageLimit = 10
                 try withValidatedDomainTransaction(db) {
                 let rows = try Row.fetchAll(db, sql: """
+                    WITH triage_members AS MATERIALIZED (
+                        SELECT g.project_id,
+                               CASE WHEN m.type='object' THEN json_extract(m.value,'$.task_id') ELSE m.value END AS task_id
+                        FROM records g, json_each(CASE WHEN json_array_length(json_extract(g.data,'$.members'))>0 THEN json_extract(g.data,'$.members') ELSE json_extract(g.data,'$.task_ids') END) m
+                        WHERE g.rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='group')
+                          AND json_extract(g.data,'$.kind')='triage' AND COALESCE(json_extract(g.data,'$.archived'),0)=0
+                    )
                     SELECT r.rowid AS position, \(Self.canonicalColumns(alias: "r"))
                     FROM records r JOIN records p ON p.id=r.project_id AND p.type='project'
                     WHERE r.rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='task') AND r.rowid>? AND COALESCE(json_extract(p.data,'$.archived'),0)=0
@@ -227,8 +234,7 @@ extension CommandRouter {
                     AND COALESCE(json_extract(r.data,'$.archived'),0)=0 AND COALESCE(json_extract(r.data,'$.trashed'),0)=0
                     AND (json_extract(r.data,'$.active_attempt_id') IS NOT NULL
                          OR EXISTS (SELECT 1 FROM records s WHERE s.id=json_extract(r.data,'$.status_id') AND s.type='status' AND s.project_id=r.project_id AND json_extract(s.data,'$.category')='active')
-                         OR EXISTS (SELECT 1 FROM records g WHERE g.type='group' AND g.project_id=r.project_id AND json_extract(g.data,'$.kind')='triage' AND COALESCE(json_extract(g.data,'$.archived'),0)=0
-                           AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_array_length(json_extract(g.data,'$.members'))>0 THEN json_extract(g.data,'$.members') ELSE json_extract(g.data,'$.task_ids') END) m WHERE (CASE WHEN m.type='object' THEN json_extract(m.value,'$.task_id') ELSE m.value END)=r.id)))
+                         OR EXISTS (SELECT 1 FROM triage_members m WHERE m.project_id=r.project_id AND m.task_id=r.id))
                     ORDER BY r.rowid LIMIT ?
                     """, arguments: [workHealthScanPosition,pageLimit])
                 var inspected = 0, changed = 0

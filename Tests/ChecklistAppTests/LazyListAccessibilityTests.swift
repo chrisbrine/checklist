@@ -170,7 +170,7 @@ enum RestorePreviewTemplate {
             RestorePreviewSheet(preview: holder.preview, cancel: cancel, confirm: confirm)
         }
     }
-    struct Presented {
+    @MainActor struct Presented {
         let window: NSWindow
         let sheet: NSWindow
         let restore: () -> Void

@@ -480,7 +480,7 @@ import ChecklistIPC
         try await until {f.held.contains {$0.0 == "task_list"}}
         try await until {store.selectedTask("a")?.string("status_name") == "Review"}
         XCTAssertEqual(f.calls.filter {$0 == "task_context"}.count,1)
-        f.holdList = false;f.release("task_list");await apply.value
+        f.holdList = false;f.release("task_list");_ = await apply.value
         XCTAssertEqual(cursor(store),"c1");XCTAssertEqual(f.calls.filter {$0 == "task_context"}.count,1)
     }
     func testParallelSnapshotsDoNotDiscardStatusBehindNoteTraffic() async throws {
@@ -631,7 +631,7 @@ import ChecklistIPC
         await Task.yield()
         XCTAssertEqual(store.selectedTask("b")?.string("status_name"),"Review")
         XCTAssertNil(store.preparedTicketWorkspace,"The obsolete page cannot reinstall v1")
-        f.holdList = false;f.release("task_list");await apply.value
+        f.holdList = false;f.release("task_list");_ = await apply.value
         XCTAssertNil(store.selectedTask("a"));XCTAssertEqual(store.selectedTask("b")?.string("status_name"),"Review")
     }
 }

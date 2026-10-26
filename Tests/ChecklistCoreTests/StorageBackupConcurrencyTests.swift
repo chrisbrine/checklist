@@ -134,7 +134,7 @@ final class StorageBackupConcurrencyTests: XCTestCase {
             DispatchQueue.global().async {
                 defer {finished.fulfill()}
                 attempted.signal()
-                do {try StorageSnapshotRetention.withCapture(root:f.root) {_ in captured.signal()}}
+                do {_ = try StorageSnapshotRetention.withCapture(root:f.root) {_ in captured.signal()}}
                 catch {XCTFail("Capture admission: \(error)")}
             }
             XCTAssertEqual(attempted.wait(timeout:.now()+5),.success)

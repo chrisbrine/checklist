@@ -18,7 +18,7 @@ struct TicketRetirementControls: View {
                 } else {Button("Cancel ticket…") { reasonAction = .cancel }}
             }
             if let receipt = undo,receipt.available(task:task,files:files) {
-                Button("Undo") {store.run(receipt.method,receipt.parameters,success:"Ticket change undone") {_ in undo = nil}}
+                Button("Undo") {store.run(receipt.method,receipt.parameters,success:"Ticket change undone", completion: {_ in undo = nil})}
             }
         }.buttonStyle(.checklistBordered).controlSize(.small)
             .checklistDisabled([(!store.selectedTicketCurrent(task.id),DisabledReasons.ticketLoading),(!store.connected,DisabledReasons.offline),(store.busy,DisabledReasons.saving)])
@@ -29,15 +29,15 @@ struct TicketRetirementControls: View {
             }
     }
     func archiveAction(_ action: String, reason: String = "") {
-        store.run("task_archive",["project_id":task.string("project_id"),"task_id":task.id,"expected_revision":task.integer("revision"),"action":action,"reason":reason],success:action == "trash" ? "Ticket moved to Trash" : "Ticket restored") {result in
+        store.run("task_archive",["project_id":task.string("project_id"),"task_id":task.id,"expected_revision":task.integer("revision"),"action":action,"reason":reason],success:action == "trash" ? "Ticket moved to Trash" : "Ticket restored", completion: {result in
             undo = TicketUndo.archive(result,action:action);reasonAction = nil
-        }
+        })
     }
     func perform(_ action: TicketRetirementAction, reason: String) {
         if action == .trash {archiveAction(action.rawValue, reason: reason);return}
-        store.run("task_transition",["project_id":task.string("project_id"),"task_id":task.id,"expected_revision":task.integer("revision"),"action":action.rawValue,"reason":reason],success:action == .cancel ? "Ticket canceled" : "Ticket reopened in Queued") {result in
+        store.run("task_transition",["project_id":task.string("project_id"),"task_id":task.id,"expected_revision":task.integer("revision"),"action":action.rawValue,"reason":reason],success:action == .cancel ? "Ticket canceled" : "Ticket reopened in Queued", completion: {result in
             undo = TicketUndo.transition(result,previous:task);reasonAction = nil
-        }
+        })
     }
 }
 
@@ -131,6 +131,6 @@ struct TicketReasonSheet: View {
         var params: [String:Any] = ["project_id":task.string("project_id"),"task_id":task.id,"expected_revision":task.integer("revision")]
         if let assignment { params["planned_assignee"] = assignment;params["assignment_reason"] = reason }
         else if let status {params["target_status_id"] = status.id;params["reason"] = reason}
-        store.run(assignment == nil ? "task_transition" : "task_edit",params,success:"Ticket changed with your recorded reason") {result in onTransition?(result);dismiss()}
+        store.run(assignment == nil ? "task_transition" : "task_edit",params,success:"Ticket changed with your recorded reason", completion: {result in onTransition?(result);dismiss()})
     }
 }

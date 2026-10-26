@@ -265,7 +265,7 @@ extension CommandRouter {
         let pid=task["project_id"] as! String,rid=source["id"] as! String
         let messages=try scopedTaskRows(db,type:"message",task:task,predicate:"json_extract(data,'$.human_request_id')=CAST(? AS TEXT) COLLATE BINARY",arguments:[Data(rid.utf8)],limit:25,descending:true)
         let ids=try jsonString(messages.compactMap{$0["id"] as? String})
-        let deliveries=try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='delivery' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.message_id') IN (SELECT value FROM json_each(?)) ORDER BY rowid DESC LIMIT 201",arguments:[Data(pid.utf8),ids]).map {try GRDBRecordEnvelopeAdapter.decode($0,expectedType:"delivery").object}
+        let deliveries=try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='delivery' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.message_id') IN (SELECT value FROM json_each(?)) ORDER BY rowid DESC LIMIT 201",arguments:[Data(pid.utf8),ids]).map {try deliveryReceiptProjection(db,GRDBRecordEnvelopeAdapter.decode($0,expectedType:"delivery").object)}
         result["detail_messages"]=messages.map {message in
             var value=contextRecord(message,type:"message",caller:caller)
             value["deliveries"]=deliveries.prefix(200).filter {SnapshotRecordIdentity($0["message_id"] as? String ?? "")==SnapshotRecordIdentity(message["id"] as? String ?? "")}

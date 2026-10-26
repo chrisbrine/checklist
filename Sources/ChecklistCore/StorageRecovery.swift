@@ -289,7 +289,7 @@ extension CommandRouter {
             }
         }
         try ArchiveStorageGate.withExclusive(root:root) { permit in
-            try dbQueue.writeWithoutTransaction { _ = self.performStorageMaintenance($0,permit:permit) }
+            dbQueue.writeWithoutTransaction { _ = self.performStorageMaintenance($0,permit:permit) }
         }
     }
 }

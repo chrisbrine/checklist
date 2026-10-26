@@ -27,7 +27,6 @@ docs/design/*.png
 .build/
 build/
 .swiftpm/
-Packages/
 DerivedData/
 xcuserdata/
 *.xcuserstate

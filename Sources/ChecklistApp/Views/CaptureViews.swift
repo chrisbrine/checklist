@@ -1,4 +1,5 @@
 import SwiftUI
+import ChecklistDomain
 import ChecklistIPC
 
 struct CaptureTaskView: View {
@@ -70,7 +71,7 @@ struct CaptureTaskView: View {
     }
     var captureDefaults: [String: Any] { store.project(projectID)?.object("capture_defaults") ?? [:] }
     var captureNeedsReconciliation: Bool { (!title.isEmpty || !brief.isEmpty) && draftStoreIncarnation != store.storeIncarnation }
-    var enabledKinds: [String] { captureDefaults["enabled_kinds"] as? [String] ?? ["work","bug","asset","playtest","question"] }
+    var enabledKinds: [String] { captureDefaults["enabled_kinds"] as? [String] ?? TicketKind.wireValues }
     var starterHint: String {
         let hint = (captureDefaults["starter_overrides"] as? [[String: Any]] ?? []).first { $0["kind"] as? String == kind } ?? [:]
         return [hint["brief_hint"] as? String,hint["outcome_hint"] as? String].compactMap {$0}.joined(separator: " · ")
@@ -144,7 +145,7 @@ struct NewProjectView: View {
             AccessibleHStack { Text(root.isEmpty ? "No workspace selected" : root).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).lineLimit(2); Spacer(); Button("Choose folder…") { if let path = chooseFiles(directories: true, files: false, multiple: false).first { root = path.path } } }
             Text("Workspace binding lets agents resolve this project safely. You can add it later. No existing checklists are imported.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             AccessibleHStack { Text("Accent"); Picker("Accent", selection: $accent) { ForEach(["teal", "blue", "purple", "orange", "green", "pink"], id: \.self) { Text($0.capitalized).tag($0) } }.labelsHidden(); Spacer() }
-            AccessibleHStack { Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction); Spacer(); Button("Create project") { var params: [String: Any] = ["name": name, "key_prefix": prefix.uppercased(), "icon": symbol, "accent": accent]; if !root.isEmpty { params["root_path"] = root }; store.run("project_create", params, success: "Project created") { result in if let project = result["project"] as? [String: Any], let id = project["id"] as? String { store.select(.tasks, project: id) } else if let id = result["id"] as? String { store.select(.tasks, project: id) }; dismiss() } }.buttonStyle(.checklistProminent).checklistDisabled([(name.isEmpty, "Enter a name first."), (prefix.isEmpty, "Enter a key prefix first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline)]) }
+            AccessibleHStack { Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction); Spacer(); Button("Create project") { var params: [String: Any] = ["name": name, "key_prefix": prefix.uppercased(), "icon": symbol, "accent": accent]; if !root.isEmpty { params["root_path"] = root }; store.run("project_create", params, success: "Project created", completion: { result in if let project = result["project"] as? [String: Any], let id = project["id"] as? String { store.select(.tasks, project: id) } else if let id = result["id"] as? String { store.select(.tasks, project: id) }; dismiss() }) }.buttonStyle(.checklistProminent).checklistDisabled([(name.isEmpty, "Enter a name first."), (prefix.isEmpty, "Enter a key prefix first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline)]) }
         }.padding(Spacing.page).checklistSheet(width: 500)
     }
 }

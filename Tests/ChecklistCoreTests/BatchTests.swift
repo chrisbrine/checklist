@@ -44,7 +44,7 @@ extension CoreTests {
         var state: JSON = [:]
         for key in ["tasks","attempts","groups","events"] { state[key] = snapshot[key] }
         state["batch"] = try call("batch_get",["project_id":p["id"]!,"batch_id":batch["id"]!])
-        state["dispatches"] = try router.dbQueue.read {try router.records($0,type:"batch_claim",project:p["id"] as! String)}
+        state["dispatches"] = try router.dbQueue.read {try router.records($0,type:"batch_claim",project:(p["id"] as! String))}
         return try jsonString(state)
     }
     func testBatchClaimPolicyInputRefusalsLeavePreparationClaimable() throws {

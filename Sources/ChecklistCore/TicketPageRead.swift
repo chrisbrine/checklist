@@ -14,21 +14,9 @@ extension CommandRouter {
 
     static func installTicketSearchFunctions(_ db: Database) {
         // Registered by prepareDatabase on every connection, never persisted DDL.
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let standard = ISO8601DateFormatter()
-        // SQLite serializes each connection. Repeated date strings across the
-        // Overview's count/order queries need one parse, with a bounded cache.
-        var timestamps: [String:Double] = [:]
+        let timestamps = TicketTimestampCache()
         db.add(function: DatabaseFunction("checklist_timestamp", argumentCount: 1) { values in
-            let value = String.fromDatabaseValue(values[0]) ?? ""
-            if let cached = timestamps[value] {return cached}
-            let result = (fractional.date(from:value) ?? standard.date(from:value) ?? .distantPast).timeIntervalSince1970
-            if value.utf8.count <= 64 {
-                if timestamps.count >= 1024 {timestamps.removeAll(keepingCapacity:true)}
-                timestamps[value] = result
-            }
-            return result
+            timestamps.timestamp(String.fromDatabaseValue(values[0]) ?? "")
         })
         // Locale is intentionally not marked deterministic and is cursor-bound.
         db.add(collation: DatabaseCollation("checklist_display_label") { left, right in
@@ -444,5 +432,29 @@ private struct TicketPageLookupKey: Hashable {
     let id: SnapshotRecordIdentity
     init(project: String, type: String, id: String) {
         self.project = SnapshotRecordIdentity(project); self.type = type; self.id = SnapshotRecordIdentity(id)
+    }
+}
+
+/// Each SQL function retains its own bounded cache. The lock protects both
+/// Foundation formatters and cached values when called from a Sendable closure.
+private final class TicketTimestampCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private let fractional = ISO8601DateFormatter()
+    private let standard = ISO8601DateFormatter()
+    private var timestamps: [String:Double] = [:]
+
+    init() {
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    }
+
+    func timestamp(_ value: String) -> Double {
+        lock.lock(); defer { lock.unlock() }
+        if let cached = timestamps[value] { return cached }
+        let result = (fractional.date(from:value) ?? standard.date(from:value) ?? .distantPast).timeIntervalSince1970
+        if value.utf8.count <= 64 {
+            if timestamps.count >= 1024 { timestamps.removeAll(keepingCapacity:true) }
+            timestamps[value] = result
+        }
+        return result
     }
 }

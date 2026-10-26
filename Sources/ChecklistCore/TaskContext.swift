@@ -125,7 +125,7 @@ extension CommandRouter {
         result["handler_recipients"] = try relevantHandlerRecipients(db,task:task)
         result["relation_context"] = try scopedRelationContext(db,task:task)
         let batches = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='batch' AND project_id=CAST(? AS TEXT) AND EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.members')) WHERE json_extract(value,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY) ORDER BY rowid DESC LIMIT 11",arguments:[Data(pid.utf8),Data(tid.utf8)]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
-        result["batches"] = try batches.prefix(10).reversed().map {batch -> JSON in
+        result["batches"] = batches.prefix(10).reversed().map {batch -> JSON in
             var reference:JSON=[:]
             for key in ["id","project_id","triage_id","triage_key","triage_name","phase","revision","created_at","digest"] {reference[key]=batch[key]}
             reference["triage_key"] = batchTriageKey(db,batch) as Any? ?? NSNull()

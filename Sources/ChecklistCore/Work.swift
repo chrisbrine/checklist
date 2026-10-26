@@ -1,3 +1,4 @@
+import ChecklistDomain
 import Foundation
 import ChecklistProviders
 import GRDB
@@ -77,7 +78,7 @@ extension CommandRouter {
         }
         return task["status_category"] as? String ?? "queued"
     }
-    func work(_ db: Database,_ p: JSON,_ c: Caller,_ method: String,operation: TicketStatusOperation = .individual,batchContext: BatchClaimContext? = nil) throws -> JSON {
+    func work(_ db: Database,_ p: JSON,_ c: Caller,_ method: String,operation: TicketStatusOperation = .individual,batchContext: BatchClaimContext? = nil, includeClaimContext: Bool = true) throws -> JSON {
         try worker(c); let pid = try scope(db,p,c,write:true)
         if method == "task_complete" {
             var t = try task(db,p,pid); try revision(p,t)
@@ -109,7 +110,7 @@ extension CommandRouter {
             if let a = t["planned_assignee"] as? String,a == "human",!c.isOwner,p["phase"] as? String != "review" { throw CoreError("POLICY_DENIED","This task is assigned to the owner.") }
             if let a = t["planned_assignee"] as? JSON,a["kind"] as? String == "human",!c.isOwner,p["phase"] as? String != "review" { throw CoreError("POLICY_DENIED","This task is assigned to the owner.") }
             let phase = p["phase"] as? String ?? "implementation"
-            guard ["implementation","review"].contains(phase) else { throw CoreError("INVALID_INPUT","Invalid work phase.") }
+            guard AttemptPhase.wireValues.contains(phase) else { throw CoreError("INVALID_INPUT","Invalid work phase.") }
             let project = try record(db,pid,type:"project")
             if let pr = p["policy_revision"],(pr as? NSNumber)?.intValue != int(project,"policy_revision",default:1) { throw CoreError("POLICY_CHANGED","Refresh the current workflow rules before claiming.") }
             if !c.isOwner {
@@ -140,7 +141,15 @@ extension CommandRouter {
             let token = uuid()+uuid(); a["token_hash"] = hash(Data(token.utf8)); try save(db,a,type:"attempt")
             // A new implementation round ends any release-set hold of an earlier pass (CL-45).
             if phase != "review" { t.removeValue(forKey:"release_hold") }
-            t["active_attempt_id"] = a["id"]; t["status_id"] = try status(db,pid,phase == "review" ? "review" : "active")["id"]; t = revised(t); try save(db,t,type:"task"); try recordTicketStatusAction(db,task:t,caller:c,operation:operation); try event(db,caller:c,project:pid,entity:t["id"] as? String,kind:"work_claimed",data:["attempt_id":a["id"]!,"phase":phase]); a.removeValue(forKey:"token_hash"); a["claim_token"] = token; a["task"] = try taskProjection(db,t);a["context"] = try compactTaskContext(db,task:t,caller:c,directionAttempt:a);return a
+            t["active_attempt_id"] = a["id"]; t["status_id"] = try status(db,pid,phase == "review" ? "review" : "active")["id"]; t = revised(t); try save(db,t,type:"task"); try recordTicketStatusAction(db,task:t,caller:c,operation:operation); try event(db,caller:c,project:pid,entity:t["id"] as? String,kind:"work_claimed",data:["attempt_id":a["id"]!,"phase":phase]); a.removeValue(forKey:"token_hash"); a["claim_token"] = token
+            // Preparation needs the real authority/side effects inside its rollback,
+            // but does not consume a response context. Dispatch builds it once,
+            // after installing the claim, and shares its selected task projection.
+            if includeClaimContext {
+                let context = try compactTaskContext(db,task:t,caller:c,directionAttempt:a)
+                a["task"] = context["task"];a["context"] = context
+            }
+            return a
         }
         var a = try claimAttempt(db,p,c,pid); var t = try scoped(db,a["task_id"] as! String,pid,type:"task")
         try verifyPolicyAuthority(db,attempt:a,caller:c,requireAcknowledgment: !["work_checkpoint","work_release"].contains(method))

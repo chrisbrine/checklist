@@ -212,14 +212,19 @@ extension Coordinator {
         })
     }
 
-    func requireCommittedRegistration(_ enrollment: Enrollment, project: String, caller: Caller) throws {
-        guard let session = try router.connectionSession(sessionID:enrollment.sessionID,project:project,caller:caller),
+    func requireCommittedRegistration(_ enrollment: Enrollment, project: String, caller: Caller, timing: ServiceCallTiming? = nil) throws {
+        let currentSession = try ServiceCallTiming.measure(timing,"route_current_session_ms") {
+            try router.connectionSession(sessionID:enrollment.sessionID,project:project,caller:caller)
+        }
+        guard let session = currentSession,
               ConnectionCommit.registrationMatches(session, sessionID: enrollment.sessionID, installation: enrollment.installation, generation: enrollment.generation, role: enrollment.role, provider: enrollment.provider, projects: enrollment.projectIDs) else {
             throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "The saved connection does not match its committed registration. No authority was resumed.")
         }
         if let command = enrollment.pairingCommandID {
             guard let digest = enrollment.pairingIntentDigest, let principal = enrollment.pairingPrincipal,
-                  try router.connectionRegistrationIsCurrent(commandID: command, digest: digest, sessionID: enrollment.sessionID, installation: enrollment.installation, receiptPrincipal: principal, caller: caller) else {
+                  try ServiceCallTiming.measure(timing,"route_registration_receipt_ms", {
+                      try router.connectionRegistrationIsCurrent(commandID: command, digest: digest, sessionID: enrollment.sessionID, installation: enrollment.installation, receiptPrincipal: principal, caller: caller)
+                  }) else {
                 throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "Pairing preparation has no matching committed receipt. Reconcile its original command before repair.")
             }
         }

@@ -1,5 +1,6 @@
 import ChecklistTestSupport
 import XCTest
+import LocalAuthentication
 import Security
 @testable import ChecklistApp
 @testable import ChecklistCore
@@ -215,7 +216,7 @@ import ChecklistIPC
 
     func testKeychainRecoveryDistinguishesAbsenceFailureAndMalformedBytesWithoutUI() throws {
         XCTAssertNil(try HumanClaims.readRecovery(query: [:], copyMatching: { query, _ in
-            XCTAssertEqual((query as NSDictionary)[kSecUseAuthenticationUI] as? String, kSecUseAuthenticationUIFail as String)
+            XCTAssertTrue(((query as NSDictionary)[kSecUseAuthenticationContext] as? LAContext)?.interactionNotAllowed == true)
             return errSecItemNotFound
         }))
         for status in [errSecInteractionNotAllowed, errSecAuthFailed, errSecNotAvailable] {

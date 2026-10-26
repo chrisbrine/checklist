@@ -177,7 +177,8 @@ enum StorageSnapshotAuthority {
                 let mode = try text(value, "mode")
                 if mode == "external_reference" { external.append(authority); continue }
                 guard mode == "managed" else { throw StorageSnapshotFailure.unsupportedAuthority }
-                let project = try text(value, "project_id"), availability = try text(value, "availability")
+                _ = try text(value, "project_id")
+                let availability = try text(value, "availability")
                 if availability == "available" {
                     guard let size = (value["size"] as? NSNumber)?.int64Value else { throw StorageSnapshotFailure.unsupportedAuthority }
                     try regular(path: try text(value, "path"), family: "objects",

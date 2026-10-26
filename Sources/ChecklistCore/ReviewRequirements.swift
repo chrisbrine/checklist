@@ -1,3 +1,4 @@
+import ChecklistDomain
 import Foundation
 import CryptoKit
 
@@ -17,7 +18,8 @@ struct ReviewRequirementID: Hashable {
     func hash(into hasher: inout Hasher) { hasher.combine(bytes) }
 }
 
-enum ReviewRequirementKind: String, CaseIterable { case work, bug, asset, playtest, question }
+// Compatibility name; the shared definition owns these wire values.
+typealias ReviewRequirementKind = TicketKind
 enum ReviewRequirementEvidenceType: String, CaseIterable, Hashable {
     case reviewerReport = "reviewer_report", sourceCapture = "source_capture", image, textRecord = "text_record"
 }

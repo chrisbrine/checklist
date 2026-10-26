@@ -72,6 +72,8 @@ struct RequestAnswerDeliveryProjection {
                 // A later ended/revoked/replaced session does not erase this exact
                 // generation's recorded ACK or attribute it to its replacement.
                 receipt = currentPrefix + (state == "acknowledged" ? "Acknowledged" : "Addressed") + availability.historyQualifier
+            } else if state == "fenced" {
+                receipt = currentPrefix + stateLabel(state)
             } else if !availability.current {
                 receipt = currentPrefix + "Unavailable · " + availability.reason
             } else {
@@ -124,6 +126,7 @@ struct RequestAnswerDeliveryProjection {
 
     static func stateLabel(_ state: String) -> String {
         switch Canceled.normalized(state) {
+        case "fenced": return DeliveryLabels.receipt(state)
         case "queued", "pending": return "Queued for agent pickup"
         case "saved", "saved_for_pickup": return "Saved for pickup"
         case "transport_written", "transport_accepted": return "Transport written; acknowledgment pending"

@@ -119,7 +119,8 @@ struct DetailItemStateRetention: NSViewRepresentable {
         private var isCurrentItem: Bool {
             memory.owns(key: key, generation: navigationGeneration)
         }
-        init(key: String, memory: DetailItemNavigationMemory = .shared) {
+        init(key: String, memory: DetailItemNavigationMemory? = nil) {
+            let memory = memory ?? .shared
             self.key = key
             self.memory = memory
             navigationGeneration = memory.navigationGeneration

@@ -9,19 +9,28 @@ let package = Package(
         .executable(name: "checklist", targets: ["ChecklistCLI"])
     ],
     dependencies: [
+        .package(path: "Packages/ChecklistShared"),
         .package(url: "https://github.com/groue/GRDB.swift.git", exact: "7.11.1"),
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", exact: "0.12.1")
     ],
     targets: [
         .target(name: "ChecklistProviders"),
         .target(name: "ChecklistFileAccess"),
-        .target(name: "ChecklistCore", dependencies: ["ChecklistProviders", "ChecklistFileAccess", .product(name: "GRDB", package: "GRDB.swift")]),
-        .target(name: "ChecklistIPC"),
+        .target(name: "ChecklistCore", dependencies: [
+            .product(name: "ChecklistDomain", package: "ChecklistShared"),
+            .product(name: "ChecklistContracts", package: "ChecklistShared"),
+            .product(name: "ChecklistApplication", package: "ChecklistShared"),
+            "ChecklistProviders", "ChecklistFileAccess", .product(name: "GRDB", package: "GRDB.swift")
+        ]),
+        .target(name: "ChecklistIPC", dependencies: [.product(name: "ChecklistContracts", package: "ChecklistShared")]),
         .target(name: "ChecklistBridges", dependencies: ["ChecklistCore", "ChecklistIPC", "ChecklistProviders"]),
         .target(name: "ChecklistMCPServer", dependencies: ["ChecklistIPC", "ChecklistBridges", .product(name: "MCP", package: "swift-sdk")]),
         .executableTarget(name: "ChecklistService", dependencies: ["ChecklistCore", "ChecklistIPC", "ChecklistBridges", "ChecklistProviders"]),
         .executableTarget(name: "ChecklistCLI", dependencies: ["ChecklistProviders", "ChecklistIPC", "ChecklistBridges", "ChecklistMCPServer", .product(name: "MCP", package: "swift-sdk")]),
-        .executableTarget(name: "ChecklistApp", dependencies: ["ChecklistIPC", "ChecklistCore", "ChecklistProviders"]),
+        .executableTarget(name: "ChecklistApp", dependencies: [
+            .product(name: "ChecklistDomain", package: "ChecklistShared"),
+            "ChecklistIPC", "ChecklistCore", "ChecklistProviders"
+        ]),
         // Build-only group: link all shipping executables in one SwiftPM pass.
         .target(name: "ChecklistProducts", dependencies: ["ChecklistApp", "ChecklistService", "ChecklistCLI"]),
         .target(name: "StorageReleasedCoreFixture", dependencies: [.product(name: "GRDB", package: "GRDB.swift")], path: "Tests/StorageCrashProbe/ReleasedCore"),

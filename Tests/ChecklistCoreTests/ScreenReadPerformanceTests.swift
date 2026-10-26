@@ -61,7 +61,7 @@ final class ScreenReadPerformanceTests: XCTestCase {
         var configuration = Configuration(); configuration.readonly = true
         configuration.prepareDatabase { db in
             try SchemaMigrations.installStorageCollation(db)
-            try CommandRouter.installTicketSearchFunctions(db)
+            CommandRouter.installTicketSearchFunctions(db)
         }
         let pool = try DatabasePool(path: path, configuration: configuration)
         defer { try? pool.close() }

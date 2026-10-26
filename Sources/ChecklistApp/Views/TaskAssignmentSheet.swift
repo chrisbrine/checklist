@@ -57,9 +57,9 @@ struct TaskAssignmentSheet: View {
         }.padding(Spacing.page).checklistSheet(width: 570)
             .onAppear { restoreDraft() }
             .task(id: task.id + ":" + String(projectPolicyRevision)) { await loadPolicy() }
-            .onChange(of: selectedSessionID) { _ in saveDraft() }
-            .onChange(of: reason) { _ in saveDraft() }
-            .onChange(of: expectedRevision) { _ in saveDraft() }
+            .onChange(of: selectedSessionID) { _, _ in saveDraft() }
+            .onChange(of: reason) { _, _ in saveDraft() }
+            .onChange(of: expectedRevision) { _, _ in saveDraft() }
     }
     var currentAssignment: String {
         let assignment = currentTask.object("planned_assignee")
@@ -95,8 +95,8 @@ struct TaskAssignmentSheet: View {
     }
     func assign() {
         guard let session = selectedSession, !contextChanged else { return }
-        store.run("task_edit", ["project_id": project, "task_id": task.id, "expected_revision": expectedRevision, "planned_assignee": ["kind": "agent", "session_id": session.id, "provider": session.string("provider")], "assignment_reason": reason.trimmingCharacters(in: .whitespacesAndNewlines)], success: "Existing worker assigned with your recorded reason") { _ in
+        store.run("task_edit", ["project_id": project, "task_id": task.id, "expected_revision": expectedRevision, "planned_assignee": ["kind": "agent", "session_id": session.id, "provider": session.string("provider")], "assignment_reason": reason.trimmingCharacters(in: .whitespacesAndNewlines)], success: "Existing worker assigned with your recorded reason", completion: { _ in
             store.windowPreferences.removeObject(forKey: draftKey); dismiss()
-        }
+        })
     }
 }

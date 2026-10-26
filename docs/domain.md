@@ -49,6 +49,8 @@ The owner's closed-conversation decision is conditional on real native evidence:
 
 ## Cheap capture and readiness
 
+The initial authoritative wire values and pure capture plan live in [ChecklistShared](shared-modules.md). Project workflow policy and authenticated persistence remain in Core; shared values grant no authority.
+
 [Ticket fields](ticket-fields.md) defines the optional/required field matrix, canonical prerequisites and queue-versus-pickup guards.
 
 Capture requires only **project and title**. A screenshot, note or file is optional. The service allocates a project-local key, `kind=work`, `readiness=draft`, and the queued semantic status. A draft is visible in Open/Captured and never eligible for agent pickup. Draft is a readiness badge, not another owner-configured lifecycle category.

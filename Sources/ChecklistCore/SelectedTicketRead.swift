@@ -31,7 +31,7 @@ extension CommandRouter {
         else {result["cleaned_original_count"] = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type='attachment' AND project_id=? AND json_extract(data,'$.task_id')=? AND json_extract(data,'$.availability')='original_cleaned'",arguments:[pid,tid]) ?? 0}
         return try withStatusReason(db,task:result)
     }
-    private func selectedTaskPrerequisites(_ db: Database, task: JSON) throws -> [JSON] {
+    func selectedTaskPrerequisites(_ db: Database, task: JSON) throws -> [JSON] {
         let pid = task["project_id"] as! String, tid = task["id"] as! String
         let edges = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='relation' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.source_task_id')=CAST(? AS TEXT) COLLATE BINARY AND COALESCE(json_extract(data,'$.state'),'')<>'removed' ORDER BY rowid",arguments:[Data(pid.utf8),Data(tid.utf8)]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
         return projectedPrerequisites(task:task,relations:edges,taskLookup:{try self.scoped(db,$0,pid,type:"task")},statusLookup:{try self.scoped(db,$0,pid,type:"status")})
@@ -76,7 +76,7 @@ extension CommandRouter {
         let notes = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='message' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY ORDER BY checklist_timestamp(json_extract(data,'$.created_at')) DESC,rowid DESC LIMIT 51 OFFSET ?",arguments:[Data(pid.utf8),Data(tid.utf8),offset])
         let messages = chronologicalMessages(try Array(notes.prefix(50)).map {try GRDBRecordEnvelopeAdapter.decode($0).object})
         let messageIDs = try jsonString(messages.compactMap {$0["id"] as? String})
-        let deliveries = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='delivery' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.message_id') IN (SELECT value FROM json_each(?)) ORDER BY rowid",arguments:[Data(pid.utf8),messageIDs]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
+        let deliveries = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='delivery' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.message_id') IN (SELECT value FROM json_each(?)) ORDER BY rowid",arguments:[Data(pid.utf8),messageIDs]).map {try deliveryReceiptProjection(db,GRDBRecordEnvelopeAdapter.decode($0).object)}
         var collections: JSON = ["messages":try noteRevisionProjection(db,messages:SnapshotMessageProjection.hydrate(messages,loadDeliveries:{deliveries}),project:pid)]
         var counts: JSON = [:]
         for (name,type,limit) in [("attachments","attachment",50),("attempts","attempt",25),("requests","request",25)] {

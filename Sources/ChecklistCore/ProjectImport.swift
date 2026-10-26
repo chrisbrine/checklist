@@ -1,3 +1,4 @@
+import ChecklistDomain
 import Foundation
 import GRDB
 
@@ -130,7 +131,7 @@ extension CommandRouter {
             var value: JSON = ["id":id,"project_id":pid,"revision":1,"name":raw["name"] ?? "Imported","import_receipt_id":receiptID,"origin":"import","created_at":time,"updated_at":time]
             if entry.family == "status" {
                 let category = raw["category"] as? String ?? "parked"
-                guard ["queued","active","review","blocked","done","canceled","parked"].contains(category) else {throw CoreError("IMPORT_MAPPING_REQUIRED","Unsupported source status category.")}
+                guard TicketStatusCategory.wireValues.contains(category) else {throw CoreError("IMPORT_MAPPING_REQUIRED","Unsupported source status category.")}
                 value["category"] = category;value["sort_order"] = raw["sort_order"] ?? 0;statusMap[entry.sourceID] = id
             }
             if entry.family == "tag" {tagMap[entry.sourceID] = id}
@@ -161,7 +162,7 @@ extension CommandRouter {
             guard let epic else {throw CoreError("EPIC_REQUIRED","Every imported task needs an explicit same-project primary Epic mapping.")}
             _ = try requiredEpicID(db,project:pid,value:epic)
             let kind = raw["kind"] as? String ?? "work"
-            var task: JSON = ["id":id,"project_id":pid,"revision":1,"key":"\(project["key_prefix"] as? String ?? "TASK")-\(number)","title":raw["title"] ?? entry.sourceID,"brief":raw["brief"] ?? raw["detail"] ?? "","acceptance":raw["acceptance"] ?? [],"acceptance_revision":1,"kind":["work","bug","asset","playtest","question"].contains(kind) ? kind : "work","readiness":"draft","status_id":sid!,"tag_ids":tags,"epic_id":epic,"priority":"normal","archived":raw["archived"] ?? false,"trashed":false,"origin":"import","created_by":caller.principal,"created_at":time,"updated_at":time,"import_receipt_id":receiptID,"source_id":entry.sourceID,"historical_unverified":true]
+            var task: JSON = ["id":id,"project_id":pid,"revision":1,"key":"\(project["key_prefix"] as? String ?? "TASK")-\(number)","title":raw["title"] ?? entry.sourceID,"brief":raw["brief"] ?? raw["detail"] ?? "","acceptance":raw["acceptance"] ?? [],"acceptance_revision":1,"kind":TicketKind.wireValues.contains(kind) ? kind : "work","readiness":"draft","status_id":sid!,"tag_ids":tags,"epic_id":epic,"priority":"normal","archived":raw["archived"] ?? false,"trashed":false,"origin":"import","created_by":caller.principal,"created_at":time,"updated_at":time,"import_receipt_id":receiptID,"source_id":entry.sourceID,"historical_unverified":true]
             if let note = raw["note"] {task["imported_note"] = note}
             if let state = raw["state"] {task["imported_state"] = state}
             try store(task,"task");number += 1

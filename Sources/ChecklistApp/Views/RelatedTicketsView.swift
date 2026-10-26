@@ -106,7 +106,7 @@ struct RelatedTicketsView: View {
                 Text("This preserves this ticket as a duplicate. Active work must be released first. Reopen explicitly to resume it.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
             Button("Add link") {
-                store.run("task_link", ["project_id": task.string("project_id"), "task_id": task.id, "expected_revision": task.integer("revision"), "relation": relation, "target_task_id": targetID, "action": "add", "required": required], success: "Ticket linked") { _ in adding = false; targetID = "" }
+                store.run("task_link", ["project_id": task.string("project_id"), "task_id": task.id, "expected_revision": task.integer("revision"), "relation": relation, "target_task_id": targetID, "action": "add", "required": required], success: "Ticket linked", completion: { _ in adding = false; targetID = "" })
             }.buttonStyle(.checklistBordered).checklistDisabled([(targetID.isEmpty, "Choose a ticket to link first."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
         }.checklistCard(padding: Spacing.row)
             .task(id:candidateSearch) {await loadCandidates(candidateSearch)}

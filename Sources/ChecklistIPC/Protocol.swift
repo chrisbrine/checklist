@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import LocalAuthentication
 import Darwin
 
 @objc public protocol ChecklistRPC {
@@ -48,7 +49,12 @@ public enum KeychainWithoutUI {
         guard disabled == errSecSuccess else { return disabled }
         defer { SecKeychainSetUserInteractionAllowed(wasAllowed.boolValue) }
         var query = attributes
-        query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
+        // LAContext is the supported SecItem no-UI mechanism. Keep the legacy
+        // guard above for file-based keychain ACLs, which do not honor it.
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        query.removeValue(forKey: kSecUseAuthenticationUI as String)
+        query[kSecUseAuthenticationContext as String] = context
         return operation(query as CFDictionary)
     }
 }
@@ -56,7 +62,11 @@ public enum KeychainWithoutUI {
 public enum ChecklistKeychain {
     private static var service: String { ChecklistInstance.current.keychainService }
     public static func read(_ account: String) throws -> String? {
-        var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
+        try read(query: [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account])
+    }
+    // Tests scope the same production reader to their own temporary keychain.
+    static func read(query: [String: Any]) throws -> String? {
+        var query = query
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?

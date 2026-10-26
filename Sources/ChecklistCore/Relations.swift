@@ -50,7 +50,7 @@ extension CommandRouter {
     /// Prerequisites gate claim, pickup and completion. They never gate readiness or queueing: Draft means the brief needs
     /// refinement, and Triage planning orders Queued work by its prerequisites (owner decision, CL-133).
     func requirePrerequisitesSatisfied(_ db: Database, task: JSON) throws {
-        let blockers = try relationBlockers(db, task: task)
+        let blockers = prerequisiteBlockers(try selectedTaskPrerequisites(db, task: task))
         guard blockers.isEmpty else { throw CoreError("DEPENDENCY_UNSATISFIED", blockers.compactMap { $0["reason"] as? String }.joined(separator: " "), details: ["prerequisites": blockers]) }
         try requireNotSuperseded(task)
     }

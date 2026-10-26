@@ -4,7 +4,7 @@ struct DesktopAlertPreferencesView: View {
     @AppStorage(DesktopAlertPreferences.enabledKey,store:.standard) private var enabled = false
     @AppStorage(DesktopAlertPreferences.defaultModeKey,store:.standard) private var defaultMode = "needs_you"
     @ObservedObject private var alerts: DesktopAlertCoordinator
-    init(alerts: DesktopAlertCoordinator = .shared) { self.alerts = alerts }
+    @MainActor init(alerts: DesktopAlertCoordinator? = nil) { self.alerts = alerts ?? .shared }
     @State private var authorization: DesktopAlertAuthorization = .notRequested
     @State private var setupError = ""
     var body: some View {

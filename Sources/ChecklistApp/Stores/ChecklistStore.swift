@@ -382,9 +382,10 @@ final class ChecklistStore: ObservableObject {
     var groupTaskLoading: Bool {groupTasksObservation.loading}
     var groupTaskError: String? {groupTasksObservation.error}
 
-    init(draftJournal: LocalDraftJournal = LocalDraftJournal(), preferences: UserDefaults = .standard, restorePendingCommand: Bool = true, desktopAlerts: DesktopAlertCoordinator = .shared, requestTransport: ((String,[String:Any]) async throws -> [String:Any])? = nil, navigationMemory: DetailItemNavigationMemory = .shared, pendingCommandKey:String = WorkspaceWindowIdentity.primary.pendingCommandKey, pendingCommandPersistence:PendingCommandPersistence = .keychain, pendingCommandServiceIdentity: String = ChecklistInstance.current.machServiceName, qualificationFaults: QualificationFaults? = nil) {
+    init(draftJournal: LocalDraftJournal = LocalDraftJournal(), preferences: UserDefaults = .standard, restorePendingCommand: Bool = true, desktopAlerts: DesktopAlertCoordinator? = nil, requestTransport: ((String,[String:Any]) async throws -> [String:Any])? = nil, navigationMemory: DetailItemNavigationMemory? = nil, pendingCommandKey:String = WorkspaceWindowIdentity.primary.pendingCommandKey, pendingCommandPersistence:PendingCommandPersistence = .keychain, pendingCommandServiceIdentity: String = ChecklistInstance.current.machServiceName, qualificationFaults: QualificationFaults? = nil) {
+        let navigationMemory = navigationMemory ?? .shared
         self.qualificationFaults = qualificationFaults ?? .shared
-        self.draftJournal = draftJournal; self.preferences = preferences; self.desktopAlerts = desktopAlerts;self.requestTransport = requestTransport;self.navigationMemory = navigationMemory;self.pendingCommandKey=pendingCommandKey;self.pendingCommandPersistence=pendingCommandPersistence;self.pendingCommandServiceIdentity=pendingCommandServiceIdentity
+        self.draftJournal = draftJournal; self.preferences = preferences; self.desktopAlerts = desktopAlerts ?? .shared;self.requestTransport = requestTransport;self.navigationMemory = navigationMemory;self.pendingCommandKey=pendingCommandKey;self.pendingCommandPersistence=pendingCommandPersistence;self.pendingCommandServiceIdentity=pendingCommandServiceIdentity
         if restorePendingCommand { restoreSavedCommand() }
         if let bytes = preferences.data(forKey: "lastDetail") {
             if let savedDetail = try? JSONDecoder().decode(Detail.self, from: bytes) { detail = savedDetail }
@@ -424,10 +425,10 @@ final class ChecklistStore: ObservableObject {
     var archivedProjects: [Record] { projects.filter { $0.bool("archived") } }
     func setProjectArchived(_ project: Record, archived: Bool) {
         run("project_archive", ["project_id": project.id, "expected_revision": project.integer("revision"), "archived": archived],
-            success: archived ? "Project archived" : "Project restored") { [weak self] _ in
+            success: archived ? "Project archived" : "Project restored", completion: { [weak self] _ in
             guard let self, archived, let selected = self.projectID, RecordIdentity(selected) == RecordIdentity(project.id) else { return }
             self.select(.overview)
-        }
+        })
     }
     var ticketTags: [Record] {ticketCatalog.tags ?? records("tags")}
     var tasks: [Record] { records("tasks") }

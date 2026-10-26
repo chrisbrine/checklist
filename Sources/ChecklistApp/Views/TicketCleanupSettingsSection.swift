@@ -49,7 +49,7 @@ struct TicketCleanupSettingsSection: View {
     }
     private func save() {
         let params: [String:Any] = ["project_id":project.id,"expected_revision":project.integer("revision"),"ticket_cleanup":settings]
-        store.run("project_settings_save",params,success:"Ticket cleanup settings saved") { _ in loadReceipts() }
+        store.run("project_settings_save",params,success:"Ticket cleanup settings saved", completion: { _ in loadReceipts() })
     }
 }
 

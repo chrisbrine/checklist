@@ -28,7 +28,7 @@ struct EpicDetailView: View {
                     DetailSection(title: "Epic brief") {
                         TextField("Epic name", text: $name).textFieldStyle(.roundedBorder).onChange(of: name) { _, _ in preserveDraft() }
                         TextEditor(text: $brief).checklistFont(.body).frame(minHeight: 110).padding(Spacing.compact).overlay(RoundedRectangle(cornerRadius: Radius.medium).stroke(.quaternary)).onChange(of: brief) { _, _ in preserveDraft() }
-                        AccessibleHStack { Button("Cancel") { editing = false; store.windowPreferences.removeObject(forKey: draftKey) }; Spacer(); Button("Save brief") { store.run("epic_edit", ["project_id": projectID, "group_id": epic.id, "expected_revision": epic.integer("revision"), "name": name, "brief": brief, "purpose": brief], success: "Epic brief saved") { _ in editing = false; store.windowPreferences.removeObject(forKey: draftKey) } }.buttonStyle(.checklistProminent).checklistDisabled([(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Enter a name first."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)]) }
+                        AccessibleHStack { Button("Cancel") { editing = false; store.windowPreferences.removeObject(forKey: draftKey) }; Spacer(); Button("Save brief") { store.run("epic_edit", ["project_id": projectID, "group_id": epic.id, "expected_revision": epic.integer("revision"), "name": name, "brief": brief, "purpose": brief], success: "Epic brief saved", completion: { _ in editing = false; store.windowPreferences.removeObject(forKey: draftKey) }) }.buttonStyle(.checklistProminent).checklistDisabled([(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Enter a name first."), (!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)]) }
                         Text("Draft saved on this Mac until applied").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     }
                 } else {
@@ -92,7 +92,7 @@ struct EpicDetailView: View {
             params["from_epic_id"] = task.string("epic_id")
             if let previous = store.groups.first(where: { $0.id == task.string("epic_id") }) { params["from_epic_revision"] = previous.integer("revision") }
         }
-        store.run("group_membership", params, success: "Ticket moved into this Epic") { _ in selectedTicket = "" }
+        store.run("group_membership", params, success: "Ticket moved into this Epic", completion: { _ in selectedTicket = "" })
     }
 }
 

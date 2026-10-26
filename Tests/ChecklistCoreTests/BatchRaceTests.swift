@@ -28,7 +28,7 @@ extension CoreTests {
         let params: [JSON] = zip([first,second],commands).map {batch,command in ["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":1,"policy_revision":batch["policy_revision"]!,"command_id":command]}
         let results = raceBatchCommands([("batch_claim",params[0],worker),("batch_claim",params[1],other)])
         XCTAssertEqual(results.filter {$0 == "batch_claim:success"}.count,1);XCTAssertEqual(results.filter {$0 == "batch_claim:SCOPE_CONFLICT"}.count,1)
-        let attempts = try router.dbQueue.read {try router.records($0,type:"attempt",project:p["id"] as! String)}
+        let attempts = try router.dbQueue.read {try router.records($0,type:"attempt",project:(p["id"] as! String))}
         XCTAssertEqual(attempts.count,2);XCTAssertEqual(Set(attempts.compactMap {$0["batch_id"] as? String}).count,1)
         let winning = attempts[0]["batch_id"] as! String == first["id"] as! String ? 0 : 1
         let replay = try call("batch_claim",params[winning],[worker,other][winning],commands[winning])["claims"] as! [JSON]
@@ -50,7 +50,7 @@ extension CoreTests {
             }
             XCTAssertEqual(results.filter {$0.hasSuffix(":success")}.count,1)
             XCTAssertTrue(results.contains("batch_claim:BATCH_DISCARDED") || results.contains("batch_discard:BATCH_ALREADY_CLAIMED"),"\(results)")
-            let state = try router.dbQueue.read {db in (try router.records(db,type:"batch_disposition",project:p["id"] as! String),try router.records(db,type:"attempt",project:p["id"] as! String),try router.records(db,type:"batch_claim",project:p["id"] as! String))}
+            let state = try router.dbQueue.read {db in (try router.records(db,type:"batch_disposition",project:(p["id"] as! String)),try router.records(db,type:"attempt",project:(p["id"] as! String)),try router.records(db,type:"batch_claim",project:(p["id"] as! String)))}
             if state.0.isEmpty {XCTAssertEqual(state.1.count,2);XCTAssertEqual(state.2.count,1)}
             else {XCTAssertEqual(state.0.count,1);XCTAssertTrue(state.1.isEmpty);XCTAssertTrue(state.2.isEmpty)}
         }

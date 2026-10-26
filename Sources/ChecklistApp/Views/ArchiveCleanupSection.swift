@@ -27,11 +27,11 @@ struct ArchiveStorageSettingsSection: View {
     private func save() {
         guard let value = draft.value else { return }
         let submitted = draft
-        store.run("archive_storage_settings",["project_id":project.id,"expected_revision":baseRevision,"settings_revision":settingsRevision,"archive_storage":value],success:"Archive storage settings saved") { reply in
+        store.run("archive_storage_settings",["project_id":project.id,"expected_revision":baseRevision,"settings_revision":settingsRevision,"archive_storage":value],success:"Archive storage settings saved", completion: { reply in
             baseRevision = (reply["revision"] as? NSNumber)?.intValue ?? baseRevision
             settingsRevision = (reply["settings_revision"] as? NSNumber)?.intValue ?? settingsRevision
             baseline = submitted // Edits made during the save remain dirty.
-        }
+        })
     }
 }
 
@@ -59,7 +59,7 @@ struct ArchiveCleanupSection: View {
                     AccessibleHStack {
                         if job.bool("can_cancel_remaining") { Button("Cancel remaining cleanup") { change(job,"cleanup_job_cancel") }.checklistDisabled([(!store.connected, DisabledReasons.offline), (!current, "The cleanup state changed. Refresh first."), (store.busy, DisabledReasons.saving), (store.hasPendingMutation, DisabledReasons.uncheckedChange)]) }
                         if job.string("state") == "suspended" { Button("Retry with a new Undo window") { change(job,"cleanup_job_retry") }.checklistDisabled([(!store.connected, DisabledReasons.offline), (!current, "The cleanup state changed. Refresh first."), (store.busy, DisabledReasons.saving), (store.hasPendingMutation, DisabledReasons.uncheckedChange)]) }
-                        if task.bool("archived") { Button("Undo archive") { store.run("task_archive",["project_id":task.string("project_id"),"task_id":task.id,"expected_revision":task.integer("revision"),"action":"unarchive","cleanup":false],success:"Unarchived; any deleted originals remain unavailable") { _ in Task { await load() } } }.checklistDisabled([(!store.connected, DisabledReasons.offline), (!current, "The cleanup state changed. Refresh first."), (store.busy, DisabledReasons.saving), (store.hasPendingMutation, DisabledReasons.uncheckedChange)]) }
+                        if task.bool("archived") { Button("Undo archive") { store.run("task_archive",["project_id":task.string("project_id"),"task_id":task.id,"expected_revision":task.integer("revision"),"action":"unarchive","cleanup":false],success:"Unarchived; any deleted originals remain unavailable", completion: { _ in Task { await load() } }) }.checklistDisabled([(!store.connected, DisabledReasons.offline), (!current, "The cleanup state changed. Refresh first."), (store.busy, DisabledReasons.saving), (store.hasPendingMutation, DisabledReasons.uncheckedChange)]) }
                     }
                     Text("Cancel affects only remaining originals. Unarchiving restores the ticket and retained previews, never deleted bytes.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 }.padding(.vertical,Spacing.compact)
@@ -79,6 +79,6 @@ struct ArchiveCleanupSection: View {
     }
     private func change(_ job: Record,_ method: String) {
         guard current else { return }
-        store.run(method,["project_id":task.string("project_id"),"cleanup_job_id":job.id,"expected_revision":job.integer("revision")],success:method == "cleanup_job_retry" ? "Cleanup queued with a new cancellation window" : "Remaining cleanup canceled") { _ in Task { await load() } }
+        store.run(method,["project_id":task.string("project_id"),"cleanup_job_id":job.id,"expected_revision":job.integer("revision")],success:method == "cleanup_job_retry" ? "Cleanup queued with a new cancellation window" : "Remaining cleanup canceled", completion: { _ in Task { await load() } })
     }
 }

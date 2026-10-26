@@ -1,3 +1,4 @@
+import ChecklistDomain
 import Foundation
 import ChecklistProviders
 import GRDB
@@ -156,7 +157,7 @@ extension CommandRouter {
         result["connections"] = result["sessions"]
         let groups = try (result["groups"] as? [JSON] ?? []).map {try groupProjection(db,$0)};result["groups"] = groups
         result["triages"] = groups.filter { $0["kind"] as? String == "triage" }; result["epics"] = groups.filter { $0["kind"] as? String == "epic" }
-        result["messages"] = try SnapshotMessageProjection.hydrate(records(db,type:"message"), loadDeliveries: { try records(db,type:"delivery") })
+        result["messages"] = try SnapshotMessageProjection.hydrate(records(db,type:"message"), loadDeliveries: { try records(db,type:"delivery").map {try deliveryReceiptProjection(db,$0)} })
         result["events"] = try Row.fetchAll(db,sql:"SELECT id,project_id,entity_id,actor,kind,occurred_at,data FROM events ORDER BY seq DESC LIMIT 200").map { row -> JSON in ["id":row["id"] as String,"project_id":row["project_id"] as String? ?? "","entity_id":row["entity_id"] as String? ?? "","actor":row["actor"] as String,"kind":row["kind"] as String,"occurred_at":row["occurred_at"] as String,"data":jsonObject(row["data"])] }
         result["service"] = try dispatch(db,method:"service_info",p:[:],c:c)
         return result
@@ -243,32 +244,12 @@ extension CommandRouter {
             r["retired"] = true
         } else {
             if p["name"] != nil || method.hasSuffix("create") { r["name"] = try text(p,"name",max:100) }; if let color = p["color"] { r["color"] = color }; if r["color"] == nil { r["color"] = "gray" }; if let order = p["sort_order"] { r["sort_order"] = order }
-            if type == "status" { let category = p["category"] as? String ?? r["category"] as? String ?? "parked"; guard ["queued","active","review","blocked","parked","done","canceled"].contains(category) else { throw CoreError("INVALID_INPUT","Choose a supported status behavior.") }; if r["category"] != nil && r["category"] as? String != category { throw CoreError("POLICY_DENIED","Create a new behavior and move tasks explicitly.") }; r["category"] = category }
+            if type == "status" { let category = p["category"] as? String ?? r["category"] as? String ?? "parked"; guard TicketStatusCategory.wireValues.contains(category) else { throw CoreError("INVALID_INPUT","Choose a supported status behavior.") }; if r["category"] != nil && r["category"] as? String != category { throw CoreError("POLICY_DENIED","Create a new behavior and move tasks explicitly.") }; r["category"] = category }
         }
         try save(db,r,type:type)
         var project = try record(db,pid,type:"project");project["taxonomy_revision"] = int(project,"taxonomy_revision",default:1)+1;project = revised(project);try save(db,project,type:"project")
         let snapshot: JSON = ["id":uuid(),"project_id":pid,"taxonomy_revision":project["taxonomy_revision"]!,"statuses":try records(db,type:"status",project:pid),"tags":try records(db,type:"tag",project:pid),"revision":1,"created_at":now()];try save(db,snapshot,type:"taxonomy_revision")
         try event(db,caller:c,project:pid,entity:r["id"] as? String,kind:type+"_updated",data:["origin":c.isOwner ? "human_ui" : "agent"]); return r
-    }
-    func taskCreate(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
-        let pid = try scope(db,p,c,write:true); var project = try record(db,pid,type:"project")
-        if c.role == "assistant",p["planned_assignee"] != nil || p["key"] != nil || p["epic_id"] != nil { throw CoreError("FORBIDDEN","Assistants capture Drafts without work assignment.") }
-        try assistantPermission(c,pid,"create_drafts_on_request")
-        let title = try text(p,"title",max:2000); let kind = p["kind"] as? String ?? "work"
-        guard ["work","bug","asset","playtest","question"].contains(kind) else { throw CoreError("INVALID_INPUT","Unsupported task kind.") }
-        let status = try self.status(db,pid,"queued")
-        let number = int(project,"next_number",default:1); let key = p["key"] as? String ?? "\(project["key_prefix"] as? String ?? "TASK")-\(number)"
-        guard !(try records(db,type:"task",project:pid).contains { $0["key"] as? String == key }) else { throw CoreError("KEY_CONFLICT","This ticket key is already in this project.") }
-        let time = now(); var task: JSON = ["id":uuid(),"project_id":pid,"key":key,"title":title,"brief":try text(p,"brief",required:false),"acceptance":p["acceptance"] ?? [],"acceptance_revision":1,"kind":kind,"readiness":"draft","status_id":status["id"]!,"priority":p["priority"] ?? "normal","tag_ids":strings(p,"tag_ids"),"revision":1,"archived":false,"trashed":false,"created_at":time,"updated_at":time]
-        if let assignment = p["planned_assignee"] { try validateAssignment(assignment); task["planned_assignee"] = assignment }
-        if let fields = try validatedStarterFields(p["starter_fields"],kind:kind) { task["starter_fields"] = fields }
-        task["epic_id"] = try requiredEpicID(db,project:pid,value:p["epic_id"])
-        let epic = try scoped(db,task["epic_id"] as! String,pid,type:"group")
-        guard epic["kind"] as? String == "epic",!bool(epic,"archived") else { throw CoreError("INVALID_INPUT","Choose a current Epic in this project.") }
-        for tag in strings(task,"tag_ids") { _ = try scoped(db,tag,pid,type:"tag") }
-        try validateTaskPolicyAssignment(db,project:project,task:&task,input:p,caller:c)
-        task["created_by"] = c.principal; task["origin"] = c.isOwner ? "human_ui" : c.role
-        project["next_number"] = number+1; try save(db,project,type:"project"); try save(db,task,type:"task");if let epic = task["epic_id"] as? String { _ = try syncEpic(db,try scoped(db,epic,pid,type:"group")) }; try event(db,caller:c,project:pid,entity:task["id"] as? String,kind:"task_created",data:["key":key]); return try taskProjection(db,task)
     }
     func validateAssignment(_ a: Any) throws {
         if let s = a as? String { guard ["human","unassigned"].contains(s) else { throw CoreError("INVALID_INPUT","Choose human or an eligible worker connection.") }; return }
@@ -293,7 +274,7 @@ extension CommandRouter {
                 r["assignment_reason"] = try text(patch,"assignment_reason",max:4000)
             }
         }
-        let choices = ["kind":["work","bug","asset","playtest","question"],"readiness":["draft","ready"],"priority":["urgent","high","normal","low","none"]]
+        let choices = ["kind":TicketKind.wireValues,"readiness":["draft","ready"],"priority":["urgent","high","normal","low","none"]]
         for (field,allowed) in choices where patch[field] != nil {
             guard let value = patch[field] as? String,allowed.contains(value) else { throw CoreError("INVALID_INPUT","Unsupported ticket \(field).") }
         }

@@ -7,7 +7,7 @@ final class PlainLanguageTests: XCTestCase {
     func testEveryDeliveryStateHasAPlainLabel() {
         let states = ["queued", "pending", "saved", "saved_for_pickup", "transport_written", "transport_accepted", "transport_receipt",
                       "provider_accepted", "acknowledged", "addressed", "held", "held_for_approval", "refused", "failed", "uncertain",
-                      "delivery_uncertain", "expired", "unavailable", "ended", "canceled", "cancelled", "revoked"]
+                      "delivery_uncertain", "expired", "unavailable", "ended", "canceled", "cancelled", "revoked", "fenced"]
         for state in states {
             let label = DeliveryLabels.receipt(state)
             XCTAssertFalse(label.contains("_"), state)
@@ -22,6 +22,28 @@ final class PlainLanguageTests: XCTestCase {
         }
         XCTAssertEqual(RequestAnswerDeliveryProjection.stateLabel("delivery_uncertain"), "Delivery outcome uncertain")
         XCTAssertEqual(DeliveryLabels.receipt("some_future_state"), "Delivery status unavailable")
+    }
+
+    func testNoteReceiptDistinguishesDisconnectedAndPickupStates() {
+        XCTAssertEqual(DeliveryLabels.receipt("fenced"), "Not delivered: this conversation was disconnected")
+        XCTAssertEqual(DeliveryLabels.receipt("saved_for_pickup"), "Saved for pickup")
+        XCTAssertEqual(DeliveryLabels.receipt("queued"), "Queued for agent pickup")
+        XCTAssertEqual(DeliveryLabels.receipt("acknowledged"), "Acknowledged")
+    }
+
+    func testSavedResponseKeepsFencedReceiptAfterAllowAndReconnect() {
+        let response = Record(values: ["id": "response", "origin": "human_ui", "form_identity": "form", "form_revision": 1])
+        let request = Record(values: ["id": "request", "project_id": "project", "task_id": "task", "form_identity": "form", "form_revision": 1,
+                                      "responses": [response.values], "continuation_message_id": "message"])
+        let delivery: [String: Any] = ["id": "delivery", "project_id": "project", "message_id": "message", "recipient_session_id": "session",
+                                       "recipient_authorization_generation": "old", "state": "fenced"]
+        let message = Record(values: ["id": "message", "project_id": "project", "task_id": "task", "human_request_id": "request",
+                                      "human_response_id": "response", "form_revision": 1, "origin": "human_ui", "deliveries": [delivery]])
+        for (state, generation) in [("revoked", "disconnect"), ("revoked", "allow"), ("connected", "new")] {
+            let session = Record(values: ["id": "session", "project_id": "project", "role": "worker", "state": state, "authorization_generation": generation])
+            let receipt = RequestAnswerDeliveryProjection.make(request: request, response: response, messages: [message], sessions: [session], snapshotCurrent: true)
+            XCTAssertEqual(receipt.recipients.map(\.receipt), ["Not delivered: this conversation was disconnected"], "\(state), \(generation)")
+        }
     }
 
     func testTimestampsWithAndWithoutFractionalSecondsShowAsRelativeTime() {

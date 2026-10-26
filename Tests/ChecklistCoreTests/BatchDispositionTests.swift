@@ -79,7 +79,7 @@ extension CoreTests {
         try router.dbQueue.write {db in var s = try router.record(db,worker.sessionID!,type:"session");s["provider"] = "unsupported";try router.save(db,s,type:"session")}
         assertCode("UNVERIFIED_SESSION") {_ = try self.call("batch_discard",input,worker)}
         XCTAssertEqual(try batchClaimState(p,batch),before)
-        XCTAssertTrue(try router.dbQueue.read {try router.records($0,type:"batch_disposition",project:p["id"] as! String)}.isEmpty)
+        XCTAssertTrue(try router.dbQueue.read {try router.records($0,type:"batch_disposition",project:(p["id"] as! String))}.isEmpty)
     }
     func testDiscardReplayAndRepeatedFreshCommandKeepOneImmutableDispositionAndEvent() throws {
         let p = try cohortProject(),worker = try cohortWorker(p),other = try cohortWorker(p),batch = try sharedBatch(p,worker),command = UUID().uuidString
@@ -90,7 +90,7 @@ extension CoreTests {
         XCTAssertEqual(try jsonString(discarded["disposition"]!),try jsonString(repeated["disposition"]!))
         let marker = discarded["disposition"] as! JSON
         try router.dbQueue.read {db in
-            XCTAssertEqual(try router.records(db,type:"batch_disposition",project:p["id"] as! String).count,1)
+            XCTAssertEqual(try router.records(db,type:"batch_disposition",project:(p["id"] as! String)).count,1)
             XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM events WHERE project_id=? AND kind='batch_discarded'",arguments:[p["id"] as! String]),1)
         }
         XCTAssertThrowsError(try router.dbQueue.write {db in var changed = marker;changed["reason"] = "changed";try router.save(db,changed,type:"batch_disposition")})

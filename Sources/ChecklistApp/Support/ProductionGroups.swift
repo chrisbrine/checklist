@@ -1,4 +1,5 @@
 import Foundation
+import ChecklistDomain
 
 /// Shared presentation vocabulary; Epics and Triages have separate views and commands.
 enum ProductionGroups {
@@ -6,7 +7,7 @@ enum ProductionGroups {
         let key = group.string("key"), name = group.string("name")
         return key.isEmpty ? name : key + " " + name
     }
-    static let taskKinds = ["work", "bug", "asset", "playtest", "question"]
+    static let taskKinds = TicketKind.wireValues
     static func kindLabel(_ kind: String) -> String {
         switch kind {
         case "bug": return "Bugs"

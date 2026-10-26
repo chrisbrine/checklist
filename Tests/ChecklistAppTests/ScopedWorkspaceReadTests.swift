@@ -274,9 +274,9 @@ import ChecklistIPC
                 f.holdSurface = page == .needsYou ? "requests" : "overview"
                 var completion: RequestAnswerCompletion?
                 let params: [String:Any] = ["project_id":f.a,"request_id":request.id,"expected_revision":request.integer("revision"),"form_identity":draft.targetIdentity,"response":"answered","answers":[["question_id":"q",type == "text" ? "text" : "result":result]]]
-                store.run("human_request_answer",params) { reply in
+                store.run("human_request_answer",params,completion: { reply in
                     completion = submission.reconcile(Record(values:reply),currentRequest:store.requests.first { $0.id == request.id },currentDetail:store.detail,draft:draft)
-                }
+                })
                 try await until { f.held != nil }
                 XCTAssertTrue(store.busy,"The refresh is still waiting")
                 XCTAssertEqual(completion?.shouldDismiss,true,"The confirmed send reconciles before waiting for refresh")
@@ -478,7 +478,7 @@ import ChecklistIPC
         XCTAssertEqual(replay["command_id"] as? String,uuid)
         XCTAssertEqual(try JSONSerialization.data(withJSONObject:replay,options:.sortedKeys),try JSONSerialization.data(withJSONObject:original,options:.sortedKeys))
         var target:String?
-        restored.run("task_create",replay,success:"reconciled") {target=restored.recordCapturedTask($0,projectID:f.a,commandID:uuid,store:storeID)}
+        restored.run("task_create",replay,success:"reconciled",completion: {target=restored.recordCapturedTask($0,projectID:f.a,commandID:uuid,store:storeID)})
         try await until {!restored.busy && target != nil}
         let tasks=try f.command("task_list",["project_id":f.a])["data"] as! [String:Any]
         XCTAssertEqual((tasks["tasks"] as! [[String:Any]]).filter{$0["title"] as? String=="Lost create"}.count,1)

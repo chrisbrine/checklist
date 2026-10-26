@@ -6,11 +6,11 @@ final class StorageDeadlineReadTests: XCTestCase {
     func testForegroundCleanupAdmissionReadsOnlyIndexedJobFamily() throws {
         let f = try ReadPerformanceFixture("CL-283-cleanup-admission"), router = f.router
         var statements: [String] = []
-        try router.dbQueue.writeWithoutTransaction { db in
+        router.dbQueue.writeWithoutTransaction { db in
             db.trace { if case .statement(let statement) = $0 { statements.append(statement.expandedSQL) } }
         }
         _ = try f.call("project_create",["name":"Indexed admissions","key_prefix":"IA"])
-        try router.dbQueue.writeWithoutTransaction { $0.trace(options:[]) }
+        router.dbQueue.writeWithoutTransaction { $0.trace(options:[]) }
         let admission = try XCTUnwrap(statements.first { $0.contains("SELECT j.id FROM records j LEFT JOIN records c") })
         try router.dbQueue.read { db in
             let plan = try Row.fetchAll(db,sql:"EXPLAIN QUERY PLAN " + admission).map { $0["detail"] as String }
@@ -51,13 +51,11 @@ final class StorageDeadlineReadTests: XCTestCase {
         var holding = false
         DispatchQueue.global().async {
             defer {finished.fulfill()}
-            do {
-                try router.dbQueue.writeWithoutTransaction { _ in
-                    lock.lock();holding = true;lock.unlock();held.signal()
-                    _ = resume.wait(timeout:.now()+10)
-                    lock.lock();holding = false;lock.unlock()
-                }
-            } catch {XCTFail("\(error)")}
+            router.dbQueue.writeWithoutTransaction { _ in
+                lock.lock();holding = true;lock.unlock();held.signal()
+                _ = resume.wait(timeout:.now()+10)
+                lock.lock();holding = false;lock.unlock()
+            }
         }
         defer {resume.signal()}
         XCTAssertEqual(held.wait(timeout:.now()+10),.success)

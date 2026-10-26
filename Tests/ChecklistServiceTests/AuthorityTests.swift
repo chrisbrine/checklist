@@ -148,7 +148,7 @@ final class AuthorityTests: XCTestCase {
         let first = try peerReply(input)
         XCTAssertNotNil(first["data"],String(describing:first))
         let timing = try XCTUnwrap(first["_checklist_timing"] as? [String:Any])
-        XCTAssertEqual(Set(timing.keys),["queue_wait_ms","bootstrap_verification_ms","execution_ms","encoding_ms","total_ms","request_id"])
+        XCTAssertEqual(Set(timing.keys),["queue_wait_ms","bootstrap_verification_ms","execution_ms","encoding_ms","total_ms","request_id","route_lifecycle_ms","route_current_session_ms"])
         XCTAssertTrue(timing.filter {$0.key != "request_id"}.values.allSatisfy {($0 as? Double).map {$0.isFinite && $0 >= 0} == true})
         XCTAssertGreaterThan(timing["bootstrap_verification_ms"] as! Double,0)
         XCTAssertGreaterThan(timing["execution_ms"] as! Double,0)

@@ -35,7 +35,7 @@ struct RequestFileInspectionGate {
     }
 }
 
-private final class RequestFileCancellation {
+private final class RequestFileCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var canceled = false
     func cancel() { lock.lock(); canceled = true; lock.unlock() }

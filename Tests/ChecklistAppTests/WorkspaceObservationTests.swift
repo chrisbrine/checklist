@@ -14,17 +14,18 @@ final class WorkspaceObservationTests: XCTestCase {
         let journal = LocalDraftJournal(directory:root)
         let alerts = ObservationDesktopAlertSink()
         let store = ChecklistStore(draftJournal:journal,preferences:preferences,restorePendingCommand:false,desktopAlerts:DesktopAlertCoordinator(sink:alerts))
-        var global = 0,unrelated = 0,search = 0,note = 0
+        var global = 0
+        let unrelated = ObservationCounter(),search = ObservationCounter(),note = ObservationCounter()
         let token = store.objectWillChange.sink {global += 1};defer {token.cancel()}
-        withObservationTracking({_ = store.projects;_ = store.needsCount},onChange:{unrelated += 1})
-        withObservationTracking({_ = store.search},onChange:{search += 1})
-        withObservationTracking({_ = store.noteDrafts["ticket"]},onChange:{note += 1})
+        withObservationTracking({_ = store.projects;_ = store.needsCount},onChange:{unrelated.increment()})
+        withObservationTracking({_ = store.search},onChange:{search.increment()})
+        withObservationTracking({_ = store.noteDrafts["ticket"]},onChange:{note.increment()})
         store.search = "local query"
         store.saveNote("ticket",text:"durable local edit")
         XCTAssertEqual(alerts.calls,0,"Local typing must not invoke a system notification boundary")
         XCTAssertEqual(global,0,"Typing must not broadcast objectWillChange to every Store consumer")
-        XCTAssertEqual(unrelated,0,"Unchanged project/sidebar data must not observe filter/draft writes")
-        XCTAssertEqual(search,1);XCTAssertEqual(note,1)
+        XCTAssertEqual(unrelated.value,0,"Unchanged project/sidebar data must not observe filter/draft writes")
+        XCTAssertEqual(search.value,1);XCTAssertEqual(note.value,1)
         XCTAssertEqual(preferences.dictionary(forKey:"taskFilters:overview")?["search"] as? String,"local query")
         let recovered = try journal.recover(StoredNoteDraft.self,kind:"note")
         XCTAssertEqual(recovered.values["ticket"]?.text,"durable local edit")
@@ -51,4 +52,11 @@ final class WorkspaceObservationTests: XCTestCase {
     func requestAuthorizationFromOwnerAction() async throws -> Bool { calls += 1;return false }
     func send(_ alert: DesktopAlert) async throws { calls += 1;throw NSError(domain:"UnexpectedTestNotification",code:1) }
     func remove(_ identifiers: [String]) { calls += 1 }
+}
+
+private final class ObservationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func increment() { lock.lock();defer {lock.unlock()};count += 1 }
+    var value: Int { lock.lock();defer {lock.unlock()};return count }
 }

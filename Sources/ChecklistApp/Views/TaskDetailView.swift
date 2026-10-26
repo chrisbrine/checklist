@@ -340,7 +340,7 @@ struct TaskDetailView: View {
               store.selectedTicketCurrent(task.id), !recipientChanged else { return }
         observeMentionDraft()
         guard let submission = mentionComposer.begin(expectedAttempt: store.noteDestinations[task.id] ?? "") else { return }
-        store.run("message_mentions_prepare", submission.parameters) { result in
+        store.run("message_mentions_prepare", submission.parameters, completion: { result in
             guard mentionDestinationCurrent(submission) else {
                 mentionComposer.cancel(); store.notice = "The destination changed. Review it before sending."
                 return
@@ -363,15 +363,15 @@ struct TaskDetailView: View {
                         var params: [String: Any] = ["project_id": project, "task_id": task.id, "body": body,
                             "expects_reply": true, "expected_attempt_id": submission.expectedAttempt.string]
                         if let target { params["mention_target"] = target }
-                        store.run("message_send", params, success: task.string("active_attempt_id").isEmpty ? "Note saved for pickup" : "Note saved; see delivery receipts") { _ in
+                        store.run("message_send", params, success: task.string("active_attempt_id").isEmpty ? "Note saved for pickup" : "Note saved; see delivery receipts", completion: { _ in
                             if MentionDraftResolution.ExactText(store.noteDrafts[task.id] ?? "") == submission.snapshot.body { store.saveNote(task.id, text: "") }
                             else { store.notice = "Note sent; newer local draft text was retained." }
                             observeMentionDraft()
-                        }
+                        })
                     }
                 }
             } catch { store.error = PlainError.text(error) }
-        }
+        })
     }
     var editNeedsReconciliation: Bool {
         guard let draft = store.taskEditDrafts[task.id] else { return false }
@@ -401,11 +401,11 @@ struct TaskDetailView: View {
     }
     func saveEdit() {
         let submittedTitle = title, submittedBrief = brief
-        store.run("task_edit", ["project_id": project, "task_id": task.id, "expected_revision": editBaseRevision, "patch": ["title": submittedTitle, "brief": submittedBrief]], success: "Ticket updated") { result in
+        store.run("task_edit", ["project_id": project, "task_id": task.id, "expected_revision": editBaseRevision, "patch": ["title": submittedTitle, "brief": submittedBrief]], success: "Ticket updated", completion: { result in
             editBaseRevision = (result["revision"] as? NSNumber)?.intValue ?? editBaseRevision
             let changedAgain = title != submittedTitle || brief != submittedBrief
             editing = changedAgain; persistEdit(hasChanges: changedAgain, reconcile: true)
-        }
+        })
     }
     func assign(_ value: String) { assignmentTarget = value;showingAssignmentReason = true }
     func attach(mode: String) {
@@ -425,7 +425,7 @@ struct TaskDetailView: View {
     func archive(clean: Bool, preview: [String: Any] = [:]) {
         var params: [String: Any] = ["project_id": project, "task_id": task.id, "expected_revision": task.integer("revision"), "action": task.bool("archived") ? "unarchive" : "archive", "cleanup": clean]
         if let previewID = preview["cleanup_preview_id"] { params["cleanup_preview_id"] = previewID }
-        store.run("task_archive", params, success: task.bool("archived") ? (files.contains { $0.string("availability") == "original_cleaned" } ? "Ticket restored; previously cleaned originals remain unavailable" : "Ticket restored") : clean ? "Ticket archived; cleanup queued; Undo is available until original bytes are removed" : "Ticket archived; files retained") {result in ticketUndo = TicketUndo.archive(result,action:params["action"] as? String ?? "");if params["action"] as? String == "unarchive" {store.notice = (result["cleaned_original_count"] as? Int ?? 0) > 0 ? "Ticket visible again; cleaned original files are not restored" : "Ticket visible again"} }
+        store.run("task_archive", params, success: task.bool("archived") ? (files.contains { $0.string("availability") == "original_cleaned" } ? "Ticket restored; previously cleaned originals remain unavailable" : "Ticket restored") : clean ? "Ticket archived; cleanup queued; Undo is available until original bytes are removed" : "Ticket archived; files retained", completion: {result in ticketUndo = TicketUndo.archive(result,action:params["action"] as? String ?? "");if params["action"] as? String == "unarchive" {store.notice = (result["cleaned_original_count"] as? Int ?? 0) > 0 ? "Ticket visible again; cleaned original files are not restored" : "Ticket visible again"} })
     }
 }
 

@@ -226,10 +226,10 @@ struct TicketBulkEditSheet: View {
         guard valid, !rows.isEmpty, store.connected, !store.busy else { return }
         preview = nil
         let project = project, summary = summary
-        store.run(isUndo ? "task_bulk_undo" : "task_bulk_edit", parameters(rows, preview: false), success: summary) { reply in
+        store.run(isUndo ? "task_bulk_undo" : "task_bulk_edit", parameters(rows, preview: false), success: summary, completion: { reply in
             completed(isUndo ? nil : TicketBulkReceipt(reply: reply, project: project, summary: summary, selected: rows))
             dismiss()
-        }
+        })
     }
     private func loadOptions(cursor: String? = nil) async {
         guard !isUndo, ["assignee", "epic", "triage"].contains(draft.kind) else { return }

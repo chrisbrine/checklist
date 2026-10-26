@@ -219,7 +219,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
               let hash=(info as? [String:Any])?[kSecCodeInfoUnique as String] as? Data else { return false }
         return hash == expectedOwnerHash
     }
-    func caller(_ request: [String: Any], connection: NSXPCConnection) throws -> Caller {
+    func caller(_ request: [String: Any], connection: NSXPCConnection, timing: ServiceCallTiming? = nil) throws -> Caller {
         if request["owner_channel"] as? Bool == true {
             guard owner(connection) else { throw ChecklistError("OWNER_CHANNEL_REQUIRED", "Only the signed native Checklist app can author human actions.") }
             return Caller(role: "owner", installation: "native-app", projectIDs: [], sessionID: nil, workspace: nil)
@@ -237,7 +237,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
             throw ChecklistError("ADAPTER_UNAVAILABLE", "This provider plugin is disabled, incompatible or unqualified. Existing grants and pending messages are retained for recovery.")
         }
         var callerWorkspace=enrollment.workspace
-        if enrollment.automatic == true { callerWorkspace = try verifyAutomatic(enrollment, request:request, connection:connection) }
+        if enrollment.automatic == true { callerWorkspace = try ServiceCallTiming.measure(timing,"route_native_identity_ms") { try verifyAutomatic(enrollment, request:request, connection:connection) } }
         else if let bound = enrollment.workspace {
             guard let supplied = request["workspace"] as? String,
                   URL(fileURLWithPath: supplied).resolvingSymlinksInPath().standardizedFileURL.path == bound else {
@@ -245,7 +245,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
             }
         }
         guard let pid = enrollment.projectIDs.first else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This connection has no registered project.") }
-        try requireCommittedRegistration(enrollment, project: pid, caller: Caller(role: "owner", installation: "connection-consistency", projectIDs: []))
+        try requireCommittedRegistration(enrollment, project: pid, caller: Caller(role: "owner", installation: "connection-consistency", projectIDs: []), timing:timing)
         return Caller(role: enrollment.role, installation: enrollment.installation + "/" + enrollment.generation, projectIDs: enrollment.projectIDs, sessionID: enrollment.sessionID, workspace: enrollment.assistantRelay == true ? nil:callerWorkspace, assistantGrants:enrollment.assistantGrants ?? [:],executionDomain:enrollment.nativeExecutionDomain)
     }
     func constantEqual(_ a: String, _ b: String) -> Bool {
@@ -255,7 +255,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     }
     enum Routed { case done([String: Any], runHooks: Bool = true); case router(method: String, params: [String: Any], caller: Caller) }
     func execute(_ request: [String: Any], connection: NSXPCConnection, timing: ServiceCallTiming? = nil) throws -> [String: Any] {
-        let routed = try ServiceCallTiming.measure(timing,"bootstrap_verification_ms") { try route(request, connection: connection) }
+        let routed = try ServiceCallTiming.measure(timing,"bootstrap_verification_ms") { try route(request, connection: connection, timing:timing) }
         switch routed {
         case .done(let result, _): return result
         case .router(let method, let params, let caller):
@@ -264,8 +264,8 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     }
     /// Resolves the caller and every coordinator-owned operation on the serial queue.
     /// A routed command needs only the router, which serializes its own writes.
-    func route(_ request: [String: Any], connection: NSXPCConnection) throws -> Routed {
-        observeNativeConversationLifecycles()
+    func route(_ request: [String: Any], connection: NSXPCConnection, timing: ServiceCallTiming? = nil) throws -> Routed {
+        ServiceCallTiming.measure(timing,"route_lifecycle_ms") { observeNativeConversationLifecycles() }
         if request["method"] as? String == "connection_bootstrap" {
             let result = try bootstrap(request["params"] as? [String:Any] ?? [:], connection:connection)
             return .done(result.reply, runHooks:result.changed)
@@ -275,7 +275,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         if method == "project_create", request["owner_channel"] as? Bool != true {
             return .done(try createWorkspaceProject(params,request:request,connection:connection))
         }
-        let caller = try caller(request, connection: connection)
+        let caller = try caller(request, connection: connection, timing:timing)
         if method == "connection_list" {
             guard caller.role == "owner" else { throw ChecklistError("FORBIDDEN", "Connection setup is owner-only.") }
             return .done(["data": ["connections": enrollments.values.sorted { $0.name < $1.name }.map { e -> [String:Any] in
@@ -570,7 +570,7 @@ final class Peer: NSObject, ChecklistRPC {
             let routed: Coordinator.Routed
             do {
                 guard let connection, let object else { throw ChecklistError("INVALID_INPUT","Invalid command envelope.") }
-                routed = try ServiceCallTiming.measure(timing,"bootstrap_verification_ms") { try coordinator.route(object,connection:connection) }
+                routed = try ServiceCallTiming.measure(timing,"bootstrap_verification_ms") { try coordinator.route(object,connection:connection,timing:timing) }
             } catch { finish(["error":Self.publicError(error)],timing:timing,runHooks:Self.requiresAfterCommand(object?["method"] as? String ?? ""),method:object?["method"] as? String ?? "",reply:reply);return }
             switch routed {
             case .done(let result,let runHooks): finish(result,timing:timing,runHooks:runHooks,method:object?["method"] as? String ?? "",reply:reply)

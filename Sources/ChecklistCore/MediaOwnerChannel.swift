@@ -1,10 +1,11 @@
+import ChecklistContracts
 import Foundation
 import GRDB
 
 /// First native owner slice. Deliberately absent from worker/assistant catalogs.
 /// Keep dispatch outside the ordinary writer: capture and hashing prepare first.
 extension CommandRouter {
-    static let mediaOwnerReads: Set<String> = ["media_navigation", "media_round_page", "media_round_header", "media_item_get", "media_publication_preview", "media_type_get", "media_intake_get", "media_item_page", "media_item_counts", "media_approved_examples", "media_original_read", "media_example_read_lease", "media_example_read_release"]
+    static let mediaOwnerReads = CommandMethods.mediaOwnerReads
     static let mediaOwnerMethods = mediaOwnerReads.union([
         "media_type_create", "media_type_revise", "media_type_adopt", "media_type_retire", "media_round_create", "media_round_cancel", "media_round_archive", "media_item_create", "media_item_update", "media_round_publish", "media_intake_preview", "media_intake_revise", "media_intake_confirm", "media_intake_capture", "media_context_approve", "media_context_reconcile", "media_decide", "media_example_read_lease", "media_example_read_release", "media_original_read"
     ])

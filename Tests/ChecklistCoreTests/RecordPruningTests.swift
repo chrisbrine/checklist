@@ -102,7 +102,7 @@ extension CoreTests {
         let holding = expectation(description: "writer held"), release = DispatchSemaphore(value: 0), done = expectation(description: "writer released")
         DispatchQueue.global().async {
             try? ArchiveStorageGate.withExclusive(root: self.directory) { _ in
-                try self.router.dbQueue.writeWithoutTransaction { _ in holding.fulfill(); _ = release.wait(timeout: .now() + 10) }
+                self.router.dbQueue.writeWithoutTransaction { _ in holding.fulfill(); _ = release.wait(timeout: .now() + 10) }
             }
             done.fulfill()
         }

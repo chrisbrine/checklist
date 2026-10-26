@@ -1,3 +1,4 @@
+import ChecklistDomain
 import Foundation
 import GRDB
 
@@ -125,7 +126,7 @@ extension CommandRouter {
             var normalized: [JSON] = [], seen: Set<String> = []
             for entry in entries {
                 let input = (entry as? String).map {["body":$0] as JSON} ?? entry as? JSON ?? [:]
-                guard Set(input.keys).isSubset(of:["id","body","title","task_kinds","tag_ids","revision","origin","approved_by","approved_at"]),input["task_kinds"] == nil || input["task_kinds"] is [String],input["tag_ids"] == nil || input["tag_ids"] is [String],strings(input,"task_kinds").allSatisfy({["work","bug","asset","playtest","question"].contains($0)}) else { throw CoreError("INVALID_INPUT","Pinned decisions contain unsupported fields or task kinds.") }
+                guard Set(input.keys).isSubset(of:["id","body","title","task_kinds","tag_ids","revision","origin","approved_by","approved_at"]),input["task_kinds"] == nil || input["task_kinds"] is [String],input["tag_ids"] == nil || input["tag_ids"] is [String],strings(input,"task_kinds").allSatisfy({TicketKind.wireValues.contains($0)}) else { throw CoreError("INVALID_INPUT","Pinned decisions contain unsupported fields or task kinds.") }
                 let id = input["id"] as? String ?? uuid(); guard !seen.contains(id) else { throw CoreError("INVALID_INPUT","Pinned decision IDs must be distinct.") }; seen.insert(id)
                 let oldPin = prior.first {$0["id"] as? String == id}
                 if input["id"] != nil,oldPin == nil { throw CoreError("INVALID_INPUT","New decisions receive server-generated IDs; existing IDs must belong to this project.") }

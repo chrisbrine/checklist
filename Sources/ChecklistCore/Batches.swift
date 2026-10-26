@@ -1,3 +1,4 @@
+import ChecklistDomain
 import Foundation
 import GRDB
 
@@ -25,7 +26,7 @@ extension CommandRouter {
         let group = try scoped(db,try text(p,"triage_id"),pid,type:"group");try revision(p,group)
         guard group["kind"] as? String == "triage",!bool(group,"archived") else { throw CoreError("INVALID_INPUT","Prepare a batch from an active Triage.") }
         let phase = try text(p,"phase")
-        guard ["implementation","review"].contains(phase),let selected = p["tasks"] as? [JSON],!selected.isEmpty,selected.count <= 200 else { throw CoreError("INVALID_INPUT","Select one phase and between 1 and 200 exact Triage members.") }
+        guard AttemptPhase.wireValues.contains(phase),let selected = p["tasks"] as? [JSON],!selected.isEmpty,selected.count <= 200 else { throw CoreError("INVALID_INPUT","Select one phase and between 1 and 200 exact Triage members.") }
         guard triagePhase(group) == phase else { throw CoreError("TRIAGE_PHASE_CONFLICT","The batch phase must match its Triage. Use a separate Triage for the next phase.") }
         let ids = selected.compactMap {$0["task_id"] as? String}
         guard ids.count == selected.count,Set(ids).count == ids.count,Set(ids).isSubset(of:Set(triageMemberIDs(group))) else { throw CoreError("REVISION_CONFLICT","Select unique current members of this Triage before preparing a batch.") }
@@ -56,7 +57,7 @@ extension CommandRouter {
         try db.inSavepoint {
             for (index,member) in selected.enumerated() {
                 var input = member;input["project_id"] = pid;input["phase"] = phase;input["policy_revision"] = project["policy_revision"] ?? 1
-                let provisional = try work(db,input,c,"work_claim",operation:.triage,batchContext:cohort)
+                let provisional = try work(db,input,c,"work_claim",operation:.triage,batchContext:cohort,includeClaimContext:false)
                 frozen[index]["policy_revision"] = provisional["policy_revision"] ?? 1;frozen[index]["policy_snapshot"] = provisional["policy_snapshot"] ?? [:]
             }
             return .rollback
@@ -91,11 +92,16 @@ extension CommandRouter {
         }
         let cohort = BatchClaimContext(batch:batch)
         var claims: [JSON] = []
+        // Only this fixed batch transaction shares row identities. Writes
+        // invalidate their family; every consumer still checks its full scope.
+        let selectedTasks = try members.map {try scoped(db,$0["task_id"] as! String,pid,type:"task")}
+        try withTaskRecordSelection(db,tasks:selectedTasks) {
         for member in members {
             var input: JSON = ["project_id":pid,"task_id":member["task_id"]!,"expected_revision":member["task_revision"]!,"phase":batch["phase"]!,"policy_revision":batch["policy_revision"]!,"file_scopes":(member["file_scopes"] as? [JSON] ?? []).map {$0.filter {["path","access","declared_path"].contains($0.key)}},"lane_scopes":member["lane_scopes"] ?? []]
             for key in ["review_request_id","target_manifest_id","gate"] { if let value = member[key] { input[key] = value } }
             var claim = try work(db,input,c,"work_claim",operation:.triage,batchContext:cohort)
             claim["batch_id"] = batch["id"];claim["key"] = member["key"] ?? (claim["task"] as? JSON)?["key"] ?? "";claim["title"] = member["title"] ?? (claim["task"] as? JSON)?["title"] ?? "";claims.append(claim)
+        }
         }
         let receipt: JSON = ["id":uuid(),"project_id":pid,"batch_id":batch["id"]!,"batch_digest":batch["digest"]!,"attempt_ids":claims.compactMap {$0["id"] as? String},"principal":c.principal,"revision":1,"created_at":now()]
         try save(db,receipt,type:"batch_claim");try event(db,caller:c,project:pid,entity:batch["triage_id"] as? String,kind:"batch_claimed",data:["batch_id":batch["id"]!,"claim_id":receipt["id"]!,"attempt_ids":receipt["attempt_ids"]!])
@@ -211,7 +217,7 @@ extension CommandRouter {
         if let id = batch["triage_id"] as? String,let pid = batch["project_id"] as? String,let group = try? scoped(db,id,pid,type:"group") {
             result["triage_name"] = batch["triage_name"] ?? group["name"] ?? ""
         }
-        result["members"] = try (batch["members"] as? [JSON] ?? []).map { member -> JSON in
+        result["members"] = (batch["members"] as? [JSON] ?? []).map { member -> JSON in
             var member = member
             if let id = member["task_id"] as? String,let pid = batch["project_id"] as? String,let task = try? scoped(db,id,pid,type:"task") {
                 member["key"] = member["key"] ?? task["key"];member["title"] = member["title"] ?? task["title"]
@@ -256,7 +262,7 @@ extension CommandRouter {
         guard !remaining.contains(where: {$0["state"] as? String == "active"}) else { throw CoreError("CLAIM_CONFLICT","Finish or safely release active batch work before preparing its next handling set.") }
         guard !remaining.isEmpty else { return ["triage_id":batch["triage_id"] ?? NSNull(),"triage_key":batchTriageKey(db,batch) as Any? ?? NSNull(),"triage_name":batch["triage_name"] ?? "","batch_id":batch["id"]!,"triage":NSNull(),"task_ids":[],"reason":"no_remaining_tasks"] }
         var groups: [JSON] = []
-        for phase in ["implementation","review"] {
+        for phase in AttemptPhase.wireValues {
             let phaseMembers = try remaining.filter { member in
                 let task = try scoped(db,member["task_id"] as! String,pid,type:"task")
                 let currentPhase = try taskProjection(db,task)["status_category"] as? String == "review" && task["current_manifest_id"] != nil ? "review" : "implementation"

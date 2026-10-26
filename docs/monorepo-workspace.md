@@ -4,8 +4,17 @@ Checklist already has one root SwiftPM workspace. Keep `Package.swift`, `Package
 
 The shipping product dependency graph is acyclic:
 
+The first real shared package is now extracted by CL-98. See [shared modules](shared-modules.md) for its boundary, compatibility facade and migration ownership.
+
 ```mermaid
 graph LR
+  Core --> Application[ChecklistApplication]
+  Application --> Contracts[ChecklistContracts]
+  Contracts --> Domain[ChecklistDomain]
+  Core --> Contracts
+  Core --> Domain
+  App --> Domain
+  IPC --> Contracts
   App[ChecklistApp] --> IPC[ChecklistIPC]
   App --> Core[ChecklistCore]
   App --> Providers[ChecklistProviders]
@@ -129,9 +138,9 @@ before/after timing comparison was run during the parallel Pass 2 work.
 
 ## Complete local package inputs
 
-Create `Packages/ChecklistShared` only when the first real shared implementation is extracted. The root then declares `.package(path: "Packages/ChecklistShared")`; target dependencies explicitly name its real products. A local package may depend on other complete local packages under `Packages`, including nested directories. Every source needed by a local path dependency must stay within the captured root; external paths, symlinked packages and nested repositories/submodules are not supported substitutes for captured inputs. No empty package/platform scaffold is required now.
+`Packages/ChecklistShared` contains the first real Domain, Contracts and Application extraction. The root declares `.package(path: "Packages/ChecklistShared")`; target dependencies explicitly name its real products. A local package may depend on other complete local packages under `Packages`, including nested directories. Every source needed by a local path dependency must stay within the captured root; external paths, symlinked packages and nested repositories/submodules are not supported substitutes for captured inputs. No empty package/platform scaffold is required now.
 
-The accepted extraction direction is Domain ← Contracts ← Application. Shared targets must not depend on the root application, GRDB, SwiftUI/AppKit, XPC, credentials, filesystem/process authority or native adapters. Local persistence/native adapters implement application interfaces, and the service composes them. Extract one real command family at a time behind the existing compatibility facade, retaining transaction, wire/hash and provenance behavior. This preparation creates none of those modules and proves no non-macOS support.
+The accepted extraction direction is Domain ← Contracts ← Application. Shared targets must not depend on the root application, GRDB, SwiftUI/AppKit, XPC, credentials, filesystem/process authority or native adapters. Local persistence/native adapters implement application interfaces, and the service composes them. Extract one real command family at a time behind the existing compatibility facade, retaining transaction, wire/hash and provenance behavior. CL-98 creates these initial modules with real root consumers; this extraction proves no non-macOS product support.
 
 `script/build_input_inventory.py` defines the single inventory used before capture and after build. Its own bytes, the build helper and the stage- and installed-verification helpers are inputs. It includes the complete `Packages` tree: root and nested manifests, manifest variants, lockfiles, Sources, Tests, resources and other authored package/contract inputs. In the working Git repository, tracked files remain included even if a later ignore rule matches, and nonignored untracked files are included before staging. Git applies ignore exceptions exactly. The inventory adds no generic `cache` or `build` directory exclusion; actual Git ignore rules still apply.
 

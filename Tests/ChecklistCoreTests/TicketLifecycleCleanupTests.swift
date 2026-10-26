@@ -504,7 +504,7 @@ extension TicketLifecycleCleanupTests {
         let (p,_,_) = try fixture()
         _ = try fixture(category:"queued")
         _ = try fixture(category:"canceled")
-        let (_,path) = try cacheExecution(p,try router.dbQueue.read {try router.records($0,type:"task",project:p["id"] as! String)[0]})
+        let (_,path) = try cacheExecution(p,try router.dbQueue.read {try router.records($0,type:"task",project:(p["id"] as! String))[0]})
         try StorageObjectFiles(root:router.root).writeNew(path + "/checkouts/package/file",bytes:Data("cache".utf8))
         try FileManager.default.createDirectory(at:router.root.appendingPathComponent("backups/old-protected-snapshot"),withIntermediateDirectories:true)
         let root = router.root;try router.closeStore();router = try TestStore.router(root:root)

@@ -439,7 +439,7 @@ extension CommandRouter {
     }
     func mediaValidateIntakePublication(_ db: Database,round: JSON,selection: [JSON]) throws {
         let selected = Set(selection.compactMap {$0["item_id"] as? String})
-        for intake in try records(db,type:"media_intake",project:round["project_id"] as! String) where intake["round_id"] as? String == round["id"] as? String {
+        for intake in try records(db,type:"media_intake",project:(round["project_id"] as! String)) where intake["round_id"] as? String == round["id"] as? String {
             guard intake["confirmed_plan_id"] as? String == intake["plan_id"] as? String else {throw CoreError("MEDIA_PLAN_REQUIRED","Confirm every intake's current mapping before publication.")}
             for row in try mediaIntakeRows(db,intake:intake) {
                 guard row["disposition"] as? String == "skip" || row["disposition"] as? String == "include" && row["capture_state"] as? String == "committed" && selected.contains(row["item_id"] as? String ?? "") else {throw CoreError("MEDIA_CAPTURE_REQUIRED","Publish the complete included captured intake; unresolved rows remain Draft.")}

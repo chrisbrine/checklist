@@ -79,6 +79,60 @@ extension EvidenceAuthorityTests {
         let events = try call("history_list",["project_id":p["id"]!,"task_id":t["id"]!])["events"] as! [JSON]
         XCTAssertEqual(events.filter { $0["kind"] as? String == "owner_conversation_allowed" }.count,1)
     }
+    func testNoteReceiptProjectionsKeepFencedHistoryAcrossAllowAndReconnect() throws {
+        let p = try project(), worker = try native(p,"receipt-history",domain:"codex:309:1:0"), t = try ready(p)
+        func send(_ body: String) throws -> JSON { try call("message_send",["project_id":p["id"]!,"task_id":t["id"]!,"body":body]) }
+        func receipts(_ note: JSON) throws -> JSON { try call("message_delivery_list",["project_id":p["id"]!,"task_id":t["id"]!,"message_id":note["id"]!]) }
+        func assertState(_ note: JSON,_ state: String,file: StaticString = #filePath,line: UInt = #line) throws {
+            let listed = try receipts(note)["deliveries"] as! [JSON]
+            XCTAssertEqual(listed.first?["state"] as? String,state,file:file,line:line)
+            let selected = try call("task_context",["project_id":p["id"]!,"task_id":t["id"]!,"detail_level":"ui"])
+            let messages = (selected["collections"] as! JSON)["messages"] as! [JSON]
+            let snapshot = try call("snapshot",[:])["messages"] as! [JSON]
+            var surfaces = [messages,snapshot]
+            if let requestID = note["human_request_id"] as? String {
+                let page = try call("workspace_page",["project_id":p["id"]!,"surface":"record","record_id":requestID])
+                let request = try XCTUnwrap((page["rows"] as! [JSON]).first,file:file,line:line)
+                surfaces.append(request["detail_messages"] as! [JSON])
+            }
+            for surface in surfaces {
+                let message = try XCTUnwrap(surface.first {$0["id"] as? String == note["id"] as? String},file:file,line:line)
+                XCTAssertEqual((message["deliveries"] as! [JSON]).first?["state"] as? String,state,file:file,line:line)
+            }
+        }
+        let saved = try send("No recipient yet")
+        XCTAssertEqual(try receipts(saved)["delivery_status"] as? String,"saved_for_pickup")
+        XCTAssertTrue((try receipts(saved)["deliveries"] as! [JSON]).isEmpty)
+        _ = try claim(p,t,caller:worker)
+        let acknowledged = try send("Acknowledged before disconnect")
+        let delivery = try XCTUnwrap((acknowledged["deliveries"] as! [JSON]).first)
+        _ = try call("message_ack",["project_id":p["id"]!,"delivery_id":delivery["id"]!],worker)
+        let request = try call("human_request_create",["project_id":p["id"]!,"task_id":t["id"]!,"title":"Receipt input","blocking":false,"questions":[["id":"q","type":"text","prompt":"Synthetic receipt input","required":true]]],worker)
+        let answer = try call("human_request_answer",["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":request["revision"]!,"answers":[["question_id":"q","text":"Synthetic answer"]]])
+        let answerNote = try XCTUnwrap(answer["message"] as? JSON)
+        let old = try send("Queued before disconnect")
+        try assertState(old,"queued")
+        try assertState(answerNote,"queued")
+        _ = try call("connection_revoke",accessInput(p,worker,task:t))
+        try assertState(old,"fenced")
+        try assertState(answerNote,"fenced")
+        try assertState(acknowledged,"acknowledged")
+        _ = try call("connection_allow",accessInput(p,worker,task:t))
+        try assertState(old,"fenced")
+        try assertState(answerNote,"fenced")
+        _ = try router.reconnectOwnerAllowedSession(accessResumption(p,worker),caller:accessBootstrap)
+        try assertState(old,"fenced")
+        try assertState(answerNote,"fenced")
+        try assertState(acknowledged,"acknowledged")
+        let resumed = Caller(role:"worker",installation:worker.installation+"/new",projectIDs:worker.projectIDs,sessionID:worker.sessionID,workspace:workspace.path,executionDomain:worker.executionDomain)
+        let returned = try call("task_get",["project_id":p["id"]!,"task_id":t["id"]!])
+        _ = try claim(p,returned,caller:resumed)
+        let fresh = try send("New generation delivery")
+        try assertState(fresh,"queued")
+        let inbox = try call("session_inbox",["project_id":p["id"]!],resumed)["deliveries"] as! [JSON]
+        XCTAssertFalse(inbox.contains {$0["message_id"] as? String == old["id"] as? String})
+        XCTAssertTrue(inbox.contains {$0["message_id"] as? String == fresh["id"] as? String})
+    }
     func testOwnerDisconnectActionsAreAbsentAndRefusedForWorkersAndAssistants() throws {
         let p = try project(), worker = try native(p,"forbidden-access",domain:"codex:304:1:0")
         let assistant = Caller(role:"assistant",installation:"assistant",projectIDs:worker.projectIDs,assistantGrants:[p["id"] as! String:["read":true]])

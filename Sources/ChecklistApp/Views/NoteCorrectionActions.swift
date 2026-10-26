@@ -42,6 +42,6 @@ struct NoteCorrectionActions: View {
         }
     }
     func save() {
-        store.run("message_send",["project_id":task.string("project_id"),"task_id":task.id,"correction_of":message.id,"kind":retracting ? "retraction" : "correction","body":text],success:retracting ? "Retraction saved; original retained" : "Correction saved; original retained") {_ in correcting = false}
+        store.run("message_send",["project_id":task.string("project_id"),"task_id":task.id,"correction_of":message.id,"kind":retracting ? "retraction" : "correction","body":text],success:retracting ? "Retraction saved; original retained" : "Correction saved; original retained", completion: {_ in correcting = false})
     }
 }

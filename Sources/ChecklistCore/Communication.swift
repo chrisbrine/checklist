@@ -193,24 +193,32 @@ extension CommandRouter {
         guard message["task_id"] as? String == tid else { throw CoreError("NOT_FOUND","This note is not available on this ticket.") }
         let rows = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='delivery' AND project_id=? AND json_extract(data,'$.message_id')=? COLLATE BINARY ORDER BY rowid",arguments:[pid,mid])
         let deliveries = try rows.map { row -> JSON in
-            let delivery = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"delivery").object
+            let delivery = try deliveryReceiptProjection(db,GRDBRecordEnvelopeAdapter.decode(row,expectedType:"delivery").object)
             // Keep transport receipts, reply allowances, note bodies and credentials private.
-            let fields = ["id","message_id","recipient_session_id","recipient_authorization_generation","push_state","host_status","created_at","updated_at","delivered_at","acknowledged_at","addressed_at","host_status_at"]
+            let fields = ["id","message_id","recipient_session_id","recipient_authorization_generation","push_state","host_status","created_at","updated_at","delivered_at","acknowledged_at","addressed_at","host_status_at","native_closure_ref","owner_disconnect_ref","fenced_at"]
             var result = delivery.filter { fields.contains($0.key) }
             let state = delivery["state"] as? String ?? "queued"
-            result["state"] = state == "quarantined" ? "quarantined" : ["acknowledged","addressed"].contains(state) ? "acknowledged" : (state == "delivered" ? "delivered" : "queued")
-            if let closure = try deliveryNativeClosure(db,delivery) {
-                result["state"] = "fenced"; result["native_closure_ref"] = closure["id"]
-                result["fenced_at"] = closure["observed_at"]
-            } else if !["acknowledged","addressed"].contains(state), let ownerDisconnect = delivery["owner_disconnect_ref"] as? String {
-                result["state"] = "fenced"; result["owner_disconnect_ref"] = ownerDisconnect
-                result["fenced_at"] = delivery["owner_disconnected_at"]
-            }
+            result["state"] = ["fenced","quarantined"].contains(state) ? state : ["acknowledged","addressed"].contains(state) ? "acknowledged" : (state == "delivered" ? "delivered" : "queued")
             return result
         }
         var result: JSON = ["message_id":mid,"task_id":tid,"deliveries":deliveries]
         // No recipient exists yet; do not invent a delivery ID or generation.
         if deliveries.isEmpty { result["delivery_status"] = "saved_for_pickup"; result["created_at"] = message["created_at"] }
+        return result
+    }
+
+    /// Read-only receipt state shared by ticket notes and explicit receipt reads.
+    /// Durable disconnect/closure markers belong to the original delivery generation.
+    func deliveryReceiptProjection(_ db: Database,_ delivery: JSON) throws -> JSON {
+        guard !["acknowledged","addressed"].contains(delivery["state"] as? String ?? "") else { return delivery }
+        var result = delivery
+        if let closure = try deliveryNativeClosure(db,delivery) {
+            result["state"] = "fenced"; result["native_closure_ref"] = closure["id"]
+            result["fenced_at"] = closure["observed_at"]
+        } else if let ownerDisconnect = delivery["owner_disconnect_ref"] as? String {
+            result["state"] = "fenced"; result["owner_disconnect_ref"] = ownerDisconnect
+            result["fenced_at"] = delivery["owner_disconnected_at"]
+        }
         return result
     }
 

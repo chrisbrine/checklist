@@ -34,11 +34,7 @@ public final class CommandRouter: @unchecked Sendable {
         } catch {
             throw CoreError("RECOVERY_REQUIRED", "Cannot establish source-process restart fences. Preserve the store and reconcile recovery before work resumes.")
         }
-        do {
-            try dbQueue.writeWithoutTransaction { db in _ = self.performStorageMaintenance(db) }
-        } catch {
-            storageMaintenanceFallbackFailures = 2
-        }
+        dbQueue.writeWithoutTransaction { db in _ = self.performStorageMaintenance(db) }
     }
     func record(_ db: Database, _ id: String, type: String? = nil) throws -> JSON {
         guard let row = try Row.fetchOne(db, sql: "SELECT type,data FROM records WHERE id=?", arguments: [id]), type == nil || (row["type"] as String) == type else { throw CoreError("NOT_FOUND", "This record is not available.") }

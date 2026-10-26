@@ -8,13 +8,20 @@ extension CommandRouter {
     /// SQL predicates bind both project and opaque task identity before decoding.
     /// Callers supply only internal SQL fragments, never public column/order text.
     func scopedTaskRows(_ db: Database, type: String, task: JSON, predicate: String = "1", arguments: [DatabaseValueConvertible] = [], limit: Int? = nil, descending: Bool = false) throws -> [JSON] {
-        var sql = "SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type=? AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND ("+predicate+") ORDER BY rowid"+(descending ? " DESC" : "")
-        var args: [DatabaseValueConvertible] = [type,Data((task["project_id"] as! String).utf8),Data((task["id"] as! String).utf8)]+arguments
+        let selected = try selectedTaskRecordIDs(db,type:type,task:task)
+        let selection = selected == nil ? "" : "rowid IN (SELECT value FROM json_each(?)) AND "
+        var sql = "SELECT "+Self.canonicalRecordColumns+" FROM records WHERE "+selection+"type=? AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND ("+predicate+") ORDER BY rowid"+(descending ? " DESC" : "")
+        var args: [DatabaseValueConvertible] = try selected.map {[try jsonString($0)]} ?? []
+        args += [type,Data((task["project_id"] as! String).utf8),Data((task["id"] as! String).utf8)]+arguments
         if let limit {sql += " LIMIT ?";args.append(limit)}
         return try Row.fetchAll(db,sql:sql,arguments:StatementArguments(args)).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
     }
     func scopedTaskCount(_ db: Database, type: String, task: JSON, predicate: String = "1") throws -> Int {
-        try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type=? AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND ("+predicate+")",arguments:[type,Data((task["project_id"] as! String).utf8),Data((task["id"] as! String).utf8)]) ?? 0
+        let selected = try selectedTaskRecordIDs(db,type:type,task:task)
+        let selection = selected == nil ? "" : "rowid IN (SELECT value FROM json_each(?)) AND "
+        var arguments: [DatabaseValueConvertible] = try selected.map {[try jsonString($0)]} ?? []
+        arguments += [type,Data((task["project_id"] as! String).utf8),Data((task["id"] as! String).utf8)]
+        return try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE "+selection+"type=? AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND ("+predicate+")",arguments:StatementArguments(arguments)) ?? 0
     }
     func scopedTaskGroups(_ db: Database, task: JSON) throws -> [JSON] {
         let pid = task["project_id"] as! String,tid = task["id"] as! String

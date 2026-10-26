@@ -48,6 +48,8 @@ This is cooperative isolation between local clients, not a security boundary aga
 
 ## Modules
 
+The implemented initial shared package is [ChecklistShared](shared-modules.md): Domain values, read-method Contracts and pure Application capture planning. The remaining table describes architectural responsibilities, including later extractions; persistence/native adapters remain in their current root targets.
+
 | Module | Owns | Does not own |
 |---|---|---|
 | ChecklistDomain | State transitions, eligibility, policy evaluation, claim/review/triage invariants | UI, SQL, provider APIs |
