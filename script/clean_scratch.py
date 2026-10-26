@@ -248,7 +248,10 @@ def released_by(root, session_id=None):
 
 def in_scope(item, kind, session_id, include_released=False):
     if kind in {'session', 'spare'}:
-        owner = item.parent.parent.name
+        scratchpad = next((p for p in item.parents if p.name == 'scratchpad'), None)
+        if scratchpad is None:
+            return False
+        owner = scratchpad.parent.name
         return owner == session_id or (include_released and released_by(item, owner))
     # Qualification runs have no session path: their root marker supplies ownership.
     if item.is_symlink():
@@ -259,6 +262,30 @@ def in_scope(item, kind, session_id, include_released=False):
                                 (include_released and marker['released'])))
     except (OSError, ValueError):
         return False
+
+
+def private_copy(path):
+    """Recognize layouts, not names; links never establish a container child."""
+    if path.is_symlink() or not path.is_dir():
+        return False
+    return ((path / '.build').is_dir() or (path / '.git').exists() or (path / 'src/.git').exists()
+            or (path / 'capture-manifest.json').is_file()
+            or (path / 'source-manifest.json').is_file()
+            or (path / 'build-info.json').is_file())
+
+
+def session_items(item):
+    # Inspect just one level into an unmarked container. Loose files and other
+    # directories are not cleanup candidates. A marked root keeps its ordinary
+    # whole-item protections (including malformed markers failing closed).
+    try:
+        if (item.is_symlink() or not item.is_dir() or read_marker(item) is not None
+                or re.fullmatch(r'ws[a-z]*\d+', item.name) or private_copy(item)):
+            return [item]
+        copies = [child for child in children(item) if private_copy(child)]
+        return copies or [item]
+    except (OSError, ValueError):
+        return [item]
 
 
 def candidates(sessions, qualification, session_id, include_released=False):
@@ -277,10 +304,26 @@ def candidates(sessions, qualification, session_id, include_released=False):
             for item in children(session / 'scratchpad'):
                 kind = 'session' if checklist else 'spare'
                 if in_scope(item, kind, session_id, include_released):
-                    yield item, kind
+                    # Foreign scope still requires the owner's root release;
+                    # container discovery never expands that authorization.
+                    for candidate in session_items(item) if session.name == session_id else [item]:
+                        yield candidate, kind
     for item in children(qualification):
         if in_scope(item, 'qualification', session_id, include_released):
             yield item, 'qualification'
+
+
+def legacy_workspaces(before):
+    return [path for path, entry in before.items()
+            if re.fullmatch(r'ws[a-z]*\d+', path.name) and stat.S_ISDIR(entry[2])
+            and read_marker(path) is None]
+
+
+def released_ancestor(path, item):
+    scratchpad = next((p for p in item.parents if p.name == 'scratchpad'), None)
+    owner = scratchpad.parent.name if scratchpad else (read_marker(item) or {}).get('session_id')
+    return any(released_by(root, owner) for root in path.parents
+               if within(root, item))
 
 
 def workspace_protection(item, before):
@@ -296,9 +339,8 @@ def workspace_protection(item, before):
         if marker and not marker['released']:
             return 'persistent workspace marker; retained: ' + str(root)
     # Migration guard only: never infer release from the old naming convention.
-    for path, entry in before.items():
-        if (re.fullmatch(r'ws[a-z]*\d+', path.name) and stat.S_ISDIR(entry[2])
-                and read_marker(path) is None):
+    for path in legacy_workspaces(before):
+        if path == item or not released_ancestor(path, item):
             return 'unmarked legacy persistent workspace; mark before retirement: ' + str(path)
     return None
 
@@ -313,6 +355,7 @@ def installed_fingerprint(path):
 
 def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
     before = inventory(item)
+    legacy = legacy_workspaces(before)
     files = {path: entry for path, entry in before.items() if not stat.S_ISDIR(entry[2])}
     size = sum(entry[3] for entry in files.values())
     reason = None
@@ -369,6 +412,8 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
         components = (item.name,) + parts
         why = reason
         category = 'kept_bytes'
+        if not why and any(within(path, root) for root in legacy):
+            why = 'unmarked legacy persistent workspace; mark before retirement'
         if not why:
             if retire_run:
                 category, why = 'qualification_bytes', 'released obsolete qualification run (including copied stores)'
@@ -397,7 +442,8 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
         children_by_parent.setdefault(path.parent, []).append(path)
         # Empty folders can accompany an eligible tree, but never override an
         # item-wide hold or remove even empty Git metadata.
-        removable_tree[path] = (not reason and '.git' not in (item.name,) + path.relative_to(item).parts
+        removable_tree[path] = (not reason and not any(within(path, root) for root in legacy)
+                                 and '.git' not in (item.name,) + path.relative_to(item).parts
                                  and all(removable_tree[p] for p in children_by_parent.get(path, []))
                                ) if stat.S_ISDIR(entry[2]) else path in removable
     def select(path):
@@ -414,52 +460,176 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
     select(item)
     return {'path': str(item), 'kind': kind, **counts, 'total_bytes': size,
             'reason': reason or 'eligible build/Git bytes only; other bytes retained',
-            'reasons': dict(reasons), 'moves': moves, 'inventory': before}
+            'reasons': dict(reasons), 'retained_legacy_paths': [str(p) for p in legacy],
+            'moves': moves, 'inventory': before}
+
+
+def move_error(decision, error, path=None, stop=False):
+    decision['public'].update(action='kept_error', reason=str(error))
+    decision['public'].setdefault('errors', []).append(
+        {'source': str(path or decision['path']), 'reason': str(error)})
+    if stop:
+        decision['stopped'] = True
+
+
+def permission_root(item, kind, session_id):
+    if kind in {'session', 'spare'}:
+        scratchpad = next((p for p in item.parents if p.name == 'scratchpad'), None)
+        return scratchpad if scratchpad and scratchpad.parent.name == session_id else None
+    return item if (read_marker(item) or {}).get('session_id') == session_id else None
+
+
+def writable_directory(path, expected, root, modes):
+    """Adjust only the selected folder or its parent, with a no-follow identity check."""
+    metadata = path.lstat()
+    expected_mode = expected[2] if expected else None
+    if expected and path in modes:
+        expected_mode |= stat.S_IWUSR
+    if not stat.S_ISDIR(metadata.st_mode) or (expected and
+            (metadata.st_dev, metadata.st_ino, metadata.st_mode) != (*expected[:2], expected_mode)):
+        raise ValueError('directory changed before permission adjustment: ' + str(path))
+    if metadata.st_mode & stat.S_IWUSR:
+        return
+    if root is None or not within(path, root):
+        raise PermissionError('read-only directory outside caller permission scope; retained: ' + str(path))
+    # Do not traverse a linked ancestor while adjusting a directory's mode.
+    for parent in (path, *path.parents):
+        if not stat.S_ISDIR(parent.lstat().st_mode):
+            raise ValueError('linked/non-directory permission ancestor: ' + str(parent))
+        if parent == root:
+            break
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        observed = os.fstat(descriptor)
+        if (observed.st_dev, observed.st_ino, observed.st_mode) != (
+                metadata.st_dev, metadata.st_ino, metadata.st_mode):
+            raise ValueError('directory changed before permission adjustment: ' + str(path))
+        modes.setdefault(path, (stat.S_IMODE(observed.st_mode), (observed.st_dev, observed.st_ino)))
+        os.fchmod(descriptor, observed.st_mode | stat.S_IWUSR)
+    finally:
+        os.close(descriptor)
+
+
+def restore_modes(modes, destinations):
+    for source, (mode, identity) in modes.items():
+        path = destinations.get(source, source)
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            metadata = os.fstat(descriptor)
+            if (metadata.st_dev, metadata.st_ino) != identity:
+                raise ValueError('directory changed before permission restoration: ' + str(path))
+            os.fchmod(descriptor, mode)
+        finally:
+            os.close(descriptor)
 
 
 def apply_batch(batch, installed_info, fingerprint, process_reader, mover,
                 session_id, include_released):
-    decisions = {id(decision): decision for decision, _ in batch}.values()
+    batch = [(d, p) for d, p in batch if not d.get('stopped')]
+    if not batch:
+        return
+    decisions = list({id(decision): decision for decision, _ in batch}.values())
     # Inspect processes before the filesystem so changes during lsof are also fenced.
-    processes = process_reader()
-    if used_items(processes, (Path(d['path']) for d in decisions)):
-        raise ValueError('running process began using item; stopped')
+    try:
+        processes = process_reader()
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        for decision in decisions:
+            move_error(decision, error, stop=True)
+        return
+    used = used_items(processes, (Path(d['path']) for d in decisions))
     for decision in decisions:
         item = Path(decision['path'])
-        if not in_scope(item, decision['kind'], session_id, include_released):
-            raise ValueError('workspace ownership/release changed; stopped')
-        if inventory(item) != decision['inventory']:
-            raise ValueError('item changed during inspection/Trash moves; stopped')
-        if workspace_protection(item, decision['inventory']):
-            raise ValueError('workspace ownership/release changed; stopped')
+        try:
+            if item in used:
+                raise ValueError('running process began using item; stopped')
+            if not in_scope(item, decision['kind'], session_id, include_released):
+                raise ValueError('workspace ownership/release changed; stopped')
+            if inventory(item) != decision['inventory']:
+                raise ValueError('item changed during inspection/Trash moves; stopped')
+            if workspace_protection(item, decision['inventory']):
+                raise ValueError('workspace ownership/release changed; stopped')
+        except (OSError, ValueError) as error:
+            move_error(decision, error, stop=True)
     if installed_fingerprint(installed_info) != fingerprint:
-        raise ValueError('installed round changed; rerun preview with its qualified copy retained')
-    paths = [path for _, path in batch]
+        for decision in decisions:
+            if not decision.get('stopped'):
+                move_error(decision, ValueError('installed round changed; rerun preview with its qualified copy retained'), stop=True)
+        return
+    batch = [(d, p) for d, p in batch if not d.get('stopped')]
+    modes, selected = {}, []
+    for decision, path in batch:
+        try:
+            root = permission_root(Path(decision['path']), decision['kind'], session_id)
+            writable_directory(path.parent, decision['inventory'].get(path.parent), root, modes)
+            if stat.S_ISDIR(decision['inventory'][path][2]):
+                writable_directory(path, decision['inventory'][path], root, modes)
+            selected.append((decision, path))
+        except (OSError, ValueError) as error:
+            move_error(decision, error, path)
+    paths = [path for _, path in selected]
+    by_path = {path: decision for decision, path in selected}
     confirmed = set()
-    for path, destination in mover(paths):
-        if path not in paths or path in confirmed:
-            raise ValueError('unexpected or duplicate Trash receipt; stopped')
-        confirmed.add(path)
-        decision = next(d for d, p in batch if p == path)
-        receipt = {'source': str(path), 'trash': str(destination)}
-        decision['public']['destinations'].append(receipt)
-        print(json.dumps({'action': 'trash_move', **receipt}), flush=True)
-    if confirmed != set(paths):
-        raise ValueError('Trash receipts incomplete; inspect paths before retry')
+    destinations, retry = {}, []
+    try:
+        if paths:
+            for path, destination in mover(paths):
+                # stopOnError receipts must be an ordered prefix. Unknown or
+                # incomplete receipts cannot authorize retrying uncertain paths.
+                if len(confirmed) >= len(paths) or path != paths[len(confirmed)]:
+                    raise ValueError('unexpected or duplicate Trash receipt; stopped')
+                confirmed.add(path)
+                destinations[path] = destination
+                receipt = {'source': str(path), 'trash': str(destination)}
+                by_path[path]['public']['destinations'].append(receipt)
+                print(json.dumps({'action': 'trash_move', **receipt}), flush=True)
+            for path in paths[len(confirmed):]:
+                move_error(by_path[path], ValueError('Trash receipts incomplete; inspect paths before retry'), path)
+    except (OSError, subprocess.SubprocessError) as error:
+        remaining = paths[len(confirmed):]
+        if remaining:
+            # The first unconfirmed move failed. Later paths were not attempted
+            # by stopOnError; re-fence them after accounting for confirmed moves.
+            move_error(by_path[remaining[0]], error, remaining[0])
+            retry = [(by_path[path], path) for path in remaining[1:]]
+        elif paths:
+            move_error(by_path[paths[-1]], ValueError('Trash backend failed after confirmed moves: ' + str(error)))
+    except ValueError as error:
+        for path in paths[len(confirmed):]:
+            move_error(by_path[path], error, path, stop=True)
+        if paths and len(confirmed) == len(paths):
+            move_error(by_path[paths[-1]], error, stop=True)
+    finally:
+        # Restore retained parents and moved folders alike; never chmod a
+        # replacement pathname or follow a link returned in place of a receipt.
+        for path, value in modes.items():
+            try:
+                restore_modes({path: value}, destinations)
+            except (OSError, ValueError) as error:
+                for decision, selected_path in batch:
+                    if path in {selected_path, selected_path.parent}:
+                        move_error(decision, error, path, stop=True)
     for decision in decisions:
         item = Path(decision['path'])
-        removed = {p for d, p in batch if d is decision}
+        if decision.get('stopped'):
+            continue
+        removed = {p for d, p in batch if d is decision and p in confirmed}
         remaining = {p: e for p, e in decision['inventory'].items()
                      if not any(parent in removed for parent in (p, *p.parents))}
-        after = inventory(item) if item not in removed else {}
-        # Moving a child updates directory timestamps, never remaining file bytes
-        # or directory identity/mode. Do not silently adopt an exchanged directory.
-        if set(after) != set(remaining) or any(
-            after[p] != e if not stat.S_ISDIR(e[2]) else after[p][:3] != e[:3]
-            for p, e in remaining.items()
-        ):
-            raise ValueError('remaining files changed during Trash move; stopped')
-        decision['inventory'] = after
+        try:
+            after = inventory(item) if item not in removed else {}
+            # Moving a child updates directory timestamps, never remaining file bytes
+            # or directory identity/mode. Do not silently adopt an exchanged directory.
+            if set(after) != set(remaining) or any(
+                after[p] != e if not stat.S_ISDIR(e[2]) else after[p][:3] != e[:3]
+                for p, e in remaining.items()
+            ):
+                raise ValueError('remaining files changed during Trash move; stopped')
+            decision['inventory'] = after
+        except (OSError, ValueError) as error:
+            move_error(decision, error, stop=True)
+    if retry:
+        apply_batch(retry, installed_info, fingerprint, process_reader, mover,
+                    session_id, include_released)
 
 
 def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
@@ -511,20 +681,15 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 print(json.dumps({'path': str(item), 'action': 'kept_error', 'reason': str(error)}))
                 failed = True
-        try:
-            for batch in move_batches((d, p) for d in pending for p in d['moves']):
+        for batch in move_batches((d, p) for d in pending for p in d['moves']):
+            try:
                 apply_batch(batch, installed_info, fingerprint, process_reader, mover,
                             session_id, include_released)
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
-            # Native Trash can fail after moving part of a batch. Keep confirmed
-            # per-path receipts and all item accounting; never retry blindly.
-            for decision in pending:
-                decision['public'].update(action='kept_error', reason=str(error))
-            failed = True
-            for decision in pending:
-                print(json.dumps(decision['public'], sort_keys=True))
-            return 1
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                for decision in {id(d): d for d, _ in batch}.values():
+                    move_error(decision, error, stop=True)
         for decision in pending:
+            failed |= decision['public']['action'] == 'kept_error'
             print(json.dumps(decision['public'], sort_keys=True))
     return 1 if failed else 0
 

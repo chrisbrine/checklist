@@ -19,9 +19,10 @@ import clean_scratch as cleanup
 
 class CleanScratchTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = tempfile.TemporaryDirectory(prefix='checklist-clean-scratch-test-', dir=Path('/tmp').resolve())
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
+        self.assertNotIn('scratchpad', self.root.parts)
         caller = patch.dict(os.environ, {'CODEX_THREAD_ID': 'session', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
         caller.start();self.addCleanup(caller.stop)
         self.repo = self.root / 'retained';self.repo.mkdir()
@@ -726,9 +727,11 @@ class CleanScratchTests(unittest.TestCase):
         self.assertFalse(first.exists());self.assertTrue(second.exists())
         self.assertEqual(len([r for r in records if r['action'] == 'trash_move']), 1)
         errors = [r for r in records if r['action'] == 'kept_error']
-        self.assertEqual(len(errors), 2)
-        self.assertEqual([len(r['destinations']) for r in errors], [1, 0])
-        self.assertTrue(all(r['build_bytes'] == len(b'generated') for r in errors))
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]['path'], str(second))
+        self.assertEqual(errors[0]['destinations'], [])
+        self.assertEqual(errors[0]['build_bytes'], len(b'generated'))
+        self.assertEqual(next(r for r in records if r.get('path') == str(first))['action'], 'trashed')
 
     def test_incomplete_receipts_refuse_success(self):
         item = self.item();self.write(item, '.build/object')
@@ -736,6 +739,326 @@ class CleanScratchTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertIn('receipts incomplete', records[0]['reason'])
         self.assertTrue(item.exists())
+
+    def test_released_parent_reports_nested_legacy_but_only_keeps_legacy_subtree(self):
+        root = self.item('review');self.mark(root, release=True)
+        nested = root / 'R17C/plan-fixtures/ws1'
+        self.write(nested, 'src/source.py', b'old source\n')
+        protected = self.write(nested, '.build/object', b'legacy warm build')
+        source = self.write(root, 'R17C/source.py', b'old source\n')
+        build = self.write(root, '.build/output', b'eligible output')
+        before = cleanup.inventory(nested)
+        result, records = self.run_cleanup(apply=True)
+        self.assertEqual(result, 0)
+        self.assertFalse(source.exists());self.assertFalse(build.exists())
+        self.assertTrue(protected.exists())
+        self.assertEqual(cleanup.inventory(nested), before)
+        self.assertTrue(any(str(nested) in json.dumps(r) and
+                            'unmarked legacy persistent workspace' in json.dumps(r) for r in records))
+        summary = next(r for r in records if r.get('path') == str(root))
+        self.assertGreater(summary['build_bytes'], 0)
+        self.assertGreater(summary['kept_bytes'], 0)
+
+    def test_released_outer_root_does_not_override_valid_nested_unreleased_marker(self):
+        root = self.item('review');self.mark(root, release=True)
+        nested = root / 'R17C/plan-fixtures/ws1'
+        self.write(nested, 'src/source.py', b'old source\n');self.mark(nested)
+        self.write(root, '.build/output')
+        before = cleanup.inventory(root)
+        result, records = self.run_cleanup(apply=True)
+        self.assertEqual(result, 0)
+        self.assertEqual(cleanup.inventory(root), before)
+        self.assertEqual(records[0]['eligible_paths'], [])
+        self.assertIn('persistent workspace marker', records[0]['reason'])
+
+    def test_readonly_parent_and_capture_folder_move_across_batches_and_workspaces(self):
+        root = self.item('released');self.mark(root, release=True)
+        readonly_parent = root / 'diag1/src'
+        first = self.write(root, 'diag1/src/source.py', b'old source\n')
+        self.write(root, 'diag1/src/keep.md', b'private evidence')
+        capture = self.write(root, '.local/build/capture/source/source.py', b'old source\n').parent
+        # Match the original report: a 0555 parent plus a 0555 capture folder
+        # itself, with many siblings and a later workspace after the first window.
+        self.write(root, '.local/keep.md', b'private evidence')
+        self.write(root, '.local/build/keep.md', b'private evidence')
+        self.write(root, '.local/build/capture/keep.md', b'private evidence')
+        readonly_parent.chmod(0o555);capture.chmod(0o555)
+        self.addCleanup(readonly_parent.chmod, 0o755)
+        expected = {first, capture}
+        for number in range(40):
+            item = self.item(f'copy-{number:02d}')
+            expected.add(self.write(item, '.build/object').parent)
+            self.write(item, 'keep.md', b'private evidence')
+        later = self.item('zz-later');expected.add(self.write(later, '.build/object').parent)
+        self.write(later, 'keep.md', b'private evidence')
+        moved = []
+        def mode_checking_mover(paths):
+            for path in paths:
+                self.assertTrue(path.parent.stat().st_mode & stat.S_IWUSR, str(path.parent))
+                if path.is_dir():
+                    self.assertTrue(path.stat().st_mode & stat.S_IWUSR, str(path))
+                destination = cleanup.trash(path)
+                moved.append(path)
+                yield path, destination
+        with patch.object(cleanup, 'MOVE_BATCH_SIZE', 3):
+            result, records = self.run_cleanup(apply=True, mover=mode_checking_mover)
+        self.assertEqual(result, 0)
+        self.assertEqual(set(moved), expected)
+        self.assertEqual(len([r for r in records if r['action'] == 'trash_move']), len(expected))
+        self.assertFalse(any(r['action'] == 'kept_error' for r in records))
+        self.assertEqual((readonly_parent / 'keep.md').read_bytes(), b'private evidence')
+        self.assertEqual(stat.S_IMODE(readonly_parent.stat().st_mode), 0o555)
+        # Moved directories retain their original permissions in the Trash.
+        moved_capture = next(Path(r['trash']) for r in records
+                             if r['action'] == 'trash_move' and r['source'] == str(capture))
+        self.assertEqual(stat.S_IMODE(moved_capture.stat().st_mode), 0o555)
+        self.addCleanup(moved_capture.chmod, 0o755)
+
+    def test_foreign_released_readonly_copy_never_has_permissions_changed(self):
+        foreign = self.item('foreign', session='other-session');self.mark(foreign, session='other-session', release=True)
+        protected = self.write(foreign, '.build/object').parent
+        self.write(foreign, 'keep.md', b'private')
+        protected.chmod(0o555)
+        self.addCleanup(protected.chmod, 0o755)
+        own = self.item('own');owned_output = self.write(own, '.build/object')
+        self.write(own, 'keep.md', b'private')
+        def enforce_permissions(paths):
+            for path in paths:
+                if path == protected:
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o555)
+                    raise PermissionError('foreign read-only directory')
+                yield path, cleanup.trash(path)
+        result, records = self.run_cleanup(apply=True, include_released=True, mover=enforce_permissions)
+        self.assertTrue(protected.exists())
+        self.assertEqual(stat.S_IMODE(protected.stat().st_mode), 0o555)
+        self.assertFalse(owned_output.exists())
+        self.assertTrue(any(r.get('path') == str(foreign) and 'reason' in r for r in records))
+
+    def test_failed_move_does_not_block_siblings_later_batches_or_later_workspaces(self):
+        expected = set()
+        failed = None
+        for number in range(40):
+            item = self.item(f'copy-{number:02d}')
+            path = self.write(item, '.build/object').parent
+            self.write(item, 'keep.md', b'private evidence')
+            if number == 0:
+                failed = path
+            else:
+                expected.add(path)
+        def fail_one(paths):
+            for path in paths:
+                if path == failed:
+                    raise PermissionError('fixture permission denied')
+                yield path, cleanup.trash(path)
+        with patch.object(cleanup, 'MOVE_BATCH_SIZE', 3):
+            result, records = self.run_cleanup(apply=True, mover=fail_one)
+        self.assertEqual(result, 1)
+        self.assertTrue(failed.exists())
+        receipts = [r for r in records if r['action'] == 'trash_move']
+        self.assertEqual({Path(r['source']) for r in receipts}, expected)
+        self.assertEqual(len(receipts), len(expected))
+        errors = [r for r in records if r['action'] == 'kept_error']
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]['path'], str(failed.parent))
+        self.assertIn('permission denied', errors[0]['reason'])
+
+    def test_container_children_have_individual_counts_reasons_and_safety_rules(self):
+        container = self.item('w')
+        loose = self.write(container, 'brief.md', b'loose private brief')
+        loose_git = self.write(container, 'source.py', b'old source\n')
+        copies = {}
+        for name in ['eligible', 'running', 'recent', 'marked', 'qualified', 'unknown']:
+            child = container / name;child.mkdir();copies[name] = child
+            self.write(child, 'src/.git/config', b'private git metadata')
+            self.write(child, 'src/source.py', b'old source\n')
+            self.write(child, '.build/output.o', b'1234')
+        self.mark(copies['marked'])
+        os.utime(copies['recent'] / '.build/output.o', (self.now - 60, self.now - 60))
+        self.write(copies['qualified'], 'capture-manifest.json',
+                   json.dumps({'source_fingerprint': self.fingerprint}).encode())
+        self.write(copies['unknown'], 'src/unlanded.py', b'uncommitted source')
+        process = lambda: [copies['running'] / '.build/output.o']
+        before = cleanup.inventory(container)
+        result, records = self.run_cleanup(process_reader=process)
+        self.assertEqual(result, 0)
+        self.assertEqual(cleanup.inventory(container), before)
+        summaries = {r['path']: r for r in records if 'build_bytes' in r}
+        for child in copies.values():
+            self.assertIn(str(child), summaries)
+        eligible = summaries[str(copies['eligible'])]
+        self.assertEqual(eligible['build_bytes'], 4)
+        self.assertEqual(eligible['git_redundant_source_bytes'], len(b'old source\n'))
+        self.assertEqual(eligible['kept_bytes'], len(b'private git metadata'))
+        self.assertIn('rebuildable build output/cache', eligible['reasons'])
+        self.assertIn('exact bytes held by retained Git history', eligible['reasons'])
+        for name, reason in [('running', 'running process'), ('recent', 'last 45 minutes'),
+                             ('marked', 'persistent workspace marker'), ('qualified', 'latest installed round')]:
+            self.assertEqual(summaries[str(copies[name])]['eligible_paths'], [])
+            self.assertIn(reason, summaries[str(copies[name])]['reason'])
+        result, records = self.run_cleanup(apply=True, process_reader=process)
+        self.assertEqual(result, 0)
+        for name in ['eligible', 'unknown']:
+            self.assertFalse((copies[name] / '.build').exists())
+            self.assertFalse((copies[name] / 'src/source.py').exists())
+            self.assertTrue((copies[name] / 'src/.git/config').exists())
+        self.assertEqual((copies['unknown'] / 'src/unlanded.py').read_bytes(), b'uncommitted source')
+        for name in ['running', 'recent', 'marked', 'qualified']:
+            self.assertTrue((copies[name] / '.build/output.o').exists())
+        self.assertEqual(loose.read_bytes(), b'loose private brief')
+        self.assertEqual(loose_git.read_bytes(), b'old source\n')
+
+    def test_marked_container_preserves_all_descendants_and_loose_files(self):
+        container = self.item('w');self.mark(container)
+        self.write(container, 'copy/src/.git/config', b'git')
+        self.write(container, 'copy/src/source.py', b'old source\n')
+        self.write(container, 'copy/.build/object')
+        self.write(container, 'brief.md', b'private')
+        before = cleanup.inventory(container)
+        result, records = self.run_cleanup(apply=True)
+        self.assertEqual(result, 0)
+        self.assertEqual(cleanup.inventory(container), before)
+        self.assertFalse(any(r['action'] == 'trash_move' for r in records))
+
+    def test_readonly_parent_with_many_selected_files_is_restored_after_each_batch(self):
+        item = self.item();parent = item / 'src'
+        self.write(item, 'src/keep.md', b'private')
+        expected = {self.write(item, f'src/old-{i}.py', b'old source\n') for i in range(12)}
+        parent.chmod(0o555);self.addCleanup(parent.chmod, 0o755)
+        def requiring_write(paths):
+            for path in paths:
+                self.assertTrue(path.parent.stat().st_mode & stat.S_IWUSR)
+                yield path, cleanup.trash(path)
+        with patch.object(cleanup, 'MOVE_BATCH_SIZE', 4):
+            result, records = self.run_cleanup(apply=True, mover=requiring_write)
+        self.assertEqual(result, 0)
+        self.assertEqual({Path(r['source']) for r in records if r['action'] == 'trash_move'}, expected)
+        self.assertEqual(stat.S_IMODE(parent.stat().st_mode), 0o555)
+        self.assertEqual((parent / 'keep.md').read_bytes(), b'private')
+
+    def test_failed_readonly_folder_restores_mode_and_continues_same_item(self):
+        item = self.item();failed = self.write(item, '.build/object').parent
+        source = self.write(item, 'src/source.py', b'old source\n')
+        self.write(item, 'keep.md', b'private')
+        failed.chmod(0o555);self.addCleanup(failed.chmod, 0o755)
+        def failing_folder(paths):
+            for path in paths:
+                if path == failed:
+                    self.assertTrue(path.stat().st_mode & stat.S_IWUSR)
+                    raise PermissionError('one fixture move failed')
+                yield path, cleanup.trash(path)
+        result, records = self.run_cleanup(apply=True, mover=failing_folder)
+        self.assertEqual(result, 1)
+        self.assertTrue((failed / 'object').exists());self.assertFalse(source.exists())
+        self.assertEqual(stat.S_IMODE(failed.stat().st_mode), 0o555)
+        summary = next(r for r in records if r['action'] == 'kept_error')
+        self.assertEqual(len(summary['errors']), 1)
+        self.assertEqual(len(summary['destinations']), 1)
+
+    def test_empty_nested_legacy_folder_is_reported_under_released_root(self):
+        item = self.item('review');self.mark(item, release=True)
+        legacy = item / 'fixtures/ws1';legacy.mkdir(parents=True)
+        output = self.write(item, '.build/object')
+        result, records = self.run_cleanup(apply=True)
+        self.assertEqual(result, 0);self.assertFalse(output.exists());self.assertTrue(legacy.is_dir())
+        summary = next(r for r in records if r.get('path') == str(item))
+        self.assertEqual(summary['retained_legacy_paths'], [str(legacy)])
+
+    def test_container_root_build_identity_keeps_qualified_or_unreadable_tree(self):
+        for name, contents, reason in [
+            ('qualified', json.dumps({'source_fingerprint': self.fingerprint}).encode(), 'latest installed round'),
+            ('unreadable', b'{', 'unreadable build identity'),
+        ]:
+            with self.subTest(name=name):
+                container = self.item(name)
+                self.write(container, 'build-info.json', contents)
+                output = self.write(container, 'copy/.build/object')
+                result, records = self.run_cleanup(apply=True)
+                self.assertEqual(result, 0);self.assertTrue(output.exists())
+                summary = next(r for r in records if r.get('path') == str(container))
+                self.assertIn(reason, summary['reason']);self.assertEqual(summary['eligible_paths'], [])
+
+    def test_container_recognizes_capture_without_build_or_git_metadata(self):
+        container = self.item('w')
+        capture = container / 'capture'
+        self.write(capture, 'capture-manifest.json', json.dumps({'source_fingerprint': 'b' * 64}).encode())
+        source = self.write(capture, 'source/source.py', b'old source\n')
+        loose = self.write(container, 'brief.py', b'old source\n')
+        result, records = self.run_cleanup(apply=True)
+        self.assertEqual(result, 0);self.assertFalse(source.exists());self.assertTrue(loose.exists())
+        summary = next(r for r in records if r.get('path') == str(capture))
+        self.assertEqual(summary['git_redundant_source_bytes'], len(b'old source\n'))
+
+    def test_discovery_does_not_expand_legacy_or_git_workspace_as_container(self):
+        for name in ['ws1', 'git-copy']:
+            with self.subTest(name=name):
+                item = self.item(name)
+                child = item / 'nested-copy';self.write(child, '.build/object')
+                self.write(item, 'source.py', b'old source\n')
+                if name == 'git-copy':
+                    self.write(item, '.git/config', b'private Git metadata')
+                result, records = self.run_cleanup()
+                self.assertEqual(result, 0)
+                summaries = {r['path']: r for r in records if 'build_bytes' in r}
+                self.assertIn(str(item), summaries);self.assertNotIn(str(child), summaries)
+                if name == 'ws1':
+                    self.assertEqual(summaries[str(item)]['eligible_paths'], [])
+                    self.assertIn('unmarked legacy persistent workspace', summaries[str(item)]['reason'])
+                else:
+                    self.assertEqual(summaries[str(item)]['git_redundant_source_bytes'], len(b'old source\n'))
+
+    def test_backend_error_or_extra_receipt_after_last_success_is_not_swallowed(self):
+        for name in ['backend', 'duplicate', 'unknown', 'parser']:
+            with self.subTest(name=name):
+                item = self.item(name);self.write(item, '.build/object')
+                def terminal_failure(paths):
+                    for path in paths:
+                        destination = cleanup.trash(path)
+                        yield path, destination
+                    if name == 'backend':
+                        raise subprocess.CalledProcessError(5, ['fixture-trash'])
+                    if name == 'parser':
+                        raise ValueError('fixture unrecognized trailing receipt')
+                    yield paths[-1] if name == 'duplicate' else self.root / 'unknown', destination
+                result, records = self.run_cleanup(apply=True, mover=terminal_failure)
+                self.assertEqual(result, 1)
+                self.assertFalse(item.exists())
+                self.assertEqual(len([r for r in records if r['action'] == 'trash_move']), 1)
+                errors = [r for r in records if r['action'] == 'kept_error']
+                self.assertEqual(len(errors), 1)
+                self.assertEqual(len(errors[0]['destinations']), 1)
+
+    def test_retry_safety_failure_does_not_relabel_preceding_success(self):
+        for failure in ['process', 'installed']:
+            with self.subTest(failure=failure):
+                # Use a new fixture namespace in each subcase so already kept
+                # failures cannot participate in the next subcase's batch.
+                session = 'session-' + failure
+                items = [self.item(name, session=session) for name in ['a', 'b', 'c']]
+                for item in items:
+                    self.write(item, '.build/object')
+                calls = 0
+                def reader():
+                    nonlocal calls
+                    calls += 1
+                    if calls == 3:
+                        if failure == 'process':
+                            raise OSError('fixture process inspection failed')
+                        self.installed.write_text(json.dumps({'source_fingerprint': 'b' * 64}))
+                    return []
+                def partial(paths):
+                    yield paths[0], cleanup.trash(paths[0])
+                    raise PermissionError('fixture second move failed')
+                result, records = self.run_cleanup(apply=True, session_id=session,
+                                                   process_reader=reader, mover=partial)
+                self.assertEqual(result, 1)
+                summaries = {r['path']: r for r in records if 'build_bytes' in r}
+                self.assertEqual(summaries[str(items[0])]['action'], 'trashed')
+                self.assertEqual(len(summaries[str(items[0])]['destinations']), 1)
+                self.assertEqual(summaries[str(items[1])]['action'], 'kept_error')
+                self.assertEqual(summaries[str(items[2])]['action'], 'kept_error')
+                self.assertIn('process inspection failed' if failure == 'process' else 'installed round changed',
+                              summaries[str(items[2])]['reason'])
+                self.installed.write_text(json.dumps({'source_fingerprint': self.fingerprint}))
 
     def test_large_deep_tree_apply_time_bound_and_linear_inspection(self):
         # 250 items, 32,000 small files plus 11 GB logical sparse output. The
