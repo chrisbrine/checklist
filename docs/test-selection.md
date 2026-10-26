@@ -155,7 +155,7 @@ own tickets. A previous failure is never a passing result for this ticket.
 
 Every entry is listed below with a concrete source area that selects it. These
 are examples within the existing conservative dependency closure, not a narrower
-map: any Core source selects all 28 registered qualification cases across its
+map: any Core source selects all 29 registered qualification cases across its
 transitive test targets; App source selects its one App qualifier, and IPC source
 selects qualifiers in the targets reached by its actual package dependencies.
 `Tests/ChecklistTestSupport/` changes also select qualification in consuming targets.
@@ -184,6 +184,9 @@ qualification commands for Core, mapped Core, App and IPC production paths.
 | `ChecklistCoreTests.MediaListQueryTests/testThousandItemBoundedGroupedPagesFreezeOrderAcrossInsertsAndUpdates` | `Sources/ChecklistCore/MediaListQueries.swift` |
 | `ChecklistCoreTests.ScreenReadPerformanceTests/testRealSizeScreenReads` | `Sources/ChecklistCore/WorkspacePageRead.swift` |
 | `ChecklistCoreTests.ScreenReadPerformanceTests/testOverviewWithRetainedReviewHistory` | `Sources/ChecklistCore/WorkspacePageRead.swift` |
+| `ChecklistCoreTests.ScreenReadQueryPlanTests/testRealSizeScreenReadQueryPlans` | `Sources/ChecklistCore/WorkspacePageRead.swift` |
+| `ChecklistCoreTests.OverviewReadOptimizationTests/testReadOnlyBatchClaimProjectionProfile` | `Sources/ChecklistCore/Work.swift` |
+| `ChecklistCoreTests.OverviewReadOptimizationTests/testReadOnlyOverviewQueryProfile` | `Sources/ChecklistCore/WorkspacePageRead.swift` |
 | `ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeAutomaticFirstPassKeepsConcurrentReadAndWriteUnderTwoSeconds` | `Sources/ChecklistCore/TicketLifecycleCleanup.swift` |
 | `ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeCacheAliasInventoryExhaustsOneBoundedClosureBudgetAndRetainsEntry` | `Sources/ChecklistCore/TicketLifecycleCleanup.swift` |
 | `ChecklistCoreTests.MediaRoundTests/testLargeRetainedHistoryDoesNotHoldWriterDuringPreparation` | `Sources/ChecklistCore/MediaRounds.swift` |
@@ -257,3 +260,27 @@ swift build --target ChecklistProducts --scratch-path <build-slot>/.build
 Only `src/` is synchronized. Keep the scratch path fixed so source identity and incremental outputs are reused. For a Git checkout, verify the expected base and clean tree before editing; for an immutable capture without Git, verify its source fingerprint and files instead. A new slot may need its initial cold build once; subsequent tasks must reuse it. Keep measurement edits out of hand-ins and restore their exact original bytes afterward.
 
 Installed check runners normally use empty or small synthetic seeds. Use a verified real-store backup only for an acceptance item or installation storage gate that needs that store, and record why; preserve the required same-build live-backup promotion qualification. Keep test-slot folders outside `~/Documents` (the harness uses `~/Library/Application Support/Checklist Test Instances`). Follow [test instances](test-instances.md) for seed safety, slot identity, startup, qualification and cleanup. Build workspaces and installed instance slots are separate resources. See the [combined build round rule](../skills/checklist/references/coordinate.md#combined-build-rounds) and [session briefs](../skills/checklist/references/driven-sessions.md#reviewer-brief-template).
+
+### Screen read query plans (CL-280)
+
+`ScreenReadQueryPlanTests/testRealSizeScreenReadQueryPlans` is opt-in qualification,
+never part of the default pass. Its disposable current-schema template contains
+542 tickets, 227 Triages, 8,300 messages, 800 reviews and 8,300 events. It traces
+production `executePureRead` SQL on cold and repeated reads, then prints each
+unique SELECT/WITH statement, execution count, `EXPLAIN QUERY PLAN` details
+(including each chosen index), and the records/events index inventory. Coverage
+includes full/projected Triage and ticket lists, ticket UI/summary context, Epics,
+project-switch tickets, and all twelve surfaces in
+`ScreenReadPerformanceTests/testReadOnlyBackupScreenMeasurements`, including the
+combined Overview and completed-since digest. Transaction/PRAGMA control statements
+are excluded because they do not access the record corpus.
+
+The guard rejects a records/events full scan when the statement constrains an
+applicable leading primary/scope index key. Type-only and JSON-only corpus scans
+remain visible in the plan notes: the schema has no type-leading/JSON index.
+EXPLAIN bytecode cursor roots distinguish main corpus tables/indexes from
+materialized CTE aliases; forward/reverse scans are checked. Virtual-table, CTE
+and small metadata scans are not corpus scan failures.
+The small scan-policy test stays in the default suite. These plans qualify the
+synthetic fixture, not a live-store timing claim; CL-280 still requires an
+independent runner's matched same-seed, exact-build screen/read measurements.

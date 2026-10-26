@@ -239,7 +239,7 @@ final class ChecklistMCPServerTests: XCTestCase {
         let tools = try await session.client.listTools()
         let tool = try XCTUnwrap(tools.tools.first {$0.name == "history_list"})
         let schema = try JSONSerialization.jsonObject(with:JSONEncoder().encode(tool.inputSchema)) as! [String:Any]
-        XCTAssertEqual(((schema["properties"] as? [String:Any])?["entity"] as? [String:Any])?["enum"] as? [String],["project"])
+        XCTAssertEqual(((schema["properties"] as? [String:Any])?["entity"] as? [String:Any])?["enum"] as? [String],["project","backup"])
         do {
             for archived in [true,false] {
                 let current = try call("project_settings_get",["project_id":pid])

@@ -108,7 +108,7 @@ extension CommandRouter {
         return "missing"
     }
 
-    func workHealthView(_ db: Database, task: JSON, at date: Date = Date()) throws -> JSON {
+    func workHealthView(_ db: Database, task: JSON, at date: Date = Date(), selectedProjection: JSON? = nil) throws -> JSON {
         let pid = task["project_id"] as! String, target = try workHealthTarget(db, task: task)
         let settings = workHealthSettings(try record(db, pid, type: "project"))
         var value = task["work_health"] as? JSON ?? ["state": "pending_check"]
@@ -125,7 +125,10 @@ extension CommandRouter {
         }
         let requests = try scopedTaskRows(db, type: "request", task: task, predicate: "json_extract(data,'$.state')='pending' AND json_extract(data,'$.blocking')=1", limit: 25)
         waits += requests.map { ["kind": "human", "request_id": $0["id"]!, "reason": $0["title"] ?? "Owner answer"] }
-        let selected = try selectedTaskProjectionWithoutHealth(db, task: task)
+        // A selected read has already built this task's status/dependency facts
+        // in the same transaction. Reuse that request-local value only; health
+        // and its time-sensitive fields are still computed on every read.
+        let selected = try selectedProjection ?? selectedTaskProjectionWithoutHealth(db, task: task)
         let blockers = selected["prerequisite_blockers"] as? [JSON] ?? []
         waits += blockers.prefix(25).map { ["kind": "dependency", "detail": $0] }
         let jobs = try scopedTaskRows(db, type: "source_execution", task: task, predicate: "json_extract(data,'$.state') IN ('queued','running')", limit: 25)

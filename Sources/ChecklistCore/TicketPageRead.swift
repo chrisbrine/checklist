@@ -5,8 +5,10 @@ import GRDB
 /// decoding boundary; count/search predicates stay inside the authorized query.
 extension CommandRouter {
     func ownerNeedsYouCounts(_ db: Database) throws -> (requests: Int, tasks: Int) {
-        let requests = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type='request' AND COALESCE(json_extract(data,'$.state'),'') NOT IN ('answered','canceled','\(LegacyStoredValue.canceled)','superseded','resolved')") ?? 0
-        let tasks = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records t LEFT JOIN records s ON s.id=json_extract(t.data,'$.status_id') AND s.project_id=t.project_id AND s.type='status' WHERE t.type='task' AND COALESCE(json_extract(t.data,'$.archived'),0)=0 AND COALESCE(json_extract(t.data,'$.trashed'),0)=0 AND COALESCE(json_extract(s.data,'$.category'),'') NOT IN ('done','completed','canceled','\(LegacyStoredValue.canceled)') AND (json_extract(t.data,'$.planned_assignee')='human' OR json_extract(t.data,'$.planned_assignee.kind')='human' OR json_extract(t.data,'$.assignee')='human')") ?? 0
+        // Global owner counts need only these two small record families. A
+        // covering-index rowid pass avoids loading unrelated retained payloads.
+        let requests = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='request') AND COALESCE(json_extract(data,'$.state'),'') NOT IN ('answered','canceled','\(LegacyStoredValue.canceled)','superseded','resolved')") ?? 0
+        let tasks = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records t LEFT JOIN records s ON s.id=json_extract(t.data,'$.status_id') AND s.project_id=t.project_id AND s.type='status' WHERE t.rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='task') AND COALESCE(json_extract(t.data,'$.archived'),0)=0 AND COALESCE(json_extract(t.data,'$.trashed'),0)=0 AND COALESCE(json_extract(s.data,'$.category'),'') NOT IN ('done','completed','canceled','\(LegacyStoredValue.canceled)') AND (json_extract(t.data,'$.planned_assignee')='human' OR json_extract(t.data,'$.planned_assignee.kind')='human' OR json_extract(t.data,'$.assignee')='human')") ?? 0
         return (requests,tasks)
     }
 

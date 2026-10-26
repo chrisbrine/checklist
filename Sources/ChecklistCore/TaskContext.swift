@@ -38,8 +38,12 @@ extension CommandRouter {
         let pid = task["project_id"] as! String, project = try record(db,pid,type:"project")
         let directions = try ownerDirections(db,task:task).map { ["id":$0["id"]!,"revision":int($0,"revision"),"addressed":bool($0,"addressed")] as JSON }
         let relevant: JSON = ["brief":project["brief"] ?? "","brief_revision":project["brief_revision"] ?? 0,"decisions":applicableDecisions(project,task:task),"directions":directions]
-        let callerAttempt = try scopedTaskRows(db,type:"attempt",task:task,predicate:"json_extract(data,'$.state')='active' AND json_extract(data,'$.principal')=?",arguments:[caller.principal],limit:1,descending:true).first
-        let round = attempt?["id"] as? String ?? callerAttempt?["id"] as? String ?? task["active_attempt_id"] as? String ?? task["current_manifest_id"] as? String ?? "unclaimed"
+        let round: String
+        if let explicitID = attempt?["id"] as? String {round = explicitID}
+        else {
+            let callerAttempt = try scopedTaskRows(db,type:"attempt",task:task,predicate:"json_extract(data,'$.state')='active' AND json_extract(data,'$.principal')=?",arguments:[caller.principal],limit:1,descending:true).first
+            round = callerAttempt?["id"] as? String ?? task["active_attempt_id"] as? String ?? task["current_manifest_id"] as? String ?? "unclaimed"
+        }
         return pid+":directions:"+(task["id"] as! String)+":"+round+":"+hash(Data((try jsonString(relevant)).utf8))+":"+(try authorizationScope(db,caller))+":"+(try callerSessionGeneration(db,caller,project:pid))
     }
 
@@ -55,7 +59,7 @@ extension CommandRouter {
         _ = try cursorSequence(db,["cursor":supplied],caller:caller,scope:directionCursorScope(db,task:task,caller:caller,attempt:attempt))
     }
 
-    func compactTaskContext(_ db: Database, task: JSON, caller: Caller) throws -> JSON {
+    func compactTaskContext(_ db: Database, task: JSON, caller: Caller, directionAttempt: JSON? = nil) throws -> JSON {
         let pid = task["project_id"] as! String, tid = task["id"] as! String, project = try record(db,pid,type:"project")
         let savedNotesMore=try deliverSavedNotesToHandler(db,task:task,caller:caller)
         let directions = try scopedTaskRows(db,type:"message",task:task,predicate:"json_extract(data,'$.origin')='human_ui' AND json_extract(data,'$.requires_action')=1 AND COALESCE(json_extract(data,'$.addressed'),0)=0 AND \(Self.unretractedDirectionSQL())",limit:26)
@@ -89,19 +93,21 @@ extension CommandRouter {
         // CL-43: failed rounds per gate and repeated-cause warnings; advice only.
         result["review_summary"] = try reviewSummary(db,task:task)
         result["evidence_measures"] = try evidenceMeasuresContext(db,task:task)
-        result["direction_cursor"] = try cursor(db,caller:caller,scope:directionCursorScope(db,task:task,caller:caller))
+        result["direction_cursor"] = try cursor(db,caller:caller,scope:directionCursorScope(db,task:task,caller:caller,attempt:directionAttempt))
         result["unresolved_directions"] = directions.prefix(limit).map(contextPreview)
         result["review_requests"] = Array(reviews.prefix(limit))
         result["recent_messages"] = messages.suffix(10).map(contextPreview)
         result["direction_deliveries"] = Array(deliveries.suffix(50))
         var counts:JSON=[:]
-        counts["unresolved_directions"]=try scopedTaskCount(db,type:"message",task:task,predicate:"json_extract(data,'$.origin')='human_ui' AND json_extract(data,'$.requires_action')=1 AND COALESCE(json_extract(data,'$.addressed'),0)=0 AND \(Self.unretractedDirectionSQL())")
-        counts["unresolved_findings"]=try scopedTaskCount(db,type:"finding",task:task,predicate:"json_extract(data,'$.state')='open'")
-        counts["pending_requests"]=try scopedTaskCount(db,type:"request",task:task,predicate:"json_extract(data,'$.state')='pending'")
-        counts["pending_reviews"]=try scopedTaskCount(db,type:"review_request",task:task,predicate:"json_extract(data,'$.state') IN ('queued','active','blocked','evidence_requested')")
+        // A short bounded window is complete for that exact predicate. At the
+        // SQL limit, retain the full count query rather than infer completeness.
+        counts["unresolved_directions"]=directions.count<limit+1 ? directions.count : try scopedTaskCount(db,type:"message",task:task,predicate:"json_extract(data,'$.origin')='human_ui' AND json_extract(data,'$.requires_action')=1 AND COALESCE(json_extract(data,'$.addressed'),0)=0 AND \(Self.unretractedDirectionSQL())")
+        counts["unresolved_findings"]=findings.count<limit+1 ? findings.count : try scopedTaskCount(db,type:"finding",task:task,predicate:"json_extract(data,'$.state')='open'")
+        counts["pending_requests"]=requests.count<limit+1 ? requests.count : try scopedTaskCount(db,type:"request",task:task,predicate:"json_extract(data,'$.state')='pending'")
+        counts["pending_reviews"]=reviews.count<limit+1 ? reviews.count : try scopedTaskCount(db,type:"review_request",task:task,predicate:"json_extract(data,'$.state') IN ('queued','active','blocked','evidence_requested')")
         counts["blocking_findings"]=try scopedTaskCount(db,type:"finding",task:task,predicate:"json_extract(data,'$.state')='open' AND COALESCE(json_extract(data,'$.severity'),'')<>'advice'")
-        counts["messages"]=try scopedTaskCount(db,type:"message",task:task)
-        counts["attempts"]=try scopedTaskCount(db,type:"attempt",task:task)
+        counts["messages"]=messages.count<11 ? messages.count : try scopedTaskCount(db,type:"message",task:task)
+        counts["attempts"]=attempts.count<limit+1 ? attempts.count : try scopedTaskCount(db,type:"attempt",task:task)
         counts["direction_deliveries"]=try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records d JOIN records m ON m.type='message' AND m.project_id=d.project_id AND m.id=json_extract(d.data,'$.message_id') WHERE d.type='delivery' AND m.project_id=CAST(? AS TEXT) AND json_extract(m.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND json_extract(m.data,'$.origin')='human_ui' AND json_extract(m.data,'$.requires_action')=1 AND COALESCE(json_extract(m.data,'$.addressed'),0)=0 AND \(Self.unretractedDirectionSQL("m"))",arguments:[Data(pid.utf8),Data(tid.utf8)]) ?? 0
         result["counts"]=counts
         let truncatedSections: [Bool] = [directions.count > limit,findings.count > limit,requests.count > limit,reviews.count > limit,messages.count > 10,deliveries.count > 50]
@@ -139,7 +145,8 @@ extension CommandRouter {
         result["pending_requests"] = Array(requests.prefix(limit))
         // Compatibility sections are bounded; records_ref retrieves every omitted record.
         for (key,type) in [("findings","finding"),("finding_resolutions","finding_resolution"),("requests","request"),("reviews","review"),("attachments","attachment"),("attempts","attempt"),("manifests","manifest")] {
-            let values = try scopedTaskRows(db,type:type,task:task,limit:limit+1,descending:true).reversed().map {$0}
+            // The newest attempt window was selected above in this same read.
+            let values = type == "attempt" ? attempts : try scopedTaskRows(db,type:type,task:task,limit:limit+1,descending:true).reversed().map {$0}
             result[key] = values.suffix(limit).map {contextPreview(contextRecord($0,type:type,caller:caller))}
             if values.count > limit { result["truncated"] = true }
         }

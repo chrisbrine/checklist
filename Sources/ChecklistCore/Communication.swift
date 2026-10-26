@@ -236,21 +236,53 @@ extension CommandRouter {
         } }
         return ["deliveries":deliveries,"messages":deliveries.compactMap { $0["message"] as? JSON }]
     }
+    private func backupHistoryData(_ db: Database,_ row: Row) throws -> JSON {
+        var data = jsonObject(row["data"])
+        if let operation = data["operation_id"] as? String {
+            if data["command_id"] == nil {
+                data["command_id"] = try String.fetchOne(db,sql:"SELECT command_id FROM commands WHERE principal=? AND json_extract(result,'$.data.operation_id')=? LIMIT 1",arguments:[row["actor"] as String,operation])
+            }
+            if data["captured_at"] == nil || data["verified_at"] == nil,
+               let raw = try String.fetchOne(db,sql:"SELECT json_extract(value,'$.summary') FROM metadata WHERE key=?",arguments:["backup-generation:" + operation]),
+               let summary = try JSONSerialization.jsonObject(with:Data(raw.utf8)) as? JSON {
+                for key in ["captured_at","verified_at"] where data[key] == nil { data[key] = summary[key] }
+            }
+        }
+        return data.filter { ["origin","session_id","command_id","operation_id","manifest_sha256","reason","captured_at","verified_at"].contains($0.key) }
+    }
+
     func history(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         let pid = try scope(db,p,c)
         let keys = ["task_id","triage_id","epic_id","conversation_id","entity"].filter { p[$0] != nil }
         guard keys.count == 1 else { throw CoreError("INVALID_INPUT","Select exactly one task, group, conversation or project entity.") }
         let key = keys[0]
-        if key == "entity",try text(p,key) != "project" { throw CoreError("INVALID_INPUT","entity must be project.") }
+        let backup = key == "entity" && (p[key] as? String) == "backup"
+        if key == "entity", !backup, try text(p,key) != "project" { throw CoreError("INVALID_INPUT","entity must be project or backup.") }
+        if backup { try worker(c) }
         let id = key == "entity" ? pid : try text(p,key)
         let type = key == "entity" ? "project" : (key == "task_id" ? "task" : (key == "conversation_id" ? "conversation" : "group"))
         let r = try type == "project" ? record(db,pid,type:"project") : scoped(db,id,pid,type:type)
         if type == "conversation",!c.isOwner { try assistantPermission(c,pid,"receive_messages"); guard let sid = c.sessionID,strings(r,"participants").contains(sid),(r["participant_authorization_generations"] as? [String:String])?[sid] == (try callerSessionGeneration(db,c,project:pid)) else { throw CoreError("FORBIDDEN","Only conversation participants can read these messages.") } }
-        let cursorScope = pid+":"+key+":"+id+":"+(try authorizationScope(db,c))+":"+(try callerSessionGeneration(db,c,project:pid)); let after = try cursorSequence(db,p,caller:c,scope:cursorScope)
+        let cursorScope = pid+":"+key+":"+id+(backup ? ":backup" : "")+":"+(try authorizationScope(db,c))+":"+(try callerSessionGeneration(db,c,project:pid)); let after = try cursorSequence(db,p,caller:c,scope:cursorScope)
         let limit = min(max(int(p,"limit",default:200),1),200)
-        let fetched = try Row.fetchAll(db,sql:"SELECT seq,id,actor,kind,occurred_at,data FROM events WHERE project_id=? AND entity_id=? AND seq>? ORDER BY seq LIMIT ?",arguments:[pid,id,after,limit+1])
+        let fetched: [Row]
+        if backup {
+            // Global owner receipts are visible only in projects actually captured
+            // in that snapshot. Legacy unscoped receipts have no such evidence.
+            fetched = try Row.fetchAll(db,sql:"""
+                SELECT seq,id,actor,kind,occurred_at,data FROM events
+                WHERE kind='backup_created' AND seq>? AND
+                    (project_id=? OR (project_id IS NULL AND json_extract(data,'$.origin')='human_ui'
+                        AND EXISTS (SELECT 1 FROM json_each(events.data,'$.project_ids') WHERE value=?)))
+                ORDER BY seq LIMIT ?
+                """,arguments:[after,pid,pid,limit+1])
+        } else {
+            fetched = try Row.fetchAll(db,sql:"SELECT seq,id,actor,kind,occurred_at,data FROM events WHERE project_id=? AND entity_id=? AND seq>? ORDER BY seq LIMIT ?",arguments:[pid,id,after,limit+1])
+        }
         let rows = Array(fetched.prefix(limit))
-        let events: [JSON] = rows.map { ["subject":["id":r["id"]!,"key":r["key"] ?? NSNull(),"title":r["title"] ?? r["name"] ?? ""],"id":$0["id"] as String,"actor":$0["actor"] as String,"kind":$0["kind"] as String,"occurred_at":$0["occurred_at"] as String,"data":jsonObject($0["data"])] }
+        let events: [JSON] = try rows.map { row in
+            let data = backup ? try backupHistoryData(db,row) : jsonObject(row["data"])
+            return ["subject":["id":r["id"]!,"key":r["key"] ?? NSNull(),"title":r["title"] ?? r["name"] ?? ""],"id":row["id"] as String,"actor":row["actor"] as String,"kind":row["kind"] as String,"occurred_at":row["occurred_at"] as String,"data":data] }
         var seenMessageIDs = Set<SnapshotRecordIdentity>()
         let messageIDs = events.flatMap {entry -> [String] in let data = entry["data"] as? JSON ?? [:]; return [data["message_id"] as? String,data["reply_id"] as? String].compactMap {$0}}.filter {seenMessageIDs.insert(SnapshotRecordIdentity($0)).inserted}
         // Hydrate only IDs named by this authorized event page, never every project message.

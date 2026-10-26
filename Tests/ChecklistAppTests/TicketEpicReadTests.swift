@@ -121,6 +121,37 @@ import AppKit
         draw()
         try await until { f.calls.filter { $0.0 == "workspace_page" && $0.1["surface"] as? String == "epics" }.count > before }
     }
+    func testAcceptedEpicChoicesSurviveSelectedContextRefreshWithoutAnotherPageRead() async throws {
+        _ = NSApplication.shared
+        let f = Fixture(isolatedDefaults("EpicReadLiveRefresh").preferences); defer { f.cleanup() }
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); store.stopWindowReads() }
+        try await until { store.connected }
+        store.open(.task("a")); try await until { store.selectedTicketCurrent("a") }
+        let host = NSHostingView(rootView: Host(store: store) {})
+        let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 560, height: 600), styleMask: [], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false; window.contentView = host; window.orderFront(nil)
+        defer { window.contentView = nil; window.close() }
+        func draw() { host.layoutSubtreeIfNeeded(); host.displayIfNeeded() }
+        func choiceReads() -> Int { f.calls.filter { $0.0 == "workspace_page" && $0.1["surface"] as? String == "epics" }.count }
+        draw(); try await until { choiceReads() == 1 }
+        // Allow the initial SwiftUI task to install its template page.
+        try await Task.sleep(nanoseconds: 30_000_000)
+        for version in ["status-commit", "note-commit", "queue-return"] {
+            f.version = version; f.hold = true
+            store.retrySelectedTicket(); draw()
+            try await until { !f.pending.isEmpty }
+            XCTAssertFalse(store.selectedTicketCurrent("a"))
+            f.hold = false; f.release()
+            try await until { store.selectedTicketCurrent("a") }
+            draw()
+            // Let the hosted .task observe both sides of the held context read.
+            // This asserts request behaviour, never an elapsed-time budget.
+            try await Task.sleep(nanoseconds: 30_000_000)
+            XCTAssertEqual(choiceReads(), 1, "An accepted choice page must not amplify ordinary selected-context refreshes")
+        }
+    }
+
 }
 @MainActor private final class EpicReadAlertSink: DesktopAlertSink {
     func authorization() async -> DesktopAlertAuthorization { .denied }

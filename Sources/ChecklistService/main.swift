@@ -88,6 +88,8 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     var storageWakePlan = StorageMaintenanceWakePlan()
     let storageQueue = DispatchQueue(label:"org.checklist.storage-maintenance",qos:.utility)
     var storageRunning = false
+    var storageWakePlanning = false
+    var storageWakeReplan = false
     var attemptedDeliveries = Set<String>()
     var nativeInFlight: [String: NativeInFlight] = [:]
     var workHealthWake: DispatchWorkItem?
@@ -138,11 +140,35 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
 
     /// One-shot durable cleanup deadline. Held work waits for a relevant
     /// command or an actual lease deadline; this is not a model/pickup loop.
-    func armStorageWake() {
+    func armStorageWake(loadDeadline: (() throws -> Date?)? = nil, diagnostics: Bool = false) {
         guard !storageRunning else {return}
-        let next: Date?
-        do {next = try router.nextArchiveCleanupDeadline()}
-        catch {next = Date().addingTimeInterval(60)}
+        if storageWakePlanning {storageWakeReplan = true;return}
+        storageWakePlanning = true
+        // Deadline discovery parses retained job metadata. It is a pure read,
+        // not request admission work. One in-flight read and one dirty bit bound
+        // repeated command wakes without losing a change made during that read.
+        storageQueue.async { [self] in
+            let started = ProcessInfo.processInfo.systemUptime
+            let next: Date?
+            do {
+                if let loadDeadline {next = try loadDeadline()}
+                else {next = try router.nextArchiveCleanupDeadline()}
+            } catch {next = Date().addingTimeInterval(60)}
+            if diagnostics {CallTimingLog.write(["scope":"storage_wake_plan","duration_ms":(ProcessInfo.processInfo.systemUptime-started)*1000])}
+            queue.async { [self] in
+                storageWakePlanning = false
+                let replan = storageWakeReplan;storageWakeReplan = false
+                // A previously armed timer may have fired during discovery.
+                // That maintenance turn owns the next fresh scheduling read.
+                guard !storageRunning else {return}
+                installStorageWake(next)
+                if replan {armStorageWake(loadDeadline:loadDeadline,diagnostics:diagnostics)}
+            }
+        }
+    }
+    /// Apply every completed plan before a dirty follow-up, so continuous notes
+    /// cannot postpone an already discovered earlier deadline.
+    func installStorageWake(_ next: Date?) {
         guard storageWakePlan.update(next) else {return}
         storageWake?.cancel();storageWake = nil
         guard let deadline = storageWakePlan.deadline else {return}
@@ -537,9 +563,9 @@ final class Peer: NSObject, ChecklistRPC {
             do {
                 guard let connection, let object else { throw ChecklistError("INVALID_INPUT","Invalid command envelope.") }
                 routed = try ServiceCallTiming.measure(timing,"bootstrap_verification_ms") { try coordinator.route(object,connection:connection) }
-            } catch { finish(["error":Self.publicError(error)],timing:timing,runHooks:Self.requiresAfterCommand(object?["method"] as? String ?? ""),reply:reply);return }
+            } catch { finish(["error":Self.publicError(error)],timing:timing,runHooks:Self.requiresAfterCommand(object?["method"] as? String ?? ""),method:object?["method"] as? String ?? "",reply:reply);return }
             switch routed {
-            case .done(let result,let runHooks): finish(result,timing:timing,runHooks:runHooks,reply:reply)
+            case .done(let result,let runHooks): finish(result,timing:timing,runHooks:runHooks,method:object?["method"] as? String ?? "",reply:reply)
             case .router(let method,let params,let caller) where CommandRouter.runsOutsideSerialQueue(method):
                 // CL-71/72: file work and pure reads do not hold the serial queue; the router
                 // serializes writes itself. Retain the original reply until handle returns
@@ -553,40 +579,51 @@ final class Peer: NSObject, ChecklistRPC {
                     let result: [String:Any]
                     do { result = try ServiceCallTiming.measure(timing,"execution_ms") { try router.handle(method:method,params:params,caller:caller) } } catch { result = ["error":Self.publicError(error)] }
                     reply(Self.responseBytes(result,timing:timing))
-                    coordinator.queue.async { [self] in autoreleasepool {afterCommand(result,runHooks:Self.requiresAfterCommand(method),timed:timing)} }
+                    coordinator.queue.async { [self] in autoreleasepool {afterCommand(result,runHooks:Self.requiresAfterCommand(method),timed:timing,method:method)} }
                 }}
             case .router(let method,let params,let caller):
                 let result: [String:Any]
                 do { result = try ServiceCallTiming.measure(timing,"execution_ms") { try coordinator.router.handle(method:method,params:params,caller:caller) } } catch { result = ["error":Self.publicError(error)] }
-                finish(result,timing:timing,runHooks:Self.requiresAfterCommand(method),reply:reply)
+                finish(result,timing:timing,runHooks:Self.requiresAfterCommand(method),method:method,reply:reply)
             }
         }}
     }
     /// These paths do not prepare managed reads/leases or repair availability.
     /// Keep hooks on other reads that can fall back to the writer.
     static func requiresAfterCommand(_ method:String) -> Bool {
-        !["service_info","tool_catalog","task_get","session_list","project_list","project_resolve"].contains(method)
+        !["service_info","tool_catalog","task_get","session_list","project_list","project_resolve","workspace_page","task_list","triage_list","epic_list"].contains(method)
     }
     /// On the serial queue.
-    func finish(_ result:[String:Any],timing:ServiceCallTiming? = nil,runHooks:Bool = true,reply:(Data)->Void) {
+    func finish(_ result:[String:Any],timing:ServiceCallTiming? = nil,runHooks:Bool = true,method:String = "",reply:(Data)->Void) {
         reply(Self.responseBytes(result,timing:timing))
-        afterCommand(result,runHooks:runHooks,timed:timing)
+        afterCommand(result,runHooks:runHooks,timed:timing,method:method)
     }
     static func responseBytes(_ result:[String:Any],timing:ServiceCallTiming?) -> Data {
         if let timing {return (try? timing.encode(result)) ?? Data("{}".utf8)}
         return (try? JSONSerialization.data(withJSONObject:result,options:[.sortedKeys])) ?? Data("{}".utf8)
     }
-    func afterCommand(_ result:[String:Any],runHooks:Bool = true,timed:ServiceCallTiming? = nil) {
+    func afterCommand(_ result:[String:Any],runHooks:Bool = true,timed:ServiceCallTiming? = nil,method:String = "") {
         // The selected pure reads cannot create deliveries or cleanup deadlines. Their hooks used
         // to re-read/project every pending native delivery after each reply.
         // Startup, committed writes and native/storage event hooks own those wakes.
         guard runHooks else { return }
         let started = ProcessInfo.processInfo.systemUptime
-        defer {if let timed {CallTimingLog.write(["scope":"service_hooks","request_id":timed.requestID,"total_ms":(ProcessInfo.processInfo.systemUptime-started)*1000])}}
+        defer {if let timed {CallTimingLog.write(["scope":"service_hooks","method":method,"request_id":timed.requestID,"start_uptime_s":started,"total_ms":(ProcessInfo.processInfo.systemUptime-started)*1000])}}
         if result["error"] == nil {
-            coordinator.changed();coordinator.dispatchNative()
-            coordinator.armStorageWake()
-            if coordinator.workHealthWake == nil && coordinator.workHealthFailures < 2 { coordinator.runWorkHealth() }
+            var phases: [String:Any] = ["scope":"service_hook_phases","method":method,"request_id":timed?.requestID ?? "","start_uptime_s":started]
+            func phase(_ name:String,_ body:()->Void) {
+                guard timed != nil else {body();return}
+                let start = ProcessInfo.processInfo.systemUptime
+                body()
+                phases[name] = (ProcessInfo.processInfo.systemUptime-start)*1000
+            }
+            phase("change_waiters_ms") { coordinator.changed() }
+            phase("native_dispatch_ms") { coordinator.dispatchNative() }
+            phase("storage_wake_ms") { coordinator.armStorageWake(diagnostics:timed != nil) }
+            phase("work_health_ms") {
+                if coordinator.workHealthWake == nil && coordinator.workHealthFailures < 2 { coordinator.runWorkHealth() }
+            }
+            if timed != nil {CallTimingLog.write(phases)}
         } else {
             // A failed/canceled backup also releases its retention barrier. Resume
             // deferred cleanup after either outcome, without waking during capture.

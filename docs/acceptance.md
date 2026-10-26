@@ -194,6 +194,7 @@ Change project/recipient and deliver a later host hold while a Refresh is pendin
 
 ### CL-258 / CL-6 backup and disposable restore
 
+- `history_list(project_id, entity:"backup")` returns agent and trusted-owner backup completion provenance, command/operation IDs, manifest digest and times under current worker project/workspace/session grants. Owner visibility is limited to captured projects; assistants, foreign scopes and revoked grants refuse. Pagination stays bounded with scope-bound cursors; legacy missing fields remain honest and unscoped legacy owner events remain hidden.
 - An enrolled worker creates and replays a complete backup in the published or named qualification folder with agent provenance; owner-only project policy, assistant role, arbitrary path, traversal and no-follow violations refuse.
 - A current-schema agent snapshot seeds an authorized disposable slot with identical database bytes/schema and no migration.
 - Owner-only native preview verifies every record family/table and managed file before confirmation. Wrong schema, changed digest, missing file or checksum failure leaves the working store and backup intact and publishes no candidate.

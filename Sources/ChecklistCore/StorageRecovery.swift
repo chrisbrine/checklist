@@ -147,7 +147,7 @@ extension CommandRouter {
             let prepared = try prepareStorageBackupReceipt(destination:destination,receipt:receipt,identity:identity,budget:budget)
             return try ArchiveStorageGate.withExclusive(root:root) { permit in
                 try dbQueue.writeWithoutTransaction { db in
-                    try self.commitStorageBackupReceipt(db,params:params,caller:caller,permit:permit,command:command,digest:digest,key:key,destination:destination,receipt:receipt,identity:identity,generation:prepared.generation,summary:prepared.summary)
+                    try self.commitStorageBackupReceipt(db,params:params,caller:caller,permit:permit,command:command,digest:digest,key:key,destination:destination,receipt:receipt,identity:identity,generation:prepared.generation,summary:prepared.summary,projectIDs:prepared.projectIDs)
                 }
             }
         }
@@ -198,14 +198,16 @@ extension CommandRouter {
         guard manifest.storeID.utf8.elementsEqual(identity.logical_store_id.utf8),manifest.sourceRoot.utf8.elementsEqual(root.path.utf8) else {throw CoreError("BACKUP_TARGET_MISMATCH","This backup belongs to another logical store or source root.")}
         return manifest
     }
-    private func prepareStorageBackupReceipt(destination: URL,receipt: StorageSnapshotReceipt,identity: StoreIdentityReceipt,budget: StorageSnapshotBudget) throws -> (generation: String,summary: JSON) {
+    private func prepareStorageBackupReceipt(destination: URL,receipt: StorageSnapshotReceipt,identity: StoreIdentityReceipt,budget: StorageSnapshotBudget) throws -> (generation: String,summary: JSON,projectIDs: [String]) {
         let manifestBytes = try StorageObjectFiles(root:destination).read("manifest.json",maximum:StorageSnapshotBudget.manifestByteLimit)
         guard hash(manifestBytes) == receipt.manifestSHA256 else {throw StorageSnapshotFailure.sourceChanged}
         let manifest = try currentBackupManifest(destination,identity:identity)
         var config = Configuration();config.readonly = true;config.prepareDatabase {try SchemaMigrations.installStorageCollation($0)}
         let copy = try DatabaseQueue(path:destination.appendingPathComponent("database.sqlite").path,configuration:config)
+        var projectIDs: [String] = []
         do {
             try copy.read { db in
+                projectIDs = try String.fetchAll(db,sql:"SELECT id FROM records WHERE type='project' ORDER BY id")
                 guard case .current(let captured) = try SchemaMigrations.inspect(db),
                       captured.logical_store_id.utf8.elementsEqual(identity.logical_store_id.utf8),
                       captured.incarnation.utf8.elementsEqual(identity.incarnation.utf8) else {throw CoreError("BACKUP_TARGET_MISMATCH","This captured database belongs to another store generation.")}
@@ -221,9 +223,9 @@ extension CommandRouter {
             "source_root":manifest.sourceRoot,"store_id":manifest.storeID,"captured_at":manifest.capturedAt as Any? ?? NSNull(),
             "verified_at":now(),"verification":"manifest_database_managed_files","manifest_sha256":receipt.manifestSHA256,"usage":usage]
         let generation: JSON = ["summary":summary,"format":1,"state":"complete","operation_id":receipt.operationID.uuidString.lowercased(),"manifest_sha256":receipt.manifestSHA256,"known_at":now(),"current_physical_verified":false,"objects":indexedObjects]
-        return (try jsonString(generation),summary)
+        return (try jsonString(generation),summary,projectIDs)
     }
-    private func commitStorageBackupReceipt(_ db: Database,params: JSON,caller: Caller,permit: ArchiveStoragePermit,command: String,digest: String,key: String,destination: URL,receipt: StorageSnapshotReceipt,identity: StoreIdentityReceipt,generation: String,summary: JSON) throws -> JSON {
+    private func commitStorageBackupReceipt(_ db: Database,params: JSON,caller: Caller,permit: ArchiveStoragePermit,command: String,digest: String,key: String,destination: URL,receipt: StorageSnapshotReceipt,identity: StoreIdentityReceipt,generation: String,summary: JSON,projectIDs: [String]) throws -> JSON {
         try permit.requireRoot(root)
         guard let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='store_identity'"),
               try StoreIdentityReceipt.decode(Data(raw.utf8)) == identity else {throw CoreError("BACKUP_TARGET_MISMATCH","The store generation changed during backup.")}
@@ -232,7 +234,7 @@ extension CommandRouter {
             try authorizeStorageBackup(db,params:params,caller:caller)
             try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
             let data: JSON = ["path":destination.path,"format":"checklist-store-snapshot","manifest_sha256":receipt.manifestSHA256,"operation_id":receipt.operationID.uuidString.lowercased(),"restore_supported":true,"status":"complete"]
-            try event(db,caller:caller,project:params["project_id"] as? String,entity:nil,kind:"backup_created",data:["origin":caller.isOwner ? "human_ui" : "agent","session_id":caller.sessionID ?? "","operation_id":receipt.operationID.uuidString.lowercased(),"manifest_sha256":receipt.manifestSHA256,"reason":try text(params,"reason",max:4000,required:false)])
+            try event(db,caller:caller,project:params["project_id"] as? String,entity:nil,kind:"backup_created",data:["origin":caller.isOwner ? "human_ui" : "agent","session_id":caller.sessionID ?? "","command_id":command,"operation_id":receipt.operationID.uuidString.lowercased(),"manifest_sha256":receipt.manifestSHA256,"captured_at":summary["captured_at"] ?? NSNull(),"verified_at":summary["verified_at"] ?? NSNull(),"project_ids":caller.isOwner ? projectIDs : [],"reason":try text(params,"reason",max:4000,required:false)])
             output = ["data":data,"command_id":command,"event_cursor":try self.cursor(db,caller:caller,scope:self.authorizationScope(db,caller))]
             try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[caller.principal,command,digest,try jsonString(output)])
             try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["backup-generation:" + receipt.operationID.uuidString.lowercased(),generation])

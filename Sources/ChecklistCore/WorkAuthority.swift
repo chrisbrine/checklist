@@ -70,6 +70,7 @@ extension CommandRouter {
     func validateWorkReservations(_ db: Database, candidate: JSON, excluding: Set<String> = [],batchContext: BatchClaimContext? = nil) throws {
         let pid = candidate["project_id"] as! String,project = try record(db,pid,type:"project")
         let files = candidate["file_scopes"] as? [JSON] ?? [],lanes = candidate["lane_scopes"] as? [JSON] ?? []
+        guard files.contains(where: {$0["access"] as? String == "write"}) || !lanes.isEmpty else {return}
         let others = try records(db,type:"attempt").filter {$0["state"] as? String == "active" && !excluding.contains($0["id"] as? String ?? "") && $0["id"] as? String != candidate["id"] as? String}
         for scope in files where scope["access"] as? String == "write" {
             let path = reservationKey(scope["path"] as! String)

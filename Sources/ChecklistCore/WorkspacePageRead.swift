@@ -1,6 +1,15 @@
 import Foundation
 import GRDB
 
+private struct WorkspaceTaskIdentity: Hashable {
+    let project: SnapshotRecordIdentity
+    let task: SnapshotRecordIdentity
+    init(project: String,task: String) {
+        self.project = SnapshotRecordIdentity(project)
+        self.task = SnapshotRecordIdentity(task)
+    }
+}
+
 extension CommandRouter {
     /// Owner workspace surfaces keep one bounded value, separate from the full
     /// snapshot index. An omitted row never means that the record was deleted.
@@ -85,15 +94,18 @@ extension CommandRouter {
         }
         let total = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM ("+select+predicate+")",arguments:args) ?? 0
         let fetched = try Row.fetchAll(db,sql:select+predicate+order+" LIMIT :limit OFFSET :offset",arguments:args)
+        let selectedRows = Array(fetched.prefix(limit))
+        let cleanedCounts = surface == "activity" ? [:] : try workspaceCleanedOriginalCounts(db,rows:selectedRows)
         var rows: [JSON] = []
-        for row in fetched.prefix(limit) {
+        for row in selectedRows {
             if surface == "activity" {
                 rows.append(["id":row["id"] as String,"project_id":row["project_id"] as String,"entity_id":row["entity_id"] as String? ?? "","actor":row["actor"] as String,"kind":row["kind"] as String,"occurred_at":row["occurred_at"] as String,"data":jsonObject(row["data"])])
                 continue
             }
             let envelope=try GRDBRecordEnvelopeAdapter.decode(row)
             let raw = envelope.object,type = envelope.type
-            var value = type == "task" ? try selectedTaskProjection(db,task:raw) : contextRecord(raw,type:type,caller:c)
+            let taskKey = WorkspaceTaskIdentity(project:raw["project_id"] as? String ?? "",task:raw["id"] as? String ?? "")
+            var value = type == "task" ? try selectedTaskProjection(db,task:raw,cleanedOriginalCount:cleanedCounts[taskKey] ?? 0) : contextRecord(raw,type:type,caller:c)
             if type == "request",let taskID = raw["task_id"] as? String,let task = try? scoped(db,taskID,raw["project_id"] as! String,type:"task") {
                 value["task_key"] = task["key"];value["task_title"] = task["title"];value["selected_task"] = try selectedTaskProjection(db,task:task)
                 if surface == "record" {value=try workspaceRequestDetail(db,value,task:task,caller:c)}
@@ -136,6 +148,20 @@ extension CommandRouter {
                 "next_cursor":fetched.count>limit ? try cursor(db,caller:c,scope:cursorScope,sequence:offset+limit) : NSNull(),
                 "previous_cursor":offset>0 ? try cursor(db,caller:c,scope:cursorScope,sequence:max(0,offset-limit)) : NSNull()]
         return page.merging(metadata) {_,shared in shared}
+    }
+
+    /// Count cleanup facts once for the selected page, rather than scanning a
+    /// project's attachment history separately for every displayed task. These
+    /// values live only in this pinned read; no projected result is cached.
+    private func workspaceCleanedOriginalCounts(_ db: Database,rows: [Row]) throws -> [WorkspaceTaskIdentity:Int] {
+        let tasks = rows.filter {($0["type"] as String) == "task"}
+        guard !tasks.isEmpty else {return [:]}
+        let projects = tasks.map {$0["project_id"] as String}
+        let ids = tasks.map {$0["id"] as String}
+        let counts = try Row.fetchAll(db,sql:"SELECT project_id,json_extract(data,'$.task_id') task_id,COUNT(*) clean_count FROM records WHERE type='attachment' AND project_id IN (SELECT value FROM json_each(?)) AND json_extract(data,'$.task_id') IN (SELECT value FROM json_each(?)) AND json_extract(data,'$.availability')='original_cleaned' GROUP BY project_id,json_extract(data,'$.task_id') COLLATE BINARY",arguments:[try jsonString(projects),try jsonString(ids)])
+        var result: [WorkspaceTaskIdentity:Int] = [:]
+        for row in counts {result[WorkspaceTaskIdentity(project:row["project_id"] as String,task:row["task_id"] as String)] = row["clean_count"] as Int}
+        return result
     }
     /// Overview groups by what needs the owner (CL-53). Each is an ordinary paged task surface with an
     /// exact total; together they derive from existing ticket, attempt and session records only.

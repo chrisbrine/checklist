@@ -643,6 +643,14 @@ final class ChecklistStore: ObservableObject {
                 self.selectedTicketLoading = false
                 if self.isReadCancellation(error) {
                     if self.selectedRecordsReadID == recordsReadID {self.selectedRecordsLoading = false}
+                    // Complete coverage for another ticket can retire a search
+                    // page's epoch while this first detail is still in flight.
+                    // Keep the old reply fenced, then read the current epoch;
+                    // a canceled/superseded selection never starts replacement work.
+                    if !Task.isCancelled, self.selectedReadEpoch != self.contentEpoch,
+                       self.isSelectedTicket(id), self.projectID.map(RecordIdentity.init) == scope {
+                        self.scheduleSelectedTicket(for:self.detail)
+                    }
                     return
                 }
                 if let failure = error as? ChecklistError, ["NOT_FOUND", "FORBIDDEN", "DENIED"].contains(failure.code) {
@@ -1532,7 +1540,7 @@ final class ChecklistStore: ObservableObject {
         if let requestTransport {reply=try await requestTransport(method,params)}
         else {reply=try await NativeServiceTransport.call(method,params)}
         let transportMS = Int((liveNow() - transportStart) * 1000)
-        if ["task_list","workspace_page","task_context"].contains(method) {
+        if ["task_list","workspace_page","task_context","changes_wait"].contains(method) {
             // Service timings are optional; -1 explicitly means not supplied.
             let timing = reply["_checklist_timing"] as? [String:Any] ?? [:]
             let queueMS = (timing["queue_wait_ms"] as? Double).map(Int.init) ?? -1
@@ -1929,7 +1937,9 @@ final class ChecklistStore: ObservableObject {
             guard let source = known.max(by: {$0.integer("revision") < $1.integer("revision")}) else {continue}
             let displayedRevision = source.integer("revision")
             floors[key] = max(floors[key] ?? 0,max(revision,displayedRevision))
-            guard revision > displayedRevision else {continue}
+            // The list can already have this revision while the mounted detail
+            // is still older. Only destinations behind the commit need a patch.
+            guard revision >= displayedRevision, known.contains(where: {$0.integer("revision") < revision}) else {continue}
             if retireReads, installed == 0 {
                 // These page replies may have pinned a snapshot before the
                 // read-ahead status. Retire even empty replies before publishing.
@@ -1943,7 +1953,7 @@ final class ChecklistStore: ObservableObject {
             // stays visibly refreshing and cannot authorize selected actions.
             let fields = values.filter {["id","project_id","revision","status_id","status_name","status_category","archived","trashed"].contains($0.key)}
             let task = Record(values:source.values.merging(fields) {_,new in new})
-            if var display = selectedTicketDisplay, StatusIdentity(display.task) == key {
+            if var display = selectedTicketDisplay, StatusIdentity(display.task) == key, display.task.integer("revision") < revision {
                 display.task = Record(values:display.task.values.merging(fields) {_,new in new})
                 selectedTicketDisplay = display
             }

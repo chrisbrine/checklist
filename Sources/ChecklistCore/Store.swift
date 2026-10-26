@@ -132,7 +132,13 @@ public final class CommandRouter: @unchecked Sendable {
         return value
     }
     func records(_ db: Database, type: String, project: String? = nil) throws -> [JSON] {
-        var query = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type = CAST(? AS TEXT)"
+        // The project catalog is small, but a type-only table scan touches every
+        // large retained history payload on a cold store. Enumerate its rowids
+        // from the existing narrow scope index, then load only those records.
+        let catalog = type == "project" && project == nil
+        var query = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE " + (catalog
+            ? "rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type = CAST(? AS TEXT))"
+            : "type = CAST(? AS TEXT)")
         var arguments: [DatabaseValueConvertible] = [Data(type.utf8)]
         if let project {
             if type == "session" { query += " AND " + Self.sessionProjectCandidate; arguments += [Data(project.utf8),Data(project.utf8)] }

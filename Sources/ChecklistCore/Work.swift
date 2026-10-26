@@ -68,6 +68,15 @@ extension CommandRouter {
             if let acceptedVerdictIDs,!acceptedVerdictIDs.contains(verdictID) { throw CoreError("EVIDENCE_STALE","The accepted verdict list omits a current required gate.") }
         }
     }
+    /// The implementation guard needs only the category. Preserve the full
+    /// projection's scoped status refusal and legacy absent-status fallback;
+    /// display and context projections still run after the claim is installed.
+    func implementationClaimCategory(_ db: Database,task: JSON) throws -> String {
+        if let statusID = task["status_id"] as? String {
+            return try scoped(db,statusID,task["project_id"] as! String,type:"status")["category"] as? String ?? "queued"
+        }
+        return task["status_category"] as? String ?? "queued"
+    }
     func work(_ db: Database,_ p: JSON,_ c: Caller,_ method: String,operation: TicketStatusOperation = .individual,batchContext: BatchClaimContext? = nil) throws -> JSON {
         try worker(c); let pid = try scope(db,p,c,write:true)
         if method == "task_complete" {
@@ -125,13 +134,13 @@ extension CommandRouter {
                 a["review_requirement_snapshot"] = try pinReviewRequirement(db,project:project,task:t)
                 if let captured = manifest["policy_snapshot"] as? JSON { a["policy_snapshot"] = captured } else { a["policy_snapshot"] = try attemptPolicy(db,try scoped(db,manifest["attempt_id"] as! String,pid,type:"attempt")) }; a["policy_revision"] = manifest["policy_revision"] ?? a["policy_revision"]; a["review_request_id"] = rid; a["manifest_id"] = request["manifest_id"]; a["gate"] = request["gate"]; request["state"] = "active"; try save(db,revised(request),type:"review_request")
             } else {
-                let cat = try taskProjection(db,t)["status_category"] as? String ?? "queued"
+                let cat = try implementationClaimCategory(db,task:t)
                 guard ["queued","blocked"].contains(cat) else { throw CoreError("INVALID_TRANSITION","Queue a Parked task before pickup.") }
             }
             let token = uuid()+uuid(); a["token_hash"] = hash(Data(token.utf8)); try save(db,a,type:"attempt")
             // A new implementation round ends any release-set hold of an earlier pass (CL-45).
             if phase != "review" { t.removeValue(forKey:"release_hold") }
-            t["active_attempt_id"] = a["id"]; t["status_id"] = try status(db,pid,phase == "review" ? "review" : "active")["id"]; t = revised(t); try save(db,t,type:"task"); try recordTicketStatusAction(db,task:t,caller:c,operation:operation); try event(db,caller:c,project:pid,entity:t["id"] as? String,kind:"work_claimed",data:["attempt_id":a["id"]!,"phase":phase]); a.removeValue(forKey:"token_hash"); a["claim_token"] = token; a["task"] = try taskProjection(db,t);a["context"] = try compactTaskContext(db,task:t,caller:c);return a
+            t["active_attempt_id"] = a["id"]; t["status_id"] = try status(db,pid,phase == "review" ? "review" : "active")["id"]; t = revised(t); try save(db,t,type:"task"); try recordTicketStatusAction(db,task:t,caller:c,operation:operation); try event(db,caller:c,project:pid,entity:t["id"] as? String,kind:"work_claimed",data:["attempt_id":a["id"]!,"phase":phase]); a.removeValue(forKey:"token_hash"); a["claim_token"] = token; a["task"] = try taskProjection(db,t);a["context"] = try compactTaskContext(db,task:t,caller:c,directionAttempt:a);return a
         }
         var a = try claimAttempt(db,p,c,pid); var t = try scoped(db,a["task_id"] as! String,pid,type:"task")
         try verifyPolicyAuthority(db,attempt:a,caller:c,requireAcknowledgment: !["work_checkpoint","work_release"].contains(method))

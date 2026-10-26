@@ -439,6 +439,18 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(len(set(selector.ISOLATED_TESTS)), len(selector.ISOLATED_TESTS))
         self.assertFalse(set(selector.ISOLATED_TESTS) & set(selector.QUALIFICATION_CASES))
 
+    def test_screen_query_plans_are_qualification_only_and_follow_their_source(self):
+        case = 'ChecklistCoreTests.ScreenReadQueryPlanTests/testRealSizeScreenReadQueryPlans'
+        default = self.plan(full=True)
+        self.assertIn(case, default['skip'])
+        self.assertEqual(default['qualification_commands'], [])
+        self.assert_case_runs(self.plan(full=True, qualification=True), case)
+        path = self.root / 'Tests/ChecklistCoreTests/ScreenReadQueryPlanTests.swift'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('final class ScreenReadQueryPlanTests: XCTestCase { func testRealSizeScreenReadQueryPlans() throws {} }')
+        self.assert_case_runs(self.plan(path.relative_to(self.root).as_posix()), case)
+        self.assert_case_runs(self.plan('Sources/ChecklistCore/WorkspacePageRead.swift'), case)
+
     def test_manifest_production_change_runs_real_size_qualification(self):
         case, = selector.REAL_SIZE_TESTS
         plan = self.plan('Sources/ChecklistCore/StorageCompactManifest.swift')

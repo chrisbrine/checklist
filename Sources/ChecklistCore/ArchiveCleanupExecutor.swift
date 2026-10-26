@@ -246,8 +246,12 @@ extension CommandRouter {
     /// Service uses a one-shot deadline, never a polling/model timer. Held work
     /// resumes on a relevant command or an expiring actual reader/backup lease.
     public func nextArchiveCleanupDeadline() throws -> Date? {
+        let lease = try storageAdmission.acquire();defer {lease.finish()}
         if try StorageSnapshotRetention.isActive(root:root) {return Date().addingTimeInterval(60)}
-        return try dbQueue.read { db in
+        // Pure scheduling metadata must not occupy the writer while retained
+        // storage-job JSON is inspected. Retry/yield properties are lock-backed;
+        // the service coalesces a fresh plan after concurrent command activity.
+        return try readForPreparation { db in
             let nowMS = self.archiveCleanupNowMS()
             let deadline = try Int64.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.not_before_ms') AS INTEGER)) FROM records WHERE type='cleanup_job' AND json_valid(data) AND json_extract(data,'$.state') IN ('queued','ready')")
             let expiry = try Double.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.expires_at') AS REAL)) FROM records WHERE type='storage_hold' AND json_valid(data) AND json_extract(data,'$.state')='active' AND CAST(json_extract(data,'$.expires_at') AS REAL)>?",arguments:[Date().timeIntervalSince1970])

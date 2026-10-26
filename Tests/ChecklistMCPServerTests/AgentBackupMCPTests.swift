@@ -19,7 +19,7 @@ final class AgentBackupMCPTests: XCTestCase {
         let owner = Caller(role:"owner",installation:"mcp-backup-owner",projectIDs:[])
         let projectID: String
         let taskID: String
-        let caller: Caller
+        var caller: Caller
         private let lock = NSLock()
         private var backupCalls = 0
         private var backupFinished = false
@@ -144,6 +144,47 @@ final class AgentBackupMCPTests: XCTestCase {
             XCTAssertEqual(row["actor"] as String,f.caller.principal)
             XCTAssertEqual(jsonObject(row["data"])["origin"] as? String,"agent")
         }
+        try await client.ping()
+    }
+
+    func testMCPBackupHistoryReturnsAgentAndOwnerProvenanceAndRefusesScopeAndGrants() async throws {
+        let f = try Fixture(),client = try await start(f),params = arguments(f)
+        _ = try verifiedBackup(try await client.callTool(name:"backup_create",arguments:params),f)
+        let ownerCommand = UUID().uuidString
+        _ = try f.router.handle(method:"backup_create",params:["command_id":ownerCommand,"path":f.base.appendingPathComponent("owner-backup").path],caller:f.owner)
+        let input: [String:MCP.Value] = ["project_id":.string(f.projectID),"entity":.string("backup")]
+        let reply = try await client.callTool(name:"history_list",arguments:input)
+        XCTAssertFalse(reply.isError ?? false,text(reply))
+        let envelope = try JSONSerialization.jsonObject(with:Data(text(reply).utf8)) as! [String:Any]
+        let events = (envelope["data"] as! [String:Any])["events"] as! [[String:Any]]
+        XCTAssertEqual(events.count,2)
+        for (event,origin,actor,command,session) in [(events[0],"agent",f.caller.principal,params["command_id"]!,f.caller.sessionID!), (events[1],"human_ui",f.owner.principal,MCP.Value.string(ownerCommand),"")] {
+            XCTAssertEqual(event["actor"] as? String,actor)
+            XCTAssertNotNil(event["occurred_at"] as? String)
+            let data = event["data"] as! [String:Any]
+            XCTAssertEqual(data["origin"] as? String,origin)
+            XCTAssertEqual(data["session_id"] as? String,session)
+            XCTAssertEqual(MCP.Value.string(data["command_id"] as! String),command)
+            for key in ["operation_id","manifest_sha256","captured_at","verified_at"] {XCTAssertNotNil(data[key] as? String)}
+            XCTAssertNil(data["project_ids"]);XCTAssertNil(data["path"])
+        }
+        let foreign = try await client.callTool(name:"history_list",arguments:["project_id":.string(UUID().uuidString),"entity":.string("backup")])
+        XCTAssertTrue(foreign.isError ?? false);XCTAssertTrue(text(foreign).contains("FORBIDDEN"),text(foreign))
+        f.caller = Caller(role:"worker",installation:"mcp-backup-worker",projectIDs:[],sessionID:f.context.nativeSessionID,workspace:f.workspace.path)
+        let revoked = try await client.callTool(name:"history_list",arguments:input)
+        XCTAssertTrue(revoked.isError ?? false);XCTAssertTrue(text(revoked).contains("FORBIDDEN"),text(revoked))
+        try await client.ping()
+    }
+
+    func testMCPAssistantCannotDiscoverOrReadBackupHistory() async throws {
+        let f = try Fixture(role:"assistant")
+        f.caller = Caller(role:"assistant",installation:"mcp-backup-assistant",projectIDs:[f.projectID],assistantGrants:[f.projectID:["read":true]])
+        let client = try await start(f),tools = try await client.listTools()
+        let history = try XCTUnwrap(tools.tools.first {$0.name == "history_list"})
+        let schema = try JSONSerialization.jsonObject(with:JSONEncoder().encode(history.inputSchema)) as! [String:Any]
+        XCTAssertEqual(((schema["properties"] as! [String:Any])["entity"] as! [String:Any])["enum"] as? [String],["project"])
+        let reply = try await client.callTool(name:"history_list",arguments:["project_id":.string(f.projectID),"entity":.string("backup")])
+        XCTAssertTrue(reply.isError ?? false);XCTAssertTrue(text(reply).contains("FORBIDDEN"),text(reply))
         try await client.ping()
     }
 

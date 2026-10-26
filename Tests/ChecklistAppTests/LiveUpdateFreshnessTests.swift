@@ -149,6 +149,34 @@ import ChecklistIPC
         }
     }
 
+    func testNewerTicketsPageDoesNotSuppressCoverageForOlderSelectedDetail() async throws {
+        for grouped in [false,true] {
+            let f = Fixture(isolatedDefaults("TicketsStatusAfterPage").preferences)
+            f.inTriage = grouped
+            let store = f.store(), live = Task {await store.startLiveUpdates()}
+            defer {live.cancel();store.stopWindowReads();f.cleanup()}
+            try await until {f.wait != nil}
+            store.open(.task("a"));try await until {store.selectedTicketCurrent("a")}
+            f.holdContext = true
+            f.commit()
+            store.retryTicketPage()
+            try await until {self.shownStatus(store,page:.tasks) == "Review"}
+            XCTAssertEqual(store.selectedTask("a")?.string("status_name"),"In progress")
+            f.statusCoverage = true;f.holdList = true;f.holdContext = true
+            let apply = Task {await store.applyChangeCoverage(f.changes())};defer {apply.cancel()}
+            try await until {f.held.contains {$0.0 == "task_list"} && f.held.contains {$0.0 == "task_context"}}
+            XCTAssertEqual(shownStatus(store,page:.tasks),"Review")
+            XCTAssertEqual(store.selectedTask("a")?.string("status_name"),"Review",
+                           "A list at the coverage revision must not suppress the same committed status for an older detail")
+            XCTAssertFalse(store.selectedTicketCurrent("a"))
+            XCTAssertEqual(cursor(store),"c0")
+            f.holdList = false;f.holdContext = false
+            while !f.held.isEmpty {f.release(f.held[0].0)}
+            let accepted = await apply.value;XCTAssertTrue(accepted)
+            XCTAssertTrue(store.selectedTicketCurrent("a"));XCTAssertEqual(cursor(store),"c1")
+        }
+    }
+
     func testTicketsCommittedStatusReadAheadFencesEarlierPageWithoutAcknowledgingIt() async throws {
         let f = Fixture(isolatedDefaults("TicketsStatusReadAhead").preferences)
         f.inTriage = true
@@ -519,6 +547,29 @@ import ChecklistIPC
             XCTAssertEqual(store.selectedTask("a")?.string("status_name"),"Queued")
             XCTAssertEqual(cursor(store),"c2","The earlier interval cannot cover a later commit")
         }
+    }
+
+    func testFirstDetailReplacesEpochRetiredByAnotherTicketsSearchChange() async throws {
+        let f = Fixture(isolatedDefaults("FirstDetailSearchCoverage").preferences)
+        let store = f.store(), live = Task {await store.startLiveUpdates()}
+        defer {live.cancel();store.stopWindowReads();f.cleanup()}
+        try await until {f.wait != nil}
+        store.search = "Fixture"
+        try await until {!store.ticketPageLoading}
+        f.holdContext = true;store.open(.task("a"))
+        try await until {f.held.contains {$0.0 == "task_context"}}
+        XCTAssertNil(store.selectedTask("a"),"This is the first visit, with no cached detail")
+        f.version = "v2"
+        let changes: [String:Any] = ["changed":true,"event_cursor":"c1","coverage":["schema_version":2,"complete":true,"reset":false,"changes":[["project_id":"p","families":["messages"],"task_ids":["b"],"all_tasks":false]]]]
+        let accepted = await store.applyChangeCoverage(changes)
+        XCTAssertTrue(accepted)
+        // The old v1 reply is obsolete even though the selected task was not
+        // touched. A fresh v2 read must replace it without a watchdog or another event.
+        f.holdContext = false;f.release("task_context")
+        try await until {store.selectedTicketCurrent("a")}
+        XCTAssertEqual(store.selectedTask("a")?.string("title"),"Fixture")
+        XCTAssertEqual(f.calls.filter {$0 == "task_context"}.count,2)
+        XCTAssertNil(store.selectedTicketError)
     }
 
     func testDelayedOlderReplyAndSelectionSwitchRemainFenced() async throws {
