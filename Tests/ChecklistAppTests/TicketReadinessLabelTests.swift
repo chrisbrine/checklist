@@ -2,7 +2,7 @@ import XCTest
 @testable import ChecklistApp
 
 /// Draft means the brief needs refinement; a Ready ticket that waits for prerequisites stays out of Drafts (CL-133).
-final class TicketReadinessLabelTests: XCTestCase {
+@MainActor final class TicketReadinessLabelTests: XCTestCase {
     private func ticket(_ id: String, _ key: String, readiness: String, waitsFor blockers: [String], category: String = "queued") -> Record {
         Record(values: ["id": id, "key": key, "title": key, "project_id": "p", "readiness": readiness, "status_category": category, "status_name": "Queued", "updated_at": "2026-10-19T00:00:00Z",
                         "prerequisite_blockers": blockers.map { ["key": $0, "reason": "Prerequisite \($0) must be Done."] as [String: Any] }])

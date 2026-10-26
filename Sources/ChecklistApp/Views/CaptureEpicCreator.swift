@@ -3,7 +3,7 @@ import SwiftUI
 /// Empty-project capture creates only the Epic for the concrete ticket being entered.
 struct CaptureEpicCreator: View {
     let projectID: String
-    let request: (String,[String:Any]) async throws -> [String:Any]
+    let request: @MainActor (String,[String:Any]) async throws -> [String:Any]
     let created: (Record) -> Void
     @State private var name = ""
     @State private var pending: [String:Any]?

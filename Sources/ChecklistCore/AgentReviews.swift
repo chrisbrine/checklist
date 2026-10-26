@@ -1,4 +1,5 @@
 import Foundation
+import os
 import ChecklistProviders
 import GRDB
 import Darwin
@@ -6,7 +7,8 @@ import Darwin
 /// Only this fresh O_EXCL report can be discarded on its creating transaction's
 /// rollback. Production dispatch retains the object gate until rollback ends,
 /// so no backup can have inventoried it. This is not a general capture bypass.
-private final class UncommittedReviewReport {
+private final class UncommittedReviewReport: Sendable {
+    private let rolledBack = OSAllocatedUnfairLock(initialState: false)
     private let directory: Int32
     private let name: String
     private let identity: stat
@@ -22,11 +24,14 @@ private final class UncommittedReviewReport {
     }
     deinit {Darwin.close(directory)}
     func rollback() {
-        var current = stat()
-        guard fstatat(directory,name,&current,AT_SYMLINK_NOFOLLOW) == 0,current.st_mode & S_IFMT == S_IFREG,
-              current.st_dev == identity.st_dev,current.st_ino == identity.st_ino,current.st_size == identity.st_size,
-              current.st_mtimespec.tv_sec == identity.st_mtimespec.tv_sec,current.st_mtimespec.tv_nsec == identity.st_mtimespec.tv_nsec else {return}
-        if unlinkat(directory,name,0) == 0 {_ = fsync(directory)}
+        rolledBack.withLock { done in
+            guard !done else { return }; done = true
+            var current = stat()
+            guard fstatat(directory,name,&current,AT_SYMLINK_NOFOLLOW) == 0,current.st_mode & S_IFMT == S_IFREG,
+                  current.st_dev == identity.st_dev,current.st_ino == identity.st_ino,current.st_size == identity.st_size,
+                  current.st_mtimespec.tv_sec == identity.st_mtimespec.tv_sec,current.st_mtimespec.tv_nsec == identity.st_mtimespec.tv_nsec else {return}
+            if unlinkat(directory,name,0) == 0 {_ = fsync(directory)}
+        }
     }
 }
 

@@ -1,83 +1,102 @@
 # Swift concurrency checking (CL-86)
 
 The root manifest enables complete concurrency checking for every Swift target.
-ChecklistProviders, ChecklistIPC, ChecklistBridges, ChecklistMCPServer,
-ChecklistService, ChecklistCLI and the build-only ChecklistProducts use Swift 6 language mode. The independent
-ChecklistShared manifest keeps ChecklistDomain, ChecklistContracts and
-ChecklistApplication in Swift 6; no shared target is relaxed.
+ChecklistCore, ChecklistApp, ChecklistProviders, ChecklistIPC, ChecklistBridges,
+ChecklistMCPServer, ChecklistService, ChecklistCLI and the build-only
+ChecklistProducts use Swift 6 language mode. The independent ChecklistShared
+manifest keeps ChecklistDomain, ChecklistContracts and ChecklistApplication in
+Swift 6; no shared target is relaxed.
 
-The remaining root adapters and fixtures temporarily use Swift 5 language mode
-with complete checking. This is an explicit migration boundary, not a claim that
-warnings are safe or that an unchecked Sendable conformance proves isolation.
-Switching the remaining adapters to Swift 6 was checked and fails on legacy
-shared state and isolation boundaries. The per-location audit below records the remaining findings and repair
-boundaries. Do not add blanket unchecked conformances, preconcurrency imports or
-diagnostic suppression to make this conversion appear complete.
+Test/probe targets retain Swift 5 with complete checking. Their callbacks now use
+lock-owned state, actor-owned harnesses and independent wire-value copies; Swift 5
+is a compatibility boundary for XCTest fixtures, not a warning exemption.
+StorageReleasedCoreFixture remains a frozen historical crash/recovery input.
+The C/Objective-C compatibility targets have no Swift language settings.
 
-## Fixed risks and ownership
+## Ownership repairs
 
 The router's old mutable lifecycle callback is absent: the service coordinator
-owns command hooks on its serial queue. CommandRouter still has an unchecked
-conformance relying on GRDB writer serialization, per-read snapshots, preparation
+owns command hooks on its serial queue. CommandRouter's existing unchecked
+conformance relies on GRDB writer serialization, per-read snapshots, preparation
 locks and the serialized maintenance lane. Its lifecycle owner must drain work
 before closeStore; closeStore itself does not establish that drain.
 
-ChecklistClient registration state is contained in an OSAllocatedUnfairLock.
-Detached unregister tasks own their SMAppService instance and return a copied
-error string through a separate lock. XPC completion state is contained in one
-lock; only the first reply/interruption/invalidation signals its waiter. Async
-calls transfer JSON Data across dispatch, decoding a local graph on each side.
-The public error's arbitrary Any details remain a separate unresolved boundary.
+ChecklistClient registration, detached unregister errors and XPC completion state
+are owned by locks. Only the first reply/interruption/invalidation signals its
+waiter. Async calls transfer JSON Data across dispatch, decoding an independent
+graph on each side. The UI Data entrypoint validates JSON before serialization
+to retain the original catchable rejection of unsupported request values. Bridge retains a dedicated serial dispatch executor for its
+blocking IPC/bootstrap/child waits; actor jobs cannot overtake a waiting job.
 
-Bridge has a dedicated serial dispatch executor. Its synchronous IPC, bootstrap
-and child-process waits run on that executor, preserving actor serialization
-without blocking a Swift cooperative worker. This does not make IPC asynchronous
-or permit another Bridge job to overtake a waiting job.
+Core pipe readers write into one lock-owned result tuple. EpicReferenceIndex has
+separate lock-owned lifecycle and page-work state, preserving writer lock order
+and commit-before-offset publication. The review-report rollback token is
+immutable except for its lock-owned once flag. Database preparation is Sendable.
+The folder reaper still serializes native helper operations on its own queue and
+owns child IDs in a lock. PinnedRoots contains weak entries in one private lock;
+its narrow unchecked state exists only to retain roots for immutable descriptor
+and gate access, never to expose per-operation mutable batch state.
 
-RecordOrdering's former static ISO8601DateFormatter instances already reside in
-one locked bounded cache in the inherited source; its private fields cannot
-escape. RequestRowPresentation now also contains both parsers in one lock and
-returns only Date values. Its unchecked lock-state initializer is narrow: no
-formatter reference leaves the critical section. Work-health defaults and cleanup
-schema dictionaries are computed fresh instead of sharing non-Sendable Any graphs.
+RecordOrdering and RequestRowPresentation retain their locked formatter caches;
+no formatter reference escapes. Work-health defaults and cleanup schemas produce
+fresh JSON graphs. ChecklistError now stores recursive immutable diagnostic
+values and reconstructs independent details on access: JSON dictionaries, arrays,
+null, Boolean, signed/unsigned integers, floating point and strings retain their
+values; Data, Date, URL and UUID are value snapshots. Unsupported arbitrary
+reference payloads become their captured String(reflecting:) diagnostic text.
+This is an explicit tightening of the formerly arbitrary Any initializer:
+unsupported objects are no longer retained or shared. It preserves field names
+and current wire diagnostics, including command_id and reason. It does not claim
+unsupported objects are valid JSON or silently certify their thread safety.
 
-## Remaining boundaries
+Service mutable coordinator state stays on its command queue; native listener
+startup/continuation reads use that lane. Dispatch workers receive immutable
+metadata, JSON Data, caller/enrollment values and a Sendable timing accumulator.
+The XPC reply owner atomically takes its callback once. Deferred reply state
+retains the original connection lifetime and reads it only on the command lane.
+Narrow unchecked owners document those invariants beside their declarations.
+These rules preserve admission, pooled reads, replies and cleanup wake ordering.
 
-Core stays in Swift 5 while captured process-pipe results, database callbacks,
-reference-index observers and native storage helper caches acquire explicit
-Sendable ownership. Replacing Any-backed records and errors needs a value/codec
-contract, coordinated with CL-88; storage callbacks/helpers overlap CL-99.
-Do not move them into shared packages merely to avoid checking them.
+App UI callbacks and transports now explicitly belong to MainActor. Selected
+record recovery retains its display inside an actor-owned result object; overview
+task groups send immutable query values and call actor methods. Preview worker
+inputs and authorization replies cross as Data. AuthorizedPreviewFile stores only
+immutable Sendable values and reconstructs source records locally. PDFDocument
+initialization stays off the UI actor; a sending parameter transfers its unique
+worker region into a MainActor owner before publication; media workers return CGImage values before
+UI image construction. UI caches and modal/file-panel helpers are MainActor.
+Isolated deinit keeps native observer cleanup on that actor. AX installation and
+scrolling enforce/check the main thread at their synchronous Objective-C entry.
+Inspection, termination and file-storage callbacks declare their actual Sendable
+or actor ownership. Cancellation, generation and scope fences remain in place.
 
-IPC compiles in Swift 6, but ChecklistError.details still publicly accepts arbitrary
-[String: Any]. Serializing it silently would reject, discard or trap on values
-that its nonthrowing initializer currently preserves. Define and test the error
-value contract before changing its stored representation.
+Fixture counters and pending confirmation state now have lock/actor owners.
+Held Any replies are copied through JSON Data before continuation transfer, so a
+fixture's retained graph is never sent to a reader. Concurrent fixture budgets
+are initialized in their worker; mutable records are projected or independently
+constructed. The original assertions, temporary keychain and native AX setup are
+retained.
 
-Service also compiles in Swift 6, with warnings for dispatch callbacks capturing
-the coordinator, peer/XPC reply closures, timing state and Any request/reply graphs. Queue-confined
-ownership needs to be expressed and verified across the exact signed XPC path;
-an annotation alone would not protect those objects.
+## Bounded legacy API exceptions (CL-85)
 
-App stays in Swift 5 because preview tasks return Any graphs or PDFDocument,
-loader/file-inspection/termination callbacks cross isolation boundaries, and
-AppKit accessibility/window/cache callbacks need explicit main-actor ownership.
-SwiftUI environment defaults also retain non-Sendable closures. Converting these
-requires updating their callers and native lifecycle tests together; this pass
-does not change their UI behavior or claim those races are resolved.
+Credential CRUD continues to use SecItem. The following compatibility calls keep
+their arguments and behavior in small C/Objective-C targets. Each implementation
+has a local clang diagnostic push/ignored -Wdeprecated-declarations/pop around
+only the legacy calls, with its compatibility reason. No Swift-wide deprecation
+or concurrency warning suppression is used.
 
-Test/probe targets stay in Swift 5 with complete checking because legacy mutable
-fixture counters, lock-protected captured variables, Any test records and native
-fake callbacks need their own checked state containers/isolation. Preserve their
-assertions; do not weaken tests or mark every fake unchecked to compile in Swift 6.
-StorageReleasedCoreFixture is a frozen historical crash/recovery input and is
-not rewritten as part of the current language migration.
+| Target / calls | Compatibility reason |
+| --- | --- |
+| ChecklistLegacyKeychain: SecKeychainGetUserInteractionAllowed / SecKeychainSetUserInteractionAllowed | Read, disable and restore the process-wide file-keychain interaction flag; LAContext does not replace file-based ACL UI control. |
+| ChecklistLegacyKeychain: SecTrustedApplicationCreateFromPath / SecAccessCreate | Preserve the exact ChecklistApp/ChecklistService/checklist executable ACL for existing file-keychain items. Access groups/data protection would change credential placement and sharing. |
+| ChecklistKeychainTestFixture: SecKeychainCreate / SecKeychainDelete, with the production ACL/interaction wrappers | Create and remove only the isolated file-keychain fixture; retain old-item compatibility and denied foreign-ACL/no-prompt coverage. SecItem cannot create/delete this keychain. |
+| ChecklistAXTestSupport: NSObject accessibilityAttributeValue / accessibilitySetValue:forAttribute: | Read, enable and restore the literal AXEnhancedUserInterface fixture state. The modern NSAccessibility protocol has no equivalent property; removing setup changes native AX publication. |
 
-Legacy Keychain and native AX deprecation warnings remain visible. Credential
-CRUD already uses SecItem. The remaining file-keychain interaction/ACL APIs and
-AXEnhancedUserInterface fixture setup have no established supported equivalent
-with the same behavior. Credential migration or changing that native harness
-requires explicit scope and qualification, not suppression of these diagnostics.
+The exception contains SDK deprecation diagnostics at the compatibility boundary;
+it does not modernize these APIs, migrate credentials, weaken ACLs or replace the
+native test harness. Swift callers invoke typed wrappers. Signed installed
+credential continuity and real UI responsiveness still need exact-stage native
+qualification.
 
 ## Qualification
 
@@ -88,15 +107,14 @@ anonymous XPC fixtures do not qualify installed signed credentials, service
 registration, native bootstrap, UI accessibility, traffic latency or memory.
 Those observations bind to the exact composed stage and remain runner work.
 
-## Exact complete-check findings
+## Baseline complete-check inventory
 
-The clean all-target check with the Swift 6.4 toolchain reports 318 distinct
-concurrency diagnostics, plus 40 legacy API deprecations. Each line/column below
-identifies a remaining compiler finding in this source; the reason and repair
-apply to every listed location in that row. Multiple diagnostics at one location
-share that ownership boundary. These are deferred implementation steps, not
-requests for owner permission. No listed warning is certified harmless. Recheck
-changed boundaries after CL-88/CL-99 composition, since source locations move.
+The round-40.2 input audit reported 318 distinct concurrency diagnostics plus
+40 legacy deprecations. The tables below retain the original locations and
+smallest-repair rationale for traceability; they describe the pre-repair findings,
+not current unresolved warnings. Current locations move as ownership repairs are
+composed. The P85f clean all-target build and affected-test logs are the authority
+for the resulting compiler/test state; native qualification remains separate.
 
 ### Production
 

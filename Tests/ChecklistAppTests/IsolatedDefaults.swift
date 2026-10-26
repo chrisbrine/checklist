@@ -2,7 +2,9 @@ import XCTest
 
 /// No writes reach Foundation's persistent domains, including writes by owners
 /// retained past teardown. Window tests reopen the same in-memory child store.
-final class IsolatedDefaults {
+// All mutable fixture state is protected by childrenLock or MemoryDefaults.lock.
+final class IsolatedDefaults: @unchecked Sendable {
+    private let childrenLock = NSLock()
     let suiteName: String
     let preferences: UserDefaults
     let plistURL: URL
@@ -17,6 +19,7 @@ final class IsolatedDefaults {
     }
 
     func childPreferences(_ id: UUID) -> UserDefaults {
+        childrenLock.lock(); defer { childrenLock.unlock() }
         if let child = children[id] { return child }
         let child = MemoryDefaults()
         children[id] = child
@@ -24,6 +27,7 @@ final class IsolatedDefaults {
     }
 
     func clean() throws {
+        childrenLock.lock(); defer { childrenLock.unlock() }
         (preferences as! MemoryDefaults).clear()
         for child in children.values { child.clear() }
     }

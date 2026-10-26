@@ -168,7 +168,8 @@ final class ScreenReadQueryPlanTests: XCTestCase {
     }
 }
 
-private final class QueryTrace {
+// Every query access is owned by lock; no mutable state escapes.
+private final class QueryTrace: @unchecked Sendable {
     private let lock = NSLock()
     private var queries: [String] = []
     func append(_ sql: String) {

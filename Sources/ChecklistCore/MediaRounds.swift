@@ -259,6 +259,16 @@ extension CommandRouter {
         for key in ["attachment_owner_id","attachment_reference_ids"] { shape[key] = target[key] }
         return shape
     }
+    /// Historical schema/shape incompatibility remains optional; mandatory stored-field corruption aborts the command.
+    func mediaCompatibleShapeForTarget(_ db: Database,item: JSON,target: JSON,typeRevision: JSON,context: JSON) throws -> JSON? {
+        do {
+            return try mediaShapeForTarget(db,item:item,target:target,typeRevision:typeRevision,context:context)
+        } catch let error as CoreError where error.code == "CANONICAL_RECORD_INVALID" {
+            throw error
+        } catch {
+            return nil
+        }
+    }
     func mediaRoundView(_ db: Database,round: JSON,caller: Caller) throws -> JSON {
         var result = round;let (type,context) = try mediaRoundParts(db,round)
         result["observed_context_token"] = try mediaToken(db,round:round,caller:caller);result["context"] = context
@@ -406,8 +416,8 @@ extension CommandRouter {
                      family: "media").string("target_id"))) }
                 for targetID in Set(targetIDs) {
                 let target = try scoped(db,targetID,pid,type:"media_item_target")
-                let oldShape = try? mediaShapeForTarget(db,item:item,target:target,typeRevision:old,context:context)
-                let newShape = try? mediaShapeForTarget(db,item:item,target:target,typeRevision:revision,context:context)
+                let oldShape = try mediaCompatibleShapeForTarget(db,item:item,target:target,typeRevision:old,context:context)
+                let newShape = try mediaCompatibleShapeForTarget(db,item:item,target:target,typeRevision:revision,context:context)
                 if oldShape == nil || newShape == nil || oldShape?["review_basis_signature"] as? String != newShape?["review_basis_signature"] as? String { relevant = true }
                 }
             }

@@ -15,7 +15,7 @@ import Combine
         }
     }
 
-    typealias Transport = (String, [String: Any]) async throws -> [String: Any]
+    typealias Transport = @MainActor (String, [String: Any]) async throws -> [String: Any]
     typealias Opener = (URL, URL) async throws -> Void
     @Published private(set) var loading = true
     @Published private(set) var instruction = ""

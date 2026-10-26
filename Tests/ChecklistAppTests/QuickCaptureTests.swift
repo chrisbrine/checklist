@@ -89,12 +89,12 @@ import ChecklistIPC
     func testUnavailableProjectRequiresFreshChoiceAndOfflineKeepsExistingChoice() async throws {
         preferences.set("p2", forKey: QuickCaptureModel.lastProjectKey)
         for archived in [false, true] {
-            var offline = true
+            let offline = FixtureState(true)
             let journal = LocalDraftJournal(directory: root.appendingPathComponent(UUID().uuidString))
             let saved = QuickCaptureDraft(projectID: "p1", title: "Do not reroute", note: "Keep this note")
             try journal.save(saved, kind: QuickCaptureModel.journalKind, key: "draft")
             let restored = QuickCaptureModel(journal: journal, preferences: preferences!) { _, _ in
-                if offline { throw ChecklistError("SERVICE_UNAVAILABLE", "offline") }
+                if offline.value { throw ChecklistError("SERVICE_UNAVAILABLE", "offline") }
                 var rows: [[String: Any]] = [["id": "p2", "name": "Remaining"]]
                 if archived { rows.append(["id": "p1", "name": "Archived", "archived": true]) }
                 return ["projects": rows]
@@ -103,7 +103,7 @@ import ChecklistIPC
             XCTAssertEqual(restored.draft, saved)
             XCTAssertFalse(restored.projectsAvailable)
             XCTAssertEqual(restored.state, .notSent(QuickCaptureModel.notSentOffline))
-            offline = false
+            offline.value = false
             await restored.loadProjects()
             XCTAssertEqual(restored.draft.projectID, "")
             XCTAssertEqual(restored.draft.title, saved.title)
@@ -140,11 +140,11 @@ import ChecklistIPC
     }
 
     func testOfflineDraftIsKeptAndSaysNotSentThenSendsWithTheSameCommands() async throws {
-        var online = false
+        let online = FixtureState(false)
         var calls: [(String, [String: Any])] = []
         let transport: QuickCaptureModel.Transport = { method, params in
             calls.append((method, params))
-            guard online else { throw ChecklistError("SERVICE_UNAVAILABLE", "offline") }
+            guard online.value else { throw ChecklistError("SERVICE_UNAVAILABLE", "offline") }
             switch method {
             case "project_list": return ["projects": [["id": "p1", "name": "Game"], ["id": "p2", "name": "Old", "archived": true]]]
             case "task_create": return ["id": "t1", "key": "GAME-7", "project_id": "p1"]
@@ -172,7 +172,7 @@ import ChecklistIPC
         XCTAssertEqual(restored.draft.title, "Boss door does not open")
         XCTAssertEqual(restored.draft.createCommandID, command)
         XCTAssertEqual(restored.draft.files.map(\.commandID), first.draft.files.map(\.commandID))
-        online = true
+        online.value = true
         await restored.loadProjects()
         XCTAssertEqual(restored.projects.map(\.id), ["p1"], "Archived projects are not offered")
         await restored.send()
@@ -241,7 +241,7 @@ import ChecklistIPC
 
     func testUnknownCreateKeepsOriginalIntentAndNewerEditsAsNextDraft() async throws {
         let fixture = try CreateFixture(); defer { fixture.cleanup() }
-        let quick = model(fixture.transport)
+        let quick = model { try await fixture.transport($0, $1) }
         quick.draft.projectID = fixture.projectID; quick.draft.epicID = fixture.epicID
         quick.draft.title = "Original title"
         quick.draft.note = "Original brief"
@@ -282,7 +282,7 @@ import ChecklistIPC
         XCTAssertEqual(quick.draft.projectID, "", "Even an unfinished newer edit stays intact")
         XCTAssertNil(quick.draft.createCommandID, "The next draft must get a new command ID")
         XCTAssertEqual(preferences.string(forKey: QuickCaptureModel.lastProjectKey), fixture.projectID)
-        let restarted = model(fixture.transport)
+        let restarted = model { try await fixture.transport($0, $1) }
         XCTAssertEqual(restarted.draft, quick.draft, "Confirmation must not default the newer blank draft on restart")
         await restarted.loadProjects()
         XCTAssertEqual(restarted.draft, quick.draft)
@@ -292,13 +292,13 @@ import ChecklistIPC
 
     func testRestartReplaysOriginalCreateDespiteSavedNewerTitle() async throws {
         let fixture = try CreateFixture(); defer { fixture.cleanup() }
-        var quick: QuickCaptureModel? = model(fixture.transport)
+        var quick: QuickCaptureModel? = model { try await fixture.transport($0, $1) }
         quick!.draft.projectID = fixture.projectID; quick!.draft.epicID = fixture.epicID
         quick!.draft.title = "Original before restart"
         await quick!.send()
         quick!.draft.title = "Newer after restart"
         quick = nil
-        let restored = model(fixture.transport)
+        let restored = model { try await fixture.transport($0, $1) }
         XCTAssertEqual(restored.state, .uncertain(QuickCaptureModel.uncertainCreate))
         XCTAssertEqual(restored.sendTitle, "Check again")
         await restored.send()
@@ -313,7 +313,7 @@ import ChecklistIPC
     func testRefusalBeforeAcceptanceLeavesEditableNotSentDraft() async throws {
         let fixture = try CreateFixture(); defer { fixture.cleanup() }
         fixture.refusal = "SERVICE_UNAVAILABLE"
-        let quick = model(fixture.transport)
+        let quick = model { try await fixture.transport($0, $1) }
         quick.draft.projectID = fixture.projectID; quick.draft.epicID = fixture.epicID
         quick.draft.title = "Before refusal"
         await quick.send()
@@ -330,7 +330,7 @@ import ChecklistIPC
     func testValidationRefusalDoesNotFreezeTheDraft() async throws {
         let fixture = try CreateFixture(); defer { fixture.cleanup() }
         fixture.loseReply = false
-        let quick = model(fixture.transport)
+        let quick = model { try await fixture.transport($0, $1) }
         quick.draft.projectID = fixture.projectID; quick.draft.epicID = fixture.epicID
         quick.draft.title = String(repeating: "x", count: 2001)
         await quick.send()
@@ -345,22 +345,22 @@ import ChecklistIPC
 
     func testUnknownOutcomeSurvivesOfflineRefreshAndPreSendRefusalOnCheck() async throws {
         let fixture = try CreateFixture(); defer { fixture.cleanup() }
-        var offline = false
+        let offline = FixtureState(false)
         let quick = model { method, params in
-            if offline { throw ChecklistError("SERVICE_UNAVAILABLE", "Connection refused") }
+            if offline.value { throw ChecklistError("SERVICE_UNAVAILABLE", "Connection refused") }
             return try await fixture.transport(method, params)
         }
         quick.draft.projectID = fixture.projectID; quick.draft.epicID = fixture.epicID
         quick.draft.title = "Saved before outage"
         await quick.send()
         let original = quick.draft.pendingCreate
-        offline = true
+        offline.value = true
         await quick.loadProjects()
         XCTAssertEqual(quick.state, .uncertain(QuickCaptureModel.uncertainCreate))
         await quick.send()
         XCTAssertEqual(quick.state, .uncertain(QuickCaptureModel.uncertainCreate))
         XCTAssertEqual(quick.draft.pendingCreate, original, "A later connect failure does not disprove the earlier commit")
-        offline = false
+        offline.value = false
         await quick.send()
         guard case .captured = quick.state else { return XCTFail("The original intent remains recoverable") }
         XCTAssertEqual(try fixture.tickets().count, 1)
@@ -369,7 +369,7 @@ import ChecklistIPC
     func testSavedTicketWithLostAttachmentReplyKeepsFixedFileIntentAcrossRestart() async throws {
         let fixture = try CreateFixture(); defer { fixture.cleanup() }
         fixture.loseReply = false; fixture.loseAttachmentReply = true
-        let quick = model(fixture.transport)
+        let quick = model { try await fixture.transport($0, $1) }
         quick.draft.projectID = fixture.projectID; quick.draft.epicID = fixture.epicID; quick.draft.title = "Ticket with file"
         let file = fixture.root.appendingPathComponent("attachment.txt")
         try Data("Qualification file".utf8).write(to: file)
@@ -379,7 +379,7 @@ import ChecklistIPC
         XCTAssertTrue(text.contains("The ticket is saved")); XCTAssertFalse(text.contains("Not sent"))
         let taskID = try XCTUnwrap(quick.draft.createdTaskID)
         quick.draft.projectID = ""; quick.draft.note = "Newer note"
-        let restored = model(fixture.transport)
+        let restored = model { try await fixture.transport($0, $1) }
         XCTAssertEqual(restored.state, .filesPending(QuickCaptureModel.savedTicketFiles))
         await restored.loadProjects()
         XCTAssertEqual(restored.draft.projectID, "")
@@ -609,7 +609,7 @@ import ChecklistIPC
     }
     func testRequiredEpicChoicesAndLastSuccessfulDefaultStayProjectScoped() async throws {
         let fixture=try CreateFixture();defer {fixture.cleanup()};fixture.loseReply=false
-        let quick=model(fixture.transport)
+        let quick=model { try await fixture.transport($0, $1) }
         quick.draft.projectID=fixture.projectID;quick.draft.title="Concrete ticket"
         XCTAssertFalse(quick.canSend)
         await quick.loadEpics()
@@ -619,7 +619,7 @@ import ChecklistIPC
         await quick.send()
         XCTAssertEqual(fixture.creates.first?["epic_id"] as? String,fixture.epicID)
         XCTAssertEqual(CaptureEpicDefaults.last(fixture.projectID,preferences:preferences),fixture.epicID)
-        let other=QuickCaptureModel(journal:LocalDraftJournal(directory:root.appendingPathComponent("second")),preferences:preferences,transport:fixture.transport)
+        let other=QuickCaptureModel(journal:LocalDraftJournal(directory:root.appendingPathComponent("second")),preferences:preferences,transport:{ try await fixture.transport($0, $1) })
         other.draft.projectID=fixture.projectID
         XCTAssertEqual(other.draft.epicID,fixture.epicID)
         other.draft.projectID="other-project"
@@ -629,7 +629,7 @@ import ChecklistIPC
     func testRequiredEpicEmptyProjectCanCreateConcreteEpicAndLegacyIntentCanBeRepaired() async throws {
         let fixture=try CreateFixture();defer {fixture.cleanup()};fixture.loseReply=false
         let project=try await fixture.transport("project_create",["command_id":UUID().uuidString,"name":"Empty","key_prefix":"EMPTY"])
-        let pid=project["id"] as! String,quick=model(fixture.transport)
+        let pid=project["id"] as! String,quick=model { try await fixture.transport($0, $1) }
         quick.draft.projectID=pid;quick.draft.title="Concrete first ticket"
         await quick.loadEpics()
         XCTAssertEqual(quick.epicTotal,0);XCTAssertFalse(quick.canSend)

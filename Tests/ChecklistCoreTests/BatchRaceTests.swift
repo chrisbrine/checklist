@@ -1,6 +1,7 @@
 import XCTest
 @testable import ChecklistCore
 
+// The private lock owns the string array; only value copies escape.
 private final class BatchRaceResults: @unchecked Sendable {
     private let lock = NSLock()
     private var values: [String] = []
@@ -11,9 +12,10 @@ extension CoreTests {
     func raceBatchCommands(_ calls: [(String,JSON,Caller)]) -> [String] {
         let group = DispatchGroup(),start = DispatchSemaphore(value:0),results = BatchRaceResults(),router = self.router!
         for (method,params,caller) in calls {
+            let bytes = try! JSONSerialization.data(withJSONObject:params)
             group.enter();DispatchQueue.global().async {
                 defer {group.leave()};start.wait()
-                do {_ = try router.handle(method:method,params:params,caller:caller);results.append(method+":success")}
+                do {let params = try JSONSerialization.jsonObject(with:bytes) as! JSON;_ = try router.handle(method:method,params:params,caller:caller);results.append(method+":success")}
                 catch let error as CoreError {results.append(method+":"+error.code)}
                 catch {results.append(method+":"+String(describing:error))}
             }

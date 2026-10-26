@@ -1,6 +1,9 @@
 import XCTest
 import Security
 import LocalAuthentication
+import ChecklistLegacyKeychain
+import ChecklistKeychainTestFixture
+import os
 @testable import ChecklistIPC
 @testable import ChecklistApp
 
@@ -8,41 +11,38 @@ final class HumanClaimsKeychainTests: XCTestCase {
     func testEveryOperationReceivesNoUIQueryAndRestoresInteractionSetting() throws {
         // The wrapper is used for every read/add/update/delete in both stores.
         var original: DarwinBoolean = false
-        XCTAssertEqual(SecKeychainGetUserInteractionAllowed(&original), errSecSuccess)
-        defer { SecKeychainSetUserInteractionAllowed(original.boolValue) }
+        XCTAssertEqual(ChecklistKeychainGetUserInteractionAllowed(&original), errSecSuccess)
+        defer { ChecklistKeychainSetUserInteractionAllowed(original.boolValue) }
         for allowed in [false, true] {
-            XCTAssertEqual(SecKeychainSetUserInteractionAllowed(allowed), errSecSuccess)
+            XCTAssertEqual(ChecklistKeychainSetUserInteractionAllowed(allowed), errSecSuccess)
             let result = KeychainWithoutUI.perform([:]) { query in
                 let query = query as NSDictionary
                 XCTAssertTrue((query[kSecUseAuthenticationContext] as? LAContext)?.interactionNotAllowed == true)
                 XCTAssertNil(query[kSecUseAuthenticationUI])
                 var current: DarwinBoolean = true
-                XCTAssertEqual(SecKeychainGetUserInteractionAllowed(&current), errSecSuccess)
+                XCTAssertEqual(ChecklistKeychainGetUserInteractionAllowed(&current), errSecSuccess)
                 XCTAssertFalse(current.boolValue)
                 return errSecAuthFailed
             }
             XCTAssertEqual(result, errSecAuthFailed)
             var restored: DarwinBoolean = false
-            XCTAssertEqual(SecKeychainGetUserInteractionAllowed(&restored), errSecSuccess)
+            XCTAssertEqual(ChecklistKeychainGetUserInteractionAllowed(&restored), errSecSuccess)
             XCTAssertEqual(restored.boolValue, allowed, "Restore even on an unsuccessful operation")
         }
     }
 
     func testConcurrentOperationsSerializeInteractionFlag() {
-        let state = NSLock()
-        var active = 0
+        let active = OSAllocatedUnfairLock(initialState: 0)
         DispatchQueue.concurrentPerform(iterations: 16) { _ in
             let status = KeychainWithoutUI.perform([:]) { _ in
-                state.lock()
-                active += 1
-                XCTAssertEqual(active, 1)
-                state.unlock()
+                active.withLock { count in
+                    count += 1
+                    XCTAssertEqual(count, 1)
+                }
                 var allowed: DarwinBoolean = true
-                XCTAssertEqual(SecKeychainGetUserInteractionAllowed(&allowed), errSecSuccess)
+                XCTAssertEqual(ChecklistKeychainGetUserInteractionAllowed(&allowed), errSecSuccess)
                 XCTAssertFalse(allowed.boolValue)
-                state.lock()
-                active -= 1
-                state.unlock()
+                active.withLock { $0 -= 1 }
                 return errSecSuccess
             }
             XCTAssertEqual(status, errSecSuccess)
@@ -85,16 +85,16 @@ final class HumanClaimsKeychainTests: XCTestCase {
         let password = "temporary-fixture-password"
         let createStatus = KeychainWithoutUI.perform([:]) { _ in
             password.withCString { bytes in
-                SecKeychainCreate(root.appendingPathComponent("fixture.keychain-db").path,
+                ChecklistFixtureKeychainCreate(root.appendingPathComponent("fixture.keychain-db").path,
                                   UInt32(password.utf8.count), bytes, false, nil, &created)
             }
         }
         XCTAssertEqual(createStatus, errSecSuccess)
         let keychain = try XCTUnwrap(created, "Temporary keychain creation failed: \(createStatus)")
-        defer { XCTAssertEqual(KeychainWithoutUI.perform([:]) { _ in SecKeychainDelete(keychain) }, errSecSuccess) }
+        defer { XCTAssertEqual(KeychainWithoutUI.perform([:]) { _ in ChecklistFixtureKeychainDelete(keychain) }, errSecSuccess) }
 
         var access: SecAccess?
-        XCTAssertEqual(SecAccessCreate("CL-195 foreign fixture" as CFString, [] as CFArray, &access), errSecSuccess)
+        XCTAssertEqual(ChecklistAccessCreate("CL-195 foreign fixture" as CFString, [] as CFArray, &access), errSecSuccess)
         let foreignAccess = try XCTUnwrap(access)
         var foreign: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                       kSecAttrService as String: HumanClaims.service,
@@ -143,9 +143,9 @@ final class HumanClaimsKeychainTests: XCTestCase {
                        kSecValueData as String: Data("legacy-pairing".utf8),
                        kSecUseKeychain as String: keychain] as [String: Any]
         var application: SecTrustedApplication?
-        XCTAssertEqual(SecTrustedApplicationCreateFromPath(nil, &application), errSecSuccess)
+        XCTAssertEqual(ChecklistTrustedApplicationCreateFromPath(nil, &application), errSecSuccess)
         var pairingAccess: SecAccess?
-        XCTAssertEqual(SecAccessCreate("Checklist paired local executables" as CFString,
+        XCTAssertEqual(ChecklistAccessCreate("Checklist paired local executables" as CFString,
                                        [try XCTUnwrap(application)] as CFArray, &pairingAccess), errSecSuccess)
         pairing[kSecAttrAccess as String] = try XCTUnwrap(pairingAccess)
         XCTAssertEqual(SecItemAdd(pairing as CFDictionary, nil), errSecSuccess)

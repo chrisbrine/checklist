@@ -13,18 +13,19 @@ final class StorageBackupConcurrencyTests: XCTestCase {
         let destination = f.base.appendingPathComponent("concurrent-backup"),command = UUID().uuidString
         let copying = DispatchSemaphore(value:0),verifying = DispatchSemaphore(value:0),resume = DispatchSemaphore(value:0)
         let finished = expectation(description:"backup finishes")
-        var budget = StorageSnapshotBudget.production()
-        budget.observe = { event in
-            if event == "copying_objects" || event == "manifest_written" {
-                (event == "copying_objects" ? copying : verifying).signal()
-                guard resume.wait(timeout:.now()+15) == .success else {throw StorageSnapshotFailure.canceled}
-            }
-        }
         XCTAssertTrue(CommandRouter.runsOutsideSerialQueue("backup_create"))
+        let owner = f.owner
         DispatchQueue.global().async {
             defer {finished.fulfill()}
+            var budget = StorageSnapshotBudget.production()
+            budget.observe = { event in
+                if event == "copying_objects" || event == "manifest_written" {
+                    (event == "copying_objects" ? copying : verifying).signal()
+                    guard resume.wait(timeout:.now()+15) == .success else {throw StorageSnapshotFailure.canceled}
+                }
+            }
             do {
-                let reply = try router.executeStorageBackup(params:["command_id":command,"path":destination.path],caller:f.owner,budget:budget)
+                let reply = try router.executeStorageBackup(params:["command_id":command,"path":destination.path],caller:owner,budget:budget)
                 XCTAssertEqual((reply["data"] as? JSON)?["status"] as? String,"complete")
             } catch {XCTFail("Backup: \(error)")}
         }
@@ -130,11 +131,12 @@ final class StorageBackupConcurrencyTests: XCTestCase {
     func testCaptureAdmissionWaitsForAnAlreadyAdmittedObjectOperation() throws {
         let f = try StorageFixture(),attempted = DispatchSemaphore(value:0),captured = DispatchSemaphore(value:0)
         let finished = expectation(description:"capture admission finishes")
-        try ArchiveStorageGate.withExclusive(root:f.root) { _ in
+        let root = f.root // Fixture teardown follows the worker join.
+        try ArchiveStorageGate.withExclusive(root:root) { _ in
             DispatchQueue.global().async {
                 defer {finished.fulfill()}
                 attempted.signal()
-                do {_ = try StorageSnapshotRetention.withCapture(root:f.root) {_ in captured.signal()}}
+                do {_ = try StorageSnapshotRetention.withCapture(root:root) {_ in captured.signal()}}
                 catch {XCTFail("Capture admission: \(error)")}
             }
             XCTAssertEqual(attempted.wait(timeout:.now()+5),.success)

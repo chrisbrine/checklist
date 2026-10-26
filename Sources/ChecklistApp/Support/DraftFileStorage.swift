@@ -3,7 +3,7 @@ import Darwin
 import ChecklistIPC
 
 /// Owner-local draft bytes only. This capability never executes service commands.
-protocol DraftFileStorage {
+protocol DraftFileStorage: Sendable {
     func exists(_ url: URL) throws -> Bool
     func read(_ url: URL) throws -> Data
     func contents(of directory: URL) throws -> [URL]

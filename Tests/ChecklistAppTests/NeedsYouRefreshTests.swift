@@ -52,7 +52,7 @@ import Observation
             }
             return response(params)
         }
-        func release() { let saved = held; held = nil; saved?.resume(returning:heldReply) }
+        func release() { let saved = held; held = nil; saved?.resume(returning: fixtureReply(heldReply)) }
         func store() -> ChecklistStore {
             ChecklistStore(draftJournal:LocalDraftJournal(directory:root),preferences:preferences,restorePendingCommand:false,
                            desktopAlerts:DesktopAlertCoordinator(sink:RefreshAlertSink()),

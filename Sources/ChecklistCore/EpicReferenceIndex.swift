@@ -1,31 +1,30 @@
 import Foundation
+import os
 import GRDB
 import SQLite3
 
 /// Rebuildable proof on the sole writer connection. TEMP tables/triggers keep the
 /// durable protocol unchanged and participate in the same transaction/rollback as
 /// every record/event write, including direct SQL, import and purge paths.
-final class EpicReferenceIndex {
+final class EpicReferenceIndex: Sendable {
     static let maximumPayloadBytes = 2_000_000
-    private let lock = NSLock()
-    private var started = false
-    private var stopped = false
+    private struct Lifecycle: Sendable { var started = false; var stopped = false }
+    private let lifecycle = OSAllocatedUnfairLock(initialState: Lifecycle())
     // Only the utility worker (or the component fixture) owns a prepared slice.
     // Never acquire this lock while holding the writer connection.
-    private let workLock = NSLock()
-    private var decoder: DatabaseQueue?
-    private struct Source {
+    private struct Work: Sendable { var decoder: DatabaseQueue?; var prepared: Prepared? }
+    private let work = OSAllocatedUnfairLock(initialState: Work())
+    private struct Source: Sendable {
         let kind: Int,position: Int64,id: Data,project: Data?,type: String?,entity: Data?,payload: Data?
     }
-    private struct Prepared {
+    private struct Prepared: Sendable {
         let source: Source,targets: [Data],epic: Data?,invalid: String?
         var offset = 0
     }
-    private var prepared: Prepared?
     private let queue = DispatchQueue(label:"org.checklist.epic-reference-index",qos:.utility)
 
-    func stop() { lock.lock(); stopped = true; lock.unlock() }
-    private var isStopped: Bool { lock.lock(); defer {lock.unlock()}; return stopped }
+    func stop() { lifecycle.withLock { $0.stopped = true } }
+    private var isStopped: Bool { lifecycle.withLock { $0.stopped } }
 
     func install(_ db: Database) throws {
         try db.execute(sql:"""
@@ -103,10 +102,11 @@ final class EpicReferenceIndex {
     }
 
     private func start(_ router: CommandRouter) {
-        lock.lock(); defer {lock.unlock()}
-        guard !started,!stopped else {return}
-        started = true
-        enqueue(router)
+        let shouldStart = lifecycle.withLock { state in
+            guard !state.started,!state.stopped else { return false }
+            state.started = true; return true
+        }
+        if shouldStart { enqueue(router) }
     }
     private func enqueue(_ router: CommandRouter) {
         // Each continuation is one finite page, not a timer/polling runtime.
@@ -119,7 +119,7 @@ final class EpicReferenceIndex {
             } catch {
                 // Infrastructure failure does not poison the connection. Leave
                 // committed progress intact; a later request may restart work.
-                self.lock.lock();self.started = false;self.lock.unlock()
+                self.lifecycle.withLock { $0.started = false }
             }
         }
     }
@@ -148,13 +148,13 @@ final class EpicReferenceIndex {
         return nil
     }
 
-    private func prepare(_ source: Source) throws -> Prepared {
+    private func prepare(_ source: Source, work: inout Work) throws -> Prepared {
         // Parse at most 2 MB on a separate in-memory SQLite connection, using the
         // same JSON semantics as the live triggers. No writer/coordinator is held
         // during large payload parsing, traversal or target deduplication.
         guard let payload = source.payload else {return Prepared(source:source,targets:[],epic:nil,invalid:"payload_type_or_size")}
-        if decoder == nil {decoder = try DatabaseQueue()}
-        return try decoder!.read { db in
+        if work.decoder == nil {work.decoder = try DatabaseQueue()}
+        return try work.decoder!.read { db in
             guard try Bool.fetchOne(db,sql:"SELECT json_valid(CAST(? AS TEXT))",arguments:[payload]) == true else {
                 return Prepared(source:source,targets:[],epic:nil,invalid:"malformed_json")
             }
@@ -175,45 +175,46 @@ final class EpicReferenceIndex {
     /// Budget exhaustion retains the next offset, rather than rolling back the
     /// whole row forever. Only this background worker reads legacy payloads.
     @discardableResult func buildPage(_ router: CommandRouter,seconds: TimeInterval = 0.05) throws -> Bool {
-        workLock.lock();defer {workLock.unlock()}
-        let deadline = ProcessInfo.processInfo.systemUptime + seconds
-        var units = 0
-        while !isStopped && units<64 && (units == 0 || ProcessInfo.processInfo.systemUptime<deadline) {
-            if prepared == nil {
-                guard let source = try router.dbQueue.writeWithoutTransaction({try nextSource($0)}) else {return false}
-                prepared = try prepare(source)
-            }
-            let item = prepared!,source = item.source
-            var offset = item.offset,done = false,applied = 0
-            try router.dbQueue.writeWithoutTransaction { db in
-                try db.inTransaction {
-                    // A live trigger has already replaced all proof for any source
-                    // changed since startup. Never append a stale prepared slice,
-                    // even after same-revision SQL UPDATE, REPLACE or deletion.
-                    let touched = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM epic_guard_touched WHERE source_kind=? AND source_id=?)",arguments:[source.kind,source.id]) ?? true
-                    if !touched {
-                        if let invalid = item.invalid {
-                            try db.execute(sql:"INSERT INTO epic_guard_invalid VALUES (?,?,?) ON CONFLICT DO NOTHING",arguments:[source.kind,source.id,invalid])
-                        } else {
-                            while offset<item.targets.count && units+applied<64 && (applied == 0 || ProcessInfo.processInfo.systemUptime<deadline) {
-                                try db.execute(sql:"INSERT INTO epic_guard_refs VALUES (?,?,?,?) ON CONFLICT DO NOTHING",arguments:[source.kind,source.id,source.project,item.targets[offset]])
-                                offset += 1;applied += 1
-                            }
-                            if offset == item.targets.count,let epic = item.epic {
-                                try db.execute(sql:"INSERT INTO epic_guard_members VALUES (?,?,?) ON CONFLICT(source_id) DO UPDATE SET project=excluded.project,epic=excluded.epic",arguments:[source.project,epic,source.id])
+        return try work.withLock { work in
+            let deadline = ProcessInfo.processInfo.systemUptime + seconds
+            var units = 0
+            while !isStopped && units<64 && (units == 0 || ProcessInfo.processInfo.systemUptime<deadline) {
+                if work.prepared == nil {
+                    guard let source = try router.dbQueue.writeWithoutTransaction({try nextSource($0)}) else {return false}
+                    work.prepared = try prepare(source,work:&work)
+                }
+                let item = work.prepared!,source = item.source
+                var offset = item.offset,done = false,applied = 0
+                try router.dbQueue.writeWithoutTransaction { db in
+                    try db.inTransaction {
+                        // A live trigger has already replaced all proof for any source
+                        // changed since startup. Never append a stale prepared slice,
+                        // even after same-revision SQL UPDATE, REPLACE or deletion.
+                        let touched = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM epic_guard_touched WHERE source_kind=? AND source_id=?)",arguments:[source.kind,source.id]) ?? true
+                        if !touched {
+                            if let invalid = item.invalid {
+                                try db.execute(sql:"INSERT INTO epic_guard_invalid VALUES (?,?,?) ON CONFLICT DO NOTHING",arguments:[source.kind,source.id,invalid])
+                            } else {
+                                while offset<item.targets.count && units+applied<64 && (applied == 0 || ProcessInfo.processInfo.systemUptime<deadline) {
+                                    try db.execute(sql:"INSERT INTO epic_guard_refs VALUES (?,?,?,?) ON CONFLICT DO NOTHING",arguments:[source.kind,source.id,source.project,item.targets[offset]])
+                                    offset += 1;applied += 1
+                                }
+                                if offset == item.targets.count,let epic = item.epic {
+                                    try db.execute(sql:"INSERT INTO epic_guard_members VALUES (?,?,?) ON CONFLICT(source_id) DO UPDATE SET project=excluded.project,epic=excluded.epic",arguments:[source.project,epic,source.id])
+                                }
                             }
                         }
+                        done = touched || item.invalid != nil || offset == item.targets.count
+                        if done {try db.execute(sql:"UPDATE epic_guard_progress SET position=? WHERE kind=?",arguments:[source.position,source.kind])}
+                        return .commit
                     }
-                    done = touched || item.invalid != nil || offset == item.targets.count
-                    if done {try db.execute(sql:"UPDATE epic_guard_progress SET position=? WHERE kind=?",arguments:[source.position,source.kind])}
-                    return .commit
                 }
+                // Publish the slice offset only after its transaction commits.
+                if done {work.prepared = nil} else {work.prepared!.offset = offset}
+                units += max(1,applied)
             }
-            // Publish the slice offset only after its transaction commits.
-            if done {prepared = nil} else {prepared!.offset = offset}
-            units += max(1,applied)
+            return try router.dbQueue.read {try hasPending($0)}
         }
-        return try router.dbQueue.read {try hasPending($0)}
     }
 
     static func budgetFailure() -> CoreError {

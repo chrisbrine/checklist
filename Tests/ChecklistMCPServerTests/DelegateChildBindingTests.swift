@@ -32,6 +32,9 @@ final class DelegateChildBindingTests: XCTestCase {
         }
         deinit { try? FileManager.default.removeItem(at: directory) }
         func setSlot(_ slot: Int?) throws {
+            try Self.setSlot(slot, executable: executable)
+        }
+        static func setSlot(_ slot: Int?, executable: URL) throws {
             var plist: [String: Any] = ["CFBundleIdentifier": "org.checklist.app" + (slot.map { ".test\($0)" } ?? "")]
             if let slot { plist["ChecklistInstanceSlot"] = slot }
             try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: executable.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Info.plist"), options: .atomic)
@@ -42,11 +45,13 @@ final class DelegateChildBindingTests: XCTestCase {
         let original = try Fixture(slot: 2), replacement = try Fixture(slot: nil, variant: true)
         let originalHash = try XCTUnwrap(ClientBuildIdentity.executable(original.executable)?.cdhash)
         XCTAssertNotEqual(originalHash, ClientBuildIdentity.executable(replacement.executable)?.cdhash)
+        let replacementExecutable = replacement.executable
+        defer { withExtendedLifetime((original, replacement)) {} }
         let update = ShimUpdateEnvironment.launched(path: original.executable.path, ownHash: originalHash,
             instance: original.instance, directory: original.directory.path, environment: [:], identity: { path in
                 let validated = ClientBuildIdentity.executable(path)
                 try! FileManager.default.moveItem(at: path, to: path.appendingPathExtension("validated"))
-                try! FileManager.default.createSymbolicLink(at: path, withDestinationURL: replacement.executable)
+                try! FileManager.default.createSymbolicLink(at: path, withDestinationURL: replacementExecutable)
                 return validated
             })
         XCTAssertThrowsError(try update.run(["signal"], nil)) { error in
@@ -67,11 +72,13 @@ final class DelegateChildBindingTests: XCTestCase {
         let original = try Fixture(slot: 2), replacement = try Fixture(slot: 2)
         let hash = try XCTUnwrap(ClientBuildIdentity.executable(original.executable)?.cdhash)
         XCTAssertEqual(hash, ClientBuildIdentity.executable(replacement.executable)?.cdhash)
+        let replacementExecutable = replacement.executable
+        defer { withExtendedLifetime((original, replacement)) {} }
         let update = ShimUpdateEnvironment.launched(path: original.executable.path, ownHash: hash,
             instance: original.instance, directory: original.directory.path, environment: [:], identity: { path in
                 let validated = ClientBuildIdentity.executable(path)
                 try! FileManager.default.moveItem(at: path, to: path.appendingPathExtension("validated"))
-                try! FileManager.default.createSymbolicLink(at: path, withDestinationURL: replacement.executable)
+                try! FileManager.default.createSymbolicLink(at: path, withDestinationURL: replacementExecutable)
                 return validated
             })
         XCTAssertThrowsError(try update.run(["signal"], nil)) { error in
@@ -85,10 +92,12 @@ final class DelegateChildBindingTests: XCTestCase {
     func testMetadataSwapAfterValidationIsRefusedByChildBeforeItsBody() throws {
         let fixture = try Fixture(slot: 2)
         let hash = try XCTUnwrap(ClientBuildIdentity.executable(fixture.executable)?.cdhash)
+        let executable = fixture.executable
+        defer { withExtendedLifetime(fixture) {} }
         let update = ShimUpdateEnvironment.launched(path: fixture.executable.path, ownHash: hash,
             instance: fixture.instance, directory: fixture.directory.path, environment: [:], identity: { path in
                 let validated = ClientBuildIdentity.executable(path)
-                try! fixture.setSlot(nil)
+                try! Fixture.setSlot(nil, executable: executable)
                 return validated
             })
         let result = try update.run(["signal"], nil)

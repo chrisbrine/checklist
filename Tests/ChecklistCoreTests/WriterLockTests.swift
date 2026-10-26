@@ -11,12 +11,21 @@ extension EvidenceAuthorityTests {
         for index in 0..<megabytes { try (chunk + Data("\(index)".utf8)).write(to: workspace.appendingPathComponent("asset-\(index).bin")) }
         try git(["init"])
         let p = try project(), t = try ready(p), a = try claim(p, t), other = try ready(p)
-        let finished = DispatchSemaphore(value: 0), lock = NSLock()
-        var submitError: Error?, submitSeconds = 0.0
+        let finished = DispatchSemaphore(value: 0)
+        let state = LockedTestState((error: Optional<Error>.none, seconds: 0.0))
+        let workerRouter = router!, caller = owner
+        var submission = auth(p,a); submission["acceptance_revision"] = 1; submission["evidence_manifest"] = ["kind":"source","source_capture":[:]]
+        let input = try JSONSerialization.data(withJSONObject:submission)
+        // The semaphore joins the worker before this test's fixture can be torn down.
         DispatchQueue.global(qos: .userInitiated).async {
             let start = Date()
-            do { _ = try self.submitSource(p, a) } catch { submitError = error }
-            lock.lock(); submitSeconds = Date().timeIntervalSince(start); lock.unlock()
+            do {
+                var params = try JSONSerialization.jsonObject(with:input) as! JSON
+                params = try fixtureAcceptanceEvidence(workerRouter,input:params)
+                params["command_id"] = UUID().uuidString
+                _ = try workerRouter.handle(method:"work_submit",params:fixtureTaskInput(workerRouter,method:"work_submit",input:params),caller:caller)
+            } catch { state.withLock { $0.error = error } }
+            state.withLock { $0.seconds = Date().timeIntervalSince(start) }
             finished.signal()
         }
         var writes: [Double] = [], reads: [Double] = []
@@ -28,8 +37,8 @@ extension EvidenceAuthorityTests {
             _ = try call("task_list", ["project_id": p["id"]!])
             reads.append(Date().timeIntervalSince(start))
         }
-        XCTAssertNil(submitError)
-        lock.lock(); let total = submitSeconds; lock.unlock()
+        XCTAssertNil(state.snapshot.error)
+        let total = state.snapshot.seconds
         let report: JSON = ["source_mb": megabytes, "submit_seconds": total, "probes": writes.count, "max_write_seconds": writes.max() ?? 0, "max_read_seconds": reads.max() ?? 0,
                             "median_write_seconds": try XCTUnwrap(writes.sorted().dropFirst(writes.count / 2).first), "median_read_seconds": try XCTUnwrap(reads.sorted().dropFirst(reads.count / 2).first)]
         let text = try jsonString(report)
@@ -41,22 +50,23 @@ extension EvidenceAuthorityTests {
     }
 
     /// Runs `command` on another thread while this thread times small writes and reads.
-    func probeDuring(_ command: @escaping () throws -> Void, project p: JSON, ticket: JSON) throws -> (seconds: Double, maxWrite: Double, maxRead: Double, probes: Int) {
-        let finished = DispatchSemaphore(value: 0), lock = NSLock()
-        var failure: Error?, seconds = 0.0
+    func probeDuring(_ command: @escaping @Sendable () throws -> Data, project p: JSON, ticket: JSON) throws -> (seconds: Double, maxWrite: Double, maxRead: Double, probes: Int, reply: Data) {
+        let finished = DispatchSemaphore(value: 0)
+        let state = LockedTestState((failure: Optional<Error>.none, seconds: 0.0, reply: Data()))
         DispatchQueue.global(qos: .userInitiated).async {
             let start = Date()
-            do { try command() } catch { failure = error }
-            lock.lock(); seconds = Date().timeIntervalSince(start); lock.unlock(); finished.signal()
+            do { let reply = try command(); state.withLock { $0.reply = reply } }
+            catch { state.withLock { $0.failure = error } }
+            state.withLock { $0.seconds = Date().timeIntervalSince(start) }; finished.signal()
         }
         var writes: [Double] = [], reads: [Double] = []
         while finished.wait(timeout: .now() + 0.005) == .timedOut {
             var start = Date(); _ = try call("message_send", ["project_id": p["id"]!, "task_id": ticket["id"]!, "body": "Latency probe"]); writes.append(Date().timeIntervalSince(start))
             start = Date(); _ = try call("task_list", ["project_id": p["id"]!]); reads.append(Date().timeIntervalSince(start))
         }
-        if let failure { throw failure }
-        lock.lock(); defer { lock.unlock() }
-        return (seconds, writes.max() ?? 0, reads.max() ?? 0, writes.count)
+        let result = state.snapshot
+        if let failure = result.failure { throw failure }
+        return (result.seconds, writes.max() ?? 0, reads.max() ?? 0, writes.count, result.reply)
     }
 
     /// Finding d21e29c2: a reference-mode import reads and hashes its file before the writer.
@@ -67,8 +77,15 @@ extension EvidenceAuthorityTests {
         let chunk = Data((0..<(1 << 20)).map { UInt8(truncatingIfNeeded: $0 &* 7) })
         FileManager.default.createFile(atPath: file.path, contents: nil)
         let handle = try FileHandle(forWritingTo: file); for _ in 0..<256 { try handle.write(contentsOf: chunk) }; try handle.close()
-        var attached: JSON = [:]
-        let measured = try probeDuring({ attached = try self.call("attachment_add", ["project_id": p["id"]!, "task_id": t["id"]!, "path": file.path, "mode": "reference"]) }, project: p, ticket: other)
+        let workerRouter = router!, caller = owner
+        let input = try JSONSerialization.data(withJSONObject:["project_id":p["id"]!,"task_id":t["id"]!,"path":file.path,"mode":"reference"])
+        let measured = try probeDuring({
+            var params = try JSONSerialization.jsonObject(with:input) as! JSON
+            params["command_id"] = UUID().uuidString
+            let result = try workerRouter.handle(method:"attachment_add",params:fixtureTaskInput(workerRouter,method:"attachment_add",input:params),caller:caller)["data"]!
+            return try JSONSerialization.data(withJSONObject:result)
+        }, project:p, ticket:other)
+        let attached = try JSONSerialization.jsonObject(with:measured.reply) as! JSON
         print("CL-71 reference import: \(measured)")
         XCTAssertEqual(attached["size"] as? Int, 256 << 20)
         XCTAssertGreaterThanOrEqual(measured.probes, 2, "the probe ran while the import was in progress")
@@ -84,8 +101,16 @@ extension EvidenceAuthorityTests {
         let p = try project(), t = try ready(p), a = try claim(p, t), other = try ready(p)
         let submitted = try submitSource(p, a)
         let reviewer = try native(p, "claim-reviewer", domain: "codex:4242:1:1")
-        var review: JSON = [:]
-        let measured = try probeDuring({ review = try self.reviewClaim(p, submitted, reviewer) }, project: p, ticket: other)
+        let target = submitted["task"] as! JSON
+        let input = try JSONSerialization.data(withJSONObject:["project_id":p["id"]!,"task_id":target["id"]!,"expected_revision":target["revision"]!,"phase":"review","review_request_id":(submitted["review_request_ids"] as! [String])[0],"target_manifest_id":submitted["manifest_id"]!,"gate":"review"])
+        let workerRouter = router!
+        let measured = try probeDuring({
+            var params = try JSONSerialization.jsonObject(with:input) as! JSON
+            params["command_id"] = UUID().uuidString
+            let result = try workerRouter.handle(method:"work_claim",params:fixtureTaskInput(workerRouter,method:"work_claim",input:params),caller:reviewer)["data"]!
+            return try JSONSerialization.data(withJSONObject:result)
+        }, project:p, ticket:other)
+        let review = try JSONSerialization.jsonObject(with:measured.reply) as! JSON
         print("CL-71 review claim: \(measured)")
         XCTAssertEqual(review["state"] as? String, "active")
         XCTAssertGreaterThanOrEqual(measured.probes, 2)

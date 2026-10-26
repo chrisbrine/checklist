@@ -186,7 +186,7 @@ import ChecklistIPC
         let held = try XCTUnwrap(f.heldIdentity)
         f.pageIncarnation = "concurrently-restored-store"; await store.refresh()
         XCTAssertFalse(store.hasPendingMutation); XCTAssertTrue(store.noticeIsWarning)
-        held.resume(returning: try XCTUnwrap(f.identityReply)); f.heldIdentity = nil
+        held.resume(returning: fixtureReply(try XCTUnwrap(f.identityReply))); f.heldIdentity = nil
         try await settled(store)
         XCTAssertFalse(store.hasPendingMutation); XCTAssertTrue(f.mutations.isEmpty)
         XCTAssertNotNil(f.saved); XCTAssertTrue(store.noticeIsWarning)

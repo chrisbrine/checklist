@@ -1,3 +1,4 @@
+import ChecklistAXTestSupport
 import XCTest
 import SwiftUI
 import CryptoKit
@@ -232,7 +233,7 @@ private func unavailableEntryFile(availability: String, name: String = "unavaila
 }
 
 @MainActor private extension PreviewAvailabilityTests {
-func previewEntryStore(_ transport: @escaping (String, [String: Any]) async throws -> [String: Any]) -> ChecklistStore {
+func previewEntryStore(_ transport: @escaping @MainActor @Sendable (String, [String: Any]) async throws -> [String: Any]) -> ChecklistStore {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("SyntheticPreviewEntryDrafts-" + UUID().uuidString)
     addTeardownBlock { try? FileManager.default.removeItem(at: root) }
     let store = ChecklistStore(draftJournal: LocalDraftJournal(directory: root),
@@ -265,8 +266,8 @@ private func previewAXEnabled(_ object: NSObject) -> Bool {
     private let enhanced = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
     private let wasEnhanced: Any
     init<V: View>(_ root: V) {
-        wasEnhanced = NSApplication.shared.accessibilityAttributeValue(enhanced) ?? false
-        NSApplication.shared.accessibilitySetValue(true, forAttribute: enhanced)
+        wasEnhanced = ChecklistTestAXAttributeValue(NSApplication.shared, enhanced) ?? false
+        ChecklistTestAXSetValue(NSApplication.shared, true, enhanced)
         view = NSHostingView(rootView: root)
         window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 1000, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
         window.title = "Synthetic Checklist preview-entry regression (offscreen)"
@@ -275,7 +276,7 @@ private func previewAXEnabled(_ object: NSObject) -> Bool {
     func close() {
         if let sheet = window.attachedSheet { window.endSheet(sheet); sheet.close() }
         window.contentView = nil; window.close()
-        NSApplication.shared.accessibilitySetValue(wasEnhanced, forAttribute: enhanced)
+        ChecklistTestAXSetValue(NSApplication.shared, wasEnhanced, enhanced)
     }
     func settle(_ state: String, root: NSObject? = nil, file: StaticString = #filePath, line: UInt = #line,
                 until predicate: () -> Bool) async throws {

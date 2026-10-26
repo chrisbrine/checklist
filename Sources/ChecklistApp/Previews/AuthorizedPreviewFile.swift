@@ -13,13 +13,18 @@ struct FilePreviewFailure: LocalizedError {
 
 /// An owned, verified copy isolates all native decoders and external editors from
 /// immutable evidence. Its attribution describes the source, never a new artifact.
-final class AuthorizedPreviewFile: @unchecked Sendable {
+final class AuthorizedPreviewFile: Sendable {
     let url: URL
-    let source: Record
+    // Immutable JSON bytes cross the worker boundary; every read gets its own value graph.
+    private let sourceBytes: Data
+    var source: Record {
+        // Only JSONSerialization-produced dictionary bytes enter this immutable field.
+        Record(values: try! JSONSerialization.jsonObject(with: sourceBytes) as! [String: Any])
+    }
     let sha256: String
     let directory: URL
-    init(url: URL, source: Record, directory: URL) {
-        self.url = url; self.source = source; sha256 = source.string("sha256"); self.directory = directory
+    init(url: URL, source: Record, directory: URL) throws {
+        self.url = url; self.sourceBytes = try JSONSerialization.data(withJSONObject: source.values); sha256 = source.string("sha256"); self.directory = directory
     }
     deinit { try? FileManager.default.removeItem(at: directory) }
 
@@ -63,8 +68,9 @@ final class AuthorizedPreviewFile: @unchecked Sendable {
         if isCanceled() || progress?.isCancelled == true { throw CancellationError() }
         try output.synchronize()
         try FileManager.default.setAttributes([.posixPermissions: 0o400], ofItemAtPath: outputURL.path)
+        let file = try AuthorizedPreviewFile(url: outputURL, source: source, directory: root)
         finished = true
-        return AuthorizedPreviewFile(url: outputURL, source: source, directory: root)
+        return file
     }
 
     /// External copies persist in the app cache, with a provenance sidecar. They
@@ -146,9 +152,11 @@ final class FilePreviewLoader: ObservableObject {
             try Task.checkCancellation()
             // Capture a returned hold even if the view closes during authorization.
             // The independent read/release tasks retain the transport's usual bounds.
-            let response = try await Task { @MainActor in
-                try await store.request("attachment_read", ["project_id": attachment.string("project_id"), "attachment_id": attachment.id, "representation": "original"])
+            let responseBytes = try await Task { @MainActor in
+                let reply = try await store.request("attachment_read", ["project_id": attachment.string("project_id"), "attachment_id": attachment.id, "representation": "original"])
+                return try JSONSerialization.data(withJSONObject: reply)
             }.value
+            let response = try JSONSerialization.jsonObject(with: responseBytes) as? [String: Any] ?? [:]
             hold = response["read_hold_id"] as? String
             try Task.checkCancellation()
             guard generation == current, !canceling else { throw CancellationError() }
@@ -169,8 +177,10 @@ final class FilePreviewLoader: ObservableObject {
                     self.copiedBytes = max(self.copiedBytes, count)
                 }
             let didCopyChunkForTesting = self.didCopyChunkForTesting
+            let sourceBytes = try JSONSerialization.data(withJSONObject: attachment.values)
             let work = Task.detached(priority: .userInitiated) {
-                try AuthorizedPreviewFile.copy(path: path, source: attachment, progress: progress, didCopyChunkForTesting: didCopyChunkForTesting)
+                let source = Record(values: try JSONSerialization.jsonObject(with: sourceBytes) as? [String: Any] ?? [:])
+                return try AuthorizedPreviewFile.copy(path: path, source: source, progress: progress, didCopyChunkForTesting: didCopyChunkForTesting)
             }
             let copy = try await withTaskCancellationHandler(operation: { try await work.value }, onCancel: { work.cancel() })
             try Task.checkCancellation()

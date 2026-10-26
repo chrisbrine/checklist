@@ -224,8 +224,8 @@ enum MediaImageDecode {
             guard data.count==size,digest(data)==sha256 else {throw Failure.unavailable};return data
         }
     }
-    static func decode(_ bytes:Data,sha256:String) async throws -> NSImage {
-        try await work {
+    @MainActor static func decode(_ bytes:Data,sha256:String) async throws -> NSImage {
+        let cg = try await work {
             guard bytes.count<=8*1024*1024,digest(bytes)==sha256,
                   let source=CGImageSourceCreateWithData(bytes as CFData,[kCGImageSourceShouldCache:false] as CFDictionary),
                   let props=CGImageSourceCopyPropertiesAtIndex(source,0,nil) as? [CFString:Any],
@@ -233,11 +233,12 @@ enum MediaImageDecode {
                   let height=(props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
                   width>0,height>0,width<=16_000_000/height,
                   let cg=CGImageSourceCreateThumbnailAtIndex(source,0,[kCGImageSourceCreateThumbnailFromImageAlways:true,kCGImageSourceThumbnailMaxPixelSize:1600,kCGImageSourceShouldCacheImmediately:true] as CFDictionary) else {throw Failure.unsupported}
-            return NSImage(cgImage:cg,size:NSSize(width:cg.width,height:cg.height))
+            return cg
         }
+        return NSImage(cgImage:cg,size:NSSize(width:cg.width,height:cg.height))
     }
     private static func digest(_ bytes:Data)->String {SHA256.hash(data:bytes).map {String(format:"%02x",$0)}.joined()}
-    private static func work<T>(_ operation:@escaping () throws -> T) async throws -> T {
+    private static func work<T: Sendable>(_ operation:@escaping @Sendable () throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation {continuation in queue.addOperation {do {continuation.resume(returning:try operation())} catch {continuation.resume(throwing:error)}}}
     }
 }

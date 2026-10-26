@@ -478,6 +478,7 @@ extension CommandRouter {
                 t["completed_at"] = now()
                 completion = ["completed": true]
             } catch let waiting as CoreError {
+                if waiting.code == "CANONICAL_RECORD_INVALID" { throw waiting }
                 completion = ["completed": false, "waiting_for": waiting.code, "reason": waiting.message]
             }
         }

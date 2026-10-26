@@ -45,7 +45,7 @@ import AppKit
         func release() async throws {
             hold = false
             let reads = pending; pending = []
-            for (method,params,read) in reads {read.resume(returning:try await transport(method,params))}
+            for (method,params,read) in reads {read.resume(returning: fixtureReply(try await transport(method,params)))}
         }
         func cleanup() {for read in pending {read.2.resume(throwing:CancellationError())};pending=[];try? FileManager.default.removeItem(at:root)}
     }

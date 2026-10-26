@@ -62,7 +62,7 @@ import ChecklistIPC
         }
         func release(_ error: Error? = nil) {
             guard let held else {return};self.held = nil
-            if let error = error ?? heldError {held.resume(throwing:error)} else {held.resume(returning:heldReply!)}
+            if let error = error ?? heldError {held.resume(throwing:error)} else {held.resume(returning: fixtureReply(heldReply!))}
             heldReply = nil;heldError = nil
         }
         func store(qualificationFaults: QualificationFaults? = nil) -> ChecklistStore {

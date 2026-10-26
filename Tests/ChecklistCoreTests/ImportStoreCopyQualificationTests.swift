@@ -25,14 +25,24 @@ final class ImportStoreCopyQualificationTests: XCTestCase {
         do {_ = try router.handle(method:"import_preview",params:["project_id":pid,"path":source.path,"source_format":"synthetic-board/1","source_namespace":"synthetic-qualification","command_id":UUID().uuidString],caller:owner);result["preview_supported"] = true}
         catch let e as CoreError where ["UNSUPPORTED_METHOD","FORBIDDEN"].contains(e.code) {result["preview_supported"] = false;result["preview_code"] = e.code}
         result["preview_seconds"] = ProcessInfo.processInfo.systemUptime-previewStart
-        func sample() -> JSON {
+        struct Sample: Sendable {
+            let time: Double, footprint: UInt64, cpu: Double
+            var json: JSON {["time":time,"phys_footprint":footprint,"cpu_seconds":cpu]}
+        }
+        struct CallMeasurement: Sendable {
+            let lane: Int, index: Int
+            let wall: Double, cpu: Double
+            var json: JSON {["lane":lane,"index":index,"wall_seconds":wall,"process_cpu_interval_seconds":cpu]}
+        }
+        @Sendable func sample() -> Sample {
             var vm = task_vm_info_data_t(),count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size/MemoryLayout<integer_t>.size)
             let rc = withUnsafeMutablePointer(to:&vm) {p in p.withMemoryRebound(to:integer_t.self,capacity:Int(count)) {task_info(mach_task_self_,task_flavor_t(TASK_VM_INFO),$0,&count)}}
             var u = rusage();getrusage(RUSAGE_SELF,&u)
-            return ["time":ProcessInfo.processInfo.systemUptime,"phys_footprint":rc == KERN_SUCCESS ? vm.phys_footprint : 0,"cpu_seconds":Double(u.ru_utime.tv_sec+u.ru_stime.tv_sec)+Double(u.ru_utime.tv_usec+u.ru_stime.tv_usec)/1_000_000]
+            return Sample(time:ProcessInfo.processInfo.systemUptime,footprint:rc == KERN_SUCCESS ? vm.phys_footprint : 0,cpu:Double(u.ru_utime.tv_sec+u.ru_stime.tv_sec)+Double(u.ru_utime.tv_usec+u.ru_stime.tv_usec)/1_000_000)
         }
-        let lock = NSLock(),group = DispatchGroup(),origin = ProcessInfo.processInfo.systemUptime
-        var calls: [JSON] = [],samples: [JSON] = [sample()],failures: [String] = []
+        let group = DispatchGroup(),origin = ProcessInfo.processInfo.systemUptime
+        let measurements = LockedTestState<(calls: [CallMeasurement], failures: [String])>(([], []))
+        var samples = [sample()]
         for lane in 0..<4 {
             group.enter();DispatchQueue.global().async {
                 defer {group.leave()}
@@ -45,14 +55,15 @@ final class ImportStoreCopyQualificationTests: XCTestCase {
                         if lane != 3 {p["command_id"] = UUID().uuidString;p["body"] = "CL-21 owned-copy synthetic traffic lane \(lane) sequence \(index)";p["kind"] = "note"}
                         _ = try router.handle(method:method,params:p,caller:owner)
                         let after = sample()
-                        lock.lock();calls.append(["lane":lane,"index":index,"wall_seconds":(after["time"] as! Double)-(before["time"] as! Double),"process_cpu_interval_seconds":(after["cpu_seconds"] as! Double)-(before["cpu_seconds"] as! Double)]);lock.unlock()
-                    } catch {lock.lock();failures.append(String(describing:error));lock.unlock();return}
+                        measurements.withLock { $0.calls.append(CallMeasurement(lane:lane,index:index,wall:after.time-before.time,cpu:after.cpu-before.cpu)) }
+                    } catch {measurements.withLock { $0.failures.append(String(describing:error)) };return}
                 }
             }
         }
         for index in 1...18 {let delay = origin+Double(index*10)-ProcessInfo.processInfo.systemUptime;if delay>0 {Thread.sleep(forTimeInterval:delay)};samples.append(sample())}
-        group.wait();result["calls"] = calls;result["samples"] = samples;result["failures"] = failures;result["duration_seconds"] = ProcessInfo.processInfo.systemUptime-origin
-        result["cpu_per_completed_call"] = ((samples.last!["cpu_seconds"] as! Double)-(samples.first!["cpu_seconds"] as! Double))/Double(max(1,calls.count))
+        group.wait();let (calls, failures) = measurements.snapshot
+        result["calls"] = calls.map(\.json);result["samples"] = samples.map(\.json);result["failures"] = failures;result["duration_seconds"] = ProcessInfo.processInfo.systemUptime-origin
+        result["cpu_per_completed_call"] = (samples.last!.cpu-samples.first!.cpu)/Double(max(1,calls.count))
         try JSONSerialization.data(withJSONObject:result,options:[.sortedKeys,.prettyPrinted]).write(to:URL(fileURLWithPath:output))
         XCTAssertEqual(calls.count,360);XCTAssertTrue(failures.isEmpty)
     }

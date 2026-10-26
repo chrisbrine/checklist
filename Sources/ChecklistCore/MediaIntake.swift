@@ -127,6 +127,8 @@ extension CommandRouter {
                     let validation = try mediaInspectFile((try StoredRecord(prepared.attachment, family: "media").string("path")),caller:c,project:project,managed:true)
                     guard validation["sha256"] as? String == row["sha256"] as? String,validation["media_kind"] as? String == row["media_kind"] as? String else { throw CoreError("SOURCE_CHANGED","Captured media differs from the frozen preview.") }
                     resources.captures[id] = .init(owner:owner,prepared:prepared,encodedReceipt:try jsonString(["data":prepared.attachment]))
+                } catch let error as CoreError where error.code == "CANONICAL_RECORD_INVALID" {
+                    throw error
                 } catch { resources.errors[id] = (error as? CoreError)?.code ?? "MEDIA_SOURCE_UNAVAILABLE" }
             }
             // Selected UTF-8 files use their frozen text, but still revalidate the original

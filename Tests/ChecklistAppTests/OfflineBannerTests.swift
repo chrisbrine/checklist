@@ -10,11 +10,11 @@ import ChecklistIPC
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("offline-" + UUID().uuidString)
         let preferences = isolatedDefaults("Offline").preferences
         defer { try? FileManager.default.removeItem(at: root) }
-        var online = false
+        let online = FixtureState(false)
         let store = ChecklistStore(draftJournal: LocalDraftJournal(directory: root), preferences: preferences, restorePendingCommand: false,
                                    desktopAlerts: DesktopAlertCoordinator(sink: OfflineAlertSink()),
                                    requestTransport: { method, _ in
-                                       guard online else { throw Down() }
+                                       guard online.value else { throw Down() }
                                        return method == "snapshot" ? ["data": ["service": ["store_incarnation": "offline-test"]], "event_cursor": "c1"] : [:]
                                    })
         XCTAssertFalse(store.showsOfflineBanner, "No banner before the first connection attempt")
@@ -25,7 +25,7 @@ import ChecklistIPC
         }
         XCTAssertTrue(store.showsOfflineBanner)
         XCTAssertEqual(store.lastServiceFailure, "Connection refused")
-        online = true
+        online.value = true
         await store.ensureFullSnapshot()
         XCTAssertTrue(store.connected)
         XCTAssertFalse(store.showsOfflineBanner, "Reconnection clears the banner")

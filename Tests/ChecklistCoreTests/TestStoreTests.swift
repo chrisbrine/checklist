@@ -36,15 +36,15 @@ final class TestStoreTests: XCTestCase {
 
     func testConcurrentCopiesAreIndependent() throws {
         let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
-        let lock = NSLock(); var identities = Set<String>(), errors: [String] = []
+        let state = LockedTestState((identities: Set<String>(), errors: [String]()))
         DispatchQueue.concurrentPerform(iterations: 12) { index in
             do {
                 let router = try TestStore.router(root: root.appendingPathComponent(String(index)))
                 defer { try? router.closeStore() }
-                lock.withLock { _ = identities.insert(router.incarnation) }
-            } catch { lock.withLock { errors.append(String(describing: error)) } }
+                state.withLock { _ = $0.identities.insert(router.incarnation) }
+            } catch { state.withLock { $0.errors.append(String(describing: error)) } }
         }
-        XCTAssertEqual(errors, []); XCTAssertEqual(identities.count, 12)
+        XCTAssertEqual(state.snapshot.errors, []); XCTAssertEqual(state.snapshot.identities.count, 12)
     }
 
     func testUnitSynchronizationDoesNotChangeProductionOrQualification() throws {

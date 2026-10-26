@@ -1,10 +1,46 @@
 import XCTest
 import CryptoKit
 import CoreServices
+import PDFKit
+import CoreGraphics
 import ChecklistCore
 @testable import ChecklistApp
 
 final class FilePreviewNativeTests: XCTestCase {
+    @MainActor func testPDFWorkerTransfersAReadableDocumentToItsMainActorOwner() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pdf-owner-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("one-page.pdf")
+        var bounds = CGRect(x: 0, y: 0, width: 72, height: 72)
+        let context = try XCTUnwrap(CGContext(url as CFURL, mediaBox: &bounds, nil))
+        context.beginPDFPage(nil)
+        context.setFillColor(CGColor(gray: 0.5, alpha: 1))
+        context.fill(bounds)
+        context.endPDFPage()
+        context.closePDF()
+        let owner = await NativePDFDocument.load(url: url)
+        MainActor.preconditionIsolated()
+        let document = try XCTUnwrap(owner.document)
+        XCTAssertEqual(document.pageCount, 1)
+        XCTAssertFalse(document.isLocked)
+        XCTAssertEqual(document.documentURL?.standardizedFileURL, url.standardizedFileURL)
+        XCTAssertNotNil(document.page(at: 0))
+    }
+
+    @MainActor func testPDFWorkerRejectsMissingAndUnreadableFiles() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pdf-invalid-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let corrupt = root.appendingPathComponent("corrupt.pdf")
+        try Data("This is not a PDF".utf8).write(to: corrupt)
+        for url in [root.appendingPathComponent("missing.pdf"), corrupt] {
+            let owner = await NativePDFDocument.load(url: url)
+            MainActor.preconditionIsolated()
+            XCTAssertNil(owner.document, url.lastPathComponent)
+        }
+    }
+
     func fixture(_ data: Data = Data("# Sample\n".utf8)) throws -> (URL, Record) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -86,13 +122,14 @@ final class FilePreviewNativeTests: XCTestCase {
     @MainActor func testLoaderRequiresManagedHoldButReferencesUseTheirExistingAuthorization() async throws {
         let (url, record) = try fixture()
         let preferences = isolatedDefaults("FilePreview").preferences
-        var reply = record.values; reply["url"] = url.path
-        let store = ChecklistStore(draftJournal: LocalDraftJournal(directory: url.deletingLastPathComponent().appendingPathComponent("drafts")), preferences: preferences, restorePendingCommand: false, desktopAlerts: DesktopAlertCoordinator(sink: FilePreviewNoAlertSink()), requestTransport: { _, _ in reply })
+        var initialReply = record.values; initialReply["url"] = url.path
+        let reply = FixtureState(initialReply)
+        let store = ChecklistStore(draftJournal: LocalDraftJournal(directory: url.deletingLastPathComponent().appendingPathComponent("drafts")), preferences: preferences, restorePendingCommand: false, desktopAlerts: DesktopAlertCoordinator(sink: FilePreviewNoAlertSink()), requestTransport: { _, _ in reply.value })
         store.connected = true
         let loader = FilePreviewLoader(); await loader.load(record, store: store)
         XCTAssertNil(loader.file, "Managed originals require the service reader hold")
-        reply["mode"] = "external_reference"
-        let reference = Record(values: reply)
+        reply.value["mode"] = "external_reference"
+        let reference = Record(values: reply.value)
         await loader.load(reference, store: store)
         let copy = try XCTUnwrap(loader.file?.url)
         XCTAssertEqual(try Data(contentsOf: copy), try Data(contentsOf: url))
@@ -101,9 +138,9 @@ final class FilePreviewNativeTests: XCTestCase {
     @MainActor func testLoaderReadAndReleaseErrorsSettleWithoutLosingVerifiedCopy() async throws {
         let (url, record) = try fixture()
         let preferences = isolatedDefaults("FilePreview").preferences
-        var failRead = true
+        let failRead = FixtureState(true)
         let store = ChecklistStore(draftJournal: LocalDraftJournal(directory: url.deletingLastPathComponent().appendingPathComponent("drafts")), preferences: preferences, restorePendingCommand: false, desktopAlerts: DesktopAlertCoordinator(sink: FilePreviewNoAlertSink()), requestTransport: { method, _ in
-            if failRead || method == "attachment_read_release" { throw FilePreviewFailure("Synthetic peer did not reply before its read deadline.") }
+            if failRead.value || method == "attachment_read_release" { throw FilePreviewFailure("Synthetic peer did not reply before its read deadline.") }
             var reply = record.values; reply["url"] = url.path; reply["read_hold_id"] = "synthetic-hold"
             return reply
         })
@@ -112,7 +149,7 @@ final class FilePreviewNativeTests: XCTestCase {
         await loader.load(record, store: store)
         XCTAssertFalse(loader.loading); XCTAssertNil(loader.file)
         XCTAssertTrue(loader.problem.contains("Synthetic peer"))
-        failRead = false
+        failRead.value = false
         await loader.load(record, store: store)
         XCTAssertFalse(loader.loading)
         XCTAssertNotNil(loader.file, "An unconfirmed release must not discard verified preview bytes")

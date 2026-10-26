@@ -99,10 +99,12 @@ extension CoreTests {
         let file = directory.appendingPathComponent("read-path-original.txt"); try Data("original bytes".utf8).write(to: file)
         let attachment = try call("attachment_add", ["project_id": p["id"]!, "task_id": t["id"]!, "path": file.path])
         let cursor = try XCTUnwrap(try router.handle(method: "task_list", params: ["project_id": p["id"]!], caller: owner)["event_cursor"] as? String)
+        let fixtureRouter = router!, root = directory!, caller = owner
+        let projectID = p["id"] as! String, attachmentID = attachment["id"] as! String
         let holding = expectation(description: "writer held"), release = DispatchSemaphore(value: 0), done = expectation(description: "writer released")
         DispatchQueue.global().async {
-            try? ArchiveStorageGate.withExclusive(root: self.directory) { _ in
-                self.router.dbQueue.writeWithoutTransaction { _ in holding.fulfill(); _ = release.wait(timeout: .now() + 10) }
+            try? ArchiveStorageGate.withExclusive(root: root) { _ in
+                fixtureRouter.dbQueue.writeWithoutTransaction { _ in holding.fulfill(); _ = release.wait(timeout: .now() + 10) }
             }
             done.fulfill()
         }
@@ -119,17 +121,17 @@ extension CoreTests {
         let elapsed = Date().timeIntervalSince(start)
         // An owner's original read issues a reader hold, so it falls back to the writer and waits.
         let fallback = expectation(description: "original read finished"), heldStart = Date()
-        var fallbackSeconds = 0.0, holdID: String?
+        let fallbackResult = LockedTestState<(Double, String?)>((0, nil))
         DispatchQueue.global().async {
-            let output = try? self.router.handle(method: "attachment_read", params: ["project_id": p["id"]!, "attachment_id": attachment["id"]!, "representation": "original"], caller: self.owner)
-            fallbackSeconds = Date().timeIntervalSince(heldStart); holdID = (output?["data"] as? JSON)?["read_hold_id"] as? String
+            let output = try? fixtureRouter.handle(method: "attachment_read", params: ["project_id": projectID, "attachment_id": attachmentID, "representation": "original"], caller: caller)
+            fallbackResult.withLock { $0 = (Date().timeIntervalSince(heldStart), (output?["data"] as? JSON)?["read_hold_id"] as? String) }
             fallback.fulfill()
         }
         Thread.sleep(forTimeInterval: 0.3)
         release.signal(); wait(for: [done, fallback], timeout: 5)
         XCTAssertLessThan(elapsed, 1.0, "reads completed while the object gate and the writer were held")
-        XCTAssertGreaterThanOrEqual(fallbackSeconds, 0.3, "the writing read waited for the writer")
-        XCTAssertNotNil(holdID, "the fallback read still issued its reader hold")
+        XCTAssertGreaterThanOrEqual(fallbackResult.snapshot.0, 0.3, "the writing read waited for the writer")
+        XCTAssertNotNil(fallbackResult.snapshot.1, "the fallback read still issued its reader hold")
     }
 
     func testSnapshotLoadsTagsGroupsAndRelationsOncePerCall() throws {

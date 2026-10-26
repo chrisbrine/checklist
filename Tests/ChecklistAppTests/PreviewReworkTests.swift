@@ -1,3 +1,4 @@
+import ChecklistAXTestSupport
 import XCTest
 import SwiftUI
 import AVFoundation
@@ -5,7 +6,7 @@ import CryptoKit
 import ChecklistCore
 @testable import ChecklistApp
 
-final class PreviewReworkTests: XCTestCase {
+@MainActor final class PreviewReworkTests: XCTestCase {
     private func verified(_ name: String) throws -> AuthorizedPreviewFile {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("SyntheticPreviewRework-" + UUID().uuidString)
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
@@ -46,9 +47,9 @@ final class PreviewReworkTests: XCTestCase {
         defer { watchdog.cancel() }
         let file = try verified("unsupported.synthetic-unknown")
         let enhanced = NSAccessibility.Attribute(rawValue:"AXEnhancedUserInterface")
-        let wasEnhanced = NSApplication.shared.accessibilityAttributeValue(enhanced) ?? false
-        NSApplication.shared.accessibilitySetValue(true,forAttribute:enhanced)
-        defer { NSApplication.shared.accessibilitySetValue(wasEnhanced,forAttribute:enhanced) }
+        let wasEnhanced = ChecklistTestAXAttributeValue(NSApplication.shared, enhanced) ?? false
+        ChecklistTestAXSetValue(NSApplication.shared, true, enhanced)
+        defer { ChecklistTestAXSetValue(NSApplication.shared, wasEnhanced, enhanced) }
         let host = NSHostingView(rootView: VStack { Text("Viewing does not approve this candidate."); NativeFilePreview(file:file,kind:.unsupported,presentation:.init(kind:.unsupported)).frame(maxWidth:.infinity,maxHeight:.infinity) })
         let window = NSWindow(contentRect:NSRect(x:-10000,y:-10000,width:800,height:600),styleMask:[.titled],backing:.buffered,defer:false)
         window.title = "Synthetic Checklist preview regression (offscreen)"

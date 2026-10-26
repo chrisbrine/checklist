@@ -3,6 +3,16 @@ import XCTest
 @testable import ChecklistIPC
 
 final class AsyncServiceCallTests: XCTestCase {
+    // The lock transfers the XPC callback to exactly one sender; only immutable Data crosses queues.
+    private final class ReplySender: @unchecked Sendable {
+        private let lock = NSLock()
+        private var reply: ((Data) -> Void)?
+        init(_ reply: @escaping (Data) -> Void) { self.reply = reply }
+        func send(_ response: Data) {
+            lock.lock(); let callback = reply; reply = nil; lock.unlock()
+            callback?(response)
+        }
+    }
     private final class Service: NSObject, NSXPCListenerDelegate, ChecklistRPC {
         let listener = NSXPCListener.anonymous()
         let response: Data?
@@ -22,7 +32,8 @@ final class AsyncServiceCallTests: XCTestCase {
         }
         func execute(_ request: Data, withReply reply: @escaping (Data) -> Void) {
             guard let response else { return }
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) { reply(response) }
+            let sender = ReplySender(reply)
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) { sender.send(response) }
         }
         func stop() {
             listener.invalidate()

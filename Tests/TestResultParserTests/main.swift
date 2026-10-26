@@ -78,7 +78,7 @@ Test Suite 'AgentReviewAssessmentTests' passed at 2026-10-18 01:24:36.199.
 	 Executed 9 tests, with 0 failures (0 unexpected) in 0.478 (0.479) seconds
 """
 
-let checks: [(String, () throws -> Void)] = [
+var checks: [(String, () throws -> Void)] { [
     ("NUnit nested suites, decoded names and case counts", {
         let r = try parsed(nunit)
         try require(r.format == .nunit && r.total == 3 && r.passed == 1 && r.failed == 1 && r.skipped == 1 && r.other == 0, "NUnit outcomes or suite deduplication")
@@ -181,7 +181,7 @@ let checks: [(String, () throws -> Void)] = [
         let log = try parsed("Test Suite 'All tests' started.\nTest Suite 'All tests' passed.\nExecuted 0 tests, with 0 failures (0 unexpected) in 0.1 seconds")
         try require(xml.total == 0 && log.total == 0, "Empty complete runs")
     })
-]
+] }
 
 final class TestResultParserTests: XCTestCase {
     func testNUnitNestedSuitesDecodedNamesAndCaseCounts() throws { try checks[0].1() }

@@ -1,3 +1,4 @@
+import ChecklistAXTestSupport
 import XCTest
 import SwiftUI
 import ChecklistIPC
@@ -92,7 +93,7 @@ import ChecklistIPC
         }
         await fulfillment(of: [began], timeout: 2)
         await load(history, rows: [discarded])
-        pending?.resume(returning: reply([prepared]))
+        pending?.resume(returning: fixtureReply(reply([prepared])))
         await old.value
         XCTAssertEqual(history.batches.map(\.id), ["discarded"])
         XCTAssertFalse(history.loading); XCTAssertNil(history.error)
@@ -176,9 +177,9 @@ import ChecklistIPC
     private func hostedText<Content: View>(_ content: Content,
         afterMount: (NSHostingView<AnyView>) async throws -> Void = { _ in }) async throws -> String {
         let enhanced = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
-        let wasEnhanced = NSApplication.shared.accessibilityAttributeValue(enhanced) ?? false
-        NSApplication.shared.accessibilitySetValue(true, forAttribute: enhanced)
-        defer { NSApplication.shared.accessibilitySetValue(wasEnhanced, forAttribute: enhanced) }
+        let wasEnhanced = ChecklistTestAXAttributeValue(NSApplication.shared, enhanced) ?? false
+        ChecklistTestAXSetValue(NSApplication.shared, true, enhanced)
+        defer { ChecklistTestAXSetValue(NSApplication.shared, wasEnhanced, enhanced) }
         let host = NSHostingView(rootView: AnyView(content.accessibilityElement(children: .contain)))
         let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 700, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
         window.title = "Synthetic Checklist fixed-batch regression (offscreen)"

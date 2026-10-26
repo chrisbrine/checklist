@@ -3,7 +3,7 @@ import SwiftUI
 @testable import ChecklistApp
 
 /// docs/interface.md#glossary names each visible concept once (CL-56).
-final class GlossaryTests: XCTestCase {
+@MainActor final class GlossaryTests: XCTestCase {
     func testOneCanceledSpellingWithOneLegacyAlias() {
         XCTAssertEqual(Canceled.normalized("cancelled"), "canceled")
         XCTAssertEqual(Canceled.normalized("answered"), "answered")

@@ -139,7 +139,7 @@ struct ProjectSettingsView: View {
     }
     var workflowSettings: some View {
         DetailSection(title: "Workflow") {
-            Picker("Routing preset", selection:Binding(get:{preset},set:applyPreset)) {
+            Picker("Routing preset", selection:Binding(get:{preset},set:{ applyPreset($0) })) {
                 ForEach(ProviderPolicyDefaults.presets,id:\.self) { value in
                     Text(value == "shared" ? "Shared work" : value.replacingOccurrences(of:"_",with:" ").capitalized).tag(value)
                 }

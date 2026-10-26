@@ -1,4 +1,5 @@
 import Foundation
+import os
 #if os(macOS)
 import Darwin
 #endif
@@ -38,15 +39,15 @@ struct MacOSSourceGitProcessAdapter: SourceGitProcessAdapter {
         process.environment = request.environment
         process.standardOutput = out; process.standardError = err; process.standardInput = FileHandle.nullDevice
         process.terminationHandler = { _ in exited.signal() }
-        let readers = DispatchGroup(), lock = NSLock()
-        var output = Data(), errors = Data()
+        let readers = DispatchGroup()
+        let results = OSAllocatedUnfairLock(initialState: (output: Data(), errors: Data()))
         do { try process.run() }
         catch { throw SourceGit.Confinement.unavailable() }
         for (handle, isOutput) in [(out.fileHandleForReading, true), (err.fileHandleForReading, false)] {
             readers.enter()
             DispatchQueue.global(qos: .userInitiated).async {
                 let data = handle.readDataToEndOfFile()
-                lock.lock(); if isOutput { output = data } else { errors = data }; lock.unlock()
+                results.withLock { if isOutput { $0.output = data } else { $0.errors = data } }
                 readers.leave()
             }
         }
@@ -59,7 +60,7 @@ struct MacOSSourceGitProcessAdapter: SourceGitProcessAdapter {
         }
         // The child has exited; its pipes reach end of file unless a grandchild still holds them.
         guard readers.wait(timeout: .now() + 5) == .success else { throw CoreError("SOURCE_CAPTURE_INCOMPLETE", "Git output did not close after git exited.", details: ["reason": "git_pipe_open"]) }
-        lock.lock(); defer { lock.unlock() }
+        let (output, errors) = results.withLock { $0 }
         guard process.terminationReason == .exit else {
             throw CoreError("SOURCE_GIT_CONFINED", "Source Git was terminated by protected-root or helper confinement (or an external signal); no source inventory was accepted.", details: ["signal": process.terminationStatus])
         }

@@ -163,7 +163,7 @@ private struct MarkdownAttachedImage: View {
 
 /// Preview resources are ticket attachments, independent of a submission's refs.
 enum MarkdownPreviewResources {
-    static func load(source: Record, seed: [Record], request: (String, [String: Any]) async throws -> [String: Any]) async throws -> [Record] {
+    @MainActor static func load(source: Record, seed: [Record], request: @MainActor (String, [String: Any]) async throws -> [String: Any]) async throws -> [Record] {
         guard !source.string("project_id").isEmpty, !source.string("task_id").isEmpty else {
             throw FilePreviewFailure("This document has no ticket attachment scope.")
         }

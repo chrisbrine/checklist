@@ -248,18 +248,21 @@ final class MediaHistoryCaptureTests: XCTestCase {
         let parent = f.base.appendingPathComponent("protected-snapshots");try FileManager.default.createDirectory(at:parent,withIntermediateDirectories:true)
         let identity = try f.router.dbQueue.read { db in try StoreIdentityReceipt.decode(Data(String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='store_identity'")!.utf8)) }
         let started = DispatchSemaphore(value:0),finished = DispatchSemaphore(value:0),operation = UUID()
-        var contenderError: Error?,observed = false
+        let contenderError = LockedTestState<Error?>(nil)
+        let router = f.router, root = f.root, holdID = reference["id"] as! String
+        let attachmentPath = prepared.attachment["path"] as! String
+        var observed = false
         var budget = StorageSnapshotBudget(deadlineUptime:ProcessInfo.processInfo.systemUptime + 30,canceled:{false})
         budget.observe = { boundary in
             guard boundary == "backup_done",!observed else { return };observed = true
             DispatchQueue.global().async {
                 started.signal()
                 do {
-                    try f.tx { db,_ in
-                        var r = try f.router.record(db,reference["id"] as! String,type:"storage_hold");r["state"] = "released";try f.router.save(db,f.router.revised(r),type:"storage_hold")
-                    }
-                    try ArchiveStorageGate.withExclusive(root:f.root) { _ in try FileManager.default.removeItem(at:f.router.managedURL(prepared.attachment["path"] as! String,family:"objects")) }
-                } catch { contenderError = error }
+                    try ArchiveStorageGate.withExclusive(root:root) { _ in try router.dbQueue.write { db in
+                        var r = try router.record(db,holdID,type:"storage_hold");r["state"] = "released";try router.save(db,router.revised(r),type:"storage_hold")
+                    } }
+                    try ArchiveStorageGate.withExclusive(root:root) { _ in try FileManager.default.removeItem(at:router.managedURL(attachmentPath,family:"objects")) }
+                } catch { contenderError.withLock { $0 = error } }
                 finished.signal()
             }
             XCTAssertEqual(started.wait(timeout:.now()+3),.success)
@@ -268,7 +271,7 @@ final class MediaHistoryCaptureTests: XCTestCase {
         let receipt = try ArchiveStorageGate.withExclusive(root:f.root) { permit in
             try StorageSnapshot.build(StorageSnapshotSource(source:f.root,parent:parent,storeID:identity.logical_store_id,permit:permit),operation:operation,budget:budget)
         }
-        XCTAssertTrue(observed);XCTAssertEqual(finished.wait(timeout:.now()+5),.success);XCTAssertNil(contenderError)
+        XCTAssertTrue(observed);XCTAssertEqual(finished.wait(timeout:.now()+5),.success);XCTAssertNil(contenderError.snapshot)
         let directory = parent.appendingPathComponent(StorageSnapshot.names(operation).published)
         let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self,from:Data(contentsOf:directory.appendingPathComponent("manifest.json")))
         let object = try XCTUnwrap(manifest.objects.first { $0.descriptor.authorities.contains("attachment:" + (prepared.attachment["id"] as! String) + ":original") })

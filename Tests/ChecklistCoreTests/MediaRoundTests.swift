@@ -463,7 +463,10 @@ final class MediaRoundTests: XCTestCase {
             }
         }
         let started = DispatchSemaphore(value:0),done = DispatchSemaphore(value:0)
-        var commandError: Error?,signaled = false,historyScans = 0
+        let commandError = LockedTestState<Error?>(nil)
+        let router = f.router, caller = f.owner, projectID = f.project
+        let editID = first["id"] as! String, editRevision = first["revision"] as! Int
+        var signaled = false,historyScans = 0
         f.router.dbQueue.writeWithoutTransaction { db in
             db.trace(options:[.statement]) { event in
                 guard case .statement(let statement) = event else {return}
@@ -473,7 +476,7 @@ final class MediaRoundTests: XCTestCase {
         }
         let overallStart = Date()
         DispatchQueue.global().async {
-            do {_ = try f.call("media_item_update",["item_id":first["id"]!,"expected_revision":first["revision"]!,"title":"Tiny edit after history"])} catch {commandError = error}
+            do {_ = try router.executeMediaCommand(method:"media_item_update",params:["project_id":projectID,"command_id":UUID().uuidString,"item_id":editID,"expected_revision":editRevision,"title":"Tiny edit after history"],caller:caller)} catch {commandError.withLock { $0 = error }}
             done.signal()
         }
         XCTAssertEqual(started.wait(timeout:.now()+30),.success)
@@ -482,7 +485,7 @@ final class MediaRoundTests: XCTestCase {
         let writerWait = Date().timeIntervalSince(waitStart)
         XCTAssertEqual(done.wait(timeout:.now()+30),.success)
         f.router.dbQueue.writeWithoutTransaction {$0.trace(nil)}
-        if let commandError {throw commandError}
+        if let error = commandError.snapshot {throw error}
         XCTAssertEqual(historyScans,0,"No full-history read/validation may run on the writer connection")
         XCTAssertLessThan(writerWait,0.5,"A tiny edit must not keep another writer waiting on retained history")
         let current = try f.record(item["id"] as! String,"media_item")

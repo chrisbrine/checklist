@@ -1,5 +1,4 @@
 import ChecklistTestSupport
-import ChecklistTestSupport
 import Foundation
 import XCTest
 @testable import ChecklistCore
@@ -8,18 +7,65 @@ import XCTest
 /// Real XPC, client decoding and Core command receipts, with an isolated service
 /// peer in place of installed-service authentication/bootstrap.
 final class LongCommandTests: XCTestCase {
-    private final class Service: NSObject, NSXPCListenerDelegate, ChecklistRPC {
+    // The lock transfers the XPC callback once; its only input is immutable response Data.
+    private final class ReplySender: @unchecked Sendable {
+        private let lock = NSLock()
+        private var reply: ((Data) -> Void)?
+        init(_ reply: @escaping (Data) -> Void) { self.reply = reply }
+        func send(_ response: Data) {
+            lock.lock(); let callback = reply; reply = nil; lock.unlock()
+            callback?(response)
+        }
+    }
+
+    // receivedIDs is lock-owned; the remaining references are immutable thread-safe router/synchronization objects.
+    private final class Execution: @unchecked Sendable {
         let router: CommandRouter
         let delay: TimeInterval
         let committed: XCTestExpectation
+        let commandStarted = DispatchSemaphore(value: 0)
+        let commandFinished = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var receivedIDs: Set<String> = []
+        init(router: CommandRouter, delay: TimeInterval, committed: XCTestExpectation) {
+            self.router = router; self.delay = delay; self.committed = committed
+        }
+        func run(_ request: Data, sender: ReplySender) {
+            do {
+                let object = try JSONSerialization.jsonObject(with: request) as! JSON
+                let params = object["params"] as! JSON
+                // Delay the first invocation only; retries keep the same wire input.
+                lock.lock(); let first = receivedIDs.insert(params["command_id"] as! String).inserted; lock.unlock()
+                if first { commandStarted.signal(); Thread.sleep(forTimeInterval: delay) }
+                let result = try router.handle(method: object["method"] as! String, params: params, caller: Caller(role: "owner", installation: "long-command-tests", projectIDs: []))
+                committed.fulfill(); commandFinished.signal()
+                sender.send(try JSONSerialization.data(withJSONObject: result))
+            } catch {
+                sender.send(try! JSONSerialization.data(withJSONObject: ["error": ["code": "FIXTURE_FAILED", "message": String(describing: error)]]))
+            }
+        }
+    }
+
+    // NSXPCConnection permits concurrent invalidation; this immutable handle performs that operation only.
+    private final class Disconnect: @unchecked Sendable {
+        let connection: NSXPCConnection
+        let started: DispatchSemaphore
+        init(connection: NSXPCConnection, started: DispatchSemaphore) {
+            self.connection = connection; self.started = started
+        }
+        func run() {
+            _ = started.wait(timeout: .now() + 5)
+            connection.invalidate()
+        }
+    }
+
+    private final class Service: NSObject, NSXPCListenerDelegate, ChecklistRPC {
+        let execution: Execution
         let listener = NSXPCListener.anonymous()
         private let lock = NSLock()
         private var connections: [NSXPCConnection] = []
-        private var receivedIDs: Set<String> = []
-        let commandStarted = DispatchSemaphore(value: 0)
-        let commandFinished = DispatchSemaphore(value: 0)
         init(router: CommandRouter, delay: TimeInterval, committed: XCTestExpectation) {
-            self.router = router; self.delay = delay; self.committed = committed
+            execution = Execution(router: router, delay: delay, committed: committed)
             super.init(); listener.delegate = self; listener.resume()
         }
         func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
@@ -28,21 +74,8 @@ final class LongCommandTests: XCTestCase {
             lock.lock(); connections.append(connection); lock.unlock(); connection.resume(); return true
         }
         func execute(_ request: Data, withReply reply: @escaping (Data) -> Void) {
-            DispatchQueue.global().async { [self] in
-                do {
-                    let object = try JSONSerialization.jsonObject(with: request) as! JSON
-                    let params = object["params"] as! JSON
-                    // Delay first execution only, simulating preparation before
-                    // Core commits the receipt. Retry sends identical wire input.
-                    lock.lock(); let first = receivedIDs.insert(params["command_id"] as! String).inserted; lock.unlock()
-                    if first { commandStarted.signal(); Thread.sleep(forTimeInterval: delay) }
-                    let result = try router.handle(method: object["method"] as! String, params: params, caller: Caller(role: "owner", installation: "long-command-tests", projectIDs: []))
-                    committed.fulfill(); commandFinished.signal()
-                    reply(try JSONSerialization.data(withJSONObject: result))
-                } catch {
-                    reply(try! JSONSerialization.data(withJSONObject: ["error": ["code": "FIXTURE_FAILED", "message": String(describing: error)]]))
-                }
-            }
+            let execution = execution, sender = ReplySender(reply)
+            DispatchQueue.global().async { execution.run(request, sender: sender) }
         }
         func stop() {
             listener.invalidate()
@@ -67,10 +100,8 @@ final class LongCommandTests: XCTestCase {
             let bytes = try JSONSerialization.data(withJSONObject: ["method": "project_create", "params": params])
             let connection = NSXPCConnection(listenerEndpoint: service.listener.endpoint)
             if disconnect && timeout == nil {
-                DispatchQueue.global().async {
-                    _ = service.commandStarted.wait(timeout: .now() + 5)
-                    connection.invalidate()
-                }
+                let disconnect = Disconnect(connection: connection, started: service.execution.commandStarted)
+                DispatchQueue.global().async { disconnect.run() }
             }
             return try client.requestOnce(bytes, replyTimeout: timeout, connection: connection)
         }
@@ -89,7 +120,7 @@ final class LongCommandTests: XCTestCase {
         }
         // Wait explicitly for the original invocation to commit before retrying;
         // no production polling or schedule is involved.
-        XCTAssertEqual(service.commandFinished.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(service.execution.commandFinished.wait(timeout: .now() + 5), .success)
         let replay = try send(params, timeout: 5)
         XCTAssertEqual(replay["replayed"] as? Bool, true)
         XCTAssertEqual(replay["command_id"] as? String, commandID)

@@ -69,8 +69,8 @@ import AppKit
             return ChecklistStore(draftJournal: LocalDraftJournal(directory: root), preferences: preferences, restorePendingCommand: false,
                 desktopAlerts: DesktopAlertCoordinator(sink: EpicReadAlertSink()), requestTransport: { [self] in try await transport($0, $1) }, navigationMemory: DetailItemNavigationMemory())
         }
-        func release(_ index: Int) { let (continuation, response) = pending.remove(at: index); continuation.resume(returning: response) }
-        func release() { let reads = pending; pending = []; for (continuation, response) in reads { continuation.resume(returning: response) } }
+        func release(_ index: Int) { let (continuation, response) = pending.remove(at: index); continuation.resume(returning: fixtureReply(response)) }
+        func release() { let reads = pending; pending = []; for (continuation, response) in reads { continuation.resume(returning: fixtureReply(response)) } }
         func cleanup() { for (continuation, _) in pending { continuation.resume(throwing: CancellationError()) }; pending = []; try? FileManager.default.removeItem(at: root) }
     }
     private func until(_ predicate: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async throws {

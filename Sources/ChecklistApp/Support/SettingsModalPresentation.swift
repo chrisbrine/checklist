@@ -12,9 +12,9 @@ extension FocusedValues {
         set { self[SettingsModalActionsKey.self] = newValue }
     }
 }
-private struct OpenChecklistSettingsKey: EnvironmentKey { static let defaultValue: () -> Void = {} }
+private struct OpenChecklistSettingsKey: EnvironmentKey { static let defaultValue: @MainActor @Sendable () -> Void = {} }
 extension EnvironmentValues {
-    var openChecklistSettings: () -> Void {
+    var openChecklistSettings: @MainActor @Sendable () -> Void {
         get { self[OpenChecklistSettingsKey.self] }
         set { self[OpenChecklistSettingsKey.self] = newValue }
     }
@@ -49,7 +49,7 @@ final class SettingsModalPresentation: ObservableObject {
     private let panelFactory: @MainActor () -> NSPanel
 
     init(panelFactory: @escaping @MainActor () -> NSPanel = { SettingsSheetPanel() }) { self.panelFactory = panelFactory }
-    deinit {
+    isolated deinit {
         if let monitor { NSEvent.removeMonitor(monitor) }
         if let resizeObserver { NotificationCenter.default.removeObserver(resizeObserver) }
         menuObservers.forEach(NotificationCenter.default.removeObserver)

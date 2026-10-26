@@ -83,7 +83,7 @@ extension TicketLifecycleCleanupTests {
         XCTAssertNotNil(inventory.rows.first {$0.id == hold},"A typed hold's digest in a JSON key still protects the object")
     }
 
-    private func residentBytes() -> UInt64 {
+    private static func residentBytes() -> UInt64 {
         var info = mach_task_basic_info(),count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<integer_t>.size)
         let result = withUnsafeMutablePointer(to:&info) {pointer in
             pointer.withMemoryRebound(to:integer_t.self,capacity:Int(count)) {task_info(mach_task_self_,task_flavor_t(MACH_TASK_BASIC_INFO),$0,&count)}
@@ -125,13 +125,13 @@ extension TicketLifecycleCleanupTests {
                 try self.router.save(db,value,type:type)
             }
         }
-        let before = residentBytes(),traffic = CleanupTraffic(),fixtureRouter = router!
+        let before = TicketLifecycleCleanupTests.residentBytes(),traffic = CleanupTraffic(),fixtureRouter = router!, trafficCaller = owner
         let writer = expectation(description:"constant unrelated writer"),sampler = expectation(description:"bounded preparation RSS sampler")
         DispatchQueue.global(qos:.utility).async {
             defer {writer.fulfill()}
             while !traffic.isStopped {
                 do {
-                    _ = try fixtureRouter.handle(method:"message_send",params:["command_id":uuid(),"project_id":pid,"task_id":other,"body":"Constant unrelated traffic"],caller:self.owner)
+                    _ = try fixtureRouter.handle(method:"message_send",params:["command_id":uuid(),"project_id":pid,"task_id":other,"body":"Constant unrelated traffic"],caller:trafficCaller)
                     traffic.recordWrite()
                 } catch {XCTFail("Concurrent writer failed: \(error)");break}
                 Thread.sleep(forTimeInterval:0.005)
@@ -139,12 +139,12 @@ extension TicketLifecycleCleanupTests {
         }
         DispatchQueue.global(qos:.utility).async {
             defer {sampler.fulfill()}
-            while !traffic.isStopped {traffic.sample(self.residentBytes());Thread.sleep(forTimeInterval:0.005)}
+            while !traffic.isStopped {traffic.sample(TicketLifecycleCleanupTests.residentBytes());Thread.sleep(forTimeInterval:0.005)}
         }
         var committed = 0
         for attempt in 0..<3 {
             try write {db in try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?, '0')",arguments:["ticket-cleanup-next:" + pid])}
-            let preparationBefore = residentBytes(),writesBefore = traffic.count
+            let preparationBefore = TicketLifecycleCleanupTests.residentBytes(),writesBefore = traffic.count
             try router.withTicketCleanupPreparation({db in
                 let prepared = try self.router.prepareTicketLifecycleCleanup(db)
                 // Exceed the former 256-row change budget during EVERY snapshot,
@@ -157,10 +157,10 @@ extension TicketLifecycleCleanupTests {
                 committed += 1
                 try self.router.commitTicketLifecycleCleanup(db,prepared:prepared,at:Date())
             }
-            print("CL193_PREPARATION attempt=\(attempt+1) unrelated_writes=\(traffic.count-writesBefore) rss_before=\(preparationBefore) rss_after=\(residentBytes()) sampled_peak=\(traffic.peakBytes)")
+            print("CL193_PREPARATION attempt=\(attempt+1) unrelated_writes=\(traffic.count-writesBefore) rss_before=\(preparationBefore) rss_after=\(TicketLifecycleCleanupTests.residentBytes()) sampled_peak=\(traffic.peakBytes)")
         }
         traffic.stop();wait(for:[writer,sampler],timeout:10)
-        let after = residentBytes(),growth = after > before ? after-before : 0
+        let after = TicketLifecycleCleanupTests.residentBytes(),growth = after > before ? after-before : 0
         print("CL193_CONTENTION records=5000 attachments=2000 json_payload_bytes=\(payload.utf8.count * 5000) preparations=3 commits=\(committed) rss_before=\(before) rss_after=\(after) rss_growth=\(growth) sampled_peak_rss=\(traffic.peakBytes) process_high_water_rss=\(peakResidentBytes()) writes=\(traffic.count)")
         XCTAssertEqual(committed,3,"Unrelated writes must not fence any prepared pass")
         XCTAssertLessThan(traffic.peakBytes-before,128 * 1024 * 1024,"Transient preparation memory must stay bounded under constant writes")
@@ -310,10 +310,10 @@ extension TicketLifecycleCleanupTests {
                 try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[self.owner.principal,uuid(),"fixture",try jsonString(["data":["body":text]])])
             }
         }
-        let before = residentBytes(),sample = CleanupTraffic(),finished = expectation(description:"selected payload memory sample")
+        let before = TicketLifecycleCleanupTests.residentBytes(),sample = CleanupTraffic(),finished = expectation(description:"selected payload memory sample")
         DispatchQueue.global(qos:.utility).async {
             defer {finished.fulfill()}
-            while !sample.isStopped {sample.sample(self.residentBytes());Thread.sleep(forTimeInterval:0.005)}
+            while !sample.isStopped {sample.sample(TicketLifecycleCleanupTests.residentBytes());Thread.sleep(forTimeInterval:0.005)}
         }
         try pass();sample.stop();wait(for:[finished],timeout:5)
         XCTAssertTrue(bool(try read(t),"purged"))
@@ -391,11 +391,11 @@ extension TicketLifecycleCleanupTests {
                 _ = try self.router.ticketCleanupBackupRetentionIndex(db,objects:[])
                 var current: Int32 = 0,high: Int32 = 0
                 sqlite3_db_status(db.sqliteConnection,SQLITE_DBSTATUS_CACHE_USED,&current,&high,0)
-                let rss = self.residentBytes()
+                let rss = TicketLifecycleCleanupTests.residentBytes()
                 if n == 0 {baseline = rss}
                 XCTAssertLessThan(rss,baseline + 64 * 1024 * 1024)
                 XCTAssertLessThan(current,32 * 1024 * 1024)
-                print("CL193_ALLOCATION attempt=\(n) rss=\(self.residentBytes()) sqlite_cache=\(current) sqlite_peak=\(high)")
+                print("CL193_ALLOCATION attempt=\(n) rss=\(TicketLifecycleCleanupTests.residentBytes()) sqlite_cache=\(current) sqlite_peak=\(high)")
             }
         }
         _ = p
@@ -455,7 +455,8 @@ extension TicketLifecycleCleanupTests {
         guard let duration = Double(ProcessInfo.processInfo.environment["CL193_SOAK_SECONDS"] ?? "360"),duration >= 180 else {throw XCTSkip("Qualification soak duration must be at least 180 seconds")}
         let (p,t,a) = try fixture(),pid = p["id"] as! String
         let trafficEpic = try call("epic_create",["project_id":pid,"name":"Independent traffic"])
-        let other = try call("task_create",["project_id":pid,"title":"Independent traffic ticket","epic_id":trafficEpic["id"]!]),otherID = other["id"] as! String
+        let trafficEpicID = trafficEpic["id"] as! String
+        let other = try call("task_create",["project_id":pid,"title":"Independent traffic ticket","epic_id":trafficEpicID]),otherID = other["id"] as! String
         try write {db in
             try autoreleasepool {
                 let payload = String(repeating:"unrelated-payload-",count:1536)
@@ -467,7 +468,7 @@ extension TicketLifecycleCleanupTests {
                 try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('backup-generation:soak',?)",arguments:[try jsonString(["state":"complete","objects":objects])])
             }
         }
-        let traffic = CleanupTraffic(),fixtureRouter = router!,started = Date(),initialCPU = cpuSeconds()
+        let traffic = CleanupTraffic(),fixtureRouter = router!, trafficCaller = owner,started = Date(),initialCPU = cpuSeconds()
         var workers: [XCTestExpectation] = []
         for worker in 0..<3 {
             let done = expectation(description:"sustained writer \(worker)");workers.append(done)
@@ -475,9 +476,9 @@ extension TicketLifecycleCleanupTests {
                 defer {done.fulfill()}
                 while !traffic.isStopped {
                     do {try autoreleasepool {
-                        _ = try fixtureRouter.handle(method:"message_send",params:["command_id":uuid(),"project_id":pid,"task_id":otherID,"body":"Sustained unrelated writer \(worker)"],caller:self.owner)
+                        _ = try fixtureRouter.handle(method:"message_send",params:["command_id":uuid(),"project_id":pid,"task_id":otherID,"body":"Sustained unrelated writer \(worker)"],caller:trafficCaller)
                         // Actual ticket creation writes the project's next_number.
-                        _ = try fixtureRouter.handle(method:"task_create",params:["command_id":uuid(),"project_id":pid,"title":"Counter traffic \(worker)","epic_id":trafficEpic["id"]!],caller:self.owner)
+                        _ = try fixtureRouter.handle(method:"task_create",params:["command_id":uuid(),"project_id":pid,"title":"Counter traffic \(worker)","epic_id":trafficEpicID],caller:trafficCaller)
                         traffic.recordWrite()
                     }} catch {XCTFail("Sustained writer: \(error)");return}
                     Thread.sleep(forTimeInterval:2)
@@ -487,13 +488,13 @@ extension TicketLifecycleCleanupTests {
         let sampler = expectation(description:"sustained RSS sampler");workers.append(sampler)
         DispatchQueue.global(qos:.utility).async {
             defer {sampler.fulfill()}
-            while !traffic.isStopped {traffic.sample(self.residentBytes());Thread.sleep(forTimeInterval:0.01)}
+            while !traffic.isStopped {traffic.sample(TicketLifecycleCleanupTests.residentBytes());Thread.sleep(forTimeInterval:0.01)}
         }
         let reader = expectation(description:"sustained reader");workers.append(reader)
         DispatchQueue.global(qos:.utility).async {
             defer {reader.fulfill()}
             while !traffic.isStopped {
-                do {try autoreleasepool {_ = try fixtureRouter.handle(method:"task_get",params:["project_id":pid,"task_id":otherID],caller:self.owner)}} catch {XCTFail("Sustained reader: \(error)");return}
+                do {try autoreleasepool {_ = try fixtureRouter.handle(method:"task_get",params:["project_id":pid,"task_id":otherID],caller:trafficCaller)}} catch {XCTFail("Sustained reader: \(error)");return}
                 Thread.sleep(forTimeInterval:2)
             }
         }
@@ -522,7 +523,7 @@ extension TicketLifecycleCleanupTests {
                 }) {_,_,_ in XCTFail("Selected-ticket conflict cannot commit")}
                 let state = try router.dbQueue.read {try self.router.ticketCleanupPreparationState($0,project:pid)}
                 XCTAssertEqual(state["state"] as? String,"deferred")
-                let rss = residentBytes()
+                let rss = TicketLifecycleCleanupTests.residentBytes()
                 if let first = postAttemptRSS.first {
                     XCTAssertLessThan(rss,first + 64 * 1024 * 1024,"Drained preparation memory cannot grow with repeated attempts")
                 }
@@ -532,7 +533,7 @@ extension TicketLifecycleCleanupTests {
             }
             if let deadline = armed,deadline <= Date() {try router.runStorageMaintenance();armed = try router.nextArchiveCleanupDeadline()}
             if elapsed >= nextSample {
-                let rss = residentBytes();traffic.sample(rss);minutePeak = max(minutePeak,rss)
+                let rss = TicketLifecycleCleanupTests.residentBytes();traffic.sample(rss);minutePeak = max(minutePeak,rss)
                 let state = try router.dbQueue.read {try self.router.ticketCleanupPreparationState($0,project:pid)}
                 lastAttempts = int(state,"attempt_count")
                 if let expected = backoffAttempts,let retry = (state["next_attempt_at"] as? String).flatMap({ISO8601DateFormatter().date(from:$0)}),retry > Date() {XCTAssertEqual(lastAttempts,expected,"Backoff must not start preparations")}

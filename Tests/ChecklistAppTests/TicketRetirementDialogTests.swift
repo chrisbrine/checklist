@@ -33,7 +33,7 @@ import ChecklistIPC
         } }
         await fulfillment(of: [started])
         state.presented = false
-        pending?.resume(returning: preview); await read.value
+        pending?.resume(returning: fixtureReply(preview)); await read.value
         XCTAssertNil(state.preview(for: current))
         XCTAssertNil(state.failure(for: current))
     }
@@ -54,7 +54,7 @@ import ChecklistIPC
         await fulfillment(of: [started])
         XCTAssertTrue(state.presented, "A slow service must not gate presentation")
         XCTAssertNil(state.preview(for: current))
-        pending?.resume(returning: preview)
+        pending?.resume(returning: fixtureReply(preview))
         await read.value
         let loaded = try XCTUnwrap(state.preview(for: current))
         XCTAssertEqual(loaded["cleanup_preview_id"] as? String, "exact-preview")
@@ -84,7 +84,7 @@ import ChecklistIPC
                           "An open sheet must reload when the epoch changes")
         var fresh = preview; fresh["cleanup_preview_id"] = "new-observation"
         await state.load(next) { fresh }
-        pending?.resume(returning: preview); await read.value
+        pending?.resume(returning: fixtureReply(preview)); await read.value
         XCTAssertEqual(state.preview(for: next)?["cleanup_preview_id"] as? String, "new-observation")
         XCTAssertNil(state.preview(for: first))
         XCTAssertNil(state.preview(for: scope(store: "restored-store")))
@@ -118,7 +118,7 @@ import ChecklistIPC
         } }
         await fulfillment(of: [started])
         state.cancel(); read.cancel()
-        pending?.resume(returning: preview); await read.value
+        pending?.resume(returning: fixtureReply(preview)); await read.value
         XCTAssertFalse(state.presented); XCTAssertNil(state.preview(for: current))
         state.present()
         await state.load(scope(readable: false)) { XCTFail("No read while selection/offline state is unresolved"); return self.preview }

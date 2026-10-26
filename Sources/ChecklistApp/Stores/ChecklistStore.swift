@@ -43,7 +43,11 @@ final class ChecklistStore: ObservableObject {
     // This selection/lifetime fence survives a record-context rebase. The shared
     // read fetches only; each waiting consumer must still own its installation.
     private var selectedRecordLifetimeID = UUID()
-    private var selectedRecordRecovery: (id: UUID, context: String, read: Task<SelectedTicketDisplay,Error>)?
+    @MainActor private final class SelectedRecordRecoveryResult {
+        let display: SelectedTicketDisplay
+        init(_ display: SelectedTicketDisplay) { self.display = display }
+    }
+    private var selectedRecordRecovery: (id: UUID, context: String, read: Task<SelectedRecordRecoveryResult,Error>)?
     @Published private(set) var recordHistoryNotice: String?
     private var ticketPages: TicketPagePreparation { get {ticketObservation.pages} set {ticketObservation.pages = newValue} }
     private var pagedTicketWorkspace: PreparedTicketWorkspace? { get {ticketObservation.workspace} set {ticketObservation.workspace = newValue} }
@@ -328,7 +332,7 @@ final class ChecklistStore: ObservableObject {
     private let desktopAlerts: DesktopAlertCoordinator
     let navigationMemory: DetailItemNavigationMemory
     private let qualificationFaults: QualificationFaults
-    private let requestTransport: ((String,[String:Any]) async throws -> [String:Any])?
+    private let requestTransport: (@MainActor (String,[String:Any]) async throws -> [String:Any])?
     private let workspaceObservation = WorkspacePageObservation()
     private let otherDetailObservation = WorkspacePageObservation()
     private let recordHistoryObservation = WorkspacePageObservation()
@@ -382,7 +386,7 @@ final class ChecklistStore: ObservableObject {
     var groupTaskLoading: Bool {groupTasksObservation.loading}
     var groupTaskError: String? {groupTasksObservation.error}
 
-    init(draftJournal: LocalDraftJournal = LocalDraftJournal(), preferences: UserDefaults = .standard, restorePendingCommand: Bool = true, desktopAlerts: DesktopAlertCoordinator? = nil, requestTransport: ((String,[String:Any]) async throws -> [String:Any])? = nil, navigationMemory: DetailItemNavigationMemory? = nil, pendingCommandKey:String = WorkspaceWindowIdentity.primary.pendingCommandKey, pendingCommandPersistence:PendingCommandPersistence = .keychain, pendingCommandServiceIdentity: String = ChecklistInstance.current.machServiceName, qualificationFaults: QualificationFaults? = nil) {
+    init(draftJournal: LocalDraftJournal = LocalDraftJournal(), preferences: UserDefaults = .standard, restorePendingCommand: Bool = true, desktopAlerts: DesktopAlertCoordinator? = nil, requestTransport: (@MainActor (String,[String:Any]) async throws -> [String:Any])? = nil, navigationMemory: DetailItemNavigationMemory? = nil, pendingCommandKey:String = WorkspaceWindowIdentity.primary.pendingCommandKey, pendingCommandPersistence:PendingCommandPersistence = .keychain, pendingCommandServiceIdentity: String = ChecklistInstance.current.machServiceName, qualificationFaults: QualificationFaults? = nil) {
         let navigationMemory = navigationMemory ?? .shared
         self.qualificationFaults = qualificationFaults ?? .shared
         self.draftJournal = draftJournal; self.preferences = preferences; self.desktopAlerts = desktopAlerts ?? .shared;self.requestTransport = requestTransport;self.navigationMemory = navigationMemory;self.pendingCommandKey=pendingCommandKey;self.pendingCommandPersistence=pendingCommandPersistence;self.pendingCommandServiceIdentity=pendingCommandServiceIdentity
@@ -490,7 +494,7 @@ final class ChecklistStore: ObservableObject {
     private func refreshSelectedRecordContext(_ displayed: SelectedTicketDisplay, isCurrent: @MainActor () -> Bool) async throws -> SelectedTicketDisplay {
         guard !Task.isCancelled,isCurrent() else {throw CancellationError()}
         if let current = selectedTicketDisplay,current.contextCursor != displayed.contextCursor {return current}
-        let recovery: (id: UUID, context: String, read: Task<SelectedTicketDisplay,Error>)
+        let recovery: (id: UUID, context: String, read: Task<SelectedRecordRecoveryResult,Error>)
         if let pending = selectedRecordRecovery,pending.context == displayed.contextCursor {recovery = pending}
         else {
             recovery = (UUID(),displayed.contextCursor,Task {
@@ -502,12 +506,12 @@ final class ChecklistStore: ObservableObject {
                       RecordIdentity(value.project.id) == RecordIdentity(displayed.project.id),
                       RecordIdentity(value.service.string("store_incarnation")) == RecordIdentity(displayed.service.string("store_incarnation")),
                       value.task.integer("revision") >= displayed.task.integer("revision") else {throw TicketPageError.invalid("selected_ticket.identity")}
-                return value
+                return SelectedRecordRecoveryResult(value)
             })
             selectedRecordRecovery = recovery
         }
         defer {if selectedRecordRecovery?.id == recovery.id {selectedRecordRecovery = nil}}
-        let value = try await recovery.read.value
+        let value = try await recovery.read.value.display
         guard !Task.isCancelled,isCurrent() else {throw CancellationError()}
         if let current = selectedTicketDisplay,current.contextCursor != displayed.contextCursor {return current}
         // Do not run the ordinary expanded-record reload hook: that would cancel
@@ -879,7 +883,7 @@ final class ChecklistStore: ObservableObject {
     private var overviewLoadVisit = 1, overviewLoadCombined = 0
     private var overviewLoadAttempts: [String: Int] = [:]
     private let overviewDefaultDigestSince = Date().addingTimeInterval(-86400)
-    private struct OverviewRead {
+    private struct OverviewRead: Sendable {
         let query: WorkspacePageQuery
         let cursor: String?
         let generation: UUID
@@ -969,10 +973,8 @@ final class ChecklistStore: ObservableObject {
                 let installed = await withTaskGroup(of: Bool.self) { group in
                     func enqueue(_ surface: String) {
                         guard let read = reads[surface] else { return }
-                        group.addTask { @MainActor in
-                            let ok = await self.readOverviewNeed(surface,read:read,id:id,focus:focus,reads:reads,mode:"independent")
-                            if self.overviewReadID == id { self.overviewPending.removeValue(forKey:surface) }
-                            return ok
+                        group.addTask {
+                            await self.readIndependentOverviewNeed(surface,read:read,id:id,focus:focus,reads:reads)
                         }
                     }
                     for _ in 0..<min(3,remaining.count) { enqueue(remaining.removeFirst()) }
@@ -1029,6 +1031,12 @@ final class ChecklistStore: ObservableObject {
         overviewRead = task
         return task
     }
+    private func readIndependentOverviewNeed(_ surface: String, read: OverviewRead, id: UUID, focus: String?, reads: [String: OverviewRead]) async -> Bool {
+        let accepted = await readOverviewNeed(surface,read:read,id:id,focus:focus,reads:reads,mode:"independent")
+        if overviewReadID == id { overviewPending.removeValue(forKey:surface) }
+        return accepted
+    }
+
     private func overviewReadCurrent(_ id: UUID, focus: String?, reads: [String: OverviewRead]) -> Bool {
         overviewReadID == id && page == .overview && overviewFocus == focus && reads.allSatisfy { overviewQuery($0.key) == $0.value.query }
     }

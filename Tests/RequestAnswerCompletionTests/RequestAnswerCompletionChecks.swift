@@ -8,6 +8,7 @@ import XCTest
 @main
 #endif
 
+@MainActor
 enum RequestAnswerCompletionChecks {
     static var count = 0
     static func check(_ condition: @autoclosure () -> Bool, _ name: String) {
@@ -99,7 +100,7 @@ enum RequestAnswerCompletionChecks {
 
 #if canImport(ChecklistApp)
 final class RequestAnswerCompletionTests: XCTestCase {
-    func testStandaloneChecks() throws {
+    @MainActor func testStandaloneChecks() throws {
         RequestAnswerCompletionChecks.main()
     }
 }

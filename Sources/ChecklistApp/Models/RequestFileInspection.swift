@@ -1,9 +1,10 @@
 import Foundation
 import Combine
+import os
 
 /// Captures only the form/selection being inspected, never question answer text.
-struct RequestFileInspectionScope: Equatable {
-    struct Selection: Equatable {
+struct RequestFileInspectionScope: Equatable, Sendable {
+    struct Selection: Equatable, Sendable {
         let fileID: Data
         let paths: [Data]
     }
@@ -24,7 +25,7 @@ struct RequestFileInspectionScope: Equatable {
 
 /// Both queued progress and completion must retain this exact generation/scope.
 struct RequestFileInspectionGate {
-    struct Ticket: Equatable { let id = UUID(); let scope: RequestFileInspectionScope }
+    struct Ticket: Equatable, Sendable { let id = UUID(); let scope: RequestFileInspectionScope }
     private(set) var current: Ticket?
     mutating func begin(_ scope: RequestFileInspectionScope) -> Ticket {
         let ticket = Ticket(scope: scope); current = ticket; return ticket
@@ -35,16 +36,15 @@ struct RequestFileInspectionGate {
     }
 }
 
-private final class RequestFileCancellation: @unchecked Sendable {
-    private let lock = NSLock()
-    private var canceled = false
-    func cancel() { lock.lock(); canceled = true; lock.unlock() }
-    var isCanceled: Bool { lock.lock(); defer { lock.unlock() }; return canceled }
+private final class RequestFileCancellation: Sendable {
+    private let state = OSAllocatedUnfairLock(initialState: false)
+    func cancel() { state.withLock { $0 = true } }
+    var isCanceled: Bool { state.withLock { $0 } }
 }
 
 @MainActor
 final class RequestFileInspector: ObservableObject {
-    typealias Worker = ([String], [String: String], @escaping () -> Bool, @escaping (RequestFileHashProgress) -> Void) -> RequestFileInspectionResult?
+    typealias Worker = @Sendable ([String], [String: String], @escaping @Sendable () -> Bool, @escaping @Sendable (RequestFileHashProgress) -> Void) -> RequestFileInspectionResult?
     @Published private(set) var progress: RequestFileHashProgress?
     private let worker: Worker
     private let queue = DispatchQueue(label: "org.checklist.request-file-hashing", qos: .userInitiated)
@@ -61,7 +61,7 @@ final class RequestFileInspector: ObservableObject {
         cancellation?.cancel(); cancellation = nil
         gate.cancel(); checkedScope = nil; progress = nil
     }
-    func inspect(scope: RequestFileInspectionScope, expectedHashes: [String: String], force: Bool = false, completion: @escaping (RequestFileInspectionScope, RequestFileInspectionResult) -> Void) {
+    func inspect(scope: RequestFileInspectionScope, expectedHashes: [String: String], force: Bool = false, completion: @escaping @MainActor @Sendable (RequestFileInspectionScope, RequestFileInspectionResult) -> Void) {
         if !force, gate.current?.scope == scope || checkedScope == scope { return }
         cancel()
         let ticket = gate.begin(scope), stop = RequestFileCancellation()
@@ -69,7 +69,7 @@ final class RequestFileInspector: ObservableObject {
         progress = RequestFileHashProgress(completedFiles: 0, totalFiles: scope.paths.count, bytesRead: 0, fileSize: 0)
         let work = worker
         queue.async { [weak self] in
-            let result = work(scope.paths, expectedHashes, { stop.isCanceled }) { update in
+            let result = work(scope.paths, expectedHashes, { stop.isCanceled }) { [weak self] update in
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.gate.accepts(ticket, currentScope: scope), !stop.isCanceled else { return }
                     self.progress = update

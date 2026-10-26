@@ -47,13 +47,15 @@ final class ReadSnapshotCacheTests: XCTestCase {
     func testInterleavedPoolReadersKeepScopeTokensAndPinnedOldReadCannotAliasNewCommit() throws {
         let f = try ReadPerformanceFixture("CL-254-pool-version"),r = f.router,reader = try XCTUnwrap(r.readers)
         try f.save([("message",["id":"pinned-version","project_id":"project","revision":1])])
+        // Every observation field is accessed under lock, and the worker joins before teardown.
         final class Observation: @unchecked Sendable {
             let lock=NSLock();var before:String?;var after:String?;var error:Error?
         }
+        let owner = f.owner // Value copy; fixture stays alive until reader joins.
         let values=Observation(),pinned=DispatchSemaphore(value:0),resume=DispatchSemaphore(value:0),finished=expectation(description:"pinned reader finishes")
         DispatchQueue.global().async {
             defer {finished.fulfill()}
-            do {try reader.read {db in try r.readSnapshotCache.withSnapshot(db,caller:f.owner) {
+            do {try reader.read {db in try r.readSnapshotCache.withSnapshot(db,caller:owner) {
                 XCTAssertEqual(try r.record(db,"pinned-version")["revision"] as? Int,1)
                 values.lock.withLock {values.before=r.readSnapshotCache.readVersion(db)}
                 pinned.signal()

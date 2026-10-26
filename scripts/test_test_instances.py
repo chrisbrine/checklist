@@ -1090,14 +1090,48 @@ class SeedIsolationTests(unittest.TestCase):
             counts = self.inspect(Path(directory).resolve(), [('message', {'id': 'note', 'body': 'ordinary prose'})])
             self.assertEqual(counts['inert_history_path_occurrences'], 0)
 
-    def test_unknown_leading_slash_text_keeps_strict_path_refusals(self):
+    def test_other_record_text_accepts_leading_slashes(self):
         for value in ['/outside/evidence/', '/usr/bin/trash --stopOnError printed success', '/outside/../evidence', '/outside/evidence']:
             with self.subTest(value=value), test_directory() as directory:
-                with self.assertRaises(ValueError):
-                    self.inspect(Path(directory).resolve(), [('fixture', {'id': 'fixture', 'unknown': value})])
+                counts = self.inspect(Path(directory).resolve(), [
+                    ('task', {'id': 'task', 'title': value, 'description': value}),
+                    ('review', {'id': 'review', 'checks': [{'notes': value}]}),
+                    ('fixture', {'id': 'fixture', 'unknown': value, 'evidence': value})])
+                self.assertEqual(counts['inert_history_path_occurrences'], 5)
+
+    def test_starter_text_with_leading_slashes_seeds_without_rewriting(self):
+        text = '/usr/bin/trash returns exit status 5 on a read-only folder.'
+        for kind, fields in [('bug', ['reproduction', 'expected', 'actual']),
+                             ('playtest', ['build', 'platform', 'clip'])]:
+            with self.subTest(kind=kind), test_directory() as directory:
+                source, destination, manifest = self.fixture(Path(directory).resolve(), 3,
+                    [('task', {'id': 'task', 'kind': kind, 'starter_fields': dict.fromkeys(fields, text)})])
+                seed = harness.snapshot_seed(source, destination)
+                self.assertEqual(seed['path_inspection']['inert_history_path_occurrences'], 3)
+                self.assertEqual(harness.sha(source / 'database.sqlite'), manifest['databaseSHA256'])
+                self.assertEqual(harness.sha(destination / 'checklist.sqlite'), manifest['databaseSHA256'])
+                counts = harness.require_local_paths(destination / 'checklist.sqlite', destination, immutable=False)
+                self.assertEqual(counts['inert_history_path_occurrences'], 3)
+
+    def test_outside_file_authority_still_refuses_before_seed_copy(self):
+        for field in ['path', 'database_path', *sorted(harness.ABSOLUTE_PATH_FIELDS)]:
+            with self.subTest(field=field), test_directory() as directory:
+                source, destination, manifest = self.fixture(Path(directory).resolve(), 3,
+                    [('task', {'id': 'task', 'starter_fields': {'actual': '/usr/bin/trash returned 5'},
+                               'details': {field: '/outside/file'}})])
+                with self.assertRaisesRegex(ValueError, 'absolute path outside.*records.data.details.' + field):
+                    harness.snapshot_seed(source, destination)
+                self.assertEqual(list(destination.iterdir()), [])
+                self.assertEqual(harness.sha(source / 'database.sqlite'), manifest['databaseSHA256'])
+
         with test_directory() as directory:
-            with self.assertRaises(ValueError):
-                self.inspect(Path(directory).resolve(), [('fixture', {'id': 'fixture', 'evidence': '/outside/evidence/'})])
+            source, destination, manifest = self.fixture(Path(directory).resolve(), 3,
+                [('task', {'id': 'task', 'starter_fields': {'actual': '/usr/bin/trash returned 5'}}),
+                 ('attachment', attachment(harness.LIVE / 'objects/outside'))])
+            with self.assertRaisesRegex(ValueError, 'different Checklist data root.*records.data.path'):
+                harness.snapshot_seed(source, destination)
+            self.assertEqual(list(destination.iterdir()), [])
+            self.assertEqual(harness.sha(source / 'database.sqlite'), manifest['databaseSHA256'])
 
     def test_declared_file_scope_paths_use_project_binding_checks(self):
         with test_directory() as directory:
@@ -1121,8 +1155,8 @@ class SeedIsolationTests(unittest.TestCase):
                     'file_state_refs': values, 'stop_observation_refs': values})])
                 self.assertEqual(counts['inert_history_path_occurrences'], 6)
         with test_directory() as directory:
-            with self.assertRaises(ValueError):
-                self.inspect(Path(directory).resolve(), [('fixture', {'id': 'record', 'file_state_refs': ['/outside/file']})])
+            counts = self.inspect(Path(directory).resolve(), [('fixture', {'id': 'record', 'file_state_refs': ['/outside/file']})])
+            self.assertEqual(counts['inert_history_path_occurrences'], 1)
         for kind in ['attempt', 'source_execution']:
             with self.subTest(kind=kind), test_directory() as directory:
                 with self.assertRaises(ValueError):

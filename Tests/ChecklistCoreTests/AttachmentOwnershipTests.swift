@@ -249,10 +249,11 @@ final class AttachmentOwnershipTests: XCTestCase {
         let (f,p,t,a) = try fixture();let job = try archiveAndDue(f,p,t)
         let source = try anchor(f,p,.draftItem),r = try adopt(f,p,a,source),target = try anchor(f,p,.target),pid = p["id"] as! String
         let prepared = try f.router!.prepareOwnedAttachmentOriginals(project:pid,owner:source,referenceIDs:[r["id"] as! String],caller:f.owner)
+        let router = try XCTUnwrap(f.router) // Joined below before fixture teardown.
         let entered = DispatchSemaphore(value:0),finished = DispatchSemaphore(value:0)
         var published: (MediaAttachmentOwner,[JSON])!
         try ArchiveStorageGate.withExclusive(root:f.root) { permit in
-            DispatchQueue.global().async { entered.signal();defer { finished.signal() };try? f.router!.runStorageMaintenance() }
+            DispatchQueue.global().async { entered.signal();defer { finished.signal() };try? router.runStorageMaintenance() }
             XCTAssertEqual(entered.wait(timeout:.now()+3),.success)
             XCTAssertEqual(finished.wait(timeout:.now()+0.05),.timedOut)
             published = try f.router!.dbQueue.write { db in

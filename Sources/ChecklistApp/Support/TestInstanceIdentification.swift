@@ -42,8 +42,11 @@ private struct TestInstanceWindowTitle: NSViewRepresentable {
             window.title = ChecklistInstance.current.displayName
             // Child navigation titles can be applied after the scene's title.
             titleObservation = window.observe(\.title, options:[.new]) { window, _ in
-                let title = ChecklistInstance.current.displayName
-                if window.title != title { window.title = title }
+                // KVO runs synchronously on the title setter; AppKit title writes are main-thread only.
+                MainActor.assumeIsolated {
+                    let title = ChecklistInstance.current.displayName
+                    if window.title != title { window.title = title }
+                }
             }
         }
     }

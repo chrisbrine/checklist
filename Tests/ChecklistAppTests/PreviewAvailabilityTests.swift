@@ -1,3 +1,4 @@
+import ChecklistAXTestSupport
 import XCTest
 import SwiftUI
 import ChecklistCore
@@ -17,9 +18,9 @@ final class PreviewAvailabilityTests: XCTestCase {
         let file = Record(values: ["id": "cleaned", "project_id": "synthetic-project", "task_id": "synthetic-ticket", "name": "cleaned.txt",
                                    "sha256": String(repeating: "a", count: 64), "size": 3_700_000, "mode": "managed", "availability": "original_cleaned"])
         let enhanced = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
-        let wasEnhanced = NSApplication.shared.accessibilityAttributeValue(enhanced) ?? false
-        NSApplication.shared.accessibilitySetValue(true, forAttribute: enhanced)
-        defer { NSApplication.shared.accessibilitySetValue(wasEnhanced, forAttribute: enhanced) }
+        let wasEnhanced = ChecklistTestAXAttributeValue(NSApplication.shared, enhanced) ?? false
+        ChecklistTestAXSetValue(NSApplication.shared, true, enhanced)
+        defer { ChecklistTestAXSetValue(NSApplication.shared, wasEnhanced, enhanced) }
         let host = NSHostingView(rootView: AttachmentRow(file: file).accessibilityIdentifier("detailOverlay").environmentObject(store))
         let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 1000, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
         window.title = "Synthetic Checklist attachment-row regression (offscreen)"
@@ -77,9 +78,9 @@ final class PreviewAvailabilityTests: XCTestCase {
         let file = Record(values: ["id": "cleaned", "project_id": "synthetic-project", "task_id": "synthetic-ticket", "name": "cleaned.txt",
                                    "sha256": String(repeating: "a", count: 64), "size": 3_700_000, "mode": "managed", "availability": "original_cleaned"])
         let enhanced = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
-        let wasEnhanced = NSApplication.shared.accessibilityAttributeValue(enhanced) ?? false
-        NSApplication.shared.accessibilitySetValue(true, forAttribute: enhanced)
-        defer { NSApplication.shared.accessibilitySetValue(wasEnhanced, forAttribute: enhanced) }
+        let wasEnhanced = ChecklistTestAXAttributeValue(NSApplication.shared, enhanced) ?? false
+        ChecklistTestAXSetValue(NSApplication.shared, true, enhanced)
+        defer { ChecklistTestAXSetValue(NSApplication.shared, wasEnhanced, enhanced) }
         let host = NSHostingView(rootView: FilePreviewSheet(attachment: file, inspected: { XCTFail("Unavailable originals cannot be inspected") }).accessibilityLabel("Selected attachment preview").environmentObject(store))
         let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 800, height: 600), styleMask: [.titled], backing: .buffered, defer: false)
         window.title = "Synthetic Checklist unavailable-preview regression (offscreen)"

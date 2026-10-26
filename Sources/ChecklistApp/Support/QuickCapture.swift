@@ -5,8 +5,8 @@ import ImageIO
 
 /// CL-65: one quick-capture draft that lives outside every workspace window. It is saved on this Mac
 /// after each change, so it survives a closed main window, a quit and an unavailable service.
-struct QuickCaptureDraft: Codable, Equatable {
-    struct File: Codable, Equatable, Identifiable {
+struct QuickCaptureDraft: Codable, Equatable, Sendable {
+    struct File: Codable, Equatable, Identifiable, Sendable {
         var id: String { commandID }
         let path: String
         let ownedStaging: Bool
@@ -15,7 +15,7 @@ struct QuickCaptureDraft: Codable, Equatable {
         var attached = false
     }
     /// Immutable bytes for the create being checked, separate from the next draft's editable text.
-    struct PendingCreate: Codable, Equatable {
+    struct PendingCreate: Codable, Equatable, Sendable {
         let commandID: String
         let projectID: String
         let title: String
@@ -55,7 +55,7 @@ final class QuickCaptureModel: ObservableObject {
         case filesPending(String)
         case captured(key: String, taskID: String, projectID: String)
     }
-    typealias Transport = (String, [String: Any]) async throws -> [String: Any]
+    typealias Transport = @MainActor (String, [String: Any]) async throws -> [String: Any]
     static let journalKind = "quick_capture"
     static let projectsKey = "quickCaptureProjects"
     static let lastProjectKey = "quickCaptureLastProject"
@@ -106,7 +106,7 @@ final class QuickCaptureModel: ObservableObject {
     }
 
     /// The service connection that the app windows use; owner calls from the trusted app.
-    nonisolated static func liveTransport(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
+    static func liveTransport(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
         let reply = try await NativeServiceTransport.call(method, params)
         if let failure = reply["error"] as? [String: Any] {
             throw ChecklistError(failure["code"] as? String ?? "SERVICE_ERROR", failure["message"] as? String ?? "The Checklist service could not complete this request.", details: failure["details"] as? [String: Any] ?? [:])
@@ -284,11 +284,11 @@ final class QuickCaptureModel: ObservableObject {
         try? FileManager.default.removeItem(at: url)
     }
     func captureTerminationCheck() -> CaptureTerminationCheck {
-        let snapshot = draft, journal = journal, failed = draftSaveFailed
+        let snapshot = draft, journal = journal, failed = draftSaveFailed, kind = Self.journalKind
         return CaptureTerminationCheck(verify: {
             guard !failed else { throw CocoaError(.fileWriteUnknown) }
             if !snapshot.isEmpty || snapshot.pendingCreate != nil || snapshot.createdTaskID != nil {
-                try journal.checkSaved(snapshot, kind: Self.journalKind, key: "draft")
+                try journal.checkSaved(snapshot, kind: kind, key: "draft")
             }
         }, isCurrent: { [weak self] in self?.draft == snapshot })
     }

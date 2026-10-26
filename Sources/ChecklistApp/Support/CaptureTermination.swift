@@ -3,9 +3,9 @@ import SwiftUI
 
 /// Autosave synchronizes drafts before returning. Quit verifies the exact current
 /// snapshot off the main thread; it never sends/replays a pending service command.
-struct CaptureTerminationCheck {
-    let verify: () throws -> Void
-    let isCurrent: @MainActor () -> Bool
+struct CaptureTerminationCheck: Sendable {
+    let verify: @Sendable () throws -> Void
+    let isCurrent: @MainActor @Sendable () -> Bool
 }
 
 @MainActor protocol CaptureTerminationParticipant: AnyObject {
@@ -17,11 +17,12 @@ struct CaptureTerminationCheck {
     private struct WeakParticipant { weak var value: CaptureTerminationParticipant? }
     private var participants: [ObjectIdentifier: WeakParticipant] = [:]
     private var attempt: UUID?
+    private var watchdog: DispatchWorkItem?
     private let timeout: TimeInterval
-    private let verify: (@escaping () throws -> Void, @escaping (Bool) -> Void) -> Void
+    private let verify: (@escaping @Sendable () throws -> Void, @escaping @Sendable (Bool) -> Void) -> Void
 
     init(timeout: TimeInterval = 3,
-         verify: @escaping (@escaping () throws -> Void, @escaping (Bool) -> Void) -> Void = { check, complete in
+         verify: @escaping (@escaping @Sendable () throws -> Void, @escaping @Sendable (Bool) -> Void) -> Void = { check, complete in
              DispatchQueue.global(qos: .userInitiated).async {
                  do { try check(); complete(true) } catch { complete(false) }
              }
@@ -33,7 +34,7 @@ struct CaptureTerminationCheck {
         participants[ObjectIdentifier(participant)] = WeakParticipant(value: participant)
     }
 
-    func request(reply: @escaping (Bool) -> Void, failure: @escaping (String) -> Void) -> NSApplication.TerminateReply {
+    func request(reply: @escaping @MainActor @Sendable (Bool) -> Void, failure: @escaping @MainActor @Sendable (String) -> Void) -> NSApplication.TerminateReply {
         guard attempt == nil else { return .terminateLater }
         let id = UUID(); attempt = id
         participants = participants.filter { $0.value.value != nil }
@@ -41,13 +42,13 @@ struct CaptureTerminationCheck {
         let watchdog = DispatchWorkItem { [weak self] in
             self?.finish(id, saved: false, message: "Checking your capture draft took too long. Checklist stayed open to protect it. Retry Quit when storage is available.", reply: reply, failure: failure)
         }
+        self.watchdog = watchdog
         DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: watchdog)
         verify({ for check in checks { try check.verify() } }) { [weak self] saved in
             // Also works during AppKit's termination modal run loop. Never reply
             // inline before applicationShouldTerminate has returned terminateLater.
             DispatchQueue.main.async {
                 guard self?.attempt == id else { return }
-                watchdog.cancel()
                 self?.finish(id, saved: saved && checks.allSatisfy { $0.isCurrent() }, message: "Your capture draft could not be confirmed saved. Checklist stayed open to protect it. Check its save error or retry after storage is available.", reply: reply, failure: failure)
             }
         }
@@ -57,6 +58,7 @@ struct CaptureTerminationCheck {
     private func finish(_ id: UUID, saved: Bool, message: String, reply: (Bool) -> Void, failure: (String) -> Void) {
         guard attempt == id else { return }
         attempt = nil
+        watchdog?.cancel(); watchdog = nil
         reply(saved)
         if !saved { failure(message) }
     }

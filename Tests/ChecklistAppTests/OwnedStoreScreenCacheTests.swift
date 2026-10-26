@@ -32,7 +32,13 @@ import GRDB
             desktopAlerts:DesktopAlertCoordinator(sink:OwnedStoreAlertSink()), requestTransport: { method, params in
                 if method == "changes_wait" { try await Task.sleep(nanoseconds:30_000_000_000); throw CancellationError() }
                 calls.append(method + ":" + (params["surface"] as? String ?? ""))
-                return try await Task.detached { try router.executePureRead(pool, method:method, params:params, caller:owner) }.value
+                let requestWire = try JSONSerialization.data(withJSONObject: params)
+                let replyWire = try await Task.detached {
+                    let request = try JSONSerialization.jsonObject(with: requestWire) as! [String: Any]
+                    let reply = try router.executePureRead(pool, method:method, params:request, caller:owner)
+                    return try JSONSerialization.data(withJSONObject: reply)
+                }.value
+                return try JSONSerialization.jsonObject(with: replyWire) as! [String: Any]
             })
         var load = [Double](repeating:0, count:3); getloadavg(&load, 3)
         let start = ProcessInfo.processInfo.systemUptime

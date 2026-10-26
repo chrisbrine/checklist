@@ -180,6 +180,22 @@ struct NativePlayerAdapter: NSViewRepresentable {
     }
 }
 
+/// PDFKit initialization stays off the UI executor. The worker sends its unique
+/// document region into this MainActor owner and never accesses it afterward.
+@MainActor
+final class NativePDFDocument {
+    let document: PDFDocument?
+    private init(document: sending PDFDocument?) { self.document = document }
+    isolated deinit {}
+
+    static func load(url: URL) async -> NativePDFDocument {
+        await Task.detached(priority: .userInitiated) {
+            let document = PDFDocument(url: url)
+            return await NativePDFDocument(document: document)
+        }.value
+    }
+}
+
 struct NativePDFPreview: View {
     let url: URL
     @State private var document: PDFDocument?
@@ -190,8 +206,7 @@ struct NativePDFPreview: View {
             else if let document { PDFPageAdapter(document: document) }
             else { Text("This PDF is unreadable, locked, unsupported or exceeds 2,000 pages. Use Open in… to inspect it.").foregroundStyle(.orange) }
         }.task(id: url) {
-            let work = Task.detached(priority: .userInitiated) { PDFDocument(url: url) }
-            let result = await work.value
+            let result = await NativePDFDocument.load(url: url).document
             guard !Task.isCancelled else { return }
             document = result.flatMap { !$0.isLocked && $0.pageCount <= 2000 ? $0 : nil }; loading = false
         }

@@ -79,7 +79,7 @@ import ChecklistIPC
             }
             return reply
         }
-        func release() {if let held {self.held=nil;held.resume(returning:heldReply!);heldReply=nil}}
+        func release() {if let held {self.held=nil;held.resume(returning: fixtureReply(heldReply!));heldReply=nil}}
         func supersede(_ request:Record) throws {
             try router.dbQueue.writeWithoutTransaction { db in try router.withValidatedDomainTransaction(db) {
                 var changed = request.values; changed["state"] = "superseded"

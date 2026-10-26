@@ -31,7 +31,7 @@ final class DetailOverlayInteraction: ObservableObject {
 
     init(frameAutosaveName: NSWindow.FrameAutosaveName? = nil) { self.frameAutosaveName = frameAutosaveName }
 
-    deinit {
+    isolated deinit {
         if let monitor { NSEvent.removeMonitor(monitor) }
         menuObservers.forEach(NotificationCenter.default.removeObserver)
         frameObservers.forEach(NotificationCenter.default.removeObserver)

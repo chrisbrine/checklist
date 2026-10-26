@@ -24,7 +24,7 @@ enum SafeFileRead {
     static func descriptorPath(_ fd: Int32) throws -> String {
         var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
         guard fcntl(fd, F_GETPATH, &buffer) == 0 else { throw CoreError("FILE_ACCESS_REQUIRED", "The opened file's location could not be verified.") }
-        return normalizedPrivatePrefix(String(cString: buffer))
+        return normalizedPrivatePrefix(String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))
     }
 
     static func normalizedPrivatePrefix(_ path: String) -> String {

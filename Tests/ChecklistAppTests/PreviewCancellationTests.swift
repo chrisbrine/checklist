@@ -105,14 +105,14 @@ final class PreviewCancellationTests: XCTestCase {
         let continuation = try XCTUnwrap(pending)
         load.cancel()
         var reply = source.values; reply["url"] = url.path; reply["read_hold_id"] = "late-hold"
-        continuation.resume(returning: reply)
+        continuation.resume(returning: fixtureReply(reply))
         await load.value
         XCTAssertNil(loader.file); XCTAssertFalse(loader.loading)
         XCTAssertEqual(loader.copiedBytes, 0)
         XCTAssertEqual(calls, ["attachment_read", "attachment_read_release"])
     }
 
-    @MainActor private func makeStore(root: URL, transport: @escaping (String, [String: Any]) async throws -> [String: Any]) -> ChecklistStore {
+    @MainActor private func makeStore(root: URL, transport: @escaping @MainActor @Sendable (String, [String: Any]) async throws -> [String: Any]) -> ChecklistStore {
         let store = ChecklistStore(draftJournal: LocalDraftJournal(directory: root.appendingPathComponent("drafts")),
                                    preferences: isolatedDefaults("PreviewCancellation").preferences, restorePendingCommand: false,
                                    desktopAlerts: DesktopAlertCoordinator(sink: CancellationNoAlerts()), requestTransport: transport)

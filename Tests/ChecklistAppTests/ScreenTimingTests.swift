@@ -25,7 +25,7 @@ import ChecklistIPC
         var heldReceipts: [(CheckedContinuation<[String:Any],Error>,[String:Any])] = []
         func releaseReceipts(throwing error: Error? = nil) {
             let held = heldReceipts;heldReceipts = []
-            for (continuation,reply) in held {if let error {continuation.resume(throwing:error)} else {continuation.resume(returning:reply)}}
+            for (continuation,reply) in held {if let error {continuation.resume(throwing:error)} else {continuation.resume(returning: fixtureReply(reply))}}
         }
         var projects: [[String:Any]] { (0..<5).map { ["id":$0 == 0 ? "p" : "q\($0)", "name":"Synthetic project \($0)", "revision":1, "brief":String(repeating:"Context. ",count:100), "pinned_decisions":largeSettings ? (0..<2).map {["id":"decision-\($0)","title":"Decision \($0)","body":String(repeating:"Pinned context. ",count:200)]} : []] } }
         var service: [String:Any] { ["store_incarnation":"fixture-store", "read_version":version] }

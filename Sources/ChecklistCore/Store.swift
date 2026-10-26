@@ -81,7 +81,7 @@ public final class CommandRouter: @unchecked Sendable {
         self.cliCommand = cliCommand
         self.providerPlugins = providerPlugins
         let opened: StorageBootstrap.Opened
-        do { opened = try StorageBootstrap.open(root:root,serviceLease:serviceLease,prepareDatabase:Self.installTicketSearchFunctions) }
+        do { opened = try StorageBootstrap.open(root:root,serviceLease:serviceLease,prepareDatabase:{ Self.installTicketSearchFunctions($0) }) }
         catch { StoreRecovery.recordFailure(root:root,error:error);throw error }
         let gateFiles = try StorageObjectFiles(root:root,pinRootForGates:true)
         self.gateFiles = gateFiles

@@ -4,10 +4,10 @@ import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let termination: CaptureTerminationCoordinator
-    private var terminationReply: ((Bool) -> Void)?
-    private var terminationFailure: ((String) -> Void)?
+    private var terminationReply: (@MainActor @Sendable (Bool) -> Void)?
+    private var terminationFailure: (@MainActor @Sendable (String) -> Void)?
     override init() { termination = MainActor.assumeIsolated { .shared }; super.init() }
-    init(termination: CaptureTerminationCoordinator, reply: @escaping (Bool) -> Void, failure: @escaping (String) -> Void) {
+    init(termination: CaptureTerminationCoordinator, reply: @escaping @MainActor @Sendable (Bool) -> Void, failure: @escaping @MainActor @Sendable (String) -> Void) {
         self.termination = termination; terminationReply = reply; terminationFailure = failure; super.init()
     }
 

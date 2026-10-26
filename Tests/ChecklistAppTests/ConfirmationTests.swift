@@ -3,7 +3,7 @@ import SwiftUI
 @testable import ChecklistApp
 
 /// CL-57: one confirmation pattern for destructive and authority-releasing actions.
-final class ConfirmationTests: XCTestCase {
+@MainActor final class ConfirmationTests: XCTestCase {
     func testEveryConfirmationNamesTheActionAndItsEffect() {
         let all = [Confirmations.archiveTicket {}, Confirmations.cancelRequest {}, Confirmations.retireTag("Bug") {}, Confirmations.removeDecision {},
                    Confirmations.removeLink {}, Confirmations.releaseWork("CL-1") {}, Confirmations.removeFromTriage("CL-1") {}, Confirmations.removeFromEpic("CL-1") {},
@@ -28,28 +28,28 @@ final class ConfirmationTests: XCTestCase {
     }
 
     func testSafeDefaultCancellationDismissesAndExplicitConfirmationRunsOnce() {
-        var performed=0
+        let state = ConfirmationState()
         let make: [(String, (@escaping () -> Void) -> PendingConfirmation)] = [
             ("Retire type", {Confirmations.retireMediaType("Animation",perform:$0)}),
             ("Cancel round", {Confirmations.cancelMediaRound("Round C",perform:$0)}),
             ("Archive round", {Confirmations.archiveMediaRound("Round C",perform:$0)})
         ]
         for (name,make) in make {
-            var pending:PendingConfirmation?=make {performed+=1}
-            let binding=Binding(get:{pending},set:{pending=$0})
-            XCTAssertTrue(pending!.cancelIsDefault,name)
+            state.pending = make {state.performed += 1}
+            let binding=Binding(get:{state.pending},set:{state.pending=$0})
+            XCTAssertTrue(state.pending!.cancelIsDefault,name)
             // Escape, Return and the Keep button all resolve this same safe path.
             PendingConfirmation.resolve(binding,confirmed:false)
-            XCTAssertNil(pending,name)
-            XCTAssertEqual(performed,0,name)
+            XCTAssertNil(state.pending,name)
+            XCTAssertEqual(state.performed,0,name)
         }
-        var pending:PendingConfirmation?=Confirmations.archiveMediaRound("Round C") {performed+=1}
-        let binding=Binding(get:{pending},set:{pending=$0})
+        state.pending = Confirmations.archiveMediaRound("Round C") {state.performed += 1}
+        let binding=Binding(get:{state.pending},set:{state.pending=$0})
         PendingConfirmation.resolve(binding,confirmed:true)
-        XCTAssertNil(pending)
-        XCTAssertEqual(performed,1)
+        XCTAssertNil(state.pending)
+        XCTAssertEqual(state.performed,1)
         PendingConfirmation.resolve(binding,confirmed:true)
-        XCTAssertEqual(performed,1,"A dismissed confirmation cannot run again")
+        XCTAssertEqual(state.performed,1,"A dismissed confirmation cannot run again")
     }
 
     /// Each destructive button opens its shared confirmation instead of acting at once.
@@ -76,4 +76,9 @@ final class ConfirmationTests: XCTestCase {
         XCTAssertEqual(Confirmations.cancelTicket("CL-7", status: "Won't do") {}.title, "Set CL-7 to Won't do?")
         XCTAssertEqual(Confirmations.cancelTicket("CL-7", status: "Canceled") {}.keepLabel, "Keep current status")
     }
+}
+
+@MainActor private final class ConfirmationState {
+    var pending: PendingConfirmation?
+    var performed = 0
 }

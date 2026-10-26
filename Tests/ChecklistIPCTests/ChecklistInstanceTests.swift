@@ -208,10 +208,26 @@ final class ChecklistInstanceTests: XCTestCase {
             process.waitUntilExit()
             return (process.terminationStatus,output)
         }
+        // Compile the actual credential compatibility target used by Protocol.swift;
+        // the standalone startup helper must link production code, not a test stub.
+        let keychain = repository.appendingPathComponent("Sources/ChecklistLegacyKeychain")
+        let include = keychain.appendingPathComponent("include")
+        let module = directory.appendingPathComponent("ChecklistLegacyKeychain")
+        try files.createDirectory(at:module,withIntermediateDirectories:true)
+        let header = include.appendingPathComponent("ChecklistLegacyKeychain.h").path
+            .replacingOccurrences(of:"\\",with:"\\\\").replacingOccurrences(of:"\"",with:"\\\"")
+        try Data("module ChecklistLegacyKeychain { header \"\(header)\" export * }\n".utf8)
+            .write(to:module.appendingPathComponent("module.modulemap"))
+        let object = directory.appendingPathComponent("ChecklistLegacyKeychain.o")
+        let clang = try run(URL(fileURLWithPath:"/usr/bin/xcrun"),["clang","-c",
+            keychain.appendingPathComponent("ChecklistLegacyKeychain.c").path,"-I",include.path,"-o",object.path])
+        XCTAssertEqual(clang.0,0,clang.1)
+        guard clang.0 == 0 else { return }
         // Compile the production current/exit handler and its error type, with no IPC calls.
-        let compiled = try run(URL(fileURLWithPath:"/usr/bin/xcrun"),["swiftc","-swift-version","5",
+        let compiled = try run(URL(fileURLWithPath:"/usr/bin/xcrun"),["swiftc","-swift-version","5","-I",module.path,
             repository.appendingPathComponent("Sources/ChecklistIPC/Protocol.swift").path,
-            repository.appendingPathComponent("Sources/ChecklistIPC/ChecklistInstance.swift").path,main.path,"-o",helper.path])
+            repository.appendingPathComponent("Sources/ChecklistIPC/ChecklistInstance.swift").path,main.path,
+            object.path,"-framework","Security","-o",helper.path])
         XCTAssertEqual(compiled.0,0,compiled.1)
         guard compiled.0 == 0 else { return }
         for name in ["Checklist Test 4.app","Checklist.app","Other.app"] {

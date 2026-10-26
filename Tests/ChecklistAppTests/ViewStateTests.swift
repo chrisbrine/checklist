@@ -6,7 +6,7 @@ import ChecklistIPC
 @MainActor final class ViewStateTests: XCTestCase {
     struct Down: LocalizedError { var errorDescription: String? { "Connection refused" } }
 
-    private func makeStore(_ transport: @escaping (String, [String: Any]) async throws -> [String: Any]) -> (ChecklistStore, () -> Void) {
+    private func makeStore(_ transport: @escaping @MainActor @Sendable (String, [String: Any]) async throws -> [String: Any]) -> (ChecklistStore, () -> Void) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("viewstate-" + UUID().uuidString)
         let preferences = isolatedDefaults("ViewState").preferences
         let store = ChecklistStore(draftJournal: LocalDraftJournal(directory: root), preferences: preferences, restorePendingCommand: false,

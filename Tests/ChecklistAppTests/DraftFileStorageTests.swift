@@ -3,15 +3,28 @@ import ChecklistIPC
 @testable import ChecklistApp
 
 final class DraftFileStorageTests: XCTestCase {
-    private final class MemoryFiles: DraftFileStorage {
-        var values: [URL: Data] = [:]
-        var failWrite = false
-        func exists(_ url: URL) throws -> Bool { values[url] != nil || values.keys.contains { $0.deletingLastPathComponent().path == url.path } }
-        func read(_ url: URL) throws -> Data { try XCTUnwrap(values[url]) }
-        func contents(of directory: URL) throws -> [URL] { values.keys.filter { $0.deletingLastPathComponent().path == directory.path } }
+    // Every mutable fixture value, including failure injection, is owned by lock.
+    private final class MemoryFiles: DraftFileStorage, @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: [URL: Data] = [:]
+        private var writeFails = false
+        var values: [URL: Data] { lock.withLock { stored } }
+        var failWrite: Bool {
+            get { lock.withLock { writeFails } }
+            set { lock.withLock { writeFails = newValue } }
+        }
+        func exists(_ url: URL) throws -> Bool {
+            lock.withLock { stored[url] != nil || stored.keys.contains { $0.deletingLastPathComponent().path == url.path } }
+        }
+        func read(_ url: URL) throws -> Data { try lock.withLock { try XCTUnwrap(stored[url]) } }
+        func contents(of directory: URL) throws -> [URL] {
+            lock.withLock { stored.keys.filter { $0.deletingLastPathComponent().path == directory.path } }
+        }
         func replace(_ bytes: Data, at target: URL, directory: URL) throws {
-            if failWrite { throw CocoaError(.fileWriteNoPermission) }
-            values[target] = bytes
+            try lock.withLock {
+                if writeFails { throw CocoaError(.fileWriteNoPermission) }
+                stored[target] = bytes
+            }
         }
     }
     func testJournalRoundTripsThroughExplicitStorage() throws {

@@ -135,12 +135,19 @@ final class CoreTests: XCTestCase {
     }
     func testConcurrentClaimsAndRestart() throws {
         let p = try project(); let t = try ready(p,task(p)); let input: JSON = ["project_id":p["id"]!,"task_id":t["id"]!,"expected_revision":t["revision"]!]
-        let lock = NSLock(); var successes = 0; var failures = 0
+        let bytes = try JSONSerialization.data(withJSONObject:input)
+        let claimRouter = router!, caller = owner
+        let counts = LockedTestState((successes: 0, failures: 0))
+        // concurrentPerform joins every worker before the router is replaced below.
         DispatchQueue.concurrentPerform(iterations:8) { _ in
-            do { _ = try call("work_claim",input); lock.lock(); successes += 1; lock.unlock() }
-            catch { lock.lock(); failures += 1; lock.unlock() }
+            do {
+                var params = try JSONSerialization.jsonObject(with:bytes) as! JSON
+                params["command_id"] = UUID().uuidString
+                _ = try claimRouter.handle(method:"work_claim",params:try fixtureTaskInput(claimRouter,method:"work_claim",input:params),caller:caller)
+                counts.withLock { $0.successes += 1 }
+            } catch { counts.withLock { $0.failures += 1 } }
         }
-        XCTAssertEqual(successes,1);XCTAssertEqual(failures,7)
+        XCTAssertEqual(counts.snapshot.successes,1);XCTAssertEqual(counts.snapshot.failures,7)
         router = nil; router = try TestStore.router(root:directory)
         let after = try call("task_get",["project_id":p["id"]!,"task_id":t["id"]!]);XCTAssertNotNil(after["active_attempt_id"])
     }

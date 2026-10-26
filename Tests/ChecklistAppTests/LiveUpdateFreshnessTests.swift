@@ -90,7 +90,7 @@ import ChecklistIPC
             return result
         }
         func commit() { status = "Review";version = "v2";revision = 2;title = "Updated fixture" }
-        func release(_ method:String) { guard let i = held.firstIndex(where: {$0.0 == method}) else {return};let row = held.remove(at:i);row.1.resume(returning:row.2) }
+        func release(_ method:String) { guard let i = held.firstIndex(where: {$0.0 == method}) else {return};let row = held.remove(at:i);row.1.resume(returning: fixtureReply(row.2)) }
         func store() -> ChecklistStore {
             preferences.set(page.rawValue,forKey:"lastPage");preferences.set("p",forKey:"lastProject")
             let store = ChecklistStore(draftJournal:LocalDraftJournal(directory:root),preferences:preferences,restorePendingCommand:false,
@@ -186,11 +186,11 @@ import ChecklistIPC
         try await until {f.wait != nil}
         var now: TimeInterval = 1802.7;store.liveNow = {now}
         f.holdList = true;f.statusCoverage = true
-        let first = f.wait;f.wait = nil;first?.resume(returning:f.changes())
+        let first = f.wait;f.wait = nil;first?.resume(returning: fixtureReply(f.changes()))
         try await until {f.held.count == 1}
         now += 0.25;f.commit();f.statusCoverage = true
         var changed = f.changes();changed["event_cursor"] = "c2"
-        if let wait = f.wait {f.wait = nil;wait.resume(returning:changed)} else {f.queuedChanges.append(changed)}
+        if let wait = f.wait {f.wait = nil;wait.resume(returning: fixtureReply(changed))} else {f.queuedChanges.append(changed)}
         try await until {self.shownStatus(store,page:.tasks) == "Review"}
         XCTAssertEqual(cursor(store),"c0");XCTAssertEqual(f.held.count,1)
         // Read-ahead observes but does not consume the primary subscription's
@@ -288,11 +288,11 @@ import ChecklistIPC
         var earlier = f.changes(),coverage = earlier["coverage"] as! [String:Any]
         coverage["changes"] = [["project_id":"p","families":["work"],"task_ids":["a"],"all_tasks":false]]
         earlier["coverage"] = coverage
-        let firstWait = f.wait;f.wait = nil;firstWait?.resume(returning:earlier)
+        let firstWait = f.wait;f.wait = nil;firstWait?.resume(returning: fixtureReply(earlier))
         try await until {f.held.count >= 4}
         now += 0.25;f.commit()
         var statusChange = f.changes();statusChange["event_cursor"] = "c2"
-        if let wait = f.wait {f.wait = nil;wait.resume(returning:statusChange)}
+        if let wait = f.wait {f.wait = nil;wait.resume(returning: fixtureReply(statusChange))}
         else {f.queuedChanges.append(statusChange)}
         try await until {store.selectedTask("a")?.string("status_name") == "Review" && self.shownStatus(store,page:.overview) == "Review" && f.held.count == 5}
         XCTAssertEqual(f.held.count,5,"Read-ahead replaces the canceled context without releasing any held reply")
@@ -311,11 +311,11 @@ import ChecklistIPC
         var earlier = f.changes(),coverage = earlier["coverage"] as! [String:Any]
         coverage["changes"] = [["project_id":"p","families":["work"],"task_ids":["a"],"all_tasks":false]]
         earlier["coverage"] = coverage
-        let wait = f.wait;f.wait = nil;wait?.resume(returning:earlier)
+        let wait = f.wait;f.wait = nil;wait?.resume(returning: fixtureReply(earlier))
         try await until {f.held.count >= 4}
         f.commit();f.holdContext = false
         var newer = f.changes();newer["event_cursor"] = "c2"
-        if let wait = f.wait {f.wait = nil;wait.resume(returning:newer)} else {f.queuedChanges.append(newer)}
+        if let wait = f.wait {f.wait = nil;wait.resume(returning: fixtureReply(newer))} else {f.queuedChanges.append(newer)}
         try await until {store.selectedTicketCurrent("a") && store.selectedTask("a")?.string("status_name") == "Review"}
         XCTAssertEqual(f.held.count,4,"The old context and all three old pages remain held")
         XCTAssertEqual(cursor(store),"c0","Fresh selected context alone does not acknowledge page coverage")
@@ -443,7 +443,7 @@ import ChecklistIPC
             if selected {store.open(.task("a"));try await until {store.selectedTicketCurrent("a")}}
             f.commit();f.failMethod = selected ? "task_context" : page == .tasks ? "task_list" : "workspace_page"
             f.failNext = true;f.holdList = !selected;f.holdContext = selected
-            f.replayChanges = true;f.wait?.resume(returning:f.changes());f.wait = nil
+            f.replayChanges = true;f.wait?.resume(returning: fixtureReply(f.changes()));f.wait = nil
             try await until {selected ? store.selectedTicketError != nil : page == .tasks ? store.ticketPageError != nil : page == .overview ? store.overviewObservations["needs_review"]?.error != nil : store.workspaceError != nil}
             XCTAssertEqual(cursor(store),"c0","Failure must not cover the interval")
             try await until {f.held.contains {$0.0 == f.failMethod}}

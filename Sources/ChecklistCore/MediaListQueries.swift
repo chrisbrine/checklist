@@ -225,7 +225,7 @@ extension CommandRouter {
               let current = try? scoped(db,currentManifestID,project,type:"media_round_manifest"),
               (current["items"] as? [JSON] ?? []).contains(where:{EnvelopeStorageIdentity.equal($0["item_id"] as? String,item["id"] as? String) && $0["review_basis_signature"] as? String == basis}) else {return nil}
         let (type,context) = try mediaRoundParts(db,round)
-        guard let shape = try? mediaShapeForTarget(db,item:item,target:target,typeRevision:type,context:context),
+        guard let shape = try mediaCompatibleShapeForTarget(db,item:item,target:target,typeRevision:type,context:context),
               bool(shape,"publication_ready"),shape["review_basis_signature"] as? String == basis else {return nil}
         guard try mediaMaterialOriginalsAvailable(db,target:target,project:project,typeID:typeID,caller:caller) else {return nil}
         let candidate = try scoped(db,winner,project,type:"media_candidate")

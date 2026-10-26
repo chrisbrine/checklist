@@ -1,3 +1,4 @@
+import ChecklistAXTestSupport
 import XCTest
 import SwiftUI
 import AppKit
@@ -205,9 +206,9 @@ enum RestorePreviewTemplate {
     }
     static func enableEnhancedUserInterface() -> () -> Void {
         let enhanced = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
-        let was = NSApplication.shared.accessibilityAttributeValue(enhanced) ?? false
-        NSApplication.shared.accessibilitySetValue(true, forAttribute: enhanced)
-        return { NSApplication.shared.accessibilitySetValue(was, forAttribute: enhanced) }
+        let was = ChecklistTestAXAttributeValue(NSApplication.shared, enhanced) ?? false
+        ChecklistTestAXSetValue(NSApplication.shared, true, enhanced)
+        return { ChecklistTestAXSetValue(NSApplication.shared, was, enhanced) }
     }
     static func until(_ predicate: () -> Bool) async throws {
         // A liveness bound, not a budget: 60 s keeps a stuck fixture finite while a

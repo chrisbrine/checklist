@@ -39,6 +39,9 @@ extension CommandRouter {
                 return .commit
             }
         } catch let error as CoreError {
+            // Unavailable holders and changed authority may queue the ticket; malformed
+            // stored input must abort the entire verdict transaction instead.
+            if error.code == "CANONICAL_RECORD_INVALID" { throw error }
             result["code"] = error.code;result["reason"] = error.message
         }
         task = try scoped(db,tid,pid,type:"task")

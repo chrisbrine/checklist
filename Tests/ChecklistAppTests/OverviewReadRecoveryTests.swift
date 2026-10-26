@@ -64,7 +64,7 @@ import ChecklistIPC
         func release(_ index: Int = 0, error: Error? = nil) {
             let read = held.remove(at: index)
             if let error { read.continuation.resume(throwing: error) }
-            else { read.continuation.resume(returning: reply(read.call)) }
+            else { read.continuation.resume(returning: fixtureReply(reply(read.call))) }
         }
         func store() -> ChecklistStore {
             ChecklistStore(draftJournal: LocalDraftJournal(directory: root), preferences: preferences, restorePendingCommand: false,

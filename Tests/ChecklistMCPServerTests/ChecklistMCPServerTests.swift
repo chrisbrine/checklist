@@ -342,13 +342,13 @@ final class ChecklistMCPServerTests: XCTestCase {
         for historical in [false,true] {
             if historical {_ = try call("task_bulk_edit",["project_id":pid,"tasks":[["task_id":task["id"]!,"expected_revision":task["revision"]!]],"changes":["kind":"epic","epic_id":destination["id"]!],"preview":false])}
             let group = (try call("epic_list",["project_id":pid,"key":epic["key"]!])["groups"] as! [[String:Any]])[0]
-            let before = try await router.dbQueue.read {try SchemaMigrations.contentFingerprint($0)}
+            let before = try router.dbQueue.read {try SchemaMigrations.contentFingerprint($0)}
             let result = try await session.client.callTool(name:"epic_delete",arguments:["project_id":.string(pid),"epic_id":.string(gid),"expected_revision":.int(group["revision"] as! Int),"command_id":.string(UUID().uuidString)])
             XCTAssertTrue(result.isError ?? false)
             let frames = try await session.transport.frames().map {try JSONSerialization.jsonObject(with:$0) as! [String:Any]}
             let error = try XCTUnwrap((frames.last?["result"] as? [String:Any])?["structuredContent"] as? [String:Any])
             XCTAssertEqual((error["error"] as! [String:Any])["code"] as? String,historical ? "EPIC_HELD_TICKETS":"EPIC_HAS_TICKETS")
-            let after = try await router.dbQueue.read {try SchemaMigrations.contentFingerprint($0)}
+            let after = try router.dbQueue.read {try SchemaMigrations.contentFingerprint($0)}
             XCTAssertEqual(after,before)
         }
         try await assertProtocolOnly(session)

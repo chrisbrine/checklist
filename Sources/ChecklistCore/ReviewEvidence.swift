@@ -77,7 +77,11 @@ extension CommandRouter {
                 try requireCompletable(db,task:task,pid:pid,answeringRequestID:request["id"] as? String)
                 let done = try status(db,pid,"done")
                 if done["category"] as? String == "done",!bool(done,"retired") { task["status_id"] = done["id"]; task["completed_at"] = now(); completed = true }
-            } catch is CoreError {}
+            } catch let error as CoreError {
+                // Other unmet completion gates retain the passing verdict. Corrupt
+                // stored inputs must roll back the answer and verdict together.
+                if error.code == "CANONICAL_RECORD_INVALID" { throw error }
+            }
         }
         try save(db,revised(task),type:"task")
         try recordTicketStatusAction(db,task:task,caller:caller)

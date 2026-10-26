@@ -134,16 +134,17 @@ final class OverviewReadOptimizationTests: XCTestCase {
             try router.save(db,router.revised(value),type:"task")
             return .commit
         }}
+        // Every observation field is accessed under lock, and the worker joins before teardown.
         final class Observation: @unchecked Sendable {
             let lock = NSLock()
             var result: Result<JSON,Error>?
         }
         let observation = Observation(), counted = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0)
         let finished = expectation(description:"Pinned aggregate and projection finish")
-        let readers = try XCTUnwrap(router.readers)
+        let readers = try XCTUnwrap(router.readers), owner = fixture.owner
         DispatchQueue.global().async {
             defer {finished.fulfill()}
-            let result = Result {try readers.read {db in try router.readSnapshotCache.withSnapshot(db,caller:fixture.owner) {
+            let result = Result {try readers.read {db in try router.readSnapshotCache.withSnapshot(db,caller:owner) {
                 db.trace(options:.profile) {event in
                     if case .profile(let statement,_) = event, statement.sql.contains("COUNT(*) clean_count") {
                         counted.signal()
@@ -151,7 +152,7 @@ final class OverviewReadOptimizationTests: XCTestCase {
                     }
                 }
                 defer {db.trace(options:[])}
-                return try router.workspacePage(db,["project_id":pid,"surface":"needs_done_today","limit":5],fixture.owner)
+                return try router.workspacePage(db,["project_id":pid,"surface":"needs_done_today","limit":5],owner)
             }}}
             observation.lock.withLock {observation.result = result}
             counted.signal()

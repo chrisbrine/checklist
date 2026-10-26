@@ -7,7 +7,7 @@ func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
     guard condition() else { throw CheckFailure.failed(message) }
 }
 let sha = String(repeating: "a", count: 64)
-let task = Record(values: ["id": "task", "project_id": "project", "current_manifest_id": "M2"])
+var task: Record { Record(values: ["id": "task", "project_id": "project", "current_manifest_id": "M2"]) }
 func file(_ id: String, target: String? = nil, attempt: String? = nil) -> [String: Any] {
     var record: [String: Any] = ["id": id, "task_id": "task", "project_id": "project", "name": "results.xml", "path": "/managed/\(id).md", "mode": "managed", "availability": "available", "sha256": sha, "size": 100, "author": "reviewer", "revision": 1]
     if let target { record["target_manifest_id"] = target }
@@ -29,7 +29,7 @@ func projected(files: [[String: Any]] = [], M2refs: [String] = ["A2"], attempts:
     ]
     return TestResultEvidenceProjection(review: ReviewProjection(task: task, project: nil, data: data))
 }
-let checks: [(String, () throws -> Void)] = [
+var checks: [(String, () throws -> Void)] { [
     ("Unused M1 reviewer result stays bound before a verdict and compares to M0", {
         let projection = projected()
         let oldRows = projection.artifacts(in: "M1")
@@ -72,7 +72,8 @@ let checks: [(String, () throws -> Void)] = [
         try require(!projection.artifacts(in: nil).contains { $0.file.id == row.file.id }, "History paging cannot relabel evidence")
         try require(projection.previous(for: row) == nil, "Oldest target has no later-target comparison")
     })
-]
+] }
+
 final class TestResultEvidenceProjectionTests: XCTestCase {
     func testUnusedM1ReviewerResultStaysBoundBeforeAVerdictAndComparesToM0() throws { try checks[0].1() }
     func testGenuineUnsubmittedUploadRemainsDistinctFromReviewerEvidence() throws { try checks[1].1() }

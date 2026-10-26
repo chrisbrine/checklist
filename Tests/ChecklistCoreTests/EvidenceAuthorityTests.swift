@@ -82,9 +82,21 @@ final class EvidenceAuthorityTests: XCTestCase {
     }
     func testConcurrentCanonicalClaimsHaveOneWinner() throws {
         let p = try project(),tasks = try (0..<8).map {_ in try ready(p)}
-        let lock = NSLock();var winners = 0
-        DispatchQueue.concurrentPerform(iterations:8) { index in do {_ = try claim(p,tasks[index],files:[["path":"shared","access":"write"]]);lock.lock();winners += 1;lock.unlock()}catch {} }
-        XCTAssertEqual(winners,1)
+        let projectID = p["id"] as! String
+        let inputs = try tasks.map { task in
+            try JSONSerialization.data(withJSONObject:["project_id":projectID,"task_id":task["id"]!,"expected_revision":task["revision"]!,"file_scopes":[["path":"shared","access":"write"]],"lane_scopes":[]] as JSON)
+        }
+        let claimRouter = router!, caller = owner, winners = LockedTestState(0)
+        // concurrentPerform joins every worker before XCTest teardown closes the router.
+        DispatchQueue.concurrentPerform(iterations:8) { index in
+            do {
+                var params = try JSONSerialization.jsonObject(with:inputs[index]) as! JSON
+                params["command_id"] = UUID().uuidString
+                _ = try claimRouter.handle(method:"work_claim",params:try fixtureTaskInput(claimRouter,method:"work_claim",input:params),caller:caller)
+                winners.withLock { $0 += 1 }
+            } catch {}
+        }
+        XCTAssertEqual(winners.snapshot,1)
     }
     func testWritableChildrenBlockParentExitAndNarrowing() throws {
         let p = try project(),t = try ready(p),parent = try native(p,"parent",domain:"host-A"),child = try native(p,"child",domain:"host-A")

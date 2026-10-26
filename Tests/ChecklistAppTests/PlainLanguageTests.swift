@@ -3,7 +3,7 @@ import ChecklistIPC
 @testable import ChecklistApp
 
 /// CL-55: plain main-flow text; IDs, hashes, revisions and raw records only in Technical details.
-final class PlainLanguageTests: XCTestCase {
+@MainActor final class PlainLanguageTests: XCTestCase {
     func testEveryDeliveryStateHasAPlainLabel() {
         let states = ["queued", "pending", "saved", "saved_for_pickup", "transport_written", "transport_accepted", "transport_receipt",
                       "provider_accepted", "acknowledged", "addressed", "held", "held_for_approval", "refused", "failed", "uncertain",

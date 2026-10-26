@@ -14,7 +14,7 @@ import ObjectiveC
 enum LazyListAccessibilityGuard {
     static let nodeClassName = "SwiftUI.AccessibilityLazyLayoutNode"
     static let edgeActions: Set<String> = ["AXScrollToTop", "AXScrollToBottom"]
-    private static var installed = false
+    @MainActor private static var installed = false
 
     /// Installs the guard once per process. Returns true when the node type
     /// exists and its action handler now goes through the guard.
@@ -26,7 +26,12 @@ enum LazyListAccessibilityGuard {
         typealias Perform = @convention(c) (NSObject, Selector, NSString) -> Void
         let original = unsafeBitCast(method_getImplementation(method), to: Perform.self)
         let handler: @convention(block) (NSObject, NSString) -> Void = { object, action in
-            if edgeActions.contains(action as String), scrollToEdge(from: object, top: action as String == "AXScrollToTop") { return }
+            // AppKit AX actions execute synchronously on the main thread; check before touching UI.
+            precondition(Thread.isMainThread, "AppKit accessibility action must run on the main thread")
+            let handled = MainActor.assumeIsolated {
+                edgeActions.contains(action as String) && scrollToEdge(from: object, top: action as String == "AXScrollToTop")
+            }
+            if handled { return }
             original(object, selector, action)
         }
         let replacement = imp_implementationWithBlock(handler)
@@ -38,7 +43,7 @@ enum LazyListAccessibilityGuard {
 
     /// Scrolls the nearest enclosing scroll view of an accessibility node to
     /// its top or bottom. Returns false when no scroll view is found.
-    static func scrollToEdge(from node: NSObject, top: Bool) -> Bool {
+    @MainActor static func scrollToEdge(from node: NSObject, top: Bool) -> Bool {
         var current: NSObject? = node
         for _ in 0..<64 {
             guard let object = current else { return false }

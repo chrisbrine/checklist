@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Optional diagnostics outside command parameters and durable receipts.
 /// Durations use the monotonic clock; no credentials, workspace or caller IDs.
@@ -13,18 +14,18 @@ public enum CallTimingLog {
 }
 
 /// One request owns this value through its serial and off-queue phases.
-public final class ServiceCallTiming {
+public final class ServiceCallTiming: Sendable {
     public let requestID = UUID().uuidString.lowercased()
     private let received: TimeInterval
-    private var durations: [String: Double] = ["queue_wait_ms": 0, "bootstrap_verification_ms": 0, "execution_ms": 0]
+    private let durations = OSAllocatedUnfairLock(initialState: ["queue_wait_ms": 0.0, "bootstrap_verification_ms": 0.0, "execution_ms": 0.0])
 
     public init(received: TimeInterval = ProcessInfo.processInfo.systemUptime) { self.received = received }
     public func queued(since start: TimeInterval) {
-        durations["queue_wait_ms", default: 0] += (ProcessInfo.processInfo.systemUptime - start) * 1000
+        durations.withLock { $0["queue_wait_ms", default: 0] += (ProcessInfo.processInfo.systemUptime - start) * 1000 }
     }
     public func measure<T>(_ phase: String, _ body: () throws -> T) rethrows -> T {
         let start = ProcessInfo.processInfo.systemUptime
-        defer { durations[phase, default: 0] += (ProcessInfo.processInfo.systemUptime - start) * 1000 }
+        defer { durations.withLock { $0[phase, default: 0] += (ProcessInfo.processInfo.systemUptime - start) * 1000 } }
         return try body()
     }
 
@@ -39,7 +40,7 @@ public final class ServiceCallTiming {
     public func encode(_ result: [String: Any]) throws -> Data {
         let start = ProcessInfo.processInfo.systemUptime
         var bytes = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
-        var fields: [String:Any] = durations
+        var fields: [String:Any] = durations.withLock { $0 }
         fields["request_id"] = requestID
         fields["encoding_ms"] = (ProcessInfo.processInfo.systemUptime - start) * 1000
         fields["total_ms"] = (ProcessInfo.processInfo.systemUptime - received) * 1000

@@ -164,12 +164,12 @@ enum RequestDraftIdentity {
 enum RequestFileHashOutcome: Equatable {
     case hashed(String), directory, unavailable, unreadable, changed, canceled
 }
-struct RequestFileInspectionResult {
+struct RequestFileInspectionResult: Sendable {
     var hashes: [String: String] = [:]
     var problems: [String: String] = [:]
     var directories: Set<String> = []
 }
-struct RequestFileHashProgress {
+struct RequestFileHashProgress: Sendable {
     let completedFiles: Int
     let totalFiles: Int
     let bytesRead: Int64

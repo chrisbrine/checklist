@@ -96,6 +96,420 @@ REAL_SIZE_TESTS = (
     'ChecklistCoreTests.StorageCompactManifestTests/testTwoHundredThousandObjectTemplateFitsManifestBudgetWithoutLosingDescriptors',
 )
 QUALIFICATION_CASES = QUALIFICATION_TESTS + REAL_SIZE_TESTS
+# Qualification fixture audit (CL-294). Exact shared startup/record inputs and
+# case-specific command paths include extension fixtures, rather than inferring
+# fixtures from XCTest class names. Patterns use repository-relative paths.
+def _core_paths(names):
+    return tuple('Sources/ChecklistCore/' + name + '.swift' for name in names.split())
+
+
+QUALIFICATION_STORE_PATHS = _core_paths(
+    'EpicReferenceIndex FileDurability GRDBRecordEnvelopeAdapter GRDBTransactionAdapter '
+    'LegacyStoredValue ManagedPaths Models OrphanFileCleanup PublicErrorText ReadSnapshotCache '
+    'RecordEnvelope RecordPruning Router SchemaMigrations SnapshotReadProjection SourceCapture '
+    'StorageAdmission StorageBootstrap StorageFolderAccess StorageMaintenance StorageObjectFiles '
+    'StorageRecovery StorageStatus Store StoredRecord '
+) + (
+    'Packages/ChecklistShared/Sources/ChecklistContracts/*',
+    'Packages/ChecklistShared/Sources/ChecklistDomain/*',
+    'Sources/ChecklistProviders/BundledProviderPlugins.swift',
+    'Sources/ChecklistProviders/ProviderPlugin.swift',
+    'Tests/ChecklistTestSupport/*',
+)
+QUALIFICATION_SOURCE_PATHS = {
+    # Synthetic storage_job receipts, project_create and paged ticket_cleanup_receipts. Does not execute cleanup preparation/deletion.
+    'ChecklistCoreTests.TicketCleanupReceiptReadTests/testLatestSummaryPagesRetainFirstReceiptAndAreBoundedWithLargeItems': QUALIFICATION_STORE_PATHS + _core_paths(
+        'Catalog TicketCleanupReceiptRead TicketObjectDeletion WorkspaceProjectCreation '
+    ) + (
+        'Tests/ChecklistCoreTests/TicketCleanupReceiptReadTests.swift',
+    ),
+    # 25 paired TestStore.router vs fresh CommandRouter opens; startup protected snapshots/admission/migration, maintenance and close/checkpoint. No feature commands.
+    'ChecklistCoreTests.TestStoreTests/testWarmStoreSetupReportsPairedMedians': QUALIFICATION_STORE_PATHS + _core_paths(
+        'ManagedAttachmentImport SourceExport StorageRestore StorageSnapshot '
+        'StorageSnapshotAuthority StorageSnapshotRetention '
+    ) + (
+        'Tests/ChecklistCoreTests/TestStoreTests.swift',
+    ),
+    # Media Fixture type adoption/round/item/context publication and real router commands; MediaList cases page/freeze/count/read leases, FrozenIntake captures/preview/confirms/resumes sources, decisions bulk prepare/apply/reverse, round case updates retained history.
+    'ChecklistCoreTests.MediaListQueryTests/testExamplesStayCollapsedUntilShowThenCapPageAndNeverGrantApproval': QUALIFICATION_STORE_PATHS + _core_paths(
+        'Catalog ConnectionRegistration MediaCommandPreparation MediaDecisions MediaIntake '
+        'MediaIntakeMapping MediaListConfiguration MediaListQueries MediaOwnerChannel '
+        'MediaRecordRegistry MediaReviewContext MediaReviewSchema MediaRounds Policy '
+        'PolicySnapshots ProjectSettings WorkspaceProjectCreation '
+    ) + (
+        'Tests/ChecklistCoreTests/MediaListQueryTests.swift',
+        'Tests/ChecklistCoreTests/MediaRoundTests.swift',
+        'Tests/ChecklistCoreTests/StorageConsistencyTests.swift',
+    ),
+    # Anonymous NSXPCListener -> ChecklistClient.requestOnce -> MacOSLocalCommandTransport -> delayed project_create + command replay. No installed authentication/bootstrap/service launch.
+    'ChecklistIPCTests.LongCommandTests/testCommandLongerThanOldDeadlineReturnsCommittedResultThroughRealClient': QUALIFICATION_STORE_PATHS + _core_paths(
+        'Catalog Policy ProjectSettings StarterFields WorkspaceProjectCreation '
+    ) + (
+        'Sources/ChecklistIPC/ChecklistClient.swift',
+        'Sources/ChecklistIPC/CommandReply.swift',
+        'Sources/ChecklistIPC/LocalPlatformServices.swift',
+        'Sources/ChecklistIPC/Protocol.swift',
+        'Tests/ChecklistIPCTests/LongCommandTests.swift',
+    ),
+    # Child xctest constructs WorkspaceWindowStorage/State and ChecklistStore with injected no-request transport and denied alerts; only memory preferences + draft/navigation/window initialization. Does not exercise Media SwiftUI views.
+    'ChecklistAppTests.IsolatedDefaultsTests/testPreferencesRemainAbsentAfterChildProcessExit': (
+        'Sources/ChecklistApp/Media/MediaReviewModel.swift',
+        'Sources/ChecklistApp/Models/WorkspaceObservation.swift',
+        'Sources/ChecklistApp/Stores/ChecklistStore.swift',
+        'Sources/ChecklistApp/Support/CaptureTermination.swift',
+        'Sources/ChecklistApp/Support/DesktopAlerts.swift',
+        'Sources/ChecklistApp/Support/DetailItemStateRetention.swift',
+        'Sources/ChecklistApp/Support/DisplayCaches.swift',
+        'Sources/ChecklistApp/Support/DraftFileStorage.swift',
+        'Sources/ChecklistApp/Support/LocalDraftPersistence.swift',
+        'Sources/ChecklistApp/Support/PendingCommandRecovery.swift',
+        'Sources/ChecklistApp/Support/ProductionGroups.swift',
+        'Sources/ChecklistApp/Support/ScreenTiming.swift',
+        'Sources/ChecklistApp/Support/WorkspaceWindowRoot.swift',
+        'Sources/ChecklistApp/Views/TicketCleanupSettingsSection.swift',
+        'Sources/ChecklistIPC/ChecklistInstance.swift',
+        'Tests/ChecklistAppTests/IsolatedDefaults.swift',
+        'Tests/ChecklistAppTests/IsolatedDefaultsTests.swift',
+        'Tests/ChecklistTestSupport/*',
+    ),
+    # Fixture.ownerBackup with >30k symlinks -> inventory, durable publication, compact/legacy manifest, reconcile, lost-SQL-receipt recovery, changed-file refusal.
+    'ChecklistCoreTests.StorageSnapshotCapacityTests/testMoreThanThirtyThousandObjectsAndEightMiBManifestRoundTripWithoutPruning': QUALIFICATION_STORE_PATHS + _core_paths(
+        'ManagedPathConsumers MediaRecordRegistry StorageCompactManifest StorageRestore '
+        'StorageSnapshot StorageSnapshotAuthority StorageSnapshotRetention '
+    ) + (
+        'Tests/ChecklistCoreTests/StorageSnapshotCapacityTests.swift',
+    ),
+    # Media Fixture type adoption/round/item/context publication and real router commands; MediaList cases page/freeze/count/read leases, FrozenIntake captures/preview/confirms/resumes sources, decisions bulk prepare/apply/reverse, round case updates retained history.
+    'ChecklistCoreTests.MediaFrozenIntakeTests/test300SourcePreviewExactConfirmationStop200Resume96AndPlanRevision': QUALIFICATION_STORE_PATHS + _core_paths(
+        'Attachments Catalog ConnectionRegistration ManagedAttachmentImport MediaCommandPreparation '
+        'MediaDecisions MediaIntake MediaIntakeMapping MediaListConfiguration MediaListQueries '
+        'MediaOwnerChannel MediaRecordRegistry MediaReviewContext MediaReviewSchema MediaRounds '
+        'Policy PolicySnapshots ProjectSettings ReferenceImportPreparation WorkspaceProjectCreation '
+    ) + (
+        'Tests/ChecklistCoreTests/MediaFrozenIntakeTests.swift',
+        'Tests/ChecklistCoreTests/MediaRoundTests.swift',
+        'Tests/ChecklistCoreTests/StorageConsistencyTests.swift',
+    ),
+    # Media Fixture type adoption/round/item/context publication and real router commands; MediaList cases page/freeze/count/read leases, FrozenIntake captures/preview/confirms/resumes sources, decisions bulk prepare/apply/reverse, round case updates retained history.
+    'ChecklistCoreTests.MediaDecisionTests/test450SelectionLostReplyFailedMiddleOnlyRefreshAndLaterReversal': QUALIFICATION_STORE_PATHS + _core_paths(
+        'Catalog ConnectionRegistration MediaCommandPreparation MediaDecisions MediaOwnerChannel '
+        'MediaRecordRegistry MediaReviewContext MediaReviewSchema MediaRounds Policy '
+        'PolicySnapshots ProjectSettings WorkspaceProjectCreation '
+    ) + (
+        'Tests/ChecklistCoreTests/MediaDecisionTests.swift',
+        'Tests/ChecklistCoreTests/MediaRoundTests.swift',
+        'Tests/ChecklistCoreTests/StorageConsistencyTests.swift',
+    ),
+    # EvidenceAuthority fixture builds actual verified test worker, ready task and claim; 20,001 tasks then runWorkHealthChecks and candidate-page decoder count.
+    'ChecklistCoreTests.EvidenceAuthorityTests/testWorkHealthLargeProjectDecodesOnlyCandidatePage': QUALIFICATION_STORE_PATHS + _core_paths(
+        'AcceptanceEvidence AgentReference AgentReviews AttachmentOwnership Attachments '
+        'AuthorizedFileReadAdapter BatchClaimContext Communication ConnectionRegistration '
+        'DirectionContext EvidenceMeasures GroupKeys Groups HumanRequestFilePreparation ListFields '
+        'ManagedAttachmentImport NativeCommunicationRoutes Policy PolicySnapshots ProjectSettings '
+        'ReferenceImportPreparation Relations RequiredEpic ReviewBatchInputs ReviewDrafts '
+        'ReviewEvidence ReviewOutcomes ReviewRequirementIntegration ReviewRequirements '
+        'ReviewReturns SafeFileRead ScopedMentionProjection ScopedTaskRecords SelectedTicketRead '
+        'SourceExport SourceGitProcessAdapter StarterFields TaskContext TaskRecordSelection '
+        'TaskReferenceValidation TaskSessions TaskStatusReason TicketChangeCoverage '
+        'TicketPageFilters TicketPageRead TriageCommandEffects Work WorkAuthority WorkHealth '
+        'WorkspacePageRead '
+    ) + (
+        'Tests/ChecklistCoreTests/EvidenceAuthorityTests.swift',
+        'Tests/ChecklistCoreTests/WorkHealthTests.swift',
+    ),
+    # TicketLifecycleCleanup fixture (base test file plus contention extension), targeted preparation/inventory/commit or automatic maintenance; fixture helpers create ready/claimed/submitted tickets and source cache executions. Ordinary-note traffic executes the mention parser through Communication.
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testPreparationProgressUnderConstantUnrelatedWritesAndBoundsMemory': QUALIFICATION_STORE_PATHS + _core_paths(
+        'ArchiveCleanupConfiguration ArchiveCleanupExecutor ArchiveCleanupJob ArchiveCleanupJobs '
+        'ArchiveCleanupObservation ArchiveCleanupReferences ArchiveRetention AssistantGrants '
+        'AttachmentOwnership Attachments Catalog Communication EvidenceMeasures '
+        'ManagedPathConsumers NativeCommunicationRoutes OrdinaryMentionCommands '
+        'OrdinaryMentionTokens OrdinaryMentions SafeFileRead SourceBuildCacheCleanup SourceExport '
+        'StorageCompactManifest StorageSnapshotAuthority StorageSnapshotRetention TaskContext '
+        'TaskSessions TicketCleanupFence TicketCleanupInventory TicketCleanupPreparation '
+        'TicketCleanupReceiptRead TicketLifecycleCleanup TicketObjectDeletion TicketPurge '
+        'TicketRetirement Work WorkAuthority '
+    ) + (
+        'Tests/ChecklistCoreTests/TicketCleanupContentionTests.swift',
+        'Tests/ChecklistCoreTests/TicketLifecycleCleanupTests.swift',
+    ),
+    # TicketLifecycleCleanup fixture (base test file plus contention extension), targeted preparation/inventory/commit or automatic maintenance; fixture helpers create ready/claimed/submitted tickets and source cache executions.
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testBackupDescriptorStreamingHasBoundedAllocations': QUALIFICATION_STORE_PATHS + _core_paths(
+        'ArchiveCleanupConfiguration ArchiveCleanupExecutor ArchiveCleanupJob ArchiveCleanupJobs '
+        'ArchiveCleanupObservation ArchiveCleanupReferences ArchiveRetention AttachmentOwnership '
+        'Attachments Catalog Communication EvidenceMeasures ManagedPathConsumers '
+        'NativeCommunicationRoutes SafeFileRead SourceBuildCacheCleanup SourceExport '
+        'StorageCompactManifest StorageSnapshotAuthority StorageSnapshotRetention TaskContext '
+        'TaskSessions TicketCleanupFence TicketCleanupInventory TicketCleanupPreparation '
+        'TicketCleanupReceiptRead TicketLifecycleCleanup TicketObjectDeletion TicketPurge '
+        'TicketRetirement Work '
+    ) + (
+        'Tests/ChecklistCoreTests/TicketCleanupContentionTests.swift',
+        'Tests/ChecklistCoreTests/TicketLifecycleCleanupTests.swift',
+    ),
+    # TicketLifecycleCleanup fixture (base test file plus contention extension), targeted preparation/inventory/commit or automatic maintenance; fixture helpers create ready/claimed/submitted tickets and source cache executions.
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testProjectedReferenceScanBoundsWorkWithManyOwnedTokens': QUALIFICATION_STORE_PATHS + _core_paths(
+        'ArchiveCleanupConfiguration ArchiveCleanupExecutor ArchiveCleanupJob ArchiveCleanupJobs '
+        'ArchiveCleanupObservation ArchiveCleanupReferences ArchiveRetention AttachmentOwnership '
+        'Attachments Catalog Communication EvidenceMeasures ManagedPathConsumers '
+        'NativeCommunicationRoutes SafeFileRead SourceBuildCacheCleanup SourceExport '
+        'StorageCompactManifest StorageSnapshotAuthority StorageSnapshotRetention TaskContext '
+        'TaskSessions TicketCleanupFence TicketCleanupInventory TicketCleanupPreparation '
+        'TicketCleanupReceiptRead TicketLifecycleCleanup TicketObjectDeletion TicketPurge '
+        'TicketRetirement Work '
+    ) + (
+        'Tests/ChecklistCoreTests/TicketCleanupContentionTests.swift',
+        'Tests/ChecklistCoreTests/TicketLifecycleCleanupTests.swift',
+    ),
+    # TicketLifecycleCleanup fixture (base test file plus contention extension), targeted preparation/inventory/commit or automatic maintenance; fixture helpers create ready/claimed/submitted tickets and source cache executions. Ordinary-note traffic executes the mention parser through Communication.
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testSustainedWritersBoundRSSCPUAndBackoff': QUALIFICATION_STORE_PATHS + _core_paths(
+        'ArchiveCleanupConfiguration ArchiveCleanupExecutor ArchiveCleanupJob ArchiveCleanupJobs '
+        'ArchiveCleanupObservation ArchiveCleanupReferences ArchiveRetention AssistantGrants '
+        'AttachmentOwnership Attachments Catalog Communication EvidenceMeasures '
+        'ManagedPathConsumers NativeCommunicationRoutes OrdinaryMentionCommands '
+        'OrdinaryMentionTokens OrdinaryMentions SafeFileRead SourceBuildCacheCleanup SourceExport '
+        'StorageCompactManifest StorageSnapshotAuthority StorageSnapshotRetention TaskContext '
+        'TaskSessions TicketCleanupFence TicketCleanupInventory TicketCleanupPreparation '
+        'TicketCleanupReceiptRead TicketLifecycleCleanup TicketObjectDeletion TicketPurge '
+        'TicketRetirement Work WorkAuthority '
+    ) + (
+        'Tests/ChecklistCoreTests/TicketCleanupContentionTests.swift',
+        'Tests/ChecklistCoreTests/TicketLifecycleCleanupTests.swift',
+    ),
+    # TicketLifecycleCleanup fixture (base test file plus contention extension), targeted preparation/inventory/commit or automatic maintenance; fixture helpers create ready/claimed/submitted tickets and source cache executions.
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testSelectedPayloadAndHistoryPreparationHasBoundedPeak': QUALIFICATION_STORE_PATHS + _core_paths(
+        'ArchiveCleanupConfiguration ArchiveCleanupExecutor ArchiveCleanupJob ArchiveCleanupJobs '
+        'ArchiveCleanupObservation ArchiveCleanupReferences ArchiveRetention AttachmentOwnership '
+        'Attachments Catalog Communication EvidenceMeasures ManagedPathConsumers '
+        'NativeCommunicationRoutes SafeFileRead SourceBuildCacheCleanup SourceExport '
+        'StorageCompactManifest StorageSnapshotAuthority StorageSnapshotRetention TaskContext '
+        'TaskSessions TicketCleanupFence TicketCleanupInventory TicketCleanupPreparation '
+        'TicketCleanupReceiptRead TicketLifecycleCleanup TicketObjectDeletion TicketPurge '
+        'TicketRetirement Work '
+    ) + (
+        'Tests/ChecklistCoreTests/TicketCleanupContentionTests.swift',
+        'Tests/ChecklistCoreTests/TicketLifecycleCleanupTests.swift',
+    ),
+    # CoreTests fixture; large records/events and epic_create/epic_delete/service_info; indexed references, resumable backfill and concurrent read.
+    'ChecklistCoreTests.CoreTests/testEpicDeleteRealSizeBackfillResumesExpiredSlices': QUALIFICATION_STORE_PATHS + _core_paths(
+        'Catalog EpicDeletion GroupKeys Groups Policy ProjectSettings Relations RequiredEpic '
+        'TaskContext TaskReferenceValidation TaskSessions Work '
+    ) + (
+        'Tests/ChecklistCoreTests/CoreTests.swift',
+        'Tests/ChecklistCoreTests/EpicDeletionTests.swift',
+        'Tests/ChecklistCoreTests/RequiredEpicFixture.swift',
+    ),
+    # CoreTests fixture; large records/events and epic_create/epic_delete/service_info; indexed references, resumable backfill and concurrent read.
+    'ChecklistCoreTests.CoreTests/testEpicDeleteIndexedThirtyThousandRecordsAndEventsAndConcurrentRead': QUALIFICATION_STORE_PATHS + _core_paths(
+        'Catalog EpicDeletion GroupKeys Groups Policy ProjectSettings Relations RequiredEpic '
+        'TaskContext TaskReferenceValidation TaskSessions Work '
+    ) + (
+        'Tests/ChecklistCoreTests/CoreTests.swift',
+        'Tests/ChecklistCoreTests/EpicDeletionTests.swift',
+        'Tests/ChecklistCoreTests/RequiredEpicFixture.swift',
+    ),
+    # Media Fixture type adoption/round/item/context publication and real router commands; MediaList cases page/freeze/count/read leases, FrozenIntake captures/preview/confirms/resumes sources, decisions bulk prepare/apply/reverse, round case updates retained history.
+    'ChecklistCoreTests.MediaListQueryTests/testThousandItemBoundedGroupedPagesFreezeOrderAcrossInsertsAndUpdates': QUALIFICATION_STORE_PATHS + _core_paths(
+        'Catalog ConnectionRegistration MediaCommandPreparation MediaDecisions MediaIntake '
+        'MediaIntakeMapping MediaListConfiguration MediaListQueries MediaOwnerChannel '
+        'MediaRecordRegistry MediaReviewContext MediaReviewSchema MediaRounds Policy '
+        'PolicySnapshots ProjectSettings WorkspaceProjectCreation '
+    ) + (
+        'Tests/ChecklistCoreTests/MediaListQueryTests.swift',
+        'Tests/ChecklistCoreTests/MediaRoundTests.swift',
+        'Tests/ChecklistCoreTests/StorageConsistencyTests.swift',
+    ),
+    # ReadPerformanceFixture seeds real-size task/group/history rows; screen workspace/task/triage queries or read-only component profiles invoke projection/context/prerequisite/claim category helpers.
+    'ChecklistCoreTests.ScreenReadPerformanceTests/testRealSizeScreenReads': QUALIFICATION_STORE_PATHS + _core_paths(
+        'AgentReference BatchClaimContext BatchDisposition Batches Catalog Communication '
+        'CompletionPreview DirectionContext EvidenceMeasures GroupKeys Groups ListFields Policy '
+        'PolicySnapshots ProjectSettings Relations Requests RequiredEpic ReviewOutcomes '
+        'ReviewRequirementIntegration ReviewRequirements ScopedMentionProjection ScopedTaskRecords '
+        'SelectedTicketRead StarterFields TaskContext TaskRecordSelection TaskReferenceValidation '
+        'TaskSessions TaskStatusReason TicketPageFilters TicketPageRead TriageCommandEffects '
+        'TriageTransitions Work WorkAuthority WorkHealth WorkspacePageRead '
+    ) + (
+        'Tests/ChecklistCoreTests/ScreenReadPerformanceTests.swift',
+        'Tests/ChecklistCoreTests/StorageReadPerformanceTests.swift',
+    ),
+    # ReadPerformanceFixture seeds real-size task/group/history rows; screen workspace/task/triage queries or read-only component profiles invoke projection/context/prerequisite/claim category helpers.
+    'ChecklistCoreTests.ScreenReadPerformanceTests/testOverviewWithRetainedReviewHistory': QUALIFICATION_STORE_PATHS + _core_paths(
+        'AgentReference BatchClaimContext BatchDisposition Batches Catalog Communication '
+        'CompletionPreview DirectionContext EvidenceMeasures GroupKeys Groups ListFields Policy '
+        'PolicySnapshots ProjectSettings Relations Requests RequiredEpic ReviewOutcomes '
+        'ReviewRequirementIntegration ReviewRequirements ScopedMentionProjection ScopedTaskRecords '
+        'SelectedTicketRead StarterFields TaskContext TaskRecordSelection TaskReferenceValidation '
+        'TaskSessions TaskStatusReason TicketPageFilters TicketPageRead TriageCommandEffects '
+        'TriageTransitions Work WorkAuthority WorkHealth WorkspacePageRead '
+    ) + (
+        'Tests/ChecklistCoreTests/ScreenReadPerformanceTests.swift',
+        'Tests/ChecklistCoreTests/StorageReadPerformanceTests.swift',
+    ),
+    # ReadPerformanceFixture seeds real-size task/group/history rows; screen workspace/task/triage queries or read-only component profiles invoke projection/context/prerequisite/claim category helpers.
+    'ChecklistCoreTests.ScreenReadQueryPlanTests/testRealSizeScreenReadQueryPlans': QUALIFICATION_STORE_PATHS + _core_paths(
+        'AgentReference BatchClaimContext BatchDisposition Batches Catalog Communication '
+        'CompletionPreview DirectionContext EvidenceMeasures GroupKeys Groups ListFields Policy '
+        'PolicySnapshots ProjectSettings Relations Requests RequiredEpic ReviewOutcomes '
+        'ReviewRequirementIntegration ReviewRequirements ScopedMentionProjection ScopedTaskRecords '
+        'SelectedTicketRead StarterFields TaskContext TaskRecordSelection TaskReferenceValidation '
+        'TaskSessions TaskStatusReason TicketPageFilters TicketPageRead TriageCommandEffects '
+        'TriageTransitions Work WorkAuthority WorkHealth WorkspacePageRead '
+    ) + (
+        'Tests/ChecklistCoreTests/ScreenReadQueryPlanTests.swift',
+        'Tests/ChecklistCoreTests/StorageReadPerformanceTests.swift',
+    ),
+    # ReadPerformanceFixture seeds real-size task/group/history rows; screen workspace/task/triage queries or read-only component profiles invoke projection/context/prerequisite/claim category helpers.
+    'ChecklistCoreTests.OverviewReadOptimizationTests/testReadOnlyBatchClaimProjectionProfile': QUALIFICATION_STORE_PATHS + _core_paths(
+        'AgentReference BatchClaimContext BatchDisposition Batches Catalog Communication '
+        'CompletionPreview DirectionContext EvidenceMeasures GroupKeys Groups ListFields Policy '
+        'PolicySnapshots ProjectSettings Relations Requests RequiredEpic ReviewOutcomes '
+        'ReviewRequirementIntegration ReviewRequirements ScopedMentionProjection ScopedTaskRecords '
+        'SelectedTicketRead StarterFields TaskContext TaskRecordSelection TaskReferenceValidation '
+        'TaskSessions TaskStatusReason TicketPageFilters TicketPageRead TriageCommandEffects '
+        'TriageTransitions Work WorkAuthority WorkHealth WorkspacePageRead '
+    ) + (
+        'Tests/ChecklistCoreTests/OverviewReadOptimizationTests.swift',
+        'Tests/ChecklistCoreTests/StorageReadPerformanceTests.swift',
+    ),
+    # ReadPerformanceFixture seeds real-size task/group/history rows; screen workspace/task/triage queries or read-only component profiles invoke projection/context/prerequisite/claim category helpers.
+    'ChecklistCoreTests.ClaimPathOptimizationTests/testReadOnlyClaimComponentProfile': QUALIFICATION_STORE_PATHS + _core_paths(
+        'AgentReference BatchClaimContext BatchDisposition Batches Catalog Communication '
+        'CompletionPreview DirectionContext EvidenceMeasures GroupKeys Groups ListFields Policy '
+        'PolicySnapshots ProjectSettings Relations Requests RequiredEpic ReviewOutcomes '
+        'ReviewRequirementIntegration ReviewRequirements ScopedMentionProjection ScopedTaskRecords '
+        'SelectedTicketRead StarterFields TaskContext TaskRecordSelection TaskReferenceValidation '
+        'TaskSessions TaskStatusReason TicketPageFilters TicketPageRead TriageCommandEffects '
+        'TriageTransitions Work WorkAuthority WorkHealth WorkspacePageRead '
+    ) + (
+        'Tests/ChecklistCoreTests/ClaimPathOptimizationTests.swift',
+        'Tests/ChecklistCoreTests/StorageReadPerformanceTests.swift',
+    ),
+    # ReadPerformanceFixture seeds real-size task/group/history rows; screen workspace/task/triage queries or read-only component profiles invoke projection/context/prerequisite/claim category helpers.
+    'ChecklistCoreTests.OverviewReadOptimizationTests/testReadOnlyOverviewQueryProfile': QUALIFICATION_STORE_PATHS + _core_paths(
+        'AgentReference BatchClaimContext BatchDisposition Batches Catalog Communication '
+        'CompletionPreview DirectionContext EvidenceMeasures GroupKeys Groups ListFields Policy '
+        'PolicySnapshots ProjectSettings Relations Requests RequiredEpic ReviewOutcomes '
+        'ReviewRequirementIntegration ReviewRequirements ScopedMentionProjection ScopedTaskRecords '
+        'SelectedTicketRead StarterFields TaskContext TaskRecordSelection TaskReferenceValidation '
+        'TaskSessions TaskStatusReason TicketPageFilters TicketPageRead TriageCommandEffects '
+        'TriageTransitions Work WorkAuthority WorkHealth WorkspacePageRead '
+    ) + (
+        'Tests/ChecklistCoreTests/OverviewReadOptimizationTests.swift',
+        'Tests/ChecklistCoreTests/StorageReadPerformanceTests.swift',
+    ),
+    # TicketLifecycleCleanup fixture (base test file plus contention extension), targeted preparation/inventory/commit or automatic maintenance; fixture helpers create ready/claimed/submitted tickets and source cache executions. Ordinary-note traffic executes the mention parser through Communication.
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeAutomaticFirstPassKeepsConcurrentReadAndWriteUnderTwoSeconds': QUALIFICATION_STORE_PATHS + _core_paths(
+        'ArchiveCleanupConfiguration ArchiveCleanupExecutor ArchiveCleanupJob ArchiveCleanupJobs '
+        'ArchiveCleanupObservation ArchiveCleanupReferences ArchiveRetention AssistantGrants '
+        'AttachmentOwnership Attachments Catalog Communication EvidenceMeasures '
+        'ManagedPathConsumers NativeCommunicationRoutes OrdinaryMentionCommands '
+        'OrdinaryMentionTokens OrdinaryMentions SafeFileRead SourceBuildCacheCleanup SourceExport '
+        'StorageCompactManifest StorageSnapshotAuthority StorageSnapshotRetention TaskContext '
+        'TaskSessions TicketCleanupFence TicketCleanupInventory TicketCleanupPreparation '
+        'TicketCleanupReceiptRead TicketLifecycleCleanup TicketObjectDeletion TicketPurge '
+        'TicketRetirement Work WorkAuthority '
+    ) + (
+        'Tests/ChecklistCoreTests/TicketCleanupContentionTests.swift',
+        'Tests/ChecklistCoreTests/TicketLifecycleCleanupTests.swift',
+    ),
+    # TicketLifecycleCleanup fixture (base test file plus contention extension), targeted preparation/inventory/commit or automatic maintenance; fixture helpers create ready/claimed/submitted tickets and source cache executions.
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeCacheAliasInventoryExhaustsOneBoundedClosureBudgetAndRetainsEntry': QUALIFICATION_STORE_PATHS + _core_paths(
+        'ArchiveCleanupConfiguration ArchiveCleanupExecutor ArchiveCleanupJob ArchiveCleanupJobs '
+        'ArchiveCleanupObservation ArchiveCleanupReferences ArchiveRetention AttachmentOwnership '
+        'Attachments Catalog Communication EvidenceMeasures ManagedPathConsumers '
+        'NativeCommunicationRoutes SafeFileRead SourceBuildCacheCleanup SourceExport '
+        'StorageCompactManifest StorageSnapshotAuthority StorageSnapshotRetention TaskContext '
+        'TaskSessions TicketCleanupFence TicketCleanupInventory TicketCleanupPreparation '
+        'TicketCleanupReceiptRead TicketLifecycleCleanup TicketObjectDeletion TicketPurge '
+        'TicketRetirement Work '
+    ) + (
+        'Tests/ChecklistCoreTests/TicketCleanupContentionTests.swift',
+        'Tests/ChecklistCoreTests/TicketLifecycleCleanupTests.swift',
+    ),
+    # Media Fixture type adoption/round/item/context publication and real router commands; MediaList cases page/freeze/count/read leases, FrozenIntake captures/preview/confirms/resumes sources, decisions bulk prepare/apply/reverse, round case updates retained history.
+    'ChecklistCoreTests.MediaRoundTests/testLargeRetainedHistoryDoesNotHoldWriterDuringPreparation': QUALIFICATION_STORE_PATHS + _core_paths(
+        'Catalog ConnectionRegistration MediaCommandPreparation MediaDecisions MediaOwnerChannel '
+        'MediaRecordRegistry MediaReviewContext MediaReviewSchema MediaRounds Policy '
+        'PolicySnapshots ProjectSettings WorkspaceProjectCreation '
+    ) + (
+        'Tests/ChecklistCoreTests/MediaRoundTests.swift',
+        'Tests/ChecklistCoreTests/StorageConsistencyTests.swift',
+    ),
+    # ReadPerformanceFixture seeded 5k records; repeated GRDBRecordEnvelopeAdapter session lookups and bridge(delivery_pending) revoked-recipient filtering.
+    'ChecklistCoreTests.StorageReadPerformanceTests/testDeliveryPassLookupTimingAtFiveThousandRecords': QUALIFICATION_STORE_PATHS + _core_paths(
+        'Catalog Communication ConnectionRegistration NativeCommunicationRoutes '
+        'NativeDeliveryStatus WorkAuthority '
+    ) + (
+        'Tests/ChecklistCoreTests/StorageReadPerformanceTests.swift',
+    ),
+    # ReadPerformanceFixture seeds capture/manifest/attachment records; calls attachment_cleanup_preview twice, checks exact clean/retained/held bytes.
+    'ChecklistCoreTests.ArchivePreviewPerformanceTests/testFourFourHundredFileCapturesKeepExactPreviewUnderOneSecond': QUALIFICATION_STORE_PATHS + _core_paths(
+        'ArchiveCleanupConfiguration ArchiveCleanupObservation ArchiveCleanupReferences '
+        'ArchiveRetention AttachmentOwnership Attachments Catalog ManagedPathConsumers TaskContext '
+        'Work '
+    ) + (
+        'Tests/ChecklistCoreTests/StorageReadPerformanceTests.swift',
+    ),
+    # EvidenceAuthority base fixture + writer-lock extension; real source capture/submit or large reference attachment or captured-target review claim, with concurrent message_send/task_list probes. Ordinary-note traffic executes the mention parser through Communication.
+    'ChecklistCoreTests.EvidenceAuthorityTests/testLargeSubmitBlocksOtherCommandsOnlyBriefly': QUALIFICATION_STORE_PATHS + _core_paths(
+        'AcceptanceEvidence AgentReference AgentReviews AssistantGrants AttachmentOwnership '
+        'Attachments AuthorizedFileReadAdapter BatchClaimContext Communication '
+        'ConnectionRegistration DirectionContext EvidenceMeasures GroupKeys Groups '
+        'HumanRequestFilePreparation ListFields ManagedAttachmentImport NativeCommunicationRoutes '
+        'OrdinaryMentionCommands OrdinaryMentionTokens OrdinaryMentions Policy PolicySnapshots '
+        'ProjectSettings ReferenceImportPreparation Relations RequiredEpic ReviewBatchInputs '
+        'ReviewDrafts ReviewEvidence ReviewOutcomes ReviewRequirementIntegration ReviewRequirements '
+        'ReviewReturns SafeFileRead ScopedMentionProjection ScopedTaskRecords SelectedTicketRead '
+        'SourceExport SourceGitProcessAdapter StarterFields TaskContext TaskRecordSelection '
+        'TaskReferenceValidation TaskSessions TaskStatusReason TicketChangeCoverage '
+        'TicketPageFilters TicketPageRead TriageCommandEffects Work WorkAuthority WorkHealth '
+        'WorkspacePageRead '
+    ) + (
+        'Tests/ChecklistCoreTests/EvidenceAuthorityTests.swift',
+        'Tests/ChecklistCoreTests/WriterLockTests.swift',
+    ),
+    # EvidenceAuthority base fixture + writer-lock extension; real source capture/submit or large reference attachment or captured-target review claim, with concurrent message_send/task_list probes. Ordinary-note traffic executes the mention parser through Communication.
+    'ChecklistCoreTests.EvidenceAuthorityTests/testLargeReferenceImportBlocksOtherCommandsOnlyBriefly': QUALIFICATION_STORE_PATHS + _core_paths(
+        'AcceptanceEvidence AgentReference AgentReviews AssistantGrants AttachmentOwnership '
+        'Attachments AuthorizedFileReadAdapter BatchClaimContext Communication '
+        'ConnectionRegistration DirectionContext EvidenceMeasures GroupKeys Groups '
+        'HumanRequestFilePreparation ListFields ManagedAttachmentImport NativeCommunicationRoutes '
+        'OrdinaryMentionCommands OrdinaryMentionTokens OrdinaryMentions Policy PolicySnapshots '
+        'ProjectSettings ReferenceImportPreparation Relations RequiredEpic ReviewBatchInputs '
+        'ReviewDrafts ReviewEvidence ReviewOutcomes ReviewRequirementIntegration ReviewRequirements '
+        'ReviewReturns SafeFileRead ScopedMentionProjection ScopedTaskRecords SelectedTicketRead '
+        'SourceExport SourceGitProcessAdapter StarterFields TaskContext TaskRecordSelection '
+        'TaskReferenceValidation TaskSessions TaskStatusReason TicketChangeCoverage '
+        'TicketPageFilters TicketPageRead TriageCommandEffects Work WorkAuthority WorkHealth '
+        'WorkspacePageRead '
+    ) + (
+        'Tests/ChecklistCoreTests/EvidenceAuthorityTests.swift',
+        'Tests/ChecklistCoreTests/WriterLockTests.swift',
+    ),
+    # EvidenceAuthority base fixture + writer-lock extension; real source capture/submit or large reference attachment or captured-target review claim, with concurrent message_send/task_list probes. Ordinary-note traffic executes the mention parser through Communication.
+    'ChecklistCoreTests.EvidenceAuthorityTests/testReviewClaimValidatesTheCapturedTargetBeforeTheWriter': QUALIFICATION_STORE_PATHS + _core_paths(
+        'AcceptanceEvidence AgentReference AgentReviews AssistantGrants AttachmentOwnership '
+        'Attachments AuthorizedFileReadAdapter BatchClaimContext Communication '
+        'ConnectionRegistration DirectionContext EvidenceMeasures GroupKeys Groups '
+        'HumanRequestFilePreparation ListFields ManagedAttachmentImport NativeCommunicationRoutes '
+        'OrdinaryMentionCommands OrdinaryMentionTokens OrdinaryMentions Policy PolicySnapshots '
+        'ProjectSettings ReferenceImportPreparation Relations RequiredEpic ReviewBatchInputs '
+        'ReviewDrafts ReviewEvidence ReviewOutcomes ReviewRequirementIntegration ReviewRequirements '
+        'ReviewReturns SafeFileRead ScopedMentionProjection ScopedTaskRecords SelectedTicketRead '
+        'SourceExport SourceGitProcessAdapter StarterFields TaskContext TaskRecordSelection '
+        'TaskReferenceValidation TaskSessions TaskStatusReason TicketChangeCoverage '
+        'TicketPageFilters TicketPageRead TriageCommandEffects Work WorkAuthority WorkHealth '
+        'WorkspacePageRead '
+    ) + (
+        'Tests/ChecklistCoreTests/EvidenceAuthorityTests.swift',
+        'Tests/ChecklistCoreTests/WriterLockTests.swift',
+    ),
+    # Pure in-memory template -> StorageSnapshot.encoded -> compact Codable manifest and exact descriptor decoding. No CommandRouter or App/IPC fixture.
+    'ChecklistCoreTests.StorageCompactManifestTests/testTwoHundredThousandObjectTemplateFitsManifestBudgetWithoutLosingDescriptors': _core_paths(
+        'StorageCompactManifest StorageSnapshot StorageSnapshotAuthority '
+    ) + (
+        'Tests/ChecklistCoreTests/StorageCompactManifestTests.swift',
+    ),
+}
 # Compatibility name for consumers of the original selector plan.
 HEAVY_TESTS = QUALIFICATION_CASES
 ISOLATED_TESTS = TIMING_TESTS + LOAD_SENSITIVE_TESTS
@@ -103,13 +517,9 @@ ISOLATED_TESTS = TIMING_TESTS + LOAD_SENSITIVE_TESTS
 # Keep native guards intact and isolate this class from all other test work.
 ISOLATED_TEST_GROUPS = ('ChecklistCoreTests.SourceGitConfinementTests',
                         'ChecklistMCPServerTests.DelegateChildBindingTests')
-# Heavy fixtures instantiate CommandRouter and exercise shared models, hashing,
-# imports, persistence and provider policy. No Core source is proven unreachable.
-HEAVY_MODULES = ('ChecklistCore', 'ChecklistIPC', 'ChecklistApp')
-HEAVY_SOURCE_PREFIXES = ('Sources/ChecklistApp/Media/', 'Tests/ChecklistTestSupport/')
 # Explicit validation-only families; runtime inputs below take precedence.
 # Other non-code files (including arbitrary Markdown and docs binary fixtures)
-# have unknown impact and select the full suite.
+# have unknown impact and select the full unit suite; qualification uses its table.
 VALIDATION_ONLY_FILES = ('README.md', 'AGENTS.md')
 VALIDATION_ONLY_GLOBS = (
     'docs/*.md', 'docs/**/*.md', 'skills/**/*.md', 'templates/**/*.md',
@@ -120,6 +530,8 @@ VALIDATION_ONLY_GLOBS = (
 # Repository files read at runtime, not represented by SwiftPM dependencies.
 # RepositoryDependencyTests audits Swift and Python repository input reads.
 FILE_TEST_CONSUMERS = {
+    'Sources/ChecklistLegacyKeychain/ChecklistLegacyKeychain.c': ('ChecklistIPCTests',),
+    'Sources/ChecklistLegacyKeychain/include/ChecklistLegacyKeychain.h': ('ChecklistIPCTests',),
     'docs/integrations.md': ('ChecklistCoreTests',),
     'examples/human-request.json': ('ChecklistCoreTests',),
     'contracts/human-request.schema.json': ('ChecklistCoreTests',),
@@ -157,20 +569,75 @@ RUNTIME_TEST_CONSUMERS = {
     'StorageCrashProbe': ('ChecklistCoreTests',),
     'ChecklistCLIInputProbe': ('ChecklistMCPServerTests',),
 }
-# Small, closed entry points whose tests are narrower than their SwiftPM module.
-# The grammar and ordinary-note command behavior have a dedicated boundary
-# group. Dependent targets stay broad; the migration fixture reads stored types.
-# Unmapped Core source changes retain whole-target coverage.
+# Audited leaf entry points are narrower than their SwiftPM module.
+# Declare actual target/group consumers, including source inspections and
+# service callers. Unmapped source changes retain the module closure and
+# are reported in the plan.
 SOURCE_TEST_GROUPS = {
-    'Sources/ChecklistCore/OrdinaryMentionTokens.swift': {
-        'ChecklistCoreTests': ('OrdinaryMentionPublicBoundaryTests',),
+    'Sources/ChecklistCore/NativeOutcomeRecorder.swift': {
+        'ChecklistCoreTests': ('NativeOutcomeRecorderTests',),
+        'ChecklistAppTests': ('GlossaryTests',),
+        # The sole production caller is the service entry point. Keep all its
+        # native authority/scheduling groups, rather than infer no coverage.
+        'ChecklistServiceTests': ('AuthorityTests', 'NativeCodeIdentityTests', 'ServiceRouteTimingTests',
+                                  'ServiceQueueTimingTests', 'CallOverheadTests'),
+    },
+    'Sources/ChecklistApp/Views/TicketStatusReason.swift': {
+        'ChecklistAppTests': (
+            'TicketStatusReasonTests', 'TicketReadinessLabelTests', 'RemainingLazyListAccessibilityTests',
+            'ScreenTimingTests', 'CachedProjectSwitchFrameTests', 'WorkspaceObservationTests',
+            'LiveUpdateFreshnessTests', 'TriageBatchHistoryTests', 'TaskRowAccessibilityTests',
+            'GlossaryTests', 'PlainLanguageTests', 'ViewStateTests', 'ConfirmationTests',
+            'TicketPurgePreviewTests', 'NextActionTests'),
+    },
+    'Sources/ChecklistCore/MediaListConfiguration.swift': {
+        # The only production caller is MediaListQueries; route tests enter
+        # media_item_page/counts/approved_examples in MediaListQueryTests.
+        'ChecklistCoreTests': ('MediaListConfigurationTests', 'MediaIntakeMappingTests', 'MediaListQueryTests'),
+        'ChecklistAppTests': ('GlossaryTests',),
+    },
+    'Sources/ChecklistApp/Models/TicketPurgePreview.swift': {
+        'ChecklistAppTests': ('TicketPurgePreviewTests', 'GlossaryTests', 'PlainLanguageTests', 'ViewStateTests'),
+    },
+    'Sources/ChecklistApp/Support/CodexComposeLink.swift': {
+        'ChecklistAppTests': ('TaskHandoffTests', 'ProviderPresentationTests', 'GlossaryTests',
+                              'PlainLanguageTests', 'ViewStateTests'),
     },
 }
 
+# These maps declare the complete test-consumer set, including dependent modules.
+# Other source maps may narrow only one target and leave dependents conservative.
+CLOSED_SOURCE_GROUPS = frozenset(SOURCE_TEST_GROUPS)
+
 
 SOURCE_GROUP_SYMBOLS = {
-    'Sources/ChecklistCore/OrdinaryMentionTokens.swift': (
-        'OrdinaryMentionTokens', {'Sources/ChecklistCore/OrdinaryMentionTokens.swift', 'Sources/ChecklistCore/OrdinaryMentionCommands.swift'}),
+    'Sources/ChecklistCore/NativeOutcomeRecorder.swift': (
+        'NativeOutcomeRecorder', {
+            'Sources/ChecklistCore/NativeOutcomeRecorder.swift',
+            'Sources/ChecklistService/main.swift',
+        }),
+    'Sources/ChecklistApp/Views/TicketStatusReason.swift': (
+        'TicketStatusReason(?:Presentation|Line|Detail)', {
+            'Sources/ChecklistApp/Models/TaskRowPresentation.swift',
+            'Sources/ChecklistApp/Views/EpicDetailView.swift',
+            'Sources/ChecklistApp/Views/TaskDetailView.swift',
+            'Sources/ChecklistApp/Views/TaskWorkspaceView.swift',
+            'Sources/ChecklistApp/Views/TicketStatusReason.swift',
+            'Sources/ChecklistApp/Views/TriageDetailView.swift',
+        }),
+    'Sources/ChecklistCore/MediaListConfiguration.swift': (
+        '(?:MediaListConfiguration|MediaListItem|MediaListEntry|MediaHistoricalExamples|MediaHistoricalExampleRequest|MediaMaterialReference)', {
+            'Sources/ChecklistCore/MediaListConfiguration.swift',
+            'Sources/ChecklistCore/MediaListQueries.swift',
+        }),
+    'Sources/ChecklistApp/Models/TicketPurgePreview.swift': (
+        'TicketPurgePreview', {
+            'Sources/ChecklistApp/Models/TicketPurgePreview.swift',
+        }),
+    'Sources/ChecklistApp/Support/CodexComposeLink.swift': (
+        'CodexComposeLink', {
+            'Sources/ChecklistApp/Support/CodexComposeLink.swift',
+        }),
 }
 
 
@@ -178,8 +645,8 @@ def source_test_groups(root, path):
     mapping = SOURCE_TEST_GROUPS.get(path, {})
     if path in SOURCE_GROUP_SYMBOLS:
         symbol, expected = SOURCE_GROUP_SYMBOLS[path]
-        readers = {source.relative_to(root).as_posix() for source in (root / 'Sources/ChecklistCore').rglob('*.swift')
-                   if re.search(r'\b' + re.escape(symbol) + r'\b', source.read_text())}
+        readers = {source.relative_to(root).as_posix() for source in (root / 'Sources').rglob('*.swift')
+                   if re.search(r'\b' + symbol + r'\b', source.read_text())}
         if readers != expected:
             return {}  # A new/deleted caller invalidates the narrower map.
     return mapping
@@ -369,23 +836,17 @@ def wall_clock_budget_cases(root):
     return cases
 
 
-def changed_qualification_tests(root, paths):
-    # Registered real-size fixtures need not call the opt-in gate themselves.
-    selected = set()
-    for path in paths:
-        if path == 'Tests/ChecklistCoreTests/QualificationSuite.swift':
-            return list(QUALIFICATION_CASES)
-        source = root / path
-        if path.startswith('Tests/') and source.suffix == '.swift' and source.is_file():
-            methods = re.findall(r'func (test\w+)\(', source.read_text())
-            selected.update(case for case in QUALIFICATION_CASES if case.split('/')[1] in methods)
-    return [case for case in QUALIFICATION_CASES if case in selected]
+def qualification_reasons(paths):
+    """Keep the changed input for every selected case, including deleted fixtures."""
+    return {case: [path for path in paths if any(fnmatchcase(path, pattern) for pattern in patterns)]
+            for case, patterns in QUALIFICATION_SOURCE_PATHS.items()}
 
 
-def select(root, graph, paths, scratch, full=False, qualification=False):
+
+def select(root, graph, paths, scratch, full=False, qualification=False, last_round=False):
     targets = {target['name']: target for target in graph['targets']}
     all_tests = {name for name, target in targets.items() if target['type'] == 'test'}
-    affected, changed_targets, python, unknown = set(), set(), set(), []
+    affected, python, unknown = set(), set(), []
     # Longest target path wins (e.g. StorageCrashProbe/ReleasedCore).
     owners = sorted(targets.values(), key=lambda target: len(target['path']), reverse=True)
     normalized = sorted(set(PurePosixPath(path.removeprefix('./')).as_posix() for path in paths))
@@ -405,16 +866,15 @@ def select(root, graph, paths, scratch, full=False, qualification=False):
             python.update(name for name in python_consumers if (root / name).is_file())
             # Explicit readers supplement the package graph, including resources.
             owner = next((target for target in owners if path.startswith(target['path'] + '/')), None)
-            if owner and is_target_resource(root, owner, path):
+            if owner and (PurePosixPath(path).suffix in ('.swift', '.c', '.h', '.m', '.mm', '.cpp', '.s')
+                          or is_target_resource(root, owner, path)):
                 affected.add(owner['name'])
-                changed_targets.add(owner['name'])
         elif path.startswith(('Sources/', 'Tests/')) or any(
                 path.startswith(target['path'] + '/') for target in owners):
             owner = next((target for target in owners if path.startswith(target['path'] + '/')), None)
             if owner and (PurePosixPath(path).suffix in ('.swift', '.c', '.h', '.m', '.mm', '.cpp', '.s')
                           or is_target_resource(root, owner, path)):
                 affected.add(owner['name'])
-                changed_targets.add(owner['name'])
                 for prefix, consumers in SOURCE_TEST_CONSUMERS.items():
                     if path.startswith(prefix):
                         affected.update(name for name in consumers if name in targets)
@@ -431,66 +891,78 @@ def select(root, graph, paths, scratch, full=False, qualification=False):
             pass
         else:
             unknown.append(path)
-    # Reverse dependency closure includes executable modules and their consumers.
-    while True:
-        dependents = {name for name, target in targets.items()
-                      if affected.intersection(target.get('target_dependencies', []))}
-        for producer, consumers in RUNTIME_TEST_CONSUMERS.items():
-            if producer in affected:
-                dependents.update(name for name in consumers if name in targets)
-        added = dependents - affected
-        if not added:
-            break
-        affected.update(added)
+    def dependency_closure(initial):
+        result = set(initial)
+        while True:
+            dependents = {name for name, target in targets.items()
+                          if result.intersection(target.get('target_dependencies', []))}
+            for producer, consumers in RUNTIME_TEST_CONSUMERS.items():
+                if producer in result:
+                    dependents.update(name for name in consumers if name in targets)
+            added = dependents - result
+            if not added:
+                return result
+            result.update(added)
+
+    affected = dependency_closure(affected)
+    path_consumers = {}
+    for path in normalized:
+        owner = next((target for target in owners if path.startswith(target['path'] + '/')), None)
+        seeds = set(FILE_TEST_CONSUMERS.get(path, ()))
+        if owner:
+            seeds.add(owner['name'])
+        for prefix, consumers in SOURCE_TEST_CONSUMERS.items():
+            if path.startswith(prefix):
+                seeds.update(consumers)
+        path_consumers[path] = dependency_closure(seeds)
     if unknown or full:
         affected.update(targets)
         python.update(str(path.relative_to(root)) for path in (root / 'scripts').glob('test_*.py'))
     tests = sorted(all_tests.intersection(affected))
-    # Follow forward dependencies of the heavy tests' production module too:
-    # a Providers change can affect Core's policy and data behavior.
-    heavy_dependencies = set(HEAVY_MODULES)
-    pending = list(HEAVY_MODULES)
-    while pending:
-        for dependency in targets.get(pending.pop(), {}).get('target_dependencies', []):
-            if dependency not in heavy_dependencies:
-                heavy_dependencies.add(dependency)
-                pending.append(dependency)
-    heavy_changed = bool(changed_targets.intersection(heavy_dependencies)) or any(
-        path.startswith(HEAVY_SOURCE_PREFIXES) for path in normalized)
-    changed_qualifiers = changed_qualification_tests(root, normalized)
-    explicitly_qualified = qualification
-    qualification = qualification or (not full and (bool(unknown) or heavy_changed or bool(changed_qualifiers)))
+    explicitly_qualified = qualification or last_round
+    qualification_mode = ('requested-full' if qualification else 'pass-final-round' if last_round
+                          else 'full-default' if full else 'affected')
+    reasons = qualification_reasons(normalized)
+    qualification_tests = (list(QUALIFICATION_CASES) if explicitly_qualified else
+                           [] if full else [case for case in QUALIFICATION_CASES if reasons[case]])
+    qualification = bool(qualification_tests)
     source_groups = {path: source_test_groups(root, path) for path in normalized}
+    group_fallback_paths = []
     groups = {}
     if not full and not unknown:
+        for path in normalized:
+            owner = next((target for target in owners if path.startswith(target['path'] + '/')), None)
+            if owner and owner['type'] != 'test' and not source_groups[path]:
+                group_fallback_paths.append(path)
         for name in tests:
             relevant = []
             for path in normalized:
+                if name not in path_consumers[path]:
+                    continue
                 mapping = source_groups[path]
                 owner = next((target for target in owners if path.startswith(target['path'] + '/')), None)
                 if name in mapping:
                     relevant.append(mapping[name])
+                elif mapping and path in CLOSED_SOURCE_GROUPS:
+                    relevant.append(())  # Declared closed map: no consumer in this target.
                 elif name in FILE_TEST_CONSUMERS.get(path, ()):
                     relevant.append(None)
                 elif owner and owner['name'] == name:
                     relevant.append(test_file_groups(root, owner, path))
                 elif owner and owner['type'] != 'test':
                     relevant.append(None)
-            if relevant and all(relevant):
+            if relevant and all(selected is not None for selected in relevant):
                 groups[name] = sorted({group for selected in relevant for group in selected})
-    # Group narrowing applies to the fast unit suite. Qualification retains
-    # the production dependency closure: ordinary-note parsing also runs in
-    # the writer-traffic and scale fixtures.
-    qualification_tests = (list(QUALIFICATION_CASES) if qualification and
-                           (explicitly_qualified or heavy_changed or unknown or full) else
-                           changed_qualifiers if qualification else [])
-    qualification_tests = [case for case in qualification_tests if case.split('.')[0] in tests]
+        tests = [name for name in tests if name not in groups or groups[name]]
+        groups = {name: selected for name, selected in groups.items() if name in tests}
+    # Qualification is independent of unit group narrowing: an explicitly requested
+    # full qualification includes Core/App/IPC cases even for a docs-only change.
     skip = [case for case in QUALIFICATION_CASES if case not in qualification_tests] if tests else []
     swift = []
     isolated = []
     qualification_commands = []
     timing_tests, timing_commands, timing_deferred = [], [], False
-    if tests or full:
+    if tests or full or qualification_tests:
         command = ['swift', 'test', '--parallel', '--num-workers', '10', '--cache-path',
                    str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
                    '--enable-dependency-cache', '--scratch-path', str(scratch)]
@@ -500,7 +972,7 @@ def select(root, graph, paths, scratch, full=False, qualification=False):
                 command.extend(['--filter', '^' + re.escape(target) + r'\.' + suffix])
         for case in QUALIFICATION_CASES + ISOLATED_TESTS:
             command.extend(['--skip', '^' + re.escape(case) + r'(?:/|$)'])
-        if 'ChecklistCoreTests' in tests:
+        if 'ChecklistCoreTests' in tests or any(case.startswith('ChecklistCoreTests.') for case in qualification_tests):
             command = ['env', 'CHECKLIST_STORAGE_PROBE=' + str(scratch / 'out/Products/Debug/StorageCrashProbe')] + command
         command = ['env', 'CHECKLIST_TEST_TEMPLATE_ROOT=' + str(scratch / 'test-store-templates'), 'CHECKLIST_QUALIFICATION=0'] + command
         isolated = [group for group in ISOLATED_TEST_GROUPS
@@ -508,7 +980,8 @@ def select(root, graph, paths, scratch, full=False, qualification=False):
                     or group.split('.')[1] in groups[group.split('.')[0]])]
         for group in isolated:
             command.extend(['--skip', '^' + re.escape(group) + r'(?:/|$)'])
-        swift.append(command)
+        if tests or full:
+            swift.append(command)
         for target in sorted({group.split('.')[0] for group in isolated}):
             # The parallel pass above builds this exact test bundle. Selecting
             # the native class directly avoids rediscovering/starting every
@@ -520,7 +993,7 @@ def select(root, graph, paths, scratch, full=False, qualification=False):
         timing_tests = [case for case in ISOLATED_TESTS if case.split('.')[0] in tests and (
             case.split('.')[0] not in groups or case.split('.')[1].split('/')[0] in groups[case.split('.')[0]])]
         # Wall-clock budgets are performance checks (CL-266 item 2): they run in
-        # qualification runs (--qualification, every round commit) or when a
+        # full qualification runs (--qualification/--last-round) or when a
         # timing test file itself changes; ordinary affected runs defer them.
         timing_classes = {case.split('.')[1].split('/')[0] for case in timing_tests}
         timing_changed = any(path.startswith('Tests/') and Path(path).stem in timing_classes for path in normalized)
@@ -551,8 +1024,11 @@ def select(root, graph, paths, scratch, full=False, qualification=False):
     return {'paths': normalized, 'affected_targets': sorted(affected), 'test_targets': tests,
             'python_tests': sorted(python), 'fallback_paths': unknown, 'skip': skip, 'full': full, 'qualification': qualification,
             'isolated_test_groups': isolated, 'test_groups': groups,
+            'group_fallback_paths': group_fallback_paths, 'qualification_mode': qualification_mode,
+            'qualification_reasons': {case: reasons[case] for case in qualification_tests},
             'default_swift_commands': [command for command in swift if command not in qualification_commands and command not in timing_commands],
             'qualification_commands': qualification_commands, 'qualification_tests': qualification_tests,
+            'qualification_test_targets': sorted({case.split('.')[0] for case in qualification_tests}),
             'timing_commands': timing_commands, 'timing_tests': timing_tests, 'timing_deferred': timing_deferred,
             'swift_commands': swift, 'commands': swift + python_commands + [VALIDATE]}
 
@@ -565,12 +1041,13 @@ def main(argv=None):
     source.add_argument('--paths-file', type=Path, help='newline-delimited paths, or - for stdin')
     parser.add_argument('--full', action='store_true', help='full default Swift suite in parallel and all Python tests')
     parser.add_argument('--qualification', action='store_true', help='include the opt-in scale, timing and soak qualification suite')
+    parser.add_argument('--last-round', action='store_true', help='full qualification once, on the final round of a pass')
     parser.add_argument('--json', action='store_true', help='emit the plan as JSON argv arrays')
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument('--scratch-path', type=Path, default=Path('.build'))
     args = parser.parse_args(argv)
-    if not any((args.base, args.paths, args.paths_file, args.full)):
-        parser.error('supply --base, --paths, --paths-file or --full')
+    if not any((args.base, args.paths, args.paths_file, args.full, args.qualification, args.last_round)):
+        parser.error('supply --base, --paths, --paths-file, --full, --qualification or --last-round')
     root = args.root.resolve()
     scratch = args.scratch_path.resolve()
     try:
@@ -580,11 +1057,17 @@ def main(argv=None):
         elif args.paths_file:
             contents = sys.stdin.read() if str(args.paths_file) == '-' else args.paths_file.read_text()
             paths = contents.splitlines()
-        plan = select(root, package_graph(root, scratch), paths, scratch, args.full, args.qualification)
+        plan = select(root, package_graph(root, scratch), paths, scratch, args.full, args.qualification, args.last_round)
         if args.json:
             print(json.dumps(plan, indent=2))
         else:
-            print('Test targets: ' + (', '.join(plan['test_targets']) or '(none)'))
+            print('Unit test targets: ' + (', '.join(plan['test_targets']) or '(none)'))
+            print('Qualification mode: ' + plan['qualification_mode'])
+            print('Qualification targets: ' + (', '.join(plan['qualification_test_targets']) or '(none)'))
+            for case, paths in plan['qualification_reasons'].items():
+                print('Qualification case: ' + case + ' <- ' + (', '.join(paths) or plan['qualification_mode']))
+            if plan['group_fallback_paths']:
+                print('Module group fallback for: ' + ', '.join(plan['group_fallback_paths']))
             if plan['fallback_paths']:
                 print('Full selection for: ' + ', '.join(plan['fallback_paths']))
             for target, groups in plan['test_groups'].items():

@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import os
 import ChecklistIPC
 @testable import ChecklistCore
 @testable import ChecklistService
@@ -55,11 +56,10 @@ extension ServiceQueueTimingTests {
         let firstStarted = DispatchSemaphore(value:0), secondStarted = DispatchSemaphore(value:0)
         let resumeFirst = DispatchSemaphore(value:0), resumeSecond = DispatchSemaphore(value:0)
         defer {resumeFirst.signal();resumeSecond.signal()}
-        let lock = NSLock()
-        var reads = 0
+        let reads = OSAllocatedUnfairLock(initialState:0)
         let first = Date().addingTimeInterval(3600), earlier = first.addingTimeInterval(-600)
-        let load: () throws -> Date? = {
-            lock.lock();reads += 1;let index = reads;lock.unlock()
+        let load: @Sendable () throws -> Date? = {
+            let index = reads.withLock { $0 += 1; return $0 }
             if index == 1 {
                 firstStarted.signal()
                 guard resumeFirst.wait(timeout:.now()+10) == .success else {throw NSError(domain:"DeadlineTest",code:1)}
@@ -77,7 +77,7 @@ extension ServiceQueueTimingTests {
             for _ in 0..<20 {coordinator.armStorageWake(loadDeadline:load)}
             XCTAssertTrue(coordinator.storageWakePlanning)
         }
-        lock.lock();XCTAssertEqual(reads,1);lock.unlock()
+        XCTAssertEqual(reads.withLock { $0 },1)
         resumeFirst.signal()
         XCTAssertEqual(secondStarted.wait(timeout:.now()+10),.success)
         coordinator.queue.sync {XCTAssertEqual(coordinator.storageWakePlan.deadline,first)}
@@ -88,7 +88,7 @@ extension ServiceQueueTimingTests {
             XCTAssertFalse(coordinator.storageWakePlanning)
             XCTAssertFalse(coordinator.storageWakeReplan)
         }
-        lock.lock();XCTAssertEqual(reads,2);lock.unlock()
+        XCTAssertEqual(reads.withLock { $0 },2)
     }
 
     func testPureWorkspaceReadsKeepRepairHooksReservedForManagedReadsAndWrites() throws {

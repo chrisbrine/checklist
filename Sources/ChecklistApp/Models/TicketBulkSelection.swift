@@ -37,9 +37,9 @@ import SwiftUI
     }
 }
 
-struct TicketBulkRowInteraction {
-    var selected: (Record) -> Bool = { _ in false }
-    var activate: (Record, Bool, Bool) -> Bool = { _, _, _ in false }
+struct TicketBulkRowInteraction: Sendable {
+    var selected: @MainActor @Sendable (Record) -> Bool = { _ in false }
+    var activate: @MainActor @Sendable (Record, Bool, Bool) -> Bool = { _, _, _ in false }
 }
 private struct TicketBulkRowInteractionKey: EnvironmentKey { static let defaultValue = TicketBulkRowInteraction() }
 extension EnvironmentValues {

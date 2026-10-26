@@ -23,7 +23,7 @@ enum DockBadge {
     /// The owner's direction for CL-53 (request a6c0bf5d, 20 October 2026): the badge is on by default and macOS
     /// asks for its permission by itself the first time. macOS shows that prompt once per app, so it covers badges
     /// and alerts; desktop alerts still stay off in Checklist until the owner turns them on.
-    static func requestPermissionIfNeeded(defaults: UserDefaults = .standard) async {
+    @MainActor static func requestPermissionIfNeeded(defaults: UserDefaults = .standard) async {
         guard defaults.object(forKey: key) as? Bool ?? true else { return }
         let center = UNUserNotificationCenter.current()
         guard await center.notificationSettings().authorizationStatus == .notDetermined else { return }

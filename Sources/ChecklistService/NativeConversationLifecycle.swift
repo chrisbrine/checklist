@@ -35,6 +35,7 @@ extension Coordinator {
     /// Called on the existing command queue at startup, before requests/dispatch,
     /// and by observed native process/registry events. main.swift owns the hooks.
     func observeNativeConversationLifecycles() {
+        requireCommandQueue()
         for enrollment in Array(enrollments.values) {
             guard enrollment.automatic == true, enrollment.role == "worker", enrollment.assistantRelay != true,
                   let plugin=ProviderPluginRegistry.bundled.plugin(enrollment.provider, requiring: .registryClosure),

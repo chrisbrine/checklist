@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Darwin
 import ChecklistFileAccess
 
@@ -61,12 +62,12 @@ struct StorageFolderAccess {
 /// source can fire earlier or be starved under sustained command traffic. One
 /// registered signal source and a capped set keep both races and process count
 /// bounded; only our own PIDs are reaped, without altering signal dispositions.
-private final class StorageFolderReaper {
+private final class StorageFolderReaper: Sendable {
     static let shared = StorageFolderReaper()
     private let queue = DispatchQueue(label:"checklist.folder-reaper",qos:.userInitiated)
     private let worker = DispatchSemaphore(value:1)
     private let slots = DispatchSemaphore(value:16)
-    private var children = Set<pid_t>()
+    private let children = OSAllocatedUnfairLock(initialState: Set<pid_t>())
     private let signal: DispatchSourceSignal
     private let registration = DispatchGroup()
     private init() {
@@ -91,7 +92,7 @@ private final class StorageFolderReaper {
             let descriptor = checklist_open_bounded(path,timeout,barrier,&retired,&active)
             let failure = errno
             for child in retired {
-                if child > 0 { children.insert(child) } else { slots.signal() }
+                if child > 0 { children.withLock { _ = $0.insert(child) } } else { slots.signal() }
             }
             reap()
             return (descriptor,failure,Array(Set(retired.filter {$0 > 0} + (active > 0 ? [active] : []))))
@@ -101,9 +102,11 @@ private final class StorageFolderReaper {
         // This queue also owns the native helper state, so a SIGCHLD callback
         // cannot reap/recycle a PID while a request is retiring that generation.
         checklist_reap_idle_folder_helper()
-        for child in children {
-            let result = waitpid(child,nil,WNOHANG)
-            if result == child || result < 0 && errno == ECHILD { children.remove(child);slots.signal() }
+        children.withLock { children in
+            for child in children {
+                let result = waitpid(child,nil,WNOHANG)
+                if result == child || result < 0 && errno == ECHILD { children.remove(child);slots.signal() }
+            }
         }
     }
 }

@@ -99,7 +99,7 @@ struct MediaReviewWorkspace: View {
                 HStack {
                     Picker("Rounds",selection:$model.roundState) {ForEach(["draft","open","closed","canceled","archived"],id:\.self) {Text($0.capitalized).tag($0)}}.frame(maxWidth:160)
                         .onChange(of:model.roundState) {_,_ in model.roundOffset=0;Task {await model.refresh()}}
-                    Picker("Round",selection:Binding(get:{model.roundID},set:model.chooseRound)) {
+                    Picker("Round",selection:Binding(get:{model.roundID},set:{ model.chooseRound($0) })) {
                         Text("Choose round").tag("")
                         ForEach(model.rounds) {Text($0.string("title")).tag($0.id)}
                     }

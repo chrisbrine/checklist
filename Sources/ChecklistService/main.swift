@@ -7,7 +7,7 @@ import ChecklistIPC
 import ChecklistBridges
 import ChecklistProviders
 
-struct Enrollment: Codable {
+struct Enrollment: Codable, Sendable {
     var installation: String
     var name: String
     var provider: String
@@ -74,8 +74,10 @@ final class StorageRecoveryPeer: NSObject, ChecklistRPC {
     func execute(_ request: Data, withReply reply: @escaping (Data)->Void) {reply(state.response(to:request))}
 }
 
-final class Coordinator: NSObject, NSXPCListenerDelegate {
+// Invariant: after startup, mutable coordinator state is confined to queue; storage/native workers carry immutable snapshots and return mutations to queue.
+final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     let router: CommandRouter
+    private let enforcesQueueIsolation: Bool
     let listener = NSXPCListener(machServiceName: ChecklistInstance.current.machServiceName)
     // Bound request envelopes, reply serialization and afterCommand bridge
     // temporaries even when the service thread's outer pool is long-lived.
@@ -102,6 +104,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     let clientIdentity = ClientCodeIdentity.bundledAdmission()
     init(router: CommandRouter, enrollmentFile: URL = ChecklistPaths.root.appendingPathComponent("connections.json"), startBackgroundWork: Bool = true) {
         self.router = router
+        self.enforcesQueueIsolation = startBackgroundWork
         self.enrollmentFile = enrollmentFile
         let gui=ChecklistPaths.serviceExecutable.deletingLastPathComponent().appendingPathComponent("ChecklistApp").resolvingSymlinksInPath()
         self.expectedOwnerPath=gui.path
@@ -118,9 +121,16 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
             queue.async { [weak self] in self?.observeNativeConversationLifecycles();self?.armStorageWake();self?.runWorkHealth() }
         }
     }
+    /// Production mutable state belongs to queue. Synchronous fixtures disable
+    /// background work and own their coordinator exclusively until they enqueue work.
+    func requireCommandQueue() {
+        if enforcesQueueIsolation { dispatchPrecondition(condition:.onQueue(queue)) }
+    }
+
     /// Advisory database supervision only; never launches or polls a model.
     /// One bounded page per wake; persisted deadlines survive sleep/restart.
     func runWorkHealth() {
+        requireCommandQueue()
         workHealthWake?.cancel(); workHealthWake = nil
         let started = ProcessInfo.processInfo.systemUptime
         defer { if timingDiagnosticsEnabled { CallTimingLog.write(["scope":"work_health_maintenance","start_uptime_s":started,"duration_ms":(ProcessInfo.processInfo.systemUptime-started)*1000]) } }
@@ -143,7 +153,8 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
 
     /// One-shot durable cleanup deadline. Held work waits for a relevant
     /// command or an actual lease deadline; this is not a model/pickup loop.
-    func armStorageWake(loadDeadline: (() throws -> Date?)? = nil, diagnostics: Bool = false) {
+    func armStorageWake(loadDeadline: (@Sendable () throws -> Date?)? = nil, diagnostics: Bool = false) {
+        requireCommandQueue()
         guard !storageRunning else {return}
         if storageWakePlanning {storageWakeReplan = true;return}
         storageWakePlanning = true
@@ -173,6 +184,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     /// Apply every completed plan before a dirty follow-up, so continuous notes
     /// cannot postpone an already discovered earlier deadline.
     func installStorageWake(_ next: Date?) {
+        requireCommandQueue()
         guard storageWakePlan.update(next) else {return}
         storageWake?.cancel();storageWake = nil
         guard let deadline = storageWakePlan.deadline else {return}
@@ -197,6 +209,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         return clientIdentity.accept(connection) { Peer(coordinator: self, connection: connection) }
     }
     func saveEnrollments() throws {
+        requireCommandQueue()
         let data = try JSONEncoder().encode(enrollments)
         try data.write(to: enrollmentFile, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: enrollmentFile.path)
@@ -220,6 +233,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         return hash == expectedOwnerHash
     }
     func caller(_ request: [String: Any], connection: NSXPCConnection, timing: ServiceCallTiming? = nil) throws -> Caller {
+        requireCommandQueue()
         if request["owner_channel"] as? Bool == true {
             guard owner(connection) else { throw ChecklistError("OWNER_CHANNEL_REQUIRED", "Only the signed native Checklist app can author human actions.") }
             return Caller(role: "owner", installation: "native-app", projectIDs: [], sessionID: nil, workspace: nil)
@@ -265,6 +279,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     /// Resolves the caller and every coordinator-owned operation on the serial queue.
     /// A routed command needs only the router, which serializes its own writes.
     func route(_ request: [String: Any], connection: NSXPCConnection, timing: ServiceCallTiming? = nil) throws -> Routed {
+        requireCommandQueue()
         ServiceCallTiming.measure(timing,"route_lifecycle_ms") { observeNativeConversationLifecycles() }
         if request["method"] as? String == "connection_bootstrap" {
             let result = try bootstrap(request["params"] as? [String:Any] ?? [:], connection:connection)
@@ -363,8 +378,11 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         }
         return .router(method:method,params:params,caller:caller)
     }
-    func changed() { for callback in Array(waiters.values) { callback() } }
+    func changed() { requireCommandQueue(); for callback in Array(waiters.values) { callback() } }
     func startNativeReplies() {
+        queue.sync { startNativeRepliesOnQueue() }
+    }
+    private func startNativeRepliesOnQueue() {
         let directory=URL(fileURLWithPath:"/tmp/cc-socks",isDirectory:true)
         if !FileManager.default.fileExists(atPath:directory.path) { try? FileManager.default.createDirectory(at:directory,withIntermediateDirectories:false,attributes:[.posixPermissions:0o700]) }
         do { nativeListener=try NativeReplyListener(path:directory.appendingPathComponent("\(getpid()).sock").path) }
@@ -372,9 +390,9 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         // Startup owns one pending-delivery pass; ordinary pure reads no longer
         // provide incidental dispatch after a service restart.
         queue.async { [self] in autoreleasepool {dispatchNative()} }
-        DispatchQueue.global(qos:.utility).async { [self] in
-            guard let listener = nativeListener else { return }
-            NativeReplyLoop.run(shouldContinue: { self.nativeListener != nil },
+        guard let listener = nativeListener else { return }
+        DispatchQueue.global(qos:.utility).async { [self, listener] in
+            NativeReplyLoop.run(shouldContinue: { queue.sync { self.nativeListener != nil } },
                 receive: { try listener.receiveFrame(timeout: 50) },
                 onFrame: { frame in queue.async { self.recordNativeReply(frame) } },
                 onError: { error in fputs("Native reply rejected: \(error.localizedDescription)\n", stderr) })
@@ -389,6 +407,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     }
     func nativeDispatchDeliveries(endpointAvailable: (Enrollment)->Bool = Coordinator.nativeEndpointAvailable,
                                   load: ([String:Any]) -> [String:Any]?) -> [[String:Any]] {
+        requireCommandQueue()
         let sessions = enrollments.values.filter {$0.nativeEndpoint != nil && $0.revoked != true && endpointAvailable($0)}.map { $0.sessionID }
         var pending: [[String:Any]] = []
         // Bound each internal request without imposing a new installation-wide
@@ -400,6 +419,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         return pending
     }
     func dispatchNative() {
+        requireCommandQueue()
         observeNativeConversationLifecycles()
         guard let listener=nativeListener else { return }
         let bridge=Caller(role:"owner",installation:"native-bridge",projectIDs:[])
@@ -428,6 +448,11 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
             let peerPID=NativeProviderTransport.endpointPID(provider:enrollment.provider,endpoint:endpoint) ?? 0
             // Registered before I/O: Claude can report a hold before this write's outcome is recorded.
             nativeInFlight[id]=NativeInFlight(deliveryID:id,messageID:mid,peerPID:peerPID,routeGeneration:enrollment.generation,startedAt:Date())
+            let replyAddress = listener.address
+            // JSON metadata never crosses the queue as an Any-valued dictionary.
+            let author = message["author_display"] as? String ?? "unknown session"
+            let subjectBytes = (delivery["subject"] as? [String:Any]).flatMap { try? JSONSerialization.data(withJSONObject:$0) }
+            let ticketBytes = (delivery["ticket"] as? [String:Any]).flatMap { try? JSONSerialization.data(withJSONObject:$0) }
             DispatchQueue.global(qos:.utility).async { [self] in
                 let state:String;let receipt:[String:Any]
                 do {
@@ -447,14 +472,16 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
                             registryPath:plugin.nativeHost?.registryPath(processID:peerPID)) else {
                         throw ChecklistError("NATIVE_REGISTRATION_UNPROVEN","Native push requires the current verified native registration; this note remains available through Checklist pickup.")
                     }
-                    let content=try NativeRelayContent.render(origin:origin,messageID:mid,authorDisplayName:message["author_display"] as? String ?? "unknown session",body:body,subject:delivery["subject"] as? [String:Any],ticket:delivery["ticket"] as? [String:Any],permittedReply:replyPermitted ? NativeRelayReply(address:listener.address):nil)
-                    let sent=try NativeProviderTransport.send(provider:enrollment.provider,content:content,messageID:mid,replyAddress:listener.address,displayName:"Checklist",endpoint:endpoint,expectedPeerPID:peerPID,expectedRegistration:registration)
+                    let content=try NativeRelayContent.render(origin:origin,messageID:mid,authorDisplayName:author,body:body,subject:subjectBytes.flatMap { (try? JSONSerialization.jsonObject(with:$0)) as? [String:Any] },ticket:ticketBytes.flatMap { (try? JSONSerialization.jsonObject(with:$0)) as? [String:Any] },permittedReply:replyPermitted ? NativeRelayReply(address:replyAddress):nil)
+                    let sent=try NativeProviderTransport.send(provider:enrollment.provider,content:content,messageID:mid,replyAddress:replyAddress,displayName:"Checklist",endpoint:endpoint,expectedPeerPID:peerPID,expectedRegistration:registration)
                     state="transport_written";receipt=["bytes":sent.byteCount,"socket_device":sent.socketDevice,"socket_inode":sent.socketInode,"route_generation":enrollment.generation]
                 } catch {
                     state=(error as? NativeBridgeError)?.deliveryMayHaveOccurred == true ? "uncertain":"failed"
                     receipt=["reason":PublicErrorText.describe(error),"route_generation":enrollment.generation]
                 }
+                let receiptBytes = (try? JSONSerialization.data(withJSONObject:receipt)) ?? Data("{}".utf8)
                 queue.async { [self] in
+                    let receipt = (try? JSONSerialization.jsonObject(with:receiptBytes)) as? [String:Any] ?? [:]
                     nativeOutcomes().record("delivery_record",params:["delivery_id":id,"state":state,"receipt":receipt],deliveryID:id,routeGeneration:enrollment.generation)
                     if state == "failed" { nativeInFlight.removeValue(forKey:id) }
                     else if var entry=nativeInFlight[id] {
@@ -472,6 +499,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         return NativeOutcomeRecorder(handle:{ [router] method,params in try router.handle(method:method,params:params,caller:bridge) },log:{ fputs("ChecklistService: \($0)\n",stderr) })
     }
     func recordNativeReply(_ frame:NativeReplyFrame) {
+        requireCommandQueue()
         guard let object=(try? JSONSerialization.jsonObject(with:frame.data)) as? [String:Any] else { return }
         // Kernel peer identity selects one current qualified adapter before any
         // provider frame is decoded. Disabling native I/O leaves MCP pickup intact.
@@ -508,6 +536,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     /// Correlate it only with an in-flight write whose recipient is the kernel-reported notifier
     /// and whose message ID Claude echoed exactly. Anything else stays uncorrelated.
     func recordHostStatus(_ status:NativeProviderHostStatus,peerPID:Int32) {
+        requireCommandQueue()
         let cutoff=Date().addingTimeInterval(-300)
         nativeInFlight=nativeInFlight.filter { $0.value.startedAt > cutoff }
         let matches=nativeInFlight.values.filter { status.refers(to:$0.messageID,recipientPID:$0.peerPID,notifierPID:peerPID) }
@@ -518,6 +547,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
         applyHostStatus(entry,status,correlation:"orig_msg_id")
     }
     func applyHostStatus(_ entry:NativeInFlight,_ status:NativeProviderHostStatus,correlation:String) {
+        requireCommandQueue()
         nativeInFlight[entry.deliveryID]?.pendingStatus=nil
         var receipt:[String:Any]=["host_status":status.status,"native_peer_pid":entry.peerPID,"correlation":correlation,"route_generation":entry.routeGeneration]
         if let id=status.originalMessageID { receipt["orig_msg_id"]=id }
@@ -529,11 +559,33 @@ final class Coordinator: NSObject, NSXPCListenerDelegate {
     }
 }
 
-final class Peer: NSObject, ChecklistRPC {
+// Invariant: the lock owns the non-Sendable XPC callback; send atomically takes it once, so no two execution lanes invoke or retain a mutable callback together.
+private final class ServiceReply: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callback: ((Data) -> Void)?
+    init(_ callback: @escaping (Data) -> Void) { self.callback = callback }
+    func send(_ bytes: Data) {
+        let callback = lock.withLock { let callback = self.callback; self.callback = nil; return callback }
+        callback?(bytes)
+    }
+}
+
+// Invariant: this retains an XPC connection across a deferred wait but only exposes it on the coordinator's serial queue.
+private final class DeferredConnection: @unchecked Sendable {
+    private let connection: NSXPCConnection
+    private let queue: DispatchQueue
+    init(_ connection: NSXPCConnection, queue: DispatchQueue) { self.connection = connection; self.queue = queue }
+    func valueOnQueue() -> NSXPCConnection { dispatchPrecondition(condition:.onQueue(queue)); return connection }
+}
+
+// Invariant: connection is initialized before publication and its weak storage is read only on coordinator.queue; all other Peer state is immutable.
+final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
     let coordinator: Coordinator
-    weak var connection: NSXPCConnection?
+    private weak var connection: NSXPCConnection?
     init(coordinator: Coordinator, connection: NSXPCConnection) { self.coordinator=coordinator;self.connection=connection }
-    func execute(_ request: Data, withReply reply: @escaping (Data) -> Void) {
+    func execute(_ request: Data, withReply callback: @escaping (Data) -> Void) {
+        let replyOwner = ServiceReply(callback)
+        let reply: @Sendable (Data) -> Void = { replyOwner.send($0) }
         guard request.count <= 4 * 1024 * 1024 else { reply(Data("{\"error\":{\"code\":\"TOO_LARGE\",\"message\":\"Command is larger than 4 MiB.\"}}".utf8));return }
         // Drain caller-thread JSON/serialization and hook temporaries for each
         // request, including off-queue reads and deferred change replies.
@@ -545,6 +597,7 @@ final class Peer: NSObject, ChecklistRPC {
             if let timing { coordinator.timingDiagnosticsEnabled = true;CallTimingLog.write(["scope":"service_admission","request_id":timing.requestID,"method":object?["method"] as? String ?? "","received_uptime_s":received,"start_uptime_s":ProcessInfo.processInfo.systemUptime]) }
             if let object, object["method"] as? String == "changes_wait", let connection {
                 let id = UUID()
+                let heldConnection = DeferredConnection(connection,queue:coordinator.queue)
                 let finish: () -> Void = { [self] in autoreleasepool {
                     do {
                         let result = try coordinator.execute(object,connection:connection,timing:timing)
@@ -562,7 +615,10 @@ final class Peer: NSObject, ChecklistRPC {
                 finish()
                 coordinator.queue.asyncAfter(deadline:.now()+8) { [self] in autoreleasepool {
                     guard coordinator.waiters.removeValue(forKey:id) != nil else { return }
-                    do { let result=try coordinator.execute(object,connection:connection,timing:timing);reply(Self.responseBytes(result,timing:timing)) }
+                    do {
+                        guard let object = (try? JSONSerialization.jsonObject(with:request)) as? [String:Any] else { throw ChecklistError("INVALID_INPUT","Invalid command envelope.") }
+                        let result=try coordinator.execute(object,connection:heldConnection.valueOnQueue(),timing:timing);reply(Self.responseBytes(result,timing:timing))
+                    }
                     catch { reply(Self.responseBytes(["error":Self.publicError(error)],timing:timing)) }
                 }}
                 return
@@ -581,13 +637,21 @@ final class Peer: NSObject, ChecklistRPC {
                 // never cancels it; a same-ID retry uses the router's stored receipt.
                 // Hooks return to the serial queue after the reply.
                 let router = coordinator.router
+                // Freeze the JSON command before transferring it to a pooled read worker.
+                let paramsBytes: Data
+                do { paramsBytes = try JSONSerialization.data(withJSONObject:params) }
+                catch { finish(["error":Self.publicError(error)],timing:timing,method:method,reply:reply); return }
                 let queued = ProcessInfo.processInfo.systemUptime
                 DispatchQueue.global(qos:.userInitiated).async { [self] in autoreleasepool {
                     timing?.queued(since:queued)
                     let result: [String:Any]
-                    do { result = try ServiceCallTiming.measure(timing,"execution_ms") { try router.handle(method:method,params:params,caller:caller) } } catch { result = ["error":Self.publicError(error)] }
+                    do {
+                        let params = try JSONSerialization.jsonObject(with:paramsBytes) as? [String:Any] ?? [:]
+                        result = try ServiceCallTiming.measure(timing,"execution_ms") { try router.handle(method:method,params:params,caller:caller) }
+                    } catch { result = ["error":Self.publicError(error)] }
                     reply(Self.responseBytes(result,timing:timing))
-                    coordinator.queue.async { [self] in autoreleasepool {afterCommand(result,runHooks:Self.requiresAfterCommand(method),timed:timing,method:method)} }
+                    let succeeded = result["error"] == nil
+                    coordinator.queue.async { [self] in autoreleasepool {afterCommand(succeeded:succeeded,runHooks:Self.requiresAfterCommand(method),timed:timing,method:method)} }
                 }}
             case .router(let method,let params,let caller):
                 let result: [String:Any]
@@ -603,21 +667,23 @@ final class Peer: NSObject, ChecklistRPC {
     }
     /// On the serial queue.
     func finish(_ result:[String:Any],timing:ServiceCallTiming? = nil,runHooks:Bool = true,method:String = "",reply:(Data)->Void) {
+        coordinator.requireCommandQueue()
         reply(Self.responseBytes(result,timing:timing))
-        afterCommand(result,runHooks:runHooks,timed:timing,method:method)
+        afterCommand(succeeded:result["error"] == nil,runHooks:runHooks,timed:timing,method:method)
     }
     static func responseBytes(_ result:[String:Any],timing:ServiceCallTiming?) -> Data {
         if let timing {return (try? timing.encode(result)) ?? Data("{}".utf8)}
         return (try? JSONSerialization.data(withJSONObject:result,options:[.sortedKeys])) ?? Data("{}".utf8)
     }
-    func afterCommand(_ result:[String:Any],runHooks:Bool = true,timed:ServiceCallTiming? = nil,method:String = "") {
+    func afterCommand(succeeded:Bool,runHooks:Bool = true,timed:ServiceCallTiming? = nil,method:String = "") {
+        coordinator.requireCommandQueue()
         // The selected pure reads cannot create deliveries or cleanup deadlines. Their hooks used
         // to re-read/project every pending native delivery after each reply.
         // Startup, committed writes and native/storage event hooks own those wakes.
         guard runHooks else { return }
         let started = ProcessInfo.processInfo.systemUptime
         defer {if let timed {CallTimingLog.write(["scope":"service_hooks","method":method,"request_id":timed.requestID,"start_uptime_s":started,"total_ms":(ProcessInfo.processInfo.systemUptime-started)*1000])}}
-        if result["error"] == nil {
+        if succeeded {
             var phases: [String:Any] = ["scope":"service_hook_phases","method":method,"request_id":timed?.requestID ?? "","start_uptime_s":started]
             func phase(_ name:String,_ body:()->Void) {
                 guard timed != nil else {body();return}

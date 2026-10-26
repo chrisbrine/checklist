@@ -126,7 +126,7 @@ import ChecklistIPC
     }
 
     func testTimeoutRepliesOnceAndLateCompletionCannotFinishNewQuit() async throws {
-        var completions: [(Bool) -> Void] = []
+        var completions: [@Sendable (Bool) -> Void] = []
         let coordinator = CaptureTerminationCoordinator(timeout: 0.05, verify: { _, complete in completions.append(complete) })
         let replied = expectation(description: "Timed out quit replies")
         var replies: [Bool] = [], messages: [String] = []

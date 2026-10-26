@@ -22,6 +22,8 @@
     "Resources/AppIcon/source.png",
     "Resources/org.checklist.coordination.plist",
     "Resources/org.checklist.service.plist",
+    "Sources/ChecklistAXTestSupport/ChecklistAXTestSupport.m",
+    "Sources/ChecklistAXTestSupport/include/ChecklistAXTestSupport.h",
     "Sources/ChecklistApp/App/ChecklistApp.swift",
     "Sources/ChecklistApp/ImageReview/ImageFrameReviewPreview.swift",
     "Sources/ChecklistApp/ImageReview/ImageReviewProjection.swift",
@@ -343,6 +345,8 @@
     "Sources/ChecklistIPC/Protocol.swift",
     "Sources/ChecklistIPC/ProviderMessageReadiness.swift",
     "Sources/ChecklistIPC/ProviderSettingsObservation.swift",
+    "Sources/ChecklistLegacyKeychain/ChecklistLegacyKeychain.c",
+    "Sources/ChecklistLegacyKeychain/include/ChecklistLegacyKeychain.h",
     "Sources/ChecklistMCPServer/Bridge.swift",
     "Sources/ChecklistMCPServer/BridgeEnvironment.swift",
     "Sources/ChecklistMCPServer/ChecklistMCPServer.swift",
@@ -518,6 +522,8 @@
     "Tests/ChecklistIPCTests/CommandOutcomeTests.swift",
     "Tests/ChecklistIPCTests/HandoffInstructionTests.swift",
     "Tests/ChecklistIPCTests/LongCommandTests.swift",
+    "Tests/ChecklistKeychainTestFixture/ChecklistKeychainTestFixture.c",
+    "Tests/ChecklistKeychainTestFixture/include/ChecklistKeychainTestFixture.h",
     "Tests/ChecklistMCPServerTests/ChecklistMCPServerTests.swift",
     "Tests/ChecklistMCPServerTests/DelegateChildBindingTests.swift",
     "Tests/ChecklistMCPServerTests/ShimExecutableMonitorTests.swift",
@@ -747,7 +753,7 @@
       "reason": "Renewed review for round 28 / CL-228: the only change routes the existing fixture through the required-Epic fixture helper and adds no identifier. Synthetic redaction, path quoting, instance isolation or native routing fixture; no actual owner or native session."
     },
     "Tests/ChecklistIPCTests/ChecklistInstanceTests.swift": {
-      "sha256": "163cd55067578a3762045ee800a5b954ce7eddde1f9a90260a588f5b4c25fa71",
+      "sha256": "9531a5c47641a8eb2d9a86ed1fc0d601f2b207b5c1c7be115be024d6545bd6a2",
       "patterns": [
         "home_path"
       ],

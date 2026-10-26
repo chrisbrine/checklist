@@ -9,6 +9,14 @@ extension ChecklistClient {
         }
     }
 
+    /// Actor-owned clients transfer immutable wire bytes; Foundation graphs stay
+    /// local to the caller and the dispatch worker, including error replies.
+    public func callAsyncData(_ method: String, _ params: Data, replyTimeout: TimeInterval? = nil) async throws -> Data {
+        try await Self.offloadBlockingJSONDataCall(params) {
+            try self.call(method, $0, replyTimeout: replyTimeout)
+        }
+    }
+
     /// Keep Foundation object graphs local to each side of the worker boundary.
     static func offloadBlockingJSONCall(_ params: [String: Any], operation: @escaping @Sendable ([String: Any]) throws -> [String: Any]) async throws -> [String: Any] {
         // Dictionaries contain arbitrary Foundation values. Send an immutable JSON
@@ -17,15 +25,21 @@ extension ChecklistClient {
             throw NSError(domain: NSCocoaErrorDomain, code: 3840, userInfo: [NSLocalizedDescriptionKey: "The request contains unsupported JSON values."])
         }
         let request = try JSONSerialization.data(withJSONObject: params)
-        let response = try await Self.offloadBlockingCall {
-            let parameters = try JSONSerialization.jsonObject(with: request) as! [String: Any]
+        let response = try await Self.offloadBlockingJSONDataCall(request, operation: operation)
+        return try JSONSerialization.jsonObject(with: response) as! [String: Any]
+    }
+
+    private static func offloadBlockingJSONDataCall(_ request: Data, operation: @escaping @Sendable ([String: Any]) throws -> [String: Any]) async throws -> Data {
+        try await Self.offloadBlockingCall {
+            guard let parameters = try JSONSerialization.jsonObject(with: request) as? [String: Any] else {
+                throw NSError(domain: NSCocoaErrorDomain, code: 3840, userInfo: [NSLocalizedDescriptionKey: "The request is not a JSON object."])
+            }
             let reply = try operation(parameters)
             guard JSONSerialization.isValidJSONObject(reply) else {
                 throw NSError(domain: NSCocoaErrorDomain, code: 3840, userInfo: [NSLocalizedDescriptionKey: "The reply contains unsupported JSON values."])
             }
             return try JSONSerialization.data(withJSONObject: reply)
         }
-        return try JSONSerialization.jsonObject(with: response) as! [String: Any]
     }
 
     /// Shared by the real client and anonymous-connection qualification tests.

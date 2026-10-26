@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Darwin
 import CryptoKit
 
@@ -166,26 +167,23 @@ final class StorageObjectFiles {
         guard let last = ancestors.last,fstat(descriptor,&actual) == 0,actual.st_dev == last.device,actual.st_ino == last.inode else { throw changed() }
     }
 
-    private final class PinnedRoots {
+    private final class PinnedRoots: Sendable {
         private struct Entry { weak var root: StorageObjectFiles?; let id: ObjectIdentifier }
         static let shared = PinnedRoots()
-        private let lock = NSLock()
-        private var entries: [Data:[Entry]] = [:]
+        // Entries are lock-owned; unchecked access only retains roots for immutable gate/descriptor reads, never batch state.
+        private let entries = OSAllocatedUnfairLock(uncheckedState: [Data:[Entry]]())
         func root(for key: Data) -> StorageObjectFiles? {
             // Retain before unlocking; validation and all I/O happen outside it.
-            var retained: StorageObjectFiles?
-            lock.lock()
-            for entry in entries[key] ?? [] {
-                if let root = entry.root { retained = root;break }
+            entries.withLockUnchecked { entries in
+                for entry in entries[key] ?? [] { if let root = entry.root { return root } }
+                return nil
             }
-            lock.unlock()
-            return retained
         }
         func insert(_ root: StorageObjectFiles,key: Data) {
-            lock.withLock { entries[key,default:[]].append(Entry(root:root,id:ObjectIdentifier(root))) }
+            entries.withLockUnchecked { $0[key,default:[]].append(Entry(root:root,id:ObjectIdentifier(root))) }
         }
         func remove(_ root: StorageObjectFiles,key: Data) {
-            lock.withLock {
+            entries.withLockUnchecked { entries in
                 let remaining = (entries[key] ?? []).filter { $0.id != ObjectIdentifier(root) }
                 entries[key] = remaining.isEmpty ? nil : remaining
             }

@@ -357,7 +357,15 @@ extension CommandRouter {
             let a = try scoped(db, (try StoredRecord(target, family: "health_target").string("id")), pid, type: "attempt")
             let handler = Caller(role: "worker", installation: session["installation"] as? String ?? "", projectIDs: [pid], sessionID: sid, workspace: session["workspace"] as? String, executionDomain: session["execution_domain"] as? String)
             authorized = a["incarnation"] as? String == incarnation && a["principal"] as? String == handler.principal
-            if authorized { do { try requireLiveAncestry(db, attempt: a); try verifyPolicyAuthority(db, attempt: a, caller: handler) } catch { authorized = false } }
+            if authorized {
+                do {
+                    try requireLiveAncestry(db, attempt: a)
+                    try verifyPolicyAuthority(db, attempt: a, caller: handler)
+                } catch let error as CoreError where error.code == "CANONICAL_RECORD_INVALID" {
+                    // Corruption is not a change of authority: roll back the reply and outcome.
+                    throw error
+                } catch { authorized = false }
+            }
         }
         let outcome = authorized ? "resumed" : "fresh_claim_or_handoff_required"
         try healthOutcome(db, task: task, request: &request, outcome: outcome, body: authorized ? "Work health resumed after correlated reply to \(mid): \(reply["body"] as? String ?? ""). The same current handler and phase remain authorized; assignment and claim are retained." : "Late work health reply to \(mid) retained. Ownership, phase, material basis or authority changed; use ordinary fresh claim/handoff reconciliation. Newer work and assignments were preserved.")

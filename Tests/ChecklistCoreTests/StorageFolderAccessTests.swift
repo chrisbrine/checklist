@@ -21,8 +21,9 @@ final class StorageFolderAccessTests: XCTestCase {
         // The finite process exit event reaps the child without an open worker
         // thread, process wait thread or a repeated service timer.
         let reaped = expectation(description:"killed openers are reaped")
+        let childPIDs = children
         DispatchQueue.global().asyncAfter(deadline:.now()+0.5) {
-            for child in children {
+            for child in childPIDs {
                 XCTAssertEqual(waitpid(child,nil,WNOHANG),-1)
                 XCTAssertEqual(errno,ECHILD)
             }
@@ -83,8 +84,9 @@ final class StorageFolderAccessTests: XCTestCase {
         access.blockingReadDescriptor = { _ in ends[0] }
         XCTAssertThrowsError(try StorageObjectFiles(root:f.workspace,folderAccess:access)) {self.timeout($0,folder:f.workspace)}
         let finished = expectation(description:"retired helper generation reaped")
+        let childPIDs = children
         DispatchQueue.global().asyncAfter(deadline:.now()+0.5) {
-            for child in children { XCTAssertEqual(waitpid(child,nil,WNOHANG),-1);XCTAssertEqual(errno,ECHILD) }
+            for child in childPIDs { XCTAssertEqual(waitpid(child,nil,WNOHANG),-1);XCTAssertEqual(errno,ECHILD) }
             finished.fulfill()
         }
         wait(for:[finished],timeout:3)

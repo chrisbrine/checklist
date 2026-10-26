@@ -3,7 +3,7 @@ import SwiftUI
 import AppKit
 @testable import ChecklistApp
 
-final class ColorContrastTests: XCTestCase {
+@MainActor final class ColorContrastTests: XCTestCase {
     private struct RGB {
         let r: Double, g: Double, b: Double, a: Double
         init(_ r: Double, _ g: Double, _ b: Double, _ a: Double = 1) {

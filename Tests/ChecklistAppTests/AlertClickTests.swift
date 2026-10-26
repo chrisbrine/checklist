@@ -5,7 +5,7 @@ import ChecklistIPC
 /// CL-59: a desktop alert click opens its item in the most recently active window; a removed item
 /// opens the unavailable state without a crash.
 @MainActor final class AlertClickTests: XCTestCase {
-    private func makeStore(_ transport: @escaping (String, [String: Any]) async throws -> [String: Any]) -> (ChecklistStore, () -> Void) {
+    private func makeStore(_ transport: @escaping @MainActor @Sendable (String, [String: Any]) async throws -> [String: Any]) -> (ChecklistStore, () -> Void) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("alertclick-" + UUID().uuidString)
         let preferences = isolatedDefaults("AlertClick").preferences
         let store = ChecklistStore(draftJournal: LocalDraftJournal(directory: root), preferences: preferences, restorePendingCommand: false,

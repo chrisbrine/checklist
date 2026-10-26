@@ -376,7 +376,7 @@ func relativeTime(_ string: String) -> String {
     RelativeTimeFormatterCache.shared.string(from: string)
 }
 
-func chooseFiles(directories: Bool = false, files: Bool = true, multiple: Bool = true) -> [URL] {
+@MainActor func chooseFiles(directories: Bool = false, files: Bool = true, multiple: Bool = true) -> [URL] {
     let panel = NSOpenPanel()
     panel.canChooseDirectories = directories
     panel.canChooseFiles = files

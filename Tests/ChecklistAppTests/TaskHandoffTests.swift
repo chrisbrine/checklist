@@ -161,7 +161,7 @@ import ChecklistProviders
         await model.prepare(task: other, provider: claude) { _, _ in
             ["instruction": "Claude ticket B", "limitation": "Copy into Claude."]
         }
-        pending.continuation?.resume(returning: response())
+        pending.continuation?.resume(returning: fixtureReply(response()))
         await old.value
         XCTAssertEqual(model.instruction, "Claude ticket B")
         XCTAssertEqual(model.limitation, "Copy into Claude.")
@@ -180,7 +180,7 @@ import ChecklistProviders
             await fulfillment(of: [pending.started], timeout: 2)
             preparation.cancel()
             if fails { pending.continuation?.resume(throwing: OpenFailure()) }
-            else { pending.continuation?.resume(returning: response()) }
+            else { pending.continuation?.resume(returning: fixtureReply(response())) }
             await preparation.value
             XCTAssertTrue(model.instruction.isEmpty); XCTAssertTrue(model.limitation.isEmpty)
             XCTAssertTrue(model.preparationFailure.isEmpty); XCTAssertNil(model.composeURL)
@@ -196,7 +196,7 @@ import ChecklistProviders
         old.cancel()
         let claude = HandoffProvider(id: "claude")
         await model.prepare(task: task, provider: claude) { _, _ in ["instruction": "Current Claude instruction"] }
-        pending.continuation?.resume(returning: response())
+        pending.continuation?.resume(returning: fixtureReply(response()))
         await old.value
         XCTAssertEqual(model.instruction, "Current Claude instruction"); XCTAssertNil(model.composeURL)
         XCTAssertFalse(model.loading); XCTAssertTrue(model.preparationFailure.isEmpty)
@@ -208,7 +208,7 @@ import ChecklistProviders
         let old = Task { await model.prepare(task: task, provider: codex) { _, _ in try await pending.response() } }
         await fulfillment(of: [pending.started], timeout: 2)
         await model.prepare(task: task, provider: codex) { _, _ in ["instruction": "New generation"] }
-        pending.continuation?.resume(returning: response())
+        pending.continuation?.resume(returning: fixtureReply(response()))
         await old.value
         XCTAssertEqual(model.instruction, "New generation"); XCTAssertNil(model.composeURL)
         XCTAssertFalse(model.loading); XCTAssertTrue(model.preparationFailure.isEmpty)
@@ -223,7 +223,7 @@ import ChecklistProviders
         first.continuation?.resume(throwing: OpenFailure())
         await old.value
         XCTAssertTrue(model.loading); XCTAssertTrue(model.preparationFailure.isEmpty)
-        second.continuation?.resume(returning: response())
+        second.continuation?.resume(returning: fixtureReply(response()))
         await current.value
         XCTAssertFalse(model.loading); XCTAssertEqual(model.instruction, instruction)
         XCTAssertNotNil(model.composeURL); XCTAssertTrue(model.preparationFailure.isEmpty)

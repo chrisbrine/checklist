@@ -1,3 +1,4 @@
+import ChecklistAXTestSupport
 import ChecklistTestSupport
 import XCTest
 import SwiftUI
@@ -51,7 +52,7 @@ import ChecklistIPC
         }
         func release(_ error: Error? = nil) {
             guard let held else { return }; self.held = nil
-            if let error { held.resume(throwing: error) } else { held.resume(returning: reply) }
+            if let error { held.resume(throwing: error) } else { held.resume(returning: fixtureReply(reply)) }
         }
         func store() -> ChecklistStore {
             ChecklistStore(draftJournal: LocalDraftJournal(directory: root.appendingPathComponent("drafts")), preferences: preferences, restorePendingCommand: false,
@@ -77,13 +78,13 @@ import ChecklistIPC
                     try await withCheckedThrowingContinuation { held = $0 }
                 })
             var current = true
-            let read = Task { try await store.request(method, ifCurrent:{ current }) }
+            let read = Task { try await store.request(method, ifCurrent:{ current })["accepted"] as? String }
             try await until { held != nil }
             store.data = ["service":["store_incarnation":"new-screen-generation"]]
-            held?.resume(returning:["accepted":method])
+            held?.resume(returning: fixtureReply(["accepted":method]))
             do {
                 let reply = try await read.value
-                XCTAssertEqual(reply["accepted"] as? String,method)
+                XCTAssertEqual(reply,method)
             } catch { XCTFail("An unrelated screen invalidation cancelled \(method): \(error)") }
             current = false
         }
@@ -98,9 +99,9 @@ import ChecklistIPC
                 try await withCheckedThrowingContinuation { held = $0 }
             })
         var current = true
-        let read = Task { try await store.request("storage_status",ifCurrent:{ current }) }
+        let read = Task { _ = try await store.request("storage_status",ifCurrent:{ current }) }
         try await until { held != nil };current = false
-        held?.resume(returning:["accepted":"obsolete"])
+        held?.resume(returning: fixtureReply(["accepted":"obsolete"]))
         do { _ = try await read.value;XCTFail("Superseded settings reply must be retired") }
         catch { XCTAssertTrue(error is CancellationError) }
     }
@@ -194,9 +195,9 @@ import ChecklistIPC
     }
     private func assertFooter(_ host: NSView, loading: Bool, context: String, file: StaticString = #filePath, line: UInt = #line) async throws {
         let enhanced = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
-        let previous = NSApplication.shared.accessibilityAttributeValue(enhanced) ?? false
-        NSApplication.shared.accessibilitySetValue(true, forAttribute: enhanced)
-        defer { NSApplication.shared.accessibilitySetValue(previous, forAttribute: enhanced) }
+        let previous = ChecklistTestAXAttributeValue(NSApplication.shared, enhanced) ?? false
+        ChecklistTestAXSetValue(NSApplication.shared, true, enhanced)
+        defer { ChecklistTestAXSetValue(NSApplication.shared, previous, enhanced) }
         host.layoutSubtreeIfNeeded()
         func attribute(_ object: NSObject, _ name: String) -> Any? {
             let selector = NSSelectorFromString(name)

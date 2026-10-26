@@ -155,15 +155,15 @@ final class AgentBackupRouteTests: XCTestCase {
         let copying = DispatchSemaphore(value:0),verifying = DispatchSemaphore(value:0),resume = DispatchSemaphore(value:0)
         let finished = expectation(description:"Agent backup completes"),command = UUID().uuidString
         let destination = f.root.appendingPathComponent("backups/qualification-core-concurrent/snapshot-" + command.lowercased())
-        var budget = StorageSnapshotBudget.production()
-        budget.observe = {event in
-            if event == "copying_objects" || event == "manifest_written" {
-                (event == "copying_objects" ? copying : verifying).signal()
-                guard resume.wait(timeout:.now()+15) == .success else {throw StorageSnapshotFailure.canceled}
-            }
-        }
         DispatchQueue.global().async {
             defer {finished.fulfill()}
+            var budget = StorageSnapshotBudget.production()
+            budget.observe = {event in
+                if event == "copying_objects" || event == "manifest_written" {
+                    (event == "copying_objects" ? copying : verifying).signal()
+                    guard resume.wait(timeout:.now()+15) == .success else {throw StorageSnapshotFailure.canceled}
+                }
+            }
             do {
                 let reply = try router.executeStorageBackup(params:["command_id":command,"project_id":pid,"qualification_name":"core-concurrent"],caller:c,budget:budget)
                 XCTAssertEqual((reply["data"] as? JSON)?["status"] as? String,"complete")

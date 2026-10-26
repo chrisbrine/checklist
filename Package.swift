@@ -16,13 +16,17 @@ let package = Package(
     targets: [
         .target(name: "ChecklistProviders"),
         .target(name: "ChecklistFileAccess"),
+        // File-keychain ACL compatibility uses the original deprecated calls in a bounded C bridge.
+        .target(name: "ChecklistLegacyKeychain", linkerSettings: [.linkedFramework("Security")]),
+        .target(name: "ChecklistKeychainTestFixture", path: "Tests/ChecklistKeychainTestFixture", linkerSettings: [.linkedFramework("Security")]),
+        .target(name: "ChecklistAXTestSupport", linkerSettings: [.linkedFramework("AppKit")]),
         .target(name: "ChecklistCore", dependencies: [
             .product(name: "ChecklistDomain", package: "ChecklistShared"),
             .product(name: "ChecklistContracts", package: "ChecklistShared"),
             .product(name: "ChecklistApplication", package: "ChecklistShared"),
             "ChecklistProviders", "ChecklistFileAccess", .product(name: "GRDB", package: "GRDB.swift")
         ]),
-        .target(name: "ChecklistIPC", dependencies: [.product(name: "ChecklistContracts", package: "ChecklistShared")]),
+        .target(name: "ChecklistIPC", dependencies: ["ChecklistLegacyKeychain", .product(name: "ChecklistContracts", package: "ChecklistShared")]),
         .target(name: "ChecklistBridges", dependencies: ["ChecklistCore", "ChecklistIPC", "ChecklistProviders"]),
         .target(name: "ChecklistMCPServer", dependencies: ["ChecklistIPC", "ChecklistBridges", .product(name: "MCP", package: "swift-sdk")]),
         .executableTarget(name: "ChecklistService", dependencies: ["ChecklistCore", "ChecklistIPC", "ChecklistBridges", "ChecklistProviders"]),
@@ -45,7 +49,7 @@ let package = Package(
         .testTarget(name: "ChecklistProvidersTests", dependencies: ["ChecklistProviders"]),
         .target(name: "ChecklistTestSupport", dependencies: ["ChecklistCore", "ChecklistProviders", .product(name: "GRDB", package: "GRDB.swift")], path: "Tests/ChecklistTestSupport"),
         .testTarget(name: "ChecklistCoreTests", dependencies: ["ChecklistTestSupport", "ChecklistCore", "ChecklistBridges", "ChecklistProviders", .product(name: "GRDB", package: "GRDB.swift")]),
-        .testTarget(name: "ChecklistAppTests", dependencies: ["ChecklistTestSupport", "ChecklistApp", "ChecklistCore", "ChecklistIPC", "ChecklistProviders"]),
+        .testTarget(name: "ChecklistAppTests", dependencies: ["ChecklistLegacyKeychain", "ChecklistKeychainTestFixture", "ChecklistAXTestSupport", "ChecklistTestSupport", "ChecklistApp", "ChecklistCore", "ChecklistIPC", "ChecklistProviders"]),
         .testTarget(name: "ChecklistCLITests", dependencies: ["ChecklistCLI", .product(name: "MCP", package: "swift-sdk")]),
         .testTarget(name: "ChecklistIPCTests", dependencies: ["ChecklistTestSupport", "ChecklistIPC", "ChecklistCore", .product(name: "GRDB", package: "GRDB.swift")]),
         .testTarget(name: "ChecklistBridgesTests", dependencies: ["ChecklistBridges", "ChecklistIPC", "ChecklistProviders"]),
@@ -53,12 +57,12 @@ let package = Package(
     ], swiftLanguageModes: [.v5]
 )
 
-// Legacy adapters stay in Swift 5 while every root Swift target reports complete
-// concurrency findings. See docs/swift-concurrency.md for the remaining boundaries.
+// Production adapters use Swift 6; XCTest/probe compatibility targets retain Swift 5
+// with complete checking. See docs/swift-concurrency.md for ownership boundaries.
 // Portable shared targets keep their own Swift 6 manifest.
-for target in package.targets where target.name != "ChecklistFileAccess" {
+for target in package.targets where !["ChecklistFileAccess", "ChecklistLegacyKeychain", "ChecklistKeychainTestFixture", "ChecklistAXTestSupport"].contains(target.name) {
     let strict: [SwiftSetting] = [.enableExperimentalFeature("StrictConcurrency")]
-    let converted = ["ChecklistProviders", "ChecklistIPC", "ChecklistBridges", "ChecklistMCPServer", "ChecklistService", "ChecklistCLI", "ChecklistProducts"]
+    let converted = ["ChecklistApp", "ChecklistCore", "ChecklistProviders", "ChecklistIPC", "ChecklistBridges", "ChecklistMCPServer", "ChecklistService", "ChecklistCLI", "ChecklistProducts"]
     target.swiftSettings = (target.swiftSettings ?? []) + strict
         + (converted.contains(target.name) ? [.swiftLanguageMode(.v6)] : [])
 }

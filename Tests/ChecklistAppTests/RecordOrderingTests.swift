@@ -17,15 +17,16 @@ final class RecordOrderingTests: XCTestCase {
         XCTAssertEqual(RecordOrdering.newestFirst(records).map(\.id),["z","m","a"])
     }
     func testConcurrentTimestampParsingKeepsExactResults() {
-        let records = [
+        let makeRecords: @Sendable () -> [Record] = { [
             Record(values:["id":"earlier","created_at":"2026-10-24T10:00:00Z"]),
             Record(values:["id":"later","created_at":"2026-10-24T10:00:00.500Z"])
         ]
-        let lock = NSLock();var failures = 0
-        DispatchQueue.concurrentPerform(iterations:64) { _ in
-            if RecordOrdering.newestFirst(records).map(\.id) != ["later","earlier"] {lock.lock();failures += 1;lock.unlock()}
         }
-        XCTAssertEqual(failures,0)
+        let failures = FixtureFailureCount()
+        DispatchQueue.concurrentPerform(iterations:64) { _ in
+            if RecordOrdering.newestFirst(makeRecords()).map(\.id) != ["later","earlier"] { failures.increment() }
+        }
+        XCTAssertEqual(failures.value,0)
     }
     func testFiftyCoarseMessagesSortWithinFrameBudget() {
         let records = (0..<50).map {Record(values:["id":"message-\($0)","created_at":"2026-10-24T10:00:00Z"])}
@@ -36,4 +37,12 @@ final class RecordOrderingTests: XCTestCase {
         XCTAssertEqual(ordered.map(\.id),records.reversed().map(\.id))
         XCTAssertLessThan(ms,300,"Sorting a bounded conversation must leave room for its native frame")
     }
+}
+
+// The lock owns every read and write of the failure count.
+private final class FixtureFailureCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func increment() { lock.withLock { count += 1 } }
+    var value: Int { lock.withLock { count } }
 }

@@ -12,7 +12,7 @@ enum StorageBootstrap {
         value.queryItems = [URLQueryItem(name:"mode",value:"rw")]
         guard let uri = value.string else { throw StoreRecovery.required("database_location_unavailable") };return uri
     }
-    static func open(root: URL, serviceLease: StorageServiceLease? = nil, prepareDatabase: @escaping (Database)throws->Void = { _ in }, observe: (Boundary)->Void = { _ in }) throws -> Opened {
+    static func open(root: URL, serviceLease: StorageServiceLease? = nil, prepareDatabase: @escaping @Sendable (Database)throws->Void = { _ in }, observe: (Boundary)->Void = { _ in }) throws -> Opened {
         let root = StoreDirectory.anchoredRoot(root)
         let directory = try StoreDirectory(root:root)
         if let serviceLease { try serviceLease.requireRoot(root) }

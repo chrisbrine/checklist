@@ -32,7 +32,7 @@ struct TaskEditDraft: Codable {
     var scope: DraftScope
 }
 
-struct CaptureDraft: Codable, Equatable {
+struct CaptureDraft: Codable, Equatable, Sendable {
     var projectID: String
     var title: String
     var brief: String
@@ -47,7 +47,7 @@ struct CaptureDraft: Codable, Equatable {
 
 /// The private owner journal contains drafts only. It never replays service commands.
 /// Each entity is replaced atomically, synchronized, and read back before Saved is shown.
-final class LocalDraftJournal {
+final class LocalDraftJournal: Sendable {
     private struct Envelope<Value: Codable>: Codable {
         let schemaVersion: Int
         let kind: String

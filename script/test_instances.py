@@ -49,12 +49,15 @@ KEYCHAIN_DELETE_LIMIT = 1024
 
 # A field name alone does not establish file authority. The inspector below
 # distinguishes canonical managed descriptors, project references, captured names
-# and inert replay history. Unknown file references retain strict slot containment.
+# and inert replay history. Unclassified record text is not file authority.
 PATH_FIELDS = frozenset({'path', 'preview_path', 'icon_path', 'root_path', 'source_root',
                         'snapshot_path', 'output_path', 'working_directory', 'workspace',
                         'workspace_path', 'canonical_key', 'mcp_executable', 'git_path',
                         'object_relative_path', 'relative_path', 'resolved_path', 'database_path'})
 PATH_LIST_FIELDS = frozenset({'paths', 'additional_paths'})
+# These retained descriptor spellings may be relative; preserve their existing
+# absolute slot-containment check instead of inferring authority from all prose.
+ABSOLUTE_PATH_FIELDS = frozenset({'stored_path', 'capture_path', 'cache_path', 'declared_path', 'link_target', 'root'})
 
 
 def slot_number(value):
@@ -490,11 +493,13 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
         if key == 'working_directory' and record_kind == 'request' and location.endswith('.command'):
             return ('instruction', None)
         if key in PATH_FIELDS or key in PATH_LIST_FIELDS: return ('strict', None)
-        # These scalar fields are prose, never file authority in Core. Keep
-        # unknown fields strict and continue inspecting structured children.
-        if key in {'body', 'brief', 'reason', 'summary'} or (
-                key == 'evidence' and record_kind == 'manifest' and location.endswith('.evidence.checks[]')) or (
-                record_kind in {'attempt', 'source_execution'} and key in {'file_state_refs', 'stop_observation_refs'}):
+        if key in ABSOLUTE_PATH_FIELDS: return ('slot_absolute', None)
+        # File authority is enumerated above. Other record scalars (including
+        # Bug/Playtest starter fields) are text; structured children still get
+        # their own path rules. Unknown metadata keeps its fail-closed fallback.
+        if record_kind is not None and record_kind not in {'capture_bindings', 'storage_summary'}:
+            return ('text', None)
+        if key in {'body', 'brief', 'reason', 'summary'}:
             return ('text', None)
         return (None, None)
 

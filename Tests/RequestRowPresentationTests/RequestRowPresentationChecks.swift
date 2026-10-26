@@ -8,13 +8,14 @@ import os
 #if !canImport(ChecklistApp)
 @main
 #endif
+@MainActor
 struct RequestRowPresentationChecks {
     static var checks = 0
     static func expect(_ result: @autoclosure () -> Bool,_ message: String) throws {
         checks += 1
         if !result() { throw NSError(domain:"RequestRowPresentationChecks",code:1,userInfo:[NSLocalizedDescriptionKey:message]) }
     }
-    static func request(_ id: String,_ created: String,_ blocking: Bool = false,_ extra: [String:Any] = [:]) -> Record {
+    nonisolated static func request(_ id: String,_ created: String,_ blocking: Bool = false,_ extra: [String:Any] = [:]) -> Record {
         var value: [String:Any] = ["id":id,"project_id":"p","task_id":"t","created_at":created,"blocking":blocking]
         for (key,item) in extra { value[key] = item }
         return Record(values:value)
@@ -83,7 +84,7 @@ final class RequestRowPresentationTests: XCTestCase {
         XCTAssertEqual(failures.withLock { $0 }, 0)
     }
 
-    func testStandaloneChecks() throws {
+    @MainActor func testStandaloneChecks() throws {
         try RequestRowPresentationChecks.main()
     }
 }

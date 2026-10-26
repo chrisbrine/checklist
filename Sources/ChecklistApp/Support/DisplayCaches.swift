@@ -40,7 +40,7 @@ final class RelativeTimeFormatterCache: @unchecked Sendable {
 
 /// Positive cache for service-owned immutable normalized thumbnails. Capacity is
 /// deterministic; NSCache's advisory count/cost limits are not used as a bound.
-final class ProjectIconImageCache {
+@MainActor final class ProjectIconImageCache {
     static let shared = ProjectIconImageCache()
     private struct Key: Hashable {
         let project: [UInt8]

@@ -1,8 +1,9 @@
+import ChecklistAXTestSupport
 import XCTest
 import SwiftUI
 @testable import ChecklistApp
 
-final class TicketStatusReasonTests: XCTestCase {
+@MainActor final class TicketStatusReasonTests: XCTestCase {
     private func ticket(_ reason: [String:Any]? = nil, category: String = "blocked") -> Record {
         var value: [String:Any] = ["id":"ticket", "status_category":category, "status_name":category.capitalized, "title":"Fix this"]
         value["status_reason"] = reason
@@ -36,9 +37,9 @@ extension TicketStatusReasonTests {
         let task = ticket(["text":"Waiting for the exact build. More details continue beyond the visible row width.","actor_display":"Reviewer","at":"2026-10-22T21:00:00Z"])
         let reason = task.object("status_reason")["text"] as! String
         let enhanced = NSAccessibility.Attribute(rawValue:"AXEnhancedUserInterface")
-        let previous = NSApplication.shared.accessibilityAttributeValue(enhanced) ?? false
-        NSApplication.shared.accessibilitySetValue(true,forAttribute:enhanced)
-        defer {NSApplication.shared.accessibilitySetValue(previous,forAttribute:enhanced)}
+        let previous = ChecklistTestAXAttributeValue(NSApplication.shared, enhanced) ?? false
+        ChecklistTestAXSetValue(NSApplication.shared, true, enhanced)
+        defer {ChecklistTestAXSetValue(NSApplication.shared, previous, enhanced)}
         let host = NSHostingView(rootView: AnyView(VStack {
             TicketStatusReasonDetail(task:task)
             TicketStatusReasonLine(task:task)

@@ -139,7 +139,7 @@ final class AgentBackupMCPTests: XCTestCase {
         XCTAssertNil((schema["properties"] as? [String:Any])?["path"])
         _ = try verifiedBackup(try await client.callTool(name:"backup_create",arguments:arguments(f)),f)
         XCTAssertEqual(f.numberOfBackupCalls,1)
-        try await f.router.dbQueue.read {db in
+        try f.router.dbQueue.read {db in
             let row = try XCTUnwrap(Row.fetchOne(db,sql:"SELECT actor,data FROM events WHERE kind='backup_created'"))
             XCTAssertEqual(row["actor"] as String,f.caller.principal)
             XCTAssertEqual(jsonObject(row["data"])["origin"] as? String,"agent")
