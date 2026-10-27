@@ -144,14 +144,21 @@ modules. `qualification_reasons` names each selected case and the changed paths
 that selected it. A mapped file selects only its measured covering classes and
 qualification cases. A mapped zero-hit file selects no measured tests. Classes
 that cannot be measured are recorded in `coverage_unmeasurable_classes` with
-their native skip or owner-rule reason and automatically derived static
-references: type/function names used by the class file and its extensions, plus
-literal source reads. They are selected only when one of those referenced files
-changes; `coverage_unmeasurable_classes` in the plan reports the selecting
-paths. No module closure adds unmeasured classes or qualification cases for a
-mapped file. Skipped coverage is never presented as measured coverage. The
-owner-forbidden keychain class is inventoried with a reason and static edges,
-without executing it.
+their native skip or owner-rule reason and `source: "index-store"`. The compiler
+index identifies each class file (and indexed extensions), resolves its referenced
+declarations by USR to their defining source files, and follows recorded
+called-by/contained-by edges for at most five outgoing declaration edges after
+each direct reference. Callable-local declarations are followed; a type reference
+does not expand to every member or extension. This conservatively includes
+reachable router branches; it does not specialize dispatch by method-name strings
+or establish that a branch executed. Lexical symbol matching is not used.
+They are selected only when one of those indexed source files changes;
+`coverage_unmeasurable_classes` reports the selecting paths and `test_group_sources`
+names `index-store` for each selected class. No module closure adds unmeasured
+classes or qualification cases for a mapped file. Skipped coverage is never
+presented as measured coverage. The owner-forbidden keychain class uses the same
+index path without executing it. Missing index dependencies keep generation
+incomplete, and the loader refuses legacy lexical exceptions.
 A new/unmapped source falls back to the package module closure, including its
 qualification cases, and appears in `group_fallback_paths`.
 
@@ -171,8 +178,19 @@ python3 script/test_impact_map.py --scratch-path <build-slot>/.build --runner-wr
 python3 script/affected_tests.py --base <round-base> --last-round --scratch-path <build-slot>/.build --runner-wrapper <shared-build-wrapper>
 ```
 
-The generator builds with Swift code coverage in the assigned warm scratch path,
-then runs each ordinary XCTest class in a separate native process and every
+The generator first builds test targets once in a separate sibling scratch path
+(default `<build-slot>/.build-idx`, configurable with `--index-scratch-path`),
+using `swift build --build-tests --build-system native --enable-index-store` and
+an explicit `-Xswiftc -index-store-path`. The explicit native backend is needed
+because the Xcode SwiftPM backend can ignore these compiler flags. The index
+build never alters the warm coverage scratch. `script/index_store.py` reads
+current unit record dependencies through the toolchain's public
+`libIndexStore.dylib` C API; orphan records, external dependencies and generated
+build files are excluded. SwiftPM Clang-target records from the same build’s
+standard `.build-idx/debug/index/store` are also read, retaining C definitions and
+header declarations. No product dependency is added.
+The generator then builds with Swift code coverage in the assigned warm scratch
+path and runs each ordinary XCTest class in a separate native process and every
 qualification case individually. Each execution gets its own LLVM raw profiles
 (including child-process profiles), merged with `llvm-profdata` and exported with
 `llvm-cov`. Unit source-inspection tests' literal repository paths/directories are
@@ -189,8 +207,27 @@ second qualification command. Supply the actual shared build wrapper (or `CHECKL
 full qualification keeps the ordinary separate single-worker qualification
 command. `--full` alone remains the fast default without scale/soak cases.
 The planner prints the mode and never executes its commands itself. Checkpoint
-logs and measured failures are retained by the generator; `--resume <logs>` continues a compatible run and `--resume <logs> --reexport` reuses completed native profiles after a generator-only change. Every selected method needs a terminal native result, and exports include instrumented child executable objects. An assertion failure is recorded and returns failure even when coverage collection completed; an interrupted or
-incomplete refresh never authorizes closed-world selection. Every qualification case must have a non-skipped observation; a skipped case leaves the map incomplete. Every discovered class must be measured or have an explicit unmeasurable reason and static edges. The loader also refuses older maps whose inventories do not meet these requirements.
+logs and measured failures are retained by the generator; `--resume <logs>` continues a compatible run and `--resume <logs> --reexport` reuses completed native profiles after a generator/index-reader-only change. Every selected method needs a terminal native result, and exports include instrumented child executable objects. An assertion failure is recorded and returns failure even when coverage collection completed; an interrupted or
+incomplete refresh never authorizes closed-world selection. Every qualification case must have a non-skipped observation; a skipped case leaves the map incomplete. Every discovered class must be measured or have an explicit unmeasurable reason and nonempty index-store edges. The loader also refuses older maps whose inventories do not meet these requirements.
+
+A bounded index-only refresh can replace skipped-class edges in an existing
+complete coverage map without repeating native observations:
+
+```sh
+python3 script/index_store.py --store <build-slot>/.build-idx/index-store --additional-store <build-slot>/.build-idx/debug/index/store --output <index-export.json>
+python3 script/test_impact_map.py --scratch-path <build-slot>/.build --refresh-index-map <coverage-map.json> --index-export <index-export.json> --output <updated-map.json>
+```
+
+Build that index from the same source/test/manifest inputs first. The refresh
+requires the original inputs to match, preserves coverage timestamps, commit,
+failures and measured edges, and records the input map hash and index provenance.
+It changes only index/generator implementation fingerprints. `--index-store-path`
+can read an already built store directly instead of a saved export; a full
+refresh can consume either input too. Saved exports include indexed source
+hashes, unit/record counts and generation time; both full generation and index-only
+refresh reject stale saved-export hashes. A prebuilt raw store must come from the
+same completed build inputs: read-time hashes do not establish compile-time
+freshness. The export remains local evidence.
 
 The refresh restores the ordinary uninstrumented build before publishing its map, so later affected tests and production builds reuse that configuration. No tests execute during either build-only filter. Coverage collection and this configuration restoration cost a full refresh and are outside the 1–2 minute
 affected-plan goal. A genuinely affected 360-second soak also cannot meet that

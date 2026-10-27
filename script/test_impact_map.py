@@ -4,6 +4,7 @@
 One instrumented build is followed by a separate xctest process per class and
 qualification case. Each process owns its raw profiles, including child processes.
 A failed/incomplete refresh is retained as incomplete, never a closed-world map.
+Skipped classes use compiler-index declaration reachability, never lexical names.
 """
 import argparse
 from datetime import datetime, timezone
@@ -16,7 +17,13 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from index_store import (read_index_store, repository_path, DECLARATION, DEFINITION,
+                         REFERENCE, CALL, CHILDOF, CALLEDBY, CONTAINEDBY,
+                         EXTENDEDBY, CALLABLE_KINDS)
+
 SCHEMA_VERSION = 1
+INDEX_DEPTH = 5
 
 
 def _source_path(filename, root):
@@ -62,7 +69,8 @@ def parse_coverage_export(payload, root):
     return covered
 
 
-def build_map(root, observations, commit, generated_at, generation_seconds, inventory=None):
+def build_map(root, observations, commit, generated_at, generation_seconds, inventory=None,
+              index_export=None, index_depth=INDEX_DEPTH):
     """Union observations; inventory includes instrumented files with zero hits.
 
     Each observation has sources and either class or qualification_case. The
@@ -73,6 +81,11 @@ def build_map(root, observations, commit, generated_at, generation_seconds, inve
     paths = set(inventory or ())
     for observation in observations:
         paths.update(observation['sources'])
+    index_edges = {item['class']: index_references(root, item['class'], index_export, index_depth)
+                   if index_export is not None else set()
+                   for item in observations if item.get('class') and item.get('skipped')}
+    for edges in index_edges.values():
+        paths.update(edges)
     sources = {path: {'classes': set(), 'qualification_cases': set()} for path in sorted(paths)}
     classes, cases = set(), set()
     unmeasurable = {}
@@ -81,7 +94,7 @@ def build_map(root, observations, commit, generated_at, generation_seconds, inve
         if group and observation.get('skipped'):
             unmeasurable[group] = {
                 'reason': observation.get('unmeasurable_reason', 'All native methods skipped; see generation logs'),
-                'sources': sorted(static_references(root, group))}
+                'sources': sorted(index_edges[group]), 'source': 'index-store', 'max_depth': index_depth}
         if group and not observation.get('skipped'):
             classes.add(group)
         if case and not observation.get('skipped'):
@@ -106,7 +119,10 @@ def coverage_gaps(result, classes, cases):
     """A finished attempt is closed only with coverage or an explicit exception."""
     missing_classes = set(classes) - set(result['measured_classes']) - set(result['coverage_unmeasurable_classes'])
     missing_cases = set(cases) - set(result['measured_qualification_cases'])
-    return (['Unmeasured class: ' + value for value in sorted(missing_classes)] +
+    missing_index = [group for group, entry in result['coverage_unmeasurable_classes'].items()
+                     if entry.get('source') != 'index-store' or not entry.get('sources')]
+    return (['Missing index-store dependencies: ' + value for value in sorted(missing_index)] +
+            ['Unmeasured class: ' + value for value in sorted(missing_classes)] +
             ['Unmeasured qualification case: ' + value for value in sorted(missing_cases)])
 
 
@@ -132,59 +148,135 @@ def inspection_references(root, identifier, executed_sources=()):
     return references
 
 
-def _swift_code(text):
-    """Remove comments and string contents before deriving symbol references."""
-    return re.sub(r'//[^\n]*|/\*.*?\*/|""".*?"""|"(?:\\.|[^"\\])*"', ' ', text, flags=re.S)
+def index_references(root, identifier, export, max_depth=INDEX_DEPTH):
+    """Resolve test-file references by USR, then traverse recorded declaration edges.
 
-
-def static_references(root, identifier):
-    """Unmeasurable classes use declared type/function names in their own files.
-
-    Include extension files; never expand these edges to the module closure.
-    This is a lexical dependency approximation, separate from measured coverage.
+    Depth counts outgoing edges after a directly referenced declaration. Types do
+    not expand to all their members; only callable-local declarations are entered.
+    This is conservative static reachability, not execution/branch coverage.
     """
+    if not isinstance(max_depth, int) or isinstance(max_depth, bool) or max_depth < 0:
+        raise ValueError('index depth must be a nonnegative integer')
+    if not isinstance(export, dict) or export.get('schema_version') != 1 or not isinstance(export.get('occurrences'), list):
+        raise ValueError('invalid index export')
+    root = Path(root)
     target, owner = identifier.split('/')[0].split('.', 1)
-    test_codes = []
-    for test in sorted((root / 'Tests' / target).rglob('*.swift')):
-        code = _swift_code(test.read_text())
-        if re.search(r'\b(?:class|extension|struct)\s+' + re.escape(owner) + r'\b', code):
-            test_codes.append(code)
-    code = '\n'.join(test_codes)
-    names = set(re.findall(r'\b[A-Za-z_]\w*\b', code))
-    calls = set(re.findall(r'\b([A-Za-z_]\w*)\s*(?:<[^\n<>]*>)?\s*\(', code))
-    references = inspection_references(root, identifier)
-    sources = [path for folder in ('Sources', 'Tests', 'Packages')
-               for path in (root / folder).rglob('*') if path.is_file()
-               and _source_path(str(path), root)]
-    for source in sorted(sources):
-        declared = _swift_code(source.read_text())
-        # A member named `record` is not the unrelated router.record call.
-        # Top-level functions stand alone; members need their owning type.
-        types, functions = set(), set()
-        depth = 0
-        for token in re.finditer(r'[{}]|\b(class|struct|enum|protocol|typealias|actor|extension|func)\s+([A-Za-z_]\w*)', declared):
-            if token[0] == '{':
-                depth += 1
-            elif token[0] == '}':
-                depth -= 1
-            elif depth == 0:
-                if token[1] != 'extension':
-                    (functions if token[1] == 'func' else types).add(token[2])
-        if source.suffix != '.swift':
-            depth = 0
-            # C/Objective-C fixture functions also have direct Swift callers.
-            for token in re.finditer(r'[{}]|\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?=[{;])', declared):
-                if token[0] == '{':
-                    depth += 1
-                elif token[0] == '}':
-                    depth -= 1
-                elif depth == 0:
-                    functions.add(token[1])
-        extension_owners = set(re.findall(r'\bextension\s+([A-Za-z_]\w*)', declared))
-        members = set(re.findall(r'\bfunc\s+([A-Za-z_]\w*)', declared))
-        if types & names or functions & calls or (extension_owners & names and members & calls):
-            references.add(source.relative_to(root).as_posix())
+    rows, locations, kinds, edges = [], {}, {}, {}
+    paths = {}
+    for item in export['occurrences']:
+        if (not isinstance(item, dict) or not isinstance(item.get('file'), str)
+                or not isinstance(item.get('usr'), str) or not isinstance(item.get('name'), str)
+                or not isinstance(item.get('roles'), int) or not isinstance(item.get('kind'), int)
+                or not isinstance(item.get('relations', []), list)):
+            raise ValueError('invalid index occurrence')
+        for relation in item.get('relations', []):
+            if (not isinstance(relation, dict) or not isinstance(relation.get('usr'), str)
+                    or not isinstance(relation.get('roles'), int)):
+                raise ValueError('invalid index relation')
+        filename = item['file']
+        if filename not in paths:
+            path = repository_path(filename, root)
+            paths[filename] = path if path and (root / path).is_file() else None
+        path = paths[filename]
+        if not path or not item['usr']:
+            continue
+        rows.append((path, item))
+        kinds[item['usr']] = item['kind']
+        if item['roles'] & (DECLARATION | DEFINITION):
+            locations.setdefault(item['usr'], set()).add(path)
+    class_usrs = {item['usr'] for path, item in rows
+                  if path.startswith('Tests/' + target + '/') and item['kind'] == 7
+                  and item['name'] == owner and item['roles'] & (DECLARATION | DEFINITION)}
+    files = {path for path, item in rows if item['usr'] in class_usrs
+             and item['roles'] & (DECLARATION | DEFINITION | EXTENDEDBY)}
+    if not files:
+        return set()
+    seeds = set()
+    for path, item in rows:
+        usr, roles = item['usr'], item['roles']
+        if path in files and roles & (REFERENCE | CALL | DECLARATION | DEFINITION):
+            seeds.add(usr)
+        for relation in item.get('relations', []):
+            parent = relation['usr']
+            if (roles & (REFERENCE | CALL) and relation['roles'] & (CALLEDBY | CONTAINEDBY)
+                    or roles & (DECLARATION | DEFINITION) and relation['roles'] & CHILDOF
+                    and kinds.get(parent) in CALLABLE_KINDS):
+                edges.setdefault(parent, set()).add(usr)
+    references, visited, frontier = set(files), set(), seeds
+    for _ in range(max_depth + 1):
+        frontier -= visited
+        if not frontier:
+            break
+        for usr in frontier:
+            references.update(locations.get(usr, ()))
+        visited.update(frontier)
+        frontier = {callee for usr in frontier for callee in edges.get(usr, ())}
     return references
+
+
+def validate_index_sources(root, export, require_hashes=True):
+    """A saved export may be reused only with its original indexed source bytes."""
+    if (not isinstance(export, dict) or export.get('schema_version') != 1
+            or not isinstance(export.get('occurrences'), list)):
+        raise ValueError('invalid index export')
+    hashes = export.get('source_hashes', {})
+    if not isinstance(hashes, dict) or (require_hashes and not hashes):
+        raise ValueError('index export needs source hashes')
+    root = Path(root)
+    for path, digest in hashes.items():
+        if (not isinstance(path, str) or repository_path(path, root) != path
+                or not (root / path).is_file()
+                or hashlib.sha256((root / path).read_bytes()).hexdigest() != digest):
+            raise ValueError('index export source inputs differ: ' + str(path))
+    if require_hashes:
+        for item in export.get('occurrences', []):
+            if not isinstance(item, dict) or item.get('file') not in hashes:
+                raise ValueError('index export occurrence has no source hash')
+
+
+def refresh_index_map(root, data, export, index_depth=INDEX_DEPTH):
+    """Replace skipped-class edges while preserving the original native evidence.
+
+    This bounded refresh does not run skipped tests, renew coverage timestamps or
+    forgive coverage errors. All original source/test/build inputs must still
+    match; only the two index/generator implementation files may have changed.
+    """
+    root = Path(root)
+    if data.get('schema_version') != SCHEMA_VERSION or data.get('complete') is not True:
+        raise ValueError('index refresh requires a complete coverage map')
+    inputs = data.get('input_hashes', {})
+    if not inputs:
+        raise ValueError('index refresh requires original input hashes')
+    allowed = {'script/test_impact_map.py', 'script/index_store.py'}
+    current = {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+               for folder in ('Sources', 'Tests', 'Packages') for path in (root / folder).rglob('*')
+               if path.is_file() and (path.suffix in ('.swift', '.c', '.h', '.m', '.mm', '.cpp')
+                                      or path.name in ('Package.swift', 'Package.resolved'))}
+    for path in ('Package.swift', 'Package.resolved'):
+        if (root / path).is_file():
+            current[path] = hashlib.sha256((root / path).read_bytes()).hexdigest()
+    if current != {path: digest for path, digest in inputs.items() if path not in allowed}:
+        raise ValueError('index refresh source/test/manifest inputs differ from native coverage')
+    validate_index_sources(root, export, require_hashes=False)
+    result = json.loads(json.dumps(data))
+    for group, observation in result.get('coverage_unmeasurable_classes', {}).items():
+        references = index_references(root, group, export, index_depth)
+        observation.update(source='index-store', sources=sorted(references), max_depth=index_depth)
+        for path in references:
+            result['sources'].setdefault(path, {'classes': [], 'qualification_cases': []})
+            result['source_hashes'][path] = current[path]
+    result['input_hashes'] = dict(inputs)
+    for path in allowed:
+        if (root / path).is_file():
+            result['input_hashes'][path] = hashlib.sha256((root / path).read_bytes()).hexdigest()
+    result['index_store'] = {key: value for key, value in export.items()
+                             if key not in ('occurrences', 'source_hashes')}
+    result['index_store']['max_depth'] = index_depth
+    errors = coverage_gaps(result, result.get('class_inventory', []),
+                           result.get('qualification_case_inventory', []))
+    result['errors'] = list(data.get('errors', [])) + errors
+    result['complete'] = not result['errors']
+    return result
 
 
 def collect_default_profiles(root, destination):
@@ -245,15 +337,26 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument('--scratch-path', type=Path, required=True)
+    parser.add_argument('--index-scratch-path', type=Path,
+                        help='dedicated index build scratch (default: sibling <scratch>-idx)')
+    index_input = parser.add_mutually_exclusive_group()
+    index_input.add_argument('--index-store-path', type=Path, help='read an already built index store')
+    index_input.add_argument('--index-export', type=Path, help='read a saved semantic index export')
+    parser.add_argument('--additional-index-store', type=Path, action='append', default=[],
+                        help='additional same-build store, such as SwiftPM Clang records')
+    parser.add_argument('--refresh-index-map', type=Path,
+                        help='replace skipped-class edges in this complete map, retaining native observations')
     parser.add_argument('--runner-wrapper', type=Path, default=os.environ.get('CHECKLIST_SWIFT_RUNNER'),
                         help='shared build-cap shell wrapper; every swift test runs through it')
     parser.add_argument('--output', type=Path, default=Path('.local/build/test-impact-map.json'))
     parser.add_argument('--test-timeout', type=float, default=1800, help='maximum seconds for one test process')
     parser.add_argument('--resume', type=Path, help='resume a generation log directory at the same source/test hashes')
-    parser.add_argument('--reexport', action='store_true', help='with --resume, re-export existing profiles without rerunning completed tests; permit only generator hash changes')
+    parser.add_argument('--reexport', action='store_true', help='with --resume, re-export existing profiles without rerunning completed tests; permit only generator/index-reader hash changes')
     parser.add_argument('--classes', nargs='+', help='bounded diagnostic subset; result stays incomplete')
     parser.add_argument('--qualification-cases', nargs='+', help='bounded diagnostic subset')
     args = parser.parse_args(argv)
+    if args.additional_index_store and not args.index_store_path:
+        parser.error('--additional-index-store requires --index-store-path')
     if args.reexport and not args.resume:
         parser.error('--reexport requires --resume')
     load_start = _load()
@@ -261,6 +364,27 @@ def main(argv=None):
     output = args.output if args.output.is_absolute() else root / args.output
     output.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
+    if args.refresh_index_map:
+        if not (args.index_store_path or args.index_export):
+            parser.error('--refresh-index-map requires --index-store-path or --index-export')
+        if args.resume or args.classes or args.qualification_cases:
+            parser.error('--refresh-index-map cannot resume or select native executions')
+        original_bytes = args.refresh_index_map.read_bytes()
+        exported = (json.loads(args.index_export.read_text()) if args.index_export else
+                    read_index_store(args.index_store_path, root, additional_stores=args.additional_index_store))
+        validate_index_sources(root, exported)
+        result = refresh_index_map(root, json.loads(original_bytes), exported)
+        result['index_refresh'] = {'at': datetime.now(timezone.utc).isoformat(),
+            'seconds': round(time.monotonic() - started, 3),
+            'input_map': str(args.refresh_index_map.resolve()),
+            'input_map_sha256': hashlib.sha256(original_bytes).hexdigest(),
+            'coverage_generated_at': result['generated_at'], 'native_executions_reused': True}
+        temporary = output.with_suffix('.tmp')
+        temporary.write_text(json.dumps(result, indent=2) + '\n')
+        temporary.replace(output)
+        print(json.dumps({'output': str(output), 'complete': result['complete'],
+                          'index_refresh': result['index_refresh'], 'errors': result['errors']}, indent=2))
+        return 0 if result['complete'] else 1
     work = args.resume or output.parent / ('test-impact-profiles-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f'))
     work = work.resolve()
     work.mkdir(exist_ok=bool(args.resume))
@@ -276,7 +400,7 @@ def main(argv=None):
                     for folder in ('Sources', 'Tests', 'Packages') for path in sorted((root / folder).rglob('*'))
                     if path.is_file() and (path.suffix in ('.swift', '.c', '.h', '.m', '.mm', '.cpp')
                                            or path.name in ('Package.swift', 'Package.resolved'))}
-    for relative in ('Package.swift', 'Package.resolved', 'script/test_impact_map.py'):
+    for relative in ('Package.swift', 'Package.resolved', 'script/test_impact_map.py', 'script/index_store.py'):
         path = root / relative
         if path.is_file():
             input_hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -285,8 +409,9 @@ def main(argv=None):
     compared_previous = dict(previous_hashes or {})
     compared_current = dict(input_hashes)
     if args.reexport:
-        compared_previous.pop('script/test_impact_map.py', None)
-        compared_current.pop('script/test_impact_map.py', None)
+        for relative in ('script/test_impact_map.py', 'script/index_store.py'):
+            compared_previous.pop(relative, None)
+            compared_current.pop(relative, None)
     if args.resume and (previous_hashes is None or compared_previous != compared_current):
         parser.error('resume source/test/manifest inputs differ; start a new generation')
     # Preserve the original fingerprint; a re-export records its own fingerprint
@@ -302,14 +427,36 @@ def main(argv=None):
         origin_path.write_text(json.dumps(origin) + '\n')
     profile_caveats.extend('Preserved unattributed profile: ' + path for path in
                            collect_default_profiles(root, work / 'unattributed-profiles'))
+    coverage_build_started = False
+    prefix = ['bash', str(args.runner_wrapper.resolve())] if args.runner_wrapper else []
+    common = prefix + ['env', 'LLVM_PROFILE_FILE=' + str(work / 'build-%m-%p.profraw'), 'swift', 'test',
+              '--cache-path', str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
+              '--enable-dependency-cache', '--scratch-path', str(scratch)]
     try:
-        prefix = ['bash', str(args.runner_wrapper.resolve())] if args.runner_wrapper else []
-        common = prefix + ['env', 'LLVM_PROFILE_FILE=' + str(work / 'build-%m-%p.profraw'), 'swift', 'test',
-                  '--cache-path', str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
-                  '--enable-dependency-cache', '--scratch-path', str(scratch)]
+        if args.index_export:
+            exported_index = json.loads(args.index_export.read_text())
+        elif args.index_store_path:
+            exported_index = read_index_store(args.index_store_path, root, additional_stores=args.additional_index_store)
+        else:
+            index_scratch = (args.index_scratch_path or scratch.with_name(scratch.name + '-idx')).resolve()
+            if index_scratch == scratch:
+                raise ValueError('index scratch must be separate from the warm coverage scratch')
+            index_path = index_scratch / 'index-store'
+            # The Xcode SwiftPM backend can ignore -Xswiftc index flags. The
+            # native backend honors the explicit path; never change warm scratch.
+            _run(prefix + ['swift', 'build', '--build-tests', '--build-system', 'native',
+                '--enable-index-store', '--cache-path', str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
+                '--enable-dependency-cache', '--scratch-path', str(index_scratch),
+                '-Xswiftc', '-index-store-path', '-Xswiftc', str(index_path)],
+                root, work / 'index-build.log')
+            exported_index = read_index_store(index_path, root,
+                additional_stores=[index_scratch / 'debug/index/store'])
+        validate_index_sources(root, exported_index)
+        (work / 'index-export.json').write_text(json.dumps(exported_index, separators=(',', ':')) + '\n')
         # Swift 6 forwards --list-tests into the list subcommand, which rejects
         # --enable-code-coverage. Build instrumented tests with an empty filter
         # first; discovery reuses that build and never runs test methods.
+        coverage_build_started = True
         _run(common + ['--enable-code-coverage', '--skip', 'HumanClaimsKeychainTests',
                        '--filter', '^$'], root, work / 'build.log')
         # Listing does not execute methods; Swift's list subcommand rejects --skip.
@@ -452,14 +599,19 @@ def main(argv=None):
     # Coverage is a final-round refresh cost. Leave the assigned warm scratch
     # ready for ordinary uninstrumented affected tests and production builds.
     try:
-        _run(common + ['--skip', 'HumanClaimsKeychainTests', '--filter', '^$'],
-             root, work / 'restore-default-build.log')
+        if coverage_build_started:
+            _run(common + ['--skip', 'HumanClaimsKeychainTests', '--filter', '^$'],
+                 root, work / 'restore-default-build.log')
     except (RuntimeError, OSError, ValueError) as error:
         errors.append('restore default build: ' + str(error))
     profile_caveats.extend('Preserved build/discovery profile: ' + path for path in
                            collect_default_profiles(root, work / 'phase-fallback-profiles'))
     result = build_map(root, observations, commit, datetime.now(timezone.utc).isoformat(),
-                       round(time.monotonic() - started, 3), inventory)
+                       round(time.monotonic() - started, 3), inventory,
+                       index_export=exported_index if 'exported_index' in locals() else None)
+    result['index_store'] = {key: value for key, value in locals().get('exported_index', {}).items()
+                             if key not in ('occurrences', 'source_hashes')}
+    result['index_store']['max_depth'] = INDEX_DEPTH
     result['invocation_seconds'] = result['generation_seconds']
     result['generation_seconds'] = round((datetime.now(timezone.utc) -
         datetime.fromisoformat(origin['started_at'])).total_seconds(), 3)

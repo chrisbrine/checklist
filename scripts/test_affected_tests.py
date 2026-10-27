@@ -112,7 +112,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(unmapped['qualification_tests'],
                          ['ChecklistAppTests.IsolatedDefaultsTests/testPreferencesRemainAbsentAfterChildProcessExit'])
 
-    def test_unmeasurable_classes_select_only_static_reference_sources(self):
+    def test_unmeasurable_classes_select_only_index_reference_sources(self):
         referenced = 'Sources/ChecklistCore/HumanClaims.swift'
         unrelated = 'Sources/ChecklistCore/Leaf.swift'
         measured = self.measured_map({path: {'classes': [], 'qualification_cases': []}
@@ -120,14 +120,83 @@ class SelectionTests(unittest.TestCase):
         group = 'ChecklistAppTests.HumanClaimsKeychainTests'
         measured['class_inventory'] = [group]
         measured['coverage_unmeasurable_classes'] = {
-            group: {'reason': 'owner prohibits keychain access', 'sources': [referenced]}}
+            group: {'reason': 'owner prohibits keychain access', 'sources': [referenced],
+                    'source': 'index-store', 'max_depth': 5}}
         plan = self.plan(referenced, impact_map=measured)
         self.assertEqual(plan['test_groups'], {'ChecklistAppTests': ['HumanClaimsKeychainTests']})
         self.assertEqual(plan['coverage_unmeasurable_classes'], {group: [referenced]})
+        self.assertEqual(plan['test_group_sources'],
+                         {group: {'source': 'index-store', 'paths': [referenced]}})
         self.assertEqual(plan['group_fallback_paths'], [])
         plan = self.plan(unrelated, impact_map=measured)
         self.assertEqual(plan['test_targets'], [])
         self.assertEqual(plan['coverage_unmeasurable_classes'], {})
+        output = io.StringIO()
+        with patch.object(selector, 'package_graph', return_value=GRAPH), \
+             patch.object(selector, 'load_impact_map', return_value=(measured, {'state': 'current'})), \
+             redirect_stdout(output):
+            selector.main(['--root', str(self.root), '--paths', referenced])
+        self.assertIn('Unmeasurable class index-store references: ' + group + ' <- ' + referenced,
+                      output.getvalue())
+
+    def test_synthetic_index_export_selects_store_copy_classes_and_indirect_receipt(self):
+        spec = importlib.util.spec_from_file_location('test_impact_map',
+                    Path(__file__).resolve().parents[1] / 'script/test_impact_map.py')
+        generator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(generator)
+        names = ['ArchivePreviewStoreCopyTests', 'GroupKeyStoreCopyTests',
+                 'ImportStoreCopyQualificationTests', 'TicketCleanupReceiptMeasurementTests']
+        used = ['ArchivePreview.swift', 'GroupKeys.swift', 'Import.swift', 'Router.swift']
+        occurrences, observations = [], []
+        def occurrence(file, usr, roles, relations=(), kind=12):
+            occurrences.append({'file': file, 'usr': usr, 'name': usr, 'kind': kind,
+                                'roles': roles, 'relations': list(relations)})
+        for name, filename in zip(names, used):
+            test = 'Tests/ChecklistCoreTests/' + name + '.swift'
+            (self.root / test).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / test).write_text('final class ' + name + ': XCTestCase {}')
+            source = 'Sources/ChecklistCore/' + filename
+            (self.root / source).write_text('// synthetic declaration locations\n')
+            occurrence(test, name, 2, kind=7)
+            occurrence(test, name + '.test', 2, [{'usr': name, 'roles': 512}], kind=16)
+            occurrence(test, filename, 4 | 32, [{'usr': name + '.test', 'roles': 8192}])
+            occurrence(source, filename, 2)
+            observations.append({'class': 'ChecklistCoreTests.' + name,
+                                 'sources': [], 'skipped': True})
+        cleanup = 'Sources/ChecklistCore/TicketLifecycleCleanup.swift'
+        unrelated = 'Sources/ChecklistCore/Unrelated.swift'
+        (self.root / cleanup).write_text('// synthetic declaration locations\n')
+        (self.root / unrelated).write_text('// unrelated declaration location\n')
+        occurrence('Sources/ChecklistCore/Router.swift', 'ticketCleanupRead', 4 | 32,
+                   [{'usr': 'Router.swift', 'roles': 8192}])
+        occurrence(cleanup, 'ticketCleanupRead', 2)
+        occurrence(cleanup, 'ticketCleanupPassProjection', 4 | 32,
+                   [{'usr': 'ticketCleanupRead', 'roles': 8192}])
+        occurrence(cleanup, 'ticketCleanupPassProjection', 2)
+        occurrence(unrelated, 'unrelated', 2)
+        # An unrelated function in a reached file must not open its call graph.
+        occurrence('Sources/ChecklistCore/Router.swift', 'unrelated', 4 | 32,
+                   [{'usr': 'unrelatedRouterFunction', 'roles': 8192}])
+        inventory = ['Sources/ChecklistCore/' + filename for filename in used] + [cleanup, unrelated]
+        measured = generator.build_map(self.root, observations, 'synthetic-commit',
+                    '2026-10-26T00:00:00Z', 0.5, inventory=inventory,
+                    index_export={'schema_version': 1, 'occurrences': occurrences}, index_depth=5)
+        measured['complete'] = True
+        self.assertEqual(measured['measured_classes'], [])
+        for name, filename in zip(names, used):
+            path = cleanup if name == names[-1] else 'Sources/ChecklistCore/' + filename
+            with self.subTest(group=name):
+                plan = self.plan(path, impact_map=measured)
+                group = 'ChecklistCoreTests.' + name
+                self.assertEqual(plan['test_groups'], {'ChecklistCoreTests': [name]})
+                self.assertEqual(plan['coverage_unmeasurable_classes'], {group: [path]})
+                self.assertEqual(plan['test_group_sources'],
+                                 {group: {'source': 'index-store', 'paths': [path]}})
+                self.assertEqual(plan['group_fallback_paths'], [])
+                self.assertEqual(measured['coverage_unmeasurable_classes'][group]['max_depth'], 5)
+        plan = self.plan(unrelated, impact_map=measured)
+        self.assertEqual(plan['test_targets'], [])
+        self.assertEqual(plan['test_group_sources'], {})
 
     def test_generated_map_unions_measured_consumers_and_reasons(self):
         paths = ['Sources/ChecklistCore/First.swift', 'Sources/ChecklistCore/Second.swift']
@@ -262,12 +331,14 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(plan['test_targets'], ['ChecklistCoreTests'])
 
     def test_python_only_selects_own_test(self):
+        (self.root / 'scripts/test_test_impact_map.py').touch()
         for path, expected in [('script/test_instances.py', 'scripts/test_test_instances.py'),
                                ('script/affected_tests.py', 'scripts/test_affected_tests.py'),
                                ('scripts/test_affected_tests.py', 'scripts/test_affected_tests.py'),
                                ('scripts/prepare-public-source.py', 'scripts/test_prepare_public_source.py'),
                                ('scripts/public_source_privacy.py', 'scripts/test_prepare_public_source.py'),
-                               ('script/verify_install.py', 'scripts/test_test_instances.py')]:
+                               ('script/verify_install.py', 'scripts/test_test_instances.py'),
+                               ('script/index_store.py', 'scripts/test_test_impact_map.py')]:
             with self.subTest(path=path):
                 plan = self.plan(path)
                 self.assertEqual(plan['python_tests'], [expected])
@@ -735,9 +806,10 @@ class SelectionTests(unittest.TestCase):
             selector.package_graph(self.root, self.root / '.build')
             self.assertEqual(run.call_count, 3)
 
-    def test_loader_refuses_skipped_inventory_without_static_class_exception(self):
+    def test_loader_requires_nonempty_index_edges_for_skipped_inventory(self):
         from datetime import datetime, timezone
-        measured = self.measured_map({})
+        measured = self.measured_map({'Sources/ChecklistCore/HumanClaims.swift': {
+            'classes': [], 'qualification_cases': []}})
         measured.update(generated_at=datetime.now(timezone.utc).isoformat(),
                         measured_qualification_cases=list(selector.QUALIFICATION_CASES),
                         qualification_case_inventory=list(selector.QUALIFICATION_CASES),
@@ -747,9 +819,32 @@ class SelectionTests(unittest.TestCase):
             map_path.write_text(json.dumps(measured))
             self.assertIsNone(selector.load_impact_map(self.root, map_path)[0])
             measured['coverage_unmeasurable_classes'] = {
-                'ChecklistAppTests.ForbiddenTests': {'reason': 'Owner forbids keychain', 'sources': []}}
+                'ChecklistAppTests.ForbiddenTests': {'reason': 'Owner forbids keychain',
+                    'sources': ['Sources/ChecklistCore/HumanClaims.swift'],
+                    'source': 'index-store', 'max_depth': 5}}
             map_path.write_text(json.dumps(measured))
-            self.assertIsNotNone(selector.load_impact_map(self.root, map_path)[0])
+            loaded, status = selector.load_impact_map(self.root, map_path)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded['measured_classes'], [])
+            self.assertEqual(status['unmeasured_classes'], ['ChecklistAppTests.ForbiddenTests'])
+            observation = measured['coverage_unmeasurable_classes']['ChecklistAppTests.ForbiddenTests']
+            for field, invalid in [('source', None), ('source', 'static-reference'),
+                                   ('source', 'coverage'), ('source', 'index'),
+                                   ('max_depth', None), ('max_depth', 0), ('max_depth', True),
+                                   ('sources', []), ('sources', None),
+                                   ('sources', ['../Sources/Escape.swift']),
+                                   ('sources', ['/Sources/Absolute.swift']),
+                                   ('sources', ['Sources/../Escape.swift']),
+                                   ('sources', ['Sources/./Unnormalized.swift']),
+                                   ('sources', ['Sources\\Escape.swift']),
+                                   ('sources', ['Sources/ChecklistCore/AbsentFromInventory.swift']),
+                                   ('sources', ['']), ('sources', ['docs/file.md'])]:
+                with self.subTest(field=field, invalid=invalid):
+                    original = observation[field]
+                    observation[field] = invalid
+                    map_path.write_text(json.dumps(measured))
+                    self.assertIsNone(selector.load_impact_map(self.root, map_path)[0])
+                    observation[field] = original
             measured['measured_qualification_cases'].pop()
             map_path.write_text(json.dumps(measured))
             self.assertIsNone(selector.load_impact_map(self.root, map_path)[0])

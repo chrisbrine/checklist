@@ -1,4 +1,5 @@
-"""Coverage mapping tests use synthetic LLVM exports, never Swift or live stores."""
+"""Coverage mapping tests use synthetic LLVM/index exports, never Swift or live stores."""
+import ctypes
 import hashlib
 import importlib.util
 import json
@@ -10,6 +11,7 @@ from unittest.mock import patch
 SPEC = importlib.util.spec_from_file_location('test_impact_map', Path(__file__).resolve().parents[1] / 'script/test_impact_map.py')
 impact = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(impact)
+import index_store
 
 
 class CoverageMapTests(unittest.TestCase):
@@ -112,81 +114,334 @@ class CoverageMapTests(unittest.TestCase):
                          {'Sources/ChecklistCore/Unused.swift'})
 
 
-    def test_unmeasurable_class_uses_static_symbols_and_keeps_reason(self):
+    def index_occurrence(self, file, usr, name, roles=2, kind=12, relations=()):
+        return {'file': file, 'usr': usr, 'name': name, 'kind': kind,
+                'roles': roles, 'relations': list(relations)}
+
+    def index_export(self, *occurrences):
+        return {'schema_version': 1, 'occurrences': list(occurrences)}
+
+    def class_index(self, *occurrences):
+        return self.index_export(self.index_occurrence(
+            'Tests/ChecklistCoreTests/CoreTests.swift', 'class:CoreTests', 'CoreTests', kind=7),
+            *occurrences)
+
+    def test_unmeasurable_class_uses_index_symbols_and_keeps_reason(self):
         used = 'Sources/ChecklistCore/Used.swift'
         unused = 'Sources/ChecklistCore/Unused.swift'
+        test = 'Tests/ChecklistCoreTests/CoreTests.swift'
         (self.root / used).write_text('struct UsedType {}\nfunc usedFunction() {}')
         (self.root / unused).write_text('struct OtherType { func usedFunction() {} }\nfunc otherFunction() {}')
-        test = self.root / 'Tests/ChecklistCoreTests/CoreTests.swift'
-        test.write_text('final class CoreTests: XCTestCase { func testIt() { _ = UsedType(); usedFunction() } }'
-                        '// OtherType otherFunction()\nlet label = "OtherType otherFunction()"')
-        self.assertEqual(impact.static_references(self.root, 'ChecklistCoreTests.CoreTests'), {used, 'Tests/ChecklistCoreTests/CoreTests.swift'})
+        (self.root / test).write_text(
+            'final class CoreTests: XCTestCase { func testIt() { _ = UsedType(); usedFunction() } }'
+            '// OtherType otherFunction()\nlet label = "OtherType otherFunction()"')
+        export = self.class_index(
+            self.index_occurrence(used, 'type:UsedType', 'UsedType', kind=6),
+            self.index_occurrence(used, 'function:usedFunction', 'usedFunction'),
+            self.index_occurrence(unused, 'type:OtherType', 'OtherType', kind=6),
+            self.index_occurrence(unused, 'member:usedFunction', 'usedFunction', kind=16),
+            self.index_occurrence(unused, 'function:otherFunction', 'otherFunction'),
+            self.index_occurrence(test, 'type:UsedType', 'UsedType', roles=4, kind=6),
+            self.index_occurrence(test, 'function:usedFunction', 'usedFunction', roles=36))
+        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export),
+                         {used, test})
         result = impact.build_map(self.root, [
             {'class': 'ChecklistCoreTests.CoreTests', 'sources': [], 'skipped': True,
              'unmeasurable_reason': 'Owner forbids keychain access'}
-        ], 'abc', 'now', 0, inventory=[used, unused])
+        ], 'abc', 'now', 0, inventory=[used, unused], index_export=export)
         self.assertEqual(result['measured_classes'], [])
         self.assertEqual(result['coverage_unmeasurable_classes'], {
-            'ChecklistCoreTests.CoreTests': {'reason': 'Owner forbids keychain access', 'sources': [used, 'Tests/ChecklistCoreTests/CoreTests.swift']}})
+            'ChecklistCoreTests.CoreTests': {'reason': 'Owner forbids keychain access',
+                'sources': [used, test], 'source': 'index-store', 'max_depth': 5}})
         self.assertEqual(result['sources'][used]['classes'], [])
 
-    def test_static_references_do_not_confuse_unrelated_member_names(self):
-        (self.root / 'Sources/ChecklistCore/Used.swift').write_text(
-            'struct Recorder { func record() {} }')
-        (self.root / 'Sources/ChecklistCore/Unused.swift').write_text(
-            'extension CommandRouter { func record() {} }')
-        (self.root / 'Tests/ChecklistCoreTests/CoreTests.swift').write_text(
+    def test_index_references_do_not_confuse_unrelated_member_names(self):
+        used = 'Sources/ChecklistCore/Used.swift'
+        selected = 'Sources/ChecklistCore/Unused.swift'
+        test = 'Tests/ChecklistCoreTests/CoreTests.swift'
+        (self.root / used).write_text('struct Recorder { func record() {} }')
+        (self.root / selected).write_text('extension CommandRouter { func record() {} }')
+        (self.root / test).write_text(
             'class CoreTests { func testIt() { let router = CommandRouter(); router.record() } }')
-        self.assertEqual(impact.static_references(self.root, 'ChecklistCoreTests.CoreTests'),
-                         {'Sources/ChecklistCore/Unused.swift', 'Tests/ChecklistCoreTests/CoreTests.swift'})
+        export = self.class_index(
+            self.index_occurrence(used, 'Recorder.record', 'record', kind=16),
+            self.index_occurrence(selected, 'CommandRouter.record', 'record', kind=16),
+            self.index_occurrence(test, 'CommandRouter.record', 'record', roles=36, kind=16))
+        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export),
+                         {selected, test})
 
     def test_extension_type_alone_does_not_expand_to_all_its_files(self):
-        used = self.root / 'Sources/ChecklistCore/Used.swift'
-        unused = self.root / 'Sources/ChecklistCore/Unused.swift'
-        used.write_text('extension CommandRouter { func selected() {} }')
-        unused.write_text('extension CommandRouter { func unrelated() {} }')
-        (self.root / 'Tests/ChecklistCoreTests/CoreTests.swift').write_text(
+        used = 'Sources/ChecklistCore/Used.swift'
+        unused = 'Sources/ChecklistCore/Unused.swift'
+        test = 'Tests/ChecklistCoreTests/CoreTests.swift'
+        (self.root / used).write_text('extension CommandRouter { func selected() {} }')
+        (self.root / unused).write_text('extension CommandRouter { func unrelated() {} }')
+        (self.root / test).write_text(
             'class CoreTests { func testIt() { let router = CommandRouter(); router.selected() } }')
-        self.assertEqual(impact.static_references(self.root, 'ChecklistCoreTests.CoreTests'),
-                         {'Sources/ChecklistCore/Used.swift', 'Tests/ChecklistCoreTests/CoreTests.swift'})
+        export = self.class_index(
+            self.index_occurrence(used, 'CommandRouter', 'CommandRouter', kind=6),
+            self.index_occurrence(used, 'CommandRouter.selected', 'selected', kind=16,
+                                  relations=[{'usr': 'CommandRouter', 'roles': 512}]),
+            self.index_occurrence(unused, 'CommandRouter.unrelated', 'unrelated', kind=16,
+                                  relations=[{'usr': 'CommandRouter', 'roles': 512}]),
+            self.index_occurrence(test, 'CommandRouter', 'CommandRouter', roles=4, kind=6),
+            self.index_occurrence(test, 'CommandRouter.selected', 'selected', roles=36, kind=16))
+        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export),
+                         {used, test})
 
-    def test_static_references_include_class_extensions_and_package_symbols(self):
-        package = self.root / 'Packages/Domain/Sources/Domain/Thing.swift'
-        package.parent.mkdir(parents=True); package.write_text('enum PackageThing {}')
-        (self.root / 'Tests/ChecklistCoreTests/CoreTests.swift').write_text('class CoreTests {}')
-        (self.root / 'Tests/ChecklistCoreTests/Extra.swift').write_text(
-            'extension CoreTests { func testMore() { _ = PackageThing() } }')
-        self.assertEqual(impact.static_references(self.root, 'ChecklistCoreTests.CoreTests'),
-                         {'Packages/Domain/Sources/Domain/Thing.swift', 'Tests/ChecklistCoreTests/CoreTests.swift',
-                          'Tests/ChecklistCoreTests/Extra.swift'})
-        self.assertEqual(impact.static_references(self.root, 'ChecklistCoreTests.Absent'), set())
+    def test_index_references_include_class_extensions_and_package_symbols(self):
+        package = 'Packages/Domain/Sources/Domain/Thing.swift'
+        test = 'Tests/ChecklistCoreTests/CoreTests.swift'
+        extension = 'Tests/ChecklistCoreTests/Extra.swift'
+        other = 'Tests/ChecklistCoreTests/OtherTests.swift'
+        (self.root / package).parent.mkdir(parents=True)
+        (self.root / package).write_text('enum PackageThing {}')
+        (self.root / test).write_text('class CoreTests {}')
+        (self.root / extension).write_text('extension CoreTests { func testMore() { _ = PackageThing() } }')
+        (self.root / other).write_text('class OtherTests { func testOther() { _ = CoreTests(); unused() } }')
+        export = self.class_index(
+            self.index_occurrence(extension, 'class:CoreTests', 'CoreTests', roles=4 | 16384, kind=7,
+                                  relations=[{'usr': 'extension:CoreTests', 'roles': 16384}]),
+            self.index_occurrence(package, 'PackageThing', 'PackageThing', kind=5),
+            self.index_occurrence(extension, 'PackageThing', 'PackageThing', roles=4, kind=5),
+            self.index_occurrence(other, 'class:CoreTests', 'CoreTests', roles=4, kind=7),
+            self.index_occurrence('Sources/ChecklistCore/Unused.swift', 'unused', 'unused'),
+            self.index_occurrence(other, 'unused', 'unused', roles=36))
+        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export),
+                         {package, test, extension})
+        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.Absent', export), set())
 
     def test_unmeasurable_class_has_c_function_and_fixture_edges(self):
-        production = self.root / 'Sources/Legacy/Legacy.c'
-        fixture = self.root / 'Tests/KeychainFixture/Fixture.c'
-        header = production.with_suffix('.h')
-        for path in (production, fixture, header): path.parent.mkdir(parents=True, exist_ok=True)
-        production.write_text('int KeychainRead(void) { return 0; }')
-        header.write_text('int KeychainRead(void);')
-        fixture.write_text('int FixtureCreate(void) { return 1; }')
-        (self.root / 'Tests/ChecklistCoreTests/CoreTests.swift').write_text(
-            'class CoreTests { func testIt() { KeychainRead(); FixtureCreate() } }')
-        self.assertEqual(impact.static_references(self.root, 'ChecklistCoreTests.CoreTests'),
-                         {'Sources/Legacy/Legacy.c', 'Sources/Legacy/Legacy.h',
-                          'Tests/KeychainFixture/Fixture.c', 'Tests/ChecklistCoreTests/CoreTests.swift'})
+        production = 'Sources/Legacy/Legacy.c'
+        header = 'Sources/Legacy/Legacy.h'
+        fixture = 'Tests/KeychainFixture/Fixture.c'
+        test = 'Tests/ChecklistCoreTests/CoreTests.swift'
+        for file, text in ((production, 'int KeychainRead(void) { return 0; }'),
+                           (header, 'int KeychainRead(void);'),
+                           (fixture, 'int FixtureCreate(void) { return 1; }')):
+            path = self.root / file
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        (self.root / test).write_text('class CoreTests { func testIt() { KeychainRead(); FixtureCreate() } }')
+        export = self.class_index(
+            self.index_occurrence(production, 'c:KeychainRead', 'KeychainRead'),
+            self.index_occurrence(header, 'c:KeychainRead', 'KeychainRead', roles=1),
+            self.index_occurrence(fixture, 'c:FixtureCreate', 'FixtureCreate'),
+            self.index_occurrence(test, 'c:KeychainRead', 'KeychainRead', roles=36),
+            self.index_occurrence(test, 'c:FixtureCreate', 'FixtureCreate', roles=36))
+        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export),
+                         {production, header, fixture, test})
+
+    def test_index_references_follow_cleanup_router_to_indirect_projection(self):
+        test = 'Tests/ChecklistCoreTests/CoreTests.swift'
+        router = 'Sources/ChecklistCore/Router.swift'
+        cleanup = 'Sources/ChecklistCore/TicketLifecycleCleanup.swift'
+        for file in (router, cleanup):
+            (self.root / file).write_text('// Synthetic indexed declarations')
+        export = self.class_index(
+            self.index_occurrence(router, 'router.route', 'route', kind=16),
+            self.index_occurrence(cleanup, 'cleanup.read', 'ticketCleanupRead', kind=16),
+            self.index_occurrence(cleanup, 'cleanup.projection', 'ticketCleanupPassProjection'),
+            self.index_occurrence(test, 'router.route', 'route', roles=36, kind=16),
+            self.index_occurrence(router, 'cleanup.read', 'ticketCleanupRead', roles=36, kind=16,
+                                  relations=[{'usr': 'router.route', 'roles': 8192}]),
+            self.index_occurrence(cleanup, 'cleanup.projection', 'ticketCleanupPassProjection', roles=36,
+                                  relations=[{'usr': 'cleanup.read', 'roles': 65536}]))
+        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export),
+                         {test, router, cleanup})
+        result = impact.build_map(self.root, [
+            {'class': 'ChecklistCoreTests.CoreTests', 'sources': [], 'skipped': True,
+             'unmeasurable_reason': 'Store-copy cannot run under coverage'}
+        ], 'abc', 'now', 0, index_export=export)
+        self.assertIn(cleanup, result['coverage_unmeasurable_classes']['ChecklistCoreTests.CoreTests']['sources'])
+        self.assertEqual(result['coverage_unmeasurable_classes']['ChecklistCoreTests.CoreTests']['source'], 'index-store')
+
+    def test_index_call_graph_depth_is_bounded_and_cycles_terminate(self):
+        test = 'Tests/ChecklistCoreTests/CoreTests.swift'
+        paths = ['Sources/ChecklistCore/Level%d.swift' % level for level in range(7)]
+        rows = []
+        for level, file in enumerate(paths):
+            (self.root / file).write_text('func level%d() {}' % level)
+            rows.append(self.index_occurrence(file, 'level%d' % level, 'level%d' % level))
+            if level:
+                rows.append(self.index_occurrence(paths[level - 1], 'level%d' % level, 'level%d' % level,
+                    roles=36, relations=[{'usr': 'level%d' % (level - 1), 'roles': 8192}]))
+        rows.extend([
+            self.index_occurrence(test, 'level0', 'level0', roles=36),
+            self.index_occurrence(paths[2], 'level0', 'level0', roles=36,
+                                  relations=[{'usr': 'level2', 'roles': 8192}])])
+        export = self.class_index(*rows)
+        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export, max_depth=0),
+                         {test, paths[0]})
+        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export, max_depth=2),
+                         {test, *paths[:3]})
+        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export),
+                         {test, *paths[:6]})
+        result = impact.build_map(self.root, [
+            {'class': 'ChecklistCoreTests.CoreTests', 'sources': [], 'skipped': True}
+        ], 'abc', 'now', 0, index_export=export, index_depth=2)
+        unmeasurable = result['coverage_unmeasurable_classes']['ChecklistCoreTests.CoreTests']
+        self.assertEqual(unmeasurable['sources'], sorted({test, *paths[:3]}))
+        self.assertEqual(unmeasurable['max_depth'], 2)
+        with self.assertRaises(ValueError):
+            impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export, max_depth=-1)
+
+    def test_index_call_graph_follows_contained_local_declarations(self):
+        test = 'Tests/ChecklistCoreTests/CoreTests.swift'
+        outer = 'Sources/ChecklistCore/Used.swift'
+        leaf = 'Sources/ChecklistCore/Unused.swift'
+        export = self.class_index(
+            self.index_occurrence(outer, 'outer', 'outer'),
+            self.index_occurrence(outer, 'outer.local', 'local',
+                                  relations=[{'usr': 'outer', 'roles': 512}]),
+            self.index_occurrence(leaf, 'leaf', 'leaf'),
+            self.index_occurrence(test, 'outer', 'outer', roles=36),
+            self.index_occurrence(outer, 'leaf', 'leaf', roles=36,
+                                  relations=[{'usr': 'outer.local', 'roles': 8192}]))
+        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export),
+                         {test, outer, leaf})
+
+    def test_index_references_exclude_external_unsafe_and_undefined_symbols(self):
+        test = 'Tests/ChecklistCoreTests/CoreTests.swift'
+        export = self.class_index(
+            self.index_occurrence('../Sources/Escape.swift', 'escaped', 'escaped'),
+            self.index_occurrence(str(self.root.parent / 'External.swift'), 'external', 'external'),
+            self.index_occurrence('.build/checkouts/dep/Sources/Thing.swift', 'dependency', 'dependency'),
+            self.index_occurrence('Sources/ChecklistCore/Missing.swift', 'missing', 'missing'),
+            *(self.index_occurrence(test, usr, usr, roles=36)
+              for usr in ('escaped', 'external', 'dependency', 'missing', 'no-definition')))
+        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export), {test})
+
+    def test_missing_index_fails_closed_without_lexical_fallback(self):
+        used = 'Sources/ChecklistCore/Used.swift'
+        test = self.root / 'Tests/ChecklistCoreTests/CoreTests.swift'
+        test.write_text('class CoreTests { func testIt() { UsedType() } }')
+        (self.root / used).write_text('struct UsedType {}')
+        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', self.index_export()), set())
+        for export in (None, self.index_export()):
+            with self.subTest(export=export):
+                result = impact.build_map(self.root, [
+                    {'class': 'ChecklistCoreTests.CoreTests', 'sources': [], 'skipped': True,
+                     'unmeasurable_reason': 'Store-copy qualification'}
+                ], 'abc', 'now', 0, index_export=export)
+                self.assertEqual(result['coverage_unmeasurable_classes']['ChecklistCoreTests.CoreTests'], {
+                    'reason': 'Store-copy qualification', 'sources': [], 'source': 'index-store', 'max_depth': 5})
+                self.assertEqual(impact.coverage_gaps(result, ['ChecklistCoreTests.CoreTests'], []),
+                                 ['Missing index-store dependencies: ChecklistCoreTests.CoreTests'])
+        for malformed in ({}, {'schema_version': 99, 'occurrences': []},
+                          {'schema_version': 1, 'occurrences': 'bad'}):
+            with self.subTest(malformed=malformed), self.assertRaises(ValueError):
+                impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', malformed)
 
     def test_skipped_qualification_cannot_certify_a_complete_inventory(self):
+        test = 'Tests/Target/Forbidden.swift'
+        (self.root / test).parent.mkdir(parents=True)
+        (self.root / test).write_text('class Forbidden {}')
+        export = self.index_export(self.index_occurrence(test, 'Target.Forbidden', 'Forbidden', kind=7))
         result = impact.build_map(self.root, [
             {'class': 'Target.Measured', 'sources': []},
             {'class': 'Target.Forbidden', 'sources': [], 'skipped': True,
              'unmeasurable_reason': 'Owner prohibits keychain'},
             {'qualification_case': 'Target.Profile/testPrivate', 'sources': [], 'skipped': True},
-        ], 'abc', 'now', 0)
+        ], 'abc', 'now', 0, index_export=export)
         self.assertEqual(impact.coverage_gaps(result, ['Target.Measured', 'Target.Forbidden'],
                          ['Target.Profile/testPrivate']),
                          ['Unmeasured qualification case: Target.Profile/testPrivate'])
         self.assertEqual(impact.coverage_gaps(result, ['Target.Missing'], []),
                          ['Unmeasured class: Target.Missing'])
+
+    def index_refresh_fixture(self):
+        used = 'Sources/ChecklistCore/Used.swift'
+        test = 'Tests/ChecklistCoreTests/CoreTests.swift'
+        export = self.class_index(
+            self.index_occurrence(used, 'used', 'used'),
+            self.index_occurrence(test, 'used', 'used', roles=36))
+        export['source_hashes'] = {path: hashlib.sha256((self.root / path).read_bytes()).hexdigest()
+                                   for path in (used, test)}
+        result = impact.build_map(self.root, [
+            {'class': 'Target.Measured', 'sources': [used]},
+            {'class': 'ChecklistCoreTests.CoreTests', 'sources': [], 'skipped': True,
+             'unmeasurable_reason': 'Requires owned store'}], 'original-commit', 'original-time', 12,
+             index_export=export)
+        result.update(complete=True, errors=[], coverage_errors=[],
+                      class_inventory=['Target.Measured', 'ChecklistCoreTests.CoreTests'],
+                      qualification_case_inventory=[], test_failures=[{'test': 'original failure'}])
+        result['input_hashes'] = {path.relative_to(self.root).as_posix():
+                                  hashlib.sha256(path.read_bytes()).hexdigest()
+                                  for path in self.root.rglob('*') if path.is_file()}
+        return result, export
+
+    def test_saved_index_requires_matching_hashes_for_every_occurrence_file(self):
+        _, export = self.index_refresh_fixture()
+        impact.validate_index_sources(self.root, export)
+        for hashes in ({}, {'Sources/ChecklistCore/Used.swift': 'stale'}):
+            with self.subTest(hashes=hashes), self.assertRaises(ValueError):
+                impact.validate_index_sources(self.root, dict(export, source_hashes=hashes))
+        missing = dict(export, source_hashes=dict(export['source_hashes']))
+        del missing['source_hashes']['Tests/ChecklistCoreTests/CoreTests.swift']
+        with self.assertRaisesRegex(ValueError, 'occurrence has no source hash'):
+            impact.validate_index_sources(self.root, missing)
+
+    def test_full_generation_rejects_stale_saved_index_before_any_swift_command(self):
+        _, export = self.index_refresh_fixture()
+        export['source_hashes']['Sources/ChecklistCore/Used.swift'] = 'stale'
+        saved = self.root / 'index.json'
+        saved.write_text(json.dumps(export))
+        output = self.root / 'map.json'
+        with patch.object(impact.subprocess, 'check_output', return_value='synthetic-commit'), \
+                patch.object(impact, '_run') as runner:
+            result = impact.main(['--root', str(self.root), '--scratch-path', str(self.root / '.build'),
+                '--index-export', str(saved), '--classes', 'ChecklistCoreTests.CoreTests',
+                '--output', str(output)])
+        self.assertEqual(result, 1)
+        runner.assert_not_called()
+        data = json.loads(output.read_text())
+        self.assertFalse(data['complete'])
+        self.assertEqual(data['errors'], ['index export source inputs differ: Sources/ChecklistCore/Used.swift'])
+        self.assertEqual(data['measured_classes'], [])
+
+    def test_index_only_refresh_keeps_native_evidence_and_replaces_lexical_edges(self):
+        original, export = self.index_refresh_fixture()
+        group = 'ChecklistCoreTests.CoreTests'
+        original['coverage_unmeasurable_classes'][group] = {
+            'reason': 'Requires owned store', 'sources': ['Sources/ChecklistCore/Unused.swift']}
+        refreshed = impact.refresh_index_map(self.root, original, export)
+        self.assertTrue(refreshed['complete'])
+        for field in ('commit', 'generated_at', 'generation_seconds', 'measured_classes',
+                      'measured_qualification_cases', 'test_failures', 'coverage_errors'):
+            self.assertEqual(refreshed[field], original[field], field)
+        self.assertEqual(refreshed['coverage_unmeasurable_classes'][group], {
+            'reason': 'Requires owned store', 'source': 'index-store', 'max_depth': 5,
+            'sources': ['Sources/ChecklistCore/Used.swift', 'Tests/ChecklistCoreTests/CoreTests.swift']})
+        self.assertNotIn('source', original['coverage_unmeasurable_classes'][group],
+                         'refresh must not mutate the input evidence')
+
+    def test_index_only_refresh_refuses_source_test_manifest_drift_or_stale_export(self):
+        original, export = self.index_refresh_fixture()
+        for name in ('Sources/ChecklistCore/Used.swift', 'Tests/ChecklistCoreTests/CoreTests.swift', 'Package.swift'):
+            with self.subTest(path=name):
+                path = self.root / name
+                prior = path.read_bytes() if path.exists() else None
+                path.write_text('changed input')
+                with self.assertRaisesRegex(ValueError, 'source/test/manifest inputs differ'):
+                    impact.refresh_index_map(self.root, original, export)
+                if prior is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(prior)
+        export['source_hashes']['Sources/ChecklistCore/Used.swift'] = 'stale-index'
+        with self.assertRaisesRegex(ValueError, 'index export source inputs differ'):
+            impact.refresh_index_map(self.root, original, export)
+
+    def test_index_only_refresh_cannot_certify_missing_edges_or_incomplete_coverage(self):
+        original, export = self.index_refresh_fixture()
+        original['complete'] = False
+        with self.assertRaisesRegex(ValueError, 'complete coverage map'):
+            impact.refresh_index_map(self.root, original, export)
+        original['complete'] = True
+        refreshed = impact.refresh_index_map(self.root, original, self.index_export())
+        self.assertFalse(refreshed['complete'])
+        self.assertEqual(refreshed['errors'], ['Missing index-store dependencies: ChecklistCoreTests.CoreTests'])
 
     def test_completed_native_methods_include_assertion_failures_and_skips(self):
         log = """Test Case '-[ChecklistCoreTests.CoreTests testPass]' started.
@@ -259,6 +514,77 @@ Process terminated due to signal 6
         self.assertEqual(result['source_hashes'], {})
         self.assertEqual(result['sources']['Sources/ChecklistCore/Deleted.swift'],
                          {'classes': [], 'qualification_cases': []})
+
+
+class IndexStoreBindingTests(unittest.TestCase):
+    def test_string_ref_copies_exact_byte_length_and_preserves_embedded_nuls(self):
+        for raw, length, expected in ((b'caf\xc3\xa9-unowned', 5, 'café'),
+                                      (b'route\x00tail', 6, 'route\x00')):
+            with self.subTest(raw=raw):
+                buffer = ctypes.create_string_buffer(raw)
+                value = index_store.StringRef(ctypes.cast(buffer, ctypes.c_void_p), length)
+                copied = index_store._string(value)
+                self.assertEqual(copied, expected)
+                buffer[0] = b'x'
+                self.assertEqual(copied, expected, 'reader-owned bytes must be copied eagerly')
+        self.assertEqual(index_store._string(index_store.StringRef(None, 0)), '')
+
+    def test_object_callback_exception_reaches_python_caller(self):
+        api = index_store.IndexStore.__new__(index_store.IndexStore)
+        failure = ValueError('invalid semantic occurrence')
+        stopped = []
+
+        def visit(value):
+            self.assertEqual(value, 42)
+            raise failure
+
+        def enumerate_objects(reader, context, callback):
+            self.assertEqual(reader, 17)
+            self.assertIsNone(context)
+            stopped.append(callback(None, 42))
+            return True  # Even a C enumerator ignoring stop cannot hide errors.
+
+        with self.assertRaises(ValueError) as raised:
+            api.apply(enumerate_objects, 17, visit)
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(stopped, [False])
+
+    def test_unit_callback_uses_string_ref_and_forwards_exceptions(self):
+        api = index_store.IndexStore.__new__(index_store.IndexStore)
+        buffer = ctypes.create_string_buffer(b'unit-name-unowned')
+        name = index_store.StringRef(ctypes.cast(buffer, ctypes.c_void_p), 9)
+        visited = []
+
+        def enumerate_units(reader, options, context, callback):
+            self.assertEqual((reader, options, context), (17, 1, None))
+            return callback(None, name)
+
+        api.apply(enumerate_units, 17, lambda value: visited.append(index_store._string(value)), units=True)
+        self.assertEqual(visited, ['unit-name'])
+        failure = ValueError('invalid unit')
+
+        def fail(value):
+            raise failure
+
+        with self.assertRaises(ValueError) as raised:
+            api.apply(enumerate_units, 17, fail, units=True)
+        self.assertIs(raised.exception, failure)
+
+    def test_empty_record_is_explicit_but_partial_record_still_fails(self):
+        api = index_store.IndexStore.__new__(index_store.IndexStore)
+        api.apply(lambda reader, context, callback: False, 17, lambda value: None, allow_empty=True)
+
+        def partial(reader, context, callback):
+            callback(None, 42)
+            return False
+
+        with self.assertRaisesRegex(RuntimeError, 'enumeration did not finish'):
+            api.apply(partial, 17, lambda value: None, allow_empty=True)
+
+    def test_incomplete_c_enumeration_cannot_claim_success(self):
+        api = index_store.IndexStore.__new__(index_store.IndexStore)
+        with self.assertRaisesRegex(RuntimeError, 'enumeration did not finish'):
+            api.apply(lambda reader, context, callback: False, 17, lambda value: None)
 
 
 if __name__ == '__main__':

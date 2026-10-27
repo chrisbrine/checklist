@@ -681,6 +681,7 @@
     "script/build_support.py",
     "script/clean_builds.py",
     "script/clean_scratch.py",
+    "script/index_store.py",
     "script/retire_old_bundles.py",
     "script/test_desktop_alerts.sh",
     "script/test_impact_map.py",
