@@ -324,11 +324,14 @@ typealias MediaValues = [String: Any]
         let project=projectID
         do {
             let query=WorkspacePageQuery(surface:"epics",project:project)
-            let page=try WorkspacePage(await store.request("workspace_page",query.parameters(cursor:nil)),query:query)
+            // CL-302: a retired Epic read is read again; it never shows the CancellationError text.
+            guard case .loaded(let reply)=try await store.retirableRead("workspace_page",query.parameters(cursor:nil),isCurrent:{self.projectID==project}) else {return}
+            let page=try WorkspacePage(reply,query:query)
             guard projectID==project else {return}
             epics=page.rows.filter {!$0.bool("archived")}
             if !reworkEpicID.isEmpty && !epics.contains(where:{$0.id==reworkEpicID}) {reworkEpicID=""}
-        } catch {self.error=PlainError.text(error)}
+        } catch is CancellationError {}
+        catch {self.error=PlainError.text(error)}
     }
     func previewRework() async {
         let round=roundID,selection=reworkSelection.sorted(),epic=reworkEpicID

@@ -14,6 +14,9 @@ struct TaskAssignmentSheet: View {
     @State private var nextWorkers:String?
     @State private var previousWorkers:String?
     @State private var failure = ""
+    @State private var workersRetired = false
+    /// CL-302: shown when every attempt of the worker read was retired by newer reads.
+    static let retiredWorkersText = "The worker list kept changing while it loaded. Retry to see the current workers."
     @State private var loadedDraft = false
     var project: String { task.string("project_id") }
     var currentTask: Record { store.selectedTask(task.id) ?? store.task(task.id) ?? task }
@@ -34,13 +37,17 @@ struct TaskAssignmentSheet: View {
                 Text(failure).checklistFont(.micro).foregroundStyle(.orange)
                 Button("Retry eligibility check") { Task { await loadPolicy() } }
             }
+            if workersRetired && !loading {
+                Text(Self.retiredWorkersText).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                Button("Retry workers") { Task { await loadPolicy() } }
+            }
             Picker("Worker", selection: $selectedSessionID) {
                 Text("Choose an actual worker").tag("")
                 if !selectedSessionID.isEmpty && selectedSession == nil { Text("Previous selection is unavailable · \(String(selectedSessionID.prefix(8)))").tag(selectedSessionID) }
                 ForEach(eligibleSessions) { session in Text("\(session.string("provider").capitalized) · \(session.string("native_conversation_title", fallback: session.string("label", fallback: String(session.id.prefix(8))))) · \(String(session.id.prefix(8)))").tag(session.id) }
             }.checklistDisabled([(loading, "Still loading."), (!failure.isEmpty, "Loading failed. Read the message above.")])
             AccessibleHStack {if let cursor=previousWorkers {Button("Previous workers") {Task {await loadPolicy(cursor:cursor)}}};if let cursor=nextWorkers {Button("More workers") {Task {await loadPolicy(cursor:cursor)}}}}.checklistFont(.micro).checklistDisabled([(loading, "Still loading.")])
-            if !loading && failure.isEmpty && eligibleSessions.isEmpty { Text("No currently enrolled worker is eligible for this ticket. Connect a supported provider session through its normal Checklist integration.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+            if !loading && failure.isEmpty && !workersRetired && eligibleSessions.isEmpty { Text("No currently enrolled worker is eligible for this ticket. Connect a supported provider session through its normal Checklist integration.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             if let session = selectedSession { Text("Provider: \(session.string("provider").capitalized)").checklistFont(.micro); TechnicalDetails([("Session", session.id), ("Policy revision", "\(policyRevision)")]) }
             TextField("Why should this worker handle this ticket?", text: $reason, axis: .vertical).textFieldStyle(.roundedBorder).lineLimit(2...5)
             if contextChanged && !loading {
@@ -52,7 +59,7 @@ struct TaskAssignmentSheet: View {
             AccessibleHStack {
                 Button("Close; keep draft") { saveDraft(); dismiss() }.keyboardShortcut(.cancelAction)
                 Spacer()
-                Button("Assign worker") { assign() }.buttonStyle(.checklistProminent).checklistDisabled([(loading, "Still loading."), (!failure.isEmpty, "Loading failed. Read the message above."), (contextChanged, "The ticket changed. Close and reopen this sheet."), (selectedSession == nil, "Choose a worker first."), (reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write a reason first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline)])
+                Button("Assign worker") { assign() }.buttonStyle(.checklistProminent).checklistDisabled([(loading, "Still loading."), (!failure.isEmpty, "Loading failed. Read the message above."), (workersRetired, "The worker list did not load. Retry workers first."), (contextChanged, "The ticket changed. Close and reopen this sheet."), (selectedSession == nil, "Choose a worker first."), (reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write a reason first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline)])
             }
         }.padding(Spacing.page).checklistSheet(width: 570)
             .onAppear { restoreDraft() }
@@ -79,13 +86,15 @@ struct TaskAssignmentSheet: View {
         store.windowPreferences.set(["session_id": selectedSessionID, "reason": reason, "expected_revision": String(expectedRevision)], forKey: draftKey)
     }
     func loadPolicy(cursor:String? = nil) async {
-        loading = true; failure = ""
+        loading = true; failure = ""; workersRetired = false
         defer { loading = false }
         do {
             let response = try await store.request("policy_get", ["project_id": project, "task_id": task.id])
             let query=WorkspacePageQuery(surface:"worker_sessions",project:project)
-            // CL-288: a retired (superseded) worker read is read again, never shown as an error.
-            guard let reply=try await store.supersedableRead("workspace_page",query.parameters(cursor:cursor)) else { return }
+            // CL-288/CL-302: a retired (superseded) worker read is read again, never shown as an error;
+            // after every attempt is retired the sheet shows a plain retry state, not "no eligible worker".
+            let read=try await store.retirableRead("workspace_page",query.parameters(cursor:cursor))
+            guard case .loaded(let reply)=read else { if case .retired=read { workersRetired = true }; return }
             let workers=try WorkspacePage(reply,query:query)
             availableSessions=workers.rows;nextWorkers=workers.next;previousWorkers=workers.previous
             let policy = Record(values: response["policy"] as? [String: Any] ?? [:])

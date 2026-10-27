@@ -1549,6 +1549,32 @@ final class ChecklistStore: ObservableObject {
         }
         return nil
     }
+    /// CL-302: a view-owned read ends loaded, retired (every attempt was superseded while the view still
+    /// wants it, so the view shows a plain retry state) or not current (the view moved on).
+    enum RetirableRead { case loaded([String: Any]), retired, notCurrent }
+    func retirableRead(_ method: String, _ params: [String: Any], isCurrent: () -> Bool = { true }) async throws -> RetirableRead {
+        if let reply = try await supersedableRead(method, params, isCurrent: isCurrent) { return .loaded(reply) }
+        return !Task.isCancelled && isCurrent() ? .retired : .notCurrent
+    }
+    /// CL-302: the plain text when every attempt of an action's pre-read was retired. No change was sent.
+    static let retiredPreReadText = "Checklist kept receiving newer changes while it checked this ticket. Nothing was changed. Try again; your draft is preserved."
+    /// CL-302: the pre-read of an owner action (answer, claim, completion, group Done). A retired read is
+    /// read again; when every attempt is retired it fails with plain text, never the CancellationError text.
+    /// Real failures still throw their own error.
+    func actionPreRead(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
+        guard let reply = try await supersedableRead(method, params) else { throw ChecklistError("READ_SUPERSEDED", Self.retiredPreReadText) }
+        return reply
+    }
+    /// CL-302: the direction cursor of each ticket for a group Done, read with `actionPreRead`.
+    func groupDirectionCursors(project: String, taskIDs: [String]) async throws -> [String: String] {
+        var cursors: [String: String] = [:]
+        for id in taskIDs {
+            let context = try await actionPreRead("task_context", ["project_id": project, "task_id": id])
+            guard let cursor = context["direction_cursor"] as? String else { throw ChecklistError("DIRECTION_CURSOR_REQUIRED", "Refresh this ticket's context before group completion.") }
+            cursors[id] = cursor
+        }
+        return cursors
+    }
     func request(_ method: String, _ params: [String: Any] = [:], ifCurrent: () -> Bool) async throws -> [String: Any] {
         guard connected || params["command_id"] == nil else { throw ChecklistError("SERVICE_UNAVAILABLE", "Reconnect and refresh before sending changes. Your local draft is preserved.") }
         try Task.checkCancellation()
@@ -1747,7 +1773,8 @@ final class ChecklistStore: ObservableObject {
         busy = true
         Task {
             do {
-                let context = try await request("task_context", ["project_id": params["project_id"] ?? "", "task_id": taskID])
+                // CL-302: a newer read can retire this pre-read; read again, never show CancellationError.
+                let context = try await actionPreRead("task_context", ["project_id": params["project_id"] ?? "", "task_id": taskID])
                 guard let current = context["task"] as? [String: Any], let cursor = context["direction_cursor"] as? String else { throw NSError(domain: "Checklist", code: 1, userInfo: [NSLocalizedDescriptionKey: "Refresh this ticket's context before continuing. Your draft is preserved."]) }
                 if ["work_claim", "task_complete", "work_recover"].contains(method), let expected = params["expected_revision"] as? Int, expected != (current["revision"] as? Int) { throw NSError(domain: "Checklist", code: 1, userInfo: [NSLocalizedDescriptionKey: "This ticket changed. Review its current state before continuing. Your draft is preserved."]) }
                 for key in ["target_manifest_id", "current_manifest_id"] {
@@ -1763,7 +1790,8 @@ final class ChecklistStore: ObservableObject {
                 command["direction_cursor"] = cursor
                 busy = false
                 run(method, command, success: success, completion: completion)
-            } catch { busy = false; self.error = PlainError.text(error) }
+            } catch is CancellationError { busy = false }
+            catch { busy = false; self.error = PlainError.text(error) }
         }
     }
 
@@ -1866,7 +1894,7 @@ final class ChecklistStore: ObservableObject {
             // replaced since the page that offered this command was accepted.
             if checkIdentity {
                 do {
-                    let service = try await request("service_info")
+                    let service = try await actionPreRead("service_info", [:])
                     guard let incarnation = service["store_incarnation"] as? String, !incarnation.isEmpty else {
                         throw ChecklistError("INVALID_RESPONSE", "Checklist could not identify the store. Reconnect before checking the last change.")
                     }

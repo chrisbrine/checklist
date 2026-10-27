@@ -91,14 +91,12 @@ struct InlineTriageRow: View {
                 }
                 var observed = PendingTriageStatus(name: status.string("name"), statusID: status.id, groupRevision: group.integer("revision"), memberRevisions: Dictionary(uniqueKeysWithValues: members.map { ($0.id, $0.integer("revision")) }))
                 if status.string("category") == "done" {
-                    for task in members {
-                        let context = try await store.request("task_context",["project_id":group.string("project_id"),"task_id":task.id])
-                        guard let cursor = context["direction_cursor"] as? String else { throw ChecklistError("DIRECTION_CURSOR_REQUIRED", "Refresh this ticket's context before group completion.") }
-                        observed.directionCursors[task.id] = cursor
-                    }
+                    // CL-302: a retired pre-read is read again, never shown as CancellationError.
+                    observed.directionCursors = try await store.groupDirectionCursors(project: group.string("project_id"), taskIDs: members.map(\.id))
                 }
                 pendingStatus = observed
-            } catch { store.error = PlainError.text(error) }
+            } catch is CancellationError {}
+            catch { store.error = PlainError.text(error) }
         }
     }
     private func applyStatus(_ pending: PendingTriageStatus) {

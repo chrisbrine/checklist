@@ -207,7 +207,7 @@ struct TicketBulkEditSheet: View {
             if isUndo {
                 var current: [Record] = []
                 for row in draft.tickets {
-                    let reply = try await store.request("task_context", ["task_id": row.id, "project_id": project, "detail_level": "ui"])
+                    let reply = try await store.actionPreRead("task_context", ["task_id": row.id, "project_id": project, "detail_level": "ui"])
                     try Task.checkCancellation()
                     let display = try SelectedTicketDisplay(response: reply)
                     guard RecordIdentity(display.task.id) == RecordIdentity(row.id), RecordIdentity(display.project.id) == RecordIdentity(project) else { throw TicketPageError.invalid("undo.scope") }
@@ -243,7 +243,7 @@ struct TicketBulkEditSheet: View {
                 options = groups.map(Record.init).filter { $0.string("kind") == "triage" && !$0.bool("archived") && RecordIdentity($0.string("project_id")) == RecordIdentity(project) }
             } else {
                 let query = WorkspacePageQuery(surface: draft.kind == "epic" ? "epics" : "worker_sessions", project: project)
-                let reply = try await store.request("workspace_page", query.parameters(cursor: cursor))
+                let reply = try await store.actionPreRead("workspace_page", query.parameters(cursor: cursor))
                 try Task.checkCancellation()
                 let page = try WorkspacePage(reply, query: query)
                 options = page.rows; previous = page.previous; next = page.next

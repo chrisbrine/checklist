@@ -12,6 +12,9 @@ struct RelatedTicketsView: View {
     @State private var candidateCount = 0
     @State private var candidateLoading = false
     @State private var candidateError: String?
+    @State private var candidateRetired = false
+    /// CL-302: shown when every attempt of the ticket search was retired by newer reads.
+    static let retiredSearchText = "The ticket search kept changing while it loaded. Retry to see matching tickets."
 
     private var links: [Record] {
         store.detailRecords("relations",task:task).filter {
@@ -87,6 +90,10 @@ struct RelatedTicketsView: View {
             TextField("Search project ticket title, brief or key",text:$candidateSearch).textFieldStyle(.roundedBorder)
             if candidateLoading {ProgressView("Finding tickets…")}
             if let candidateError {Text(candidateError).checklistFont(.micro).foregroundStyle(.orange)}
+            if candidateRetired && !candidateLoading {
+                Text(Self.retiredSearchText).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                Button("Retry ticket search") {Task {await loadCandidates(candidateSearch)}}
+            }
             Text("Showing \(candidateRows.count) of \(candidateCount) matching project tickets. Refine the search to find another ticket.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             Picker("Relation", selection: $relation) {
                 Text("Depends on").tag("depends_on")
@@ -113,15 +120,20 @@ struct RelatedTicketsView: View {
     }
 
     @MainActor private func loadCandidates(_ text: String) async {
-        candidateLoading = true;candidateError = nil
+        candidateLoading = true;candidateError = nil;candidateRetired = false
         func current() -> Bool { adding && candidateSearch == text }
         do {
             // CL-288: a retired (superseded) search is read again, never shown as an error.
-            guard let open = try await store.supersedableRead("task_list",["project_id":task.string("project_id"),"text":text,"archived":false,"limit":100],isCurrent:current),
-                  let archived = try await store.supersedableRead("task_list",["project_id":task.string("project_id"),"text":text,"archived":true,"limit":100],isCurrent:current) else {
-                if !Task.isCancelled,current() {candidateLoading = false}
-                return
+            // CL-302: after every attempt is retired, show a plain retry state instead of an empty result.
+            func retired(_ read: ChecklistStore.RetirableRead) {
+                guard !Task.isCancelled,current() else {return}
+                candidateLoading = false
+                if case .retired = read {candidateRetired = true;candidateRows = [];candidateCount = 0}
             }
+            let openRead = try await store.retirableRead("task_list",["project_id":task.string("project_id"),"text":text,"archived":false,"limit":100],isCurrent:current)
+            guard case .loaded(let open) = openRead else {retired(openRead);return}
+            let archivedRead = try await store.retirableRead("task_list",["project_id":task.string("project_id"),"text":text,"archived":true,"limit":100],isCurrent:current)
+            guard case .loaded(let archived) = archivedRead else {retired(archivedRead);return}
             guard !Task.isCancelled,current() else {return}
             let all = ((open["tasks"] as? [[String:Any]]) ?? []) + ((archived["tasks"] as? [[String:Any]]) ?? [])
             candidateRows = all.map(Record.init).filter {RecordIdentity($0.id) != RecordIdentity(task.id)}.sorted {$0.string("key").localizedStandardCompare($1.string("key")) == .orderedAscending}

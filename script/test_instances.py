@@ -241,15 +241,45 @@ def require_instance_support(manifest):
         raise ValueError('Stage predates bundle-derived test identity; rebuild before creating a slot.')
 
 
+SCHEMA_SOURCE = 'Sources/ChecklistCore/SchemaMigrations.swift'
+
+
+def storage_schema(path):
+    """The current store schema of one source tree: SchemaMigrations.currentSchema.
+
+    Stages built before that constant (schema 3) name their schema only as the
+    highest migration target; when both exist they must agree.
+    """
+    text = Path(path).read_text()
+    constant = re.findall(r'^\s*static let currentSchema = (\d+)\s*$', text, re.M)
+    targets = [int(value) for value in re.findall(r'PRAGMA user_version=(\d+)', text)]
+    if len(constant) > 1 or not targets or (constant and int(constant[0]) != max(targets)):
+        raise ValueError('Cannot read one current store schema from ' + str(path) + '.')
+    return int(constant[0]) if constant else max(targets)
+
+
 def require_managed_path_support(capture, manifest):
-    """Relaxed seeds may run only with the verified schema-3 implementation."""
-    required = {'Sources/ChecklistCore/ManagedPaths.swift', 'Sources/ChecklistCore/SchemaMigrations.swift'}
+    """Relaxed seeds run only with a verified stage that has the schema-3 managed-path migration.
+
+    Returns that stage's current store schema, read from the verified captured source.
+    """
+    required = {'Sources/ChecklistCore/ManagedPaths.swift', SCHEMA_SOURCE}
     inputs = {entry['path']: entry for entry in manifest.get('inputs', [])}
     if not required <= inputs.keys():
         raise ValueError('Stage predates the instance-local managed-path contract; rebuild before seeding a slot.')
-    migration = Path(capture) / 'source/Sources/ChecklistCore/SchemaMigrations.swift'
-    if sha(migration) != inputs['Sources/ChecklistCore/SchemaMigrations.swift']['sha256'] or 'managedPathsLedger' not in migration.read_text():
+    migration = Path(capture) / 'source' / SCHEMA_SOURCE
+    if sha(migration) != inputs[SCHEMA_SOURCE]['sha256'] or 'managedPathsLedger' not in migration.read_text() or storage_schema(migration) < 3:
         raise ValueError('Stage has no verified schema-3 managed-path migration; rebuild before seeding a slot.')
+    return storage_schema(migration)
+
+
+def supported_schema(schema, current_schema, kind):
+    # A seed may be older (the stage migrates it at first start) but never newer than the stage.
+    if type(schema) is not int or schema < 0:
+        raise ValueError('Unsupported ' + kind + ' schema.')
+    if schema > current_schema:
+        raise ValueError(f'{kind.capitalize()} schema {schema} is newer than the staged build supports (schema {current_schema}); '
+                         'stage a build that supports it.')
 
 
 def stage_selection(arguments):
@@ -686,7 +716,9 @@ def snapshot_objects(manifest):
     return result
 
 
-def snapshot_seed(source, destination, destination_root=None):
+def snapshot_seed(source, destination, destination_root=None, current_schema=None):
+    """current_schema is the staged build's (create passes it); the default reads this source tree."""
+    if current_schema is None: current_schema = storage_schema(REPO / SCHEMA_SOURCE)
     source = source.expanduser().absolute()
     # Live access is confined to published backups, never its open database or connections.
     for live in {LIVE, DEFAULT_LIVE}:
@@ -697,8 +729,9 @@ def snapshot_seed(source, destination, destination_root=None):
     contained(manifest_file, source)
     raw = manifest_file.read_bytes()
     manifest = json.loads(raw)
-    if manifest['format'] not in [1, 2] or manifest['kind'] != 'checklist-store-snapshot' or manifest['schema'] not in [0, 1, 2, 3]:
+    if manifest['format'] not in [1, 2] or manifest['kind'] != 'checklist-store-snapshot':
         raise ValueError('Unsupported snapshot format/schema.')
+    supported_schema(manifest['schema'], current_schema, 'snapshot')
     uuid.UUID(manifest['storeID']); uuid.UUID(manifest['operationID'])
     contained(source / 'intent.json', source)
     intent = json.loads((source / 'intent.json').read_text())
@@ -801,7 +834,7 @@ def snapshot_seed(source, destination, destination_root=None):
     return {'kind': 'backup', 'source': str(source), 'source_hash': hashlib.sha256(raw).hexdigest(),
             'age_seconds_at_create': age, 'source_root': manifest['sourceRoot'], 'before_start': observation,
             'live_snapshot': live_snapshot, 'path_inspection': inspection, 'source_summary_paths': source_summary_paths,
-            'current_schema_no_migration': observation['schema'] == 3}
+            'current_schema_no_migration': observation['schema'] == current_schema}
 
 
 def restored_inventory(root):
@@ -850,7 +883,7 @@ def restored_inventory(root):
     return sorted(inventory)
 
 
-def restored_source_manifest(source, receipt):
+def restored_source_manifest(source, receipt, schema):
     """Recover origin only from the exact manifest verified by the product restore.
 
     Format-1 restore receipts do not embed sourceRoot. Search only published
@@ -870,7 +903,7 @@ def restored_source_manifest(source, receipt):
                 manifest = json.loads(raw)
                 origin = manifest.get('sourceRoot')
                 if (manifest.get('format') not in [1, 2] or manifest.get('kind') != 'checklist-store-snapshot'
-                        or manifest.get('schema') != 3 or manifest.get('storeID') != receipt['source_store_id']
+                        or manifest.get('schema') != schema or manifest.get('storeID') != receipt['source_store_id']
                         or not isinstance(origin, str) or not origin.startswith('/') or '\0' in origin
                         or any(part in ['', '.', '..'] for part in origin.split('/')[1:])):
                     raise ValueError('Restored source manifest does not match its validation receipt.')
@@ -878,7 +911,9 @@ def restored_source_manifest(source, receipt):
     return None, str(source)  # Preserve strict admission for self-contained legacy candidates.
 
 
-def restored_seed(source, destination, destination_root=None):
+def restored_seed(source, destination, destination_root=None, current_schema=None):
+    """current_schema is the staged build's (create passes it); the default reads this source tree."""
+    if current_schema is None: current_schema = storage_schema(REPO / SCHEMA_SOURCE)
     source = source.expanduser().absolute()
     contained(source, source)
     # Candidate bytes must be disposable; origin proof may read published backup manifests.
@@ -909,9 +944,12 @@ def restored_seed(source, destination, destination_root=None):
     observation = database_observation(database)
     identity_file = contained(source / 'checklist-store.identity.json', source)
     identity = json.loads(identity_file.read_bytes())
-    if (not isinstance(identity, dict) or observation['schema'] != 3 or observation['quick_check'] != 'ok' or observation['identity'] != identity
+    # Product restores publish only the restoring build's schema; restore receipts and
+    # instance-local managed paths exist from schema 3, so older candidates never occur.
+    supported_schema(observation['schema'], current_schema, 'restored database')
+    if (not isinstance(identity, dict) or observation['schema'] < 3 or observation['quick_check'] != 'ok' or observation['identity'] != identity
             or identity.get('format_version') != 1 or identity.get('state') != 'ready'
-            or identity.get('schema_revision') != 3 or identity.get('database_generation') != 1
+            or identity.get('schema_revision') != observation['schema'] or identity.get('database_generation') != 1
             or identity.get('logical_store_id') != receipt['source_store_id'] or identity.get('incarnation') != receipt['incarnation']):
         raise ValueError('Restored database/identity does not match its validation receipt.')
     with closing(sqlite3.connect(database.as_uri() + '?mode=ro&immutable=1', uri=True)) as connection:
@@ -920,7 +958,7 @@ def restored_seed(source, destination, destination_root=None):
     if (values.get('incarnation') != receipt['incarnation']
             or json.loads(values.get('restore_receipt', '{}')) != {k: v for k, v in receipt.items() if k != 'database_sha256'}):
         raise ValueError('Restored database has no matching authority-fencing receipt.')
-    source_manifest, source_root = restored_source_manifest(source, receipt)
+    source_manifest, source_root = restored_source_manifest(source, receipt, observation['schema'])
     # Display-only summaries get the backup: seed's exception only from a live-origin snapshot.
     live_snapshot = source_manifest is not None and is_live_snapshot(source_manifest.parent, source_root)
     summary_source_root = source_root if live_snapshot else None
@@ -939,7 +977,8 @@ def restored_seed(source, destination, destination_root=None):
             'database_sha256': receipt['database_sha256'], 'receipt_sha256': hashlib.sha256(receipt_bytes).hexdigest(),
             'source_hash': hashlib.sha256(json.dumps(before).encode()).hexdigest(),
             'age_seconds_at_create': max(0, time.time() - receipt_file.stat().st_mtime),
-            'before_start': observation, 'path_inspection': inspection, 'current_schema_no_migration': True}
+            'before_start': observation, 'path_inspection': inspection,
+            'current_schema_no_migration': observation['schema'] == current_schema}
 
 
 def slot_seed(other, destination, destination_root=None):
@@ -1020,12 +1059,12 @@ def create(arguments, p):
     with ExitStack() as preparation:
         prepared = None
         if arguments.seed.startswith('restored:'):
-            require_managed_path_support(capture, manifest)
+            current_schema = require_managed_path_support(capture, manifest)
             # Keep the verified copy outside the replaced folder. Its source may
             # be that slot's own restore/ candidate; replacement must happen last.
             temporary = preparation.enter_context(tempfile.TemporaryDirectory(prefix='.restored-seed-', dir=BASE))
             prepared = Path(temporary) / 'data'; prepared.mkdir(mode=0o700)
-            restored = restored_seed(Path(arguments.seed[9:]), prepared, p['data'])
+            restored = restored_seed(Path(arguments.seed[9:]), prepared, p['data'], current_schema)
         if p['folder'].exists(): destroy(p)
         p['folder'].mkdir(mode=0o700)
         mark_qualification(p['folder'], manifest['source_fingerprint'],
@@ -1037,14 +1076,14 @@ def create(arguments, p):
         if prepared is not None: prepared.rename(pending)
         else: pending.mkdir(mode=0o700)
         try:
-            if arguments.seed != 'empty': require_managed_path_support(capture, manifest)
+            if arguments.seed != 'empty': current_schema = require_managed_path_support(capture, manifest)
             seed = {'kind': 'empty', 'source_hash': None, 'age_seconds_at_create': 0}
             if prepared is not None:
                 seed = restored
             elif arguments.seed == 'latest-backup':
-                seed = snapshot_seed(latest_backup(), pending, p['data'])
+                seed = snapshot_seed(latest_backup(), pending, p['data'], current_schema)
             elif arguments.seed.startswith('backup:'):
-                seed = snapshot_seed(Path(arguments.seed[7:]), pending, p['data'])
+                seed = snapshot_seed(Path(arguments.seed[7:]), pending, p['data'], current_schema)
             elif arguments.seed.startswith('slot:'):
                 seed = slot_seed(checked(slot_number(arguments.seed[5:])), pending, p['data'])
             elif arguments.seed != 'empty': raise ValueError('Seed must be empty, latest-backup, backup:PATH, restored:PATH or slot:M.')

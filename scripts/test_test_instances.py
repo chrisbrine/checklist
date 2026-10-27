@@ -197,6 +197,29 @@ class AdditionalGuardsTests(unittest.TestCase):
         with self.assertRaises(ValueError): harness.require_instance_support({'inputs': []})
         harness.require_instance_support({'inputs': [{'path': 'Sources/ChecklistIPC/ChecklistInstance.swift'}]})
 
+    def test_stage_schema_comes_from_the_verified_captured_migrations(self):
+        with test_directory() as directory:
+            capture = Path(directory).resolve()
+            migration = capture / 'source' / harness.SCHEMA_SOURCE
+            paths = capture / 'source/Sources/ChecklistCore/ManagedPaths.swift'
+            migration.parent.mkdir(parents=True);paths.write_text('managed paths')
+            def stage(text):
+                migration.write_text(text)
+                return {'inputs': [{'path': harness.SCHEMA_SOURCE, 'sha256': harness.sha(migration)},
+                                   {'path': 'Sources/ChecklistCore/ManagedPaths.swift', 'sha256': harness.sha(paths)}]}
+            schema_four = ('static var managedPathsLedger: JSON\n    static let currentSchema = 4\n'
+                           '"PRAGMA user_version=1"\n"PRAGMA user_version=4"\n"PRAGMA user_version=3"\n')
+            self.assertEqual(harness.require_managed_path_support(capture, stage(schema_four)), 4)
+            # A schema-3 stage predates the constant; its highest migration target names it.
+            self.assertEqual(harness.require_managed_path_support(capture, stage('managedPathsLedger "PRAGMA user_version=2" "PRAGMA user_version=3"')), 3)
+            for text in ['managedPathsLedger "PRAGMA user_version=2"', '"PRAGMA user_version=3"',
+                         'managedPathsLedger\n    static let currentSchema = 5\n"PRAGMA user_version=4"']:
+                with self.subTest(text=text), self.assertRaises(ValueError):
+                    harness.require_managed_path_support(capture, stage(text))
+            manifest = stage(schema_four);migration.write_text(schema_four + '// changed')
+            with self.assertRaisesRegex(ValueError, 'no verified schema-3'):
+                harness.require_managed_path_support(capture, manifest)
+
     def test_dry_run_never_acquires_a_lock(self):
         with patch.object(sys, 'argv', ['test_instances.py', 'promote', '--slot', '1', '--dry-run']), \
              patch.object(harness, 'promote') as promote, patch.object(harness, 'locked') as locked:
@@ -629,7 +652,7 @@ class SnapshotLogicTests(unittest.TestCase):
             (source / 'manifest.json').write_text(json.dumps(manifest))
             intent = json.loads((source / 'intent.json').read_text()); intent['format'] = '2'
             (source / 'intent.json').write_text(json.dumps(intent))
-            seed = harness.snapshot_seed(source, destination)
+            seed = harness.snapshot_seed(source, destination, current_schema=3)
             self.assertTrue(seed['current_schema_no_migration'])
             self.assertEqual((destination / 'objects/file').read_bytes(), b'managed')
             for field, value in [('strings', [[1, 'bad']]), ('contents', [[2, 7], [2, 7]]),
@@ -646,7 +669,7 @@ class SnapshotLogicTests(unittest.TestCase):
             observation = harness.database_observation(source / 'database.sqlite')
             manifest.update(recordFamilies={'project': 0, 'task': 0}, tableRows=observation['table_rows'])
             (source / 'manifest.json').write_text(json.dumps(manifest))
-            seed = harness.snapshot_seed(source, destination)
+            seed = harness.snapshot_seed(source, destination, current_schema=3)
             self.assertTrue(seed['current_schema_no_migration'])
             self.assertEqual(harness.sha(destination / 'checklist.sqlite'), manifest['databaseSHA256'])
             self.assertEqual(harness.database_observation(destination / 'checklist.sqlite')['schema'], 3)
@@ -670,6 +693,48 @@ class SnapshotLogicTests(unittest.TestCase):
                 with self.assertRaises(ValueError): harness.snapshot_seed(source, destination)
                 self.assertEqual(list(destination.iterdir()), [])
 
+    def test_schema_four_backup_on_schema_four_stage_needs_no_migration(self):
+        with test_directory() as directory:
+            source, destination, manifest = self.fixture(Path(directory).resolve(), schema=4, records=[('attachment', attachment('objects/file'))])
+            observation = harness.database_observation(source / 'database.sqlite')
+            manifest.update(recordFamilies={'attachment': 1, 'task': 0}, tableRows=observation['table_rows'])
+            (source / 'manifest.json').write_text(json.dumps(manifest))
+            seed = harness.snapshot_seed(source, destination, current_schema=4)
+            self.assertTrue(seed['current_schema_no_migration'])
+            self.assertEqual(seed['before_start']['schema'], 4)
+            self.assertEqual(seed['path_inspection']['managed_relative'], 1)
+            self.assertEqual(harness.sha(destination / 'checklist.sqlite'), manifest['databaseSHA256'])
+            self.assertEqual(json.loads((destination / 'checklist-store.identity.json').read_text())['schema_revision'], 4)
+
+    def test_older_schemas_on_schema_four_stage_are_migrations(self):
+        for schema in [0, 2, 3]:
+            with self.subTest(schema=schema), test_directory() as directory:
+                source, destination, manifest = self.fixture(Path(directory).resolve(), schema=schema)
+                seed = harness.snapshot_seed(source, destination, current_schema=4)
+                self.assertFalse(seed['current_schema_no_migration'])
+                self.assertEqual(harness.sha(destination / 'checklist.sqlite'), manifest['databaseSHA256'])
+
+    def test_schema_newer_than_stage_refuses_before_seed_bytes(self):
+        with test_directory() as directory:
+            source, destination, _ = self.fixture(Path(directory).resolve(), schema=5)
+            with self.assertRaisesRegex(ValueError, r'Snapshot schema 5 is newer than the staged build supports \(schema 4\)'):
+                harness.snapshot_seed(source, destination, current_schema=4)
+            self.assertEqual(list(destination.iterdir()), [])
+        for value in [-1, '3', None]:
+            with self.subTest(value=value), test_directory() as directory:
+                source, destination, manifest = self.fixture(Path(directory).resolve(), schema=3)
+                manifest['schema'] = value
+                (source / 'manifest.json').write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(ValueError, 'Unsupported snapshot schema'):
+                    harness.snapshot_seed(source, destination, current_schema=4)
+
+    def test_default_current_schema_is_the_source_tree_constant(self):
+        current = harness.storage_schema(harness.REPO / harness.SCHEMA_SOURCE)
+        self.assertGreaterEqual(current, 4)
+        with test_directory() as directory:
+            source, destination, _ = self.fixture(Path(directory).resolve(), schema=current)
+            self.assertTrue(harness.snapshot_seed(source, destination)['current_schema_no_migration'])
+
     def test_current_identity_comes_from_copied_database(self):
         with test_directory() as directory:
             source, destination, manifest = self.fixture(Path(directory).resolve(), schema=2)
@@ -686,13 +751,13 @@ class RestoredSeedTests(unittest.TestCase):
             patched = patch.object(harness, name, Path(directory.name).resolve() / name)
             patched.start();self.addCleanup(patched.stop)
 
-    def fixture(self, base):
+    def fixture(self, base, schema=3):
         source = base / 'restore' / ('restored-' + 'a' * 32); source.mkdir(parents=True)
         records = [('session', {'id': 'session', 'state': 'revoked', 'authorization_generation': 'new-generation', 'restore_quarantined': True}),
                    ('task', {'id': 'task', 'active_attempt_id': 'attempt', 'recovery_required': True}),
                    ('attempt', {'id': 'attempt', 'state': 'active', 'recovery_required': True}),
                    ('delivery', {'id': 'delivery', 'state': 'quarantined', 'push_state': 'quarantined', 'restore_prior_state': 'queued'})]
-        identity = store_fixture(source / 'checklist.sqlite', 3, records)
+        identity = store_fixture(source / 'checklist.sqlite', schema, records)
         receipt = {'format': 1, 'state': 'complete', 'command_id': '10000000-0000-4000-8000-000000000001',
                    'principal': 'owner:fixture', 'intent_digest': 'b' * 64, 'manifest_sha256': 'c' * 64,
                    'source_store_id': identity['logical_store_id'], 'incarnation': identity['incarnation'],
@@ -707,13 +772,13 @@ class RestoredSeedTests(unittest.TestCase):
         destination = base / 'copy';destination.mkdir()
         return source, destination, receipt
 
-    def origin_fixture(self, base, snapshot_format=2, records=(), summaries=()):
-        source, destination, receipt = self.fixture(base)
+    def origin_fixture(self, base, snapshot_format=2, records=(), summaries=(), schema=3):
+        source, destination, receipt = self.fixture(base, schema)
         destination.rmdir();destination = base / 'slots/slot-4/data';destination.mkdir(parents=True)
         origin = base / 'Checklist'
         manifest_file = origin / 'backups/snapshot-fixture/manifest.json'
         manifest_file.parent.mkdir(parents=True)
-        manifest = {'format': snapshot_format, 'kind': 'checklist-store-snapshot', 'schema': 3,
+        manifest = {'format': snapshot_format, 'kind': 'checklist-store-snapshot', 'schema': schema,
                     'storeID': receipt['source_store_id'], 'sourceRoot': str(origin)}
         manifest_file.write_text(json.dumps(manifest))
         receipt['manifest_sha256'] = harness.sha(manifest_file)
@@ -870,7 +935,7 @@ class RestoredSeedTests(unittest.TestCase):
                 harness.save(p, {'slot': 4, 'stage_path': str(base / 'stage'), 'mode': 'stopped', 'seed': seed})
                 manifest.unlink()
                 before = harness.sha(destination / 'checklist.sqlite')
-                with patch.object(harness, 'bundle_check', return_value={}), patch.object(harness, 'require_managed_path_support'), \
+                with patch.object(harness, 'bundle_check', return_value={}), patch.object(harness, 'require_managed_path_support', return_value=4), \
                      patch.object(harness, 'launch_state', return_value={'registered': True}), \
                      patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}), \
                      patch.object(harness, 'service_status') as health, patch.object(harness, 'run') as run:
@@ -888,7 +953,7 @@ class RestoredSeedTests(unittest.TestCase):
         with test_directory() as directory:
             source, destination, receipt = self.fixture(Path(directory).resolve())
             original = harness.restored_inventory(source)
-            seed = harness.restored_seed(source, destination)
+            seed = harness.restored_seed(source, destination, current_schema=3)
             self.assertEqual(harness.restored_inventory(destination), original)
             self.assertEqual(harness.restored_inventory(source), original)
             self.assertEqual(seed['kind'], 'restored')
@@ -904,6 +969,39 @@ class RestoredSeedTests(unittest.TestCase):
             self.assertTrue(values['attempt']['recovery_required'])
             self.assertTrue(values['task']['recovery_required'])
             self.assertEqual(values['delivery']['state'], 'quarantined')
+
+    def test_schema_four_restored_seed_on_schema_four_stage(self):
+        with test_directory() as directory:
+            base = Path(directory).resolve()
+            source, destination, receipt, origin, manifest_file = self.origin_fixture(base, schema=4)
+            original = harness.restored_inventory(source)
+            with patch.object(harness, 'LIVE', origin):
+                seed = harness.restored_seed(source, destination, current_schema=4)
+            self.assertTrue(seed['current_schema_no_migration'])
+            self.assertEqual(seed['before_start']['schema'], 4)
+            self.assertEqual(seed['source_manifest'], str(manifest_file))
+            self.assertEqual(harness.restored_inventory(destination), original)
+            self.assertEqual(json.loads((destination / 'checklist-store.identity.json').read_text())['schema_revision'], 4)
+
+    def test_restored_schema_three_on_schema_four_stage_is_a_migration(self):
+        with test_directory() as directory:
+            source, destination, _ = self.fixture(Path(directory).resolve(), 3)
+            self.assertFalse(harness.restored_seed(source, destination, current_schema=4)['current_schema_no_migration'])
+
+    def test_restored_schema_newer_than_stage_or_mismatched_manifest_refuses(self):
+        with test_directory() as directory:
+            source, destination, _ = self.fixture(Path(directory).resolve(), 5)
+            with self.assertRaisesRegex(ValueError, r'Restored database schema 5 is newer than the staged build supports \(schema 4\)'):
+                harness.restored_seed(source, destination, current_schema=4)
+            self.assertEqual(list(destination.iterdir()), [])
+        with test_directory() as directory:
+            # The origin manifest must name the restored database's schema.
+            source, destination, receipt, origin, manifest_file = self.origin_fixture(Path(directory).resolve(), schema=4)
+            manifest = json.loads(manifest_file.read_text());manifest['schema'] = 3
+            manifest_file.write_text(json.dumps(manifest));receipt['manifest_sha256'] = harness.sha(manifest_file)
+            self.update_restored_fixture(source, receipt)
+            with patch.object(harness, 'LIVE', origin), self.assertRaisesRegex(ValueError, 'source manifest does not match'):
+                harness.restored_seed(source, destination, current_schema=4)
 
     def test_unvalidated_and_non_restore_folders_refuse(self):
         for fault in ['no_receipt', 'incomplete', 'non_restore', 'staging', 'identity', 'database', 'db_receipt']:
@@ -968,7 +1066,7 @@ class RestoredSeedTests(unittest.TestCase):
             harness.shutil.copytree(destination, p['data'], dirs_exist_ok=True)
             harness.save(p, {'slot': 4, 'stage_path': str(base / 'stage'), 'mode': 'stopped', 'seed': seed})
             before = harness.sha(p['data'] / 'checklist.sqlite')
-            with patch.object(harness, 'bundle_check', return_value={}) as bundle, patch.object(harness, 'require_managed_path_support') as stage, patch.object(harness, 'launch_state', return_value={'registered': False}), patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}), patch.object(harness, 'service_status') as health, patch.object(harness, 'run') as run:
+            with patch.object(harness, 'bundle_check', return_value={}) as bundle, patch.object(harness, 'require_managed_path_support', return_value=4) as stage, patch.object(harness, 'launch_state', return_value={'registered': False}), patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}), patch.object(harness, 'service_status') as health, patch.object(harness, 'run') as run:
                 harness.start(SimpleNamespace(slot=4, gui=False), p)
             bundle.assert_called_once();stage.assert_called_once();health.assert_called_once()
             self.assertEqual(run.call_args.args[0][:2], ['launchctl', 'bootstrap'])
@@ -1017,7 +1115,7 @@ class RestoredSeedTests(unittest.TestCase):
             args = SimpleNamespace(slot=4, seed='restored:' + str(source), replace=True, session_id='fixture-session')
             # Marking is covered by the clean_scratch tests; a TMPDIR inside a session
             # scratchpad must not decide this copy-before-destroy case (CL-276 review).
-            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(stage, selected)), patch.object(harness, 'require_managed_path_support'), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'signing_teams'), patch.object(harness, 'destroy', side_effect=destroy), patch.object(harness, 'run', side_effect=run), patch.object(harness, 'mark_qualification'):
+            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(stage, selected)), patch.object(harness, 'require_managed_path_support', return_value=4), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'signing_teams'), patch.object(harness, 'destroy', side_effect=destroy), patch.object(harness, 'run', side_effect=run), patch.object(harness, 'mark_qualification'):
                 harness.create(args, p)
             seed = harness.load(p)['seed']
             self.assertEqual(seed['kind'], 'restored')
@@ -1032,7 +1130,7 @@ class RestoredSeedTests(unittest.TestCase):
             harness.save(p, {'slot': 4, 'build_id': 'old'})
             selected = {'source_fingerprint': 'b' * 64}
             args = SimpleNamespace(slot=4, seed='restored:' + str(base / 'not-restored'), replace=True, session_id='fixture-session')
-            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(base, selected)), patch.object(harness, 'require_managed_path_support'), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'destroy') as destroy, patch.object(harness, 'run') as run:
+            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(base, selected)), patch.object(harness, 'require_managed_path_support', return_value=4), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'destroy') as destroy, patch.object(harness, 'run') as run:
                 with self.assertRaises(ValueError): harness.create(args, p)
                 destroy.assert_not_called();run.assert_not_called()
             self.assertEqual(harness.load(p)['build_id'], 'old')
@@ -1323,11 +1421,13 @@ class SeedIsolationTests(unittest.TestCase):
             def run(command):
                 if command[0] == 'ditto': harness.shutil.copytree(command[1], command[2])
                 return subprocess.CompletedProcess(command, 0, '', '')
-            with patch.dict(os.environ, {'CODEX_THREAD_ID': 'slot-fixture', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(sys, 'argv', ['test_instances.py', 'create', '--slot', '4', '--stage', str(stage), '--seed', 'backup:' + str(source)]), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(stage, selected)), patch.object(harness, 'require_managed_path_support'), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'signing_teams'), patch.object(harness, 'run', side_effect=run):
+            with patch.dict(os.environ, {'CODEX_THREAD_ID': 'slot-fixture', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(sys, 'argv', ['test_instances.py', 'create', '--slot', '4', '--stage', str(stage), '--seed', 'backup:' + str(source)]), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(stage, selected)), patch.object(harness, 'require_managed_path_support', return_value=4), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'signing_teams'), patch.object(harness, 'run', side_effect=run):
                 harness.main()
             p = harness.checked(4);created = harness.load(p)
             self.assertEqual(created['mode'], 'stopped')
             self.assertEqual(created['seed']['kind'], 'backup')
+            # The stage's schema (4) reaches the seed: this schema-3 backup migrates at first start.
+            self.assertFalse(created['seed']['current_schema_no_migration'])
             self.assertEqual(created['seed']['path_inspection']['inert_history_path_occurrences'], 8)
             self.assertEqual(created['seed']['path_inspection']['inert_metadata_path_occurrences'], 1)
             self.assertTrue(p['bundle'].is_dir())
@@ -1709,7 +1809,7 @@ class SeedIsolationTests(unittest.TestCase):
             p = harness.checked(1)
             manifest = {'build_id': 'fixture', 'source_fingerprint': 'b' * 64}
             args = SimpleNamespace(slot=1, replace=False, seed='backup:' + str(source), session_id='slot-fixture')
-            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(base, manifest)), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'require_managed_path_support'), patch.object(harness, 'run') as run:
+            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(base, manifest)), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'require_managed_path_support', return_value=4), patch.object(harness, 'run') as run:
                 with self.assertRaisesRegex(ValueError, 'managed.path contract'): harness.create(args, p)
                 marker = json.loads((p['folder'] / '.checklist-workspace.json').read_text())
                 self.assertFalse(marker['released'])
@@ -1829,7 +1929,7 @@ class SeedIsolationTests(unittest.TestCase):
                                 'source_fingerprint': 'fixture', 'seed': seed, 'mode': 'stopped'}
                     harness.save(p, metadata)
                     healthy = {'data': {'name': 'Checklist', 'version': 'fixture', 'capabilities': ['durable_store']}}
-                    with patch.object(harness, 'bundle_check', return_value={}), patch.object(harness, 'require_managed_path_support'), \
+                    with patch.object(harness, 'bundle_check', return_value={}), patch.object(harness, 'require_managed_path_support', return_value=4), \
                          patch.object(harness, 'launch_state', return_value={'registered': True}), \
                          patch.object(harness, 'service_status', return_value=healthy), \
                          patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}), \
@@ -1997,7 +2097,7 @@ class SeedIsolationTests(unittest.TestCase):
                             'source_fingerprint': 'fixture', 'seed': {'kind': 'backup'}, 'mode': 'stopped'}
                 harness.save(p, metadata)
                 healthy = {'data': {'name': 'Checklist', 'version': 'fixture', 'capabilities': ['durable_store']}}
-                with patch.object(harness, 'BASE', base), patch.object(harness, 'bundle_check', return_value={}), patch.object(harness, 'require_managed_path_support'), \
+                with patch.object(harness, 'BASE', base), patch.object(harness, 'bundle_check', return_value={}), patch.object(harness, 'require_managed_path_support', return_value=4), \
                      patch.object(harness, 'launch_state', return_value={'registered': True}), \
                      patch.object(harness, 'service_status', return_value=healthy), \
                      patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}), \
@@ -2037,10 +2137,10 @@ class SeedIsolationTests(unittest.TestCase):
     def test_seed_requires_hash_bound_schema_three_migration_in_stage(self):
         with test_directory() as directory:
             base = Path(directory).resolve();migration = base / 'source/Sources/ChecklistCore/SchemaMigrations.swift'
-            migration.parent.mkdir(parents=True);migration.write_text('static var managedPathsLedger = "schema3"')
+            migration.parent.mkdir(parents=True);migration.write_text('static var managedPathsLedger = "schema3"; "PRAGMA user_version=3"')
             manifest = {'inputs': [{'path': 'Sources/ChecklistCore/ManagedPaths.swift', 'sha256': 'resolver'},
                                    {'path': 'Sources/ChecklistCore/SchemaMigrations.swift', 'sha256': harness.sha(migration)}]}
-            harness.require_managed_path_support(base, manifest)
+            self.assertEqual(harness.require_managed_path_support(base, manifest), 3)
             migration.write_text('schema2')
             with self.assertRaisesRegex(ValueError, 'verified schema-3'): harness.require_managed_path_support(base, manifest)
             manifest['inputs'][1]['sha256'] = harness.sha(migration)
@@ -2251,7 +2351,7 @@ class SlotStartupTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, json.dumps(response), '')
             for context in [patch.dict(os.environ, environment or {}, clear=True),
                             patch.object(harness, 'load', return_value=metadata), patch.object(harness, 'bundle_check', return_value={}),
-                            patch.object(harness, 'require_managed_path_support'), patch.object(harness, 'require_local_paths'),
+                            patch.object(harness, 'require_managed_path_support', return_value=4), patch.object(harness, 'require_local_paths'),
                             patch.object(harness, 'launch_state', return_value={'registered': registered}),
                             patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}),
                             patch.object(harness, 'run', side_effect=run), patch.object(harness.time, 'monotonic', clock.monotonic),

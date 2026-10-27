@@ -56,6 +56,8 @@ Before a thread stops, checkpoint the remaining tickets, claims/attempt IDs (nev
 
 A queued note does not resume an idle host subagent. The orchestrator uses the supported host resume operation for an already authorized idle child (in Codex, `collaboration.followup_task`) and points it to the original note. A finished `codex exec` run instead needs a fresh authorized session and ordinary authority reconciliation. Silence, a timeout or a finished turn proves neither abandonment nor native closure. If a host cannot supply required closure evidence, retain the unknown state and report the capability limit. See [bounded work authority](../../../docs/work-authority.md).
 
+An orchestrator that ends its turn while side sessions work keeps its own bounded, read-only wake watcher of member ticket status and named report files, and restarts it after each wake while work stays open; see [coordination](coordinate.md#coordination-and-communication). The watcher is not a schedule, hidden runtime or model polling.
+
 ## Running-server support checked 22 October 2026
 
 The installed CLI catalog was read from the registered Checklist project folder, and these schemas were compared with `Catalog.swift`, `Groups.swift`, `Batches.swift`, `WorkAuthority.swift`, `TriageTransitions.swift` and `Communication.swift`. This was read-only inspection, not a new mutation or native-route qualification. Re-discover on the installation used for a pass; some schemas leave nested member constraints to server validation.

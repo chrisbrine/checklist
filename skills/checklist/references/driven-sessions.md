@@ -26,6 +26,7 @@ Observed on 19 October 2026 with codex-cli 0.159.0 and installed Checklist build
 
 - A run that ends does not release its claim, prove native closure, complete work or acknowledge a message. A claim that a finished run still holds stays until an eligible session takes it over with `work_takeover` and a reason, or the owner recovers it.
 - A queued Checklist note does not wake a finished `codex exec` thread, and a resumed thread cannot read that thread's inbox. Send the next step to a fresh thread in its prompt.
+- A finished run does not wake its orchestrator. The orchestrator keeps its own bounded wake watcher; see [coordination](coordinate.md#coordination-and-communication).
 
 ### Identity and review independence
 

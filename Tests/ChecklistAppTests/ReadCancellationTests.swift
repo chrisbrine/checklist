@@ -476,6 +476,150 @@ import ChecklistIPC
         try await until { store.ticketPageError != nil }
         XCTAssertFalse(store.ticketPageError?.contains("CancellationError") ?? true)
     }
+
+    // CL-302: hold the next read that `match` selects, change content and refresh so its content epoch
+    // retires it, then release it. Repeat `times`; the next hold is armed before each release.
+    private func retire(_ times: Int, _ f: Fixture, _ store: ChecklistStore, _ match: @escaping (String, [String: Any]) -> Bool) async throws {
+        for n in 0..<times {
+            try await until { f.held != nil }
+            _ = try f.command("task_create", ["project_id": f.project, "title": "Synthetic retiring change \(n) \(UUID().uuidString.prefix(4))"])
+            await store.refresh()
+            // The refresh can take the coverage-overlap path, which keeps reads in flight. Retiring the
+            // window's reads moves the content epoch every time, so the held read is epoch_retired.
+            store.stopWindowReads()
+            if n + 1 < times { f.hold = match }
+            f.release()
+        }
+    }
+    private func preRead(_ f: Fixture) -> (String, [String: Any]) -> Bool {
+        let task = f.task
+        return { method, params in method == "task_context" && params["detail_level"] == nil && params["task_id"] as? String == task }
+    }
+    private func revision(_ f: Fixture) throws -> Int {
+        let reply = try f.command("task_get", ["project_id": f.project, "task_id": f.task])
+        return ((reply["data"] as? [String: Any])?["task"] as? [String: Any] ?? reply["data"] as? [String: Any])?["revision"] as? Int ?? 0
+    }
+
+    // CL-302 items 0 and 3: a retired task_context pre-read of an owner answer, a claim and task_complete is
+    // read again; the action is sent and no CancellationError text appears (a real refusal may still show).
+    func testRetiredPreReadDoesNotStopOwnerActions() async throws {
+        let actions: [(String, (Fixture, Int) -> [String: Any])] = [
+            ("human_request_answer", { f, rev in ["project_id": f.project, "request_id": UUID().uuidString, "expected_task_revision": rev, "response": "Synthetic answer"] }),
+            ("work_claim", { f, rev in ["project_id": f.project, "task_id": f.task, "expected_revision": rev] }),
+            ("task_complete", { f, rev in ["project_id": f.project, "task_id": f.task, "expected_revision": rev] }),
+        ]
+        for (method, parameters) in actions {
+            // A fresh store per action: a refused earlier change must not block the next one.
+            let f = try Fixture(isolatedDefaults("ReadCancellation").preferences); defer { f.cleanup() }
+            f.preferences.set(Page.tasks.rawValue, forKey: "lastPage")
+            let store = f.store(), live = Task { await store.startLiveUpdates() }
+            defer { live.cancel(); store.stopWindowReads() }
+            try await until { store.connected && !store.ticketPageLoading }
+            let params = parameters(f, try revision(f))
+            let reads = f.calls.filter { preRead(f)($0.0, $0.1) }.count
+            f.hold = preRead(f)
+            store.runTaskCommand(method, params, taskID: f.task)
+            try await retire(1, f, store, preRead(f))
+            try await until { f.calls.contains { $0.0 == method } || store.error != nil }
+            XCTAssertTrue(f.calls.contains { $0.0 == method }, "\(method) proceeds after a retired pre-read: \(store.error ?? "")")
+            XCTAssertEqual(f.calls.filter { preRead(f)($0.0, $0.1) }.count, reads + 2, "\(method): the retired pre-read was read again once")
+            try await until { !store.busy }
+            XCTAssertFalse((store.error ?? "").contains("CancellationError"), method)
+            XCTAssertFalse((store.error ?? "").contains("couldn"), method)
+        }
+    }
+
+    // CL-302 item 0: when every pre-read attempt is retired, the action is not sent and a plain retry text
+    // shows instead of the CancellationError text. A real pre-read failure still shows its own text.
+    func testEveryRetiredPreReadShowsPlainRetryText() async throws {
+        let f = try Fixture(isolatedDefaults("ReadCancellation").preferences); defer { f.cleanup() }
+        f.preferences.set(Page.tasks.rawValue, forKey: "lastPage")
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); store.stopWindowReads() }
+        try await until { store.connected && !store.ticketPageLoading }
+        let rev = try revision(f)
+        let sent = f.calls.filter { $0.0 == "task_complete" }.count
+        store.error = nil
+        f.hold = preRead(f)
+        store.runTaskCommand("task_complete", ["project_id": f.project, "task_id": f.task, "expected_revision": rev], taskID: f.task)
+        try await retire(3, f, store, preRead(f))
+        try await until { store.error != nil }
+        XCTAssertEqual(store.error, ChecklistStore.retiredPreReadText)
+        XCTAssertEqual(f.calls.filter { $0.0 == "task_complete" }.count, sent, "No change is sent after every pre-read was retired")
+        store.error = nil
+        f.hold = preRead(f)
+        store.runTaskCommand("task_complete", ["project_id": f.project, "task_id": f.task, "expected_revision": rev], taskID: f.task)
+        try await until { f.held != nil }
+        f.release(ChecklistError("DENIED", "Synthetic denial"))
+        try await until { store.error != nil }
+        XCTAssertEqual(store.error, "Synthetic denial")
+    }
+
+    // CL-302 items 0 and 3: the group Done pre-read (InlineTriageRow.prepareStatus) reads a retired
+    // task_context again; after every attempt is retired it fails with the plain retry text.
+    func testGroupDonePreReadSurvivesRetiredRead() async throws {
+        let f = try Fixture(isolatedDefaults("ReadCancellation").preferences); defer { f.cleanup() }
+        f.preferences.set(Page.tasks.rawValue, forKey: "lastPage")
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); store.stopWindowReads() }
+        try await until { store.connected && !store.ticketPageLoading }
+        let project = f.project, task = f.task
+        f.hold = preRead(f)
+        let once = Task { try await store.groupDirectionCursors(project: project, taskIDs: [task]) }
+        try await retire(1, f, store, preRead(f))
+        let cursors = try await once.value
+        XCTAssertFalse((cursors[task] ?? "").isEmpty, "A retired group pre-read is read again and returns the cursor")
+        f.hold = preRead(f)
+        let always = Task { () async -> Error? in
+            do { _ = try await store.groupDirectionCursors(project: project, taskIDs: [task]); return nil } catch { return error }
+        }
+        try await retire(3, f, store, preRead(f))
+        let failure = await always.value
+        XCTAssertNotNil(failure)
+        XCTAssertEqual(failure.map(PlainError.text), ChecklistStore.retiredPreReadText)
+        XCTAssertNil(store.error)
+    }
+
+    // CL-302 items 2 and 3: a view read whose every attempt was retired ends in `.retired` (the plain retry
+    // state of TaskAssignmentSheet, RelatedTicketsView and CaptureTaskView), never an empty result.
+    func testRepeatedRetiredViewReadsEndInRetryState() async throws {
+        let f = try Fixture(isolatedDefaults("ReadCancellation").preferences); defer { f.cleanup() }
+        f.preferences.set(Page.tasks.rawValue, forKey: "lastPage")
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); store.stopWindowReads() }
+        try await until { store.connected && !store.ticketPageLoading }
+        let query = WorkspacePageQuery(surface: "worker_sessions", project: f.project, limit: 100)
+        let workers: (String, [String: Any]) -> Bool = { method, params in method == "workspace_page" && params["surface"] as? String == "worker_sessions" }
+        func outcome(_ read: ChecklistStore.RetirableRead) -> String {
+            switch read { case .loaded: return "loaded"; case .retired: return "retired"; case .notCurrent: return "notCurrent" }
+        }
+        f.hold = workers
+        let retired = Task { outcome(try await store.retirableRead("workspace_page", query.parameters(cursor: nil))) }
+        try await retire(3, f, store, workers)
+        let retiredOutcome = try await retired.value
+        XCTAssertEqual(retiredOutcome, "retired")
+        let search: (String, [String: Any]) -> Bool = { method, params in method == "task_list" && params["text"] as? String == "Synthetic" }
+        f.hold = search
+        let project = f.project
+        let searched = Task { outcome(try await store.retirableRead("task_list", ["project_id": project, "text": "Synthetic", "archived": false, "limit": 100])) }
+        try await retire(3, f, store, search)
+        let searchedOutcome = try await searched.value
+        XCTAssertEqual(searchedOutcome, "retired")
+        let loaded = try await store.retirableRead("workspace_page", query.parameters(cursor: nil))
+        XCTAssertEqual(outcome(loaded), "loaded")
+        f.hold = workers
+        var wanted = true
+        let gone = Task { outcome(try await store.retirableRead("workspace_page", query.parameters(cursor: nil), isCurrent: { wanted })) }
+        try await until { f.held != nil }
+        wanted = false; f.release()
+        let goneOutcome = try await gone.value
+        XCTAssertEqual(goneOutcome, "notCurrent")
+        for text in [TaskAssignmentSheet.retiredWorkersText, RelatedTicketsView.retiredSearchText, CaptureTaskView.retiredEpicsText, ChecklistStore.retiredPreReadText] {
+            XCTAssertTrue(text.contains("Retry") || text.contains("Try again"), text)
+            XCTAssertFalse(text.contains("CancellationError") || text.contains("couldn"), text)
+        }
+        XCTAssertNil(store.error)
+    }
 }
 
 @MainActor private final class CancellationAlertSink: DesktopAlertSink {

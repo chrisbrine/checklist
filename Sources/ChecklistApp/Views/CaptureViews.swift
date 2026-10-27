@@ -21,6 +21,9 @@ struct CaptureTaskView: View {
     @State private var epicPrevious:String?
     @State private var epicLoading=false
     @State private var epicError:String?
+    @State private var epicRetired=false
+    /// CL-302: shown when every attempt of the Epic read was retired by newer reads.
+    static let retiredEpicsText = "The Epic choices kept changing while they loaded. Retry to see the current Epics. The saved Epic is preserved."
     @State private var epicRead=UUID()
     @FocusState private var titleFocused: Bool
     var body: some View {
@@ -37,6 +40,7 @@ struct CaptureTaskView: View {
                 AccessibleHStack {if epicLoading {ProgressView().controlSize(.small)};if let token=epicPrevious {Button("Previous Epics") {Task {await loadEpics(cursor:token)}}};if let token=epicNext {Button("More Epics") {Task {await loadEpics(cursor:token)}}}}.checklistFont(.micro).checklistDisabled([(epicLoading, "Epics are still loading.")])
                 if epicTotal == 0,!epicLoading {CaptureEpicCreator(projectID:projectID,request: {try await store.request($0,$1)}) {epic in guard RecordIdentity(epic.string("project_id"))==RecordIdentity(projectID) else {return};epicID=epic.id;epicPage=[epic];epicTotal=1;persistCapture()}}
                 if let epicError {Text(epicError).checklistFont(.micro).foregroundStyle(.orange)}
+                if epicRetired,!epicLoading {Text(Self.retiredEpicsText).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText);Button("Retry Epic choices") {Task {await loadEpics()}}}
             }
             TextField("What needs doing?", text: Binding(get: { title }, set: { title = $0; persistCapture() })).checklistFont(.subheading).textFieldStyle(.roundedBorder).focused($titleFocused).accessibilityIdentifier("captureTitle").checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)])
             AccessibleHStack { Picker("Starter", selection: Binding(get: { kind }, set: { kind = $0; persistCapture() })) { ForEach(enabledKinds, id: \.self) { Text($0.capitalized).tag($0) } }.frame(maxWidth: .infinity, alignment: .leading).checklistDisabled([(createCommandID != nil, "This ticket is being created."), (createdTaskID != nil, "This ticket is being created."), (store.busy, DisabledReasons.saving)]); Spacer(); Text("Saves as Draft").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
@@ -79,7 +83,7 @@ struct CaptureTaskView: View {
     func applyCaptureDefaults() { kind = captureDefaults["default_kind"] as? String ?? "work" }
     func switchProject(_ next: String) {
         if !title.isEmpty || !brief.isEmpty { persistCapture() }
-        epicRead=UUID();epicPage=[];epicNext=nil;epicPrevious=nil;epicTotal=nil;epicError=nil;epicLoading = !next.isEmpty
+        epicRead=UUID();epicPage=[];epicNext=nil;epicPrevious=nil;epicTotal=nil;epicError=nil;epicRetired=false;epicLoading = !next.isEmpty
         projectID = next
         if let draft = store.captureDrafts[next] {
             title = draft.title; brief = draft.brief; kind = draft.kind; epicID = draft.epicID.isEmpty ? CaptureEpicDefaults.last(next,preferences:store.windowPreferences) : draft.epicID; starterFields = draft.starterFields ?? [:]; draftStoreIncarnation = draft.storeIncarnation;createdTaskID=draft.createdTaskID;createCommandID=draft.createCommandID
@@ -117,11 +121,13 @@ struct CaptureTaskView: View {
     func loadEpics(cursor:String? = nil)async {
         let project=projectID,read=UUID();epicRead=read
         guard !project.isEmpty else {epicPage=[];epicNext=nil;epicPrevious=nil;return}
-        epicLoading=true;epicError=nil
+        epicLoading=true;epicError=nil;epicRetired=false
         do {
             let query=WorkspacePageQuery(surface:"epics",project:project)
             // CL-288: a retired (superseded) read is read again, never shown as an error.
-            guard let response=try await store.supersedableRead("workspace_page",query.parameters(cursor:cursor),isCurrent:{epicRead==read && RecordIdentity(projectID)==RecordIdentity(project)}) else {if epicRead==read {epicLoading=false};return}
+            // CL-302: after every attempt is retired, show a plain retry state instead of an empty list.
+            let outcome=try await store.retirableRead("workspace_page",query.parameters(cursor:cursor),isCurrent:{epicRead==read && RecordIdentity(projectID)==RecordIdentity(project)})
+            guard case .loaded(let response)=outcome else {if epicRead==read {epicLoading=false;if case .retired=outcome {epicRetired=true}};return}
             guard !Task.isCancelled,epicRead==read,RecordIdentity(projectID)==RecordIdentity(project) else{return}
             let page=try WorkspacePage(response,query:query)
             epicPage=page.rows;epicTotal=page.total;epicNext=page.next;epicPrevious=page.previous;epicLoading=false
