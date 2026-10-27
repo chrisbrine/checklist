@@ -170,10 +170,59 @@ The map records its Git commit, UTC generation timestamp, elapsed generation
 seconds, test inventories, input hashes and per-file source hashes. It is ignored
 local build output, never a checked-in declaration. The planner accepts a complete
 map for 24 hours by default (`--map-max-age-hours` overrides this), only from an
-ancestor commit with unchanged test/build inputs and runtime fixtures/resources. Dirty fixture data without a captured fingerprint conservatively falls back until refreshed after commit. Missing, incomplete, old,
+ancestor commit with unchanged build inputs, unnamed runtime fixtures/resources and nested-package tests. Changed test-tree code and runtime inputs with named readers do not invalidate the map; the planner selects them directly (see below) and `impact_map_status.changed_test_inputs` lists them. Other dirty fixture data without a captured fingerprint conservatively falls back until refreshed after commit. Missing, incomplete, old,
 malformed or incompatible maps use module fallback and report the reason in
 `impact_map_status`. Changed source files already in a valid map keep measured
 selection; `git diff` finds new files and untracked additions for fallback.
+
+### Changed test files and new sources (CL-299)
+
+With a current map, a round that adds or changes test files keeps a narrow plan.
+Every changed path that the planner selects directly is listed in
+`direct_test_selections` with its `reason`, `classes`, `qualification_cases` and
+`whole_targets`; every path in `fallback_paths` or `group_fallback_paths` has a
+reason in `fallback_reasons`.
+
+- A changed test file that is in the map selects its measured consumers (the
+  classes and qualification cases that executed it), plus the XCTest classes it
+  declares now and the qualification cases whose methods it declares. Measured
+  consumers that no longer have a class declaration in their target are dropped.
+- A new test file selects only its own classes and its own qualification cases
+  when it declares XCTest classes and only `private`/`fileprivate` top-level
+  helpers, and no other file of its target names its classes. Otherwise it is a
+  shared test helper whose consumers are not measured: its target stays whole,
+  with all qualification cases of the target, and the path is in
+  `group_fallback_paths`.
+- A deleted test file in the map selects its remaining measured consumers. A
+  deleted file that is not in the map keeps its whole target.
+- A new Core test file is also read as text by the App source-inspection classes.
+  The planner selects the classes whose recorded `inspection_references` read
+  that directory; without them `ChecklistAppTests` stays whole.
+- A named runtime input (`FILE_TEST_CONSUMERS`, outside the code suffixes)
+  selects the classes and cases of the test files in each consumer target that
+  name the file, through the rules above. If no file names it, the consumer
+  target stays whole with all its qualification cases.
+- Changed production sources in the map keep their measured edges, also when
+  test files change in the same round.
+- A new Swift source that is not in the map has no measured edges. Unchanged
+  code compiled without its declarations, so only changed files can reach them.
+  When every non-private name it declares is absent from the unchanged Swift
+  files, and a chain of changed files that name it reaches a file with its own
+  selection, the new source adds no classes of its own; those changed files carry
+  the selection, and `new_source_reachability` lists them. Extensions of existing
+  types may add new member names and the `Equatable`, `Hashable` or `Sendable`
+  conformances with their `==`/`hash(into:)` requirements. Any other conformance,
+  an initializer, operator or subscript on an existing type, `override`,
+  `@objc`, `@main`, `@_cdecl`, `NSClassFromString`, a reused name or an
+  unreached file keeps the module-closure fallback, with the reason.
+- `Package.swift`, `Package.resolved`, build scripts, unknown paths, unnamed
+  runtime inputs and nested-package test files keep the full or map fallback.
+
+Measured on the round 41 diff (`6ba5c4c..r41-1`, 75 paths, 8 test files, 6 new
+sources, 27 Swift sources): before, the map fell back and the plan selected all
+13 unit targets and all 32 qualification cases; with this rule it selects 5
+targets with 133 classes and 30 qualification cases (the changed `Router.swift`
+and `Catalog.swift` execute in 30 of the 32 cases).
 
 Generate or refresh it without a native app or test slot:
 
@@ -275,8 +324,9 @@ Generated coverage groups include classes in dependent targets. Mixed paths
 union those groups; an unmapped input broadens only the targets in that input's
 module closure. `default_swift_commands` is the ordinary component and
 `qualification_commands` is the affected scale/soak component, except during a
-final-round coverage refresh as described above. Source/test moves and changes to
-the observation environment require a refresh or conservative fallback.
+final-round coverage refresh as described above. Changes to the observation
+environment other than the test files and named runtime inputs above require a
+refresh or conservative fallback.
 
 ## Persistent build slots and installed checks
 

@@ -71,8 +71,10 @@ struct TaskDetailView: View {
                         }
                     } else {
                         DetailSection(title: "Brief") {
-                            Text(task.string("brief").isEmpty ? "Add a brief and expected outcome so the next handler has useful context." : task.string("brief"))
-                                .checklistFont(.body).foregroundStyle(task.string("brief").isEmpty ? Color.checklistSecondaryText : .primary).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                            if task.string("brief").isEmpty {
+                                Text("Add a brief and expected outcome so the next handler has useful context.")
+                                    .checklistFont(.body).foregroundStyle(Color.checklistSecondaryText).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                            } else { RichTextView(text: task.string("brief"), capability: .ticketBrief, task: task, role: .body) }
                         }
                     }
                     StarterFieldsSection(task: task)
@@ -475,7 +477,7 @@ struct MessageRow: View {
                 Spacer()
                 Text(relativeTime(message.string("created_at"))).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
-            Text(message.string("body")).checklistFont(.callout).textSelection(.enabled)
+            RichTextView(text: message.string("body"), content: message.values["content"], capability: .note, task: task, contentDigest: message.string("content_digest"))
             NoteCorrectionActions(message:message,task:task)
             if savedResponseRequest != nil {
                 Button("View saved response") {

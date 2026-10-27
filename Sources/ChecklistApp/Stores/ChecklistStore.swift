@@ -1537,6 +1537,18 @@ final class ChecklistStore: ObservableObject {
     func request(_ method: String, _ params: [String: Any] = [:]) async throws -> [String: Any] {
         try await request(method, params, ifCurrent: { true })
     }
+    /// CL-288: `request` retires a content read by throwing `CancellationError` when its scope,
+    /// status floor or content epoch changed (scope_retired, status_revision_retired, epoch_retired).
+    /// For a view-owned read that the view still wants, that read is superseded, not failed:
+    /// read again and never show the cancellation as an error. Returns nil when the caller is no
+    /// longer current or every attempt was retired; real failures and task cancellation still throw.
+    func supersedableRead(_ method: String, _ params: [String: Any], attempts: Int = 3, isCurrent: () -> Bool = { true }) async throws -> [String: Any]? {
+        for _ in 0..<attempts {
+            do { return try await request(method, params, ifCurrent: isCurrent) }
+            catch is CancellationError where !Task.isCancelled { guard isCurrent() else { return nil } }
+        }
+        return nil
+    }
     func request(_ method: String, _ params: [String: Any] = [:], ifCurrent: () -> Bool) async throws -> [String: Any] {
         guard connected || params["command_id"] == nil else { throw ChecklistError("SERVICE_UNAVAILABLE", "Reconnect and refresh before sending changes. Your local draft is preserved.") }
         try Task.checkCancellation()

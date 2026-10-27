@@ -1,0 +1,253 @@
+import SwiftUI
+import AppKit
+import AVKit
+import Combine
+import ChecklistCore
+
+/// Native take control. AVPlayer is the production adapter; tests use small fakes.
+@MainActor protocol MediaTakeControl: AnyObject {
+    func play()
+    func pause()
+}
+extension AVPlayer: MediaTakeControl {}
+
+struct MediaPlaybackMeasurement: Equatable, Sendable {
+    var copyMilliseconds: Int
+    var probeMilliseconds: Int
+    var bytes: Int
+    var facts: MediaPlaybackBudget.Facts
+}
+
+/// One verified, local, display-only take. Its copy is deleted when released.
+/// Exact IDs bind the take to its candidate, slot, typed reference and attachment.
+@MainActor final class MediaPreparedTake {
+    let key: String
+    let label: String
+    let kind: String
+    let ids: [String: String]
+    let control: MediaTakeControl
+    let player: AVPlayer?
+    let file: AuthorizedPreviewFile?
+    let measurement: MediaPlaybackMeasurement
+    init(key: String, label: String, kind: String, ids: [String: String], control: MediaTakeControl, player: AVPlayer? = nil, file: AuthorizedPreviewFile? = nil, measurement: MediaPlaybackMeasurement) {
+        self.key = key; self.label = label; self.kind = kind; self.ids = ids; self.control = control
+        self.player = player; self.file = file; self.measurement = measurement
+    }
+    var details: MediaValues {
+        var values: MediaValues = ["label": label, "kind": kind, "copy_ms": measurement.copyMilliseconds, "probe_ms": measurement.probeMilliseconds,
+            "bytes": measurement.bytes, "duration_seconds": measurement.facts.durationSeconds, "width": measurement.facts.width,
+            "height": measurement.facts.height, "frames": measurement.facts.frames]
+        for (key, value) in ids { values[key] = value }
+        return values
+    }
+}
+
+/// Owns every loaded take: at most two verified copies within the shared cache budget,
+/// one preparation at a time and exactly one playing take. Display state only.
+@MainActor final class MediaPlaybackCoordinator: ObservableObject {
+    @Published private(set) var takes: [String: MediaPreparedTake] = [:]
+    @Published private(set) var playingKey: String?
+    @Published private(set) var preparing: String?
+    private var order: [String] = []
+    private var observations: [String: AnyCancellable] = [:]
+
+    var cachedBytes: Int { takes.values.reduce(0) { $0 + $1.measurement.bytes } }
+    func beginPreparation(_ key: String) -> Bool {
+        guard preparing == nil || preparing == key else { return false }
+        preparing = key; return true
+    }
+    func endPreparation(_ key: String) { if preparing == key { preparing = nil } }
+    /// Admits a prepared take, evicting the oldest non-playing take beyond the budget.
+    func admit(_ take: MediaPreparedTake) {
+        release(take.key)
+        while !order.isEmpty, takes.count >= MediaPlaybackBudget.preparedTakes || cachedBytes + take.measurement.bytes > MediaPlaybackBudget.cacheBytes {
+            release(order.first { $0 != playingKey } ?? order[0])
+        }
+        takes[take.key] = take; order.append(take.key)
+        if let player = take.player {
+            // Native inline controls may start playback directly; still keep one playing take.
+            observations[take.key] = player.publisher(for: \.timeControlStatus).receive(on: DispatchQueue.main).sink { [weak self, key = take.key] status in
+                MainActor.assumeIsolated {
+                    if status == .paused { self?.didStop(key) } else { self?.didStart(key) }
+                }
+            }
+        }
+    }
+    func play(_ key: String) {
+        guard let take = takes[key] else { return }
+        didStart(key); take.control.play()
+    }
+    func pause(_ key: String) { takes[key]?.control.pause(); didStop(key) }
+    func didStart(_ key: String) {
+        guard takes[key] != nil else { return }
+        for (other, take) in takes where other != key { take.control.pause() }
+        playingKey = key
+    }
+    func didStop(_ key: String) { if playingKey == key { playingKey = nil } }
+    func release(_ key: String) {
+        guard let take = takes.removeValue(forKey: key) else { return }
+        observations[key] = nil; take.control.pause(); take.player?.replaceCurrentItem(with: nil)
+        order.removeAll { $0 == key }
+        if playingKey == key { playingKey = nil }
+    }
+    func releaseAll(prefix: String = "") {
+        for key in Array(takes.keys) where key.hasPrefix(prefix) { release(key) }
+    }
+}
+
+/// Bounded exact-lease copy and native probe. Every lease is released after its copy,
+/// including on refusal or cancellation; the copy is hash-verified against the slot digest.
+enum MediaTakeLoader {
+    struct Lease: Sendable { let id: String; let path: String; let size: Int; let name: String; let attachmentID: String }
+
+    static func verifiedCopy(expectedSHA256: String, lease: @MainActor () async throws -> Lease,
+                             release: @MainActor (String) async -> Void) async throws -> (AuthorizedPreviewFile, Int) {
+        try Task.checkCancellation()
+        let leased = try await lease()
+        do {
+            guard leased.size > 0, leased.size <= MediaPlaybackBudget.originalBytes, leased.path.hasPrefix("/") else {
+                throw FilePreviewFailure("The original exceeds the 500 MiB playback bound or is unavailable.")
+            }
+            let source = try JSONSerialization.data(withJSONObject: ["id": leased.attachmentID, "size": leased.size, "sha256": expectedSHA256, "name": leased.name])
+            let path = leased.path, start = ContinuousClock.now
+            let work = Task.detached(priority: .userInitiated) {
+                try AuthorizedPreviewFile.copy(path: path, source: Record(values: try JSONSerialization.jsonObject(with: source) as? [String: Any] ?? [:]))
+            }
+            let file = try await withTaskCancellationHandler(operation: { try await work.value }, onCancel: { work.cancel() })
+            await release(leased.id)
+            try Task.checkCancellation()
+            return (file, milliseconds(ContinuousClock.now - start))
+        } catch { await release(leased.id); throw error }
+    }
+
+    /// Measures the native asset against the declared kind's duration/pixel/frame budget.
+    static func probe(url: URL, kind: String) async throws -> (AVURLAsset, MediaPlaybackBudget.Facts, Int) {
+        let start = ContinuousClock.now
+        let (asset, facts) = try await withThrowingTaskGroup(of: (AVURLAsset, MediaPlaybackBudget.Facts).self) { group in
+            group.addTask { try await measure(url: url) }
+            group.addTask {
+                try await Task.sleep(for: .seconds(MediaPlaybackBudget.probeSeconds))
+                throw FilePreviewFailure("The native decoder probe exceeded its \(Int(MediaPlaybackBudget.probeSeconds)) s budget.")
+            }
+            defer { group.cancelAll() }
+            guard let first = try await group.next() else { throw CancellationError() }
+            return first
+        }
+        try Task.checkCancellation()
+        if let refusal = MediaPlaybackBudget.refusal(facts, kind: kind) { throw FilePreviewFailure(refusal) }
+        return (asset, facts, milliseconds(ContinuousClock.now - start))
+    }
+
+    static func measure(url: URL) async throws -> (AVURLAsset, MediaPlaybackBudget.Facts) {
+        let asset = try await NativePlaybackAsset.load(url: url)
+        let duration = try await asset.load(.duration).seconds
+        let video = try await asset.loadTracks(withMediaType: .video), audio = try await asset.loadTracks(withMediaType: .audio)
+        var facts = MediaPlaybackBudget.Facts(durationSeconds: duration, hasVideo: !video.isEmpty, hasAudio: !audio.isEmpty)
+        for track in video {
+            let (size, rate) = try await track.load(.naturalSize, .nominalFrameRate)
+            facts.width = max(facts.width, Int(abs(size.width).rounded())); facts.height = max(facts.height, Int(abs(size.height).rounded()))
+            facts.frames = max(facts.frames, duration.isFinite ? Int((Double(rate) * duration).rounded(.up)) : Int.max)
+        }
+        return (asset, facts)
+    }
+
+    private static func milliseconds(_ duration: Duration) -> Int {
+        Int(duration.components.seconds * 1000 + duration.components.attoseconds / 1_000_000_000_000_000)
+    }
+}
+
+enum MediaPlaybackLabels {
+    static func measurement(_ value: MediaPlaybackMeasurement) -> String {
+        let facts = value.facts
+        var parts = [String(format: "%.1f s", facts.durationSeconds)]
+        if facts.hasVideo { parts.append("\(facts.width)×\(facts.height) px"); parts.append("\(facts.frames) frames") }
+        parts.append(ByteCountFormatter.string(fromByteCount: Int64(value.bytes), countStyle: .file))
+        parts.append("verified in \(value.copyMilliseconds) ms, probed in \(value.probeMilliseconds) ms")
+        return "Measured: " + parts.joined(separator: " · ")
+    }
+}
+
+/// Audio/video take adapter selected by the slot's declared portable kind.
+struct MediaPlaybackSlotView: View {
+    @ObservedObject var model: MediaReviewModel
+    @ObservedObject var playback: MediaPlaybackCoordinator
+    let slot: Record
+    let original: Record
+    let example: Record?
+    let kind: String
+    let label: String
+    @State private var request = 0
+    @State private var status = ""
+    var key: String { (example == nil ? "current:" : "example:") + original.string("reference_id") + ":" + slot.string("slot_id") }
+    var noun: String { kind == "audio" ? "audio" : "video" }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let take = playback.takes[key], let player = take.player {
+                NativePlayerAdapter(player: player, audio: kind == "audio").frame(minWidth: 200, minHeight: kind == "audio" ? 60 : 160, maxHeight: kind == "audio" ? 80 : 300)
+                    .accessibilityLabel(label + ", " + noun + " playback")
+                ViewThatFits(in: .horizontal) {
+                    HStack { controls }
+                    VStack(alignment: .leading) { controls }
+                }
+                Text(MediaPlaybackLabels.measurement(take.measurement)).font(.caption).foregroundStyle(Color.checklistSecondaryText).textSelection(.enabled)
+            } else {
+                Text(status.isEmpty ? "Take not loaded" : status).foregroundStyle(Color.checklistSecondaryText).textSelection(.enabled)
+                Button("Load exact " + noun + " take") { request += 1 }
+                    .accessibilityLabel("Load exact " + noun + " take, " + label)
+                    .checklistDisabled([(playback.preparing != nil && playback.preparing != key, "Another take is being prepared. Wait for it to finish.")])
+            }
+            Button("Open original") { Task { await openOriginal() } }
+                .accessibilityLabel("Open original, " + label)
+                .help("Requests a fresh exact lease and opens a verified copy. Edits do not change the reviewed original.")
+        }
+        .accessibilityElement(children: .contain).accessibilityIdentifier("mediaTake:" + original.string("reference_id"))
+        // Leaving view cancels its preparation; the lease is released and the copy discarded.
+        .task(id: request) { if request > 0 { await load() } }
+        .onDisappear { playback.release(key) }
+    }
+    @ViewBuilder var controls: some View {
+        if playback.playingKey == key { Button("Pause") { playback.pause(key) }.accessibilityLabel("Pause " + label) }
+        else { Button("Play") { playback.play(key) }.accessibilityLabel("Play " + label + "; other takes pause") }
+        Button("Unload take") { playback.release(key) }.accessibilityLabel("Unload take, " + label)
+    }
+    func load() async {
+        guard playback.beginPreparation(key) else { status = "Another take is being prepared."; return }
+        defer { playback.endPreparation(key) }
+        status = "Requesting the exact original…"
+        do {
+            let (file, copyMilliseconds) = try await MediaTakeLoader.verifiedCopy(expectedSHA256: slot.string("sha256", fallback: original.string("sha256")),
+                lease: { try await model.playbackLease(original: original, example: example) }, release: { await model.releasePlaybackLease($0) })
+            status = "Measuring the verified " + noun + "…"
+            let (asset, facts, probeMilliseconds) = try await MediaTakeLoader.probe(url: file.url, kind: kind)
+            try Task.checkCancellation()
+            let player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+            var ids = ["slot_id": slot.string("slot_id"), "reference_id": original.string("reference_id"), "attachment_id": original.string("attachment_id"), "sha256": slot.string("sha256")]
+            if let example { ids["target_id"] = example.string("target_id"); ids["decision_id"] = example.string("decision_id") }
+            else { ids["target_id"] = model.item.object("target")["id"] as? String ?? "" }
+            playback.admit(MediaPreparedTake(key: key, label: label, kind: kind, ids: ids, control: player, player: player, file: file,
+                measurement: .init(copyMilliseconds: copyMilliseconds, probeMilliseconds: probeMilliseconds, bytes: (try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? original.integer("size", fallback: 0), facts: facts)))
+            status = ""
+        } catch is CancellationError { status = "Loading stopped."
+        } catch { status = "Original unavailable or unsupported: " + PlainError.text(error) }
+    }
+    func openOriginal() async {
+        status = "Reauthorizing the exact original…"
+        do {
+            let (file, _) = try await MediaTakeLoader.verifiedCopy(expectedSHA256: slot.string("sha256", fallback: original.string("sha256")),
+                lease: { try await model.playbackLease(original: original, example: example) }, release: { await model.releasePlaybackLease($0) })
+            let copy = try file.externalWorkingCopy()
+            NSWorkspace.shared.open(copy)
+            status = "Opened a verified copy. Edits do not change the reviewed original or record a decision."
+        } catch { status = "Original unavailable: " + PlainError.text(error) }
+    }
+}
+
+/// Exact take IDs and measurements for TechnicalDetails; display state only.
+struct MediaTakeDetails: View {
+    @ObservedObject var playback: MediaPlaybackCoordinator
+    var body: some View {
+        if !playback.takes.isEmpty {
+            TechnicalDetails(raw: [("Loaded takes", playback.takes.keys.sorted().compactMap { playback.takes[$0]?.details } as [MediaValues])])
+        }
+    }
+}

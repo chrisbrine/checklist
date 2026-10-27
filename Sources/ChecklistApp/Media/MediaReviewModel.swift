@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import ChecklistIPC
+import ChecklistCore
 
 typealias MediaValues = [String: Any]
 
@@ -37,6 +38,8 @@ typealias MediaValues = [String: Any]
     @Published var loading = false
     @Published var draft = MediaOwnerDraft() { didSet { saveDraft() } }
     @Published var contextConflict = false
+    /// Audio/video takes: two verified copies, one preparation and one playing take at most.
+    let playback = MediaPlaybackCoordinator()
     private(set) var projectID = ""
     private weak var store: ChecklistStore?
     private var epoch = UUID()
@@ -51,13 +54,15 @@ typealias MediaValues = [String: Any]
     var schema: MediaValues { header.object("type_revision")["schema"] as? MediaValues ?? [:] }
     var fields: [Record] { (schema["fields"] as? [MediaValues] ?? []).map(Record.init) }
     var slots: [Record] { (schema["slots"] as? [MediaValues] ?? []).map(Record.init) }
+    /// The declared layout's reference role; every other compatible slot is a candidate take.
+    var referenceSlotID: String { (schema["layout"] as? MediaValues)?["reference_slot_id"] as? String ?? "" }
     var decisionEnabled: Bool { !historyOnly && item.bool("published") && header.string("state") == "open" && !contextConflict && header.records("attention").isEmpty && !item.object("target").isEmpty }
 
     func connect(store: ChecklistStore) async {
         self.store = store
         let project = store.projectID ?? ""
         if project != projectID {
-            saveDraft(); projectID = project; epoch = UUID(); selectionEpoch = UUID()
+            saveDraft(); playback.releaseAll(); projectID = project; epoch = UUID(); selectionEpoch = UUID()
             currentImageReference="";historicalImageReference="";listScope="";list=[:];roundOffset=0
             types=[];rounds=[];rows=[];typeID="";roundID="";selectedID="";header=Record(values:[:]);item=Record(values:[:]);intake=Record(values:[:]);publication=[];examples=[]
             draftScope="";draft = MediaOwnerDraft(); contextConflict=false
@@ -178,7 +183,7 @@ typealias MediaValues = [String: Any]
         if filter == "all" {counts=result["counts"] as? [String:Int] ?? [:]};next=result["next_cursor"] as? String
     }
     func select(_ id: String) async {
-        saveDraft();if selectedID != id {currentImageReference="";historicalImageReference="";item=Record(values:[:]);contextConflict=false};selectedID=id
+        saveDraft();if selectedID != id {playback.releaseAll();currentImageReference="";historicalImageReference="";item=Record(values:[:]);contextConflict=false};selectedID=id
         let scope=projectID+":"+id
         if draftScope != scope {
             draftScope=scope
@@ -210,7 +215,7 @@ typealias MediaValues = [String: Any]
     }
     func showExamples(_ show: Bool,more: Bool=false) async {
         examplesShown=show
-        guard show,!selectedID.isEmpty else {historicalImageReference="";examples=[];examplesNext=nil;return}
+        guard show,!selectedID.isEmpty else {playback.releaseAll(prefix:"example:");historicalImageReference="";examples=[];examplesNext=nil;return}
         let selected=selectedID,round=roundID
         do {
             let match=(list["group_by"] as? [String] ?? []) + ((list["visible_columns"] as? [String] ?? []).contains("direction") ? ["direction"] : [])
@@ -229,6 +234,22 @@ typealias MediaValues = [String: Any]
         return true
     }
     func endImage() {imageLoads=max(0,imageLoads-1)}
+    /// Each load or Open original requests a fresh exact lease: the selected target's typed
+    /// reference, or a historical example's exact accepted decision and winning reference.
+    func playbackLease(original: Record,example: Record?) async throws -> MediaTakeLoader.Lease {
+        let (method,params)=Self.playbackLeaseRequest(roundID:roundID,selectedID:selectedID,targetID:item.object("target")["id"] as? String ?? "",original:original,example:example)
+        let value=try await read(method,params)
+        let attachment=Record(values:value["attachment"] as? MediaValues ?? [:])
+        guard let lease=value["lease_id"] as? String,!attachment.string("path").isEmpty else {throw ChecklistError("MANAGED_ORIGINAL_UNAVAILABLE","The service did not return this exact original's reader lease.")}
+        return .init(id:lease,path:attachment.string("path"),size:attachment.integer("size",fallback:0),name:attachment.string("name",fallback:"Original"),attachmentID:attachment.id)
+    }
+    static func playbackLeaseRequest(roundID: String,selectedID: String,targetID: String,original: Record,example: Record?) -> (String,MediaValues) {
+        if let example {
+            return ("media_example_read_lease",["round_id":roundID,"target_id":example.string("target_id"),"decision_id":example.string("decision_id"),"reference_id":original.string("reference_id"),"seconds":MediaPlaybackBudget.leaseSeconds])
+        }
+        return ("media_original_read",["round_id":roundID,"item_id":selectedID,"target_id":targetID,"reference_id":original.string("reference_id"),"representation":"lease","seconds":MediaPlaybackBudget.leaseSeconds])
+    }
+    func releasePlaybackLease(_ id: String) async {_ = try? await read("media_example_read_release",["lease_id":id])}
     func imageIsActive(_ key:String,historical:Bool) -> Bool {(historical ? historicalImageReference : currentImageReference)==key}
     func observation() -> MediaValues {["round_id":roundID,"expected_revision":header.integer("revision"),"observed_context_token":header.string("observed_context_token")]}
     func decide(_ disposition: String) {

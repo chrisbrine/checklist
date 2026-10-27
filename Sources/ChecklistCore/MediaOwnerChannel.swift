@@ -15,7 +15,7 @@ extension CommandRouter {
         let projections: [String: Set<String>] = [
             "media_navigation": [], "media_round_page": ["type_id", "state", "offset"],
             "media_round_header": ["round_id"], "media_publication_preview": ["round_id"],
-            "media_item_get": ["round_id", "item_id"], "media_original_read": ["round_id", "item_id", "target_id", "reference_id"]
+            "media_item_get": ["round_id", "item_id"], "media_original_read": ["round_id", "item_id", "target_id", "reference_id", "representation", "seconds"]
         ]
         if let fields = projections[method] {
             guard Set(p.keys).isSubset(of: fields.union(["project_id"])) else { throw CoreError("INVALID_INPUT", "Unknown media read fields.") }
@@ -80,6 +80,7 @@ extension CommandRouter {
             family:"media_intake",predicate:" AND json_extract(data,'$.round_id')=?",arguments:[(try StoredRecord(round,
              family: "media").string("id"))],limit:100).map { ["id":(try StoredRecord($0, family: "media").requiredValue("id")),
             "state":(try StoredRecord($0, family: "media").requiredValue("state"))] }
+        result["rework"] = try mediaReworkSummary(db,round:round)
         return result
     }
     func mediaOwnerItem(_ db: Database,round: JSON,itemID: String,caller: Caller) throws -> JSON {
@@ -105,12 +106,14 @@ extension CommandRouter {
                 let (reference,attachment) = try mediaAttachmentReference(db,project:project,id:id,owner:owner,caller:caller)
                 let identity = (attachment["path"] as? String).flatMap {try? self.managedIdentity($0)}
                 let available = attachment["availability"] as? String == "available" && identity?.size == Int64(int(attachment,"size"))
-                return ["reference_id":(try StoredRecord(reference, family: "media").requiredValue("id")),
+                var original: JSON = ["reference_id":(try StoredRecord(reference, family: "media").requiredValue("id")),
                     "attachment_id":(try StoredRecord(attachment, family: "media").requiredValue("id")),
                     "sha256":(try StoredRecord(attachment, family: "media").requiredValue("sha256")),
                     "availability":available ? "available" : "unavailable","size":(try StoredRecord(attachment,
                      family: "media").requiredValue("size")),"name":attachment["name"] ?? "Original"]
-            } catch {return ["reference_id":id,"availability":"unavailable"]}
+                if !available {original["unavailable_reason"] = identity == nil ? "missing" : "changed"}
+                return original
+            } catch {return ["reference_id":id,"availability":"unavailable","unavailable_reason":mediaOriginalUnavailableReason(db,project:project,referenceID:id)]}
         }
         return item
     }
@@ -124,7 +127,29 @@ extension CommandRouter {
             guard EnvelopeStorageIdentity.equal(target["id"] as? String,p["target_id"] as? String),strings(target,"attachment_reference_ids").contains(reference) else {throw CoreError("MEDIA_BASIS_CHANGED","Refresh the selected original.")}
             return (project,try self.mediaOwnerValue(db,id:(try StoredRecord(target, family: "media").string("attachment_owner_id")),project:project),reference)
         }
+        let representation = p["representation"] as? String ?? "bytes"
+        guard ["bytes","lease"].contains(representation) else { throw CoreError("INVALID_INPUT","Choose bytes or lease.") }
+        if representation == "lease" {
+            // Playback consumers copy and hash the exact original themselves. Each request
+            // (load or Open original) is a fresh, short, caller-bound reader lease.
+            let seconds = try MediaConfigurationValue.integer(p["seconds"] ?? MediaPlaybackBudget.leaseSeconds,min:1,max:300,"seconds")
+            let lease = try acquireMediaAttachmentReadLease(project:selected.0,referenceID:selected.2,owner:selected.1,caller:c,seconds:seconds)
+            let a = lease.attachment
+            return ["lease_id":lease.id,"expires_at":lease.expiresAt.timeIntervalSince1970,"reference_id":selected.2,"verified_original":false,
+                "attachment":["id":a["id"] ?? NSNull(),"path":a["path"] ?? NSNull(),"size":a["size"] ?? NSNull(),"sha256":a["sha256"] ?? NSNull(),"name":a["name"] ?? "Original"]]
+        }
+        guard p["seconds"] == nil else { throw CoreError("INVALID_INPUT","seconds applies only to a lease.") }
         let bytes = try readMediaAttachment(project:selected.0,referenceID:selected.2,owner:selected.1,caller:c,maximum:8 * 1024 * 1024)
         return ["base64":bytes.base64EncodedString(),"reference_id":selected.2,"verified_original":true]
+    }
+    /// Honest, non-authorizing reason for an unavailable typed original reference.
+    private func mediaOriginalUnavailableReason(_ db: Database,project: String,referenceID: String) -> String {
+        guard let hold = try? scoped(db,referenceID,project,type:"storage_hold"),hold["state"] as? String == "active",
+              let aid = hold["attachment_id"] as? String,let attachment = try? scoped(db,aid,project,type:"attachment") else {return "reference_unavailable"}
+        switch attachment["availability"] as? String {
+        case "original_cleaned": return "cleaned"
+        case "available": return "changed"
+        default: return "missing"
+        }
     }
 }

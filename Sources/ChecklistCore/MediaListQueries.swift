@@ -80,7 +80,7 @@ extension CommandRouter {
         return (order + ["CAST(i.id AS BLOB)"]).joined(separator:",")
     }
     private var mediaDispositionSQL: String {
-        "CASE WHEN d.id IS NULL OR member.value IS NULL THEN 'pending' WHEN json_extract(d.data,'$.review_basis_signature') IS NOT json_extract(member.value,'$.review_basis_signature') THEN 'stale' ELSE json_extract(d.data,'$.disposition') END"
+        "CASE WHEN d.id IS NULL AND member.value IS NOT NULL AND json_extract(i.data,'$.stale_predecessor_decision_id') IS NOT NULL THEN 'stale' WHEN d.id IS NULL OR member.value IS NULL THEN 'pending' WHEN json_extract(d.data,'$.review_basis_signature') IS NOT json_extract(member.value,'$.review_basis_signature') THEN 'stale' ELSE json_extract(d.data,'$.disposition') END"
     }
     private func mediaListIndex(_ db: Database,_ p: JSON,round: JSON,list: MediaListConfiguration,schema: MediaReviewSchema) throws -> [JSON] {
         let filter = p["filter"] as? JSON ?? [:]

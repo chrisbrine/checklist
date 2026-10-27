@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import ImageIO
 import CryptoKit
+import ChecklistCore
 
 struct MediaOwnerComparison: View {
     @EnvironmentObject var store: ChecklistStore
@@ -22,7 +23,7 @@ struct MediaOwnerComparison: View {
                     VStack(alignment:.leading,spacing:6) {
                         Text(choice.label).font(.headline).accessibilityLabel(choice.label)
                         ForEach(candidate.records("slots"),id:\.stringID) {slot in
-                            MediaSlotView(model:model,slot:slot,example:nil)
+                            MediaSlotView(model:model,slot:slot,example:nil,candidateIndex:choice.index)
                         }
                     }.padding(8).background(.quaternary.opacity(0.3),in:RoundedRectangle(cornerRadius:6))
                 }
@@ -44,6 +45,7 @@ struct MediaOwnerComparison: View {
                 }
                 if model.writable {ownerActions}
                 TechnicalDetails(raw: [("Selected media and candidates",model.item.values),("Historical examples",model.examples.map(\.values)),("Review attention",model.header.records("attention").map(\.values)),("Review context sources",model.header.records("context_sources").map(\.values)),("Proposed context sources",model.header.records("attention_sources").map(\.values))]).id(model.item.id)
+                MediaTakeDetails(playback:model.playback)
             } else {Text("Select a media item to inspect its exact original and history.").foregroundStyle(Color.checklistSecondaryText)}
         }.accessibilityElement(children:.contain).accessibilityIdentifier("mediaComparison")
     }
@@ -101,6 +103,7 @@ private extension Record {var stringID:String {string("slot_id")}}
 struct MediaCandidateChoice: Identifiable {
     let candidate: Record
     let label: String
+    var index = 0
     var id: String { candidate.id }
 }
 enum MediaComparisonLabels {
@@ -135,6 +138,11 @@ enum MediaComparisonLabels {
         let name=["text","image","audio","video"].contains(kind) ? kind.capitalized : "Media"
         return name+" slot"+(index.map {" \($0+1)"} ?? "")
     }
+    /// Comparison role: the layout's declared reference slot, otherwise the numbered candidate.
+    static func role(slotID: String, candidateIndex: Int?, referenceSlotID: String, historical: Bool) -> String {
+        let base = !referenceSlotID.isEmpty && slotID == referenceSlotID ? "Reference" : candidateIndex.map {"Candidate \($0+1)"} ?? "Candidate"
+        return historical ? "Approved example · "+base : base
+    }
     static func imageAccessibilityLabel(_ slot: Record, definitions: [Record]) -> String {
         "Verified original image, "+self.slot(slot,definitions:definitions)
     }
@@ -142,21 +150,37 @@ enum MediaComparisonLabels {
         item.records("candidates").enumerated().map {index,candidate in
             let slots=candidate.records("slots").map {slot($0,definitions:definitions)}.joined(separator:", ")
             let label=["Candidate \(index+1)",item.string("title"),candidate.string("source_name",fallback:"Inline text"),origin(candidate.string("origin")),time(candidate.string("created_at")),slots].filter {!$0.isEmpty}.joined(separator:" · ")
-            return MediaCandidateChoice(candidate:candidate,label:label)
+            return MediaCandidateChoice(candidate:candidate,label:label,index:index)
         }
     }
 }
 
 enum MediaComparisonAvailability: Equatable {
-    case text(String),image,unavailable(String),unsupported(String)
-    static func resolve(slot:Record,original:Record?) -> Self {
+    case text(String),image,playback(String),unavailable(String),unsupported(String)
+    /// The captured take must match its slot's declared kind before any read or decode.
+    static func resolve(slot:Record,original:Record?,declaredKind:String?=nil) -> Self {
         if let text=slot.values["text"] as? String {return .text(text)}
         let kind=slot.string("media_kind")
-        if ["video","audio"].contains(kind) {return .unsupported(kind.capitalized+" comparison is not yet supported in this slice.")}
+        if let declaredKind,!declaredKind.isEmpty,declaredKind != kind {return .unsupported("This take is "+(kind.isEmpty ? "untyped" : kind)+", but its slot declares "+declaredKind+". It cannot be compared.")}
+        if ["video","audio"].contains(kind) {
+            guard let original,original.string("availability")=="available" else {return .unavailable(unavailableText(original))}
+            guard original.integer("size",fallback:0)<=MediaPlaybackBudget.originalBytes else {return .unsupported("This "+kind+" original exceeds the 500 MiB playback bound.")}
+            return .playback(kind)
+        }
         guard kind=="image" else {return .unsupported("This media format is not supported.")}
-        guard let original,original.string("availability")=="available" else {return .unavailable("Original unavailable. A cached preview cannot establish exact review availability.")}
+        guard let original,original.string("availability")=="available" else {return .unavailable(unavailableText(original))}
         guard original.integer("size",fallback:0)<=8*1024*1024 else {return .unsupported("This image exceeds the 8 MiB in-app original-read bound.")}
         return .image
+    }
+    /// Honest outcome per service reason; metadata stays visible, nothing is reauthorized.
+    static func unavailableText(_ original:Record?) -> String {
+        switch original?.string("unavailable_reason") ?? "" {
+        case "cleaned": return "Original cleaned. Its record and history remain, but the exact bytes were removed, so it cannot be compared."
+        case "missing": return "Original missing from managed storage. It cannot be compared."
+        case "changed": return "Original changed after capture. It no longer matches its recorded size, so it cannot be compared."
+        case "reference_unavailable": return "Original reference unavailable for this project. It cannot be compared."
+        default: return "Original unavailable. A cached preview cannot establish exact review availability."
+        }
     }
 }
 
@@ -164,20 +188,28 @@ struct MediaSlotView: View {
     @ObservedObject var model:MediaReviewModel
     let slot:Record
     let example:Record?
+    var candidateIndex:Int?=nil
     @State private var image:NSImage?
     @State private var status="Image not loaded"
     var original:Record? {
         if let example {return example.records("original_references").first {$0.string("slot_id")==slot.string("slot_id")}.map {var v=$0.values;v["availability"]="available";return Record(values:v)}}
         return model.item.records("originals").first {$0.string("attachment_id")==slot.string("attachment_id")}
     }
+    var declaredKind:String {model.slots.first {$0.id==slot.string("slot_id")}?.string("kind") ?? ""}
+    var role:String {MediaComparisonLabels.role(slotID:slot.string("slot_id"),candidateIndex:candidateIndex,referenceSlotID:model.referenceSlotID,historical:example != nil)}
     var imageKey:String {(original?.string("reference_id") ?? "")+":"+slot.string("slot_id")}
     var active:Bool {model.imageIsActive(imageKey,historical:example != nil)}
     var body: some View {
         VStack(alignment:.leading,spacing:4) {
             Text(MediaComparisonLabels.slot(slot,definitions:model.slots)).font(.caption)
-            switch MediaComparisonAvailability.resolve(slot:slot,original:original) {
+            switch MediaComparisonAvailability.resolve(slot:slot,original:original,declaredKind:declaredKind) {
             case .text(let value): Text(value).textSelection(.enabled).frame(maxWidth:.infinity,alignment:.leading).accessibilityLabel("Exact captured text: "+value)
             case .unavailable(let reason),.unsupported(let reason):Text(reason).foregroundStyle(Color.checklistSecondaryText)
+            case .playback(let kind):
+                if let original {
+                    Text(role).font(.caption.weight(.semibold))
+                    MediaPlaybackSlotView(model:model,playback:model.playback,slot:slot,original:original,example:example,kind:kind,label:role+" · "+MediaComparisonLabels.slot(slot,definitions:model.slots))
+                }
             case .image:
                 if active,let image {Image(nsImage:image).resizable().scaledToFit().frame(maxWidth:460,maxHeight:300).accessibilityLabel(MediaComparisonLabels.imageAccessibilityLabel(slot,definitions:model.slots))}
                 else {Text(active ? status : "Image not loaded");Button("Load exact image") {Task {await load()}}.checklistDisabled([(model.imageLoads>=2,"Two original images are loading. Wait for one to finish.")])}

@@ -50,7 +50,10 @@ extension CommandRouter {
         "media_suggest":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","items","disposition","winner_id","none_fit","note","no_follow_up_reason"],
         "media_decide":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","items","disposition","winner_id","none_fit","note","no_follow_up_reason"],
         "media_adopt_suggestion":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","items","suggestion_id"],
-        "media_round_finish":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest"]
+        "media_round_finish":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest"],
+        "media_rework_preview":["round_id","epic_id","items"],
+        "media_rework_create":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","epic_id","items","preview_digest"],
+        "media_round_successor":["source_round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","title","items"]
         ]
 
     private func executeValidatedMediaCommand(method: String,params p: JSON,caller c: Caller,nativeOwnerProjection: Bool) throws -> JSON {
@@ -60,6 +63,7 @@ extension CommandRouter {
         guard let data = try? JSONSerialization.data(withJSONObject:p),data.count <= 2_000_000 else { throw CoreError("INVALID_INPUT","Media command exceeds its input bound.") }
         let lease = try storageAdmission.acquire();defer {lease.finish()}
         if method == "media_example_read_lease" || method == "media_example_read_release" {return try mediaExampleLease(method:method,p:p,c:c)}
+        if method == "media_rework_preview" {return try dbQueue.read { db in try self.mediaReworkPreview(db,p,c,project:self.mediaAccess(db,p,c)) }}
         if reads.contains(method) {
             return try dbQueue.read { db in
                 let pid = try self.mediaAccess(db,p,c)
@@ -77,6 +81,8 @@ extension CommandRouter {
         let command = try text(p,"command_id",max:100)
         guard UUID(uuidString:command) != nil else { throw CoreError("INVALID_INPUT","command_id must be a UUID.") }
         let digest = hash(Data((method + (try jsonString(p))).utf8))
+        // Rework capture writes ordinary tickets, which the media-only preparation cannot hold.
+        if method == "media_rework_create" {return try mediaReworkCreateCommand(params:p,caller:c,command:command,digest:digest)}
         var resources = try prepareMediaResources(method:method,params:p,caller:c)
         resources.nativeOwnerProjection = nativeOwnerProjection
         let prepared = try prepareMediaCommand(method:method,params:p,caller:c,resources:resources)
@@ -286,9 +292,10 @@ extension CommandRouter {
                     let decision = try scoped(db,id,(try StoredRecord(round, family: "media").string("project_id")),type:"media_owner_decision")
                     let applies = decision["review_basis_signature"] as? String == entry["review_basis_signature"] as? String
                     row["decision"] = decision;row["decision_applicable"] = applies;row["disposition"] = applies ? (try StoredRecord(decision, family: "media").requiredValue("disposition")) : "stale"
-                }
+                } else if item["stale_predecessor_decision_id"] is String { row["disposition"] = "stale" }
             };return row
         }
+        result["rework"] = try mediaReworkSummary(db,round:round)
         result["attention"] = try strings(round,"attention_ids").map {try scoped(db,$0,(try StoredRecord(round, family: "media").string("project_id")),type:"media_context_attention")}
         return result
     }
@@ -381,6 +388,8 @@ extension CommandRouter {
         case "media_decide","media_suggest","media_adopt_suggestion": return try mediaDecision(db,p,c,project:pid,method:method)
         case "media_round_finish":
             return try mediaFinishRound(db,p,c,project:pid)
+        case "media_round_successor":
+            return try mediaSuccessorRound(db,p,c,project:pid)
         default: throw CoreError("UNSUPPORTED_METHOD","Internal media command is unavailable.")
         }
     }
@@ -507,17 +516,11 @@ extension CommandRouter {
 
     private func mediaFinishRound(_ db: Database,_ p: JSON,_ c: Caller,project pid: String) throws -> JSON {
         try owner(c);var round = try scoped(db,try text(p,"round_id"),pid,type:"media_round")
-        try mediaObserve(db,p,round:round,caller:c);_ = try mediaObservedManifest(db,p,round:round)
-        let rows = try StoredRecord(mediaRoundView(db,round:round,caller:c), family: "media_round_view").objects("items")
-        let members = try Set((try StoredRecord(mediaObservedManifest(db,p,round:round),
-             family: "media_round_manifest").objects("items")).map {(try StoredRecord($0,
-             family: "media").string("item_id"))})
-        for row in rows where members.contains((try StoredRecord(row, family: "media").string("id"))) {
-            let disposition = (try StoredRecord(row, family: "media").string("disposition"))
-            guard ["accepted","excluded","changes_requested"].contains(disposition) else { throw CoreError("MEDIA_UNRESOLVED","Every published item needs a current explicit final disposition.") }
-            if disposition == "changes_requested",(row["decision"] as? JSON)?["no_follow_up_reason"] == nil { throw CoreError("MEDIA_UNRESOLVED",
-                "Rework needs a link or explicit owner no-follow-up reason.") }
-        }
+        try mediaObserve(db,p,round:round,caller:c);let manifest = try mediaObservedManifest(db,p,round:round)
+        // CL-118: exact current dispositions; rework links and no-follow-up counted separately.
+        let (closure,links) = try mediaClosure(db,round:round,manifest:manifest,caller:c)
+        round["closure"] = closure
+        round["record_references"] = (try StoredRecord(round, family: "media").objects("record_references")) + (try links.map {try mediaRef("media_rework_link",$0)})
         round["state"] = "closed";round = revised(round);try mediaWrite(db,round,type:"media_round");return round
     }
 

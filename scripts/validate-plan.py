@@ -160,6 +160,23 @@ def check() -> dict:
     bad = copy.deepcopy(examples['human-request']); bad['file_requests'][0]['kind'] = 'file_or_directory'
     reject('human-request', bad, 'file_or_directory instead of either')
 
+    triage = examples['triage-orchestrator']
+    bad = copy.deepcopy(triage); bad['triage']['orchestrator'] = None
+    reject('triage-orchestrator', bad, 'orchestrated Triage without an orchestrator')
+    bad = copy.deepcopy(triage); bad['triage']['state'] = 'plan'
+    reject('triage-orchestrator', bad, 'plan with an orchestrator')
+    bad = copy.deepcopy(triage); bad['triage']['phase'] = 'review'
+    reject('triage-orchestrator', bad, 'fixed Triage phase')
+    bad = copy.deepcopy(triage); bad['note']['audience'] = 'everyone'
+    reject('triage-orchestrator', bad, 'unknown audience')
+    bad = copy.deepcopy(triage); bad['note']['recipient'] = {'kind': 'session', 'session_id': bad['note']['deliveries'][0]['recipient_session_id']}
+    reject('triage-orchestrator', bad, 'recipient combined with audience')
+    recipients = [d['recipient_session_id'] for d in triage['note']['deliveries']]
+    if len(recipients) != len(set(recipients)):
+        errors.append('Triage orchestrator example: more than one delivery for one session')
+    if len({m['task_id'] for m in triage['members']}) != len(triage['members']):
+        errors.append('Triage orchestrator example: duplicate member ticket')
+
     project_id = examples['project-binding']['project_id']
     if settings['project_id'] != project_id or any(g['project_id'] != project_id for g in grant['projects']):
         errors.append('Synthetic project settings/grants/binding disagree')

@@ -1609,6 +1609,66 @@ class SeedIsolationTests(unittest.TestCase):
             store_fixture(database, 2, [('manifest', {'id': 'manifest', 'evidence': {'source_capture': {'source_root': str(project), 'additional_paths': ['src/file']}}})])
             self.assertEqual(harness.require_local_paths(database, base / 'data')['external_project_path_occurrences'], 2)
 
+    def test_manifest_evidence_additional_paths_are_project_relative(self):
+        # CL-298: artifact submit evidence keeps project-relative additional_paths.
+        accepted = ['unity/Assets/Game/Runtime/UI/TitleScreen.cs', 'docs/design/batch.md', 'file.txt']
+        with test_directory() as directory:
+            base = Path(directory).resolve()
+            counts = self.inspect(base, [('manifest', {'id': 'manifest', 'evidence': {'kind': 'artifact', 'additional_paths': accepted,
+                                                                                      'summary': 'ready'}})])
+            self.assertEqual(counts['relative_evidence_paths'], 3)
+            self.assertEqual(counts['external_project_path_occurrences'], 0)
+            second = base / 'second';second.mkdir()
+            inside = str(second / 'data' / 'objects' / 'file')
+            counts = self.inspect(second, [('manifest', {'id': 'manifest', 'evidence': {'additional_paths': [inside]}})])
+            self.assertEqual(counts['relative_evidence_paths'], 0)
+        refusals = [('', 'relative, malformed or traversing'), ('.', 'relative, malformed or traversing'),
+                    ('..', 'relative, malformed or traversing'), ('../outside/file', 'relative, malformed or traversing'),
+                    ('src/../../outside', 'relative, malformed or traversing'), ('src/./file', 'relative, malformed or traversing'),
+                    ('src//file', 'relative, malformed or traversing'), ('src/', 'relative, malformed or traversing'),
+                    ('src/file\0bad', 'relative, malformed or traversing'), ('/outside/file', 'stored absolute path outside'),
+                    ('/outside/../file', 'relative, malformed or traversing'), ('file:///outside/file', 'stored file URL'),
+                    ('FILE:src/file', 'stored file URL'), ('src/file:x', 'stored file URL')]
+        for value, message in refusals:
+            with self.subTest(value=value), test_directory() as directory, self.assertRaisesRegex(ValueError, message):
+                self.inspect(Path(directory).resolve(), [('manifest', {'id': 'manifest', 'evidence': {'kind': 'artifact', 'additional_paths': [value]}})])
+        # Only top-level manifest evidence gains the rule; other contexts keep the absolute binding rule.
+        for kind, record in [('fixture', {'evidence': {'additional_paths': ['src/file']}}),
+                             ('request', {'evidence': {'additional_paths': ['src/file']}}),
+                             ('manifest', {'evidence': {'checks': [{'additional_paths': ['src/file']}]}}),
+                             ('manifest', {'additional_paths': ['src/file']})]:
+            with self.subTest(kind=kind, record=record), test_directory() as directory:
+                with self.assertRaisesRegex(ValueError, 'relative, malformed or traversing'):
+                    self.inspect(Path(directory).resolve(), [(kind, dict(record, id='record'))])
+
+    def test_manifest_evidence_check_report_paths_are_project_relative(self):
+        # CL-298: a submitted check result names its report relative to the project root.
+        def record(value, checks_key='checks'):
+            return [('manifest', {'id': 'manifest', 'evidence': {checks_key: [{'name': 'EditMode', 'result': 'passed', 'path': value}]}})]
+        with test_directory() as directory:
+            counts = self.inspect(Path(directory).resolve(), record('TestResults/unity-EditMode-20261026.xml'))
+            self.assertEqual(counts['relative_evidence_paths'], 1)
+        for value, message in [('', 'relative, malformed or traversing'), ('../outside.xml', 'relative, malformed or traversing'),
+                               ('TestResults/../../x.xml', 'relative, malformed or traversing'), ('x\0.xml', 'relative, malformed or traversing'),
+                               ('/outside/run.xml', 'stored absolute path outside'), ('file:///outside/run.xml', 'stored file URL')]:
+            with self.subTest(value=value), test_directory() as directory, self.assertRaisesRegex(ValueError, message):
+                self.inspect(Path(directory).resolve(), record(value))
+        # Other check-like lists keep the strict slot-absolute rule.
+        with test_directory() as directory, self.assertRaisesRegex(ValueError, 'relative, malformed or traversing'):
+            self.inspect(Path(directory).resolve(), record('TestResults/run.xml', 'results'))
+
+    def test_manifest_evidence_additional_paths_with_source_root_refuse_checklist_aliases(self):
+        with test_directory() as directory:
+            base = Path(directory).resolve();project = base / 'project';project.mkdir();live = base / 'live';live.mkdir()
+            (project / 'alias').symlink_to(live)
+            evidence = {'source_root': str(project), 'additional_paths': ['alias/file']}
+            with patch.object(harness, 'LIVE', live), self.assertRaisesRegex(ValueError, 'Checklist data root'):
+                self.inspect(base, [('manifest', {'id': 'manifest', 'evidence': evidence})])
+            evidence['additional_paths'] = ['src/file'];second = base / 'second';second.mkdir()
+            with patch.object(harness, 'LIVE', live):
+                counts = self.inspect(second, [('manifest', {'id': 'manifest', 'evidence': evidence})])
+            self.assertEqual((counts['external_project_path_occurrences'], counts['relative_evidence_paths']), (2, 0))
+
     def test_captured_links_cannot_escape_the_captured_tree(self):
         for value in ['../../outside', '/outside', 'file\0bad']:
             with self.subTest(value=value), test_directory() as directory:

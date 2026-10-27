@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "project_id": "65b298d0-5a4f-4c4a-b190-df7ed3b4f281",
+  "triage": {
+    "triage_id": "20000000-0000-4000-8000-000000000010",
+    "key": "DEMO-T3",
+    "name": "Codex · 7f3a21",
+    "revision": 4,
+    "state": "orchestrated",
+    "orchestrator": {
+      "orchestration_id": "20000000-0000-4000-8000-000000000020",
+      "session": {
+        "session_id": "20000000-0000-4000-8000-000000000040",
+        "provider": "codex",
+        "thread_label": "Codex · 7f3a21"
+      },
+      "started_at": "2026-10-24T16:00:00Z",
+      "route_state": "working"
+    },
+    "history_phase": null,
+    "member_counts": {
+      "active": 1,
+      "review": 1
+    }
+  },
+  "members": [
+    {
+      "task_id": "20000000-0000-4000-8000-000000000003",
+      "key": "DEMO-12",
+      "status_category": "active",
+      "holder": {
+        "session_id": "20000000-0000-4000-8000-000000000041",
+        "provider": "claude",
+        "thread_label": "Claude · 4c9e02"
+      },
+      "return_triage_id": null,
+      "joined_at": "2026-10-24T16:01:00Z",
+      "join_reason": "explicit_add"
+    },
+    {
+      "task_id": "20000000-0000-4000-8000-000000000004",
+      "key": "DEMO-18",
+      "status_category": "review",
+      "holder": null,
+      "return_triage_id": "20000000-0000-4000-8000-000000000010",
+      "joined_at": "2026-10-24T16:02:00Z",
+      "join_reason": "orchestrator_claim"
+    }
+  ],
+  "note": {
+    "message_id": "20000000-0000-4000-8000-000000000050",
+    "task_id": "20000000-0000-4000-8000-000000000003",
+    "triage_id": "20000000-0000-4000-8000-000000000010",
+    "audience": "all",
+    "mandatory_both": false,
+    "deliveries": [
+      {
+        "delivery_id": "20000000-0000-4000-8000-000000000060",
+        "recipient_session_id": "20000000-0000-4000-8000-000000000041",
+        "recipient_role": "ticket_holder",
+        "state": "queued",
+        "label": "A copy also went to the Triage orchestrator Codex · 7f3a21."
+      },
+      {
+        "delivery_id": "20000000-0000-4000-8000-000000000061",
+        "recipient_session_id": "20000000-0000-4000-8000-000000000040",
+        "recipient_role": "triage_orchestrator",
+        "state": "queued",
+        "label": "Also sent to Claude · 4c9e02, which holds DEMO-12."
+      }
+    ]
+  }
+}

@@ -84,14 +84,15 @@ struct TaskAssignmentSheet: View {
         do {
             let response = try await store.request("policy_get", ["project_id": project, "task_id": task.id])
             let query=WorkspacePageQuery(surface:"worker_sessions",project:project)
-            let reply=try await store.request("workspace_page",query.parameters(cursor:cursor))
+            // CL-288: a retired (superseded) worker read is read again, never shown as an error.
+            guard let reply=try await store.supersedableRead("workspace_page",query.parameters(cursor:cursor)) else { return }
             let workers=try WorkspacePage(reply,query:query)
             availableSessions=workers.rows;nextWorkers=workers.next;previousWorkers=workers.previous
             let policy = Record(values: response["policy"] as? [String: Any] ?? [:])
             let role = Record(values: policy.object("roles")["implementer"] as? [String: Any] ?? [:])
             eligibleProviders = Set(role.strings("providers")).intersection(policy.strings("allowed_providers"))
             policyRevision = (response["revision"] as? NSNumber)?.intValue ?? 0
-        } catch { failure = PlainError.text(error); eligibleProviders = [] }
+        } catch { guard !(error is CancellationError) else { return }; failure = PlainError.text(error); eligibleProviders = [] }
     }
     func assign() {
         guard let session = selectedSession, !contextChanged else { return }

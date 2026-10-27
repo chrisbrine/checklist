@@ -294,9 +294,17 @@ class SelectionTests(unittest.TestCase):
         # Production changes are expected; the recorded map still selects their consumers.
         (self.root / 'Sources/ChecklistCore/NativeOutcomeRecorder.swift').write_text('changed')
         self.assertIsNotNone(selector.load_impact_map(self.root, map_path)[0])
+        # CL-299: changed test code keeps the measured map; the planner selects it directly.
         fixture.write_text('changed fixture')
-        self.assertIn('test/build inputs changed', selector.load_impact_map(self.root, map_path)[1]['reason'])
+        accepted, status = selector.load_impact_map(self.root, map_path)
+        self.assertIsNotNone(accepted)
+        self.assertEqual(status['changed_test_inputs'], ['Tests/ChecklistCoreTests/Fixture.swift'])
         fixture.write_text('fixture')
+        data = self.root / 'Tests/ChecklistCoreTests/data.json'
+        data.write_text('{}')
+        self.assertIn('test/build inputs changed: Tests/ChecklistCoreTests/data.json',
+                      selector.load_impact_map(self.root, map_path)[1]['reason'])
+        data.unlink()
         measured['generated_at'] = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
         map_path.write_text(json.dumps(measured))
         self.assertIn('old', selector.load_impact_map(self.root, map_path)[1]['reason'])
@@ -308,6 +316,154 @@ class SelectionTests(unittest.TestCase):
         measured['commit'] = '0000000000000000000000000000000000000000'
         map_path.write_text(json.dumps(measured))
         self.assertIsNone(selector.load_impact_map(self.root, map_path)[0])
+
+    def write(self, path, text):
+        source = self.root / path
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(text)
+        return path
+
+    def direct_map(self, extra=None):
+        """A current map with one mapped Core source and declared test classes."""
+        self.write('Tests/ChecklistCoreTests/ExistingTests.swift', 'final class ExistingTests: XCTestCase { func testOne() {} }')
+        self.write('Tests/ChecklistIPCTests/UserTests.swift', 'final class UserTests: XCTestCase { func testOne() {} }')
+        sources = {'Sources/ChecklistCore/Existing.swift': {'classes': ['ChecklistCoreTests.ExistingTests'],
+                                                            'qualification_cases': []}}
+        sources.update(extra or {})
+        return self.measured_map(sources)
+
+    def test_new_test_file_selects_own_classes_and_keeps_source_coverage(self):
+        measured = self.direct_map()
+        new = self.write('Tests/ChecklistCoreTests/NewTests.swift',
+                         '@MainActor final class NewTests: XCTestCase {\n    private struct Fixture {}\n'
+                         '    func helper() {}\n    func testOne() {}\n}\n@MainActor private final class Fake {}\n')
+        plan = self.plan('Sources/ChecklistCore/Existing.swift', new, impact_map=measured)
+        self.assertEqual(plan['test_groups']['ChecklistCoreTests'], ['ExistingTests', 'NewTests'])
+        self.assertEqual(plan['group_fallback_paths'], [])
+        self.assertEqual(plan['qualification_tests'], [])
+        selection = plan['direct_test_selections'][new]
+        self.assertIn('new test file', selection['reason'])
+        self.assertEqual(selection['classes'], ['ChecklistCoreTests.NewTests'])
+        # Core test sources are read as text by App inspection tests; without
+        # recorded readers that target stays whole, with the reason named.
+        self.assertEqual(selection['whole_targets'], ['ChecklistAppTests'])
+        self.assertIn('ChecklistAppTests', plan['test_targets'])
+        self.assertNotIn('ChecklistAppTests', plan['test_groups'])
+        self.write('Tests/ChecklistAppTests/GlossaryTests.swift', 'final class GlossaryTests: XCTestCase {}')
+        measured['inspection_references'] = {'ChecklistAppTests.GlossaryTests': ['Tests/ChecklistCoreTests/ExistingTests.swift']}
+        plan = self.plan('Sources/ChecklistCore/Existing.swift', new, impact_map=measured)
+        self.assertEqual(plan['test_groups']['ChecklistAppTests'], ['GlossaryTests'])
+        self.assertEqual(len(plan['test_targets']), 2)
+
+    def test_changed_test_file_keeps_measured_consumers_and_adds_new_classes(self):
+        changed = 'Tests/ChecklistIPCTests/ChangedTests.swift'
+        measured = self.direct_map({changed: {'classes': ['ChecklistIPCTests.ChangedTests', 'ChecklistIPCTests.UserTests'],
+                                              'qualification_cases': []}})
+        # Measured consumers make even a shared top-level helper selectable.
+        self.write(changed, 'func sharedHelper() {}\nfinal class ChangedTests: XCTestCase { func testOne() {} }\n'
+                            'final class AddedTests: XCTestCase { func testTwo() {} }\n')
+        plan = self.plan(changed, 'Sources/ChecklistCore/Existing.swift', impact_map=measured)
+        self.assertEqual(plan['test_groups'], {'ChecklistCoreTests': ['ExistingTests'],
+                                               'ChecklistIPCTests': ['AddedTests', 'ChangedTests', 'UserTests']})
+        self.assertIn('changed test file', plan['direct_test_selections'][changed]['reason'])
+        self.assertEqual(plan['group_fallback_paths'], [])
+
+    def test_deleted_test_file_selects_remaining_measured_consumers_or_falls_back(self):
+        gone = 'Tests/ChecklistIPCTests/GoneTests.swift'
+        measured = self.direct_map({gone: {'classes': ['ChecklistIPCTests.GoneTests', 'ChecklistIPCTests.UserTests'],
+                                           'qualification_cases': []}})
+        plan = self.plan(gone, impact_map=measured)
+        self.assertEqual(plan['test_groups'], {'ChecklistIPCTests': ['UserTests']})
+        self.assertIn('deleted test file', plan['direct_test_selections'][gone]['reason'])
+        unknown = 'Tests/ChecklistIPCTests/UnmappedTests.swift'
+        plan = self.plan(unknown, impact_map=measured)
+        self.assertEqual(plan['group_fallback_paths'], [unknown])
+        self.assertIn('deleted test file is not in the coverage map', plan['fallback_reasons'][unknown])
+        self.assertEqual(plan['test_targets'], ['ChecklistIPCTests'])
+        self.assertNotIn('ChecklistIPCTests', plan['test_groups'])
+
+    def test_shared_test_helper_without_measured_consumers_falls_back(self):
+        measured = self.direct_map()
+        helper = self.write('Tests/ChecklistCoreTests/SharedFixture.swift',
+                            'struct SharedFixture {}\nfinal class HelperTests: XCTestCase { func testOne() {} }\n')
+        plan = self.plan(helper, 'Sources/ChecklistCore/Existing.swift', impact_map=measured)
+        self.assertEqual(plan['group_fallback_paths'], [helper])
+        self.assertIn('shared test helpers (struct SharedFixture)', plan['fallback_reasons'][helper])
+        self.write(helper, 'nonisolated func sharedHelper() {}\nfinal class HelperTests: XCTestCase { func testOne() {} }\n')
+        self.assertIn('unrecognized nonisolated func', self.plan(helper, impact_map=measured)['fallback_reasons'][helper])
+        self.assertNotIn('ChecklistCoreTests', plan['test_groups'])
+        self.assertTrue(all(case.startswith(('ChecklistCoreTests.', 'ChecklistAppTests.'))
+                            for case in plan['qualification_tests']))
+        self.assertIn('ChecklistCoreTests.MediaDecisionTests/test450SelectionLostReplyFailedMiddleOnlyRefreshAndLaterReversal',
+                      plan['qualification_tests'])
+        # A new class another test file uses is a shared helper too.
+        self.write(helper, 'final class HelperTests: XCTestCase { func testOne() {} }\n')
+        self.write('Tests/ChecklistCoreTests/UserOfHelper.swift', 'final class UserOfHelper: HelperTests {}')
+        plan = self.plan(helper, impact_map=measured)
+        self.assertIn('used by Tests/ChecklistCoreTests/UserOfHelper.swift', plan['fallback_reasons'][helper])
+
+    def test_qualification_test_file_selects_only_its_own_cases(self):
+        measured = self.direct_map()
+        method = 'test450SelectionLostReplyFailedMiddleOnlyRefreshAndLaterReversal'
+        path = self.write('Tests/ChecklistCoreTests/MediaDecisionTests.swift',
+                          'final class MediaDecisionTests: XCTestCase {\n    func ' + method +
+                          '() throws { try QualificationSuite.requireEnabled() }\n    func testSmall() {}\n}\n')
+        plan = self.plan(path, impact_map=measured)
+        self.assertEqual(plan['qualification_tests'], ['ChecklistCoreTests.MediaDecisionTests/' + method])
+        self.assertEqual(plan['qualification_reasons'], {'ChecklistCoreTests.MediaDecisionTests/' + method: [path]})
+        self.assertEqual(plan['test_groups']['ChecklistCoreTests'], ['MediaDecisionTests'])
+        self.assertEqual(plan['direct_test_selections'][path]['qualification_cases'],
+                         ['ChecklistCoreTests.MediaDecisionTests/' + method])
+
+    def test_runtime_input_selects_reading_test_classes(self):
+        measured = self.direct_map()
+        self.write('Tests/ChecklistCoreTests/ReaderTests.swift',
+                   'final class ReaderTests: XCTestCase { func testRead() { _ = "docs/integrations.md" } }')
+        plan = self.plan('docs/integrations.md', impact_map=measured)
+        self.assertEqual(plan['test_groups'], {'ChecklistCoreTests': ['ReaderTests']})
+        self.assertIn('ReaderTests.swift', plan['direct_test_selections']['docs/integrations.md']['reason'])
+        (self.root / 'Tests/ChecklistCoreTests/ReaderTests.swift').unlink()
+        plan = self.plan('docs/integrations.md', impact_map=measured)
+        self.assertEqual(plan['test_targets'], ['ChecklistCoreTests'])
+        self.assertNotIn('ChecklistCoreTests', plan['test_groups'])
+
+    def test_new_source_reached_only_through_changed_files(self):
+        measured = self.direct_map()
+        mapped = self.write('Sources/ChecklistCore/Existing.swift', 'let value = NewFeature().run()')
+        new = self.write('Sources/ChecklistCore/NewFeature.swift',
+                         'public struct NewFeature { public func run() {} }\n'
+                         'extension NewFeature: Equatable {}\n'
+                         'extension NativeOutcomeRecorder { func newFeatureName() {} }\n')
+        plan = self.plan(mapped, new, impact_map=measured)
+        self.assertEqual(plan['group_fallback_paths'], [])
+        self.assertEqual(plan['new_source_reachability'][new]['referenced_by'], [mapped])
+        self.assertEqual(plan['test_groups'], {'ChecklistCoreTests': ['ExistingTests']})
+        cases = {
+            'extension NativeOutcomeRecorder: CustomStringConvertible { var description: String { "" } }': 'conformance',
+            'public struct NativeOutcomeRecorder2 {}\nextension NativeOutcomeRecorder { init(x: Int) {} }': 'initializer',
+            'public struct Unreferenced {}': 'not reached',
+            'public struct NewFeature {}\n@objc class Bridge: NSObject {}': 'runtime lookup',
+            'public struct NewFeature {}\nnonisolated func newFeatureHelper() {}': 'unrecognized top-level',
+        }
+        for text, reason in cases.items():
+            with self.subTest(reason=reason):
+                self.write(new, text)
+                plan = self.plan(mapped, new, impact_map=measured)
+                self.assertEqual(plan['group_fallback_paths'], [new])
+                self.assertIn(reason, plan['fallback_reasons'][new])
+                self.assertEqual(len(plan['test_targets']), 7)
+        # A name an unchanged file already uses may be an overload or a move.
+        self.write(new, 'public struct NewFeature {}')
+        self.write('Sources/ChecklistCore/Unchanged.swift', 'let other = NewFeature()')
+        plan = self.plan(mapped, new, impact_map=measured)
+        self.assertIn('reuses names in unchanged files: NewFeature', plan['fallback_reasons'][new])
+
+    def test_every_fallback_names_its_reason(self):
+        plan = self.plan('Package.swift', 'script/build_app.sh', 'unknown.bin', '../outside', 'Sources/ChecklistCore/Store.swift')
+        self.assertEqual(set(plan['fallback_reasons']), set(plan['fallback_paths'] + plan['group_fallback_paths']))
+        self.assertEqual(plan['fallback_reasons']['Package.swift'], 'package manifest or lockfile')
+        self.assertEqual(plan['fallback_reasons']['script/build_app.sh'], 'build script')
+        self.assertIn('no current coverage map', plan['fallback_reasons']['Sources/ChecklistCore/Store.swift'])
 
     def test_app_only(self):
         plan = self.plan('Sources/ChecklistApp/ContentView.swift')
@@ -877,12 +1033,18 @@ class SelectionTests(unittest.TestCase):
                         measured_qualification_cases=list(selector.QUALIFICATION_CASES))
         map_path = self.root / 'coverage.json'
         map_path.write_text(json.dumps(measured))
-        for path in ['examples/media-intake.json', 'Sources/ChecklistApp/Assets/catalog.json']:
+        for path in ['Sources/ChecklistApp/Assets/catalog.json', 'Tests/Fixtures/unnamed.json']:
             with self.subTest(path=path), patch.object(selector, 'changed_paths', return_value=[path]), \
                     patch.object(selector.subprocess, 'run'):
                 mapping, status = selector.load_impact_map(self.root, map_path)
                 self.assertIsNone(mapping)
                 self.assertIn(path, status['reason'])
+        # A runtime input with named readers keeps the map; its readers are selected directly.
+        with patch.object(selector, 'changed_paths', return_value=['examples/media-intake.json']), \
+                patch.object(selector.subprocess, 'run'):
+            mapping, status = selector.load_impact_map(self.root, map_path)
+            self.assertIsNotNone(mapping)
+            self.assertEqual(status['changed_test_inputs'], ['examples/media-intake.json'])
 
     def test_nested_package_build_and_test_inputs_invalidate_coverage(self):
         from datetime import datetime, timezone

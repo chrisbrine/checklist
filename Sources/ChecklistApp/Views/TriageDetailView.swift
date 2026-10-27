@@ -47,7 +47,8 @@ struct TriageDetailView: View {
                     }
                 } else {
                     DetailSection(title: "Triage purpose") {
-                        Text(triage.string("purpose").isEmpty ? "Describe the fix or review pass these tickets should share." : triage.string("purpose")).checklistFont(.callout).foregroundStyle(triage.string("purpose").isEmpty ? Color.checklistSecondaryText : .primary).textSelection(.enabled)
+                        if triage.string("purpose").isEmpty { Text("Describe the fix or review pass these tickets should share.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText).textSelection(.enabled) }
+                        else { RichTextView(text: triage.string("purpose"), capability: .triagePurpose) }
                         Button("Edit Triage brief…") { beginEdit() }.checklistFont(.micro)
                     }
                 }

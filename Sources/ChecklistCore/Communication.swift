@@ -78,6 +78,11 @@ extension CommandRouter {
         try assistantPermission(c,pid,"post_notes_on_request")
         if ["correction","retraction"].contains(p["kind"] as? String ?? ""),p["correction_of"] == nil { throw CoreError("INVALID_INPUT","A correction or retraction needs correction_of and text in body.") }
         let body = try text(p,"body",max:65536)
+        // Optional v1 rich companion (CL-127): validated before any write; `body` stays the plain record.
+        let richContent = try p["content"].map { value -> RichContentEnvelope in
+            guard method == "message_send" else { throw CoreError("INVALID_INPUT","Rich content is advertised only on message_send.") }
+            return try RichContentEnvelope.validate(value,text:body)
+        }
         if !c.isOwner && bool(p,"requires_action") { throw CoreError("HUMAN_CHANNEL_REQUIRED","Only a trusted owner note can create an owner direction.") }
         var taskID: String? = p["task_id"] as? String
         if let tid = taskID { let task = try scoped(db,tid,pid,type:"task"); if let expected = p["expected_attempt_id"] as? String,expected != (task["active_attempt_id"] as? String ?? "") { throw CoreError("RECIPIENT_CHANGED","The handler changed while this note was being drafted. Review the current recipient before sending.") } }
@@ -148,6 +153,18 @@ extension CommandRouter {
             if let id = p[field] as? String { let group = try scoped(db,id,pid,type:"group");guard group["kind"] as? String == kind else { throw CoreError("INVALID_INPUT","Select the matching group kind.") };m[field] = id }
         }
         if let tid = taskID { m["task_id"] = tid }; if let cid = conversationID { m["conversation_id"] = cid }
+        if let richContent {
+            // Media may cite only attachments this ticket already holds, with the exact hash.
+            for block in richContent.blocks {
+                guard case .media(let ref, _) = block.payload else { continue }
+                guard let tid = taskID, let file = try? scoped(db,ref.attachmentID,pid,type:"attachment"), file["task_id"] as? String == tid,
+                      Data((file["sha256"] as? String ?? "").utf8) == Data(ref.sha256.utf8) else {
+                    throw CoreError("CONTENT_REFERENCE_UNAVAILABLE","Media block \(block.id) must cite an attachment of this ticket with its exact sha256.",details:["path":"content.blocks","block_id":block.id])
+                }
+            }
+            m["content"] = richContent.source; m["content_schema_version"] = RichContentLimits.schemaVersion
+            m["content_digest"] = RichContentEnvelope.digest(text:body,content:richContent.source)
+        }
         if let reply = p["reply_to"] as? String {
             let original = try scoped(db,reply,pid,type:"message")
             guard original["task_id"] as? String == taskID,original["conversation_id"] as? String == conversationID else { throw CoreError("INVALID_INPUT","A reply must retain its original ticket and conversation scope.") }

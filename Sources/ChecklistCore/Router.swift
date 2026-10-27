@@ -80,6 +80,7 @@ extension CommandRouter {
         case "workspace_page": return try workspacePage(db,p,c)
         case "task_transition": return try taskTransition(db,p,c)
         case "review_prepare": return try prepareAgentReview(db,p,c)
+        case "codex_thread_start": return try codexThreadStart(db,p,c)
         case "review_context": return try agentReviewContext(db,p,c)
         case "review_evidence_add": return try addAgentReviewEvidence(db,p,c)
         case "source_execution_get": return try sourceExecutionGet(db,p,c)

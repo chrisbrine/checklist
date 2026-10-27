@@ -64,6 +64,9 @@ extension CommandRouter {
             kind = "image"
         } else if ["txt","md"].contains(url.pathExtension.lowercased()),bytes.count <= 256 * 1024,String(data:bytes,encoding:.utf8) != nil {
             kind = "text"
+        } else if MediaIntakeMovie.inspect(bytes) != nil {
+            // Self-contained ISO/QuickTime movie within the shared playback budget.
+            kind = "video"
         } else {
             // Byte-only PCM WAV validation cannot follow a playlist, reference movie
             // or embedded remote URL. Broader native codecs remain explicitly unsupported.

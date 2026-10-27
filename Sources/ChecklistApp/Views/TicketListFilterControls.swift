@@ -10,6 +10,7 @@ struct TicketListFilterControls: View {
     @State private var workerError: String?
     @State private var loadingWorkers = false
     @State private var workerReadID = UUID()
+    @State private var workersSuperseded = false
     var scope: String { store.projectID.map { store.projectName($0) } ?? "All projects" }
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.small) {
@@ -59,7 +60,7 @@ struct TicketListFilterControls: View {
                     HStack { Button("Cancel") { savingView = false }.keyboardShortcut(.cancelAction); Spacer(); Button("Save view") { save() }.keyboardShortcut(.defaultAction) }
                 }.padding(Spacing.page).frame(width:400)
             }
-            .task(id:store.projectID.map(RecordIdentity.init)) { workerReadID = UUID(); loadingWorkers = false; workers = []; workerCursor = nil; workerError = nil; await loadWorkers() }
+            .task(id:store.projectID.map(RecordIdentity.init)) { workerReadID = UUID(); loadingWorkers = false; workers = []; workerCursor = nil; workerError = nil; workersSuperseded = false; await loadWorkers() }
             .onChange(of: store.projectID.map(RecordIdentity.init)) { _, _ in
                 savingView = false; viewName = ""
             }
@@ -73,7 +74,7 @@ struct TicketListFilterControls: View {
                 ForEach(workers) { Text(workerLabel($0)).tag($0.id) }
             }
             if workerCursor != nil { Button("More workers…") { Task { await loadWorkers(cursor:workerCursor) } } }
-            if workerError != nil { Button("Retry workers") { Task { await loadWorkers() } } }
+            if workerError != nil || workersSuperseded { Button("Retry workers") { Task { await loadWorkers() } } }
         } label: { Text(title) }
     }
     func loadWorkers(cursor:String? = nil) async {
@@ -81,16 +82,22 @@ struct TicketListFilterControls: View {
         let readID = UUID(); workerReadID = readID; loadingWorkers = true
         defer { if workerReadID == readID { loadingWorkers = false } }
         let query = WorkspacePageQuery(surface:"worker_sessions",project:store.projectID,limit:100)
+        func current() -> Bool { workerReadID == readID && store.projectID.map(RecordIdentity.init) == query.project.map(RecordIdentity.init) }
         do {
-            let response = try await store.request("workspace_page",query.parameters(cursor:cursor))
+            // CL-288: a retired (superseded) worker read is read again, never shown as an error.
+            guard let response = try await store.supersedableRead("workspace_page",query.parameters(cursor:cursor),isCurrent:current) else {
+                if current() { workersSuperseded = true }
+                return
+            }
             try Task.checkCancellation()
-            guard workerReadID == readID, store.projectID.map(RecordIdentity.init) == query.project.map(RecordIdentity.init) else { return }
+            guard current() else { return }
+            workersSuperseded = false
             let page = try WorkspacePage(response,query:query)
             let rows = page.rows.filter { $0.string("role") == "worker" }
             if cursor == nil { workers = rows } else { for row in rows where !workers.contains(where: { RecordIdentity($0.id) == RecordIdentity(row.id) }) { workers.append(row) } }
             workerCursor = page.next; workerError = nil
         } catch {
-            guard workerReadID == readID, !Task.isCancelled else { return }
+            guard workerReadID == readID, !Task.isCancelled, !(error is CancellationError) else { return }
             workerError = PlainError.text(error)
         }
     }

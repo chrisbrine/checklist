@@ -114,16 +114,21 @@ struct RelatedTicketsView: View {
 
     @MainActor private func loadCandidates(_ text: String) async {
         candidateLoading = true;candidateError = nil
+        func current() -> Bool { adding && candidateSearch == text }
         do {
-            let open = try await store.request("task_list",["project_id":task.string("project_id"),"text":text,"archived":false,"limit":100])
-            let archived = try await store.request("task_list",["project_id":task.string("project_id"),"text":text,"archived":true,"limit":100])
-            guard !Task.isCancelled,adding,candidateSearch == text else {return}
+            // CL-288: a retired (superseded) search is read again, never shown as an error.
+            guard let open = try await store.supersedableRead("task_list",["project_id":task.string("project_id"),"text":text,"archived":false,"limit":100],isCurrent:current),
+                  let archived = try await store.supersedableRead("task_list",["project_id":task.string("project_id"),"text":text,"archived":true,"limit":100],isCurrent:current) else {
+                if !Task.isCancelled,current() {candidateLoading = false}
+                return
+            }
+            guard !Task.isCancelled,current() else {return}
             let all = ((open["tasks"] as? [[String:Any]]) ?? []) + ((archived["tasks"] as? [[String:Any]]) ?? [])
             candidateRows = all.map(Record.init).filter {RecordIdentity($0.id) != RecordIdentity(task.id)}.sorted {$0.string("key").localizedStandardCompare($1.string("key")) == .orderedAscending}
             candidateCount = (open["total"] as? Int ?? 0)+(archived["total"] as? Int ?? 0)
             candidateLoading = false
         } catch {
-            guard !Task.isCancelled,adding,candidateSearch == text else {return}
+            guard !Task.isCancelled,current(),!(error is CancellationError) else {return}
             candidateLoading = false;candidateError = "Could not search project tickets. No link was changed."
         }
     }

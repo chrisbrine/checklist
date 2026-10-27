@@ -363,7 +363,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
     source_root = Path(os.path.normpath(source_root)).absolute() if source_root is not None else None
     counts = dict.fromkeys(['managed_relative', 'managed_local_absolute', 'managed_origin_absolute',
                            'managed_unavailable_absolute', 'external_project_path_occurrences',
-                           'relative_capture_paths', 'inert_history_path_occurrences', 'inert_metadata_path_occurrences',
+                           'relative_capture_paths', 'relative_evidence_paths', 'inert_history_path_occurrences', 'inert_metadata_path_occurrences',
                            'capture_git_provenance'], 0)
     mapping = ManagedPathMapping()
     summary_source_root = Path(summary_source_root) if summary_source_root is not None else None
@@ -462,6 +462,9 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
             return ('slot_summary', None)
         if key == 'path':
             if parent.get('mode') == 'managed': return ('managed', 'objects')
+            # CL-298: a submitted check result names its report file relative
+            # to the project root (for example TestResults/run.xml).
+            if record_kind == 'manifest' and location.endswith('.evidence.checks[]'): return ('evidence_relative', None)
             if parent.get('mode') in {'reference', 'external_reference'}: return ('binding', None)
             if '.file_scopes[]' in location: return ('recursive_binding', None)
             if (capture and location.endswith('.files[]')) or any(name in location for name in ['.project_instruction_refs[]', '.instruction_coverage[]', '.link_chain[]']):
@@ -478,6 +481,11 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
             return ('managed', 'staging' if key == 'stage' else None)
         if key in {'object_relative_path', 'relative_path'}: return ('managed', None)
         if key == 'additional_paths' and capture: return ('project_relative', parent.get('source_root'))
+        # CL-298: submit evidence keeps the submitter's project-relative
+        # additional_paths verbatim (for example kind "artifact"). They name
+        # files under the manifest project's root; Core never resolves them.
+        if key == 'additional_paths' and record_kind == 'manifest' and location.endswith('.evidence'):
+            return ('evidence_relative', parent.get('source_root'))
         if key in {'root_path', 'source_root', 'workspace', 'workspace_path', 'canonical_key', 'additional_paths'}:
             return ('recursive_binding_optional' if key in {'workspace', 'workspace_path'} else 'recursive_binding', None)
         if key == 'paths': return ('binding', None)
@@ -568,6 +576,18 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
                 if not isinstance(family, str): refuse(location, 'a project-relative source path without its source root')
                 source = check_absolute(family, location)
                 check_binding(str(source / value), location)
+            elif kind == 'evidence_relative':
+                # Same spelling safety as capture project-relative paths. A
+                # leading slash keeps the slot-contained absolute rule; nothing
+                # outside the slot is opened or resolved.
+                if value.startswith('/'):
+                    check_slot_absolute(value, location)
+                elif '\0' in value or any(x in ['', '.', '..'] for x in value.split('/')):
+                    refuse(location, 'a relative, malformed or traversing stored file path')
+                elif isinstance(family, str):
+                    check_binding(str(check_absolute(family, location) / value), location)
+                else:
+                    counts['relative_evidence_paths'] += 1
             elif kind in {'captured', 'captured_link'}:
                 if not value or value.startswith('/') or '\0' in value or (kind == 'captured' and any(x in ['', '.', '..'] for x in value.split('/'))):
                     refuse(location, 'an unsafe captured relative path')

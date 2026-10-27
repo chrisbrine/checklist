@@ -1,0 +1,370 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Triage orchestrator snapshot v1",
+  "description": "Prepared CL-269 shape for one Triage, its single orchestrator (null for a plan), its members with their holders and return Triage, and the deliveries of one ticket note. This is not a command, complete history or authority. One Triage per ticket, one orchestrated Triage per conversation per project, same-project references, verified native identity, current grants and generations require service validation.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "project_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "triage": {
+      "$ref": "#/$defs/triage"
+    },
+    "members": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/member"
+      },
+      "maxItems": 200
+    },
+    "note": {
+      "$ref": "#/$defs/note"
+    }
+  },
+  "required": [
+    "schema_version",
+    "project_id",
+    "triage",
+    "members"
+  ],
+  "$defs": {
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9._-]*$"
+        },
+        "thread_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        }
+      },
+      "required": [
+        "session_id",
+        "provider",
+        "thread_label"
+      ]
+    },
+    "triage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "triage_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "key": {
+          "type": "string",
+          "pattern": "^.+-T[1-9][0-9]*$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "state": {
+          "enum": [
+            "orchestrated",
+            "plan",
+            "archived"
+          ]
+        },
+        "orchestrator": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/orchestrator"
+            }
+          ]
+        },
+        "history_phase": {
+          "description": "Older fixed phase kept as a history label only; it drives no behaviour.",
+          "enum": [
+            null,
+            "implementation",
+            "review"
+          ]
+        },
+        "member_counts": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "propertyNames": {
+            "enum": [
+              "draft",
+              "queued",
+              "active",
+              "review",
+              "blocked",
+              "deferred",
+              "done",
+              "canceled"
+            ]
+          }
+        }
+      },
+      "required": [
+        "triage_id",
+        "key",
+        "name",
+        "revision",
+        "state",
+        "orchestrator",
+        "history_phase",
+        "member_counts"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "orchestrated"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "orchestrator": {
+                "$ref": "#/$defs/orchestrator"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "plan",
+                  "archived"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "orchestrator": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "orchestrator": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "orchestration_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "session": {
+          "$ref": "#/$defs/session"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "route_state": {
+          "enum": [
+            "working",
+            "idle",
+            "needs_recovery",
+            "unknown"
+          ]
+        }
+      },
+      "required": [
+        "orchestration_id",
+        "session",
+        "started_at",
+        "route_state"
+      ]
+    },
+    "member": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "status_category": {
+          "enum": [
+            "draft",
+            "queued",
+            "active",
+            "review",
+            "blocked",
+            "deferred",
+            "done",
+            "canceled"
+          ]
+        },
+        "holder": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/session"
+            }
+          ]
+        },
+        "return_triage_id": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "format": "uuid"
+            }
+          ]
+        },
+        "joined_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "join_reason": {
+          "enum": [
+            "orchestrator_claim",
+            "orchestrator_review_claim",
+            "orchestrator_takeover",
+            "handoff_accept",
+            "explicit_add",
+            "verdict_return",
+            "upgrade_kept"
+          ]
+        }
+      },
+      "required": [
+        "task_id",
+        "key",
+        "status_category",
+        "holder",
+        "return_triage_id",
+        "joined_at",
+        "join_reason"
+      ]
+    },
+    "note": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "task_id": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "format": "uuid"
+            }
+          ]
+        },
+        "triage_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "audience": {
+          "enum": [
+            "all",
+            "holder",
+            "orchestrator"
+          ]
+        },
+        "mandatory_both": {
+          "type": "boolean",
+          "description": "True for owner directions, Human Request answers and workflow notices; audience cannot narrow them."
+        },
+        "deliveries": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "$ref": "#/$defs/delivery"
+          }
+        }
+      },
+      "required": [
+        "message_id",
+        "task_id",
+        "triage_id",
+        "audience",
+        "mandatory_both",
+        "deliveries"
+      ]
+    },
+    "delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "delivery_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "recipient_session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "recipient_role": {
+          "enum": [
+            "ticket_holder",
+            "triage_orchestrator",
+            "exact_recipient"
+          ]
+        },
+        "state": {
+          "enum": [
+            "saved_for_pickup",
+            "queued",
+            "acknowledged"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 640
+        }
+      },
+      "required": [
+        "delivery_id",
+        "recipient_session_id",
+        "recipient_role",
+        "state",
+        "label"
+      ]
+    }
+  }
+}

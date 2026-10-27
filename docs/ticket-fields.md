@@ -17,7 +17,7 @@ Ticket fields describe facts the service must validate or agents must select rel
 | Required prerequisites | Optional typed same-project links | Not required: a refined brief can be Ready while prerequisites are open | Queueing and Triage planning are allowed; required links gate pickup and claim | Claiming review still uses dependency guards | Required prerequisites are rechecked |
 | Priority, tags | Optional | Optional | Hints/context; never authority | Context only | No invented requirements |
 | Starter fields (`starter_fields`: Bug reproduction/expected/actual; Playtest build/platform/clip) | Optional; capture offers them for that kind only | Optional; the brief still carries the outcome | Included in task context when present | Context for the reviewer | No invented requirements |
-| Triage | Optional temporary phase grouping | Optional | Grouping does not grant a claim | Separate Review Triage; exact per-ticket results | Passing tickets complete independently |
+| Triage | Work list of one orchestrator conversation; a plan when it has none | Optional | Grouping does not grant a claim | A review claim by another orchestrator moves the ticket; exact per-ticket results | Passing tickets complete independently |
 | Evidence / attempts / checks | None required to capture | None required to prepare work | Real claim and bounded scopes precede actual work | Immutable target, exact gate/request and independent review identity required | Current evidence, accepted gates, resolved findings and applicable human/direction dependencies required |
 | Notes / decision rationale | Optional | Add useful context without making fields compulsory | Preserve source and full history | Link findings/dispositions to exact evidence | History remains retrievable |
 

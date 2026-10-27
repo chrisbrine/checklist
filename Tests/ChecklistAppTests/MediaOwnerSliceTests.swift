@@ -3,6 +3,7 @@ import SwiftUI
 @testable import ChecklistApp
 import ChecklistIPC
 import CryptoKit
+import ChecklistCore
 
 @MainActor final class MediaOwnerSliceTests: XCTestCase {
     @MainActor final class Peer {
@@ -301,7 +302,19 @@ import CryptoKit
         if case .unavailable = MediaComparisonAvailability.resolve(slot:image,original:nil) {} else {XCTFail("Missing original")}
         XCTAssertEqual(MediaComparisonAvailability.resolve(slot:image,original:Record(values:["availability":"available","size":100])),.image)
         if case .unsupported = MediaComparisonAvailability.resolve(slot:image,original:Record(values:["availability":"available","size":9*1024*1024])) {} else {XCTFail("Bounded image")}
-        for kind in ["audio","video"] {if case .unsupported(let label)=MediaComparisonAvailability.resolve(slot:Record(values:["media_kind":kind]),original:nil) {XCTAssertTrue(label.contains("not yet supported"))} else {XCTFail(kind)}}
+        for kind in ["audio","video"] {
+            let slot=Record(values:["media_kind":kind])
+            XCTAssertEqual(MediaComparisonAvailability.resolve(slot:slot,original:nil),.unavailable(MediaComparisonAvailability.unavailableText(nil)))
+            XCTAssertEqual(MediaComparisonAvailability.resolve(slot:slot,original:Record(values:["availability":"available","size":100]),declaredKind:kind),.playback(kind))
+            if case .unsupported(let label)=MediaComparisonAvailability.resolve(slot:slot,original:Record(values:["availability":"available","size":MediaPlaybackBudget.originalBytes+1])) {XCTAssertTrue(label.contains("500 MiB"),label)} else {XCTFail(kind)}
+            if case .unsupported(let label)=MediaComparisonAvailability.resolve(slot:slot,original:Record(values:["availability":"available","size":100]),declaredKind:"image") {XCTAssertTrue(label.contains("declares image"),label)} else {XCTFail(kind)}
+            for (reason,text) in [("cleaned","Original cleaned."),("missing","Original missing"),("changed","Original changed"),("reference_unavailable","Original reference unavailable")] {
+                if case .unavailable(let label)=MediaComparisonAvailability.resolve(slot:slot,original:Record(values:["availability":"unavailable","unavailable_reason":reason])) {XCTAssertTrue(label.hasPrefix(text),label)} else {XCTFail(reason)}
+            }
+        }
+        XCTAssertEqual(MediaComparisonLabels.role(slotID:"reference",candidateIndex:0,referenceSlotID:"reference",historical:false),"Reference")
+        XCTAssertEqual(MediaComparisonLabels.role(slotID:"take",candidateIndex:1,referenceSlotID:"reference",historical:false),"Candidate 2")
+        XCTAssertEqual(MediaComparisonLabels.role(slotID:"take",candidateIndex:nil,referenceSlotID:"",historical:true),"Approved example · Candidate")
     }
 }
 @MainActor private final class MediaNoAlerts:DesktopAlertSink {

@@ -52,6 +52,7 @@ QUALIFICATION_TESTS = (
 TIMING_TESTS = (
     'ChecklistAppTests.ApplicationTerminationTests/testOpenFloatingCaptureQuitsAndRestoresBlankTextAndFiles',
     'ChecklistAppTests.CachedScreenReturnTests/testTemplateCatalogOverviewReturnNeedsNoReadOrCatalogReplay',
+    'ChecklistAppTests.MediaPlaybackComparisonTests/testSyntheticWrittenMovieIsSelfContainedAndProbeMeasuresIt',
     'ChecklistCoreTests.EvidenceAuthorityTests/testGitCallsAreBoundedAndReadBothPipes',
     'ChecklistCoreTests.ArchivePreviewStoreCopyTests/testCL24PreviewOnOwnedStoreCopy',
     'ChecklistCoreTests.ScreenReadPerformanceTests/testOwnedStoreMeasurements',
@@ -176,6 +177,249 @@ def test_file_groups(root, target, path):
         if sibling != source and any(re.search(r'\b' + re.escape(name) + r'\b', sibling.read_text()) for name in classes):
             return None
     return tuple(classes)
+
+
+CODE_SUFFIXES = ('.swift', '.c', '.h', '.m', '.mm', '.cpp', '.s')
+TOP_LEVEL_DECLARATION = re.compile(
+    r'^(?:@\w+(?:\([^)\n]*\))?\s+)*(?:(private|fileprivate|internal|public|open)\s+)?(?:(?:final|static|indirect)\s+)*'
+    r'(class|struct|enum|actor|protocol|extension|func|let|var|typealias)\s+(\w+)([^\n{]*)', re.M)
+
+
+def unrecognized_top_level(text):
+    """Column-0 lines that are not imports, attributes, directives or recognized declarations."""
+    return [line.strip() for line in text.splitlines() if re.match(r'[A-Za-z]', line)
+            and not re.match(r'import\b', line) and not TOP_LEVEL_DECLARATION.match(line)]
+
+
+def direct_test_input(path):
+    """Changed inputs whose readers the planner selects directly (CL-299).
+
+    Test-tree code and runtime inputs with named readers keep a valid map; every
+    other changed file keeps the measured edges recorded for it.
+    """
+    suffix = PurePosixPath(path).suffix
+    if path.startswith('Tests/') and suffix in CODE_SUFFIXES:
+        return True
+    return (path in FILE_TEST_CONSUMERS or path in FILE_PYTHON_TEST_CONSUMERS) and suffix not in CODE_SUFFIXES
+
+
+def declared_test_classes(root, target, cache):
+    if target['name'] not in cache:
+        names = set()
+        for source in (root / target['path']).rglob('*.swift'):
+            names.update(re.findall(r'\bclass\s+(\w+)', source.read_text(errors='replace')))
+        cache[target['name']] = names
+    return cache[target['name']]
+
+
+def test_file_declarations(text, known):
+    """Own XCTestCase classes and other non-private top-level declarations."""
+    own, shared = set(), ['unrecognized ' + line[:40] for line in unrecognized_top_level(text)]
+    for access, kind, name, rest in TOP_LEVEL_DECLARATION.findall(text):
+        if kind == 'class' and re.search(r'\bXCTestCase\b', rest):
+            own.add(name)
+        elif kind == 'extension' and name in known:
+            own.add(name)
+        elif access not in ('private', 'fileprivate'):
+            shared.append(kind + ' ' + name)
+    return own, shared
+
+
+def test_file_selection(root, targets, owner, path, impact_map, cache):
+    """Select a changed test file's own classes/cases plus its measured consumers.
+
+    Returns {'fallback': reason} when the consumers cannot be determined.
+    """
+    entry = impact_map.get('sources', {}).get(path)
+    classes, cases, broad = {}, set(), set()
+
+    def add(group):
+        name, _, cls = group.partition('.')
+        target = targets.get(name)
+        # A deleted or renamed class has no remaining declaration to run.
+        if target and target['type'] == 'test' and cls in declared_test_classes(root, target, cache):
+            classes.setdefault(name, set()).add(cls)
+
+    if entry is not None:
+        for group in entry['classes']:
+            add(group)
+        cases.update(case for case in entry['qualification_cases'] if case in QUALIFICATION_CASES)
+    source = root / path
+    if not source.is_file():
+        if entry is None:
+            return {'fallback': 'deleted test file is not in the coverage map; its consumers are unknown'}
+        return {'reason': 'deleted test file: its measured consumers that still exist',
+                'classes': classes, 'cases': cases, 'broad': broad}
+    text = source.read_text(errors='replace')
+    known = {group.split('.', 1)[1] for group in impact_map.get('class_inventory', []) +
+             impact_map.get('measured_classes', []) if group.startswith(owner['name'] + '.')}
+    own, shared = test_file_declarations(text, known)
+    if entry is None:
+        if not own:
+            return {'fallback': 'new test file declares no XCTestCase class'}
+        if shared:
+            return {'fallback': 'new test file declares shared test helpers (' + ', '.join(shared[:5]) +
+                                '); their consumers are not measured'}
+        users = sorted(other.relative_to(root).as_posix() for other in (root / owner['path']).rglob('*.swift')
+                       if other != source and any(re.search(r'\b' + re.escape(name) + r'\b', other.read_text(errors='replace'))
+                                                  for name in own - known))
+        if users:
+            return {'fallback': 'new test file classes are used by ' + ', '.join(users[:5]) +
+                                '; their consumers are not measured'}
+        reason = 'new test file: its own classes and qualification cases'
+        for prefix, readers in SOURCE_TEST_CONSUMERS.items():
+            if not path.startswith(prefix):
+                continue
+            for reader in readers:
+                if reader not in targets:
+                    continue
+                # Source-inspection classes read the whole directory as text.
+                found = [group for group, references in impact_map.get('inspection_references', {}).items()
+                         if group.startswith(reader + '.') and any(item.startswith(prefix) for item in references)]
+                for group in found:
+                    add(group)
+                if not found:
+                    # Inspection readers are unit classes; qualification edges are executed coverage.
+                    broad.add(reader)
+            reason += ' plus source-inspection readers of ' + prefix
+    else:
+        reason = 'changed test file: its own classes and qualification cases plus measured consumers'
+    for name in own:
+        classes.setdefault(owner['name'], set()).add(name)
+    for case in QUALIFICATION_CASES:
+        group, _, method = case.partition('/')
+        target_name, _, cls = group.partition('.')
+        if (target_name == owner['name'] and cls in own and
+                re.search(r'\bfunc\s+' + re.escape(method) + r'\s*\(', text)):
+            cases.add(case)
+    return {'reason': reason, 'classes': classes, 'cases': cases, 'broad': broad}
+
+
+# Value conformances add operations that unchanged code could not name before;
+# CustomStringConvertible and similar protocols change existing output and fall back.
+VALUE_CONFORMANCES = ('Equatable', 'Hashable', 'Sendable')
+RUNTIME_LOOKUP = re.compile(r'@(?:main|objc|_cdecl|_dynamicReplacement|NSApplicationMain)\b|NSClassFromString|override\b')
+
+
+def new_source_names(text):
+    """Names a new Swift source adds, or (None, reason) when unchanged code could observe it.
+
+    New top-level declarations are reachable only by code that names them. An
+    extension of an existing type may add members, and conform only to protocols
+    the same file declares; overrides, runtime lookups and entry points fall back.
+    """
+    if RUNTIME_LOOKUP.search(text):
+        return None, 'new source uses an override, entry point or runtime lookup'
+    unrecognized = unrecognized_top_level(text)
+    if unrecognized:
+        return None, 'new source has an unrecognized top-level declaration: ' + unrecognized[0][:60]
+    declarations = list(TOP_LEVEL_DECLARATION.finditer(text))
+    declared = {match.group(3) for match in declarations if match.group(2) != 'extension'}
+    names = set()
+    for match in declarations:
+        access, kind, name, rest = match.groups()
+        if access in ('private', 'fileprivate'):
+            continue
+        if kind != 'extension':
+            names.add(name)
+            continue
+        if name in declared:
+            continue
+        conformances = [part.replace('@unchecked', '').strip() for part in
+                        re.sub(r'\bwhere\b.*', '', rest).partition(':')[2].split(',')]
+        if any(item and item not in declared and item not in VALUE_CONFORMANCES for item in conformances):
+            return None, 'new source adds a conformance to existing type ' + name
+        # The value-conformance requirements themselves (==, hash(into:)).
+        requirements = ('', 'hash') if set(conformances) & set(VALUE_CONFORMANCES) else ()
+        brace = text.find('{', match.end() - 1)
+        end = _close(text, brace, '{', '}')
+        depth, body = 0, text[brace + 1:end]
+        for line in body.splitlines():
+            if depth == 0:
+                member = re.match(r'\s*(?:@\w+(?:\([^)]*\))?\s+)*((?:\w+\s+)*)(func|var|let|case|subscript|init|struct|class|enum|actor|typealias)\b\s*(\w*)', line)
+                if member and not re.search(r'\b(?:private|fileprivate)\b', member.group(1)):
+                    if member.group(2) == 'func' and member.group(3) in requirements:
+                        pass
+                    elif member.group(2) in ('init', 'subscript') or not member.group(3):
+                        return None, 'new source adds an initializer, operator or subscript to existing type ' + name
+                    else:
+                        names.add(member.group(3))
+            depth += line.count('{') - line.count('}')
+    if not names:
+        return None, 'new source declares no new names'
+    return names, None
+
+
+def new_source_reachability(root, normalized, candidates):
+    """Map each self-contained new source to changed files that name it.
+
+    Unchanged code compiled without these names, so it cannot reach them; only
+    changed files can. A new source is covered when a referencing chain reaches a
+    changed file with its own selection. Returns (reached, reasons).
+    """
+    names, reasons = {}, {}
+    for path in candidates:
+        found, reason = new_source_names((root / path).read_text(errors='replace'))
+        if found is None:
+            reasons[path] = reason
+        else:
+            names[path] = found
+    if names:
+        changed = set(normalized)
+        pattern = re.compile(r'\b(?:' + '|'.join(sorted(map(re.escape, set().union(*names.values())))) + r')\b')
+        existing = set()
+        for folder in ('Sources', 'Tests', 'Packages'):
+            for source in (root / folder).rglob('*.swift'):
+                if source.relative_to(root).as_posix() not in changed:
+                    existing.update(pattern.findall(source.read_text(errors='replace')))
+        for path in sorted(names):
+            if names[path] & existing:
+                reasons[path] = ('new source reuses names in unchanged files: ' +
+                                 ', '.join(sorted(names[path] & existing)[:5]))
+                del names[path]
+    texts = {path: (root / path).read_text(errors='replace') for path in normalized
+             if path.endswith('.swift') and (root / path).is_file()}
+    referenced_by = {path: sorted(other for other, text in texts.items() if other != path and re.search(
+        r'\b(?:' + '|'.join(map(re.escape, sorted(found))) + r')\b', text)) for path, found in names.items()}
+    covered = set()
+    while True:
+        added = {path for path, users in referenced_by.items() if path not in covered and
+                 any(user not in referenced_by or user in covered for user in users)}
+        if not added:
+            break
+        covered |= added
+    for path in sorted(set(names) - covered):
+        reasons[path] = 'new source is not reached from a changed file with its own selection'
+    return {path: referenced_by[path] for path in sorted(covered)}, reasons
+
+
+def runtime_input_selection(root, targets, path, impact_map, cache):
+    """A named runtime input selects the classes of the test files that name it."""
+    classes, cases, broad, readers = {}, set(), set(), []
+    name = PurePosixPath(path).name
+    for consumer in FILE_TEST_CONSUMERS.get(path, ()):
+        target = targets.get(consumer)
+        if not target:
+            continue
+        files = sorted(source.relative_to(root).as_posix() for source in (root / target['path']).rglob('*.swift')
+                       if name in source.read_text(errors='replace'))
+        selections = [test_file_selection(root, targets, target, item, impact_map, cache) for item in files]
+        if not files or any('fallback' in selection for selection in selections):
+            # A dynamic read may come from any class or qualification case.
+            broad.add(consumer)
+            cases.update(case for case in QUALIFICATION_CASES if case.split('.')[0] == consumer)
+            continue
+        readers.extend(files)
+        for selection in selections:
+            for group, values in selection['classes'].items():
+                classes.setdefault(group, set()).update(values)
+            cases.update(selection['cases'])
+            broad.update(selection['broad'])
+    reason = ('runtime input: classes and qualification cases of its reading test files ' + ', '.join(readers)
+              if readers else 'runtime input')
+    if broad:
+        reason += '; whole target where no literal reader is measured: ' + ', '.join(sorted(broad))
+    return {'reason': reason, 'classes': classes, 'cases': cases, 'broad': broad}
 
 
 # One interpreter for round checks, background full suites and validation.
@@ -355,7 +599,10 @@ def load_impact_map(root, path=None, max_age_hours=24):
     """Accept only a complete, recent map from an ancestor with stable test inputs.
 
     Production edits remain eligible for coverage selection; new files use module
-    fallback. Changed tests/build inputs invalidate the observation environment.
+    fallback. Changed build inputs, unnamed runtime inputs and nested-package tests
+    invalidate the observation environment. Changed test-tree code and runtime
+    inputs with named readers keep the map; the planner selects them directly
+    and reports them as changed_test_inputs (CL-299).
     """
     from datetime import datetime, timezone
     path = path or root / '.local/build/test-impact-map.json'
@@ -383,6 +630,8 @@ def load_impact_map(root, path=None, max_age_hours=24):
         invalidating = [name for name in invalidating if not (root / name).is_file() or
                         data.get('input_hashes', {}).get(name) !=
                         hashlib.sha256((root / name).read_bytes()).hexdigest()]
+        deferred = [name for name in invalidating if direct_test_input(name)]
+        invalidating = [name for name in invalidating if name not in deferred]
         if invalidating:
             raise ValueError('test/build inputs changed: ' + ', '.join(invalidating))
         if set(data.get('qualification_case_inventory', data.get('measured_qualification_cases', []))) != set(QUALIFICATION_CASES):
@@ -432,7 +681,7 @@ def load_impact_map(root, path=None, max_age_hours=24):
                          set(data.get('measured_qualification_cases', [])))
         if missing_classes or missing_cases:
             raise ValueError('coverage inventory is unmeasured without an explicit class exception')
-        status.update(state='current',
+        status.update(state='current', changed_test_inputs=deferred,
                       unmeasured_qualification_cases=sorted(set(data.get('qualification_case_inventory', [])) - set(data.get('measured_qualification_cases', []))),
                       unmeasured_classes=sorted(set(data.get('class_inventory', [])) - set(data.get('measured_classes', []))),
                       commit=data['commit'], generated_at=data['generated_at'],
@@ -457,21 +706,28 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
     unmeasurable_classes = impact_map.get('coverage_unmeasurable_classes', {}) if impact_map else {}
     all_tests = {name for name, target in targets.items() if target['type'] == 'test'}
     affected, python, unknown = set(), set(), []
+    fallback_reasons = {}
+
+    def fallback(path, reason):
+        unknown.append(path)
+        fallback_reasons[path] = reason
     # Longest target path wins (e.g. StorageCrashProbe/ReleasedCore).
     owners = sorted(targets.values(), key=lambda target: len(target['path']), reverse=True)
     normalized = sorted(set(PurePosixPath(path.removeprefix('./')).as_posix() for path in paths))
     for path in normalized:
         parts = PurePosixPath(path).parts
         if PurePosixPath(path).is_absolute() or '..' in parts:
-            unknown.append(path)
-        elif path == 'Package.swift' or path == 'Package.resolved' or path.startswith(BUILD_SCRIPTS):
-            unknown.append(path)
+            fallback(path, 'unsafe path')
+        elif path == 'Package.swift' or path == 'Package.resolved':
+            fallback(path, 'package manifest or lockfile')
+        elif path.startswith(BUILD_SCRIPTS):
+            fallback(path, 'build script')
         elif path in FILE_TEST_CONSUMERS or path in FILE_PYTHON_TEST_CONSUMERS:
             consumers = FILE_TEST_CONSUMERS.get(path, ())
             python_consumers = FILE_PYTHON_TEST_CONSUMERS.get(path, ())
             if any(name not in all_tests for name in consumers) or any(
                     not (root / name).is_file() for name in python_consumers):
-                unknown.append(path)
+                fallback(path, 'named runtime reader is missing from the package or scripts')
             affected.update(name for name in consumers if name in all_tests)
             python.update(name for name in python_consumers if (root / name).is_file())
             # Explicit readers supplement the package graph, including resources.
@@ -489,18 +745,18 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
                     if path.startswith(prefix):
                         affected.update(name for name in consumers if name in targets)
             else:
-                unknown.append(path)
+                fallback(path, 'not a source or resource of a package target')
         elif path in PYTHON_TEST_OWNERS or (path.endswith('.py') and path.startswith(('script/', 'scripts/'))):
             own_tests = python_tests(root, path)
             if own_tests is not None:
                 python.update(own_tests)
             else:
-                unknown.append(path)
+                fallback(path, 'Python file without a test owner')
         elif path in VALIDATION_ONLY_FILES or any(
                 fnmatchcase(path, pattern) for pattern in VALIDATION_ONLY_GLOBS):
             pass
         else:
-            unknown.append(path)
+            fallback(path, 'unknown path; its consumers cannot be determined')
     def dependency_closure(initial):
         result = set(initial)
         while True:
@@ -525,6 +781,26 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
             if path.startswith(prefix):
                 seeds.update(consumers)
         path_consumers[path] = dependency_closure(seeds)
+    # CL-299: with a current map, changed test files and named runtime inputs
+    # select their own classes and measured consumers instead of the map falling back.
+    direct, direct_fallbacks, declared = {}, {}, {}
+    for path in normalized if impact_map else ():
+        owner = next((target for target in owners if path.startswith(target['path'] + '/')), None)
+        if owner and owner['type'] == 'test' and direct_test_input(path):
+            selection = test_file_selection(root, targets, owner, path, impact_map, declared)
+        elif path in FILE_TEST_CONSUMERS and direct_test_input(path):
+            selection = runtime_input_selection(root, targets, path, impact_map, declared)
+        else:
+            continue
+        if 'fallback' in selection:
+            direct_fallbacks[path] = selection['fallback']
+        else:
+            direct[path] = selection
+    new_sources = [path for path in normalized if impact_map and path not in mapped_sources
+                   and path.endswith('.swift') and (root / path).is_file()
+                   and (owner := next((target for target in owners if path.startswith(target['path'] + '/')), None))
+                   and owner['type'] != 'test']
+    reached, new_source_reasons = new_source_reachability(root, normalized, new_sources)
     if last_round:
         affected.update(targets)
     if unknown or full:
@@ -539,6 +815,20 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
     qualification_fallback_cases, coverage_fallback_classes = {}, {}
     selected_unmeasurable_classes = {}
     for path in normalized:
+        if path in reached:
+            # Its changed referencing files carry the selection (CL-299).
+            source_groups[path] = {}
+            continue
+        if path in direct:
+            selection = direct[path]
+            mapping = {name: sorted(classes) for name, classes in selection['classes'].items()}
+            source_groups[path] = mapping
+            affected.update(mapping)
+            affected.update(selection['broad'])
+            for case in QUALIFICATION_CASES:
+                if case in selection['cases']:
+                    reasons[case].append(path)
+            continue
         entry = mapped_sources.get(path)
         owner = next((target for target in owners if path.startswith(target['path'] + '/')), None)
         if entry is not None:
@@ -561,11 +851,18 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
                     reasons[case].append(path)
         elif owner and owner['type'] != 'test':
             group_fallback_paths.append(path)
+            fallback_reasons[path] = ('source file is not in the coverage map; module closure' if impact_map
+                                      else 'no current coverage map; module closure')
+            if path in new_source_reasons:
+                fallback_reasons[path] += ' (' + new_source_reasons[path] + ')'
             for case in QUALIFICATION_CASES:
                 if case.split('.')[0] in path_consumers[path]:
                     reasons[case].append(path)
         elif owner and owner['type'] == 'test':
             # An unmapped/changed fixture needs all qualifiers in its target.
+            if path in direct_fallbacks:
+                group_fallback_paths.append(path)
+                fallback_reasons[path] = direct_fallbacks[path] + '; whole target'
             for case in QUALIFICATION_CASES:
                 if case.split('.')[0] in path_consumers[path]:
                     reasons[case].append(path)
@@ -582,14 +879,15 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
                 owner = next((target for target in owners if path.startswith(target['path'] + '/')), None)
                 if mapping is not None:
                     # A complete coverage refresh includes dependent test targets.
-                    relevant.append(mapping.get(name, ()))
+                    relevant.append(None if name in direct.get(path, {}).get('broad', ()) else mapping.get(name, ()))
                 elif name not in path_consumers[path]:
                     continue
                 elif name in FILE_TEST_CONSUMERS.get(path, ()):
                     relevant.append(None)
                 elif owner and owner['name'] == name:
                     relevant.append(test_file_groups(root, owner, path))
-                elif owner and owner['type'] != 'test':
+                elif owner:
+                    # Production modules and source-inspection readers of test trees.
                     relevant.append(None)
             if relevant and all(selected is not None for selected in relevant):
                 groups[name] = sorted({group for selected in relevant for group in selected})
@@ -675,6 +973,17 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
             'python_tests': sorted(python), 'fallback_paths': unknown, 'skip': skip, 'full': full, 'qualification': qualification,
             'isolated_test_groups': isolated, 'test_groups': groups,
             'group_fallback_paths': group_fallback_paths, 'qualification_mode': qualification_mode,
+            'fallback_reasons': {path: fallback_reasons[path] for path in unknown + group_fallback_paths
+                                 if path in fallback_reasons},
+            'direct_test_selections': {path: {'reason': selection['reason'],
+                                              'classes': sorted(name + '.' + cls for name, values in selection['classes'].items()
+                                                                for cls in values),
+                                              'qualification_cases': sorted(selection['cases']),
+                                              'whole_targets': sorted(selection['broad'])}
+                                       for path, selection in sorted(direct.items())},
+            'new_source_reachability': {path: {'reason': 'new source: its names are new to the repository; '
+                                                         'changed files that name it carry the selection',
+                                               'referenced_by': users} for path, users in reached.items()},
             'qualification_fallback_cases': qualification_fallback_cases, 'coverage_fallback_classes': coverage_fallback_classes,
             'coverage_unmeasurable_classes': selected_unmeasurable_classes,
             'test_group_sources': {group: {'source': 'index-store', 'paths': paths}
@@ -735,8 +1044,15 @@ def main(argv=None):
             for group, observation in plan['test_group_sources'].items():
                 print('Unmeasurable class index-store references: ' + group + ' <- ' +
                       ', '.join(observation['paths']))
+            for path, selection in plan['direct_test_selections'].items():
+                print('Direct test-file selection: ' + path + ' -> ' + (', '.join(selection['classes']) or '(none)') +
+                      ' (' + selection['reason'] + ')')
+            for path, selection in plan['new_source_reachability'].items():
+                print('New source reached through: ' + path + ' <- ' + ', '.join(selection['referenced_by']))
             if plan['group_fallback_paths']:
                 print('Module group fallback for: ' + ', '.join(plan['group_fallback_paths']))
+            for path, reason in plan['fallback_reasons'].items():
+                print('Fallback reason: ' + path + ': ' + reason)
             if plan['fallback_paths']:
                 print('Full selection for: ' + ', '.join(plan['fallback_paths']))
             for target, groups in plan['test_groups'].items():

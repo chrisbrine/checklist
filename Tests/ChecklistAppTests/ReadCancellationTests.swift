@@ -385,6 +385,97 @@ import ChecklistIPC
         }
         XCTAssertEqual(health(store), before)
     }
+
+    // CL-288: ten quick successive searches supersede the held first search. Whether its late reply or a
+    // cancellation arrives, no error text appears and only the newest search's rows install.
+    func testSupersededTicketSearchesShowNoErrorBanner() async throws {
+        let f = try Fixture(isolatedDefaults("ReadCancellation").preferences); defer { f.cleanup() }
+        f.preferences.set(Page.tasks.rawValue, forKey: "lastPage")
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); store.stopWindowReads() }
+        try await until { store.connected && !store.ticketPageLoading }
+        let before = health(store)
+        for (round, late) in [(0, true), (1, false)] {
+            store.search = ""; try await until { !store.ticketPageLoading && store.ticketPageShownCount == 1 }
+            f.hold = { method, params in method == "task_list" && (params["text"] as? String ?? "") == "S" }
+            let typed = ["S", "Sy", "Syn", "Synt", "Synth", "Synthe", "Synthet", "Syntheti", "Synthetic", round == 0 ? "Synthetic t" : "Nothing matches"]
+            for text in typed { store.search = text; await Task.yield() }
+            try await until { f.held != nil }
+            if late { f.release() } else { f.release(CancellationError()) }
+            try await until { !store.ticketPageLoading }
+            XCTAssertNil(store.ticketPageError, "A superseded search must not show an error")
+            XCTAssertNil(store.error)
+            XCTAssertFalse([store.ticketPageError, store.error].compactMap { $0 }.contains { $0.contains("CancellationError") })
+            XCTAssertEqual(store.ticketPageShownCount, round == 0 ? 1 : 0, "Only the newest search's rows show")
+        }
+        XCTAssertEqual(health(store), before)
+    }
+
+    // CL-288: the store retires a view-owned read whose content epoch changed (request: epoch_retired).
+    // `supersedableRead` reads again instead of surfacing the CancellationError that became the banner.
+    func testRetiredViewReadIsReadAgainWithoutError() async throws {
+        let f = try Fixture(isolatedDefaults("ReadCancellation").preferences); defer { f.cleanup() }
+        f.preferences.set(Page.tasks.rawValue, forKey: "lastPage")
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); store.stopWindowReads() }
+        try await until { store.connected && !store.ticketPageLoading }
+        let before = health(store)
+        let query = WorkspacePageQuery(surface: "worker_sessions", project: f.project, limit: 100)
+        func workerReads() -> Int { f.calls.filter { $0.0 == "workspace_page" && $0.1["surface"] as? String == "worker_sessions" }.count }
+        // Direct proof of the cause: a plain request across the epoch change throws CancellationError.
+        f.hold = { method, params in method == "workspace_page" && params["surface"] as? String == "worker_sessions" }
+        let plain = Task { () async -> Error? in
+            do { _ = try await store.request("workspace_page", query.parameters(cursor: nil)); return nil } catch { return error }
+        }
+        try await until { f.held != nil }
+        _ = try f.command("task_create", ["project_id": f.project, "title": "Synthetic change one"])
+        await store.refresh()
+        f.release()
+        let plainError = await plain.value
+        XCTAssertTrue(plainError is CancellationError, "A read retired by the content epoch throws CancellationError")
+        // The fix: the same retirement is read again and returns the newer page with no error.
+        let reads = workerReads()
+        f.hold = { method, params in method == "workspace_page" && params["surface"] as? String == "worker_sessions" }
+        let retried = Task { try await store.supersedableRead("workspace_page", query.parameters(cursor: nil)).map { try WorkspacePage($0, query: query).rows.count } }
+        try await until { f.held != nil }
+        _ = try f.command("task_create", ["project_id": f.project, "title": "Synthetic change two"])
+        await store.refresh()
+        f.release()
+        let rows = try await retried.value
+        XCTAssertNotNil(rows, "A superseded read is read again and returns a valid page")
+        XCTAssertEqual(workerReads(), reads + 2)
+        // A caller that is no longer current gets nil, not an error.
+        f.hold = { method, params in method == "workspace_page" && params["surface"] as? String == "worker_sessions" }
+        var wanted = true
+        let gone = Task { try await store.supersedableRead("workspace_page", query.parameters(cursor: nil), isCurrent: { wanted }) == nil }
+        try await until { f.held != nil }
+        wanted = false; f.release()
+        let none = try await gone.value
+        XCTAssertTrue(none, "A caller that is no longer current gets nil")
+        XCTAssertNil(store.error); XCTAssertNil(store.ticketPageError)
+        XCTAssertEqual(health(store), before)
+    }
+
+    // CL-288: real failures still reach the error text, for a view-owned read and for a ticket search.
+    func testRealReadAndSearchFailuresStillShowAnError() async throws {
+        let f = try Fixture(isolatedDefaults("ReadCancellation").preferences); defer { f.cleanup() }
+        f.preferences.set(Page.tasks.rawValue, forKey: "lastPage")
+        let store = f.store(), live = Task { await store.startLiveUpdates() }
+        defer { live.cancel(); store.stopWindowReads() }
+        try await until { store.connected && !store.ticketPageLoading }
+        let query = WorkspacePageQuery(surface: "worker_sessions", project: f.project, limit: 100)
+        f.hold = { method, params in method == "workspace_page" && params["surface"] as? String == "worker_sessions" }
+        let denied = Task { try await store.supersedableRead("workspace_page", query.parameters(cursor: nil)) != nil }
+        try await until { f.held != nil }
+        f.release(ChecklistError("DENIED", "Synthetic denial"))
+        do { _ = try await denied.value; XCTFail("A real failure must throw") } catch {
+            XCTAssertEqual(PlainError.text(error), "Synthetic denial")
+        }
+        f.readsFail = true
+        store.search = "Synthetic"
+        try await until { store.ticketPageError != nil }
+        XCTAssertFalse(store.ticketPageError?.contains("CancellationError") ?? true)
+    }
 }
 
 @MainActor private final class CancellationAlertSink: DesktopAlertSink {

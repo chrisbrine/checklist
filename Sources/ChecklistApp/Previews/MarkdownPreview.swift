@@ -114,12 +114,8 @@ struct RenderedMarkdownPreview: View {
         case .rule: Divider()
         }
     }
-    func inline(_ text: String) -> Text {
-        // Bound inline-parser work per block. Unsupported HTML remains visible text.
-        guard text.utf8.count < 32_768, !text.contains("<") else { return Text(verbatim: text) }
-        let value = try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))
-        return value.map(Text.init) ?? Text(verbatim: text)
-    }
+    // Bound inline-parser work per block. Unsupported HTML remains visible text.
+    func inline(_ text: String) -> Text { RichInline.markdown(text) }
     func anchor(for block: MarkdownBlock) -> String {
         guard case .heading(_, let text) = block else { return "block-" + String(describing: block) }
         return text.lowercased().replacingOccurrences(of: " ", with: "-")

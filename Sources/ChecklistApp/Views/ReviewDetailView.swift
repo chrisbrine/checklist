@@ -255,7 +255,7 @@ private struct ReviewGateCard: View {
                     }
                     let submitter = Record(values: review.object("submitted_by"))
                     if !submitter.values.isEmpty { Text("Draft by this reviewer, submitted by \(submitter.string("actor_display", fallback: "the coordinator"))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
-                    if !review.string("reason").isEmpty { Text((review.string("check").isEmpty ? "" : review.string("check") + ": ") + review.string("reason")).checklistFont(.micro).textSelection(.enabled) }
+                    if !review.string("reason").isEmpty { RichTextView(text: (review.string("check").isEmpty ? "" : review.string("check") + ": ") + review.string("reason"), capability: .reviewExplanation, role: .micro) }
                     ForEach(StableListRows.checks(review.records("checks"), review: review)) { row in
                         let check = row.value
                         VStack(alignment: .leading, spacing: Spacing.tight) {

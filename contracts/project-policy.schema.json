@@ -161,7 +161,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 200,
-      "description": "Optional existing enrolled eligible worker recipient for context copies. The runtime validates same-project membership and actual worker role; this never assigns or enrolls work."
+      "description": "Superseded by the Triage orchestrator (CL-269). Until CL-248 ships, an optional existing enrolled eligible worker recipient for owner-direction context copies; after CL-248 it routes nothing, new policy saves refuse it, and old values stay readable as history. The runtime validates same-project membership and actual worker role; this never assigns or enrolls work."
     },
     "allow_human_decision_evidence": {
       "type": "boolean",

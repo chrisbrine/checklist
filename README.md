@@ -16,7 +16,7 @@ Personal-assistant integration, including Dot access, named contact and notifica
 
 Current work providers are Codex and Claude, using actual sessions attached to tickets. **Use in Codex** prepares a native composer; the user presses Send. A separate explicit native Codex thread-creation test also returned a real thread that automatically connected to its ticket; that association alone assigns no work and acquires no claim. Claude automatic creation remains unqualified. Other clients such as Muse require their own supported, qualified adapters; names and personalities confer no access.
 
-The versioned [bundled provider-plugin boundary](docs/provider-plugins.md) separates Codex/Claude metadata and supported native behavior from ticket/review policy. Optional [project orchestrators](docs/project-orchestrators.md) and [conversation content](docs/conversation-content.md) are defined as planned contracts; there is no Orchestrators tab or rich-message command in the current build.
+The versioned [bundled provider-plugin boundary](docs/provider-plugins.md) separates Codex/Claude metadata and supported native behavior from ticket/review policy. The [Triage orchestrator contract](docs/triage-orchestrators.md) (a Triage is the work list of one orchestrator conversation) and [conversation content](docs/conversation-content.md) are defined as contracts that CL-125, CL-248, CL-126 and CL-127 implement; there is no Orchestrators tab, and no rich-message command in the current build.
 
 ## Start here
 

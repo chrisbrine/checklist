@@ -72,7 +72,7 @@ struct RequestDetailView: View {
                     AccessibleHStack { StatusPill(name: Self.stateName(request), category: answered ? "done" : "blocked"); Spacer() }
                     Text("Requested by \(requesterLabel)").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).textSelection(.enabled)
                     TechnicalDetails([("Request", request.id), ("Form revision", "\(request.integer("form_revision"))"), ("Candidate", exactTarget.id), ("Candidate SHA-256", exactTarget.string("sha256"))])
-                    if !spec.string("explanation").isEmpty { Text(spec.string("explanation")).checklistFont(.callout).textSelection(.enabled) }
+                    if !spec.string("explanation").isEmpty { RichTextView(text: spec.string("explanation"), capability: .requestExplanation) }
                     if !request.string("task_id").isEmpty, let task = store.task(request.string("task_id")) { Button { store.open(.task(task.id)) } label: { Label("\(task.string("key")) · \(task.string("title"))", systemImage: "arrow.turn.up.left") }.buttonStyle(.link) }
                     if staleDraft && !answered {
                         VStack(alignment: .leading, spacing: Spacing.small) {
@@ -122,7 +122,7 @@ struct RequestDetailView: View {
                                     Text("You · \(relativeTime(response.string("created_at")))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                                     Text(response.bool("complete") ? "Answer saved" : "Response saved; dependency remains unresolved").checklistFont(.micro)
                                     if !response.records("inspected_images").isEmpty { Text("Inspected originals: \(response.records("inspected_images").count)").checklistFont(.micro) }
-                                    if !response.string("explanation").isEmpty { Text(response.string("explanation")).checklistFont(.callout).textSelection(.enabled) }
+                                    if !response.string("explanation").isEmpty { RichTextView(text: response.string("explanation"), capability: .requestExplanation) }
                                     let continuation = RequestAnswerDeliveryProjection.make(request: request, response: response, messages: request.records("detail_messages"), sessions: request.records("detail_sessions"), snapshotCurrent: store.connected)
                                     ForEach(continuation.recipients) { recipient in
                                         Text("\(recipient.label) · \(recipient.receipt)").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)

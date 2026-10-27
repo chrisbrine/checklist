@@ -41,7 +41,7 @@ Use task history when relevant, or a project conversation without creating a tic
 
 ## Versioned provider extension
 
-Current source uses the [version-1 bundled plugin contract](provider-plugins.md) for provider/model metadata, actual host/bootstrap interpretation, supported transport and conversation handoff. Follow its controlled registration/qualification/update procedure for a future provider; unknown, incompatible, disabled or unqualified adapters/models remain unavailable. A plugin ID/version, observed model or optional [orchestrator registration](project-orchestrators.md) cannot supply an identity, project grant or worker claim. The registry does not reactivate the cancelled assistant integration.
+Current source uses the [version-1 bundled plugin contract](provider-plugins.md) for provider/model metadata, actual host/bootstrap interpretation, supported transport and conversation handoff. Follow its controlled registration/qualification/update procedure for a future provider; unknown, incompatible, disabled or unqualified adapters/models remain unavailable. A plugin ID/version, observed model or [Triage orchestration](triage-orchestrators.md) cannot supply an identity, project grant or worker claim. The registry does not reactivate the cancelled assistant integration.
 
 ## Future adapters and persistent records
 

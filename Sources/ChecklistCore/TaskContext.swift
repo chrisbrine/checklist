@@ -19,6 +19,8 @@ extension CommandRouter {
         for key in ["body","description","progress","final_report"] {
             if let full = value[key] as? String,full.count > 1200 { value[key] = String(full.prefix(1200)); value[key+"_truncated"] = true }
         }
+        // A rich companion describes the complete body; a preview omits it rather than mismatch.
+        if value["body_truncated"] as? Bool == true, value.removeValue(forKey:"content") != nil { value["content_omitted"] = true }
         return value
     }
 

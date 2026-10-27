@@ -1,6 +1,6 @@
 # Versioned provider plugins (CL-128)
 
-The local source has a Foundation-only `ChecklistProviders` target with a small version-1 contract, reviewed bundled Codex and Claude implementations, and an immutable validated registry. It is compiled into the existing macOS products. It is not a runtime loader, marketplace, model runtime, new enrollment route or future server. Windows/Linux clients remain deferred. The separate [project orchestrator](project-orchestrators.md) and [optional content](conversation-content.md) contracts are planned; this refactor does not expose them as commands or UI.
+The local source has a Foundation-only `ChecklistProviders` target with a small version-1 contract, reviewed bundled Codex and Claude implementations, and an immutable validated registry. It is compiled into the existing macOS products. It is not a runtime loader, marketplace, model runtime, new enrollment route or future server. Windows/Linux clients remain deferred. The separate [Triage orchestrator](triage-orchestrators.md) and [optional content](conversation-content.md) contracts are implemented by later tickets; this refactor does not expose them as commands or UI.
 
 ## Ownership and interface
 

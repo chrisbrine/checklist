@@ -120,12 +120,13 @@ struct CaptureTaskView: View {
         epicLoading=true;epicError=nil
         do {
             let query=WorkspacePageQuery(surface:"epics",project:project)
-            let response=try await store.request("workspace_page",query.parameters(cursor:cursor))
+            // CL-288: a retired (superseded) read is read again, never shown as an error.
+            guard let response=try await store.supersedableRead("workspace_page",query.parameters(cursor:cursor),isCurrent:{epicRead==read && RecordIdentity(projectID)==RecordIdentity(project)}) else {if epicRead==read {epicLoading=false};return}
             guard !Task.isCancelled,epicRead==read,RecordIdentity(projectID)==RecordIdentity(project) else{return}
             let page=try WorkspacePage(response,query:query)
             epicPage=page.rows;epicTotal=page.total;epicNext=page.next;epicPrevious=page.previous;epicLoading=false
             // Omission from this page never invalidates a durable draft's Epic.
-        } catch {if epicRead==read {epicLoading=false;epicError="Could not load Epic choices. The saved Epic is preserved; retry by reopening capture."}}
+        } catch {if epicRead==read {epicLoading=false;if !(error is CancellationError) {epicError="Could not load Epic choices. The saved Epic is preserved; retry by reopening capture."}}}
     }
 }
 

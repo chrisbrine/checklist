@@ -65,12 +65,14 @@ struct TicketEpicSection: View {
         let token=UUID(),project=task.string("project_id"),incarnation=store.storeIncarnation;read=token;loading=true;failure=nil
         do {
             let query=WorkspacePageQuery(surface:"epics",project:project)
-            let page=try WorkspacePage(await store.request("workspace_page",query.parameters(cursor:cursor),ifCurrent: {
+            // CL-288: a retired (superseded) read is read again, never shown as an error.
+            guard let reply=try await store.supersedableRead("workspace_page",query.parameters(cursor:cursor),isCurrent: {
                 read==token && store.storeIncarnation==incarnation && store.selectedTicketCurrent(task.id)
-            }),query:query)
+            }) else {if read==token {loading=false};return}
+            let page=try WorkspacePage(reply,query:query)
             guard !Task.isCancelled,read==token,store.storeIncarnation==incarnation else {return}
             choices=page.rows;next=page.next;previous=page.previous;loadedChoices=identity;loading=false
-        } catch {if read==token {loading=false;if !Task.isCancelled,store.selectedTicketCurrent(task.id) {failure="Could not load Epic choices. The current Epic is kept."}}}
+        } catch {if read==token {loading=false;if !Task.isCancelled,!(error is CancellationError),store.selectedTicketCurrent(task.id) {failure="Could not load Epic choices. The current Epic is kept."}}}
     }
     func save() {
         guard let target=choices.first(where: {$0.id == selection}) else {return}
