@@ -82,7 +82,7 @@ extension CoreTests {
         let edit = tools.first { $0["name"] as? String == "task_edit" }!
         let patch = ((edit["inputSchema"] as! JSON)["properties"] as! JSON)["patch"] as! JSON
         XCTAssertTrue((patch["description"] as? String ?? "").contains("readiness"))
-        XCTAssertTrue((tools.first { $0["name"] as? String == "triage_create" }!["description"] as? String ?? "").contains("Queued tickets"))
+        XCTAssertTrue((tools.first { $0["name"] as? String == "triage_create" }!["description"] as? String ?? "").contains("A Triage has no phase"))
     }
 
     func testTaskContextNamesRefinementAndPrerequisiteWaits() throws {

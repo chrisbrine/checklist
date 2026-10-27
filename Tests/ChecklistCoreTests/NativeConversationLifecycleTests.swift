@@ -57,7 +57,9 @@ extension EvidenceAuthorityTests {
         XCTAssertEqual(receipt["state"] as? String, "acknowledged"); XCTAssertNotNil(receipt["acknowledged_at"])
         let tool = try XCTUnwrap(router.toolCatalog(assistant).first { $0["name"] as? String == "message_delivery_list" })
         XCTAssertEqual((tool["annotations"] as? JSON)?["readOnlyHint"] as? Bool, true)
-        XCTAssertEqual(Set((tool["inputSchema"] as! JSON)["required"] as! [String]), ["project_id", "task_id", "message_id"])
+        // CL-248: a ticket note by task_id or a ticket-free Triage note by triage_id.
+        XCTAssertEqual(Set((tool["inputSchema"] as! JSON)["required"] as! [String]), ["project_id", "message_id"])
+        XCTAssertNotNil(((tool["inputSchema"] as! JSON)["properties"] as? JSON)?["triage_id"])
     }
     func testMessageDeliveryReadRefusesOutsideScopeAndOtherTicketOrPrivateConversation() throws {
         let p = try project(), t = try ready(p), other = try ready(p)

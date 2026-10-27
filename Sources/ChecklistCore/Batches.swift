@@ -27,7 +27,6 @@ extension CommandRouter {
         guard group["kind"] as? String == "triage",!bool(group,"archived") else { throw CoreError("INVALID_INPUT","Prepare a batch from an active Triage.") }
         let phase = try text(p,"phase")
         guard AttemptPhase.wireValues.contains(phase),let selected = p["tasks"] as? [JSON],!selected.isEmpty,selected.count <= 200 else { throw CoreError("INVALID_INPUT","Select one phase and between 1 and 200 exact Triage members.") }
-        guard triagePhase(group) == phase else { throw CoreError("TRIAGE_PHASE_CONFLICT","The batch phase must match its Triage. Use a separate Triage for the next phase.") }
         let ids = selected.compactMap {$0["task_id"] as? String}
         guard ids.count == selected.count,Set(ids).count == ids.count,Set(ids).isSubset(of:Set(triageMemberIDs(group))) else { throw CoreError("REVISION_CONFLICT","Select unique current members of this Triage before preparing a batch.") }
         let project = try record(db,pid,type:"project")
@@ -168,7 +167,7 @@ extension CommandRouter {
         var results: [JSON] = []
         for input in inputs {
             var memberInput = input;memberInput["project_id"] = pid
-            // Reviewer-side blockers retain handling membership; implementation returns depart.
+            // Each verdict applies the same membership move as review_record (Work.swift).
             let operation: TicketStatusOperation = method == "batch_review_record" && input["verdict"] as? String == "blocked" && input["blocked_on"] as? String != "implementation" ? .triage : .individual
             var result = try work(db,memberInput,c,action,operation:operation)
             let task = try scoped(db, try StoredAttemptRecord(attempts[results.count]).taskID, pid, type: "task")

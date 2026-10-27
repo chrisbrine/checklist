@@ -316,7 +316,7 @@ enum StorageSnapshot {
         ] else { throw StorageSnapshotFailure.incomplete }
         let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self, from: manifestData)
         guard [1, 2].contains(manifest.format), manifest.kind == kind, manifest.operationID == operation.uuidString.lowercased(),
-              UUID(uuidString: manifest.storeID) != nil, [0, 1, 2, 3].contains(manifest.schema), manifest.objects.count <= budget.maximumObjects else { throw StorageSnapshotFailure.incomplete }
+              UUID(uuidString: manifest.storeID) != nil, (0...SchemaMigrations.currentSchema).contains(manifest.schema), manifest.objects.count <= budget.maximumObjects else { throw StorageSnapshotFailure.incomplete }
         if let capturedAt = manifest.capturedAt {
             guard capturedAt.utf8.count <= 40,ISO8601DateFormatter().date(from:capturedAt) != nil else {throw StorageSnapshotFailure.incomplete}
         }

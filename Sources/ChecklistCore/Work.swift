@@ -360,8 +360,10 @@ extension CommandRouter {
             verdict: verdict, reviewID: reviewID, reviewer: c, hold: hold)
         t = revised(t)
         try save(db, t, type: "task")
+        // Rule 10: a reject also returns the work, so it moves the ticket to its return Triage.
         try recordTicketStatusAction(
-            db, task: t, caller: actor, operation: returnsToImplementation ? .individual : operation)
+            db, task: t, caller: actor, operation: returnsToImplementation ? .individual : operation,
+            membership: returnsToImplementation || verdict == "reject" ? .verdictReturn : .status)
         try event(
             db, caller: actor, project: pid, entity: t["id"] as? String, kind: "review_" + verdict,
             data: [
@@ -606,7 +608,7 @@ extension CommandRouter {
         t["status_id"] = try status(db, pid, phase == "review" ? "review" : "active")["id"]
         t = revised(t)
         try save(db, t, type: "task")
-        try recordTicketStatusAction(db, task: t, caller: c, operation: operation)
+        try recordTicketStatusAction(db, task: t, caller: c, operation: operation, membership: .claim(review: phase == "review"))
         try event(
             db, caller: c, project: pid, entity: t["id"] as? String, kind: "work_claimed",
             data: ["attempt_id": try StoredRecord(a, family: "attempt").string("id"), "phase": phase])
@@ -753,7 +755,7 @@ extension CommandRouter {
                     "manifest_id": mid, "gate": gate, "state": "queued", "revision": 1,
                 ], type: "review_request")
         }
-        try recordTicketStatusAction(db, task: t, caller: c, operation: operation)
+        try recordTicketStatusAction(db, task: t, caller: c, operation: operation, membership: .submission)
         try event(
             db, caller: c, project: pid, entity: t["id"] as? String, kind: "work_submitted",
             data: ["manifest_id": mid])

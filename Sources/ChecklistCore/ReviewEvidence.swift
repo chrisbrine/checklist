@@ -84,7 +84,7 @@ extension CommandRouter {
             }
         }
         try save(db,revised(task),type:"task")
-        try recordTicketStatusAction(db,task:task,caller:caller)
+        try recordTicketStatusAction(db,task:task,caller:caller,membership:verdict == "reject" ? .verdictReturn : .status)
         try event(db,caller:caller,project:pid,entity:task["id"] as? String,kind:"human_approval_"+verdict,data:["review_id":review["id"]!,"manifest_id":mid,"attachment_id":attachmentID])
         if completed { try event(db,caller:caller,project:pid,entity:task["id"] as? String,kind:"task_completed",data:["origin":"review_pass","review_id":review["id"]!]) }
         return review

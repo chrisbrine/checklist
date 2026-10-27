@@ -206,10 +206,18 @@ extension CommandRouter {
             type:"session"))["provider"] ?? ""];t["assignment_reason"] = offer["summary"];
             t["assignment_provenance"] = ["actor":c.principal,"origin":"accepted_handoff",
             "at":now(),"handoff_id":(try StoredRecord(offer, family: "WorkAuthority").requiredValue("id"))] }
-            try save(db,revised(t),type:"task")
+            let accepted = revised(t);try save(db,accepted,type:"task")
+            try recordTicketStatusAction(db,task:accepted,caller:c,membership:.claim(review:a["phase"] as? String == "review"))
         }
         offer["state"] = "accepted";offer["accepted_attempt_id"] = a["id"];
         try save(db,revised(offer),type:isChild ? "delegation" : "handoff");
+        if !isChild, let earlier = origin["id"] as? String {
+            // CL-248: a handoff notice reaches the earlier holder and the Triage orchestrator.
+            let handed = try scoped(db,(try StoredRecord(a, family: "WorkAuthority").string("task_id")),pid,type:"task")
+            let body = "Ticket metadata: \(try agentReference(db,handed)). \(AgentReference.quoted(author(db,c))) accepted the handoff of this ticket's implementation claim. The earlier holder's claim ended."
+            let notices = try roleChangeNotices(db,task:handed,earlier:[earlier],body:body,caller:c)
+            a["handoff_notices"] = notices.map { ["message_id":$0["id"] ?? NSNull(),"deliveries":$0["deliveries"] ?? []] as JSON }
+        }
         try event(db,caller:c,project:pid,entity:a["task_id"] as? String,kind:method,
         data:["attempt_id":(try StoredRecord(a, family: "WorkAuthority").requiredValue("id"))]);
         a.removeValue(forKey:"token_hash");a["claim_token"] = token;let task = try scoped(db,
@@ -304,6 +312,7 @@ extension CommandRouter {
         t["assignment_provenance"] = ["actor":c.principal,"origin":"takeover",
         "at":now(),"attempt_id":(try StoredRecord(a, family: "WorkAuthority").requiredValue("id"))] }
         t = revised(t);try save(db,t,type:"task")
+        try recordTicketStatusAction(db,task:t,caller:c,membership:.claim(review:phase == "review"))
         try event(db,caller:c,project:pid,entity:t["id"] as? String,kind:"work_taken_over",
         data:["attempt_id":(try StoredRecord(a, family: "WorkAuthority").requiredValue("id")),
         "from_attempt_id":oldID,"from_session_id":old["session_id"] ?? "",
@@ -312,14 +321,8 @@ extension CommandRouter {
         let body = "Ticket metadata: \(try agentReference(db,t)). \(AgentReference.quoted(author(db,c))) took over this ticket's \(phase) claim. Reason: \(reason)\nYour claim on this ticket ended: stop changing files for it and do not submit or record a verdict. Post anything useful as a note on this ticket."
         var holders: [String] = []
         for attempt in [old] + children { if let holder = attempt["session_id"] as? String,holder != sid,holder != "human",!holders.contains(holder) { holders.append(holder) } }
-        var notices: [JSON] = []
-        for holder in holders {
-            guard let target = try? scoped(db,holder,pid,type:"session"),canReceive(target,project:pid) else { continue }
-            notices.append(try messageWrite(db,["project_id":pid,"task_id":(try StoredRecord(t,
-             family: "WorkAuthority").requiredValue("id")),"body":body,"recipient":["kind":"session",
-            "session_id":holder]],c,"message_send"))
-        }
-        if notices.isEmpty { notices.append(try messageWrite(db,["project_id":pid,"task_id":(try StoredRecord(t, family: "WorkAuthority").requiredValue("id")),"body":body],c,"message_send")) }
+        // CL-248: the Triage orchestrator also receives the takeover notice.
+        let notices = try roleChangeNotices(db,task:t,earlier:holders,body:body,caller:c)
         a.removeValue(forKey:"token_hash");a["claim_token"] = token;a["task"] = try taskProjection(db,t);a["context"] = try compactTaskContext(db,task:t,caller:c)
         a["takeover_notices"] = notices.map { ["message_id":$0["id"] ?? NSNull(),"deliveries":$0["deliveries"] ?? []] as JSON }
         return a

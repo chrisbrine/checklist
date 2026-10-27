@@ -5,6 +5,7 @@ import GRDB
 
 extension CoreTests {
     func prepareImplementationBatch(_ p: JSON,_ group: JSON,_ tasks: [JSON],_ caller: Caller? = nil,scopes: [[JSON]] = []) throws -> JSON {
+        if orchestrateBatchTriages { try ensureOrchestrated(p,group) }
         let current = try currentTriage(p,group)
         let members: [JSON] = try tasks.enumerated().map { index,task in
             let currentTask = try call("task_get",["project_id":p["id"]!,"task_id":task["id"]!],caller)
@@ -30,6 +31,7 @@ extension CoreTests {
         return ["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":batch["revision"]!,"expected_direction_cursors":cursors]
     }
     func prepareReviewBatch(_ p: JSON,_ group: JSON,_ tasks: [JSON],_ reviewer: Caller) throws -> JSON {
+        if orchestrateBatchTriages { try ensureOrchestrated(p,group) }
         let current = try currentTriage(p,group)
         let members: [JSON] = try tasks.map { task in
             let context = try call("task_context",["project_id":p["id"]!,"task_id":task["id"]!,"detail_level":"full"],reviewer),currentTask = context["task"] as! JSON
@@ -48,6 +50,7 @@ extension CoreTests {
         return try jsonString(state)
     }
     func testBatchClaimPolicyInputRefusalsLeavePreparationClaimable() throws {
+        orchestrateBatchTriages = true // CL-125 rule 6: claims keep tickets in an orchestrated Triage.
         let invalid: [Any?] = [nil,NSNull(),"1",true,false,1.5,0,-1,NSNumber(value:UInt64.max)]
         for value in invalid {
             let p = try project(),tasks = try [ready(p,task(p)),ready(p,task(p))],group = try triage(p)
@@ -109,6 +112,7 @@ extension CoreTests {
         XCTAssertFalse(strings(workSchema,"required").contains("policy_revision"))
     }
     func testBatchSnapshotSurvivesLiveMembershipEditsAndKeepsExclusiveClaims() throws {
+        orchestrateBatchTriages = true // CL-125 rule 6: claims keep tickets in an orchestrated Triage.
         let p = try project(),first = try ready(p,task(p,"One")),second = try ready(p,task(p,"Two")),later = try ready(p,task(p,"Later")),group = try triage(p)
         try addTriage(p,group,first);try addTriage(p,group,second)
         let batch = try prepareImplementationBatch(p,group,[first,second]),frozen = batch["members"] as! [JSON]
@@ -123,7 +127,7 @@ extension CoreTests {
         XCTAssertEqual(try jsonString(frozen),try jsonString(after["members"]!));XCTAssertEqual(after["triage_revision"] as? Int,batch["triage_revision"] as? Int)
         let history = try currentTriage(p,group)["membership_history"] as! [JSON]
         let old = history.first {$0["task_id"] as? String == second["id"] as? String}!
-        XCTAssertNotNil(old["originating_triage_revision"]);XCTAssertEqual((old["exit"] as? JSON)?["reason"] as? String,"manual")
+        XCTAssertNotNil(old["originating_triage_revision"]);XCTAssertEqual((old["exit"] as? JSON)?["reason"] as? String,"removed")
         assertCode("CLAIM_CONFLICT") { _ = try self.claimFixedBatch(p,batch) }
     }
     func testBatchClaimRejectsStaleMemberWithoutPartialClaimsOrHistory() throws {
@@ -206,14 +210,16 @@ extension CoreTests {
         assertCode("INVALID_INPUT") { _ = try self.prepareImplementationBatch(p,group,[task]) }
     }
     func testTaskInTwoPreparedBatchesStillHasOnlyOneExclusiveClaim() throws {
-        let p = try project(),task = try ready(p,self.task(p)),first = try triage(p,"First"),second = try triage(p,"Second")
-        try addTriage(p,first,task);try addTriage(p,second,task)
-        let firstBatch = try prepareImplementationBatch(p,first,[task]),secondBatch = try prepareImplementationBatch(p,second,[task]),claim = try claimFixedBatch(p,firstBatch)
+        orchestrateBatchTriages = true // CL-125 rule 6: claims keep tickets in an orchestrated Triage.
+        // CL-125 rule 4: a ticket is in one Triage, so both preparations come from that Triage.
+        let p = try project(),task = try ready(p,self.task(p)),first = try triage(p,"First")
+        try addTriage(p,first,task)
+        let firstBatch = try prepareImplementationBatch(p,first,[task]),secondBatch = try prepareImplementationBatch(p,first,[task]),claim = try claimFixedBatch(p,firstBatch)
         assertCode("REVISION_CONFLICT") { _ = try self.claimFixedBatch(p,secondBatch) }
         let attempts = try call("snapshot")["attempts"] as! [JSON]
         XCTAssertEqual(attempts.filter {$0["state"] as? String == "active"}.count,1)
         XCTAssertEqual(try call("task_get",["project_id":p["id"]!,"task_id":task["id"]!])["active_attempt_id"] as? String,(claim["claims"] as! [JSON])[0]["id"] as? String)
-        XCTAssertEqual(strings(try currentTriage(p,first),"task_ids").count,1);XCTAssertEqual(strings(try currentTriage(p,second),"task_ids").count,1)
+        XCTAssertEqual(strings(try currentTriage(p,first),"task_ids").count,1)
     }
     func testReviewBatchPinsRequestRevisionAndImmutableManifestDigest() throws {
         let value = try submittedArtifact(),p = value.project,group = try triage(p,phase:"review"),reviewer = Caller(role:"owner",installation:"frozen-request-review",projectIDs:[])
@@ -303,12 +309,13 @@ extension CoreTests {
     }
 
     func testBatchOnlyReviewerSideBlockedRetainsTriages() throws {
+        orchestrateBatchTriages = true // CL-125 rule 6: claims keep tickets in an orchestrated Triage.
         for kind in ["blocked","not_run","evidence_missing","implementation_blocked"] {
             let verdict = kind == "implementation_blocked" ? "blocked" : kind
             let returned = kind != "blocked"
             for batched in [true,false] {
-                let value = try submittedArtifact(),p = value.project,group = try triage(p,phase:"review"),other = try triage(p,"Other review",phase:"review")
-                try addTriage(p,group,value.task);try addTriage(p,other,value.task)
+                let value = try submittedArtifact(),p = value.project,group = try triage(p,phase:"review")
+                try addTriage(p,group,value.task)
                 let reviewer = Caller(role:"owner",installation:"non-final-"+verdict,projectIDs:[]),batch = try prepareReviewBatch(p,group,[value.task],reviewer)
                 let claim = (try claimFixedBatch(p,batch,reviewer)["claims"] as! [JSON])[0]
                 var input: JSON = ["attempt_id":claim["id"]!,"claim_token":claim["claim_token"]!,"review_request_id":claim["review_request_id"]!,"target_manifest_id":claim["manifest_id"]!,"gate":"review","verdict":verdict]
@@ -317,7 +324,8 @@ extension CoreTests {
                 if verdict == "not_run" { input["check"] = "Inspect result" }
                 if batched { _ = try call("batch_review_record",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":1,"members":[input]],reviewer) }
                 else { input["project_id"] = p["id"];_ = try call("review_record",input,reviewer) }
-                for triage in [group,other] { XCTAssertEqual(strings(try currentTriage(p,triage),"task_ids"),batched && !returned ? [value.task["id"] as! String] : [],kind) }
+                // CL-125 rules 8 and 10: every verdict keeps the ticket in its orchestrated Triage; no other return Triage is recorded.
+                XCTAssertEqual(strings(try currentTriage(p,group),"task_ids"),[value.task["id"] as! String],kind)
                 let request = try router.dbQueue.read {try router.record($0,claim["review_request_id"] as! String,type:"review_request")}
                 XCTAssertEqual(request["state"] as? String,returned ? "returned" : "queued")
                 let task = try call("task_get",["project_id":p["id"]!,"task_id":value.task["id"]!])
@@ -325,13 +333,14 @@ extension CoreTests {
                 XCTAssertEqual(task["status_category"] as? String,returned ? "queued" : "review")
                 let history = try call("history_list",["project_id":p["id"]!,"task_id":value.task["id"]!])
                 let departures = (history["events"] as! [JSON]).filter {$0["kind"] as? String == "task_left_triage"}
-                XCTAssertEqual(departures.count,returned || !batched ? 2 : 0,kind)
+                XCTAssertEqual(departures.count,0,kind)
             }
         }
     }
     func testBatchPartialReleaseKeepsOtherClaimAndSubmitsOnlyLiveMembers() throws {
-        let p = try project(),first = try ready(p,task(p,"Release")),second = try ready(p,task(p,"Continue")),group = try triage(p),other = try triage(p,"Other handling")
-        try addTriage(p,group,first);try addTriage(p,group,second);try addTriage(p,other,first)
+        orchestrateBatchTriages = true // CL-125 rule 6: claims keep tickets in an orchestrated Triage.
+        let p = try project(),first = try ready(p,task(p,"Release")),second = try ready(p,task(p,"Continue")),group = try triage(p)
+        try addTriage(p,group,first);try addTriage(p,group,second)
         let batch = try prepareImplementationBatch(p,group,[first,second]),claims = try claimFixedBatch(p,batch)["claims"] as! [JSON]
         let beforeOther = try call("task_get",["project_id":p["id"]!,"task_id":second["id"]!]),beforeClaim = try router.dbQueue.read {try router.record($0,claims[1]["id"] as! String,type:"attempt")}
         let result = try call("batch_release",["project_id":p["id"]!,"batch_id":batch["id"]!,"members":[["attempt_id":claims[0]["id"]!,"claim_token":claims[0]["claim_token"]!]],"reason":"Continue in a later pass"])
@@ -341,16 +350,18 @@ extension CoreTests {
         let released = try router.dbQueue.read {try router.record($0,claims[0]["id"] as! String,type:"attempt")}
         XCTAssertEqual(released["state"] as? String,"released");XCTAssertEqual(released["reason"] as? String,"Continue in a later pass")
         XCTAssertEqual(try call("task_get",["project_id":p["id"]!,"task_id":first["id"]!])["status_category"] as? String,"queued")
-        XCTAssertEqual(strings(try currentTriage(p,group),"task_ids").count,2);XCTAssertEqual(strings(try currentTriage(p,other),"task_ids"),[first["id"] as! String])
+        XCTAssertEqual(strings(try currentTriage(p,group),"task_ids").count,2)
         let events = try call("snapshot")["events"] as! [JSON]
         XCTAssertTrue(events.contains {$0["kind"] as? String == "batch_released" && ($0["data"] as? JSON)?["reason"] as? String == "Continue in a later pass"})
         XCTAssertTrue(events.contains {$0["kind"] as? String == "work_released" && $0["entity_id"] as? String == first["id"] as? String && ($0["data"] as? JSON)?["reason"] as? String == "Continue in a later pass"})
         let input = try batchArtifactInput(p,claims[1])
         assertCode("REVISION_CONFLICT") { _ = try self.call("batch_submit",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":1,"members":[input,input]]) }
         _ = try call("batch_submit",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":1,"members":[input]])
-        XCTAssertEqual(strings(try currentTriage(p,group),"task_ids"),[first["id"] as! String])
+        // CL-125 rule 10: submission keeps the ticket in its orchestrated Triage.
+        XCTAssertEqual(Set(strings(try currentTriage(p,group),"task_ids")),[first["id"] as! String,second["id"] as! String])
     }
     func testBatchFullReleaseAndInvalidSelectionsAreAtomic() throws {
+        orchestrateBatchTriages = true // CL-125 rule 6: claims keep tickets in an orchestrated Triage.
         let p = try project(),tasks = try [ready(p,task(p)),ready(p,task(p))],group = try triage(p)
         for task in tasks { try addTriage(p,group,task) }
         let batch = try prepareImplementationBatch(p,group,tasks),claims = try claimFixedBatch(p,batch)["claims"] as! [JSON]
@@ -367,6 +378,7 @@ extension CoreTests {
         for task in tasks { let current = try call("task_get",["project_id":p["id"]!,"task_id":task["id"]!]);XCTAssertNil(current["active_attempt_id"]);XCTAssertEqual(current["status_category"] as? String,"queued") }
     }
     func testReviewBatchReleaseKeepsReviewAndRecordsOnlyRemainingLiveVerdict() throws {
+        orchestrateBatchTriages = true // CL-125 rule 6: claims keep tickets in an orchestrated Triage.
         let p = try project(),tasks = try [ready(p,task(p)),ready(p,task(p))],implementation = try triage(p)
         for task in tasks {try addTriage(p,implementation,task)}
         let batch = try prepareImplementationBatch(p,implementation,tasks),claims = try claimFixedBatch(p,batch)["claims"] as! [JSON]

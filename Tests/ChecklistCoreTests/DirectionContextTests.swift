@@ -172,16 +172,17 @@ final class DirectionContextTests: XCTestCase {
         let child = Caller(role:"worker",installation:"child-installation-"+childID,projectIDs:[pid],sessionID:childID,workspace:directory.path,executionDomain:"synthetic-child-host-"+childID)
         let observer = Caller(role:"worker",installation:"child-installation-"+observerID,projectIDs:[pid],sessionID:observerID,workspace:directory.path,executionDomain:"synthetic-child-host-"+observerID)
         _ = try call("session_attach_task",["project_id":pid,"task_id":task["id"]!],observer)
-        let settings = try call("project_settings_get",["project_id":pid])
-        var policy = settings["policy"] as! JSON;policy["coordinator_session_id"] = coordinatorID
-        _ = try call("policy_apply",["project_id":pid,"expected_revision":settings["revision"]!,"policy":policy])
+        // CL-248: the Triage orchestrator replaces the retired coordinator_session_id.
+        let coordinator = Caller(role:"worker",installation:"child-installation-"+coordinatorID,projectIDs:[pid],sessionID:coordinatorID,workspace:directory.path,executionDomain:"synthetic-child-host-"+coordinatorID)
+        let triage = try call("triage_orchestrate",["project_id":pid,"action":"start"],coordinator)
+        _ = try call("group_membership",["project_id":pid,"group_id":triage["id"]!,"expected_revision":triage["revision"]!,"task_id":task["id"]!,"action":"add"],coordinator)
         let attempt = try claim(project,task,parent)
         let offer = try call("work_delegate",["project_id":pid,"attempt_id":attempt["id"]!,"claim_token":attempt["claim_token"]!,"child_session_id":childID,"file_scopes":[],"lane_scopes":[],"brief":"Inspect only this ticket context"],parent)
         _ = try call("work_child_accept",["project_id":pid,"delegation_id":offer["id"]!],child)
         let note = try call("message_send",["project_id":pid,"task_id":task["id"]!,"body":"Retain the current constraints","requires_action":true])
         let receipts = note["deliveries"] as! [JSON]
         XCTAssertEqual(Set(receipts.compactMap {$0["recipient_session_id"] as? String}),Set([parent.sessionID!,childID,coordinatorID]))
-        XCTAssertEqual(Set(receipts.compactMap {$0["recipient_role"] as? String}),Set(["handler","registered_child","coordinator"]))
+        XCTAssertEqual(Set(receipts.compactMap {$0["recipient_role"] as? String}),Set(["handler","registered_child","triage_orchestrator"]))
         let childReceipt = receipts.first {$0["recipient_session_id"] as? String == childID}!
         _ = try call("message_ack",["project_id":pid,"delivery_id":childReceipt["id"]!,"stage":"acknowledged"],child)
         let parentInbox = try call("session_inbox",["project_id":pid],parent)["deliveries"] as! [JSON]

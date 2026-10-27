@@ -170,7 +170,7 @@ final class StorageMigrationTests: XCTestCase {
             XCTAssertEqual(actualDigest,expectedDigest)
             XCTAssertEqual(try ManagedPathRelocation.captureBindings(db,root:run),expectedBindings)
             _ = try SchemaMigrations.inspect(db)
-            XCTAssertEqual(try Int.fetchOne(db,sql:"PRAGMA user_version"),3)
+            XCTAssertEqual(try Int.fetchOne(db,sql:"PRAGMA user_version"),4)
             XCTAssertEqual(try String.fetchOne(db,sql:"PRAGMA integrity_check"),"ok")
             return (jsonObject(try XCTUnwrap(String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='preupgrade_snapshot'"))), actualDigest)
         }
@@ -184,11 +184,11 @@ final class StorageMigrationTests: XCTestCase {
         XCTAssertEqual(manifest.sourceRoot,run.path)
         XCTAssertEqual(protected["protected"] as? Bool,true)
         let ready = try StoreIdentityReceipt.decode(Data(contentsOf:run.appendingPathComponent(StoreIdentityReceipt.fileName)))
-        XCTAssertEqual(ready.state,"ready");XCTAssertEqual(ready.schema_revision,3);XCTAssertEqual(ready.incarnation,inspected.0)
+        XCTAssertEqual(ready.state,"ready");XCTAssertEqual(ready.schema_revision,4);XCTAssertEqual(ready.incarnation,inspected.0)
         XCTAssertEqual(manifest.storeID,ready.logical_store_id)
-        XCTAssertEqual(protected["target_migration_checksum"] as? String,SchemaMigrations.managedPathsChecksum)
+        XCTAssertEqual(protected["target_migration_checksum"] as? String,SchemaMigrations.triageMembershipChecksum)
         XCTAssertEqual(ChecklistCore.hash(try Data(contentsOf:input)),inputSHA,"The retained input copy remains unchanged.")
-        let result:JSON = ["input_sha256":inputSHA,"records_decoded":inspected.2,"objects_verified":inspected.3.objects.count,"object_bytes_verified":verifiedBytes,"schema":3,"bootstrap_opened":true,"input_domain_digest":inspected.1,"expected_migrated_domain_digest":expectedDigest,"migrated_domain_digest":migratedDigest,"conservation_matches":migratedDigest == expectedDigest,"relocated_managed_path_fields":relocatedFields,"immutable_capture_bindings":expectedBindings.count,"additive_group_label_records":groupLabelRecords,"full_bootstrap_seconds":ProcessInfo.processInfo.systemUptime - bootstrapStart,"protected_manifest_sha256":ChecklistCore.hash(manifestBytes),"protected_objects":manifest.objects.count,"source_access":"read-only descriptors/bytes; independent copied fixture objects; no source SQL or filesystem writes","limit":"Real full protected snapshot/rehearsal/migration on owned relocated copy; no live restore/authority promotion or cloned service."]
+        let result:JSON = ["input_sha256":inputSHA,"records_decoded":inspected.2,"objects_verified":inspected.3.objects.count,"object_bytes_verified":verifiedBytes,"schema":4,"bootstrap_opened":true,"input_domain_digest":inspected.1,"expected_migrated_domain_digest":expectedDigest,"migrated_domain_digest":migratedDigest,"conservation_matches":migratedDigest == expectedDigest,"relocated_managed_path_fields":relocatedFields,"immutable_capture_bindings":expectedBindings.count,"additive_group_label_records":groupLabelRecords,"full_bootstrap_seconds":ProcessInfo.processInfo.systemUptime - bootstrapStart,"protected_manifest_sha256":ChecklistCore.hash(manifestBytes),"protected_objects":manifest.objects.count,"source_access":"read-only descriptors/bytes; independent copied fixture objects; no source SQL or filesystem writes","limit":"Real full protected snapshot/rehearsal/migration on owned relocated copy; no live restore/authority promotion or cloned service."]
         try JSONSerialization.data(withJSONObject:result,options:.sortedKeys).write(to:run.appendingPathComponent("qualification-result.json"))
         print("CL19 retained-domain compatibility result: " + run.appendingPathComponent("qualification-result.json").path)
     }
@@ -197,7 +197,7 @@ final class StorageMigrationTests: XCTestCase {
         try f.reopen()
         let pid = project["id"] as! String
         let pointer = try f.router!.dbQueue.read {db -> JSON in
-            XCTAssertEqual(try Int.fetchOne(db,sql:"PRAGMA user_version"),3)
+            XCTAssertEqual(try Int.fetchOne(db,sql:"PRAGMA user_version"),4)
             _ = try SchemaMigrations.inspect(db)
             XCTAssertEqual(try f.router!.record(db,pid,type:"project")["name"] as? String,"Released storage")
             return jsonObject(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='preupgrade_snapshot'")!)
@@ -232,7 +232,7 @@ final class StorageMigrationTests: XCTestCase {
         XCTAssertFalse(child.isRunning);XCTAssertTrue(FileManager.default.fileExists(atPath:original))
         try f.reopen()
         XCTAssertTrue(FileManager.default.fileExists(atPath:original),"Killed old continuation cannot execute later")
-        XCTAssertEqual(try f.router!.dbQueue.read {try Int.fetchOne($0,sql:"PRAGMA user_version")},3)
+        XCTAssertEqual(try f.router!.dbQueue.read {try Int.fetchOne($0,sql:"PRAGMA user_version")},4)
     }
     func testMigrationDeathBeforeAndAfterCommitRepairsForwardWithoutReplacingUserData() throws {
         for mode in ["migration-before-commit","migration-committed"] {
@@ -241,13 +241,13 @@ final class StorageMigrationTests: XCTestCase {
             XCTAssertEqual(child.terminationReason,.uncaughtSignal);XCTAssertEqual(child.terminationStatus,SIGKILL)
             XCTAssertEqual(try String(contentsOf:f.base.appendingPathComponent("ready"),encoding:.utf8),mode)
             let preparing = try StoreIdentityReceipt.decode(Data(contentsOf:f.root.appendingPathComponent(StoreIdentityReceipt.fileName)))
-            XCTAssertEqual(preparing.state,"preparing");XCTAssertEqual(preparing.schema_revision,3)
+            XCTAssertEqual(preparing.state,"preparing");XCTAssertEqual(preparing.schema_revision,4)
             try f.reopen()
             let ready = try StoreIdentityReceipt.decode(Data(contentsOf:f.root.appendingPathComponent(StoreIdentityReceipt.fileName)))
             XCTAssertEqual(ready.state,"ready");XCTAssertEqual(ready.logical_store_id,preparing.logical_store_id);XCTAssertEqual(ready.incarnation,preparing.incarnation)
             try f.router!.dbQueue.read {db in
                 XCTAssertEqual(try f.router!.record(db,pid,type:"project")["name"] as? String,"Released storage")
-                XCTAssertEqual(try Int.fetchOne(db,sql:"PRAGMA user_version"),3)
+                XCTAssertEqual(try Int.fetchOne(db,sql:"PRAGMA user_version"),4)
                 XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE id=?",arguments:[pid]),1)
                 XCTAssertEqual(try String.fetchOne(db,sql:"PRAGMA integrity_check"),"ok")
             }
@@ -267,7 +267,7 @@ final class StorageMigrationTests: XCTestCase {
         // not a production auto-repair path or a rollback over later user writes.
         var config = Configuration();config.prepareDatabase {try SchemaMigrations.installStorageCollation($0)}
         let q = try DatabaseQueue(path:try StorageBootstrap.writableURI(db),configuration:config)
-        try q.write {try $0.execute(sql:"UPDATE metadata SET value=? WHERE key='schema_migrations'",arguments:[try jsonString([SchemaMigrations.ledger,SchemaMigrations.protocolLedger,SchemaMigrations.managedPathsLedger])])};try q.close()
+        try q.write {try $0.execute(sql:"UPDATE metadata SET value=? WHERE key='schema_migrations'",arguments:[try jsonString(SchemaMigrations.ledgers(4))])};try q.close()
         try f.reopen();XCTAssertEqual(try f.router!.dbQueue.read {try f.router!.record($0,pid,type:"project")["name"] as? String},p["name"] as? String)
         try f.close();try FileManager.default.moveItem(at:db,to:f.base.appendingPathComponent("preserved.sqlite"))
         XCTAssertThrowsError(try f.reopen())

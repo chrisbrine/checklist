@@ -85,6 +85,8 @@ extension CoreTests {
         XCTAssertTrue((((selected["collections"] as! JSON)["groups"] as! [JSON])).allSatisfy {!($0["key"] as? String ?? "").isEmpty})
         let tools = try call("tool_catalog")["tools"] as! [JSON]
         for name in ["triage_list","epic_list"] { let tool = tools.first {$0["name"] as? String == name}!;XCTAssertNotNil(((tool["inputSchema"] as! JSON)["properties"] as! JSON)["key"]) }
+        // CL-125 rule 6: the owner's batch claim keeps the tickets in an orchestrated Triage.
+        try orchestrateTriage(p,g)
         let current = try currentTriage(p,g)
         let batch = try call("batch_prepare",["project_id":p["id"]!,"triage_id":g["id"]!,"expected_revision":current["revision"]!,"phase":"implementation","tasks":[a,b].map { ["task_id":$0["id"]!,"expected_revision":(try! call("task_get",["project_id":p["id"]!,"task_id":$0["id"]!]))["revision"]!] }])
         XCTAssertEqual(batch["triage_key"] as? String,"PJ-T1");XCTAssertEqual((batch["members"] as? [JSON])?.first?["title"] as? String,"First")

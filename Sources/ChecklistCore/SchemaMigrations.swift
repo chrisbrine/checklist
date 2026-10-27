@@ -22,7 +22,7 @@ struct StoreIdentityReceipt: Codable, Equatable {
         let keys: Set<String> = ["format_version", "logical_store_id", "incarnation", "database_generation", "schema_revision", "state"]
         guard let object = try? JSONSerialization.jsonObject(with: bytes) as? JSON, Set(object.keys) == keys,
               let value = try? JSONDecoder().decode(Self.self, from: bytes) else { throw StoreRecovery.required("invalid_identity_receipt") }
-        guard value.format_version == 1, [1,2,3].contains(value.schema_revision) else { throw StoreRecovery.upgradeUnavailable() }
+        guard value.format_version == 1, (1...4).contains(value.schema_revision) else { throw StoreRecovery.upgradeUnavailable() }
         guard UUID(uuidString: value.logical_store_id) != nil, UUID(uuidString: value.incarnation) != nil,
               value.database_generation == 1, ["preparing", "ready"].contains(value.state) else { throw StoreRecovery.required("invalid_identity_receipt") }
         return value
@@ -97,6 +97,23 @@ enum SchemaMigrations {
         guard case .current(let actual) = try inspect(db), actual == ready else { throw StoreRecovery.required("migration_result_invalid") }
     }
     static var managedPathsChecksum: String { hash(Data("0003-instance-local-managed-paths;reader=3;writer=3;protected-relative-rewrite;single-origin-local-content-proof;immutable-manifest-capture-sidecar".utf8)) }
+    /// 0004 (CL-125): one orchestrator per Triage, one Triage per ticket, plans and
+    /// automatic archive of empty plans (docs/triage-orchestrators.md#store-upgrade-rules).
+    static let currentSchema = 4
+    static var triageMembershipChecksum: String { hash(Data("0004-triage-orchestrator-membership;reader=4;writer=4;one-triage-per-ticket;upgrade-single-membership;plans;empty-plan-archive;phase-history-label".utf8)) }
+    static var triageMembershipLedger: JSON { ["migration_id":"0004-triage-orchestrator-membership","checksum":triageMembershipChecksum,"from_version":3,"to_version":4,"minimum_reader":4,"minimum_writer":4,"maximum_writer":4,"phase":"applied"] }
+    static func ledgers(_ version: Int) -> [JSON] { Array([ledger,protocolLedger,managedPathsLedger,triageMembershipLedger].prefix(max(0,version))) }
+    static func upgradeTriageMembership(_ db: Database, identity: StoreIdentityReceipt, protectedSnapshot: JSON) throws {
+        guard case .current(let old) = try inspect(db), old.schema_revision == 3,
+              old.logical_store_id == identity.logical_store_id, old.incarnation == identity.incarnation else { throw StoreRecovery.required("migration_source_changed") }
+        try TriageMembershipUpgrade.apply(db)
+        let ready = identity.withSchema(4).withState("ready")
+        try db.execute(sql:"UPDATE metadata SET value=? WHERE key='store_identity'",arguments:[String(decoding:try ready.encoded(),as:UTF8.self)])
+        try db.execute(sql:"UPDATE metadata SET value=? WHERE key='schema_migrations'",arguments:[try jsonString(ledgers(4))])
+        try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('preupgrade_snapshot',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[try jsonString(protectedSnapshot)])
+        try db.execute(sql:"PRAGMA user_version=4")
+        guard case .current(let actual) = try inspect(db), actual == ready else { throw StoreRecovery.required("migration_result_invalid") }
+    }
     static var managedPathsLedger: JSON { ["migration_id":"0003-instance-local-managed-paths","checksum":managedPathsChecksum,"from_version":2,"to_version":3,"minimum_reader":3,"minimum_writer":3,"maximum_writer":3,"phase":"applied"] }
     static func upgradeManagedPaths(_ db: Database, identity: StoreIdentityReceipt, root: URL, plan: ManagedPathRelocation.Plan, protectedSnapshot: JSON) throws {
         guard case .current(let old) = try inspect(db), old.schema_revision == 2,
@@ -140,7 +157,7 @@ enum SchemaMigrations {
 
     static func inspect(_ db: Database) throws -> State {
         let version = try Int.fetchOne(db, sql: "PRAGMA user_version") ?? -1
-        guard [0, 1, 2, 3].contains(version) else { throw StoreRecovery.upgradeUnavailable() }
+        guard (0...currentSchema).contains(version) else { throw StoreRecovery.upgradeUnavailable() }
         try validateContainer(db)
         guard try String.fetchOne(db, sql: "PRAGMA quick_check") == "ok",
               let incarnation = try String.fetchOne(db, sql: "SELECT value FROM metadata WHERE key='incarnation'"), UUID(uuidString: incarnation) != nil else { throw StoreRecovery.required("invalid_legacy_store") }
@@ -154,7 +171,7 @@ enum SchemaMigrations {
         let value = try StoreIdentityReceipt.decode(Data(identity.utf8))
         guard value.state == "ready", value.incarnation == incarnation else { throw StoreRecovery.required("database_identity_mismatch") }
         guard let array = try? JSONSerialization.jsonObject(with: Data(receipts.utf8)) as? [JSON], array.count == version,
-              try jsonString(array) == jsonString(version == 1 ? [ledger] : (version == 2 ? [ledger,protocolLedger] : [ledger,protocolLedger,managedPathsLedger])), value.schema_revision == version else { throw StoreRecovery.required("migration_checksum_or_order_mismatch") }
+              try jsonString(array) == jsonString(ledgers(version)), value.schema_revision == version else { throw StoreRecovery.required("migration_checksum_or_order_mismatch") }
         return .current(value)
     }
     static func adoptBaseline(_ db: Database, identity: StoreIdentityReceipt, fresh: Bool) throws {

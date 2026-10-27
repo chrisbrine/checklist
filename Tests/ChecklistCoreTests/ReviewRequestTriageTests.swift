@@ -5,8 +5,7 @@ import GRDB
 extension CoreTests {
     private func reviewRequestTriageFixture(_ verdict: String) throws -> (project: JSON, task: JSON, groups: [JSON], request: JSON, reviewer: Caller) {
         let f = try reviewBatchInputsFixture(), p = f.project, task = f.tasks[0]
-        let other = try triage(p,"Other review pass",phase:"review")
-        try addTriage(p,other,task);try addTriage(p,other,f.tasks[2])
+        // CL-125 rule 4: the ticket is in this one review Triage.
         let batch = try prepareReviewBatch(p,f.group,[task,f.tasks[2]],f.reviewer)
         let claims = try claimFixedBatch(p,batch,f.reviewer)["claims"] as! [JSON]
         let inputs: [JSON] = claims.map { claim in
@@ -27,7 +26,7 @@ extension CoreTests {
         }
         let claim = claims.first { $0["task_id"] as? String == task["id"] as? String }!
         let request = try router.dbQueue.read { try router.record($0,claim["review_request_id"] as! String,type:"review_request") }
-        return (p,task,[f.group,other],request,f.reviewer)
+        return (p,task,[f.group],request,f.reviewer)
     }
     private func requestAgain(_ p: JSON,_ task: JSON,_ request: JSON) throws -> JSON {
         let current = try call("task_get",["project_id":p["id"]!,"task_id":task["id"]!])
@@ -42,6 +41,7 @@ extension CoreTests {
         try router.dbQueue.read { try jsonString(router.record($0,group["id"] as! String,type:"group")) }
     }
     func testReviewRequestSupplementalEvidenceRetainsReviewTriagesAndRefreshesBatchInputs() throws {
+        orchestrateBatchTriages = true // CL-125 rule 6: claims keep tickets in an orchestrated Triage.
         let f = try reviewRequestTriageFixture("evidence_missing"), p = f.project
         let before = try f.groups.map { try reviewTriageState($0) }
         let log = directory.appendingPathComponent("supplemental.log");try Data("Required check passed".utf8).write(to:log)
@@ -53,7 +53,7 @@ extension CoreTests {
         XCTAssertEqual(result["manifest_id"] as? String,f.request["manifest_id"] as? String)
         XCTAssertEqual((result["supplemental_evidence_refs"] as? [JSON])?.first?["artifact_id"] as? String,artifact["id"] as? String)
         XCTAssertNotNil(result["answers_evidence_request"])
-        XCTAssertEqual(int(result["triage_effect"] as! JSON,"removed_count"),0)
+        XCTAssertEqual(int(result["triage_effect"] as? JSON ?? [:],"removed_count"),0)
         XCTAssertEqual(try f.groups.map { try reviewTriageState($0) },before)
         for group in f.groups {
             let read = try call("review_batch_inputs",["project_id":p["id"]!,"triage_id":group["id"]!],f.reviewer)
@@ -73,6 +73,7 @@ extension CoreTests {
         XCTAssertFalse((history["events"] as! [JSON]).contains { $0["kind"] as? String == "task_left_triage" && groupIDs.contains(($0["data"] as? JSON)?["triage_id"] as? String ?? "") })
     }
     func testReviewRequestSameTargetRoundAndNotRunPickupRetainReviewTriages() throws {
+        orchestrateBatchTriages = true // CL-125 rule 6: claims keep tickets in an orchestrated Triage.
         for verdict in ["evidence_missing","not_run"] {
             let f = try reviewRequestTriageFixture(verdict), p = f.project
             let reviewStatus = try call("status_create",["project_id":p["id"]!,"name":"Review waiting for checks","category":"review"])
@@ -93,7 +94,8 @@ extension CoreTests {
             }
         }
     }
-    func testReviewRequestNewTargetStillDepartsReviewTriages() throws {
+    func testReviewRequestNewTargetKeepsReviewTriage() throws {
+        orchestrateBatchTriages = true // CL-125 rule 6: claims keep tickets in an orchestrated Triage.
         let f = try reviewRequestTriageFixture("evidence_missing"), p = f.project, mid = UUID().uuidString
         // Model a replacement current target with no request yet. Keep the old memberships
         // in this owned fixture so this command's departure is tested independently of work_submit.
@@ -107,13 +109,15 @@ extension CoreTests {
         input.removeValue(forKey:"supersedes_request_id")
         let result = try call("review_request",input)
         XCTAssertEqual(result["manifest_id"] as? String,mid)
-        XCTAssertEqual(int(result["triage_effect"] as! JSON,"removed_count"),2)
-        for group in f.groups { XCTAssertFalse(strings(try currentTriage(p,group),"task_ids").contains(f.task["id"] as! String)) }
+        // CL-125 rule 8: a review request is a status action and keeps membership.
+        XCTAssertEqual(int(result["triage_effect"] as? JSON ?? [:],"removed_count"),0)
+        for group in f.groups { XCTAssertTrue(strings(try currentTriage(p,group),"task_ids").contains(f.task["id"] as! String)) }
         let history = try call("history_list",["project_id":p["id"]!,"task_id":f.task["id"]!])
         let groupIDs = Set(f.groups.compactMap { $0["id"] as? String })
-        XCTAssertEqual((history["events"] as! [JSON]).filter { $0["kind"] as? String == "task_left_triage" && groupIDs.contains(($0["data"] as? JSON)?["triage_id"] as? String ?? "") }.count,2)
+        XCTAssertEqual((history["events"] as! [JSON]).filter { $0["kind"] as? String == "task_left_triage" && groupIDs.contains(($0["data"] as? JSON)?["triage_id"] as? String ?? "") }.count,0)
     }
-    func testReviewRequestPhaseChangeStillDepartsTriagesForExistingTarget() throws {
+    func testReviewRequestPhaseChangeKeepsTriageForExistingTarget() throws {
+        orchestrateBatchTriages = true // CL-125 rule 6: claims keep tickets in an orchestrated Triage.
         let f = try reviewRequestTriageFixture("evidence_missing"), p = f.project
         // A retained target outside Review must not opt out of status departures.
         try reviewFixtureWrite { db in
@@ -122,8 +126,9 @@ extension CoreTests {
             try router.save(db,router.revised(task),type:"task")
         }
         let result = try call("review_request",requestAgain(p,f.task,f.request))
-        XCTAssertEqual(int(result["triage_effect"] as! JSON,"removed_count"),2)
-        for group in f.groups { XCTAssertFalse(strings(try currentTriage(p,group),"task_ids").contains(f.task["id"] as! String)) }
+        // CL-125 rule 8: the status change keeps membership.
+        XCTAssertEqual(int(result["triage_effect"] as? JSON ?? [:],"removed_count"),0)
+        for group in f.groups { XCTAssertTrue(strings(try currentTriage(p,group),"task_ids").contains(f.task["id"] as! String)) }
         let task = try call("task_get",["project_id":p["id"]!,"task_id":f.task["id"]!])
         XCTAssertEqual(task["status_category"] as? String,"review")
     }

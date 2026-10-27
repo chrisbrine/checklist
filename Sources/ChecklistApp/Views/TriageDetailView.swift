@@ -8,7 +8,7 @@ struct TriageDetailView: View {
     @State private var name = ""
     @State private var purpose = ""
     @State private var selectedTicket = ""
-    @State private var selectedPhase = "implementation"
+    @StateObject private var messageFeed = TriageMessageFeed()
     @State private var confirmation: PendingConfirmation?
     var projectID: String { triage.string("project_id") }
     var members:[Record] {store.groupTaskRows}
@@ -19,25 +19,22 @@ struct TriageDetailView: View {
                 VStack(alignment: .leading, spacing: Spacing.small) {
                     Text("Edit Triage").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     Text(ProductionGroups.label(triage)).checklistFont(.title)
-                    Text("\(store.projectName(projectID)) · \(triage.string("phase",fallback:"Choose phase").capitalized) · \(members.count) current tickets").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-                    Text("Tickets leave when this phase finishes. Implementation submission moves to Review; create a separate review Triage for those targets. Complete passing tickets and return only failed tickets to implementation.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                    Text("\(store.projectName(projectID)) · \(orchestrator.summary) · \(members.count) current tickets").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                    let counts = TriageOrchestratorDisplay.statusCountsText(triage)
+                    if !counts.isEmpty { Text(counts).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+                    Text("A ticket stays in this Triage through status changes. It leaves when it is Done or canceled, when another orchestrator handles it, or when it is removed.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     Text("Active includes only tickets whose own status is In progress. Triage orchestration does not change ticket status.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     if triage.bool("archived") { Text("Archived Triage · tickets and dispatched batches are preserved").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                 }
-                if triage.bool("phase_requires_selection") || members.isEmpty {
-                    DetailSection(title:"Phase") {
-                        Picker("Phase",selection:$selectedPhase) { Text("Implementation").tag("implementation");Text("Review").tag("review") }.pickerStyle(.segmented).tint(.checklistAccent)
-                        Button("Set phase") { store.run("triage_edit",["project_id":projectID,"group_id":triage.id,"expected_revision":triage.integer("revision"),"phase":selectedPhase],success:"Triage phase saved") }.checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
-                    }
-                }
-                if !triage.object("orchestration").isEmpty {
+                DetailSection(title:"Orchestrator") {
+                    // CL-126: the orchestrator conversation and its route state; a plan has none.
+                    Text(orchestrator.orchestrator ?? "No orchestrator").checklistFont(.callout).accessibilityLabel("Orchestrator: \(orchestrator.orchestrator ?? "none")")
+                    Text(orchestrator.stateLabel).checklistFont(.captionStrong).accessibilityLabel("State: \(orchestrator.stateLabel)")
+                    Text(orchestrator.routeState).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).fixedSize(horizontal: false, vertical: true)
                     let orchestration = Record(values:triage.object("orchestration"))
-                    DetailSection(title:"Actual coordination") {
-                        Text(orchestration.string("actor_display") + " · " + orchestration.string("provider").capitalized).checklistFont(.callout)
-                        Text(GlossaryText.title(orchestration.string("state"))).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-                        if !orchestration.string("progress").isEmpty { Text(orchestration.string("progress")).checklistFont(.micro).textSelection(.enabled) }
-                        if triage.string("orchestration_connection") == "recovery_required" { Text("The recorded session needs recovery or an explicit finish. Its ending does not complete these tickets.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
-                    }
+                    if orchestrator.orchestrator != nil, !orchestration.string("progress").isEmpty { Text(orchestration.string("progress")).checklistFont(.micro).textSelection(.enabled) }
+                    if orchestrator.state == .needsRecovery { Text("Its ending does not complete, review or release these tickets.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+                    if !orchestrator.sessionID.isEmpty { TechnicalDetails([("Orchestrator session", orchestrator.sessionID)]) }
                 }
                 if editingPurpose {
                     DetailSection(title: "Triage brief") {
@@ -52,6 +49,9 @@ struct TriageDetailView: View {
                         Button("Edit Triage brief…") { beginEdit() }.checklistFont(.micro)
                     }
                 }
+                Divider()
+                TriageMessagesSection(feed: messageFeed, reload: { Task { await loadMessages() } }, loadMore: { Task { await messageFeed.loadMore { method, params in try await store.request(method, params) } } })
+                TriageNoteComposer(triage: triage, display: orchestrator, sent: { Task { await loadMessages() } })
                 Divider()
                 DetailSection(title: "Current members") {
                     GroupTaskPagingControls(group:triage,closed:false)
@@ -82,7 +82,8 @@ struct TriageDetailView: View {
                     if archived { change() } else { confirmation = Confirmations.archiveTriage(ProductionGroups.label(triage), perform: change) }
                 }.checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)])
             }.padding(Spacing.page)
-        }.onAppear { selectedPhase = triage.string("phase",fallback:"implementation");store.loadGroupTasks(triage,closed:false);store.loadGroupCandidates(triage,closed:false) }
+        }.onAppear { store.loadGroupTasks(triage,closed:false);store.loadGroupCandidates(triage,closed:false) }
+        .task(id: triage.integer("revision")) { await loadMessages() }
         .task(id: store.archivePreviewEpoch) { await loadBatches() }
         .checklistConfirmation($confirmation)
     }
@@ -90,6 +91,13 @@ struct TriageDetailView: View {
         await batchHistory.load(projectID: projectID, triageID: triage.id) { method, params in
             try await store.request(method, params)
         }
+    }
+    var orchestrator: TriageOrchestratorDisplay { TriageOrchestratorDisplay(triage) }
+    private func loadMessages() async {
+        let rows = members
+        let ids = triage.strings("task_ids").isEmpty ? rows.map(\.id) : triage.strings("task_ids")
+        let pairs = ids.map { id in (id: id, key: rows.first { $0.id == id }?.string("key") ?? store.task(id)?.string("key") ?? "") }
+        await messageFeed.load(projectID: projectID, triageID: triage.id, members: pairs) { method, params in try await store.request(method, params) }
     }
     var draftKey: String { "triageHandlingDraft-" + triage.id }
     func beginEdit() {

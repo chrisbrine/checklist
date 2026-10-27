@@ -8,17 +8,6 @@ extension CommandRouter {
         let phases = Set((group["members"] as? [JSON] ?? []).compactMap {$0["handling_phase"] as? String})
         return phases.count == 1 && phases.isSubset(of:AttemptPhase.wireValues) ? phases.first : nil
     }
-    func validateTriageTaskPhase(_ db: Database,task: JSON,phase: String) throws {
-        let category: String
-        if let sid = task["status_id"] as? String {
-            category = try scoped(db, sid, (try StoredRecord(task, family: "task").string("project_id")), type: "status")["category"] as? String ?? "queued"
-        } else {
-            category = "queued"
-        }
-        if phase == "review" {
-            guard category == "review",task["current_manifest_id"] != nil else { throw CoreError("TRIAGE_PHASE_CONFLICT","A review Triage accepts only tickets currently in review with a submitted exact target. Create a separate implementation Triage for further fixes.") }
-        } else { guard !["review","done","canceled"].contains(category) else { throw CoreError("TRIAGE_PHASE_CONFLICT","An implementation Triage accepts implementation work, including In Progress tickets. Submitted targets go into a separate review Triage; completed tickets remain outside active handling.") } }
-    }
     /// Legacy advisory handling signal: orchestration and member attempts count here.
     /// It is not the Active section predicate; that uses each ticket's status category.
     func triageActiveAttention(_ db: Database,_ group: JSON) throws -> Bool {
@@ -102,14 +91,29 @@ extension CommandRouter {
         ]
     }
     func triageOrchestrate(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
-        try worker(c);let pid = try scope(db,p,c,write:true),gid = try text(p,"triage_id")
-        var group = try scoped(db,gid,pid,type:"group");try revision(p,group)
-        guard group["kind"] as? String == "triage",!bool(group,"archived"),triagePhase(group) != nil else { throw CoreError("TRIAGE_PHASE_REQUIRED","Use an active Triage with an established implementation or review phase.") }
-        let action = try text(p,"action");var orchestration = group["orchestration"] as? JSON ?? [:]
+        try worker(c);let pid = try scope(db,p,c,write:true)
+        let action = try text(p,"action")
         guard ["start","checkpoint","finish","takeover"].contains(action) else { throw CoreError("INVALID_INPUT","Use start, checkpoint, finish or takeover for the actual orchestration session.") }
+        var group: JSON
+        if p["triage_id"] == nil {
+            // CL-125: start with no Triage creates the caller's Triage.
+            guard action == "start" else { throw CoreError("INVALID_INPUT","Name the Triage (triage_id) to checkpoint, finish or take over.") }
+            let session = try eligibleTriageCoordinator(db,c,pid)
+            try requireNoOtherOrchestratedTriage(db,project:pid,caller:c,except:nil)
+            let provider = (session["provider"] as? String ?? "Agent").capitalized
+            let name = p["name"] != nil ? try text(p,"name",max:200) : provider + " · " + String((c.sessionID ?? "").prefix(8))
+            let created = try groupWrite(db,["project_id":pid,"name":name,"purpose":""],c,"triage_create")
+            group = try scoped(db,try StoredRecord(created,family:"group").string("id"),pid,type:"group")
+        } else {
+            group = try scoped(db,try text(p,"triage_id"),pid,type:"group");try revision(p,group)
+        }
+        let gid = try StoredRecord(group,family:"group").string("id")
+        guard group["kind"] as? String == "triage",!bool(group,"archived") else { throw CoreError("INVALID_TRANSITION","Use a current, unarchived Triage.") }
+        var orchestration = group["orchestration"] as? JSON ?? [:]
         var notice: JSON?
         if action == "start" || action == "takeover" {
             let session = try eligibleTriageCoordinator(db,c,pid)
+            try requireNoOtherOrchestratedTriage(db,project:pid,caller:c,except:gid)
             let previous = orchestration
             var reason: String?
             if action == "takeover" {
@@ -154,10 +158,16 @@ extension CommandRouter {
         if p["progress"] != nil { let progress = try text(p,"progress"); recordHealthProgress(&orchestration,progress:progress); orchestration["progress"] = progress }
         orchestration["last_checkpoint"] = now()
         if action == "finish" { orchestration["state"] = "finished";orchestration["finished_at"] = now() }
-        group["orchestration"] = orchestration;group = revised(group);try save(db,group,type:"group")
-        try event(db,caller:c,project:pid,entity:gid,kind:"triage_orchestration_"+action,data:["orchestration":orchestration,"member_claims_unchanged":true,"memberships_unchanged":true])
+        group["orchestration"] = orchestration;group = revised(group)
+        try event(db,caller:c,project:pid,entity:gid,kind:"triage_orchestration_"+action,data:["orchestration":orchestration,"member_claims_unchanged":true,"memberships_unchanged":true,"plan":action == "finish" && !triageMemberIDs(group).isEmpty])
+        // Finish turns a Triage with tickets into a plan; an empty one archives (CL-125).
+        if action == "finish" { try archiveEmptyPlan(db,&group,caller:c,after:"finish") }
+        try save(db,group,type:"group")
+        // CL-248: saved notes with no recipient reach the new orchestrator once (at most 50 per pickup).
+        let saved: (delivered: Int, hasMore: Bool) = action == "start" || action == "takeover" ? try deliverSavedTriageNotes(db,group:group) : (0,false)
         var result = try groupProjection(db,group)
         if let notice { result["takeover_notice"] = notice }
+        if action == "start" || action == "takeover" { result["saved_notes_delivered"] = saved.delivered; result["saved_note_delivery_has_more"] = saved.hasMore }
         return result
     }
     func taskEpicContext(_ db: Database,_ task: JSON) throws -> Any {
@@ -185,8 +195,15 @@ extension CommandRouter {
             let uniformStatus = try statuses.count == 1 ? record(db,statuses.first!,type:"status") : nil
             let label = uniformStatus?["name"] as? String ?? (state == "empty" ? "Empty" : "Mixed")
             group["task_ids"] = ids;group["member_count"] = ids.count;group["status_state"] = state
-            group["phase"] = triagePhase(source) ?? NSNull();group["phase_requires_selection"] = triagePhase(source) == nil
-            group["phase_source"] = source["phase"] == nil ? "legacy_membership" : "explicit"
+            // CL-125: a Triage has no phase. An older Triage keeps its phase as a history label.
+            group["phase"] = source["phase"] ?? NSNull();group["phase_requires_selection"] = false
+            group["phase_source"] = source["phase"] == nil ? "none" : "history_label"
+            let orchestratorSession = triageOrchestratorSession(source), orchestration = source["orchestration"] as? JSON ?? [:]
+            group["orchestrator"] = orchestratorSession == nil ? NSNull() : ["session_id":orchestratorSession!,"orchestration_id":orchestration["id"] ?? NSNull(),"provider":orchestration["provider"] ?? NSNull(),"actor_display":orchestration["actor_display"] ?? NSNull(),"started_at":orchestration["started_at"] ?? NSNull()] as JSON
+            group["plan"] = orchestratorSession == nil
+            var countsByStatus: [String: Int] = [:]
+            for task in tasks { countsByStatus[try task["status_id"].map { try record(db,$0 as? String ?? "",type:"status")["category"] as? String ?? "unknown" } ?? "unknown",default:0] += 1 }
+            group["member_counts_by_status"] = countsByStatus
             group["status_id"] = uniformStatus?["id"] ?? NSNull();group["status_name"] = label;group["status_category"] = uniformStatus?["category"] ?? state
             group["derived_status"] = ["kind":state,"label":label,"status_id":uniformStatus?["id"] ?? NSNull(),"member_count":ids.count]
             if fields.isEmpty || fields.contains("active_attention") { group["active_attention"] = try triageActiveAttention(db,source) }
@@ -305,11 +322,8 @@ extension CommandRouter {
             try save(db,project,type:"project")
             var group: JSON = ["key":"\(project["key_prefix"] as? String ?? "TASK")-\(GroupKeys.marker(kind))\(number)","id":uuid(),"project_id":pid,"kind":kind,"name":try text(p,"name",max:200),"revision":1,"members":[],"task_ids":[],"archived":false,"created_at":now(),"updated_at":now()]
             if kind == "epic" { group["brief"] = brief;group["description"] = brief }
-            else {
-                let phase = p["phase"] as? String ?? "implementation"
-                guard AttemptPhase.wireValues.contains(phase) else { throw CoreError("INVALID_INPUT","Choose an implementation or review Triage.") }
-                group["phase"] = phase;group["purpose"] = p["purpose"] ?? brief
-            }
+            // CL-125: a Triage has no phase; an old phase input is ignored.
+            else { group["purpose"] = p["purpose"] ?? brief }
             try save(db,group,type:"group");try event(db,caller:c,project:pid,entity:group["id"] as? String,kind:kind+"_created");return try groupProjection(db,group)
         }
         let gid = p["group_id"] as? String ?? p["triage_id"] as? String ?? p["epic_id"] as? String ?? ""
@@ -318,12 +332,6 @@ extension CommandRouter {
             if p["name"] != nil { group["name"] = try text(p,"name",max:200) }
             if group["kind"] as? String == "epic" { if let brief = p["brief"] ?? p["description"] ?? p["purpose"] { guard let text = brief as? String,text.utf8.count <= 65536 else { throw CoreError("INVALID_INPUT","The Epic brief must be text up to 64 KiB.") };group["brief"] = text;group["description"] = text } }
             else if let purpose = p["purpose"] ?? p["brief"] { guard let text = purpose as? String,text.utf8.count <= 65536 else { throw CoreError("INVALID_INPUT","The Triage purpose must be text up to 64 KiB.") };group["purpose"] = text }
-            if group["kind"] as? String == "triage",let phase = p["phase"] as? String {
-                guard AttemptPhase.wireValues.contains(phase) else { throw CoreError("INVALID_INPUT","Choose implementation or review handling.") }
-                guard triageMemberIDs(group).isEmpty || triagePhase(group) == nil || triagePhase(group) == phase else { throw CoreError("TRIAGE_PHASE_CONFLICT","Use a separate Triage for the next phase. Only an empty Triage can change its established phase.") }
-                for memberID in triageMemberIDs(group) { try validateTriageTaskPhase(db,task:scoped(db,memberID,pid,type:"task"),phase:phase) }
-                group["phase"] = phase
-            }
             if p["archived"] != nil {
                 if bool(p,"archived"),group["kind"] as? String == "epic" {
                     let live = try String.fetchOne(db,sql:"SELECT id FROM records WHERE type='task' AND project_id=? AND json_extract(data,'$.epic_id')=? AND COALESCE(json_extract(data,'$.archived'),0)=0 AND COALESCE(json_extract(data,'$.trashed'),0)=0 AND COALESCE(json_extract(data,'$.purged'),0)=0 LIMIT 1",arguments:[pid,gid])
@@ -361,25 +369,35 @@ extension CommandRouter {
             try event(db,caller:c,project:pid,entity:gid,kind:"epic_member_"+action,data:["task_id":tid,"from_epic_id":old ?? NSNull()]);return group
         }
         guard ["add","update","remove"].contains(action) else { throw CoreError("INVALID_INPUT","Triage membership supports add, update or remove.") }
-        guard !bool(group,"archived") || action == "remove" else { throw CoreError("INVALID_TRANSITION","Restore this Triage before adding or updating its handling set.") }
-        var members = group["members"] as? [JSON] ?? [];let prior = members.first {$0["task_id"] as? String == tid};members.removeAll {$0["task_id"] as? String == tid}
-        if action != "remove" {
-            if action == "update",prior == nil { throw CoreError("NOT_FOUND","This task is not a Triage member.") }
-            guard let groupPhase = triagePhase(group) else { throw CoreError("TRIAGE_PHASE_REQUIRED","Choose this legacy Triage's implementation or review phase before handling new work. Existing memberships are preserved.") }
-            try validateTriageTaskPhase(db,task:task,phase:groupPhase)
-            if let requested = p["handling_phase"] as? String,requested != groupPhase { throw CoreError("TRIAGE_PHASE_CONFLICT","A member's handling phase must match its Triage.") }
-            let milestone = p["exit_milestone"] as? String ?? prior?["exit_milestone"] as? String ?? (groupPhase == "review" ? "review_accepted" : "implementation_submitted")
-            guard ["manual","implementation_submitted","review_accepted"].contains(milestone) else { throw CoreError("INVALID_INPUT","Choose implementation submission, accepted review or manual removal.") }
-            let phase = groupPhase
-            guard AttemptPhase.wireValues.contains(phase) else { throw CoreError("INVALID_INPUT","Choose implementation or review handling.") }
-            var member: JSON = ["task_id":tid,"exit_milestone":milestone,"handling_phase":phase,"joined_at":prior?["joined_at"] ?? now(),"updated_at":now()]
-            if let prior = prior { member["membership_id"] = try ensureTriageMembershipInterval(db,group:group,member:prior,caller:c)["id"] }
-            else { member["membership_id"] = try ensureTriageMembershipInterval(db,group:group,member:member,caller:c,joiningRevision:int(group,"revision")+1)["id"] }
-            members.append(member)
-        } else if let prior = prior {
-            _ = try closeTriageMembership(db,group:group,member:prior,caller:c,reason:"manual",extra:["label":c.isOwner ? "Owner removed from Triage" : "Manually removed from Triage"])
+        guard !bool(group,"archived") || action == "remove" else { throw CoreError("INVALID_TRANSITION","Restore this Triage before adding or updating its tickets.") }
+        let prior = triageMember(group,taskID:tid)
+        if action == "remove" {
+            if prior != nil { group = try leaveTriage(db,group:group,taskID:tid,caller:c,reason:"removed",extra:["label":c.isOwner ? "Owner removed from Triage" : "Manually removed from Triage"]) }
+            else { group = revised(group);try save(db,group,type:"group") }
+            try event(db,caller:c,project:pid,entity:gid,kind:"triage_member_removed",data:["task_id":tid]);return try groupProjection(db,group)
         }
-        group["members"] = members;group["task_ids"] = members.compactMap {$0["task_id"] as? String};group = revised(group);try save(db,group,type:"group")
-        try event(db,caller:c,project:pid,entity:gid,kind:action == "remove" ? "triage_member_removed" : (prior == nil ? "triage_member_added" : "triage_member_updated"),data:["task_id":tid]);return try groupProjection(db,group)
+        // CL-125 rule 5: only the orchestrator or the owner adds tickets to an orchestrated Triage; anyone eligible edits plans.
+        let orchestrator = triageOrchestratorSession(group)
+        if let orchestrator,!c.isOwner,c.sessionID != orchestrator { throw CoreError("TRIAGE_ORCHESTRATED","Only this Triage's orchestrator or the owner adds or updates its tickets. Send a note to the orchestrator instead.",details:["orchestrator_session_id":orchestrator]) }
+        if let prior {
+            var member = prior;member["updated_at"] = now()
+            member["membership_id"] = try ensureTriageMembershipInterval(db,group:group,member:prior,caller:c)["id"]
+            group["members"] = triageMembers(group).map {$0["task_id"] as? String == tid ? member : $0}
+            group = revised(group);try save(db,group,type:"group")
+            try event(db,caller:c,project:pid,entity:gid,kind:"triage_member_updated",data:["task_id":tid]);return try groupProjection(db,group)
+        }
+        if action == "update" { throw CoreError("NOT_FOUND","This task is not a Triage member.") }
+        // Rule 4: a ticket is in at most one Triage, so an add moves it and keeps its return Triage (rule 10).
+        var carried: String?
+        for other in try currentTriages(db,project:pid,taskID:tid) where other["id"] as? String != gid {
+            let otherOrchestrator = triageOrchestratorSession(other)
+            if let otherOrchestrator,orchestrator == nil,!c.isOwner,c.sessionID != otherOrchestrator {
+                throw CoreError("TRIAGE_MEMBERSHIP_CONFLICT","This ticket is in \(try agentReference(db,other)), which has an orchestrator. Only that orchestrator, another orchestrator that handles the ticket, or the owner moves it.",details:["triage_id":other["id"] ?? NSNull()])
+            }
+            carried = carried ?? triageMember(other,taskID:tid)?["return_triage_id"] as? String
+            try leaveTriage(db,group:other,taskID:tid,caller:c,reason:otherOrchestrator == nil ? "removed" : "other_orchestrator",extra:["moved_to_triage_id":gid])
+        }
+        group = try joinTriage(db,group:group,taskID:tid,caller:c,reason:"explicit_add",returnTriageID:carried)
+        return try groupProjection(db,group)
     }
 }

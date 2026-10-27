@@ -32,14 +32,17 @@ extension CoreTests {
         let task = try ready(project,self.task(project))
         // Recipients are sorted by session ID; this coordinator sorts before the handler.
         let handlerID = "ffffffff-ffff-4fff-bfff-ffffffffffff",coordinatorID = "00000000-0000-4000-8000-000000000000"
-        for (id,name) in [(handlerID,"handler"),(coordinatorID,"coordinator")] { _ = try call("session_register",["project_id":pid,"session_id":id,"role":"worker","provider":"claude","installation":name,"workspace":workspace.path]) }
-        let settings = try call("project_settings_get",["project_id":pid]);var policy = settings["policy"] as! JSON;policy["coordinator_session_id"] = coordinatorID
-        _ = try call("policy_apply",["project_id":pid,"expected_revision":settings["revision"]!,"policy":policy])
+        for (id,name) in [(handlerID,"handler")] { _ = try call("session_register",["project_id":pid,"session_id":id,"role":"worker","provider":"claude","installation":name,"workspace":workspace.path]) }
+        // CL-248: the Triage orchestrator (which sorts first) replaces the retired coordinator_session_id.
+        _ = try call("session_register",["project_id":pid,"session_id":coordinatorID,"role":"worker","provider":"claude","installation":"coordinator","workspace":workspace.path,"execution_domain":"host-coordinator"])
+        let coordinator = Caller(role:"worker",installation:"coordinator",projectIDs:[pid],sessionID:coordinatorID,workspace:workspace.path,executionDomain:"host-coordinator")
+        let triage = try call("triage_orchestrate",["project_id":pid,"action":"start"],coordinator)
+        _ = try call("group_membership",["project_id":pid,"group_id":triage["id"]!,"expected_revision":triage["revision"]!,"task_id":task["id"]!,"action":"add"],coordinator)
         let handler = Caller(role:"worker",installation:"handler",projectIDs:[pid],sessionID:handlerID,workspace:workspace.path)
         _ = try call("work_claim",["project_id":pid,"task_id":task["id"]!,"expected_revision":task["revision"]!],handler)
         let note = try call("message_send",["project_id":pid,"task_id":task["id"]!,"body":"Which logo size did you pick?","expects_reply":true])
-        // docs/domain.md, Scoped ordinary comment mentions: current attempts/children only.
-        XCTAssertEqual(Set((note["deliveries"] as! [JSON]).compactMap {$0["recipient_session_id"] as? String}),Set([handlerID]))
+        // docs/triage-orchestrators.md, Message routing: the holder and the Triage orchestrator.
+        XCTAssertEqual(Set((note["deliveries"] as! [JSON]).compactMap {$0["recipient_session_id"] as? String}),Set([handlerID,coordinatorID]))
         XCTAssertEqual(note["reply_recipient_session_id"] as? String,handlerID)
         let bridge = Caller(role:"owner",installation:"native-bridge",projectIDs:[])
         assertCode("FORBIDDEN") { _ = try self.call("native_reply_record",["project_id":pid,"reply_to":note["id"]!,"recipient_session_id":coordinatorID,"body":"Coordinator answer","source_evidence":[:]],bridge) }

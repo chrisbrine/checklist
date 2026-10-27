@@ -146,9 +146,10 @@ extension CommandRouter {
            try jsonString(canonicalReviewRequirements((project["policy"] as? JSON)?["review_requirements"])) != jsonString(canonicalReviewRequirements(policy["review_requirements"])) {
             throw CoreError("REVIEW_REQUIREMENT_RECONCILIATION_UNSUPPORTED","Use future work rounds for review-requirement changes. Same-gate active reconciliation requires a fresh explicit review path.")
         }
-        if let sid = policy["coordinator_session_id"] as? String {
-            let session = try scoped(db,sid,pid,type:"session"), role = (policy["roles"] as? JSON)?["coordinator"] as? JSON ?? [:]
-            guard session["role"] as? String == "worker", canReceive(session,project:pid), strings(role,"providers").contains(session["provider"] as? String ?? "") else { throw CoreError("POLICY_DENIED", "Context copies require an existing eligible enrolled coordinator session. Selecting a recipient never enrolls or assigns work.") }
+        // CL-248: coordinator_session_id is retired and routes nothing. An unchanged stored
+        // value stays readable as history; a new or changed value is refused.
+        if let sid = policy["coordinator_session_id"], (try? jsonString(["v":sid])) != (try? jsonString(["v":(project["policy"] as? JSON)?["coordinator_session_id"] ?? NSNull()])) {
+            throw CoreError("INVALID_INPUT", "coordinator_session_id is retired: the Triage orchestrator now receives ticket communications. Remove the field; an old stored value stays readable as history.")
         }
         let tasks = try records(db,type:"task",project:pid).filter { !bool($0,"archived") && !bool($0,"trashed") }
         let attempts = try records(db,type:"attempt",project:pid).filter { $0["state"] as? String == "active" }

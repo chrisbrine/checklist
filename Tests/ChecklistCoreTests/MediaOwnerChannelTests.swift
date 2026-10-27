@@ -22,7 +22,7 @@ final class MediaOwnerChannelTests: XCTestCase {
             }
             XCTAssertFalse(try jsonString(f.router.handle(method:"tool_catalog",params:[:],caller:role)).contains("media_"))
         }
-        for method in ["media_suggest","media_round_finish","media_material_reference_adopt","media_bulk_apply"] {
+        for method in ["media_suggest","media_material_reference_adopt","media_bulk_apply"] {
             XCTAssertThrowsError(try f.router.handle(method:method,params:["project_id":f.project,"command_id":uuid()],caller:f.owner))
         }
         XCTAssertThrowsError(try owner(f,"media_type_create",["title":"Story","origin":"human_ui"]))

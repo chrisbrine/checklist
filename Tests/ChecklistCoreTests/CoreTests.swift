@@ -10,6 +10,8 @@ final class CoreTests: XCTestCase {
     var directory: URL!
     var router: CommandRouter!
     let owner = Caller(role:"owner",installation:"test-owner",projectIDs:[])
+    /// CL-125: batch fixtures that keep tickets through claims prepare from an orchestrated Triage (rule 6).
+    var orchestrateBatchTriages = false
     override func setUpWithError() throws {
         // macOS /var temporary paths traverse a symlink rejected by storage admission.
         let qualificationRoot = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)

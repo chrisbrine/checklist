@@ -14,6 +14,15 @@ struct InlineTriageRow: View {
         return first
     }
     var statusName: String { section.totalCount == 0 ? "Empty" : section.triage.values["members_complete"] as? Bool == false ? section.triage.string("status_name", fallback: "Mixed") : !completeSnapshot ? "Refresh needed" : uniformStatus?.string("status_name", fallback: "Queued") ?? "Mixed" }
+    var rowFacts: [String] {
+        var facts: [String] = []
+        if store.projectID == nil { facts.append(store.projectName(section.triage.string("project_id"))) }
+        facts.append(TriageOrchestratorDisplay(section.triage).summary)
+        facts.append(section.visibleMembers.count == section.totalCount ? "\(section.totalCount) tickets" : "\(section.visibleMembers.count) of \(section.totalCount) tickets shown")
+        let counts = TriageOrchestratorDisplay.statusCountsText(section.triage)
+        if !counts.isEmpty { facts.append(counts) }
+        return facts
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.none) {
             AccessibleHStack(spacing: Spacing.row) {
@@ -24,16 +33,11 @@ struct InlineTriageRow: View {
                         Image(systemName: "tray.2").foregroundStyle(Color.checklistAccentText)
                         VStack(alignment: .leading, spacing: Spacing.tight) {
                             Text(ProductionGroups.label(section.triage)).checklistFont(.bodyStrong).frame(maxWidth: .infinity, alignment: .leading)
-                            HStack(spacing: Spacing.compact) {
-                                if store.projectID == nil { Text(store.projectName(section.triage.string("project_id"))); Text("·") }
-                                Text(section.triage.string("phase",fallback:"Choose phase").capitalized)
-                                Text("·")
-                                Text(section.visibleMembers.count == section.totalCount ? "\(section.totalCount) tickets" : "\(section.visibleMembers.count) of \(section.totalCount) tickets shown")
-                                if let label = section.orchestrationLabel { Text("· " + label) }
-                            }.checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                            // CL-126: orchestrator and its state (or Planned), then ticket counts by status.
+                            Text(rowFacts.joined(separator: " · ")).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }.padding(.leading, Spacing.small).padding(.vertical, Spacing.small)
-                }.buttonStyle(.checklistRow).accessibilityIdentifier("triageRow-\(section.id)").accessibilityLabel("\(ProductionGroups.label(section.triage)), \(expanded ? "expanded" : "collapsed") Triage")
+                }.buttonStyle(.checklistRow).accessibilityIdentifier("triageRow-\(section.id)").accessibilityLabel("\(ProductionGroups.label(section.triage)), \(expanded ? "expanded" : "collapsed") Triage, \(rowFacts.joined(separator: ", "))")
                 Menu {
                     Text("Apply to all \(section.totalCount) current tickets")
                     if filtered && section.visibleMembers.count != section.totalCount { Text("Includes tickets hidden by filters") }

@@ -74,6 +74,13 @@ extension CommandRouter {
             }
         }
         var ordinaryRoute: OrdinaryMentionRoute?
+        // CL-248: audience narrows ordinary notes only and never combines with an exact recipient.
+        let audience = method == "message_send" ? try ticketAudience(p) : nil
+        if audience != nil, explicitSessionID != nil { throw CoreError("INVALID_INPUT","Choose audience or an exact recipient, not both. No message was saved.") }
+        if let audience, audience != .all, mentionTarget != nil || bool(p,"requires_action") || p["correction_of"] != nil || purpose != .ordinaryNote {
+            throw CoreError("INVALID_INPUT","Owner directions, Human Request answers, corrections and mention plans always reach both roles; audience cannot narrow them. No message was saved.")
+        }
+        var pickupPending = false
         if c.isOwner, explicitSessionID != nil, bool(p,"requires_action") { throw CoreError("INVALID_INPUT", "Owner directions must omit recipient so all required handlers receive them.") }
         try assistantPermission(c,pid,"post_notes_on_request")
         if ["correction","retraction"].contains(p["kind"] as? String ?? ""),p["correction_of"] == nil { throw CoreError("INVALID_INPUT","A correction or retraction needs correction_of and text in body.") }
@@ -113,6 +120,10 @@ extension CommandRouter {
                 let participants = [sid] + (c.sessionID.map { [$0] } ?? [])
                 try save(db,["id":conversationID!,"project_id":pid,"participants":participants,"participant_authorization_generations":generations,"owner_participant":c.isOwner,"revision":1,"created_at":now()],type:"conversation")
             }
+        } else if taskID == nil, method == "message_send", c.role != "assistant", mentionTarget == nil, !bool(p,"requires_action"), purpose == .ordinaryNote, p["correction_of"] == nil {
+            // CL-248: a Triage note (triage_id, no task_id) or an exact-recipient project note.
+            let route = try triageNoteRoute(db,params:p,project:pid,explicit:explicitSessionID,audience:audience,caller:c)
+            recipientDetails = route.recipients; recipients = route.recipients.compactMap {$0["session_id"] as? String}; pickupPending = route.pickupPending
         } else {
             guard let tid = taskID else { throw CoreError("INVALID_INPUT","Ticket notes need task_id.") }
             let task = try scoped(db,tid,pid,type:"task")
@@ -122,12 +133,14 @@ extension CommandRouter {
             } else {
                 if !bool(p,"requires_action"),c.role != "assistant",purpose == .ordinaryNote {
                     try validateOrdinaryMentionBody(db,project:pid,body:body,mentionTarget:mentionTarget)
-                    let route = try ordinaryMessageRoute(db,project:pid,task:task,replyTo:p["reply_to"] as? String,mentionTarget:mentionTarget,caller:c)
+                    let route = try ordinaryMessageRoute(db,project:pid,task:task,replyTo:p["reply_to"] as? String,mentionTarget:mentionTarget,caller:c,audience:audience ?? .all)
                     ordinaryRoute = route; recipientDetails = route.recipients
                 } else {
-                    recipientDetails = try relevantHandlerRecipients(db,task:task).filter {$0["session_id"] as? String != c.sessionID}
+                    recipientDetails = try relevantHandlerRecipients(db,task:task,sender:c.sessionID).filter {$0["session_id"] as? String != c.sessionID}
                 }
                 recipients = recipientDetails.compactMap {$0["session_id"] as? String}
+                // No holder and no orchestrator: saved for the next holder or orchestrator pickup.
+                if recipients.isEmpty, try ordinaryHandlerRecipients(db,task:task).isEmpty, try ticketOrchestratedTriage(db,task:task) == nil { pickupPending = true }
             }
         }
         if c.isOwner,bool(p,"requires_action"),let tid = taskID {
@@ -149,6 +162,8 @@ extension CommandRouter {
         var m: JSON = ["id":mid,"project_id":pid,"body":body,"kind":p["kind"] ?? "note","origin":origin,"author":c.principal,"author_display":author(db,c),"author_session_id":c.sessionID ?? "human","requires_action":c.isOwner && bool(p,"requires_action"),"addressed":false,"revision":1,"created_at":now(),"profile_snapshot":profileSnapshot]
         m["original_requester_session_id"] = c.sessionID ?? "human"; m["handler_session_ids_at_send"] = recipients
         if let route = ordinaryRoute { m["ordinary_routing"] = route.mode; m["mentions"] = route.references }
+        if pickupPending { m["pickup_pending"] = true }
+        if let audience { m["audience"] = audience.rawValue }
         for (field,kind) in [("triage_id","triage"),("epic_id","epic")] {
             if let id = p[field] as? String { let group = try scoped(db,id,pid,type:"group");guard group["kind"] as? String == kind else { throw CoreError("INVALID_INPUT","Select the matching group kind.") };m[field] = id }
         }
@@ -168,6 +183,7 @@ extension CommandRouter {
         if let reply = p["reply_to"] as? String {
             let original = try scoped(db,reply,pid,type:"message")
             guard original["task_id"] as? String == taskID,original["conversation_id"] as? String == conversationID else { throw CoreError("INVALID_INPUT","A reply must retain its original ticket and conversation scope.") }
+            if let scope = original["triage_id"] as? String,let mine = m["triage_id"] as? String,scope != mine { throw CoreError("INVALID_INPUT","A reply must retain its original Triage scope.") }
             for field in ["triage_id","epic_id"] where m[field] == nil { m[field] = original[field] }
             m["reply_to"] = reply; m["original_requester_session_id"] = original["original_requester_session_id"] ?? original["author_session_id"] ?? "human"
         }
@@ -178,7 +194,11 @@ extension CommandRouter {
         }
         // The single reply allowance goes to the explicit recipient, or else to the current handler.
         // Recipients are sorted by session ID, so a child or coordinator can come first.
-        let replyRecipient = explicitSessionID ?? (recipientDetails.isEmpty ? recipients.first : recipientDetails.first { $0["recipient_role"] as? String == "handler" }?["session_id"] as? String)
+        // CL-248: the holder for all and holder; the orchestrator for orchestrator or when there is no holder.
+        let replyRole = audience == .orchestrator || taskID == nil ? "triage_orchestrator" : "handler"
+        let hasHandler = recipientDetails.contains { $0["recipient_role"] as? String == "handler" }
+        let replyRecipient = explicitSessionID ?? (recipientDetails.isEmpty ? recipients.first : (recipientDetails.first { $0["recipient_role"] as? String == replyRole }
+            ?? (hasHandler ? nil : recipientDetails.first { $0["recipient_role"] as? String == "triage_orchestrator" }))?["session_id"] as? String)
         if bool(p,"expects_reply"),let sid = replyRecipient { m["reply_allowed"] = true; m["reply_used"] = false; m["reply_recipient_session_id"] = sid; m["reply_sender_session_id"] = c.sessionID ?? "human";m["reply_recipient_authorization_generation"] = sessionGeneration(try scoped(db,sid,pid,type:"session"));m["reply_sender_authorization_generation"] = try callerSessionGeneration(db,c,project:pid) }
         try save(db,m,type:"message")
         if let health = try reconcileHealthReply(db,reply:m,caller:c) { m["health_reconciliation"] = health }
@@ -186,7 +206,8 @@ extension CommandRouter {
         let deliveries = ordinaryRoute != nil
             ? try queueOrdinaryDeliveries(db,message:m,recipients:details)
             : try queueDirectionDeliveries(db,message:m,recipients:details)
-        try event(db,caller:c,project:pid,entity:taskID ?? conversationID,kind:"message_saved",data:["message_id":mid,"origin":origin])
+        try event(db,caller:c,project:pid,entity:taskID ?? conversationID ?? m["triage_id"] as? String,kind:"message_saved",data:["message_id":mid,"origin":origin])
+            // entity: ticket, conversation or (CL-248) the Triage of a ticket-free note
         m["subject"] = try subject(db,message:m);m["deliveries"] = deliveries; m["delivery_status"] = recipients.isEmpty ? "saved_for_pickup" : "queued"; m["native_push"] = false; return m
     }
     private func acknowledgeMessage(_ db: Database, params p: JSON, caller c: Caller, projectID pid: String) throws -> JSON {
@@ -222,21 +243,23 @@ extension CommandRouter {
 
     /// Ticket-scoped receipt metadata only: this is never a recipient inbox read.
     func messageDeliveryList(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
-        let pid = try scope(db,p,c), tid = try text(p,"task_id"), mid = try text(p,"message_id")
-        _ = try scoped(db,tid,pid,type:"task")
+        let pid = try scope(db,p,c), mid = try text(p,"message_id")
         let message = try scoped(db,mid,pid,type:"message")
-        guard message["task_id"] as? String == tid else { throw CoreError("NOT_FOUND","This note is not available on this ticket.") }
+        // CL-248: a ticket note by task_id, or a ticket-free Triage note by triage_id.
+        let subjectKey = p["task_id"] != nil ? "task_id" : "triage_id", subjectID = try text(p,subjectKey)
+        _ = try scoped(db,subjectID,pid,type:subjectKey == "task_id" ? "task" : "group")
+        guard message[subjectKey] as? String == subjectID, subjectKey == "task_id" || message["task_id"] == nil else { throw CoreError("NOT_FOUND","This note is not available on this ticket or Triage.") }
         let rows = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='delivery' AND project_id=? AND json_extract(data,'$.message_id')=? COLLATE BINARY ORDER BY rowid",arguments:[pid,mid])
         let deliveries = try rows.map { row -> JSON in
             let delivery = try deliveryReceiptProjection(db,GRDBRecordEnvelopeAdapter.decode(row,expectedType:"delivery").object)
             // Keep transport receipts, reply allowances, note bodies and credentials private.
-            let fields = ["id","message_id","recipient_session_id","recipient_authorization_generation","push_state","host_status","created_at","updated_at","delivered_at","acknowledged_at","addressed_at","host_status_at","native_closure_ref","owner_disconnect_ref","fenced_at"]
+            let fields = ["id","message_id","recipient_session_id","recipient_authorization_generation","recipient_role","label","push_state","host_status","created_at","updated_at","delivered_at","acknowledged_at","addressed_at","host_status_at","native_closure_ref","owner_disconnect_ref","fenced_at"]
             var result = delivery.filter { fields.contains($0.key) }
             let state = delivery["state"] as? String ?? "queued"
             result["state"] = ["fenced","quarantined"].contains(state) ? state : ["acknowledged","addressed"].contains(state) ? "acknowledged" : (state == "delivered" ? "delivered" : "queued")
             return result
         }
-        var result: JSON = ["message_id":mid,"task_id":tid,"deliveries":deliveries]
+        var result: JSON = ["message_id":mid,subjectKey:subjectID,"deliveries":deliveries]
         // No recipient exists yet; do not invent a delivery ID or generation.
         if deliveries.isEmpty { result["delivery_status"] = "saved_for_pickup"; result["created_at"] = message["created_at"] }
         return result

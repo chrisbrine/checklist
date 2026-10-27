@@ -161,7 +161,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 200,
-      "description": "Superseded by the Triage orchestrator (CL-269). Until CL-248 ships, an optional existing enrolled eligible worker recipient for owner-direction context copies; after CL-248 it routes nothing, new policy saves refuse it, and old values stay readable as history. The runtime validates same-project membership and actual worker role; this never assigns or enrolls work."
+      "description": "Retired history (CL-269, CL-248): the Triage orchestrator receives ticket communications. It routes nothing; a policy save refuses a new or changed value, and an old stored value stays readable as history. It never assigns or enrolls work."
     },
     "allow_human_decision_evidence": {
       "type": "boolean",

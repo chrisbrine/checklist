@@ -12,13 +12,11 @@ struct ProjectSettingsView: View {
     @State private var brief = ""
     @State private var pinnedDecisions = PinnedDecisionDrafts()
     @State private var editingContext = false
-    @State private var choosingCoordinatorSession = false
     @State private var preset = "shared"
     @State private var requireReview = true
     @State private var requireHumanApproval = false
     @State private var allowHumanDecisionEvidence = false
     @State private var coordinator = "both"
-    @State private var coordinatorSession = ""
     @State private var implementer = "both"
     @State private var reviewer = "both"
     @State private var allowedProviders = ProviderPluginRegistry.bundled.workProviders
@@ -150,14 +148,6 @@ struct ProjectSettingsView: View {
             PolicyProviderPicker(title:"Coordinator", selection:$coordinator)
             PolicyProviderPicker(title:"Implementation", selection:$implementer)
             PolicyProviderPicker(title:"Independent review", selection:$reviewer)
-            Text("Coordinator context copies: \(coordinatorSessionLabel)").checklistFont(.callout)
-            Button(choosingCoordinatorSession ? "Hide coordinator session picker" : "Choose coordinator context session") { choosingCoordinatorSession.toggle() }
-            // A project may have hundreds of retained sessions. Build their
-            // menu only when requested, rather than on every settings open.
-            if choosingCoordinatorSession {
-                Picker("Coordinator context copies",selection:$coordinatorSession) { Text("No selected session").tag(""); ForEach(store.workSessions.filter { $0.string("project_id") == project.id || $0.strings("project_ids").contains(project.id) }) { session in Text("\(session.string("label",fallback:"Worker")) · \(session.string("provider")) · \(session.id.prefix(8))").tag(session.id) } }
-            }
-            Text("Select an existing eligible worker to receive relevant context copies. This does not assign work or enroll a connection.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             Toggle("Agents may change this project's rules and settings", isOn: $agentsChangeRules).toggleStyle(.checkbox).help("On by default. Agents change rules, statuses, tags and settings; each change is recorded as an agent action. Only you can switch this.")
             Toggle("Require independent review", isOn: $requireReview).toggleStyle(.checkbox)
             Toggle("Require owner approval", isOn: $requireHumanApproval).toggleStyle(.checkbox)
@@ -190,11 +180,6 @@ struct ProjectSettingsView: View {
                 }
             }
         }
-    }
-    private var coordinatorSessionLabel: String {
-        guard !coordinatorSession.isEmpty else {return "No selected session"}
-        guard let session = store.workSessions.first(where: {$0.id == coordinatorSession}) else {return coordinatorSession}
-        return "\(session.string("label",fallback:"Worker")) · \(session.string("provider")) · \(session.id.prefix(8))"
     }
     var captureSettings: some View {
         DetailSection(title:"Project defaults") {
@@ -243,7 +228,8 @@ struct ProjectSettingsView: View {
         value["review_batch_policy"] = batchPolicy
         value["agent_rule_changes"] = agentsChangeRules ? "allowed" : "owner_only"
         value["allow_human_decision_evidence"] = allowHumanDecisionEvidence
-        if coordinatorSession.isEmpty { value.removeValue(forKey:"coordinator_session_id") } else { value["coordinator_session_id"] = coordinatorSession }
+        // CL-248 retires coordinator_session_id; a new policy save never carries it (CL-126).
+        value.removeValue(forKey:"coordinator_session_id")
         value["task_kind_overrides"] = kindDrafts.compactMap { draft -> [String:Any]? in
             var roles: [String:Any] = [:]
             let oldRoles = ((project.object("policy")["task_kind_overrides"] as? [[String:Any]] ?? []).first { $0["kind"] as? String == draft.kind })?["roles"] as? [String:Any] ?? [:]
@@ -278,7 +264,6 @@ struct ProjectSettingsView: View {
         let policy = project.object("policy"), gates = policy["required_gates"] as? [String] ?? ["review"], roles = policy["roles"] as? [String:Any] ?? [:]
         reviewRequirements = ReviewRequirementsDraft(raw:policy["review_requirements"])
         preset = policy["routing_preset"] as? String ?? "shared"; requireReview = gates.contains("review"); requireHumanApproval = gates.contains("human_approval")
-        coordinatorSession = policy["coordinator_session_id"] as? String ?? ""
         allowHumanDecisionEvidence = policy["allow_human_decision_evidence"] as? Bool ?? false
         agentsChangeRules = policy["agent_rule_changes"] as? String != "owner_only"
         allowedProviders = policy["allowed_providers"] as? [String] ?? ProviderPluginRegistry.bundled.workProviders

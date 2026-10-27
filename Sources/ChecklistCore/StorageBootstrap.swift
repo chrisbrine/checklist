@@ -28,7 +28,7 @@ enum StorageBootstrap {
                 case .legacy(let incarnation):
                     guard serviceLease != nil else { throw StoreRecovery.required("upgrade_requires_exclusive_service") }
                     if let external {
-                        guard external.state == "preparing",[1,2,3].contains(external.schema_revision),external.incarnation == incarnation else { throw StoreRecovery.required("legacy_identity_mismatch") };identity = external
+                        guard external.state == "preparing",(1...SchemaMigrations.currentSchema).contains(external.schema_revision),external.incarnation == incarnation else { throw StoreRecovery.required("legacy_identity_mismatch") };identity = external
                     } else {
                         identity = StoreIdentityReceipt(format_version:1,logical_store_id:uuid(),incarnation:incarnation,database_generation:1,schema_revision:1,state:"preparing")
                         try directory.publishReceipt(identity.encoded(),name:StoreIdentityReceipt.fileName,replacingPreparedReceipt:false)
@@ -36,9 +36,9 @@ enum StorageBootstrap {
                 case .current(let current):
                     guard let external else { throw StoreRecovery.required("initialized_identity_receipt_missing") }
                     let matching = current == external.withState("ready")
-                    let planned = current.schema_revision < external.schema_revision && [2,3].contains(external.schema_revision) && external.state == "preparing" && current.withSchema(external.schema_revision) == external.withState("ready")
+                    let planned = current.schema_revision < external.schema_revision && (2...SchemaMigrations.currentSchema).contains(external.schema_revision) && external.state == "preparing" && current.withSchema(external.schema_revision) == external.withState("ready")
                     guard matching || planned else { throw StoreRecovery.required("external_database_identity_mismatch") }
-                    if current.schema_revision < 3 { guard serviceLease != nil else { throw StoreRecovery.required("upgrade_requires_exclusive_service") } }
+                    if current.schema_revision < SchemaMigrations.currentSchema { guard serviceLease != nil else { throw StoreRecovery.required("upgrade_requires_exclusive_service") } }
                     identity = external
                 }
                 fresh = false
@@ -65,7 +65,7 @@ enum StorageBootstrap {
                     guard try String.fetchOne(db,sql:"PRAGMA journal_mode=WAL")?.lowercased() == "wal" else { throw StoreRecovery.required("wal_configuration_failed") }
                 }
                 try directory.ensureObjectsDirectory()
-                if version < 3 {
+                if version < SchemaMigrations.currentSchema {
                     let protected: JSON
                     if fresh {
                         protected = ["fresh_store":true,"operation_id":uuid()]
@@ -76,7 +76,7 @@ enum StorageBootstrap {
                         try serviceLease.requireRoot(root)
                         protected = try prepareUpgrade(queue:queue,root:root,identity:identity,permit:permit)
                     }
-                    let prepared = identity.withSchema(3).withState("preparing")
+                    let prepared = identity.withSchema(SchemaMigrations.currentSchema).withState("preparing")
                     let plan = try queue.read { try ManagedPathRelocation.plan($0, root: root, budget: .production()) }
                     try directory.publishReceipt(prepared.encoded(),name:StoreIdentityReceipt.fileName,replacingPreparedReceipt:true)
                     try queue.write { db in
@@ -85,12 +85,13 @@ enum StorageBootstrap {
                         }
                         if version < 1 && !fresh { try SchemaMigrations.adoptBaseline(db,identity:identity.withSchema(1),fresh:false) }
                         if version < 2 { try SchemaMigrations.upgradeProtocol(db,identity:prepared,protectedSnapshot:protected) }
-                        try SchemaMigrations.upgradeManagedPaths(db,identity:prepared,root:root,plan:plan,protectedSnapshot:protected)
+                        if version < 3 { try SchemaMigrations.upgradeManagedPaths(db,identity:prepared,root:root,plan:plan,protectedSnapshot:protected) }
+                        try SchemaMigrations.upgradeTriageMembership(db,identity:prepared,protectedSnapshot:protected)
                         observe(.upgradeBeforeCommit)
                     }
                     observe(.upgradeCommitted)
                 }
-                let ready = identity.withSchema(3).withState("ready")
+                let ready = identity.withSchema(SchemaMigrations.currentSchema).withState("ready")
                 // A crash after SQL COMMIT repairs only the external publication.
                 // Never restore an older snapshot over later committed work.
                 if external != ready {
@@ -117,7 +118,7 @@ enum StorageBootstrap {
         var config = Configuration();config.readonly = true;config.prepareDatabase { try SchemaMigrations.installStorageCollation($0) }
         let copy = try DatabaseQueue(path:copyURL.path,configuration:config)
         let fingerprint = try copy.read { try SchemaMigrations.contentFingerprint($0) };try copy.close()
-        let protected: JSON = ["operation_id":operation.uuidString.lowercased(),"path":generation.path,"manifest_sha256":receipt.manifestSHA256,"source_fingerprint":fingerprint,"target_migration_checksum":SchemaMigrations.managedPathsChecksum,"protected":true]
+        let protected: JSON = ["operation_id":operation.uuidString.lowercased(),"path":generation.path,"manifest_sha256":receipt.manifestSHA256,"source_fingerprint":fingerprint,"target_migration_checksum":SchemaMigrations.triageMembershipChecksum,"protected":true]
         // Rehearse the exact migration on the closed, checksummed SQLite copy.
         // This candidate is separate from both live store and protected backup.
         let rehearsal = root.appendingPathComponent("staging/preupgrade-" + operation.uuidString.lowercased() + ".sqlite")
@@ -130,7 +131,8 @@ enum StorageBootstrap {
             try candidate.write { db in
                 if try Int.fetchOne(db,sql:"PRAGMA user_version") == 0 { try SchemaMigrations.adoptBaseline(db,identity:identity.withSchema(1),fresh:false) }
                 if try Int.fetchOne(db,sql:"PRAGMA user_version") == 1 { try SchemaMigrations.upgradeProtocol(db,identity:identity.withSchema(2),protectedSnapshot:protected) }
-                try SchemaMigrations.upgradeManagedPaths(db,identity:identity.withSchema(3),root:root,plan:plan,protectedSnapshot:protected)
+                if try Int.fetchOne(db,sql:"PRAGMA user_version") == 2 { try SchemaMigrations.upgradeManagedPaths(db,identity:identity.withSchema(3),root:root,plan:plan,protectedSnapshot:protected) }
+                try SchemaMigrations.upgradeTriageMembership(db,identity:identity.withSchema(4),protectedSnapshot:protected)
             }
             try candidate.read { db in _ = try SchemaMigrations.inspect(db);guard try String.fetchOne(db,sql:"PRAGMA integrity_check") == "ok" else { throw StoreRecovery.required("migration_rehearsal_integrity_failed") } }
             try candidate.close()

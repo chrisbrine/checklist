@@ -42,8 +42,8 @@ extension CommandRouter {
         }
     }
 
-    // Only actual current attempts/accepted children; the project coordinator is
-    // deliberately retained only by the separate protected direction contract.
+    // Only actual current attempts/accepted children. The Triage orchestrator copy is
+    // added by withTriageOrchestratorCopy (CL-248); coordinator_session_id routes nothing.
     func ordinaryHandlerRecipients(_ db: Database, task: JSON) throws -> [JSON] {
         let storedTask = try StoredTaskRecord(task)
         let pid = storedTask.projectID, tid = storedTask.id
@@ -195,13 +195,14 @@ extension CommandRouter {
     }
 
     func ordinaryMessageRoute(_ db: Database, project: String, task: JSON, replyTo: String?,
-                              mentionTarget: String?, caller: Caller) throws -> OrdinaryMentionRoute {
+                              mentionTarget: String?, caller: Caller, audience: TicketAudience = .all) throws -> OrdinaryMentionRoute {
         try mentionTransaction(db); try mentionCaller(db, caller: caller, project: project)
         let tid = try StoredRecord(task, family: "task").string("id")
         let handlers = try ordinaryHandlerRecipients(db, task: task)
         guard let mentionTarget else {
+            // CL-248: the ticket holder and the Triage orchestrator, narrowed only by audience.
             return .init(messageID: nil, mode: "handlers", references: [],
-                         recipients: handlers.filter { !mentionEqual($0["session_id"] as? String, caller.sessionID) })
+                         recipients: try withTriageOrchestratorCopy(db, task: task, holders: handlers, sender: caller.sessionID, audience: audience))
         }
         var plan = try scoped(db, mentionTarget, project, type: "ordinary_mention_plan")
         guard mentionEqual(plan["project_id"] as? String, project), mentionEqual(plan["task_id"] as? String, tid),
@@ -263,6 +264,7 @@ extension CommandRouter {
                                   "push_state": "unavailable", "push_reason": "Native push is unqualified; available on recipient MCP pickup.",
                                   "revision": 1, "created_at": now()]
             if let aid = recipient["attempt_id"] { delivery["recipient_attempt_id"] = aid }
+            copyRoleLabel(recipient, into: &delivery)
             try save(db, delivery, type: "delivery"); deliveries.append(delivery)
         }
         return deliveries

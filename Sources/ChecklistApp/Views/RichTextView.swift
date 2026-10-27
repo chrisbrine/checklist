@@ -215,7 +215,9 @@ struct RichTableBlock: View {
                     Divider().gridCellUnsizedAxes(.horizontal)
                     ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
                         GridRow { ForEach(Array(row.enumerated()), id: \.offset) { index, value in
-                            cell(value).textSelection(.enabled).accessibilityLabel(index < headers.count ? headers[index] + ": " + value : value)
+                            // An explicit label on a selectable cell sent an AX client's label read into endless recursion
+                            // (R41A crash). A plain-text representation keeps the header context without that label.
+                            cell(value).textSelection(.enabled).accessibilityRepresentation { Text(verbatim: index < headers.count ? headers[index] + ": " + value : value) }
                         } }
                     }
                 }.padding(8).background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 6))

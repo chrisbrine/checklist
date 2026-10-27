@@ -17,6 +17,7 @@ public enum CommandMethods {
         "media_item_page",
         "media_item_counts",
         "media_approved_examples",
+        "media_rework_preview",
         "media_original_read",
         "media_example_read_lease",
         "media_example_read_release",

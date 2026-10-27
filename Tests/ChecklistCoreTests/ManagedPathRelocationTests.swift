@@ -90,7 +90,7 @@ final class ManagedPathRelocationTests: XCTestCase {
                 try db.execute(sql: "INSERT INTO metadata(key,value) VALUES ('incarnation',?)", arguments: [identity.incarnation])
                 if schema != 0 {
                     try db.execute(sql: "INSERT INTO metadata(key,value) VALUES ('store_identity',?),('schema_migrations',?)", arguments: [
-                        String(decoding: try identity.withSchema(schema).encoded(), as: UTF8.self), try jsonString(schema == 1 ? [SchemaMigrations.ledger] : (schema == 3 ? [SchemaMigrations.ledger, SchemaMigrations.protocolLedger, SchemaMigrations.managedPathsLedger] : [SchemaMigrations.ledger, SchemaMigrations.protocolLedger]))])
+                        String(decoding: try identity.withSchema(schema).encoded(), as: UTF8.self), try jsonString(SchemaMigrations.ledgers(schema))])
                 }
                 for (id, scope, type, revision, raw) in records {
                     let value = id == projectID ? try jsonString(project) : raw
@@ -166,7 +166,7 @@ final class ManagedPathRelocationTests: XCTestCase {
         XCTAssertNil(try ManagedPaths.resolve(f.source.root.appendingPathComponent(f.original).path, family: "objects", root: f.root), file: file, line: line)
         try f.poisonOrigin()
         try f.open()
-        XCTAssertEqual(try f.router!.dbQueue.read { try Int.fetchOne($0, sql: "PRAGMA user_version") }, 3, file: file, line: line)
+        XCTAssertEqual(try f.router!.dbQueue.read { try Int.fetchOne($0, sql: "PRAGMA user_version") }, 4, file: file, line: line)
         let protection = try f.protected(), protectedRoot = URL(fileURLWithPath: try XCTUnwrap(protection["path"] as? String))
         XCTAssertEqual(protection["protected"] as? Bool, true, file: file, line: line)
         let bytes = try Data(contentsOf: protectedRoot.appendingPathComponent("manifest.json"))
@@ -271,9 +271,9 @@ final class ManagedPathRelocationTests: XCTestCase {
         let original = try StoreIdentityReceipt.decode(Data(contentsOf: receipt))
         try original.withSchema(2).withState("preparing").encoded().write(to: receipt)
         try f.open()
-        XCTAssertEqual(try f.router!.dbQueue.read { try Int.fetchOne($0, sql: "PRAGMA user_version") }, 3)
+        XCTAssertEqual(try f.router!.dbQueue.read { try Int.fetchOne($0, sql: "PRAGMA user_version") }, 4)
         let ready = try StoreIdentityReceipt.decode(Data(contentsOf: receipt))
-        XCTAssertEqual(ready, original.withSchema(3).withState("ready"))
+        XCTAssertEqual(ready, original.withSchema(4).withState("ready"))
         let protection = try f.protected()
         XCTAssertEqual(protection["protected"] as? Bool, true)
         let generation = URL(fileURLWithPath: try XCTUnwrap(protection["path"] as? String))
@@ -293,7 +293,7 @@ final class ManagedPathRelocationTests: XCTestCase {
     }
 
     func testCurrentRelativeCopyNeedsNoRelocationOrProtectedUpgrade() throws {
-        let f = try Fixture(schema: 3, relative: true)
+        let f = try Fixture(schema: SchemaMigrations.currentSchema, relative: true)
         try f.poisonOrigin(); try f.open()
         XCTAssertNil(try f.router!.dbQueue.read { try String.fetchOne($0, sql: "SELECT value FROM metadata WHERE key='preupgrade_snapshot'") })
         XCTAssertEqual(try f.record(f.attachmentID, "attachment")["path"] as? String, f.original)

@@ -32,6 +32,10 @@ final class MediaReworkTests: XCTestCase {
         p["items"] = (preview["items"] as! [JSON]).map {["item_id":$0["item_id"]!,"expected_revision":$0["expected_revision"]!,"decision_id":$0["decision_id"]!]}
         return p
     }
+    /// Native owner channel `media_item_get` (the comparison headline reads its disposition).
+    func ownerItem(_ f: Fixture,_ r: JSON,_ id: String) throws -> JSON {
+        try f.router.handle(method:"media_item_get",params:["project_id":f.project,"round_id":r["id"]!,"item_id":id],caller:f.owner)["data"] as! JSON
+    }
     func row(_ r: JSON,_ id: String) -> JSON { (r["items"] as! [JSON]).first {$0["id"] as? String == id}! }
     func finishInput(_ f: Fixture,_ r: JSON) throws -> JSON {
         let current = try f.get(r);var p = f.observation(current);let m = current["manifest"] as! JSON
@@ -39,6 +43,40 @@ final class MediaReworkTests: XCTestCase {
     }
     func tasks(_ f: Fixture) throws -> [JSON] {try f.rows("task")}
     func category(_ f: Fixture,_ task: JSON) throws -> String? {try f.record(task["status_id"] as! String,"status")["category"] as? String}
+
+    /// CL-300 native owner channel call (owner allowlist), with the wire command ID for writes.
+    func ownerCall(_ f: Fixture,_ method: String,_ params: JSON) throws -> JSON {
+        var p = params;p["project_id"] = f.project
+        if !CommandRouter.mediaOwnerReads.contains(method) {p["command_id"] = uuid()}
+        let reply = try f.router.handle(method:method,params:p,caller:f.owner)
+        XCTAssertEqual(reply["command_id"] as? String,p["command_id"] as? String)
+        return reply["data"] as! JSON
+    }
+
+    func testNativeOwnerChannelRoutesReworkClosureAndSuccessorOnlyForOwner() throws {
+        let (f,_,r,ids) = try setup(2),epicID = try epic(f)
+        try decide(f,r,ids[0],"accepted");try decide(f,r,ids[1],"changes_requested")
+        XCTAssertTrue(CommandRouter.mediaOwnerReads.contains("media_rework_preview"))
+        for method in ["media_rework_preview","media_rework_create","media_round_finish","media_round_successor"] {
+            XCTAssertTrue(CommandRouter.mediaOwnerMethods.contains(method),method)
+            XCTAssertThrowsError(try f.router.handle(method:method,params:["project_id":f.project,"command_id":uuid()],caller:f.worker)) {XCTAssertEqual(($0 as? CoreError)?.code,"FORBIDDEN",method)}
+        }
+        let shown = try ownerCall(f,"media_rework_preview",["round_id":r["id"]!,"epic_id":epicID,"items":[["item_id":ids[1]]]])
+        XCTAssertEqual((shown["items"] as! [JSON]).map {$0["action"] as? String},["create"])
+        let created = try ownerCall(f,"media_rework_create",createInput(shown))
+        XCTAssertEqual(strings(created,"created_task_ids").count,1)
+        let again = try ownerCall(f,"media_rework_preview",["round_id":r["id"]!,"epic_id":epicID,"items":[["item_id":ids[1]]]])
+        XCTAssertEqual((again["items"] as! [JSON]).map {$0["action"] as? String},["reuse"])
+        let closed = try ownerCall(f,"media_round_finish",try finishInput(f,r))
+        XCTAssertEqual(closed["state"] as? String,"closed")
+        XCTAssertEqual(((closed["closure"] as! JSON)["counts"] as! JSON)["rework_linked"] as? Int,1)
+        let current = try f.get(r);var p = f.observation(current);let m = current["manifest"] as! JSON
+        p["source_round_id"] = p.removeValue(forKey:"round_id");p["manifest_id"] = m["id"];p["manifest_digest"] = m["digest"];p["title"] = "Successor"
+        p["items"] = [["item_id":ids[0],"carry_decision_id":row(current,ids[0])["last_decision_id"]!]]
+        let successor = try ownerCall(f,"media_round_successor",p)
+        XCTAssertEqual(successor["state"] as? String,"draft")
+        XCTAssertEqual(((successor["successor"] as! JSON)["items"] as! [JSON]).map {$0["carried"] as? Bool},[true])
+    }
 
     func testOnlySelectedChangesRequestedCreateDraftTicketsAndRetriesReuseExactLinks() throws {
         let (f,_,r,ids) = try setup(5),epicID = try epic(f)
@@ -195,6 +233,8 @@ final class MediaReworkTests: XCTestCase {
         let carried = outcomes[0]["item_id"] as! String,plain = outcomes[1]["item_id"] as! String
         XCTAssertEqual(row(published,carried)["disposition"] as? String,"accepted")
         XCTAssertEqual(row(published,plain)["disposition"] as? String,"pending")
+        XCTAssertEqual(try ownerItem(f,published,carried)["disposition"] as? String,"accepted")
+        XCTAssertEqual(try ownerItem(f,published,plain)["disposition"] as? String,"pending")
         let decision = try f.record(outcomes[0]["decision_id"] as! String,"media_owner_decision")
         XCTAssertEqual(decision["carried_from_decision_id"] as? String,heads[0]);XCTAssertEqual(decision["origin"] as? String,"human_ui")
         XCTAssertEqual(try jsonString(f.record(r["id"] as! String,"media_round")),sourceRecord)
@@ -209,6 +249,12 @@ final class MediaReworkTests: XCTestCase {
         XCTAssertEqual(row(republished,outcome["item_id"] as! String)["disposition"] as? String,"stale")
         let page = try f.call("media_item_page",["round_id":second["id"]!,"filter":["dispositions":["stale"]]])
         XCTAssertEqual((page["rows"] as! [JSON]).count,1)
+        // Every owner projection reads the same Stale disposition for the changed-basis item.
+        let counts = try f.call("media_item_counts",["round_id":second["id"]!])
+        XCTAssertEqual(counts["counts"] as? [String:Int],["stale":1])
+        let detail = try ownerItem(f,republished,outcome["item_id"] as! String)
+        XCTAssertEqual(detail["disposition"] as? String,"stale");XCTAssertNil(detail["decision"])
+        XCTAssertEqual(detail["stale_predecessor_decision_id"] as? String,heads[2])
         XCTAssertEqual(try jsonString(f.record(r["id"] as! String,"media_round")),sourceRecord)
     }
 }

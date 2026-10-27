@@ -12,7 +12,7 @@ extension CommandRouter {
         try validateDirectionCursor(db,params:params,task:task,caller:caller)
     }
 
-    func relevantHandlerRecipients(_ db: Database, task: JSON) throws -> [JSON] {
+    func relevantHandlerRecipients(_ db: Database, task: JSON, sender: String? = nil) throws -> [JSON] {
         let pid = (try StoredRecord(task, family: "task").string("project_id")), tid = (try StoredRecord(task, family: "task").string("id"))
         let root = (task["active_attempt_id"] as? String).flatMap {try? scoped(db,$0,pid,type:"attempt")}
         let attempts: [JSON]
@@ -31,11 +31,10 @@ extension CommandRouter {
             if attempt["id"] as? String != task["active_attempt_id"] as? String,attempt["parent_attempt_id"] == nil { continue }
             result[sid] = ["session_id":sid,"attempt_id":attempt["id"]!,"recipient_role":attempt["parent_attempt_id"] == nil ? "handler" : "registered_child","display_name":session["label"] ?? "Worker"]
         }
-        let project = try record(db,pid,type:"project"), policy = project["policy"] as? JSON ?? [:]
-        if let sid = policy["coordinator_session_id"] as? String,result[sid] == nil,let session = try? scoped(db,sid,pid,type:"session"),session["role"] as? String == "worker",canReceive(session,project:pid) {
-            result[sid] = ["session_id":sid,"recipient_role":"coordinator","display_name":session["label"] ?? "Coordinator"]
-        }
-        return result.values.sorted { ($0["session_id"] as? String ?? "") < ($1["session_id"] as? String ?? "") }
+        // CL-248: mandatory notices reach both roles. The Triage orchestrator replaces the
+        // retired project coordinator_session_id, which routes nothing.
+        let holders = result.values.sorted { ($0["session_id"] as? String ?? "") < ($1["session_id"] as? String ?? "") }
+        return try withTriageOrchestratorCopy(db,task:task,holders:holders,sender:sender)
     }
 
     func queueDirectionDeliveries(_ db: Database, message: JSON, recipients: [JSON]) throws -> [JSON] {
@@ -46,6 +45,7 @@ extension CommandRouter {
             if deliveries.contains(where: {$0["recipient_session_id"] as? String == sid && $0["recipient_authorization_generation"] as? String == generation}) { continue }
             var delivery: JSON = ["id":uuid(),"project_id":pid,"message_id":mid,"recipient_session_id":sid,"recipient_authorization_generation":generation,"recipient_role":recipient["recipient_role"] ?? "recipient","recipient_display":recipient["display_name"] ?? session["label"] ?? "Worker","state":"queued","push_state":"unavailable","push_reason":"Native push is unqualified; available on recipient MCP pickup.","revision":1,"created_at":now()]
             if let aid = recipient["attempt_id"] { delivery["recipient_attempt_id"] = aid }
+            copyRoleLabel(recipient, into: &delivery)
             try save(db,delivery,type:"delivery"); deliveries.append(delivery)
         }
         return deliveries
@@ -53,7 +53,11 @@ extension CommandRouter {
 
     @discardableResult
     func deliverSavedNotesToHandler(_ db: Database, task: JSON, caller: Caller) throws -> Bool {
-        guard try !scopedTaskRows(db,type:"attempt",task:task,predicate:"json_extract(data,'$.state')='active' AND json_extract(data,'$.principal')=?",arguments:[caller.principal],limit:1).isEmpty else {return false}
+        // CL-248: the holder's pickup or the Triage orchestrator's pickup delivers saved notes once.
+        let holds = try !scopedTaskRows(db,type:"attempt",task:task,predicate:"json_extract(data,'$.state')='active' AND json_extract(data,'$.principal')=?",arguments:[caller.principal],limit:1).isEmpty
+        let orchestrated = try ticketOrchestratedTriage(db,task:task)
+        let orchestrates = caller.sessionID != nil && orchestrated.map { triageOrchestratorSession($0) == caller.sessionID } == true
+        guard holds || orchestrates else {return false}
         let recipients=try relevantHandlerRecipients(db,task:task)
         let pairs: [JSON]=try recipients.map {recipient in
             let sid=(try StoredRecord(recipient, family: "recipient").string("session_id")),session=try scoped(db,sid,(try StoredRecord(task, family: "task").string("project_id")),type:"session")
@@ -63,7 +67,7 @@ extension CommandRouter {
         // Existing current-generation receipts are not decoded or revisited.
         // Each authenticated pickup processes at most50 missing notes; further
         // work is advertised, never hidden in a polling loop or huge allocation.
-        let sql="SELECT "+Self.canonicalColumns(alias:"m")+" FROM records m WHERE m.type='message' AND m.project_id=CAST(? AS TEXT) AND json_extract(m.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND json_extract(m.data,'$.origin')='human_ui' AND (COALESCE(json_extract(m.data,'$.requires_action'),0)=0 OR \(Self.unretractedDirectionSQL("m"))) AND (NOT EXISTS (SELECT 1 FROM records d WHERE d.type='delivery' AND d.project_id=m.project_id AND json_extract(d.data,'$.message_id')=m.id) OR (json_extract(m.data,'$.requires_action')=1 AND COALESCE(json_extract(m.data,'$.addressed'),0)=0 AND EXISTS (SELECT 1 FROM json_each(?) target WHERE NOT EXISTS (SELECT 1 FROM records d WHERE d.type='delivery' AND d.project_id=m.project_id AND json_extract(d.data,'$.message_id')=m.id AND json_extract(d.data,'$.recipient_session_id')=json_extract(target.value,'$.session') COLLATE BINARY AND json_extract(d.data,'$.recipient_authorization_generation')=json_extract(target.value,'$.generation') COLLATE BINARY)))) ORDER BY m.rowid LIMIT 51"
+        let sql="SELECT "+Self.canonicalColumns(alias:"m")+" FROM records m WHERE m.type='message' AND m.project_id=CAST(? AS TEXT) AND json_extract(m.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND (json_extract(m.data,'$.origin')='human_ui' OR json_extract(m.data,'$.pickup_pending')=1) AND (COALESCE(json_extract(m.data,'$.requires_action'),0)=0 OR \(Self.unretractedDirectionSQL("m"))) AND (NOT EXISTS (SELECT 1 FROM records d WHERE d.type='delivery' AND d.project_id=m.project_id AND json_extract(d.data,'$.message_id')=m.id) OR (json_extract(m.data,'$.requires_action')=1 AND COALESCE(json_extract(m.data,'$.addressed'),0)=0 AND EXISTS (SELECT 1 FROM json_each(?) target WHERE NOT EXISTS (SELECT 1 FROM records d WHERE d.type='delivery' AND d.project_id=m.project_id AND json_extract(d.data,'$.message_id')=m.id AND json_extract(d.data,'$.recipient_session_id')=json_extract(target.value,'$.session') COLLATE BINARY AND json_extract(d.data,'$.recipient_authorization_generation')=json_extract(target.value,'$.generation') COLLATE BINARY)))) ORDER BY m.rowid LIMIT 51"
         let rows=try Row.fetchAll(db,sql:sql,arguments:[Data(((try StoredRecord(task, family: "task").string("project_id"))).utf8),Data(((try StoredRecord(task,
             family: "task").string("id"))).utf8),try jsonString(pairs)])
         for row in rows.prefix(50) {
@@ -77,7 +81,7 @@ extension CommandRouter {
                 .map {try GRDBRecordEnvelopeAdapter.decode($0,expectedType:"delivery").object}
             if bool(message,"requires_action") || message["human_request_id"] != nil {
                 if existing.isEmpty || (bool(message,"requires_action") && !bool(message,"addressed")) {_=try queueDirectionDeliveries(db,message:message,recipients:recipients)}
-            } else if message["ordinary_routing"] as? String != "tagged_reply",existing.isEmpty {_=try queueOrdinaryDeliveries(db,message:message,recipients:ordinaryHandlerRecipients(db,task:task))}
+            } else if message["ordinary_routing"] as? String != "tagged_reply",existing.isEmpty {_=try queueOrdinaryDeliveries(db,message:message,recipients:withTriageOrchestratorCopy(db,task:task,holders:ordinaryHandlerRecipients(db,task:task),sender:message["author_session_id"] as? String))}
         }
         return rows.count>50
     }

@@ -101,13 +101,15 @@ extension CoreTests {
     func testDuplicateActiveWorkRejectedAndOrdinaryLinksRetainTriage() throws {
         let p = try project(), original = try ready(p, task(p)), canonical = try task(p), group = try triage(p)
         try addTriage(p, group, original)
+        // CL-125 rule 6: the owner's claim keeps the ticket in this orchestrated Triage.
+        try orchestrateTriage(p, group)
         try link(p, original, canonical, "related_to")
         XCTAssertEqual(strings(try currentTriage(p, group), "task_ids"), [original["id"] as! String])
         let current = try currentRelationTask(p, original)
         let claim = try call("work_claim", ["project_id": p["id"]!, "task_id": original["id"]!, "expected_revision": current["revision"]!])
         assertCode("CLAIM_CONFLICT") { _ = try self.link(p, original, canonical, "duplicate_of") }
         _ = try call("work_release", ["project_id": p["id"]!, "attempt_id": claim["id"]!, "claim_token": claim["claim_token"]!, "reason": "Fixture stopped"])
-        try addTriage(p, group, original)
+        XCTAssertEqual(strings(try currentTriage(p, group), "task_ids"), [original["id"] as! String])
         try link(p, original, canonical, "duplicate_of")
         try assertEmptyTriage(p, group)
     }

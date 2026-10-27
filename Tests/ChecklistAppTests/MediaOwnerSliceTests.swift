@@ -14,9 +14,12 @@ import ChecklistCore
         var roundRecords:[MediaValues]=[]
         var token="context-1",basis="basis-1",target="target-1"
         var reject=false
+        var extra:[String:MediaValues]=[:]
+        var itemDisposition="pending"
+        var pageCounts:[String:Int]?
         var pending:[String:String]=[:]
         let project="synthetic-project"
-        var schema:MediaValues {MediaTypeSettings.schema(title:"Animation",starter:"animation")}
+        var schema:MediaValues=MediaTypeSettings.schema(title:"Animation",starter:"animation")
         func request(_ method:String,_ params:MediaValues) async throws -> MediaValues {
             calls.append((method,params))
             let value:MediaValues
@@ -36,15 +39,15 @@ import ChecklistCore
                 value=["round":["id":"round","state":"draft","revision":1,"observed_context_token":token],"items":[["item_id":"frozen-item","target_id":"frozen-target","expected_revision":1,"review_basis_signature":"frozen-basis","title":"Frozen item","publication_ready":true]]]
             case "media_item_page":
                 let page=params["cursor"] as? String == "second" ? secondPage : rows
-                var result:MediaValues=["rows":page,"counts":["pending":rows.count+secondPage.count]]
+                var result:MediaValues=["rows":page,"counts":pageCounts ?? ["pending":rows.count+secondPage.count]]
                 if params["cursor"] == nil && !secondPage.isEmpty {result["next_cursor"]="second"}
                 value=result
-            case "media_item_get":value=["id":params["item_id"]!,"title":"Exact item","published":true,"revision":1,"disposition":"pending","target":["id":target,"review_basis_signature":basis,"candidate_ids":["candidate"]],"candidates":[["id":"candidate","author_session_id":"human","origin":"human_ui","slots":[["slot_id":"text","text":"Exact text\r\n"]]]]]
+            case "media_item_get":value=["id":params["item_id"]!,"title":"Exact item","published":true,"revision":1,"disposition":itemDisposition,"target":["id":target,"review_basis_signature":basis,"candidate_ids":["candidate"]],"candidates":[["id":"candidate","author_session_id":"human","origin":"human_ui","slots":[["slot_id":"text","text":"Exact text\r\n"]]]]]
             case "media_approved_examples":value=["examples":[["id":"historical","target_id":"historical","historical_context_label":"Historical owner-accepted example — no current approval","display_only":true,"grants_current_approval":false,"context_id":"historical-context","slots":[["slot_id":"text","text":"Past exact text"]]]]]
             case "media_decide":
                 if reject {throw ChecklistError("MEDIA_CONTEXT_CHANGED","Approved context changed; no records changed.",details:["command_outcome":"rejected"])}
                 value=["decisions":[["id":"owner-action","origin":"human_ui"]]]
-            default:value=[:]
+            default:value=extra[method] ?? [:]
             }
             return ["data":value]
         }
@@ -116,7 +119,7 @@ import ChecklistCore
         peer.rows=[row("north","N"),row("east","E")];await model.refresh()
         XCTAssertEqual(model.selectedID,"east");XCTAssertFalse(model.selectedOutsideFilter)
         XCTAssertEqual(MediaFlatRow.project(model.rows).map(\.id),entries.map(\.id))
-        XCTAssertTrue(MediaReviewWorkspace.rowLabel(Record(values:row("east","E"))).contains("pending"))
+        XCTAssertTrue(MediaReviewWorkspace.rowLabel(Record(values:row("east","E"))).contains("Pending"))
         XCTAssertTrue(MediaReviewWorkspace.rowLabel(Record(values:row("east","E"))).contains("direction E"))
     }
     func testShowHideIsReadOnlyAndExamplesKeepHistoricalContext() async {
@@ -166,6 +169,30 @@ import ChecklistCore
         let resolution=try XCTUnwrap((sent["resolutions"] as? [MediaValues])?.first)
         XCTAssertEqual(resolution["row_id"] as? String,"source-row");XCTAssertEqual(resolution["group_id"] as? String,"explicit-takes")
         XCTAssertEqual(resolution["slot_id"] as? String,"image");XCTAssertEqual(resolution["disposition"] as? String,"include")
+    }
+    func testVideoAndAudioStartersOfferIncludeForValidRowsAndSendTheExactSlot() async throws {
+        let (peer,store,_,_)=fixture();peer.schema=MediaTypeSettings.schema(title:"Takes",starter:"video");let model=await setup(peer,store)
+        XCTAssertEqual(model.slots.map(\.id),["take","reference"]);XCTAssertEqual(model.slots.map {$0.string("kind")},["video","video"])
+        XCTAssertEqual(model.referenceSlotID,"reference")
+        let movie=Record(values:["id":"movie-row","media_kind":"video","status":"valid","disposition":"unresolved"])
+        let choices=MediaFrozenIntakeView.includeChoices(movie,slots:model.slots)
+        XCTAssertEqual(choices.map(\.label),["Include as Take","Include as Reference"])
+        XCTAssertEqual(MediaFrozenIntakeView.includeChoices(Record(values:["id":"dup","media_kind":"video","status":"duplicate"]),slots:model.slots).count,2)
+        XCTAssertTrue(MediaFrozenIntakeView.includeChoices(Record(values:["id":"wav","media_kind":"audio","status":"valid"]),slots:model.slots).isEmpty,"A video type offers no audio slot")
+        XCTAssertTrue(MediaFrozenIntakeView.includeChoices(Record(values:["id":"long","media_kind":"video","status":"unsupported"]),slots:model.slots).isEmpty,"Unsupported rows offer Skip only")
+        model.intake=Record(values:["id":"intake","revision":4])
+        model.resolveIntake(movie,disposition:"include",slotID:choices[0].slot.id)
+        try await settle {peer.calls.contains {$0.0=="media_intake_revise"}}
+        let sent=try XCTUnwrap(peer.calls.last {$0.0=="media_intake_revise"}?.1)
+        XCTAssertEqual(sent["expected_revision"] as? Int,4)
+        let resolution=try XCTUnwrap((sent["resolutions"] as? [MediaValues])?.first)
+        XCTAssertEqual(resolution["row_id"] as? String,"movie-row");XCTAssertEqual(resolution["slot_id"] as? String,"take");XCTAssertEqual(resolution["disposition"] as? String,"include")
+        let audioSlots=(MediaTypeSettings.schema(title:"Voice",starter:"audio")["slots"] as? [MediaValues] ?? []).map {Record(values:$0)}
+        let wav=Record(values:["id":"wav-row","media_kind":"audio","status":"valid"])
+        XCTAssertEqual(MediaFrozenIntakeView.includeChoices(wav,slots:audioSlots).map(\.label),["Include as Take","Include as Reference"])
+        XCTAssertTrue(MediaFrozenIntakeView.includeChoices(movie,slots:audioSlots).isEmpty,"An audio type offers no video slot")
+        XCTAssertEqual(MediaComparisonLabels.role(slotID:"reference",candidateIndex:0,referenceSlotID:model.referenceSlotID,historical:false),"Reference")
+        XCTAssertEqual(MediaComparisonLabels.role(slotID:"take",candidateIndex:0,referenceSlotID:model.referenceSlotID,historical:false),"Candidate 1")
     }
     func testLoadedPagesKeepSelectedAnchorAndImageReadsHaveTwoJobBound() async {
         let (peer,store,_,_)=fixture();peer.rows=[row("north","N")];peer.secondPage=[row("east","E")]

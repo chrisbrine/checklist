@@ -24,6 +24,7 @@ extension CoreTests {
         try call("work_claim",["project_id":p["id"]!,"task_id":t["id"]!,"expected_revision":t["revision"]!,"file_scopes":[["path":path,"access":"write"]]],worker)
     }
     func testSharedBatchNormalizesBeforePrepareAndClaimsFullScopesRetainingMembership() throws {
+        orchestrateBatchTriages = true // CL-125 rule 6: claims keep tickets in an orchestrated Triage.
         for paths in [["src/shared.swift","src/shared.swift"],["src","src/shared.swift"]] {
             let p = try cohortProject(),worker = try cohortWorker(p),before = try call("snapshot"),batch = try sharedBatch(p,worker,paths:paths)
             let prepared = try call("snapshot")
@@ -50,6 +51,7 @@ extension CoreTests {
         XCTAssertEqual(Set(claims.map {($0["file_scopes"] as! [JSON])[0]["canonical_key"] as! String}).count,1)
     }
     func testSharedBatchExternalUnionSurvivesPartialReleaseAndIndividualSubmission() throws {
+        orchestrateBatchTriages = true // CL-125 rule 6: claims keep tickets in an orchestrated Triage.
         for submit in [false,true] {
             let p = try cohortProject(),worker = try cohortWorker(p),other = try cohortWorker(p),batch = try sharedBatch(p,worker),claims = try claimFixedBatch(p,batch,worker)["claims"] as! [JSON]
             let outside = try ready(p,task(p))
@@ -65,7 +67,8 @@ extension CoreTests {
             if submit {
                 var input = try batchArtifactInput(p,claims[0]);input["project_id"] = p["id"]
                 _ = try call("work_submit",input,worker)
-                XCTAssertEqual(strings(try currentTriage(p,["id":batch["triage_id"]!]),"task_ids").count,1)
+                // CL-125 rule 10: submission keeps the ticket in its Triage.
+                XCTAssertEqual(strings(try currentTriage(p,["id":batch["triage_id"]!]),"task_ids").count,2)
             } else {
                 _ = try call("batch_release",["project_id":p["id"]!,"batch_id":batch["id"]!,"members":[["attempt_id":claims[0]["id"]!,"claim_token":claims[0]["claim_token"]!]],"reason":"Partial release"],worker)
                 XCTAssertEqual(strings(try currentTriage(p,["id":batch["triage_id"]!]),"task_ids").count,2)

@@ -116,4 +116,47 @@ final class RichTextViewTests: XCTestCase {
             XCTAssertGreaterThan(host.fittingSize.height, 10)
         }
     }
+
+    // Item 7 (R41A defect): an AX read of Markdown and chart-data tables lists headers and cells and never recurses.
+    // In-process reads use the modern selectors and the AppKit attribute entry point. They did not reproduce the R41A
+    // crash on the unfixed code (the remote AXUIElement path from a test thread returns nothing in xctest), so the
+    // native slot read stays the qualifying check; this test guards the exposed header and cell text.
+    @MainActor func testHostedTablesExposeHeadersAndCellsToAccessibilityReads() async throws {
+        let watchdog = AXProbe.watchdog(seconds: 60, "RICH TABLE AX READ"); defer { watchdog.cancel() }
+        let restoreAX = AXProbe.enableEnhancedUserInterface(); defer { restoreAX() }
+        // Each node answers the modern selectors and the AppKit attribute entry point a remote client reaches.
+        func texts(_ host: NSObject) -> [String] {
+            AXProbe.nodes(host).flatMap { node -> [String] in
+                ["accessibilityRole", "accessibilityLabel", "accessibilityValue", "accessibilityTitle"].compactMap { AXProbe.attribute(node, $0) as? String }
+                    + ["AXRole", "AXDescription", "AXValue", "AXTitle"].compactMap { ChecklistTestAXAttributeValue(node, NSAccessibility.Attribute(rawValue: $0)) as? String }
+            }
+        }
+        let cases: [(String, AnyView, headers: [String], cells: [String])] = [
+            ("Markdown note", AnyView(RichTextView(text: "| A | B |\n|---|---|\n| 1 | 2 |", capability: .note)), ["A", "B"], ["1", "2"]),
+            ("Markdown brief", AnyView(RichTextView(text: "Brief\n\n| Field | Value |\n|---|---|\n| slot | 1 |", capability: .ticketBrief)), ["Field", "Value"], ["slot", "1"]),
+            ("Chart data", AnyView(RichTableBlock(headers: ["Series", "Build", "Frame time (ms)"], rows: [["Measured", "before", "24"], ["Measured", "after", "16"]], caption: "")),
+             ["Series", "Build", "Frame time (ms)"], ["Measured", "before", "24", "after", "16"]),
+        ]
+        for (name, view, headers, cells) in cases {
+            let host = NSHostingView(rootView: view.frame(width: 640))
+            let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 700, height: 400), styleMask: [.titled], backing: .buffered, defer: false)
+            window.title = "Synthetic Checklist rich table AX regression (offscreen)"
+            window.isReleasedWhenClosed = false; window.contentView = host
+            defer { window.contentView = nil; window.close() }
+            window.orderFront(nil)
+            func complete(_ all: [String]) -> Bool {
+                headers.allSatisfy(all.contains) && cells.allSatisfy { cell in all.contains { $0 == cell || $0.hasSuffix(": " + cell) } }
+            }
+            var all: [String] = []
+            for _ in 0..<100 {
+                try await Task.sleep(nanoseconds: 50_000_000)
+                host.layoutSubtreeIfNeeded()
+                all = texts(host)
+                if complete(all) { break }
+            }
+            XCTAssertTrue(complete(all), "\(name): headers \(headers) and cells \(cells) expected in \(all)")
+            // Three full reads, as the runner's check does: each one completes and returns the same text.
+            for _ in 0..<3 { XCTAssertEqual(texts(host), all, name) }
+        }
+    }
 }

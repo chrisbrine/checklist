@@ -508,7 +508,7 @@ extension TicketLifecycleCleanupTests {
         try StorageObjectFiles(root:router.root).writeNew(path + "/checkouts/package/file",bytes:Data("cache".utf8))
         try FileManager.default.createDirectory(at:router.root.appendingPathComponent("backups/old-protected-snapshot"),withIntermediateDirectories:true)
         let root = router.root;try router.closeStore();router = try TestStore.router(root:root)
-        XCTAssertEqual(try router.dbQueue.read {try Int.fetchOne($0,sql:"PRAGMA user_version")},3)
+        XCTAssertEqual(try router.dbQueue.read {try Int.fetchOne($0,sql:"PRAGMA user_version")},SchemaMigrations.currentSchema)
         XCTAssertFalse(try StorageSnapshotRetention.isActive(root:root))
         XCTAssertLessThan(try XCTUnwrap(router.nextArchiveCleanupDeadline()).timeIntervalSinceNow,0.2)
         try router.runStorageMaintenance()

@@ -423,9 +423,19 @@ extension CommandRouter {
             // Display only: a bounded coordinator identity, never member work authority.
             if let orchestration = source["orchestration"] as? JSON {
                 var display: JSON = [:]
-                for key in ["state", "actor_display", "session_id"] { display[key] = orchestration[key] as? String ?? "" }
+                for key in ["state", "actor_display", "session_id", "provider"] { display[key] = orchestration[key] as? String ?? "" }
                 result["orchestration"] = display
+                // CL-126: the row's route state, as in the full Triage projection.
+                if orchestration["state"] as? String == "active" {
+                    let session = try? scoped(db, orchestration["session_id"] as? String ?? "", pid, type: "session")
+                    let current = session.map { canReceive($0, project: pid) && sessionGeneration($0) == orchestration["session_authorization_generation"] as? String } ?? false
+                    result["orchestration_connection"] = current ? "current" : "recovery_required"
+                }
             }
+            // CL-126: display counts only; never member revisions or work authority.
+            let counts = try Row.fetchAll(db, sql: "SELECT json_extract(s.data,'$.name') name,json_extract(s.data,'$.category') category,COUNT(*) n,SUM(CASE WHEN json_extract(t.data,'$.active_attempt_id') IS NOT NULL OR json_extract(s.data,'$.category')='active' THEN 1 ELSE 0 END) working FROM records t LEFT JOIN records s ON s.type='status' AND s.project_id=t.project_id AND s.id=json_extract(t.data,'$.status_id') WHERE t.type='task' AND t.project_id=? AND t.id IN (SELECT value FROM json_each(?)) GROUP BY 1,2 ORDER BY 1", arguments: [pid, try jsonStringArray(triageMemberIDs(source))])
+            result["member_status_counts"] = counts.map { row -> JSON in ["name": (row["name"] as String?) ?? "", "category": (row["category"] as String?) ?? "unknown", "count": row["n"] as Int] }
+            result["member_working_count"] = counts.reduce(0) { $0 + (($1["working"] as Int?) ?? 0) }
             byID[SnapshotRecordIdentity(gid)] = result
         }
         return groupIDs.compactMap { byID[SnapshotRecordIdentity($0)] }

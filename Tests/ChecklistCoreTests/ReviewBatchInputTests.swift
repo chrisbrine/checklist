@@ -35,9 +35,10 @@ extension CoreTests {
         assertCode("REVISION_CONFLICT") { _ = try self.call("batch_prepare",input,f.reviewer) }
         let after = try call("snapshot");for key in ["batches","tasks","attempts","events","groups"] {XCTAssertEqual(try jsonString(before[key]!),try jsonString(after[key]!))}
     }
-    func testReviewBatchInputsRejectImplementationAndValidateDisplayKeyWithoutTrustingContributors() throws {
+    func testReviewBatchInputsReadAnyTriageAndValidateDisplayKeyWithoutTrustingContributors() throws {
         let f = try reviewBatchInputsFixture(),p = f.project,implementation = try triage(p)
-        assertCode("TRIAGE_PHASE_CONFLICT") { _ = try self.call("review_batch_inputs",["project_id":p["id"]!,"triage_id":implementation["id"]!]) }
+        // CL-125 rule 9: a Triage has no phase; an empty Triage has no review rows.
+        XCTAssertTrue((try call("review_batch_inputs",["project_id":p["id"]!,"triage_id":implementation["id"]!])["tasks"] as! [JSON]).isEmpty)
         let read = try call("review_batch_inputs",["project_id":p["id"]!,"triage_id":f.group["id"]!],f.reviewer)
         var rows = read["tasks"] as! [JSON];rows[0]["key"] = "WRONG-KEY"
         var input: JSON = ["project_id":p["id"]!,"triage_id":f.group["id"]!,"expected_revision":read["triage_revision"]!,"phase":"review","tasks":rows]

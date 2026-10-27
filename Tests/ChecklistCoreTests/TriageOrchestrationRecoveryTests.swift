@@ -42,10 +42,13 @@ extension EvidenceAuthorityTests {
         let (p, group, tasks) = try orchestrationFixture()
         let old = try native(p,"old-coordinator",domain:"host-old"), next = try native(p,"next-coordinator",domain:"host-next"), implementer = try native(p,"member-worker",domain:"host-member")
         let batch = try call("batch_prepare",["project_id":p["id"]!,"triage_id":group["id"]!,"expected_revision":group["revision"]!,"phase":"implementation","tasks":tasks.map {["task_id":$0["id"]!,"expected_revision":$0["revision"]!] as JSON}])
-        _ = try call("batch_claim",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":batch["revision"]!,"policy_revision":batch["policy_revision"]!],implementer)
+        // CL-125 rule 6: orchestration starts first, so the member worker's claim keeps the tickets in this Triage.
         let started = try orchestrate(p,group,"start",old), previous = started["orchestration"] as! JSON
+        _ = try call("batch_claim",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":batch["revision"]!,"policy_revision":batch["policy_revision"]!],implementer)
         let protected = try orchestrationProtectedRecords(p)
-        let input: JSON = ["project_id":p["id"]!,"triage_id":group["id"]!,"expected_revision":started["revision"]!,"action":"takeover","reason":"Coordinate the remaining pass"]
+        let claimed = try router.dbQueue.read { try router.record($0,group["id"] as! String,type:"group") }
+        XCTAssertEqual(claimed["task_ids"] as? [String] ?? [],tasks.compactMap {$0["id"] as? String})
+        let input: JSON = ["project_id":p["id"]!,"triage_id":group["id"]!,"expected_revision":claimed["revision"]!,"action":"takeover","reason":"Coordinate the remaining pass"]
         let command = UUID().uuidString
         let taken = try call("triage_orchestrate",input,next,command:command), current = taken["orchestration"] as! JSON
         XCTAssertEqual(current["session_id"] as? String,next.sessionID)

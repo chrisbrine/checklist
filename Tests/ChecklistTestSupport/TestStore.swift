@@ -90,7 +90,7 @@ public enum TestStore {
         }
         let identity = StoreIdentityReceipt(format_version: 1, logical_store_id: UUID().uuidString.lowercased(),
                                           incarnation: UUID().uuidString.lowercased(), database_generation: 1,
-                                          schema_revision: 3, state: "ready")
+                                          schema_revision: SchemaMigrations.currentSchema, state: "ready")
         var configuration = Configuration()
         configuration.prepareDatabase {
             try SchemaMigrations.installStorageCollation($0)

@@ -1,6 +1,6 @@
 # Triage orchestrator contract
 
-**Contract (CL-269, owner direction 24 October 2026).** A Triage is the work list of one orchestrator, which is one actual Codex or Claude conversation. A Triage holds 0 or more tickets, and its orchestrator receives every communication about them. This contract applies to every project. CL-125 implements ownership and membership, CL-248 implements message routing and CL-126 implements the app view, in that order. Until each ticket ships, the running build keeps the [superseded behaviour](#superseded-behaviour-in-the-running-build) listed below; the running server's discovered tools remain authoritative for what a call does today.
+**Contract (CL-269, owner direction 24 October 2026).** A Triage is the work list of one orchestrator, which is one actual Codex or Claude conversation. A Triage holds 0 or more tickets, and its orchestrator receives every communication about them. This contract applies to every project. CL-125 implements ownership and membership, CL-248 implements message routing and CL-126 implements the app view. The [retired rules](#retired-rules) are history; the running server's discovered tools remain authoritative for what a call does.
 
 This contract replaces the separate project orchestrator registry that CL-124 planned (registrations, participant groups, a shared inbox, request take, handoff and close, and an Orchestrators tab). That registry was never built and is not planned. The CL-124 [conversation content](conversation-content.md) contract stays.
 
@@ -62,6 +62,8 @@ Each ticket has two roles:
 | Project note | A note with no ticket and no Triage needs an exact recipient. |
 | Reply allowance | The holder for `all` and `holder`; the orchestrator for `orchestrator`; the exact recipient as today. |
 
+CL-248 implements this routing. Limits: a tagged mention note keeps its exact mention projection (holders and the tagged sessions); saved notes are delivered on the holder's or the orchestrator's `task_context` pickup and on `triage_orchestrate start` or `takeover` (the result reports `saved_notes_delivered` and `saved_note_delivery_has_more`); a Triage-note reply (`reply_to`) without a recipient goes to the original note's author; the orchestrator copy needs the orchestrator session's current authorization generation to equal the orchestration record, otherwise `audience=orchestrator` and Triage notes refuse `RECIPIENT_CHANGED`; `audience` other than `all` with a `requires_action` direction, correction or mention plan refuses `INVALID_INPUT`; a missing orchestrator for `audience=orchestrator` refuses `TRIAGE_ORCHESTRATOR_REQUIRED`. Every refusal saves no message. The stored message keeps `audience` and, when no role could receive it, `pickup_pending`; each delivery keeps `recipient_role` and its `label`.
+
 The project policy field `coordinator_session_id` no longer routes anything; the Triage orchestrator replaces it. New policy saves do not accept it, and old values stay readable in exports and history. Delivery states stay truthful: saved for pickup, queued for an exact recipient and that recipient's acknowledgment are separate, and a missing reply never means failure, acknowledgment or completion. No route broadcasts to other sessions, wakes a native model, adds grants or routes to an assistant.
 
 ## Store upgrade rules
@@ -88,10 +90,6 @@ These rules are superseded by this contract. They are history, not current or pl
 - membership in several Triages;
 - a separate Review Triage for each round;
 - the project policy field `coordinator_session_id`.
-
-## Superseded behaviour in the running build
-
-Until CL-125 ships, the installed service still applies the retired membership rules: an individual status action (claim, release, submission, review request or verdict, recovery) removes the ticket from every current Triage; group commands check a Triage phase; a ticket can be in several Triages; and `triage_orchestrate start` needs a named Triage. Until CL-248 ships, ordinary ticket notes reach only the claim holder and its accepted child attempts, and owner directions also use `coordinator_session_id`. Agents working against such a build inspect a ticket's memberships before a status action and use the discovered atomic group or batch command when the ticket must stay grouped. Each implementing ticket removes its part of this section when it ships.
 
 ## Implementation sequence
 

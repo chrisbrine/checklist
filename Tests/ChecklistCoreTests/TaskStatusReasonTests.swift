@@ -32,6 +32,7 @@ extension CoreTests {
     }
 
     func testStatusReasonReleaseAndBatchReleaseClearOnNextClaim() throws {
+        orchestrateBatchTriages = true // CL-125 rule 6: claims keep tickets in an orchestrated Triage.
         let p = try project(), first = try ready(p,task(p)), second = try ready(p,task(p)), group = try triage(p)
         try addTriage(p,group,first);try addTriage(p,group,second)
         let batch = try prepareImplementationBatch(p,group,[first,second]), claims = try claimFixedBatch(p,batch)["claims"] as! [JSON]

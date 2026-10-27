@@ -31,6 +31,8 @@ struct MediaTypeSettings: View {
                 Text("Text and images").tag("generic")
                 Text("Story text").tag("text")
                 Text("Character animation images").tag("animation")
+                Text("Video takes").tag("video")
+                Text("Audio takes").tag("audio")
             }
             Button("Add review type") {
                 model.mutate("media_type_create",["title":title,"schema":Self.schema(title:title,starter:starter)]) { result in
@@ -69,6 +71,11 @@ struct MediaTypeSettings: View {
         if starter == "animation" {
             value["fields"]=[["id":"character","kind":"short_text","material":true],["id":"animation_label","kind":"short_text","material":true],["id":"direction","kind":"choice","material":true,"choices":["N","NE","E","SE","S","SW","W","NW"]]]
             value["layout"]=["kind":"image_compare","primary_slot_id":"image"]
+        }
+        if starter == "video" || starter == "audio" {
+            // CL-117: a candidate take and a declared reference of the same kind; portable IDs and kinds only.
+            value["slots"]=[["id":"take","label":"Take","kind":starter,"material":true],["id":"reference","label":"Reference","kind":starter,"material":true]]
+            value["layout"]=["kind":starter+"_compare","primary_slot_id":"take","reference_slot_id":"reference"]
         }
         return value
     }
@@ -140,7 +147,7 @@ struct MediaReviewWorkspace: View {
     var roundControls: some View {
         VStack(alignment:.leading,spacing:6) {
             Text(model.header.string("title")+" · "+GlossaryText.title(model.header.string("state"))).font(.headline)
-            Text(model.counts.keys.sorted().map { $0.replacingOccurrences(of:"_",with:" ")+": "+String(model.counts[$0]!) }.joined(separator:" · ")).font(.caption)
+            Text(MediaReviewModel.countsText(model.counts)).font(.caption)
             if model.writable {
                 HStack {
                     TextField("New item title",text:$itemTitle)
@@ -181,6 +188,7 @@ struct MediaReviewWorkspace: View {
             } else if !model.historyOnly && ["closed","canceled"].contains(model.header.string("state")) {
                 Button("Archive round and retain originals…") {confirmation = model.archiveRoundConfirmation()}.checklistDisabled([(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
             }
+            MediaRoundActions(model:model,confirmation:$confirmation)
             TechnicalDetails(raw: [("Round",model.header.values),("Publication preview",model.publication.map(\.values)),("Frozen intake",model.intake.values)]).id(model.roundID)
         }
     }
@@ -196,7 +204,7 @@ struct MediaReviewWorkspace: View {
                                 Button {Task {await model.select(item.id)}} label: {
                                     VStack(alignment:.leading) {
                                         Text(row.title).lineLimit(2)
-                                        Text(item.string("disposition").replacingOccurrences(of:"_",with:" ").capitalized).font(.caption)
+                                        Text(MediaReviewModel.dispositionLabel(item.string("disposition"))).font(.caption)
                                         Text((model.list["visible_columns"] as? [String] ?? item.object("metadata").keys.sorted()).compactMap {key in item.object("metadata")[key].map {key+": "+String(describing:$0)}}.joined(separator:" · ")).font(.caption2)
                                     }.frame(maxWidth:.infinity,alignment:.leading).padding(6)
                                         .background(model.selectedID==item.id ? Color.accentColor.opacity(0.16) : .clear,in:RoundedRectangle(cornerRadius:4))
@@ -215,7 +223,7 @@ struct MediaReviewWorkspace: View {
             if model.selectedOutsideFilter {Text("Selected item is outside this filter. Its comparison stays open.").font(.caption)}
         }
     }
-    static func rowLabel(_ item: Record) -> String {item.string("title")+", "+item.string("disposition").replacingOccurrences(of:"_",with:" ")+", "+item.object("metadata").keys.sorted().map {"\($0) \(item.object("metadata")[$0]!)"}.joined(separator:", ")}
+    static func rowLabel(_ item: Record) -> String {item.string("title")+", "+MediaReviewModel.dispositionLabel(item.string("disposition"))+", "+item.object("metadata").keys.sorted().map {"\($0) \(item.object("metadata")[$0]!)"}.joined(separator:", ")}
     func addFiles() {
         let panel=NSOpenPanel();panel.canChooseDirectories=false;panel.allowsMultipleSelection=true
         if panel.runModal() == .OK {model.previewIntake(["sources":panel.urls.map {["path":$0.path]}])}
@@ -267,6 +275,13 @@ struct MediaFrozenIntakeView: View {
         let first=rows.firstIndex {$0.string("group_id")==row.string("group_id")}
         return first.map {"Candidate group \($0+1)"} ?? "Separate candidate"
     }
+    /// Declared slots of the row's measured kind; only rows the service can include (valid or duplicate) get a choice.
+    static func includeChoices(_ row: Record, slots: [Record]) -> [(slot: Record, label: String)] {
+        guard ["valid","duplicate"].contains(row.string("status")) else {return []}
+        return slots.filter {$0.string("kind")==row.string("media_kind")}.map {slot in
+            (slot,"Include as "+MediaComparisonLabels.slot(Record(values:["slot_id":slot.id,"media_kind":slot.string("kind")]),definitions:slots))
+        }
+    }
     var body: some View {
         DisclosureGroup("Frozen intake · \(model.intake.strings("committed_row_ids").count) captured · \(model.intake.strings("remaining_row_ids").count) remaining") {
             Text("Preview only until confirmation. Included, skipped and unresolved rows are explicit; duplicates stay separate unless you supply an explicit group in TSV. Capture never changes Finder originals.").font(.caption)
@@ -283,8 +298,8 @@ struct MediaFrozenIntakeView: View {
                             }
                             HStack {
                                 Button("Skip") {model.resolveIntake(row,disposition:"skip")}
-                                ForEach(model.slots.filter {$0.string("kind")==row.string("media_kind")}) {slot in
-                                    Button("Include as "+MediaComparisonLabels.slot(Record(values:["slot_id":slot.id,"media_kind":slot.string("kind")]),definitions:model.slots)) {model.resolveIntake(row,disposition:"include",slotID:slot.id)}
+                                ForEach(Self.includeChoices(row,slots:model.slots),id:\.slot.id) {choice in
+                                    Button(choice.label) {model.resolveIntake(row,disposition:"include",slotID:choice.slot.id)}
                                 }
                             }
                         }

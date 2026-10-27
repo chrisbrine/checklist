@@ -513,7 +513,8 @@ extension CoreTests {
         let before = try currentTriage(p,group)
         try router.dbQueue.write { db in
             let statuses = try router.records(db,type:"status",project:pid)
-            for status in statuses where status["category"] as? String != "done" {
+            // Canceled leaves the Triage since CL-125 (rule 8), like Done.
+            for status in statuses where !["done","canceled"].contains(status["category"] as? String ?? "") {
                 var destination = try router.record(db,t["id"] as! String,type:"task")
                 destination["status_id"] = status["id"]
                 // The persisted fallback cannot override a present destination.
@@ -561,6 +562,8 @@ extension CoreTests {
         func current() throws -> JSON {
             try XCTUnwrap((try call("triage_list",["project_id":pid,"triage_id":group["id"]!,"fields":["task_ids"]])["groups"] as? [JSON])?.first)
         }
+        // CL-125 rule 6: the owner's batch claim keeps the tickets in an orchestrated Triage.
+        try orchestrateTriage(p,group)
         let selected = try tasks.map {value -> JSON in
             let fresh = try call("task_get",["project_id":pid,"task_id":value["id"]!])
             return ["task_id":fresh["id"]!,"expected_revision":fresh["revision"]!]

@@ -5,7 +5,8 @@ extension CommandRouter {
     /// Read selectors, not authority: preparation and claim still validate the stored target and contributors.
     func reviewBatchInputs(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         let pid = try scope(db,p,c),group = try scoped(db,try text(p,"triage_id"),pid,type:"group")
-        guard group["kind"] as? String == "triage",triagePhase(group) == "review" else { throw CoreError("TRIAGE_PHASE_CONFLICT","review_batch_inputs requires a Review Triage.") }
+        // CL-125: any Triage; members without an open review request are listed in not_ready.
+        guard group["kind"] as? String == "triage" else { throw CoreError("INVALID_INPUT","review_batch_inputs requires a Triage.") }
         let requests = try records(db,type:"review_request",project:pid).enumerated().sorted {
             let first = $0.element["created_at"] as? String ?? "",second = $1.element["created_at"] as? String ?? ""
             return first == second ? $0.offset < $1.offset : first < second

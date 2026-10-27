@@ -470,17 +470,19 @@ import ChecklistIPC
         AXProbe.press(try XCTUnwrap(AXProbe.button(window,"Hide project context editor")))
         try await until {draw();return views(host).allSatisfy {!($0 is NSTextView)}}
         let scroll = try XCTUnwrap(views(host).compactMap {$0 as? NSScrollView}.last {!$0.isHiddenOrHasHiddenAncestor && !$0.visibleRect.isEmpty && $0.bounds.height > 400 && $0.bounds.width > 400 && $0.bounds.width < 600 && ($0.documentView?.bounds.height ?? 0) > 2000})
+        let rulesToggle = "Agents may change this project's rules and settings"
         for _ in 0..<100 {
-            if AXProbe.button(window,"Choose coordinator context session") != nil {break}
+            if AXProbe.text(window).contains(rulesToggle) {break}
             var bounds = scroll.contentView.bounds;bounds.origin.y += 100
             scroll.contentView.scroll(to:scroll.contentView.constrainBoundsRect(bounds).origin);scroll.reflectScrolledClipView(scroll.contentView)
             draw();try await Task.sleep(nanoseconds:5_000_000)
         }
         print("N260 context scroll bounds=\(scroll.contentView.bounds) frame=\(scroll.frame) document=\(String(describing:scroll.documentView?.frame)) flipped=\(scroll.documentView?.isFlipped ?? false)")
-        let pickerStart = ProcessInfo.processInfo.systemUptime
-        AXProbe.press(try XCTUnwrap(AXProbe.button(window,"Choose coordinator context session"),AXProbe.text(window).suffix(1500).description))
-        try await until {draw();return hasPicker()}
-        print("C260b demand session_picker_ms=\((ProcessInfo.processInfo.systemUptime-pickerStart)*1000)")
+        // CL-126: the coordinator session field is gone from Project Settings; CL-248 retires it.
+        XCTAssertTrue(AXProbe.text(window).contains(rulesToggle),AXProbe.text(window).suffix(1500).description)
+        XCTAssertNil(AXProbe.button(window,"Choose coordinator context session"))
+        XCTAssertFalse(hasPicker(),"No coordinator session picker exists")
+        XCTAssertFalse(AXProbe.text(window).contains("Coordinator context copies"))
         XCTAssertEqual(store.workSessions.count,479)
     }
     func testAutomaticOverviewRefreshRetainsValidRowsAndCountsUntilEachReply() async throws {

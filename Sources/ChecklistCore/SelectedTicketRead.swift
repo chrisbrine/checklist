@@ -109,6 +109,8 @@ extension CommandRouter {
         collections["groups"] = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records g WHERE type='group' AND project_id=CAST(? AS TEXT) AND (id=CAST(? AS TEXT) OR (json_extract(data,'$.kind')='triage' AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_array_length(json_extract(g.data,'$.members'))>0 THEN json_extract(g.data,'$.members') ELSE json_extract(g.data,'$.task_ids') END) member WHERE (CASE WHEN member.type='object' THEN json_extract(member.value,'$.task_id') ELSE member.value END)=CAST(? AS TEXT) COLLATE BINARY))) ORDER BY rowid",arguments:[Data(pid.utf8),Data((task["epic_id"] as? String ?? "").utf8),Data(tid.utf8)]).map {row -> JSON in
             let source = try GRDBRecordEnvelopeAdapter.decode(row).object;var value: JSON = ["id":row["id"] as String,"project_id":pid,"selected_task_member":true,"members_complete":false]
             for key in ["key","name","kind","phase","purpose","revision"] {value[key]=source[key] ?? ""}
+            // CL-126: the ticket detail names the Triage orchestrator (display only).
+            if let orchestration = source["orchestration"] as? JSON { var display: JSON = [:]; for key in ["state","actor_display","session_id","provider"] { display[key] = orchestration[key] as? String ?? "" }; value["orchestration"] = display }
             return value
         }
         for (name,type) in [("statuses","status"),("tags","tag")] {collections[name] = try records(db,type:type,project:pid)}

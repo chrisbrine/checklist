@@ -12,7 +12,7 @@ struct MediaOwnerComparison: View {
         VStack(alignment:.leading,spacing:10) {
             if !model.item.id.isEmpty {
                 Text(model.item.string("title")).font(.title3).accessibilityAddTraits(.isHeader)
-                Text(model.item.string("disposition").replacingOccurrences(of:"_",with:" ").capitalized).font(.headline)
+                Text(MediaReviewModel.dispositionLabel(model.item.string("disposition"))).font(.headline)
                 if !model.item.object("decision").isEmpty {
                     let decision=Record(values:model.item.object("decision"))
                     Text("Last owner action: "+GlossaryText.title(decision.string("disposition"))+" · "+MediaComparisonLabels.time(decision.string("created_at"))+" · "+MediaComparisonLabels.origin(decision.string("origin"))).font(.caption).textSelection(.enabled)

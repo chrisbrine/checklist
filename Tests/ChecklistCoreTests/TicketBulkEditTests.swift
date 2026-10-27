@@ -90,7 +90,7 @@ final class TicketBulkEditTests: XCTestCase {
         XCTAssertEqual(int(preview,"affected_count"),0)
     }
 
-    func testEpicMovesTriageUndoAndStatusDepartureUseNormalHistory() throws {
+    func testEpicMovesTriageUndoAndStatusActionUseNormalHistory() throws {
         let (p,t) = try fixture(),e1 = try call("epic_create",["project_id":p["id"]!,"name":"Art"]),e2 = try call("epic_create",["project_id":p["id"]!,"name":"Code"])
         _ = try edit(p,Array(t.prefix(2)),["kind":"epic","epic_id":e1["id"]!])
         let moved = try edit(p,[try current(p,t[0]),try current(p,t[1])],["kind":"epic","epic_id":e2["id"]!])
@@ -99,10 +99,14 @@ final class TicketBulkEditTests: XCTestCase {
         let group = try call("triage_create",["project_id":p["id"]!,"name":"This pass","phase":"implementation"])
         let added = try edit(p,[try current(p,t[0]),try current(p,t[1])],["kind":"triage","triage_id":group["id"]!,"action":"add"])
         _ = try undo(p,[try current(p,t[0]),try current(p,t[1])],added)
-        _ = try edit(p,[try current(p,t[0]),try current(p,t[1])],["kind":"triage","triage_id":group["id"]!,"action":"add"])
+        // CL-125 rule 11: the plan emptied by the undo archives with its history; a new plan takes the tickets.
+        XCTAssertTrue(try router.dbQueue.read { try router.record($0,group["id"] as! String,type:"group") }["archived"] as? Bool ?? false)
+        let next = try call("triage_create",["project_id":p["id"]!,"name":"Next pass"])
+        _ = try edit(p,[try current(p,t[0]),try current(p,t[1])],["kind":"triage","triage_id":next["id"]!,"action":"add"])
         _ = try edit(p,[try current(p,t[0]),try current(p,t[1])],["kind":"status","action":"queue"])
         let groups = try call("triage_list",["project_id":p["id"]!])["groups"] as! [JSON]
-        XCTAssertTrue(strings(groups.first {$0["id"] as? String == group["id"] as? String}!,"task_ids").isEmpty)
+        // Rule 8: a status action keeps membership.
+        XCTAssertEqual(strings(groups.first {$0["id"] as? String == next["id"] as? String}!,"task_ids").count,2)
         XCTAssertEqual(try current(p,t[0])["epic_id"] as? String,e1["id"] as? String)
     }
 
@@ -124,7 +128,7 @@ final class TicketBulkEditTests: XCTestCase {
         XCTAssertEqual(try current(p,t[0])["disposition"] as? String,"open")
     }
 
-    func testTriageRemovalUndoRetainsManualExitPolicyWithNewHistory() throws {
+    func testTriageRemovalUndoRestoresMembershipWithNewHistory() throws {
         let (p,t) = try fixture(),group = try call("triage_create",["project_id":p["id"]!,"name":"Manual pass","phase":"implementation"])
         let added = try call("group_membership",["project_id":p["id"]!,"group_id":group["id"]!,"expected_revision":group["revision"]!,"task_id":t[0]["id"]!,"expected_task_revision":t[0]["revision"]!,"action":"add","exit_milestone":"manual"])
         let originalMember = try XCTUnwrap((added["members"] as! [JSON]).first {$0["task_id"] as? String == t[0]["id"] as? String})
@@ -133,7 +137,7 @@ final class TicketBulkEditTests: XCTestCase {
         _ = try undo(p,[try current(p,t[0])],receipt)
         let groups = try call("triage_list",["project_id":p["id"]!])["groups"] as! [JSON]
         let restored = try XCTUnwrap((groups.first {$0["id"] as? String == group["id"] as? String}!["members"] as! [JSON]).first {$0["task_id"] as? String == t[0]["id"] as? String})
-        XCTAssertEqual(restored["exit_milestone"] as? String,"manual")
+        // CL-125 retired exit milestones (rule 8); the restored member has a new membership interval.
         XCTAssertNotEqual(restored["membership_id"] as? String,originalMember["membership_id"] as? String)
     }
 

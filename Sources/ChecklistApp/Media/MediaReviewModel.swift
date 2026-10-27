@@ -38,6 +38,13 @@ typealias MediaValues = [String: Any]
     @Published var loading = false
     @Published var draft = MediaOwnerDraft() { didSet { saveDraft() } }
     @Published var contextConflict = false
+    /// CL-300 owner rework, closure and successor screens. Selections are explicit and local;
+    /// a changed selection or Epic drops the preview so create never sends a different preview.
+    @Published var reworkSelection = Set<String>() { didSet { if reworkSelection != oldValue { reworkPreview = Record(values: [:]) } } }
+    @Published var reworkEpicID = "" { didSet { if reworkEpicID != oldValue { reworkPreview = Record(values: [:]) } } }
+    @Published var reworkPreview = Record(values: [:])
+    @Published var epics: [Record] = []
+    @Published var successorItems: [String: MediaValues] = [:]
     /// Audio/video takes: two verified copies, one preparation and one playing take at most.
     let playback = MediaPlaybackCoordinator()
     private(set) var projectID = ""
@@ -65,7 +72,7 @@ typealias MediaValues = [String: Any]
             saveDraft(); playback.releaseAll(); projectID = project; epoch = UUID(); selectionEpoch = UUID()
             currentImageReference="";historicalImageReference="";listScope="";list=[:];roundOffset=0
             types=[];rounds=[];rows=[];typeID="";roundID="";selectedID="";header=Record(values:[:]);item=Record(values:[:]);intake=Record(values:[:]);publication=[];examples=[]
-            draftScope="";draft = MediaOwnerDraft(); contextConflict=false
+            draftScope="";draft = MediaOwnerDraft(); contextConflict=false; clearRoundActions(); epics=[]
         }
         await refresh()
     }
@@ -151,7 +158,7 @@ typealias MediaValues = [String: Any]
         }
     }
     func chooseType(_ id: String) {saveDraft();roundOffset=0;typeID=id;list=[:];roundID="";selectedID="";rows=[];header=Record(values:[:]);item=Record(values:[:]);intake=Record(values:[:]);publication=[];Task {await refresh()}}
-    func chooseRound(_ id: String) {saveDraft();roundID=id;selectedID="";rows=[];item=Record(values:[:]);publication=[];intake=Record(values:[:]);contextConflict=false;Task {await refresh()}}
+    func chooseRound(_ id: String) {saveDraft();clearRoundActions();roundID=id;selectedID="";rows=[];item=Record(values:[:]);publication=[];intake=Record(values:[:]);contextConflict=false;Task {await refresh()}}
     private func loadRound(token: UUID) async throws {
         let id=roundID
         let result=try await read("media_round_header",["round_id":id])
@@ -300,6 +307,83 @@ typealias MediaValues = [String: Any]
     func confirmIntake() {let plan=Record(values:intake.object("plan"));mutate("media_intake_confirm",["intake_id":intake.id,"expected_revision":intake.integer("revision"),"plan_id":plan.id,"plan_digest":plan.string("digest")]) {[weak self] in self?.intake=Record(values:$0)}}
     func captureIntake() {mutate("media_intake_capture",["intake_id":intake.id,"expected_revision":intake.integer("revision"),"plan_id":intake.string("plan_id"),"row_ids":Array(intake.strings("remaining_row_ids").prefix(200))]) {[weak self] in self?.intake=Record(values:$0)}}
     func resumeIntake(_ id: String) async {do {intake=Record(values:try await read("media_intake_get",["intake_id":id]))} catch {self.error=PlainError.text(error)}}
+    // CL-300: rework preview/create, closure and successor use the native owner channel only.
+    static func dispositionLabel(_ value: String) -> String { value.replacingOccurrences(of:"_",with:" ").capitalized }
+    static func countsText(_ counts: [String: Int]) -> String { counts.keys.sorted().map { dispositionLabel($0)+": "+String(counts[$0] ?? 0) }.joined(separator:" · ") }
+    var reworkAvailable: Bool { !historyOnly && header.string("state") == "open" }
+    var successorAvailable: Bool { !historyOnly && ["open","closed"].contains(header.string("state")) }
+    var reworkCandidates: [Record] { rows.filter { $0.string("disposition") == "changes_requested" } }
+    func clearRoundActions() { reworkSelection=[];reworkPreview=Record(values:[:]);successorItems=[:] }
+    /// Only a listed Changes-requested item can be selected; the service checks the exact decision.
+    func toggleRework(_ row: Record) {
+        if reworkSelection.contains(row.id) {reworkSelection.remove(row.id)}
+        else if row.string("disposition") == "changes_requested" {reworkSelection.insert(row.id)}
+    }
+    func loadEpics() async {
+        guard let store, !projectID.isEmpty else {return}
+        let project=projectID
+        do {
+            let query=WorkspacePageQuery(surface:"epics",project:project)
+            let page=try WorkspacePage(await store.request("workspace_page",query.parameters(cursor:nil)),query:query)
+            guard projectID==project else {return}
+            epics=page.rows.filter {!$0.bool("archived")}
+            if !reworkEpicID.isEmpty && !epics.contains(where:{$0.id==reworkEpicID}) {reworkEpicID=""}
+        } catch {self.error=PlainError.text(error)}
+    }
+    func previewRework() async {
+        let round=roundID,selection=reworkSelection.sorted(),epic=reworkEpicID
+        do {
+            let result=try await read("media_rework_preview",["round_id":round,"epic_id":epic,"items":selection.map {["item_id":$0]}])
+            guard roundID==round,reworkSelection.sorted()==selection,reworkEpicID==epic else {return}
+            reworkPreview=Record(values:result)
+        } catch {reworkPreview=Record(values:[:]);self.error=PlainError.text(error)}
+    }
+    /// Create repeats the exact preview: observation fence, Epic, item revisions, decisions and digest.
+    static func reworkCreateParams(_ preview: Record) -> MediaValues {
+        var p: MediaValues=[:]
+        for key in ["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","epic_id","preview_digest"] {p[key]=preview.values[key]}
+        p["items"]=preview.records("items").map {["item_id":$0.string("item_id"),"expected_revision":$0.values["expected_revision"] ?? NSNull(),"decision_id":$0.string("decision_id")] as MediaValues}
+        return p
+    }
+    func createRework() {
+        guard !reworkPreview.records("items").isEmpty else {return}
+        mutate("media_rework_create",Self.reworkCreateParams(reworkPreview)) { [weak self] _ in
+            self?.reworkSelection=[];self?.reworkPreview=Record(values:[:])
+        }
+    }
+    /// Pending, Needs look and Stale each block closure with their own text.
+    static func closureBlockers(_ counts: [String: Int]) -> [(Bool, String)] {
+        let pending=counts["pending"] ?? 0,look=counts["needs_look"] ?? 0,stale=counts["stale"] ?? 0
+        return [(pending>0,"\(pending) Pending item(s) need an owner decision before you close this round."),
+                (look>0,"\(look) Needs look item(s) need a final decision: Accepted, Excluded or Changes requested."),
+                (stale>0,"\(stale) Stale item(s) changed after their decision. Decide them again on the current material.")]
+    }
+    func finishRoundConfirmation() -> PendingConfirmation {
+        let project=projectID,round=header,id=roundID,manifest=Record(values:header.object("manifest"))
+        return Confirmations.finishMediaRound(round.string("title")) { [weak self] in
+            guard let self,self.projectID==project else {return}
+            self.mutate("media_round_finish",["round_id":id,"expected_revision":round.integer("revision"),"observed_context_token":round.string("observed_context_token"),"manifest_id":manifest.id,"manifest_digest":manifest.string("digest")])
+        }
+    }
+    /// A carry names the item's current decision; Pending and Stale items have none to carry.
+    static func canCarry(_ row: Record) -> Bool { ["accepted","excluded","changes_requested","needs_look"].contains(row.string("disposition")) && !row.string("decision_id").isEmpty }
+    func includeInSuccessor(_ row: Record,include: Bool,carry: Bool) {
+        guard include else {successorItems[row.id]=nil;return}
+        var entry: MediaValues=["item_id":row.id]
+        if carry,Self.canCarry(row) {entry["carry_decision_id"]=row.string("decision_id")}
+        successorItems[row.id]=entry
+    }
+    static func successorParams(header: Record,title: String,items: [String: MediaValues]) -> MediaValues {
+        let manifest=Record(values:header.object("manifest"))
+        return ["source_round_id":header.id,"expected_revision":header.integer("revision"),"observed_context_token":header.string("observed_context_token"),
+                "manifest_id":manifest.id,"manifest_digest":manifest.string("digest"),"title":title,"items":items.keys.sorted().compactMap {items[$0]}]
+    }
+    func createSuccessor(title: String,then: @escaping () -> Void = {}) {
+        mutate("media_round_successor",Self.successorParams(header:header,title:title,items:successorItems)) { [weak self] result in
+            guard let self,let id=result["id"] as? String,!id.isEmpty else {return}
+            then();self.roundState="draft";self.roundOffset=0;self.chooseRound(id)
+        }
+    }
     private func saveDraft() {guard !draftScope.isEmpty else {return};drafts[draftScope]=draft;if let data=try? JSONEncoder().encode(draft) {store?.windowPreferences.set(data,forKey:"mediaDraft:"+draftScope)}}
     static func defaultList(_ schema: MediaValues) -> MediaValues {
         let ids=(schema["fields"] as? [MediaValues] ?? []).compactMap {$0["id"] as? String}

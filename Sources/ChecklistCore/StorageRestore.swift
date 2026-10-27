@@ -31,7 +31,7 @@ extension CommandRouter {
             guard digest == manifestDigest else {throw StorageSnapshotFailure.sourceChanged}
             // Older schemas need the separately protected migration path before
             // restore. Never apply an unqualified schema rewrite during restore.
-            guard manifest.schema == 3 else {throw CoreError("RESTORE_SCHEMA_UNSUPPORTED","Restore requires a current-format backup. Qualify an upgrade on a separate copy first.")}
+            guard manifest.schema == SchemaMigrations.currentSchema else {throw CoreError("RESTORE_SCHEMA_UNSUPPORTED","Restore requires a current-format backup. Qualify an upgrade on a separate copy first.")}
             if method == "restore_preview" {
                 var config = Configuration();config.readonly = true;config.prepareDatabase {try SchemaMigrations.installStorageCollation($0)}
                 let database = try DatabaseQueue(path:source.appendingPathComponent("database.sqlite").path,configuration:config)
@@ -154,8 +154,8 @@ extension CommandRouter {
         let incarnation = uuid()
         let receipt: JSON = ["format":1,"state":"complete","command_id":params["command_id"]!,"principal":caller.principal,"intent_digest":intent,"manifest_sha256":manifestSHA,"source_store_id":manifest.storeID,"incarnation":incarnation,"restored_at":now(),"dispatch":"quarantined"]
         let identity = try copy.write {db -> StoreIdentityReceipt in
-            guard case .current(let old) = try SchemaMigrations.inspect(db),old.logical_store_id == manifest.storeID,old.schema_revision == 3 else {throw StorageSnapshotFailure.incomplete}
-            let identity = StoreIdentityReceipt(format_version:1,logical_store_id:old.logical_store_id,incarnation:incarnation,database_generation:1,schema_revision:3,state:"ready")
+            guard case .current(let old) = try SchemaMigrations.inspect(db),old.logical_store_id == manifest.storeID,old.schema_revision == SchemaMigrations.currentSchema else {throw StorageSnapshotFailure.incomplete}
+            let identity = StoreIdentityReceipt(format_version:1,logical_store_id:old.logical_store_id,incarnation:incarnation,database_generation:1,schema_revision:old.schema_revision,state:"ready")
             try db.execute(sql:"UPDATE metadata SET value=? WHERE key='incarnation'",arguments:[incarnation])
             try db.execute(sql:"UPDATE metadata SET value=? WHERE key='store_identity'",arguments:[String(decoding:try identity.encoded(),as:UTF8.self)])
             try db.execute(sql:"DELETE FROM cursors")

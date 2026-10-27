@@ -1,7 +1,8 @@
 import Foundation
 import GRDB
 
-/// Only trusted atomic group/batch code can choose group scope. No tool input can retain an individual ticket's memberships.
+/// Kept for callers. Since CL-125 the operation scope never changes Triage membership;
+/// `TriageMembershipEvent` selects the membership move.
 enum TicketStatusOperation { case individual, triage }
 
 extension CommandRouter {
@@ -42,26 +43,9 @@ extension CommandRouter {
         var seen = Set<String>()
         return (members.isEmpty ? strings(group,"task_ids") : members).filter {seen.insert($0).inserted}
     }
-    func recordTicketStatusAction(_ db: Database,task: JSON,caller: Caller,operation: TicketStatusOperation = .individual) throws {
-        let pid = (try StoredRecord(task, family: "task").string("project_id")), tid = (try StoredRecord(task, family: "task").string("id"))
-        // Membership effects need only the destination category. Building a full
-        // task projection here repeats relation, health and tag reads for every
-        // member of an atomic batch, even when membership is retained.
-        let status = try? record(db,task["status_id"] as? String ?? "",type:"status")
-        let category = status.map {$0["category"] as? String ?? ""} ?? (task["status_category"] as? String ?? "")
-        guard operation == .individual || category == "done" else { return }
-        let reason = category == "done" ? "completed" : "individual_status_action"
-        for var group in try records(db,type:"group",project:pid) where group["kind"] as? String == "triage" && triageMemberIDs(group).contains(tid) {
-            let previous = (group["members"] as? [JSON] ?? []).first {$0["task_id"] as? String == tid} ?? ["task_id":tid]
-            var extra: JSON = ["status_id":task["status_id"] ?? NSNull()]
-            if category == "done",let mid = task["current_manifest_id"] as? String,let manifest = try? scoped(db,mid,pid,type:"manifest") {
-                extra["target_manifest_id"] = mid;extra["label"] = try manifestGates(db,manifest).isEmpty ? "No review required" : "Completed after required gates"
-                if try records(db,type:"finding_resolution",project:pid).contains(where: {$0["task_id"] as? String == tid && $0["disposition"] as? String == "waived"}) { extra["label"] = "Completed with owner-waived findings" }
-            }
-            _ = try closeTriageMembership(db,group:group,member:previous,caller:caller,reason:reason,extra:extra)
-            group["members"] = (group["members"] as? [JSON] ?? []).filter {$0["task_id"] as? String != tid}
-            group["task_ids"] = triageMemberIDs(group).filter {$0 != tid};group = revised(group);try save(db,group,type:"group")
-        }
+    /// Status changes keep membership (CL-125); `membership` selects a claim, submission or verdict move.
+    func recordTicketStatusAction(_ db: Database,task: JSON,caller: Caller,operation: TicketStatusOperation = .individual,membership: TriageMembershipEvent = .status) throws {
+        try applyTriageMembership(db,task:task,caller:caller,event:membership)
     }
     private func triageTransitionSnapshot(_ tasks: [JSON]) throws -> [JSON] {
         try tasks.map { task in
@@ -81,7 +65,6 @@ extension CommandRouter {
         guard group["kind"] as? String == "triage" else { throw CoreError("INVALID_INPUT","Only a Triage can change the statuses of its current handling group. Epics remain persistent subprojects.") }
         try revision(p,group)
         let ids = triageMemberIDs(group)
-        if !ids.isEmpty,triagePhase(group) == nil { throw CoreError("TRIAGE_PHASE_REQUIRED","Choose this legacy Triage's handling phase before applying a group workflow. Existing memberships are preserved.") }
         guard ids.count <= 1000 else { throw CoreError("CAPACITY_EXCEEDED","This atomic status action supports at most 1,000 Triage members. No tickets changed.") }
         guard let rawRevisions = p["expected_member_revisions"] as? JSON else { throw CoreError("REVISION_REQUIRED","Include the expected revision of every current Triage ticket.") }
         guard Set(rawRevisions.keys) == Set(ids) else { throw CoreError("REVISION_CONFLICT","Triage membership changed or the ticket revision map is incomplete. Reload all \(ids.count) current members before retrying; no tickets changed.",details:["current_member_ids":ids,"missing_member_ids":Array(Set(ids).subtracting(rawRevisions.keys)),"unexpected_member_ids":Array(Set(rawRevisions.keys).subtracting(ids))]) }
@@ -122,9 +105,8 @@ extension CommandRouter {
                 input["direction_cursor"] = directionCursors[(try StoredRecord(task, family: "task").string("id"))]!
                 return try work(db,input,c,"task_complete",operation:.triage)
             }
-            // Returning review work to implementation/parking or canceling a phase departs its handling groups.
-            let operation: TicketStatusOperation = triagePhase(group) == "review" || category == "canceled" ? .individual : .triage
-            return try taskTransition(db,input,c,operation:operation)
+            // Status changes keep membership; canceled members leave (CL-125).
+            return try taskTransition(db,input,c,operation:.triage)
         }
         // Evaluate every existing guard in rollback-only savepoints, so the user sees all blockers before any change is retained.
         var blockers: [JSON] = []

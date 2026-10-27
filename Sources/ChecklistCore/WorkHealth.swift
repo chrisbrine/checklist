@@ -57,7 +57,7 @@ extension CommandRouter {
         // An ambiguous pair of orchestrators is visible and never guessed.
         if coordinators.count == 1, let group = coordinators.first, let orchestration = group["orchestration"] as? JSON,
            let id = orchestration["id"] as? String, !id.isEmpty, let sid = orchestration["session_id"] as? String, !sid.isEmpty,
-           let phase = triagePhase(group) {
+           let phase = Optional(((try? scoped(db, task["status_id"] as? String ?? "", group["project_id"] as? String ?? "", type: "status"))?["category"] as? String) == "review" ? "review" : "implementation") {
             return ["kind": "orchestration", "id": id, "triage_id": (try StoredRecord(group, family: "record").requiredValue("id")),
                     "phase": phase, "session_id": sid,
                     "generation": orchestration["session_authorization_generation"] ?? "", "started_at": orchestration["started_at"] ?? NSNull()]
@@ -163,7 +163,8 @@ extension CommandRouter {
             let session = try scoped(db,sid,pid,type:"session")
             guard session["role"] as? String == "worker", canReceive(session,project:pid), sessionGeneration(session) == generation else { throw CoreError("RECIPIENT_CHANGED", "Health recipient authorization changed before pickup queueing.") }
             if deliveries.contains(where: { $0["recipient_session_id"] as? String == sid && $0["recipient_authorization_generation"] as? String == generation }) { continue }
-            let delivery: JSON = ["id":uuid(),"project_id":pid,"message_id":mid,"recipient_session_id":sid,"recipient_authorization_generation":generation,"recipient_role":recipient["recipient_role"] ?? "health_handler","state":"queued","push_state":"unavailable","push_reason":"System health requests have no qualified native wake; available on exact-session MCP pickup.","revision":1,"created_at":now()]
+            var delivery: JSON = ["id":uuid(),"project_id":pid,"message_id":mid,"recipient_session_id":sid,"recipient_authorization_generation":generation,"recipient_role":recipient["recipient_role"] ?? "health_handler","state":"queued","push_state":"unavailable","push_reason":"System health requests have no qualified native wake; available on exact-session MCP pickup.","revision":1,"created_at":now()]
+            copyRoleLabel(recipient, into: &delivery)
             try save(db,delivery,type:"delivery");deliveries.append(delivery)
         }
         return deliveries
@@ -181,6 +182,17 @@ extension CommandRouter {
         if let target, let sid = target["session_id"] as? String, let session = try? scoped(db, sid, pid, type: "session"),
            canReceive(session, project: pid), sessionGeneration(session) == target["generation"] as? String {
             recipients = [["session_id": sid, "authorization_generation": sessionGeneration(session), "recipient_role": "health_handler"]]
+        }
+        // CL-248: work-health notices always reach both roles: the current holder and the Triage orchestrator.
+        let current = try workHealthTarget(db, task: task)
+        if target == nil, current["kind"] as? String == "attempt", let sid = current["session_id"] as? String,
+           let session = try? scoped(db, sid, pid, type: "session"), session["role"] as? String == "worker",
+           canReceive(session, project: pid), sessionGeneration(session) == current["generation"] as? String {
+            recipients.append(["session_id": sid, "authorization_generation": sessionGeneration(session), "recipient_role": "health_handler"])
+        }
+        if let group = try ticketOrchestratedTriage(db, task: task), let copy = triageOrchestratorRecipient(db, group: group),
+           !recipients.contains(where: { $0["session_id"] as? String == copy["session_id"] as? String }) {
+            recipients.append(copy)
         }
         let deliveries = try queueHealthDeliveries(db, message: message, recipients: recipients)
         try event(db, caller: healthActor, project: pid, entity: task["id"] as? String, kind: "work_health_note", data: ["message_id": (try StoredRecord(message,

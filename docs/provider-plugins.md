@@ -13,7 +13,7 @@ The local source has a Foundation-only `ChecklistProviders` target with a small 
 | `ChecklistProviders/ProviderPlugin.swift` | Portable versioned manifest/model/capability contracts, registration validation and unavailable lookup |
 | `ChecklistProviders/BundledProviderPlugins.swift` | Codex/Claude observed session/model metadata, signed host/application IDs, registry interpretation, composer/hold explanations, compatibility policy defaults |
 | `ChecklistBridges` | Provider adapters for native process discovery, bounded secure registry observations and existing Claude peer framing/status/reply I/O; `NativeProviderTransport` gates reviewed dispatch by capability |
-| Core | Project policy intersection, claims, review independence, Triage phases, immutable history/outbox, exact reply allowance and trusted owner answers; no native provider transport |
+| Core | Project policy intersection, claims, review independence, Triage orchestration and membership, immutable history/outbox, exact reply allowance and trusted owner answers; no native provider transport |
 | Service | Kernel/signature/workspace/credential/grant validation, committed registration, durable pre-I/O fence, callback attribution and transaction coordination using validated plugin contracts |
 | App | Generic provider presentation, eligible menus/settings, installed-app lookup, explicit composer/open/copy actions; no authority or model launching |
 

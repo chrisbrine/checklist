@@ -7,7 +7,9 @@ import GRDB
 extension CommandRouter {
     static let mediaOwnerReads = CommandMethods.mediaOwnerReads
     static let mediaOwnerMethods = mediaOwnerReads.union([
-        "media_type_create", "media_type_revise", "media_type_adopt", "media_type_retire", "media_round_create", "media_round_cancel", "media_round_archive", "media_item_create", "media_item_update", "media_round_publish", "media_intake_preview", "media_intake_revise", "media_intake_confirm", "media_intake_capture", "media_context_approve", "media_context_reconcile", "media_decide", "media_example_read_lease", "media_example_read_release", "media_original_read"
+        "media_type_create", "media_type_revise", "media_type_adopt", "media_type_retire", "media_round_create", "media_round_cancel", "media_round_archive", "media_item_create", "media_item_update", "media_round_publish", "media_intake_preview", "media_intake_revise", "media_intake_confirm", "media_intake_capture", "media_context_approve", "media_context_reconcile", "media_decide", "media_example_read_lease", "media_example_read_release", "media_original_read",
+        // CL-300: owner screens for CL-118 rework Drafts, round closure and successor rounds.
+        "media_rework_create", "media_round_finish", "media_round_successor"
     ])
     func executeMediaOwnerChannel(method: String, params p: JSON, caller c: Caller) throws -> JSON {
         try owner(c)
@@ -99,6 +101,9 @@ extension CommandRouter {
             item["decision"] = decision
             item["disposition"] = decision["review_basis_signature"] as? String == target["review_basis_signature"] as? String ? (try StoredRecord(decision,
                  family: "media").requiredValue("disposition")) : "stale"
+        } else if member != nil,item["stale_predecessor_decision_id"] is String {
+            // CL-118 successor with a changed basis: same Stale as the round view and item page.
+            item["disposition"] = "stale"
         }
         item["originals"] = try strings(target,"attachment_reference_ids").map { id -> JSON in
             let owner = try mediaOwnerValue(db,id:(try StoredRecord(target, family: "media").string("attachment_owner_id")),project:project)

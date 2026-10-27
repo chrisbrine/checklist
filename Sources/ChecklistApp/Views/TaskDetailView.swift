@@ -22,9 +22,10 @@ struct TaskDetailView: View {
     @State private var showWorkerAssignment = false
     @State private var eventHistory = SelectedEventHistory()
     @State private var mentionComposer = MentionComposerState()
+    @State private var noteAudience: NoteAudience = .all
     var project: String { task.string("project_id") }
     var messages: [Record] { RecordOrdering.newestFirst(store.detailRecords("messages",task:task).filter { $0.string("task_id") == task.id }, chronologicalInput: true) }
-    var recipientChanged: Bool { store.noteDestinations[task.id] != task.string("active_attempt_id") || store.noteDraftNeedsReconciliation(task.id) }
+    var recipientChanged: Bool { store.noteDestinations[task.id] != task.string("active_attempt_id") || store.noteDraftNeedsReconciliation(task.id) || orchestratorChanged }
     var destinationLabel: String {
         guard let expected = store.noteDestinations[task.id] else { return (store.noteDrafts[task.id] ?? "").isEmpty ? "Next pickup / current handlers" : "Choose current recipient" }
         if expected.isEmpty { return "Next pickup" }
@@ -120,7 +121,7 @@ struct TaskDetailView: View {
                         }
                         if messages.isEmpty { Text("Notes and agent messages build the context for this ticket.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText) }
                         LazyVStack(alignment: .leading, spacing: Spacing.small) {
-                            ForEach(messages) { message in MessageRow(message: message, task: task) }
+                            ForEach(DeliveryLabels.correlateReplies(messages)) { message in MessageRow(message: message, task: task) }
                         }
                     }
                     let currentHistory = eventHistory.records(in:store.storeIncarnation)
@@ -231,8 +232,10 @@ struct TaskDetailView: View {
             if noLongerMatchesView { Text("No longer matches this view. This ticket stays open by its identity.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             if task.bool("archived") { Label("Archived elsewhere · this ticket stays open", systemImage: "archivebox").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
             if task.bool("trashed") { Label("Trashed elsewhere · this ticket stays open", systemImage: "trash").checklistFont(.micro).foregroundStyle(.orange) }
-            if store.detailRecords("groups",task:task).contains(where: { $0.string("kind") == "triage" && ($0.bool("selected_task_member") || $0.strings("task_ids").contains(task.id)) }) {
-                Text("Changing this ticket's status takes it out of every Triage.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+            if let triage = currentTriage {
+                let display = TriageOrchestratorDisplay(triage)
+                // CL-126: the holder and the Triage orchestrator; status changes keep membership (CL-125).
+                Text("Holder: \(holderLabel) · Triage: \(ProductionGroups.label(triage)) · Orchestrator: \(display.orchestrator ?? "none, Planned")").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).fixedSize(horizontal: false, vertical: true).accessibilityIdentifier("ticketTriageRoute")
             }
             AccessibleHStack(spacing: Spacing.small) {
                 ForEach(HandoffProvider.workProviders()) { provider in
@@ -257,6 +260,16 @@ struct TaskDetailView: View {
         if let sessionID = task.object("planned_assignee")["session_id"] as? String, let session = store.workSessions.first(where: { $0.id == sessionID }) { return session.string("native_conversation_title", fallback: session.string("label", fallback: sessionID)) }
         return "Unassigned"
     }
+    var holderLabel: String { task.string("active_attempt_id").isEmpty ? "No holder" : handler }
+    var currentTriage: Record? {
+        guard let triage = store.detailRecords("groups",task:task).first(where: { $0.string("kind") == "triage" && ($0.bool("selected_task_member") || $0.strings("task_ids").contains(task.id)) }) else { return nil }
+        if triage.object("orchestration").isEmpty, triage.object("orchestrator").isEmpty, let full = store.groups.first(where: { $0.id == triage.id }) { return full }
+        return triage
+    }
+    var triageOrchestrator: TriageOrchestratorDisplay? { currentTriage.map(TriageOrchestratorDisplay.init) }
+    var noteRouting: TicketNoteRouting { TicketNoteRouting(preferences: store.windowPreferences) }
+    var orchestratorChanged: Bool { noteRouting.orchestratorChanged(task.id, current: triageOrchestrator?.sessionID ?? "", hasDraft: !(store.noteDrafts[task.id] ?? "").isEmpty) }
+    var audienceUnavailable: String? { noteAudience.unavailableReason(hasOrchestrator: triageOrchestrator?.orchestrator != nil) }
     var recordHistorySection:some View {
         DisclosureGroup("Work, review & file history") {
             VStack(alignment:.leading,spacing: Spacing.row) {
@@ -289,13 +302,17 @@ struct TaskDetailView: View {
             AccessibleHStack(spacing: Spacing.compact) {
                 Text("\(store.projectName(project)) · \(task.string("key"))").lineLimit(1)
                 Image(systemName: "arrow.right")
-                Text(destinationLabel)
+                Text(noteAudience.destination(holder: destinationLabel, orchestrator: triageOrchestrator?.orchestrator))
                 Spacer()
             }.checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-            if recipientChanged && !(store.noteDrafts[task.id] ?? "").isEmpty {
-                AccessibleHStack { Text("The handler changed. Confirm the current destination before sending.").checklistFont(.micro).foregroundStyle(.orange); Spacer(); Button("Update recipients") { store.refreshNoteDestination(task.id) }.checklistFont(.micro) }
+            if let orchestrator = triageOrchestrator?.orchestrator {
+                // CL-126: Both is the default; owner directions and notices always go to both.
+                NoteAudiencePicker(selection: Binding(get: { noteAudience }, set: { noteAudience = $0; noteRouting.setAudience($0, for: task.id) }), orchestrator: orchestrator)
             }
-            TextEditor(text: Binding(get: { store.noteDrafts[task.id] ?? "" }, set: { store.saveNote(task.id, text: $0); observeMentionDraft() }))
+            if recipientChanged && !(store.noteDrafts[task.id] ?? "").isEmpty {
+                AccessibleHStack { Text("The holder or orchestrator changed. Confirm the new destination before sending.").checklistFont(.micro).foregroundStyle(.orange); Spacer(); Button("Update recipients") { store.refreshNoteDestination(task.id); noteRouting.bind(task.id, orchestrator: triageOrchestrator?.sessionID ?? "") }.checklistFont(.micro) }
+            }
+            TextEditor(text: Binding(get: { store.noteDrafts[task.id] ?? "" }, set: { let started = (store.noteDrafts[task.id] ?? "").isEmpty; store.saveNote(task.id, text: $0); if $0.isEmpty { noteRouting.clearDestination(task.id) } else if started { noteRouting.bind(task.id, orchestrator: triageOrchestrator?.sessionID ?? "") }; observeMentionDraft() }))
                 .checklistFont(.callout).frame(height: 55).padding(Spacing.compact).background(.background, in: RoundedRectangle(cornerRadius: Radius.small)).overlay(RoundedRectangle(cornerRadius: Radius.small).stroke(.quaternary)).accessibilityLabel("Add a note")
             if let panel = mentionComposer.panel {
                 ScrollView {
@@ -318,10 +335,10 @@ struct TaskDetailView: View {
                 } label: { Image(systemName: "paperclip") }.menuStyle(.button).buttonStyle(.checklistPlain).menuIndicator(.hidden).frame(width: 24).help("Add files").accessibilityLabel("Add files")
                 Spacer()
                 Button("Send note") { prepareNoteWithMentions()
-                }.buttonStyle(.checklistProminent).keyboardShortcut(.return, modifiers: .command).help("Send note (⌘Return)").checklistDisabled([((store.noteDrafts[task.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write a note first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline), (!store.selectedTicketCurrent(task.id), DisabledReasons.ticketLoading), (recipientChanged, "The recipients changed. Check them first."), (store.hasPendingMutation, DisabledReasons.uncheckedChange)])
+                }.buttonStyle(.checklistProminent).keyboardShortcut(.return, modifiers: .command).help("Send note (⌘Return)").checklistDisabled([((store.noteDrafts[task.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Write a note first."), (store.busy, DisabledReasons.saving), (!store.connected, DisabledReasons.offline), (!store.selectedTicketCurrent(task.id), DisabledReasons.ticketLoading), (recipientChanged, "The recipients changed. Check them first."), (audienceUnavailable != nil, audienceUnavailable ?? ""), (store.hasPendingMutation, DisabledReasons.uncheckedChange)])
             }
             if !(store.noteDrafts[task.id] ?? "").isEmpty { DraftSaveStatusView(kind: "note", draftID: task.id) }
-        }.padding(Spacing.group).background(.bar)
+        }.padding(Spacing.group).background(.bar).onAppear { noteAudience = noteRouting.audience(task.id) }
     }
     var mentionContext: MentionDraftResolution.Context {
         .init(storeIncarnation: .init(store.storeIncarnation), projectID: .init(project), taskID: .init(task.id), replyID: nil)
@@ -365,8 +382,9 @@ struct TaskDetailView: View {
                         var params: [String: Any] = ["project_id": project, "task_id": task.id, "body": body,
                             "expects_reply": true, "expected_attempt_id": submission.expectedAttempt.string]
                         if let target { params["mention_target"] = target }
+                        if triageOrchestrator?.orchestrator != nil, let audience = noteAudience.effective(ownerDirection: false, mentionPlan: target != nil).parameter { params["audience"] = audience }
                         store.run("message_send", params, success: task.string("active_attempt_id").isEmpty ? "Note saved for pickup" : "Note saved; see delivery receipts", completion: { _ in
-                            if MentionDraftResolution.ExactText(store.noteDrafts[task.id] ?? "") == submission.snapshot.body { store.saveNote(task.id, text: "") }
+                            if MentionDraftResolution.ExactText(store.noteDrafts[task.id] ?? "") == submission.snapshot.body { store.saveNote(task.id, text: ""); noteRouting.clearDestination(task.id) }
                             else { store.notice = "Note sent; newer local draft text was retained." }
                             observeMentionDraft()
                         })
@@ -488,11 +506,12 @@ struct MessageRow: View {
             ForEach(message.records("deliveries")) { delivery in
                 VStack(alignment: .leading, spacing: Spacing.hairline) {
                     AccessibleHStack(spacing: Spacing.tight) {
-                        Text("\(recipientLabel(delivery)): \(receiptLabel(delivery.string("state")))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                        Text("\(delivery.string("recipient_role") == "triage_orchestrator" ? "Orchestrator · " : "")\(recipientLabel(delivery)): \(DeliveryLabels.receipt(delivery: delivery))").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                         if let reaction = reactionLabel(delivery.string("reaction")) {
                             Text(reaction.symbol).checklistFont(.caption).help(reaction.meaning).accessibilityLabel("Agent reaction: \(reaction.meaning)")
                         }
                     }
+                    if delivery.string("recipient_role") == "triage_orchestrator", !delivery.string("label").isEmpty { Text(delivery.string("label")).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                     if ["queued", "pending", "saved", "saved_for_pickup"].contains(delivery.string("state")), delivery.string("push_state") == "unavailable" {
                         Text("Saved for the agent’s next Checklist check.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     } else if !delivery.string("reason", fallback: delivery.string("push_reason")).isEmpty && !delivery.string("reason", fallback: delivery.string("push_reason")).contains("Native push is unqualified") {
@@ -508,7 +527,7 @@ struct MessageRow: View {
             let label = session.string("native_conversation_title", fallback: session.string("label"))
             if !label.isEmpty && UUID(uuidString: label) == nil { return label }
         }
-        let label = delivery.string("recipient_label")
+        let label = delivery.string("recipient_label").isEmpty ? delivery.string("recipient_display") : delivery.string("recipient_label")
         if !label.isEmpty && UUID(uuidString: label) == nil { return label }
         return sessionID.isEmpty ? "Agent" : "Agent · " + String(sessionID.prefix(8))
     }
