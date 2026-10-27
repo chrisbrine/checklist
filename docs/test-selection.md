@@ -14,7 +14,7 @@ The script prints commands; it does not execute them. JSON contains argv arrays 
 
 ## Target selection
 
-The selector reads `swift package describe --type json` and caches the result under `<scratch-path>/affected-tests/<Package.swift SHA-256>.json`. A manifest change invalidates the cache. It uses target paths from that graph, including custom paths and nested fixture targets, and follows reverse `target_dependencies` transitively. Graph closure for a changed test target selects itself, without selecting tests of its dependencies; explicit file readers can add other consumers. The named runtime-consumer map also selects Core tests for `StorageCrashProbe` (including its nested released fixture) and MCPServer tests for `ChecklistCLIInputProbe`. The tests launch or copy these executables at runtime without a SwiftPM dependency. The shipping CLI is imported by CLI tests; the MCP shim tests launch the input probe instead. Source-inspection dependencies also select App tests when Service, CLI, Bridges or Core test sources change (the glossary checks enumerate those trees). App source selects `ChecklistAppTests`, its extracted App test targets and bundle-identity consumers. Core source selects its transitive App, Bridges, CLI, IPC, MCPServer, Service and Providers test consumers. Use `test_targets` from the actual graph for the complete list.
+The selector reads `swift package describe --type json` and caches the result under `<scratch-path>/affected-tests/<Package.swift SHA-256>.json`. Root or nested package manifest/lockfile changes invalidate the cache. For fallback it uses target paths from that graph, including custom paths and nested fixture targets, and follows reverse `target_dependencies` transitively. Graph closure for a changed test target selects itself, without selecting tests of its dependencies; explicit file readers can add other consumers. The named runtime-consumer map also selects Core tests for `StorageCrashProbe` (including its nested released fixture) and MCPServer tests for `ChecklistCLIInputProbe`. The tests launch or copy these executables at runtime without a SwiftPM dependency. The shipping CLI is imported by CLI tests; the MCP shim tests launch the input probe instead. Source-inspection dependencies also select App tests when Service, CLI, Bridges or Core test sources change (the glossary checks enumerate those trees). App source selects `ChecklistAppTests`, its extracted App test targets and bundle-identity consumers. Core source selects its transitive App, Bridges, CLI, IPC, MCPServer, Service and Providers test consumers. Use `test_targets` from the actual graph for the complete list.
 
 Each selected test target gets an anchored `--filter` in the generated `swift test` command; SwiftPM combines these filters. Python sources select their corresponding `scripts/test_<stem>.py` (hyphens become underscores), Python test files select themselves, and named shared Python helpers have explicit test owners. The validator selects its own shape/reference checks. `FILE_TEST_CONSUMERS` and `FILE_PYTHON_TEST_CONSUMERS` map repository inputs to every Swift test target and Python test script that reads them at runtime, before applying validation-only rules. Shared inputs select the union of both maps and any SwiftPM resource consumers; one known reader never excludes another:
 
@@ -70,7 +70,7 @@ alongside the parallel pass. `TIMING_TESTS` lists the ungated default-suite meth
 that assert a wall-clock budget of any size: the
 parallel pass skips them, and one separate `--num-workers 1` SwiftPM invocation
 (JSON `timing_commands` and `timing_tests`) runs them with unchanged assertions in
-qualification runs (`--qualification`, which every round commit uses) and whenever a
+qualification runs (`--qualification` or the final-round coverage refresh) and whenever a
 changed path is the test file of one of those classes. Ordinary default and affected
 plans skip them and report `timing_deferred: true`, because wall-clock budgets are
 performance checks that belong with the opt-in qualification level (CL-266 item 2); `scripts/test_affected_tests.py` fails when such a
@@ -112,9 +112,8 @@ in that same single-worker group. Small receipt paging/cursor cases stay default
 encode/decode/descriptor round trip in the single-worker qualification invocation.
 It took 66.9 s in a warm 64-worker pass and left a measured 28.3 s last-case
 tail at 32 workers. Smaller compact Unicode/malformed-index and legacy-format
-correctness cases remain default. Full qualification, a change to
-`Sources/ChecklistCore/StorageCompactManifest.swift`, and an edit to this fixture
-all emit its original assertions in `qualification_commands`. It stays out of
+correctness cases remain default. Full qualification and any mapped affected change
+emit its original assertions in `qualification_commands`. It stays out of
 `timing_tests`: timing deferral never removes a selected real-size fixture.
 `QUALIFICATION_CASES` combines `REAL_SIZE_TESTS` and `QUALIFICATION_TESTS`, so the
 qualification selection, fast-pass skips and aggregate `skip` report agree.
@@ -138,70 +137,55 @@ Small correctness cases in the same classes still run by default. Owned-copy
 qualifiers additionally require their existing explicitly selected private-copy
 inputs; the switch never selects a live store or fabricates those inputs.
 
-Affected plans include qualification for selected test targets when their Core,
-App or IPC production dependencies, or unknown/package/build inputs change. Editing a
-qualification or real-size fixture selects its registered cases; editing the gate helper
-selects all registered cases in the selected targets. JSON `qualification_tests` gives the exact included IDs. Full default mode
-always omits qualification; full qualification mode always includes it. This
-keeps the default budget separate from scale and soak coverage without dropping
-any assertions. `skip` and `qualification` in JSON make that decision reviewable.
+Affected plans read `.local/build/test-impact-map.json`, generated by
+`script/test_impact_map.py`. Its source entries contain the XCTest classes and
+individual real-size cases that executed that file, across all dependent test
+modules. `qualification_reasons` names each selected case and the changed paths
+that selected it. A covered file with no qualification execution selects none of the measured cases. Cases/classes skipped for absent private inputs keep explicit per-case/class module fallback (`qualification_fallback_cases`, `coverage_fallback_classes`), without discarding the measured map. Skipped coverage is never presented as a pass or an empty measured closure.
+A new/unmapped source falls back to the package module closure, including its
+qualification cases, and appears in `group_fallback_paths`.
 
-After affected checks pass, use the existing installation/storage gates. A bounded
-full qualification job on the exact immutable source can run in the background;
-retain its PID/job receipt, source fingerprint and logs. Map failures to their
-own tickets. A previous failure is never a passing result for this ticket.
+The map records its Git commit, UTC generation timestamp, elapsed generation
+seconds, test inventories, input hashes and per-file source hashes. It is ignored
+local build output, never a checked-in declaration. The planner accepts a complete
+map for 24 hours by default (`--map-max-age-hours` overrides this), only from an
+ancestor commit with unchanged test/build inputs and runtime fixtures/resources. Dirty fixture data without a captured fingerprint conservatively falls back until refreshed after commit. Missing, incomplete, old,
+malformed or incompatible maps use module fallback and report the reason in
+`impact_map_status`. Changed source files already in a valid map keep measured
+selection; `git diff` finds new files and untracked additions for fallback.
 
-### Qualification source-area audit
+Generate or refresh it without a native app or test slot:
 
-Every entry is listed below with a concrete source area that selects it. These
-are examples within the existing conservative dependency closure, not a narrower
-map: any Core source selects all 29 registered qualification cases across its
-transitive test targets; App source selects its one App qualifier, and IPC source
-selects qualifiers in the targets reached by its actual package dependencies.
-`Tests/ChecklistTestSupport/` changes also select qualification in consuming targets.
-Fast class narrowing (including `OrdinaryMentionTokens.swift`) never narrows this
-qualification closure. The actual-graph selector regression checks runnable
-qualification commands for Core, mapped Core, App and IPC production paths.
+```sh
+python3 script/test_impact_map.py --scratch-path <build-slot>/.build --runner-wrapper <shared-build-wrapper>
+python3 script/affected_tests.py --base <round-base> --last-round --scratch-path <build-slot>/.build --runner-wrapper <shared-build-wrapper>
+```
 
-| Registered test | Selecting source area |
-| --- | --- |
-| `ChecklistCoreTests.TicketCleanupReceiptReadTests/testLatestSummaryPagesRetainFirstReceiptAndAreBoundedWithLargeItems` | `Sources/ChecklistCore/TicketCleanupReceiptRead.swift` |
-| `ChecklistCoreTests.TestStoreTests/testWarmStoreSetupReportsPairedMedians` | `Tests/ChecklistTestSupport/TestStore.swift` |
-| `ChecklistCoreTests.MediaListQueryTests/testExamplesStayCollapsedUntilShowThenCapPageAndNeverGrantApproval` | `Sources/ChecklistCore/MediaListQueries.swift` |
-| `ChecklistIPCTests.LongCommandTests/testCommandLongerThanOldDeadlineReturnsCommittedResultThroughRealClient` | `Sources/ChecklistIPC/ChecklistClient.swift` |
-| `ChecklistAppTests.IsolatedDefaultsTests/testPreferencesRemainAbsentAfterChildProcessExit` | `Sources/ChecklistApp/Stores/ChecklistStore.swift` |
-| `ChecklistCoreTests.StorageSnapshotCapacityTests/testMoreThanThirtyThousandObjectsAndEightMiBManifestRoundTripWithoutPruning` | `Sources/ChecklistCore/StorageSnapshot.swift` |
-| `ChecklistCoreTests.MediaFrozenIntakeTests/test300SourcePreviewExactConfirmationStop200Resume96AndPlanRevision` | `Sources/ChecklistCore/MediaIntake.swift` |
-| `ChecklistCoreTests.MediaDecisionTests/test450SelectionLostReplyFailedMiddleOnlyRefreshAndLaterReversal` | `Sources/ChecklistCore/MediaDecisions.swift` |
-| `ChecklistCoreTests.EvidenceAuthorityTests/testWorkHealthLargeProjectDecodesOnlyCandidatePage` | `Sources/ChecklistCore/WorkHealth.swift` |
-| `ChecklistCoreTests.TicketLifecycleCleanupTests/testPreparationProgressUnderConstantUnrelatedWritesAndBoundsMemory` | `Sources/ChecklistCore/TicketLifecycleCleanup.swift` |
-| `ChecklistCoreTests.TicketLifecycleCleanupTests/testBackupDescriptorStreamingHasBoundedAllocations` | `Sources/ChecklistCore/TicketLifecycleCleanup.swift` |
-| `ChecklistCoreTests.TicketLifecycleCleanupTests/testProjectedReferenceScanBoundsWorkWithManyOwnedTokens` | `Sources/ChecklistCore/TicketLifecycleCleanup.swift` |
-| `ChecklistCoreTests.TicketLifecycleCleanupTests/testSustainedWritersBoundRSSCPUAndBackoff` | `Sources/ChecklistCore/TicketLifecycleCleanup.swift` |
-| `ChecklistCoreTests.TicketLifecycleCleanupTests/testSelectedPayloadAndHistoryPreparationHasBoundedPeak` | `Sources/ChecklistCore/TicketLifecycleCleanup.swift` |
-| `ChecklistCoreTests.CoreTests/testEpicDeleteRealSizeBackfillResumesExpiredSlices` | `Sources/ChecklistCore/EpicDeletion.swift` |
-| `ChecklistCoreTests.CoreTests/testEpicDeleteIndexedThirtyThousandRecordsAndEventsAndConcurrentRead` | `Sources/ChecklistCore/EpicDeletion.swift` |
-| `ChecklistCoreTests.MediaListQueryTests/testThousandItemBoundedGroupedPagesFreezeOrderAcrossInsertsAndUpdates` | `Sources/ChecklistCore/MediaListQueries.swift` |
-| `ChecklistCoreTests.ScreenReadPerformanceTests/testRealSizeScreenReads` | `Sources/ChecklistCore/WorkspacePageRead.swift` |
-| `ChecklistCoreTests.ScreenReadPerformanceTests/testOverviewWithRetainedReviewHistory` | `Sources/ChecklistCore/WorkspacePageRead.swift` |
-| `ChecklistCoreTests.ScreenReadQueryPlanTests/testRealSizeScreenReadQueryPlans` | `Sources/ChecklistCore/WorkspacePageRead.swift` |
-| `ChecklistCoreTests.OverviewReadOptimizationTests/testReadOnlyBatchClaimProjectionProfile` | `Sources/ChecklistCore/Work.swift` |
-| `ChecklistCoreTests.OverviewReadOptimizationTests/testReadOnlyOverviewQueryProfile` | `Sources/ChecklistCore/WorkspacePageRead.swift` |
-| `ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeAutomaticFirstPassKeepsConcurrentReadAndWriteUnderTwoSeconds` | `Sources/ChecklistCore/TicketLifecycleCleanup.swift` |
-| `ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeCacheAliasInventoryExhaustsOneBoundedClosureBudgetAndRetainsEntry` | `Sources/ChecklistCore/TicketLifecycleCleanup.swift` |
-| `ChecklistCoreTests.MediaRoundTests/testLargeRetainedHistoryDoesNotHoldWriterDuringPreparation` | `Sources/ChecklistCore/MediaRounds.swift` |
-| `ChecklistCoreTests.StorageReadPerformanceTests/testDeliveryPassLookupTimingAtFiveThousandRecords` | `Sources/ChecklistCore/Communication.swift` |
-| `ChecklistCoreTests.ArchivePreviewPerformanceTests/testFourFourHundredFileCapturesKeepExactPreviewUnderOneSecond` | `Sources/ChecklistCore/ArchiveCleanupObservation.swift` |
-| `ChecklistCoreTests.EvidenceAuthorityTests/testLargeSubmitBlocksOtherCommandsOnlyBriefly` | `Sources/ChecklistCore/SourceCapture.swift` |
-| `ChecklistCoreTests.EvidenceAuthorityTests/testLargeReferenceImportBlocksOtherCommandsOnlyBriefly` | `Sources/ChecklistCore/ReferenceImportPreparation.swift` |
-| `ChecklistCoreTests.EvidenceAuthorityTests/testReviewClaimValidatesTheCapturedTargetBeforeTheWriter` | `Sources/ChecklistCore/AgentReviews.swift` |
-| `ChecklistCoreTests.StorageCompactManifestTests/testTwoHundredThousandObjectTemplateFitsManifestBudgetWithoutLosingDescriptors` | `Sources/ChecklistCore/StorageCompactManifest.swift` |
+The generator builds with Swift code coverage in the assigned warm scratch path,
+then runs each ordinary XCTest class in a separate native process and every
+qualification case individually. Each execution gets its own LLVM raw profiles
+(including child-process profiles), merged with `llvm-profdata` and exported with
+`llvm-cov`. Unit source-inspection tests' literal repository paths/directories are
+collected automatically and recorded separately as `inspection_references`;
+coverage alone cannot observe a source file read as text. Qualification edges use the individual case’s executed-file coverage; unit source readers also include executed shared helper files. No manually maintained
+source-to-class or source-to-qualification table exists. Dynamic source reads
+remain subject to the repository-input audit and conservative fallback.
 
-Both registry families are omitted by `--full` alone and included by
-`--full --qualification`. Affected production selection adds them to the separate
-qualification command without enabling the `TIMING_TESTS` / `LOAD_SENSITIVE_TESTS`
-command. Those timing cases still require `--qualification` or their own test-file
-change. No Swift fixture, assertion or private-input gate changes for this audit.
+Run full qualification once per pass, on its last round (`--last-round`), or on
+request (`--qualification`). The final-round plan emits
+`coverage_refresh_commands` in `commands`; that refresh executes the classes and
+full qualification while collecting the next map, instead of also executing a
+second qualification command. Supply the actual shared build wrapper (or `CHECKLIST_SWIFT_RUNNER`) when the shared cap applies; standalone generation can run Swift directly. Read-only test listing is the one Swift subcommand that rejects `--skip`; no methods execute there, and the keychain class is excluded before any native execution. A requested
+full qualification keeps the ordinary separate single-worker qualification
+command. `--full` alone remains the fast default without scale/soak cases.
+The planner prints the mode and never executes its commands itself. Checkpoint
+logs and measured failures are retained by the generator; `--resume <logs>` continues a compatible run and `--resume <logs> --reexport` reuses completed native profiles after a generator-only change. Every selected method needs a terminal native result, and exports include instrumented child executable objects. An assertion failure is recorded and returns failure even when coverage collection completed; an interrupted or
+incomplete refresh never authorizes closed-world selection.
+
+The refresh restores the ordinary uninstrumented build before publishing its map, so later affected tests and production builds reuse that configuration. No tests execute during either build-only filter. Coverage collection and this configuration restoration cost a full refresh and are outside the 1–2 minute
+affected-plan goal. A genuinely affected 360-second soak also cannot meet that
+goal; retain its real fixture and report its measured cost. Test filters govern
+execution, while SwiftPM may compile dependent modules incrementally.
 
 ## Private template stores and finer groups
 
@@ -235,17 +219,12 @@ extensions, other global declarations and deleted files retain whole-target
 selection. Mixed paths union groups; any broad input for a target overrides its
 narrow groups. Repository input consumers still supplement that selection.
 
-The explicit Core grammar map selects `OrdinaryMentionPublicBoundaryTests` for
-`OrdinaryMentionTokens.swift` in the fast unit suite, keeping dependent targets broad.
-Qualification still follows Core production dependencies: ordinary-note parsing
-also runs in the writer-traffic fixtures. `default_swift_commands` gives the fast
-blocking component; `qualification_commands` is its separate scale/soak component. A scan of the
-symbol's production readers invalidates that map when a caller is added or
-removed. Unmapped Core source and resource changes retain whole-target coverage
-and the conservative qualification trigger. `--full` always runs the fast
-default even with changed paths; `--full --qualification` always adds all scale
-and soak cases. Test execution filters do not claim a production module split or
-promise SwiftPM will compile only those classes.
+Generated coverage groups include classes in dependent targets. Mixed paths
+union those groups; an unmapped input broadens only the targets in that input's
+module closure. `default_swift_commands` is the ordinary component and
+`qualification_commands` is the affected scale/soak component, except during a
+final-round coverage refresh as described above. Source/test moves and changes to
+the observation environment require a refresh or conservative fallback.
 
 ## Persistent build slots and installed checks
 

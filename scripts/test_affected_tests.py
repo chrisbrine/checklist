@@ -15,11 +15,9 @@ SPEC = importlib.util.spec_from_file_location('affected_tests', Path(__file__).r
 selector = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(selector)
 
-
 def target(name, dependencies=(), kind='library', path=None):
     return {'name': name, 'type': kind, 'path': path or ('Tests/' if kind == 'test' else 'Sources/') + name,
             'target_dependencies': list(dependencies)}
-
 
 GRAPH = {'targets': [
     target('ChecklistProviders'), target('ChecklistCore', ['ChecklistProviders']), target('ChecklistIPC'),
@@ -38,7 +36,6 @@ GRAPH = {'targets': [
     ('ChecklistProviders', ['ChecklistProviders']),
 ]]}
 
-
 class SelectionTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -52,8 +49,169 @@ class SelectionTests(unittest.TestCase):
         for name in ['test_affected_tests.py', 'test_test_instances.py', 'test_prepare_public_source.py']:
             (self.root / 'scripts' / name).touch()
 
-    def plan(self, *paths, full=False, qualification=False, last_round=False):
-        return selector.select(self.root, GRAPH, paths, self.root / '.build', full, qualification, last_round)
+    def plan(self, *paths, full=False, qualification=False, last_round=False, impact_map=None):
+        return selector.select(self.root, GRAPH, paths, self.root / '.build', full, qualification, last_round, impact_map)
+
+    def measured_map(self, sources, complete=True):
+        return {'schema_version': 1, 'commit': 'synthetic-commit', 'complete': complete,
+                'generated_at': '2026-10-26T00:00:00Z', 'generation_seconds': 1.25,
+                'measured_classes': sorted({item for entry in sources.values() for item in entry['classes']}),
+                'measured_qualification_cases': sorted({item for entry in sources.values()
+                                                       for item in entry['qualification_cases']}),
+                'source_hashes': {}, 'sources': sources}
+
+    def test_synthetic_llvm_exports_feed_selection_without_source_declarations(self):
+        spec = importlib.util.spec_from_file_location('test_impact_map',
+                    Path(__file__).resolve().parents[1] / 'script/test_impact_map.py')
+        generator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(generator)
+        path = 'Sources/ChecklistCore/NativeOutcomeRecorder.swift'
+        case = selector.REAL_SIZE_TESTS[0]
+        export = {'data': [{'files': [{'filename': str(self.root / path),
+                                      'segments': [[1, 1, 2, True, True, False]]}]}]}
+        covered = generator.parse_coverage_export(export, self.root)
+        measured = generator.build_map(self.root, [
+            {'class': 'ChecklistCoreTests.NativeOutcomeRecorderTests', 'sources': covered},
+            {'qualification_case': case, 'sources': covered}],
+            'synthetic-commit', '2026-10-26T00:00:00Z', 0.5)
+        measured['complete'] = True
+        plan = self.plan(path, impact_map=measured)
+        self.assertEqual(plan['test_groups'], {'ChecklistCoreTests': ['NativeOutcomeRecorderTests']})
+        self.assertEqual(plan['qualification_tests'], [case])
+        self.assertEqual(plan['group_fallback_paths'], [])
+
+    def test_generated_map_selects_only_executing_classes_and_cases(self):
+        path = 'Sources/ChecklistCore/MediaDecisions.swift'
+        case = 'ChecklistCoreTests.MediaDecisionTests/test450SelectionLostReplyFailedMiddleOnlyRefreshAndLaterReversal'
+        measured = self.measured_map({path: {'classes': ['ChecklistCoreTests.MediaDecisionTests',
+                                                       'ChecklistAppTests.GlossaryTests'],
+                                           'qualification_cases': [case]}})
+        plan = self.plan(path, impact_map=measured)
+        self.assertEqual(plan['test_targets'], ['ChecklistAppTests', 'ChecklistCoreTests'])
+        self.assertEqual(plan['test_groups'], {'ChecklistAppTests': ['GlossaryTests'],
+                                               'ChecklistCoreTests': ['MediaDecisionTests']})
+        self.assertEqual(plan['qualification_tests'], [case])
+        self.assertEqual(plan['qualification_reasons'][case], [path])
+        self.assertEqual(plan['group_fallback_paths'], [])
+        self.assert_case_runs(plan, case)
+
+    def test_skipped_coverage_uses_reported_module_fallback_without_discarding_map(self):
+        path = 'Sources/ChecklistCore/Leaf.swift'
+        private = selector.QUALIFICATION_CASES[0]
+        measured = self.measured_map({path: {'classes': ['ChecklistCoreTests.LeafTests'], 'qualification_cases': []}})
+        measured.update(class_inventory=['ChecklistCoreTests.LeafTests', 'ChecklistCoreTests.PrivateTests'],
+                        qualification_case_inventory=[private])
+        plan = self.plan(path, impact_map=measured)
+        self.assertEqual(plan['test_groups'], {'ChecklistCoreTests': ['LeafTests', 'PrivateTests']})
+        self.assertEqual(plan['qualification_tests'], [private])
+        self.assertEqual(plan['qualification_fallback_cases'], {private: [path]})
+        self.assertEqual(plan['coverage_fallback_classes'], {'ChecklistCoreTests.PrivateTests': [path]})
+        self.assertEqual(self.plan('Sources/ChecklistApp/View.swift', impact_map=measured)['qualification_tests'],
+                         ['ChecklistAppTests.IsolatedDefaultsTests/testPreferencesRemainAbsentAfterChildProcessExit'])
+
+    def test_generated_map_unions_measured_consumers_and_reasons(self):
+        paths = ['Sources/ChecklistCore/First.swift', 'Sources/ChecklistCore/Second.swift']
+        case = selector.REAL_SIZE_TESTS[0]
+        measured = self.measured_map({path: {'classes': ['ChecklistCoreTests.SharedTests',
+                                                         'ChecklistCoreTests.' + name],
+                                             'qualification_cases': [case]}
+                                      for path, name in zip(paths, ['FirstTests', 'SecondTests'])})
+        plan = self.plan(*paths, impact_map=measured)
+        self.assertEqual(plan['test_groups'], {'ChecklistCoreTests': ['FirstTests', 'SecondTests', 'SharedTests']})
+        self.assertEqual(plan['qualification_tests'], [case])
+        self.assertEqual(plan['qualification_reasons'][case], paths)
+
+    def test_generated_empty_coverage_entry_needs_no_swift_execution(self):
+        path = 'Sources/ChecklistApp/Unused.swift'
+        measured = self.measured_map({path: {'classes': [], 'qualification_cases': []}})
+        plan = self.plan(path, impact_map=measured)
+        self.assertEqual(plan['test_targets'], [])
+        self.assertEqual(plan['qualification_tests'], [])
+        self.assertEqual(plan['group_fallback_paths'], [])
+        self.assertEqual(plan['commands'], [selector.VALIDATE])
+
+    def test_unflushable_probe_source_bypasses_even_complete_empty_coverage(self):
+        for path, consumer in [
+            ('Tests/StorageCrashProbe/ReleasedCore/Old.swift', 'ChecklistCoreTests'),
+            ('Tests/ChecklistCLIInputProbe/main.swift', 'ChecklistMCPServerTests'),
+        ]:
+            with self.subTest(path=path):
+                measured = self.measured_map({path: {'classes': [], 'qualification_cases': []}})
+                plan = self.plan(path, impact_map=measured)
+                self.assertIn(consumer, plan['test_targets'])
+                self.assertEqual(plan['group_fallback_paths'], [path])
+                self.assertNotIn(consumer, plan['test_groups'])
+
+    def test_new_source_uses_module_closure_even_with_other_mapped_inputs(self):
+        mapped = 'Sources/ChecklistCore/Existing.swift'
+        new = 'Sources/ChecklistCore/NewHelper.swift'
+        measured = self.measured_map({mapped: {'classes': ['ChecklistCoreTests.ExistingTests'],
+                                               'qualification_cases': []}})
+        plan = self.plan(mapped, new, impact_map=measured)
+        self.assertEqual(plan['group_fallback_paths'], [new])
+        self.assertEqual(len(plan['test_targets']), 7)
+        self.assertEqual(plan['test_groups'], {})
+        self.assertTrue(plan['qualification_tests'])
+
+    def test_unrelated_module_fallback_keeps_mapped_core_class(self):
+        mapped = 'Sources/ChecklistCore/Existing.swift'
+        new = 'Sources/ChecklistApp/NewView.swift'
+        measured = self.measured_map({mapped: {'classes': ['ChecklistCoreTests.ExistingTests'],
+                                               'qualification_cases': []}})
+        plan = self.plan(mapped, new, impact_map=measured)
+        self.assertEqual(plan['test_groups'].get('ChecklistCoreTests'), ['ExistingTests'])
+        self.assertNotIn('ChecklistAppTests', plan['test_groups'])
+        self.assertEqual(plan['group_fallback_paths'], [new])
+
+    def test_incomplete_map_cannot_narrow_module_closure(self):
+        path = 'Sources/ChecklistCore/Existing.swift'
+        measured = self.measured_map({path: {'classes': ['ChecklistCoreTests.ExistingTests'],
+                                             'qualification_cases': []}}, complete=False)
+        plan = self.plan(path, impact_map=measured)
+        self.assertEqual(len(plan['test_targets']), 7)
+        self.assertEqual(plan['test_groups'], {})
+        self.assertEqual(plan['group_fallback_paths'], [path])
+        self.assertTrue(plan['qualification_tests'])
+
+    def test_map_freshness_rejects_missing_old_incomplete_and_test_drift(self):
+        from datetime import datetime, timedelta, timezone
+        def git(*args):
+            return subprocess.check_output(['git', *args], cwd=self.root, text=True).strip()
+        git('init', '-q')
+        git('config', 'user.name', 'Synthetic Test')
+        git('config', 'user.email', 'test@example.invalid')
+        fixture = self.root / 'Tests/ChecklistCoreTests/Fixture.swift'
+        fixture.parent.mkdir(parents=True)
+        fixture.write_text('fixture')
+        git('add', '.')
+        git('commit', '-qm', 'map base')
+        map_path = self.root / 'coverage.json'
+        self.assertEqual(selector.load_impact_map(self.root, map_path)[1]['state'], 'missing')
+        measured = self.measured_map({})
+        measured.update(commit=git('rev-parse', 'HEAD'),
+                        generated_at=datetime.now(timezone.utc).isoformat(),
+                        measured_qualification_cases=list(selector.QUALIFICATION_CASES))
+        map_path.write_text(json.dumps(measured))
+        accepted, status = selector.load_impact_map(self.root, map_path)
+        self.assertIsNotNone(accepted)
+        self.assertEqual(status['state'], 'current')
+        # Production changes are expected; the recorded map still selects their consumers.
+        (self.root / 'Sources/ChecklistCore/NativeOutcomeRecorder.swift').write_text('changed')
+        self.assertIsNotNone(selector.load_impact_map(self.root, map_path)[0])
+        fixture.write_text('changed fixture')
+        self.assertIn('test/build inputs changed', selector.load_impact_map(self.root, map_path)[1]['reason'])
+        fixture.write_text('fixture')
+        measured['generated_at'] = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        map_path.write_text(json.dumps(measured))
+        self.assertIn('old', selector.load_impact_map(self.root, map_path)[1]['reason'])
+        measured['generated_at'] = datetime.now(timezone.utc).isoformat()
+        measured['complete'] = False
+        map_path.write_text(json.dumps(measured))
+        self.assertIsNone(selector.load_impact_map(self.root, map_path)[0])
+        measured['complete'] = True
+        measured['commit'] = '0000000000000000000000000000000000000000'
+        map_path.write_text(json.dumps(measured))
+        self.assertIsNone(selector.load_impact_map(self.root, map_path)[0])
 
     def test_app_only(self):
         plan = self.plan('Sources/ChecklistApp/ContentView.swift')
@@ -65,6 +223,7 @@ class SelectionTests(unittest.TestCase):
         command = plan['swift_commands'][0]
         self.assertEqual(command[command.index('--num-workers') + 1], '10')
         self.assertIn('--enable-dependency-cache', plan['swift_commands'][0])
+        self.assertIn('HumanClaimsKeychainTests', plan['swift_commands'][0])
 
     def test_core_includes_transitive_dependents(self):
         self.assertEqual(self.plan('Sources/ChecklistCore/Domain.swift')['test_targets'],
@@ -137,43 +296,6 @@ class SelectionTests(unittest.TestCase):
             self.assertTrue(any(re.search(pattern, identifier) for pattern in patterns), identifier)
         self.assertFalse(any(re.search(pattern, 'ChecklistCoreTests.StorageSnapshotCapacityTests/testSmall')
                              for pattern in patterns))
-
-    def test_qualification_table_selects_only_declared_inputs_with_reasons(self):
-        case = 'ChecklistCoreTests.MediaDecisionTests/test450SelectionLostReplyFailedMiddleOnlyRefreshAndLaterReversal'
-        path = 'Sources/ChecklistCore/MediaDecisions.swift'
-        plan = self.plan(path)
-        self.assertIn(case, plan['qualification_tests'])
-        self.assertEqual(plan['qualification_reasons'][case], [path])
-        self.assertNotIn(selector.REAL_SIZE_TESTS[0], plan['qualification_tests'])
-        self.assertEqual(plan['qualification_mode'], 'affected')
-        self.assertLess(len(plan['qualification_tests']), len(selector.QUALIFICATION_CASES))
-        self.assertEqual(self.plan('Sources/ChecklistCore/NewHelper.swift')['qualification_tests'], [])
-        self.assertEqual(self.plan('Sources/ChecklistApp/Views/NewView.swift')['qualification_tests'], [])
-
-    def test_ordinary_note_parser_selects_all_six_writer_qualification_cases(self):
-        path = 'Sources/ChecklistCore/OrdinaryMentionTokens.swift'
-        plan = self.plan(path)
-        expected = [
-            'ChecklistCoreTests.TicketLifecycleCleanupTests/testPreparationProgressUnderConstantUnrelatedWritesAndBoundsMemory',
-            'ChecklistCoreTests.TicketLifecycleCleanupTests/testSustainedWritersBoundRSSCPUAndBackoff',
-            'ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeAutomaticFirstPassKeepsConcurrentReadAndWriteUnderTwoSeconds',
-            'ChecklistCoreTests.EvidenceAuthorityTests/testLargeSubmitBlocksOtherCommandsOnlyBriefly',
-            'ChecklistCoreTests.EvidenceAuthorityTests/testLargeReferenceImportBlocksOtherCommandsOnlyBriefly',
-            'ChecklistCoreTests.EvidenceAuthorityTests/testReviewClaimValidatesTheCapturedTargetBeforeTheWriter',
-        ]
-        self.assertEqual(plan['qualification_tests'], expected)
-        self.assertEqual(plan['group_fallback_paths'], [path])
-        self.assertEqual(plan['test_groups'], {})
-        self.assertEqual(len(plan['test_targets']), 7)
-        for case in expected:
-            self.assertEqual(plan['qualification_reasons'][case], [path])
-
-    def test_shared_qualification_inputs_select_their_declared_cases(self):
-        plan = self.plan('Sources/ChecklistCore/Store.swift')
-        self.assertIn('ChecklistCoreTests', plan['test_targets'])
-        self.assertNotIn(selector.REAL_SIZE_TESTS[0], plan['qualification_tests'])
-        self.assertIn('CHECKLIST_QUALIFICATION=1', plan['qualification_commands'][0])
-        self.assertEqual(self.plan('Sources/ChecklistProviders/NewHelper.swift')['qualification_tests'], [])
 
     def test_unknown_inputs_keep_unit_fallback_without_implicit_full_qualification(self):
         for path in ['Package.swift', 'mystery.txt', 'docs/new-fixture.bin']:
@@ -261,23 +383,14 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(len(plan['test_targets']), 7)
         self.assertEqual(len(plan['python_tests']), 3)
 
-    def test_template_store_changes_select_only_declared_qualification_consumers(self):
-        plan = self.plan('Tests/ChecklistTestSupport/TestStore.swift')
-        self.assertNotIn(selector.REAL_SIZE_TESTS[0], plan['qualification_tests'])
-        self.assertIn(selector.QUALIFICATION_TESTS[1], plan['qualification_tests'])
-        self.assertEqual(plan['qualification_reasons'][selector.QUALIFICATION_TESTS[1]],
-                         ['Tests/ChecklistTestSupport/TestStore.swift'])
-
     def test_changed_qualification_fixture_selects_its_case(self):
         path = self.root / 'Tests/ChecklistCoreTests/MediaDecisionTests.swift'
         path.parent.mkdir(parents=True)
         method = 'test450SelectionLostReplyFailedMiddleOnlyRefreshAndLaterReversal'
         path.write_text('func ' + method + '() throws {\n try QualificationSuite.requireEnabled()\n}')
         plan = self.plan(path.relative_to(self.root).as_posix())
-        self.assertEqual(plan['qualification_tests'], ['ChecklistCoreTests.MediaDecisionTests/' + method])
+        self.assertIn('ChecklistCoreTests.MediaDecisionTests/' + method, plan['qualification_tests'])
         self.assertTrue(plan['qualification_commands'])
-        helper = self.plan('Tests/ChecklistTestSupport/TestStore.swift')
-        self.assertEqual(helper['qualification_tests'], list(selector.QUALIFICATION_TESTS))
 
     def test_full_default_overrides_manifest_auto_qualification(self):
         plan = self.plan('Package.swift', full=True)
@@ -295,36 +408,6 @@ class SelectionTests(unittest.TestCase):
         for case in selector.QUALIFICATION_CASES:
             self.assertTrue(any(re.search(pattern, case) for pattern in patterns), case)
         self.assertFalse(any(re.search(pattern, 'ChecklistCoreTests.CoreTests/testSmall') for pattern in patterns))
-
-    def test_closed_core_helper_selects_its_groups_and_mapped_dependents(self):
-        plan = self.plan('Sources/ChecklistCore/NativeOutcomeRecorder.swift')
-        self.assertEqual(plan['test_targets'], ['ChecklistAppTests', 'ChecklistCoreTests'])
-        self.assertEqual(plan['test_groups'], {'ChecklistCoreTests': ['NativeOutcomeRecorderTests'],
-                                               'ChecklistAppTests': ['GlossaryTests']})
-        self.assertFalse(plan['qualification'])
-        self.assertEqual(plan['qualification_tests'], [])
-        self.assertEqual(plan['group_fallback_paths'], [])
-        self.assertEqual(len(plan['default_swift_commands']), 1)
-        self.assertEqual(plan['isolated_test_groups'], [])
-        self.assertIn('^ChecklistCoreTests\\.(?:NativeOutcomeRecorderTests)(?:/|$)', plan['swift_commands'][0])
-
-    def test_new_symbol_reader_invalidates_closed_group(self):
-        (self.root / 'Sources/ChecklistCore/Another.swift').write_text('NativeOutcomeRecorder()')
-        plan = self.plan('Sources/ChecklistCore/NativeOutcomeRecorder.swift')
-        self.assertNotIn('ChecklistCoreTests', plan['test_groups'])
-        self.assertFalse(plan['qualification'])
-        self.assertEqual(plan['group_fallback_paths'], ['Sources/ChecklistCore/NativeOutcomeRecorder.swift'])
-
-    def test_unmapped_core_input_overrides_narrow_group(self):
-        plan = self.plan('Sources/ChecklistCore/NativeOutcomeRecorder.swift', 'Sources/ChecklistCore/Store.swift')
-        self.assertNotIn('ChecklistCoreTests', plan['test_groups'])
-        self.assertTrue(plan['qualification'])
-        self.assertTrue(plan['isolated_test_groups'])
-        docs = self.plan('Sources/ChecklistCore/NativeOutcomeRecorder.swift', 'README.md')
-        self.assertIn('ChecklistCoreTests', docs['test_groups'])
-        self.assertFalse(docs['qualification'])
-        resource = self.plan('Sources/ChecklistCore/NativeOutcomeRecorder.swift', 'docs/integrations.md')
-        self.assertNotIn('ChecklistCoreTests', resource['test_groups'])
 
     def test_independent_test_files_select_classes_but_shared_helpers_do_not(self):
         directory = self.root / 'Tests/ChecklistCoreTests'; directory.mkdir(parents=True)
@@ -379,17 +462,6 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(len(plan['default_swift_commands']), 2)
         self.assertIn('^ChecklistMCPServerTests\\.DelegateChildBindingTests(?:/|$)', plan['default_swift_commands'][0])
         self.assertTrue(plan['default_swift_commands'][1][-1].endswith('/debug/ChecklistMCPServerTests.xctest'))
-
-    def test_view_outside_declared_defaults_inputs_selects_no_qualification(self):
-        plan = self.plan('Sources/ChecklistApp/ContentView.swift')
-        self.assertEqual(plan['qualification_tests'], [])
-        self.assertEqual(plan['qualification_commands'], [])
-        self.assertEqual(plan['qualification_mode'], 'affected')
-        path = 'Sources/ChecklistApp/Stores/ChecklistStore.swift'
-        selected = self.plan(path)
-        case = 'ChecklistAppTests.IsolatedDefaultsTests/testPreferencesRemainAbsentAfterChildProcessExit'
-        self.assertEqual(selected['qualification_tests'], [case])
-        self.assertEqual(selected['qualification_reasons'], {case: [path]})
 
     def test_ipc_timing_qualification_follows_ipc_source(self):
         plan = self.plan('Sources/ChecklistIPC/ChecklistClient.swift')
@@ -501,7 +573,8 @@ class SelectionTests(unittest.TestCase):
             changed = self.plan(path)
             self.assertFalse(changed['timing_deferred'])
             for case in expected:
-                self.assert_case_runs(changed, case, 'timing_commands')
+                if '.HumanClaimsKeychainTests/' not in case:
+                    self.assert_case_runs(changed, case, 'timing_commands')
 
     def test_full_qualification_mode_is_explicit_or_last_round_and_not_target_limited(self):
         for options, mode in [({'qualification': True}, 'requested-full'),
@@ -510,17 +583,17 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(plan['qualification_mode'], mode)
             self.assertEqual(plan['qualification_tests'], list(selector.QUALIFICATION_CASES))
             self.assertEqual(plan['default_swift_commands'], [])
-            for case in selector.QUALIFICATION_CASES:
-                self.assert_case_runs(plan, case)
+            if options.get('last_round'):
+                self.assertEqual(plan['swift_commands'], [])
+                self.assertEqual(plan['qualification_commands'], [])
+                self.assertEqual(len(plan['coverage_refresh_commands']), 1)
+                self.assertIn('script/test_impact_map.py', plan['coverage_refresh_commands'][0])
+                self.assertIn(plan['coverage_refresh_commands'][0], plan['commands'])
+            else:
+                self.assertEqual(plan['coverage_refresh_commands'], [])
+                for case in selector.QUALIFICATION_CASES:
+                    self.assert_case_runs(plan, case)
         self.assertEqual(self.plan(full=True)['qualification_mode'], 'full-default')
-
-    def test_deleted_extension_fixture_still_selects_its_registered_methods(self):
-        path = 'Tests/ChecklistCoreTests/TicketCleanupContentionTests.swift'
-        self.assertFalse((self.root / path).exists())
-        plan = self.plan(path)
-        self.assertIn('ChecklistCoreTests.TicketLifecycleCleanupTests/testSustainedWritersBoundRSSCPUAndBackoff',
-                      plan['qualification_tests'])
-        self.assertNotIn(selector.REAL_SIZE_TESTS[0], plan['qualification_tests'])
 
     def test_unmapped_source_falls_back_to_module_closure_and_reports_path(self):
         path = 'Sources/ChecklistCore/NewHelper.swift'
@@ -528,11 +601,6 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(plan['group_fallback_paths'], [path])
         self.assertEqual(len(plan['test_targets']), 7)
         self.assertEqual(plan['test_groups'], {})
-
-    def test_unrelated_source_input_does_not_broaden_mapped_core_groups(self):
-        plan = self.plan('Sources/ChecklistCore/NativeOutcomeRecorder.swift', 'Sources/ChecklistApp/NewView.swift')
-        self.assertEqual(plan['test_groups'].get('ChecklistCoreTests'), ['NativeOutcomeRecorderTests'])
-        self.assertNotIn('ChecklistAppTests', plan['test_groups'])
 
     def test_full_qualification_cli_needs_no_changed_paths(self):
         for switch, mode in [('--qualification', 'requested-full'), ('--last-round', 'pass-final-round')]:
@@ -634,6 +702,54 @@ class SelectionTests(unittest.TestCase):
             selector.package_graph(self.root, self.root / '.build')
             self.assertEqual(run.call_count, 2)
 
+    def test_nested_package_manifest_changes_invalidate_graph_cache(self):
+        (self.root / 'Package.swift').write_text('root package')
+        manifest = self.root / 'Packages/Nested/Package.swift'
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text('first nested package')
+        with patch.object(selector.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, json.dumps(GRAPH))) as run:
+            selector.package_graph(self.root, self.root / '.build')
+            selector.package_graph(self.root, self.root / '.build')
+            self.assertEqual(run.call_count, 1)
+            manifest.write_text('second nested package')
+            selector.package_graph(self.root, self.root / '.build')
+            self.assertEqual(run.call_count, 2)
+            manifest.unlink()
+            selector.package_graph(self.root, self.root / '.build')
+            self.assertEqual(run.call_count, 3)
+
+    def test_runtime_fixture_change_invalidates_observed_coverage(self):
+        from datetime import datetime, timezone
+        measured = self.measured_map({})
+        measured.update(generated_at=datetime.now(timezone.utc).isoformat(),
+                        measured_qualification_cases=list(selector.QUALIFICATION_CASES))
+        map_path = self.root / 'coverage.json'
+        map_path.write_text(json.dumps(measured))
+        for path in ['examples/media-intake.json', 'Sources/ChecklistApp/Assets/catalog.json']:
+            with self.subTest(path=path), patch.object(selector, 'changed_paths', return_value=[path]), \
+                    patch.object(selector.subprocess, 'run'):
+                mapping, status = selector.load_impact_map(self.root, map_path)
+                self.assertIsNone(mapping)
+                self.assertIn(path, status['reason'])
+
+    def test_nested_package_build_and_test_inputs_invalidate_coverage(self):
+        from datetime import datetime, timezone
+        measured = self.measured_map({})
+        measured.update(generated_at=datetime.now(timezone.utc).isoformat(),
+                        measured_qualification_cases=list(selector.QUALIFICATION_CASES))
+        map_path = self.root / 'coverage.json'
+        map_path.write_text(json.dumps(measured))
+        for path in ['Packages/Runtime/Package.swift', 'Packages/Runtime/Package.resolved',
+                     'Packages/Runtime/Tests/RuntimeTests/Fixture.swift']:
+            with self.subTest(path=path), patch.object(selector, 'changed_paths', return_value=[path]), \
+                 patch.object(selector.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+                loaded, status = selector.load_impact_map(self.root, map_path)
+                self.assertIsNone(loaded)
+                self.assertIn(path, status['reason'])
+        with patch.object(selector, 'changed_paths', return_value=['Packages/Runtime/Sources/Runtime/File.swift']), \
+             patch.object(selector.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+            self.assertIsNotNone(selector.load_impact_map(self.root, map_path)[0])
+
     def test_base_diff_includes_staged_unstaged_deleted_renamed_and_untracked(self):
         def git(*args):
             return subprocess.check_output(['git', *args], cwd=self.root)
@@ -663,7 +779,6 @@ class SelectionTests(unittest.TestCase):
                 selector.main(['--root', str(self.root), '--json', *args])
             self.assertEqual(json.loads(output.getvalue())['test_targets'], ['ChecklistAppTests', 'ChecklistProvidersTests'])
 
-
 # These tests create a different script in an owned workspace, or reject the
 # requested execution before a read. Neither reads our repository's validator.
 SYNTHETIC_FILE_REFERENCES = {
@@ -675,7 +790,6 @@ SYNTHETIC_EXECUTABLE_REFERENCES = {
     ('Tests/ChecklistIPCTests/ChecklistInstanceTests.swift', 'ChecklistApp'),
     ('Tests/ChecklistIPCTests/ChecklistInstanceTests.swift', 'ChecklistService'),
 }
-
 
 def repository_references(root):
     """Audit path literals, including directory enumerations, in Swift inputs.
@@ -701,7 +815,6 @@ def repository_references(root):
                     if item.is_file():
                         references.append((source.relative_to(root).as_posix(), item.relative_to(root).as_posix()))
     return references
-
 
 def python_repository_references(root):
     """Audit literal repository paths passed to Python file reads.
@@ -739,11 +852,16 @@ def python_repository_references(root):
                     references.add((source.relative_to(root).as_posix(), item.relative_to(root).as_posix()))
     return sorted(references)
 
-
 class RepositoryDependencyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.root = Path(__file__).resolve().parents[1]
+        # These audit package/resource fallback, independently of an ignored
+        # machine-local coverage cache. Generated-map tests use synthetic exports.
+        cls.coverage_patch = patch.object(selector, 'load_impact_map',
+            return_value=(None, {'state': 'graph-audit-fixture'}))
+        cls.coverage_patch.start()
+        cls.addClassCleanup(cls.coverage_patch.stop)
         # Reuse the assigned persistent slot when present. This describes the
         # actual package; it never builds Swift or runs the application.
         cls.scratch = cls.root.parent / '.build'
@@ -754,65 +872,6 @@ class RepositoryDependencyTests(unittest.TestCase):
 
     def owner(self, path):
         return next(t for t in self.targets if path.startswith(t['path'] + '/'))
-
-    def test_actual_graph_qualification_inputs_are_complete_and_runnable(self):
-        self.assertEqual(set(selector.QUALIFICATION_SOURCE_PATHS), set(selector.QUALIFICATION_CASES))
-        for case, patterns in selector.QUALIFICATION_SOURCE_PATHS.items():
-            self.assertTrue(patterns, case)
-            fixtures = []
-            for pattern in patterns:
-                self.assertNotIn(pattern, ['Sources/ChecklistCore/*', 'Sources/ChecklistApp/*', 'Sources/ChecklistIPC/*'])
-                matches = list(self.root.glob(pattern))
-                self.assertTrue(matches, (case, pattern))
-                fixtures.extend(p for p in matches if p.suffix == '.swift' and p.is_file()
-                                and p.relative_to(self.root).as_posix().startswith('Tests/'))
-            self.assertTrue(any('func ' + case.split('/')[1] + '(' in fixture.read_text()
-                                for fixture in fixtures), case)
-        for path in ['Sources/ChecklistCore/StorageCompactManifest.swift',
-                     'Sources/ChecklistCore/NativeOutcomeRecorder.swift',
-                     'Sources/ChecklistIPC/ChecklistClient.swift',
-                     'Sources/ChecklistApp/Support/Canceled.swift']:
-            plan = selector.select(self.root, self.graph, [path], self.scratch)
-            expected = [case for case, patterns in selector.QUALIFICATION_SOURCE_PATHS.items()
-                        if any(selector.fnmatchcase(path, pattern) for pattern in patterns)]
-            self.assertEqual(plan['qualification_tests'], expected)
-            for case in expected:
-                self.assertNotIn(case, plan['skip'])
-                self.assertEqual(plan['qualification_reasons'][case], [path])
-                self.assertTrue(any('^' + re.escape(case) + '$' in command and '--skip' not in command
-                                    for command in plan['qualification_commands']))
-
-    def test_actual_graph_mapped_view_selects_only_consumer_groups(self):
-        path = 'Sources/ChecklistApp/Views/TicketStatusReason.swift'
-        plan = selector.select(self.root, self.graph, [path], self.scratch)
-        self.assertEqual(plan['test_targets'], ['ChecklistAppTests'])
-        self.assertIn('TicketStatusReasonTests', plan['test_groups']['ChecklistAppTests'])
-        self.assertIn('GlossaryTests', plan['test_groups']['ChecklistAppTests'])
-        self.assertEqual(plan['group_fallback_paths'], [])
-        self.assertEqual(plan['qualification_tests'], [])
-        self.assertEqual(plan['timing_commands'], [])
-        self.assertTrue(plan['timing_deferred'])
-        classes = set()
-        for source in (self.root / 'Tests/ChecklistAppTests').glob('*.swift'):
-            classes.update(re.findall(r'final class (\w+)\s*:\s*XCTestCase', source.read_text()))
-        self.assertTrue(set(plan['test_groups']['ChecklistAppTests']).issubset(classes))
-
-    def test_actual_graph_leaf_maps_cover_unit_and_dependent_consumers(self):
-        for path, expected in [
-            ('Sources/ChecklistCore/MediaListConfiguration.swift', ['ChecklistAppTests', 'ChecklistCoreTests']),
-            ('Sources/ChecklistApp/Models/TicketPurgePreview.swift', ['ChecklistAppTests']),
-            ('Sources/ChecklistApp/Support/CodexComposeLink.swift', ['ChecklistAppTests']),
-        ]:
-            with self.subTest(path=path):
-                plan = selector.select(self.root, self.graph, [path], self.scratch)
-                self.assertEqual(plan['test_targets'], expected)
-                self.assertEqual(plan['group_fallback_paths'], [])
-                for name, groups in plan['test_groups'].items():
-                    target_path = next(t['path'] for t in self.targets if t['name'] == name)
-                    classes = set()
-                    for source in (self.root / target_path).rglob('*.swift'):
-                        classes.update(re.findall(r'final class (\w+)\s*:\s*XCTestCase', source.read_text()))
-                    self.assertTrue(set(groups).issubset(classes), (path, set(groups) - classes))
 
     def test_repository_input_map_covers_swift_literals(self):
         found = {}
@@ -908,7 +967,6 @@ class RepositoryDependencyTests(unittest.TestCase):
             target = next(t for t in self.targets if t['name'] == name)
             plan = selector.select(self.root, self.graph, [target['path'] + '/main.swift'], self.scratch)
             self.assertTrue(consumers.issubset(plan['test_targets']), (name, plan))
-
 
 if __name__ == '__main__':
     unittest.main()
