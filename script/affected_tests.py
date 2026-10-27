@@ -409,11 +409,12 @@ def load_impact_map(root, path=None, max_age_hours=24):
                     or not isinstance(observation.get('reason'), str)
                     or not observation['reason']
                     or observation.get('source') != 'index-store'
-                    or type(observation.get('max_depth')) is not int
-                    or observation['max_depth'] < 1
+                    or 'max_depth' in observation
+                    or not isinstance(observation.get('walk'), dict)
+                    or observation['walk'].get('complete') is not True
                     or not isinstance(observation.get('sources'), list)
                     or not observation['sources']):
-                raise ValueError('unmeasurable coverage class needs nonempty index-store edges and a bounded depth')
+                raise ValueError('unmeasurable coverage class needs nonempty index-store edges and a complete fixed-point walk')
             for path in observation['sources']:
                 if (not isinstance(path, str) or not path or '\\' in path
                         or PurePosixPath(path).is_absolute()

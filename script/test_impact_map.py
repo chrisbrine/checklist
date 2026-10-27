@@ -23,7 +23,6 @@ from index_store import (read_index_store, repository_path, DECLARATION, DEFINIT
                          EXTENDEDBY, CALLABLE_KINDS)
 
 SCHEMA_VERSION = 1
-INDEX_DEPTH = 5
 
 
 def _source_path(filename, root):
@@ -70,7 +69,7 @@ def parse_coverage_export(payload, root):
 
 
 def build_map(root, observations, commit, generated_at, generation_seconds, inventory=None,
-              index_export=None, index_depth=INDEX_DEPTH):
+              index_export=None):
     """Union observations; inventory includes instrumented files with zero hits.
 
     Each observation has sources and either class or qualification_case. The
@@ -81,9 +80,13 @@ def build_map(root, observations, commit, generated_at, generation_seconds, inve
     paths = set(inventory or ())
     for observation in observations:
         paths.update(observation['sources'])
-    index_edges = {item['class']: index_references(root, item['class'], index_export, index_depth)
-                   if index_export is not None else set()
-                   for item in observations if item.get('class') and item.get('skipped')}
+    index_edges, index_walks = {}, {}
+    for item in observations:
+        if item.get('class') and item.get('skipped'):
+            group = item['class']
+            index_walks[group] = {}
+            index_edges[group] = (index_references(root, group, index_export, index_walks[group])
+                                  if index_export is not None else set())
     for edges in index_edges.values():
         paths.update(edges)
     sources = {path: {'classes': set(), 'qualification_cases': set()} for path in sorted(paths)}
@@ -94,7 +97,7 @@ def build_map(root, observations, commit, generated_at, generation_seconds, inve
         if group and observation.get('skipped'):
             unmeasurable[group] = {
                 'reason': observation.get('unmeasurable_reason', 'All native methods skipped; see generation logs'),
-                'sources': sorted(index_edges[group]), 'source': 'index-store', 'max_depth': index_depth}
+                'sources': sorted(index_edges[group]), 'source': 'index-store', 'walk': index_walks[group]}
         if group and not observation.get('skipped'):
             classes.add(group)
         if case and not observation.get('skipped'):
@@ -120,7 +123,8 @@ def coverage_gaps(result, classes, cases):
     missing_classes = set(classes) - set(result['measured_classes']) - set(result['coverage_unmeasurable_classes'])
     missing_cases = set(cases) - set(result['measured_qualification_cases'])
     missing_index = [group for group, entry in result['coverage_unmeasurable_classes'].items()
-                     if entry.get('source') != 'index-store' or not entry.get('sources')]
+                     if entry.get('source') != 'index-store' or not entry.get('sources')
+                     or entry.get('walk', {}).get('complete') is not True]
     return (['Missing index-store dependencies: ' + value for value in sorted(missing_index)] +
             ['Unmeasured class: ' + value for value in sorted(missing_classes)] +
             ['Unmeasured qualification case: ' + value for value in sorted(missing_cases)])
@@ -148,15 +152,16 @@ def inspection_references(root, identifier, executed_sources=()):
     return references
 
 
-def index_references(root, identifier, export, max_depth=INDEX_DEPTH):
+def index_references(root, identifier, export, walk_stats=None):
     """Resolve test-file references by USR, then traverse recorded declaration edges.
 
-    Depth counts outgoing edges after a directly referenced declaration. Types do
+    Follow the finite graph to a fixed point, visiting each USR once. Types do
     not expand to all their members; only callable-local declarations are entered.
     This is conservative static reachability, not execution/branch coverage.
     """
-    if not isinstance(max_depth, int) or isinstance(max_depth, bool) or max_depth < 0:
-        raise ValueError('index depth must be a nonnegative integer')
+    started = time.monotonic()
+    if walk_stats is not None:
+        walk_stats.update(complete=False, nodes=0, edges=0, seconds=0.0)
     if not isinstance(export, dict) or export.get('schema_version') != 1 or not isinstance(export.get('occurrences'), list):
         raise ValueError('invalid index export')
     root = Path(root)
@@ -189,8 +194,6 @@ def index_references(root, identifier, export, max_depth=INDEX_DEPTH):
                   and item['name'] == owner and item['roles'] & (DECLARATION | DEFINITION)}
     files = {path for path, item in rows if item['usr'] in class_usrs
              and item['roles'] & (DECLARATION | DEFINITION | EXTENDEDBY)}
-    if not files:
-        return set()
     seeds = set()
     for path, item in rows:
         usr, roles = item['usr'], item['roles']
@@ -203,14 +206,19 @@ def index_references(root, identifier, export, max_depth=INDEX_DEPTH):
                     and kinds.get(parent) in CALLABLE_KINDS):
                 edges.setdefault(parent, set()).add(usr)
     references, visited, frontier = set(files), set(), seeds
-    for _ in range(max_depth + 1):
+    edge_count = 0
+    while frontier:
         frontier -= visited
         if not frontier:
             break
         for usr in frontier:
             references.update(locations.get(usr, ()))
         visited.update(frontier)
+        edge_count += sum(len(edges.get(usr, ())) for usr in frontier)
         frontier = {callee for usr in frontier for callee in edges.get(usr, ())}
+    if walk_stats is not None:
+        walk_stats.update(complete=True, nodes=len(visited), edges=edge_count,
+                          seconds=round(time.monotonic() - started, 6))
     return references
 
 
@@ -234,7 +242,7 @@ def validate_index_sources(root, export, require_hashes=True):
                 raise ValueError('index export occurrence has no source hash')
 
 
-def refresh_index_map(root, data, export, index_depth=INDEX_DEPTH):
+def refresh_index_map(root, data, export):
     """Replace skipped-class edges while preserving the original native evidence.
 
     This bounded refresh does not run skipped tests, renew coverage timestamps or
@@ -260,8 +268,10 @@ def refresh_index_map(root, data, export, index_depth=INDEX_DEPTH):
     validate_index_sources(root, export, require_hashes=False)
     result = json.loads(json.dumps(data))
     for group, observation in result.get('coverage_unmeasurable_classes', {}).items():
-        references = index_references(root, group, export, index_depth)
-        observation.update(source='index-store', sources=sorted(references), max_depth=index_depth)
+        walk = {}
+        references = index_references(root, group, export, walk)
+        observation.pop('max_depth', None)
+        observation.update(source='index-store', sources=sorted(references), walk=walk)
         for path in references:
             result['sources'].setdefault(path, {'classes': [], 'qualification_cases': []})
             result['source_hashes'][path] = current[path]
@@ -271,7 +281,7 @@ def refresh_index_map(root, data, export, index_depth=INDEX_DEPTH):
             result['input_hashes'][path] = hashlib.sha256((root / path).read_bytes()).hexdigest()
     result['index_store'] = {key: value for key, value in export.items()
                              if key not in ('occurrences', 'source_hashes')}
-    result['index_store']['max_depth'] = index_depth
+    result['index_store']['traversal'] = 'fixed-point'
     errors = coverage_gaps(result, result.get('class_inventory', []),
                            result.get('qualification_case_inventory', []))
     result['errors'] = list(data.get('errors', [])) + errors
@@ -611,7 +621,7 @@ def main(argv=None):
                        index_export=exported_index if 'exported_index' in locals() else None)
     result['index_store'] = {key: value for key, value in locals().get('exported_index', {}).items()
                              if key not in ('occurrences', 'source_hashes')}
-    result['index_store']['max_depth'] = INDEX_DEPTH
+    result['index_store']['traversal'] = 'fixed-point'
     result['invocation_seconds'] = result['generation_seconds']
     result['generation_seconds'] = round((datetime.now(timezone.utc) -
         datetime.fromisoformat(origin['started_at'])).total_seconds(), 3)

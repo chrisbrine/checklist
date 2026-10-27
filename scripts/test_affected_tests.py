@@ -121,7 +121,7 @@ class SelectionTests(unittest.TestCase):
         measured['class_inventory'] = [group]
         measured['coverage_unmeasurable_classes'] = {
             group: {'reason': 'owner prohibits keychain access', 'sources': [referenced],
-                    'source': 'index-store', 'max_depth': 5}}
+                    'source': 'index-store', 'walk': {'complete': True, 'nodes': 1, 'edges': 0, 'seconds': 0.0}}}
         plan = self.plan(referenced, impact_map=measured)
         self.assertEqual(plan['test_groups'], {'ChecklistAppTests': ['HumanClaimsKeychainTests']})
         self.assertEqual(plan['coverage_unmeasurable_classes'], {group: [referenced]})
@@ -167,8 +167,18 @@ class SelectionTests(unittest.TestCase):
         unrelated = 'Sources/ChecklistCore/Unrelated.swift'
         (self.root / cleanup).write_text('// synthetic declaration locations\n')
         (self.root / unrelated).write_text('// unrelated declaration location\n')
-        occurrence('Sources/ChecklistCore/Router.swift', 'ticketCleanupRead', 4 | 32,
-                   [{'usr': 'Router.swift', 'roles': 8192}])
+        # The receipt dependency lies beyond five recorded edges. Each helper
+        # lives in its own source file so a truncated traversal cannot hide it.
+        parent, parent_file = 'Router.swift', 'Sources/ChecklistCore/Router.swift'
+        for level in range(6):
+            usr = 'helper%d' % level
+            file = 'Sources/ChecklistCore/Helper%d.swift' % level
+            (self.root / file).write_text('// synthetic declaration location\n')
+            occurrence(parent_file, usr, 4 | 32, [{'usr': parent, 'roles': 8192}])
+            occurrence(file, usr, 2)
+            parent, parent_file = usr, file
+        occurrence(parent_file, 'ticketCleanupRead', 4 | 32,
+                   [{'usr': parent, 'roles': 8192}])
         occurrence(cleanup, 'ticketCleanupRead', 2)
         occurrence(cleanup, 'ticketCleanupPassProjection', 4 | 32,
                    [{'usr': 'ticketCleanupRead', 'roles': 8192}])
@@ -180,7 +190,7 @@ class SelectionTests(unittest.TestCase):
         inventory = ['Sources/ChecklistCore/' + filename for filename in used] + [cleanup, unrelated]
         measured = generator.build_map(self.root, observations, 'synthetic-commit',
                     '2026-10-26T00:00:00Z', 0.5, inventory=inventory,
-                    index_export={'schema_version': 1, 'occurrences': occurrences}, index_depth=5)
+                    index_export={'schema_version': 1, 'occurrences': occurrences})
         measured['complete'] = True
         self.assertEqual(measured['measured_classes'], [])
         for name, filename in zip(names, used):
@@ -193,7 +203,7 @@ class SelectionTests(unittest.TestCase):
                 self.assertEqual(plan['test_group_sources'],
                                  {group: {'source': 'index-store', 'paths': [path]}})
                 self.assertEqual(plan['group_fallback_paths'], [])
-                self.assertEqual(measured['coverage_unmeasurable_classes'][group]['max_depth'], 5)
+                self.assertIs(measured['coverage_unmeasurable_classes'][group]['walk']['complete'], True)
         plan = self.plan(unrelated, impact_map=measured)
         self.assertEqual(plan['test_targets'], [])
         self.assertEqual(plan['test_group_sources'], {})
@@ -821,16 +831,27 @@ class SelectionTests(unittest.TestCase):
             measured['coverage_unmeasurable_classes'] = {
                 'ChecklistAppTests.ForbiddenTests': {'reason': 'Owner forbids keychain',
                     'sources': ['Sources/ChecklistCore/HumanClaims.swift'],
-                    'source': 'index-store', 'max_depth': 5}}
+                    'source': 'index-store', 'walk': {'complete': True, 'nodes': 1, 'edges': 0, 'seconds': 0.0}}}
             map_path.write_text(json.dumps(measured))
             loaded, status = selector.load_impact_map(self.root, map_path)
             self.assertIsNotNone(loaded)
             self.assertEqual(loaded['measured_classes'], [])
             self.assertEqual(status['unmeasured_classes'], ['ChecklistAppTests.ForbiddenTests'])
             observation = measured['coverage_unmeasurable_classes']['ChecklistAppTests.ForbiddenTests']
+            # A legacy depth-cut map must fall back even when labeled complete.
+            walk = observation.pop('walk')
+            observation['max_depth'] = 5
+            map_path.write_text(json.dumps(measured))
+            loaded, status = selector.load_impact_map(self.root, map_path)
+            self.assertIsNone(loaded)
+            self.assertEqual(status['state'], 'fallback')
+            self.assertIn('complete fixed-point walk', status['reason'])
+            del observation['max_depth']
+            observation['walk'] = walk
             for field, invalid in [('source', None), ('source', 'static-reference'),
                                    ('source', 'coverage'), ('source', 'index'),
-                                   ('max_depth', None), ('max_depth', 0), ('max_depth', True),
+                                   ('walk', None), ('walk', {}), ('walk', {'complete': False}),
+                                   ('walk', {'complete': 1}),
                                    ('sources', []), ('sources', None),
                                    ('sources', ['../Sources/Escape.swift']),
                                    ('sources', ['/Sources/Absolute.swift']),

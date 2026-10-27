@@ -147,9 +147,9 @@ that cannot be measured are recorded in `coverage_unmeasurable_classes` with
 their native skip or owner-rule reason and `source: "index-store"`. The compiler
 index identifies each class file (and indexed extensions), resolves its referenced
 declarations by USR to their defining source files, and follows recorded
-called-by/contained-by edges for at most five outgoing declaration edges after
-each direct reference. Callable-local declarations are followed; a type reference
-does not expand to every member or extension. This conservatively includes
+called-by/contained-by edges until the visited-set frontier is empty, with no
+depth, node-count or time cutoff. Callable-local declarations are followed; a type
+reference does not expand to every member or extension. This conservatively includes
 reachable router branches; it does not specialize dispatch by method-name strings
 or establish that a branch executed. Lexical symbol matching is not used.
 They are selected only when one of those indexed source files changes;
@@ -158,7 +158,11 @@ names `index-store` for each selected class. No module closure adds unmeasured
 classes or qualification cases for a mapped file. Skipped coverage is never
 presented as measured coverage. The owner-forbidden keychain class uses the same
 index path without executing it. Missing index dependencies keep generation
-incomplete, and the loader refuses legacy lexical exceptions.
+incomplete. Each class records a `walk` with `complete`, visited USR `nodes`,
+traversed distinct `edges` (including cycle edges) and elapsed `seconds` for graph
+construction and traversal. The loader requires a complete walk and refuses
+legacy lexical or depth-cut exceptions. An interrupted refresh cannot publish
+a complete map.
 A new/unmapped source falls back to the package module closure, including its
 qualification cases, and appears in `group_fallback_paths`.
 
@@ -221,7 +225,8 @@ python3 script/test_impact_map.py --scratch-path <build-slot>/.build --refresh-i
 Build that index from the same source/test/manifest inputs first. The refresh
 requires the original inputs to match, preserves coverage timestamps, commit,
 failures and measured edges, and records the input map hash and index provenance.
-It changes only index/generator implementation fingerprints. `--index-store-path`
+It changes only index/generator implementation fingerprints and replaces legacy
+depth metadata with fixed-point traversal receipts. `--index-store-path`
 can read an already built store directly instead of a saved export; a full
 refresh can consume either input too. Saved exports include indexed source
 hashes, unit/record counts and generation time; both full generation and index-only

@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 SPEC = importlib.util.spec_from_file_location('test_impact_map', Path(__file__).resolve().parents[1] / 'script/test_impact_map.py')
 impact = importlib.util.module_from_spec(SPEC)
@@ -152,7 +152,7 @@ class CoverageMapTests(unittest.TestCase):
         self.assertEqual(result['measured_classes'], [])
         self.assertEqual(result['coverage_unmeasurable_classes'], {
             'ChecklistCoreTests.CoreTests': {'reason': 'Owner forbids keychain access',
-                'sources': [used, test], 'source': 'index-store', 'max_depth': 5}})
+                'sources': [used, test], 'source': 'index-store', 'walk': ANY}})
         self.assertEqual(result['sources'][used]['classes'], [])
 
     def test_index_references_do_not_confuse_unrelated_member_names(self):
@@ -256,7 +256,7 @@ class CoverageMapTests(unittest.TestCase):
         self.assertIn(cleanup, result['coverage_unmeasurable_classes']['ChecklistCoreTests.CoreTests']['sources'])
         self.assertEqual(result['coverage_unmeasurable_classes']['ChecklistCoreTests.CoreTests']['source'], 'index-store')
 
-    def test_index_call_graph_depth_is_bounded_and_cycles_terminate(self):
+    def test_index_call_graph_reaches_beyond_five_edges_and_cycles_terminate(self):
         test = 'Tests/ChecklistCoreTests/CoreTests.swift'
         paths = ['Sources/ChecklistCore/Level%d.swift' % level for level in range(7)]
         rows = []
@@ -271,20 +271,19 @@ class CoverageMapTests(unittest.TestCase):
             self.index_occurrence(paths[2], 'level0', 'level0', roles=36,
                                   relations=[{'usr': 'level2', 'roles': 8192}])])
         export = self.class_index(*rows)
-        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export, max_depth=0),
-                         {test, paths[0]})
-        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export, max_depth=2),
-                         {test, *paths[:3]})
         self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export),
-                         {test, *paths[:6]})
+                         {test, *paths})
         result = impact.build_map(self.root, [
             {'class': 'ChecklistCoreTests.CoreTests', 'sources': [], 'skipped': True}
-        ], 'abc', 'now', 0, index_export=export, index_depth=2)
+        ], 'abc', 'now', 0, index_export=export)
         unmeasurable = result['coverage_unmeasurable_classes']['ChecklistCoreTests.CoreTests']
-        self.assertEqual(unmeasurable['sources'], sorted({test, *paths[:3]}))
-        self.assertEqual(unmeasurable['max_depth'], 2)
-        with self.assertRaises(ValueError):
-            impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export, max_depth=-1)
+        self.assertEqual(unmeasurable['sources'], sorted({test, *paths}))
+        walk = unmeasurable['walk']
+        self.assertIs(walk['complete'], True)
+        self.assertEqual(walk['nodes'], 8)  # Class seed plus all seven declarations.
+        self.assertEqual(walk['edges'], 7)  # Six chain edges plus the cycle.
+        self.assertGreaterEqual(walk['seconds'], 0)
+        self.assertNotIn('max_depth', unmeasurable)
 
     def test_index_call_graph_follows_contained_local_declarations(self):
         test = 'Tests/ChecklistCoreTests/CoreTests.swift'
@@ -325,7 +324,7 @@ class CoverageMapTests(unittest.TestCase):
                      'unmeasurable_reason': 'Store-copy qualification'}
                 ], 'abc', 'now', 0, index_export=export)
                 self.assertEqual(result['coverage_unmeasurable_classes']['ChecklistCoreTests.CoreTests'], {
-                    'reason': 'Store-copy qualification', 'sources': [], 'source': 'index-store', 'max_depth': 5})
+                    'reason': 'Store-copy qualification', 'sources': [], 'source': 'index-store', 'walk': ANY})
                 self.assertEqual(impact.coverage_gaps(result, ['ChecklistCoreTests.CoreTests'], []),
                                  ['Missing index-store dependencies: ChecklistCoreTests.CoreTests'])
         for malformed in ({}, {'schema_version': 99, 'occurrences': []},
@@ -405,13 +404,17 @@ class CoverageMapTests(unittest.TestCase):
         group = 'ChecklistCoreTests.CoreTests'
         original['coverage_unmeasurable_classes'][group] = {
             'reason': 'Requires owned store', 'sources': ['Sources/ChecklistCore/Unused.swift']}
+        original['coverage_unmeasurable_classes'][group]['max_depth'] = 5
         refreshed = impact.refresh_index_map(self.root, original, export)
         self.assertTrue(refreshed['complete'])
+        self.assertIs(refreshed['coverage_unmeasurable_classes'][group]['walk']['complete'], True)
+        self.assertNotIn('max_depth', refreshed['coverage_unmeasurable_classes'][group])
+        self.assertEqual(refreshed['index_store']['traversal'], 'fixed-point')
         for field in ('commit', 'generated_at', 'generation_seconds', 'measured_classes',
                       'measured_qualification_cases', 'test_failures', 'coverage_errors'):
             self.assertEqual(refreshed[field], original[field], field)
         self.assertEqual(refreshed['coverage_unmeasurable_classes'][group], {
-            'reason': 'Requires owned store', 'source': 'index-store', 'max_depth': 5,
+            'reason': 'Requires owned store', 'source': 'index-store', 'walk': ANY,
             'sources': ['Sources/ChecklistCore/Used.swift', 'Tests/ChecklistCoreTests/CoreTests.swift']})
         self.assertNotIn('source', original['coverage_unmeasurable_classes'][group],
                          'refresh must not mutate the input evidence')
@@ -432,6 +435,17 @@ class CoverageMapTests(unittest.TestCase):
         export['source_hashes']['Sources/ChecklistCore/Used.swift'] = 'stale-index'
         with self.assertRaisesRegex(ValueError, 'index export source inputs differ'):
             impact.refresh_index_map(self.root, original, export)
+
+    def test_missing_or_incomplete_walk_cannot_certify_nonempty_index_edges(self):
+        original, _ = self.index_refresh_fixture()
+        group = 'ChecklistCoreTests.CoreTests'
+        observation = original['coverage_unmeasurable_classes'][group]
+        self.assertTrue(observation['sources'])
+        for walk in ({}, {'complete': False}):
+            with self.subTest(walk=walk):
+                observation['walk'] = walk
+                self.assertEqual(impact.coverage_gaps(original, [group], []),
+                                 ['Missing index-store dependencies: ' + group])
 
     def test_index_only_refresh_cannot_certify_missing_edges_or_incomplete_coverage(self):
         original, export = self.index_refresh_fixture()
