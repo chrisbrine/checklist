@@ -112,6 +112,82 @@ class CoverageMapTests(unittest.TestCase):
                          {'Sources/ChecklistCore/Unused.swift'})
 
 
+    def test_unmeasurable_class_uses_static_symbols_and_keeps_reason(self):
+        used = 'Sources/ChecklistCore/Used.swift'
+        unused = 'Sources/ChecklistCore/Unused.swift'
+        (self.root / used).write_text('struct UsedType {}\nfunc usedFunction() {}')
+        (self.root / unused).write_text('struct OtherType { func usedFunction() {} }\nfunc otherFunction() {}')
+        test = self.root / 'Tests/ChecklistCoreTests/CoreTests.swift'
+        test.write_text('final class CoreTests: XCTestCase { func testIt() { _ = UsedType(); usedFunction() } }'
+                        '// OtherType otherFunction()\nlet label = "OtherType otherFunction()"')
+        self.assertEqual(impact.static_references(self.root, 'ChecklistCoreTests.CoreTests'), {used, 'Tests/ChecklistCoreTests/CoreTests.swift'})
+        result = impact.build_map(self.root, [
+            {'class': 'ChecklistCoreTests.CoreTests', 'sources': [], 'skipped': True,
+             'unmeasurable_reason': 'Owner forbids keychain access'}
+        ], 'abc', 'now', 0, inventory=[used, unused])
+        self.assertEqual(result['measured_classes'], [])
+        self.assertEqual(result['coverage_unmeasurable_classes'], {
+            'ChecklistCoreTests.CoreTests': {'reason': 'Owner forbids keychain access', 'sources': [used, 'Tests/ChecklistCoreTests/CoreTests.swift']}})
+        self.assertEqual(result['sources'][used]['classes'], [])
+
+    def test_static_references_do_not_confuse_unrelated_member_names(self):
+        (self.root / 'Sources/ChecklistCore/Used.swift').write_text(
+            'struct Recorder { func record() {} }')
+        (self.root / 'Sources/ChecklistCore/Unused.swift').write_text(
+            'extension CommandRouter { func record() {} }')
+        (self.root / 'Tests/ChecklistCoreTests/CoreTests.swift').write_text(
+            'class CoreTests { func testIt() { let router = CommandRouter(); router.record() } }')
+        self.assertEqual(impact.static_references(self.root, 'ChecklistCoreTests.CoreTests'),
+                         {'Sources/ChecklistCore/Unused.swift', 'Tests/ChecklistCoreTests/CoreTests.swift'})
+
+    def test_extension_type_alone_does_not_expand_to_all_its_files(self):
+        used = self.root / 'Sources/ChecklistCore/Used.swift'
+        unused = self.root / 'Sources/ChecklistCore/Unused.swift'
+        used.write_text('extension CommandRouter { func selected() {} }')
+        unused.write_text('extension CommandRouter { func unrelated() {} }')
+        (self.root / 'Tests/ChecklistCoreTests/CoreTests.swift').write_text(
+            'class CoreTests { func testIt() { let router = CommandRouter(); router.selected() } }')
+        self.assertEqual(impact.static_references(self.root, 'ChecklistCoreTests.CoreTests'),
+                         {'Sources/ChecklistCore/Used.swift', 'Tests/ChecklistCoreTests/CoreTests.swift'})
+
+    def test_static_references_include_class_extensions_and_package_symbols(self):
+        package = self.root / 'Packages/Domain/Sources/Domain/Thing.swift'
+        package.parent.mkdir(parents=True); package.write_text('enum PackageThing {}')
+        (self.root / 'Tests/ChecklistCoreTests/CoreTests.swift').write_text('class CoreTests {}')
+        (self.root / 'Tests/ChecklistCoreTests/Extra.swift').write_text(
+            'extension CoreTests { func testMore() { _ = PackageThing() } }')
+        self.assertEqual(impact.static_references(self.root, 'ChecklistCoreTests.CoreTests'),
+                         {'Packages/Domain/Sources/Domain/Thing.swift', 'Tests/ChecklistCoreTests/CoreTests.swift',
+                          'Tests/ChecklistCoreTests/Extra.swift'})
+        self.assertEqual(impact.static_references(self.root, 'ChecklistCoreTests.Absent'), set())
+
+    def test_unmeasurable_class_has_c_function_and_fixture_edges(self):
+        production = self.root / 'Sources/Legacy/Legacy.c'
+        fixture = self.root / 'Tests/KeychainFixture/Fixture.c'
+        header = production.with_suffix('.h')
+        for path in (production, fixture, header): path.parent.mkdir(parents=True, exist_ok=True)
+        production.write_text('int KeychainRead(void) { return 0; }')
+        header.write_text('int KeychainRead(void);')
+        fixture.write_text('int FixtureCreate(void) { return 1; }')
+        (self.root / 'Tests/ChecklistCoreTests/CoreTests.swift').write_text(
+            'class CoreTests { func testIt() { KeychainRead(); FixtureCreate() } }')
+        self.assertEqual(impact.static_references(self.root, 'ChecklistCoreTests.CoreTests'),
+                         {'Sources/Legacy/Legacy.c', 'Sources/Legacy/Legacy.h',
+                          'Tests/KeychainFixture/Fixture.c', 'Tests/ChecklistCoreTests/CoreTests.swift'})
+
+    def test_skipped_qualification_cannot_certify_a_complete_inventory(self):
+        result = impact.build_map(self.root, [
+            {'class': 'Target.Measured', 'sources': []},
+            {'class': 'Target.Forbidden', 'sources': [], 'skipped': True,
+             'unmeasurable_reason': 'Owner prohibits keychain'},
+            {'qualification_case': 'Target.Profile/testPrivate', 'sources': [], 'skipped': True},
+        ], 'abc', 'now', 0)
+        self.assertEqual(impact.coverage_gaps(result, ['Target.Measured', 'Target.Forbidden'],
+                         ['Target.Profile/testPrivate']),
+                         ['Unmeasured qualification case: Target.Profile/testPrivate'])
+        self.assertEqual(impact.coverage_gaps(result, ['Target.Missing'], []),
+                         ['Unmeasured class: Target.Missing'])
+
     def test_completed_native_methods_include_assertion_failures_and_skips(self):
         log = """Test Case '-[ChecklistCoreTests.CoreTests testPass]' started.
 Test Case '-[ChecklistCoreTests.CoreTests testPass]' passed (0.001 seconds).

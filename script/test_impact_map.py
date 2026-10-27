@@ -75,8 +75,13 @@ def build_map(root, observations, commit, generated_at, generation_seconds, inve
         paths.update(observation['sources'])
     sources = {path: {'classes': set(), 'qualification_cases': set()} for path in sorted(paths)}
     classes, cases = set(), set()
+    unmeasurable = {}
     for observation in observations:
         group, case = observation.get('class'), observation.get('qualification_case')
+        if group and observation.get('skipped'):
+            unmeasurable[group] = {
+                'reason': observation.get('unmeasurable_reason', 'All native methods skipped; see generation logs'),
+                'sources': sorted(static_references(root, group))}
         if group and not observation.get('skipped'):
             classes.add(group)
         if case and not observation.get('skipped'):
@@ -90,10 +95,19 @@ def build_map(root, observations, commit, generated_at, generation_seconds, inve
             'generated_at': generated_at, 'generation_seconds': generation_seconds,
             'complete': False, 'measured_classes': sorted(classes),
             'measured_qualification_cases': sorted(cases),
+            'coverage_unmeasurable_classes': unmeasurable,
             'sources': {path: {key: sorted(values) for key, values in entry.items()}
                         for path, entry in sources.items()},
             'source_hashes': {path: hashlib.sha256((root / path).read_bytes()).hexdigest()
                               for path in sources if (root / path).is_file()}}
+
+
+def coverage_gaps(result, classes, cases):
+    """A finished attempt is closed only with coverage or an explicit exception."""
+    missing_classes = set(classes) - set(result['measured_classes']) - set(result['coverage_unmeasurable_classes'])
+    missing_cases = set(cases) - set(result['measured_qualification_cases'])
+    return (['Unmeasured class: ' + value for value in sorted(missing_classes)] +
+            ['Unmeasured qualification case: ' + value for value in sorted(missing_cases)])
 
 
 def inspection_references(root, identifier, executed_sources=()):
@@ -115,6 +129,61 @@ def inspection_references(root, identifier, executed_sources=()):
             paths = candidate.rglob('*') if candidate.is_dir() else [candidate]
             references.update(path for item in paths if item.is_file()
                               if (path := _source_path(str(item), root)))
+    return references
+
+
+def _swift_code(text):
+    """Remove comments and string contents before deriving symbol references."""
+    return re.sub(r'//[^\n]*|/\*.*?\*/|""".*?"""|"(?:\\.|[^"\\])*"', ' ', text, flags=re.S)
+
+
+def static_references(root, identifier):
+    """Unmeasurable classes use declared type/function names in their own files.
+
+    Include extension files; never expand these edges to the module closure.
+    This is a lexical dependency approximation, separate from measured coverage.
+    """
+    target, owner = identifier.split('/')[0].split('.', 1)
+    test_codes = []
+    for test in sorted((root / 'Tests' / target).rglob('*.swift')):
+        code = _swift_code(test.read_text())
+        if re.search(r'\b(?:class|extension|struct)\s+' + re.escape(owner) + r'\b', code):
+            test_codes.append(code)
+    code = '\n'.join(test_codes)
+    names = set(re.findall(r'\b[A-Za-z_]\w*\b', code))
+    calls = set(re.findall(r'\b([A-Za-z_]\w*)\s*(?:<[^\n<>]*>)?\s*\(', code))
+    references = inspection_references(root, identifier)
+    sources = [path for folder in ('Sources', 'Tests', 'Packages')
+               for path in (root / folder).rglob('*') if path.is_file()
+               and _source_path(str(path), root)]
+    for source in sorted(sources):
+        declared = _swift_code(source.read_text())
+        # A member named `record` is not the unrelated router.record call.
+        # Top-level functions stand alone; members need their owning type.
+        types, functions = set(), set()
+        depth = 0
+        for token in re.finditer(r'[{}]|\b(class|struct|enum|protocol|typealias|actor|extension|func)\s+([A-Za-z_]\w*)', declared):
+            if token[0] == '{':
+                depth += 1
+            elif token[0] == '}':
+                depth -= 1
+            elif depth == 0:
+                if token[1] != 'extension':
+                    (functions if token[1] == 'func' else types).add(token[2])
+        if source.suffix != '.swift':
+            depth = 0
+            # C/Objective-C fixture functions also have direct Swift callers.
+            for token in re.finditer(r'[{}]|\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?=[{;])', declared):
+                if token[0] == '{':
+                    depth += 1
+                elif token[0] == '}':
+                    depth -= 1
+                elif depth == 0:
+                    functions.add(token[1])
+        extension_owners = set(re.findall(r'\bextension\s+([A-Za-z_]\w*)', declared))
+        members = set(re.findall(r'\bfunc\s+([A-Za-z_]\w*)', declared))
+        if types & names or functions & calls or (extension_owners & names and members & calls):
+            references.add(source.relative_to(root).as_posix())
     return references
 
 
@@ -251,7 +320,11 @@ def main(argv=None):
         if not discovered:
             raise RuntimeError('no XCTest cases discovered')
         safe = [case for case in discovered if '.HumanClaimsKeychainTests/' not in case]
+        all_classes = sorted({case.split('/')[0] for case in discovered})
         classes = sorted({case.split('/')[0] for case in safe})
+        for group in sorted(set(all_classes) - set(classes)):
+            observations.append({'class': group, 'sources': [], 'skipped': True,
+                'unmeasurable_reason': 'Owner no-keychain rule: HumanClaimsKeychainTests must never execute'})
         requested_classes = args.classes or classes
         requested_cases = (args.qualification_cases if args.qualification_cases is not None else
                            [] if args.classes else list(QUALIFICATION_CASES))
@@ -363,6 +436,8 @@ def main(argv=None):
                                sorted(executed_sources | references)}
                 if all_skipped:
                     observation['skipped'] = True
+                    reasons = [line.strip() for line in test_output.splitlines() if 'skipped:' in line or 'Test skipped' in line]
+                    observation['unmeasurable_reason'] = '; '.join(dict.fromkeys(reasons)) or 'All native methods skipped; see ' + str(test_log)
                 observations.append(observation)
                 checkpoint.write_text(json.dumps(dict(observation, inventory=sorted(inventory),
                     test_failures=[failure for failure in test_failures if failure['test'] == identifier],
@@ -388,6 +463,8 @@ def main(argv=None):
     result['invocation_seconds'] = result['generation_seconds']
     result['generation_seconds'] = round((datetime.now(timezone.utc) -
         datetime.fromisoformat(origin['started_at'])).total_seconds(), 3)
+    if not args.classes and args.qualification_cases is None:
+        errors.extend(coverage_gaps(result, all_classes if 'all_classes' in locals() else [], QUALIFICATION_CASES))
     result['complete'] = not errors and not args.classes and args.qualification_cases is None
     result['errors'] = errors
     result['coverage_errors'] = errors
@@ -396,7 +473,7 @@ def main(argv=None):
     result['profile_caveats'] = profile_caveats
     result['inspection_references'] = inspection_edges
     result['input_hashes'] = input_hashes
-    result['class_inventory'] = classes if 'classes' in locals() else []
+    result['class_inventory'] = all_classes if 'all_classes' in locals() else []
     result['qualification_case_inventory'] = list(QUALIFICATION_CASES)
     result['generation_logs'] = str(work)
     result['load_start'] = load_start

@@ -95,19 +95,39 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(plan['group_fallback_paths'], [])
         self.assert_case_runs(plan, case)
 
-    def test_skipped_coverage_uses_reported_module_fallback_without_discarding_map(self):
+    def test_mapped_source_never_adds_unmeasured_module_consumers(self):
         path = 'Sources/ChecklistCore/Leaf.swift'
         private = selector.QUALIFICATION_CASES[0]
         measured = self.measured_map({path: {'classes': ['ChecklistCoreTests.LeafTests'], 'qualification_cases': []}})
         measured.update(class_inventory=['ChecklistCoreTests.LeafTests', 'ChecklistCoreTests.PrivateTests'],
                         qualification_case_inventory=[private])
         plan = self.plan(path, impact_map=measured)
-        self.assertEqual(plan['test_groups'], {'ChecklistCoreTests': ['LeafTests', 'PrivateTests']})
-        self.assertEqual(plan['qualification_tests'], [private])
-        self.assertEqual(plan['qualification_fallback_cases'], {private: [path]})
-        self.assertEqual(plan['coverage_fallback_classes'], {'ChecklistCoreTests.PrivateTests': [path]})
-        self.assertEqual(self.plan('Sources/ChecklistApp/View.swift', impact_map=measured)['qualification_tests'],
+        self.assertEqual(plan['test_groups'], {'ChecklistCoreTests': ['LeafTests']})
+        self.assertEqual(plan['qualification_tests'], [])
+        self.assertEqual(plan['qualification_fallback_cases'], {})
+        self.assertEqual(plan['coverage_fallback_classes'], {})
+        self.assertEqual(plan['group_fallback_paths'], [])
+        unmapped = self.plan('Sources/ChecklistApp/View.swift', impact_map=measured)
+        self.assertEqual(unmapped['group_fallback_paths'], ['Sources/ChecklistApp/View.swift'])
+        self.assertEqual(unmapped['qualification_tests'],
                          ['ChecklistAppTests.IsolatedDefaultsTests/testPreferencesRemainAbsentAfterChildProcessExit'])
+
+    def test_unmeasurable_classes_select_only_static_reference_sources(self):
+        referenced = 'Sources/ChecklistCore/HumanClaims.swift'
+        unrelated = 'Sources/ChecklistCore/Leaf.swift'
+        measured = self.measured_map({path: {'classes': [], 'qualification_cases': []}
+                                      for path in (referenced, unrelated)})
+        group = 'ChecklistAppTests.HumanClaimsKeychainTests'
+        measured['class_inventory'] = [group]
+        measured['coverage_unmeasurable_classes'] = {
+            group: {'reason': 'owner prohibits keychain access', 'sources': [referenced]}}
+        plan = self.plan(referenced, impact_map=measured)
+        self.assertEqual(plan['test_groups'], {'ChecklistAppTests': ['HumanClaimsKeychainTests']})
+        self.assertEqual(plan['coverage_unmeasurable_classes'], {group: [referenced]})
+        self.assertEqual(plan['group_fallback_paths'], [])
+        plan = self.plan(unrelated, impact_map=measured)
+        self.assertEqual(plan['test_targets'], [])
+        self.assertEqual(plan['coverage_unmeasurable_classes'], {})
 
     def test_generated_map_unions_measured_consumers_and_reasons(self):
         paths = ['Sources/ChecklistCore/First.swift', 'Sources/ChecklistCore/Second.swift']
@@ -130,17 +150,14 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(plan['group_fallback_paths'], [])
         self.assertEqual(plan['commands'], [selector.VALIDATE])
 
-    def test_unflushable_probe_source_bypasses_even_complete_empty_coverage(self):
-        for path, consumer in [
-            ('Tests/StorageCrashProbe/ReleasedCore/Old.swift', 'ChecklistCoreTests'),
-            ('Tests/ChecklistCLIInputProbe/main.swift', 'ChecklistMCPServerTests'),
-        ]:
+    def test_mapped_probe_source_uses_measured_coverage_without_module_fallback(self):
+        for path in ('Tests/StorageCrashProbe/ReleasedCore/Old.swift',
+                     'Tests/ChecklistCLIInputProbe/main.swift'):
             with self.subTest(path=path):
                 measured = self.measured_map({path: {'classes': [], 'qualification_cases': []}})
                 plan = self.plan(path, impact_map=measured)
-                self.assertIn(consumer, plan['test_targets'])
-                self.assertEqual(plan['group_fallback_paths'], [path])
-                self.assertNotIn(consumer, plan['test_groups'])
+                self.assertEqual(plan['test_targets'], [])
+                self.assertEqual(plan['group_fallback_paths'], [])
 
     def test_new_source_uses_module_closure_even_with_other_mapped_inputs(self):
         mapped = 'Sources/ChecklistCore/Existing.swift'
@@ -717,6 +734,25 @@ class SelectionTests(unittest.TestCase):
             manifest.unlink()
             selector.package_graph(self.root, self.root / '.build')
             self.assertEqual(run.call_count, 3)
+
+    def test_loader_refuses_skipped_inventory_without_static_class_exception(self):
+        from datetime import datetime, timezone
+        measured = self.measured_map({})
+        measured.update(generated_at=datetime.now(timezone.utc).isoformat(),
+                        measured_qualification_cases=list(selector.QUALIFICATION_CASES),
+                        qualification_case_inventory=list(selector.QUALIFICATION_CASES),
+                        class_inventory=['ChecklistAppTests.ForbiddenTests'])
+        map_path = self.root / 'coverage.json'
+        with patch.object(selector, 'changed_paths', return_value=[]), patch.object(selector.subprocess, 'run'):
+            map_path.write_text(json.dumps(measured))
+            self.assertIsNone(selector.load_impact_map(self.root, map_path)[0])
+            measured['coverage_unmeasurable_classes'] = {
+                'ChecklistAppTests.ForbiddenTests': {'reason': 'Owner forbids keychain', 'sources': []}}
+            map_path.write_text(json.dumps(measured))
+            self.assertIsNotNone(selector.load_impact_map(self.root, map_path)[0])
+            measured['measured_qualification_cases'].pop()
+            map_path.write_text(json.dumps(measured))
+            self.assertIsNone(selector.load_impact_map(self.root, map_path)[0])
 
     def test_runtime_fixture_change_invalidates_observed_coverage(self):
         from datetime import datetime, timezone

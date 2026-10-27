@@ -399,6 +399,26 @@ def load_impact_map(root, path=None, max_age_hours=24):
                 raise ValueError('invalid coverage class')
             if any(case not in QUALIFICATION_CASES for case in entry['qualification_cases']):
                 raise ValueError('unknown qualification case')
+        unmeasurable = data.get('coverage_unmeasurable_classes', {})
+        if not isinstance(unmeasurable, dict):
+            raise ValueError('invalid unmeasurable coverage classes')
+        for group, observation in unmeasurable.items():
+            if (not isinstance(group, str) or not re.fullmatch(r'\w+\.\w+', group)
+                    or not isinstance(observation, dict)
+                    or not isinstance(observation.get('reason'), str)
+                    or not observation['reason']
+                    or not isinstance(observation.get('sources'), list)):
+                raise ValueError('invalid unmeasurable coverage class')
+            for path in observation['sources']:
+                if (not isinstance(path, str) or PurePosixPath(path).is_absolute()
+                        or '..' in PurePosixPath(path).parts):
+                    raise ValueError('unmeasurable coverage contains an unsafe path')
+        missing_classes = (set(data.get('class_inventory', [])) -
+                           set(data.get('measured_classes', [])) - set(unmeasurable))
+        missing_cases = (set(data.get('qualification_case_inventory', [])) -
+                         set(data.get('measured_qualification_cases', [])))
+        if missing_classes or missing_cases:
+            raise ValueError('coverage inventory is unmeasured without an explicit class exception')
         status.update(state='current',
                       unmeasured_qualification_cases=sorted(set(data.get('qualification_case_inventory', [])) - set(data.get('measured_qualification_cases', []))),
                       unmeasured_classes=sorted(set(data.get('class_inventory', [])) - set(data.get('measured_classes', []))),
@@ -421,10 +441,7 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
         if not impact_map.get('complete'):
             impact_map = None
     mapped_sources = impact_map.get('sources', {}) if impact_map else {}
-    unmeasured_cases = (set(impact_map.get('qualification_case_inventory', [])) -
-                        set(impact_map.get('measured_qualification_cases', []))) if impact_map else set()
-    unmeasured_classes = (set(impact_map.get('class_inventory', [])) -
-                          set(impact_map.get('measured_classes', []))) if impact_map else set()
+    unmeasurable_classes = impact_map.get('coverage_unmeasurable_classes', {}) if impact_map else {}
     all_tests = {name for name, target in targets.items() if target['type'] == 'test'}
     affected, python, unknown = set(), set(), []
     # Longest target path wins (e.g. StorageCrashProbe/ReleasedCore).
@@ -507,13 +524,9 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
     reasons = {case: [] for case in QUALIFICATION_CASES}
     source_groups, group_fallback_paths = {}, []
     qualification_fallback_cases, coverage_fallback_classes = {}, {}
+    selected_unmeasurable_classes = {}
     for path in normalized:
         entry = mapped_sources.get(path)
-        # Native crash probes can strip the profile environment or die before
-        # flushing. Their module fallback cannot be closed by zero counters.
-        if any(name in targets and targets[name]['path'].startswith('Tests/') and
-               path.startswith(targets[name]['path'] + '/') for name in RUNTIME_TEST_CONSUMERS):
-            entry = None
         owner = next((target for target in owners if path.startswith(target['path'] + '/')), None)
         if entry is not None:
             mapping = {}
@@ -521,11 +534,13 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
                 name, separator, cls = group.partition('.')
                 if separator and name in all_tests:
                     mapping.setdefault(name, []).append(cls)
-            for group in sorted(unmeasured_classes):
-                name, _, cls = group.partition('.')
-                if name in path_consumers[path]:
+            # Forbidden/native-only classes have no measured profile. Their
+            # static references are explicit source edges, never module closure.
+            for group, observation in sorted(unmeasurable_classes.items()):
+                name, separator, cls = group.partition('.')
+                if separator and name in all_tests and path in observation['sources']:
                     mapping.setdefault(name, []).append(cls)
-                    coverage_fallback_classes.setdefault(group, []).append(path)
+                    selected_unmeasurable_classes.setdefault(group, []).append(path)
             source_groups[path] = mapping
             affected.update(mapping)
             for case in entry['qualification_cases']:
@@ -541,11 +556,6 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
             for case in QUALIFICATION_CASES:
                 if case.split('.')[0] in path_consumers[path]:
                     reasons[case].append(path)
-        for case in sorted(unmeasured_cases):
-            if case.split('.')[0] in path_consumers[path]:
-                if path not in reasons[case]:
-                    reasons[case].append(path)
-                qualification_fallback_cases.setdefault(case, []).append(path)
     qualification_tests = (list(QUALIFICATION_CASES) if explicitly_qualified else
                            [] if full else [case for case in QUALIFICATION_CASES if reasons[case]])
     qualification = bool(qualification_tests)
@@ -653,6 +663,7 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
             'isolated_test_groups': isolated, 'test_groups': groups,
             'group_fallback_paths': group_fallback_paths, 'qualification_mode': qualification_mode,
             'qualification_fallback_cases': qualification_fallback_cases, 'coverage_fallback_classes': coverage_fallback_classes,
+            'coverage_unmeasurable_classes': selected_unmeasurable_classes,
             'qualification_reasons': {case: reasons[case] for case in qualification_tests},
             'default_swift_commands': [command for command in swift if command not in qualification_commands and command not in timing_commands],
             'qualification_commands': qualification_commands, 'qualification_tests': qualification_tests,
@@ -706,6 +717,8 @@ def main(argv=None):
                 print('Unmeasured qualification fallback: ' + case + ' <- ' + ', '.join(inputs))
             for group, inputs in plan['coverage_fallback_classes'].items():
                 print('Unmeasured class fallback: ' + group + ' <- ' + ', '.join(inputs))
+            for group, inputs in plan['coverage_unmeasurable_classes'].items():
+                print('Unmeasurable class static references: ' + group + ' <- ' + ', '.join(inputs))
             if plan['group_fallback_paths']:
                 print('Module group fallback for: ' + ', '.join(plan['group_fallback_paths']))
             if plan['fallback_paths']:
