@@ -468,6 +468,12 @@ extension TicketLifecycleCleanupTests {
                 try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('backup-generation:soak',?)",arguments:[try jsonString(["state":"complete","objects":objects])])
             }
         }
+        func logLoad(_ phase: String) {
+            var averages = [Double](repeating:0,count:3)
+            XCTAssertEqual(getloadavg(&averages,3),3)
+            print("CL193_SOAK_LOAD phase=\(phase) averages=\(averages)")
+        }
+        logLoad("start");defer {logLoad("end")}
         let traffic = CleanupTraffic(),fixtureRouter = router!, trafficCaller = owner,started = Date(),initialCPU = cpuSeconds()
         var workers: [XCTestExpectation] = []
         for worker in 0..<3 {
@@ -503,7 +509,8 @@ extension TicketLifecycleCleanupTests {
         var nextSample = 0.0,nextReset = 0.0,nextRefusal = duration/2,minuteStart = started,minuteCPU = initialCPU
         var minutePeaks: [UInt64] = [],minutePeak: UInt64 = 0,commitsObserved = 0,refusals = 0,backoffAttempts: Int?,lastAttempts = 0
         var postAttemptRSS: [UInt64] = [],backoffStart: Date?,backoffCPU = 0.0,backoffWindows = 0,firstNewPass: Double?
-        while Date().timeIntervalSince(started) < duration {
+        // Match the service work-item pool: fixture inspection must drain too.
+        while Date().timeIntervalSince(started) < duration {try autoreleasepool {
             let elapsed = Date().timeIntervalSince(started)
             if elapsed < duration/2,elapsed >= nextReset {
                 _ = try configure(p);nextReset += 30;armed = try router.nextArchiveCleanupDeadline()
@@ -551,7 +558,7 @@ extension TicketLifecycleCleanupTests {
                 minutePeaks.append(minutePeak);minutePeak = 0;minuteStart = Date();minuteCPU = cpu
             }
             Thread.sleep(forTimeInterval:0.05)
-        }
+        }}
         print("CL193_SOAK_RESULT duration=\(Date().timeIntervalSince(started)) peak_rss=\(traffic.peakBytes) process_high_water=\(peakResidentBytes()) writes=\(traffic.count) attempts=\(lastAttempts) receipts=\(commitsObserved) refusals=\(refusals) minute_peaks=\(minutePeaks) drained_attempt_rss=\(postAttemptRSS) backoff_windows=\(backoffWindows) first_new_pass_seconds=\(firstNewPass ?? -1)")
         XCTAssertGreaterThan(commitsObserved,1);XCTAssertGreaterThan(backoffWindows,0);XCTAssertLessThan(firstNewPass ?? .infinity,300);XCTAssertGreaterThan(refusals,1);XCTAssertGreaterThan(traffic.count,Int(duration))
         XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))

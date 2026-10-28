@@ -3,7 +3,8 @@ import GRDB
 @testable import ChecklistApp
 @testable import ChecklistCore
 
-/// Opt-in model timing on an explicitly selected read-only database clone. No XPC or GUI claim.
+/// Opt-in model timing from a read-only backup, using a disposable WAL runtime copy.
+/// No XPC or GUI claim; the source backup is never opened for writing.
 @MainActor final class OwnedStoreScreenCacheTests: XCTestCase {
     func testRealBackupColdOverviewAndCachedNavigation() async throws {
         guard let path = ProcessInfo.processInfo.environment["CHECKLIST_READ_ONLY_DATABASE"],
@@ -13,15 +14,40 @@ import GRDB
         let root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
             .appendingPathComponent("ChecklistSyntheticTests/P9-r1-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
         let router = try CommandRouter(root: root.appendingPathComponent("router"))
+        defer { try? router.closeStore() }
         var configuration = Configuration(); configuration.readonly = true
         configuration.prepareDatabase { db in
             try SchemaMigrations.installStorageCollation(db)
             CommandRouter.installTicketSearchFunctions(db)
         }
-        let pool = try DatabasePool(path: path, configuration: configuration)
-        defer { try? pool.close(); try? router.closeStore(); try? FileManager.default.removeItem(at: root) }
         let owner = Caller(role: "owner", installation: "P9-r1-read-only", projectIDs: [])
+        let source = try DatabasePool(path: path, configuration: configuration)
+        let schema: Int
+        do {
+            defer { try? source.close() }
+            schema = try await source.read { try XCTUnwrap(Int.fetchOne($0, sql: "PRAGMA user_version")) }
+            let service = try router.executePureRead(source, method: "service_info", params: [:], caller: owner)["data"] as? [String: Any]
+            print("P296 source_backup_read_version_present=\(service?["read_version"] != nil)")
+        }
+        // Published backups are checkpointed: non-WAL/empty-WAL reads deliberately
+        // omit read_version and cannot populate the app's display caches. Recreate
+        // the service's WAL conditions on a separate disposable copy, retaining a
+        // writer so its committed snapshot stays available to read-only readers.
+        // Rewriting the same header value creates a WAL frame without changing records.
+        let runtime = root.appendingPathComponent("runtime.sqlite")
+        try FileManager.default.copyItem(at: URL(fileURLWithPath: path), to: runtime)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: runtime.path)
+        var writerConfiguration = configuration; writerConfiguration.readonly = false
+        let writer = try DatabasePool(path: runtime.path, configuration: writerConfiguration)
+        defer { try? writer.close() }
+        try await writer.write { try $0.execute(sql: "PRAGMA user_version = \(schema)") }
+        let pool = try DatabasePool(path: runtime.path, configuration: configuration)
+        defer { try? pool.close() }
+        let service = try router.executePureRead(pool, method: "service_info", params: [:], caller: owner)["data"] as? [String: Any]
+        let readVersion = try XCTUnwrap(service?["read_version"] as? String, "Cached navigation requires a genuine WAL snapshot identity")
+        XCTAssertFalse(readVersion.isEmpty)
         let preferences = isolatedDefaults("OwnedScreenCache").preferences
         preferences.set(Page.overview.rawValue, forKey: "lastPage")
         // Freeze the same digest scope in before/after Core and App fixtures.
@@ -38,7 +64,12 @@ import GRDB
                     let reply = try router.executePureRead(pool, method:method, params:request, caller:owner)
                     return try JSONSerialization.data(withJSONObject: reply)
                 }.value
-                return try JSONSerialization.jsonObject(with: replyWire) as! [String: Any]
+                let reply = try JSONSerialization.jsonObject(with: replyWire) as! [String: Any]
+                let data = reply["data"] as? [String: Any]
+                let page = data?["tickets_page"] as? [String: Any] ?? data
+                let service = page?["service"] as? [String: Any]
+                XCTAssertEqual(service?["read_version"] as? String, readVersion, "Every \(method) display read must retain the same qualified snapshot")
+                return reply
             })
         var load = [Double](repeating:0, count:3); getloadavg(&load, 3)
         let start = ProcessInfo.processInfo.systemUptime

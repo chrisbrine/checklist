@@ -10,11 +10,30 @@ private struct WorkspaceTaskIdentity: Hashable {
     }
 }
 
+private struct WorkspacePageScope {
+    let projectIDs: [String]
+    let projectsJSON: String
+    let latest: Int
+}
+
+private struct PreparedWorkspacePage {
+    let surface: String
+    let scope: WorkspacePageScope
+    let rows: [Row]
+    let page: JSON
+}
+
 extension CommandRouter {
     func workspaceCoverage(_ db: Database,projectsJSON: String) throws -> Int {
-        // Separate exact project/global ranges let the covering events_scope
-        // index supply coverage without the combined OR scan of event rows.
-        try Int.fetchOne(db,sql:"""
+        // The newest event proves the maximum immediately when it belongs to
+        // this scope. The one-row probe stays bounded even for a quiet project.
+        if let latest = try Int.fetchOne(db,sql:"""
+            SELECT seq FROM events WHERE seq=(SELECT MAX(seq) FROM events)
+              AND (project_id IS NULL OR project_id IN (SELECT value FROM json_each(?)))
+            """,arguments:[projectsJSON]) {return latest}
+        // Otherwise use exact project/global ranges of the covering index,
+        // without walking unrelated event payloads to find an older match.
+        return try Int.fetchOne(db,sql:"""
             SELECT COALESCE(MAX(latest),0) FROM (
               SELECT (SELECT MAX(seq) FROM events WHERE project_id=p.value) latest FROM json_each(?) p
               UNION ALL SELECT MAX(seq) FROM events WHERE project_id IS NULL)
@@ -23,25 +42,32 @@ extension CommandRouter {
     /// Owner workspace surfaces keep one bounded value, separate from the full
     /// snapshot index. An omitted row never means that the record was deleted.
     func workspacePage(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
-        try workspacePage(db,p,c,sharedMetadata:nil)
-    }
-    private func workspacePage(_ db: Database,_ p: JSON,_ c: Caller,sharedMetadata: JSON?) throws -> JSON {
         try owner(c)
-        if p["surface"] as? String == "overview" { return try overviewGroupsPage(db,p,c) }
+        if p["surface"] as? String == "overview" {return try overviewGroupsPage(db,p,c)}
+        let prepared = try prepareWorkspacePage(db,p,c,sharedMetadata:nil,sharedScope:nil)
+        let counts = prepared.surface == "activity" ? [:] : try workspaceCleanedOriginalCounts(db,rows:prepared.rows)
+        return try projectWorkspacePage(db,prepared,c,cleanedCounts:counts)
+    }
+    private func prepareWorkspacePage(_ db: Database,_ p: JSON,_ c: Caller,sharedMetadata: JSON?,sharedScope: WorkspacePageScope?) throws -> PreparedWorkspacePage {
         let surfaces = ["requests","human_tasks","epics","activity","epic_tasks","epic_candidates","triage_tasks","triage_candidates","worker_sessions","record","recent_reviews","completed_since"] + Self.needSurfaces
         let surface = try text(p,"surface",max:40)
         guard surfaces.contains(surface) else {throw CoreError("INVALID_INPUT","Choose a supported workspace surface.")}
-        let projectIDs: [String]
-        if p["project_id"] != nil {projectIDs = [try scope(db,p,c)]}
-        else {projectIDs = try projects(db,c).filter {!bool($0,"archived")}.compactMap {$0["id"] as? String}}
-        let projectsJSON = try jsonString(projectIDs)
+        let scope: WorkspacePageScope
+        if let sharedScope {scope = sharedScope}
+        else {
+            let ids: [String]
+            if p["project_id"] != nil {ids = [try self.scope(db,p,c)]}
+            else {ids = try projects(db,c).filter {!bool($0,"archived")}.compactMap {$0["id"] as? String}}
+            let json = try jsonString(ids)
+            scope = WorkspacePageScope(projectIDs:ids,projectsJSON:json,latest:try workspaceCoverage(db,projectsJSON:json))
+        }
+        let projectIDs = scope.projectIDs,projectsJSON = scope.projectsJSON,latest = scope.latest
         let query = try text(p,"text",max:4000,required:false)
         let recordID = try text(p,"record_id",max:4000,required:false)
         // CL-67: the owner digest lists tickets completed after `since` (the owner's last visit).
         let since = try text(p,"since",max:40,required:false)
         let sinceDate = since.isEmpty ? nil : ISO8601DateFormatter().date(from:since)
         if surface == "completed_since" && sinceDate == nil {throw CoreError("INVALID_INPUT","Give the digest start as an ISO 8601 time.")}
-        let latest = try workspaceCoverage(db,projectsJSON:projectsJSON)
         let identity: JSON = ["surface":surface,"projects":projectIDs,"query":query,"record":recordID,"since":since,"closed":bool(p,"include_archived"),"locale":Locale.current.identifier,"authorization":try authorizationScope(db,c),"coverage":latest]
         let cursorScope = "workspace-page-v1:"+hash(Data(try jsonString(identity).utf8))
         let offset = try cursorSequence(db,p,caller:c,scope:cursorScope)
@@ -104,7 +130,29 @@ extension CommandRouter {
         let total = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM ("+select+predicate+")",arguments:args) ?? 0
         let fetched = try Row.fetchAll(db,sql:select+predicate+order+" LIMIT :limit OFFSET :offset",arguments:args)
         let selectedRows = Array(fetched.prefix(limit))
-        let cleanedCounts = surface == "activity" ? [:] : try workspaceCleanedOriginalCounts(db,rows:selectedRows)
+        // Sidebar metadata spans every owned project even when record rows are
+        // scoped to one project. Keep that catalog separate from the SQL row
+        // scope above; only the trusted owner may use this command.
+        let metadata: JSON
+        if let sharedMetadata {metadata = sharedMetadata}
+        else {
+            let needs = try ownerNeedsYouCounts(db)
+            // Native pages need authenticated identity, not the provider/route
+            // capability catalogs. Those remain available from service_info.
+            let identityKeys: Set<String> = ["session_id","caller","name","version","build_id","build_number","store_incarnation","role","project_ids","read_version"]
+            let service = try dispatch(db,method:"service_info",p:[:],c:c).filter {identityKeys.contains($0.key)}
+            metadata = ["projects":try projects(db,c),"service":service,"needs_you_count":needs.requests + needs.tasks,
+                        "content_cursor":try cursor(db,caller:c,scope:authorizationScope(db,c),sequence:latest)]
+        }
+        let page: JSON = ["workspace_version":1,"surface":surface,"record_id":recordID,"rows":[JSON](),"total":total,"has_more":fetched.count>limit,
+                "next_cursor":fetched.count>limit ? try cursor(db,caller:c,scope:cursorScope,sequence:offset+limit) : NSNull(),
+                "previous_cursor":offset>0 ? try cursor(db,caller:c,scope:cursorScope,sequence:max(0,offset-limit)) : NSNull()]
+        return PreparedWorkspacePage(surface:surface,scope:scope,rows:selectedRows,page:page.merging(metadata) {_,shared in shared})
+    }
+
+    private func projectWorkspacePage(_ db: Database,_ prepared: PreparedWorkspacePage,_ c: Caller,cleanedCounts: [WorkspaceTaskIdentity:Int]) throws -> JSON {
+        let surface = prepared.surface,projectIDs = prepared.scope.projectIDs
+        let selectedRows = prepared.rows
         var rows: [JSON] = []
         for row in selectedRows {
             if surface == "activity" {
@@ -143,24 +191,9 @@ extension CommandRouter {
             }
             rows.append(value)
         }
-        // Sidebar metadata spans every owned project even when record rows are
-        // scoped to one project. Keep that catalog separate from the SQL row
-        // scope above; only the trusted owner may use this command.
-        let metadata: JSON
-        if let sharedMetadata {metadata = sharedMetadata}
-        else {
-            let needs = try ownerNeedsYouCounts(db)
-            // Native pages need authenticated identity, not the provider/route
-            // capability catalogs. Those remain available from service_info.
-            let identityKeys: Set<String> = ["session_id","caller","name","version","build_id","build_number","store_incarnation","role","project_ids","read_version"]
-            let service = try dispatch(db,method:"service_info",p:[:],c:c).filter {identityKeys.contains($0.key)}
-            metadata = ["projects":try projects(db,c),"service":service,"needs_you_count":needs.requests + needs.tasks,
-                        "content_cursor":try cursor(db,caller:c,scope:authorizationScope(db,c),sequence:latest)]
-        }
-        let page: JSON = ["workspace_version":1,"surface":surface,"record_id":recordID,"rows":rows,"total":total,"has_more":fetched.count>limit,
-                "next_cursor":fetched.count>limit ? try cursor(db,caller:c,scope:cursorScope,sequence:offset+limit) : NSNull(),
-                "previous_cursor":offset>0 ? try cursor(db,caller:c,scope:cursorScope,sequence:max(0,offset-limit)) : NSNull()]
-        return page.merging(metadata) {_,shared in shared}
+        var page = prepared.page
+        page["rows"] = rows
+        return page
     }
 
     /// Count cleanup facts once for the selected page, rather than scanning a
@@ -232,17 +265,27 @@ extension CommandRouter {
     static let overviewGroupLimits: [(surface: String, limit: Int)] = [("requests",5),("human_tasks",1),("needs_review",5),("needs_pickup",5),
         ("needs_active",5),("needs_quiet",5),("needs_recovery",5),("needs_done_today",5),("recent_reviews",60),("completed_since",20)]
     private func overviewGroupsPage(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
-        var groups: JSON = [:]
+        var prepared: [PreparedWorkspacePage] = []
         var metadata: JSON?
+        var scope: WorkspacePageScope?
         for (surface,limit) in Self.overviewGroupLimits {
             var sub: JSON = ["surface":surface,"limit":limit]
-            if let project = p["project_id"] { sub["project_id"] = project }
-            if surface == "completed_since" { sub["since"] = p["since"] ?? NSNull() }
-            if surface == "completed_since" && (p["since"] as? String ?? "").isEmpty { continue }
-            var page = try workspacePage(db,sub,c,sharedMetadata:metadata)
-            if metadata == nil {metadata = page.filter {Self.overviewSharedFields.contains($0.key)}}
+            if let project = p["project_id"] {sub["project_id"] = project}
+            if surface == "completed_since" {sub["since"] = p["since"] ?? NSNull()}
+            if surface == "completed_since" && (p["since"] as? String ?? "").isEmpty {continue}
+            let selection = try prepareWorkspacePage(db,sub,c,sharedMetadata:metadata,sharedScope:scope)
+            if metadata == nil {metadata = selection.page.filter {Self.overviewSharedFields.contains($0.key)}}
+            scope = selection.scope
+            prepared.append(selection)
+        }
+        // Only the bounded selected pages contribute task IDs. Count once in
+        // their pinned snapshot, including tickets shown in more than one group.
+        let counts = try workspaceCleanedOriginalCounts(db,rows:prepared.flatMap(\.rows))
+        var groups: JSON = [:]
+        for selection in prepared {
+            var page = try projectWorkspacePage(db,selection,c,cleanedCounts:counts)
             for key in Self.overviewSharedFields {page.removeValue(forKey:key)}
-            groups[surface] = page
+            groups[selection.surface] = page
         }
         let page: JSON = ["workspace_version":1,"surface":"overview","record_id":"","groups":groups,"rows":[JSON](),"total":0,"has_more":false,
                           "next_cursor":NSNull(),"previous_cursor":NSNull()]

@@ -23,10 +23,11 @@ extension CommandRouter {
         let queued = try status(db, pid, TicketStatusCategory.queued.rawValue)
         let input = TicketCaptureInput(title: title, kind: kind, requestedKey: p["key"] as? String,
                                        tagIDs: strings(p, "tag_ids"))
+        let existingTasks = try records(db, type: "task", project: pid)
         let state = TicketCaptureState(
             projectID: pid, keyPrefix: project["key_prefix"] as? String ?? "TASK",
             nextNumber: int(project, "next_number", default: 1),
-            existingKeys: Set(try records(db, type: "task", project: pid).compactMap { $0["key"] as? String }),
+            existingKeys: Set(existingTasks.compactMap { $0["key"] as? String }),
             queuedStatusID: try StoredRecord(queued, family: "status").string("id"), ticketID: uuid(), timestamp: now()
         )
         let plan = try captureOperation { try TicketCapture.plan(input, state: state) }
@@ -60,7 +61,7 @@ extension CommandRouter {
         project["next_number"] = plan.nextNumber
         try save(db, project, type: "project")
         try save(db, task, type: "task")
-        _ = try syncEpic(db, try scoped(db, epicID, pid, type: "group"))
+        _ = try syncEpic(db, try scoped(db, epicID, pid, type: "group"), taskOverride: task, tasks: existingTasks)
         try event(db, caller: c, project: pid, entity: state.ticketID, kind: "task_created", data: ["key": plan.key])
         return try taskProjection(db, task)
     }

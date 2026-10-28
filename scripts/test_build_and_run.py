@@ -386,9 +386,10 @@ elif name=='plutil': pass
         for sig in [signal.SIGHUP, signal.SIGINT, signal.SIGTERM]:
             with self.subTest(signal=sig):
                 fixture = BuildScriptTests();fixture.setUp();self.addCleanup(fixture.doCleanups)
-                process, release = fixture.start_paused()
+                # Keep Bash's builtin read blocked until the signal exits it. Releasing
+                # a foreground compiler first races Bash's deferred SIGINT handling.
+                process, _ = fixture.start_paused(signal_wait=True)
                 process.send_signal(sig)
-                release.touch()
                 stdout, stderr = process.communicate(timeout=30)
                 self.assertEqual(process.returncode, 128 + sig, stdout + stderr)
                 self.assertFalse((fixture.root / '.local/build/.build-lock').exists())
@@ -407,15 +408,17 @@ elif name=='plutil': pass
         self.assertEqual(clean[0][clean[0].index('--scratch-path')+1],str(scratch))
         self.assertTrue((self.capture()/'source/Sources/value.swift').is_file())
 
-    def start_paused(self):
+    def start_paused(self, signal_wait=False):
         ready=self.root/'ready';release=self.root/'release'
+        environment = (dict(self.env, CHECKLIST_TEST_BUILD_SIGNAL_READY=str(ready)) if signal_wait
+                       else dict(self.env, PAUSE_READY=str(ready), PAUSE_RELEASE=str(release)))
         process=subprocess.Popen([str(self.root/'script/build_and_run.sh'),'--stage'],
-            env=dict(self.env,PAUSE_READY=str(ready),PAUSE_RELEASE=str(release)),
+            env=environment, stdin=subprocess.PIPE if signal_wait else None,
             stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
         def finish():
             release.touch()
             if process.poll() is None:
-                process.communicate(timeout=30)
+                process.communicate(input='\n' if signal_wait else None, timeout=30)
         self.addCleanup(finish)
         deadline=time.monotonic()+20
         while not ready.exists():

@@ -90,11 +90,13 @@ final class QuickCaptureModel: ObservableObject {
     private var draftSaveFailed = false
     private let journal: LocalDraftJournal
     private let preferences: UserDefaults
+    private let stagingDirectory: URL
     private let transport: Transport
 
     init(journal: LocalDraftJournal = LocalDraftJournal(directory: LocalDraftJournal.defaultDirectory.appendingPathComponent("QuickCapture", isDirectory: true)),
-         preferences: UserDefaults = .standard, transport: @escaping Transport = QuickCaptureModel.liveTransport) {
-        self.journal = journal; self.preferences = preferences; self.transport = transport
+         preferences: UserDefaults = .standard, stagingDirectory: URL = CaptureAttachment.staging,
+         transport: @escaping Transport = QuickCaptureModel.liveTransport) {
+        self.journal = journal; self.preferences = preferences; self.stagingDirectory = stagingDirectory; self.transport = transport
         draft = (try? journal.load(QuickCaptureDraft.self, kind: Self.journalKind))?["draft"] ?? QuickCaptureDraft()
         projects = (preferences.data(forKey: Self.projectsKey)).flatMap { try? JSONDecoder().decode([QuickCaptureProject].self, from: $0) } ?? []
         if draft.projectID.isEmpty, draft.pendingCreate == nil, draft.createdTaskID == nil, draft.isEmpty {
@@ -187,8 +189,8 @@ final class QuickCaptureModel: ObservableObject {
             problem = "The clipboard has no image or file."; return false
         }
         do {
-            try FileManager.default.createDirectory(at: CaptureAttachment.staging, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            let url = CaptureAttachment.staging.appendingPathComponent(UUID().uuidString).appendingPathExtension("png")
+            try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            let url = stagingDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("png")
             try png.write(to: url, options: .atomic)
             draft.files.append(.init(path: url.path, ownedStaging: true, commandID: UUID().uuidString))
             return true
@@ -279,7 +281,7 @@ final class QuickCaptureModel: ObservableObject {
     }
     private func removeStaging(_ file: QuickCaptureDraft.File) {
         let url = URL(fileURLWithPath: file.path)
-        guard file.ownedStaging, url.deletingLastPathComponent().path == CaptureAttachment.staging.path,
+        guard file.ownedStaging, url.deletingLastPathComponent().path == stagingDirectory.path,
               UUID(uuidString: url.deletingPathExtension().lastPathComponent) != nil else { return }
         try? FileManager.default.removeItem(at: url)
     }

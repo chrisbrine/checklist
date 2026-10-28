@@ -459,6 +459,7 @@ private final class TicketTimestampCache: @unchecked Sendable {
     private let lock = NSLock()
     private let fractional = ISO8601DateFormatter()
     private let standard = ISO8601DateFormatter()
+    private let wholeSecondUTC = Date.ISO8601FormatStyle()
     private var timestamps: [String:Double] = [:]
 
     init() {
@@ -468,7 +469,16 @@ private final class TicketTimestampCache: @unchecked Sendable {
     func timestamp(_ value: String) -> Double {
         lock.lock(); defer { lock.unlock() }
         if let cached = timestamps[value] { return cached }
-        let result = (fractional.date(from:value) ?? standard.date(from:value) ?? .distantPast).timeIntervalSince1970
+        let date: Date
+        // Most stored stamps are canonical whole-second UTC. Avoid two ICU
+        // formatter parses, while retaining their behavior for every other form.
+        if value.utf8.count == 20, value.hasSuffix("Z"),
+           let parsed = try? wholeSecondUTC.parse(value), wholeSecondUTC.format(parsed) == value {
+            date = parsed
+        } else {
+            date = fractional.date(from:value) ?? standard.date(from:value) ?? .distantPast
+        }
+        let result = date.timeIntervalSince1970
         if value.utf8.count <= 64 {
             if timestamps.count >= 1024 { timestamps.removeAll(keepingCapacity:true) }
             timestamps[value] = result

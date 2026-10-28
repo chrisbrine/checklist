@@ -20,10 +20,18 @@ extension CoreTests {
                 db.trace(options:[])
                 let previous = try Int.fetchOne(db,sql:"SELECT COALESCE(MAX(seq),0) FROM events WHERE project_id IN (SELECT value FROM json_each(?)) OR project_id IS NULL",arguments:[encoded])
                 XCTAssertEqual(actual,previous)
-                let plan = try Row.fetchAll(db,sql:"EXPLAIN QUERY PLAN " + XCTUnwrap(statements.first)).map { $0["detail"] as String }
-                XCTAssertFalse(plan.contains {$0.contains("MULTI-INDEX OR")},plan.joined(separator:"\n"))
-                XCTAssertTrue(plan.contains {$0.contains("CORRELATED SCALAR SUBQUERY")},plan.joined(separator:"\n"))
-                XCTAssertTrue(plan.contains {$0.contains("COVERING INDEX events_scope")},plan.joined(separator:"\n"))
+                let newestPlan = try Row.fetchAll(db,sql:"EXPLAIN QUERY PLAN " + XCTUnwrap(statements.first)).map { $0["detail"] as String }
+                XCTAssertTrue(newestPlan.contains {$0.contains("SEARCH events USING INTEGER PRIMARY KEY")},newestPlan.joined(separator:"\n"))
+                // The newest scoped event needs only the bounded last-row probe.
+                // Every other scope still proves the original covering-range plan.
+                let fallback = statements.filter {$0.contains("COALESCE(MAX(latest),0)")}
+                XCTAssertEqual(fallback.count,projects == ["foreign"] ? 0 : 1)
+                for sql in fallback {
+                    let plan = try Row.fetchAll(db,sql:"EXPLAIN QUERY PLAN " + sql).map { $0["detail"] as String }
+                    XCTAssertFalse(plan.contains {$0.contains("MULTI-INDEX OR")},plan.joined(separator:"\n"))
+                    XCTAssertTrue(plan.contains {$0.contains("CORRELATED SCALAR SUBQUERY")},plan.joined(separator:"\n"))
+                    XCTAssertTrue(plan.contains {$0.contains("COVERING INDEX events_scope")},plan.joined(separator:"\n"))
+                }
             }
         }
     }

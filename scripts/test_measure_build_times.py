@@ -15,7 +15,8 @@ import measure_build_times as measure
 
 class MeasurementTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        # Fixture marker ownership must not inherit the caller scratch session.
+        self.temporary = tempfile.TemporaryDirectory(dir='/private/tmp')
         self.addCleanup(self.temporary.cleanup)
         caller = patch.dict(os.environ, {'CODEX_THREAD_ID': 'measurement-session', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
         caller.start();self.addCleanup(caller.stop)

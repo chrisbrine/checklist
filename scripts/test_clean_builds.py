@@ -23,7 +23,8 @@ import test_instances as slots
 
 class CleanupTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        # Caller scratch markers must not protect disposable cleanup fixtures.
+        self.temp = tempfile.TemporaryDirectory(dir='/private/tmp')
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
         self.repo = self.root / 'repo'; self.repo.mkdir()
@@ -698,6 +699,36 @@ class CleanupTests(unittest.TestCase):
         with contextlib.redirect_stdout(output):self.assertEqual(clean.finish(self.cleaner),0)
         report=json.loads(output.getvalue());self.assertGreater(report['bytes_removed'],0)
         self.assertIn('Trash',report['meaning'])
+
+
+class TmpdirIsolationTests(unittest.TestCase):
+    def test_cleanup_with_tmpdir_in_another_marked_scratch_session(self):
+        with tempfile.TemporaryDirectory(dir='/private/tmp') as directory:
+            scratch = Path(directory) / 'other-session/scratchpad/workspace'
+            scratch.mkdir(parents=True)
+            clean_scratch.write_marker(scratch, 'other-session', 'fake caller scratch')
+            identities = ('CODEX_THREAD_ID', 'CLAUDE_SESSION_ID', 'CHECKLIST_SESSION_ID',
+                          'CLAUDE_CODE_SESSION_ID')
+            for identity in (None,) + identities:
+                with self.subTest(identity=identity):
+                    environment = dict.fromkeys(identities, '')
+                    if identity:
+                        environment[identity] = 'other-session'
+                    environment['TMPDIR'] = str(scratch)
+                    with patch.dict(os.environ, environment), \
+                         patch.object(tempfile, 'tempdir', str(scratch)):
+                        # Construct a fresh fixture under the hostile caller environment.
+                        # Its real cleanup path must still move only obsolete outputs.
+                        result = unittest.TestResult()
+                        CleanupTests('test_preview_changes_nothing_and_apply_preserves_both_builds_and_all_receipts').run(result)
+                        self.assertEqual(result.testsRun, 1)
+                        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+            # Isolation must not weaken real scratch ownership or ancestor protection.
+            child = scratch / 'foreign-workspace'; child.mkdir()
+            with self.assertRaisesRegex(ValueError, 'another scratch session'):
+                clean_scratch.write_marker(child, 'fixture-session', 'foreign fixture')
+            self.assertIn('persistent workspace marker',
+                          clean_scratch.workspace_protection(child, clean_scratch.inventory(child)))
 
 
 if __name__ == '__main__': unittest.main()

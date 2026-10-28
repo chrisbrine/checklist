@@ -154,6 +154,11 @@ capture_source
 phase stop capture
 compile_products() {
   phase start compile
+  # Test-only barrier: keep Bash in an interruptible builtin, not waiting on Swift.
+  if [ -n "${CHECKLIST_TEST_BUILD_SIGNAL_READY:-}" ]; then
+    : > "$CHECKLIST_TEST_BUILD_SIGNAL_READY"
+    IFS= read -r -t 20
+  fi
   python3 "$BUILD_HELPER" sync "$CAPTURE_DIR" "$BUILD_SOURCE"
   if [ "$MODE" = --clean-stage ]; then
     swift package --package-path "$BUILD_SOURCE" --scratch-path "$SCRATCH" ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} clean

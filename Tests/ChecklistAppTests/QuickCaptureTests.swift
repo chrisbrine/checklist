@@ -20,7 +20,7 @@ import ChecklistIPC
         try? FileManager.default.removeItem(at: root)
     }
     private func model(_ transport: @escaping QuickCaptureModel.Transport) -> QuickCaptureModel {
-        QuickCaptureModel(journal: LocalDraftJournal(directory: root), preferences: preferences!, transport: transport)
+        QuickCaptureModel(journal: LocalDraftJournal(directory: root), preferences: preferences!, stagingDirectory: root.appendingPathComponent("staging"), transport: transport)
     }
 
     func testBlankNonemptyDraftStaysBlankThroughRestoreAndProjectRefresh() async throws {
@@ -455,6 +455,7 @@ import ChecklistIPC
         let quick = model { _, _ in [:] }
         XCTAssertTrue(quick.attachClipboardImage(pasteboard))
         let file = try XCTUnwrap(quick.draft.files.first)
+        XCTAssertEqual(URL(fileURLWithPath: file.path).deletingLastPathComponent(),root.appendingPathComponent("staging"))
         XCTAssertTrue(file.ownedStaging); XCTAssertEqual(URL(fileURLWithPath: file.path).pathExtension, "png")
         quick.remove(file)
         XCTAssertFalse(FileManager.default.fileExists(atPath: file.path), "Removing a staged clipboard image deletes its private copy")

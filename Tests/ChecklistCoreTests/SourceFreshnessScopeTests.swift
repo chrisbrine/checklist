@@ -279,12 +279,20 @@ final class SourceFreshnessScopeTests: XCTestCase {
         // relevance normalizes its parent, without resolving dependency.txt itself.
         let attempt: JSON = ["file_scopes":[["path":f.router.reservationKey(alias.path),"declared_path":alias.path,"access":"read"]]]
         var roots = [f.workspace.path,f.workspace.resolvingSymlinksInPath().path]
-        var links: [URL] = []
-        defer {for link in links {try? FileManager.default.removeItem(at:link)}}
-        for base in ["/private/tmp","/private/var/tmp"] {
-            let physical = URL(fileURLWithPath:base).appendingPathComponent("cl141-"+UUID().uuidString)
-            try FileManager.default.createSymbolicLink(atPath:physical.path,withDestinationPath:f.workspace.resolvingSymlinksInPath().path);links.append(physical)
-            roots += [physical.path,String(physical.path.dropFirst("/private".count))]
+        let aliases = f.storage.directory.appendingPathComponent("declared-aliases")
+        defer {try? FileManager.default.removeItem(at:aliases)}
+        // Model /tmp -> /private/tmp and /var/tmp -> /private/var/tmp
+        // entirely inside this fixture's disposable root.
+        for base in ["tmp","var/tmp"] {
+            let physicalBase = aliases.appendingPathComponent("private/"+base),lexicalBase = aliases.appendingPathComponent(base)
+            try FileManager.default.createDirectory(at:physicalBase,withIntermediateDirectories:true)
+            try FileManager.default.createDirectory(at:lexicalBase.deletingLastPathComponent(),withIntermediateDirectories:true)
+            try FileManager.default.createSymbolicLink(atPath:lexicalBase.path,withDestinationPath:physicalBase.path)
+            let physical = physicalBase.appendingPathComponent("workspace"),lexical = lexicalBase.appendingPathComponent("workspace")
+            try FileManager.default.createSymbolicLink(atPath:physical.path,withDestinationPath:f.workspace.resolvingSymlinksInPath().path)
+            XCTAssertNotEqual(physical.path,lexical.path)
+            XCTAssertEqual(physical.resolvingSymlinksInPath(),lexical.resolvingSymlinksInPath())
+            roots += [physical.path,lexical.path]
         }
         for root in roots { XCTAssertEqual(strings(f.router.sourceRelevance(root:root,attempt:attempt,additional:[]),"scopes"),["dependency.txt","one.txt"]) }
     }

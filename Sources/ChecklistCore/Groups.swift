@@ -262,19 +262,28 @@ extension CommandRouter {
             try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND json_extract(data,'$."+field+"')=CAST(? AS TEXT) COLLATE BINARY ORDER BY rowid",arguments:[Data(type.utf8),Data(pid.utf8),Data(gid.utf8)])
         }
     }
-    func syncEpic(_ db: Database,_ source: JSON,taskOverride: JSON? = nil) throws -> JSON {
+    // A creator may reuse the canonical tasks it just read in this writer transaction.
+    // Other callers load the current records before applying their override.
+    func syncEpic(_ db: Database,_ source: JSON,taskOverride: JSON? = nil,tasks taskRecords: [JSON]? = nil) throws -> JSON {
         guard source["kind"] as? String == "epic" else { throw CoreError("INVALID_INPUT","Persistent membership synchronization applies only to Epics.") }
         let pid = (try StoredRecord(source, family: "source").string("project_id")), gid = (try StoredRecord(source, family: "source").string("id"))
         var group = source;let previous = source["members"] as? [JSON] ?? []
-        var tasks = try records(db,type:"task",project:pid)
+        var tasks = try taskRecords ?? records(db,type:"task",project:pid)
         if let override = taskOverride { tasks.removeAll {$0["id"] as? String == override["id"] as? String};tasks.append(override) }
         let assigned = tasks.filter {$0["epic_id"] as? String == gid}
         // Retain membership evidence even after removal, ticket purge or receipt expiry.
         if !assigned.isEmpty || !previous.isEmpty { group["has_held_ticket"] = true }
+        // Preserve the first prior membership without rescanning all members for
+        // every ticket. Sustained ticket creation otherwise makes this quadratic.
+        var previousByTask: [String?:JSON] = [:]
+        for member in previous {
+            let id = member["task_id"] as? String
+            if previousByTask[id] == nil {previousByTask[id] = member}
+        }
         group["members"] = try assigned.map { task -> JSON in
             [
                 "task_id": (try StoredRecord(task, family: "task").requiredValue("id")),
-                "joined_at": previous.first(where: { $0["task_id"] as? String == task["id"] as? String })?["joined_at"] ?? now(),
+                "joined_at": previousByTask[task["id"] as? String]?["joined_at"] ?? now(),
             ]
         }
         group["task_ids"] = assigned.compactMap {$0["id"] as? String};group = revised(group);try save(db,group,type:"group");return group

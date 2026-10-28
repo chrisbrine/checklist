@@ -4,6 +4,71 @@ import GRDB
 @testable import ChecklistCore
 
 final class OverviewReadOptimizationTests: XCTestCase {
+    func testCombinedOverviewBatchesCleanupCountsAndCoverageWithoutChangingPages() throws {
+        let fixture = try ReadPerformanceFixture("CL-296-overview-batch"), router = fixture.router
+        let project = try fixture.call("project_create",["name":"Combined pages","key_prefix":"CP"])
+        let pid = project["id"] as! String
+        let task = try fixture.call("task_create",["project_id":pid,"title":"Done today","brief":"Keep both digest pages identical"])
+        let tid = task["id"] as! String
+        try router.dbQueue.writeWithoutTransaction { db in try router.withValidatedDomainTransaction(db) {
+            var value = try router.record(db,tid,type:"task")
+            value["status_id"] = try router.records(db,type:"status",project:pid).first {$0["category"] as? String == "done"}!["id"]
+            value["completed_at"] = ISO8601DateFormatter().string(from:Date())
+            try router.save(db,router.revised(value),type:"task")
+            try router.save(db,["id":"cleaned-original","project_id":pid,"task_id":tid,"mode":"managed","availability":"original_cleaned","revision":1],type:"attachment")
+            return .commit
+        }}
+        try router.dbQueue.read { db in
+            var statements: [String] = []
+            db.trace {if case .statement(let statement) = $0 {statements.append(statement.sql)}}
+            let since = "2026-01-01T00:00:00Z"
+            let combined = try router.workspacePage(db,["project_id":pid,"surface":"overview","since":since],fixture.owner)
+            db.trace(options:[])
+            XCTAssertEqual(statements.filter {$0.contains("COUNT(*) clean_count")}.count,1,"Batch cleanup facts for all selected groups in the pinned read")
+            XCTAssertEqual(statements.filter {$0.contains("FROM events") && $0.contains("json_each")}.count,1,"All groups share the same scope and pinned coverage")
+            let groups = try XCTUnwrap(combined["groups"] as? JSON)
+            for (surface,limit) in CommandRouter.overviewGroupLimits {
+                var single = try router.workspacePage(db,["project_id":pid,"surface":surface,"since":since,"limit":limit],fixture.owner)
+                for field in ["projects","service","content_cursor","needs_you_count"] {single.removeValue(forKey:field)}
+                XCTAssertEqual(try jsonString(try XCTUnwrap(groups[surface] as? JSON)),try jsonString(single),surface)
+            }
+            for surface in ["needs_done_today","completed_since"] {
+                let rows = (groups[surface] as! JSON)["rows"] as! [JSON]
+                XCTAssertEqual(rows.first?["cleaned_original_count"] as? Int,1)
+            }
+        }
+    }
+
+    func testWorkspaceCoverageChecksNewestEventBeforeScanningScopedHistory() throws {
+        let fixture = try ReadPerformanceFixture("CL-296-coverage")
+        let memory = try DatabaseQueue()
+        try memory.write { db in
+            try SchemaMigrations.installStorageCollation(db)
+            try db.execute(sql:"CREATE TABLE events(seq INTEGER PRIMARY KEY,project_id TEXT COLLATE checklist_storage_v2,entity_id TEXT, data TEXT); CREATE INDEX events_scope ON events(project_id,entity_id,seq)")
+            let projects = try jsonString(["selected", "selected\0suffix"])
+            func check(_ expected: Int, scansHistory: Bool) throws {
+                var statements: [String] = []
+                db.trace {if case .statement(let statement) = $0 {statements.append(statement.sql)}}
+                let actual = try fixture.router.workspaceCoverage(db,projectsJSON:projects)
+                db.trace(options:[])
+                XCTAssertEqual(actual,expected)
+                XCTAssertEqual(statements.contains {$0.contains("MAX(latest)")},scansHistory,"Only an out-of-scope newest event needs the scoped history fallback")
+                XCTAssertEqual(actual,try Int.fetchOne(db,sql:"SELECT COALESCE(MAX(seq),0) FROM events WHERE project_id IS NULL OR project_id IN (SELECT value FROM json_each(?))",arguments:[projects]))
+            }
+            try check(0,scansHistory:true)
+            try db.execute(sql:"INSERT INTO events VALUES(1,'selected','ticket','{}')")
+            try check(1,scansHistory:false)
+            try db.execute(sql:"INSERT INTO events VALUES(2,'foreign','ticket','{}')")
+            try check(1,scansHistory:true)
+            try db.execute(sql:"INSERT INTO events VALUES(3,NULL,'global','{}')")
+            try check(3,scansHistory:false)
+            try db.execute(sql:"INSERT INTO events VALUES(4,CAST(? AS TEXT),'ticket','{}')",arguments:[Data("selected\0suffix".utf8)])
+            try check(4,scansHistory:false)
+            try db.execute(sql:"INSERT INTO events VALUES(5,'selected-suffix','foreign','{}')")
+            try check(4,scansHistory:true)
+        }
+    }
+
     func testReadOnlyBatchClaimProjectionProfile() throws {
         try QualificationSuite.requireEnabled()
         guard let path = ProcessInfo.processInfo.environment["CHECKLIST_READ_ONLY_DATABASE"],

@@ -78,6 +78,10 @@ test is in neither `TIMING_TESTS` nor the gated `QUALIFICATION_TESTS` (CL-275).
 The guard follows same-file helpers and local clock-derived values/sample arrays,
 including `XCTAssertTrue` upper bounds. It has no size floor: 5-second termination,
 8-second Git timeout and 300 ms cached-return assertions are isolated too.
+The media scale timing group includes `MediaListScaleTests` methods
+`testThousandItemPublishedRoundListIsFast` and
+`testFiveThousandItemPublishedRoundListIsFast`, plus
+`MediaPreparationScaleTests/testLargeProjectPreparationReadsTouchedRecordsAndHoldsAtomicityReplayAndFencing`.
 The owned-copy preview/screen measurements also stay isolated and keep their
 explicit private-input gates. Two cleanup-deadline checks are conservatively
 isolated because they compare a deadline with the real current time; injected
@@ -118,6 +122,11 @@ emit its original assertions in `qualification_commands`. It stays out of
 `QUALIFICATION_CASES` combines `REAL_SIZE_TESTS` and `QUALIFICATION_TESTS`, so the
 qualification selection, fast-pass skips and aggregate `skip` report agree.
 `QUALIFICATION_TESTS` lists the gated XCTest identifiers across Core, App and IPC.
+This includes the four `MediaWorkflowQualificationTests` methods
+`test300ItemRoundGroupingFilterUpdateAndListBudgets`,
+`test1000ItemRoundGroupingFilterUpdateAndListBudgets`,
+`test1200ItemRoundAboveTheFormerCeilingKeepsListBudgets` and
+`testBulkPartialSuccessLostReplyReversalsReworkAndExamplesAboveOneThousandItems`.
 Their original fixtures and assertions stay in place; the shared
 `QualificationSuite.requireEnabled()` makes a direct `swift test` skip those gated
 cases unless `CHECKLIST_QUALIFICATION=1`. The real-size manifest fixture is ungated;
