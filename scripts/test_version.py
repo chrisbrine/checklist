@@ -44,6 +44,62 @@ class VersionTests(unittest.TestCase):
             {'CFBundleVersion': str(number), 'ChecklistVersion': value}))
         return bundle
 
+    def test_local_scopes_never_open_shared_or_legacy_history(self):
+        root, build = self.checkout('local')
+        (build / 'version-state.json').write_text('invalid legacy history')
+        for scope in ['measurement', 'test', 'private-copy']:
+            with self.subTest(scope=scope), patch.object(version, 'allocate', side_effect=AssertionError('shared allocation')):
+                info = version.stage_version(root, build, scope)
+                self.assertEqual(info, {'production_version': '0.0.1', 'version': '0.0.1.0',
+                                       'build_number': 0, 'build_scope': scope, 'installable': False})
+        self.assertFalse(self.allocator.exists())
+        with self.assertRaisesRegex(ValueError, 'Unknown build scope'):
+            version.stage_version(root, build, 'typo')
+        self.assertFalse(self.allocator.exists())
+
+    def test_local_stages_between_installations_do_not_advance_shared_history(self):
+        root, build = self.checkout('scoped')
+        installed = self.installed()
+        first = version.stage_version(root, build, installed=installed)
+        before = (self.allocator / 'version-state.json').read_bytes()
+        for scope in ['measurement', 'test', 'private-copy']:
+            version.stage_version(root, build, scope)
+            self.assertEqual((self.allocator / 'version-state.json').read_bytes(), before)
+        second = version.stage_version(root, build, installed=installed)
+        self.assertTrue(first['installable']);self.assertEqual(first['build_scope'], 'install')
+        self.assertEqual((first['version'], second['version']), ('0.0.1.2', '0.0.1.3'))
+        self.assertEqual((first['build_number'], second['build_number']), (122, 123))
+
+    def test_mixed_concurrent_scopes_do_not_share_reservations_or_block_local_stages(self):
+        installed = self.installed();processes = []
+        version.allocator_directory(self.allocator)
+        with (self.allocator / 'allocator.lock').open('a+b') as lock:
+            version.fcntl.flock(lock, version.fcntl.LOCK_EX)
+            for scope in ['install', 'measurement', 'install', 'test', 'private-copy']:
+                root, build = self.checkout('mixed-' + str(len(processes)))
+                code = "import json,sys;sys.path.insert(0,sys.argv[1]);import version;print(json.dumps(version.stage_version(sys.argv[2],sys.argv[3],sys.argv[4],installed=sys.argv[5])))"
+                process = subprocess.Popen([sys.executable, '-c', code, str(Path(version.__file__).parent),
+                                            str(root), str(build), scope, str(installed)],
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                processes.append((scope, process))
+                def cleanup(process=process):
+                    if process.poll() is None: process.kill()
+                    process.communicate()
+                self.addCleanup(cleanup)
+            for scope, process in processes:
+                if scope == 'install': continue
+                stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertEqual(json.loads(stdout)['build_number'], 0)
+            self.assertFalse((self.allocator / 'version-state.json').exists())
+        results = []
+        for scope, process in processes:
+            if scope != 'install': continue
+            stdout, stderr = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 0, stderr);results.append(json.loads(stdout))
+        self.assertEqual({item['version'] for item in results}, {'0.0.1.2', '0.0.1.3'})
+        self.assertEqual({item['build_number'] for item in results}, {122, 123})
+
     def test_initial_series_starts_at_one_above_historical_ordinal(self):
         self.assertEqual(version.next_version('0.0.1', 5, {'build_number': 118}),
                          {'production_version': '0.0.1', 'version': '0.0.1.1', 'build_number': 119})
@@ -276,6 +332,24 @@ class BundleVersionTests(unittest.TestCase):
         changed=dict(self.manifest,version='0.0.1.2')
         (self.bundle/'Contents/Resources/source-manifest.json').write_text(json.dumps(changed))
         with self.assertRaises(ValueError): version.verify_bundle(self.bundle)
+
+    def test_local_bundle_scope_is_stamped_verified_and_refused_before_native_calls(self):
+        for scope in ['measurement', 'test', 'private-copy']:
+            with self.subTest(scope=scope):
+                manifest = dict(self.manifest, version='0.0.1.0', build_number=0, build_scope=scope, installable=False)
+                (self.root / 'capture-manifest.json').write_text(json.dumps(manifest))
+                version.stamp(self.root, self.bundle)
+                info = version.verify_bundle(self.bundle)
+                self.assertEqual(info['build_scope'], scope);self.assertIs(info['installable'], False)
+                with patch.object(verify_install, 'executable_paths') as paths, patch.object(verify_install.subprocess, 'run') as native:
+                    with self.assertRaisesRegex(ValueError, 'not installable'):
+                        verify_install.verify(self.bundle)
+                    paths.assert_not_called();native.assert_not_called()
+                # A changed mark cannot relabel a local bundle for installation.
+                info['build_scope'] = 'install';info['installable'] = True
+                (self.bundle / 'Contents/Resources/build-info.json').write_text(json.dumps(info))
+                with self.assertRaisesRegex(ValueError, 'scope differs'):
+                    version.verify_bundle(self.bundle)
 
     def test_installed_check_rejects_stale_service_version_id_or_ordinal(self):
         paths=[str(self.bundle/'Contents/MacOS/ChecklistApp')]

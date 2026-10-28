@@ -61,6 +61,8 @@ App preference regression: `python3 scripts/check-app-test-preferences.py` runs 
 
 `./script/build_and_run.sh --stage` captures source, builds/signs the app and verifies its staged bundle. `./script/build_and_run.sh --verify` additionally replaces `/Applications/Checklist.app`, opens it and checks the service. Staging/signing and installation have effects beyond compiling and require the applicable installation authorization. The helper defaults to release; `CHECKLIST_BUILD_CONFIGURATION=debug` selects debug. It retains the prior compatible application bundle for binary rollback and does not create a database backup. Follow [self-hosting](self-hosting.md) for compatibility and store rollback rules.
 
+The default `CHECKLIST_BUILD_SCOPE=install` reserves the next shared development version. For disposable test-only stages use `CHECKLIST_BUILD_SCOPE=test`; private-copy inspection uses `private-copy`. These local stages record version `<VERSION>.0`, ordinal `0` and `installable:false`, without reserving shared history. A combined round intended for installation keeps `install` even in its private copy; local stages cannot be promoted. See [build versions](self-hosting.md#build-versions).
+
 Test slots reuse that verified stage without another build:
 
 ```sh
@@ -100,6 +102,8 @@ removal restores owner write only within generated stages (including older
 read-only stages). Immutable capture bytes and modes stay unchanged. Capture,
 compile, assemble and sign have named shell functions for later
 version/cleanup hooks; the existing timing phases remain unchanged.
+
+The measurement runner forces `CHECKLIST_BUILD_SCOPE=measurement` for all warmups and measured builds, including clean runs. Scope participates in capture identity while matching toolchains/configurations retain their warm compilation lane. Its local stages consume no shared version or build ordinal and cannot be installed.
 
 Use `script/measure_build_times.py` in an **exclusive private, already-warmed
 checkout** of the staged combined build, during a quiet window. Do not run it in
@@ -199,9 +203,17 @@ linked markers also keep it and report why. Released markers remove only their
 own protection; all other safeguards still apply. Unmarked legacy persistent
 workspace names remain protected by the shared migration guard. Apply rechecks
 markers before moving evidence, build outputs or slots.
-The installed app's fingerprint and `last-install.json` identify the
-installed and previous captures. Missing/mismatched receipts or an unavailable
-previous bundle retain builds until reconciled. Unknown build layouts are kept.
+The installed bundle and newest unambiguous `.Checklist-previous-<timestamp>-<pid>.app`
+bundle identify the installed and immediate previous captures, even when a private
+integration copy performed the install and the checkout's `last-install.json` is
+stale or absent. An unreadable identity or ambiguous newest rollback bundle retains
+every build. A matching receipt that names a missing/unreadable predecessor also
+retains every build instead of substituting an older surviving bundle. With no
+rollback bundle, only a matching install receipt explicitly recording no
+predecessor permits retirement; an unavailable predecessor retains builds.
+Captures used directly by running processes, or identified by running Checklist
+bundles (including test-slot and renamed app bundles), remain intact. Unknown
+build layouts are kept.
 
 Evidence is scoped by ticket keys in folder/file names and `files.json` ticket
 fields. A round folder may explicitly declare **every** owning ticket with

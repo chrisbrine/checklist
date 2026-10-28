@@ -112,25 +112,146 @@ class CleanupTests(unittest.TestCase):
         self.assertFalse(legacy.exists()); self.assertEqual(len(self.moves), 1)
         self.assertEqual(len(list(self.build.glob('swiftpm-*'))), 2)
 
+    def test_checkout_install_preview_uses_bundle_identities_and_reports_sizes(self):
+        captures = [self.capture(key) for key in self.ids]
+        reports = self.run_clean(self.cleaner.builds)
+        self.assertEqual([r['path'] for r in reports if r['action'] == 'kept'],
+                         [str(p) for p in captures[:2]])
+        eligible = [r for r in reports if r['action'] == 'eligible']
+        self.assertEqual(len(eligible), 4)
+        self.assertTrue(all(r['bytes'] == len(b'output') for r in eligible))
+        self.assertEqual(self.moves, [])
+
+    def test_other_checkout_install_ignores_stale_missing_or_invalid_local_receipt(self):
+        captures = [self.capture(key) for key in self.ids]
+        receipt = self.build / 'last-install.json'
+        for state in ['stale', 'absent', 'invalid']:
+            with self.subTest(state=state):
+                if state == 'stale':
+                    receipt.write_text(json.dumps({'installed': str(self.installed),
+                        'build': {'source_fingerprint': 'd'*64}, 'previous_bundle': '/old/absent.app'}))
+                elif state == 'absent': receipt.unlink()
+                else: receipt.write_text('{')
+                reports = self.run_clean(self.cleaner.builds)
+                self.assertEqual(sum(r['action'] == 'eligible' for r in reports), 4)
+                self.assertTrue(all(str(p) in [r['path'] for r in reports if r['action'] == 'kept']
+                                    for p in captures[:2]))
+        self.assertEqual(self.moves, [])
+        self.run_clean(self.cleaner.builds, True)
+        self.assertEqual(len(self.moves), 4)
+        self.assertTrue(all((p/'source/bytes').exists() for p in captures[:2]))
+
     def test_missing_previous_identity_retains_every_build(self):
         self.capture(self.ids[2]); shutil.rmtree(self.previous)
+        with self.assertRaises(OSError):
+            self.run_clean(self.cleaner.builds, True)
+        self.assertEqual(self.moves, [])
+
+    def test_unreadable_installed_or_previous_identity_retains_every_build_and_reports_reason(self):
+        captures = [self.capture(key) for key in self.ids]
+        before = {p: p.read_bytes() for folder in captures for p in folder.rglob('*') if p.is_file()}
+        for bundle in [self.installed, self.previous]:
+            for state in ['missing', 'invalid']:
+                with self.subTest(bundle=bundle, state=state):
+                    path = bundle/'Contents/Resources/build-info.json'
+                    if state == 'missing': path.unlink()
+                    else: path.write_text(json.dumps({'source_fingerprint': 'invalid'}))
+                    output = io.StringIO()
+                    with patch.object(sys, 'argv', ['clean_builds.py', '--preview', '--only', 'builds',
+                            '--repo', str(self.repo), '--installed-app', str(self.installed)]), \
+                         contextlib.redirect_stdout(output):
+                        self.assertEqual(clean.main(), 1)
+                    reports = [json.loads(line) for line in output.getvalue().splitlines()]
+                    self.assertEqual(reports[0]['action'], 'kept_error')
+                    self.assertTrue(reports[0]['reason'])
+                    self.assertFalse(any(r['action'] == 'eligible' for r in reports))
+                    self.assertEqual(before, {p: p.read_bytes() for folder in captures for p in folder.rglob('*') if p.is_file()})
+                    self.info(bundle, self.ids[0] if bundle == self.installed else self.ids[1])
+        self.assertEqual(self.moves, [])
+
+    def test_newest_previous_bundle_wins_over_stale_record_and_older_bundles(self):
+        for key in self.ids: self.capture(key)
+        newer = self.apps/'.Checklist-previous-20261023T010203Z-20.app'
+        self.info(newer, self.ids[2])
+        reports = self.run_clean(self.cleaner.builds)
+        self.assertTrue(any(r['path'] == str(self.build/self.ids[1]/'source')
+                            and r['action'] == 'eligible' for r in reports))
+        self.assertTrue(any(r['path'] == str(self.build/self.ids[2])
+                            and r['action'] == 'kept' for r in reports))
+        (newer/'Contents/Resources/build-info.json').unlink()
         with self.assertRaises(OSError): self.run_clean(self.cleaner.builds, True)
         self.assertEqual(self.moves, [])
 
-    def test_mismatched_last_install_retains_every_build(self):
-        self.capture(self.ids[2]); self.info(self.installed, 'd'*64)
-        with self.assertRaisesRegex(ValueError, 'does not match'): self.run_clean(self.cleaner.builds, True)
+    def test_ambiguous_previous_bundles_retain_every_build(self):
+        self.capture(self.ids[2])
+        self.info(self.apps/'.Checklist-previous-20261022T010203Z-11.app', self.ids[2])
+        with self.assertRaisesRegex(ValueError, 'ambiguous'):
+            self.run_clean(self.cleaner.builds, True)
+        self.assertEqual(self.moves, [])
+
+    def test_missing_recorded_previous_cannot_fall_back_to_older_survivor(self):
+        self.capture(self.ids[2])
+        self.info(self.apps/'.Checklist-previous-20261021T010203Z-9.app', self.ids[2])
+        shutil.rmtree(self.previous)
+        with self.assertRaises(OSError): self.run_clean(self.cleaner.builds, True)
+        self.assertEqual(self.moves, [])
+
+    def test_unreadable_identity_shape_retains_every_build(self):
+        self.capture(self.ids[2])
+        (self.installed/'Contents/Resources/build-info.json').write_text('[]')
+        with self.assertRaisesRegex(ValueError, 'source fingerprint'):
+            self.run_clean(self.cleaner.builds, True)
         self.assertEqual(self.moves, [])
 
     def test_first_install_without_previous_can_retire_old_outputs(self):
-        self.record(False); self.capture(self.ids[2])
+        self.record(False); shutil.rmtree(self.previous); self.capture(self.ids[2])
         self.run_clean(self.cleaner.builds, True); self.assertEqual(len(self.moves),4)
 
-    def test_build_process_preserves_used_outputs(self):
-        p = self.capture(self.ids[2]); self.processes = [p/'source/Package.swift', p/'Checklist.app/Contents/MacOS/ChecklistApp']
-        self.run_clean(self.cleaner.builds, True)
-        self.assertTrue((p/'source').exists()); self.assertTrue((p/'Checklist.app').exists())
-        self.assertEqual(len(self.moves), 2)
+    def test_no_previous_and_stale_receipt_cannot_prove_first_install(self):
+        self.record(False); shutil.rmtree(self.previous); self.info(self.installed, 'd'*64)
+        self.capture(self.ids[2])
+        with self.assertRaisesRegex(ValueError, 'previous bundle identity'):
+            self.run_clean(self.cleaner.builds, True)
+        self.assertEqual(self.moves, [])
+
+    def test_build_process_preserves_entire_capture(self):
+        p = self.capture(self.ids[2]); self.processes = [p/'source/Package.swift']
+        reports = self.run_clean(self.cleaner.builds, True)
+        self.assertTrue(all((p/name/'bytes').exists() for name in ['source', 'Checklist.app', '.build', 'products']))
+        self.assertEqual(len(reports), 1); self.assertIn('uses this capture', reports[0]['reason'])
+        self.assertEqual(self.moves, [])
+
+    def test_running_copied_bundle_preserves_its_checkout_capture(self):
+        p = self.capture(self.ids[2])
+        bundle = self.apps/'Renamed Qualification.app'; self.info(bundle, self.ids[2])
+        self.processes = [bundle/'Contents/MacOS/ChecklistApp']
+        reports = self.run_clean(self.cleaner.builds, True)
+        self.assertEqual(reports[0]['action'], 'kept')
+        self.assertIn('running app bundle', reports[0]['reason'])
+        self.assertTrue((p/'source').exists()); self.assertEqual(self.moves, [])
+
+    def test_running_test_slot_bundle_outside_applications_preserves_capture(self):
+        p = self.capture(self.ids[2])
+        bundle = self.base/'slot-1/Checklist Test 1.app'; self.info(bundle, self.ids[2])
+        self.processes = [bundle/'Contents/MacOS/ChecklistService']
+        reports = self.run_clean(self.cleaner.builds, True)
+        self.assertEqual(reports[0]['action'], 'kept')
+        self.assertTrue((p/'source').exists()); self.assertEqual(self.moves, [])
+
+    def test_copied_bundle_starts_before_batch_preserves_its_capture(self):
+        p = self.capture(self.ids[2])
+        bundle = self.apps/'Renamed Qualification.app'; self.info(bundle, self.ids[2])
+        with patch.object(self.cleaner, 'process_reader', side_effect=[[], [bundle/'Contents/MacOS/ChecklistApp']]):
+            reports = self.run_clean(self.cleaner.builds, True)
+        self.assertTrue(all(r['action'] == 'kept' for r in reports))
+        self.assertTrue((p/'source').exists()); self.assertEqual(self.moves, [])
+
+    def test_unreadable_running_bundle_identity_retains_every_build(self):
+        self.capture(self.ids[2])
+        bundle = self.apps/'Renamed Qualification.app'; bundle.mkdir()
+        self.processes = [bundle/'Contents/MacOS/ChecklistApp']
+        with self.assertRaises(OSError): self.run_clean(self.cleaner.builds, True)
+        self.assertEqual(self.moves, [])
 
     def test_live_store_overlap_is_never_retired(self):
         p = self.capture(self.ids[2]); self.live = p/'source'
@@ -392,7 +513,7 @@ class CleanupTests(unittest.TestCase):
             return []
         with patch.object(self.cleaner, 'process_reader', side_effect=processes):
             self.run_clean(self.cleaner.builds, True)
-        self.assertEqual(self.moves, []); self.assertTrue(self.cleaner.failed)
+        self.assertEqual(self.moves, [])
 
     def test_build_lock_refuses_manual_apply_and_preview(self):
         lock=self.build/'.build-lock';lock.mkdir()
@@ -627,7 +748,7 @@ class CleanupTests(unittest.TestCase):
         with patch.object(self.cleaner,'process_reader',side_effect=[[],[p/'source/bytes']]) as reader:
             self.run_clean(self.cleaner.builds,True)
         self.assertEqual(reader.call_count,2);self.assertTrue((p/'source').exists())
-        self.assertEqual(len(self.moves),3)
+        self.assertEqual(len(self.moves),0)
 
     def test_many_build_outputs_use_one_batch_and_two_process_observations(self):
         for n in range(100,130):self.capture(f'{n:064x}')

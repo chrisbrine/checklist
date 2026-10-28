@@ -43,32 +43,65 @@ def read_json(path):
 
 
 def fingerprint(info):
-    value = info.get('source_fingerprint')
+    value = info.get('source_fingerprint') if isinstance(info, dict) else None
     if not isinstance(value, str) or not FINGERPRINT.fullmatch(value):
         raise ValueError('missing or invalid source fingerprint')
     return value
 
 
 def installation(build, installed):
-    """Bind retention to the actual installed and recorded immediate previous app."""
-    info = installed / 'Contents/Resources/build-info.json'
-    installed_id = fingerprint(read_json(info))
-    record = read_json(build / 'last-install.json')
-    if Path(record['installed']).resolve() != installed.resolve() or fingerprint(record['build']) != installed_id:
-        raise ValueError('last-install does not match the installed app; retain builds')
+    """Read bundle identities even when another checkout performed the install."""
+    installed_id = fingerprint(read_json(installed / 'Contents/Resources/build-info.json'))
+    # A matching receipt can prove that a newer predecessor is missing. Never
+    # substitute an older surviving bundle in that case. Stale receipts from a
+    # different installed build have no authority over bundle discovery.
+    try:
+        record = read_json(build / 'last-install.json')
+        matches = (Path(record['installed']).resolve() == installed.resolve()
+                   and fingerprint(record['build']) == installed_id)
+    except (OSError, ValueError, KeyError, TypeError):
+        record, matches = None, False
+    if matches and record['previous_bundle'] is not None:
+        recorded = safe(Path(record['previous_bundle']))
+        if (recorded.parent != installed.parent or not re.fullmatch(
+                r'\.Checklist-previous-\d{8}T\d{6}Z-\d+\.app', recorded.name)):
+            raise ValueError('previous bundle identity is unresolved; retain builds')
+        fingerprint(read_json(recorded / 'Contents/Resources/build-info.json'))
+    previous = []
+    for bundle in installed.parent.glob('.Checklist-previous-*.app'):
+        match = re.fullmatch(r'\.Checklist-previous-(\d{8}T\d{6}Z)-\d+\.app', bundle.name)
+        if not match:
+            raise ValueError('previous bundle identity is unresolved; retain builds: ' + str(bundle))
+        previous.append((match[1], bundle))
     retained = {installed_id}
     bundles = [installed]
-    previous = record['previous_bundle']
-    if previous is not None:
-        previous = safe(Path(previous))
-        if previous.parent.resolve() != installed.parent.resolve() or not re.fullmatch(
-                r'\.Checklist-previous-\d{8}T\d{6}Z-\d+\.app', previous.name):
+    if previous:
+        latest = max(stamp for stamp, _ in previous)
+        candidates = [bundle for stamp, bundle in previous if stamp == latest]
+        if len(candidates) != 1:
+            raise ValueError('immediate previous bundle is ambiguous; retain builds')
+        bundle = candidates[0]
+        retained.add(fingerprint(read_json(bundle / 'Contents/Resources/build-info.json')))
+        bundles.append(bundle)
+    else:
+        # An absent rollback app is not proof of a first install. Only a matching
+        # receipt explicitly recording no predecessor can establish that case.
+        if not matches or record['previous_bundle'] is not None:
             raise ValueError('previous bundle identity is unresolved; retain builds')
-        # A previous bundle retired after qualification may already be in Trash.
-        # Without its identity we cannot prove which capture to retain.
-        retained.add(fingerprint(read_json(previous / 'Contents/Resources/build-info.json')))
-        bundles.append(previous)
     return retained, bundles
+
+
+def running_bundle_builds(processes):
+    retained = set()
+    for bundle in processes:
+        if bundle.suffix != '.app': continue
+        known = (bundle.name == 'Checklist.app' or bundle.name.startswith('.Checklist-')
+                 or re.fullmatch(r'Checklist Test [1-4]\.app', bundle.name)
+                 or any(bundle/'Contents/MacOS'/name in processes
+                        for name in ['ChecklistApp', 'ChecklistService', 'checklist']))
+        if known or (bundle / 'Contents/MacOS/ChecklistApp').is_file():
+            retained.add(fingerprint(read_json(bundle / 'Contents/Resources/build-info.json')))
+    return retained
 
 
 def size_of(entries):
@@ -176,10 +209,11 @@ class Cleaner:
             self.failed = True
             print(json.dumps({'path': str(path), 'kind': kind, 'action': 'kept_error', 'bytes': None, 'reason': str(error)}))
 
-    def flush_builds(self):
+    def flush_builds(self, refresh=None):
         """One fresh process observation for the batch; builds also hold their lease."""
         try:
             processes = process_ancestors(self.process_reader())
+            if refresh: refresh(processes)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             self.failed = True
             for _, _, report, *_ in self.pending:
@@ -256,8 +290,21 @@ class Cleaner:
 
     def builds(self):
         retained, _ = installation(self.build, self.installed)
-        def unchanged_install():
-            return None if installation(self.build, self.installed)[0] == retained else 'installation changed; retain build'
+        processes = self.processes()
+        running = running_bundle_builds(processes)
+        def refresh(paths):
+            nonlocal processes, running
+            processes = paths
+            running = running_bundle_builds(processes)
+        def unchanged_install(folder=None):
+            if installation(self.build, self.installed)[0] != retained:
+                return 'installation changed; retain build'
+            if folder is not None:
+                if folder.name in running:
+                    return 'running app bundle uses this capture'
+                if folder.resolve() in processes:
+                    return 'running app, CLI or check uses this capture'
+            return None
         old_keep = self.keep
         self.keep = old_keep + [self.build / key for key in retained]
         self.pending = []
@@ -268,6 +315,9 @@ class Cleaner:
                     if folder.name in retained:
                         self.item(folder, 'build', reason='installed/previous build retained')
                         continue
+                    if why := unchanged_install(folder):
+                        self.item(folder, 'build', reason=why)
+                        continue
                     manifest = read_json(folder / 'capture-manifest.json')
                     if fingerprint(manifest) != folder.name:
                         self.item(folder, 'build', reason='capture identity mismatch')
@@ -275,7 +325,7 @@ class Cleaner:
                     for child in sorted(folder.iterdir()):
                         scratch = bool(SCRATCH.fullmatch(child.name))
                         if child.name in OUTPUTS or scratch:
-                            self.item(child, 'build_output', eligible=unchanged_install,
+                            self.item(child, 'build_output', eligible=lambda f=folder: unchanged_install(f),
                                       internal_links=scratch or child.name == '.build',
                                       before_move=lambda p=child, f=folder: self.preserve_build_info(p, f),
                                       eligible_reason='obsolete copied build output; receipts retained')
@@ -285,7 +335,7 @@ class Cleaner:
                     self.item(folder, 'swiftpm_scratch', reason=why, eligible=unchanged_install,
                               internal_links=True,
                               eligible_reason='legacy SwiftPM scratch has no current persistent lane')
-            if self.apply and self.pending: self.flush_builds()
+            if self.apply and self.pending: self.flush_builds(refresh)
         finally:
             self.pending = None
             self.process_snapshot = None

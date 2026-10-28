@@ -60,6 +60,129 @@ class SelectionTests(unittest.TestCase):
                                                        for item in entry['qualification_cases']}),
                 'source_hashes': {}, 'sources': sources}
 
+    def shared_graph(self):
+        graph = json.loads(json.dumps(GRAPH))
+        package = 'Packages/ChecklistShared'
+        graph['targets'].extend([
+            dict(target('ChecklistDomain'), path=package + '/Sources/ChecklistDomain', package_path=package),
+            dict(target('ChecklistContracts', ['ChecklistDomain']),
+                 path=package + '/Sources/ChecklistContracts', package_path=package),
+            dict(target('ChecklistSharedTests', ['ChecklistContracts'], 'test'),
+                 path=package + '/Tests/ChecklistSharedTests', package_path=package),
+        ])
+        graph['targets'][1]['target_dependencies'].append('ChecklistContracts')
+        return graph
+
+    def shared_plan(self, *paths, impact_map=None, full=False):
+        return selector.select(self.root, self.shared_graph(), paths, self.root / '.build', full=full,
+                               impact_map=impact_map or {'complete': False})
+
+    def test_shared_source_uses_module_consumers_and_own_package_command(self):
+        path = 'Packages/ChecklistShared/Sources/ChecklistContracts/CommandMethods.swift'
+        plan = self.shared_plan(path)
+        self.assertEqual(plan['fallback_paths'], [])
+        self.assertIn('ChecklistSharedTests', plan['test_targets'])
+        self.assertIn('ChecklistCoreTests', plan['test_targets'])
+        self.assertIn('module closure', plan['fallback_reasons'][path])
+        shared, = plan['shared_package_commands']
+        self.assertEqual(shared[shared.index('--package-path') + 1], str(self.root / 'Packages/ChecklistShared'))
+        self.assertEqual(shared[shared.index('--scratch-path') + 1], str(self.root / '.build/packages/ChecklistShared'))
+        self.assertIn('--enable-dependency-cache', shared)
+        self.assertIn('HumanClaimsKeychainTests', shared)
+        self.assertIn(shared, plan['commands'])
+        self.assertNotIn('^ChecklistSharedTests\\.', plan['swift_commands'][0])
+
+    def test_shared_measured_source_keeps_own_tests_and_narrows_root_classes(self):
+        path = 'Packages/ChecklistShared/Sources/ChecklistContracts/CommandMethods.swift'
+        measured = self.measured_map({path: {'classes': ['ChecklistIPCTests.CommandReplyTests'],
+                                             'qualification_cases': []}})
+        plan = self.shared_plan(path, impact_map=measured)
+        self.assertEqual(plan['test_targets'], ['ChecklistIPCTests', 'ChecklistSharedTests'])
+        self.assertEqual(plan['test_groups'], {'ChecklistIPCTests': ['CommandReplyTests']})
+        self.assertEqual(plan['fallback_paths'], [])
+        self.assertEqual(plan['group_fallback_paths'], [])
+
+    def test_empty_shared_coverage_does_not_drop_root_consumers(self):
+        path = 'Packages/ChecklistShared/Sources/ChecklistContracts/CommandMethods.swift'
+        plan = self.shared_plan(path, impact_map=self.measured_map({
+            path: {'classes': [], 'qualification_cases': []}}))
+        self.assertIn('ChecklistCoreTests', plan['test_targets'])
+        self.assertIn('ChecklistSharedTests', plan['test_targets'])
+        self.assertIn(path, plan['group_fallback_paths'])
+
+    def test_shared_test_change_runs_only_its_package_and_class(self):
+        path = 'Packages/ChecklistShared/Tests/ChecklistSharedTests/CommandMethodsTests.swift'
+        source = self.root / path
+        source.parent.mkdir(parents=True)
+        source.write_text('import XCTest\nfinal class CommandMethodsTests: XCTestCase {\n func testRead() {}\n}\n')
+        plan = self.shared_plan(path)
+        self.assertEqual(plan['test_targets'], ['ChecklistSharedTests'])
+        self.assertEqual(plan['test_groups'], {'ChecklistSharedTests': ['CommandMethodsTests']})
+        self.assertEqual(plan['fallback_paths'], [])
+        self.assertEqual(plan['swift_commands'], plan['shared_package_commands'])
+        self.assertIn('^ChecklistSharedTests\\.(?:CommandMethodsTests)(?:/|$)', plan['swift_commands'][0])
+
+    def test_shared_manifest_lockfile_and_unknown_input_name_full_fallback(self):
+        for path, reason in [
+            ('Packages/ChecklistShared/Package.swift', 'nested package manifest or lockfile'),
+            ('Packages/ChecklistShared/Package.resolved', 'nested package manifest or lockfile'),
+            ('Packages/ChecklistShared/unknown.bin', 'unknown path; its consumers cannot be determined'),
+        ]:
+            with self.subTest(path=path):
+                plan = self.shared_plan(path)
+                self.assertEqual(plan['fallback_paths'], [path])
+                self.assertEqual(plan['fallback_reasons'][path], reason)
+                self.assertEqual(len(plan['test_targets']), 8)
+                self.assertEqual(len(plan['shared_package_commands']), 1)
+                self.assertIn('scripts/test_affected_tests.py', plan['python_tests'])
+
+    def test_shared_index_selects_root_classes_without_execution_coverage(self):
+        import hashlib
+        shared = 'Packages/ChecklistShared/Sources/ChecklistContracts/CommandMethods.swift'
+        test = 'Tests/ChecklistIPCTests/CommandReplyTests.swift'
+        for path, text in [(shared, 'public func read() {}'),
+                           (test, 'final class CommandReplyTests: XCTestCase {}')]:
+            source = self.root / path
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(text)
+        export = {'schema_version': 1,
+                  'source_hashes': {path: hashlib.sha256((self.root / path).read_bytes()).hexdigest()
+                                    for path in [shared, test, 'Sources/ChecklistCore/NativeOutcomeRecorder.swift',
+                                                 'Sources/ChecklistService/main.swift']},
+                  'occurrences': [
+                      {'file': shared, 'usr': 'read', 'name': 'read', 'kind': 12, 'roles': 2},
+                      {'file': test, 'usr': 'class', 'name': 'CommandReplyTests', 'kind': 7, 'roles': 2},
+                      {'file': test, 'usr': 'read', 'name': 'read', 'kind': 12, 'roles': 4}]}
+        plan = selector.select(self.root, self.shared_graph(), [shared], self.root / '.build',
+                               impact_map={'complete': False}, shared_index=export)
+        self.assertEqual(plan['test_targets'], ['ChecklistIPCTests', 'ChecklistSharedTests'])
+        self.assertEqual(plan['test_groups'], {'ChecklistIPCTests': ['CommandReplyTests']})
+        self.assertEqual(plan['shared_index_selections'], {shared: ['ChecklistIPCTests.CommandReplyTests']})
+        self.assertEqual(plan['fallback_reasons'], {})
+        index_path = self.root / 'index.json'
+        index_path.write_text(json.dumps(export))
+        output = io.StringIO()
+        with patch.object(selector, 'package_graph', return_value=self.shared_graph()), \
+             patch.object(selector, 'load_impact_map', return_value=(None, {'state': 'missing'})), \
+             redirect_stdout(output):
+            selector.main(['--root', str(self.root), '--paths', './' + shared, '--json',
+                           '--scratch-path', str(self.root / '.build'), '--shared-index', str(index_path)])
+        cli_plan = json.loads(output.getvalue())
+        for key in ('test_targets', 'test_groups', 'shared_index_selections'):
+            self.assertEqual(cli_plan[key], plan[key])
+        export['source_hashes'][test] = '0' * 64
+        stale = selector.select(self.root, self.shared_graph(), [shared], self.root / '.build',
+                                impact_map={'complete': False}, shared_index=export)
+        self.assertIn('source inputs differ', stale['fallback_reasons'][shared])
+        self.assertEqual(stale['fallback_paths'], [])
+        self.assertIn('ChecklistCoreTests', stale['test_targets'])
+
+    def test_shared_full_includes_separate_package_command(self):
+        plan = self.shared_plan(full=True)
+        self.assertEqual(len(plan['test_targets']), 8)
+        self.assertEqual(len(plan['shared_package_commands']), 1)
+        self.assertNotIn('--package-path', plan['swift_commands'][0])
+
     def test_synthetic_llvm_exports_feed_selection_without_source_declarations(self):
         spec = importlib.util.spec_from_file_location('test_impact_map',
                     Path(__file__).resolve().parents[1] / 'script/test_impact_map.py')
@@ -507,7 +630,8 @@ class SelectionTests(unittest.TestCase):
                                ('script/index_store.py', 'scripts/test_test_impact_map.py')]:
             with self.subTest(path=path):
                 plan = self.plan(path)
-                self.assertEqual(plan['python_tests'], [expected])
+                self.assertEqual(plan['python_tests'], sorted([expected] + (
+                    ['scripts/test_shared_test_impact.py'] if path == 'script/index_store.py' else [])))
                 self.assertFalse(plan['swift_commands'])
 
     def test_round_and_full_use_the_same_pinned_python(self):
@@ -955,6 +1079,28 @@ class SelectionTests(unittest.TestCase):
             manifest.write_text('second')
             selector.package_graph(self.root, self.root / '.build')
             self.assertEqual(run.call_count, 2)
+
+    def test_graph_includes_shared_products_paths_and_cached_descriptions(self):
+        (self.root / 'Package.swift').write_text('root')
+        manifest = self.root / 'Packages/ChecklistShared/Package.swift'
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text('shared')
+        root = {'targets': [dict(target('ChecklistIPC'), product_dependencies=['PublicContracts'])]}
+        shared = {'products': [{'name': 'PublicContracts', 'targets': ['ChecklistContracts']}],
+                  'targets': [target('ChecklistContracts'), target('ChecklistSharedTests', ['ChecklistContracts'], 'test')]}
+        with patch.object(selector.subprocess, 'run', side_effect=[
+                subprocess.CompletedProcess([], 0, json.dumps(root)),
+                subprocess.CompletedProcess([], 0, json.dumps(shared))]) as run:
+            graph = selector.package_graph(self.root, self.root / '.build')
+            self.assertEqual(graph['targets'][0]['target_dependencies'], ['ChecklistContracts'])
+            self.assertEqual(graph['targets'][1]['path'], 'Packages/ChecklistShared/Sources/ChecklistContracts')
+            self.assertEqual(graph['targets'][2]['package_path'], 'Packages/ChecklistShared')
+            self.assertEqual(selector.package_graph(self.root, self.root / '.build'), graph)
+            self.assertEqual(run.call_count, 2)
+            command = run.call_args_list[1].args[0]
+            self.assertEqual(command[command.index('--package-path') + 1], str(manifest.parent))
+            self.assertEqual(command[command.index('--scratch-path') + 1],
+                             str(self.root / '.build/packages/ChecklistShared'))
 
     def test_nested_package_manifest_changes_invalidate_graph_cache(self):
         (self.root / 'Package.swift').write_text('root package')

@@ -9,11 +9,13 @@ Establish the caller's actual identity before creating a slot. Native Codex/Clau
 Build once with the ordinary immutable capture helper:
 
 ```sh
-CHECKLIST_BUILD_CONFIGURATION=debug ./script/build_and_run.sh --stage
+CHECKLIST_BUILD_SCOPE=test CHECKLIST_BUILD_CONFIGURATION=debug ./script/build_and_run.sh --stage
 ./script/test_instances.py create --slot 1 --latest-stage
 # Or select the exact .local/build/<fingerprint> capture directory:
 ./script/test_instances.py create --slot 2 --stage .local/build/<fingerprint> --seed latest-backup
 ```
+
+The `test` scope does not consume a shared development version and cannot be promoted. For a round whose exact stage will later be installed, use `CHECKLIST_BUILD_SCOPE=install` instead, then qualify that capture. See [build versions](self-hosting.md#build-versions).
 
 `create` never builds. It verifies the captured inputs, fingerprint, completed build receipt, bundled manifests and signatures. It copies the stage, renames the app identity, removes bundled LaunchAgents and signs with the stage's signing selection (`CHECKLIST_SIGN_IDENTITY`, otherwise the owned private `.local/build/signing-identity` file, otherwise ad-hoc). App and helpers must have one signing team. With no source option, `create` selects the latest complete stage; `--latest-stage` makes that choice explicit. Both print the selected build ID. `--replace` requires a stopped slot, runs the same name cleanup and prints the same receipt as `destroy` before copying the new stage, and moves its prior folder to the Trash.
 

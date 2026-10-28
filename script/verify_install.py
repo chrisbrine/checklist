@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from version import verify_bundle
+from version import require_installable, verify_bundle
 
 
 SAFE_FAILURE_GUIDANCE = ('The installed bundle and the store were kept. Check checklist service status and the service log. '
@@ -65,6 +65,7 @@ def executable_paths():
 def verify(destination, paths=None, runner=subprocess.run, *, clock=time.monotonic, sleep=time.sleep,
            progress=None, install_started=None):
     destination = Path(destination)
+    require_installable(verify_bundle(destination))
     executable = destination / 'Contents/MacOS/ChecklistApp'
     if paths is not None: paths = tuple(paths)
     progress = progress or (lambda line: print(line, file=sys.stderr, flush=True))

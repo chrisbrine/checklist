@@ -660,6 +660,90 @@ class CleanScratchTests(unittest.TestCase):
         self.assertTrue((item / '.git').is_dir())
         self.assertEqual((item / 'unique-note').read_bytes(), b'keep')
 
+    def test_ten_thousand_git_files_move_as_one_folder_with_exact_receipt_bytes(self):
+        item = self.item('ws1');self.mark(item, release=True)
+        folder = item / 'store-copies/h1-receipts'
+        contents = b'old source\n'
+        for i in range(10_000):
+            self.write(folder, f'file-{i:05d}', contents)
+        (folder / 'empty/nested').mkdir(parents=True)
+        # The released ownership marker retains ws1, but not its eligible child.
+        expected = item / 'store-copies'
+        before = cleanup.inventory(item)
+        result, preview = self.run_cleanup()
+        self.assertEqual(result, 0)
+        self.assertEqual(cleanup.inventory(item), before)
+        self.assertEqual(preview[0]['eligible_paths'], [str(expected)])
+        self.assertEqual(preview[0]['planned_move_count'], 1)
+        started = time.monotonic()
+        result, records = self.run_cleanup(apply=True)
+        elapsed = time.monotonic() - started
+        self.assertEqual(result, 0)
+        self.assertLess(elapsed, 120, f'10,000-file apply took {elapsed:.2f}s')
+        moves = [r for r in records if r['action'] == 'trash_move']
+        summary = records[-1]
+        size = len(contents) * 10_000
+        self.assertEqual(len(moves), 1)
+        self.assertEqual(moves[0]['source'], str(expected))
+        self.assertEqual(moves[0]['bytes'], size)
+        self.assertEqual(summary['destinations'], [{k: v for k, v in moves[0].items() if k != 'action'}])
+        self.assertEqual(summary['planned_move_count'], 1)
+        self.assertEqual(summary['moved_count'], 1)
+        self.assertEqual(summary['moved_bytes'], size)
+        self.assertEqual(summary['git_redundant_source_bytes'], size)
+        self.assertEqual(summary['kept_bytes'], before[item / cleanup.WORKSPACE_MARKER][3])
+        destination = Path(moves[0]['trash'])
+        self.assertEqual(destination.parent, self.trash)
+        files = [p for p in destination.rglob('*') if p.is_file()]
+        self.assertEqual(len(files), 10_000)
+        self.assertTrue(all(p.read_bytes() == contents for p in files))
+        self.assertTrue((destination / 'h1-receipts/empty/nested').is_dir())
+        self.assertTrue((item / cleanup.WORKSPACE_MARKER).exists())
+        print(f'CL-291 whole folder: 10,000 Git-redundant files, 1 move, {size} bytes, {elapsed:.3f}s apply')
+
+    def test_mixed_folder_moves_largest_eligible_subtrees_with_exact_counts(self):
+        item = self.item('ws1');self.mark(item, release=True)
+        folder = item / 'store-copies/h1-receipts'
+        for i in range(10_000):
+            self.write(folder, f'eligible/deep/file-{i:05d}', b'old source\n')
+        self.write(folder, 'mixed/eligible/deep/source.py', b'new source\n')
+        loose = self.write(folder, 'mixed/old.py', b'old source\n')
+        note = self.write(folder, 'mixed/notes.md', b'unique evidence')
+        link = folder / 'retained-link';link.symlink_to(self.repo / 'source.py')
+        (folder / 'eligible/empty').mkdir()
+        expected = [folder / 'eligible', folder / 'mixed/eligible', loose]
+        retained = {p: p.lstat() for p in [note, link, item / cleanup.WORKSPACE_MARKER]}
+        started = time.monotonic()
+        result, records = self.run_cleanup(apply=True)
+        elapsed = time.monotonic() - started
+        self.assertEqual(result, 0)
+        self.assertLess(elapsed, 120, f'mixed 10,000-file apply took {elapsed:.2f}s')
+        moves = [r for r in records if r['action'] == 'trash_move']
+        summary = records[-1]
+        sizes = [10_000 * len(b'old source\n'), len(b'new source\n'), len(b'old source\n')]
+        self.assertEqual(summary['eligible_paths'], list(map(str, expected)))
+        self.assertEqual([r['source'] for r in moves], list(map(str, expected)))
+        self.assertEqual([r['bytes'] for r in moves], sizes)
+        self.assertEqual(summary['planned_move_count'], 3)
+        self.assertEqual(summary['moved_count'], 3)
+        self.assertEqual(summary['moved_bytes'], sum(sizes))
+        self.assertEqual(summary['git_redundant_source_bytes'], sum(sizes))
+        self.assertEqual(summary['kept_bytes'], sum(s.st_size for s in retained.values()))
+        for path, metadata in retained.items():
+            observed = path.lstat()
+            self.assertEqual((observed.st_dev, observed.st_ino, observed.st_mode,
+                              observed.st_size, observed.st_mtime_ns, observed.st_ctime_ns),
+                             (metadata.st_dev, metadata.st_ino, metadata.st_mode,
+                              metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns))
+        self.assertEqual(note.read_bytes(), b'unique evidence')
+        self.assertEqual(link.readlink(), self.repo / 'source.py')
+        for receipt, size in zip(moves, sizes):
+            destination = Path(receipt['trash'])
+            self.assertEqual(destination.parent, self.trash)
+            entries = cleanup.inventory(destination)
+            self.assertEqual(sum(e[3] for e in entries.values() if not stat.S_ISDIR(e[2])), size)
+        print(f'CL-291 mixed folder: 10,002 Git-redundant files, 3 moves, {sum(sizes)} bytes, {elapsed:.3f}s apply')
+
     def test_batch_spans_items_and_partly_eligible_folder_keeps_unique_files(self):
         expected = set()
         for i in range(5):
@@ -730,14 +814,58 @@ class CleanScratchTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]['path'], str(second))
         self.assertEqual(errors[0]['destinations'], [])
+        self.assertEqual(errors[0]['moved_count'], 0)
+        self.assertEqual(errors[0]['moved_bytes'], 0)
         self.assertEqual(errors[0]['build_bytes'], len(b'generated'))
         self.assertEqual(next(r for r in records if r.get('path') == str(first))['action'], 'trashed')
+
+    def test_partial_folder_failure_counts_only_confirmed_moves_and_bytes(self):
+        item = self.item();self.mark(item, release=True)
+        first = self.write(item, 'a/.build/output', b'first build')
+        failed = self.write(item, 'b/.build/output', b'failed build')
+        last = self.write(item, 'c/source.py', b'old source\n')
+        note = self.write(item, 'unique-note', b'retain evidence')
+        calls = []
+        def partial(paths):
+            calls.append(list(paths))
+            for path in paths:
+                if path == item / 'b':
+                    raise OSError('fixture folder move failed')
+                yield path, cleanup.trash(path)
+        result, records = self.run_cleanup(apply=True, mover=partial)
+        self.assertEqual(result, 1)
+        self.assertEqual(calls, [[item / name for name in ['a', 'b', 'c']], [item / 'c']])
+        moves = [r for r in records if r['action'] == 'trash_move']
+        summary = records[-1]
+        self.assertEqual([r['bytes'] for r in moves], [len(b'first build'), len(b'old source\n')])
+        self.assertEqual(summary['planned_move_count'], 3)
+        self.assertEqual(summary['moved_count'], 2)
+        self.assertEqual(summary['moved_bytes'], sum(r['bytes'] for r in moves))
+        self.assertEqual(summary['build_bytes'], len(b'first buildfailed build'))
+        self.assertFalse(first.exists());self.assertFalse(last.exists())
+        self.assertEqual(failed.read_bytes(), b'failed build')
+        self.assertEqual(note.read_bytes(), b'retain evidence')
+        self.assertEqual(len(summary['destinations']), 2)
+        self.assertEqual(summary['errors'][0]['source'], str(item / 'b'))
+
+    def test_empty_folder_receipt_has_zero_logical_bytes(self):
+        item = self.item()
+        (item / 'empty/deep').mkdir(parents=True)
+        result, records = self.run_cleanup(apply=True)
+        self.assertEqual(result, 0)
+        self.assertEqual(records[0]['source'], str(item))
+        self.assertEqual(records[0]['bytes'], 0)
+        self.assertEqual(records[-1]['planned_move_count'], 1)
+        self.assertEqual(records[-1]['moved_count'], 1)
+        self.assertEqual(records[-1]['moved_bytes'], 0)
 
     def test_incomplete_receipts_refuse_success(self):
         item = self.item();self.write(item, '.build/object')
         result, records = self.run_cleanup(apply=True, mover=lambda paths: [])
         self.assertEqual(result, 1)
         self.assertIn('receipts incomplete', records[0]['reason'])
+        self.assertEqual(records[0]['moved_count'], 0)
+        self.assertEqual(records[0]['moved_bytes'], 0)
         self.assertTrue(item.exists())
 
     def test_released_parent_reports_nested_legacy_but_only_keeps_legacy_subtree(self):

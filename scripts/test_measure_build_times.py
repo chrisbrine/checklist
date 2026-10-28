@@ -34,12 +34,12 @@ class MeasurementTests(unittest.TestCase):
         (script / 'fixture.py').write_text('''import hashlib,json,os,pathlib,sys
 root=pathlib.Path(__file__).resolve().parents[1]
 inputs={str(p.relative_to(root)):p.read_text() for p in (root/'Sources').rglob('*.swift')}
-with (root/'calls.jsonl').open('a') as stream:stream.write(json.dumps({'mode':sys.argv[1],'inputs':inputs})+'\\n')
+with (root/'calls.jsonl').open('a') as stream:stream.write(json.dumps({'mode':sys.argv[1],'scope':os.environ.get('CHECKLIST_BUILD_SCOPE'),'inputs':inputs})+'\\n')
 if os.environ.get('FAIL_ON_EDIT') and any('measurement' in text for text in inputs.values()):raise SystemExit(7)
 capture=root/'.local/build/fixture';(capture/'Checklist.app').mkdir(parents=True,exist_ok=True)
 receipt={'timing':{'phases':{'compile':{'status':'skipped' if os.environ.get('SKIP_COMPILE') else 'completed'}}},'source_sha256':{p:hashlib.sha256(text.encode()).hexdigest() for p,text in inputs.items()}}
 (capture/'build-verification.json').write_text(json.dumps(receipt))
-(capture/'capture-manifest.json').write_text(json.dumps({'source_fingerprint':'fixture','configuration':'release','toolchain':'fixture','signing_profile':'ad-hoc'}))
+(capture/'capture-manifest.json').write_text(json.dumps({'source_fingerprint':'fixture','configuration':'release','toolchain':'fixture','signing_profile':'ad-hoc','build_scope':'install' if os.environ.get('WRONG_SCOPE') else os.environ.get('CHECKLIST_BUILD_SCOPE'),'installable':False}))
 print('Staged '+str(capture/'Checklist.app'))
 ''')
 
@@ -65,6 +65,7 @@ print('Staged '+str(capture/'Checklist.app'))
                 self.assertTrue((self.output/record['log']).is_file())
                 self.assertTrue((self.output/record['warmup']['log']).is_file())
         for call in calls:
+            self.assertEqual(call['scope'], 'measurement')
             changed=[p for p,text in call['inputs'].items() if 'measurement' in text]
             self.assertLessEqual(len(changed), 1)
         for path,(data,mtime) in original.items():
@@ -102,6 +103,13 @@ print('Staged '+str(capture/'Checklist.app'))
         self.assertNotIn('medians_seconds', report)
         self.assertTrue((self.output/'core-change-1.log').is_file())
         self.assertFalse((self.checkout/'.local/build/.measurement-lock').exists())
+
+    def test_measurement_overrides_inherited_install_scope_and_rejects_wrong_receipt(self):
+        with patch.dict(os.environ, CHECKLIST_BUILD_SCOPE='install', WRONG_SCOPE='1'):
+            with self.assertRaisesRegex(RuntimeError, 'measurement-scope'):
+                self.run_measurement()
+        calls = [json.loads(line) for line in (self.checkout / 'calls.jsonl').read_text().splitlines()]
+        self.assertEqual(calls[0]['scope'], 'measurement')
 
     def test_cached_stage_is_not_a_compile_measurement(self):
         with patch.dict(os.environ, SKIP_COMPILE='1'), self.assertRaisesRegex(RuntimeError, 'without compiling'):

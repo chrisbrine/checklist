@@ -5,7 +5,7 @@ from pathlib import Path
 import plistlib
 import re
 import subprocess
-from version import verify_bundle
+from version import require_installable, verify_bundle
 
 
 def sha(path):
@@ -26,7 +26,7 @@ def signing_teams(bundle, profile):
         raise ValueError('App and helpers must have one signing team matching the signing profile.')
 
 
-def verify(capture):
+def verify(capture, *, for_install=False):
     capture = Path(capture).expanduser().resolve(strict=True)
     manifest = json.loads((capture / 'capture-manifest.json').read_text())
     helper = capture / 'source/script/build_input_inventory.py'
@@ -40,7 +40,9 @@ def verify(capture):
     exec(compile(helper_source, str(helper), 'exec'), namespace)
     if namespace['inventory'](capture / 'source') != manifest['inputs']:
         raise ValueError('Captured source differs from manifest.')
-    canonical = json.dumps({key: manifest[key] for key in ['inputs', 'toolchain', 'configuration']}, sort_keys=True, separators=(',', ':')).encode()
+    canonical_inputs = {key: manifest[key] for key in ['inputs', 'toolchain', 'configuration']}
+    if 'build_scope' in manifest: canonical_inputs['build_scope'] = manifest['build_scope']
+    canonical = json.dumps(canonical_inputs, sort_keys=True, separators=(',', ':')).encode()
     fingerprint = hashlib.sha256(canonical).hexdigest()
     if manifest['source_fingerprint'] != fingerprint or manifest['build_id'] != fingerprint[:16]:
         raise ValueError('Capture fingerprint/build ID mismatch.')
@@ -52,6 +54,7 @@ def verify(capture):
     if json.loads((resources / 'source-manifest.json').read_text()) != manifest:
         raise ValueError('Bundled source manifest differs from capture.')
     info = verify_bundle(bundle)
+    if for_install: require_installable(info)
     if info['production_version'] != (capture / 'source/VERSION').read_text().strip():
         raise ValueError('Bundle production version differs from captured VERSION.')
     for key in ['build_id', 'source_fingerprint', 'build_number', 'signing_identity_sha256']:

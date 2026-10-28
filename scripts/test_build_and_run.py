@@ -90,7 +90,7 @@ class BuildScriptTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         for folder in ['script', 'Sources', 'Resources', 'tools']:
             (self.root / folder).mkdir()
-        for name in ['build_and_run.sh', 'build_input_inventory.py', 'build_support.py', 'version.py']:
+        for name in ['build_and_run.sh', 'build_input_inventory.py', 'build_support.py', 'version.py', 'verify_stage.py']:
             shutil.copyfile(ROOT / 'script' / name, self.root / 'script' / name)
         (self.root / 'script/build_and_run.sh').chmod(0o755)
         (self.root / 'VERSION').write_text('0.0.1\n')
@@ -148,6 +148,42 @@ elif name=='plutil': pass
 
     def capture(self):
         return next((self.root/'.local/build').glob('*/capture-manifest.json')).parent
+
+    def test_scope_switch_separates_captures_reuses_compilation_lane_and_reserves_only_install(self):
+        captures = {}
+        for scope in ['measurement', 'install', 'test', 'private-copy', 'measurement', 'install']:
+            result = self.run_stage(CHECKLIST_BUILD_SCOPE=scope)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            capture = Path(next(line[7:] for line in result.stdout.splitlines() if line.startswith('Staged '))).parent
+            manifest = json.loads((capture / 'capture-manifest.json').read_text())
+            info = json.loads((capture / 'Checklist.app/Contents/Resources/build-info.json').read_text())
+            self.assertEqual(manifest['build_scope'], scope);self.assertEqual(info['build_scope'], scope)
+            self.assertIs(info['installable'], scope == 'install')
+            if scope == 'measurement' and not captures: self.assertFalse((self.root / 'allocator').exists())
+            if scope != 'install':
+                self.assertEqual((info['version'], info['build_number']), ('0.0.1.0', 0))
+            if scope in captures: self.assertEqual(capture, captures[scope])
+            captures[scope] = capture
+        self.assertEqual(len(set(captures.values())), 4)
+        install = json.loads((captures['install'] / 'capture-manifest.json').read_text())
+        state = json.loads((self.root / 'allocator/version-state.json').read_text())
+        self.assertEqual(state['build_number'], install['build_number'])
+        self.assertEqual(state['series']['0.0.1'], int(install['version'].rsplit('.', 1)[1]))
+        self.assertEqual(len(list((self.root / '.local/build').glob('swiftpm-*'))), 1)
+        with patch.object(verify_stage.subprocess, 'run'), patch.object(verify_stage, 'signing_teams'):
+            verify_stage.verify(captures['measurement'])  # usable by disposable test slots
+            verify_stage.verify(captures['install'], for_install=True)
+        for scope in ['measurement', 'test', 'private-copy']:
+            result = subprocess.run([str(self.root / 'script/build_and_run.sh'), '--install-stage', str(captures[scope])],
+                                    env=self.env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('not installable', result.stderr)
+
+    def test_invalid_scope_and_local_install_mode_refuse_before_build_or_allocation(self):
+        for mode, scope in [('--stage', 'typo'), ('--verify', 'measurement'), ('--install', 'test')]:
+            result = self.run_stage(mode=mode, CHECKLIST_BUILD_SCOPE=scope)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(self.calls.exists());self.assertFalse((self.root / 'allocator').exists())
 
     def test_one_three_product_build_one_bin_read_and_phase_receipt(self):
         result=self.run_stage();self.assertEqual(result.returncode,0,result.stdout+result.stderr)
@@ -461,6 +497,27 @@ elif name=='plutil': pass
         self.assertNotEqual(lanes[0],lanes[1])
         for key in ['version', 'build_number', 'build_id']:
             self.assertNotEqual(identities[0][key], identities[1][key], key)
+
+    def test_concurrent_install_and_local_stages_only_reserve_the_install_version(self):
+        fixtures = [self]
+        for scope in ['measurement', 'test', 'private-copy']:
+            fixture = BuildScriptTests();fixture.setUp();self.addCleanup(fixture.doCleanups)
+            fixture.env.update(CHECKLIST_BUILD_SCOPE=scope,
+                               CHECKLIST_BUILD_ALLOCATOR_DIR=self.env['CHECKLIST_BUILD_ALLOCATOR_DIR'])
+            fixtures.append(fixture)
+        paused = [fixture.start_paused() for fixture in fixtures]
+        installed = json.loads((self.capture() / 'capture-manifest.json').read_text())
+        state = self.root / 'allocator/version-state.json';reserved = state.read_bytes()
+        for _, release in paused: release.touch()
+        for process, _ in paused:
+            stdout, stderr = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 0, stdout + stderr)
+        for fixture in fixtures[1:]:
+            info = json.loads((fixture.capture() / 'Checklist.app/Contents/Resources/build-info.json').read_text())
+            self.assertFalse(info['installable']);self.assertEqual(info['build_number'], 0)
+        self.assertEqual(state.read_bytes(), reserved)
+        self.assertEqual(json.loads(reserved)['build_number'], installed['build_number'])
+        self.assertEqual(json.loads(reserved)['series']['0.0.1'], int(installed['version'].rsplit('.', 1)[1]))
 
     def test_held_build_lock_refuses_before_running_native_tools(self):
         lock=self.root/'.local/build/.build-lock';lock.mkdir(parents=True)

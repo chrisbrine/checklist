@@ -154,7 +154,9 @@ BUILD_SCRIPTS = ('script/build_', 'script/build_and_run.sh', 'scripts/compile-co
 PYTHON_TEST_OWNERS = {
     'scripts/validate-plan.py': [],  # Its own shape/reference checks run in VALIDATE.
     'script/verify_install.py': ['scripts/test_test_instances.py'],
-    'script/index_store.py': ['scripts/test_test_impact_map.py'],
+    'script/index_store.py': ['scripts/test_test_impact_map.py', 'scripts/test_shared_test_impact.py'],
+    'script/test_impact_map.py': ['scripts/test_test_impact_map.py', 'scripts/test_shared_test_impact.py'],
+    'script/shared_test_impact.py': ['scripts/test_shared_test_impact.py', 'scripts/test_affected_tests.py'],
     'scripts/public_source_privacy.py': ['scripts/test_prepare_public_source.py'],
     'scripts/public-source-files.json': ['scripts/test_prepare_public_source.py'],
 }
@@ -440,7 +442,7 @@ def package_graph(root, scratch):
     manifests = {root / 'Package.swift', root / 'Package.resolved'}
     manifests.update((root / 'Packages').rglob('Package.swift'))
     manifests.update((root / 'Packages').rglob('Package.resolved'))
-    fingerprint = hashlib.sha256()
+    fingerprint = hashlib.sha256(b'shared-package-graph-v1\0')
     for manifest in sorted(manifests):
         fingerprint.update(str(manifest.relative_to(root)).encode() + b'\0')
         fingerprint.update(manifest.read_bytes() if manifest.is_file() else b'<absent>')
@@ -455,6 +457,27 @@ def package_graph(root, scratch):
                              'describe', '--type', 'json'], cwd=root, check=True,
                             text=True, capture_output=True)
     graph = json.loads(result.stdout)
+    shared = root / 'Packages/ChecklistShared'
+    if (shared / 'Package.swift').is_file():
+        package_path = shared.relative_to(root).as_posix()
+        result = subprocess.run(['swift', 'package', '--package-path', str(shared),
+                                 '--scratch-path', str(scratch / 'packages/ChecklistShared'),
+                                 'describe', '--type', 'json'], cwd=root, check=True,
+                                text=True, capture_output=True)
+        package = json.loads(result.stdout)
+        products = {product['name']: product['targets'] for product in package.get('products', [])}
+        names = {target['name'] for target in graph['targets']}
+        for target in package['targets']:
+            if target['name'] in names:
+                raise ValueError('shared package target name collides with root: ' + target['name'])
+            target['package_path'] = package_path
+            target['path'] = package_path + '/' + target['path']
+        for target in graph['targets']:
+            dependencies = set(target.get('target_dependencies', []))
+            for product in target.get('product_dependencies', []):
+                dependencies.update(products.get(product, ()))
+            target['target_dependencies'] = sorted(dependencies)
+        graph['targets'].extend(package['targets'])
     cache.parent.mkdir(parents=True, exist_ok=True)
     # Separate processes may plan checks in the same slot; publish atomically.
     import tempfile
@@ -701,7 +724,7 @@ def load_impact_map(root, path=None, max_age_hours=24):
         return None, status
 
 
-def select(root, graph, paths, scratch, full=False, qualification=False, last_round=False, impact_map=None, runner_wrapper=None):
+def select(root, graph, paths, scratch, full=False, qualification=False, last_round=False, impact_map=None, runner_wrapper=None, shared_index=None):
     targets = {target['name']: target for target in graph['targets']}
     if impact_map is None:
         impact_map, impact_status = load_impact_map(root)
@@ -727,6 +750,8 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
             fallback(path, 'unsafe path')
         elif path == 'Package.swift' or path == 'Package.resolved':
             fallback(path, 'package manifest or lockfile')
+        elif path.startswith('Packages/') and PurePosixPath(path).name in ('Package.swift', 'Package.resolved'):
+            fallback(path, 'nested package manifest or lockfile')
         elif path.startswith(BUILD_SCRIPTS):
             fallback(path, 'build script')
         elif path in FILE_TEST_CONSUMERS or path in FILE_PYTHON_TEST_CONSUMERS:
@@ -803,7 +828,21 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
             direct_fallbacks[path] = selection['fallback']
         else:
             direct[path] = selection
-    new_sources = [path for path in normalized if impact_map and path not in mapped_sources
+    shared_paths = [path for path in normalized if any(
+        target.get('package_path') and target['type'] != 'test' and path.startswith(target['path'] + '/')
+        for target in owners)]
+    shared_classes, shared_index_reason = {}, 'no current shared-package index export; module closure'
+    if shared_paths and shared_index is not None:
+        try:
+            # The helper validates the indexed source inventory before narrowing.
+            import importlib.util
+            spec = importlib.util.spec_from_file_location('shared_test_impact', Path(__file__).with_name('shared_test_impact.py'))
+            helper = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(helper)
+            shared_classes = helper.shared_source_classes(root, shared_index, shared_paths)
+        except (ValueError, OSError) as error:
+            shared_index_reason = 'shared-package index unavailable: ' + str(error) + '; module closure'
+    new_sources = [path for path in normalized if impact_map and path not in mapped_sources and path not in shared_paths
                    and path.endswith('.swift') and (root / path).is_file()
                    and (owner := next((target for target in owners if path.startswith(target['path'] + '/')), None))
                    and owner['type'] != 'test']
@@ -837,6 +876,16 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
                     reasons[case].append(path)
             continue
         entry = mapped_sources.get(path)
+        if path in shared_classes:
+            entry = {'classes': sorted(set(shared_classes[path]) | set(entry['classes'] if entry else ())),
+                     'qualification_cases': list(entry['qualification_cases']) if entry else []}
+            # Static reachability includes any registered qualification method in a selected class.
+            entry['qualification_cases'] = sorted(set(entry['qualification_cases']) | {
+                case for case in QUALIFICATION_CASES if case.split('/')[0] in shared_classes[path]})
+        elif path in shared_paths and not (entry and (entry['classes'] or entry['qualification_cases'])):
+            # Root coverage may inventory a shared declaration with no instrumented
+            # hits. An empty entry does not prove that the module has no consumers.
+            entry = None
         owner = next((target for target in owners if path.startswith(target['path'] + '/')), None)
         if entry is not None:
             mapping = {}
@@ -860,6 +909,8 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
             group_fallback_paths.append(path)
             fallback_reasons[path] = ('source file is not in the coverage map; module closure' if impact_map
                                       else 'no current coverage map; module closure')
+            if path in shared_paths:
+                fallback_reasons[path] = shared_index_reason
             if path in new_source_reasons:
                 fallback_reasons[path] += ' (' + new_source_reasons[path] + ')'
             for case in QUALIFICATION_CASES:
@@ -884,7 +935,10 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
             for path in normalized:
                 mapping = source_groups.get(path)
                 owner = next((target for target in owners if path.startswith(target['path'] + '/')), None)
-                if mapping is not None:
+                if targets[name].get('package_path') and name in path_consumers[path]:
+                    # Root coverage/index observations do not execute nested tests.
+                    relevant.append(test_file_groups(root, owner, path) if owner and owner['name'] == name else None)
+                elif mapping is not None:
                     # A complete coverage refresh includes dependent test targets.
                     relevant.append(None if name in direct.get(path, {}).get('broad', ()) else mapping.get(name, ()))
                 elif name not in path_consumers[path]:
@@ -903,16 +957,18 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
     # Qualification is independent of unit group narrowing: an explicitly requested
     # full qualification includes Core/App/IPC cases even for a docs-only change.
     skip = [case for case in QUALIFICATION_CASES if case not in qualification_tests] if tests else []
+    root_tests = [name for name in tests if not targets[name].get('package_path')]
+    shared_tests = [name for name in tests if targets[name].get('package_path')]
     swift = []
     isolated = []
     qualification_commands = []
     timing_tests, timing_commands, timing_deferred = [], [], False
-    if tests or full or qualification_tests:
+    if root_tests or full or qualification_tests:
         command = ['swift', 'test', '--parallel', '--num-workers', '10', '--cache-path',
                    str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
                    '--enable-dependency-cache', '--scratch-path', str(scratch), '--skip', 'HumanClaimsKeychainTests']
         if not full:
-            for target in tests:
+            for target in root_tests:
                 suffix = '(?:' + '|'.join(re.escape(group) for group in groups[target]) + r')(?:/|$)' if target in groups else ''
                 command.extend(['--filter', '^' + re.escape(target) + r'\.' + suffix])
         for case in QUALIFICATION_CASES + ISOLATED_TESTS:
@@ -926,7 +982,7 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
                     or group.split('.')[1] in groups[group.split('.')[0]])]
         for group in isolated:
             command.extend(['--skip', '^' + re.escape(group) + r'(?:/|$)'])
-        if tests or full:
+        if root_tests or full:
             swift.append(command)
         for target in sorted({group.split('.')[0] for group in isolated}):
             # The parallel pass above builds this exact test bundle. Selecting
@@ -974,6 +1030,19 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
         swift = []  # The refresh executes each class and qualification case once.
         qualification_commands = []
         timing_commands = []
+    shared_commands = []
+    for package_path in sorted({targets[name]['package_path'] for name in shared_tests}):
+        command = ['swift', 'test', '--package-path', str(root / package_path),
+                   '--cache-path', str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
+                   '--enable-dependency-cache', '--scratch-path',
+                   str(scratch / 'packages' / Path(package_path).name), '--skip', 'HumanClaimsKeychainTests']
+        for target in shared_tests:
+            if targets[target]['package_path'] != package_path:
+                continue
+            suffix = '(?:' + '|'.join(re.escape(group) for group in groups[target]) + r')(?:/|$)' if target in groups else ''
+            command.extend(['--filter', '^' + re.escape(target) + r'\.' + suffix])
+        shared_commands.append(command)
+    swift.extend(shared_commands)
     # uv supplies the dependencies needed by the exporter/validator tests too.
     python_commands = [SCRIPT_PYTHON + [path] for path in sorted(python)]
     return {'paths': normalized, 'affected_targets': sorted(affected), 'test_targets': tests,
@@ -1000,6 +1069,8 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
             'qualification_commands': qualification_commands, 'qualification_tests': qualification_tests,
             'qualification_test_targets': sorted({case.split('.')[0] for case in qualification_tests}),
             'timing_commands': timing_commands, 'timing_tests': timing_tests, 'timing_deferred': timing_deferred,
+            'shared_package_commands': shared_commands,
+            'shared_index_selections': shared_classes, 'shared_index_fallback_reason': shared_index_reason if shared_paths and not shared_classes else None,
             'swift_commands': swift, 'coverage_refresh_commands': refresh_commands, 'impact_map_status': impact_status,
             'commands': swift + refresh_commands + python_commands + [VALIDATE]}
 
@@ -1016,6 +1087,7 @@ def main(argv=None):
     parser.add_argument('--json', action='store_true', help='emit the plan as JSON argv arrays')
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument('--scratch-path', type=Path, default=Path('.build'))
+    parser.add_argument('--shared-index', type=Path, help='portable compiler-index export for shared source consumers')
     parser.add_argument('--impact-map', type=Path, help='coverage map (default .local/build/test-impact-map.json)')
     parser.add_argument('--map-max-age-hours', type=float, default=24)
     parser.add_argument('--runner-wrapper', type=Path, help='shared build-cap wrapper for final-round refresh')
@@ -1032,8 +1104,17 @@ def main(argv=None):
             contents = sys.stdin.read() if str(args.paths_file) == '-' else args.paths_file.read_text()
             paths = contents.splitlines()
         impact_map, impact_status = load_impact_map(root, args.impact_map, args.map_max_age_hours)
+        index_path = args.shared_index or scratch / 'affected-tests/shared-index.json'
+        shared_index = None
+        if any(PurePosixPath(path.removeprefix('./')).as_posix().startswith(
+                'Packages/ChecklistShared/Sources/') for path in paths):
+            try:
+                shared_index = json.loads(index_path.read_text()) if index_path.is_file() else None
+            except (OSError, ValueError):
+                # A damaged optional index must leave a runnable conservative plan.
+                shared_index = {'invalid': True}
         plan = select(root, package_graph(root, scratch), paths, scratch, args.full, args.qualification, args.last_round,
-                      impact_map if impact_map is not None else {'complete': False}, args.runner_wrapper)
+                      impact_map if impact_map is not None else {'complete': False}, args.runner_wrapper, shared_index)
         plan['impact_map_status'] = impact_status
         if args.json:
             print(json.dumps(plan, indent=2))
@@ -1051,6 +1132,8 @@ def main(argv=None):
             for group, observation in plan['test_group_sources'].items():
                 print('Unmeasurable class index-store references: ' + group + ' <- ' +
                       ', '.join(observation['paths']))
+            for path, classes in plan['shared_index_selections'].items():
+                print('Shared-package index: ' + path + ' -> ' + str(len(classes)) + ' root classes')
             for path, selection in plan['direct_test_selections'].items():
                 print('Direct test-file selection: ' + path + ' -> ' + (', '.join(selection['classes']) or '(none)') +
                       ' (' + selection['reason'] + ')')

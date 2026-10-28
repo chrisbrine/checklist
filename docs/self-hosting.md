@@ -51,6 +51,36 @@ reservation; process exit releases it. Keep this lock file in place: replacing o
 removing it could split the lock authority. Compilation keeps its checkout-local
 build lock and separate lanes.
 
+Only stages meant for installation reserve that shared series. The build helper
+uses `CHECKLIST_BUILD_SCOPE=install` by default, including ordinary `--stage`,
+`--rebuild-stage` and `--clean-stage` runs. Set the scope explicitly for other work:
+
+```sh
+CHECKLIST_BUILD_SCOPE=measurement ./script/build_and_run.sh --rebuild-stage
+CHECKLIST_BUILD_SCOPE=test ./script/build_and_run.sh --stage
+CHECKLIST_BUILD_SCOPE=private-copy ./script/build_and_run.sh --stage
+```
+
+These three local scopes never read, lock or write the shared allocator or import
+legacy/installed version history. Their version is `<VERSION>.0`, their ordinal is
+`0`, and the capture manifest and bundled `build-info.json`/`source-manifest.json`
+record `build_scope` and `installable:false`. Their exact identity is the captured
+fingerprint/build ID, not a shared version reservation. Installation stages record
+`build_scope:install` and `installable:true`. Scope participates in the capture
+fingerprint, so an install run cannot reuse a local stage. Compilation lanes remain
+shared for matching toolchains/configurations to preserve warm incremental builds.
+`script/measure_build_times.py` always selects `measurement`, including its warmups
+and clean cases, even if its caller exported the install scope.
+
+Local stages can supply disposable test slots, but cannot be promoted or installed.
+`--install-stage` rejects them before replacement, and `verify_install.py` refuses
+them before checking a running app/service. Install modes also reject a non-install
+scope before building. To install a previously tested tree, stage it again with
+`CHECKLIST_BUILD_SCOPE=install` and qualify that exact new capture; changing the mark
+or copying local version metadata is not promotion. A combined round intended for
+installation must select `install` from its initial stage, even in a private copy.
+Older captures without scope fields remain installation reservations.
+
 `version-state.json` in that shared directory retains the global ordinal and the
 highest fourth component for every production series. Under the shared lock,
 allocation takes the maximum of shared history, the calling checkout's legacy
@@ -72,7 +102,7 @@ allocation state is written.
 The fourth component starts at `.1` for each new production series; historical
 ordinals do not seed it. Returning to a previously built series continues its
 retained counter. The separate global `build_number` never resets. Both version
-and ordinal exceed the installed values; a source series older than the installed
+and ordinal for installation stages exceed the installed values; a source series older than the installed
 series refuses allocation. Tests use `CHECKLIST_BUILD_ALLOCATOR_DIR` or the helper's
 `allocator` parameter to select a temporary directory. All concurrently tested
 checkouts must share that temporary directory. Production checkouts must use the

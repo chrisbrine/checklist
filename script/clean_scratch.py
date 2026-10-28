@@ -435,11 +435,15 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
             removable.add(path)
 
     # Coalesce only wholly removable subtrees, preserving unknown files/links.
+    # Aggregate logical bytes in the same bottom-up pass, including empty
+    # directories as zero bytes; never rescan a subtree for each move receipt.
     moves = []
     children_by_parent = {}
-    removable_tree = {}
+    removable_tree, tree_bytes = {}, {}
     for path, entry in reversed(list(before.items())):
         children_by_parent.setdefault(path.parent, []).append(path)
+        tree_bytes[path] = (sum(tree_bytes[p] for p in children_by_parent.get(path, []))
+                            if stat.S_ISDIR(entry[2]) else entry[3])
         # Empty folders can accompany an eligible tree, but never override an
         # item-wide hold or remove even empty Git metadata.
         removable_tree[path] = (not reason and not any(within(path, root) for root in legacy)
@@ -461,6 +465,8 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
     return {'path': str(item), 'kind': kind, **counts, 'total_bytes': size,
             'reason': reason or 'eligible build/Git bytes only; other bytes retained',
             'reasons': dict(reasons), 'retained_legacy_paths': [str(p) for p in legacy],
+            'planned_move_count': len(moves),
+            'move_bytes': {path: tree_bytes[path] for path in moves},
             'moves': moves, 'inventory': before}
 
 
@@ -579,8 +585,12 @@ def apply_batch(batch, installed_info, fingerprint, process_reader, mover,
                     raise ValueError('unexpected or duplicate Trash receipt; stopped')
                 confirmed.add(path)
                 destinations[path] = destination
-                receipt = {'source': str(path), 'trash': str(destination)}
-                by_path[path]['public']['destinations'].append(receipt)
+                decision = by_path[path]
+                receipt = {'source': str(path), 'trash': str(destination),
+                           'bytes': decision['move_bytes'][path]}
+                decision['public']['destinations'].append(receipt)
+                decision['public']['moved_count'] += 1
+                decision['public']['moved_bytes'] += receipt['bytes']
                 print(json.dumps({'action': 'trash_move', **receipt}), flush=True)
             for path in paths[len(confirmed):]:
                 move_error(by_path[path], ValueError('Trash receipts incomplete; inspect paths before retry'), path)
@@ -669,11 +679,11 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
                 if not in_scope(item, kind, session_id, include_released):
                     raise ValueError('workspace ownership/release changed; retained')
                 decision = plan(item, kind, objects, [item] if item in used else [], fingerprint, keep, clock())
-                public = {key: value for key, value in decision.items() if key not in {'inventory', 'moves'}}
+                public = {key: value for key, value in decision.items() if key not in {'inventory', 'moves', 'move_bytes'}}
                 public['action'] = 'preview'
                 public['eligible_paths'] = [str(path) for path in decision['moves']]
                 if apply and decision['moves']:
-                    public.update(action='trashed', destinations=[])
+                    public.update(action='trashed', destinations=[], moved_count=0, moved_bytes=0)
                     decision['public'] = public
                     pending.append(decision)
                 else:

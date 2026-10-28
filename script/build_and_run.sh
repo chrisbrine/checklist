@@ -4,6 +4,12 @@ set -euo pipefail
 MODE="${1:-run}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 case "$MODE" in run|--verify|--install|--install-stage|--stage|--rebuild-stage|--clean-stage|--debug|--logs|--telemetry) ;; *) echo "usage: $0 [--verify|--install|--install-stage|--stage|--rebuild-stage|--clean-stage|--debug|--logs|--telemetry]" >&2; exit 2;; esac
+BUILD_SCOPE="${CHECKLIST_BUILD_SCOPE:-install}"
+case "$BUILD_SCOPE" in install|measurement|test|private-copy) ;; *) echo "CHECKLIST_BUILD_SCOPE must be install, measurement, test or private-copy." >&2; exit 2;; esac
+case "$MODE" in --stage|--rebuild-stage|--clean-stage) ;; *)
+  if [ "$BUILD_SCOPE" != install ]; then echo "Scope $BUILD_SCOPE is not installable; use a stage-only mode." >&2; exit 2; fi;;
+esac
+export CHECKLIST_BUILD_SCOPE="$BUILD_SCOPE"
 BUILD_ROOT="$ROOT_DIR/.local/build"
 mkdir -p "$BUILD_ROOT"
 if ! mkdir "$BUILD_ROOT/.build-lock" 2>/dev/null; then
@@ -81,7 +87,7 @@ if [ "$MODE" = --install-stage ]; then
 import sys
 sys.path.insert(0,sys.argv[1])
 from verify_stage import verify
-print(verify(sys.argv[2])[0])
+print(verify(sys.argv[2], for_install=True)[0])
 PYVERIFY
 )"
   SOURCE="$CAPTURE_DIR/source"
@@ -116,7 +122,8 @@ before=inventory(root)
 inventory_entry=next((entry for entry in before if entry['path']=='script/build_input_inventory.py'),None)
 if not inventory_entry or inventory_entry['sha256']!=inventory_sha256:raise SystemExit('Build inventory helper changed while bootstrapping; capture again before building.')
 toolchain=toolchain_file.read_text(); toolchain_file.unlink()
-canonical=json.dumps({'inputs':before,'toolchain':toolchain,'configuration':configuration},sort_keys=True,separators=(',',':')).encode()
+scope=os.environ['CHECKLIST_BUILD_SCOPE']
+canonical=json.dumps({'inputs':before,'toolchain':toolchain,'configuration':configuration,'build_scope':scope},sort_keys=True,separators=(',',':')).encode()
 fingerprint=hashlib.sha256(canonical).hexdigest(); destination=build/fingerprint
 if not destination.exists():
  temporary=Path(tempfile.mkdtemp(prefix='capture-',dir=build));source=temporary/'source';source.mkdir()
@@ -124,8 +131,8 @@ if not destination.exists():
   for entry in before:
    p=source/entry['path'];p.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(root/entry['path'],p);p.chmod(0o755 if entry['executable'] else 0o644)
   if inventory(source)!=before or inventory(root)!=before: raise RuntimeError('Build inputs changed while capturing. Capture again; the installed app is untouched.')
-  sys.path.insert(0,str(source/'script'));from version import allocate
-  version_info=allocate(source,build);number=version_info['build_number']
+  sys.path.insert(0,str(source/'script'));from version import stage_version
+  version_info=stage_version(source,build,scope);number=version_info['build_number']
   identity=os.environ['CHECKLIST_SIGN_IDENTITY']
   manifest={'schema_version':1,'source_fingerprint':fingerprint,'build_id':fingerprint[:16],'build_number':number,'source_root':str(root),'configuration':configuration,'swift_flags':sys.argv[5:],'toolchain':toolchain,'signing_profile':'ad-hoc' if identity=='-' else 'certificate','signing_identity_sha256':hashlib.sha256(identity.encode()).hexdigest(),'input_roots':input_roots,'inputs':before,'captured_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}
   manifest.update(version_info)

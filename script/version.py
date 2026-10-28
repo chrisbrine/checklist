@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 
 MAX_ORDINAL = 2147483647
+BUILD_SCOPES = ('install', 'measurement', 'test', 'private-copy')
 
 
 def production(value):
@@ -144,11 +145,37 @@ def allocate(root, build, installed=Path('/Applications/Checklist.app'), allocat
         return info
 
 
+def stage_version(root, build, scope='install', **allocation_options):
+    """Only installation stages reserve shared history; local stages use zero."""
+    if scope not in BUILD_SCOPES:
+        raise ValueError('Unknown build scope: ' + str(scope))
+    if scope == 'install':
+        info = allocate(root, build, **allocation_options)
+    else:
+        base = production((Path(root) / 'VERSION').read_text().strip())
+        info = {'production_version': base, 'version': base + '.0', 'build_number': 0}
+    return dict(info, build_scope=scope, installable=scope == 'install')
+
+
+def build_scope(info):
+    # Older captures predate scopes and were all installation reservations.
+    scope = info.get('build_scope', 'install')
+    if scope not in BUILD_SCOPES or info.get('installable', True) is not (scope == 'install'):
+        raise ValueError('Invalid build scope/installable metadata.')
+    return scope
+
+
+def require_installable(info):
+    if build_scope(info) != 'install':
+        raise ValueError('Build scope ' + info['build_scope'] + ' is not installable; stage again with CHECKLIST_BUILD_SCOPE=install.')
+
+
 def stamp(capture, stage):
     import datetime
     capture, stage = Path(capture), Path(stage)
     manifest = json.loads((capture / 'capture-manifest.json').read_text())
     info = {key: manifest[key] for key in ['version', 'production_version', 'build_id', 'build_number', 'source_fingerprint', 'source_root', 'configuration', 'toolchain', 'captured_at', 'signing_identity_sha256']}
+    info.update(build_scope=build_scope(manifest), installable=manifest.get('installable', True))
     info.update(built_at=datetime.datetime.now(datetime.timezone.utc).isoformat(), profile='local-development', signing=manifest['signing_profile'], source_capture=str(capture / 'source'))
     path = stage / 'Contents/Info.plist'
     plist = plistlib.loads(path.read_bytes())
@@ -171,6 +198,11 @@ def verify_bundle(bundle):
     if not re.fullmatch(re.escape(base) + r'\.[0-9]+', info['version']):
         raise ValueError('Invalid four-part Checklist version.')
     ordinal(info['build_number'])
+    scope = build_scope(info)
+    if scope != build_scope(manifest):
+        raise ValueError('Bundle build scope differs from source manifest.')
+    if scope != 'install' and (info['build_number'] != 0 or info['version'] != base + '.0'):
+        raise ValueError('Local build must use version zero and ordinal zero.')
     for key in ['version', 'production_version', 'build_number', 'build_id', 'source_fingerprint']:
         if info[key] != manifest[key]: raise ValueError('Bundle identity differs from source manifest: ' + key)
     expected = {'CFBundleShortVersionString': base, 'CFBundleVersion': str(info['build_number']),

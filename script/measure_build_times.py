@@ -33,7 +33,8 @@ def stage(checkout, output, name, mode):
               'load_start': list(os.getloadavg()), 'log': log.name}
     with log.open('w') as stream:
         stream.write(json.dumps(record) + '\n');stream.flush()
-        result = subprocess.run(command, cwd=checkout, stdout=stream, stderr=subprocess.STDOUT)
+        result = subprocess.run(command, cwd=checkout, stdout=stream, stderr=subprocess.STDOUT,
+                                env=dict(os.environ, CHECKLIST_BUILD_SCOPE='measurement'))
     record.update(seconds=time.monotonic() - started, load_end=list(os.getloadavg()), returncode=result.returncode)
     with log.open('a') as stream:
         stream.write(json.dumps({'result': record}) + '\n')
@@ -50,8 +51,10 @@ def stage(checkout, output, name, mode):
     if receipt['timing']['phases']['compile']['status'] != 'completed':
         raise RuntimeError('Measurement reused a stage without compiling.')
     manifest = json.loads((capture / 'capture-manifest.json').read_text())
+    if manifest.get('build_scope') != 'measurement' or manifest.get('installable') is not False:
+        raise RuntimeError('Measurement requires a non-installable measurement-scope stage.')
     record.update(capture=str(capture), verification=receipt,
-                  build={key: manifest[key] for key in ('source_fingerprint', 'configuration', 'toolchain', 'signing_profile')})
+                  build={key: manifest[key] for key in ('source_fingerprint', 'configuration', 'toolchain', 'signing_profile', 'build_scope', 'installable')})
     return record
 
 
