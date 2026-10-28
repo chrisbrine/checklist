@@ -20,7 +20,7 @@ struct TriageDetailView: View {
                     Text("Edit Triage").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     Text(ProductionGroups.label(triage)).checklistFont(.title)
                     Text("\(store.projectName(projectID)) · \(orchestrator.summary) · \(members.count) current tickets").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-                    let counts = TriageOrchestratorDisplay.statusCountsText(triage)
+                    let counts = TriageOrchestratorDisplay.statusCountsText(stateRecord)
                     if !counts.isEmpty { Text(counts).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
                     Text("A ticket stays in this Triage through status changes. It leaves when it is Done or canceled, when another orchestrator handles it, or when it is removed.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     Text("Active includes only tickets whose own status is In progress. Triage orchestration does not change ticket status.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
@@ -84,6 +84,7 @@ struct TriageDetailView: View {
             }.padding(Spacing.page)
         }.onAppear { store.loadGroupTasks(triage,closed:false);store.loadGroupCandidates(triage,closed:false) }
         .task(id: triage.integer("revision")) { await loadMessages() }
+        .onChange(of: members.map { $0.id + ":" + $0.string("key") }) { _, _ in messageFeed.updateKeys(memberKeys) }
         .task(id: store.archivePreviewEpoch) { await loadBatches() }
         .checklistConfirmation($confirmation)
     }
@@ -92,12 +93,23 @@ struct TriageDetailView: View {
             try await store.request(method, params)
         }
     }
-    var orchestrator: TriageOrchestratorDisplay { TriageOrchestratorDisplay(triage) }
-    private func loadMessages() async {
+    /// CL-126 (R42A D2): the row's Triage summary (or the loaded members) supplies the
+    /// state and counts, so the detail and the row agree.
+    var stateRecord: Record {
+        let summary = store.preparedTicketWorkspace?.list.triages.first { $0.triage.id.utf8.elementsEqual(triage.id.utf8) }?.triage
+        return TriageOrchestratorDisplay.withMemberState(triage, summary: summary, members: members)
+    }
+    var orchestrator: TriageOrchestratorDisplay { TriageOrchestratorDisplay(stateRecord) }
+    var memberKeys: [(id: String, key: String)] {
         let rows = members
         let ids = triage.strings("task_ids").isEmpty ? rows.map(\.id) : triage.strings("task_ids")
-        let pairs = ids.map { id in (id: id, key: rows.first { $0.id == id }?.string("key") ?? store.task(id)?.string("key") ?? "") }
-        await messageFeed.load(projectID: projectID, triageID: triage.id, members: pairs) { method, params in try await store.request(method, params) }
+        return ids.map { id in
+            let key = rows.first { $0.id == id }?.string("key") ?? ""
+            return (id: id, key: key.isEmpty ? store.task(id)?.string("key") ?? "" : key)
+        }
+    }
+    private func loadMessages() async {
+        await messageFeed.load(projectID: projectID, triageID: triage.id, members: memberKeys) { method, params in try await store.request(method, params) }
     }
     var draftKey: String { "triageHandlingDraft-" + triage.id }
     func beginEdit() {

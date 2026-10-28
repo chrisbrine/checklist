@@ -34,7 +34,7 @@ extension CommandRouter {
                     let type = try self.scoped(db, text(p,"type_id"), project, type:"media_review_type")
                     let state = p["state"] as? String ?? "draft"
                     guard ["draft", "open", "closed", "archived", "canceled"].contains(state) else { throw CoreError("INVALID_INPUT", "Choose a round state.") }
-                    let offset = try MediaConfigurationValue.integer(p["offset"] ?? 0, max:10000, "offset")
+                    let offset = try MediaConfigurationValue.integer(p["offset"] ?? 0, max:Int.max, "offset")
                     let values = try self.mediaOwnerRecords(db,project:project,family:"media_round",
                         predicate:" AND json_extract(data,'$.type_id')=? AND json_extract(data,'$.state')=?",
                         arguments:[(try StoredRecord(type, family: "media").string("id")),state],

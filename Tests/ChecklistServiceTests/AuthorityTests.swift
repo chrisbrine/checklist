@@ -26,7 +26,14 @@ final class AuthorityTests: XCTestCase {
         connection = NSXPCConnection(machServiceName: "org.checklist.synthetic.unconnected")
     }
     override func tearDownWithError() throws {
-        connection?.invalidate(); connection = nil; coordinator = nil
+        connection?.invalidate(); connection = nil
+        // finish(runHooks:) plans the storage wake on storageQueue and installs it on queue.
+        // Drain that work (and one replan) before deleting its store: it must not read the store during removal.
+        if let coordinator {
+            for _ in 0..<2 { coordinator.storageQueue.sync {}; coordinator.queue.sync {} }
+            coordinator.queue.sync { coordinator.storageWake?.cancel(); coordinator.workHealthWake?.cancel() }
+        }
+        coordinator = nil
         if let root { try FileManager.default.removeItem(at: root) }
     }
     private func enrollment() -> Enrollment {

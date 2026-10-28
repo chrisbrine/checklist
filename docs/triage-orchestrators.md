@@ -54,7 +54,7 @@ Each ticket has two roles:
 | Default (`audience=all`) | A ticket note goes to both roles, one delivery per session. When the orchestrator is also the holder, it gets one delivery. The sender gets none. |
 | `audience` field | New `message_send` field `audience=all\|holder\|orchestrator` (default `all`) in a closed schema. `holder`: the holder and its accepted subagents only; the note stays readable in ticket history. `orchestrator`: the Triage orchestrator only. |
 | Exact recipient | The `recipient` field stays exactly `{"kind":"session","session_id":"<verified scoped session>"}`. `recipient` and `audience` cannot be combined; the call refuses atomically and saves no message. `audience=orchestrator` on a ticket whose Triage has no orchestrator also refuses. |
-| Mandatory both | Owner directions, Human Request answers, review verdict notices, ticket takeover and handoff notices and work-health notices always reach both roles. `audience` cannot narrow them. |
+| Mandatory both | Owner directions, Human Request answers, review verdict notices, ticket takeover and handoff notices and work-health notices always reach both roles. `audience` cannot narrow them. A verdict notice is written after the verdict's Triage move, so it reaches the holder and the orchestrator of the return Triage, never the reviewer's own Triage; a reject notice goes out when the ticket lands in a Triage whose orchestrator is not the reviewer. |
 | Copy labels | The orchestrator's delivery has `recipient_role=triage_orchestrator` and the label "Also sent to <provider · thread>, which holds <KEY>." The holder's delivery names the orchestrator copy. `session_inbox` and `message_delivery_list` show these roles and labels. |
 | No holder | The orchestrator receives the note. |
 | No holder and no orchestrator | The note is saved for pickup, then delivered once when a holder or an orchestrator joins, and to a new orchestrator after a Triage takeover (existing saved-note pickup, at most 50 per pickup). |
@@ -75,7 +75,7 @@ The store upgrade that introduces this model (CL-125) converts existing data as 
 3. A ticket in several Triages keeps the orchestrated one; if none or several are orchestrated, it keeps the newest. Each other membership closes with a recorded exit (`upgrade_single_membership`).
 4. A conversation with two active orchestrated Triages in one project keeps both until it finishes one. Until then, new work it handles joins the Triage it started last.
 5. An empty Triage with no orchestrator archives, with its history kept.
-6. The old Triage `phase` and the policy `coordinator_session_id` stay readable as history labels; neither drives behaviour.
+6. The old Triage `phase` and the policy `coordinator_session_id` stay readable as history labels; neither drives behaviour, with one display exception: the owner's `workspace_page` surface `triage_candidates` lists Review tickets for an older Triage that keeps the history label `review` (see [commands](mcp-contract.md)).
 
 Before installing the upgrade over a working installation, qualify the exact staged code through complete startup and the protected pre-upgrade backup against an owned, consistent copy of the actual existing store, with its retained record families and required managed files (AGENTS.md; [WAL, upgrades and recovery](database-storage.md#wal-upgrades-and-recovery)). Synthetic fixtures alone do not establish compatibility. Never repair the live database by hand.
 

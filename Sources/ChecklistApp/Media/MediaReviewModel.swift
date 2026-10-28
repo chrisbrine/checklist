@@ -305,7 +305,18 @@ typealias MediaValues = [String: Any]
         mutate("media_intake_revise",["intake_id":intake.id,"expected_revision":intake.integer("revision"),"resolutions":[resolution]]) {[weak self] in self?.intake=Record(values:$0)}
     }
     func confirmIntake() {let plan=Record(values:intake.object("plan"));mutate("media_intake_confirm",["intake_id":intake.id,"expected_revision":intake.integer("revision"),"plan_id":plan.id,"plan_digest":plan.string("digest")]) {[weak self] in self?.intake=Record(values:$0)}}
-    func captureIntake() {mutate("media_intake_capture",["intake_id":intake.id,"expected_revision":intake.integer("revision"),"plan_id":intake.string("plan_id"),"row_ids":Array(intake.strings("remaining_row_ids").prefix(200))]) {[weak self] in self?.intake=Record(values:$0)}}
+    /// Captures every remaining row: the service takes 200 rows per command, so the model
+    /// repeats capture until no row remains or a chunk makes no progress (CL-307).
+    func captureIntake() {
+        let remaining = intake.strings("remaining_row_ids")
+        guard !remaining.isEmpty else {return}
+        mutate("media_intake_capture",["intake_id":intake.id,"expected_revision":intake.integer("revision"),"plan_id":intake.string("plan_id"),"row_ids":Array(remaining.prefix(200))]) {[weak self] in
+            guard let self else {return}
+            self.intake=Record(values:$0)
+            let next = self.intake.strings("remaining_row_ids")
+            if !next.isEmpty && next != remaining {self.captureIntake()}
+        }
+    }
     func resumeIntake(_ id: String) async {do {intake=Record(values:try await read("media_intake_get",["intake_id":id]))} catch {self.error=PlainError.text(error)}}
     // CL-300: rework preview/create, closure and successor use the native owner channel only.
     static func dispositionLabel(_ value: String) -> String { value.replacingOccurrences(of:"_",with:" ").capitalized }

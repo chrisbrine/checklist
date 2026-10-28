@@ -61,7 +61,8 @@ final class MediaIntakeMappingTests: XCTestCase {
         XCTAssertThrowsError(try MediaIntakePlan.parse(["input":"selected_files","assignments":Array(repeating:assignment,count:21)],schema:s))
         let many = try (0..<1_000).map { try row("r\($0)","hero__walk__N",index:$0) }
         XCTAssertEqual(try tokenPlan().map(many,schema:s).count,1_000)
-        XCTAssertThrowsError(try tokenPlan().map(many + [row("extra",nil)],schema:s))
+        // CL-307: no row-count ceiling; 1,001 rows map like 1,000.
+        XCTAssertEqual(try tokenPlan().map(many + [row("extra","hero__walk__N",index:1_000)],schema:s).count,1_001)
         XCTAssertThrowsError(try tokenPlan().map([row("huge",String(repeating:"x",count:4097))],schema:s))
         XCTAssertThrowsError(try MediaIntakeSourceRow.tsv(String(repeating:"x",count:4 * 1024 * 1024 + 1),rowIDs:[]))
     }

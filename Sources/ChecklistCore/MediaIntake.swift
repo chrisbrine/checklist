@@ -25,6 +25,8 @@ struct PreparedMediaResources {
 }
 
 extension CommandRouter {
+    /// Rows captured by one capture command; an internal chunk, not an intake limit.
+    static let mediaCaptureChunk = 200
     /// Deliberately private to the internal router seam. Even an owner input is a selected
     /// regular file, never a directory traversal, URL fetch or a new filesystem grant.
     func mediaInspectFile(_ path: String,caller: Caller,project: JSON,managed: Bool = false,reserveRead: ((Int) throws -> Void)? = nil) throws -> JSON {
@@ -177,7 +179,7 @@ extension CommandRouter {
         let inputs = [p["sources"],p["text"],p["tsv"]].filter {$0 != nil}
         guard inputs.count == 1 else { throw CoreError("INVALID_INPUT","Select files, paste lines or paste literal TSV.") }
         if let sources = p["sources"] as? [JSON] {
-            guard !sources.isEmpty,sources.count <= 1000 else { throw CoreError("INVALID_INPUT","Select 1 to 1,000 files.") }
+            guard !sources.isEmpty else { throw CoreError("INVALID_INPUT","Select at least one file.") }
             var total = 0
             for (index,source) in sources.enumerated() {
                 guard Set(source.keys).isSubset(of:["path","columns"]),let path = source["path"] as? String,
@@ -216,7 +218,7 @@ extension CommandRouter {
             // detect it. Count with the same literal splitting as the parser.
             let lines = tsv.components(separatedBy:"\n")
             let count = lines.count - (lines.last == "" ? 2 : 1)
-            guard (1...1000).contains(count) else { throw CoreError("INVALID_INPUT","Paste 1 to 1,000 TSV entries.") }
+            guard count >= 1 else { throw CoreError("INVALID_INPUT","Paste at least one TSV entry.") }
             let parsed = try MediaIntakeSourceRow.tsv(tsv,rowIDs:(0..<count).map {try MediaReviewID("row-\($0)")})
             resources.preview = try parsed.map { row in
                 guard Set(row.columns.map(\.id)).count == row.columns.count else { throw CoreError("INVALID_INPUT","TSV column names must be unambiguous for durable capture.") }
@@ -228,9 +230,9 @@ extension CommandRouter {
                     "size":text.utf8.count,"media_kind":"text","status":"valid","columns":columns]
             }
         } else { throw CoreError("INVALID_INPUT","Invalid selected source input.") }
-        guard !resources.preview.isEmpty,resources.preview.count <= 1000,resources.preview.allSatisfy({int($0,
+        guard !resources.preview.isEmpty,resources.preview.allSatisfy({int($0,
             "size") <= ($0["media_kind"] as? String == "text" ? 256 * 1024 : 500 * 1024 * 1024)}) else { throw CoreError("INVALID_INPUT",
-            "Input exceeds the row/text limit.") }
+            "Input exceeds the text limit.") }
         var seen: [String:Int] = [:]
         for i in resources.preview.indices {
             if let sha = resources.preview[i]["sha256"] as? String {
@@ -279,7 +281,8 @@ extension CommandRouter {
         guard intake["author"] as? String == caller.principal || caller.isOwner else { throw CoreError("FORBIDDEN","Capture belongs to its original intake author.") }
         let planID = try text(p,"plan_id")
         guard intake["confirmed_plan_id"] as? String == intake["plan_id"] as? String,planID == intake["plan_id"] as? String else { throw CoreError("MEDIA_PLAN_REQUIRED","Confirm the exact current included/skipped mapping first.") }
-        guard let ids = p["row_ids"] as? [String],!ids.isEmpty,ids.count <= 200,Set(ids).count == ids.count else { throw CoreError("INVALID_INPUT","Select 1 to 200 distinct original row IDs.") }
+        // 200 rows is the internal capture chunk; callers repeat capture until no row remains (CL-307).
+        guard let ids = p["row_ids"] as? [String],!ids.isEmpty,ids.count <= Self.mediaCaptureChunk,Set(ids).count == ids.count else { throw CoreError("INVALID_INPUT","Capture one chunk of up to 200 distinct original row IDs, then capture the remainder.") }
         let rows = try mediaIntakeRows(db,intake:intake),byID = try Dictionary(uniqueKeysWithValues:rows.map {((try StoredRecord($0, family: "media").string("id")),$0)})
         return try ids.map {id in
             _ = try text(["row_id":id],"row_id")
@@ -370,7 +373,7 @@ extension CommandRouter {
             let grouped = try Dictionary(grouping:rows.filter {$0["disposition"] as? String == "include"},by:{Data(((try StoredRecord($0, family: "media").string("group_id"))).utf8)})
             let (type,_) = try mediaRoundParts(db,round),schema = try MediaReviewSchema.parse((try StoredRecord(type, family: "media").object("schema")))
             for group in grouped.values {
-                guard group.count <= schema.maxCandidates,Set(try group.map {Data(try jsonString((try StoredRecord($0,
+                guard mediaGroupCandidateCount(group) <= schema.maxCandidates,Set(try group.map {Data(try jsonString((try StoredRecord($0,
                      family: "media").object("metadata"))).utf8)}).count == 1 else { throw CoreError("MEDIA_MAPPING_REQUIRED",
                     "Grouped candidates need compatible metadata and bounded candidate count.") }
             }
@@ -447,6 +450,10 @@ extension CommandRouter {
         // An explicit group key is local to this intake; equal names/content never join.
         let peers = try mediaIntakeRows(db,intake:intake)
         let existing = peers.first {$0["capture_state"] as? String == "committed" && EnvelopeStorageIdentity.equal($0["group_id"] as? String,row["group_id"] as? String)}
+        // CL-308: rows of one group that fill different slots join one candidate. The n-th row
+        // (plan order) of each slot joins candidate n, so capture order never changes the result.
+        let groupRows = peers.filter {$0["disposition"] as? String == "include" && EnvelopeStorageIdentity.equal($0["group_id"] as? String,row["group_id"] as? String)}
+        let partner = mediaGroupPartner(row,groupRows:groupRows)
         var item: JSON,previous: JSON?
         if let existing {
             item = try scoped(db,(try StoredRecord(existing, family: "media").string("item_id")),pid,type:"media_item")
@@ -455,12 +462,7 @@ extension CommandRouter {
             if let ownerID = previous?["attachment_owner_id"] as? String,try mediaOwnerValue(db,id:ownerID,project:pid).kind == .target {throw CoreError("MEDIA_PLAN_REQUIRED","Finish this frozen group before publication.")}
             item = revised(item)
         } else {
-            guard try mediaItems(db,round:round).count < 1000 else {throw CoreError("CAPACITY_EXCEEDED","A round holds at most 1,000 items.")}
-            let included = peers.filter {
-                $0["disposition"] as? String == "include"
-                    && EnvelopeStorageIdentity.equal($0["group_id"] as? String,row["group_id"] as? String)
-            }
-            guard let first = included.min(by:{int($0,"order") < int($1,"order")}) else {
+            guard let first = groupRows.min(by:{int($0,"order") < int($1,"order")}) else {
                 throw CoreError("CANONICAL_RECORD_INVALID", "A stored record is malformed.")
             }
             item = mediaRecord(["round_id":(try StoredRecord(round, family: "media").requiredValue("id")),
@@ -491,13 +493,30 @@ extension CommandRouter {
             slot["reference_id"] = draftReference["id"];slot["owner_id"] = ownerID
             references += [try mediaRef("attachment",prepared.attachment),try mediaRef("storage_job",job),try mediaRef("storage_hold",intakeReference),try mediaRef("storage_hold",draftReference)]
         }
+        var candidates = try strings(previous ?? [:],"candidate_ids").map {try scoped(db,$0,pid,type:"media_candidate")}
+        // Candidates are immutable: a joined slot makes a successor candidate with both slots,
+        // named by the group's earliest row; the earlier candidate stays in target history.
+        var slots = [slot],sourceRow = row,joined: JSON?
+        if let partner,let index = candidates.firstIndex(where:{EnvelopeStorageIdentity.equal($0["id"] as? String,partner["candidate_id"] as? String)}) {
+            let earlier = candidates.remove(at:index);joined = earlier
+            slots = try ((try StoredRecord(earlier, family: "media").objects("slots")) + [slot]).sorted {
+                Data(((try StoredRecord($0, family: "media").string("slot_id"))).utf8).lexicographicallyPrecedes(Data(((try StoredRecord($1, family: "media").string("slot_id"))).utf8))
+            }
+            if mediaRowPrecedes(partner,row) {sourceRow = partner}
+            references += try StoredRecord(earlier, family: "media").objects("record_references").filter {$0["type"] as? String != "media_item"}
+        }
         let candidate = mediaRecord(["item_id":(try StoredRecord(item, family: "media").requiredValue("id")),
-            "slots":[slot],"content_signature":try MediaCanonical.signature([slot]),"source_name":(try StoredRecord(row,
-             family: "media").requiredValue("name")),"intake_row_id":(try StoredRecord(row,
+            "slots":slots,"content_signature":try MediaCanonical.signature(slots),"source_name":(try StoredRecord(sourceRow,
+             family: "media").requiredValue("name")),"intake_row_id":(try StoredRecord(sourceRow,
              family: "media").requiredValue("id"))],project:pid,caller:caller,references:references + [try mediaRef("media_intake_row",
             row)])
-        try mediaWrite(db,candidate,type:"media_candidate")
-        var candidates = try strings(previous ?? [:],"candidate_ids").map {try scoped(db,$0,pid,type:"media_candidate")};candidates.append(candidate)
+        try mediaWrite(db,candidate,type:"media_candidate");candidates.append(candidate)
+        if let joined {
+            // Point the earlier committed rows of the joined candidate at its successor.
+            for var peer in peers where EnvelopeStorageIdentity.equal(peer["candidate_id"] as? String,joined["id"] as? String) {
+                peer["candidate_id"] = candidate["id"];try mediaWrite(db,revised(peer),type:"media_intake_row")
+            }
+        }
         try candidates.sort { ((try StoredRecord($0, family: "media").string("id"))) < ((try StoredRecord($1, family: "media").string("id"))) }
         guard candidates.count <= schema.maxCandidates else {throw CoreError("MEDIA_MAPPING_REQUIRED","The frozen group exceeds the type's candidate limit.")}
         let shape = try mediaTargetShape(db,item:item,title:(try StoredRecord(item, family: "media").string("title")),
@@ -512,6 +531,23 @@ extension CommandRouter {
         row["record_references"] = ((try StoredRecord(row, family: "media").objects("record_references"))) + [try mediaRef("media_item",
             item),try mediaRef("media_item_target",target),try mediaRef("media_candidate",candidate)]
         try mediaWrite(db,revised(row),type:"media_intake_row")
+    }
+    /// CL-308: plan order inside one group (order, then byte-exact row ID).
+    func mediaRowPrecedes(_ a: JSON,_ b: JSON) -> Bool {
+        let (x,y) = (int(a,"order"),int(b,"order"))
+        return x != y ? x < y : Data((a["id"] as? String ?? "").utf8).lexicographicallyPrecedes(Data((b["id"] as? String ?? "").utf8))
+    }
+    /// CL-308: a row's rank is the number of earlier group rows with its slot. The candidate of a
+    /// committed row with another slot and the same rank is the one this row joins.
+    func mediaGroupPartner(_ row: JSON,groupRows: [JSON]) -> JSON? {
+        func rank(_ r: JSON) -> Int {groupRows.filter {EnvelopeStorageIdentity.equal($0["slot_id"] as? String,r["slot_id"] as? String) && mediaRowPrecedes($0,r)}.count}
+        let own = rank(row)
+        return groupRows.filter {$0["capture_state"] as? String == "committed" && $0["candidate_id"] is String
+            && !EnvelopeStorageIdentity.equal($0["slot_id"] as? String,row["slot_id"] as? String) && rank($0) == own}.min {mediaRowPrecedes($0,$1)}
+    }
+    /// CL-308: the candidate count of one group is its largest per-slot row count.
+    func mediaGroupCandidateCount(_ group: [JSON]) -> Int {
+        Dictionary(grouping:group,by:{Data(($0["slot_id"] as? String ?? "").utf8)}).values.map(\.count).max() ?? 0
     }
     func mediaValidateIntakePublication(_ db: Database,round: JSON,selection: [JSON]) throws {
         let selected = Set(selection.compactMap {$0["item_id"] as? String})

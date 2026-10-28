@@ -22,8 +22,10 @@ enum MediaRecordRegistry {
     /// An explicit dependency list accompanies every media envelope, including an empty
     /// list for roots. Immutable versions have their own IDs; a moving head cannot stand
     /// in for a historical revision. Resolve against the SAME SQL boundary as the payload.
-    static func validate(_ envelopes: [DecodedEnvelope]) throws {
-        let byID = Dictionary(uniqueKeysWithValues: envelopes.map { (Data($0.id.utf8), $0) })
+    /// `dependencies` resolve references only; they are not validated themselves
+    /// (CL-307: preparation validates the rows it writes against their dependency closure).
+    static func validate(_ envelopes: [DecodedEnvelope], dependencies: [DecodedEnvelope] = []) throws {
+        let byID = Dictionary((envelopes + dependencies).map { (Data($0.id.utf8), $0) }, uniquingKeysWith: { first, _ in first })
         func dependency(_ id: String, type: String, project: String?, revision: Int64? = nil) throws -> DecodedEnvelope {
             guard let target = byID[Data(id.utf8)], EnvelopeStorageIdentity.equal(target.type,type),
                   EnvelopeStorageIdentity.equal(target.projectID,project), revision == nil || target.revision == revision else {

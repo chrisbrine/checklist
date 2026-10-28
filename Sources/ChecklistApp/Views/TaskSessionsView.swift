@@ -159,10 +159,7 @@ struct TaskSessionsView: View {
     }
     func sessionLabel(_ record: Record, _ session: Record?) -> String {
         if record.string("session_id") == "human" { return "You" }
-        let label = session?.string("native_conversation_title", fallback: session?.string("label") ?? "") ?? ""
-        if !label.isEmpty && UUID(uuidString: label) == nil { return label }
-        let historical = record.string("actor_display")
-        if !historical.isEmpty && UUID(uuidString: historical) == nil { return historical }
+        if let name = ConversationName.readable(session: session, actorDisplay: record.string("actor_display")) { return name }
         return "Work session · " + String(record.string("session_id").prefix(8))
     }
 }

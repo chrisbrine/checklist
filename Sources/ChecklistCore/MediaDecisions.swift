@@ -121,13 +121,14 @@ extension CommandRouter {
     /// Receipts are separate immutable records. The operation itself never changes,
     /// including after partial success or a refresh of only its unresolved chunks.
     func mediaBulkRelated(_ db: Database,operation: JSON,type: String,field: String) throws -> [JSON] {
-        // At most five chunks/successors can belong to a 1,000-item operation.
-        // Filter before decoding instead of reading all retained project history.
+        // One record per 200-item chunk (at least five slots for successors); no operation
+        // size ceiling (CL-307). Filter before decoding instead of reading all project history.
+        let bound = max(5,(operation["chunks"] as? [JSON])?.count ?? 0)
         let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT)"
-            + " AND json_extract(data,'$." + field + "')=CAST(? AS TEXT) COLLATE BINARY ORDER BY rowid LIMIT 6",
+            + " AND json_extract(data,'$." + field + "')=CAST(? AS TEXT) COLLATE BINARY ORDER BY rowid LIMIT \(bound + 1)",
             arguments:[Data(type.utf8),Data(((try StoredRecord(operation, family: "media").string("project_id"))).utf8),
             Data(((try StoredRecord(operation, family: "media").string("id"))).utf8)])
-        guard rows.count <= 5 else { throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A bounded bulk operation has excess related records.") }
+        guard rows.count <= bound else { throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A bounded bulk operation has excess related records.") }
         return try rows.map {try GRDBRecordEnvelopeAdapter.decode($0,expectedType:type).object}
     }
     func mediaBulkReceipts(_ db: Database,operation: JSON) throws -> [JSON] {
@@ -199,9 +200,9 @@ extension CommandRouter {
         return ["id":chunkID,"chunk":receipt,"decisions":decisions]
     }
     private func mediaPrepareBulk(_ db: Database,_ p: JSON,_ c: Caller,project pid: String) throws -> JSON {
-        guard let selected = p["items"] as? [JSON],!selected.isEmpty,selected.count <= 1000,
+        guard let selected = p["items"] as? [JSON],!selected.isEmpty,
               Set(selected.compactMap {$0["item_id"] as? String}).count == selected.count else {
-            throw CoreError("INVALID_INPUT","Freeze 1 to 1,000 distinct exact item selections, in their original order.")
+            throw CoreError("INVALID_INPUT","Freeze one or more distinct exact item selections, in their original order.")
         }
         // Validate every chunk before persisting the operation; this writes nothing.
         var chunks: [JSON] = []

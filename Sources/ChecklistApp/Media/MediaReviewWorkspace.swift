@@ -309,7 +309,7 @@ struct MediaFrozenIntakeView: View {
             }}.frame(maxHeight:140)
             HStack {
                 Button("Confirm frozen plan") {model.confirmIntake()}.checklistDisabled([(model.intake.records("rows").contains {!["include","skip"].contains($0.string("disposition"))},"Resolve every row to Include or Skip first.")])
-                Button("Capture next \(min(200,model.intake.strings("remaining_row_ids").count)) remaining") {model.captureIntake()}.checklistDisabled([(model.intake.string("confirmed_plan_id") != model.intake.string("plan_id"),"Confirm the current frozen plan first."),(model.intake.strings("remaining_row_ids").isEmpty,"Every included row is already captured.")])
+                Button("Capture \(model.intake.strings("remaining_row_ids").count) remaining") {model.captureIntake()}.checklistDisabled([(model.intake.string("confirmed_plan_id") != model.intake.string("plan_id"),"Confirm the current frozen plan first."),(model.intake.strings("remaining_row_ids").isEmpty,"Every included row is already captured.")])
             }.checklistDisabled([(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
             Text("Stop between chunks by leaving this view. Resume this intake to capture only its remaining rows; committed Draft items stay captured.").font(.caption)
         }

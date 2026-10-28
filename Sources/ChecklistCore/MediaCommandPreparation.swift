@@ -21,6 +21,10 @@ struct PreparedMediaCommand {
     let result: JSON
     let encodedResult: String
     let resources: PreparedMediaResources
+    /// Durable records (and their canonical payload bytes) that preparation read through
+    /// the overlay. They scale with the records the command touches, not the project size.
+    var readRecords = 0
+    var readBytes = 0
 
     func commit(_ db: Database,router: CommandRouter? = nil,caller: Caller? = nil) throws {
         let current = try observer.read { try Int64.fetchOne($0,sql:"PRAGMA data_version")! }
@@ -49,58 +53,126 @@ struct PreparedMediaCommand {
     }
 }
 
+/// CL-307: a copy-on-write overlay over the read-only snapshot. A TEMP view named
+/// `records` shadows the durable table on the preparation connection only; reads use the
+/// durable indexes and see only the records a command asks for, and writes land in a
+/// TEMP table. The connection opens read-only, so the durable file cannot change.
+enum MediaPreparationOverlay {
+    static let label = "checklist.media-preparation"
+    final class Reads: @unchecked Sendable { var records = 0; var bytes = 0 }
+
+    private static func literal(_ value: String) -> String {
+        "CAST(x'" + Data(value.utf8).map { String(format:"%02x",$0) }.joined() + "' AS TEXT)"
+    }
+    static func install(_ db: Database,project: String,session: String,reads: Reads) throws {
+        db.add(function:DatabaseFunction("checklist_media_prepared_read",argumentCount:1,pure:true) { values in
+            reads.records += 1;reads.bytes += Int(Int64.fromDatabaseValue(values[0]) ?? 0);return 1
+        })
+        let pid = literal(project),sid = literal(session)
+        // Same visibility as the former workspace copy: this project's records, the project
+        // record and the caller's session. New rows sort after every durable rowid.
+        try db.execute(sql:"""
+        CREATE TEMP TABLE media_prepared(id TEXT PRIMARY KEY,project_id TEXT,type TEXT NOT NULL,revision INTEGER NOT NULL,data TEXT NOT NULL,rid INTEGER NOT NULL);
+        CREATE TEMP VIEW records(rowid,id,project_id,type,revision,data) AS
+          SELECT rid,id,project_id,type,revision,data FROM temp.media_prepared
+          UNION ALL
+          SELECT s.rowid,s.id,s.project_id,s.type,s.revision,s.data FROM main.records s
+          WHERE (s.project_id=\(pid) OR s.id=\(pid) OR s.id=\(sid))
+            AND NOT EXISTS(SELECT 1 FROM temp.media_prepared o WHERE o.id=s.id)
+            AND checklist_media_prepared_read(length(CAST(s.data AS BLOB)));
+        CREATE TEMP TRIGGER media_prepared_insert INSTEAD OF INSERT ON records BEGIN
+          SELECT RAISE(ABORT,'UNIQUE constraint failed: records.id')
+            WHERE EXISTS(SELECT 1 FROM temp.media_prepared WHERE id=NEW.id) OR EXISTS(SELECT 1 FROM main.records WHERE id=NEW.id);
+          INSERT INTO temp.media_prepared(id,project_id,type,revision,data,rid)
+            VALUES(NEW.id,NEW.project_id,NEW.type,NEW.revision,NEW.data,4611686018427387904+(SELECT count(*) FROM temp.media_prepared));
+        END;
+        CREATE TEMP TRIGGER media_prepared_update INSTEAD OF UPDATE ON records BEGIN
+          SELECT RAISE(ABORT,'Media preparation cannot change a record identity.') WHERE NEW.id IS NOT OLD.id;
+          INSERT OR REPLACE INTO temp.media_prepared(id,project_id,type,revision,data,rid)
+            VALUES(NEW.id,NEW.project_id,NEW.type,NEW.revision,NEW.data,
+              COALESCE((SELECT rid FROM temp.media_prepared WHERE id=OLD.id),(SELECT rowid FROM main.records WHERE id=OLD.id)));
+        END;
+        CREATE TEMP TRIGGER media_prepared_delete INSTEAD OF DELETE ON records BEGIN
+          SELECT RAISE(ABORT,'Media preparation cannot delete records.');
+        END;
+        """)
+    }
+    /// Every row the command wrote, in byte order of its ID.
+    static func changed(_ db: Database) throws -> [DecodedEnvelope] {
+        try Row.fetchAll(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM temp.media_prepared ORDER BY id COLLATE BINARY").map { try GRDBRecordEnvelopeAdapter.decode($0) }
+    }
+    /// The declared dependencies of the changed rows, resolved through the same overlay
+    /// (prepared rows first, then the snapshot) with indexed ID reads.
+    static func dependencies(_ db: Database,of changed: [DecodedEnvelope]) throws -> [DecodedEnvelope] {
+        var ids = Set<String>()
+        for envelope in changed {
+            let value = envelope.object
+            for reference in value["record_references"] as? [JSON] ?? [] { if let id = reference["id"] as? String { ids.insert(id) } }
+            for key in ["attachment_owner_id","owner_id","attachment_id"] { if let id = value[key] as? String { ids.insert(id) } }
+        }
+        ids.subtract(changed.map(\.id))
+        // One primary-key read per ID: an IN-list over json_each is not pushed into the view.
+        return try ids.sorted().compactMap { id in
+            try Row.fetchOne(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE id = CAST(? AS TEXT)",arguments:[Data(id.utf8)]).map { try GRDBRecordEnvelopeAdapter.decode($0) }
+        }
+    }
+}
+
 extension CommandRouter {
     /// CL-71 pattern for metadata: read/decode/validate/hash before the gate/writer,
     /// then commit only the prepared rows behind an unchanged snapshot identity.
-    /// The bounded in-memory workspace exercises the same domain code and canonical
-    /// save checks; it has no filesystem capture, event, receipt or publication.
+    /// CL-307: the overlay reads only the records the command touches plus the declared
+    /// dependencies of what it writes, so time and memory follow the command, not the
+    /// project size. It has no filesystem capture, event, receipt or publication.
     func prepareMediaCommand(method: String,params p: JSON,caller c: Caller,resources: PreparedMediaResources = .init()) throws -> PreparedMediaCommand? {
         var configuration = Configuration()
         configuration.readonly = true
-        configuration.prepareDatabase { try SchemaMigrations.installStorageCollation($0) }
-        let observer = try DatabaseQueue(path:root.appendingPathComponent("checklist.sqlite").path,configuration:configuration)
-        let scratch = try DatabaseQueue()
-        defer { try? scratch.close() }
-        return try observer.read { source in
-            let version = try Int64.fetchOne(source,sql:"PRAGMA data_version")!
-            let pid = try self.mediaAccess(source,p,c,write:true)
-            let command = (try StoredRecord(p, family: "media").string("command_id"))
-            let digest = hash(Data((method + (try jsonString(p))).utf8))
-            try self.requirePendingCommandIntent(source,command:command,digest:digest,caller:c)
-            // Preserve replay behavior even if the original command's target changed.
-            if try Bool.fetchOne(source,sql:"SELECT EXISTS(SELECT 1 FROM commands WHERE principal=? AND command_id=?)",arguments:[c.principal,command]) == true { return nil }
-            return try scratch.write { db in
-                try SchemaMigrations.installStorageCollation(db)
-                try db.execute(sql:"CREATE TABLE records(id TEXT PRIMARY KEY,project_id TEXT,type TEXT NOT NULL,revision INTEGER NOT NULL,data TEXT NOT NULL)")
-                let rows = try Row.fetchCursor(source,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE project_id=CAST(? AS TEXT) OR id=CAST(? AS TEXT) OR id=CAST(? AS TEXT) ORDER BY rowid LIMIT 100001",arguments:[Data(pid.utf8),Data(pid.utf8),Data((c.sessionID ?? "").utf8)])
-                var originals: [Data:(revision:Int64,data:Data)] = [:]
-                var bytes = 0
-                while let row = try rows.next() {
-                    let raw: Data = row["_envelope_data_bytes"]
-                    bytes += raw.count
-                    guard originals.count < 100_000,bytes <= 128 * 1024 * 1024 else {
-                        throw CoreError("CAPACITY_EXCEEDED","Media preparation is limited to 100,000 records and 128 MiB of canonical payloads.")
-                    }
-                    let envelope = try GRDBRecordEnvelopeAdapter.decode(row)
-                    let key = Data(envelope.id.utf8)
-                    originals[key] = (envelope.revision,raw)
-                    try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),?,CAST(? AS TEXT))",arguments:[key,envelope.projectID.map {Data($0.utf8)},Data(envelope.type.utf8),envelope.revision,raw])
-                }
-                let result = try self.mediaCommand(db,method:method,p:p,c:c,project:pid,resources:resources)
-                // Complete same-project dependencies are checked on the final prepared
-                // graph, not an incomplete intermediate graph or a moving durable head.
-                let final = try MediaRecordRegistry.envelopes(db,project:pid)
-                try MediaRecordRegistry.validate(final)
-                var writes: [PreparedMediaCommand.Write] = []
-                for envelope in final {
-                    guard case .text(let raw) = envelope.original.data else { throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A prepared media payload is unavailable.") }
-                    let key = Data(envelope.id.utf8),data = Data(raw.utf8)
-                    if originals[key]?.data == data { continue }
-                    guard MediaRecordRegistry.families.contains(envelope.type) || resources.allows(envelope) else { throw CoreError("MEDIA_CAPTURE_INCOMPLETE","Media preparation may change only registered media records.") }
-                    writes.append(.init(id:key,project:Data(pid.utf8),type:Data(envelope.type.utf8),revision:envelope.revision,data:data,previousRevision:originals[key]?.revision))
-                }
-                return PreparedMediaCommand(observer:observer,dataVersion:version,project:pid,writes:writes,result:result,encodedResult:try jsonString(result),resources:resources)
-            }
+        configuration.label = MediaPreparationOverlay.label
+        configuration.prepareDatabase { db in
+            try SchemaMigrations.installStorageCollation(db)
+            try db.execute(sql:"PRAGMA temp_store=MEMORY")
         }
+        let observer = try DatabaseQueue(path:root.appendingPathComponent("checklist.sqlite").path,configuration:configuration)
+        var prepared: PreparedMediaCommand?
+        do {
+            try observer.inDatabase { db in
+                // The transaction pins one snapshot; ROLLBACK discards the TEMP overlay.
+                try db.inTransaction(.deferred) {
+                    prepared = try self.prepareMediaOverlay(db,observer:observer,method:method,p:p,c:c,resources:resources)
+                    return .rollback
+                }
+            }
+        } catch { try? observer.close();throw error }
+        if prepared == nil { try? observer.close() }
+        return prepared
+    }
+
+    private func prepareMediaOverlay(_ db: Database,observer: DatabaseQueue,method: String,p: JSON,c: Caller,resources: PreparedMediaResources) throws -> PreparedMediaCommand? {
+        let version = try Int64.fetchOne(db,sql:"PRAGMA data_version")!
+        let pid = try self.mediaAccess(db,p,c,write:true)
+        let command = (try StoredRecord(p, family: "media").string("command_id"))
+        let digest = hash(Data((method + (try jsonString(p))).utf8))
+        try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:c)
+        // Preserve replay behavior even if the original command's target changed.
+        if try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM commands WHERE principal=? AND command_id=?)",arguments:[c.principal,command]) == true { return nil }
+        let reads = MediaPreparationOverlay.Reads()
+        try MediaPreparationOverlay.install(db,project:pid,session:c.sessionID ?? "",reads:reads)
+        let result = try self.mediaCommand(db,method:method,p:p,c:c,project:pid,resources:resources)
+        // Same-project dependencies of every prepared row are checked on the final
+        // prepared overlay, not an intermediate graph or a moving durable head.
+        let changed = try MediaPreparationOverlay.changed(db).filter { EnvelopeStorageIdentity.equal($0.projectID,pid) }
+        try MediaRecordRegistry.validate(changed,dependencies:try MediaPreparationOverlay.dependencies(db,of:changed))
+        var writes: [PreparedMediaCommand.Write] = []
+        for envelope in changed {
+            guard case .text(let raw) = envelope.original.data else { throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A prepared media payload is unavailable.") }
+            let key = Data(envelope.id.utf8),data = Data(raw.utf8)
+            let original = try Row.fetchOne(db,sql:"SELECT revision,CAST(data AS BLOB) AS data FROM main.records WHERE id=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT)",arguments:[key,Data(pid.utf8)])
+            if let original,(original["data"] as Data?) == data { continue }
+            guard MediaRecordRegistry.families.contains(envelope.type) || resources.allows(envelope) else { throw CoreError("MEDIA_CAPTURE_INCOMPLETE","Media preparation may change only registered media records.") }
+            writes.append(.init(id:key,project:Data(pid.utf8),type:Data(envelope.type.utf8),revision:envelope.revision,data:data,previousRevision:original.map { $0["revision"] as Int64 }))
+        }
+        var prepared = PreparedMediaCommand(observer:observer,dataVersion:version,project:pid,writes:writes,result:result,encodedResult:try jsonString(result),resources:resources)
+        prepared.readRecords = reads.records;prepared.readBytes = reads.bytes
+        return prepared
     }
 }

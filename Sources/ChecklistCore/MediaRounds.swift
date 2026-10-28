@@ -125,12 +125,11 @@ extension CommandRouter {
         return r
     }
     func mediaItems(_ db: Database,round: JSON) throws -> [JSON] {
-        // Filter in SQL before decoding; one bounded round, never a whole-project item scan.
+        // Filter in SQL before decoding; one round, never a whole-project item scan (no item ceiling, CL-307).
         let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='media_item' AND project_id=CAST(? AS TEXT)"
-            + " AND json_extract(data,'$.round_id')=CAST(? AS TEXT) COLLATE BINARY ORDER BY id COLLATE BINARY LIMIT 1001",
+            + " AND json_extract(data,'$.round_id')=CAST(? AS TEXT) COLLATE BINARY ORDER BY id COLLATE BINARY",
             arguments:[Data(((try StoredRecord(round, family: "media").string("project_id"))).utf8),
             Data(((try StoredRecord(round, family: "media").string("id"))).utf8)])
-        guard rows.count <= 1000 else { throw CoreError("CAPACITY_EXCEEDED","A media round is limited to 1,000 items.") }
         return try rows.map { try GRDBRecordEnvelopeAdapter.decode($0,expectedType:"media_item").object }
     }
     func mediaTypeRevision(_ db: Database,type: JSON,input: JSON,caller: Caller) throws -> JSON {
@@ -444,7 +443,6 @@ extension CommandRouter {
         var previous: JSON?
         if method == "media_item_create" {
             round = try scoped(db,try text(p,"round_id"),pid,type:"media_round")
-            guard try mediaItems(db,round:round).count < 1000 else { throw CoreError("CAPACITY_EXCEEDED","A round holds at most 1,000 items.") }
             item = mediaRecord(["round_id":(try StoredRecord(round, family: "media").requiredValue("id")),
                 "state":"draft","title":try text(p,"title",max:2000)],project:pid,caller:c,
                 references:[try mediaRef("media_round",round)])
@@ -483,9 +481,9 @@ extension CommandRouter {
         let globalPins = (project["pinned_decisions"] as? [JSON] ?? []).filter {$0["origin"] as? String == "human_ui" && strings($0,"task_kinds").isEmpty && strings($0,"tag_ids").isEmpty}
         guard hasApprovedProjectHistory || (project["brief"] as? String ?? "").isEmpty && globalPins.isEmpty else { throw CoreError("MEDIA_PROJECT_CONTEXT_REQUIRED",
             "Explicitly adopt the observed project context before the first publication; historical text cannot mint approval.") }
-        guard let selected = p["items"] as? [JSON],!selected.isEmpty,selected.count <= 1000,
+        guard let selected = p["items"] as? [JSON],!selected.isEmpty,
             Set(selected.compactMap {$0["item_id"] as? String}).count == selected.count else { throw CoreError("INVALID_INPUT",
-            "Select 1 to 1,000 distinct exact Draft targets.") }
+            "Select one or more distinct exact Draft targets.") }
         var targets: [(JSON,JSON)] = []
         // Validate the entire selection before writing any new target or manifest.
         for entry in selected {

@@ -178,7 +178,7 @@ extension CommandRouter {
                 r));refs.append(["type":"media_review_type","id":(try StoredRecord(r, family: "media").requiredValue("type_id"))])
         }
         let items = strings(p,"item_ids")
-        guard p["item_ids"] == nil || p["item_ids"] is [String],items.count <= 1000,Set(items).count == items.count else { throw CoreError("INVALID_INPUT","Use distinct scoped items.") }
+        guard p["item_ids"] == nil || p["item_ids"] is [String],Set(items).count == items.count else { throw CoreError("INVALID_INPUT","Use distinct scoped items.") }
         for id in items {
             let item = try scoped(db,id,project,type:"media_item"),r = try scoped(db,(try StoredRecord(item, family: "media").string("round_id")),project,type:"media_round")
             guard (f["type_id"] == nil || f["type_id"] as? String == r["type_id"] as? String), (f["round_id"] == nil || f["round_id"] as? String == item["round_id"] as? String) else { throw CoreError("INVALID_INPUT","Item and context scopes must agree.") }

@@ -9,6 +9,8 @@ import GRDB
 private enum MediaQueryCursor {
     static let prefix = "ml1."
     static let maximumBytes = 1_400_000
+    /// Larger reference indexes are not sealed; the cursor keeps their digest instead.
+    static let sealedIndexBytes = 900_000
     static func seal(_ value: JSON, binding: Data, key: SymmetricKey) throws -> String {
         let bytes = try JSONSerialization.data(withJSONObject:value,options:[.sortedKeys])
         guard bytes.count <= 1_000_000 else { throw CoreError("CAPACITY_EXCEEDED","Media reference window exceeds its bound.") }
@@ -87,7 +89,7 @@ extension CommandRouter {
         guard p["filter"] == nil || p["filter"] is JSON,Set(filter.keys).isSubset(of:["dispositions","metadata","hidden_item_ids"]) else {throw CoreError("INVALID_INPUT","Unsupported media filter.")}
         let dispositions = try MediaConfigurationValue.ids(filter["dispositions"],max:6,"filter.dispositions").map(\.rawValue)
         guard Set(dispositions).isSubset(of:["pending","accepted","needs_look","changes_requested","excluded","stale"]) else {throw CoreError("INVALID_INPUT","Unknown disposition.")}
-        let hidden = try MediaConfigurationValue.ids(filter["hidden_item_ids"],max:1000,"filter.hidden_item_ids").map(\.rawValue)
+        let hidden = try MediaConfigurationValue.ids(filter["hidden_item_ids"],max:Int.max,"filter.hidden_item_ids").map(\.rawValue)
         guard filter["metadata"] == nil || filter["metadata"] is JSON else {throw CoreError("INVALID_INPUT","Metadata filter must be an object.")}
         let metadata = filter["metadata"] as? JSON ?? [:]
         guard metadata.count <= 3 else {throw CoreError("INVALID_INPUT","Filter at most three metadata fields.")}
@@ -109,10 +111,9 @@ extension CommandRouter {
         LEFT JOIN json_each(m.data,'$.items') member ON json_extract(member.value,'$.item_id')=i.id
         JOIN records t ON t.id=COALESCE(json_extract(member.value,'$.target_id'),json_extract(i.data,'$.draft_target_id')) AND t.project_id=i.project_id AND t.type='media_item_target'
         LEFT JOIN records d ON d.id=json_extract(i.data,'$.last_decision_id') AND d.project_id=i.project_id AND d.type='media_owner_decision'
-        WHERE \(predicates.joined(separator:" AND ")) ORDER BY \(mediaListOrderSQL(list,schema:schema)) LIMIT 1001
+        WHERE \(predicates.joined(separator:" AND ")) ORDER BY \(mediaListOrderSQL(list,schema:schema))
         """
         let rows = try Row.fetchAll(db,sql:sql,arguments:args)
-        guard rows.count <= 1000 else {throw CoreError("CAPACITY_EXCEEDED","A media round holds at most 1,000 items.")}
         return rows.map {["id":$0["id"] as String,"revision":$0["revision"] as Int,"target_id":$0["target_id"] as String,
             "order":$0["item_order"] as Int,"decision_id":($0["decision_id"] as String?) ?? "","disposition":$0["disposition"] as String]}
     }
@@ -123,12 +124,20 @@ extension CommandRouter {
         let list = try MediaListConfiguration.parse(p["list"] as? JSON ?? [:],schema:schema)
         let limit = try MediaConfigurationValue.integer(p["limit"] ?? 100,min:1,max:100,"limit")
         let binding = try mediaQueryBinding(db,p,c,project:project,method:method)
-        var window: JSON
+        var window: JSON,index: [JSON]
         if let token = p["cursor"] {
             guard let token = token as? String else {throw CoreError("CURSOR_RESET","Refresh this media view.")}
             window = try MediaQueryCursor.open(token,binding:binding,key:cursorKey)
-        } else {window = ["created":Date().timeIntervalSince1970,"offset":0,"index":try mediaListIndex(db,p,round:round,list:list,schema:schema)]}
-        let index = try StoredRecord(window, family: "media").objects("index")
+            if let digest = window["index_digest"] as? String {
+                // CL-307: a round too large to seal its reference index pages by recomputing
+                // the index; any change since the first page asks for a refresh.
+                index = try mediaListIndex(db,p,round:round,list:list,schema:schema)
+                guard try MediaCanonical.signature(index) == digest else {throw CoreError("CURSOR_RESET","This media view changed. Refresh it.")}
+            } else {index = try StoredRecord(window, family: "media").objects("index")}
+        } else {
+            index = try mediaListIndex(db,p,round:round,list:list,schema:schema)
+            window = ["created":Date().timeIntervalSince1970,"offset":0,"index":index]
+        }
         let offset = try mediaWindowOffset(window, count:index.count)
         var counts: [String:Int] = [:];for entry in index {counts[(try StoredRecord(entry, family: "media").string("disposition")),default:0] += 1}
         var result: JSON = ["round_id":(try StoredRecord(round, family: "media").requiredValue("id")),"total":index.count,"counts":counts,"snapshot":true,"requires_current_observation":true]
@@ -158,7 +167,13 @@ extension CommandRouter {
         }
         let next = offset + rows.count
         result["has_more"] = next < index.count
-        if next < index.count {window["offset"] = next;result["next_cursor"] = try MediaQueryCursor.seal(window,binding:binding,key:cursorKey)}
+        if next < index.count {
+            window["offset"] = next
+            if window["index"] != nil,try JSONSerialization.data(withJSONObject:index).count > MediaQueryCursor.sealedIndexBytes {
+                window.removeValue(forKey:"index");window["index_digest"] = try MediaCanonical.signature(index)
+            }
+            result["next_cursor"] = try MediaQueryCursor.seal(window,binding:binding,key:cursorKey)
+        }
         else {result["next_cursor"] = NSNull()}
         return result
     }

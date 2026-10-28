@@ -160,7 +160,8 @@ public final class CommandRouter: @unchecked Sendable {
     }
     /// A pure read runs on a read-only connection; a write there asks for the writer path.
     func requireWriter(_ db: Database) throws {
-        if db.configuration.readonly { throw CoreError("WRITER_REQUIRED", "This read needs the writer path.") }
+        // The media preparation overlay writes only TEMP rows on its read-only connection.
+        if db.configuration.readonly && db.configuration.label != MediaPreparationOverlay.label { throw CoreError("WRITER_REQUIRED", "This read needs the writer path.") }
     }
     func save(_ db: Database, _ value: JSON, type: String) throws {
         try requireWriter(db)
@@ -170,7 +171,16 @@ public final class CommandRouter: @unchecked Sendable {
         let envelope = try GRDBRecordEnvelopeAdapter.compareSave(incoming:incoming,previous:previous)
         guard case .text(let raw) = incoming.data else { throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.sqlData)) }
         let referenceWrite = try prepareTaskReferenceWrite(db,previous:previous,next:envelope)
-        try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),?,CAST(? AS TEXT)) ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,type=excluded.type,revision=excluded.revision,data=excluded.data",arguments:[Data(envelope.id.utf8),envelope.projectID.map { Data($0.utf8) },Data(envelope.type.utf8),envelope.revision,Data(raw.utf8)])
+        if db.configuration.label == MediaPreparationOverlay.label {
+            // The overlay view takes plain INSERT/UPDATE (a view cannot UPSERT); same effect.
+            if previous == nil {
+                try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),?,CAST(? AS TEXT))",arguments:[Data(envelope.id.utf8),envelope.projectID.map { Data($0.utf8) },Data(envelope.type.utf8),envelope.revision,Data(raw.utf8)])
+            } else {
+                try db.execute(sql:"UPDATE records SET project_id=CAST(? AS TEXT),type=CAST(? AS TEXT),revision=?,data=CAST(? AS TEXT) WHERE id=CAST(? AS TEXT)",arguments:[envelope.projectID.map { Data($0.utf8) },Data(envelope.type.utf8),envelope.revision,Data(raw.utf8),Data(envelope.id.utf8)])
+            }
+        } else {
+            try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),?,CAST(? AS TEXT)) ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,type=excluded.type,revision=excluded.revision,data=excluded.data",arguments:[Data(envelope.id.utf8),envelope.projectID.map { Data($0.utf8) },Data(envelope.type.utf8),envelope.revision,Data(raw.utf8)])
+        }
         invalidateTaskRecordSelection(db,type:type)
         if let previousType = previous?["type"] as String?,previousType != type {invalidateTaskRecordSelection(db,type:previousType)}
         recordTaskReferenceWrite(referenceWrite)

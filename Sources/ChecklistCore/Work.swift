@@ -364,6 +364,19 @@ extension CommandRouter {
         try recordTicketStatusAction(
             db, task: t, caller: actor, operation: returnsToImplementation ? .individual : operation,
             membership: returnsToImplementation || verdict == "reject" ? .verdictReturn : .status)
+        // CL-248: write the return notice after the Triage move, so the holder and the orchestrator
+        // of the return Triage each get one copy (a reject only when that Triage has an orchestrator).
+        if returnsToImplementation, var returned = r["implementation_return"] as? JSON {
+            returned["message_id"] = try reviewReturnNotice(
+                db, task: t, review: r, state: returned["state"] as? String ?? "queued", caller: actor)
+            r["implementation_return"] = returned
+            try save(db, r, type: "review")
+        } else if verdict == "reject", let group = try ticketOrchestratedTriage(db, task: t),
+            let copy = triageOrchestratorRecipient(db, group: group), copy["session_id"] as? String != actor.sessionID
+        {
+            r["return_notice_message_id"] = try reviewReturnNotice(db, task: t, review: r, state: "queued", caller: actor)
+            try save(db, r, type: "review")
+        }
         try event(
             db, caller: actor, project: pid, entity: t["id"] as? String, kind: "review_" + verdict,
             data: [

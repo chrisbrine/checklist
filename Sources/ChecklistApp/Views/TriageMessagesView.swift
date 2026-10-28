@@ -27,7 +27,8 @@ struct TriageMessagesSection: View {
 struct TriageMessageRow: View {
     let message: Record
     let ticketKey: String
-    var subject: String { ticketKey.isEmpty ? "Triage note" : ticketKey }
+    /// CL-126 (R42A D3): a ticket note names its ticket; "Triage note" only without a task.
+    var subject: String { !ticketKey.isEmpty ? ticketKey : message.string("task_id").isEmpty ? "Triage note" : "Ticket note" }
     var author: String {
         let display = message.string("author_display")
         if !display.isEmpty { return display }

@@ -46,16 +46,25 @@ extension CommandRouter {
         }
         task = try scoped(db,tid,pid,type:"task")
         try event(db,caller:caller,project:pid,entity:tid,kind:"review_returned_to_implementation",data:result)
-        let reason = review["reason"] as? String ?? "Implementation input is needed."
-        let findings = "Findings in the exact verdict: \((review["findings"] as? [JSON] ?? []).count)."
-        let verdict = try reviewRecord.requiredValue("verdict")
-        let state = try StoredRecord(result, family: "review return").requiredValue("state")
-        let body = "Review \(verdict) returned this ticket to implementation (\(state)). \(reason)\n\(findings)\n"
-            + "Read review \(reviewID) and submit a fresh target after addressing its missing items. "
-            + "For an automatic Active return, call work_claim at the current revision to pick up your new claim token."
-        let notice = try messageWrite(db,["project_id":pid,"task_id":tid,"body":body],caller,"message_send")
-        result["message_id"] = notice["id"]
         return result
+    }
+
+    /// CL-248: the verdict notice for returned work. The caller writes it only after the
+    /// verdict's Triage move, so the default route reaches the holder and the orchestrator of
+    /// the return Triage (not the reviewer's Triage). Returns the message ID.
+    func reviewReturnNotice(_ db: Database,task: JSON,review: JSON,state: String,caller: Caller) throws -> Any? {
+        let taskRecord = try StoredTaskRecord(task)
+        let reviewRecord = StoredRecord(review, family: "review")
+        let reviewID = try reviewRecord.requiredValue("id"),verdict = try reviewRecord.string("verdict")
+        let reason = review["reason"] as? String ?? (verdict == "reject" ? "The reviewer rejected the target." : "Implementation input is needed.")
+        let findings = "Findings in the exact verdict: \((review["findings"] as? [JSON] ?? []).count)."
+        let body = verdict == "reject"
+            ? "Review reject returned this ticket to Queued. \(reason)\n\(findings)\n"
+                + "Read review \(reviewID); any eligible implementer may claim the queued ticket and submit a fresh target."
+            : "Review \(verdict) returned this ticket to implementation (\(state)). \(reason)\n\(findings)\n"
+                + "Read review \(reviewID) and submit a fresh target after addressing its missing items. "
+                + "For an automatic Active return, call work_claim at the current revision to pick up your new claim token."
+        return try messageWrite(db,["project_id":taskRecord.projectID,"task_id":taskRecord.id,"body":body],caller,"message_send")["id"]
     }
 
     private func returnedImplementationHolder(_ db: Database,previous: JSON,projectID pid: String) throws -> Caller {

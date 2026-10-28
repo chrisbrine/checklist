@@ -92,6 +92,21 @@ struct TriageOrchestratorDisplay: Equatable {
         }
         return rows.sorted { ($0.rank, $0.label) < ($1.rank, $1.label) }.map { StatusCount(label: $0.label, count: $0.count) }
     }
+    /// CL-126 (R42A D2): the Triage detail reads the full Triage projection, which has no
+    /// member counts. Its state and counts come from the same source as the row: the
+    /// ticket page's Triage summary when the page has it; otherwise the loaded members,
+    /// counted as the page read counts them (a holder or an In progress status).
+    static func withMemberState(_ triage: Record, summary: Record?, members: [Record]) -> Record {
+        var values = triage.values
+        if let summary, summary.id.utf8.elementsEqual(triage.id.utf8) {
+            for key in ["member_working_count", "member_status_counts", "orchestration_connection"] where summary.values[key] != nil { values[key] = summary.values[key] }
+        }
+        let counted = ["member_working_count", "member_status_counts", "member_counts_by_status"].contains { values[$0] != nil }
+        if !counted, !members.isEmpty {
+            values["member_working_count"] = members.filter { !$0.string("active_attempt_id").isEmpty || Canceled.normalized($0.string("status_category")) == "active" }.count
+        }
+        return Record(values: values)
+    }
     static func statusCountsText(_ triage: Record) -> String {
         statusCounts(triage).map { "\($0.count) \($0.label)" }.joined(separator: " · ")
     }
@@ -106,6 +121,25 @@ struct TriageOrchestratorDisplay: Equatable {
             return named.filter { $0["category"] as? String == "active" }.reduce(0) { $0 + (($1["count"] as? NSNumber)?.intValue ?? 0) }
         }
         return (triage.object("member_counts_by_status")["active"] as? NSNumber)?.intValue ?? 0
+    }
+}
+
+/// CL-126 (R42A D4): one name for a conversation that holds a ticket. The selected
+/// ticket read sends missing session fields as empty strings, so each field is checked
+/// for a readable value: native title, enrollment label ("Claude thread 7b027ccb"),
+/// then the attempt's actor display. A raw ID is never a name.
+enum ConversationName {
+    static func readable(session: Record?, actorDisplay: String = "") -> String? {
+        for value in [session?.string("native_conversation_title") ?? "", session?.string("label") ?? "", actorDisplay] {
+            let name = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty, UUID(uuidString: name) == nil { return name }
+        }
+        return nil
+    }
+    /// The readable name, or the contract default "<Provider> · <short thread id>".
+    static func label(session: Record?, sessionID: String, actorDisplay: String = "") -> String {
+        readable(session: session, actorDisplay: actorDisplay)
+            ?? TriageOrchestratorDisplay.conversationLabel(provider: session?.string("provider") ?? "", display: "", sessionID: sessionID)
     }
 }
 
@@ -130,6 +164,10 @@ enum NoteAudience: String, CaseIterable, Identifiable {
     func unavailableReason(hasOrchestrator: Bool) -> String? {
         self == .orchestrator && !hasOrchestrator ? "This ticket's Triage has no orchestrator. Choose Both or Holder only." : nil
     }
+    /// CL-126 (R42A C1): the composer hides the picker when the Triage has no
+    /// orchestrator, so a stored Orchestrator only choice falls back to Both there.
+    /// The stored choice stays for when an orchestrator is back and the picker shows.
+    func available(hasOrchestrator: Bool) -> NoteAudience { self == .orchestrator && !hasOrchestrator ? .all : self }
     /// The composer destination for the selected audience.
     func destination(holder: String, orchestrator: String?) -> String {
         guard let orchestrator else { return holder }
@@ -234,7 +272,20 @@ struct TriageNoteDrafts {
     }
     /// The ticket key an orchestrator copy names, or empty for a Triage note.
     func ticketKey(_ message: Record) -> String {
-        sources.first { $0.field == "task_id" && $0.id.utf8.elementsEqual(message.string("task_id").utf8) }?.ticketKey ?? ""
+        let key = sources.first { $0.field == "task_id" && $0.id.utf8.elementsEqual(message.string("task_id").utf8) }?.ticketKey ?? ""
+        return key.isEmpty && !message.string("task_id").isEmpty ? message.string("task_key") : key
+    }
+    /// CL-126 (R42A D3): the detail can read its messages before its member rows load,
+    /// so member keys can arrive later. A known key replaces an empty one; ids never change.
+    func updateKeys(_ members: [(id: String, key: String)]) {
+        var changed = false
+        sources = sources.map { source in
+            guard source.field == "task_id", source.ticketKey.isEmpty,
+                  let key = members.first(where: { $0.id.utf8.elementsEqual(source.id.utf8) && !$0.key.isEmpty })?.key else { return source }
+            changed = true
+            return Source(field: source.field, id: source.id, ticketKey: key)
+        }
+        if changed { objectWillChange.send() }
     }
     private func fetch(_ selected: [Source], read: UUID, request: Request) async {
         loading = true; error = nil

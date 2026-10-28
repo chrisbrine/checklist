@@ -83,6 +83,16 @@ extension CoreTests {
         let patch = ((edit["inputSchema"] as! JSON)["properties"] as! JSON)["patch"] as! JSON
         XCTAssertTrue((patch["description"] as? String ?? "").contains("readiness"))
         XCTAssertTrue((tools.first { $0["name"] as? String == "triage_create" }!["description"] as? String ?? "").contains("A Triage has no phase"))
+        // CL-125 rules 8-10: no tool description keeps the retired departure or phase rules.
+        for tool in tools {
+            let text = tool["description"] as? String ?? ""
+            for retired in ["removes the ticket from all current Triages","depart","detaches every membership","removes all current Triage memberships","phase orchestrator"] {
+                XCTAssertFalse(text.contains(retired),"\(tool["name"] ?? "") still says \(retired)")
+            }
+        }
+        for name in ["work_claim","review_record","work_release","work_submit","batch_review_record"] {
+            XCTAssertTrue((tools.first { $0["name"] as? String == name }!["description"] as? String ?? "").contains("Triage"),name)
+        }
     }
 
     func testTaskContextNamesRefinementAndPrerequisiteWaits() throws {

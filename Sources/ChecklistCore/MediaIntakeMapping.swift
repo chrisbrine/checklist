@@ -64,7 +64,7 @@ struct MediaIntakePlan {
         return Self(input: input, assignments: assignments)
     }
     func map(_ rows: [MediaIntakeSourceRow], schema: MediaReviewSchema) throws -> [MediaIntakeMappedRow] {
-        guard rows.count <= 1_000, Set(rows.map(\.id)).count == rows.count else { throw MediaSchemaError.invalid("rows", "oversized or duplicate row identities") }
+        guard Set(rows.map(\.id)).count == rows.count else { throw MediaSchemaError.invalid("rows", "duplicate row identities") }
         return try rows.map { row in
             try row.validate()
             var metadata: [MediaReviewID: MediaMetadataValue] = [:], errors: [MediaIntakeDiagnostic] = []
@@ -116,7 +116,7 @@ struct MediaIntakeSourceRow {
     let stem: String?
     let columns: [MediaIntakeColumn]
     func validate() throws {
-        guard (0..<1_000).contains(sourceIndex), stem == nil || stem!.utf8.count <= 4_096, columns.count <= 64 else { throw MediaSchemaError.invalid("row", "input bounds exceeded") }
+        guard sourceIndex >= 0, stem == nil || stem!.utf8.count <= 4_096, columns.count <= 64 else { throw MediaSchemaError.invalid("row", "input bounds exceeded") }
         for column in columns {
             guard column.value is NSNull || column.value is NSNumber || (column.value as? String).map({ $0.utf8.count <= 65_536 }) == true else { throw MediaSchemaError.invalid("row.column", "expected bounded scalar") }
         }
@@ -126,7 +126,7 @@ struct MediaIntakeSourceRow {
         guard text.utf8.count <= 4 * 1_024 * 1_024 else { throw MediaSchemaError.invalid("tsv", "input byte limit") }
         var lines = text.components(separatedBy: "\n")
         if lines.last == "" { lines.removeLast() }
-        guard !lines.isEmpty, lines.count <= 1_001 else { throw MediaSchemaError.invalid("tsv", "row limit") }
+        guard !lines.isEmpty else { throw MediaSchemaError.invalid("tsv", "row limit") }
         func cells(_ line: String) -> [String] { (line.hasSuffix("\r") ? String(line.dropLast()) : line).components(separatedBy: "\t") }
         let header = try cells(lines.removeFirst()).map { try MediaReviewID($0) }
         guard !header.isEmpty, header.count <= 64, rowIDs.count == lines.count, Set(rowIDs).count == rowIDs.count else { throw MediaSchemaError.invalid("tsv", "header or row identities invalid") }

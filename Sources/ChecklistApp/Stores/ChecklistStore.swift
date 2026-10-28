@@ -973,9 +973,12 @@ final class ChecklistStore: ObservableObject {
                 let installed = await withTaskGroup(of: Bool.self) { group in
                     func enqueue(_ surface: String) {
                         guard let read = reads[surface] else { return }
-                        group.addTask {
+                        // Main-actor children start in enqueue order, so the committed destination's
+                        // request is sent first. A nonisolated child hops back in any order under load.
+                        let operation: @MainActor () async -> Bool = {
                             await self.readIndependentOverviewNeed(surface,read:read,id:id,focus:focus,reads:reads)
                         }
+                        group.addTask(operation: operation)
                     }
                     for _ in 0..<min(3,remaining.count) { enqueue(remaining.removeFirst()) }
                     var ok = true

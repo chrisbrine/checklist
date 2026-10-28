@@ -24,7 +24,12 @@ struct TaskDetailView: View {
     @State private var mentionComposer = MentionComposerState()
     @State private var noteAudience: NoteAudience = .all
     var project: String { task.string("project_id") }
-    var messages: [Record] { RecordOrdering.newestFirst(store.detailRecords("messages",task:task).filter { $0.string("task_id") == task.id }, chronologicalInput: true) }
+    var messages: [Record] { Self.conversation(store.detailRecords("messages",task:task), taskID: task.id) }
+    /// The ticket's own notes, newest first, whatever their audience (CL-126 R42A D1:
+    /// an Orchestrator only note and its receipt stay in the ticket's list).
+    static func conversation(_ records: [Record], taskID: String) -> [Record] {
+        RecordOrdering.newestFirst(records.filter { $0.string("task_id") == taskID }, chronologicalInput: true)
+    }
     var recipientChanged: Bool { store.noteDestinations[task.id] != task.string("active_attempt_id") || store.noteDraftNeedsReconciliation(task.id) || orchestratorChanged }
     var destinationLabel: String {
         guard let expected = store.noteDestinations[task.id] else { return (store.noteDrafts[task.id] ?? "").isEmpty ? "Next pickup / current handlers" : "Choose current recipient" }
@@ -248,12 +253,10 @@ struct TaskDetailView: View {
     var handler: String {
         if let attempt = store.detailRecords("attempts",task:task).first(where: { $0.id == task.string("active_attempt_id") }) {
             if attempt.string("session_id") == "human" { return "You are handling this" }
-            if let session = store.detailRecords("sessions",task:task).first(where: { $0.id == attempt.string("session_id") }) {
-                let label = session.string("native_conversation_title", fallback: session.string("label"))
-                if !label.isEmpty && UUID(uuidString: label) == nil { return label }
-                return session.string("provider", fallback: "Agent").capitalized + " · Current handler"
-            }
-            return "Current handler · details below"
+            // CL-126 (R42A D4): name the holding conversation, as the Overview does.
+            let session = store.detailRecords("sessions",task:task).first(where: { $0.id == attempt.string("session_id") })
+            if session == nil && attempt.string("session_id").isEmpty { return "Current handler · details below" }
+            return ConversationName.label(session: session, sessionID: attempt.string("session_id"), actorDisplay: attempt.string("actor_display"))
         }
         let assignee = task.string("planned_assignee")
         if assignee == "human" || task.object("planned_assignee")["kind"] as? String == "human" { return "Assigned to you" }
@@ -269,7 +272,9 @@ struct TaskDetailView: View {
     var triageOrchestrator: TriageOrchestratorDisplay? { currentTriage.map(TriageOrchestratorDisplay.init) }
     var noteRouting: TicketNoteRouting { TicketNoteRouting(preferences: store.windowPreferences) }
     var orchestratorChanged: Bool { noteRouting.orchestratorChanged(task.id, current: triageOrchestrator?.sessionID ?? "", hasDraft: !(store.noteDrafts[task.id] ?? "").isEmpty) }
-    var audienceUnavailable: String? { noteAudience.unavailableReason(hasOrchestrator: triageOrchestrator?.orchestrator != nil) }
+    /// CL-126 (R42A C1): without an orchestrator the picker is hidden, so the choice in effect is Both.
+    var effectiveAudience: NoteAudience { noteAudience.available(hasOrchestrator: triageOrchestrator?.orchestrator != nil) }
+    var audienceUnavailable: String? { effectiveAudience.unavailableReason(hasOrchestrator: triageOrchestrator?.orchestrator != nil) }
     var recordHistorySection:some View {
         DisclosureGroup("Work, review & file history") {
             VStack(alignment:.leading,spacing: Spacing.row) {
@@ -302,7 +307,7 @@ struct TaskDetailView: View {
             AccessibleHStack(spacing: Spacing.compact) {
                 Text("\(store.projectName(project)) · \(task.string("key"))").lineLimit(1)
                 Image(systemName: "arrow.right")
-                Text(noteAudience.destination(holder: destinationLabel, orchestrator: triageOrchestrator?.orchestrator))
+                Text(effectiveAudience.destination(holder: destinationLabel, orchestrator: triageOrchestrator?.orchestrator))
                 Spacer()
             }.checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             if let orchestrator = triageOrchestrator?.orchestrator {
@@ -382,7 +387,7 @@ struct TaskDetailView: View {
                         var params: [String: Any] = ["project_id": project, "task_id": task.id, "body": body,
                             "expects_reply": true, "expected_attempt_id": submission.expectedAttempt.string]
                         if let target { params["mention_target"] = target }
-                        if triageOrchestrator?.orchestrator != nil, let audience = noteAudience.effective(ownerDirection: false, mentionPlan: target != nil).parameter { params["audience"] = audience }
+                        if triageOrchestrator?.orchestrator != nil, let audience = effectiveAudience.effective(ownerDirection: false, mentionPlan: target != nil).parameter { params["audience"] = audience }
                         store.run("message_send", params, success: task.string("active_attempt_id").isEmpty ? "Note saved for pickup" : "Note saved; see delivery receipts", completion: { _ in
                             if MentionDraftResolution.ExactText(store.noteDrafts[task.id] ?? "") == submission.snapshot.body { store.saveNote(task.id, text: ""); noteRouting.clearDestination(task.id) }
                             else { store.notice = "Note sent; newer local draft text was retained." }

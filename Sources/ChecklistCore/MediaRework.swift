@@ -17,10 +17,9 @@ extension CommandRouter {
     /// Links are mutable-family records keyed by the exact decision they answer.
     func mediaReworkLinks(_ db: Database,round: JSON) throws -> [JSON] {
         let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='media_rework_link' AND project_id=CAST(? AS TEXT)"
-            + " AND json_extract(data,'$.round_id')=CAST(? AS TEXT) COLLATE BINARY ORDER BY id COLLATE BINARY LIMIT 1001",
+            + " AND json_extract(data,'$.round_id')=CAST(? AS TEXT) COLLATE BINARY ORDER BY id COLLATE BINARY",
             arguments:[Data((try StoredRecord(round, family: "media").string("project_id")).utf8),
                        Data((try StoredRecord(round, family: "media").string("id")).utf8)])
-        guard rows.count <= 1000 else { throw CoreError("CAPACITY_EXCEEDED","A media round links at most 1,000 rework tickets.") }
         return try rows.map { try GRDBRecordEnvelopeAdapter.decode($0,expectedType:"media_rework_link").object }
     }
 
@@ -220,7 +219,7 @@ extension CommandRouter {
               manifestID == p["manifest_id"] as? String else { throw CoreError("MEDIA_MANIFEST_CHANGED","Inspect the current published review record.") }
         let manifest = try scoped(db,manifestID,pid,type:"media_round_manifest")
         guard manifest["digest"] as? String == p["manifest_digest"] as? String else { throw CoreError("MEDIA_MANIFEST_CHANGED","The observed manifest digest changed.") }
-        guard let selected = p["items"] as? [JSON],!selected.isEmpty,selected.count <= 1000 else { throw CoreError("INVALID_INPUT","Include 1 to 1,000 exact items.") }
+        guard let selected = p["items"] as? [JSON],!selected.isEmpty else { throw CoreError("INVALID_INPUT","Include one or more exact items.") }
         var plan: [(item: JSON,target: JSON,carry: JSON?)] = [],seen = Set<String>()
         // Validate the whole explicit inclusion before writing any successor record.
         for entry in selected {

@@ -354,7 +354,7 @@ final class MediaFrozenIntakeTests: XCTestCase {
     }
     func testBoundedInputsAuthorizationAndPublicDispatchStayClosed() throws {
         let f = try Fixture(),round = try f.round(f.type(imageSchema()))
-        checks.checkError("INVALID_INPUT") {try preview(f,round,Array(repeating:["path":"/missing"],count:1001))}
+        checks.checkError("INVALID_INPUT") {try preview(f,round,[])}
         checks.checkError("INVALID_INPUT") {try f.call("media_intake_preview",["round_id":round["id"]!,"text":"one","sources":[["path":"/missing"]]])}
         let intake = try preview(f,round,[source(f,"real.png",1)])
         var p = captureParams(intake)
