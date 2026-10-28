@@ -157,15 +157,17 @@ extension CommandRouter {
     }
 
     /// Saved notes with no recipient (pickup_pending) for this Triage and its member tickets,
-    /// delivered once when an orchestrator starts or takes over: at most 50 per pickup.
+    /// delivered once when an orchestrator starts, takes over or checkpoints: at most 50 per pickup.
+    /// The orchestrator's own saved notes are skipped (a sender gets no copy), so they never fill a page.
     func deliverSavedTriageNotes(_ db: Database, group: JSON) throws -> (delivered: Int, hasMore: Bool) {
-        guard let recipient = triageOrchestratorRecipient(db, group: group) else { return (0, false) }
+        guard let recipient = triageOrchestratorRecipient(db, group: group), let osid = recipient["session_id"] as? String else { return (0, false) }
         let stored = StoredRecord(group, family: "group"), pid = try stored.string("project_id"), gid = try stored.string("id")
         let sql = "SELECT " + Self.canonicalColumns(alias: "m") + " FROM records m WHERE m.type='message' AND m.project_id=CAST(? AS TEXT)"
             + " AND json_extract(m.data,'$.pickup_pending')=1 AND ((json_extract(m.data,'$.triage_id')=CAST(? AS TEXT) COLLATE BINARY AND json_extract(m.data,'$.task_id') IS NULL)"
             + " OR json_extract(m.data,'$.task_id') IN (SELECT value FROM json_each(?)))"
+            + " AND COALESCE(json_extract(m.data,'$.author_session_id'),'')<>CAST(? AS TEXT) COLLATE BINARY"
             + " AND NOT EXISTS (SELECT 1 FROM records d WHERE d.type='delivery' AND d.project_id=m.project_id AND json_extract(d.data,'$.message_id')=m.id) ORDER BY m.rowid LIMIT 51"
-        let rows = try Row.fetchAll(db, sql: sql, arguments: [Data(pid.utf8), Data(gid.utf8), try jsonString(triageMemberIDs(group))])
+        let rows = try Row.fetchAll(db, sql: sql, arguments: [Data(pid.utf8), Data(gid.utf8), try jsonString(triageMemberIDs(group)), Data(osid.utf8)])
         var delivered = 0
         for row in rows.prefix(50) {
             let message = try GRDBRecordEnvelopeAdapter.decode(row, expectedType: "message").object

@@ -163,11 +163,13 @@ extension CommandRouter {
         // Finish turns a Triage with tickets into a plan; an empty one archives (CL-125).
         if action == "finish" { try archiveEmptyPlan(db,&group,caller:c,after:"finish") }
         try save(db,group,type:"group")
-        // CL-248: saved notes with no recipient reach the new orchestrator once (at most 50 per pickup).
-        let saved: (delivered: Int, hasMore: Bool) = action == "start" || action == "takeover" ? try deliverSavedTriageNotes(db,group:group) : (0,false)
+        // CL-248: saved notes with no recipient reach the orchestrator once (at most 50 per pickup);
+        // the current orchestrator's checkpoint continues the pickup while more remain.
+        let pickup = action == "start" || action == "takeover" || action == "checkpoint"
+        let saved: (delivered: Int, hasMore: Bool) = pickup ? try deliverSavedTriageNotes(db,group:group) : (0,false)
         var result = try groupProjection(db,group)
         if let notice { result["takeover_notice"] = notice }
-        if action == "start" || action == "takeover" { result["saved_notes_delivered"] = saved.delivered; result["saved_note_delivery_has_more"] = saved.hasMore }
+        if pickup { result["saved_notes_delivered"] = saved.delivered; result["saved_note_delivery_has_more"] = saved.hasMore }
         return result
     }
     func taskEpicContext(_ db: Database,_ task: JSON) throws -> Any {

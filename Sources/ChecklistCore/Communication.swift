@@ -154,7 +154,8 @@ extension CommandRouter {
         }
         if p["correction_of"] != nil,let tid = taskID {
             guard method == "message_send",explicitSessionID == nil,mentionTarget == nil else { throw CoreError("INVALID_INPUT","Note corrections use the current ticket handlers; omit recipient and mention_target.") }
-            recipientDetails = try relevantHandlerRecipients(db,task:scoped(db,tid,pid,type:"task"))
+            // CL-248: a correction, like every default route, never returns to its sender.
+            recipientDetails = try relevantHandlerRecipients(db,task:scoped(db,tid,pid,type:"task"),sender:c.sessionID).filter {$0["session_id"] as? String != c.sessionID}
             recipients = recipientDetails.compactMap {$0["session_id"] as? String}
             ordinaryRoute = nil
         }

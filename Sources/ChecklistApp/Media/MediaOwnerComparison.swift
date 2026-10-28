@@ -86,7 +86,7 @@ struct MediaOwnerComparison: View {
                 HStack {decisionButtons}
                 VStack(alignment:.leading) {decisionButtons}
             }.checklistDisabled([(!model.decisionEnabled,"Publish the selected item and choose whether to keep or update its review context before deciding."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
-            Text("Unanswered stays Pending. Show/Hide never records a decision. Changes requested creates no ticket here; rework and review closure are a later slice.").font(.caption).foregroundStyle(Color.checklistSecondaryText)
+            Text("Unanswered stays Pending. Show/Hide never records a decision. Changes requested creates no ticket by itself: Preview rework, then Create or reuse rework tickets makes one Draft ticket per decision. Close round… needs Accepted, Excluded or Changes requested on every published item.").font(.caption).foregroundStyle(Color.checklistSecondaryText)
         }
     }
     @ViewBuilder var decisionButtons: some View {
@@ -184,6 +184,16 @@ enum MediaComparisonAvailability: Equatable {
     }
 }
 
+/// Selectable exact text of a text slot. An explicit label on selectable text sent an AX client's label read into
+/// endless recursion (CL-312, same as CL-127); a plain-text representation carries the label instead.
+struct MediaExactCapturedText: View {
+    let value:String
+    static func accessibilityText(_ value:String) -> String {"Exact captured text: "+value}
+    var body: some View {
+        Text(value).textSelection(.enabled).accessibilityRepresentation {Text(verbatim:Self.accessibilityText(value))}.frame(maxWidth:.infinity,alignment:.leading)
+    }
+}
+
 struct MediaSlotView: View {
     @ObservedObject var model:MediaReviewModel
     let slot:Record
@@ -203,7 +213,7 @@ struct MediaSlotView: View {
         VStack(alignment:.leading,spacing:4) {
             Text(MediaComparisonLabels.slot(slot,definitions:model.slots)).font(.caption)
             switch MediaComparisonAvailability.resolve(slot:slot,original:original,declaredKind:declaredKind) {
-            case .text(let value): Text(value).textSelection(.enabled).frame(maxWidth:.infinity,alignment:.leading).accessibilityLabel("Exact captured text: "+value)
+            case .text(let value): MediaExactCapturedText(value:value)
             case .unavailable(let reason),.unsupported(let reason):Text(reason).foregroundStyle(Color.checklistSecondaryText)
             case .playback(let kind):
                 if let original {

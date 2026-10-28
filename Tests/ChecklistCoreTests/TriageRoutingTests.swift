@@ -152,6 +152,62 @@ extension EvidenceAuthorityTests {
         XCTAssertEqual(joined["saved_notes_delivered"] as? Int,50);XCTAssertEqual(joined["saved_note_delivery_has_more"] as? Bool,true)
     }
 
+    func testCorrectionsOnTheDefaultRouteNeverReachTheirSender() throws {
+        let f = try routeFixture()
+        // The holder corrects its own note: the subagent and the orchestrator, not the holder.
+        let held = try routeNote(f.p,f.task,f.holder)
+        let holderFix = try routeNote(f.p,f.task,f.holder,["kind":"correction","correction_of":held["id"]!,"body":"Corrected holder note"])
+        XCTAssertEqual(holderFix["kind"] as? String,"correction")
+        XCTAssertEqual(Set(routeDeliveries(holderFix).keys),Set([f.child.sessionID!,f.orchestrator.sessionID!]))
+        // The orchestrator corrects its own note: the holder and the subagent, not the orchestrator.
+        let orchestrated = try routeNote(f.p,f.task,f.orchestrator)
+        let orchestratorFix = try routeNote(f.p,f.task,f.orchestrator,["kind":"correction","correction_of":orchestrated["id"]!,"body":"Corrected orchestrator note"])
+        XCTAssertEqual(Set(routeDeliveries(orchestratorFix).keys),Set([f.holder.sessionID!,f.child.sessionID!]))
+        XCTAssertNil(routeDeliveries(orchestratorFix)[f.orchestrator.sessionID!])
+        // No holder: the orchestrator's correction has no other recipient and no self copy.
+        let idle = try ready(f.p);try routeAdd(f.p,f.triage["id"]!,idle,f.orchestrator)
+        let idleNote = try routeNote(f.p,idle,f.orchestrator)
+        let idleFix = try routeNote(f.p,idle,f.orchestrator,["kind":"correction","correction_of":idleNote["id"]!,"body":"Corrected idle note"])
+        XCTAssertEqual((idleFix["deliveries"] as! [JSON]).count,0)
+    }
+
+    func testCheckpointContinuesSavedTriageNotePickupFiftyAtATime() throws {
+        let p = try project(), o = try native(p,"orchestrator",domain:"host-o"), peer = try native(p,"peer",domain:"host-p")
+        let plan = try call("triage_create",["project_id":p["id"]!,"name":"Long plan"])
+        var saved: [String] = []
+        for _ in 0..<52 { saved.append(try routeNote(p,nil,peer,["triage_id":plan["id"]!])["id"] as! String) }
+        func orchestrate(_ action: String,command: String = UUID().uuidString) throws -> JSON {
+            try call("triage_orchestrate",["project_id":p["id"]!,"triage_id":plan["id"]!,"expected_revision":try routeTriage(plan["id"]!)["revision"]!,"action":action],o,command:command)
+        }
+        func delivered() throws -> [String] {
+            try router.dbQueue.read { try router.records($0,type:"delivery",project:p["id"] as? String) }
+                .filter { $0["recipient_session_id"] as? String == o.sessionID && saved.contains($0["message_id"] as? String ?? "") }
+                .compactMap { $0["message_id"] as? String }
+        }
+        let started = try orchestrate("start")
+        XCTAssertEqual(started["saved_notes_delivered"] as? Int,50);XCTAssertEqual(started["saved_note_delivery_has_more"] as? Bool,true)
+        XCTAssertEqual(try delivered().count,50)
+        // The current orchestrator's checkpoint delivers the rest, each once.
+        let command = UUID().uuidString, input: JSON = ["project_id":p["id"]!,"triage_id":plan["id"]!,"expected_revision":try routeTriage(plan["id"]!)["revision"]!,"action":"checkpoint"]
+        let next = try call("triage_orchestrate",input,o,command:command)
+        XCTAssertEqual(next["saved_notes_delivered"] as? Int,2);XCTAssertEqual(next["saved_note_delivery_has_more"] as? Bool,false)
+        // A same-command retry and a later checkpoint deliver nothing again.
+        let replay = try call("triage_orchestrate",input,o,command:command)
+        XCTAssertEqual(replay["saved_notes_delivered"] as? Int,2)
+        let later = try orchestrate("checkpoint")
+        XCTAssertEqual(later["saved_notes_delivered"] as? Int,0);XCTAssertEqual(later["saved_note_delivery_has_more"] as? Bool,false)
+        let all = try delivered()
+        XCTAssertEqual(all.count,52);XCTAssertEqual(Set(all),Set(saved))
+        // The orchestrator's own saved notes never fill a page or reach it.
+        let second = try call("triage_create",["project_id":p["id"]!,"name":"Own notes plan"])
+        for _ in 0..<50 { _ = try routeNote(p,nil,o,["triage_id":second["id"]!]) }
+        let foreign = try routeNote(p,nil,peer,["triage_id":second["id"]!])["id"] as! String
+        _ = try call("triage_orchestrate",["project_id":p["id"]!,"triage_id":plan["id"]!,"expected_revision":try routeTriage(plan["id"]!)["revision"]!,"action":"finish","reason":"Moving on"],o)
+        let joined = try call("triage_orchestrate",["project_id":p["id"]!,"triage_id":second["id"]!,"expected_revision":try routeTriage(second["id"]!)["revision"]!,"action":"start"],o)
+        XCTAssertEqual(joined["saved_notes_delivered"] as? Int,1);XCTAssertEqual(joined["saved_note_delivery_has_more"] as? Bool,false)
+        saved = [foreign];XCTAssertEqual(try delivered(),[foreign])
+    }
+
     func testTicketFreeTriageNotesRouteCorrelateAndRefuseAtomically() throws {
         let p = try project(), o = try native(p,"orchestrator",domain:"host-o"), peer = try native(p,"peer",domain:"host-p")
         let empty = try routeStart(p,o), command = UUID().uuidString

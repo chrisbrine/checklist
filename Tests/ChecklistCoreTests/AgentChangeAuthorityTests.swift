@@ -86,10 +86,16 @@ extension CoreTests {
         // CL-125 rules 8-10: no tool description keeps the retired departure or phase rules.
         for tool in tools {
             let text = tool["description"] as? String ?? ""
-            for retired in ["removes the ticket from all current Triages","depart","detaches every membership","removes all current Triage memberships","phase orchestrator"] {
+            for retired in ["removes the ticket from all current Triages","depart","detaches every membership","removes all current Triage memberships","phase orchestrator",
+                            "when work must remain grouped","leaves the ticket where it is"] {
                 XCTAssertFalse(text.contains(retired),"\(tool["name"] ?? "") still says \(retired)")
             }
         }
+        // CL-125 rules 5-8: an individual claim keeps grouped work; a plan member leaves the plan.
+        XCTAssertTrue((tools.first { $0["name"] as? String == "batch_claim" }!["description"] as? String ?? "").contains("a batch claim is not needed to keep work grouped"))
+        let orchestrate = tools.first { $0["name"] as? String == "triage_orchestrate" }!["description"] as? String ?? ""
+        XCTAssertTrue(orchestrate.contains("removes it only from a plan"));XCTAssertTrue(orchestrate.contains("moves the ticket into that orchestrator's Triage"))
+        XCTAssertTrue(orchestrate.contains("checkpoint again to receive the next ones"))
         for name in ["work_claim","review_record","work_release","work_submit","batch_review_record"] {
             XCTAssertTrue((tools.first { $0["name"] as? String == name }!["description"] as? String ?? "").contains("Triage"),name)
         }
