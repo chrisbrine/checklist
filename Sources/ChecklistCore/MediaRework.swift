@@ -52,6 +52,7 @@ extension CommandRouter {
     private func mediaReworkSelection(_ db: Database,_ p: JSON,round: JSON,manifest: JSON,project pid: String,exact: Bool) throws -> [MediaReworkEntry] {
         guard let selected = p["items"] as? [JSON],!selected.isEmpty,selected.count <= 200 else { throw CoreError("INVALID_INPUT","Select 1 to 200 Changes-requested items.") }
         var seen = Set<String>(),entries: [MediaReworkEntry] = []
+        let members = mediaManifestMembers(try StoredRecord(manifest, family: "media").objects("items")) {Data($0.utf8)}
         for entry in selected {
             let allowed: Set<String> = exact ? ["item_id","expected_revision","decision_id"] : ["item_id"]
             guard Set(entry.keys) == allowed else { throw CoreError("INVALID_INPUT",exact ? "Rework needs the exact item revision and decision." : "Preview names exact item IDs.") }
@@ -59,7 +60,7 @@ extension CommandRouter {
             guard seen.insert(try StoredRecord(item, family: "media").string("id")).inserted else { throw CoreError("INVALID_INPUT","Select distinct items.") }
             if exact { try mediaRevision(entry,item) }
             guard EnvelopeStorageIdentity.equal(item["round_id"] as? String,round["id"] as? String),
-                  let member = (try StoredRecord(manifest, family: "media").objects("items")).first(where:{EnvelopeStorageIdentity.equal($0["item_id"] as? String,item["id"] as? String)}),
+                  let id = item["id"] as? String,let member = members[Data(id.utf8)],
                   let head = item["last_decision_id"] as? String else { throw CoreError("MEDIA_REWORK_INELIGIBLE","Only a current Changes requested owner decision can create rework.") }
             let decision = try scoped(db,head,pid,type:"media_owner_decision")
             guard decision["review_basis_signature"] as? String == member["review_basis_signature"] as? String,
@@ -221,13 +222,14 @@ extension CommandRouter {
         guard manifest["digest"] as? String == p["manifest_digest"] as? String else { throw CoreError("MEDIA_MANIFEST_CHANGED","The observed manifest digest changed.") }
         guard let selected = p["items"] as? [JSON],!selected.isEmpty else { throw CoreError("INVALID_INPUT","Include one or more exact items.") }
         var plan: [(item: JSON,target: JSON,carry: JSON?)] = [],seen = Set<String>()
+        let members = mediaManifestMembers(try StoredRecord(manifest, family: "media").objects("items")) {Data($0.utf8)}
         // Validate the whole explicit inclusion before writing any successor record.
         for entry in selected {
             guard Set(entry.keys).isSubset(of:["item_id","carry_decision_id"]),entry["item_id"] is String else { throw CoreError("INVALID_INPUT","Include exact item IDs and optional carry_decision_id.") }
             let item = try scoped(db,try text(entry,"item_id"),pid,type:"media_item")
             guard seen.insert(try StoredRecord(item, family: "media").string("id")).inserted else { throw CoreError("INVALID_INPUT","Include distinct items.") }
             guard EnvelopeStorageIdentity.equal(item["round_id"] as? String,source["id"] as? String),
-                  let member = (try StoredRecord(manifest, family: "media").objects("items")).first(where:{EnvelopeStorageIdentity.equal($0["item_id"] as? String,item["id"] as? String)}) else {
+                  let id = item["id"] as? String,let member = members[Data(id.utf8)] else {
                 throw CoreError("MEDIA_BASIS_CHANGED","Only published items of the source record can be included.")
             }
             let target = try scoped(db,(try StoredRecord(member, family: "media").string("target_id")),pid,type:"media_item_target")

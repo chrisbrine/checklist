@@ -82,12 +82,12 @@ extension CommandRouter {
     private func mediaDecisionSelections(_ db: Database,selected: [JSON],input: JSON,round: JSON,manifest: JSON,
                                          project pid: String,method: String,disposition: String) throws -> [MediaDecisionSelection] {
         var validated: [MediaDecisionSelection] = []
+        let members = mediaManifestMembers(try StoredRecord(manifest, family: "media").objects("items")) {$0}
         for entry in selected {
             let required: Set<String> = ["item_id","expected_revision","target_id","review_basis_signature"]
             guard required.isSubset(of:Set(entry.keys)),Set(entry.keys).isSubset(of:required.union(["winner_id","none_fit"])) else { throw CoreError("INVALID_INPUT","A decision needs the exact item revision, published target and basis.") }
             let item = try scoped(db,try text(entry,"item_id"),pid,type:"media_item");try mediaRevision(entry,item)
-            guard item["round_id"] as? String == round["id"] as? String,let member = ((try StoredRecord(manifest,
-                 family: "media").objects("items"))).first(where:{$0["item_id"] as? String == item["id"] as? String}),
+            guard item["round_id"] as? String == round["id"] as? String,let id = item["id"] as? String,let member = members[id],
                 member["target_id"] as? String == entry["target_id"] as? String,
                 member["review_basis_signature"] as? String == entry["review_basis_signature"] as? String else { throw CoreError("MEDIA_BASIS_CHANGED",
                 "The published item target or basis changed.") }

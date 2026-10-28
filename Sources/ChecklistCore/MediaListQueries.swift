@@ -82,9 +82,21 @@ extension CommandRouter {
         return (order + ["CAST(i.id AS BLOB)"]).joined(separator:",")
     }
     private var mediaDispositionSQL: String {
-        "CASE WHEN d.id IS NULL AND member.value IS NOT NULL AND json_extract(i.data,'$.stale_predecessor_decision_id') IS NOT NULL THEN 'stale' WHEN d.id IS NULL OR member.value IS NULL THEN 'pending' WHEN json_extract(d.data,'$.review_basis_signature') IS NOT json_extract(member.value,'$.review_basis_signature') THEN 'stale' ELSE json_extract(d.data,'$.disposition') END"
+        "CASE WHEN d.id IS NULL AND i.member_item_id IS NOT NULL AND json_extract(i.data,'$.stale_predecessor_decision_id') IS NOT NULL THEN 'stale' WHEN d.id IS NULL OR i.member_item_id IS NULL THEN 'pending' WHEN json_extract(d.data,'$.review_basis_signature') IS NOT i.member_basis THEN 'stale' ELSE json_extract(d.data,'$.disposition') END"
     }
     private func mediaListIndex(_ db: Database,_ p: JSON,round: JSON,list: MediaListConfiguration,schema: MediaReviewSchema) throws -> [JSON] {
+        let (sql,args) = try mediaListIndexStatement(p,round:round,list:list,schema:schema)
+        let rows = try Row.fetchAll(db,sql:sql,arguments:args)
+        return rows.map {["id":$0["id"] as String,"revision":$0["revision"] as Int,"target_id":$0["target_id"] as String,
+            "order":$0["item_order"] as Int,"decision_id":($0["decision_id"] as String?) ?? "","disposition":$0["disposition"] as String]}
+    }
+    /// CL-307: the round manifest is expanded once (`member`). Published items are read by
+    /// primary key from its members, and the other round items once with one NOT IN probe, so
+    /// work grows with the round's items. The former per-item `json_each` over the whole
+    /// manifest reparsed it for every item. CROSS JOIN fixes the loop order: without table
+    /// statistics SQLite could otherwise rescan a whole arm per row. The rows (duplicates
+    /// included) and their values are those of the former LEFT JOIN.
+    func mediaListIndexStatement(_ p: JSON,round: JSON,list: MediaListConfiguration,schema: MediaReviewSchema) throws -> (String,StatementArguments) {
         let filter = p["filter"] as? JSON ?? [:]
         guard p["filter"] == nil || p["filter"] is JSON,Set(filter.keys).isSubset(of:["dispositions","metadata","hidden_item_ids"]) else {throw CoreError("INVALID_INPUT","Unsupported media filter.")}
         let dispositions = try MediaConfigurationValue.ids(filter["dispositions"],max:6,"filter.dispositions").map(\.rawValue)
@@ -93,7 +105,7 @@ extension CommandRouter {
         guard filter["metadata"] == nil || filter["metadata"] is JSON else {throw CoreError("INVALID_INPUT","Metadata filter must be an object.")}
         let metadata = filter["metadata"] as? JSON ?? [:]
         guard metadata.count <= 3 else {throw CoreError("INVALID_INPUT","Filter at most three metadata fields.")}
-        var predicates = ["i.type='media_item'","i.project_id=:project","json_extract(i.data,'$.round_id')=:round"]
+        var predicates: [String] = []
         var args: StatementArguments = ["project":(try StoredRecord(round, family: "media").string("project_id")),
             "round":(try StoredRecord(round, family: "media").string("id")),"manifest":round["manifest_id"] as? String ?? ""]
         for (index,entry) in metadata.sorted(by: {Data($0.key.utf8).lexicographicallyPrecedes(Data($1.key.utf8))}).enumerated() {
@@ -105,17 +117,26 @@ extension CommandRouter {
         if !hidden.isEmpty {predicates.append("i.id NOT IN (SELECT value FROM json_each(:hidden))");args += ["hidden":try jsonString(hidden)]}
         if !dispositions.isEmpty {predicates.append("(\(mediaDispositionSQL)) IN (SELECT value FROM json_each(:dispositions))");args += ["dispositions":try jsonString(dispositions)]}
         let sql = """
+        WITH member AS MATERIALIZED (
+          SELECT CAST(json_extract(entry.value,'$.item_id') AS TEXT) item_id,json_extract(entry.value,'$.target_id') target_id,
+            json_extract(entry.value,'$.review_basis_signature') basis
+          FROM records m,json_each(m.data,'$.items') entry
+          WHERE m.id=:manifest AND m.project_id=:project AND m.type='media_round_manifest'),
+        listed AS (
+          SELECT i.id,i.revision,i.project_id,i.data,member.item_id member_item_id,member.target_id member_target_id,member.basis member_basis
+          FROM member CROSS JOIN records i ON i.id=member.item_id
+          WHERE i.type='media_item' AND i.project_id=:project AND json_extract(i.data,'$.round_id')=:round
+          UNION ALL
+          SELECT i.id,i.revision,i.project_id,i.data,NULL,NULL,NULL FROM records i
+          WHERE i.type='media_item' AND i.project_id=:project AND json_extract(i.data,'$.round_id')=:round
+            AND i.id NOT IN (SELECT item_id FROM member WHERE item_id IS NOT NULL))
         SELECT i.id,i.revision,t.id target_id,COALESCE(json_extract(i.data,'$.order'),0) item_order,
           d.id decision_id,\(mediaDispositionSQL) disposition
-        FROM records i LEFT JOIN records m ON m.id=:manifest AND m.project_id=i.project_id AND m.type='media_round_manifest'
-        LEFT JOIN json_each(m.data,'$.items') member ON json_extract(member.value,'$.item_id')=i.id
-        JOIN records t ON t.id=COALESCE(json_extract(member.value,'$.target_id'),json_extract(i.data,'$.draft_target_id')) AND t.project_id=i.project_id AND t.type='media_item_target'
+        FROM listed i CROSS JOIN records t ON t.id=COALESCE(i.member_target_id,json_extract(i.data,'$.draft_target_id')) AND t.project_id=i.project_id AND t.type='media_item_target'
         LEFT JOIN records d ON d.id=json_extract(i.data,'$.last_decision_id') AND d.project_id=i.project_id AND d.type='media_owner_decision'
-        WHERE \(predicates.joined(separator:" AND ")) ORDER BY \(mediaListOrderSQL(list,schema:schema))
+        \(predicates.isEmpty ? "" : "WHERE " + predicates.joined(separator:" AND ")) ORDER BY \(mediaListOrderSQL(list,schema:schema))
         """
-        let rows = try Row.fetchAll(db,sql:sql,arguments:args)
-        return rows.map {["id":$0["id"] as String,"revision":$0["revision"] as Int,"target_id":$0["target_id"] as String,
-            "order":$0["item_order"] as Int,"decision_id":($0["decision_id"] as String?) ?? "","disposition":$0["disposition"] as String]}
+        return (sql,args)
     }
     func mediaListQuery(_ db: Database,method: String,p: JSON,c: Caller,project: String) throws -> JSON {
         let round = try scoped(db,try text(p,"round_id"),project,type:"media_round")
@@ -151,11 +172,13 @@ extension CommandRouter {
         let groups = groupValues.indices.map {level in
             "COUNT(*) OVER (PARTITION BY \(groupKeys.prefix(level+1).joined(separator:","))) g\(level)"
         }
+        // CL-307: CROSS JOIN keeps the parsed reference index as the outer loop (parsed once);
+        // without statistics SQLite could otherwise scan json_each(:index) once per target row.
         let sql = """
-        WITH selected AS (SELECT CAST(key AS INTEGER) position,value FROM json_each(:index))
+        WITH selected AS MATERIALIZED (SELECT CAST(key AS INTEGER) position,json_extract(value,'$.target_id') target_id FROM json_each(:index))
         SELECT selected.position,json_extract(t.data,'$.title') title,json_object(\(columns)) metadata,
           json_array(\(groupValues.joined(separator:","))) group_values \(groups.isEmpty ? "" : "," + groups.joined(separator:","))
-        FROM selected JOIN records t ON t.id=json_extract(selected.value,'$.target_id') AND t.project_id=:project AND t.type='media_item_target'
+        FROM selected CROSS JOIN records t ON t.id=selected.target_id AND t.project_id=:project AND t.type='media_item_target'
         ORDER BY selected.position LIMIT :limit OFFSET :offset
         """
         let rows = try Row.fetchAll(db,sql:sql,arguments:["index":try jsonString(index),"project":project,"limit":limit,"offset":offset])

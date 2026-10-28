@@ -124,6 +124,15 @@ extension CommandRouter {
             (try StoredRecord(type, family: "media").string("project_id")),type:"media_review_type_revision")
         return r
     }
+    /// CL-307: one pass over a manifest's members keyed by item ID. The first entry per key
+    /// wins, as `first(where:)` did, so per-item member lookups stay linear in the round size.
+    func mediaManifestMembers<Key: Hashable>(_ entries: [JSON],key: (String) -> Key) -> [Key:JSON] {
+        var members: [Key:JSON] = [:]
+        for entry in entries {
+            if let id = entry["item_id"] as? String,members[key(id)] == nil {members[key(id)] = entry}
+        }
+        return members
+    }
     func mediaItems(_ db: Database,round: JSON) throws -> [JSON] {
         // Filter in SQL before decoding; one round, never a whole-project item scan (no item ceiling, CL-307).
         let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='media_item' AND project_id=CAST(? AS TEXT)"
@@ -279,12 +288,13 @@ extension CommandRouter {
         result["observed_context_token"] = try mediaToken(db,round:round,caller:caller);result["context"] = context
         let manifest = try (round["manifest_id"] as? String).map {try scoped(db,$0,(try StoredRecord(round, family: "media").string("project_id")),type:"media_round_manifest")}
         result["manifest"] = manifest ?? [:]
+        let members = mediaManifestMembers(manifest?["items"] as? [JSON] ?? []) {$0}
         result["items"] = try mediaItems(db,round:round).map { item -> JSON in
             var row = item
             let draft = try scoped(db,(try StoredRecord(item, family: "media").string("draft_target_id")),(try StoredRecord(round, family: "media").string("project_id")),type:"media_item_target")
             row["draft_target"] = draft;row["publication_preview"] = try mediaShapeForTarget(db,item:item,target:draft,typeRevision:type,context:context)
             row["disposition"] = "pending"
-            if let entry = (manifest?["items"] as? [JSON])?.first(where:{$0["item_id"] as? String == item["id"] as? String}) {
+            if let id = item["id"] as? String,let entry = members[id] {
                 row["published_target"] = try scoped(db,(try StoredRecord(entry, family: "media").string("target_id")),
                     (try StoredRecord(round, family: "media").string("project_id")),type:"media_item_target")
                 if let id = item["last_decision_id"] as? String {
@@ -417,10 +427,13 @@ extension CommandRouter {
             guard old["id"] as? String != revision["id"] as? String || pendingTypeChange else { continue }
             var relevant = try old["rubric"] as? String != revision["rubric"] as? String || !((try StoredRecord(type,
                  family: "media").objects("adoptions"))).contains {$0["type_revision_id"] as? String == old["id"] as? String}
+            // CL-307: read the manifest once per round, not once per item.
+            let members = try (round["manifest_id"] as? String).map {
+                mediaManifestMembers(try scoped(db,$0,pid,type:"media_round_manifest")["items"] as? [JSON] ?? []) {$0}
+            }
             for item in try mediaItems(db,round:round) {
                 var targetIDs = [(try StoredRecord(item, family: "media").string("draft_target_id"))]
-                if let mid = round["manifest_id"] as? String,let member = (try scoped(db,
-                    mid,pid,type:"media_round_manifest")["items"] as? [JSON])?.first(where:{$0["item_id"] as? String == item["id"] as? String}) { targetIDs.append((try StoredRecord(member,
+                if let id = item["id"] as? String,let member = members?[id] { targetIDs.append((try StoredRecord(member,
                      family: "media").string("target_id"))) }
                 for targetID in Set(targetIDs) {
                 let target = try scoped(db,targetID,pid,type:"media_item_target")

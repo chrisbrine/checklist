@@ -21,4 +21,7 @@ enum DisabledReasons {
     static let saving = "Another change is still saving. Try again when it finishes."
     static let uncheckedChange = "The last change may already be saved. Use Check the last change first."
     static let ticketLoading = "The current version of this ticket is still loading."
+    /// CL-315: a change is bound to the store identity for safe recovery; a media write
+    /// can leave it unknown until the next page read names it again.
+    static let storeUnknown = "Refresh Checklist before making a change so it can be recovered safely."
 }

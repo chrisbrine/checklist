@@ -18,6 +18,8 @@ import ChecklistCore
         /// Replies served in order for one method before `extra` applies (CL-307 chunk loop).
         var sequence:[String:[MediaValues]]=[:]
         var onRequest:((String)->Void)?
+        /// CL-315: the recovery journal cannot save, so ChecklistStore.run returns before sending.
+        var saveFails=false
         var itemDisposition="pending"
         var pageCounts:[String:Int]?
         var pending:[String:String]=[:]
@@ -57,7 +59,7 @@ import ChecklistCore
         }
         func store(_ defaults:UserDefaults,_ directory:URL) -> ChecklistStore {
             let store=ChecklistStore(draftJournal:LocalDraftJournal(directory:directory),preferences:defaults,restorePendingCommand:false,
-                desktopAlerts:DesktopAlertCoordinator(sink:MediaNoAlerts()),requestTransport:{[self] in try await request($0,$1)},navigationMemory:DetailItemNavigationMemory(),pendingCommandPersistence:PendingCommandPersistence(read:{[self] in pending[$0]},save:{[self] in pending[$1]=$0},remove:{[self] in pending.removeValue(forKey:$0)}))
+                desktopAlerts:DesktopAlertCoordinator(sink:MediaNoAlerts()),requestTransport:{[self] in try await request($0,$1)},navigationMemory:DetailItemNavigationMemory(),pendingCommandPersistence:PendingCommandPersistence(read:{[self] in pending[$0]},save:{[self] in if saveFails {throw ChecklistError("SAVE_FAILED","Synthetic journal failure.")};pending[$1]=$0},remove:{[self] in pending.removeValue(forKey:$0)}))
             store.data=["service":["store_incarnation":"synthetic-media-store"]];store.connected=true;store.projectID=project;return store
         }
     }
@@ -199,6 +201,63 @@ import ChecklistCore
         try await settle {model.intake.strings("remaining_row_ids").isEmpty && !store.busy}
         XCTAssertEqual(peer.calls.filter {$0.0=="media_intake_capture"}.map {($0.1["row_ids"] as? [String])?.first},["row-0","row-200","row-300","next-0","next-200"])
         XCTAssertFalse(model.capturing)
+    }
+    /// CL-315 (V42B): the store identity is empty for a moment after a media write. The second
+    /// chunk waits for a known identity and is then sent; one press still captures every row.
+    func testOneCapturePressWaitsForTheStoreIdentityBetweenChunks() async throws {
+        let (peer,store,_,_)=fixture();let model=await setup(peer,store)
+        let ids=(0..<300).map {"row-"+String($0)}
+        func intake(_ revision:Int,remaining:Int) -> MediaValues {
+            ["id":"intake","revision":revision,"plan_id":"plan","confirmed_plan_id":"plan","committed_row_ids":Array(ids.prefix(300-remaining)),"remaining_row_ids":Array(ids.suffix(remaining))]
+        }
+        peer.sequence["media_intake_capture"]=[intake(2,remaining:100),intake(3,remaining:0)]
+        peer.onRequest={method in if method=="media_intake_capture" {store.data=["service":[String:Any]()]}}
+        model.intake=Record(values:intake(1,remaining:300));store.connected=true;model.error=nil
+        model.captureIntake()
+        try await settle {model.intake.strings("remaining_row_ids").count == 100 && !store.busy}
+        try await Task.sleep(nanoseconds:100_000_000)
+        XCTAssertEqual(store.writeBlockReason,DisabledReasons.storeUnknown)
+        XCTAssertTrue(model.capturing,"The sequence waits; it does not stop or send into an unknown store")
+        XCTAssertEqual(peer.calls.filter {$0.0=="media_intake_capture"}.count,1)
+        XCTAssertNil(model.error);XCTAssertNil(store.error)
+        peer.onRequest=nil;store.data=["service":["store_incarnation":"synthetic-media-store"]]
+        try await settle {model.intake.strings("remaining_row_ids").isEmpty && !store.busy && !model.capturing}
+        let sent=peer.calls.filter {$0.0=="media_intake_capture"}.map(\.1)
+        XCTAssertEqual(sent.map {($0["row_ids"] as? [String])?.count},[200,100])
+        XCTAssertEqual(sent.map {$0["expected_revision"] as? Int},[1,2])
+        XCTAssertNil(model.error);XCTAssertNil(store.error)
+    }
+    /// CL-315: every early return of ChecklistStore.run reaches the caller's failure path, so a
+    /// capture that cannot start ends with a visible error and the Capture button enabled.
+    func testRunThatReturnsEarlyEndsCaptureWithVisibleErrorAndReachesEveryCaller() async throws {
+        let (peer,store,_,_)=fixture();let model=await setup(peer,store)
+        let ids=(0..<300).map {"row-"+String($0)}
+        model.intake=Record(values:["id":"intake","revision":1,"plan_id":"plan","confirmed_plan_id":"plan","remaining_row_ids":ids]);store.connected=true
+        peer.saveFails=true
+        model.captureIntake()
+        XCTAssertFalse(model.capturing,"The Capture button is enabled again (it is disabled only while capturing)")
+        XCTAssertTrue(model.error?.contains("Cannot preserve the command") == true,model.error ?? "no error")
+        XCTAssertFalse(peer.calls.contains {$0.0=="media_intake_capture"});XCTAssertFalse(store.busy)
+        peer.saveFails=false;model.error=nil;store.error=nil
+        // A press while the identity is unknown shows why and leaves the button enabled.
+        store.data=["service":[String:Any]()]
+        model.captureIntake()
+        XCTAssertFalse(model.capturing);XCTAssertEqual(store.notice,DisabledReasons.storeUnknown)
+        // Other callers: unknown identity, offline and a busy store all reach the failure path.
+        var failures:[String]=[]
+        store.run("task_create",["project_id":peer.project],failure:{failures.append(($0 as? ChecklistError)?.code ?? "")})
+        store.data=["service":["store_incarnation":"synthetic-media-store"]];store.connected=false
+        store.run("task_create",["project_id":peer.project],failure:{failures.append(($0 as? ChecklistError)?.message ?? "")})
+        store.connected=true;store.busy=true
+        store.run("task_create",["project_id":peer.project],failure:{failures.append(($0 as? ChecklistError)?.message ?? "")})
+        store.busy=false
+        XCTAssertEqual(failures,["WRITE_NOT_STARTED",DisabledReasons.offline,DisabledReasons.saving])
+        XCTAssertFalse(peer.calls.contains {$0.0=="task_create"});XCTAssertFalse(store.hasPendingMutation)
+        // A later press in the same app session captures normally.
+        peer.sequence["media_intake_capture"]=[["id":"intake","revision":2,"plan_id":"plan","confirmed_plan_id":"plan","remaining_row_ids":Array(ids.suffix(100))],["id":"intake","revision":3,"plan_id":"plan","confirmed_plan_id":"plan","remaining_row_ids":[String]()]]
+        model.captureIntake()
+        try await settle {model.intake.strings("remaining_row_ids").isEmpty && !store.busy && !model.capturing}
+        XCTAssertEqual(peer.calls.filter {$0.0=="media_intake_capture"}.count,2);XCTAssertNil(model.error)
     }
     func testFrozenIntakeGroupResolutionIsExplicitAndRevisionChecked() async throws {
         let (peer,store,_,_)=fixture();let model=await setup(peer,store)

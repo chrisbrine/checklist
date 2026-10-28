@@ -99,6 +99,7 @@ final class ChecklistStore: ObservableObject {
         if hasPendingMutation { return DisabledReasons.uncheckedChange }
         if recoveredCommand != nil { return "Checklist is checking which saved change belongs to this store." }
         if busy { return DisabledReasons.saving }
+        if storeIncarnation.isEmpty { return DisabledReasons.storeUnknown }
         return nil
     }
     /// An action the app ignores shows a short notice instead of doing nothing.
@@ -1847,8 +1848,10 @@ final class ChecklistStore: ObservableObject {
     }
 
     func run(_ method: String, _ params: [String: Any] = [:], success: String? = nil, failure: ((Error) -> Void)? = nil, completion: (([String: Any]) -> Void)? = nil) {
-        guard allowWrite() else { return }
-        guard !storeIncarnation.isEmpty else { inform("Refresh Checklist before making a change so it can be recovered safely."); return }
+        // CL-315: every early return reaches the caller's failure path, so a caller that shows
+        // progress (a busy flag, a capture sequence) never waits for a command that was not sent.
+        let refuse = { (reason: String) in failure?(ChecklistError("WRITE_NOT_STARTED", reason)) }
+        if let reason = writeBlockReason { inform(reason); refuse(reason); return }
         var command = params
         if command["command_id"] == nil { command["command_id"] = UUID().uuidString }
         let recovery = PendingCommandRecovery(method: method, params: command, storeIncarnation: storeIncarnation, serviceIdentity: pendingCommandServiceIdentity)
@@ -1856,7 +1859,10 @@ final class ChecklistStore: ObservableObject {
         do {
             try pendingCommandPersistence.save(recovery.encoded(),pendingCommandKey)
             preferences.removeObject(forKey: ignoredRecoveryPreferenceKey)
-        } catch { pendingMutation = nil; self.error = "Cannot preserve the command for safe recovery: \(error.localizedDescription)"; return }
+        } catch {
+            let reason = "Cannot preserve the command for safe recovery: \(error.localizedDescription)"
+            pendingMutation = nil; self.error = reason; refuse(reason); return
+        }
         performPendingMutation()
     }
 

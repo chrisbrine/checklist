@@ -315,7 +315,8 @@ typealias MediaValues = [String: Any]
     /// (busy, or offline after a long chunk) and stopped the sequence after one chunk.
     func captureIntake() {
         let remaining = intake.strings("remaining_row_ids")
-        guard !remaining.isEmpty,let store,store.writeBlockReason == nil else {capturing=false;return}
+        guard !remaining.isEmpty,let store else {capturing=false;return}
+        if let reason=store.writeBlockReason {store.inform(reason);capturing=false;return}
         capturing = true
         let intakeID = intake.id
         mutate("media_intake_capture",["intake_id":intake.id,"expected_revision":intake.integer("revision"),"plan_id":intake.string("plan_id"),"row_ids":Array(remaining.prefix(200))]) {[weak self] in
@@ -328,13 +329,19 @@ typealias MediaValues = [String: Any]
     }
     /// Waits (at most 10 minutes) until the store can write, then sends the next chunk.
     /// Leaving the intake or an unchecked earlier change stops the sequence.
+    /// CL-315: a media write discards the pages that name the store identity without reading
+    /// them again, so the identity can be unknown between chunks (writeBlockReason reports it).
+    /// After 2 s the sequence asks once for a quiet refresh, then keeps waiting.
     func continueCapture(_ intakeID: String) async {
-        for _ in 0..<2400 {
+        var refreshed = false
+        for step in 0..<2400 {
             guard let store,capturing,intake.id == intakeID,!store.hasPendingMutation else {capturing=false;return}
-            if store.writeBlockReason == nil {captureIntake();return}
+            guard let reason=store.writeBlockReason else {captureIntake();return}
+            if reason == DisabledReasons.storeUnknown,!refreshed,step >= 8 {refreshed=true;await store.refresh(quiet:true);continue}
             try? await Task.sleep(nanoseconds:250_000_000)
         }
         capturing=false
+        error="Capture stopped: Checklist could not accept changes for 10 minutes. Press Capture to continue."
     }
     func resumeIntake(_ id: String) async {do {intake=Record(values:try await read("media_intake_get",["intake_id":id]))} catch {self.error=PlainError.text(error)}}
     // CL-300: rework preview/create, closure and successor use the native owner channel only.
