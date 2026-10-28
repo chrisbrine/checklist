@@ -208,9 +208,11 @@ bundle identify the installed and immediate previous captures, even when a priva
 integration copy performed the install and the checkout's `last-install.json` is
 stale or absent. An unreadable identity or ambiguous newest rollback bundle retains
 every build. A matching receipt that names a missing/unreadable predecessor also
-retains every build instead of substituting an older surviving bundle. With no
-rollback bundle, only a matching install receipt explicitly recording no
-predecessor permits retirement; an unavailable predecessor retains builds.
+retains every build instead of substituting an older surviving bundle. A newer
+rollback bundle supersedes that receipt, including a same-fingerprint reinstall
+from another copy. With no rollback bundle, only a matching install receipt
+explicitly recording no predecessor permits retirement; an unavailable
+predecessor retains builds.
 Captures used directly by running processes, or identified by running Checklist
 bundles (including test-slot and renamed app bundles), remain intact. Unknown
 build layouts are kept.

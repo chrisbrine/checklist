@@ -147,6 +147,21 @@ class CleanupTests(unittest.TestCase):
             self.run_clean(self.cleaner.builds, True)
         self.assertEqual(self.moves, [])
 
+    def test_other_checkout_reinstall_same_fingerprint_ignores_missing_older_predecessor(self):
+        captures = [self.capture(key) for key in self.ids]
+        newer = self.apps/'.Checklist-previous-20261023T010203Z-20.app'
+        self.info(newer, self.ids[0])
+        shutil.rmtree(self.previous)
+        reports = self.run_clean(self.cleaner.builds)
+        self.assertEqual(clean.installation(self.build, self.installed),
+                         ({self.ids[0]}, [self.installed, newer]))
+        self.assertEqual([r['path'] for r in reports if r['action'] == 'kept'],
+                         [str(captures[0])])
+        eligible = [r for r in reports if r['action'] == 'eligible']
+        self.assertEqual(len(eligible), 8)
+        self.assertTrue(all(r['bytes'] == len(b'output') for r in eligible))
+        self.assertEqual(self.moves, [])
+
     def test_unreadable_installed_or_previous_identity_retains_every_build_and_reports_reason(self):
         captures = [self.capture(key) for key in self.ids]
         before = {p: p.read_bytes() for folder in captures for p in folder.rglob('*') if p.is_file()}

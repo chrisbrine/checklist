@@ -53,26 +53,27 @@ def installation(build, installed):
     """Read bundle identities even when another checkout performed the install."""
     installed_id = fingerprint(read_json(installed / 'Contents/Resources/build-info.json'))
     # A matching receipt can prove that a newer predecessor is missing. Never
-    # substitute an older surviving bundle in that case. Stale receipts from a
-    # different installed build have no authority over bundle discovery.
+    # substitute an older surviving bundle in that case. A newer rollback bundle
+    # supersedes the receipt even when the same source fingerprint was reinstalled.
     try:
         record = read_json(build / 'last-install.json')
         matches = (Path(record['installed']).resolve() == installed.resolve()
                    and fingerprint(record['build']) == installed_id)
     except (OSError, ValueError, KeyError, TypeError):
         record, matches = None, False
-    if matches and record['previous_bundle'] is not None:
-        recorded = safe(Path(record['previous_bundle']))
-        if (recorded.parent != installed.parent or not re.fullmatch(
-                r'\.Checklist-previous-\d{8}T\d{6}Z-\d+\.app', recorded.name)):
-            raise ValueError('previous bundle identity is unresolved; retain builds')
-        fingerprint(read_json(recorded / 'Contents/Resources/build-info.json'))
     previous = []
     for bundle in installed.parent.glob('.Checklist-previous-*.app'):
         match = re.fullmatch(r'\.Checklist-previous-(\d{8}T\d{6}Z)-\d+\.app', bundle.name)
         if not match:
             raise ValueError('previous bundle identity is unresolved; retain builds: ' + str(bundle))
         previous.append((match[1], bundle))
+    if matches and record['previous_bundle'] is not None:
+        recorded = safe(Path(record['previous_bundle']))
+        match = re.fullmatch(r'\.Checklist-previous-(\d{8}T\d{6}Z)-\d+\.app', recorded.name)
+        if recorded.parent != installed.parent or not match:
+            raise ValueError('previous bundle identity is unresolved; retain builds')
+        if not any(stamp > match[1] for stamp, _ in previous):
+            fingerprint(read_json(recorded / 'Contents/Resources/build-info.json'))
     retained = {installed_id}
     bundles = [installed]
     if previous:
