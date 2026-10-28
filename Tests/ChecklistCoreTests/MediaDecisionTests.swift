@@ -211,14 +211,18 @@ final class MediaDecisionTests: XCTestCase {
         let input: JSON = ["project_id":f.project,"command_id":chunk["command_id"]!,"operation_id":op["id"]!,"chunk_id":chunk["id"]!]
         let prepared = try XCTUnwrap(f.router.prepareMediaCommand(method:"media_bulk_apply",params:input,caller:f.owner))
         defer {try? prepared.observer.close()}
-        // Intervening commit: the prepared result is never written under a new snapshot.
+        // Intervening commit to a media record the command read (its bulk operation): the
+        // prepared result is never written. CL-307 (V43A): an unrelated write no longer fences;
+        // MediaPreparationScaleTests covers that case.
+        let opKey = Data((op["id"] as! String).utf8)
+        let opData = try f.router.dbQueue.read { try XCTUnwrap(try Data.fetchOne($0,sql:"SELECT CAST(data AS BLOB) FROM records WHERE id=CAST(? AS TEXT)",arguments:[opKey])) }
         try f.router.dbQueue.write { db in
-            var project = try f.router.record(db,f.project,type:"project")
-            project["fixture_intervening_commit"] = true;try f.router.save(db,project,type:"project")
+            try db.execute(sql:"UPDATE records SET data=json_set(data,'$.fixture_intervening_commit',json('true')) WHERE id=CAST(? AS TEXT)",arguments:[opKey])
         }
         let beforeFence = try f.allState()
         try f.router.dbQueue.write { db in checks.checkError("MEDIA_CONTEXT_CHANGED") {try prepared.commit(db)} }
         XCTAssertEqual(try f.allState(),beforeFence)
+        try f.router.dbQueue.write { try $0.execute(sql:"UPDATE records SET data=CAST(? AS TEXT) WHERE id=CAST(? AS TEXT)",arguments:[opData,opKey]) }
         try f.router.dbQueue.write { db in
             try db.execute(sql:"CREATE TRIGGER cl114_fail_receipt BEFORE INSERT ON commands WHEN NEW.command_id='" + (chunk["command_id"] as! String) + "' BEGIN SELECT RAISE(ABORT,'fixture receipt failure'); END")
         }

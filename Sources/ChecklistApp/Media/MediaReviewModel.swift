@@ -32,6 +32,8 @@ typealias MediaValues = [String: Any]
     @Published var next: String?
     @Published var counts: [String: Int] = [:]
     @Published var intake = Record(values: [:])
+    /// CL-307: one Capture press is running its chunk sequence.
+    @Published var capturing = false
     private var publicationObservation: MediaValues = [:]
     @Published var publication: [Record] = []
     @Published var error: String?
@@ -87,6 +89,7 @@ typealias MediaValues = [String: Any]
         let project = projectID
         store.run(method,params,failure:{ [weak self] error in
             guard let self,self.projectID == project else {return}
+            self.capturing=false
             self.error=PlainError.text(error)
             if ["MEDIA_CONTEXT_CHANGED","MEDIA_CONTEXT_ATTENTION","MEDIA_BASIS_CHANGED","REVISION_CONFLICT"].contains((error as? ChecklistError)?.code ?? "") {self.contextConflict=true}
         }) { [weak self] result in
@@ -307,15 +310,31 @@ typealias MediaValues = [String: Any]
     func confirmIntake() {let plan=Record(values:intake.object("plan"));mutate("media_intake_confirm",["intake_id":intake.id,"expected_revision":intake.integer("revision"),"plan_id":plan.id,"plan_digest":plan.string("digest")]) {[weak self] in self?.intake=Record(values:$0)}}
     /// Captures every remaining row: the service takes 200 rows per command, so the model
     /// repeats capture until no row remains or a chunk makes no progress (CL-307).
+    /// The next chunk starts only after the store finished the previous command and can
+    /// write again: sending it from inside the completion found the store still blocked
+    /// (busy, or offline after a long chunk) and stopped the sequence after one chunk.
     func captureIntake() {
         let remaining = intake.strings("remaining_row_ids")
-        guard !remaining.isEmpty else {return}
+        guard !remaining.isEmpty,let store,store.writeBlockReason == nil else {capturing=false;return}
+        capturing = true
+        let intakeID = intake.id
         mutate("media_intake_capture",["intake_id":intake.id,"expected_revision":intake.integer("revision"),"plan_id":intake.string("plan_id"),"row_ids":Array(remaining.prefix(200))]) {[weak self] in
             guard let self else {return}
             self.intake=Record(values:$0)
             let next = self.intake.strings("remaining_row_ids")
-            if !next.isEmpty && next != remaining {self.captureIntake()}
+            guard !next.isEmpty,next != remaining else {self.capturing=false;return}
+            Task {[weak self] in await self?.continueCapture(intakeID)}
         }
+    }
+    /// Waits (at most 10 minutes) until the store can write, then sends the next chunk.
+    /// Leaving the intake or an unchecked earlier change stops the sequence.
+    func continueCapture(_ intakeID: String) async {
+        for _ in 0..<2400 {
+            guard let store,capturing,intake.id == intakeID,!store.hasPendingMutation else {capturing=false;return}
+            if store.writeBlockReason == nil {captureIntake();return}
+            try? await Task.sleep(nanoseconds:250_000_000)
+        }
+        capturing=false
     }
     func resumeIntake(_ id: String) async {do {intake=Record(values:try await read("media_intake_get",["intake_id":id]))} catch {self.error=PlainError.text(error)}}
     // CL-300: rework preview/create, closure and successor use the native owner channel only.

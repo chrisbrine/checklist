@@ -77,13 +77,34 @@ final class MediaPreparationScaleTests: XCTestCase {
         let replay = try f.call("media_type_create",["title":"Replay"],command:command)
         XCTAssertEqual(replay["id"] as? String,first["id"] as? String);XCTAssertEqual(replay["replayed"] as? Bool,true)
         XCTAssertEqual(try f.rows("media_review_type").filter { $0["title"] as? String == "Replay" }.count,1)
-        // A concurrent change outside the touched set fences the prepared command.
-        let prepared = try XCTUnwrap(try f.router.prepareMediaCommand(method:"media_type_create",params:["project_id":f.project,"command_id":uuid(),"title":"Fenced"],caller:f.owner))
-        defer { try? prepared.observer.close() }
-        try f.router.dbQueue.write { db in try db.execute(sql:"UPDATE records SET revision=2 WHERE id='bulk-7'") }
-        let before = try f.rows("media_review_type").count
-        XCTAssertThrowsError(try f.router.dbQueue.write { db in try prepared.commit(db) }) { XCTAssertEqual(($0 as? CoreError)?.code,"MEDIA_CONTEXT_CHANGED") }
-        XCTAssertEqual(try f.rows("media_review_type").count,before)
+        // V43A rework: an unrelated write during preparation (another media record, a ticket,
+        // a cleanup marker) does not refuse the prepared command.
+        func prepareItem(_ title: String) throws -> PreparedMediaCommand {
+            var p = itemProbe;p["title"] = title;p["project_id"] = f.project;p["command_id"] = uuid()
+            return try XCTUnwrap(try f.router.prepareMediaCommand(method:"media_item_create",params:p,caller:f.owner))
+        }
+        let unrelated = try prepareItem("Unrelated write")
+        defer { try? unrelated.observer.close() }
+        XCTAssertTrue(unrelated.observed.keys.contains(Data((round["id"] as! String).utf8)))
+        try f.router.dbQueue.write { db in
+            try db.execute(sql:"UPDATE records SET revision=2 WHERE id='bulk-7'")
+            try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES ('unrelated-task',CAST(? AS TEXT),'task',1,'{}')",arguments:[Data(f.project.utf8)])
+            try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('cl307-unrelated','1')")
+        }
+        let items = try f.rows("media_item").count
+        XCTAssertNoThrow(try f.router.dbQueue.write { db in try unrelated.commit(db) })
+        XCTAssertEqual(try f.rows("media_item").count,items + 1)
+        // A write to a record the command read (its round) still refuses, with no records changed.
+        let touched = try prepareItem("Touched write")
+        defer { try? touched.observer.close() }
+        try f.router.dbQueue.write { db in try db.execute(sql:"UPDATE records SET revision=revision+1,data=json_set(data,'$.revision',revision+1) WHERE id=CAST(? AS TEXT)",arguments:[Data((round["id"] as! String).utf8)]) }
+        XCTAssertThrowsError(try f.router.dbQueue.write { db in try touched.commit(db) }) { XCTAssertEqual(($0 as? CoreError)?.code,"MEDIA_CONTEXT_CHANGED") }
+        XCTAssertEqual(try f.rows("media_item").count,items + 1)
+        // A new media record of the project that the command could have read also refuses.
+        let phantom = try prepareItem("Phantom write")
+        defer { try? phantom.observer.close() }
+        _ = try f.item(round,title:"Concurrent item")
+        XCTAssertThrowsError(try f.router.dbQueue.write { db in try phantom.commit(db) }) { XCTAssertEqual(($0 as? CoreError)?.code,"MEDIA_CONTEXT_CHANGED") }
         // The durable store is unchanged by preparation alone (TEMP overlay only).
         XCTAssertTrue(try f.rows("media_review_type").allSatisfy { $0["title"] as? String != "Probe" })
     }
@@ -115,5 +136,69 @@ final class MediaPreparationScaleTests: XCTestCase {
         let intake = try f.call("media_intake_preview",["round_id":round2["id"]!,"tsv":tsv],as:f.worker)
         XCTAssertEqual((intake["rows"] as? [JSON])?.count,1001)
         print("CL307_ROUND_MEASUREMENT items=1001 create_seconds=\(created) publish_seconds=\(Date().timeIntervalSince(publishStart))")
+    }
+
+    /// CL-307 rework (V43A): a 200-row capture chunk takes about the same time in a small
+    /// project and in one with 200,000+ unrelated records.
+    func testCaptureChunkTimeDoesNotFollowProjectSize() throws {
+        let f = try Fixture()
+        addTeardownBlock { try? FileManager.default.removeItem(at:f.base) }
+        let type = try f.type(checks.schema())
+        func capture(_ intake: JSON,_ ids: [String]) throws -> JSON {
+            try f.call("media_intake_capture",["intake_id":intake["id"]!,"expected_revision":intake["revision"]!,"plan_id":intake["plan_id"]!,"row_ids":ids],as:f.worker)
+        }
+        func capture(_ label: String) throws -> TimeInterval {
+            let round = try f.round(type)
+            let tsv = "text\n" + (0..<300).map { "\(label) line \($0)" }.joined(separator:"\n") + "\n"
+            let preview = try f.call("media_intake_preview",["round_id":round["id"]!,"tsv":tsv],as:f.worker),plan = preview["plan"] as! JSON
+            let intake = try f.call("media_intake_confirm",["intake_id":preview["id"]!,"expected_revision":preview["revision"]!,"plan_id":plan["id"]!,"plan_digest":plan["digest"]!],as:f.worker)
+            let start = Date()
+            let first = try capture(intake,Array(strings(intake,"remaining_row_ids").prefix(200)))
+            let seconds = Date().timeIntervalSince(start)
+            XCTAssertEqual(strings(first,"remaining_row_ids").count,100)
+            let rest = try capture(first,strings(first,"remaining_row_ids"))
+            XCTAssertTrue(strings(rest,"remaining_row_ids").isEmpty)
+            return seconds
+        }
+        let small = try capture("small")
+        try f.router.dbQueue.write { db in
+            try db.execute(sql:"""
+            WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<200500)
+            INSERT INTO records(id,project_id,type,revision,data) SELECT 'bulk-task-'||i,CAST(? AS TEXT),'task',1,
+              '{"id":"bulk-task-'||i||'","project_id":"'||?||'","title":"Synthetic filler '||i||'"}' FROM n
+            """,arguments:[Data(f.project.utf8),f.project])
+        }
+        try f.router.dbQueue.writeWithoutTransaction { db in _ = try Row.fetchAll(db,sql:"PRAGMA wal_checkpoint(TRUNCATE)") }
+        let large = try capture("large")
+        print("CL307_CAPTURE_MEASUREMENT rows=200 small_seconds=\(small) large_seconds=\(large)")
+        // The chunk reads only the rows it touches by ID: at most twice the small project's
+        // time plus 2 s for machine load (P307b measured 3.4 s small, 107 s large before).
+        XCTAssertLessThanOrEqual(large,small * 2 + 2)
+    }
+
+    /// CL-307 rework (V43A): ID lookups and updates through the overlay view use the durable
+    /// ID index. The TEMP table shares the storage collation, so `id=?` on the view (which
+    /// takes the left-most arm's collation) can use sqlite_autoindex_records_1.
+    func testOverlayIDLookupsUseTheDurableIDIndex() throws {
+        let f = try Fixture()
+        addTeardownBlock { try? FileManager.default.removeItem(at:f.base) }
+        var configuration = Configuration();configuration.readonly = true
+        configuration.prepareDatabase { db in try SchemaMigrations.installStorageCollation(db) }
+        let queue = try DatabaseQueue(path:f.router.root.appendingPathComponent("checklist.sqlite").path,configuration:configuration)
+        defer { try? queue.close() }
+        try queue.inDatabase { db in
+            try db.inTransaction(.deferred) {
+                try MediaPreparationOverlay.install(db,project:f.project,session:"session",reads:.init())
+                for sql in ["SELECT EXISTS(SELECT 1 FROM records WHERE id=?)",
+                            "SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE id = CAST(? AS TEXT) AND type = CAST(? AS TEXT) AND project_id = CAST(? AS TEXT)",
+                            "UPDATE records SET revision=revision WHERE id=?"] {
+                    let arguments: StatementArguments = sql.contains("type =") ? [Data("x".utf8),Data("task".utf8),Data(f.project.utf8)] : ["x"]
+                    let plan = try Row.fetchAll(db,sql:"EXPLAIN QUERY PLAN " + sql,arguments:arguments).map { $0["detail"] as String }
+                    XCTAssertTrue(plan.contains { $0.contains("SEARCH s USING INDEX sqlite_autoindex_records_1 (id=?)") },"\(sql): \(plan)")
+                    XCTAssertFalse(plan.contains { $0.contains("records_scope") || $0.contains("MULTI-INDEX OR") },"\(sql): \(plan)")
+                }
+                return .rollback
+            }
+        }
     }
 }

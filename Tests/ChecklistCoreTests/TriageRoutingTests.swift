@@ -241,4 +241,65 @@ extension EvidenceAuthorityTests {
         XCTAssertEqual(Array(routeDeliveries(exact).keys),[o.sessionID!])
         XCTAssertEqual(try routeNote(p,nil,peer,["triage_id":other["id"]!])["delivery_status"] as? String,"saved_for_pickup")
     }
+
+    /// Claims, statuses, memberships, orchestration, messages and deliveries of the project, in a stable form.
+    private func routeSnapshot(_ p: JSON) throws -> [String] {
+        try router.dbQueue.read { db in
+            try ["task","attempt","group","triage_membership_interval","triage_membership_exit","message","delivery"].flatMap { type in
+                try router.records(db,type:type,project:p["id"] as? String).map { type+":"+String(decoding:try JSONSerialization.data(withJSONObject:$0,options:[.sortedKeys]),as:UTF8.self) }
+            }.sorted()
+        }
+    }
+    private func routeSession(_ p: JSON,_ caller: Caller,state: String) throws {
+        let session = try router.dbQueue.read { try router.record($0,caller.sessionID!,type:"session") }
+        _ = try call("session_update",["project_id":p["id"]!,"session_id":caller.sessionID!,"expected_revision":session["revision"]!,"state":state])
+    }
+
+    // Item 4: a revoked or ended exact recipient, an ended orchestrator route and a stale orchestrator generation refuse
+    // atomically (also audience=orchestrator on a ticket): no message, and claims, statuses, memberships and orchestration unchanged.
+    func testTriageNoteRefusalsForRevokedEndedAndStaleRoutesChangeNothing() throws {
+        let f = try routeFixture(), revoked = try native(f.p,"revoked",domain:"host-r"), ended = try native(f.p,"ended",domain:"host-e")
+        try routeSession(f.p,revoked,state:"revoked");try routeSession(f.p,ended,state:"ended")
+        let triageNote: JSON = ["triage_id":f.triage["id"]!]
+        func refuses(_ code: String,_ why: String,_ body: @escaping () throws -> Void) throws {
+            let before = try routeSnapshot(f.p)
+            assertCode(code) { try body() }
+            XCTAssertEqual(try routeSnapshot(f.p),before,"\(why): a refused send saves no message and changes no claim, status, membership or orchestration.")
+        }
+        // Ended orchestration (finish): the Triage becomes a plan; audience=orchestrator refuses for a Triage note and a ticket note.
+        let finisher = try native(f.p,"finisher",domain:"host-f"), finished = try routeStart(f.p,finisher), parked = try ready(f.p)
+        try routeAdd(f.p,finished["id"]!,parked,finisher)
+        _ = try call("triage_orchestrate",["project_id":f.p["id"]!,"triage_id":finished["id"]!,"expected_revision":try routeTriage(finished["id"]!)["revision"]!,"action":"finish","reason":"Paused"],finisher)
+        try refuses("TRIAGE_ORCHESTRATOR_REQUIRED","Ended orchestration, Triage note") { _ = try self.routeNote(f.p,nil,f.peer,["triage_id":finished["id"]!,"audience":"orchestrator"]) }
+        try refuses("TRIAGE_ORCHESTRATOR_REQUIRED","Ended orchestration, ticket note") { _ = try self.routeNote(f.p,parked,f.peer,["audience":"orchestrator"]) }
+        for recipient in [revoked,ended] {
+            try refuses("FORBIDDEN","Exact recipient \(recipient.installation)") { _ = try self.routeNote(f.p,nil,f.peer,triageNote.merging(["recipient":["kind":"session","session_id":recipient.sessionID!]]) {$1}) }
+        }
+        // Stale generation: the orchestration record keeps the generation the orchestrator had when it started.
+        try router.dbQueue.write {db in var session = try router.record(db,f.orchestrator.sessionID!,type:"session");session["authorization_generation"] = UUID().uuidString;try router.save(db,session,type:"session")}
+        try refuses("RECIPIENT_CHANGED","Stale Triage note route") { _ = try self.routeNote(f.p,nil,f.peer,triageNote) }
+        try refuses("RECIPIENT_CHANGED","Stale audience=orchestrator route") { _ = try self.routeNote(f.p,f.task,f.peer,["audience":"orchestrator"]) }
+        // Ended route: the orchestrator's session ended while its orchestration record stays active.
+        try routeSession(f.p,f.orchestrator,state:"ended")
+        XCTAssertEqual(try router.dbQueue.read { router.triageOrchestratorSession(try router.record($0,f.triage["id"] as! String,type:"group")) },f.orchestrator.sessionID)
+        try refuses("RECIPIENT_CHANGED","Ended Triage note route") { _ = try self.routeNote(f.p,nil,f.peer,triageNote) }
+        try refuses("RECIPIENT_CHANGED","Ended audience=orchestrator route") { _ = try self.routeNote(f.p,f.task,f.peer,["audience":"orchestrator"]) }
+    }
+
+    // Item 2: a Human Request answer reaches the holder and the Triage orchestrator, one labelled copy each.
+    func testHumanRequestAnswerReachesHolderAndTriageOrchestratorOnce() throws {
+        let f = try routeFixture()
+        let request = try call("human_request_create",["project_id":f.p["id"]!,"task_id":f.task["id"]!,"title":"Pick one","questions":[["id":"q","prompt":"Which option?"]]],f.peer)
+        _ = try call("human_request_answer",["project_id":f.p["id"]!,"request_id":request["id"]!,"expected_revision":request["revision"]!,"answers":[["question_id":"q","text":"The first"]],"explanation":"Owner answer"])
+        let deliveries = try router.dbQueue.read { db -> [JSON] in
+            let message = try XCTUnwrap(try router.records(db,type:"message",project:f.p["id"] as? String).first { $0["human_request_id"] as? String == request["id"] as? String })
+            return try router.records(db,type:"delivery",project:f.p["id"] as? String).filter { $0["message_id"] as? String == message["id"] as? String }
+        }
+        let byRecipient = Dictionary(grouping:deliveries) { $0["recipient_session_id"] as? String ?? "" }
+        XCTAssertEqual(byRecipient[f.holder.sessionID!]?.count,1);XCTAssertEqual(byRecipient[f.orchestrator.sessionID!]?.count,1)
+        let copy = try XCTUnwrap(byRecipient[f.orchestrator.sessionID!]?.first)
+        XCTAssertEqual(copy["triage_id"] as? String,f.triage["id"] as? String)
+        XCTAssertTrue((copy["label"] as? String ?? "").contains(f.task["key"] as! String),"The orchestrator copy names the ticket.")
+        XCTAssertEqual(byRecipient[f.peer.sessionID!]?.count,1,"The requester receives its own answer once.")
+    }
 }

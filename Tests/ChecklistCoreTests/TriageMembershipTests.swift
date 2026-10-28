@@ -198,6 +198,75 @@ extension EvidenceAuthorityTests {
         }
     }
 
+    /// Every membership interval of the ticket, in creation order, with its exit reason (nil while open).
+    private func intervals(_ p: JSON,_ task: JSON) throws -> [(triage: String,exit: String?)] {
+        try router.dbQueue.read { db in
+            let exits = try router.records(db,type:"triage_membership_exit",project:p["id"] as? String)
+            return try router.records(db,type:"triage_membership_interval",project:p["id"] as? String).filter {$0["task_id"] as? String == task["id"] as? String}
+                .map { interval in (interval["triage_id"] as? String ?? "",exits.first {$0["membership_id"] as? String == interval["id"] as? String}?["reason"] as? String) }
+        }
+    }
+    /// membership_history of a listed Triage for one ticket: the exit reason of each interval ("open" while open).
+    private func history(_ p: JSON,_ triage: Any,_ task: JSON) throws -> [String] {
+        let groups = try call("triage_list",["project_id":p["id"]!])["groups"] as! [JSON]
+        let group = try XCTUnwrap(groups.first {$0["id"] as? String == triage as? String})
+        return (group["membership_history"] as? [JSON] ?? []).filter {$0["task_id"] as? String == task["id"] as? String}
+            .map { ($0["exit"] as? JSON)?["reason"] as? String ?? "open" }
+    }
+
+    // Item 1: an orchestrator's handoff acceptance moves the ticket into its Triage with a closed and an opened interval.
+    func testOrchestratorHandoffAcceptanceMovesTicketIntoItsTriage() throws {
+        let p = try project(), a = try native(p,"handoff-a",domain:"host-a"), b = try native(p,"handoff-b",domain:"host-b"), holder = try native(p,"holder",domain:"host-h")
+        let triageA = try startOwn(p,a), triageB = try startOwn(p,b), task = try ready(p)
+        _ = try add(p,triageA["id"]!,task,a)
+        let attempt = try claim(p,try fresh(p,task),caller:holder)
+        XCTAssertEqual(try memberIDs(p,triageA["id"]!),[task["id"] as! String],"A holder that orchestrates nothing leaves the ticket in place.")
+        let offer = try call("work_handoff_offer",["project_id":p["id"]!,"attempt_id":attempt["id"]!,"claim_token":attempt["claim_token"]!,"target_session_id":b.sessionID!,"summary":"Please continue"],holder)
+        _ = try call("work_handoff_accept",["project_id":p["id"]!,"offer_id":offer["id"]!],b)
+        XCTAssertEqual(try memberIDs(p,triageB["id"]!),[task["id"] as! String]);XCTAssertTrue(try memberIDs(p,triageA["id"]!).isEmpty)
+        XCTAssertFalse(try triageRecord(p,triageA["id"]!)["archived"] as? Bool ?? false,"An orchestrated empty Triage stays.")
+        XCTAssertEqual(try exits(p,task),["other_orchestrator"])
+        let moved = try intervals(p,task)
+        XCTAssertEqual(moved.map {$0.triage},[triageA["id"] as! String,triageB["id"] as! String])
+        XCTAssertEqual(moved.map {$0.exit},["other_orchestrator",nil])
+        XCTAssertEqual(try history(p,triageA["id"]!,task),["other_orchestrator"]);XCTAssertEqual(try history(p,triageB["id"]!,task),["open"])
+        // The accepting orchestrator now holds the claim.
+        let attemptID = try XCTUnwrap(try fresh(p,task)["active_attempt_id"] as? String)
+        XCTAssertEqual(try router.dbQueue.read { try router.record($0,attemptID,type:"attempt") }["session_id"] as? String,b.sessionID)
+    }
+
+    // Item 1: an orchestrator's batch claim moves tickets from a plan (plan_claim) and from another orchestrator's Triage (other_orchestrator).
+    func testOrchestratorBatchClaimMovesTicketsFromPlanAndOtherTriage() throws {
+        let p = try project(), a = try native(p,"batch-a",domain:"host-a"), b = try native(p,"batch-b",domain:"host-b")
+        let triageA = try startOwn(p,a), triageB = try startOwn(p,b)
+        let plan = try call("triage_create",["project_id":p["id"]!,"name":"Pass 3"]), planned = try (0..<2).map { _ in try ready(p) }
+        for task in planned { _ = try add(p,plan["id"]!,task) }
+        let foreign = try ready(p);_ = try add(p,triageB["id"]!,foreign,b)
+        func batchClaim(_ group: Any,_ tasks: [JSON]) throws -> [JSON] {
+            let members: [JSON] = try tasks.map { ["task_id":$0["id"]!,"expected_revision":try fresh(p,$0)["revision"]!,"file_scopes":[JSON](),"lane_scopes":[JSON]()] }
+            let batch = try call("batch_prepare",["project_id":p["id"]!,"triage_id":group,"expected_revision":try triageRecord(p,group)["revision"]!,"phase":"implementation","tasks":members],a)
+            return try call("batch_claim",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":batch["revision"]!,"policy_revision":batch["policy_revision"]!],a)["claims"] as! [JSON]
+        }
+        // From a plan: each ticket leaves the plan, joins A's Triage, and the emptied plan archives.
+        XCTAssertEqual(try batchClaim(plan["id"]!,planned).count,2)
+        XCTAssertEqual(Set(try memberIDs(p,triageA["id"]!)),Set(planned.map {$0["id"] as! String}))
+        XCTAssertTrue(try memberIDs(p,plan["id"]!).isEmpty);XCTAssertEqual(try triageRecord(p,plan["id"]!)["archived"] as? Bool,true)
+        for task in planned {
+            XCTAssertEqual(try exits(p,task),["plan_claim"])
+            let moved = try intervals(p,task)
+            XCTAssertEqual(moved.map {$0.triage},[plan["id"] as! String,triageA["id"] as! String]);XCTAssertEqual(moved.map {$0.exit},["plan_claim",nil])
+            XCTAssertEqual(try history(p,triageA["id"]!,task),["open"])
+        }
+        // From another orchestrator's Triage: the ticket moves; B's empty orchestrated Triage stays.
+        XCTAssertEqual(try batchClaim(triageB["id"]!,[foreign]).count,1)
+        XCTAssertEqual(Set(try memberIDs(p,triageA["id"]!)),Set((planned + [foreign]).map {$0["id"] as! String}))
+        XCTAssertTrue(try memberIDs(p,triageB["id"]!).isEmpty);XCTAssertFalse(try triageRecord(p,triageB["id"]!)["archived"] as? Bool ?? false)
+        XCTAssertEqual(try exits(p,foreign),["other_orchestrator"])
+        let moved = try intervals(p,foreign)
+        XCTAssertEqual(moved.map {$0.triage},[triageB["id"] as! String,triageA["id"] as! String]);XCTAssertEqual(moved.map {$0.exit},["other_orchestrator",nil])
+        XCTAssertEqual(try history(p,triageB["id"]!,foreign),["other_orchestrator"]);XCTAssertEqual(try history(p,triageA["id"]!,foreign),["open"])
+    }
+
     func testStoreUpgradePlanFollowsCL269Rules() throws {
         let active: JSON = ["state":"active","session_id":"s1","started_at":"2026-10-01T00:00:00Z"]
         func group(_ id: String,_ members: [(String,String)],orchestration: JSON? = nil,legacy: Bool = false,archived: Bool = false) -> JSON {

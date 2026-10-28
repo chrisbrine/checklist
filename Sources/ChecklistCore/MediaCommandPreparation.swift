@@ -1,11 +1,17 @@
 import Foundation
 import GRDB
+import CryptoKit
 
 /// Ephemeral preparation only; the service store remains the sole durable authority.
 /// Keep the observing connection alive: SQLite data_version is comparable only on
 /// the SAME connection, and detects other connections' commits, including same-revision
 /// edits. The writer checks it after BEGIN IMMEDIATE, when no other writer can commit.
+/// CL-307: when data_version moved, the writer compares only the media records the
+/// command read (revision and payload digest) and the project's media insert marks, so
+/// unrelated writes (ticket cleanup, work health, notes) never refuse a media command.
 struct PreparedMediaCommand {
+    /// A media record the preparation read: its revision and payload digest.
+    struct Observed: Equatable { let revision: Int64; let digest: Data }
     struct Write {
         let id: Data
         let project: Data
@@ -21,6 +27,8 @@ struct PreparedMediaCommand {
     let result: JSON
     let encodedResult: String
     let resources: PreparedMediaResources
+    var observed: [Data: Observed] = [:]
+    var insertMarks: [Int64?] = []
     /// Durable records (and their canonical payload bytes) that preparation read through
     /// the overlay. They scale with the records the command touches, not the project size.
     var readRecords = 0
@@ -28,8 +36,18 @@ struct PreparedMediaCommand {
 
     func commit(_ db: Database,router: CommandRouter? = nil,caller: Caller? = nil) throws {
         let current = try observer.read { try Int64.fetchOne($0,sql:"PRAGMA data_version")! }
-        guard current == dataVersion else {
-            throw CoreError("MEDIA_CONTEXT_CHANGED","The store changed during media preparation. Refresh and retry. No records changed.")
+        if current != dataVersion {
+            // Another connection committed: refuse only when a record this command read or
+            // writes changed, or a new media record of this project appeared.
+            for (id,seen) in observed {
+                let row = try Row.fetchOne(db,sql:"SELECT revision,CAST(data AS BLOB) AS data FROM records WHERE id=CAST(? AS TEXT)",arguments:[id])
+                guard let row,row["revision"] as Int64 == seen.revision,MediaPreparationOverlay.digest(row["data"] as Data? ?? Data()) == seen.digest else {
+                    throw CoreError("MEDIA_CONTEXT_CHANGED","A media record this command uses changed during preparation. Refresh and retry. No records changed.")
+                }
+            }
+            guard try MediaPreparationOverlay.insertMarks(db,project:project) == insertMarks else {
+                throw CoreError("MEDIA_CONTEXT_CHANGED","New media records were added during preparation. Refresh and retry. No records changed.")
+            }
         }
         guard resources.captures.isEmpty && resources.originals.isEmpty || router != nil && caller != nil else {
             throw CoreError("MEDIA_CAPTURE_REQUIRED","Prepared file checks require the owning router and current caller.")
@@ -59,27 +77,47 @@ struct PreparedMediaCommand {
 /// TEMP table. The connection opens read-only, so the durable file cannot change.
 enum MediaPreparationOverlay {
     static let label = "checklist.media-preparation"
-    final class Reads: @unchecked Sendable { var records = 0; var bytes = 0 }
+    final class Reads: @unchecked Sendable { var records = 0; var bytes = 0; var observed: [Data: PreparedMediaCommand.Observed] = [:] }
+    static func digest(_ data: Data) -> Data { Data(SHA256.hash(data:data)) }
+    /// The highest rowid of each media family in the project (indexed by records_scope).
+    /// A new media record raises one, so a concurrent insert the command could have read
+    /// (an item in its round, a row of its intake) still refuses the prepared command.
+    static func insertMarks(_ db: Database,project: String) throws -> [Int64?] {
+        try MediaRecordRegistry.families.sorted().map { type in
+            try Int64.fetchOne(db,sql:"SELECT max(rowid) FROM main.records WHERE project_id=CAST(? AS TEXT) AND type=CAST(? AS TEXT)",arguments:[Data(project.utf8),Data(type.utf8)])
+        }
+    }
 
     private static func literal(_ value: String) -> String {
         "CAST(x'" + Data(value.utf8).map { String(format:"%02x",$0) }.joined() + "' AS TEXT)"
     }
     static func install(_ db: Database,project: String,session: String,reads: Reads) throws {
-        db.add(function:DatabaseFunction("checklist_media_prepared_read",argumentCount:1,pure:true) { values in
-            reads.records += 1;reads.bytes += Int(Int64.fromDatabaseValue(values[0]) ?? 0);return 1
+        db.add(function:DatabaseFunction("checklist_media_prepared_read",argumentCount:4,pure:true) { values in
+            let data = Data.fromDatabaseValue(values[3]) ?? Data()
+            reads.records += 1;reads.bytes += data.count
+            // Fence every media record read (first observation; the snapshot is pinned).
+            if let type = String.fromDatabaseValue(values[1]),MediaRecordRegistry.families.contains(type),
+               let id = Data.fromDatabaseValue(values[0]),reads.observed[id] == nil {
+                reads.observed[id] = .init(revision:Int64.fromDatabaseValue(values[2]) ?? 0,digest:digest(data))
+            }
+            return 1
         })
         let pid = literal(project),sid = literal(session)
         // Same visibility as the former workspace copy: this project's records, the project
         // record and the caller's session. New rows sort after every durable rowid.
+        // V43A: the TEMP columns use the durable storage collation. A view column takes its
+        // collation from the left-most arm; with BINARY there, `id=?` on the view could not
+        // use the durable ID index and every ID lookup read the whole project.
+        let text = "TEXT COLLATE " + SchemaMigrations.storageCollation
         try db.execute(sql:"""
-        CREATE TEMP TABLE media_prepared(id TEXT PRIMARY KEY,project_id TEXT,type TEXT NOT NULL,revision INTEGER NOT NULL,data TEXT NOT NULL,rid INTEGER NOT NULL);
+        CREATE TEMP TABLE media_prepared(id \(text) PRIMARY KEY,project_id \(text),type \(text) NOT NULL,revision INTEGER NOT NULL,data \(text) NOT NULL,rid INTEGER NOT NULL);
         CREATE TEMP VIEW records(rowid,id,project_id,type,revision,data) AS
           SELECT rid,id,project_id,type,revision,data FROM temp.media_prepared
           UNION ALL
           SELECT s.rowid,s.id,s.project_id,s.type,s.revision,s.data FROM main.records s
           WHERE (s.project_id=\(pid) OR s.id=\(pid) OR s.id=\(sid))
             AND NOT EXISTS(SELECT 1 FROM temp.media_prepared o WHERE o.id=s.id)
-            AND checklist_media_prepared_read(length(CAST(s.data AS BLOB)));
+            AND checklist_media_prepared_read(CAST(s.id AS BLOB),s.type,s.revision,CAST(s.data AS BLOB));
         CREATE TEMP TRIGGER media_prepared_insert INSTEAD OF INSERT ON records BEGIN
           SELECT RAISE(ABORT,'UNIQUE constraint failed: records.id')
             WHERE EXISTS(SELECT 1 FROM temp.media_prepared WHERE id=NEW.id) OR EXISTS(SELECT 1 FROM main.records WHERE id=NEW.id);
@@ -173,6 +211,7 @@ extension CommandRouter {
         }
         var prepared = PreparedMediaCommand(observer:observer,dataVersion:version,project:pid,writes:writes,result:result,encodedResult:try jsonString(result),resources:resources)
         prepared.readRecords = reads.records;prepared.readBytes = reads.bytes
+        prepared.observed = reads.observed;prepared.insertMarks = try MediaPreparationOverlay.insertMarks(db,project:pid)
         return prepared
     }
 }

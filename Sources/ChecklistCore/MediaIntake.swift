@@ -381,13 +381,17 @@ extension CommandRouter {
         } else if method == "media_intake_capture" {
             let selected = try mediaCaptureSelection(db,p:p,intake:intake,caller:c)
             var committed: [String] = [],failed: [String] = []
+            // CL-307: read the intake's rows once per chunk, not once per captured row; each
+            // row this chunk writes is re-read by ID so later rows see its committed state.
+            var peers = try mediaIntakeRows(db,intake:intake)
             for var row in selected where row["capture_state"] as? String != "committed" {
                 let id = (try StoredRecord(row, family: "media").string("id"))
                 if let error = resources.errors[id] {
                     row["capture_state"] = "failed";row["capture_error"] = ["code":String(error.prefix(100)),"message":"The frozen source was not captured. Reconcile this row before retrying."]
-                    try mediaWrite(db,revised(row),type:"media_intake_row");failed.append(id);continue
+                    try mediaWrite(db,revised(row),type:"media_intake_row");failed.append(id)
+                    try mediaRefreshPeer(db,&peers,id:id,project:pid);continue
                 }
-                try mediaCaptureRow(db,row:&row,intake:intake,round:round,caller:c,resources:resources)
+                try mediaCaptureRow(db,row:&row,peers:&peers,intake:intake,round:round,caller:c,resources:resources)
                 committed.append(id)
             }
             let rows = try mediaIntakeRows(db,intake:intake)
@@ -445,10 +449,15 @@ extension CommandRouter {
         intake["row_ids"] = try rows.map {(try StoredRecord($0, family: "media").requiredValue("id"))};try mediaSavePlan(db,intake:&intake,rows:rows,mapping:mapping,caller:c)
         return try mediaIntakeView(db,intake:intake)
     }
-    func mediaCaptureRow(_ db: Database,row: inout JSON,intake: JSON,round: JSON,caller: Caller,resources: PreparedMediaResources) throws {
+    /// Replaces one cached intake row with its stored value after a write (CL-307).
+    func mediaRefreshPeer(_ db: Database,_ peers: inout [JSON],id: String,project: String) throws {
+        guard let index = peers.firstIndex(where:{EnvelopeStorageIdentity.equal($0["id"] as? String,id)}) else {return}
+        peers[index] = try scoped(db,id,project,type:"media_intake_row")
+    }
+    func mediaCaptureRow(_ db: Database,row: inout JSON,peers: inout [JSON],intake: JSON,round: JSON,caller: Caller,resources: PreparedMediaResources) throws {
         let pid = (try StoredRecord(intake, family: "media").string("project_id"))
         // An explicit group key is local to this intake; equal names/content never join.
-        let peers = try mediaIntakeRows(db,intake:intake)
+        // `peers` holds the intake's current rows; the caller reads them once per chunk.
         let existing = peers.first {$0["capture_state"] as? String == "committed" && EnvelopeStorageIdentity.equal($0["group_id"] as? String,row["group_id"] as? String)}
         // CL-308: rows of one group that fill different slots join one candidate. The n-th row
         // (plan order) of each slot joins candidate n, so capture order never changes the result.
@@ -515,6 +524,7 @@ extension CommandRouter {
             // Point the earlier committed rows of the joined candidate at its successor.
             for var peer in peers where EnvelopeStorageIdentity.equal(peer["candidate_id"] as? String,joined["id"] as? String) {
                 peer["candidate_id"] = candidate["id"];try mediaWrite(db,revised(peer),type:"media_intake_row")
+                try mediaRefreshPeer(db,&peers,id:(try StoredRecord(peer, family: "media").string("id")),project:pid)
             }
         }
         try candidates.sort { ((try StoredRecord($0, family: "media").string("id"))) < ((try StoredRecord($1, family: "media").string("id"))) }
@@ -531,6 +541,7 @@ extension CommandRouter {
         row["record_references"] = ((try StoredRecord(row, family: "media").objects("record_references"))) + [try mediaRef("media_item",
             item),try mediaRef("media_item_target",target),try mediaRef("media_candidate",candidate)]
         try mediaWrite(db,revised(row),type:"media_intake_row")
+        try mediaRefreshPeer(db,&peers,id:(try StoredRecord(row, family: "media").string("id")),project:pid)
     }
     /// CL-308: plan order inside one group (order, then byte-exact row ID).
     func mediaRowPrecedes(_ a: JSON,_ b: JSON) -> Bool {

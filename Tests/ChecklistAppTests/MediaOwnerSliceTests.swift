@@ -15,13 +15,16 @@ import ChecklistCore
         var token="context-1",basis="basis-1",target="target-1"
         var reject=false
         var extra:[String:MediaValues]=[:]
+        /// Replies served in order for one method before `extra` applies (CL-307 chunk loop).
+        var sequence:[String:[MediaValues]]=[:]
+        var onRequest:((String)->Void)?
         var itemDisposition="pending"
         var pageCounts:[String:Int]?
         var pending:[String:String]=[:]
         let project="synthetic-project"
         var schema:MediaValues=MediaTypeSettings.schema(title:"Animation",starter:"animation")
         func request(_ method:String,_ params:MediaValues) async throws -> MediaValues {
-            calls.append((method,params))
+            calls.append((method,params));onRequest?(method)
             let value:MediaValues
             switch method {
             case "media_navigation":value=["types":types]
@@ -47,7 +50,8 @@ import ChecklistCore
             case "media_decide":
                 if reject {throw ChecklistError("MEDIA_CONTEXT_CHANGED","Approved context changed; no records changed.",details:["command_outcome":"rejected"])}
                 value=["decisions":[["id":"owner-action","origin":"human_ui"]]]
-            default:value=extra[method] ?? [:]
+            default:
+                if var queue=sequence[method],!queue.isEmpty {value=queue.removeFirst();sequence[method]=queue} else {value=extra[method] ?? [:]}
             }
             return ["data":value]
         }
@@ -158,6 +162,43 @@ import ChecklistCore
         let items=try XCTUnwrap(sent["items"] as? [MediaValues]);XCTAssertEqual(items.count,1)
         XCTAssertEqual(items[0]["item_id"] as? String,"frozen-item");XCTAssertEqual(items[0]["target_id"] as? String,"frozen-target")
         XCTAssertNil(items[0]["title"]);XCTAssertNil(items[0]["publication_ready"])
+    }
+    /// CL-307: one Capture press repeats the 200-row service chunks until no included row
+    /// remains. The mock captures 200, then only 100, then the last 100 rows.
+    func testOneCapturePressRepeatsChunksUntilNoRowRemains() async throws {
+        let (peer,store,_,_)=fixture();let model=await setup(peer,store)
+        let ids=(0..<400).map {"row-"+String($0)}
+        func intake(_ revision:Int,remaining:Int) -> MediaValues {
+            ["id":"intake","revision":revision,"plan_id":"plan","confirmed_plan_id":"plan","state":remaining == 0 ? "captured" : "partial",
+             "committed_row_ids":Array(ids.prefix(400-remaining)),"remaining_row_ids":Array(ids.suffix(remaining))]
+        }
+        peer.sequence["media_intake_capture"]=[intake(2,remaining:200),intake(3,remaining:100),intake(4,remaining:0)]
+        model.intake=Record(values:intake(1,remaining:400));store.connected=true
+        model.captureIntake()
+        try await settle {model.intake.strings("remaining_row_ids").isEmpty && !store.busy}
+        let sent=peer.calls.filter {$0.0=="media_intake_capture"}.map(\.1)
+        XCTAssertEqual(sent.count,3)
+        XCTAssertEqual(sent.map {$0["expected_revision"] as? Int},[1,2,3])
+        XCTAssertEqual(sent.map {($0["row_ids"] as? [String])?.count},[200,200,100])
+        XCTAssertEqual(sent.map {($0["row_ids"] as? [String])?.first},["row-0","row-200","row-300"])
+        XCTAssertEqual(Set(sent.compactMap {$0["command_id"] as? String}).count,3)
+        XCTAssertEqual(model.intake.strings("committed_row_ids").count,400);XCTAssertNil(store.error);XCTAssertFalse(model.capturing)
+        // V43A: after a long chunk the store was not writable when the reply arrived (here:
+        // offline until a reconnect). The sequence waits and continues; it does not stop.
+        let ids2=(0..<300).map {"next-"+String($0)}
+        func next(_ revision:Int,remaining:Int) -> MediaValues {
+            ["id":"intake-2","revision":revision,"plan_id":"plan","confirmed_plan_id":"plan","committed_row_ids":Array(ids2.prefix(300-remaining)),"remaining_row_ids":Array(ids2.suffix(remaining))]
+        }
+        peer.sequence["media_intake_capture"]=[next(2,remaining:100),next(3,remaining:0)]
+        peer.onRequest={method in if method=="media_intake_capture" && peer.sequence["media_intake_capture"]?.count == 2 {store.connected=false}}
+        model.intake=Record(values:next(1,remaining:300));model.captureIntake()
+        try await settle {model.intake.strings("remaining_row_ids").count == 100 && !store.busy}
+        XCTAssertTrue(model.capturing);try await Task.sleep(nanoseconds:100_000_000)
+        XCTAssertEqual(peer.calls.filter {$0.0=="media_intake_capture"}.count,4)
+        store.connected=true
+        try await settle {model.intake.strings("remaining_row_ids").isEmpty && !store.busy}
+        XCTAssertEqual(peer.calls.filter {$0.0=="media_intake_capture"}.map {($0.1["row_ids"] as? [String])?.first},["row-0","row-200","row-300","next-0","next-200"])
+        XCTAssertFalse(model.capturing)
     }
     func testFrozenIntakeGroupResolutionIsExplicitAndRevisionChecked() async throws {
         let (peer,store,_,_)=fixture();let model=await setup(peer,store)
