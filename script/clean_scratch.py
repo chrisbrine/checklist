@@ -7,6 +7,7 @@ qualification runs retire whole after their evidence is preserved externally.
 """
 import argparse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -34,6 +35,8 @@ DEFAULT_BUDGET_GB = 50.0
 ITEM_BATCH_SIZE = 32
 MOVE_BATCH_SIZE = 256
 MOVE_BATCH_BYTES = 64 * 1024
+# Preview plans items in threads: lstat/scandir/hash release the GIL (CL-359 speed).
+PREVIEW_WORKERS = 8
 
 
 def trash_paths(paths):
@@ -111,16 +114,26 @@ def blob_id(path):
 
 
 def inventory(root):
-    """lstat every entry, including directories; never walk through links."""
+    """lstat every entry, including directories; never walk through links.
+
+    Pre-order with each directory's children sorted by name: the same keys,
+    values and order as sorted(Path.iterdir()) recursion, but with os.scandir
+    names and string paths (no pathlib sorting or per-call parsing; CL-359 speed).
+    """
     result = {}
-    def visit(path):
-        metadata = path.lstat()
+    lstat, scandir, is_dir = os.lstat, os.scandir, stat.S_ISDIR
+    def visit(path, text):
+        metadata = lstat(text)
         result[path] = (metadata.st_dev, metadata.st_ino, metadata.st_mode,
                         metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
-        if stat.S_ISDIR(metadata.st_mode):
-            for child in sorted(path.iterdir()):
-                visit(child)
-    visit(root)
+        if is_dir(metadata.st_mode):
+            with scandir(text) as entries:
+                names = sorted(entry.name for entry in entries)
+            prefix = text if text.endswith('/') else text + '/'
+            for name in names:
+                visit(path / name, prefix + name)
+    root = Path(root)
+    visit(root, os.fspath(root))
     return result
 
 
@@ -195,6 +208,75 @@ def validate_tickets(values):
             or any(not isinstance(v, str) or not TICKET.fullmatch(v) for v in values)):
         raise ValueError('ticket keys must be a nonempty list of keys such as CL-10')
     return sorted(set(values))
+
+
+OWNER_RECORD = 'owner.json'
+TICKETS_ENVIRONMENT = 'CHECKLIST_TICKETS'
+OWNER_KINDS = {'evidence', 'build', 'slot', 'qualification', 'work'}
+
+
+def requested_tickets(values=None, environ=None):
+    """Ticket keys for a new folder (CL-359 item 0): --ticket values, else the
+    CHECKLIST_TICKETS comma list. A creating tool refuses a folder without keys."""
+    environ = os.environ if environ is None else environ
+    keys = [key for key in (values or []) if key]
+    if not keys:
+        keys = [key.strip() for key in environ.get(TICKETS_ENVIRONMENT, '').split(',') if key.strip()]
+    if not keys:
+        raise ValueError('register the new folder with its tickets: pass --ticket KEY (repeatable) '
+                         'or set CHECKLIST_TICKETS=CL-1,CL-2')
+    return validate_tickets(keys)
+
+
+def read_owner_record(folder):
+    """The owner.json registration of a folder: None when absent. A linked,
+    oversized or malformed record raises; cleanup then retains the folder."""
+    path = Path(folder) / OWNER_RECORD
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 65536:
+        raise ValueError('invalid owner record: ' + str(path))
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, 'r') as source:
+        value = json.loads(source.read(65537))
+    if (not isinstance(value, dict) or type(value.get('version')) is not int or value['version'] != 1
+            or value.get('kind') not in OWNER_KINDS):
+        raise ValueError('invalid owner record: ' + str(path))
+    value['tickets'] = validate_tickets(value.get('tickets'))
+    return value
+
+
+def write_owner_record(folder, tickets, kind, purpose=None, session_id=None):
+    """Register an existing folder with its tickets in owner.json. A later
+    registration of the same kind adds keys (a shared build capture); another
+    kind is refused. The write is atomic."""
+    folder = Path(folder)
+    if folder.is_symlink() or not folder.is_dir():
+        raise ValueError('owner record needs an existing directory, not a link: ' + str(folder))
+    if kind not in OWNER_KINDS:
+        raise ValueError('owner kind must be one of ' + ', '.join(sorted(OWNER_KINDS)))
+    tickets = validate_tickets(list(tickets or []))
+    previous = read_owner_record(folder)
+    if previous and previous['kind'] != kind:
+        raise ValueError(f'{folder} is registered as {previous["kind"]}, not {kind}')
+    stamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    value = dict(previous or {'version': 1, 'kind': kind, 'created_at': stamp})
+    value['tickets'] = validate_tickets(sorted(set(tickets) | set((previous or {}).get('tickets', []))))
+    value['updated_at'] = stamp
+    if purpose:
+        value['purpose'] = purpose
+    if session_id:
+        value['session_id'] = session_id
+    with tempfile.NamedTemporaryFile(mode='w', dir=folder, prefix=OWNER_RECORD + '.', delete=False) as output:
+        json.dump(value, output, indent=2, sort_keys=True)
+        output.write('\n')
+        output.flush()
+        os.fsync(output.fileno())
+        temporary = Path(output.name)
+    os.replace(temporary, folder / OWNER_RECORD)
+    return value
 
 
 def validate_fingerprint(value):
@@ -361,6 +443,35 @@ def du_sizes(paths):
     return sizes
 
 
+def background_sizes(groups, workers=8, chunk=16):
+    """Preview sizer for storage_report: du runs while the preview inspects folders.
+
+    A root directory is sized as its own block plus its children, in parallel du
+    calls of up to `chunk` children each (one large scratchpad took 27 s as one
+    du). A hard link shared by two chunks counts twice. A missing root is absent.
+    """
+    pool = ThreadPoolExecutor(max_workers=workers)
+    plans = {}
+    for path in {path for paths in groups.values() for path in paths}:
+        if not os.path.lexists(path): continue
+        try:
+            if path.is_symlink() or not path.is_dir(): raise NotADirectoryError(path)
+            own = path.lstat().st_blocks * 512
+            parts = sorted(path.iterdir())
+        except OSError:
+            own, parts = 0, [path]
+        plans[path] = (own, [pool.submit(du_sizes, parts[i:i + chunk]) for i in range(0, len(parts), chunk)])
+    pool.shutdown(wait=False)
+    def sizer(paths):
+        result = {}
+        for path in paths:
+            if path in plans:
+                own, futures = plans[path]
+                result[path] = own + sum(sum(f.result().values()) for f in futures)
+        return result
+    return sizer
+
+
 def storage_groups(sessions, qualification, repo):
     return {'scratch': scratch_roots(sessions), 'evidence': [repo / '.local/evidence'],
             'build': [repo / '.local/build'], 'qualification': [qualification]}
@@ -523,7 +634,8 @@ def installed_fingerprint(path):
         return None
 
 
-def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
+def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaustive=False):
+    """exhaustive=True skips the item-wide-hold shortcut (tests prove both agree)."""
     before = inventory(item)
     legacy = legacy_workspaces(before)
     files = {path: entry for path, entry in before.items() if not stat.S_ISDIR(entry[2])}
@@ -579,6 +691,15 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
     counts = Counter(build_bytes=0, git_redundant_source_bytes=0, qualification_bytes=0, kept_bytes=0)
     if ticket_retire:
         counts['ticket_bytes'] = 0
+    if reason and not exhaustive:
+        # An item-wide hold keeps every file under that one reason and selects no
+        # move: the per-file classification below would reach the same result
+        # (CL-359 speed; equality covered by test_item_wide_hold_matches_per_file_plan).
+        counts['kept_bytes'] = size
+        return {'path': str(item), 'kind': kind, **counts, 'total_bytes': size, 'reason': reason,
+                'reasons': {reason: size} if files else {},
+                'retained_legacy_paths': [str(p) for p in legacy], 'planned_move_count': 0,
+                'move_bytes': {}, 'moves': [], 'inventory': before}
     reasons = Counter()
     removable = set()
     for path, entry in files.items():
@@ -645,6 +766,66 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
             'planned_move_count': len(moves),
             'move_bytes': {path: tree_bytes[path] for path in moves},
             'moves': moves, 'inventory': before}
+
+
+def preview_public(decision):
+    public = {key: value for key, value in decision.items() if key not in {'inventory', 'moves', 'move_bytes'}}
+    public['action'] = 'preview'
+    public['eligible_paths'] = [str(path) for path in decision['moves']]
+    return public
+
+
+_PREVIEW_OBJECTS = set()
+
+
+def _set_preview_objects(objects):
+    """Process-pool initializer: retained Git object IDs are sent once per worker."""
+    global _PREVIEW_OBJECTS
+    _PREVIEW_OBJECTS = objects
+
+
+def preview_one(item, kind, in_use, fingerprint, keep, now, session_id, include_released, objects=None):
+    """One read-only preview decision; module-level so a process pool can run it."""
+    # An old --preview is never an executable deletion plan.
+    if not in_scope(item, kind, session_id, include_released):
+        raise ValueError('workspace ownership/release changed; retained')
+    # Preview reads a held root's marker and du size only (CL-359 speed).
+    if held := held_preview(item, kind, keep):
+        return held
+    return preview_public(plan(item, kind, _PREVIEW_OBJECTS if objects is None else objects,
+                               [item] if in_use else [], fingerprint, keep, now))
+
+
+def preview_executor(objects, workers=PREVIEW_WORKERS):
+    """CLI preview pool: spawned processes give each item plan its own CPU share
+    on a loaded host (threads share one interpreter lock). Spawn, not fork:
+    background du threads may already run in the parent."""
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+    return ProcessPoolExecutor(max_workers=max(1, workers), mp_context=multiprocessing.get_context('spawn'),
+                               initializer=_set_preview_objects, initargs=(objects,))
+
+
+def preview_items(items, objects, used, fingerprint, keep, clock, session_id, include_released,
+                  workers=PREVIEW_WORKERS, executor=None):
+    """Read-only preview: the same per-item decisions and output order as apply's
+    planning, with held-root du sizes and item plans computed in parallel.
+
+    The default pool is threads (tests patch module functions); the CLI passes a
+    process pool from preview_executor()."""
+    failed = False
+    process_pool = executor is not None
+    with (executor(objects) if process_pool else ThreadPoolExecutor(max_workers=max(1, workers))) as pool:
+        futures = [(item, pool.submit(preview_one, item, kind, item in used, fingerprint, keep, clock(),
+                                      session_id, include_released, None if process_pool else objects))
+                   for item, kind in items]
+        for item, future in futures:
+            try:
+                print(json.dumps(future.result(), sort_keys=True), flush=True)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                print(json.dumps({'path': str(item), 'action': 'kept_error', 'reason': str(error)}), flush=True)
+                failed = True
+    return failed
 
 
 def move_error(decision, error, path=None, stop=False):
@@ -821,7 +1002,7 @@ def apply_batch(batch, installed_info, fingerprint, process_reader, mover,
 
 def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
           process_reader=running_paths, mover=trash_paths, clock=time.time,
-          session_id=None, include_released=False):
+          session_id=None, include_released=False, after_inspection=None, preview_pool=None):
     if not session_id:
         raise ValueError('caller session unknown; supply --session-id for your own session')
     failed = False
@@ -847,7 +1028,14 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
     objects = git_objects(repo) if items else set()
     fingerprint = installed_fingerprint(installed_info)
     processes = process_reader() if items else []
+    # Background du starts only after process inspection: its own command
+    # arguments must never read as a running process using an item.
+    if after_inspection:
+        after_inspection()
     used = used_items(processes, (item for item, _ in items))
+    if not apply:
+        return 1 if preview_items(items, objects, used, fingerprint, keep, clock, session_id,
+                                  include_released, executor=preview_pool) or failed else 0
     for offset in range(0, len(items), ITEM_BATCH_SIZE):
         pending = []
         for item, kind in items[offset:offset + ITEM_BATCH_SIZE]:
@@ -855,15 +1043,9 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
                 # An old --preview is never an executable deletion plan.
                 if not in_scope(item, kind, session_id, include_released):
                     raise ValueError('workspace ownership/release changed; retained')
-                # Preview reads a held root's marker and du size only (CL-359 speed).
-                if not apply and (held := held_preview(item, kind, keep)):
-                    print(json.dumps(held, sort_keys=True))
-                    continue
                 decision = plan(item, kind, objects, [item] if item in used else [], fingerprint, keep, clock())
-                public = {key: value for key, value in decision.items() if key not in {'inventory', 'moves', 'move_bytes'}}
-                public['action'] = 'preview'
-                public['eligible_paths'] = [str(path) for path in decision['moves']]
-                if apply and decision['moves']:
+                public = preview_public(decision)
+                if decision['moves']:
                     public.update(action='trashed', destinations=[], moved_count=0, moved_bytes=0)
                     decision['public'] = public
                     pending.append(decision)
@@ -898,7 +1080,7 @@ def main():
     mode.add_argument('--apply', action='store_true', help='move eligible paths to macOS Trash; never permanently delete')
     parser.add_argument('--purpose', help='workspace purpose; required with --mark')
     parser.add_argument('--ticket', action='append', metavar='KEY',
-                        help='with --mark: owning ticket key (repeatable); required for a new mark')
+                        help='with --mark: owning ticket key (repeatable; or CHECKLIST_TICKETS=CL-1,CL-2); required for a new mark')
     parser.add_argument('--cli', type=Path, default=Path('/Applications/Checklist.app/Contents/MacOS/checklist'),
                         help='with --release-done: installed Checklist CLI used for read-only task_get calls')
     parser.add_argument('--project-id', help='with --release-done: project ID (default: resolved from --repo)')
@@ -927,10 +1109,12 @@ def main():
         parser.error('--source-fingerprint is only valid with --mark')
     if args.purpose is not None and args.mark is None:
         parser.error('--purpose is only valid with --mark')
-    if args.ticket is not None and args.mark is None:
+    if args.ticket is not None and args.mark is None and not os.environ.get(TICKETS_ENVIRONMENT):
         parser.error('--ticket is only valid with --mark')
     if args.ticket is not None and any(not TICKET.fullmatch(key) for key in args.ticket):
         parser.error('--ticket must be a ticket key such as CL-10')
+    if args.mark is not None and not args.ticket and os.environ.get(TICKETS_ENVIRONMENT, '').strip():
+        args.ticket = requested_tickets()
     if args.mark is not None and not args.ticket:
         try:
             registered = (read_marker(args.mark.expanduser()) or {}).get('tickets')
@@ -958,12 +1142,17 @@ def main():
     for root in [args.sessions_root.expanduser(), args.qualification_root.expanduser()]:
         if root.is_symlink():
             parser.error('scratch roots must not be symbolic links: ' + str(root))
+    groups = storage_groups(sessions.resolve(), qualification.resolve(), args.repo.expanduser().resolve())
+    # Preview sizes the folders in background du calls while it inspects items
+    # (CL-359 speed), started after process inspection; apply sizes them after its moves.
+    sizers = []
+    start_sizes = None if args.apply else lambda: sizers.append(background_sizes(groups))
     result = clean(args.sessions_root.expanduser().resolve(), args.qualification_root.expanduser().resolve(),
                    args.repo.expanduser().resolve(), args.installed_info.expanduser(),
                    [path.expanduser().resolve() for path in args.keep_qualified], args.apply,
-                   session_id=args.session_id, include_released=args.include_released)
-    storage_report(storage_groups(sessions.resolve(), qualification.resolve(), args.repo.expanduser().resolve()),
-                   args.budget_gb * 1e9)
+                   session_id=args.session_id, include_released=args.include_released,
+                   after_inspection=start_sizes, preview_pool=None if args.apply else preview_executor)
+    storage_report(groups, args.budget_gb * 1e9, sizers[0] if sizers else None)
     return result
 
 

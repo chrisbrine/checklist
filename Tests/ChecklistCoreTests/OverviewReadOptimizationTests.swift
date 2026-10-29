@@ -609,6 +609,7 @@ extension CoreTests {
     }
 
     func testRealSizeBatchClaimRetainsMembershipAndReleaseFences() throws {
+        try QualificationSuite.requireEnabled() // Retained project scale: 250 unrelated records in each of four families.
         let p = try project("Bounded batch effects", "BE"), pid = p["id"] as! String
         let tasks = try [ready(p,task(p,"One")),ready(p,task(p,"Two"))], group = try triage(p)
         for t in tasks {try addTriage(p,group,t)}

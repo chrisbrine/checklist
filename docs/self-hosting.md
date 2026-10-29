@@ -58,9 +58,9 @@ uses `CHECKLIST_BUILD_SCOPE=install` by default, including ordinary `--stage`,
 `--rebuild-stage` and `--clean-stage` runs. Set the scope explicitly for other work:
 
 ```sh
-CHECKLIST_BUILD_SCOPE=measurement ./script/build_and_run.sh --rebuild-stage
-CHECKLIST_BUILD_SCOPE=test ./script/build_and_run.sh --stage
-CHECKLIST_BUILD_SCOPE=private-copy ./script/build_and_run.sh --stage
+CHECKLIST_BUILD_SCOPE=measurement ./script/build_and_run.sh --rebuild-stage --ticket CL-N
+CHECKLIST_BUILD_SCOPE=test ./script/build_and_run.sh --stage --ticket CL-N
+CHECKLIST_BUILD_SCOPE=private-copy ./script/build_and_run.sh --stage --ticket CL-N
 ```
 
 These three local scopes never read, lock or write the shared allocator or import

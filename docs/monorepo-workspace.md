@@ -59,7 +59,7 @@ The last command requires `jsonschema`; use the project's documented Python envi
 
 App preference regression: `python3 scripts/check-app-test-preferences.py` runs the complete `ChecklistAppTests` suite, then counts test plists at three and six seconds after process exit. Any new file seen at either count fails the check; it only reads Preferences and excludes `Checklist.Workspace.*`. App-test defaults are process-local memory stores, including reopened secondary-window stores supplied through `WorkspaceWindowStorage.workspacePreferences`. Typed accessors still use the `UserDefaults` interface, but no named persistent domain is written or unlinked. This avoids Foundation/cfprefsd recreating empty plists at process exit after per-test cleanup. The child-process regression exits with retained primary/secondary defaults without teardown, then checks both paths after exit. `python3 -m unittest discover -s scripts -p test_check_app_test_preferences.py` checks the external counter's late-write failure and preservation behavior using disposable directories.
 
-`./script/build_and_run.sh --stage` captures source, builds/signs the app and verifies its staged bundle. `./script/build_and_run.sh --verify` additionally replaces `/Applications/Checklist.app`, opens it and checks the service. Staging/signing and installation have effects beyond compiling and require the applicable installation authorization. The helper defaults to release; `CHECKLIST_BUILD_CONFIGURATION=debug` selects debug. It retains the prior compatible application bundle for binary rollback and does not create a database backup. Follow [self-hosting](self-hosting.md) for compatibility and store rollback rules.
+`./script/build_and_run.sh --stage --ticket CL-N` captures source, builds/signs the app and verifies its staged bundle. Stage-only modes (`--stage`, `--rebuild-stage`, `--clean-stage`) refuse to start without ticket keys: pass `--ticket KEY` (repeatable) or `CHECKLIST_TICKETS=CL-1,CL-2`. The keys go into `owner.json` next to the stage in `.local/build/<fingerprint>`; a later stage of the same capture adds its keys. Install modes record keys when given; `--install-stage` takes none. `./script/build_and_run.sh --verify` additionally replaces `/Applications/Checklist.app`, opens it and checks the service. Staging/signing and installation have effects beyond compiling and require the applicable installation authorization. The helper defaults to release; `CHECKLIST_BUILD_CONFIGURATION=debug` selects debug. It retains the prior compatible application bundle for binary rollback and does not create a database backup. Follow [self-hosting](self-hosting.md) for compatibility and store rollback rules.
 
 The default `CHECKLIST_BUILD_SCOPE=install` reserves the next shared development version. For disposable test-only stages use `CHECKLIST_BUILD_SCOPE=test`; private-copy inspection uses `private-copy`. These local stages record version `<VERSION>.0`, ordinal `0` and `installable:false`, without reserving shared history. A combined round intended for installation keeps `install` even in its private copy; local stages cannot be promoted. See [build versions](self-hosting.md#build-versions).
 
@@ -67,7 +67,8 @@ Test slots reuse that verified stage without another build:
 
 ```sh
 # Native caller identity must be exported; otherwise add --session-id <actual session ID>.
-./script/test_instances.py create --slot 1 --latest-stage
+# --ticket KEY (repeatable) or CHECKLIST_TICKETS registers the slot store copy; create refuses without it.
+./script/test_instances.py create --slot 1 --latest-stage --ticket CL-N
 ./script/test_instances.py start --slot 1 --headless
 ./script/test_instances.py check --slot 1
 ./script/test_instances.py status --json
@@ -122,11 +123,11 @@ CHECKLIST_BUILD_CONFIGURATION=release CHECKLIST_SIGN_IDENTITY=- \
   python3 script/measure_build_times.py \
   --checkout /private/tmp/checklist-measure-after \
   --output /private/tmp/checklist-times-after --label after-EXACT-REVISION \
-  --source-fingerprint <captured-round-source-fingerprint> \
+  --source-fingerprint <captured-round-source-fingerprint> --ticket CL-N \
   --allow-source-edits-and-clean
 ```
 
-The runner marks the output root with the owning native session, label/purpose and required exact `--source-fingerprint` before saving originals or building. If no native ID is exported, supply `--session-id <actual session ID>`; exported identities cannot be overridden. Keep failed outputs protected for inspection. Mark any separately created enclosing qualification run and warmed checkout at creation too, before source/store copies. After preserving the evidence externally, only the owner releases a disposable run; released obsolete fingerprinted runs under `~/Library/Caches/ChecklistQualification` are eligible for whole-run Trash retirement, while the latest installed round stays. Unmarked runs older than seven days are reported with sizes and never retired automatically. See the [root marker procedure](../skills/checklist/references/driven-sessions.md#scratch-cleanup-and-cache-settings).
+The runner marks the output root with the owning native session, label/purpose, required exact `--source-fingerprint` and required ticket keys (`--ticket`, or `CHECKLIST_TICKETS`) before saving originals or building, and passes the keys to every measured stage. If no native ID is exported, supply `--session-id <actual session ID>`; exported identities cannot be overridden. Keep failed outputs protected for inspection. Mark any separately created enclosing qualification run and warmed checkout at creation too, before source/store copies. After preserving the evidence externally, only the owner releases a disposable run; released obsolete fingerprinted runs under `~/Library/Caches/ChecklistQualification` are eligible for whole-run Trash retirement, while the latest installed round stays. Unmarked runs older than seven days are reported with sizes and never retired automatically. See the [root marker procedure](../skills/checklist/references/driven-sessions.md#scratch-cleanup-and-cache-settings).
 
 If a shared Swift build-slot wrapper applies, run the entire Python command
 through that wrapper so its child Swift commands remain in one reserved slot.
@@ -174,6 +175,16 @@ the older capture directories. It also retires legacy `swiftpm-<id>` scratch
 without a paired `lane-<id>/source`. Paired lanes for every configuration remain
 warm. Stage-only and failed install runs do not retire anything. Cleanup failure
 is logged without turning a successful install into a failed installation.
+
+Each install is a round boundary (CL-359). After the build cleanup, the same hook
+runs the `clean_scratch.py --release-done` step for the installing session (the
+exported `CODEX_THREAD_ID`, `CLAUDE_SESSION_ID` or `CHECKLIST_SESSION_ID`): every
+marked folder of that session whose tickets are all Done or canceled is released.
+Release changes only the marker. The folder moves to the Trash at the next
+`clean_scratch.py --apply`, which still keeps a folder that a running process
+uses. Folders of open or unknown tickets stay marked. With no exported session
+the hook reports `release_done` as skipped; a status read failure is reported in
+the same log and keeps every marker.
 Build outputs move in one native Trash batch (45-second transport timeout), with
 individual destinations/errors and confirmed logical-byte totals. A failed batch
 can have successful individual moves; those receipts remain in the report. Only
@@ -217,7 +228,33 @@ Captures used directly by running processes, or identified by running Checklist
 bundles (including test-slot and renamed app bundles), remain intact. Unknown
 build layouts are kept.
 
-Evidence is scoped by ticket keys in the folder name and `files.json` ticket
+Every new folder is registered with its ticket keys when it is created (CL-359),
+and the creating tool refuses a folder without keys:
+
+| Folder | Creating tool | Record |
+| --- | --- | --- |
+| Work folder | `clean_scratch.py --mark PATH --purpose TEXT --ticket KEY` | `.checklist-workspace.json` `tickets` |
+| Build folder | `build_and_run.sh --stage --ticket KEY` | `.local/build/<fingerprint>/owner.json` |
+| Slot store copy | `test_instances.py create --ticket KEY` | `slot.json` `tickets` and the slot marker |
+| Qualification cache | `measure_build_times.py --ticket KEY`, or `--mark` of a manual run | marker `tickets` |
+| Evidence folder | `script/evidence_folder.py new --ticket KEY NAME` | `.local/evidence/NAME/owner.json` |
+
+Each `--ticket` is repeatable; `CHECKLIST_TICKETS=CL-1,CL-2` supplies the keys
+when no `--ticket` is given. `evidence_folder.py new --existing NAME` registers an
+evidence folder that already exists, and `evidence_folder.py register --kind KIND
+PATH` writes or extends `owner.json` in another folder. A later registration of
+the same kind adds keys; another kind is refused. `clean_builds.py` reads
+`owner.json` first: when it is present, its tickets alone decide, before
+`files.json`, `cleanup.json` and the folder-name fallback below. A registered
+store copy under `.local/evidence` retires whole. Each report row carries
+`registration` (`owner.json`, `slot.json`, `shared_cache`, `container`, `invalid`
+or `unregistered`) and `tickets`; the summary line lists `unregistered_count` and
+the unregistered paths. An `invalid` (linked, oversized or malformed) record keeps
+the folder. Shared SwiftPM scratch and test-selection caches serve every ticket
+and are reported as `shared_cache`. Build captures keep their existing
+installed/previous and running-process rules; their ticket keys are reported only.
+
+Without `owner.json`, evidence is scoped by ticket keys in the folder name and `files.json` ticket
 fields. A round folder may explicitly declare **every** owning ticket with
 `cleanup.json` containing `{"tickets":["CL-10","CL-11"]}` (strings or
 `{"key": ...}` rows). A `cleanup.json` without `tickets` is a cleanup receipt, not
@@ -258,6 +295,11 @@ folders, `.local/evidence`, `.local/build` and
 group). Above `--budget-gb` (default 50, or `CHECKLIST_CLEANUP_BUDGET_GB`), the run
 also writes a `WARNING: CLEANUP BUDGET EXCEEDED` line to stderr. Bytes in the Trash
 stay on disk until the owner empties the Trash.
+In a preview of either command, the `du` calls run in the background while the folders are
+inspected: each group root is sized as its own block plus parallel `du -sk` calls of up to
+16 children (a hard link shared by two calls counts twice). An apply sizes the folders
+after its moves. The `clean_scratch.py --preview` must finish in under 1 minute on the real
+scratch root (CL-359); it plans items in parallel threads and prints them in item order.
 
 Preview is read-only and apply computes new decisions, inventories and process
 observations. Preview caches one process snapshot for the pass; build apply

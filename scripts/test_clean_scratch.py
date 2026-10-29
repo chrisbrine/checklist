@@ -1244,7 +1244,11 @@ class CleanScratchTests(unittest.TestCase):
             self.assertEqual(cleanup.main(), 0)
         self.assertEqual(runner.call_args.args[:4], (self.sessions, self.qualification, self.repo, self.installed))
         self.assertEqual(runner.call_args.args[4:], ([self.root / 'keep'], False))
-        self.assertEqual(runner.call_args.kwargs, {'session_id': 'session', 'include_released': False})
+        kwargs = dict(runner.call_args.kwargs)
+        # A preview starts background sizes after inspection and plans in a process pool (CL-359 speed).
+        self.assertTrue(callable(kwargs.pop('after_inspection')))
+        self.assertIs(kwargs.pop('preview_pool'), cleanup.preview_executor)
+        self.assertEqual(kwargs, {'session_id': 'session', 'include_released': False})
 
     # CL-359: ticket registration, automatic release and size budget.
     def ticket_item(self, name, tickets, files=True):
@@ -1402,6 +1406,115 @@ print(json.dumps({"data": data}))
             self.assertEqual('BUDGET EXCEEDED' in errors.getvalue(), warned)
         fake = cleanup.storage_report({'a': ['x'], 'b': ['y']}, 50e9, sizer=lambda paths: {p: 30 * 10 ** 9 for p in paths})
         self.assertEqual(fake['total_bytes'], 60 * 10 ** 9)
+
+    def test_inventory_matches_pathlib_reference_walk(self):
+        # CL-359 speed: the scandir walk keeps the exact keys, values and order.
+        def reference(root):
+            result = {}
+            def visit(path):
+                metadata = path.lstat()
+                result[path] = (metadata.st_dev, metadata.st_ino, metadata.st_mode,
+                                metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+                if stat.S_ISDIR(metadata.st_mode):
+                    for child in sorted(path.iterdir()):
+                        visit(child)
+            visit(root)
+            return result
+        item = self.item('walk')
+        for name in ['B', 'a', 'a b', 'a.b', 'a-b', 'd/b/c', 'd/C/x', 'Z/.git/HEAD', '.build/o/1', '\u00e9', 'a0']:
+            self.write(item, name, name.encode())
+        (item / 'empty').mkdir()
+        (item / 'dirlink').symlink_to(item / 'd')
+        (item / 'dangling').symlink_to(item / 'missing')
+        os.mkfifo(item / 'fifo')
+        new, old = cleanup.inventory(item), reference(item)
+        self.assertEqual(list(new.items()), list(old.items()))
+        self.assertNotIn(item / 'dirlink' / 'b', new)
+        loose = self.write(item, 'loose', b'1')
+        self.assertEqual(list(cleanup.inventory(loose).items()), list(reference(loose).items()))
+        with self.assertRaises(FileNotFoundError):
+            cleanup.inventory(item / 'absent')
+
+    def test_item_wide_hold_matches_per_file_plan(self):
+        # Every item-wide hold returns what the per-file classification returns.
+        held = self.item('held')
+        for name, data in [('src/.git/config', b'g'), ('notes.md', b'unique'), ('.build/o', b'1234'),
+                           ('source.py', b'new source\n'), ('ws1/x', b'legacy'), ('empty/.keep', b'')]:
+            self.write(held, name, data)
+        (held / 'link').symlink_to(held / 'notes.md')
+        spare = self.item('spare', host='-Users-x--claude-spares-spare-a')
+        self.write(spare, 'Package.swift', b'let package = Package(name: "Other")\n')
+        self.write(spare, '.build/o', b'12')
+        empty = self.item('empty-root')
+        cases = [(held, {'now': time.time()}), (held, {'processes': [held]}), (held, {'keep': [held]}),
+                 (held, {'fingerprint': None}), (spare, {'kind': 'spare'}), (empty, {'now': time.time()})]
+        for item, options in cases:
+            with self.subTest(item=item.name, options=sorted(options)):
+                fast = self.plan(item, **dict(options))
+                full = self.plan(item, exhaustive=True, **dict(options))
+                self.assertNotEqual(fast['reason'], 'eligible build/Git bytes only; other bytes retained')
+                self.assertEqual(fast, full)
+        released = self.ticket_item('P-done', ['CL-1'])
+        cleanup.write_marker(released, 'session', release=True, released_for_tickets=['CL-1'])
+        self.assertEqual(self.plan(released), self.plan(released, exhaustive=True))
+
+    def test_parallel_preview_output_matches_sequential_order(self):
+        names = []
+        for index in range(12):
+            item = self.item(f'copy{index:02d}')
+            self.write(item, 'src/.git/config', b'g');self.write(item, '.build/o', b'x' * index)
+            self.write(item, 'notes.md', b'unique ' + bytes([65 + index]))
+            names.append(item.name)
+        self.ticket_item('P-held', ['CL-3'])
+        outputs = []
+        for workers in (1, 8):
+            with patch.object(cleanup.preview_items, '__defaults__', (workers, None)):
+                result, records = self.run_cleanup()
+            self.assertEqual(result, 0)
+            outputs.append(records)
+        with patch.object(cleanup, 'preview_executor', wraps=cleanup.preview_executor) as pooled:
+            result, records = self.run_cleanup(preview_pool=cleanup.preview_executor)
+        self.assertEqual((result, pooled.call_count), (0, 1))
+        outputs.append(records)
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(outputs[0], outputs[2])
+        self.assertEqual([Path(r['path']).name for r in outputs[0]], sorted(names + ['P-held']))
+        self.assertTrue(all(r['eligible_paths'] for r in outputs[0] if r['path'].endswith(tuple(names))))
+
+    def test_preview_sizes_in_background_and_apply_sizes_after_moves(self):
+        scratch = self.item('sized');self.write(scratch, 'blob', b'x' * 100000)
+        for name in range(40):
+            self.write(scratch, f'many/{name}', b'y' * 5000)
+        groups = cleanup.storage_groups(self.sessions, self.qualification, self.repo)
+        background = cleanup.background_sizes(groups, chunk=3)
+        for label, paths in groups.items():
+            self.assertEqual(sum(background(paths).values()), sum(cleanup.du_sizes(paths).values()), label)
+        common = ['clean_scratch.py', '--session-id', 'session', '--sessions-root', str(self.sessions),
+                  '--qualification-root', str(self.qualification), '--repo', str(self.repo),
+                  '--installed-info', str(self.installed), '--budget-gb', '0.00001']
+        for mode, expected in [('--preview', 1), ('--apply', 0)]:
+            output, errors = io.StringIO(), io.StringIO()
+            with patch.object(sys, 'argv', common + [mode]), redirect_stdout(output), patch('sys.stderr', errors), \
+                 patch.dict(os.environ, CHECKLIST_TRASH_DIR=str(self.trash)), \
+                 patch.object(cleanup, 'running_paths', return_value=[]), \
+                 patch.object(cleanup, 'git_objects', return_value=self.objects), \
+                 patch.object(cleanup, 'background_sizes', wraps=cleanup.background_sizes) as sized:
+                self.assertEqual(cleanup.main(), 0)
+            self.assertEqual(sized.call_count, expected, mode)
+            report = [json.loads(line) for line in output.getvalue().splitlines()][-1]
+            self.assertEqual(report['action'], 'size_report')
+            self.assertGreaterEqual(report['groups']['scratch'], 300000)
+            self.assertTrue(report['over_budget'])
+            self.assertIn('CLEANUP BUDGET EXCEEDED', errors.getvalue())
+
+    def test_background_du_starts_after_process_inspection(self):
+        # Its own du arguments must never read as a process using an item.
+        item = self.item('copy');self.write(item, '.build/o', b'1')
+        events = []
+        result, _ = self.run_cleanup(process_reader=lambda: events.append('inspect') or [],
+                                     after_inspection=lambda: events.append('sizes'))
+        self.assertEqual((result, events), (0, ['inspect', 'sizes']))
+
 
 def stat_mode_fifo(path):
     import stat

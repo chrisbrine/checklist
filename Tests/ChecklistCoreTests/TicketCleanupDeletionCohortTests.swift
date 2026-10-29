@@ -72,6 +72,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testDeletionCohortSharesObservationAndManifestAcrossMoreThan256Descriptors() throws {
+        try QualificationSuite.requireEnabled()
         let receipts = try deletionCohortFixture([257])
         var corpus = 0,media = 0,generations = 0,manifests = Set<ObjectIdentifier>(),peakPinned = 0
         let cohort = try XCTUnwrap(deletionCohortPass(afterCommit:{_,cohort in
@@ -103,6 +104,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testDeletionCohortGenerationMutationFencesRemainingContinuationAndFreshPassRebuilds() throws {
+        try QualificationSuite.requireEnabled()
         let receipts = try deletionCohortFixture([257]),receipt = receipts[0]
         var mutated = false
         let cohort = try XCTUnwrap(deletionCohortPass(afterCommit:{db,_ in
@@ -135,6 +137,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testDeletionCohortOversizedFirstReceiptDoesNotStarveBoundedSibling() throws {
+        try QualificationSuite.requireEnabled()
         let receipts = try deletionCohortFixture([1,1]),large = receipts[0],small = receipts[1]
         try write {db in
             var value = large;value["padding"] = String(repeating:"x",count:TicketCleanupDeletionCohort.descriptorByteLimit+1)
@@ -187,4 +190,75 @@ extension TicketLifecycleCleanupTests {
         XCTAssertTrue(FileManager.default.fileExists(atPath:objects[1]["stored_path"] as! String))
     }
 
+}
+
+extension TicketLifecycleCleanupTests {
+    func testP321MaintenanceSkipsInventoryRefusedHeadAndRunsLaterReceipt() throws {
+        let jobs = try deletionCohortFixture([1,1]),head = jobs[0],sibling = jobs[1]
+        let path = (head["objects"] as! [JSON])[0]["relative_path"] as! String
+        try write {db in
+            // The individually bounded head fills the cohort before its reference
+            // inventory is found to exceed the unchanged 4 MiB row bound.
+            var value = head;value["padding"] = String(repeating:"x",count:TicketCleanupDeletionCohort.descriptorByteLimit-1200)
+            try self.router.save(db,self.router.revised(value),type:"storage_job")
+            try self.router.save(db,["id":uuid(),"project_id":head["project_id"]!,"revision":1,"path":path,"padding":String(repeating:"x",count:TicketCleanupInventory.rowByteLimit+1)],type:"message")
+        }
+        router.ticketCleanupLifecycleTurn = false
+        XCTAssertThrowsError(try router.runStorageMaintenance())
+        try expireCleanupBackoff() // Advance only the synthetic fixture's retry.
+        router.ticketCleanupLifecycleTurn = false
+        try router.runStorageMaintenance()
+        XCTAssertTrue(router.ticketCleanupLifecycleTurn)
+        XCTAssertEqual(try deletionCohortReceipt(head)["state"] as? String,"pending")
+        XCTAssertEqual((try deletionCohortReceipt(sibling)["summary"] as? JSON)?["removed_count"] as? Int,1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath:router.root.appendingPathComponent(path).path))
+    }
+
+    func testP321PreparationUnavailableStillYieldsToLifecycleTurn() throws {
+        let jobs = try deletionCohortFixture([1]),head = jobs[0]
+        try write {db in
+            // Canonical but outside the per-receipt descriptor bound. A byte
+            // preparation must refuse, retain bytes, and yield the next turn.
+            var value = head;value["padding"] = String(repeating:"x",count:TicketCleanupDeletionCohort.descriptorByteLimit+1)
+            try self.router.save(db,self.router.revised(value),type:"storage_job")
+        }
+        router.ticketCleanupLifecycleTurn = false
+        XCTAssertThrowsError(try router.runStorageMaintenance())
+        XCTAssertTrue(router.ticketCleanupLifecycleTurn,"A failed byte preparation cannot monopolize every future maintenance turn")
+        XCTAssertEqual(try deletionCohortReceipt(head)["state"] as? String,"pending")
+    }
+}
+
+extension TicketLifecycleCleanupTests {
+    func testP321MaintenanceRetiresLegacyHeadWithoutUnlinkAndDeletesCurrentSibling() throws {
+        let (project,task,attachment) = try fixture(),pid = project["id"] as! String
+        _ = try configure(project);try router.runTicketLifecycleCleanup()
+        let legacy = try router.dbQueue.read {db in
+            try XCTUnwrap(self.router.records(db,type:"storage_job").first {$0["cause"] as? String == "done_evidence" && $0["task_id"] as? String == task["id"] as? String})
+        }
+        let modern = try deletionCohortFixture([1])[0]
+        try write {db in
+            var old = legacy;old.removeValue(forKey:"cleanup_policy_version")
+            old["owned_record_fingerprints"] = [:] as [String:String]
+            var objects = old["objects"] as! [JSON]
+            var retained = objects[0];retained["state"] = "retained";retained["reasons"] = ["remaining_record"]
+            // Keep an earlier retained descriptor/outcome byte-for-byte while
+            // retiring the still-pending original to a new exact-ticket plan.
+            retained["relative_path"] = "objects/prior-retained.txt";retained["stored_path"] = "objects/prior-retained.txt"
+            objects.append(retained);old["objects"] = objects;old["summary"] = CommandRouter.ticketObjectDeletionSummary(objects)
+            try self.router.save(db,self.router.revised(old),type:"storage_job")
+            var current = modern;current["project_id"] = pid
+            try self.router.save(db,self.router.revised(current),type:"storage_job")
+        }
+        router.ticketCleanupLifecycleTurn = false
+        try router.runStorageMaintenance()
+        let retired = try deletionCohortReceipt(legacy),objects = retired["objects"] as! [JSON]
+        XCTAssertEqual(retired["state"] as? String,"completed")
+        XCTAssertEqual(objects[0]["reasons"] as? [String],["legacy_replan_required"])
+        XCTAssertEqual(objects[1]["reasons"] as? [String],["remaining_record"])
+        XCTAssertEqual((retired["summary"] as? JSON)?["removed_count"] as? Int,0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath:attachment["path"] as! String))
+        XCTAssertEqual((try deletionCohortReceipt(modern)["summary"] as? JSON)?["removed_count"] as? Int,1)
+        XCTAssertNotNil(try router.dbQueue.read {try self.router.ticketCleanupRetryEntries($0,project:pid)[task["id"] as! String]})
+    }
 }

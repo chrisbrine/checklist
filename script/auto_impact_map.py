@@ -2,8 +2,9 @@
 """Restore local selection caches; stale inputs can refresh a warm compiler index.
 
 Compiler-index maps are conservative static reachability, never measured coverage.
-A configured build-cap wrapper permits an incremental index build; test methods
-never execute. An unavailable refresh leaves module fallback intact.
+A warm build permits an incremental index build, optionally through a configured
+build-cap wrapper; test methods never execute. An unavailable refresh leaves
+module fallback intact.
 """
 from datetime import datetime, timezone
 import hashlib
@@ -33,6 +34,10 @@ def generator_inputs(root):
             'script/affected_tests.py')
             if (root / path).is_file()}
 
+
+def require_generator_inputs(root, expected, phase):
+    if generator_inputs(root) != expected:
+        raise ValueError('generator inputs changed during ' + phase + '; rerun with stable tooling')
 
 def source_inventory(root):
     # Package manifests are Swift programs, but they are not target index inputs.
@@ -241,15 +246,25 @@ def file_identity(path):
 
 
 def refresh_native_index(root, scratch, runner_wrapper=None):
-    """Refresh stale compiler inputs once through the configured shared build cap."""
+    """Refresh compiler inputs automatically, preserving the warm test backend."""
     from index_store import read_index_store, DEFAULT_LIBRARY
     wrapper = runner_wrapper or os.environ.get('CHECKLIST_SWIFT_RUNNER')
-    warm = (scratch / 'build.db').is_file() and (scratch / 'debug/Modules').is_dir()
-    warm = warm or ((scratch / 'build.db').is_file() and any(path.is_dir() for path in scratch.glob('*/debug/Modules')))
-    if not wrapper or not Path(wrapper).is_file() or not warm:
-        raise ValueError('native index refresh needs a configured --runner-wrapper/CHECKLIST_SWIFT_RUNNER and warm native build cache')
+    if wrapper and not Path(wrapper).is_file():
+        raise ValueError('configured native index runner wrapper is missing: ' + str(wrapper))
+    native = (scratch / 'build.db').is_file() and (
+        (scratch / 'debug/Modules').is_dir()
+        or any(path.is_dir() for path in scratch.glob('*/debug/Modules')))
+    swiftbuild = ((scratch / 'manifest.pif').is_file()
+                  and any((scratch / 'out/Products/Debug').glob('*.swiftmodule')))
+    if not native and not swiftbuild:
+        raise ValueError('native index refresh needs a warm native or swiftbuild build cache')
+    # Swift Build may ignore -Xswiftc indexing flags. Retain a native index lane
+    # beside its receipts rather than switch/rebuild the assigned warm test lane.
+    index_scratch = scratch if native else scratch / 'affected-tests/native-index'
     inputs = compiler_inputs(root)
-    context = [inputs, generator_inputs(root), file_identity(wrapper), digest(Path(wrapper)),
+    generators = generator_inputs(root)
+    wrapper_input = [file_identity(wrapper), digest(Path(wrapper))] if wrapper else None
+    context = [inputs, generators, wrapper_input, str(index_scratch),
                file_identity(DEFAULT_LIBRARY), file_identity(DEFAULT_LIBRARY.parent.parent / 'bin/swiftc'),
                os.environ.get('DEVELOPER_DIR'), os.environ.get('TOOLCHAINS')]
     stamp = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
@@ -260,11 +275,12 @@ def refresh_native_index(root, scratch, runner_wrapper=None):
         previous = json.loads(receipt_path.read_text())
         if previous.get('inputs') == stamp and previous.get('failed'):
             raise ValueError('native index refresh already failed for these inputs; inspect ' + str(receipt_path))
-    index = scratch / 'index-store'
-    command = ['bash', str(Path(wrapper).resolve()), 'swift', 'build', '--skip-update',
+    index = index_scratch / 'index-store'
+    prefix = ['bash', str(Path(wrapper).resolve())] if wrapper else []
+    command = prefix + ['swift', 'build', '--skip-update',
                '--build-tests', '--build-system', 'native', '--enable-index-store',
                '--cache-path', str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
-               '--enable-dependency-cache', '--scratch-path', str(scratch),
+               '--enable-dependency-cache', '--scratch-path', str(index_scratch),
                '-Xswiftc', '-index-store-path', '-Xswiftc', str(index)]
     started = time.monotonic()
     receipt = {'inputs': stamp, 'command': command, 'failed': True}
@@ -276,13 +292,16 @@ def refresh_native_index(root, scratch, runner_wrapper=None):
         current = compiler_inputs(root)
         if current != inputs:
             raise ValueError('source inputs changed during native index refresh')
-        additional = [scratch / 'debug/index/store'] if (scratch / 'debug/index/store').is_dir() else []
+        require_generator_inputs(root, generators, 'native index refresh')
+        clang_store = index_scratch / 'debug/index/store'
+        additional = [clang_store] if clang_store.is_dir() else []
         export = read_index_store(index, root, additional_stores=additional)
         if compiler_inputs(root) != inputs:
             raise ValueError('source inputs changed during native index export')
         if any(path not in inputs or inputs[path] != value
                for path, value in export.get('source_hashes', {}).items()):
             raise ValueError('native index export hashes differ from compiled source snapshot')
+        require_generator_inputs(root, generators, 'native index export')
         output = directory / 'index-export.json'
         atomic_json(output, export)
         save_index_receipt(output, export)
@@ -301,6 +320,16 @@ def regenerate(root, scratch, output, cases, changed=(), index_path=None, max_ag
     from affected_tests import load_impact_map
     started = time.monotonic()
     cache = scratch / 'affected-tests/test-impact-map.json'
+    generators = generator_inputs(root)
+
+    def generator_drift():
+        try:
+            require_generator_inputs(root, generators, 'impact map regeneration')
+        except ValueError as error:
+            return {'state': 'unavailable', 'reason': str(error),
+                    'refresh': 'Rerun script/affected_tests.py after generator edits finish'}
+        return None
+
     candidates = [cache]
     candidates.extend(sorted((root / '.local/build').glob('test-impact-profiles-*/map.json'), reverse=True))
     for candidate in candidates:
@@ -308,6 +337,8 @@ def regenerate(root, scratch, output, cases, changed=(), index_path=None, max_ag
             continue
         data, status = load_impact_map(root, candidate, max_age_hours, changed)
         if data is not None:
+            if drift := generator_drift():
+                return drift
             atomic_json(output, data)
             return {'state': 'restored', 'from': str(candidate), 'source': data.get('selection_source', 'coverage')}
     indices = [index_path] if index_path else [scratch / 'affected-tests/index-export.json',
@@ -319,6 +350,8 @@ def regenerate(root, scratch, output, cases, changed=(), index_path=None, max_ag
         try:
             recovered = recover_raw_index(root, receipt, changed)
             recovered_path = scratch / 'affected-tests/index-export.json'
+            if drift := generator_drift():
+                return drift
             atomic_json(recovered_path, recovered)
             indices.insert(0, recovered_path)
         except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
@@ -330,17 +363,23 @@ def regenerate(root, scratch, output, cases, changed=(), index_path=None, max_ag
             data = build_index_map(root, json.loads(candidate.read_text()), cases, changed, graph)
             data['generation_seconds'] = round(time.monotonic() - started, 3)
             data['index_export_sha256'] = digest(candidate)
+            if drift := generator_drift():
+                return drift
             atomic_json(output, data)
             atomic_json(cache, data)
             return {'state': 'regenerated', 'from': str(candidate), 'source': 'index-store',
                     'seconds': data['generation_seconds']}
         except (OSError, ValueError, KeyError, TypeError) as error:
             reasons.append(str(candidate) + ': ' + str(error))
+    if drift := generator_drift():
+        return drift
     try:
         refreshed = refresh_native_index(root, scratch, runner_wrapper)
         data = build_index_map(root, json.loads(refreshed.read_text()), cases, changed, graph)
         data['generation_seconds'] = round(time.monotonic() - started, 3)
         data['index_export_sha256'] = digest(refreshed)
+        if drift := generator_drift():
+            return drift
         atomic_json(output, data)
         atomic_json(cache, data)
         return {'state': 'regenerated', 'from': str(refreshed), 'source': 'index-store',

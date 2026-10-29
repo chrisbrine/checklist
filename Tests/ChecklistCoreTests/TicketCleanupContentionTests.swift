@@ -234,6 +234,7 @@ extension TicketLifecycleCleanupTests {
 
 extension TicketLifecycleCleanupTests {
     func testOnePlannedTicketPerStepAndLargeUnrelatedPayloadDoesNotBlockProgress() throws {
+        try QualificationSuite.requireEnabled()
         let (p,t,a) = try fixture(),pid = p["id"] as! String
         try write {db in
             try self.router.save(db,["id":uuid(),"project_id":pid,"revision":1,"body":String(repeating:"unrelated-🟢",count:400000)],type:"message")
@@ -283,6 +284,7 @@ extension TicketLifecycleCleanupTests {
 
 extension TicketLifecycleCleanupTests {
     func testLargeUnrelatedOwnershipHeaderStaysBounded() throws {
+        try QualificationSuite.requireEnabled()
         let (p,_,a) = try fixture()
         try write {db in
             try self.router.save(db,["id":uuid(),"project_id":p["id"]!,"revision":1,"kind":String(repeating:"unrelated",count:700000),"body":"Large optional header value"],type:"message")

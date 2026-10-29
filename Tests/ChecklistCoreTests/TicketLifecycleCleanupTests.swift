@@ -216,6 +216,7 @@ final class TicketLifecycleCleanupTests: XCTestCase {
         XCTAssertThrowsError(try call("ticket_cleanup_receipts",["project_id":other["id"]!,"receipt_id":id]))
     }
     func testLargeBacklogIsBoundedAndCursorSurvivesRestart() throws {
+        try QualificationSuite.requireEnabled()
         let (p,_,_) = try fixture(category:"canceled",age:20)
         for _ in 0..<12 {
             let t = try call("task_create",["project_id":p["id"]!,"title":"Synthetic backlog"]);try mark(p,t,category:"canceled",age:20)

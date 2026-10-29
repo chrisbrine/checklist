@@ -157,6 +157,182 @@ final class ArchiveCleanupScanFenceTests: XCTestCase {
         XCTAssertLessThan(after,before,"The archive writer phase must not include the reference scan")
     }
 
+    /// CL-344 items 1-2 (qualification): 50,000+ records and one Done ticket with 64
+    /// managed attachments. 128 notes on that ticket name the originals (id and object
+    /// path), so all 64 go through archiveRetentionFacts -> completeArchiveCleanupHolds
+    /// inside the writer, and the fence id and target sets grow with the 64 originals
+    /// and the 128 notes (the printed fence_ids/fence_targets give the sizes).
+    /// A test-only SQLite profile trace on the writer connection times the archive's
+    /// write transaction (no production probe). A writer and three readers loop on
+    /// other threads for the whole command, including the snapshot scan.
+    func testQualificationSixtyFourAttachmentArchiveHoldConcurrentWriterAndReads() throws {
+        try QualificationSuite.requireEnabled()
+        let clock = {ProcessInfo.processInfo.systemUptime},setupStart = clock()
+        let f = try fixture(count:64),pid = f.project["id"] as! String,tid = f.task["id"] as! String
+        let filler = try call("task_create",["project_id":pid,"title":"Filler owner"]),other = try call("task_create",["project_id":pid,"title":"Concurrent writer target"])
+        let fid = filler["id"] as! String,oid = other["id"] as! String
+        try router.dbQueue.writeWithoutTransaction {db in try self.router.withValidatedDomainTransaction(db) {
+            let template: JSON = ["id":"00000000-0000-4000-8000-000000000000","project_id":pid,"task_id":fid,"revision":1,"body":String(repeating:"synthetic note text ",count:50),"refs":["a","b","c"]]
+            try self.router.save(db,template,type:"message")
+            try db.execute(sql:"""
+                WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<49999)
+                INSERT INTO records(id,project_id,type,revision,data)
+                SELECT printf('00000000-0000-4000-8000-%012d',i),project_id,type,revision,json_set(data,'$.id',printf('00000000-0000-4000-8000-%012d',i))
+                FROM n,records WHERE records.id='00000000-0000-4000-8000-000000000000'
+                """)
+            for (i,file) in f.files.enumerated() {
+                for (j,token) in [file["id"] as! String,file["path"] as! String].enumerated() {
+                    try self.router.save(db,["id":String(format:"00000000-0000-4000-9000-%012d",i * 2 + j),"project_id":pid,"task_id":tid,"revision":1,"body":"Evidence note","refs":[token]],type:"message")
+                }
+            }
+            return .commit
+        }}
+        // Fixture write: the ticket is Done (task_complete needs submitted work evidence).
+        let doneStatus = try XCTUnwrap(try router.dbQueue.read {db in try self.router.records(db,type:"status",project:pid).first {$0["category"] as? String == "done"}})
+        try writeTask(tid) {$0["status_id"] = doneStatus["id"];$0["status_category"] = "done"}
+        XCTAssertEqual(try call("task_get",["project_id":pid,"task_id":tid])["status_category"] as? String,"done")
+        let recordCount = try router.dbQueue.read {try Int.fetchOne($0,sql:"SELECT COUNT(*) FROM records") ?? 0}
+        XCTAssertGreaterThanOrEqual(recordCount,50_000)
+        let setup = clock() - setupStart
+
+        // The concurrent writer: task_edit commands on another ticket.
+        var otherRevision = other["revision"]!,editNumber = 0
+        func edit() throws {
+            editNumber += 1
+            let r = try call("task_edit",["project_id":pid,"task_id":oid,"expected_revision":otherRevision,"patch":["title":"Concurrent edit \(editNumber)"]])
+            otherRevision = r["revision"]!
+        }
+        let baseline = try (0..<10).map {_ -> TimeInterval in let s = clock();try edit();return clock() - s}
+        var s = clock()
+        let preview = try call("attachment_cleanup_preview",["project_id":pid,"task_id":tid])
+        let previewTotal = clock() - s
+
+        // Phase decomposition of the same writer functions on a prepared scan (rolled back).
+        s = clock()
+        let prepared = try XCTUnwrap(router.prepareArchiveCleanupScan(method:"task_archive",params:["project_id":pid,"task_id":tid,"cleanup":true]))
+        var phases: [String:TimeInterval] = ["scan":clock() - s],factCount = 0
+        let fenceSizes = (prepared.fenceIDs.count,prepared.targets.count,prepared.rows.count)
+        try router.dbQueue.writeWithoutTransaction {db in try self.router.withValidatedDomainTransaction(db) {
+            let task = try self.router.record(db,tid,type:"task")
+            let attachments = try self.router.scopedTaskRows(db,type:"attachment",task:task).filter {!bool($0,"unlinked")}
+            var p = clock();try prepared.validate(db,tokens:self.router.archiveCleanupTokens(attachments));phases["fence"] = clock() - p
+            p = clock();let index = try ArchiveCleanupReferenceIndex(prepared.rows);phases["index"] = clock() - p
+            p = clock()
+            for a in attachments {_ = try self.router.completeArchiveCleanupHolds(db,attachment:a,task:task,considerArchiving:true,currentGraph:prepared.rows,currentIndex:index)}
+            phases["holds_64"] = clock() - p
+            p = clock();factCount = try self.router.archiveRetentionFacts(db,task:task,considerArchiving:true,currentGraph:prepared.rows).count;phases["facts"] = clock() - p
+            return .rollback
+        }}
+        router.finishArchiveCleanupScan(prepared)
+        XCTAssertEqual(factCount,64,"Every attachment goes through completeArchiveCleanupHolds")
+
+        // Test-only probe: profile every statement on the writer connection.
+        final class Trace {let lock = NSLock();var events: [(at: TimeInterval,sql: String,duration: TimeInterval)] = []}
+        let trace = Trace()
+        try router.dbQueue.writeWithoutTransaction {db in db.trace(options:.profile) {event in
+            guard case let .profile(statement,duration) = event else {return}
+            let at = ProcessInfo.processInfo.systemUptime,sql = statement.sql
+            trace.lock.lock();trace.events.append((at,sql,duration));trace.lock.unlock()
+        }}
+        final class Box {
+            let lock = NSLock();var stop = false;var writes: [(start: TimeInterval,end: TimeInterval)] = [];var reads: [String:[TimeInterval]] = [:];var failures: [String] = []
+            var stopped: Bool {lock.lock();defer {lock.unlock()};return stop}
+            func record(_ body: () -> Void) {lock.lock();body();lock.unlock()}
+        }
+        let box = Box(),group = DispatchGroup(),storePath = router.root.appendingPathComponent("checklist.sqlite").path
+        var scanEnd: TimeInterval = 0
+        router.archiveCleanupScanObserver = {scanEnd = clock()}
+        group.enter()
+        DispatchQueue.global().async {
+            defer {group.leave()}
+            while !box.stopped {
+                let start = clock()
+                do {try edit();let end = clock();box.record {box.writes.append((start,end))}} catch {box.record {box.failures.append("task_edit: \(error)")}}
+                Thread.sleep(forTimeInterval:0.02)
+            }
+        }
+        for kind in ["service_info","task_get","new_connection"] {
+            group.enter()
+            DispatchQueue.global().async {
+                defer {group.leave()}
+                while !box.stopped {
+                    let start = clock()
+                    do {
+                        switch kind {
+                        case "service_info": _ = try self.router.handle(method:"service_info",params:[:],caller:self.owner)
+                        case "task_get": _ = try self.call("task_get",["project_id":pid,"task_id":tid])
+                        default:
+                            var configuration = Configuration();configuration.readonly = true;configuration.busyMode = .timeout(5)
+                            configuration.prepareDatabase {try SchemaMigrations.installStorageCollation($0)}
+                            let connection = try DatabaseQueue(path:storePath,configuration:configuration)
+                            _ = try connection.read {try Int.fetchOne($0,sql:"SELECT COUNT(*) FROM records WHERE type='task'")}
+                            try connection.close()
+                        }
+                        let elapsed = clock() - start
+                        box.record {box.reads[kind,default:[]].append(elapsed)}
+                    } catch {box.record {box.failures.append("\(kind): \(error)")}}
+                    Thread.sleep(forTimeInterval:0.01)
+                }
+            }
+        }
+        Thread.sleep(forTimeInterval:0.2)
+        let current = try call("task_get",["project_id":pid,"task_id":tid])
+        let archiveStart = clock(),archiveEnd: TimeInterval
+        do {
+            _ = try call("task_archive",["project_id":pid,"task_id":tid,"expected_revision":current["revision"]!,"action":"archive","cleanup":true,"cleanup_preview_id":preview["cleanup_preview_id"]!])
+            archiveEnd = clock()
+        } catch {box.record {box.stop = true};_ = group.wait(timeout:.now() + 60);throw error}
+        box.record {box.stop = true}
+        XCTAssertEqual(group.wait(timeout:.now() + 60),.success)
+        router.archiveCleanupScanObserver = nil
+        try router.dbQueue.writeWithoutTransaction {$0.trace(options:.profile,nil)}
+
+        // The archive's write transaction: the one that runs the fence queries.
+        var transaction: ArraySlice<(at: TimeInterval,sql: String,duration: TimeInterval)>?,open: Int?
+        let events = trace.events
+        for (i,e) in events.enumerated() {
+            let sql = e.sql.uppercased()
+            if sql.hasPrefix("BEGIN") {open = i}
+            else if let o = open,sql.hasPrefix("COMMIT") || sql.hasPrefix("END") || sql.hasPrefix("ROLLBACK") && !sql.contains(" TO ") {
+                let slice = events[o...i];open = nil
+                if slice.contains(where: {$0.sql.contains("archive_cleanup_scan_changes WHERE id IS NULL")}) {transaction = slice}
+            }
+        }
+        let tx = try XCTUnwrap(transaction,"The archive's write transaction ran the fence")
+        let txBegin = tx.first!.at - tx.first!.duration,txEnd = tx.last!.at
+        let fence = tx.filter {$0.sql.contains("temp.archive_cleanup_scan_changes") || $0.sql.contains("PRAGMA data_version")}
+        let fenceStart = fence.first!.at - fence.first!.duration,fenceEnd = fence.last!.at
+        let txHold = txEnd - txBegin,writerPhase = archiveEnd - scanEnd,total = archiveEnd - archiveStart,scan = scanEnd - archiveStart
+
+        let writes = box.writes,reads = box.reads,failures = box.failures
+        let duringScan = writes.filter {$0.start >= archiveStart && $0.end <= scanEnd}
+        let overlapping = writes.filter {$0.end > scanEnd && $0.start < archiveEnd}
+        let maxWait = overlapping.map {$0.end - $0.start}.max() ?? 0,baselineMax = baseline.max() ?? 0
+        // A write that arrives while the archive holds the gate and writer waits for the
+        // rest of that phase, then runs its own command (baseline). 0.25 s covers thread
+        // wakeup, the 20 ms loop pause and the journal trigger on its own payload.
+        let margin = baselineMax + 0.25
+        func stats(_ v: [TimeInterval]) -> String {
+            let sorted = v.sorted();guard !sorted.isEmpty else {return "n=0"}
+            return String(format:"n=%d p95=%.4fs max=%.4fs",sorted.count,sorted[min(sorted.count - 1,Int((Double(sorted.count) * 0.95).rounded(.up)) - 1)],sorted.last!)
+        }
+        let job = try XCTUnwrap(try jobs(f).first)
+        print(String(format:"CL-344 qualification64 records=%d attachments=64 job_items=%d fence_ids=%d fence_targets=%d scanned_rows=%d setup=%.3fs preview_total=%.3fs",recordCount,job.items.count,fenceSizes.0,fenceSizes.1,fenceSizes.2,setup,previewTotal))
+        print(String(format:"CL-344 qualification64 decomposition scan=%.3fs fence=%.4fs index=%.4fs holds_64=%.4fs facts=%.4fs",phases["scan"]!,phases["fence"]!,phases["index"]!,phases["holds_64"]!,phases["facts"]!))
+        print(String(format:"CL-344 qualification64 archive total=%.3fs scan=%.3fs writer_phase_upper_bound=%.4fs write_tx_hold=%.4fs tx_statements=%d tx_before_fence=%.4fs tx_fence=%.4fs tx_after_fence=%.4fs commit=%.4fs",total,scan,writerPhase,txHold,tx.count,fenceStart - txBegin,fenceEnd - fenceStart,txEnd - fenceEnd,tx.last!.duration))
+        print(String(format:"CL-344 qualification64 writer baseline_max=%.4fs margin=%.4fs writes=%d during_scan=%d overlapping_writer_phase=%d max_wait_overlapping=%.4fs max_any=%.4fs",baselineMax,margin,writes.count,duringScan.count,overlapping.count,maxWait,writes.map {$0.end - $0.start}.max() ?? 0))
+        print("CL-344 qualification64 reads service_info \(stats(reads["service_info"] ?? [])); task_get \(stats(reads["task_get"] ?? [])); new_connection \(stats(reads["new_connection"] ?? [])); failures=\(failures.count)")
+
+        XCTAssertEqual(try call("task_get",["project_id":pid,"task_id":tid])["archived"] as? Bool,true)
+        XCTAssertEqual(job.items.count,64,"All 64 originals are queued")
+        XCTAssertLessThanOrEqual(txHold,5,"The archive's write transaction holds at most 5 s")
+        XCTAssertLessThanOrEqual(writerPhase,5,"The archive's gate and writer phase is at most 5 s")
+        XCTAssertGreaterThan(duringScan.count,0,"Writes from another caller commit while the snapshot scan runs")
+        XCTAssertLessThanOrEqual(maxWait,writerPhase + margin,"A concurrent write waits at most the archive's write hold plus the margin")
+        XCTAssertTrue(failures.isEmpty,"\(failures.prefix(5))")
+        for kind in ["service_info","task_get","new_connection"] {XCTAssertGreaterThan(reads[kind]?.count ?? 0,0,kind)}
+    }
+
     // MARK: CL-345: the cleanup executor scans a read snapshot before the writer.
 
     func makeDue(_ f: (project: JSON,task: JSON,files: [JSON])) throws {
@@ -248,6 +424,7 @@ final class ArchiveCleanupScanFenceTests: XCTestCase {
     /// executor admission (full graph, holds and facts); after = the service
     /// turn's gate and writer phase (end of the snapshot scan to return).
     func testScaledExecutorWriteHoldBeforeAndAfter() throws {
+        try QualificationSuite.requireEnabled()
         let f = try fixture(count:1),filler = try call("task_create",["project_id":f.project["id"]!,"title":"Filler owner"])
         let pid = f.project["id"] as! String,tid = filler["id"] as! String
         try router.dbQueue.writeWithoutTransaction {db in try self.router.withValidatedDomainTransaction(db) {

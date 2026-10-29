@@ -11,6 +11,36 @@ final class EvidenceAuthorityTests: XCTestCase {
         _ = try router.handle(method:"epic_create",params:["command_id":uuid(),"project_id":project["id"]!,"name":"Fixture tickets"],caller:epicOwner)
         try router.dbQueue.write {try $0.execute(sql:"INSERT INTO metadata(key,value) VALUES ('test-evidence-project',?)",arguments:[try jsonString(project)])}
     }
+    // Each source test gets private Git metadata and source bytes, while the
+    // initial commit is prepared once for this linked test image.
+    private static let sourcePrepared = TestStore.DirectoryTemplate(name: "EvidenceAuthorityTests-source") { workspace in
+        try prepareSourceFixture(at: workspace)
+    }
+    private static func prepareSourceFixture(at workspace: URL) throws {
+        func write(_ path: String, _ content: String) throws {
+            let target = workspace.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(content.utf8).write(to: target)
+        }
+        func git(_ args: [String]) throws {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = ["-C", workspace.path] + args
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run(); process.waitUntilExit()
+            guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+                throw CoreError("FIXTURE_GIT_FAILED", "Preparing the private source fixture failed")
+            }
+        }
+        try write("tracked.txt", "base")
+        try write(".gitignore", "private/\n.build/\n")
+        try write("scripts/validate-plan.py", "from pathlib import Path\nassert Path('tracked.txt').read_text() == 'dirty'\nassert Path('untracked.txt').read_text() == 'new'\nprint('captured source passed')\n")
+        try git(["init"]); try git(["add", "."])
+        try git(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture"])
+        try write("tracked.txt", "dirty"); try write("untracked.txt", "new")
+        try write("private/receipt.txt", "never captured")
+    }
     private var preparedProject: JSON?
     var directory: URL!,workspace: URL!,router: CommandRouter!
     let owner = Caller(role:"owner",installation:"evidence-owner",projectIDs:[])
@@ -69,7 +99,16 @@ final class EvidenceAuthorityTests: XCTestCase {
     }
     func write(_ path: String,_ content: String) throws { let target = workspace.appendingPathComponent(path);try FileManager.default.createDirectory(at:target.deletingLastPathComponent(),withIntermediateDirectories:true);try Data(content.utf8).write(to:target) }
     func git(_ args: [String]) throws { let p = Process();p.executableURL = URL(fileURLWithPath:"/usr/bin/git");p.arguments = ["-C",workspace.path]+args;p.standardOutput = FileHandle.nullDevice;p.standardError = FileHandle.nullDevice;try p.run();p.waitUntilExit();XCTAssertEqual(p.terminationStatus,0) }
-    func sourceFixture() throws { try write("tracked.txt","base");try write(".gitignore","private/\n.build/\n");try write("scripts/validate-plan.py","from pathlib import Path\nassert Path('tracked.txt').read_text() == 'dirty'\nassert Path('untracked.txt').read_text() == 'new'\nprint('captured source passed')\n");try git(["init"]);try git(["add","."]);try git(["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-m","fixture"]);try write("tracked.txt","dirty");try write("untracked.txt","new");try write("private/receipt.txt","never captured") }
+    func sourceFixture() throws {
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        if try FileManager.default.contentsOfDirectory(atPath: workspace.path).isEmpty {
+            try Self.sourcePrepared.copy(to: workspace)
+        } else {
+            // Preserve git-add/overwrite semantics for a caller that supplies
+            // its own workspace content before requesting the source fixture.
+            try Self.prepareSourceFixture(at: workspace)
+        }
+    }
     func submitSource(_ p: JSON,_ a: JSON) throws -> JSON { var input = auth(p,a);input["acceptance_revision"] = 1;input["evidence_manifest"] = ["kind":"source","source_capture":[:]];return try call("work_submit",input) }
     func reviewClaim(_ p: JSON,_ submitted: JSON,_ reviewer: Caller) throws -> JSON {
         let task = submitted["task"] as! JSON

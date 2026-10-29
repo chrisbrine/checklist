@@ -18,8 +18,10 @@ class MeasurementTests(unittest.TestCase):
         # Fixture marker ownership must not inherit the caller scratch session.
         self.temporary = tempfile.TemporaryDirectory(dir='/private/tmp')
         self.addCleanup(self.temporary.cleanup)
-        caller = patch.dict(os.environ, {'CODEX_THREAD_ID': 'measurement-session', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
+        caller = patch.dict(os.environ, {'CODEX_THREAD_ID': 'measurement-session', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': '',
+                                         'CHECKLIST_TICKETS': ''})
         caller.start();self.addCleanup(caller.stop)
+        self.tickets = ['CL-359']
         self.root = Path(self.temporary.name).resolve()
         self.checkout = self.root / 'checkout'
         self.output = self.root / 'evidence'
@@ -34,7 +36,7 @@ class MeasurementTests(unittest.TestCase):
         (script / 'fixture.py').write_text('''import hashlib,json,os,pathlib,sys
 root=pathlib.Path(__file__).resolve().parents[1]
 inputs={str(p.relative_to(root)):p.read_text() for p in (root/'Sources').rglob('*.swift')}
-with (root/'calls.jsonl').open('a') as stream:stream.write(json.dumps({'mode':sys.argv[1],'scope':os.environ.get('CHECKLIST_BUILD_SCOPE'),'inputs':inputs})+'\\n')
+with (root/'calls.jsonl').open('a') as stream:stream.write(json.dumps({'mode':sys.argv[1],'scope':os.environ.get('CHECKLIST_BUILD_SCOPE'),'tickets':os.environ.get('CHECKLIST_TICKETS'),'inputs':inputs})+'\\n')
 if os.environ.get('FAIL_ON_EDIT') and any('measurement' in text for text in inputs.values()):raise SystemExit(7)
 capture=root/'.local/build/fixture';(capture/'Checklist.app').mkdir(parents=True,exist_ok=True)
 receipt={'timing':{'phases':{'compile':{'status':'skipped' if os.environ.get('SKIP_COMPILE') else 'completed'}}},'source_sha256':{p:hashlib.sha256(text.encode()).hexdigest() for p,text in inputs.items()}}
@@ -45,7 +47,8 @@ print('Staged '+str(capture/'Checklist.app'))
 
     def run_measurement(self):
         with contextlib.redirect_stdout(io.StringIO()):
-            return measure.measure(self.checkout, self.output, 'after-fixture', self.core, self.app, 'b' * 64)
+            return measure.measure(self.checkout, self.output, 'after-fixture', self.core, self.app, 'b' * 64,
+                                   tickets=self.tickets)
 
     def test_four_cases_three_runs_raw_logs_loads_medians_and_source_restoration(self):
         original = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in [self.checkout/self.core, self.checkout/self.app]}
@@ -56,6 +59,8 @@ print('Staged '+str(capture/'Checklist.app'))
         calls = [json.loads(line) for line in (self.checkout/'calls.jsonl').read_text().splitlines()]
         self.assertEqual(len(calls), 24)  # 12 warmups, 12 measured runs.
         self.assertEqual(sum(c['mode']=='--clean-stage' for c in calls), 3)
+        # CL-359: every measured stage build is registered with the run's tickets.
+        self.assertEqual({c['tickets'] for c in calls}, {'CL-359'})
         for case in measure.CASES:
             runs = [r for r in report['runs'] if r['case']==case]
             self.assertEqual([r['repetition'] for r in runs], [1,2,3])
@@ -75,16 +80,29 @@ print('Staged '+str(capture/'Checklist.app'))
 
     def test_root_is_marked_before_first_build_and_failure_keeps_protection(self):
         original = measure.stage
-        def stage(*args):
+        def stage(*args, **kwargs):
             marker = json.loads((self.output / '.checklist-workspace.json').read_text())
             self.assertEqual(marker['session_id'], 'measurement-session')
+            self.assertEqual(marker['tickets'], ['CL-359'])
             self.assertEqual(marker['source_fingerprint'], 'b' * 64)
             self.assertFalse(marker['released'])
-            return original(*args)
+            return original(*args, **kwargs)
         with patch.object(measure, 'stage', side_effect=stage), patch.dict(os.environ, SKIP_COMPILE='1'):
             with self.assertRaisesRegex(RuntimeError, 'without compiling'):
                 self.run_measurement()
         self.assertTrue((self.output / '.checklist-workspace.json').is_file())
+
+    def test_missing_tickets_refuse_before_any_output_or_build(self):
+        self.tickets = None
+        with self.assertRaisesRegex(ValueError, 'register the new folder'):
+            self.run_measurement()
+        self.assertFalse(self.output.exists())
+        self.assertFalse((self.checkout/'calls.jsonl').exists())
+        with patch.dict(os.environ, CHECKLIST_TICKETS='CL-1,CL-2'), patch.object(measure, 'mark_qualification',
+                side_effect=RuntimeError('stop after registration')) as mark:
+            with self.assertRaisesRegex(RuntimeError, 'stop after registration'):
+                self.run_measurement()
+        self.assertEqual(mark.call_args.kwargs['tickets'], ['CL-1', 'CL-2'])
 
     def test_invalid_owner_or_fingerprint_cannot_create_an_unmarked_output(self):
         with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}):

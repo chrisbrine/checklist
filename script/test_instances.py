@@ -25,7 +25,7 @@ import unicodedata
 from urllib.parse import unquote, urlsplit
 import uuid
 
-from clean_scratch import caller_session, mark_qualification, validate_fingerprint
+from clean_scratch import caller_session, mark_qualification, requested_tickets, validate_fingerprint
 from verify_stage import sha, signing_teams, verify as verify_stage
 from verify_install import failure_guidance, upgrading_message, upgrading_status
 
@@ -300,7 +300,7 @@ def stage_selection(arguments):
             return capture, manifest
         except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as error:
             print(f'Skipping incomplete/invalid stage {folder.name}: {error}', file=sys.stderr)
-    raise ValueError('No complete verified stage. Run script/build_and_run.sh --stage first.')
+    raise ValueError('No complete verified stage. Run script/build_and_run.sh --stage --ticket KEY first.')
 
 
 def relative_path(value):
@@ -1055,6 +1055,8 @@ def trash(folder, root=None):
 
 def create(arguments, p):
     session = caller_session(getattr(arguments, 'session_id', None))
+    # CL-359: a slot store copy is registered with its tickets before anything changes.
+    tickets = requested_tickets(getattr(arguments, 'tickets', None))
     stopped(p)
     if p['folder'].exists():
         if not arguments.replace: raise ValueError('Slot exists; use --replace after stopping it.')
@@ -1074,8 +1076,8 @@ def create(arguments, p):
         if p['folder'].exists(): destroy(p)
         p['folder'].mkdir(mode=0o700)
         mark_qualification(p['folder'], manifest['source_fingerprint'],
-                           'disposable test slot ' + str(arguments.slot), session)
-        metadata = {'slot': arguments.slot, 'build_id': manifest['build_id'], 'source_fingerprint': manifest['source_fingerprint'],
+                           'disposable test slot ' + str(arguments.slot), session, tickets=tickets)
+        metadata = {'slot': arguments.slot, 'tickets': tickets, 'build_id': manifest['build_id'], 'source_fingerprint': manifest['source_fingerprint'],
                     'stage_path': str(capture), 'seed': {'kind': 'incomplete'}, 'created_at': now(), 'mode': 'incomplete', 'checks': None}
         save(p, metadata)
         pending = contained(p['folder'] / '.seed-data', p['folder'])
@@ -1442,6 +1444,8 @@ def main():
             source = command.add_mutually_exclusive_group()
             source.add_argument('--stage', type=Path); source.add_argument('--latest-stage', action='store_true')
             command.add_argument('--session-id', help='actual owning session when no native host ID is exported')
+            command.add_argument('--ticket', dest='tickets', action='append', metavar='KEY',
+                                 help='owning ticket key (repeatable; or CHECKLIST_TICKETS=CL-1,CL-2); required')
             command.add_argument('--seed', type=seed_value, default='empty'); command.add_argument('--replace', action='store_true')
         if name == 'check':
             command.add_argument('--destroy-after-check', action='store_true',
@@ -1457,6 +1461,7 @@ def main():
     if arguments.command == 'create':
         # Identity first, then every source/destination's live-root admission, then locks/changes.
         arguments.session_id = caller_session(arguments.session_id)
+        arguments.tickets = requested_tickets(arguments.tickets)
     if arguments.command in ['stop', 'destroy'] and bool(arguments.slot) == bool(arguments.all):
         parser.error('Choose exactly one of --slot or --all.')
     if arguments.command == 'status':

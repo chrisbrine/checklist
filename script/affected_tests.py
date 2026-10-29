@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan affected checks; refresh a stale warm index when configured. Never run tests/install."""
+"""Plan affected checks; automatically refresh stale warm compiler inputs. Never run tests/install."""
 import argparse
 from fnmatch import fnmatchcase
 import hashlib
@@ -75,7 +75,31 @@ QUALIFICATION_TESTS = (
     'ChecklistCoreTests.TicketLifecycleCleanupTests/testOversizedSelectedTicketReportsRefusalWithoutBlockingAnotherProject',
     'ChecklistCoreTests.ArchiveCleanupExecutionTests/testScaledReceiptsListTiming',
     'ChecklistCoreTests.ArchiveCleanupScanFenceTests/testScaledArchiveWriteHoldBeforeAndAfter',
+    'ChecklistCoreTests.ArchiveCleanupScanFenceTests/testQualificationSixtyFourAttachmentArchiveHoldConcurrentWriterAndReads',
     'ChecklistCoreTests.StorageUpgradeOwnedCopyTests/testProtectedPreupgradePathsOnOwnedCurrentSchemaCopy',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testScaledCleanupBackupLookupTiming',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testBatchInventoryIgnoresLargeDeletionAccountingButPreservesUnknownJobReferences',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testP321ChunkAdmitsEveryEligibleTicketAndComposesGroupPurges',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testP321SweepCoversAllEligibleTicketsWhileUnrelatedNotesCommit',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testP321DoneWakesPreserveMidSweepProgress',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testP321DoneWakeBacklogReservesOrdinaryScanCapacity',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testOnePlannedTicketPerStepAndLargeUnrelatedPayloadDoesNotBlockProgress',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeUnrelatedOwnershipHeaderStaysBounded',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testDeletionCohortSharesObservationAndManifestAcrossMoreThan256Descriptors',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testDeletionCohortGenerationMutationFencesRemainingContinuationAndFreshPassRebuilds',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testDeletionCohortOversizedFirstReceiptDoesNotStarveBoundedSibling',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testLegacySettlementsWakeTheirTicketsWithoutRestartingTheOrdinarySweep',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeBacklogIsBoundedAndCursorSurvivesRestart',
+    'ChecklistCoreTests.CoreTests/testArchiveCleanupNeverDeletesReferencesAndPreservesMetadata',
+    'ChecklistCoreTests.CoreTests/testCleanupDoesNotDeleteNewlyEligibleUnpreviewedFile',
+    'ChecklistCoreTests.CoreTests/testCleanupRestartRechecksActualReaderLeaseAndRestoredTask',
+    'ChecklistCoreTests.CoreTests/testCleanupRestartRechecksPendingHumanInspection',
+    'ChecklistCoreTests.CoreTests/testCleanupRestartProtectsCurrentQueuedReviewOriginal',
+    'ChecklistCoreTests.CoreTests/testRealSizeBatchClaimRetainsMembershipAndReleaseFences',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testBatchInventoryOversizedOwnedTicketDoesNotRefuseOtherTicket',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testBatchInventoryOversizedForeignReferenceRefusesOnlyItsTarget',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testBatchInventoryAdmitsThirtyTwoIndependentTickets',
+    'ChecklistCoreTests.ArchiveCleanupScanFenceTests/testScaledExecutorWriteHoldBeforeAndAfter',
 )
 # Methods that assert a wall-clock budget, regardless of its size.
 # They keep their assertions unchanged but leave the parallel default pass and run in
@@ -145,6 +169,7 @@ FILE_TEST_CONSUMERS = {
     'Sources/ChecklistLegacyKeychain/ChecklistLegacyKeychain.c': ('ChecklistIPCTests',),
     'Sources/ChecklistLegacyKeychain/include/ChecklistLegacyKeychain.h': ('ChecklistIPCTests',),
     'docs/integrations.md': ('ChecklistCoreTests',),
+    'docs/mcp-contract.md': ('ChecklistCoreTests',),
     'examples/human-request.json': ('ChecklistCoreTests',),
     'contracts/human-request.schema.json': ('ChecklistCoreTests',),
     'contracts/ticket-bulk-edit.schema.json': ('ChecklistCoreTests',),
@@ -566,45 +591,164 @@ def _arguments(text, start):
             current += char
     return args + [current.strip()]
 
+def _swift_structure(text):
+    """Mask strings/comments without shifting offsets used by the source audit."""
+    masked, index = list(text), 0
+    string_open = re.compile(r'(#+)?("""|")')
+    while index < len(text):
+        start = index
+        if text.startswith('//', index):
+            end = text.find('\n', index)
+            index = len(text) if end < 0 else end
+        elif text.startswith('/*', index):
+            index += 2
+            depth = 1
+            while index < len(text) and depth:
+                if text.startswith('/*', index):
+                    depth += 1; index += 2
+                elif text.startswith('*/', index):
+                    depth -= 1; index += 2
+                else:
+                    index += 1
+        else:
+            opening = string_open.match(text, index)
+            if not opening:
+                index += 1
+                continue
+            hashes, quote = opening.group(1) or '', opening.group(2)
+            index += len(opening.group())
+            closing, escape = quote + hashes, '\\' + hashes
+            while index < len(text):
+                if text.startswith(escape, index):
+                    index += len(escape) + 1
+                elif text.startswith(closing, index):
+                    index += len(closing)
+                    break
+                else:
+                    index += 1
+        for position in range(start, min(index, len(text))):
+            if masked[position] != '\n':
+                masked[position] = ' '
+    return ''.join(masked)
+
 def _functions(text):
     """Yield (name, start, end, type) for members of top-level types (brace depth 1)."""
+    structure = _swift_structure(text)
     depth, depths = 0, []
-    for char in text:
+    for char in structure:
         depths.append(depth)
         depth += (char == '{') - (char == '}')
     types = []
-    for match in re.finditer(r'\b(?:class|struct|enum|actor|extension)\s+(\w+)[^{;]*\{', text):
+    for match in re.finditer(r'\b(?:class|struct|enum|actor|extension)\s+(\w+)[^{;]*\{', structure):
         if depths[match.start()] == 0:
-            types.append((match.group(1), match.end() - 1, _close(text, match.end() - 1, '{', '}')))
-    for match in re.finditer(r'\bfunc\s+(\w+)\s*(?:<[^>]*>)?\(', text):
+            types.append((match.group(1), match.end() - 1, _close(structure, match.end() - 1, '{', '}')))
+    for match in re.finditer(r'\bfunc\s+(\w+)\s*(?:<[^>]*>)?\(', structure):
         if depths[match.start()] != 1:
             continue
-        body = text.find('{', _close(text, match.end() - 1, '(', ')'))
+        body = structure.find('{', _close(structure, match.end() - 1, '(', ')'))
         owner = next((name for name, start, end in types if start < match.start() < end), None)
         if body >= 0 and owner:
-            yield match.group(1), match.start(), _close(text, body, '{', '}'), owner
+            yield match.group(1), match.start(), _close(structure, body, '{', '}'), owner
 
 
-def _budget(body):
-    # Conservative source audit, not a Swift interpreter. Follow simple local
-    # assignments and sample arrays, then inspect both comparison assertion forms.
-    # Keep clock/configuration equality tests and injected clocks in the unit suite.
+def _timer_call(expression, helpers):
+    return next((positions for name, positions in helpers.items()
+                 if re.search(r'\b' + re.escape(name) + r'\s*(?:\(|\{)', expression)), ())
+
+
+def _clock_value(expression, timed, helpers, names=False):
     clock = re.compile(CLOCK_READ.pattern + r'|timeIntervalSinceNow|Duration\b')
+    return bool(clock.search(expression) or (names and TIME_NAME.search(expression)) or
+                any(re.search(r'\b' + re.escape(name) + r'\b', expression) for name in timed) or
+                _timer_call(expression, helpers))
+
+
+def _variable_bindings(body):
+    """Read scalar/tuple bindings, including Swift's comma-separated declarations."""
+    structure = _swift_structure(body)
+    binding = re.compile(r'\s*(\([^=\n]+\)|\w+)\s*(?::[^=\n]+)?=\s*')
+    for declaration in re.finditer(r'\b(?:let|var)\s+', structure):
+        start = declaration.end()
+        end = start
+        while end < len(structure) and structure[end] not in ';\n':
+            end += 1
+        # Swift permits a continued declaration after a trailing comma.
+        while end < len(structure) and structure[end] == '\n' and structure[start:end].rstrip().endswith(','):
+            end += 1
+            while end < len(structure) and structure[end] not in ';\n':
+                end += 1
+        depth, piece = 0, start
+        boundaries = []
+        for index in range(start, end):
+            char = structure[index]
+            depth += char in '([{'
+            depth -= char in ')]}'
+            # A comma in a generic type/expression is not followed by a new
+            # binding. Requiring an initializer also avoids phantom aliases.
+            if char == ',' and depth == 0 and binding.match(structure, index + 1, end):
+                boundaries.append((piece, index))
+                piece = index + 1
+        boundaries.append((piece, end))
+        for first, last in boundaries:
+            match = binding.match(structure, first, last)
+            if match:
+                yield match.group(1).strip(), body[match.end():last]
+
+def _timed_bindings(body, helpers):
+    assignments = list(_variable_bindings(body))
+    expressions = [(name, value) for name, value in assignments if not name.startswith('(')]
+    expressions += re.findall(r'\b(\w+)\.append\(([^;\n]+)', body)
     timed = set()
-    expressions = re.findall(r'\b(?:let|var)\s+(\w+)\s*(?::[^=\n]+)?=\s*([^;,\n]+)', body)
-    expressions += re.findall(r'\b(\w+)\.append\(([^\n]+)', body)
+    for _ in range(len(assignments) + len(expressions) + 1):
+        previous = set(timed)
+        timed.update(name for name, value in expressions if _clock_value(value, timed, helpers))
+        for binding, value in assignments:
+            if binding.startswith('('):
+                names = _arguments(binding, 0)
+                positions = _timer_call(value, helpers)
+                if not positions and _clock_value(value, timed, helpers):
+                    positions = range(len(names))
+                timed.update(names[index].strip() for index in positions if index < len(names))
+        if previous == timed:
+            return timed
+    return timed
+
+
+def _timer_helpers(text):
+    """Infer clock-derived scalar/tuple return fields once per source file."""
+    functions, helpers = [], {}
+    structure = _swift_structure(text)
+    for match in re.finditer(r'\bfunc\s+(\w+)\s*(?:<[^>]*>)?\(', structure):
+        opening = structure.find('{', _close(structure, match.end() - 1, '(', ')'))
+        if opening >= 0:
+            functions.append((match.group(1), text[opening + 1:_close(structure, opening, '{', '}')]))
+    for _ in range(len(functions) + 1):
+        previous = dict(helpers)
+        for name, function in functions:
+            timed = _timed_bindings(function, helpers)
+            positions = set(helpers.get(name, ()))
+            for result in re.finditer(r'\breturn\s+([^;\n]+)', function):
+                expression = result.group(1).strip()
+                values = _arguments(expression, 0) if expression.startswith('(') else [expression]
+                positions.update(index for index, value in enumerate(values)
+                                 if _clock_value(value, timed, helpers))
+            if positions:
+                helpers[name] = tuple(sorted(positions))
+        if previous == helpers:
+            return helpers
+    return helpers
+
+
+def _budget(body, helpers=None):
+    # Conservative source audit, not a Swift interpreter. Follow local bindings,
+    # timing-returning helpers, tuple destructuring and sample aggregations.
+    # A tuple timer taints only measured fields; result-count checks stay ordinary.
+    helpers = _timer_helpers(body) if helpers is None else helpers
+    timed = _timed_bindings(body, helpers)
 
     def is_time(expression):
-        return bool(clock.search(expression) or TIME_NAME.search(expression) or
-                    any(re.search(r'\b' + re.escape(name) + r'\b', expression) for name in timed))
+        return _clock_value(expression, timed, helpers, names=True)
 
-    for _ in range(len(expressions) + 1):
-        previous = set(timed)
-        timed.update(name for name, value in expressions
-                     if clock.search(value) or any(re.search(r'\b' + re.escape(other) + r'\b', value)
-                                                   for other in timed))
-        if previous == timed:
-            break
     for match in re.finditer(r'XCTAssert(LessThan(?:OrEqual)?|True)\s*\(', body):
         args = _arguments(body, match.end() - 1)
         if match.group(1) == 'True':
@@ -630,7 +774,8 @@ def wall_clock_budget_cases(root):
         text = source.read_text()
         target = source.relative_to(root / 'Tests').parts[0]
         functions = list(_functions(text))
-        direct = {name: list(_budget(text[start:end])) for name, start, end, _ in functions}
+        helpers = _timer_helpers(text)
+        direct = {name: list(_budget(text[start:end], helpers)) for name, start, end, _ in functions}
         timed = {name for name, hits in direct.items() if hits}
         changed = True
         while changed:

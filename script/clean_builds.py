@@ -16,8 +16,10 @@ import stat
 import subprocess
 import sys
 
-from clean_scratch import (DEFAULT_BUDGET_GB, FINISHED, WORKSPACE_MARKER, du_sizes, inventory, running_paths, storage_groups,
-                           storage_report, within, workspace_protection)
+from clean_scratch import (DEFAULT_BUDGET_GB, FINISHED, OWNER_RECORD, WORKSPACE_MARKER, background_sizes,
+                           cli_status_reader, du_sizes, inventory, read_owner_record, release_finished,
+                           running_paths, storage_groups, storage_report, ticket_roots, within,
+                           workspace_protection)
 from retire_old_bundles import trash, trash_many
 import test_instances as slots
 
@@ -176,6 +178,8 @@ class Cleaner:
         self.protected_cache = None
         self.status_cache = None
         self.status_error = None
+        # CL-359 item 0: folders with no owner record, listed in the summary.
+        self.unregistered = []
 
     def protected(self):
         # Even when installation receipts are unavailable, no path may alias live
@@ -197,8 +201,10 @@ class Cleaner:
         return self.preview_process_snapshot
 
     def item(self, path, kind, reason=None, eligible=None, eligible_reason="eligible for Trash",
-             internal_links=False, before_move=None, entries=None):
+             internal_links=False, before_move=None, entries=None, extra=None):
         """Recheck identity, policy and use before each move; no cached apply plan."""
+        if extra and extra.get('registration') == 'unregistered':
+            self.unregistered.append(str(path))
         try:
             safe(path)
             before = inventory(path) if entries is None else entries
@@ -211,6 +217,7 @@ class Cleaner:
             report = {'path': str(path), 'kind': kind, 'bytes': size_of(before),
                       'action': 'kept' if why else 'eligible',
                       'reason': why or eligible_reason}
+            report.update(extra or {})
             self.reports[path] = report
             if not why and self.apply and self.pending is not None:
                 self.pending.append((path, before, report, eligible, internal_links, before_move))
@@ -336,30 +343,35 @@ class Cleaner:
             self.process_snapshot = self.processes()
             for folder in sorted(self.build.iterdir()):
                 if folder.name in {'test-impact-map.json', 'test-impact-index.json', 'index-inputs.json'}:
-                    self.item(folder, 'test_selection_cache', reason='coverage/index selection evidence retained')
+                    self.item(folder, 'test_selection_cache', reason='coverage/index selection evidence retained',
+                              extra=SHARED)
                 elif FINGERPRINT.fullmatch(folder.name):
+                    owner = registration(folder)
                     if folder.name in retained:
-                        self.item(folder, 'build', reason='installed/previous build retained')
+                        self.item(folder, 'build', reason='installed/previous build retained', extra=owner)
                         continue
                     if why := unchanged_install(folder):
-                        self.item(folder, 'build', reason=why)
+                        self.item(folder, 'build', reason=why, extra=owner)
                         continue
                     manifest = read_json(folder / 'capture-manifest.json')
                     if fingerprint(manifest) != folder.name:
-                        self.item(folder, 'build', reason='capture identity mismatch')
+                        self.item(folder, 'build', reason='capture identity mismatch', extra=owner)
                         continue
+                    if owner['registration'] == 'unregistered':
+                        self.unregistered.append(str(folder))
                     for child in sorted(folder.iterdir()):
                         scratch = bool(SCRATCH.fullmatch(child.name))
                         if child.name in OUTPUTS or scratch:
                             self.item(child, 'build_output', eligible=lambda f=folder: unchanged_install(f),
                                       internal_links=scratch or child.name == '.build',
                                       before_move=lambda p=child, f=folder: self.preserve_build_info(p, f),
-                                      eligible_reason='obsolete copied build output; receipts retained')
+                                      eligible_reason='obsolete copied build output; receipts retained',
+                                      extra={'capture_registration': owner['registration'], 'tickets': owner['tickets']})
                 elif SCRATCH.fullmatch(folder.name):
                     lane = self.build / ('lane-' + SCRATCH.fullmatch(folder.name)[1]) / 'source'
                     why = 'current persistent SwiftPM lane retained' if lane.is_dir() else None
                     self.item(folder, 'swiftpm_scratch', reason=why, eligible=unchanged_install,
-                              internal_links=True,
+                              internal_links=True, extra=SHARED,
                               eligible_reason='legacy SwiftPM scratch has no current persistent lane')
             if self.apply and self.pending: self.flush_builds(refresh)
         finally:
@@ -377,9 +389,10 @@ class Cleaner:
             sizes[path] = 0 if stat.S_ISDIR(metadata[2]) else metadata[3]
         for path in reversed(entries):
             names = {p.name for p in children.get(path, [])}
-            if path.name in {'managed', 'source-captures', 'source', 'src', '.build'} or names & {'checklist.sqlite', 'database.sqlite'}:
+            if OWNER_RECORD not in names and (path.name in {'managed', 'source-captures', 'source', 'src', '.build'}
+                                               or names & {'checklist.sqlite', 'database.sqlite'}):
                 opaque.add(path)
-            owns = bool(TICKET.search(path.name) or names & {'cleanup.json', 'files.json'})
+            owns = bool(TICKET.search(path.name) or names & HANDIN_RECORDS)
             if stat.S_ISDIR(entries[path][2]) and path not in opaque and (owns or any(p in scoped for p in children.get(path, []))):
                 scoped.add(path)
             if path != folder: sizes[path.parent] += sizes[path]
@@ -392,7 +405,7 @@ class Cleaner:
             names = {p.name for p in children.get(path, [])}
             if stat.S_ISLNK(entries[path][2]):
                 yield 'link', path
-            elif stat.S_ISDIR(entries[path][2]) and path not in opaque and (TICKET.search(path.name) or names & {'cleanup.json', 'files.json'}):
+            elif stat.S_ISDIR(entries[path][2]) and path not in opaque and (TICKET.search(path.name) or names & HANDIN_RECORDS):
                 yield 'handin', path
             else:
                 yield 'container', path
@@ -437,16 +450,23 @@ class Cleaner:
                         elif step == 'handin':
                             post = ((lambda path=path, before=before: self.post_notes(path, before))
                                     if self.note_poster else None)
+                            keys, basis, problems = self.owners.get(path, (set(), 'none', []))
                             self.item(path, 'evidence', eligible=self.evidence_check(path, before), entries=before,
-                                      before_move=post, eligible_reason='all owning tickets are Done or canceled')
+                                      before_move=post, eligible_reason='all owning tickets are Done or canceled',
+                                      extra={'registration': 'owner.json' if basis == OWNER_RECORD else
+                                                             'invalid' if problems else 'unregistered',
+                                             'tickets': sorted(keys), 'owner_basis': basis})
                         else:
                             directory = stat.S_ISDIR(entries[path][2])
+                            state = 'container' if path in scoped else 'unregistered'
+                            if state == 'unregistered': self.unregistered.append(str(path))
                             reason = ('store/source tree retained; no hand-in discovery' if path in opaque else
                                       'unscoped container retained; inspect ticket children' if path in scoped else
                                       'unscoped container retained; no ticket hand-ins' if directory else
                                       'unscoped evidence retained')
                             print(json.dumps({'path': str(path), 'kind': 'evidence_container' if directory else 'evidence',
-                                              'bytes': sizes[path], 'action': 'kept', 'reason': reason}, sort_keys=True))
+                                              'bytes': sizes[path], 'action': 'kept', 'reason': reason,
+                                              'registration': state}, sort_keys=True))
                 except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
                     self.failed = True
                     print(json.dumps({'path': str(folder), 'kind': 'evidence', 'action': 'kept_error', 'bytes': None, 'reason': str(error)}))
@@ -563,13 +583,16 @@ class Cleaner:
             if not self.apply:
                 # Preview fast path (CL-359): a marker-held slot reports from its
                 # marker and one du size, with no full inventory.
+                owner = slot_registration(p)
                 held = held_slot_reason(p['folder'])
                 if held:
+                    if owner['registration'] == 'unregistered': self.unregistered.append(str(p['folder']))
                     size = (self.sizer or du_sizes)([p['folder']]).get(p['folder'])
                     print(json.dumps({'path': str(p['folder']), 'kind': 'test_slot', 'bytes': size,
-                                      'action': 'kept', 'reason': held}, sort_keys=True))
+                                      'action': 'kept', 'reason': held, **owner}, sort_keys=True))
                     continue
-                self.item(p['folder'], 'test_slot', eligible=eligible, eligible_reason='idle slot; no app/check or registered job uses it')
+                self.item(p['folder'], 'test_slot', eligible=eligible, eligible_reason='idle slot; no app/check or registered job uses it',
+                          extra=owner)
                 continue
             # Preview decisions never authorize stopping an app. Acquire the same
             # lock used by create/start/check/promote, then destroy only if idle.
@@ -590,6 +613,14 @@ class Cleaner:
                 finally: self.mover = original
 
 
+def slot_registration(p):
+    """CL-359: the tickets test_instances.py create records in slot.json."""
+    try: tickets = slots.load(p).get('tickets')
+    except (OSError, ValueError, KeyError, TypeError): tickets = None
+    return ({'registration': 'slot.json', 'tickets': sorted(tickets)} if isinstance(tickets, list) and tickets
+            else {'registration': 'unregistered', 'tickets': []})
+
+
 def held_slot_reason(folder):
     """The persistent-marker reason when the folder or an ancestor holds it, else None."""
     if folder.is_symlink(): return None
@@ -598,33 +629,17 @@ def held_slot_reason(folder):
     return reason if reason and reason.startswith('persistent workspace marker') else None
 
 
-def background_sizes(groups, workers=8, chunk=16):
-    """Preview sizer for storage_report: du runs while the preview inspects folders.
+HANDIN_RECORDS = {'cleanup.json', 'files.json', OWNER_RECORD}
+# Shared caches serve every ticket; they are never per-ticket registered.
+SHARED = {'registration': 'shared_cache', 'tickets': []}
 
-    A root directory is sized as its own block plus its children, in parallel du
-    calls of up to `chunk` children each (one large scratchpad took 27 s as one
-    du). A hard link shared by two chunks counts twice. A missing root is absent.
-    """
-    pool = ThreadPoolExecutor(max_workers=workers)
-    plans = {}
-    for path in {path for paths in groups.values() for path in paths}:
-        if not os.path.lexists(path): continue
-        try:
-            if path.is_symlink() or not path.is_dir(): raise NotADirectoryError(path)
-            own = path.lstat().st_blocks * 512
-            parts = sorted(path.iterdir())
-        except OSError:
-            own, parts = 0, [path]
-        plans[path] = (own, [pool.submit(du_sizes, parts[i:i + chunk]) for i in range(0, len(parts), chunk)])
-    pool.shutdown(wait=False)
-    def sizer(paths):
-        result = {}
-        for path in paths:
-            if path in plans:
-                own, futures = plans[path]
-                result[path] = own + sum(sum(f.result().values()) for f in futures)
-        return result
-    return sizer
+
+def registration(folder):
+    """CL-359 report fields of a folder's owner.json: registered keys, 'unregistered' or 'invalid'."""
+    try: record = read_owner_record(folder)
+    except (OSError, ValueError): return {'registration': 'invalid', 'tickets': []}
+    return ({'registration': OWNER_RECORD, 'tickets': record['tickets']} if record
+            else {'registration': 'unregistered', 'tickets': []})
 
 
 def ticket_values(value):
@@ -657,12 +672,18 @@ def readable_rows(path):
 
 
 def evidence_owners(folder, entries=None):
-    """(keys, basis, problems) for one hand-in. Keys come from files.json entries
+    """(keys, basis, problems) for one hand-in. An owner.json registration decides
+    alone. Otherwise keys come from files.json entries
     ("ticket" or "tickets"), cleanup.json "tickets" and the folder name (the fallback
     when entries lack a ticket key). Ticket keys in nested file names add owners but
     never establish ownership alone. No keys means unknown owner; an unreadable
     record is a problem. Neither raises: both retain the folder."""
     entries = inventory(folder) if entries is None else entries
+    # CL-359: the owner.json registration written at creation is read first.
+    if (folder / OWNER_RECORD) in entries:
+        try: record = read_owner_record(folder)
+        except (OSError, ValueError) as error: return set(), 'none', [f'{OWNER_RECORD}: {error}']
+        if record: return set(record['tickets']), OWNER_RECORD, []
     keys, problems, named, recorded, nested = set(), [], set(), {}, set()
     missing = 0
     for path, entry in entries.items():
@@ -791,12 +812,36 @@ def build_lock(build, apply):
 
 
 def finish(cleaner):
+    # CL-359 item 0: folders without an owner record, for registration follow-up.
     print(json.dumps({'action': 'summary', 'bytes_removed': cleaner.moved,
+                      'unregistered_count': len(cleaner.unregistered), 'unregistered': cleaner.unregistered[:200],
                       'meaning': 'logical bytes moved to Trash; disk space is not reclaimed until Trash is emptied'}))
     return 1 if cleaner.failed else 0
 
 
-def post_install(repo, capture):
+def release_done(repo, environ=None, reader=None, sessions_root=None, qualification_root=None):
+    """CL-359 item 1: each install is a round boundary. Run clean_scratch.py
+    --release-done for the installing session: release its marked folders whose
+    tickets are all Done or canceled. Release only changes the marker; the move
+    happens at the next clean_scratch.py --apply, which still keeps a folder a
+    running process uses. Folders of open tickets stay marked."""
+    environ = os.environ if environ is None else environ
+    session = environ.get('CODEX_THREAD_ID') or environ.get('CLAUDE_SESSION_ID') or environ.get('CHECKLIST_SESSION_ID')
+    if not session or session in {'.', '..'} or '/' in session:
+        print(json.dumps({'action': 'release_done', 'status': 'skipped',
+                          'reason': 'no caller session exported; run clean_scratch.py --release-done'}), flush=True)
+        return 0
+    try:
+        reader = reader or cli_status_reader(Path('/Applications/Checklist.app/Contents/MacOS/checklist'), Path(repo).resolve())
+        roots = ticket_roots(Path(sessions_root or f'/private/tmp/claude-{os.getuid()}'),
+                             Path(qualification_root or Path.home() / 'Library/Caches/ChecklistQualification'), session)
+        return release_finished(roots, session, reader)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        print(json.dumps({'action': 'release_done', 'status': 'failed', 'reason': str(error)}), flush=True)
+        return 1
+
+
+def post_install(repo, capture, release=None):
     """Explicit background install step; acquire our own lease after installer exit."""
     cleaner = Cleaner(Path(repo), Path('/Applications/Checklist.app'), apply=True)
     with build_lock(cleaner.build, True):
@@ -804,7 +849,9 @@ def post_install(repo, capture):
         if fingerprint(read_json(Path(capture) / 'capture-manifest.json')) not in ids:
             raise ValueError('installed build changed before cleanup')
         cleaner.builds()
-    return finish(cleaner)
+    status = finish(cleaner)
+    # The release runs after the build lease ends; a failure never undoes the build cleanup.
+    return (release or release_done)(repo) or status
 
 
 def main():

@@ -5,6 +5,7 @@ import GRDB
 
 extension TicketLifecycleCleanupTests {
     func testP321ChunkAdmitsEveryEligibleTicketAndComposesGroupPurges() throws {
+        try QualificationSuite.requireEnabled()
         let (project,first,_) = try fixture(category:"canceled",age:20),pid = project["id"] as! String
         var tasks = [first]
         for n in 1..<32 {
@@ -25,6 +26,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testP321SweepCoversAllEligibleTicketsWhileUnrelatedNotesCommit() throws {
+        try QualificationSuite.requireEnabled()
         let (project,first,_) = try fixture(category:"canceled",age:20),pid = project["id"] as! String
         let traffic = try call("task_create",["project_id":pid,"title":"Ordinary note traffic"])
         var eligible = [first]
@@ -84,6 +86,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testP321DoneWakesPreserveMidSweepProgress() throws {
+        try QualificationSuite.requireEnabled()
         let (project,first,_) = try fixture(category:"canceled",age:20),pid = project["id"] as! String
         var old: [JSON] = []
         for n in 0..<40 {
@@ -108,6 +111,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testP321DoneWakeBacklogReservesOrdinaryScanCapacity() throws {
+        try QualificationSuite.requireEnabled()
         let (project,_,_) = try fixture(category:"canceled",age:20),pid = project["id"] as! String
         var cursor: Int64 = 0
         for n in 0..<40 {

@@ -9,10 +9,11 @@ Establish the caller's actual identity before creating a slot. Native Codex/Clau
 Build once with the ordinary immutable capture helper:
 
 ```sh
-CHECKLIST_BUILD_SCOPE=test CHECKLIST_BUILD_CONFIGURATION=debug ./script/build_and_run.sh --stage
-./script/test_instances.py create --slot 1 --latest-stage
+# Both commands refuse without ticket keys (--ticket KEY or CHECKLIST_TICKETS; CL-359).
+CHECKLIST_BUILD_SCOPE=test CHECKLIST_BUILD_CONFIGURATION=debug ./script/build_and_run.sh --stage --ticket CL-N
+./script/test_instances.py create --slot 1 --latest-stage --ticket CL-N
 # Or select the exact .local/build/<fingerprint> capture directory:
-./script/test_instances.py create --slot 2 --stage .local/build/<fingerprint> --seed latest-backup
+./script/test_instances.py create --slot 2 --stage .local/build/<fingerprint> --seed latest-backup --ticket CL-N
 ```
 
 The `test` scope does not consume a shared development version and cannot be promoted. For a round whose exact stage will later be installed, use `CHECKLIST_BUILD_SCOPE=install` instead, then qualify that capture. See [build versions](self-hosting.md#build-versions).
@@ -190,7 +191,7 @@ Call `backup_create` through that installation's CLI/MCP and retain its returned
 The trusted app's Storage → Preview backup restore verifies a backup, shows its unavailable/external references and prepares a separate restored data root only after explicit owner confirmation. It keeps the existing installation intact. A separately authorized disposable qualification can now start that candidate with the verified stage:
 
 ```sh
-./script/test_instances.py create --slot N --stage /absolute/verified-stage --seed 'restored:/absolute/test-data/restore/restored-<job>' --replace
+./script/test_instances.py create --slot N --stage /absolute/verified-stage --seed 'restored:/absolute/test-data/restore/restored-<job>' --replace --ticket CL-N
 ./script/test_instances.py start --slot N --headless
 ```
 

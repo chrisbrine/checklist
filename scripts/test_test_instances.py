@@ -59,6 +59,18 @@ def attachment(path):
             'revision': 1, 'created_at': '2026-10-20T00:00:00Z', 'author': 'owner:fixture', 'origin': 'human_ui'}
 
 
+# CL-359: create refuses a slot without tickets; fixtures register CL-359.
+_TICKETS = patch.dict(os.environ, CHECKLIST_TICKETS='CL-359')
+
+
+def setUpModule():
+    _TICKETS.start()
+
+
+def tearDownModule():
+    _TICKETS.stop()
+
+
 class TestInstancesTests(unittest.TestCase):
     def test_create_accepts_explicit_session_id_with_and_without_replace(self):
         for replace in [False, True]:
@@ -439,6 +451,7 @@ class DestroyCleanupTests(unittest.TestCase):
                         marker_path = state.p['folder'] / '.checklist-workspace.json'
                         marker = json.loads(marker_path.read_text())
                         self.assertEqual(marker['session_id'], 'slot-fixture')
+                        self.assertEqual(marker['tickets'], ['CL-359'])
                         self.assertFalse(marker['released'])
                         self.assertEqual(marker['source_fingerprint'], 'b' * 64)
                         self.assertTrue(all(count == 0 for count in state.counts.values()))
@@ -496,6 +509,31 @@ class DestroyCleanupTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'caller session unknown/invalid'):
                     harness.main()
                 checked.assert_not_called();locked.assert_not_called();create.assert_not_called()
+
+    def test_missing_tickets_refuse_before_slot_changes(self):
+        # CL-359: a slot store copy without ticket keys is refused before stop/replace.
+        with self.slot() as state, patch.dict(os.environ, CHECKLIST_TICKETS=''), \
+             patch.object(harness, 'stopped') as stopped, patch.object(harness, 'stage_selection') as stage, \
+             patch.object(harness, 'destroy') as destroy:
+            with self.assertRaisesRegex(ValueError, 'register the new folder'):
+                harness.create(SimpleNamespace(slot=4, replace=True, seed='empty', session_id='slot-fixture'), state.p)
+            with self.assertRaisesRegex(ValueError, 'ticket keys must be'):
+                harness.create(SimpleNamespace(slot=4, replace=True, seed='empty', session_id='slot-fixture',
+                                               tickets=['not a key']), state.p)
+            stopped.assert_not_called();stage.assert_not_called();destroy.assert_not_called()
+            self.assertEqual(harness.load(state.p), {'slot': 4})
+        argv = ['test_instances.py', 'create', '--slot', '4', '--seed', 'empty']
+        with patch.object(sys, 'argv', argv), patch.dict(os.environ, CODEX_THREAD_ID='slot-fixture', CHECKLIST_TICKETS=''), \
+             patch.object(harness, 'checked') as checked, patch.object(harness, 'locked') as locked, \
+             patch.object(harness, 'create') as create:
+            with self.assertRaisesRegex(ValueError, 'register the new folder'):
+                harness.main()
+            checked.assert_not_called();locked.assert_not_called();create.assert_not_called()
+        with patch.object(sys, 'argv', argv + ['--ticket', 'CL-9', '--ticket', 'CL-8']), \
+             patch.dict(os.environ, CODEX_THREAD_ID='slot-fixture', CHECKLIST_TICKETS=''), \
+             patch.object(harness, 'checked'), patch.object(harness, 'locked'), patch.object(harness, 'create') as create:
+            harness.main()
+            self.assertEqual(create.call_args.args[0].tickets, ['CL-8', 'CL-9'])
 
     def test_replace_cleanup_failure_preserves_slot_and_never_copies_stage(self):
         with self.slot() as state, patch.object(harness, 'stopped'), \

@@ -161,6 +161,9 @@ extension CommandRouter {
     }
 
     func prepareTicketObjectDeletionCandidates(_ db: Database,receipt: JSON,reactivated: Bool,backupGenerationRow: Int64,references: TicketObjectDeletionReferenceIndex,backup: inout StorageBackupRetentionIndex?,mediaComplete: Bool,fence: TicketCleanupFence) throws -> TicketCleanupPreparedDeletion {
+        if Self.isLegacyDoneEvidenceDeletion(receipt) {
+            return .init(fence:fence,receipt:receipt,reactivated:reactivated,backupGenerationRow:backupGenerationRow,references:references,backup:nil,mediaAuthorityComplete:mediaComplete,candidatePaths:[],verifications:[:],verificationFailures:[:])
+        }
         var objects = receipt["objects"] as? [JSON] ?? []
         for i in objects.indices where objects[i]["state"] as? String == "pending" && objects[i]["kind"] as? String == "symlink" {
             let holds = try ticketObjectDeletionHolds(db,object:objects[i],references:references,backup:backup,mediaAuthorityComplete:mediaComplete)

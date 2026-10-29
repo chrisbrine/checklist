@@ -132,7 +132,14 @@ final class CoreTests: XCTestCase {
         let p = try project();let taxonomy = try call("taxonomy_get",["project_id":p["id"]!]);let queued = (taxonomy["statuses"] as! [JSON]).first {$0["category"] as? String == "queued"}!
         assertCode("STATUS_REQUIRED") { _ = try self.call("status_retire",["project_id":p["id"]!,"status_id":queued["id"]!,"expected_revision":1]) }
         let t = try task(p)
-        for n in 0..<210 { _ = try call("message_send",["project_id":p["id"]!,"task_id":t["id"]!,"body":"Note \(n)"]) }
+        // Pagination needs 210 canonical notes/events, not 210 independent
+        // command journals and maintenance boundaries. Message routing itself
+        // remains covered by the communication tests in this class.
+        try fixtureDomainTransaction { db in
+            for n in 0..<210 {
+                _ = try router.messageWrite(db,["project_id":p["id"]!,"task_id":t["id"]!,"body":"Note \(n)"],owner,"message_send")
+            }
+        }
         let first = try call("history_list",["project_id":p["id"]!,"task_id":t["id"]!]);let second = try call("history_list",["project_id":p["id"]!,"task_id":t["id"]!,"cursor":first["next_cursor"]!]);XCTAssertEqual((first["events"] as! [JSON]).count,200);XCTAssertEqual((second["events"] as! [JSON]).count,11)
     }
     func testConcurrentClaimsAndRestart() throws {
@@ -154,6 +161,7 @@ final class CoreTests: XCTestCase {
         let after = try call("task_get",["project_id":p["id"]!,"task_id":t["id"]!]);XCTAssertNotNil(after["active_attempt_id"])
     }
     func testArchiveCleanupNeverDeletesReferencesAndPreservesMetadata() throws {
+        try QualificationSuite.requireEnabled() // Real 21 MiB original copy/hash and cleanup qualification.
         let p = try project();let t = try task(p);let source = directory.appendingPathComponent("large.bin")
         try Data(repeating:7,count:21*1024*1024).write(to:source)
         let managed = try call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":source.path]);let external = try call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":source.path,"mode":"external_reference"])
@@ -177,6 +185,7 @@ final class CoreTests: XCTestCase {
         let reference = try call("attachment_read",["project_id":p["id"]!,"attachment_id":external["id"]!,"representation":"metadata"]);XCTAssertEqual(reference["availability"] as? String,"available")
     }
     func testCleanupDoesNotDeleteNewlyEligibleUnpreviewedFile() throws {
+        try QualificationSuite.requireEnabled() // Real 21 MiB original copy/hash and cleanup qualification.
         let p = try project();let t = try task(p);let source = directory.appendingPathComponent("large.bin");try Data(repeating:4,count:21*1024*1024).write(to:source)
         let a = try call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":source.path]);_ = try call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":source.path])
         let request = try call("human_request_create",["project_id":p["id"]!,"task_id":t["id"]!,"questions":[["id":"q","type":"approval","prompt":"Inspect it"]],"target_attachment_id":a["id"]!])
@@ -482,6 +491,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(item.state,.held);XCTAssertTrue(item.holds.contains(reason))
     }
     func testCleanupRestartRechecksActualReaderLeaseAndRestoredTask() throws {
+        try QualificationSuite.requireEnabled() // Real 21 MiB original copy/hash and cleanup qualification.
         let p = try project();let t = try task(p);let path = directory.appendingPathComponent("reader-held.bin");try Data(repeating:3,count:21*1024*1024).write(to:path)
         let a = try call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":path.path]);let read = try call("attachment_read",["project_id":p["id"]!,"attachment_id":a["id"]!,"representation":"original"])
         XCTAssertNotNil(read["read_hold_id"])
@@ -494,6 +504,7 @@ final class CoreTests: XCTestCase {
         router = nil;router = try TestStore.router(root:directory);try router.runStorageMaintenance() /* CL-345: the service turn scans */;XCTAssertTrue(FileManager.default.fileExists(atPath:a2["path"] as! String));XCTAssertEqual(try call("cleanup_job_get",["project_id":p["id"]!,"cleanup_job_id":restoredJob["id"]!])["state"] as? String,"canceled");XCTAssertEqual(try call("attachment_read",["project_id":p["id"]!,"attachment_id":a2["id"]!])["availability"] as? String,"available")
     }
     func testCleanupRestartRechecksPendingHumanInspection() throws {
+        try QualificationSuite.requireEnabled() // Real 21 MiB original copy/hash and cleanup qualification.
         let p = try project();let t = try task(p);let path = directory.appendingPathComponent("inspection-held.bin");try Data(repeating:5,count:21*1024*1024).write(to:path)
         let a = try call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":path.path]);let request = try call("human_request_create",["project_id":p["id"]!,"task_id":t["id"]!,"target_attachment_id":a["id"]!,"questions":[["id":"inspect","type":"approval","prompt":"Inspect the original"]]])
         let job = try markCommittedCleanupForCrashFixture(taskID:t["id"] as! String,attachmentID:a["id"] as! String);router = nil;router = try TestStore.router(root:directory);try router.runStorageMaintenance() /* CL-345: the service turn scans */
@@ -581,6 +592,7 @@ final class CoreTests: XCTestCase {
     }
 
     func testCleanupRestartProtectsCurrentQueuedReviewOriginal() throws {
+        try QualificationSuite.requireEnabled() // Real 21 MiB original copy/hash and cleanup qualification.
         let value = try submittedArtifact(data:Data(repeating:8,count:21*1024*1024))
         let job = try markCommittedCleanupForCrashFixture(taskID:value.task["id"] as! String,attachmentID:value.artifact["id"] as! String)
         router = nil;router = try TestStore.router(root:directory);try router.runStorageMaintenance() /* CL-345: the service turn scans */

@@ -45,6 +45,10 @@ class CleanupTests(unittest.TestCase):
         for name, value in [('BASE', self.base), ('LIVE', self.live)]:
             p = patch.object(slots, name, value); p.start(); self.addCleanup(p.stop)
         p = patch.object(slots, 'live_root', return_value=self.live); p.start(); self.addCleanup(p.stop)
+        # post_install never reaches the real scratch, sessions or CLI (CL-359 release step).
+        self.releases = []
+        p = patch.object(clean, 'release_done', side_effect=lambda repo: self.releases.append(repo) or 0)
+        p.start(); self.addCleanup(p.stop)
         self.cleaner = clean.Cleaner(self.repo, self.installed, process_reader=lambda: self.processes,
                                      mover=self.move, batch_mover=self.move_batch, status_reader=lambda keys: dict(self.statuses))
 
@@ -417,6 +421,56 @@ class CleanupTests(unittest.TestCase):
         self.statuses.pop('CL-2'); self.run_clean(self.cleaner.evidence,True); self.assertTrue(p.exists())
         self.statuses['CL-2']='canceled'; self.run_clean(self.cleaner.evidence,True); self.assertFalse(p.exists())
         self.assertTrue(self.moves[0][1].exists())
+
+    def test_owner_record_decides_before_files_json_and_folder_name(self):
+        # files.json and the name say CL-2 (open); owner.json registers CL-1 (Done).
+        p=self.handin('CL-2-handin'); (p/'files.json').write_text(json.dumps([{'ticket':'CL-2'}]))
+        clean_scratch.write_owner_record(p,['CL-1'],'evidence','fixture')
+        rows=self.run_clean(self.cleaner.evidence,True)
+        row=next(r for r in rows if r.get('path')==str(p))
+        self.assertEqual((row['action'],row['registration'],row['tickets']),('trashed','owner.json',['CL-1']))
+        # An open registered ticket keeps its folder even when the name says Done.
+        q=self.handin('CL-1-open'); clean_scratch.write_owner_record(q,['CL-2'],'evidence')
+        self.run_clean(self.cleaner.evidence,True); self.assertTrue(q.exists())
+
+    def test_invalid_owner_record_retains_and_unregistered_folders_are_listed(self):
+        bad=self.handin('CL-1-bad'); (bad/'owner.json').write_text('{"version": 1, "kind": "evidence", "tickets": []}')
+        old=self.handin('CL-1-old')
+        loose=self.evidence/'store-copy'; loose.mkdir(); (loose/'checklist.sqlite').write_bytes(b'db')
+        rows=self.run_clean(self.cleaner.evidence,True); self.cleaner.apply=False
+        self.assertTrue(bad.exists())
+        self.assertEqual(next(r for r in rows if r.get('path')==str(old))['registration'],'unregistered')
+        output=io.StringIO()
+        with contextlib.redirect_stdout(output): clean.finish(self.cleaner)
+        summary=json.loads(output.getvalue())
+        self.assertIn(str(old),summary['unregistered']); self.assertIn(str(loose),summary['unregistered'])
+        self.assertNotIn(str(bad),summary['unregistered'])
+
+    def test_registered_store_copy_in_evidence_retires_whole_on_done(self):
+        p=self.evidence/'qualification-copy'; (p/'managed').mkdir(parents=True); (p/'checklist.sqlite').write_bytes(b'db')
+        clean_scratch.write_owner_record(p,['CL-1'],'evidence')
+        self.run_clean(self.cleaner.evidence,True); self.assertFalse(p.exists())
+
+    def test_build_capture_and_slot_reports_carry_registration(self):
+        old=self.capture('d'*64); clean_scratch.write_owner_record(old,['CL-7'],'build')
+        bare=self.capture('e'*64)
+        rows=self.run_clean(self.cleaner.builds)
+        child=next(r for r in rows if r.get('path')==str(old/'source'))
+        self.assertEqual((child['capture_registration'],child['tickets']),('owner.json',['CL-7']))
+        self.assertIn(str(bare),self.cleaner.unregistered); self.assertNotIn(str(old),self.cleaner.unregistered)
+        p=self.slot(); (p['folder']/'slot.json').write_text(json.dumps({'slot':1,'tickets':['CL-3']}))
+        self.assertEqual(clean.slot_registration(p),{'registration':'slot.json','tickets':['CL-3']})
+        (p['folder']/'slot.json').write_text(json.dumps({'slot':1}))
+        self.assertEqual(clean.slot_registration(p)['registration'],'unregistered')
+
+    def test_post_install_runs_release_done_after_build_cleanup(self):
+        current=self.capture(self.ids[0]); self.cleaner.apply=True
+        with patch.object(clean,'Cleaner',return_value=self.cleaner), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(clean.post_install(self.repo,current),0)
+            self.assertEqual(self.releases,[self.repo])
+            self.assertFalse((self.build/'.build-lock').exists())
+            # A failed release reports failure but never undoes the build cleanup.
+            self.assertEqual(clean.post_install(self.repo,current,release=lambda repo:1),1)
 
     def test_manifest_mixed_tickets_override_folder_done_key(self):
         p=self.handin(); (p/'files.json').write_text(json.dumps([{'ticket':'CL-2'}]))
@@ -1058,6 +1112,52 @@ class CleanupTests(unittest.TestCase):
         totals = {label: sum(sizer(paths).values()) for label, paths in groups.items()}
         self.assertEqual(set(totals), {'evidence', 'build'}); self.assertGreater(totals['build'], 0)
         self.assertEqual(sizer([self.root / 'missing']), {})
+
+class ReleaseDoneAfterInstallTests(unittest.TestCase):
+    """CL-359 item 1: each install releases Done/canceled marks; open and running folders stay."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir='/private/tmp'); self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.sessions = self.root/'sessions'; self.qualification = self.root/'qualification'; self.qualification.mkdir()
+        self.scratch = self.sessions/'-Users-Checklist'/'installer'/'scratchpad'; self.scratch.mkdir(parents=True)
+
+    def work(self, name, tickets, session='installer'):
+        p = self.sessions/'-Users-Checklist'/session/'scratchpad'/name; p.mkdir(parents=True)
+        clean_scratch.write_marker(p, session, 'package '+name, tickets=tickets)
+        return p
+
+    def release(self, environ, statuses):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = clean.release_done(self.root, environ=environ, reader=lambda keys: {k: statuses.get(k) for k in keys},
+                                        sessions_root=self.sessions, qualification_root=self.qualification)
+        return result, [json.loads(l) for l in output.getvalue().splitlines()]
+
+    def test_done_released_open_and_foreign_kept_running_folder_survives_apply(self):
+        done=self.work('done', ['CL-1']); canceled=self.work('canceled', ['CL-3']); open_=self.work('open', ['CL-1','CL-2'])
+        foreign=self.work('foreign', ['CL-1'], session='other')
+        result, rows = self.release({'CODEX_THREAD_ID': 'installer'}, {'CL-1':'done','CL-2':'active','CL-3':'canceled'})
+        self.assertEqual(result, 0)
+        self.assertTrue(clean_scratch.ticket_released(done)); self.assertTrue(clean_scratch.ticket_released(canceled))
+        self.assertFalse(clean_scratch.read_marker(open_)['released'])
+        self.assertFalse(clean_scratch.read_marker(foreign)['released'])
+        self.assertIn('open or unknown ticket status: CL-2', {r.get('reason') for r in rows})
+        # The release only changes markers; the next apply still keeps a folder a process uses.
+        decision = clean_scratch.plan(done, 'session', set(), [done], 'a'*64, now=time.time()+7200)
+        self.assertIn('running process', decision['reason'])
+
+    def test_missing_session_skips_and_status_failure_reports(self):
+        self.work('done', ['CL-1'])
+        result, rows = self.release({}, {})
+        self.assertEqual((result, rows[0]['status']), (0, 'skipped'))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = clean.release_done(self.root, environ={'CODEX_THREAD_ID': 'installer'},
+                                        reader=lambda keys: (_ for _ in ()).throw(ValueError('service restarting')),
+                                        sessions_root=self.sessions, qualification_root=self.qualification)
+        self.assertEqual(result, 1)
+        self.assertFalse(clean_scratch.read_marker(self.scratch/'done')['released'])
+
 
 class TmpdirIsolationTests(unittest.TestCase):
     def test_cleanup_with_tmpdir_in_another_marked_scratch_session(self):

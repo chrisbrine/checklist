@@ -5,6 +5,7 @@ import GRDB
 
 extension TicketLifecycleCleanupTests {
     func testLegacySettlementsWakeTheirTicketsWithoutRestartingTheOrdinarySweep() throws {
+        try QualificationSuite.requireEnabled()
         let (project,first,attachment) = try fixture(),pid = project["id"] as! String
         var legacyTasks = [first],closed = [first]
         for n in 1..<70 {
@@ -38,7 +39,9 @@ extension TicketLifecycleCleanupTests {
             }
             try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-next:" + pid,String(Date().addingTimeInterval(3600).timeIntervalSince1970)])
         }
-        XCTAssertTrue(try router.runTicketObjectDeletionCohort())
+        router.ticketCleanupLifecycleTurn = false
+        try router.runStorageMaintenance()
+        XCTAssertTrue(router.ticketCleanupLifecycleTurn)
         XCTAssertTrue(FileManager.default.fileExists(atPath:attachment["path"] as! String))
         try router.dbQueue.read {db in
             XCTAssertEqual(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-cursor:" + pid]),before)

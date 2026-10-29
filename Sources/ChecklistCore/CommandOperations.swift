@@ -25,6 +25,16 @@ final class CommandOperations: @unchecked Sendable {
     private var executing = Set<String>()
     private var admissions: [String:(mutex: NSLock,users: Int)] = [:]
     private var completion: (@Sendable (String,Bool) -> Void)?
+    /// A read operation's finished reply waits here, in process memory only,
+    /// until backup write admission opens for its terminal-state write (CL-353 F1).
+    struct Outcome {
+        let output: JSON?
+        let failure: CoreError?
+        let purgeEpoch: String?
+        let startedAt: String
+    }
+    private var held: [String:(attempt: UUID,outcome: Outcome)] = [:]
+    private var probe: ((String) -> Void)?
     let contextKey = "ChecklistCommandOperation-" + UUID().uuidString
 
     /// Serialize only matching caller/UUID admissions across the SQLite and
@@ -50,6 +60,18 @@ final class CommandOperations: @unchecked Sendable {
     func beginExecution(_ id: String) {lock.withLock {_ = executing.insert(id)}}
     func endExecution(_ id: String) {lock.withLock {_ = executing.remove(id)}}
     func isExecuting(_ id: String) -> Bool {lock.withLock {executing.contains(id)}}
+    /// True while this process executes the operation or holds its finished
+    /// read reply for the terminal-state write.
+    func isActive(_ id: String) -> Bool {lock.withLock {executing.contains(id) || held[id] != nil}}
+    func heldOutcome(_ job: Job) -> Outcome? {lock.withLock {held[job.id].flatMap {$0.attempt == job.attempt ? $0.outcome : nil}}}
+    func hold(_ job: Job,_ outcome: Outcome) {lock.withLock {held[job.id] = (job.attempt,outcome)}}
+    func releaseHeld(_ id: String) {lock.withLock {_ = held.removeValue(forKey:id)}}
+    /// Test seam only: called on the operation lane after the running marker
+    /// and before domain execution. The service never installs it.
+    var executionProbe: ((String) -> Void)? {
+        get {lock.withLock {probe}}
+        set {lock.withLock {probe = newValue}}
+    }
     func recordRecoveryRequired(_ id: String) {lock.withLock {_ = recoveryRequired.insert(id)}}
     func needsRecovery(_ id: String) -> Bool {lock.withLock {recoveryRequired.contains(id)}}
     var enabled: Bool {lock.withLock {queue != nil}}
@@ -57,7 +79,7 @@ final class CommandOperations: @unchecked Sendable {
         lock.withLock {self.queue = queue;self.completion = completion}
     }
     func add(_ job: Job,router: CommandRouter) {
-        lock.withLock {jobs[job.id] = job;recoveryRequired.remove(job.id)}
+        lock.withLock {jobs[job.id] = job;recoveryRequired.remove(job.id);held.removeValue(forKey:job.id)}
         resume(router:router)
     }
     func resume(router: CommandRouter) {
@@ -107,6 +129,12 @@ extension CommandRouter {
         "human_request_create","human_request_revise","task_get"
     ])
     static let operationCredentialMethods: Set<String> = ["work_claim","batch_claim","work_takeover"]
+    /// Methods that needsCommandOperation routes for some inputs only. The catalog
+    /// and docs/mcp-contract.md name them; CommandOperationTests checks both.
+    static let conditionalOperationMethods: Set<String> = sourceCaptureMethods.union(operationEvidenceMethods)
+        .union(["project_edit","project_settings_save","task_archive","attachment_read","attachment_add"])
+    /// Operation methods that run as synchronous reads, without write admission.
+    static var readOperationMethods: Set<String> {alwaysOperationMethods.union(conditionalOperationMethods).intersection(readMethods)}
     /// Potentially unbounded file/graph work is asynchronous. Cheap metadata and
     /// ordinary claim/edit paths stay synchronous. Planning reads no file bytes.
     func needsCommandOperation(method: String,params: JSON,caller: Caller) throws -> Bool {
@@ -182,6 +210,9 @@ extension CommandRouter {
         var value = operation
         for key in ["principal","digest","authorization_generation","incarnation","recoverable","outcome_unknown","caller","reply_write_admission","error_result_command_id"] {value.removeValue(forKey:key)}
         value["status_method"] = "operation_get"
+        // A read operation that started while backup admission was closed has
+        // no durable running marker; this process reports its actual state.
+        if operation["state"] as? String == "queued",let id = operation["operation_id"] as? String,commandOperations.isActive(id) {value["state"] = "running"}
         if operation["state"] as? String == "succeeded" {
             let command = operation["command_id"] as! String
             guard let receipt = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[caller.principal,command]) else {throw Self.expiredCommandError(command)}
@@ -316,18 +347,39 @@ extension CommandRouter {
         do {
             return try storageAdmission.withContinuation(job.lease) {
                 if job.method == "backup_create" {try performCommandOperation(job);return true}
+                // CL-353 F1: a read method runs exactly as its synchronous read:
+                // read pool, no backup write admission, so a capture never waits
+                // for it and it runs during a capture. A writer continuation inside
+                // it keeps admitWriterDependentRead. Only the operation's own
+                // running marker and terminal-state write take write admission.
+                if Self.readMethods.contains(job.method) {return try performReadOperation(job)}
                 return try backupWrites.withImmediateAccess {try performCommandOperation(job);return true} ?? false
             }
         } catch {
             // Persisting a terminal receipt can itself fail. Keep the original
             // durable running state for startup reconciliation; never invent a
             // successful/definitively failed outcome from a storage exception.
+            commandOperations.releaseHeld(job.id)
             commandOperations.recordRecoveryRequired(job.id)
             StoreRecovery.recordFailure(root:root,error:error)
             return true
         }
     }
     private func performCommandOperation(_ job: CommandOperations.Job) throws {
+        try finishCommandOperation(job,executeCommandOperation(job))
+    }
+    /// The finished read reply stays in process memory while a capture or the
+    /// FIFO queue closes write admission. The job then waits for the existing
+    /// admission notification, without polling, and writes only its terminal state.
+    private func performReadOperation(_ job: CommandOperations.Job) throws -> Bool {
+        let outcome = try commandOperations.heldOutcome(job) ?? executeCommandOperation(job)
+        guard try backupWrites.withImmediateAccess({try finishCommandOperation(job,outcome)}) != nil else {
+            commandOperations.hold(job,outcome);return false
+        }
+        commandOperations.releaseHeld(job.id)
+        return true
+    }
+    private func executeCommandOperation(_ job: CommandOperations.Job) throws -> CommandOperations.Outcome {
         let params = try JSONSerialization.jsonObject(with:job.params) as! JSON
         // GRDB executes callbacks on its own writer/reader threads. The
         // process-local admitted execution marker spans those callbacks; public
@@ -338,15 +390,29 @@ extension CommandRouter {
         Thread.current.threadDictionary[commandOperations.contextKey] = job.id
         defer {if let previous {Thread.current.threadDictionary[commandOperations.contextKey] = previous} else {Thread.current.threadDictionary.removeObject(forKey:commandOperations.contextKey)}}
         var output: JSON?,failure: CoreError?
+        let startedAt = now()
         let purgeEpoch = try readForPreparation {try String.fetchOne($0,sql:"SELECT value FROM metadata WHERE key='command-operation-purge-epoch'")}
         do {
             let generation = try backupWriteAuthorization(params:params,caller:job.caller)
             guard generation == job.generation else {throw CoreError("CONNECTION_REVOKED","The operation's session authorization changed before application.")}
-            try dbQueue.write {db in
+            let markRunning = {
+                try self.dbQueue.write {db in
                     guard var value = try self.operationRecord(db,id:job.id) else {throw CoreError("OPERATION_MISSING","The accepted operation record is missing.")}
                     try self.authorizeOperation(db,value,params:params,caller:job.caller)
-                    value["state"] = "running";value["started_at"] = now();value["updated_at"] = now();try self.saveOperation(db,value)
+                    value["state"] = "running";value["started_at"] = startedAt;value["updated_at"] = now();try self.saveOperation(db,value)
+                }
             }
+            if Self.readMethods.contains(job.method) {
+                // Never write during a capture. A read started while admission is
+                // closed checks authority on the pool; status reports it as running.
+                if try backupWrites.withImmediateAccess(markRunning) == nil {
+                    try readForPreparation {db in
+                        guard let value = try self.operationRecord(db,id:job.id) else {throw CoreError("OPERATION_MISSING","The accepted operation record is missing.")}
+                        try self.authorizeOperation(db,value,params:params,caller:job.caller)
+                    }
+                }
+            } else {try markRunning()}
+            commandOperations.executionProbe?(job.id)
             output = try handle(method:job.method,params:params,caller:job.caller)
         } catch let error as CoreError {failure = error}
         catch {
@@ -355,6 +421,10 @@ extension CommandRouter {
             if publicError["code"] as? String == "COMMAND_FAILED" {details["command_outcome"] = "unknown"}
             failure = CoreError(publicError["code"] as? String ?? "COMMAND_FAILED",publicError["message"] as? String ?? "The operation could not finish.",details:details)
         }
+        return CommandOperations.Outcome(output:output,failure:failure,purgeEpoch:purgeEpoch,startedAt:startedAt)
+    }
+    private func finishCommandOperation(_ job: CommandOperations.Job,_ outcome: CommandOperations.Outcome) throws {
+        let output = outcome.output,failure = outcome.failure,purgeEpoch = outcome.purgeEpoch
         try dbQueue.write {db in
                 guard var value = try self.operationRecord(db,id:job.id) else {throw CoreError("OPERATION_MISSING","The accepted operation record is missing.")}
                 if let output {
@@ -399,6 +469,7 @@ extension CommandRouter {
                     value["state"] = "failed";value["error_result_command_id"] = errorCommand;value.removeValue(forKey:"error")
                     value["recoverable"] = uncertain;value["outcome_unknown"] = uncertain
                 }
+                if value["started_at"] == nil {value["started_at"] = outcome.startedAt}
                 value["finished_at"] = now();value["updated_at"] = now();try self.saveOperation(db,value)
         }
     }

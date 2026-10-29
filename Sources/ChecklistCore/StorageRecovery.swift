@@ -293,10 +293,16 @@ extension CommandRouter {
 
     /// One bounded native-service continuation. The service schedules the next
     /// actual job deadline; this creates no model runtime or polling loop.
-    public func runStorageMaintenance() throws {
+    public func runStorageMaintenance() throws {try runStorageMaintenance(observe:nil)}
+
+    /// Internal diagnostic seam; production and owned-copy checks share this path.
+    func runStorageMaintenance(observe: ((JSON) -> Void)?) throws {
+        let maintenanceStarted = ProcessInfo.processInfo.systemUptime
+        observe?(["phase":"entry","lifecycle_turn":ticketCleanupLifecycleTurn])
+        defer {observe?(["phase":"return","seconds":ProcessInfo.processInfo.systemUptime-maintenanceStarted,"lifecycle_turn":ticketCleanupLifecycleTurn,"yield_until":ticketCleanupYieldAt?.timeIntervalSince1970 as Any? ?? NSNull(),"retry_until":ticketCleanupRetryAt?.timeIntervalSince1970 as Any? ?? NSNull()])}
         let lease = try storageAdmission.acquire();defer { lease.finish() }
         ticketCleanupMaintenanceLock.lock();defer {ticketCleanupMaintenanceLock.unlock()}
-        if try StorageSnapshotRetention.isActive(root:root) {return}
+        if try StorageSnapshotRetention.isActive(root:root) {observe?(["phase":"paused","reason":"snapshot_retention"]);return}
         if !(ticketCleanupRetryAt.map {$0 > Date()} ?? false) && !(ticketCleanupYieldAt.map {$0 > Date()} ?? false) {
             let started = Date()
             var prepared = false
@@ -308,21 +314,26 @@ extension CommandRouter {
                     scheduleTicketCleanupRest(since:started)
                 }
             }
+            // A refused preparation still consumed this turn. Give the other
+            // queue its next opportunity after the existing retry/rest deadline.
+            defer {ticketCleanupLifecycleTurn.toggle()}
             do {
                 func lifecycle() throws {
+                    observe?(["phase":"decision","turn":"lifecycle"])
                     try withTicketCleanupPreparation({db in
                         let result = try self.prepareTicketLifecycleCleanup(db);prepared = result != nil;return result
                     }) {db,_,value in try self.commitTicketLifecycleCleanup(db,prepared:value,at:Date())}
                 }
                 func deletion() throws {
-                    prepared = try self.runTicketObjectDeletionCohort()
+                    observe?(["phase":"decision","turn":"deletion"])
+                    prepared = try self.runTicketObjectDeletionCohort(observe:observe)
                 }
                 // Fair turns: a large admitted byte job cannot starve a newly
                 // due settings/startup/Done pass, nor can passes starve unlinks.
                 if ticketCleanupLifecycleTurn {try lifecycle();if !prepared {try deletion()}}
                 else {try deletion();if !prepared {try lifecycle()}}
-                ticketCleanupLifecycleTurn.toggle()
             } catch {
+                observe?(["phase":"failure","code":(error as? CoreError)?.code ?? "CLEANUP_PREPARATION_UNAVAILABLE","error":String(describing:error)])
                 dbQueue.writeWithoutTransaction {_ in
                     self.ticketCleanupRetryAt = Date().addingTimeInterval(60)
                     self.ticketCleanupFailure = self.ticketCleanupFailure ?? (error as? CoreError)?.code ?? "CLEANUP_PREPARATION_UNAVAILABLE"

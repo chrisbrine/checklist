@@ -10,6 +10,30 @@ case "$MODE" in --stage|--rebuild-stage|--clean-stage) ;; *)
   if [ "$BUILD_SCOPE" != install ]; then echo "Scope $BUILD_SCOPE is not installable; use a stage-only mode." >&2; exit 2; fi;;
 esac
 export CHECKLIST_BUILD_SCOPE="$BUILD_SCOPE"
+# CL-359: a stage-only build registers its build folder with ticket keys
+# (--ticket KEY, repeatable, or CHECKLIST_TICKETS=CL-1,CL-2) and refuses without.
+# Install modes record keys when given; --install-stage takes no keys.
+TICKET_ARGS=()
+if [ "$MODE" != --install-stage ] && [ "$#" -gt 0 ]; then
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --ticket) if [ "$#" -lt 2 ]; then echo "--ticket needs a key such as CL-10" >&2; exit 2; fi; TICKET_ARGS+=(--ticket "$2"); shift 2;;
+      *) echo "Unknown argument: $1" >&2; exit 2;;
+    esac
+  done
+fi
+BUILD_TICKETS=""
+case "$MODE" in
+  --stage|--rebuild-stage|--clean-stage)
+    BUILD_TICKETS="$(python3 "$ROOT_DIR/script/evidence_folder.py" tickets ${TICKET_ARGS[@]+"${TICKET_ARGS[@]}"})" || {
+      echo "Stage builds create a build folder; register it with --ticket KEY or CHECKLIST_TICKETS." >&2; exit 2; };;
+  --install-stage) ;;
+  *)
+    if [ "${#TICKET_ARGS[@]}" -gt 0 ] || [ -n "${CHECKLIST_TICKETS:-}" ]; then
+      BUILD_TICKETS="$(python3 "$ROOT_DIR/script/evidence_folder.py" tickets ${TICKET_ARGS[@]+"${TICKET_ARGS[@]}"})" || exit 2
+    fi;;
+esac
 BUILD_ROOT="$ROOT_DIR/.local/build"
 mkdir -p "$BUILD_ROOT"
 if ! mkdir "$BUILD_ROOT/.build-lock" 2>/dev/null; then
@@ -162,6 +186,11 @@ STAGE="$STAGE_FINAL"
 BUILD_HELPER="$SOURCE/script/build_support.py"
 }
 capture_source
+if [ -n "$BUILD_TICKETS" ]; then
+  # Record the keys next to the stage; a shared capture gains each later key.
+  CHECKLIST_TICKETS="$BUILD_TICKETS" python3 "$ROOT_DIR/script/evidence_folder.py" register --kind build \
+    --purpose "build_and_run.sh $MODE ($BUILD_SCOPE)" "$CAPTURE_DIR" >/dev/null
+fi
 phase stop capture
 compile_products() {
   phase start compile

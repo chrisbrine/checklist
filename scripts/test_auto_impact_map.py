@@ -5,6 +5,7 @@ import io
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -296,6 +297,64 @@ class AutoImpactMapTests(unittest.TestCase):
         self.assertTrue(self.output.is_file())
         self.assertTrue(self.index.with_name('index-inputs.json').is_file())
 
+    def test_default_environment_refreshes_missing_then_stale_native_map_without_wrapper(self):
+        _, exported = self.warm_native_fixture()
+        def current_export(*args, **kwargs):
+            return dict(exported, source_hashes={path: auto.digest(self.root / path)
+                                                for path in auto.source_inventory(self.root)})
+        with patch.dict(os.environ):
+            os.environ.pop('CHECKLIST_SWIFT_RUNNER', None)
+            with patch.object(auto.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as runner, \
+                 patch.object(auto.subprocess, 'check_output', return_value='synthetic-commit'), \
+                 patch('index_store.read_index_store', side_effect=current_export):
+                first = auto.regenerate(self.root, self.scratch, self.output, self.cases)
+                self.write('Sources/ChecklistCore/Value.swift', 'struct Value { var changed: Int }')
+                second = auto.regenerate(self.root, self.scratch, self.output, self.cases)
+        for result in (first, second):
+            self.assertEqual(result['state'], 'regenerated')
+            self.assertTrue(result['native_index_refreshed'])
+        commands = [call.args[0] for call in runner.call_args_list if call.args[0][:2] == ['swift', 'build']]
+        self.assertEqual(len(commands), 2)
+        for command in commands:
+            self.assertEqual(command[:2], ['swift', 'build'])
+            self.assertEqual(command[command.index('--scratch-path') + 1], str(self.scratch))
+            self.assertNotIn('test', command)
+        data = json.loads(self.output.read_text())
+        source = 'Sources/ChecklistCore/Value.swift'
+        self.assertEqual(data['source_hashes'][source], auto.digest(self.root / source))
+
+    def test_default_environment_preserves_warm_swiftbuild_and_retains_native_index_lane(self):
+        self.write('.build/manifest.pif', 'warm Swift Build manifest')
+        marker = self.write('.build/.buildSystem_debug', 'swiftbuild')
+        module = self.write('.build/out/Products/Debug/ChecklistCore.swiftmodule', 'warm module')
+        lane = self.scratch / 'affected-tests/native-index'
+        store = lane / 'index-store'
+        store.mkdir(parents=True)
+        (store / 'record').write_text('same-build record')
+        exported = dict(self.export, store=str(store), library='synthetic-library')
+        with patch.dict(os.environ):
+            os.environ.pop('CHECKLIST_SWIFT_RUNNER', None)
+            with patch.object(auto.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as runner, \
+                 patch.object(auto.subprocess, 'check_output', return_value='synthetic-commit'), \
+                 patch('index_store.read_index_store', return_value=exported):
+                result = auto.regenerate(self.root, self.scratch, self.output, self.cases)
+        self.assertEqual(result['state'], 'regenerated')
+        command = runner.call_args.args[0]
+        self.assertEqual(command[:2], ['swift', 'build'])
+        self.assertEqual(command[command.index('--scratch-path') + 1], str(lane))
+        self.assertEqual(command[command.index('--build-system') + 1], 'native')
+        self.assertEqual(marker.read_text(), 'swiftbuild')
+        self.assertEqual(module.read_text(), 'warm module')
+        self.assertTrue(self.output.is_file())
+        self.assertTrue(self.index.with_name('index-inputs.json').is_file())
+
+    def test_explicit_missing_wrapper_does_not_silently_bypass_build_cap(self):
+        self.warm_native_fixture()
+        with patch.object(auto.subprocess, 'run') as runner:
+            with self.assertRaisesRegex(ValueError, 'runner wrapper is missing'):
+                auto.refresh_native_index(self.root, self.scratch, self.root / 'missing.sh')
+        runner.assert_not_called()
+
     def test_failed_native_refresh_is_loud_and_does_not_retry_unchanged_inputs(self):
         wrapper, _ = self.warm_native_fixture()
         with patch.object(auto.subprocess, 'run', return_value=SimpleNamespace(returncode=8)) as runner:
@@ -330,10 +389,70 @@ class AutoImpactMapTests(unittest.TestCase):
         self.assertFalse(self.index.with_name('index-inputs.json').exists())
         self.assertTrue(json.loads(self.index.with_name('index-refresh-status.json').read_text())['failed'])
 
+    def test_generator_drift_during_map_derivation_cannot_publish_new_fingerprints(self):
+        self.save_index()
+        generator = self.write('script/affected_tests.py', '# original generator')
+        build = auto.build_index_map
+        def build_while_editing(*args, **kwargs):
+            result = build(*args, **kwargs)
+            generator.write_text('# different generator')
+            return result
+        with patch.object(auto, 'build_index_map', side_effect=build_while_editing), \
+             patch.object(auto, 'refresh_native_index') as refresh:
+            result = auto.regenerate(self.root, self.scratch, self.output, self.cases)
+        self.assertEqual(result['state'], 'unavailable')
+        self.assertIn('generator inputs changed during impact map regeneration', result['reason'])
+        self.assertFalse(self.output.exists())
+        self.assertFalse((self.scratch / 'affected-tests/test-impact-map.json').exists())
+        refresh.assert_not_called()
+
+    def test_generator_drift_during_raw_recovery_cannot_publish_recovered_export(self):
+        _, exported = self.warm_native_fixture()
+        auto.save_index_receipt(self.index, exported)
+        generator = self.write('script/affected_tests.py', '# original generator')
+        def recover_while_editing(*args, **kwargs):
+            generator.write_text('# different generator')
+            return exported
+        with patch.object(auto, 'recover_raw_index', side_effect=recover_while_editing), \
+             patch.object(auto, 'refresh_native_index') as refresh:
+            result = auto.regenerate(self.root, self.scratch, self.output, self.cases)
+        self.assertEqual(result['state'], 'unavailable')
+        self.assertIn('generator inputs changed', result['reason'])
+        self.assertFalse(self.index.exists())
+        self.assertFalse(self.output.exists())
+        refresh.assert_not_called()
+
+    def test_generator_drift_during_native_export_cannot_publish_index_or_receipt(self):
+        wrapper, exported = self.warm_native_fixture()
+        generator = self.write('script/affected_tests.py', '# original generator')
+        def export_while_editing(*args, **kwargs):
+            generator.write_text('# different generator')
+            return exported
+        with patch.object(auto.subprocess, 'run', return_value=SimpleNamespace(returncode=0)), \
+             patch('index_store.read_index_store', side_effect=export_while_editing):
+            with self.assertRaisesRegex(ValueError, 'generator inputs changed during native index export'):
+                auto.refresh_native_index(self.root, self.scratch, wrapper)
+        self.assertFalse(self.index.exists())
+        self.assertFalse(self.index.with_name('index-inputs.json').exists())
+        self.assertTrue(json.loads(self.index.with_name('index-refresh-status.json').read_text())['failed'])
+
+    def test_generator_drift_during_native_build_refuses_export(self):
+        wrapper, _ = self.warm_native_fixture()
+        generator = self.write('script/affected_tests.py', '# original generator')
+        def build_while_editing(*args, **kwargs):
+            generator.write_text('# different generator')
+            return SimpleNamespace(returncode=0)
+        with patch.object(auto.subprocess, 'run', side_effect=build_while_editing), \
+             patch('index_store.read_index_store') as export:
+            with self.assertRaisesRegex(ValueError, 'generator inputs changed during native index refresh'):
+                auto.refresh_native_index(self.root, self.scratch, wrapper)
+        export.assert_not_called()
+        self.assertFalse(self.index.exists())
+
     def test_cold_native_cache_never_builds(self):
         wrapper = self.write('build-cap.sh', '# never executed')
         with patch.object(auto.subprocess, 'run') as runner:
-            with self.assertRaisesRegex(ValueError, 'warm native build cache'):
+            with self.assertRaisesRegex(ValueError, 'warm native or swiftbuild build cache'):
                 auto.refresh_native_index(self.root, self.scratch, wrapper)
         runner.assert_not_called()
 

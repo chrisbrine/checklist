@@ -79,9 +79,15 @@ default and affected plans, including changes to a timing fixture itself, skip t
 and report `timing_deferred: true`, because wall-clock budgets are
 performance checks that belong with the opt-in qualification level (CL-266 item 2); `scripts/test_affected_tests.py` fails when such a
 test is in neither `TIMING_TESTS` nor the gated `QUALIFICATION_TESTS` (CL-275).
-The guard follows same-file helpers and local clock-derived values/sample arrays,
-including `XCTAssertTrue` upper bounds. It has no size floor: 5-second termination,
+The guard follows same-file helpers, local timing helpers that return scalars or
+tuples, tuple destructuring, comma-separated scalar/tuple bindings and their
+alias chains, and clock-derived sample arrays/aggregates (including
+`max` and `reduce`), plus `XCTAssertTrue` upper bounds. Commas inside calls,
+strings, collections, tuple values or generic types do not create extra bindings;
+independent counts in the same declaration retain their non-timing behavior. It has no size floor: 5-second termination,
 8-second Git timeout and 300 ms cached-return assertions are isolated too.
+The scaled cleanup-backup lookup also remains environment-gated qualification; its
+local tuple timer and maximum warm sample are covered by the guard.
 All Core timing methods are now environment-gated qualification (CL-358), including `MediaListScaleTests` methods
 `testThousandItemPublishedRoundListIsFast` and
 `testFiveThousandItemPublishedRoundListIsFast`, plus
@@ -200,14 +206,22 @@ cache. Otherwise the planner derives a new map from a saved same-build semantic
 index: pass `--impact-index <index-export.json>`, or retain it at
 `<scratch>/affected-tests/index-export.json` or
 `.local/build/test-impact-index.json`. Existing generator profile directories are
-also searched. When no compatible evidence exists, a configured `--runner-wrapper`
-or `CHECKLIST_SWIFT_RUNNER` permits one incremental native `swift build
---build-tests --build-system native --enable-index-store` in the same assigned
-scratch path, with `--skip-update` and the shared dependency cache flags. A native
-module cache and build database must already exist; the planner refuses a cold
-build. It then exports the current compiler index and regenerates the map. No test
+also searched. When no compatible evidence exists, the planner automatically runs
+`swift build --build-tests --build-system native --enable-index-store`, with
+`--skip-update`, the assigned scratch path and the shared dependency cache flags.
+No runner environment variable is required; an explicit `--runner-wrapper` or
+`CHECKLIST_SWIFT_RUNNER` wraps that command when a shared build cap applies. A warm
+native or Swift Build cache must already exist. A native cache refreshes in place;
+a Swift Build cache retains a separate native index lane at
+`<scratch>/affected-tests/native-index`, because Swift Build may ignore the compiler
+index flags. Its first index build is cold; later refreshes reuse that lane, and
+the assigned warm test outputs and backend stay intact. The planner then exports
+the current compiler index and regenerates the map. No test
 methods execute. `affected-tests/index-refresh.log` and its status receipt retain
 the command, timing and failure; identical failed inputs are not retried silently.
+Generator fingerprints are captured before work and checked before index/map
+publication. Tooling edits during a run refuse publication and require a fresh
+process, so imported old logic cannot be relabeled with new on-disk fingerprints.
 `impact_map_status.regeneration` records restoration, regeneration, or the exact
 reason and refresh instruction when module fallback remains necessary.
 

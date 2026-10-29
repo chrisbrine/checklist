@@ -1096,6 +1096,115 @@ class SelectionTests(unittest.TestCase):
         self.assertTrue(cases['ChecklistAppTests.BudgetTests/testGated'][1])
         self.assertFalse(cases['ChecklistAppTests.BudgetTests/testViaHelper'][1])
 
+    def test_wall_clock_scanner_tracks_local_tuple_timers_and_sample_aggregates(self):
+        directory = self.root / 'Tests/ChecklistCoreTests'
+        directory.mkdir(parents=True)
+        (directory / 'BudgetTests.swift').write_text('''final class BudgetTests: XCTestCase {
+    private let json = #"} } }"#
+    // } } fake closing braces in a comment
+    /* } } /* nested { */ } */
+    func testTupleSamples() throws {
+        func time<T>(_ work: () throws -> T) rethrows -> (T, Double) {
+            let start = Date()
+            let value = try work()
+            return (value, Date().timeIntervalSince(start))
+        }
+        var samples: [Double] = []
+        for _ in 0..<5 {
+            let (value, sample) = try time { 17 }
+            XCTAssertEqual(value, 17)
+            samples.append(sample)
+        }
+        let peak = samples.max() ?? 0
+        XCTAssertLessThan(peak, 1.0)
+    }
+    func testScalarTimerAndReduce() {
+        func measure() -> Double {
+            let begin = ProcessInfo.processInfo.systemUptime
+            return ProcessInfo.processInfo.systemUptime - begin
+        }
+        let samples = [measure(), measure()]
+        let peak = samples.reduce(0, max)
+        XCTAssertTrue(peak <= 1)
+    }
+    func testTupleProjection() {
+        func sample() -> (Int, Double) { return (17, Date().timeIntervalSince(start)) }
+        let observation = sample()
+        XCTAssertLessThan(observation.1, 2)
+    }
+    private func reading() -> Double {
+        let begin = ProcessInfo.processInfo.systemUptime
+        let end = ProcessInfo.processInfo.systemUptime
+        return end - begin
+    }
+    func testSameFileTimer() {
+        let readings = [reading(), reading()]
+        XCTAssertLessThan(readings.max() ?? 0, 3)
+    }
+    func testTupleResultCountIsNotTiming() {
+        func time<T>(_ work: () -> T) -> (T, Double) {
+            return (work(), Date().timeIntervalSince(start))
+        }
+        let (count, sample) = time { 17 }
+        XCTAssertLessThan(count, 20)
+    }
+}
+''')
+        cases = selector.wall_clock_budget_cases(self.root)
+        self.assertEqual(sorted(cases), ['ChecklistCoreTests.BudgetTests/' + name for name in
+                                        ['testSameFileTimer', 'testScalarTimerAndReduce', 'testTupleProjection', 'testTupleSamples']])
+
+    def test_wall_clock_scanner_tracks_multiple_bindings_without_tainting_counts(self):
+        directory = self.root / 'Tests/ChecklistCoreTests'
+        directory.mkdir(parents=True)
+        (directory / 'BindingBudgetTests.swift').write_text('''final class BindingBudgetTests: XCTestCase {
+    func testCommaClockAlias() {
+        let end = ProcessInfo.processInfo.systemUptime, after = end - scanEnd
+        XCTAssertLessThan(after, before)
+    }
+    func testCommaChainAliases() {
+        let mark = DispatchTime.now().uptimeNanoseconds, delta = mark - start, peak = delta
+        XCTAssertTrue(peak < 300)
+    }
+    func testTypedContinuedBindingsAndSamples() {
+        let mark: Double = ProcessInfo.processInfo.systemUptime,
+            span: Double = mark - start
+        let samples: [Double] = [span], high = samples.max() ?? 0
+        XCTAssertLessThan(high, 2)
+    }
+    func testTupleAndCommaBindings() {
+        func time() -> (Int, Double) { return (3, Date().timeIntervalSince(start)) }
+        let (value, tick) = time(), cap = tick * 2, count = value + 1
+        XCTAssertLessThan(cap, 3)
+    }
+    func testCountsStayUntimed() {
+        let pages = 2, after = pages + 1, before = 5
+        XCTAssertLessThan(after, before)
+    }
+    func testClockAndCountStaySeparate() {
+        let mark = ProcessInfo.processInfo.systemUptime, count = 3, next = count + 1
+        XCTAssertLessThan(next, 5)
+    }
+    func testArgumentStringTupleAndGenericCommasStayUntimed() {
+        let text = "bad, alias = ProcessInfo.processInfo.systemUptime", pair = (2, 3), next = pair.0 + 1
+        let count = min(2, 3), last = count + 1
+        let counts: Dictionary<String, Int> = ["page": 2], total = counts["page"]! + 1
+        XCTAssertLessThan(next, 5)
+        XCTAssertLessThan(last, 5)
+        XCTAssertLessThan(total, 5)
+    }
+    func testTupleResultCountStaysUntimed() {
+        func time() -> (Int, Double) { return (3, Date().timeIntervalSince(start)) }
+        let (value, tick) = time(), count = value + 1
+        XCTAssertLessThan(count, 5)
+    }
+}
+''')
+        self.assertEqual(sorted(selector.wall_clock_budget_cases(self.root)),
+                         ['ChecklistCoreTests.BindingBudgetTests/' + name for name in
+                          ['testCommaChainAliases', 'testCommaClockAlias', 'testTupleAndCommaBindings',
+                           'testTypedContinuedBindingsAndSamples']])
+
     def test_default_suite_wall_clock_budgets_are_in_timing_group(self):
         # Guard (CL-275): every elapsed-time budget, regardless of size or
         # assertion form, must leave the parallel default pass.

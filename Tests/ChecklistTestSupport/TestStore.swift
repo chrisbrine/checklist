@@ -11,6 +11,22 @@ import ChecklistProviders
 private final class TestStoreBundleMarker: NSObject {}
 
 public enum TestStore {
+    /// Immutable filesystem preparation (for example a tiny committed Git
+    /// repository). Every test receives private inodes, including Git metadata.
+    public final class DirectoryTemplate: @unchecked Sendable {
+        private let source: Result<URL, Error>
+        public init(name: String, prepare: @escaping (URL) throws -> Void) {
+            source = Result {
+                try TestStore.publishTemplate(name: "directory-" + name) { pending in
+                    try FileManager.default.createDirectory(at: pending, withIntermediateDirectories: true)
+                    try prepare(pending)
+                }
+            }
+        }
+        public func copy(to destination: URL) throws {
+            try TestStore.clone(source.get(), to: destination)
+        }
+    }
     /// An immutable, populated unit fixture. Its workspace is always a sibling
     /// of the template store; copies keep that separation and private bytes.
     public final class Template: @unchecked Sendable {

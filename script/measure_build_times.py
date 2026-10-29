@@ -15,7 +15,7 @@ import statistics
 import subprocess
 import time
 
-from clean_scratch import caller_session, mark_qualification, validate_fingerprint
+from clean_scratch import TICKETS_ENVIRONMENT, caller_session, mark_qualification, requested_tickets, validate_fingerprint
 
 CASES = ('unchanged', 'core-change', 'app-change', 'clean')
 REPETITIONS = 3
@@ -25,7 +25,7 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def stage(checkout, output, name, mode):
+def stage(checkout, output, name, mode, tickets=()):
     command = ['bash', str(checkout / 'script/build_and_run.sh'), mode]
     log = output / (name + '.log')
     started = time.monotonic()
@@ -34,7 +34,8 @@ def stage(checkout, output, name, mode):
     with log.open('w') as stream:
         stream.write(json.dumps(record) + '\n');stream.flush()
         result = subprocess.run(command, cwd=checkout, stdout=stream, stderr=subprocess.STDOUT,
-                                env=dict(os.environ, CHECKLIST_BUILD_SCOPE='measurement'))
+                                env=dict(os.environ, CHECKLIST_BUILD_SCOPE='measurement',
+                                         **({TICKETS_ENVIRONMENT: ','.join(tickets)} if tickets else {})))
     record.update(seconds=time.monotonic() - started, load_end=list(os.getloadavg()), returncode=result.returncode)
     with log.open('a') as stream:
         stream.write(json.dumps({'result': record}) + '\n')
@@ -58,7 +59,7 @@ def stage(checkout, output, name, mode):
     return record
 
 
-def measure(checkout, output, label, core, app, source_fingerprint, session_id=None):
+def measure(checkout, output, label, core, app, source_fingerprint, session_id=None, tickets=None):
     checkout, output = Path(checkout).resolve(), Path(output).resolve()
     sources = {'core-change': checkout / core, 'app-change': checkout / app}
     originals = {}
@@ -71,10 +72,12 @@ def measure(checkout, output, label, core, app, source_fingerprint, session_id=N
         raise ValueError('A build already owns this checkout.')
     session = caller_session(session_id)
     validate_fingerprint(source_fingerprint)
+    # CL-359: the qualification marker and every measured stage carry their tickets.
+    tickets = requested_tickets(tickets)
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
         raise ValueError('Use an empty output directory to preserve earlier evidence.')
-    mark_qualification(output, source_fingerprint, 'build measurement ' + label, session)
+    mark_qualification(output, source_fingerprint, 'build measurement ' + label, session, tickets=tickets)
     lock = checkout / '.local/build/.measurement-lock'
     lock.parent.mkdir(parents=True, exist_ok=True)
     lock.mkdir()  # A second runner must not change these sources.
@@ -101,11 +104,11 @@ def measure(checkout, output, label, core, app, source_fingerprint, session_id=N
                 name = f'{case}-{repetition}'
                 # Establish the same warmed baseline before each measured edit.
                 # Warmups are retained separately and excluded from the medians.
-                warmup = stage(checkout, output, name + '-warmup', '--rebuild-stage')
+                warmup = stage(checkout, output, name + '-warmup', '--rebuild-stage', tickets=tickets)
                 if case in sources:
                     path = sources[case]
                     path.write_bytes(originals[path][0] + f'\n// CL-173 measurement {case} {repetition}\n'.encode())
-                record = stage(checkout, output, name, '--clean-stage' if case == 'clean' else '--rebuild-stage')
+                record = stage(checkout, output, name, '--clean-stage' if case == 'clean' else '--rebuild-stage', tickets=tickets)
                 record.update(case=case, repetition=repetition, warmup=warmup)
                 records.append(record)
                 (output / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
@@ -128,6 +131,8 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--source-fingerprint', required=True, help='exact round fingerprint whose qualification copy this run retains')
     parser.add_argument('--session-id', help='actual owning session when no native host ID is exported')
+    parser.add_argument('--ticket', dest='tickets', action='append', metavar='KEY',
+                        help='owning ticket key (repeatable; or CHECKLIST_TICKETS=CL-1,CL-2); required')
     parser.add_argument('--label', required=True, help='before/after plus exact revision or source fingerprint')
     parser.add_argument('--core-file', default='Sources/ChecklistCore/Store.swift')
     parser.add_argument('--app-file', default='Sources/ChecklistApp/App/ChecklistApp.swift')
@@ -135,7 +140,7 @@ def main():
     args = parser.parse_args()
     if not args.allow_source_edits_and_clean:
         parser.error('Run only in an exclusive private copy; pass --allow-source-edits-and-clean to execute.')
-    report = measure(args.checkout, args.output, args.label, args.core_file, args.app_file, args.source_fingerprint, args.session_id)
+    report = measure(args.checkout, args.output, args.label, args.core_file, args.app_file, args.source_fingerprint, args.session_id, args.tickets)
     print(json.dumps(report['medians_seconds'], indent=2))
 
 

@@ -74,6 +74,22 @@ final class TestStoreTests: XCTestCase {
         let third = try TestStore.router(root:root.appendingPathComponent("third"),template:Self.populated,workspace:root.appendingPathComponent("third-workspace"))
         defer {try? third.closeStore()}
         XCTAssertEqual(try third.managedRead(path,family:"objects",maximum:1024),Data("prepared bytes".utf8),"Neither private copy may modify the published template")
+
+        // Filesystem-only templates also copy into an existing workspace and
+        // isolate private Git-like metadata from siblings and future copies.
+        let files = TestStore.DirectoryTemplate(name: "TestStoreTests.files") { path in
+            try FileManager.default.createDirectory(at:path.appendingPathComponent(".git"),withIntermediateDirectories:true)
+            try Data("base".utf8).write(to:path.appendingPathComponent(".git/index"))
+        }
+        let a = root.appendingPathComponent("files-a"),b = root.appendingPathComponent("files-b"),c = root.appendingPathComponent("files-c")
+        try FileManager.default.createDirectory(at:a,withIntermediateDirectories:true)
+        try Data("unrelated".utf8).write(to:a.appendingPathComponent("keep.txt"))
+        try files.copy(to:a);try files.copy(to:b)
+        try Data("private mutation".utf8).write(to:a.appendingPathComponent(".git/index"))
+        try files.copy(to:c)
+        XCTAssertEqual(try Data(contentsOf:b.appendingPathComponent(".git/index")),Data("base".utf8))
+        XCTAssertEqual(try Data(contentsOf:c.appendingPathComponent(".git/index")),Data("base".utf8))
+        XCTAssertEqual(try Data(contentsOf:a.appendingPathComponent("keep.txt")),Data("unrelated".utf8))
     }
 
     func testConcurrentCopiesAreIndependent() throws {

@@ -305,6 +305,20 @@ extension CommandRouter {
         guard try !StorageSnapshotRetention.isActive(root:root) else {return prepared.receipt}
         var receipt = prepared.receipt
         guard var objects = receipt["objects"] as? [JSON],objects.count <= 100000,objects.contains(where: {$0["state"] as? String == "pending"}) else {throw CoreError("CLEANUP_INTENT_INVALID","The deletion intent requires repair; bytes retained.")}
+        if Self.isLegacyDoneEvidenceDeletion(receipt) {
+            // No old ownership fingerprint gains unlink authority. Keep every
+            // byte, preserve all earlier outcomes, and request a fresh policy-v2
+            // plan through the existing tokenized legacy completion wake.
+            for i in objects.indices where objects[i]["state"] as? String == "pending" {
+                objects[i]["state"] = "retained";objects[i]["reasons"] = ["legacy_replan_required"]
+            }
+            var outcome = receipt
+            try withValidatedDomainTransaction(db) {
+                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow)
+                return .commit
+            }
+            return outcome
+        }
         if prepared.reactivated {
             // Publish the resumed exact intent before the first possible unlink.
             // A crash then resumes ordinary pending work, never a path sweep.

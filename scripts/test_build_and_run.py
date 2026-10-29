@@ -90,7 +90,8 @@ class BuildScriptTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         for folder in ['script', 'Sources', 'Resources', 'tools']:
             (self.root / folder).mkdir()
-        for name in ['build_and_run.sh', 'build_input_inventory.py', 'build_support.py', 'version.py', 'verify_stage.py']:
+        for name in ['build_and_run.sh', 'build_input_inventory.py', 'build_support.py', 'version.py', 'verify_stage.py',
+                     'evidence_folder.py', 'clean_scratch.py', 'retire_old_bundles.py']:
             shutil.copyfile(ROOT / 'script' / name, self.root / 'script' / name)
         (self.root / 'script/build_and_run.sh').chmod(0o755)
         (self.root / 'VERSION').write_text('0.0.1\n')
@@ -141,13 +142,27 @@ elif name=='plutil': pass
 '''
         for name in ['swift', 'xcrun', 'codesign', 'ditto', 'plutil', 'mv', 'rm']:
             path=self.root/'tools'/name;path.write_text(tool);path.chmod(0o755)
-        self.env = dict(os.environ, PATH=str(self.root/'tools')+os.pathsep+os.environ['PATH'], CALLS=str(self.calls), CHECKLIST_SIGN_IDENTITY='-', CHECKLIST_BUILD_ALLOCATOR_DIR=str(self.root/'allocator'))
+        self.env = dict(os.environ, PATH=str(self.root/'tools')+os.pathsep+os.environ['PATH'], CALLS=str(self.calls), CHECKLIST_SIGN_IDENTITY='-', CHECKLIST_BUILD_ALLOCATOR_DIR=str(self.root/'allocator'),
+                        CHECKLIST_TICKETS='CL-359')
 
     def run_stage(self, mode='--stage', **environment):
         return subprocess.run([str(self.root/'script/build_and_run.sh'), mode], env=dict(self.env, **environment), capture_output=True, text=True)
 
     def capture(self):
         return next((self.root/'.local/build').glob('*/capture-manifest.json')).parent
+
+    def test_stage_registers_tickets_next_to_the_capture_and_refuses_without(self):
+        # CL-359 item 0: no stage build folder exists without its ticket keys.
+        refused = self.run_stage(CHECKLIST_TICKETS='')
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn('register it with --ticket KEY', refused.stderr)
+        self.assertFalse((self.root/'.local/build').exists())
+        self.assertEqual(self.run_stage().returncode, 0)
+        result = subprocess.run([str(self.root/'script/build_and_run.sh'), '--stage', '--ticket', 'CL-7'],
+                                env=dict(self.env, CHECKLIST_TICKETS=''), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        owner = json.loads((self.capture()/'owner.json').read_text())
+        self.assertEqual((owner['kind'], owner['tickets']), ('build', ['CL-359', 'CL-7']))
 
     def test_scope_switch_separates_captures_reuses_compilation_lane_and_reserves_only_install(self):
         captures = {}

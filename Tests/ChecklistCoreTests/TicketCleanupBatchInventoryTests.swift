@@ -5,6 +5,7 @@ import GRDB
 
 extension TicketLifecycleCleanupTests {
     func testBatchInventoryIgnoresLargeDeletionAccountingButPreservesUnknownJobReferences() throws {
+        try QualificationSuite.requireEnabled()
         let (p,task,attachment) = try fixture(),pid = p["id"] as! String,tid = task["id"] as! String
         let ignored = (0..<5).map {_ in uuid()},unknown = [uuid(),uuid()]
         let padding = String(repeating:"x",count:3_900_000)
@@ -91,6 +92,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testBatchInventoryOversizedOwnedTicketDoesNotRefuseOtherTicket() throws {
+        try QualificationSuite.requireEnabled()
         let (p,large,_) = try fixture(),small = try call("task_create",["project_id":p["id"]!,"title":"Small selected ticket"])
         let id = uuid(),padding = String(repeating:"x",count:TicketCleanupInventory.rowByteLimit + 1)
         try write {db in try self.router.save(db,["id":id,"project_id":p["id"]!,"task_id":large["id"]!,"revision":1,"body":padding],type:"message")}
@@ -101,6 +103,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testBatchInventoryOversizedForeignReferenceRefusesOnlyItsTarget() throws {
+        try QualificationSuite.requireEnabled()
         let (p,first,a) = try fixture(),second = try call("task_create",["project_id":p["id"]!,"title":"Unaffected selected ticket"])
         let id = uuid(),padding = String(repeating:"x",count:TicketCleanupInventory.rowByteLimit + 1)
         try write {db in try self.router.save(db,["id":id,"project_id":p["id"]!,"revision":1,"body":padding,"nested":["target":a["id"]!]],type:"message")}
@@ -120,6 +123,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testBatchInventoryAdmitsThirtyTwoIndependentTickets() throws {
+        try QualificationSuite.requireEnabled()
         let (p,first,_) = try fixture()
         var selected = [first]
         for index in 1..<32 {selected.append(try call("task_create",["project_id":p["id"]!,"title":"Batch selected \(index)"]))}

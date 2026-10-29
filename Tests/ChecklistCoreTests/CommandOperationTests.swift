@@ -425,6 +425,93 @@ final class CommandOperationTests: XCTestCase {
         lane.finish();router.observeWriteAdmission {}
     }
 
+    /// CL-353 F1: read operations take no backup write admission. A capture
+    /// begins while a read operation executes, a read operation starts and runs
+    /// during the capture, and a write operation still waits for the capture.
+    func testReadOperationsRunDuringCaptureWhileWriteOperationsWait() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),pid = project["id"] as! String,router = f.router!
+        _ = try f.task(project)
+        let policy = project["policy"] as? JSON ?? [:]
+        func accept(_ method: String) throws -> JSON {
+            let current = try router.dbQueue.read {try router.record($0,pid,type:"project")}
+            let command = uuid()
+            let accepted = try f.call(method,["project_id":pid,"policy":policy,"expected_revision":current["revision"]!,"command_id":command],command:command)
+            try assertAccepted(f,accepted,method:method,command:command)
+            return accepted
+        }
+        func durableState(_ accepted: JSON) throws -> String? {
+            let id = try XCTUnwrap(data(accepted)["operation_id"] as? String)
+            return try router.dbQueue.read {try router.operationRecord($0,id:id)?["state"] as? String}
+        }
+        let lane = HeldLane(router);defer {lane.finish()}
+        let first = try accept("policy_preview")
+        let firstID = try XCTUnwrap(data(first)["operation_id"] as? String)
+        let probe = OperationCaptureProbe()
+        router.commandOperations.executionProbe = { id in
+            if id == firstID {
+                // Begin a capture on another thread while this read executes.
+                let began = DispatchSemaphore(value:0)
+                DispatchQueue.global().async {
+                    do {try router.backupWrites.beginCapture()} catch {probe.fail(error)}
+                    began.signal()
+                }
+                probe.setCaptureBegan(began.wait(timeout:.now() + 5) == .success)
+            }
+            probe.record(id,locked:router.writeAdmissionStatus["locked"] as? Bool == true)
+        }
+        defer {router.commandOperations.executionProbe = nil}
+        lane.finish()
+        XCTAssertTrue(probe.captureBegan,"A capture must not wait for a running read operation")
+        XCTAssertNil(probe.error)
+        XCTAssertEqual(router.writeAdmissionStatus["locked"] as? Bool,true)
+        // The finished read waits for admission only for its terminal-state write.
+        XCTAssertEqual(try durableState(first),"running")
+        XCTAssertEqual(try read(f,first,project:pid)["state"] as? String,"running")
+        XCTAssertNil(try read(f,first,project:pid)["result"])
+
+        let second = try accept("policy_preview"),write = try accept("policy_propose")
+        let secondID = try XCTUnwrap(data(second)["operation_id"] as? String),writeID = try XCTUnwrap(data(write)["operation_id"] as? String)
+        lane.finish()
+        XCTAssertTrue(probe.executions.contains {$0.id == secondID && $0.locked},"A read operation must start and run during a capture")
+        XCTAssertFalse(probe.executions.contains {$0.id == writeID},"A write operation must wait for the capture")
+        XCTAssertEqual(try durableState(second),"queued","No operation write happens during a capture")
+        XCTAssertEqual(try read(f,second,project:pid)["state"] as? String,"running")
+        XCTAssertEqual(try durableState(write),"queued")
+        XCTAssertEqual(try read(f,write,project:pid)["state"] as? String,"queued")
+
+        router.observeWriteAdmission { [weak router] in router?.resumeCommandOperations() }
+        defer {router.observeWriteAdmission {}}
+        router.backupWrites.endCapture(router:router);router.backupWrites.endBackup(router:router)
+        lane.finish()
+        XCTAssertTrue(probe.executions.contains {$0.id == writeID && !$0.locked},"The write operation runs after the capture")
+        XCTAssertEqual(probe.executions.filter {$0.id == firstID || $0.id == secondID}.count,2,"A held read reply is not executed again")
+        for accepted in [first,second,write] {_ = try assertSucceeded(f,accepted,project:pid)}
+    }
+
+    /// CL-353 F3: the contract lists every operation route the code uses.
+    func testContractListsEveryOperationRouteAndReadOperation() throws {
+        let root = URL(fileURLWithPath:#filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let contract = try String(contentsOf:root.appendingPathComponent("docs/mcp-contract.md"),encoding:.utf8)
+        let start = try XCTUnwrap(contract.range(of:"### Long command operations (CL-353)"))
+        let rest = contract[start.upperBound...]
+        let section = String(rest[..<(rest.range(of:"\n#{2,3} ",options:.regularExpression)?.lowerBound ?? rest.endIndex)])
+        func names(after prefix: String,until end: String) throws -> Set<String> {
+            let from = try XCTUnwrap(section.range(of:prefix),prefix)
+            let tail = section[from.upperBound...]
+            let sentence = tail[..<(try XCTUnwrap(tail.range(of:end),end).lowerBound)]
+            let regex = try NSRegularExpression(pattern:"`([a-z_]+)`")
+            let text = String(sentence)
+            return Set(regex.matches(in:text,range:NSRange(text.startIndex...,in:text)).map {String(text[Range($0.range(at:1),in:text)!])})
+        }
+        XCTAssertEqual(try names(after:"The service always uses this route for ",until:". `project_edit`"),CommandRouter.alwaysOperationMethods)
+        XCTAssertEqual(try names(after:"Read operations run exactly as their synchronous reads",until:". A backup capture"),CommandRouter.readOperationMethods)
+        let sourceTargets = try names(after:"Evidence preparation uses operation admission for the source-target methods (",until:")")
+        XCTAssertEqual(sourceTargets,CommandRouter.sourceTargetMethods)
+        for method in CommandRouter.conditionalOperationMethods.sorted() {
+            XCTAssertTrue(section.contains("`\(method)`"),"docs/mcp-contract.md must name the conditional operation route \(method)")
+        }
+    }
+
     func testLegacyBackupFIFOReservationKeepsItsIntentAndOriginalExecution() throws {
         let f = try StorageFixture(fast:true),project = try f.project(),task = try f.task(project),pid = project["id"] as! String
         let router = f.router!,command = uuid(),source = f.workspace.appendingPathComponent("legacy-attachment.txt")
@@ -470,4 +557,17 @@ private final class OperationAdmissionResults: @unchecked Sendable {
     private var outputs: [Result<JSON,Error>] = []
     func append(_ output: Result<JSON,Error>) {lock.withLock {outputs.append(output)}}
     var values: [Result<JSON,Error>] {lock.withLock {outputs}}
+}
+
+private final class OperationCaptureProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var began = false
+    private var failure: Error?
+    private var seen: [(id: String,locked: Bool)] = []
+    func setCaptureBegan(_ value: Bool) {lock.withLock {began = value}}
+    func fail(_ error: Error) {lock.withLock {failure = error}}
+    func record(_ id: String,locked: Bool) {lock.withLock {seen.append((id,locked))}}
+    var captureBegan: Bool {lock.withLock {began}}
+    var error: Error? {lock.withLock {failure}}
+    var executions: [(id: String,locked: Bool)] {lock.withLock {seen}}
 }

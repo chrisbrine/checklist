@@ -109,6 +109,7 @@ extension TicketLifecycleCleanupTests {
 
     /// Scaled per-step timing: 20 receipts x 20,000 entries, 200 wanted objects.
     func testScaledCleanupBackupLookupTiming() throws {
+        try QualificationSuite.requireEnabled()
         _ = try fixture(backed:false)
         func insert(_ range: Range<Int>) throws {
             for r in range {try insertCleanupReceipt(String(format:"p355-scaled-%03d",r),objects:((r * 1000)..<(r * 1000 + 20_000)).map {cleanupEntry("objects/p355s/\($0)",$0)},copy:"/tmp/p355-scaled-\(r)")}
