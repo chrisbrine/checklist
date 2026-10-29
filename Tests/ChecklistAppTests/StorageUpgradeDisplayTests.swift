@@ -36,6 +36,12 @@ import ChecklistIPC
         XCTAssertTrue(store.serviceConnectionFooter.hasPrefix("Service upgrading."))
         XCTAssertTrue(store.serviceConnectionFooter.contains(status.summary))
         XCTAssertEqual(store.serviceConnectionLabel, "Upgrading. " + status.summary)
+        // CL-338: Overview group cards and sections read the same known upgrade from the store.
+        for surface in ChecklistStore.overviewGroups.map(\.surface) {
+            XCTAssertEqual(OverviewGroupSection.placeholder(store.overviewObservations[surface], offline: store.showsOfflineBanner, upgrade: store.storageUpgradeStatus),
+                           .text("This group loads after the upgrade. " + status.summary), surface)
+        }
+        XCTAssertEqual(SourceState.of([store.overviewObservations["recent_reviews"]], offline: store.showsOfflineBanner, upgrade: store.storageUpgradeStatus), .upgrading(status))
         XCTAssertEqual(store.writeBlockReason, DisabledReasons.offline(upgrade: status))
         store.run("task_edit", ["project_id": "synthetic-project", "task_id": "synthetic-ticket"])
         XCTAssertEqual(store.notice, store.serviceUnavailableReason)

@@ -18,12 +18,23 @@ struct MediaOwnerComparison: View {
                     Text("Last owner action: "+GlossaryText.title(decision.string("disposition"))+" · "+MediaComparisonLabels.time(decision.string("created_at"))+" · "+MediaComparisonLabels.origin(decision.string("origin"))).font(.caption).textSelection(.enabled)
                     Text(decision.string("note")).textSelection(.enabled)
                 }
+                ForEach(MediaComparisonLabels.suggestions(item:model.item)) {suggestion in
+                    VStack(alignment:.leading,spacing:4) {
+                        Text("Agent suggestion").font(.headline)
+                        Text(suggestion.source).font(.caption)
+                        Text(suggestion.choice)
+                        if !suggestion.note.isEmpty {Text(suggestion.note).textSelection(.enabled)}
+                        Text(suggestion.isCurrent ? "Advice only. Your decision remains separate." : "Earlier target or review context. Advice only.").font(.caption).foregroundStyle(Color.checklistSecondaryText)
+                    }.padding(8).background(.quaternary.opacity(0.3),in:RoundedRectangle(cornerRadius:6))
+                }
                 ForEach(candidateChoices) {choice in
                     let candidate=choice.candidate
                     VStack(alignment:.leading,spacing:6) {
                         Text(choice.label).font(.headline).accessibilityLabel(choice.label)
-                        ForEach(candidate.records("slots"),id:\.stringID) {slot in
-                            MediaSlotView(model:model,slot:slot,example:nil,candidateIndex:choice.index)
+                        LazyVGrid(columns:[GridItem(.adaptive(minimum:220),alignment:.top)],alignment:.leading,spacing:12) {
+                            ForEach(MediaComparisonLabels.orderedSlots(candidate,layout:model.schema["layout"] as? MediaValues ?? [:]),id:\.stringID) {slot in
+                                MediaSlotView(model:model,slot:slot,example:nil,candidateIndex:choice.index)
+                            }
                         }
                     }.padding(8).background(.quaternary.opacity(0.3),in:RoundedRectangle(cornerRadius:6))
                 }
@@ -79,8 +90,8 @@ struct MediaOwnerComparison: View {
                 Text("Choose a winner").tag("")
                 ForEach(candidateChoices) {choice in Text(choice.label).tag(choice.id).accessibilityLabel(choice.label)}
             }
-            Text("Owner note · saved on this Mac, not sent").font(.caption)
-            TextEditor(text:$model.draft.note).frame(minHeight:80).overlay(RoundedRectangle(cornerRadius:4).stroke(.separator)).accessibilityLabel("Media owner decision note")
+            Text("Owner note · saves automatically on this Mac").font(.caption)
+            TextEditor(text:$model.draft.note).frame(minHeight:80).overlay(RoundedRectangle(cornerRadius:4).stroke(.separator)).accessibilityLabel("Media owner decision note").accessibilityIdentifier("mediaOwnerNote")
             TextField("No-follow-up reason (optional)",text:$model.draft.noFollowUpReason)
             ViewThatFits(in:.horizontal) {
                 HStack {decisionButtons}
@@ -90,9 +101,11 @@ struct MediaOwnerComparison: View {
         }
     }
     @ViewBuilder var decisionButtons: some View {
-        Button("Accept") {model.decide("accepted")}.accessibilityLabel("Accept exact selected media")
-        Button("Needs look") {model.decide("needs_look")}
-        Button(model.item.records("candidates").count > 1 ? "None fit / Changes requested" : "Changes requested") {model.decide("changes_requested")}
+        Button("Accept") {model.decide(.accept)}.accessibilityLabel("Accept exact selected media").accessibilityIdentifier("mediaAccept")
+        Button("Needs look") {model.decide(.lookAtIt)}.accessibilityIdentifier("mediaNeedsLook").help("Look at it: flag this item for another look.")
+        Button("Changes requested") {model.decide(.redo)}.accessibilityIdentifier("mediaChangesRequested")
+            .help("Redo or Other pose: enter what should change in the owner note, then press once.")
+            .checklistDisabled([(model.draft.note.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty,"Enter what should change in the owner note.")])
         Button("Exclude with reason") {model.decide("excluded")}.checklistDisabled([(model.draft.note.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty,"Enter an exclusion reason in the owner note.")])
     }
 }
@@ -106,7 +119,45 @@ struct MediaCandidateChoice: Identifiable {
     var index = 0
     var id: String { candidate.id }
 }
+struct MediaSuggestionPresentation: Identifiable {
+    let id:String
+    let source:String
+    let choice:String
+    let note:String
+    let isCurrent:Bool
+}
 enum MediaComparisonLabels {
+    /// Suggestions remain attributed advice; this projection never changes the owner's draft.
+    @MainActor static func suggestions(item:Record) -> [MediaSuggestionPresentation] {
+        let target=Record(values:item.object("target")),candidates=item.records("candidates")
+        return item.records("suggestions").filter {$0.string("origin")=="agent"}.map {suggestion in
+            let current=suggestion.string("target_id")==target.id && suggestion.string("review_basis_signature")==target.string("review_basis_signature")
+            var choice=MediaReviewModel.dispositionLabel(suggestion.string("disposition"))
+            let winner=suggestion.string("winner_id")
+            if !winner.isEmpty {choice += candidates.firstIndex(where:{$0.id==winner}).map {" · Candidate \($0+1)"} ?? " · Earlier candidate"}
+            let source=suggestion.string("source_label",fallback:"Worker")+" · "+time(suggestion.string("created_at"))
+            return .init(id:suggestion.id,source:source,choice:choice,note:suggestion.string("note"),isCurrent:current)
+        }
+    }
+    static func playbackSettings(slotID: String,layout: MediaValues,historical: Bool) -> (loop: Bool,frameRate: Double?) {
+        // Example queries carry historical attribution, not their historical schema.
+        // Never reinterpret an accepted example at the current type's game speed.
+        guard !historical,layout["primary_slot_id"] as? String == slotID else {return (false,nil)}
+        return (layout["loop"] as? Bool == true,(layout["frame_rate"] as? NSNumber)?.doubleValue)
+    }
+    static func referenceSlotIDs(_ layout: MediaValues) -> [String] {
+        if let references=layout["reference_slot_ids"] as? [String] {return references}
+        return (layout["reference_slot_id"] as? String).map {[$0]} ?? []
+    }
+    /// Keep the take and every declared reference in one candidate comparison.
+    static func orderedSlots(_ candidate: Record,layout: MediaValues) -> [Record] {
+        let ids=((layout["primary_slot_id"] as? String).map {[$0]} ?? [])+referenceSlotIDs(layout)
+        return candidate.records("slots").sorted {a,b in
+            let left=ids.firstIndex(of:a.string("slot_id")) ?? ids.count
+            let right=ids.firstIndex(of:b.string("slot_id")) ?? ids.count
+            return left == right ? a.string("slot_id").utf8.lexicographicallyPrecedes(b.string("slot_id").utf8) : left < right
+        }
+    }
     static func context(_ source: Record) -> String {
         if !source.string("body").isEmpty {return source.string("body")}
         if !source.string("rubric").isEmpty {return source.string("rubric")}
@@ -142,6 +193,10 @@ enum MediaComparisonLabels {
     static func role(slotID: String, candidateIndex: Int?, referenceSlotID: String, historical: Bool) -> String {
         let base = !referenceSlotID.isEmpty && slotID == referenceSlotID ? "Reference" : candidateIndex.map {"Candidate \($0+1)"} ?? "Candidate"
         return historical ? "Approved example · "+base : base
+    }
+    static func role(slotID: String,candidateIndex: Int?,layout: MediaValues,historical: Bool) -> String {
+        let reference=referenceSlotIDs(layout).contains(slotID) ? slotID : ""
+        return role(slotID:slotID,candidateIndex:candidateIndex,referenceSlotID:reference,historical:historical)
     }
     static func imageAccessibilityLabel(_ slot: Record, definitions: [Record]) -> String {
         "Verified original image, "+self.slot(slot,definitions:definitions)
@@ -206,28 +261,39 @@ struct MediaSlotView: View {
         return model.item.records("originals").first {$0.string("attachment_id")==slot.string("attachment_id")}
     }
     var declaredKind:String {model.slots.first {$0.id==slot.string("slot_id")}?.string("kind") ?? ""}
-    var role:String {MediaComparisonLabels.role(slotID:slot.string("slot_id"),candidateIndex:candidateIndex,referenceSlotID:model.referenceSlotID,historical:example != nil)}
+    var layout:MediaValues {model.schema["layout"] as? MediaValues ?? [:]}
+    var playbackSettings:(loop:Bool,frameRate:Double?) {MediaComparisonLabels.playbackSettings(slotID:slot.string("slot_id"),layout:layout,historical:example != nil)}
+    var role:String {MediaComparisonLabels.role(slotID:slot.string("slot_id"),candidateIndex:candidateIndex,layout:layout,historical:example != nil)}
     var imageKey:String {(original?.string("reference_id") ?? "")+":"+slot.string("slot_id")}
     var active:Bool {model.imageIsActive(imageKey,historical:example != nil)}
     var body: some View {
         VStack(alignment:.leading,spacing:4) {
+            Text(role).font(.caption.weight(.semibold))
             Text(MediaComparisonLabels.slot(slot,definitions:model.slots)).font(.caption)
             switch MediaComparisonAvailability.resolve(slot:slot,original:original,declaredKind:declaredKind) {
             case .text(let value): MediaExactCapturedText(value:value)
             case .unavailable(let reason),.unsupported(let reason):Text(reason).foregroundStyle(Color.checklistSecondaryText)
             case .playback(let kind):
                 if let original {
-                    Text(role).font(.caption.weight(.semibold))
-                    MediaPlaybackSlotView(model:model,playback:model.playback,slot:slot,original:original,example:example,kind:kind,label:role+" · "+MediaComparisonLabels.slot(slot,definitions:model.slots))
+                    MediaPlaybackSlotView(model:model,playback:model.playback,slot:slot,original:original,example:example,kind:kind,label:role+" · "+MediaComparisonLabels.slot(slot,definitions:model.slots),loop:playbackSettings.loop,frameRate:playbackSettings.frameRate)
+                    if example != nil {Text("Historical example at source speed; historical playback settings are unavailable.").font(.caption)}
                 }
             case .image:
                 if active,let image {Image(nsImage:image).resizable().scaledToFit().frame(maxWidth:460,maxHeight:300).accessibilityLabel(MediaComparisonLabels.imageAccessibilityLabel(slot,definitions:model.slots))}
-                else {Text(active ? status : "Image not loaded");Button("Load exact image") {Task {await load()}}.checklistDisabled([(model.imageLoads>=2,"Two original images are loading. Wait for one to finish.")])}
+                else {Text(active ? status : "Image not loaded");Button("Load exact image") {Task {await load()}}.accessibilityLabel("Load exact image, "+MediaComparisonLabels.slot(slot,definitions:model.slots)).checklistDisabled([(model.imageLoads>=2,"Two original images are loading. Wait for one to finish.")])}
             }
         }
+        .accessibilityElement(children:.contain).accessibilityLabel(role+" · "+MediaComparisonLabels.slot(slot,definitions:model.slots))
+        .task(id:imageKey) {await loadCurrentImageIfNeeded()}
+        .onChange(of:model.imageLoads) {_,count in if count<2 {Task {await loadCurrentImageIfNeeded()}}}
         .onChange(of:model.currentImageReference) {_,_ in if !active {image=nil}}
         .onChange(of:model.historicalImageReference) {_,_ in if !active {image=nil}}
         .id((example?.string("target_id") ?? model.item.object("target")["id"] as? String ?? "")+slot.string("slot_id"))
+    }
+    @MainActor func loadCurrentImageIfNeeded() async {
+        guard example == nil,!active,model.imageLoads<2,
+              MediaComparisonAvailability.resolve(slot:slot,original:original,declaredKind:declaredKind) == .image else {return}
+        await load()
     }
     @MainActor func load() async {
         guard let original,model.beginImage(imageKey,historical:example != nil) else {return}

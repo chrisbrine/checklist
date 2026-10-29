@@ -1757,6 +1757,39 @@ class SeedIsolationTests(unittest.TestCase):
         with test_directory() as directory, self.assertRaisesRegex(ValueError, 'relative, malformed or traversing'):
             self.inspect(Path(directory).resolve(), record('TestResults/run.xml', 'results'))
 
+    def test_manifest_evidence_source_files_are_inert_history(self):
+        # CL-339: submitted evidence lists changed source files by absolute
+        # scratch path and digest. They seed as inert history, never opened.
+        outside = '/private/tmp/synthetic-scratch/ws/src/Sources/File.swift'
+        def record(entries, kind='manifest', **evidence):
+            return [(kind, {'id': 'record', 'evidence': dict(evidence, source_files=entries)})]
+        with test_directory() as directory:
+            base = Path(directory).resolve()
+            counts = self.inspect(base, record([{'path': outside, 'sha256': 'a' * 64},
+                                                {'path': 'Sources/Relative.swift', 'sha256': 'b' * 64}]))
+            self.assertEqual((counts['inert_history_path_occurrences'], counts['relative_evidence_paths']), (2, 0))
+            self.assertFalse(Path('/private/tmp/synthetic-scratch').exists())
+        # A file URL keeps the blanket refusal.
+        with test_directory() as directory, self.assertRaisesRegex(ValueError, 'stored file URL'):
+            self.inspect(Path(directory).resolve(), record([{'path': 'file://' + outside}]))
+        # Managed descriptors in the same record keep the managed-path contract.
+        for entries, evidence, message in [
+                ([{'path': outside, 'mode': 'managed'}], {}, 'managed path in the wrong family'),
+                ([{'path': outside}], {'artifact_refs': [{'mode': 'managed', 'path': '../../outside/objects/file'}]},
+                 'root-relative managed path.*artifact_refs'),
+                ([{'path': outside}], {'artifact_refs': [{'mode': 'managed', 'path': str(harness.LIVE / 'objects/file')}]},
+                 'different Checklist data root'),
+                # Other evidence lists and other record kinds keep the strict rule.
+                ([{'path': outside}], {'files': [{'path': outside}]}, r'stored absolute path outside.*evidence\.files'),
+                ([{'path': outside}], {'checks': [{'source_files': [{'path': outside}]}]}, 'stored absolute path outside')]:
+            with self.subTest(entries=entries, evidence=evidence), test_directory() as directory:
+                with self.assertRaisesRegex(ValueError, message):
+                    self.inspect(Path(directory).resolve(), record(entries, **evidence))
+        for kind in ['fixture', 'request', 'review']:
+            with self.subTest(kind=kind), test_directory() as directory:
+                with self.assertRaisesRegex(ValueError, 'stored absolute path outside'):
+                    self.inspect(Path(directory).resolve(), record([{'path': outside}], kind))
+
     def test_manifest_evidence_additional_paths_with_source_root_refuse_checklist_aliases(self):
         with test_directory() as directory:
             base = Path(directory).resolve();project = base / 'project';project.mkdir();live = base / 'live';live.mkdir()

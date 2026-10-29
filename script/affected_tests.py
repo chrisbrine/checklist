@@ -57,6 +57,7 @@ TIMING_TESTS = (
     'ChecklistServiceTests.BootstrapAdmissionTests/testFreshBootstrapReadsAndTwoQueuedWritesFinishWhileActualWriterIsHeld',
     'ChecklistAppTests.ApplicationTerminationTests/testOpenFloatingCaptureQuitsAndRestoresBlankTextAndFiles',
     'ChecklistAppTests.CachedScreenReturnTests/testTemplateCatalogOverviewReturnNeedsNoReadOrCatalogReplay',
+    'ChecklistAppTests.MediaPlaybackComparisonTests/testNonloopingTakeRetainsCompletedItemAndReplaysWithoutUndoingPauseOrUnload',
     'ChecklistAppTests.MediaPlaybackComparisonTests/testSyntheticWrittenMovieIsSelfContainedAndProbeMeasuresIt',
     'ChecklistCoreTests.EvidenceAuthorityTests/testGitCallsAreBoundedAndReadBothPipes',
     'ChecklistCoreTests.ArchivePreviewStoreCopyTests/testCL24PreviewOnOwnedStoreCopy',

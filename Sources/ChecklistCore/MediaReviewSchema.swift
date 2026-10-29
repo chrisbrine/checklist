@@ -74,8 +74,13 @@ struct MediaReviewLayout {
     let kind: MediaLayoutKind
     let primarySlotID: MediaReviewID?
     let referenceSlotID: MediaReviewID?
-    fileprivate init(kind: MediaLayoutKind, primary: MediaReviewID?, reference: MediaReviewID?) {
+    let referenceSlotIDs: [MediaReviewID]
+    let loop: Bool
+    let frameRate: Double?
+    fileprivate init(kind: MediaLayoutKind, primary: MediaReviewID?, reference: MediaReviewID?, references: [MediaReviewID] = [], loop: Bool = false, frameRate: Double? = nil) {
         self.kind = kind; primarySlotID = primary; referenceSlotID = reference
+        referenceSlotIDs = reference.map { [$0] } ?? references
+        self.loop = loop; self.frameRate = frameRate
     }
 }
 
@@ -204,8 +209,16 @@ struct MediaReviewSchema {
         // Primary/reference roles affect review meaning; the native renderer kind itself is presentation.
         atom(layout.primarySlotID == nil ? "0" : "1")
         if let id = layout.primarySlotID { append(id.bytes) }
-        let reference = layout.referenceSlotID.flatMap { id in selectedSlots.contains(where: { $0.id == id }) ? id : nil }
+        let references = layout.referenceSlotIDs.filter { id in selectedSlots.contains { $0.id == id } }.sorted()
+        let reference = references.first
         atom(reference == nil ? "0" : "1"); if let id = reference { append(id.bytes) }
+        // Preserve existing v1 definitions exactly. Additional present reference roles and
+        // declared playback speed affect review meaning; looping is display state only.
+        if references.count > 1 {
+            atom("additional-reference-slots.v1"); atom(String(references.count - 1))
+            for id in references.dropFirst() { append(id.bytes) }
+        }
+        if let rate = layout.frameRate { atom("frame-rate.v1"); atom(String(format: "%.17g", locale: Locale(identifier: "en_US_POSIX"), rate)) }
         return output
     }
 
@@ -213,17 +226,29 @@ struct MediaReviewSchema {
         guard let raw else { return MediaReviewLayout(kind: .generic, primary: nil, reference: nil) }
         let kindText: String
         var primary: MediaReviewID?, reference: MediaReviewID?
+        var references: [MediaReviewID] = [], loop = false, frameRate: Double?
         if let value = raw as? String { kindText = value }
         else {
             let o = try object(raw, path: "type.layout")
-            try keys(o, allowed: ["kind", "primary_slot_id", "reference_slot_id"], path: "type.layout")
+            try keys(o, allowed: ["kind", "primary_slot_id", "reference_slot_id", "reference_slot_ids", "loop", "frame_rate"], path: "type.layout")
             kindText = try text(o["kind"], max: 32, path: "type.layout.kind")
             if let value = o["primary_slot_id"] { primary = try identifier(value, path: "type.layout.primary_slot_id") }
             if let value = o["reference_slot_id"] { reference = try identifier(value, path: "type.layout.reference_slot_id") }
+            if o["reference_slot_ids"] != nil {
+                guard reference == nil else { throw MediaSchemaError.invalid("type.layout", "choose reference_slot_id or reference_slot_ids") }
+                references = try array(o["reference_slot_ids"], max: 7, path: "type.layout.reference_slot_ids").map { try identifier($0, path: "type.layout.reference_slot_ids") }
+                try unique(references, path: "type.layout.reference_slot_ids")
+            }
+            loop = try boolean(o["loop"], fallback: false, path: "type.layout.loop")
+            if let raw = o["frame_rate"] {
+                guard let n = raw as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(), n.doubleValue.isFinite,
+                      (1...240).contains(n.doubleValue) else { throw MediaSchemaError.invalid("type.layout.frame_rate", "expected frame rate from 1 to 240 fps") }
+                frameRate = n.doubleValue
+            }
         }
         guard let kind = MediaLayoutKind(rawValue: kindText) else { throw MediaSchemaError.invalid("type.layout", "unsupported native layout") }
         guard let expected = kind.slotKind else {
-            guard primary == nil, reference == nil else { throw MediaSchemaError.invalid("type.layout", "generic layout has no comparison roles") }
+            guard primary == nil, reference == nil, references.isEmpty, !loop, frameRate == nil else { throw MediaSchemaError.invalid("type.layout", "generic layout has no comparison roles or playback settings") }
             return MediaReviewLayout(kind: kind, primary: nil, reference: nil)
         }
         if primary == nil {
@@ -234,12 +259,13 @@ struct MediaReviewSchema {
         guard let selected = slots.first(where: { $0.id == primary }), selected.kind == expected, selected.material else {
             throw MediaSchemaError.invalid("type.layout.primary_slot_id", "primary must reference a compatible material slot")
         }
-        if let reference {
-            guard reference != primary, slots.contains(where: { $0.id == reference && $0.kind == expected }) else {
-                throw MediaSchemaError.invalid("type.layout.reference_slot_id", "reference must be distinct and compatible")
+        for id in reference.map({ [$0] }) ?? references {
+            guard id != primary, slots.contains(where: { $0.id == id && ($0.kind == expected || (kind == .videoCompare && $0.kind == .image)) }) else {
+                throw MediaSchemaError.invalid("type.layout.reference_slot_ids", "references must be distinct declared compatible slots; video comparisons also allow images")
             }
         }
-        return MediaReviewLayout(kind: kind, primary: primary, reference: reference)
+        guard kind == .videoCompare || (!loop && frameRate == nil) else { throw MediaSchemaError.invalid("type.layout", "loop and frame_rate require video_compare") }
+        return MediaReviewLayout(kind: kind, primary: primary, reference: reference, references: references, loop: loop, frameRate: frameRate)
     }
 
     private static func object(_ value: Any, path: String) throws -> [String: Any] {

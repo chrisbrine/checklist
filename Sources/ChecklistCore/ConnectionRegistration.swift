@@ -23,11 +23,19 @@ extension CommandRouter {
     public func connectionSession(sessionID: String, project: String, caller: Caller) throws -> [String: Any]? {
         try owner(caller)
         let lease = try storageAdmission.acquire(); defer { lease.finish() }
-        return try readForPreparation { db in
+        return try readConnectionAuthority { db in
             let pid = try self.scope(db,["project_id":project],caller)
             do { return try self.scoped(db,sessionID,pid,type:"session") }
             catch let error as CoreError where error.code == "NOT_FOUND" { return nil }
         }
+    }
+
+    private func readConnectionAuthority<T>(_ body: (Database) throws -> T) throws -> T {
+        if readers != nil {return try readForPreparation(body)}
+        guard let result = try withImmediateWriteAccess({try dbQueue.read(body)}) else {
+            throw CoreError("BACKUP_SERVICE_CALL_DEFERRED","Connection authority verification waits for backup write admission.")
+        }
+        return result
     }
 
     private func connectionReceipt(_ db: Database, command: String, digest: String, principal: String) throws -> JSON? {
@@ -72,14 +80,12 @@ extension CommandRouter {
         try owner(caller)
         let operationLease = try storageAdmission.acquire()
         defer { operationLease.finish() }
-        return try ArchiveStorageGate.withExclusive(root: root) { _ in
-        return try dbQueue.read { db in
-            guard let stored = try connectionReceipt(db, command: commandID, digest: digest, principal: receiptPrincipal),
+        return try readConnectionAuthority { db in
+            guard let stored = try self.connectionReceipt(db, command: commandID, digest: digest, principal: receiptPrincipal),
                   let basis = stored["_connection_registration"] as? JSON,
                   basis["session_id"] as? String == sessionID,
                   (basis["installation"] as? String)?.hasPrefix(installation + "/") == true else { return false }
-            return bool(try connectionAuthority(db, receipt: stored), "registration_current")
-        }
+            return bool(try self.connectionAuthority(db, receipt: stored), "registration_current")
         }
     }
 

@@ -7,9 +7,9 @@ extension CommandRouter {
     /// Internal domain seam; CL-116 exposes only its explicit native-owner allowlist.
     /// Capture/holds are composed internally; public activation still needs the complete
     /// owner UI/rendering/query/rework slice and its native qualification.
-    func executeMediaCommand(method: String,params p: JSON,caller c: Caller,nativeOwnerProjection: Bool = false) throws -> JSON {
+    func executeMediaCommand(method: String,params p: JSON,caller c: Caller,nativeOwnerProjection: Bool = false,workerChannel: Bool = false) throws -> JSON {
         do {
-            return try executeValidatedMediaCommand(method:method,params:p,caller:c,nativeOwnerProjection:nativeOwnerProjection)
+            return try executeValidatedMediaCommand(method:method,params:p,caller:c,nativeOwnerProjection:nativeOwnerProjection,workerChannel:workerChannel)
         } catch let error as MediaSchemaError {
             // Portable schema helpers have no transport error codes. Translate at
             // the command boundary, including resource and canonical preparation.
@@ -56,16 +56,16 @@ extension CommandRouter {
         "media_round_successor":["source_round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","title","items"]
         ]
 
-    private func executeValidatedMediaCommand(method: String,params p: JSON,caller c: Caller,nativeOwnerProjection: Bool) throws -> JSON {
+    private func executeValidatedMediaCommand(method: String,params p: JSON,caller c: Caller,nativeOwnerProjection: Bool,workerChannel: Bool) throws -> JSON {
         let reads = CommandMethods.mediaInternalReads
         guard let fields = Self.mediaCommandFields[method],Set(p.keys).isSubset(of:fields.union(["command_id",
             "project_id"])) else { throw CoreError("INVALID_INPUT","Unknown internal media command or fields.") }
         guard let data = try? JSONSerialization.data(withJSONObject:p),data.count <= 2_000_000 else { throw CoreError("INVALID_INPUT","Media command exceeds its input bound.") }
         let lease = try storageAdmission.acquire();defer {lease.finish()}
         if method == "media_example_read_lease" || method == "media_example_read_release" {return try mediaExampleLease(method:method,p:p,c:c)}
-        if method == "media_rework_preview" {return try dbQueue.read { db in try self.mediaReworkPreview(db,p,c,project:self.mediaAccess(db,p,c)) }}
+        if method == "media_rework_preview" {return try readForPreparation { db in try self.mediaReworkPreview(db,p,c,project:self.mediaAccess(db,p,c)) }}
         if reads.contains(method) {
-            return try dbQueue.read { db in
+            return try readForPreparation { db in
                 let pid = try self.mediaAccess(db,p,c)
                 if method == "media_item_page" || method == "media_item_counts" {return try self.mediaListQuery(db,method:method,p:p,c:c,project:pid)}
                 if method == "media_approved_examples" {return try self.mediaExampleQuery(db,p:p,c:c,project:pid)}
@@ -83,7 +83,7 @@ extension CommandRouter {
         let digest = hash(Data((method + (try jsonString(p))).utf8))
         // Rework capture writes ordinary tickets, which the media-only preparation cannot hold.
         if method == "media_rework_create" {return try mediaReworkCreateCommand(params:p,caller:c,command:command,digest:digest)}
-        var resources = try prepareMediaResources(method:method,params:p,caller:c)
+        var resources = try prepareMediaResources(method:method,params:p,caller:c,workerChannel:workerChannel)
         resources.nativeOwnerProjection = nativeOwnerProjection
         let prepared = try prepareMediaCommand(method:method,params:p,caller:c,resources:resources)
         defer { try? prepared?.observer.close() }
@@ -331,6 +331,7 @@ extension CommandRouter {
         round["record_references"] = (round["record_references"] as? [JSON] ?? []) + [try mediaRef("media_round_manifest",manifest)];return manifest
     }
     func mediaCommand(_ db: Database,method: String,p: JSON,c: Caller,project pid: String,resources: PreparedMediaResources = .init()) throws -> JSON {
+        if resources.workerChannel { try mediaWorkerWriteAccess(db,method:method,p:p,c:c,project:pid) }
         if method.hasPrefix("media_intake_") { return try mediaIntakeCommand(db,method:method,p:p,c:c,project:pid,resources:resources) }
         if method.hasPrefix("media_bulk_") { return try mediaBulkCommand(db,method:method,p:p,c:c,project:pid) }
         switch method {
@@ -381,7 +382,9 @@ extension CommandRouter {
             let sources = try mediaCurrentSources(db,project:pid,type:(try StoredRecord(type, family: "media").string("id")),round:(try StoredRecord(round, family: "media").string("id")))
             let context = try mediaSnapshot(db,round:round,typeRevision:typeRevision,sources:sources,caller:c)
             round["context_id"] = context["id"];round["record_references"] = ((try StoredRecord(round, family: "media").objects("record_references"))) + [try mediaRef("media_review_context",context)]
-            try mediaWrite(db,round,type:"media_round");return try resources.nativeOwnerProjection ? mediaOwnerHeader(db,round,c) : mediaRoundView(db,round:round,caller:c)
+            try mediaWrite(db,round,type:"media_round")
+            if resources.workerChannel { return try mediaWorkerRound(db,round:round,p:[:],c:c) }
+            return try resources.nativeOwnerProjection ? mediaOwnerHeader(db,round,c) : mediaRoundView(db,round:round,caller:c)
         case "media_item_create","media_item_update":
             return try mediaEditItem(db,p,c,project:pid,method:method)
         case "media_context_approve":

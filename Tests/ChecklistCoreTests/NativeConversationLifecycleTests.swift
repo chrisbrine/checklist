@@ -281,7 +281,14 @@ extension EvidenceAuthorityTests {
         XCTAssertTrue((try call("service_info", [:], worker)["native_recovery"] as! [JSON]).isEmpty)
         assertCode("FORBIDDEN") { _ = try self.call("session_inbox", ["project_id": p["id"]!], worker) }
         let task = try call("task_get", ["project_id": p["id"]!, "task_id": tasks[0]["id"]!])
-        XCTAssertTrue(((task["status_reason"] as? JSON)?["text"] as? String ?? "").contains("native closure"))
+        let releaseReason = try XCTUnwrap(task["status_reason"] as? JSON)
+        XCTAssertEqual(releaseReason["text"] as? String, "Released: native closure of the conversation's earlier process.")
+        // The automatic release is Checklist's own action, never the owner's "You".
+        XCTAssertEqual(releaseReason["actor_display"] as? String, "Checklist")
+        // A real owner status action after it keeps the owner label.
+        let ownerTicket = try ready(p)
+        let blocked = try call("task_transition", ["project_id": p["id"]!, "task_id": ownerTicket["id"]!, "expected_revision": ownerTicket["revision"]!, "action": "block", "reason": "Owner holds this ticket"])
+        XCTAssertEqual((blocked["status_reason"] as? JSON)?["actor_display"] as? String, "You")
         // One more real mocked closure/resumption uses only that previous generation,
         // and the unacknowledged copy survives without un-fencing the original.
         _ = try router.reconcileVerifiedNativeClosure(closure(p, resumed), caller: lifecycleOwner)

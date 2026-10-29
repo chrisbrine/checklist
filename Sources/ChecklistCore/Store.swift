@@ -200,7 +200,8 @@ public final class CommandRouter: @unchecked Sendable {
         var data = data
         if Self.ticketStatusEventKinds.contains(kind), let entity, let task = try? record(db,entity,type:"task") {
             data["to_status_id"] = task["status_id"]
-            data["actor_display"] = author(db,caller)
+            // CL-322: a system event (native closure release) keeps its supplied label.
+            if data["actor_display"] as? String == nil { data["actor_display"] = author(db,caller) }
         }
         if let entity, let named = try? record(db,entity), named["title"] != nil || named["kind"] as? String == "triage" || named["kind"] as? String == "epic" {
             data["subject"] = ["id":entity,"key":named["key"] ?? NSNull(),"title":named["title"] ?? named["name"] ?? ""]
@@ -320,11 +321,33 @@ public final class CommandRouter: @unchecked Sendable {
         guard ["owner","worker","assistant"].contains(caller.role), !caller.installation.isEmpty else { throw CoreError("FORBIDDEN", "An authenticated connection is required.") }
         guard let encoded = try? JSONSerialization.data(withJSONObject:params), encoded.count <= 2_000_000 else { throw CoreError("INVALID_INPUT", "Command input is too large or invalid.") }
         try validateInput(method,params,caller)
+        // Worker media uses the same prepared capture boundary, with a separate
+        // allowlist and projections. An overlapping name never grants owner authority.
+        if caller.role == "worker", Self.mediaWorkerMethods.contains(method) {
+            // Worker reads use the pool; without it, admit the writer atomically with capture.
+            let writerRead = Self.mediaWorkerReads.contains(method) && readers == nil
+            if writerRead {
+                switch backupWrites.admitWriterDependentRead() {
+                case .reply(let result):return result
+                case .run:break
+                }
+            }
+            defer {if writerRead {backupWrites.finishWrite()}}
+            do {
+                let value = try executeMediaWorkerChannel(method:method,params:params,caller:caller)
+                var reply: JSON = ["data":value]
+                if !Self.mediaWorkerReads.contains(method) { reply["command_id"] = params["command_id"] }
+                return reply
+            } catch let error as DatabaseError {
+                if let command = params["command_id"] as? String { throw storageOutcomeFailure(error,command:command) }
+                throw error
+            }
+        }
         // CL-116 native owner media boundary prepares outside the ordinary writer.
         if Self.mediaOwnerMethods.contains(method) {
-            // These native reads use the writer connection or create/release
-            // reader holds. Admission also fences capture starting after this check.
-            let writerRead = Self.mediaOwnerReads.contains(method)
+            // Original/lease reads change reader holds. Safe projections use
+            // the pool, retaining admission if only the writer is available.
+            let writerRead = Self.mediaOwnerReads.contains(method) && (!Self.mediaOwnerPoolReads.contains(method) || readers == nil)
             if writerRead {
                 try owner(caller)
                 _ = try backupWriteAuthorization(params:params,caller:caller)
@@ -347,7 +370,17 @@ public final class CommandRouter: @unchecked Sendable {
         let operationLease = try storageAdmission.acquire()
         defer { operationLease.finish() }
         if Self.storageRestoreMethods.contains(method) {return try executeStorageRestore(method:method,params:params,caller:caller)}
-        if Self.projectImportMethods.contains(method) {return try executeProjectImport(method:method,params:params,caller:caller)}
+        if Self.projectImportMethods.contains(method) {
+            let writerRead = Self.readMethods.contains(method) && readers == nil
+            if writerRead {
+                switch backupWrites.admitWriterDependentRead() {
+                case .reply(let result):return result
+                case .run:break
+                }
+            }
+            defer {if writerRead {backupWrites.finishWrite()}}
+            return try executeProjectImport(method:method,params:params,caller:caller)
+        }
         // CL-72: a pure read runs on a read-only connection, without the object gate or the
         // writer. A read that turns out to write (for example a first cleanup preview) runs
         // again on the writer path below.

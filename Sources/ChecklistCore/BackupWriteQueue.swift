@@ -318,7 +318,7 @@ extension CommandRouter {
                 guard !Self.isPrunedResult(result) else {throw Self.expiredCommandError(command)}
                 // Media's journal stores its semantic payload; the native owner
                 // boundary supplies the wire envelope during ordinary execution.
-                if Self.mediaOwnerMethods.contains(method) {return ["data":result,"command_id":command]}
+                if Self.mediaOwnerMethods.contains(method) || Self.mediaWorkerMethods.contains(method) {return ["data":result,"command_id":command]}
                 return result
             }
             return ["data":["state":"applied","command_id":command,"result":result,

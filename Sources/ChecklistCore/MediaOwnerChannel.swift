@@ -6,6 +6,7 @@ import GRDB
 /// Keep dispatch outside the ordinary writer: capture and hashing prepare first.
 extension CommandRouter {
     static let mediaOwnerReads = CommandMethods.mediaOwnerReads
+    static let mediaOwnerPoolReads = mediaOwnerReads.subtracting(["media_original_read","media_example_read_lease","media_example_read_release"])
     static let mediaOwnerMethods = mediaOwnerReads.union([
         "media_type_create", "media_type_revise", "media_type_adopt", "media_type_retire", "media_round_create", "media_round_cancel", "media_round_archive", "media_item_create", "media_item_update", "media_round_publish", "media_intake_preview", "media_intake_revise", "media_intake_confirm", "media_intake_capture", "media_context_approve", "media_context_reconcile", "media_decide", "media_example_read_lease", "media_example_read_release", "media_original_read",
         // CL-300: owner screens for CL-118 rework Drafts, round closure and successor rounds.
@@ -23,7 +24,7 @@ extension CommandRouter {
             guard Set(p.keys).isSubset(of: fields.union(["project_id"])) else { throw CoreError("INVALID_INPUT", "Unknown media read fields.") }
             let admission = try storageAdmission.acquire(); defer { admission.finish() }
             if method == "media_original_read" { return try mediaOwnerOriginal(p, c) }
-            return try dbQueue.read { db in
+            return try readForPreparation { db in
                 let project = try self.mediaAccess(db, p, c)
                 if method == "media_navigation" {
                     let values = try self.mediaOwnerRecords(db, project: project, family: "media_review_type", predicate: "", arguments: [], limit: 101)
@@ -95,6 +96,7 @@ extension CommandRouter {
         item["published"] = member != nil
         item["target"] = target
         item["candidates"] = try strings(target,"candidate_ids").map {try scoped(db,$0,project,type:"media_candidate")}
+        item["suggestions"] = try mediaItemSuggestions(db,project:project,itemID:itemID,target:target)
         item["disposition"] = "pending"
         if let id = item["last_decision_id"] as? String {
             let decision = try scoped(db,id,project,type:"media_owner_decision")

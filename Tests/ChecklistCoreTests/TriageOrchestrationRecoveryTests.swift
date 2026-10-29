@@ -177,6 +177,10 @@ extension EvidenceAuthorityTests {
         assertCode("FORBIDDEN") { _ = try self.orchestrate(p,group,"resume",other,reason:"Wrong conversation") }
         assertCode("INVALID_INPUT") { _ = try self.orchestrate(p,group,"resume",resumed) }
         assertCode("INVALID_INPUT") { _ = try self.orchestrate(p,group,"resume",resumed,reason:" ") }
+        // The checkpoint refusal names the one-step route for the resumed conversation.
+        XCTAssertThrowsError(try orchestrate(p,group,"checkpoint",resumed)) {
+            XCTAssertEqual(($0 as? CoreError)?.code,"FORBIDDEN"); XCTAssertTrue(($0 as? CoreError)?.message.contains("action=resume") ?? false)
+        }
         let command = UUID().uuidString
         let input: JSON = ["project_id":p["id"]!,"triage_id":group["id"]!,"expected_revision":recovery["expected_revision"]!,"action":"resume","reason":"Continue after native closure"]
         let rebound = try call("triage_orchestrate",input,resumed,command:command)

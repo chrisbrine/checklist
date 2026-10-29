@@ -151,6 +151,67 @@ final class MediaReviewSchemaTests: XCTestCase {
         XCTAssertThrowsError(try schema.validateValue("x", fieldID: id("unknown")))
     }
 
+    func testVideoComparisonAcceptsSeveralMixedReferencesAndRejectsAmbiguousRoles() throws {
+        var raw = base()
+        raw["slots"] = [slot("take", kind: "video"), slot("sheet"), slot("concept"), slot("earlier", kind: "video"), slot("sound", kind: "audio")]
+        raw["layout"] = ["kind": "video_compare", "primary_slot_id": "take", "reference_slot_ids": ["sheet", "concept", "earlier"]]
+        let schema = try MediaReviewSchema.parse(raw)
+        XCTAssertEqual(schema.layout.referenceSlotIDs.map(\.rawValue), ["sheet", "concept", "earlier"])
+        XCTAssertNil(schema.layout.referenceSlotID)
+        XCTAssertEqual(schema.slots.map(\.kind), [.video, .image, .image, .video, .audio])
+        for references in [["sheet", "sheet"], ["take"], ["absent"], ["sound"]] {
+            raw["layout"] = ["kind": "video_compare", "primary_slot_id": "take", "reference_slot_ids": references]
+            XCTAssertThrowsError(try MediaReviewSchema.parse(raw), references.description)
+        }
+        raw["layout"] = ["kind": "video_compare", "primary_slot_id": "take", "reference_slot_id": "earlier", "reference_slot_ids": ["sheet"]]
+        XCTAssertThrowsError(try MediaReviewSchema.parse(raw))
+        for invalid in [NSNull(), "sheet", Array(repeating: "sheet", count: 8)] as [Any] {
+            raw["layout"] = ["kind": "video_compare", "primary_slot_id": "take", "reference_slot_ids": invalid]
+            XCTAssertThrowsError(try MediaReviewSchema.parse(raw))
+        }
+    }
+
+    func testAdditionalReferenceRolesAreMaterialOnlyWhenPresentAndOrderIsCosmetic() throws {
+        var raw = base(); raw["slots"] = [slot("take", kind: "video"), slot("sheet"), slot("earlier", kind: "video")]
+        raw["layout"] = ["kind": "video_compare", "primary_slot_id": "take", "reference_slot_ids": ["sheet", "earlier"]]
+        let empty = try definition(raw, slots: ["take"])
+        let present = try definition(raw, slots: ["take", "sheet", "earlier"])
+        raw["layout"] = ["kind": "video_compare", "primary_slot_id": "take", "reference_slot_ids": ["earlier", "sheet"]]
+        XCTAssertEqual(present, try definition(raw, slots: ["take", "sheet", "earlier"]))
+        raw["layout"] = ["kind": "video_compare", "primary_slot_id": "take"]
+        XCTAssertEqual(empty, try definition(raw, slots: ["take"]))
+        XCTAssertNotEqual(present, try definition(raw, slots: ["take", "sheet", "earlier"]))
+        raw["layout"] = ["kind": "video_compare", "primary_slot_id": "take", "reference_slot_id": "earlier"]
+        let legacy = try definition(raw, slots: ["take", "earlier"])
+        raw["layout"] = ["kind": "video_compare", "primary_slot_id": "take", "reference_slot_ids": ["earlier"]]
+        XCTAssertEqual(legacy, try definition(raw, slots: ["take", "earlier"]), "Equivalent singular/array roles preserve applicable decisions")
+    }
+
+    func testVideoLoopAndFrameRateAreStrictPortableSettings() throws {
+        var raw = base(); raw["slots"] = [slot("take", kind: "video")]
+        raw["layout"] = ["kind": "video_compare", "primary_slot_id": "take"]
+        let original = try definition(raw, slots: ["take"])
+        XCTAssertFalse(try MediaReviewSchema.parse(raw).layout.loop)
+        XCTAssertNil(try MediaReviewSchema.parse(raw).layout.frameRate)
+        raw["layout"] = ["kind": "video_compare", "primary_slot_id": "take", "loop": true]
+        XCTAssertTrue(try MediaReviewSchema.parse(raw).layout.loop)
+        XCTAssertEqual(original, try definition(raw, slots: ["take"]), "Loop is presentation only")
+        raw["layout"] = ["kind": "video_compare", "primary_slot_id": "take", "loop": true, "frame_rate": 12]
+        XCTAssertEqual(try MediaReviewSchema.parse(raw).layout.frameRate, 12)
+        XCTAssertNotEqual(original, try definition(raw, slots: ["take"]), "Playback speed changes review meaning")
+        for invalid in [true, 0, 241, Double.infinity, "12", NSNull()] as [Any] {
+            raw["layout"] = ["kind": "video_compare", "primary_slot_id": "take", "frame_rate": invalid]
+            XCTAssertThrowsError(try MediaReviewSchema.parse(raw))
+        }
+        for invalid in [1, "true", NSNull()] as [Any] {
+            raw["layout"] = ["kind": "video_compare", "primary_slot_id": "take", "loop": invalid]
+            XCTAssertThrowsError(try MediaReviewSchema.parse(raw))
+        }
+        raw["slots"] = [slot("take", kind: "image")]
+        raw["layout"] = ["kind": "image_compare", "primary_slot_id": "take", "loop": true]
+        XCTAssertThrowsError(try MediaReviewSchema.parse(raw))
+    }
+
     func testCosmeticAndUnusedOptionalChangesDoNotChangeMaterialDefinition() throws {
         var raw = base(); raw["fields"] = [field("used"), field("unused")]
         raw["slots"] = [slot("current"), slot("unused")]; raw["layout"] = "generic"

@@ -103,6 +103,27 @@ final class MediaGroupJoinTests: XCTestCase {
         _ = try f.publish(round)
     }
 
+    func testMixedImageAndVideoReferencesJoinOneTakeAndPublishTogether() throws {
+        var schema=starter("video",maxCandidates:1)
+        schema["slots"]=[["id":"take","kind":"video","material":true],["id":"sheet","kind":"image","material":true],
+            ["id":"concept","kind":"image","material":true],["id":"earlier","kind":"video","material":true]]
+        schema["layout"]=["kind":"video_compare","primary_slot_id":"take","reference_slot_ids":["sheet","concept","earlier"],"loop":true,"frame_rate":12]
+        let f=try MediaFrozenIntakeTests.Fixture(),round=try f.round(f.type(schema))
+        let movie=MediaPlaybackOriginalTests.movie(seconds:1,tracks:[MediaPlaybackOriginalTests.track(width:64,height:48,frames:12)])
+        let sources=try [write(f,"1-take.mp4",movie),write(f,"2-sheet.png",helper.png),
+            write(f,"3-concept.png",helper.png),write(f,"4-earlier.mp4",movie)]
+        _ = try groupAndCapture(f,round,sources,slots:["take","sheet","concept","earlier"],captureOrder:[3,1,0,2])
+        let candidates=try draftCandidates(f)
+        XCTAssertEqual(candidates.count,1)
+        XCTAssertEqual(slotIDs(candidates[0]),["concept","earlier","sheet","take"])
+        let published=try f.publish(round),items=published["items"] as! [JSON]
+        XCTAssertEqual(items.count,1)
+        let detail=try f.router.handle(method:"media_item_get",params:["project_id":f.project,"round_id":round["id"]!,"item_id":items[0]["id"]!],caller:f.owner)["data"] as! JSON
+        XCTAssertEqual((detail["candidates"] as! [JSON]).count,1)
+        XCTAssertEqual((detail["originals"] as! [JSON]).count,4)
+        XCTAssertTrue((detail["originals"] as! [JSON]).allSatisfy {$0["availability"] as? String == "available"})
+    }
+
     func testConfirmCountsJoinedCandidatesNotRows() throws {
         // One candidate allowed: Take + Reference join into one, so the plan confirms.
         let f = try MediaFrozenIntakeTests.Fixture(), round = try f.round(f.type(starter("video", maxCandidates: 1)))

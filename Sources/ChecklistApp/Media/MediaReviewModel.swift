@@ -34,6 +34,7 @@ typealias MediaValues = [String: Any]
     @Published var intake = Record(values: [:])
     /// CL-307: one Capture press is running its chunk sequence.
     @Published var capturing = false
+    @Published private(set) var publishingPrepared = false
     private var publicationObservation: MediaValues = [:]
     @Published var publication: [Record] = []
     @Published var error: String?
@@ -53,26 +54,30 @@ typealias MediaValues = [String: Any]
     private weak var store: ChecklistStore?
     private var epoch = UUID()
     private var selectionEpoch = UUID()
+    private var roundChoiceEpoch = UUID()
     private var drafts: [String: MediaOwnerDraft] = [:]
+    private var currentImageReferences = Set<String>()
     private var draftScope = ""
     private var listScope = ""
     var enabledTypes: [Record] { types.filter { $0.bool("enabled") } }
     var hasMedia: Bool { !enabledTypes.isEmpty }
     var selectedOutsideFilter: Bool { !selectedID.isEmpty && !rows.contains { $0.id == selectedID } }
     var writable: Bool { !historyOnly && ["draft", "open"].contains(header.string("state")) }
+    var preparedPublicationAvailable: Bool { !historyOnly && header.id == roundID && header.string("state") == "draft" && header.string("origin") == "agent" }
     var schema: MediaValues { header.object("type_revision")["schema"] as? MediaValues ?? [:] }
     var fields: [Record] { (schema["fields"] as? [MediaValues] ?? []).map(Record.init) }
     var slots: [Record] { (schema["slots"] as? [MediaValues] ?? []).map(Record.init) }
     /// The declared layout's reference role; every other compatible slot is a candidate take.
     var referenceSlotID: String { (schema["layout"] as? MediaValues)?["reference_slot_id"] as? String ?? "" }
     var decisionEnabled: Bool { !historyOnly && item.bool("published") && header.string("state") == "open" && !contextConflict && header.records("attention").isEmpty && !item.object("target").isEmpty }
+    var hasDecisionNote: Bool { !draft.note.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty }
 
     func connect(store: ChecklistStore) async {
         self.store = store
         let project = store.projectID ?? ""
         if project != projectID {
-            saveDraft(); playback.releaseAll(); projectID = project; epoch = UUID(); selectionEpoch = UUID()
-            currentImageReference="";historicalImageReference="";listScope="";list=[:];roundOffset=0
+            saveDraft(); playback.releaseAll(); projectID = project; epoch = UUID(); selectionEpoch = UUID(); roundChoiceEpoch = UUID()
+            clearImages();listScope="";list=[:];roundOffset=0
             types=[];rounds=[];rows=[];typeID="";roundID="";selectedID="";header=Record(values:[:]);item=Record(values:[:]);intake=Record(values:[:]);publication=[];examples=[]
             draftScope="";draft = MediaOwnerDraft(); contextConflict=false; clearRoundActions(); epics=[]
         }
@@ -160,8 +165,8 @@ typealias MediaValues = [String: Any]
             Task { await self?.select(reply.id) }
         }
     }
-    func chooseType(_ id: String) {saveDraft();roundOffset=0;typeID=id;list=[:];roundID="";selectedID="";rows=[];header=Record(values:[:]);item=Record(values:[:]);intake=Record(values:[:]);publication=[];Task {await refresh()}}
-    func chooseRound(_ id: String) {saveDraft();clearRoundActions();roundID=id;selectedID="";rows=[];item=Record(values:[:]);publication=[];intake=Record(values:[:]);contextConflict=false;Task {await refresh()}}
+    func chooseType(_ id: String) {saveDraft();roundChoiceEpoch=UUID();clearImages();roundOffset=0;typeID=id;list=[:];roundID="";selectedID="";rows=[];header=Record(values:[:]);item=Record(values:[:]);intake=Record(values:[:]);publication=[];Task {await refresh()}}
+    func chooseRound(_ id: String) {saveDraft();roundChoiceEpoch=UUID();clearImages();clearRoundActions();roundID=id;selectedID="";rows=[];item=Record(values:[:]);publication=[];intake=Record(values:[:]);contextConflict=false;Task {await refresh()}}
     private func loadRound(token: UUID) async throws {
         let id=roundID
         let result=try await read("media_round_header",["round_id":id])
@@ -193,7 +198,7 @@ typealias MediaValues = [String: Any]
         if filter == "all" {counts=result["counts"] as? [String:Int] ?? [:]};next=result["next_cursor"] as? String
     }
     func select(_ id: String) async {
-        saveDraft();if selectedID != id {playback.releaseAll();currentImageReference="";historicalImageReference="";item=Record(values:[:]);contextConflict=false};selectedID=id
+        saveDraft();if selectedID != id {playback.releaseAll();clearImages();item=Record(values:[:]);contextConflict=false};selectedID=id
         let scope=projectID+":"+id
         if draftScope != scope {
             draftScope=scope
@@ -204,6 +209,9 @@ typealias MediaValues = [String: Any]
         do {
             let result=try await read("media_item_get",["round_id":roundID,"item_id":id])
             guard selectionEpoch==token,selectedID==id else {return}
+            let priorTarget=item.object("target")["id"] as? String ?? ""
+            let nextTarget=(result["target"] as? MediaValues)?["id"] as? String ?? ""
+            if !priorTarget.isEmpty,priorTarget != nextTarget {playback.releaseAll();clearImages()}
             item=Record(values:result)
             // A refresh may reveal new content; never silently rebase an existing draft.
             let basis=item.object("target")["review_basis_signature"] as? String ?? ""
@@ -238,12 +246,13 @@ typealias MediaValues = [String: Any]
         } catch {self.error=PlainError.text(error)}
     }
     func beginImage(_ key:String,historical:Bool) -> Bool {
-        guard imageLoads<2 else {return false}
+        guard imageLoads<2,historical || currentImageReferences.contains(key) || currentImageReferences.count<8 else {return false}
         imageLoads+=1
-        if historical {historicalImageReference=key} else {currentImageReference=key}
+        if historical {historicalImageReference=key} else {currentImageReferences.insert(key);currentImageReference=key}
         return true
     }
     func endImage() {imageLoads=max(0,imageLoads-1)}
+    private func clearImages() {currentImageReferences=[];currentImageReference="";historicalImageReference=""}
     /// Each load or Open original requests a fresh exact lease: the selected target's typed
     /// reference, or a historical example's exact accepted decision and winning reference.
     func playbackLease(original: Record,example: Record?) async throws -> MediaTakeLoader.Lease {
@@ -260,10 +269,20 @@ typealias MediaValues = [String: Any]
         return ("media_original_read",["round_id":roundID,"item_id":selectedID,"target_id":targetID,"reference_id":original.string("reference_id"),"representation":"lease","seconds":MediaPlaybackBudget.leaseSeconds])
     }
     func releasePlaybackLease(_ id: String) async {_ = try? await read("media_example_read_release",["lease_id":id])}
-    func imageIsActive(_ key:String,historical:Bool) -> Bool {(historical ? historicalImageReference : currentImageReference)==key}
+    func imageIsActive(_ key:String,historical:Bool) -> Bool {historical ? historicalImageReference==key : currentImageReferences.contains(key)}
     func observation() -> MediaValues {["round_id":roundID,"expected_revision":header.integer("revision"),"observed_context_token":header.string("observed_context_token")]}
+    static func decisionRequiresNote(_ disposition: String) -> Bool { ["changes_requested","excluded"].contains(disposition) }
+    func decide(_ choice: MediaAnimationReviewChoice) {
+        let mapped=choice.mapping(note:draft.note)
+        draft.note=mapped.note
+        decide(mapped.disposition)
+    }
     func decide(_ disposition: String) {
         guard decisionEnabled else {return}
+        guard !Self.decisionRequiresNote(disposition) || hasDecisionNote else {
+            error=disposition == "changes_requested" ? "Enter a note describing the requested changes." : "Enter an exclusion reason in the owner note."
+            return
+        }
         let target=Record(values:item.object("target"))
         var p=observation()
         p["observed_context_token"]=draft.contextToken
@@ -277,7 +296,9 @@ typealias MediaValues = [String: Any]
         let scope=draftScope,sent=draft
         mutate("media_decide",p) { [weak self] _ in
             guard let self,self.draftScope==scope,self.draft==sent else {return}
-            self.draft.note="";self.draft.noFollowUpReason=""
+            // The per-item note is autosaved as typed and remains after an owner action.
+            // Only the one-decision follow-up exception is consumed by a successful send.
+            self.draft.noFollowUpReason=""
         }
     }
     func reconcile(_ action: String) {
@@ -291,6 +312,29 @@ typealias MediaValues = [String: Any]
         var p=publicationObservation
         p["items"]=publication.map {row -> MediaValues in var value=row.values;value.removeValue(forKey:"title");value.removeValue(forKey:"publication_ready");return value}
         mutate("media_round_publish",p) { [weak self] _ in self?.publication=[];self?.roundState="open" }
+    }
+    /// One owner press publishes an agent-prepared Draft through the existing exact
+    /// publication boundary. No owner intake steps or mutable list selection are used.
+    func publishPreparedRound() async {
+        guard preparedPublicationAvailable,!publishingPrepared,let store else {return}
+        if let reason=store.writeBlockReason {store.inform(reason);return}
+        let project=projectID,round=roundID,choice=roundChoiceEpoch
+        publishingPrepared=true
+        defer {publishingPrepared=false}
+        do {
+            let preview=try await read("media_publication_preview",["round_id":round])
+            guard projectID==project,roundID==round,roundChoiceEpoch==choice,!Task.isCancelled else {return}
+            let frozen=Record(values:preview["round"] as? MediaValues ?? [:])
+            let items=(preview["items"] as? [MediaValues] ?? []).map(Record.init)
+            guard frozen.id==round,frozen.string("state")=="draft" else {throw ChecklistError("MEDIA_ROUND_CHANGED","This prepared round changed. Refresh before publishing.")}
+            guard !items.isEmpty,items.allSatisfy({$0.bool("publication_ready")}) else {throw ChecklistError("MEDIA_UNRESOLVED","The agent must capture all required originals before this round can be published.")}
+            let params:MediaValues=["round_id":round,"expected_revision":frozen.integer("revision"),"observed_context_token":frozen.string("observed_context_token"),
+                "items":items.map {row -> MediaValues in ["item_id":row.string("item_id"),"expected_revision":row.integer("expected_revision"),"target_id":row.string("target_id"),"review_basis_signature":row.string("review_basis_signature")]}]
+            mutate("media_round_publish",params) { [weak self] _ in
+                guard let self,self.roundID==round,self.roundChoiceEpoch==choice else {return}
+                self.publication=[];self.roundState="open"
+            }
+        } catch {if projectID==project,roundID==round,roundChoiceEpoch==choice {self.error=PlainError.text(error)}}
     }
     func previewIntake(_ params: MediaValues) {var p=params;p["round_id"]=roundID
         let isFiles=params["sources"] != nil
@@ -432,6 +476,26 @@ typealias MediaValues = [String: Any]
 }
 struct MediaOwnerDraft: Codable,Equatable {
     var note="",winnerID="",noFollowUpReason="",reconciliationReason="",basis="",targetID="",contextToken="",manifestID="",manifestDigest=""
+}
+
+/// The old animation page's choices translate to existing native owner actions.
+/// A typed note wins; Redo and Other pose retain their reason when no note was entered.
+enum MediaAnimationReviewChoice: String,CaseIterable {
+    case accept="Accept",redo="Redo",otherPose="Other pose",lookAtIt="Look at it"
+    func mapping(note: String) -> MediaOwnerDecisionChoice {
+        let disposition: String
+        switch self {
+        case .accept: disposition="accepted"
+        case .redo,.otherPose: disposition="changes_requested"
+        case .lookAtIt: disposition="needs_look"
+        }
+        let mappedNote=disposition == "changes_requested" && note.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty ? rawValue : note
+        return MediaOwnerDecisionChoice(disposition:disposition,note:mappedNote)
+    }
+}
+struct MediaOwnerDecisionChoice: Equatable {
+    let disposition:String
+    let note:String
 }
 
 struct MediaFlatRow: Identifiable {

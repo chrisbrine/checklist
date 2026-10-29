@@ -495,6 +495,9 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
             # CL-298: a submitted check result names its report file relative
             # to the project root (for example TestResults/run.xml).
             if record_kind == 'manifest' and location.endswith('.evidence.checks[]'): return ('evidence_relative', None)
+            # CL-339: submitters list the source files they changed (often in a
+            # private scratch folder) with their digests. Core never opens them.
+            if record_kind == 'manifest' and location.endswith('.evidence.source_files[]'): return ('inert_history', None)
             if parent.get('mode') in {'reference', 'external_reference'}: return ('binding', None)
             if '.file_scopes[]' in location: return ('recursive_binding', None)
             if (capture and location.endswith('.files[]')) or any(name in location for name in ['.project_instruction_refs[]', '.instruction_coverage[]', '.link_chain[]']):
@@ -632,6 +635,9 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
             elif kind == 'provenance':
                 check_absolute(value, location)
                 counts['capture_git_provenance'] += 1
+            elif kind == 'inert_history':
+                # Submitter history: counted, never resolved, opened or rewritten.
+                counts['inert_history_path_occurrences'] += 1
             elif kind in {'text', 'instruction'}:
                 if value.startswith('/') or has_file_url:
                     counts['inert_history_path_occurrences'] += 1

@@ -1,4 +1,5 @@
 import SwiftUI
+import ChecklistIPC
 
 /// CL-53, CL-66, CL-67: Overview answers "what needs me today". It shows who works now, groups tickets
 /// by what needs the owner (each group with its count and Show all), the latest review results and
@@ -54,14 +55,16 @@ struct OverviewGroupSection: View {
             }
             if observation?.error != nil, page != nil {
                 // A refresh failed over earlier rows (finding 310a34a7): say so instead of showing them as current.
-                StaleNotice { store.scheduleOverviewNeeds(only: surface, force: true) }
+                StaleNotice(upgrade: store.storageUpgradeStatus) { store.scheduleOverviewNeeds(only: surface, force: true) }
             }
-            if let error = observation?.error, page == nil {
-                Text(error).checklistFont(.micro).foregroundStyle(.orange)
-                Button("Retry") { store.scheduleOverviewNeeds(only: surface, force: true) }.checklistFont(.micro)
-            } else if page == nil {
-                if store.showsOfflineBanner { Text("This group loads when Checklist reconnects.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
-                else { ProgressView().controlSize(.small) }
+            if let placeholder = Self.placeholder(observation, offline: store.showsOfflineBanner, upgrade: store.storageUpgradeStatus) {
+                switch placeholder {
+                case .failure(let error):
+                    Text(error).checklistFont(.micro).foregroundStyle(.orange)
+                    Button("Retry") { store.scheduleOverviewNeeds(only: surface, force: true) }.checklistFont(.micro)
+                case .text(let text): Text(text).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                case .loading: ProgressView().controlSize(.small)
+                }
             } else if let page, page.rows.isEmpty {
                 Text(OverviewText.empty(surface)).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             } else if let page {
@@ -87,6 +90,14 @@ struct OverviewGroupSection: View {
         }
         .accessibilityElement(children: .contain).accessibilityLabel(title)
     }
+    /// CL-338: what the group shows while it has no page. A known store upgrade replaces both the
+    /// reconnect text and the load error; a real outage keeps the reconnect text. Nil: the page shows.
+    static func placeholder(_ observation: WorkspacePageObservation?, offline: Bool, upgrade: StorageUpgradeStatus?) -> SourcePlaceholder? {
+        guard observation?.page == nil else { return nil }
+        if let upgrade { return .text(OverviewUpgradeText.waiting("This group loads", upgrade)) }
+        if let error = observation?.error { return .failure(error) }
+        return offline ? .text("This group loads when Checklist reconnects.") : .loading
+    }
 }
 
 /// CL-66: who works on which ticket now, from ticket attempts. Ended or unknown sessions show as
@@ -102,7 +113,7 @@ struct WorkingNowStrip: View {
         let page = store.overviewObservations[surface]?.page
         return max(0, (page?.total ?? 0) - (page?.rows.count ?? 0))
     }
-    var state: SourceState { SourceState.of(Self.sources.map { store.overviewObservations[$0] }, offline: store.showsOfflineBanner) }
+    var state: SourceState { SourceState.of(Self.sources.map { store.overviewObservations[$0] }, offline: store.showsOfflineBanner, upgrade: store.storageUpgradeStatus) }
     /// The note above the strip's entries when not every source is current.
     static func partialNotice(_ state: SourceState) -> String? {
         switch state {
@@ -110,19 +121,25 @@ struct WorkingNowStrip: View {
         case .failed: return "Could not load all of who is working; some entries may be missing."
         case .loading: return "Still loading some of who is working."
         case .offline: return "Some entries load when Checklist reconnects."
+        case .upgrading(let upgrade): return OverviewUpgradeText.partial(upgrade)
         case .loaded: return nil
+        }
+    }
+    /// What the strip shows when it has no entries (CL-338: a known upgrade names its stage and estimate).
+    static func placeholder(_ state: SourceState) -> SourcePlaceholder {
+        switch state {
+        case .loading: return .loading
+        case .failed, .stale: return .failure("Could not load who is working now.")
+        case .offline: return .text("Working now loads when Checklist reconnects.")
+        case .upgrading(let upgrade): return .text(OverviewUpgradeText.waiting("Working now loads", upgrade))
+        case .loaded: return .text("No agent is working on a ticket now.")
         }
     }
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.small) {
             SectionCaption(title: "Working now", count: rows.count)
             if rows.isEmpty {
-                switch state {
-                case .loading: ProgressView().controlSize(.small)
-                case .failed, .stale: SourceFailure(text: "Could not load who is working now.") { store.scheduleOverviewNeeds(force: true) }
-                case .offline: Text("Working now loads when Checklist reconnects.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-                case .loaded: Text("No agent is working on a ticket now.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-                }
+                SourcePlaceholderView(placeholder: Self.placeholder(state)) { store.scheduleOverviewNeeds(force: true) }
             } else {
                 // Entries can come from some sources while another failed, loads or waits (review finding 310a34a7).
                 if let text = Self.partialNotice(state) {
@@ -159,7 +176,7 @@ struct LatestReviewResults: View {
     var body: some View {
         let observation = store.overviewObservations["recent_reviews"], page = observation?.page
         let rows = page?.rows ?? []
-        let state = SourceState.of([observation], offline: store.showsOfflineBanner)
+        let state = SourceState.of([observation], offline: store.showsOfflineBanner, upgrade: store.storageUpgradeStatus)
         VStack(alignment: .leading, spacing: Spacing.small) {
             AccessibleHStack {
                 SectionCaption(title: "Latest review results", count: rows.count)
@@ -170,14 +187,9 @@ struct LatestReviewResults: View {
                 }
             }
             if rows.isEmpty {
-                switch state {
-                case .loading: ProgressView().controlSize(.small)
-                case .failed, .stale: SourceFailure(text: "Could not load the latest review results.") { store.scheduleOverviewNeeds(only: focused ? "recent_reviews" : nil, force: true) }
-                case .offline: Text("Review results load when Checklist reconnects.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-                case .loaded: Text("No review results yet.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
-                }
-            } else if state == .stale {
-                StaleNotice { store.scheduleOverviewNeeds(only: focused ? "recent_reviews" : nil, force: true) }
+                SourcePlaceholderView(placeholder: Self.placeholder(state)) { store.scheduleOverviewNeeds(only: focused ? "recent_reviews" : nil, force: true) }
+            } else if state == .stale || state.upgrade != nil {
+                StaleNotice(upgrade: state.upgrade) { store.scheduleOverviewNeeds(only: focused ? "recent_reviews" : nil, force: true) }
             }
             ForEach(OverviewText.byProject(rows), id: \.0) { project, verdicts in
                 if store.projectID == nil { Text(store.projectName(project)).checklistFont(.microEmphasis).foregroundStyle(Color.checklistSecondaryText) }
@@ -201,6 +213,16 @@ struct LatestReviewResults: View {
             }
         }
     }
+    /// What the section shows when it has no verdicts (CL-338: a known upgrade names its stage and estimate).
+    static func placeholder(_ state: SourceState) -> SourcePlaceholder {
+        switch state {
+        case .loading: return .loading
+        case .failed, .stale: return .failure("Could not load the latest review results.")
+        case .offline: return .text("Review results load when Checklist reconnects.")
+        case .upgrading(let upgrade): return .text(OverviewUpgradeText.waiting("Review results load", upgrade))
+        case .loaded: return .text("No review results yet.")
+        }
+    }
 }
 
 /// CL-67: tickets completed since the owner's previous Overview visit, one line each. It stays in the app.
@@ -221,13 +243,11 @@ struct CompletionDigest: View {
                 }
             }
             if page == nil {
-                switch SourceState.of([store.overviewObservations["completed_since"]], offline: store.showsOfflineBanner) {
-                case .loading, .loaded: ProgressView().controlSize(.small)
-                case .failed, .stale: SourceFailure(text: "Could not load the completed tickets.") { store.scheduleOverviewNeeds(only: "completed_since", force: true) }
-                case .offline: Text("The digest loads when Checklist reconnects.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                SourcePlaceholderView(placeholder: Self.placeholder(SourceState.of([store.overviewObservations["completed_since"]], offline: store.showsOfflineBanner, upgrade: store.storageUpgradeStatus))) {
+                    store.scheduleOverviewNeeds(only: "completed_since", force: true)
                 }
             } else if store.overviewObservations["completed_since"]?.error != nil {
-                StaleNotice { store.scheduleOverviewNeeds(only: "completed_since", force: true) }
+                StaleNotice(upgrade: store.storageUpgradeStatus) { store.scheduleOverviewNeeds(only: "completed_since", force: true) }
             }
             if let page, page.rows.isEmpty, store.overviewObservations["completed_since"]?.error == nil {
                 Text(since.isEmpty ? "Nothing completed since your last visit." : "Nothing completed since your last visit (\(since)).").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
@@ -242,6 +262,15 @@ struct CompletionDigest: View {
                     }.padding(.vertical, Spacing.tight).contentShape(Rectangle())
                 }.buttonStyle(.checklistPlain)
             }
+        }
+    }
+    /// What the digest shows while it has no page (CL-338: a known upgrade names its stage and estimate).
+    static func placeholder(_ state: SourceState) -> SourcePlaceholder {
+        switch state {
+        case .loading, .loaded: return .loading
+        case .failed, .stale: return .failure("Could not load the completed tickets.")
+        case .offline: return .text("The digest loads when Checklist reconnects.")
+        case .upgrading(let upgrade): return .text(OverviewUpgradeText.waiting("The digest loads", upgrade))
         }
     }
 }
@@ -308,7 +337,12 @@ enum OverviewText {
 enum SourceState: Equatable {
     /// `stale`: a refresh failed while earlier rows are still shown (review finding 310a34a7).
     case loading, failed, offline, stale, loaded
-    @MainActor static func of(_ observations: [WorkspacePageObservation?], offline: Bool) -> SourceState {
+    /// CL-338: a known store upgrade keeps a source from loading or refreshing; it replaces offline,
+    /// failed, loading and stale so the section names the upgrade stage and estimate.
+    case upgrading(StorageUpgradeStatus)
+    var upgrade: StorageUpgradeStatus? { if case .upgrading(let upgrade) = self { return upgrade }; return nil }
+    @MainActor static func of(_ observations: [WorkspacePageObservation?], offline: Bool, upgrade: StorageUpgradeStatus? = nil) -> SourceState {
+        if let upgrade, observations.contains(where: { $0?.page == nil || $0?.error != nil }) { return .upgrading(upgrade) }
         if observations.contains(where: { $0?.error != nil && $0?.page == nil }) { return offline ? .offline : .failed }
         if observations.contains(where: { $0?.page == nil }) { return offline ? .offline : .loading }
         if observations.contains(where: { $0?.error != nil }) { return .stale }
@@ -316,10 +350,42 @@ enum SourceState: Equatable {
     }
 }
 
-/// Shown above rows that a failed refresh could not update.
+/// Shown above rows that a failed refresh could not update. During a known store upgrade it names
+/// the upgrade instead of offering Retry (CL-338).
 struct StaleNotice: View {
+    var upgrade: StorageUpgradeStatus? = nil
     let retry: () -> Void
-    var body: some View { SourceFailure(text: "Could not refresh; showing the last loaded results.", retry: retry) }
+    var body: some View {
+        if let upgrade { Text(OverviewUpgradeText.stale(upgrade)).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
+        else { SourceFailure(text: "Could not refresh; showing the last loaded results.", retry: retry) }
+    }
+}
+
+/// What a section shows in place of rows it cannot show yet.
+enum SourcePlaceholder: Equatable {
+    case loading
+    case failure(String)
+    case text(String)
+}
+
+struct SourcePlaceholderView: View {
+    let placeholder: SourcePlaceholder
+    let retry: () -> Void
+    var body: some View {
+        switch placeholder {
+        case .loading: ProgressView().controlSize(.small)
+        case .failure(let text): SourceFailure(text: text, retry: retry)
+        case .text(let text): Text(text).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+        }
+    }
+}
+
+/// CL-338: Overview text while a known store upgrade keeps its sources from loading. Like the sidebar
+/// footer it names the stage and estimate, never the reconnect or load-error text of a real outage.
+enum OverviewUpgradeText {
+    static func waiting(_ subject: String, _ upgrade: StorageUpgradeStatus) -> String { "\(subject) after the upgrade. " + upgrade.summary }
+    static func partial(_ upgrade: StorageUpgradeStatus) -> String { "Some entries load after the upgrade. " + upgrade.summary }
+    static func stale(_ upgrade: StorageUpgradeStatus) -> String { "Showing the last loaded results. They refresh after the upgrade. " + upgrade.summary }
 }
 
 struct SourceFailure: View {

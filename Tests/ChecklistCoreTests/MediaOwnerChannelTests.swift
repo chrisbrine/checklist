@@ -13,14 +13,18 @@ final class MediaOwnerChannelTests: XCTestCase {
         _ = try CommandReply.decode(JSONSerialization.data(withJSONObject:reply),method:method,commandID:p["command_id"] as? String)
         return reply["data"] as! JSON
     }
-    func testNativeOwnerBoundaryAndAllWorkerAssistantMediaCommandsDenied() throws {
+    func testNativeOwnerBoundaryAndWorkerPreparationAllowlist() throws {
         let f=try Fixture()
         XCTAssertEqual((try owner(f,"media_navigation")["enabled"] as! [JSON]).count,0)
         for role in [f.worker,Caller(role:"assistant",installation:"fixture",projectIDs:[f.project],assistantGrants:[f.project:["read":true]])] {
-            for method in CommandRouter.mediaOwnerMethods {
+            for method in CommandRouter.mediaOwnerMethods where role.role != "worker" || !CommandRouter.mediaWorkerMethods.contains(method) {
                 XCTAssertThrowsError(try f.router.handle(method:method,params:["project_id":f.project,"command_id":uuid(),"origin":"human_ui"],caller:role)) {XCTAssertEqual(($0 as? CoreError)?.code,"FORBIDDEN",method)}
             }
-            XCTAssertFalse(try jsonString(f.router.handle(method:"tool_catalog",params:[:],caller:role)).contains("media_"))
+            let catalog = try jsonString(f.router.handle(method:"tool_catalog",params:[:],caller:role))
+            if role.role == "worker" {
+                for method in CommandRouter.mediaWorkerMethods {XCTAssertTrue(catalog.contains(method),method)}
+                for method in ["media_round_publish","media_decide","media_type_adopt","media_context_approve"] {XCTAssertFalse(catalog.contains(method),method)}
+            } else {XCTAssertFalse(catalog.contains("media_"))}
         }
         for method in ["media_suggest","media_material_reference_adopt","media_bulk_apply"] {
             XCTAssertThrowsError(try f.router.handle(method:method,params:["project_id":f.project,"command_id":uuid()],caller:f.owner))

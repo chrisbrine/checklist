@@ -10,6 +10,7 @@ struct PreparedMediaResources {
         let prepared: ManagedAttachmentPreparation
         let encodedReceipt: String
     }
+    var workerChannel = false
     var nativeOwnerProjection = false
     var preview: [JSON] = []
     var captures: [String:Capture] = [:]
@@ -81,8 +82,9 @@ extension CommandRouter {
         return result
     }
 
-    func prepareMediaResources(method: String,params p: JSON,caller c: Caller) throws -> PreparedMediaResources {
+    func prepareMediaResources(method: String,params p: JSON,caller c: Caller,workerChannel: Bool = false) throws -> PreparedMediaResources {
         var resources = PreparedMediaResources()
+        resources.workerChannel = workerChannel
         // These methods have no media bytes to prepare. Ordinary canonical preparation
         // below still performs their authority, receipt and context validation.
         guard ["media_intake_preview","media_intake_capture","media_round_publish","media_context_reconcile"].contains(method) else {return resources}
@@ -95,6 +97,7 @@ extension CommandRouter {
             if let row = try Row.fetchOne(db,sql:"SELECT digest FROM commands WHERE principal=? AND command_id=?",arguments:[c.principal,command]) {
                 guard row["digest"] as String == digest else { throw CoreError("IDEMPOTENCY_CONFLICT","The command has another intent.") };return nil
             }
+            if workerChannel { try self.mediaWorkerWriteAccess(db,method:method,p:p,c:c,project:pid) }
             var intake: JSON?
             if method == "media_intake_preview" { _ = try self.scoped(db,try text(p,"round_id"),pid,type:"media_round") }
             if method == "media_intake_capture" {

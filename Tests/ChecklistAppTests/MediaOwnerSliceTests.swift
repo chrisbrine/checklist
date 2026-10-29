@@ -152,7 +152,8 @@ import ChecklistCore
         XCTAssertEqual(model.draft.note,"Owner's unsent input")
         let reopened=peer.store(defaults.preferences,directory);let restored=await setup(peer,reopened);await restored.select("item")
         XCTAssertEqual(restored.draft.note,"Owner's unsent input")
-        peer.reject=false;store.connected=true;XCTAssertTrue(model.decisionEnabled);XCTAssertNil(store.writeBlockReason);model.decide("needs_look");try await settle {model.draft.note.isEmpty}
+        peer.reject=false;store.connected=true;XCTAssertTrue(model.decisionEnabled);XCTAssertNil(store.writeBlockReason);model.decide("needs_look");try await settle {peer.calls.filter {$0.0=="media_decide"}.count==2 && !store.busy}
+        XCTAssertEqual(model.draft.note,"Owner's unsent input")
         XCTAssertEqual(peer.calls.last {$0.0=="media_decide"}?.1["disposition"] as? String,"needs_look")
     }
     func testFrozenPublicationDoesNotReselectFromChangedFilterOrContext() async throws {
@@ -303,7 +304,7 @@ import ChecklistCore
         XCTAssertTrue(model.beginImage("historical-1",historical:true))
         XCTAssertFalse(model.beginImage("excess",historical:false))
         model.endImage();XCTAssertTrue(model.beginImage("current-2",historical:false))
-        XCTAssertFalse(model.imageIsActive("current-1",historical:false));XCTAssertTrue(model.imageIsActive("current-2",historical:false))
+        XCTAssertTrue(model.imageIsActive("current-1",historical:false));XCTAssertTrue(model.imageIsActive("current-2",historical:false))
         model.endImage();model.endImage();XCTAssertEqual(model.imageLoads,0)
         await model.showExamples(false);XCTAssertFalse(model.imageIsActive("historical-1",historical:true))
     }

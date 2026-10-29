@@ -32,6 +32,7 @@ struct MediaTypeSettings: View {
                 Text("Story text").tag("text")
                 Text("Character animation images").tag("animation")
                 Text("Video takes").tag("video")
+                Text("Animation takes (12 fps)").tag("animation_video")
                 Text("Audio takes").tag("audio")
             }
             Button("Add review type") {
@@ -76,6 +77,13 @@ struct MediaTypeSettings: View {
             // CL-117: a candidate take and a declared reference of the same kind; portable IDs and kinds only.
             value["slots"]=[["id":"take","label":"Take","kind":starter,"material":true],["id":"reference","label":"Reference","kind":starter,"material":true]]
             value["layout"]=["kind":starter+"_compare","primary_slot_id":"take","reference_slot_id":"reference"]
+        }
+        if starter == "animation_video" {
+            value["slots"]=[["id":"take","label":"Take","kind":"video","material":true],
+                ["id":"model_sheet","label":"Model sheet","kind":"image","material":true],
+                ["id":"concept_art","label":"Concept art","kind":"image","material":true],
+                ["id":"reference","label":"Earlier take","kind":"video","material":true]]
+            value["layout"]=["kind":"video_compare","primary_slot_id":"take","reference_slot_ids":["model_sheet","concept_art","reference"],"loop":true,"frame_rate":12]
         }
         return value
     }
@@ -149,6 +157,14 @@ struct MediaReviewWorkspace: View {
             Text(model.header.string("title")+" · "+GlossaryText.title(model.header.string("state"))).font(.headline)
             Text(MediaReviewModel.countsText(model.counts)).font(.caption)
             if model.writable {
+                if model.preparedPublicationAvailable {
+                    HStack {
+                        Text("Agent-prepared Draft. Publish its captured items for your review.").font(.caption)
+                        Button("Publish") {Task {await model.publishPreparedRound()}}
+                            .accessibilityLabel("Publish agent-prepared media round")
+                            .checklistDisabled([(model.publishingPrepared,"Preparing this round for publication."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
+                    }
+                }
                 HStack {
                     TextField("New item title",text:$itemTitle)
                     Button("Add Draft item") {

@@ -6,6 +6,7 @@ public enum CommandMethods {
         "media_type_get", "media_round_get", "media_intake_get", "media_bulk_get",
         "media_item_page", "media_item_counts", "media_approved_examples",
     ]
+    public static let mediaWorkerReads: Set<String> = MediaWorkerContract.readMethods
     public static let mediaOwnerReads: Set<String> = [
         "media_navigation",
         "media_round_page",
@@ -22,7 +23,7 @@ public enum CommandMethods {
         "media_example_read_lease",
         "media_example_read_release",
     ]
-    public static let coreReads: Set<String> = mediaOwnerReads.union([
+    public static let coreReads: Set<String> = mediaOwnerReads.union(mediaWorkerReads).union([
         "import_preview",
         "import_receipt_get",
         "restore_preview",

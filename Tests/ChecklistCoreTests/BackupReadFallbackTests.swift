@@ -115,14 +115,16 @@ final class BackupReadFallbackTests: XCTestCase {
             ("media_original_read",["round_id":UUID().uuidString,"item_id":UUID().uuidString,"reference_id":UUID().uuidString]),
             ("media_original_read",["round_id":UUID().uuidString,"item_id":UUID().uuidString,"reference_id":UUID().uuidString,"representation":"lease"]),
             ("media_example_read_lease",["round_id":UUID().uuidString,"target_id":UUID().uuidString,"decision_id":UUID().uuidString,"reference_id":UUID().uuidString]),
-            ("media_example_read_release",["lease_id":UUID().uuidString]),
-            ("media_navigation",[:])]
+            ("media_example_read_release",["lease_id":UUID().uuidString])]
         try router.backupWrites.beginCapture()
         withBlockedWriter(router) {
             for (method,input) in routes {
                 var params = input;params["project_id"] = p["id"]!
                 self.locked(try f.call(method,params))
             }
+            let navigation = try f.call("media_navigation",["project_id":p["id"]!])
+            XCTAssertNotNil((navigation["data"] as? JSON)?["types"])
+            XCTAssertEqual((navigation["write_admission"] as? JSON)?["locked"] as? Bool,true)
         }
         XCTAssertEqual(try router.dbQueue.read {try router.records($0,type:"storage_hold").count},0)
         end(router)

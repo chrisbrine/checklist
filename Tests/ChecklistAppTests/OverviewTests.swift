@@ -51,6 +51,74 @@ import ChecklistIPC
         XCTAssertNil(WorkingNowStrip.partialNotice(.loaded))
     }
 
+    /// CL-338: during a known store upgrade every Overview section and group card names the upgrade stage
+    /// and estimate, never the reconnect or load-error text; without an upgrade every branch keeps its text.
+    func testKnownUpgradeReplacesReconnectAndLoadErrorTextInEveryOverviewBranch() throws {
+        let upgrade = try XCTUnwrap(StorageUpgradeStatus(stage: "final_migration", estimatedRemainingSeconds: 90))
+        let query = WorkspacePageQuery(surface: "needs_active", project: nil)
+        let reply: [String: Any] = ["workspace_version": 1, "needs_you_count": 0, "surface": "needs_active", "record_id": "", "rows": [[String: Any]](), "total": 0, "has_more": false,
+                                    "next_cursor": NSNull(), "previous_cursor": NSNull(), "projects": [[String: Any]](), "service": ["store_incarnation": "s"], "content_cursor": "c"]
+        let loading = WorkspacePageObservation(); _ = loading.begin(query)
+        let failed = WorkspacePageObservation(); failed.fail(failed.begin(query))
+        let loaded = WorkspacePageObservation(); XCTAssertTrue(try loaded.receive(reply, query: query, generation: loaded.begin(query)))
+        let stale = WorkspacePageObservation(); XCTAssertTrue(try stale.receive(reply, query: query, generation: stale.begin(query))); stale.fail(stale.begin(query))
+        XCTAssertNotNil(stale.page); XCTAssertNotNil(stale.error)
+        let generic = ["when Checklist reconnects", "Could not load", "Could not refresh", "Refresh to load"]
+        func upgradeText(_ text: String, _ subject: String) {
+            XCTAssertEqual(text, subject + " after the upgrade. " + upgrade.summary)
+            XCTAssertTrue(text.contains("Applying the verified store migration") && text.contains("about 2 minutes"), text)
+            for phrase in generic { XCTAssertFalse(text.contains(phrase), text) }
+        }
+        let sections: [(String, (SourceState) -> SourcePlaceholder)] = [("Working now loads", WorkingNowStrip.placeholder), ("Review results load", LatestReviewResults.placeholder), ("The digest loads", CompletionDigest.placeholder)]
+        for offline in [false, true] {
+            for observation in [loading, failed, stale, nil] as [WorkspacePageObservation?] {
+                let state = SourceState.of([observation], offline: offline, upgrade: upgrade)
+                XCTAssertEqual(state, .upgrading(upgrade), "Every unloaded or failed source names the known upgrade")
+                for (subject, placeholder) in sections {
+                    guard case .text(let text) = placeholder(state) else { return XCTFail("\(subject): \(placeholder(state))") }
+                    upgradeText(text, subject)
+                }
+                if observation?.page == nil {
+                    guard case .text(let text)? = OverviewGroupSection.placeholder(observation, offline: offline, upgrade: upgrade) else { return XCTFail("group card") }
+                    upgradeText(text, "This group loads")
+                } else {
+                    XCTAssertNil(OverviewGroupSection.placeholder(observation, offline: offline, upgrade: upgrade), "Retained rows stay visible under the stale notice")
+                }
+            }
+            XCTAssertEqual(SourceState.of([loaded], offline: offline, upgrade: upgrade), .loaded, "A current page is not hidden by the upgrade")
+            XCTAssertNil(OverviewGroupSection.placeholder(loaded, offline: offline, upgrade: upgrade))
+        }
+        // Rows on screen while another source waits or a refresh failed: the notices name the upgrade too.
+        let partial = SourceState.of([loading, loaded], offline: true, upgrade: upgrade)
+        XCTAssertEqual(WorkingNowStrip.partialNotice(partial), "Some entries load after the upgrade. " + upgrade.summary)
+        XCTAssertEqual(SourceState.of([stale], offline: true, upgrade: upgrade).upgrade, upgrade, "Stale reviews show StaleNotice(upgrade:)")
+        XCTAssertEqual(OverviewUpgradeText.stale(upgrade), "Showing the last loaded results. They refresh after the upgrade. " + upgrade.summary)
+        // Without an upgrade: a real outage keeps the reconnect text and other failures keep Retry.
+        XCTAssertEqual(OverviewGroupSection.placeholder(loading, offline: true, upgrade: nil), .text("This group loads when Checklist reconnects."))
+        XCTAssertEqual(OverviewGroupSection.placeholder(loading, offline: false, upgrade: nil), .loading)
+        XCTAssertEqual(OverviewGroupSection.placeholder(failed, offline: true, upgrade: nil), .failure("Could not load this page. Refresh to load it again; drafts are kept."))
+        XCTAssertEqual(OverviewGroupSection.placeholder(failed, offline: false, upgrade: nil), .failure("Could not load this page. Refresh to load it again; drafts are kept."))
+        XCTAssertNil(OverviewGroupSection.placeholder(stale, offline: true, upgrade: nil))
+        XCTAssertEqual(SourceState.of([failed], offline: true, upgrade: nil), .offline)
+        XCTAssertEqual(SourceState.of([stale], offline: true, upgrade: nil), .stale)
+        XCTAssertEqual(WorkingNowStrip.placeholder(.offline), .text("Working now loads when Checklist reconnects."))
+        XCTAssertEqual(WorkingNowStrip.placeholder(.failed), .failure("Could not load who is working now."))
+        XCTAssertEqual(WorkingNowStrip.placeholder(.stale), .failure("Could not load who is working now."))
+        XCTAssertEqual(WorkingNowStrip.placeholder(.loading), .loading)
+        XCTAssertEqual(WorkingNowStrip.placeholder(.loaded), .text("No agent is working on a ticket now."))
+        XCTAssertEqual(LatestReviewResults.placeholder(.offline), .text("Review results load when Checklist reconnects."))
+        XCTAssertEqual(LatestReviewResults.placeholder(.failed), .failure("Could not load the latest review results."))
+        XCTAssertEqual(LatestReviewResults.placeholder(.stale), .failure("Could not load the latest review results."))
+        XCTAssertEqual(LatestReviewResults.placeholder(.loading), .loading)
+        XCTAssertEqual(LatestReviewResults.placeholder(.loaded), .text("No review results yet."))
+        XCTAssertEqual(CompletionDigest.placeholder(.offline), .text("The digest loads when Checklist reconnects."))
+        XCTAssertEqual(CompletionDigest.placeholder(.failed), .failure("Could not load the completed tickets."))
+        XCTAssertEqual(CompletionDigest.placeholder(.stale), .failure("Could not load the completed tickets."))
+        XCTAssertEqual(CompletionDigest.placeholder(.loading), .loading)
+        XCTAssertEqual(CompletionDigest.placeholder(.loaded), .loading)
+        XCTAssertEqual(WorkingNowStrip.partialNotice(.offline), "Some entries load when Checklist reconnects.")
+    }
+
     /// Review finding 38f2054e: each Overview visit shows completions since the previous visit.
     func testEachVisitStartsTheDigestFromThePreviousVisit() {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("visit-" + UUID().uuidString)

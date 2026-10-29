@@ -24,6 +24,38 @@ import SwiftUI
         XCTAssertNil(NativeClosureReleasePresentation.latestRootRelease(attempts: [Record(values: child)], activeAttemptID: ""))
         XCTAssertNil(NativeClosureReleasePresentation.latestRootRelease(attempts: [Record(values: child), attempt(state: "active")], activeAttemptID: "root"))
     }
+    func testNativeClosureStatusReasonDetailNamesChecklistNotOwner() async throws {
+        let text = "Released: native closure of the conversation's earlier process."
+        let ticket = Record(values: ["id": "synthetic-ticket", "status_category": "queued", "status_name": "Queued", "title": "Synthetic released ticket",
+                                     "status_reason": ["text": text, "actor": "owner:native-lifecycle", "actor_display": "Checklist", "at": "2026-10-28T20:00:00Z"]])
+        let detail = TicketStatusReasonDetail(task: ticket)
+        XCTAssertEqual(detail.reason?.actor, "Checklist")
+        let enhanced = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
+        let previous = ChecklistTestAXAttributeValue(NSApplication.shared, enhanced) ?? false
+        ChecklistTestAXSetValue(NSApplication.shared, true, enhanced)
+        defer { ChecklistTestAXSetValue(NSApplication.shared, previous, enhanced) }
+        let host = NSHostingView(rootView: detail)
+        let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 360, height: 200), styleMask: [.titled], backing: .buffered, defer: false)
+        window.title = "Synthetic Checklist native-closure status reason test (offscreen)"
+        window.isReleasedWhenClosed = false; window.contentView = host
+        defer { window.contentView = nil; window.close() }
+        window.orderFront(nil)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        host.layoutSubtreeIfNeeded()
+        func values(_ object: NSObject, depth: Int = 0) -> [String] {
+            guard depth < 30 else { return [] }
+            func attribute(_ name: String) -> Any? {
+                let selector = NSSelectorFromString(name)
+                return object.responds(to: selector) ? object.perform(selector)?.takeUnretainedValue() : nil
+            }
+            return ["accessibilityLabel", "accessibilityValue", "accessibilityHelp"].compactMap { attribute($0) as? String }
+                + (attribute("accessibilityChildren") as? [NSObject] ?? []).flatMap { values($0, depth: depth + 1) }
+        }
+        let shown = values(host)
+        XCTAssertTrue(shown.contains(text), shown.joined(separator: " | "))
+        XCTAssertTrue(shown.contains { $0.hasPrefix("Checklist · ") }, shown.joined(separator: " | "))
+        XCTAssertFalse(shown.contains { $0.hasPrefix("You") }, shown.joined(separator: " | "))
+    }
     func testNativeSummaryExposesReleasedClaimAndCompleteReason() async throws {
         let reason = "Verified the exact native process and registry closure. " + String(repeating: "Retained history remains available. ", count: 20)
         let release = try XCTUnwrap(NativeClosureReleasePresentation(attempt: attempt(reason: reason)))

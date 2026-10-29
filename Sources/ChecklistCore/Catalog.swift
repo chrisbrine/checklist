@@ -1,4 +1,5 @@
 import Foundation
+import ChecklistContracts
 import ChecklistProviders
 import GRDB
 
@@ -122,6 +123,11 @@ extension CommandRouter {
         fields["archive_storage_settings"] = ["settings_revision","archive_storage"]
         fields["cleanup_job_list"] = ["task_id"]
         for command in ["cleanup_job_get","cleanup_job_cancel","cleanup_job_retry"] {fields[command] = ["cleanup_job_id"]}
+        if c.role == "worker" {
+            for method in MediaWorkerContract.methods {
+                fields[method] = [] // Complete, closed schemas are shared with worker validation below.
+            }
+        }
         let reader: Set<String> = ["service_info","command_status","project_list","project_resolve","project_settings_get","policy_get","taxonomy_get","session_list","task_create","task_get",
             "task_list","task_context","message_send","message_ack","message_delivery_list","history_list","agent_resolve","agent_message_send","attachment_list","attachment_read",
             "attachment_add","review_batch_inputs"]
@@ -140,6 +146,10 @@ extension CommandRouter {
         }
     }
     func catalogEntry(name: String, extra: [String], caller c: Caller, common: [String]) -> JSON {
+        if c.role == "worker", let schema = MediaWorkerContract.inputSchema(name) {
+            return ["name":name,"description":description(name),"inputSchema":schema,
+                "annotations":["readOnlyHint":MediaWorkerContract.readMethods.contains(name),"idempotentHint":true,"openWorldHint":false]]
+        }
         var properties: JSON = [:]
         let keys = Set(extra + (name == "project_create" ? ["command_id"] : (name == "service_info" || name == "project_list" || name == "assistant_projects" ? [] : common)))
         for key in keys {
@@ -247,6 +257,11 @@ extension CommandRouter {
     }
 
     func validateInput(_ method: String,_ p: JSON,_ c: Caller) throws {
+        if c.role == "worker", MediaWorkerContract.methods.contains(method) {
+            do { try MediaWorkerContract.validate(method,parameters:p) }
+            catch { throw CoreError("INVALID_INPUT",String(describing:error)) }
+            return
+        }
         if method == "task_get" { _ = try ownerCompletionEligibilityRequested(p,caller:c) }
         if method == "task_context", ["ui","ui_records","ui_history"].contains(p["detail_level"] as? String ?? "") || p["selected_context_cursor"] != nil {try owner(c)}
         if method == "task_list" { _ = try ticketView(p,c) }
@@ -272,6 +287,17 @@ extension CommandRouter {
     }
     func description(_ method: String) -> String {
         switch method {
+        case "media_type_list":return "Discover this enrolled project's adopted enabled media types with their IDs, titles, immutable revisions and schemas. Returns types only; Draft definitions, owner adoption records and retired types are excluded."
+        case "media_type_get":return "Read the adopted enabled media type's schema and immutable revision in this enrolled project. Does not expose Draft type revisions or grant adoption authority."
+        case "media_round_create":return "Create an attributed Draft media round in an adopted enabled type. Prepare files and metadata through media_intake_*; publication requires the owner's single Publish action."
+        case "media_round_get":return "Read a bounded page of this project's media round items, metadata, exact target/candidate IDs and safe decision observations. Use its current round/context/manifest and item fences for a suggestion; repeat the same limit with next_cursor to page."
+        case "media_intake_preview":return "Prepare a frozen intake for a Draft round from explicit workspace files, literal text or TSV and finite type-defined metadata mapping. Files are copied and hash-checked during capture; preview publishes and decides nothing."
+        case "media_intake_get":return "Read an intake's immutable plan, original row IDs and committed/remaining/error states in this enrolled project. Resume only its remaining included row IDs."
+        case "media_intake_revise":return "Revise only uncaptured Draft intake rows with the current expected_revision, finite metadata mapping and explicit include/skip, slot, group or title choices. Captured rows stay immutable."
+        case "media_intake_confirm":return "Confirm the Draft intake's exact current plan_id and plan_digest at its expected_revision. This is agent preparation, with no owner publication or decision authority."
+        case "media_intake_capture":return "Capture 1–200 distinct original row_ids from the confirmed Draft intake plan into managed storage with hashes and worker provenance. Read the returned remaining rows and repeat until prepared; the owner then publishes once."
+        case "media_decision_list":return "Read a bounded append-only decision stream for this project's round: item, target, recorded disposition, winner, owner note, decision ID and decided time. Retain next_cursor, including at the end, for later decisions; read media_round_get for current item state."
+        case "media_suggest":return "Append attributed media suggestions for exact published item revisions, targets and bases under the current round/context/manifest fence. Suggestions are shown to the owner and never count as owner decisions."
         case "project_create":return "Create a project for this verified native conversation's actual unregistered workspace only. Omit root_path or use that same canonical folder. Commits worker enrollment/grant with the project; retry identical input with the same command_id to recover its receipt. Assistants cannot create projects."
         case "work_recover":return "Revoke a stopped attempt with explicit observation_refs and file_state_refs, action=confirm_stopped_revoke and reason. Name every unresolved source execution and its expected revision. Agent recovery is labeled as agent action; timeouts never prove a stop. Requires allowed agent_rule_changes."
         case "finding_waive","direction_waive":return "Record a reasoned waiver with caller provenance. Agent callers create agent waivers, never owner approvals. Requires allowed agent_rule_changes."

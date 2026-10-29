@@ -21,14 +21,15 @@ extension CommandRouter {
         return (pid,project)
     }
     func executeProjectImport(method: String,params: JSON,caller: Caller) throws -> JSON {
-        let (pid,_) = try dbQueue.read {try importAuthorization($0,params,caller,write:!Self.readMethods.contains(method))}
         if method == "import_receipt_get" {
-            return try dbQueue.read {db in
+            return try readForPreparation {db in
+                let (pid,_) = try importAuthorization(db,params,caller,write:false)
                 var receipt = try scoped(db,text(params,"receipt_id"),pid,type:"import_receipt")
                 receipt["records"] = try records(db,type:"import_record",project:pid).filter {$0["import_receipt_id"] as? String == receipt["id"] as? String}
                 return ["data":receipt]
             }
         }
+        let (pid,_) = try readForPreparation {try importAuthorization($0,params,caller,write:!Self.readMethods.contains(method))}
         let command = Self.readMethods.contains(method) ? "" : try text(params,"command_id",max:100)
         if !command.isEmpty,UUID(uuidString:command) == nil {throw CoreError("INVALID_INPUT","command_id must be a UUID.")}
         let intent = hash(Data((method + (try jsonString(params))).utf8))
@@ -47,7 +48,7 @@ extension CommandRouter {
         // Prepare hashes of the exact selected bytes outside the SQL writer.
         let bundle = try TransferBundle.read(path:path,format:format,namespace:namespace)
         if method == "import_preview" {
-            return try dbQueue.read {db in
+            return try readForPreparation {db in
                 _ = try importAuthorization(db,params,caller,write:false)
                 let destination = try importDestinationDigest(db,pid)
                 let digest = try importPreviewDigest(bundle:bundle,destination:destination,params:params)

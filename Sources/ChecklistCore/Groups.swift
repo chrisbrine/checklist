@@ -166,7 +166,7 @@ extension CommandRouter {
                 guard session["installation"] as? String == c.installation,session["execution_domain"] as? String == c.executionDomain else { throw CoreError("FORBIDDEN","Use the authenticated current session connection.") }
                 let current = orchestration["principal"] as? String == c.principal && orchestration["session_id"] as? String == c.sessionID && orchestration["execution_domain"] as? String == c.executionDomain && orchestration["session_authorization_generation"] as? String == sessionGeneration(session)
                 if !current {
-                    guard action == "finish",let closure = try resumedTriageClosure(db,orchestration,session,pid) else { throw CoreError("FORBIDDEN","Only the recorded current session can checkpoint or finish. A verified resumed conversation can finish its earlier record with a reason; an eligible different coordinator can explicitly take over.") }
+                    guard action == "finish",let closure = try resumedTriageClosure(db,orchestration,session,pid) else { throw CoreError("FORBIDDEN","Only the recorded current session can checkpoint or finish. A verified resumed conversation rebinds its earlier record in one step with action=resume and a reason (or finishes it with a reason); an eligible different coordinator can explicitly take over.") }
                     orchestration["recovery_finish_reason"] = try text(p,"reason",max:4000)
                     orchestration["native_closure_ref"] = closure;orchestration["finished_by_principal"] = c.principal
                     orchestration["finished_by_authorization_generation"] = sessionGeneration(session)

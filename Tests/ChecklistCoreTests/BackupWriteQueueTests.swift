@@ -218,6 +218,32 @@ final class BackupWriteQueueTests: XCTestCase {
         XCTAssertEqual(try router.dbQueue.read {try String.fetchAll($0,sql:"SELECT command_id FROM commands WHERE command_id IN (?,?) ORDER BY rowid",arguments:[restore,note])},[restore,note])
     }
 
+    func testQueuedWorkerMediaSuggestionStatusRestoresItsNormalWireEnvelope() throws {
+        let f = try MediaFrozenIntakeTests.Fixture(),helper = MediaWorkerChannelTests()
+        let round = try f.round(f.type(MediaRoundTests().schema()))
+        _ = try f.item(round);_ = try f.publish(round)
+        let session = try f.record(f.worker.sessionID!,"session")
+        let caller = Caller(role:"worker",installation:session["installation"] as! String,projectIDs:[f.project],
+            sessionID:f.worker.sessionID,workspace:f.workspace.path)
+        let view = try helper.worker(f,"media_round_get",["round_id":round["id"]!],as:caller)
+        var input = helper.suggestion(view,(view["items"] as! [JSON])[0]);input["note"] = "Queued worker advice"
+        let command = uuid(),router = f.router!
+        try router.backupWrites.beginCapture()
+        var params = input;params["project_id"] = f.project;params["command_id"] = command
+        let queued = try router.handle(method:"media_suggest",params:params,caller:caller)
+        XCTAssertEqual(queued["command_outcome"] as? String,"queued")
+        drain(router)
+        let applied = try router.handle(method:"command_status",params:["project_id":f.project,"command_id":command],caller:caller)["data"] as! JSON
+        XCTAssertEqual(applied["state"] as? String,"applied")
+        let wire = try XCTUnwrap(applied["result"] as? JSON)
+        XCTAssertEqual(wire["command_id"] as? String,command)
+        let suggestion = try XCTUnwrap(((wire["data"] as? JSON)?["decisions"] as? [JSON])?.first)
+        XCTAssertEqual(suggestion["note"] as? String,"Queued worker advice")
+        let replay = try helper.worker(f,"media_suggest",input,as:caller,command:command)
+        XCTAssertEqual((replay["decisions"] as! [JSON])[0]["id"] as? String,suggestion["id"] as? String)
+        XCTAssertTrue(try f.rows("media_owner_decision").isEmpty)
+    }
+
     func testQueuedNativeMediaStatusRestoresItsNormalWireEnvelope() throws {
         let f = try StorageFixture(fast:true),p = try f.project(),router = f.router!,command = UUID().uuidString
         try router.backupWrites.beginCapture()
