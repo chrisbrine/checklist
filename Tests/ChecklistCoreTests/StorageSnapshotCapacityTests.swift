@@ -58,6 +58,26 @@ final class StorageSnapshotCapacityTests: XCTestCase {
     private struct StopBeforeCopy: Error {}
     private static let gibibyte: Int64 = 1_073_741_824
 
+    func testV54RecordCapacityMustNotBecomeFreeSpaceRefusal() throws {
+        let f = try Fixture()
+        _ = try f.capture([])
+        try f.save(["id": "capture2", "project_id": "project", "revision": 1,
+                    "snapshot_path": f.root.appendingPathComponent("source-captures/project/capture2/source").path,
+                    "files": []], "source_capture")
+        var budget = StorageSnapshotBudget.production()
+        budget.maximumRecords = 1
+        budget.availableBytes = { _ in 400 * Self.gibibyte }
+        XCTAssertThrowsError(try f.build(UUID(), budget)) { error in
+            guard let e = error as? CoreError else { return XCTFail("Unexpected error: \(error)") }
+            XCTAssertEqual(e.code, "BACKUP_CAPACITY_EXCEEDED")
+            XCTAssertEqual(e.details["reason"] as? String, "snapshot_capacity",
+                           "The record count cap must keep its existing reason; 400 GiB free is sufficient.")
+            XCTAssertEqual(e.details["maximum_records"] as? Int, 1)
+            XCTAssertNil(e.details["required_free_bytes"])
+            XCTAssertNil(e.details["available_bytes"])
+        }
+    }
+
     func testProductionCapacityAndSharedDeadlineHaveMeasuredHeadroom() throws {
         let before = ProcessInfo.processInfo.systemUptime, budget = StorageSnapshotBudget.production()
         // CL-340: no fixed byte ceiling; free space on the backup volume bounds bytes.
@@ -88,11 +108,14 @@ final class StorageSnapshotCapacityTests: XCTestCase {
             let f = try Fixture(), operation = UUID()
             var clock: TimeInterval = 0
             var budget = StorageSnapshotBudget(deadlineUptime: 1, canceled: { false })
+            budget.availableBytes = { _ in 400 * Self.gibibyte }
             budget.uptime = { clock }
             budget.observe = { if $0 == boundary { clock = 1 } }
             XCTAssertThrowsError(try f.build(operation, budget)) { error in
                 XCTAssertEqual((error as? CoreError)?.code, "BACKUP_DEADLINE_EXCEEDED")
                 XCTAssertEqual((error as? CoreError)?.details["reason"] as? String, "snapshot_deadline")
+                XCTAssertEqual((error as? CoreError)?.details["production_deadline_seconds"] as? Int, 1_800)
+                XCTAssertNil((error as? CoreError)?.details["required_free_bytes"])
             }
             let names = StorageSnapshot.names(operation)
             XCTAssertFalse(FileManager.default.fileExists(atPath: f.base.appendingPathComponent(names.published).path))
@@ -182,8 +205,12 @@ final class StorageSnapshotCapacityTests: XCTestCase {
         }
         // Growth past the volume during copying reports free space, not a fixed limit.
         XCTAssertThrowsError(try budget.adding(9_000_000_000, to: 0)) { error in
-            guard case StorageSnapshotFailure.limit = error else { return XCTFail("\(error)") }
-            XCTAssertEqual((budget.reporting(error) as? CoreError)?.details["reason"] as? String, "snapshot_free_space")
+            guard case StorageSnapshotFailure.freeSpace(let measured) = error else { return XCTFail("\(error)") }
+            XCTAssertEqual(measured, 9_000_000_000)
+            let reported = budget.reporting(error) as? CoreError
+            XCTAssertEqual(reported?.details["reason"] as? String, "snapshot_free_space")
+            XCTAssertEqual(reported?.details["required_free_bytes"] as? Int64, measured + Self.gibibyte)
+            XCTAssertEqual(reported?.details["available_bytes"] as? Int64, 9_000_000_000)
         }
         // Less than the minimum margin free: refused before any staging directory exists.
         let f = try Fixture(), operation = UUID()
@@ -232,21 +259,89 @@ final class StorageSnapshotCapacityTests: XCTestCase {
         let bytes = Data("retained".utf8), sha = StorageObjectFiles.sha(bytes)
         for name in ["a", "b"] { try bytes.write(to: source.appendingPathComponent(name)) }
         _ = try f.capture(["a", "b"].map { ["path": $0, "kind": "file", "sha256": sha, "size": bytes.count] })
-        for kind in ["objects", "manifest"] {
+        for (kind, reason, limit, maximum) in [
+            ("objects", "snapshot_object_capacity", "maximum_objects", 1),
+            ("manifest", "snapshot_manifest_capacity", "maximum_manifest_bytes", 128),
+            ("object_bytes", "snapshot_object_bytes", "maximum_object_bytes", 1)
+        ] {
             var budget = StorageSnapshotBudget.production()
-            if kind == "objects" { budget.maximumObjects = 1 } else { budget.maximumManifestBytes = 128 }
+            budget.availableBytes = { _ in 400 * Self.gibibyte }
+            if kind == "objects" { budget.maximumObjects = maximum }
+            else if kind == "manifest" { budget.maximumManifestBytes = maximum }
+            else { budget.maximumObjectBytes = Int64(maximum) }
             let operation = UUID()
             XCTAssertThrowsError(try f.build(operation, budget)) { error in
                 let e = error as? CoreError
                 XCTAssertEqual(e?.code, "BACKUP_CAPACITY_EXCEEDED")
-                XCTAssertEqual(e?.details["measured_objects"] as? Int, 2)
+                XCTAssertEqual(e?.details["reason"] as? String, reason)
+                XCTAssertEqual((e?.details[limit] as? NSNumber)?.intValue, maximum)
+                XCTAssertEqual(e?.details["measured_objects"] as? Int, kind == "object_bytes" ? 1 : 2)
                 XCTAssertGreaterThan(e?.details["measured_bytes"] as? Int64 ?? 0, 0)
                 XCTAssertNotNil(e?.details["next_step"])
+                XCTAssertNil(e?.details["required_free_bytes"])
             }
             XCTAssertFalse(FileManager.default.fileExists(atPath: f.base.appendingPathComponent(StorageSnapshot.names(operation).published).path))
         }
         XCTAssertEqual(try Data(contentsOf: source.appendingPathComponent("a")), bytes)
         XCTAssertEqual(try Data(contentsOf: source.appendingPathComponent("b")), bytes)
+    }
+
+    func testUndeclaredFileSizeKeepsPerFileCapacityReason() throws {
+        let f = try Fixture(), bytes = Data("retained".utf8)
+        let output = f.root.appendingPathComponent("source-executions/project/run/output.txt")
+        try FileManager.default.createDirectory(at: output.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try bytes.write(to: output)
+        try f.save(["id": "run", "project_id": "project", "revision": 1, "state": "passed",
+                    "output_path": output.path, "output_sha256": StorageObjectFiles.sha(bytes)], "source_execution")
+        var budget = StorageSnapshotBudget.production()
+        budget.availableBytes = { _ in 400 * Self.gibibyte }
+        budget.maximumObjectBytes = 1
+        XCTAssertThrowsError(try f.build(UUID(), budget)) { error in
+            let e = error as? CoreError
+            XCTAssertEqual(e?.details["reason"] as? String, "snapshot_object_bytes")
+            XCTAssertEqual(e?.details["maximum_object_bytes"] as? Int64, 1)
+            XCTAssertEqual(e?.details["measured_objects"] as? Int, 1)
+            XCTAssertGreaterThan(e?.details["measured_bytes"] as? Int64 ?? 0, Int64(bytes.count))
+            XCTAssertNil(e?.details["required_free_bytes"])
+        }
+    }
+
+    func testCopyGrowthKeepsFreeSpaceFixedByteAndPerFileCausesSeparate() throws {
+        for kind in ["free_space", "fixed_bytes", "object_bytes"] {
+            let f = try Fixture(), bytes = Data("retained".utf8)
+            let source = f.root.appendingPathComponent("source-captures/project/capture/source")
+            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+            let file = source.appendingPathComponent("growing")
+            try bytes.write(to: file)
+            _ = try f.capture([["path": "growing", "kind": "file", "sha256": StorageObjectFiles.sha(bytes), "size": bytes.count]])
+            var budget = StorageSnapshotBudget.production()
+            budget.availableBytes = { _ in kind == "free_space" ? Self.gibibyte + 1_048_576 : 400 * Self.gibibyte }
+            if kind == "fixed_bytes" { budget.maximumBytes = 1_048_576 }
+            if kind == "object_bytes" { budget.maximumObjectBytes = 1_048_576 }
+            // Grow after preflight but before the read handle opens. The copy
+            // must refuse at the actual bound before writing beyond it.
+            budget.observe = { if $0 == "copying_objects" { try Data(repeating: 1, count: 2 * 1_048_576).write(to: file) } }
+            let operation = UUID()
+            XCTAssertThrowsError(try f.build(operation, budget)) { error in
+                let e = error as? CoreError
+                let reason = kind == "free_space" ? "snapshot_free_space" : kind == "object_bytes" ? "snapshot_object_bytes" : "snapshot_capacity"
+                XCTAssertEqual(e?.code, "BACKUP_CAPACITY_EXCEEDED")
+                XCTAssertEqual(e?.details["reason"] as? String, reason)
+                if kind == "free_space" {
+                    XCTAssertGreaterThan(e?.details["required_free_bytes"] as? Int64 ?? 0, Self.gibibyte + 1_048_576)
+                    XCTAssertEqual(e?.details["available_bytes"] as? Int64, Self.gibibyte + 1_048_576)
+                } else {
+                    let limit = kind == "object_bytes" ? "maximum_object_bytes" : "maximum_bytes"
+                    XCTAssertEqual(e?.details[limit] as? Int64, 1_048_576)
+                    XCTAssertNil(e?.details["required_free_bytes"])
+                }
+            }
+            let names = StorageSnapshot.names(operation)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.base.appendingPathComponent(names.published).path))
+            let partial = f.base.appendingPathComponent(names.staging + "/managed/source-captures/project/capture/source/growing")
+            let copied = try FileManager.default.attributesOfItem(atPath: partial.path)[.size] as! NSNumber
+            XCTAssertLessThanOrEqual(copied.int64Value, 1_048_576)
+        }
     }
 
     func testDuplicateContentSharesOnlyBackupBytesAndLegacyRestoreStillWorks() throws {

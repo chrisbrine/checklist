@@ -195,7 +195,8 @@ enum StorageSnapshot {
             budget.measurement.bytes = measured
             budget.measurement.objects = inventory.objects.count
             // Manifest bytes are added below, so this remains a lower bound.
-            guard !oversized, measured <= budget.maximumBytes else { throw budget.capacityFailure("snapshot_capacity") }
+            guard !oversized else { throw budget.capacityFailure("snapshot_object_bytes") }
+            guard measured <= budget.maximumBytes else { throw budget.capacityFailure("snapshot_capacity") }
             // CL-340: refuse before copying when the store and margin do not fit the volume.
             try budget.requireFreeSpace(forMeasured: measured)
             // Explicitly flush/close the copied DB before hashing it.
@@ -207,21 +208,21 @@ enum StorageSnapshot {
             try budget.observe("copying_objects")
             for descriptor in inventory.objects where descriptor.kind == "file" {
                 try budget.check()
-                var remainingBudget = budget
-                remainingBudget.maximumObjectBytes = min(budget.maximumObjectBytes, budget.effectiveMaximumBytes - total)
                 let value: (String, Int64)
                 if let expected = descriptor.expectedSHA256, let prior = copiedContent[expected] {
                     // Hash every source path: an expected hash alone never proves
                     // its bytes. Only the owned backup shares inodes, never the store.
-                    value = try sourceFiles.digest(descriptor.relativePath, budget: remainingBudget)
-                    guard value == (expected, prior.size), value.1 <= remainingBudget.maximumObjectBytes else { throw StorageSnapshotFailure.sourceChanged }
+                    value = try sourceFiles.digest(descriptor.relativePath, budget: budget)
+                    guard value == (expected, prior.size) else { throw StorageSnapshotFailure.sourceChanged }
+                    guard value.1 <= budget.maximumObjectBytes else { throw budget.capacityFailure("snapshot_object_bytes") }
+                    _ = try budget.adding(value.1, to: total)
                     if try !stage.writeHardLink("managed/" + descriptor.relativePath, to: prior.path, link: budget.linkFile) {
-                        let copied = try sourceFiles.copy(descriptor.relativePath, to: stage, expected: expected, budget: remainingBudget)
+                        let copied = try sourceFiles.copy(descriptor.relativePath, to: stage, expected: expected, budget: budget, logicalBytesBeforeCopy: total)
                         guard copied == value else { throw StorageSnapshotFailure.sourceChanged }
                         copiedContent[expected] = ("managed/" + descriptor.relativePath, value.1)
                     }
                 } else {
-                    value = try sourceFiles.copy(descriptor.relativePath, to: stage, expected: descriptor.expectedSHA256, budget: remainingBudget)
+                    value = try sourceFiles.copy(descriptor.relativePath, to: stage, expected: descriptor.expectedSHA256, budget: budget, logicalBytesBeforeCopy: total)
                     copiedContent[value.0] = ("managed/" + descriptor.relativePath, value.1)
                 }
                 guard descriptor.expectedSize == nil || descriptor.expectedSize == value.1 else { throw StorageSnapshotFailure.sourceChanged }

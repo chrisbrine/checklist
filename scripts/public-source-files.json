@@ -525,6 +525,7 @@
     "Tests/ChecklistCoreTests/StorageMigrationTests.swift",
     "Tests/ChecklistCoreTests/StorageReadPerformanceTests.swift",
     "Tests/ChecklistCoreTests/StorageSnapshotCapacityTests.swift",
+    "Tests/ChecklistCoreTests/StorageUpgradeOwnedCopyTests.swift",
     "Tests/ChecklistCoreTests/StructuredPrerequisiteTests.swift",
     "Tests/ChecklistCoreTests/TaskEditValidationTests.swift",
     "Tests/ChecklistCoreTests/TestStoreTests.swift",

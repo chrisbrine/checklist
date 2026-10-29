@@ -46,7 +46,11 @@ extension PurgeByteDeletionTests {
         let files = try StorageObjectFiles(root:router.root),initial = try receipt(result)["summary"] as! JSON
         for step in 0..<8 {
             if try receipt(result)["state"] as? String == "completed" {break}
-            try pumpByteDeletion()
+            // Inspect each actual writer chunk. A production cohort can now
+            // perform several such chunks in one maintenance call.
+            try router.withTicketCleanupPreparation({try self.router.prepareTicketObjectDeletion($0)}) {db,permit,prepared in
+                try self.router.processTicketObjectDeletionIntents(db,permit:permit,prepared:prepared)
+            }
             if step == 0 {
                 XCTAssertFalse(try files.regularOrLinkExists(path + "/z-links/alias.txt"))
                 XCTAssertTrue(try files.regularOrLinkExists(path + "/a-inner.txt"))

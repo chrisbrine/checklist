@@ -63,30 +63,108 @@ extension CommandRouter {
         Int64(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-cursor:" + pid]) ?? "0") ?? 0
     }
 
-    /// Read-snapshot preparation only: 32 tickets, at most one semantic action.
+    /// Read-snapshot preparation only: up to 32 tickets with independent fences.
     /// The maintenance lane yields the writer and service queue between chunks.
-    func ticketCleanupSelection(_ db: Database,project: JSON,at time: Date = Date()) throws -> TicketCleanupPreparedPass {
+    func ticketCleanupSelection(_ db: Database,project: JSON,at time: Date = Date(),observePhase: ((String) -> Void)? = nil) throws -> TicketCleanupPreparedPass {
         let pid = (try StoredRecord(project, family: "project").string("id")), settings = ticketCleanupSettings(project), cursor = try ticketCleanupCursor(db, pid)
-        let rows = try Row.fetchAll(db,sql:"SELECT rowid AS cleanup_row," + Self.canonicalRecordColumns + " FROM records WHERE type='task' AND project_id=? AND rowid>? ORDER BY rowid LIMIT 32",arguments:[pid,cursor])
-        var items: [JSON] = [],plans: [String:TicketPurgePlan] = [:],expired: [String:[Row]] = [:],admitted = 0
-        var inventory: TicketCleanupInventory?,planningAttempted = false
-        func plan(_ task: JSON) throws -> TicketPurgePlan {
-            planningAttempted = true
+        let retryEntries = try ticketCleanupRetryEntries(db,project:pid),retryState = retryEntries.mapValues(\.deadline)
+        let scheduled = Double(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-next:" + pid]) ?? "0") ?? 0
+        let sweepDeadline = Double(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-sweep-next:" + pid]) ?? "0") ?? 0
+        let sweepDue = cursor > 0 || scheduled == 0 || sweepDeadline <= time.timeIntervalSince1970
+        // A stream of Done wakes must not consume every ordinary scan slot.
+        let dueRetries = retryState.filter {$0.value <= time.timeIntervalSince1970}.sorted {
+            $0.value == $1.value ? $0.key < $1.key : $0.value < $1.value
+        }.prefix(sweepDue ? 16 : 32).map(\.key)
+        var retryRows: [Row] = []
+        for id in dueRetries {
+            if let row = try Row.fetchOne(db,sql:"SELECT rowid AS cleanup_row," + Self.canonicalRecordColumns + " FROM records WHERE type='task' AND project_id=? AND id=CAST(? AS TEXT)",arguments:[pid,Data(id.utf8)]) {retryRows.append(row)}
+        }
+        let retryOnly = !dueRetries.isEmpty && !sweepDue
+        let scanRows = retryOnly ? [] : try Row.fetchAll(db,sql:"SELECT rowid AS cleanup_row," + Self.canonicalRecordColumns + " FROM records WHERE type='task' AND project_id=? AND rowid>? ORDER BY rowid LIMIT ?",arguments:[pid,cursor,32-retryRows.count])
+        let retryIDs = Set(dueRetries)
+        let rows = retryRows + scanRows.filter { !retryIDs.contains($0["id"] as String) }
+        let tasks = try rows.map {try GRDBRecordEnvelopeAdapter.decode($0).object}
+        observePhase?("selected_tickets")
+        // Retain clocks only for the selected closed tickets, never every event
+        // entity in the project. Empty/open chunks need no history observation.
+        let clockIDs = tasks.compactMap {task -> String? in
+            guard !bool(task,"purged"),let tid = task["id"] as? String,let statusID = task["status_id"] as? String,
+                  let category = (try? record(db,statusID,type:"status"))?["category"] as? String,["done","canceled"].contains(category) else {return nil}
+            return tid
+        }
+        let clockRows = clockIDs.isEmpty ? [] : try Row.fetchAll(db,sql:"SELECT entity_id,MAX(occurred_at) AS changed FROM events WHERE project_id=? AND CAST(entity_id AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?)) AND kind NOT IN ('attachment_original_cleaned','attachment_original_missing') GROUP BY CAST(entity_id AS BLOB)",arguments:[pid,try jsonString(clockIDs)])
+        let eventTimes = Dictionary(uniqueKeysWithValues:clockRows.compactMap {row -> (Data,String)? in
+            guard let entity: String = row["entity_id"],let changed: String = row["changed"] else {return nil}
+            return (Data(entity.utf8),changed)
+        })
+        observePhase?("closed_clocks")
+        let jobTasks = bool(settings,"done_evidence_enabled") ? tasks.filter {task in
+            guard !bool(task,"purged"),retryState[task["id"] as? String ?? ""].map({$0 <= time.timeIntervalSince1970}) ?? true,
+                  (try? record(db,task["status_id"] as? String ?? "",type:"status"))?["category"] as? String == "done" else {return false}
+            let clocks = [task["updated_at"] as? String,eventTimes[Data((task["id"] as? String ?? "").utf8)]].compactMap {$0}
+            let dates = clocks.compactMap {ISO8601DateFormatter().date(from:$0)}
+            if bool(settings,"closed_purge_enabled"),task["updated_at"] is String,dates.count == clocks.count,
+               let changed = dates.max(),changed.addingTimeInterval(Double(int(settings,"closed_days")) * 86400) <= time {return false}
+            return true
+        } : []
+        let jobObservation = try ticketCleanupJobObservation(db,tasks:jobTasks)
+        observePhase?("selected_jobs")
+        let candidates = tasks.filter {task in
+            guard retryState[task["id"] as? String ?? ""].map({$0 <= time.timeIntervalSince1970}) ?? true,!bool(task,"purged"),let statusID = task["status_id"] as? String else {return false}
+            let category = (try? record(db,statusID,type:"status"))?["category"] as? String
+            guard ["done","canceled"].contains(category ?? "") else {return false}
+            let clocks = [task["updated_at"] as? String,eventTimes[Data((task["id"] as? String ?? "").utf8)]].compactMap {$0}
+            let dates = clocks.compactMap {ISO8601DateFormatter().date(from:$0)}
+            if bool(settings,"closed_purge_enabled"),task["updated_at"] is String,dates.count == clocks.count,
+               let changed = dates.max(),changed.addingTimeInterval(Double(int(settings,"closed_days")) * 86400) <= time {return true}
+            guard category == "done",bool(settings,"done_evidence_enabled") else {return false}
+            // Existing pending byte jobs already carry their durable objects;
+            // they need a continuation, not another full planning observation.
+            return (try? jobObservation.entry(task:task["id"] as? String ?? "",project:pid).pending) == false
+        }
+        var batch = try ticketCleanupInventories(db,tasks:candidates)
+        observePhase?("inventories")
+        var candidateObjects: [String:[JSON]] = [:],referenceGraphs: [String:TicketPurgeReferenceGraph] = [:],candidateBytes = 0
+        for task in candidates {
+            let tid = try StoredRecord(task,family:"task").string("id")
+            guard let inventory = batch.inventories[tid] else {continue}
+            do {
+                let graph = try ticketPurgeReferenceGraph(task:task,inventory:inventory)
+                let objects = try ticketObjectDeletionObjects(db,owned:inventory.rows.filter {graph.owned.contains($0.key)}.map {($0.type,$0.value)})
+                let bytes = try jsonString(objects).utf8.count
+                guard candidateBytes + bytes <= TicketCleanupBatchInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","Selected cleanup descriptors exceed their memory bound; this ticket is deferred.")}
+                candidateBytes += bytes;candidateObjects[tid] = objects;referenceGraphs[tid] = graph
+            } catch let error as CoreError {batch.errors[tid] = error}
+        }
+        observePhase?("candidate_objects")
+        let summaries = candidateObjects.isEmpty ? [] : try Row.fetchAll(db,sql:"SELECT json_object('known_at',json_extract(value,'$.known_at'),'created_at',json_extract(value,'$.created_at')) AS value FROM metadata WHERE key LIKE 'backup-generation:%' ORDER BY key").map {jsonObject($0["value"])}
+        let backupObservation = TicketCleanupBackupObservation(index:candidateObjects.isEmpty ? nil : try? ticketCleanupBackupRetentionIndex(db,objects:candidateObjects.values.flatMap {$0}),summaries:summaries)
+        let mediaAuthorityComplete = !candidateObjects.isEmpty && (try? ticketCleanupValidateMediaAuthority(db)) != nil
+        observePhase?("backup_media")
+        let historyObservation = try ticketCleanupEventObservation(db,tasks:candidates.filter {batch.errors[$0["id"] as? String ?? ""] == nil},inventories:batch.inventories,referenceGraphs:referenceGraphs)
+        observePhase?("events")
+        var items: [JSON] = [],plans: [String:TicketPurgePlan] = [:],expired: [String:[Row]] = [:],itemFences: [String:TicketCleanupFence] = [:]
+        var inventory: TicketCleanupInventory?,planningRetries: [String] = []
+        func plan(_ task: JSON,doneEvidence: Bool = false) throws -> TicketPurgePlan {
+            let tid = try StoredRecord(task,family:"task").string("id")
+            if let error = batch.errors[tid] {throw error}
             if inventory == nil {inventory = try ticketCleanupInventory(db,task:task)}
-            return try ticketPurgePlan(db,task:task,inventory:inventory)
+            return try ticketPurgePlan(db,task:task,inventory:inventory,doneEvidence:doneEvidence,historyObservation:historyObservation,backupObservation:backupObservation,candidateObjects:candidateObjects[tid],mediaAuthorityComplete:mediaAuthorityComplete,referenceGraph:referenceGraphs[tid])
         }
         for row in rows {
             let task = try GRDBRecordEnvelopeAdapter.decode(row).object, tid = (try StoredRecord(task, family: "task").string("id"))
+            inventory = batch.inventories[tid]
             var item: JSON = [
                 "task_id": tid, "key": task["key"] ?? "", "task_revision": (try StoredRecord(task, family: "task").requiredValue("revision")), "action": "keep",
                 "reason": "open_ticket",
             ]
             let category = (try? record(db,task["status_id"] as? String ?? "",type:"status"))?["category"] as? String ?? "unknown"
-            if bool(task,"purged") {item["reason"] = "already_purged"}
+            if let retry = retryState[tid],retry > time.timeIntervalSince1970 {item["reason"] = "ticket_retry_deferred"}
+            else if bool(task,"purged") {item["reason"] = "already_purged"}
             else if ["done","canceled"].contains(category) {
                 do {
                     try requirePurgeSafe(db,task:task,automatic:true)
-                    let eventTime = try String.fetchOne(db,sql:"SELECT MAX(occurred_at) FROM events WHERE project_id=? AND entity_id=? AND kind NOT IN ('attachment_original_cleaned','attachment_original_missing')",arguments:[pid,tid])
+                    let eventTime = eventTimes[Data(tid.utf8)]
                     let clockStrings = [task["updated_at"] as? String,eventTime].compactMap {$0}
                     let clocks = clockStrings.compactMap {ISO8601DateFormatter().date(from:$0)}
                     let changed = clocks.count == clockStrings.count && task["updated_at"] is String ? clocks.max() : nil
@@ -94,49 +172,56 @@ extension CommandRouter {
                     if bool(settings,"closed_purge_enabled"),let due,due <= time {
                         item["action"] = "purge";item["reason"] = "closed_unchanged";item["due_at"] = ISO8601DateFormatter().string(from:due)
                     } else if category == "done",bool(settings,"done_evidence_enabled") {
-                        let jobs = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND project_id=? AND json_extract(data,'$.cause')='done_evidence' AND json_extract(data,'$.task_id')=?",arguments:[pid,tid]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
-                        if jobs.contains(where: {$0["task_id"] as? String == tid && $0["state"] as? String == "pending"}) {item["reason"] = "deletion_pending"}
+                        let jobs = try jobObservation.entry(task:tid,project:pid)
+                        if jobs.pending {item["reason"] = "deletion_pending"}
                         else {
-                            let plan = try plan(task)
+                            let plan = try plan(task,doneEvidence:true)
                             let objects = plan.byteDeletion.objects
-                            let previous = jobs.filter {$0["task_id"] as? String == tid}.flatMap {$0["objects"] as? [JSON] ?? []}
                             let outstanding = objects.filter {object in
                                 guard object["state"] as? String != "already_missing" else {return false}
                                 if object["state"] as? String == "pending" {return true}
-                                return !previous.contains {prior in
-                                    prior["stored_path"] as? String == object["stored_path"] as? String && prior["sha256"] as? String == object["sha256"] as? String && strings(prior,"reasons") == strings(object,"reasons") && prior["state"] as? String == "retained"
-                                }
+                                return !jobs.retains(object)
                             }
                             if !outstanding.isEmpty {plans[tid] = plan;item["action"] = "done_evidence";item["reason"] = "done";item["plan_digest"] = plan.digest;item["objects"] = objects;item["summary"] = plan.byteDeletion.summary}
                             else {item["reason"] = "no_new_eligible_bytes"}
                         }
                     } else {item["reason"] = bool(settings,"closed_purge_enabled") ? (due == nil ? "unknown_change_time" : "retention_age") : "rule_disabled"}
-                    if item["action"] as? String == "purge" {let plan = try plan(task);plans[tid] = plan;expired[tid] = try ticketPurgeExpiringCommands(db,task:task,plan:plan);item["objects"] = plan.byteDeletion.objects;item["summary"] = plan.byteDeletion.summary;item["record_impact"] = plan.impact.filter {!["known_backup_count","known_backup_observed_times","known_backup_creation_times"].contains($0.key)};item["purge_digest"] = plan.digest}
+                    if item["action"] as? String == "purge" {let plan = try plan(task);plans[tid] = plan;item["objects"] = plan.byteDeletion.objects;item["summary"] = plan.byteDeletion.summary;item["record_impact"] = plan.impact.filter {!["known_backup_count","known_backup_observed_times","known_backup_creation_times"].contains($0.key)};item["purge_digest"] = plan.digest}
                 } catch let error as CoreError {
-                    if ["CLEANUP_INVENTORY_LIMIT","REFERENCE_GRAPH_LIMIT","PURGE_LIMIT","CANONICAL_RECORD_INVALID"].contains(error.code) {try recordTicketCleanupPreparationRefusal(project:pid,reason:error.code)}
+                    if ["CLEANUP_INVENTORY_LIMIT","REFERENCE_GRAPH_LIMIT","PURGE_LIMIT"].contains(error.code) {planningRetries.append(tid)}
                     item["action"] = "keep";item["reason"] = error.code
                 }
             }
-            if item["action"] as? String != "keep" {
-                if admitted == 1 {break}
-                admitted += 1
-            }
+            item["retry"] = retryIDs.contains(tid)
             item["scan_row"] = row["cleanup_row"] as Int64;items.append(item)
-            if admitted == 1 || planningAttempted {break}
         }
-        let end = (items.last?["scan_row"] as? Int64) ?? cursor
-        let more = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE type='task' AND project_id=? AND rowid>?)",arguments:[pid,end]) ?? false
-        let selection: JSON = ["project_id":pid,"settings":settings,"items":items,"next_cursor":more ? end : 0,"more":more,
+        observePhase?("plans")
+        let purgeTasks = tasks.filter {task in items.contains {$0["task_id"] as? String == task["id"] as? String && $0["action"] as? String == "purge"}}
+        let commands = try ticketPurgeExpiringCommands(db,tasks:purgeTasks,plans:plans)
+        expired = commands.commands
+        observePhase?("commands")
+        for index in items.indices {
+            let tid = try StoredRecord(items[index],family:"cleanup_selection_item").string("task_id")
+            if let error = commands.errors[tid] {
+                items[index]["action"] = "keep";items[index]["reason"] = error.code
+                planningRetries.append(tid);plans[tid] = nil
+                continue
+            }
+            guard let plan = plans[tid],items[index]["action"] as? String != "keep",let task = tasks.first(where:{$0["id"] as? String == tid}) else {continue}
+            var observation = batch.inventories[tid] ?? TicketCleanupInventory()
+            observation.objects(plan.byteDeletion.objects,root:root)
+            itemFences[tid] = try TicketCleanupFence(db,inventory:observation,project:pid,ids:[tid,task["status_id"] as? String ?? ""],events:plan.events,commands:expired[tid] ?? [],fencesScanMetadata:false)
+        }
+        observePhase?("fences")
+        let end = (scanRows.last?["cleanup_row"] as Int64?) ?? cursor
+        let more = retryOnly ? false : try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE type='task' AND project_id=? AND rowid>?)",arguments:[pid,end]) ?? false
+        let selection: JSON = ["project_id":pid,"settings":settings,"items":items,"next_cursor":more ? end : 0,"scan_cursor":cursor,"more":more,"attempted_retry_ids":Array(dueRetries),"retry_task_ids":planningRetries,"observed_retry_tokens":retryEntries.mapValues(\.token),"retry_only":retryOnly,"sweep_deadline":sweepDeadline,
             "selected_bytes":items.reduce(Int64(0)) {$0 + (((($1["summary"] as? JSON)?["pending_bytes"]) as? NSNumber)?.int64Value ?? 0)},"physical_reclamation":"unmeasured","source_build_cache":try sourceBuildCacheRetainedEntries(db,project:pid)]
-        var observation = inventory ?? TicketCleanupInventory()
-        for plan in plans.values {observation.objects(plan.byteDeletion.objects,root:root)}
-        let ids = try [pid] + items.flatMap {item -> [String] in
-            let tid = try StoredRecord(item, family: "cleanup_selection_item").string("task_id")
-            let task = try? record(db,tid,type:"task")
-            return [tid,task?["status_id"] as? String ?? ""]
-        }
-        let fence = try TicketCleanupFence(db,inventory:observation,project:pid,ids:ids,events:plans.values.flatMap(\.events),commands:expired.values.flatMap {$0})
-        return TicketCleanupPreparedPass(fence:fence,project:project,selection:selection,plans:plans,expiredCommands:expired)
+        // Scan resets are scheduling, not deletion authority. Each selected
+        // ticket fences its own records/references before any action commits.
+        let fence = try TicketCleanupFence(db,inventory:TicketCleanupInventory(),project:pid,ids:[pid],fencesScanMetadata:false)
+        observePhase?("final_projection")
+        return TicketCleanupPreparedPass(fence:fence,project:project,selection:selection,plans:plans,expiredCommands:expired,itemFences:itemFences)
     }
 
     func prepareTicketLifecycleCleanup(_ db: Database,at time: Date = Date()) throws -> TicketCleanupPreparedPass? {
@@ -182,8 +267,9 @@ extension CommandRouter {
                     deletion = try StoredRecord(result, family: "purge_result").object("byte_deletion")
                 } else {
                     var receipt = try self.enqueueTicketObjectDeletion(db,project:pid,task:tid,cause:"done_evidence",plan:plan.byteDeletion)
-                    receipt["owned_record_fingerprints"] = Dictionary(uniqueKeysWithValues:try plan.removed.map {($0.id,try self.ticketCleanupOwnerFingerprint($0.value,type:$0.type))})
+                    receipt["owned_record_fingerprints"] = Dictionary(uniqueKeysWithValues:try plan.byteCleanupOwners.map {($0.id,try self.ticketCleanupOwnerFingerprint($0.value,type:$0.type))})
                     receipt["task_revision"] = (try StoredRecord(task, family: "task").requiredValue("revision"))
+                    receipt["cleanup_policy_version"] = 2
                     try self.save(db,receipt,type:"storage_job");deletion = receipt
                 }
                 items[index]["byte_deletion_receipt_id"] = (try StoredRecord(deletion, family: "deletion").requiredValue("id"))
@@ -197,9 +283,17 @@ extension CommandRouter {
             try self.save(db,receipt,type:"storage_job")
             try self.event(db,caller:Caller(role:"owner",installation:"storage",projectIDs:[]),project:pid,entity:pid,kind:"ticket_cleanup_pass",data:["origin":"automatic_cleanup","receipt_id":id,"admitted_count":items.filter {$0["action"] as? String != "keep"}.count])
             try db.execute(sql:"INSERT OR IGNORE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-first:" + pid,id])
-            let cursor = (selection["next_cursor"] as? Int64) ?? 0
+            var retries = try ticketCleanupRetryEntries(db,project:pid)
+            let observedTokens = selection["observed_retry_tokens"] as? [String:String] ?? [:]
+            for id in selection["attempted_retry_ids"] as? [String] ?? [] where retries[id]?.token == observedTokens[id] {retries.removeValue(forKey:id)}
+            for id in selection["retry_task_ids"] as? [String] ?? [] {retries[id] = TicketCleanupRetry(at:time.addingTimeInterval(60))}
+            try saveTicketCleanupRetries(db,project:pid,entries:retries)
+            let reset = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM ticket_cleanup_changes WHERE kind=3 AND id=CAST(? AS BLOB))",arguments:["ticket-cleanup-cursor:" + pid]) ?? false
+            let cursor = reset ? 0 : ((selection["next_cursor"] as? Int64) ?? 0)
             try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-cursor:" + pid,String(cursor)])
-            let deadline = time.addingTimeInterval(bool(selection,"more") ? 0.05 : 86400).timeIntervalSince1970
+            let ordinaryDeadline = bool(selection,"retry_only") && !reset ? (selection["sweep_deadline"] as? Double ?? time.addingTimeInterval(86400).timeIntervalSince1970) : time.addingTimeInterval(bool(selection,"more") || reset ? 0.05 : 86400).timeIntervalSince1970
+            try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-sweep-next:" + pid,String(ordinaryDeadline)])
+            let deadline = min(ordinaryDeadline,retries.values.map(\.deadline).min() ?? ordinaryDeadline)
             try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-next:" + pid,String(deadline)])
             return .commit
         }
@@ -208,7 +302,7 @@ extension CommandRouter {
     private func ticketCleanupPassItems(_ items: [JSON]) -> [JSON] {
         items.map { item in
             var item = item
-            for field in ["scan_row", "objects", "plan_digest", "purge_digest", "record_impact"] {
+            for field in ["scan_row", "retry", "objects", "plan_digest", "purge_digest", "record_impact"] {
                 item.removeValue(forKey: field)
             }
             return item
@@ -258,12 +352,15 @@ extension CommandRouter {
         let graph = try inventory.map {$0.rows.map {row -> JSON in var value = row.value;value["record_type"] = row.type;return value}} ?? archiveCleanupReferenceRows(db)
         guard receipt["cause"] as? String == "done_evidence" else {return graph}
         let fingerprints = receipt["owned_record_fingerprints"] as? [String:String] ?? [:]
+        let owners = Set(fingerprints.keys.map {Data($0.utf8)})
+        let protected = try ticketCleanupProtectedOwners(graph.filter {$0["id"] as? String != receipt["task_id"] as? String},owners:owners,tokens:inventory?.tokens)
         return try graph.filter {value in
             // Retained historical owners do not keep their own bytes alive. Holds
             // and every newly admitted/foreign reference still win at final unlink.
             let type = value["record_type"] as? String ?? "",id = value["id"] as? String ?? ""
             if type == "storage_hold" {return true}
             if id == receipt["task_id"] as? String {return false}
+            if protected.contains(Data(id.utf8)) {return true}
             guard let expected = fingerprints[id] else {return true}
             return try expected != ticketCleanupOwnerFingerprint(value,type:type)
         }

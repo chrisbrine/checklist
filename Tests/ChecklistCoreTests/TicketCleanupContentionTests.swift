@@ -179,42 +179,34 @@ extension TicketLifecycleCleanupTests {
             }
         }
     }
-    func testSelectedTicketFenceSkipsOnlyThatTicketAndBackoffSurvivesRestart() throws {
+    func testSelectedTicketFenceRetriesOnlyThatTicketAndRetrySurvivesRestart() throws {
         let (p,t,a) = try fixture(),pid = p["id"] as! String
         let other = try call("task_create",["project_id":pid,"title":"Another Done ticket"])
         let source = directory.appendingPathComponent("other.txt");try Data("other".utf8).write(to:source)
         _ = try call("attachment_add",["project_id":pid,"task_id":other["id"]!,"path":source.path,"mode":"managed_copy"])
         try mark(p,other,category:"done")
+        _ = try call("backup_create",["path":directory.appendingPathComponent("retry-backup").path])
         var committed = false
         try router.withTicketCleanupPreparation({db in
             let prepared = try self.router.prepareTicketLifecycleCleanup(db)
             _ = try self.call("message_send",["project_id":pid,"task_id":t["id"]!,"body":"Selected ticket changed"])
             return prepared
-        }) {_,_,_ in committed = true}
-        XCTAssertFalse(committed);XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
-        let maintenance = try call("ticket_cleanup_receipts",["project_id":pid])["maintenance"] as! JSON
-        let attempt = maintenance["preparation"] as! JSON
-        XCTAssertEqual(maintenance["state"] as? String,"deferred")
-        XCTAssertNotNil(attempt["attempted_at"]);XCTAssertNotNil(attempt["last_failed_at"])
-        XCTAssertTrue((attempt["last_failure_reason"] as? String ?? "").contains("concurrent write"))
-        let next = try XCTUnwrap(ISO8601DateFormatter().date(from:attempt["next_attempt_at"] as! String))
-        XCTAssertGreaterThan(next.timeIntervalSinceNow,55)
-        var attempts = 0
-        for _ in 0..<100 {
-            try router.withTicketCleanupPreparation({db -> TicketCleanupPreparedPass? in
-                let prepared = try self.router.prepareTicketLifecycleCleanup(db)
-                if prepared != nil {attempts += 1};return prepared
-            }) {_,_,_ in XCTFail("Backoff must not commit")}
+        }) {db,_,prepared in
+            committed = true;try self.router.commitTicketLifecycleCleanup(db,prepared:prepared,at:Date())
         }
-        XCTAssertEqual(attempts,0)
+        XCTAssertTrue(committed);XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
+        let retries = try router.dbQueue.read {try self.router.ticketCleanupRetries($0,project:pid)}
+        XCTAssertEqual(Set(retries.keys),[t["id"] as! String])
+        let next = try XCTUnwrap(retries[t["id"] as! String]);XCTAssertGreaterThan(next-Date().timeIntervalSince1970,55)
+        XCTAssertNil(try router.readers!.read {try self.router.prepareTicketLifecycleCleanup($0)},"An isolated retry does not restart the full preparation")
         let root = router.root;try router.closeStore();router = try TestStore.router(root:root)
-        try router.runStorageMaintenance()
-        let restarted = try call("ticket_cleanup_receipts",["project_id":pid])["maintenance"] as! JSON
-        XCTAssertEqual((restarted["preparation"] as? JSON)?["attempt_count"] as? Int,attempt["attempt_count"] as? Int)
-        try expireCleanupBackoff();try pass(at:Date().addingTimeInterval(1))
+        XCTAssertEqual(try router.dbQueue.read {try self.router.ticketCleanupRetries($0,project:pid)},retries)
+        try pass(at:Date(timeIntervalSince1970:next+1));try finish()
         let items = try receipts(p).flatMap {$0["items"] as? [JSON] ?? []}
         XCTAssertTrue(items.contains {$0["task_id"] as? String == t["id"] as? String && $0["reason"] as? String == "fenced_by_concurrent_write"})
-        XCTAssertTrue(items.contains {$0["task_id"] as? String == other["id"] as? String && $0["action"] as? String == "done_evidence"},"\(items)")
+        XCTAssertTrue(items.contains {$0["task_id"] as? String == other["id"] as? String && $0["action"] as? String == "done_evidence"})
+        XCTAssertTrue(try router.dbQueue.read {try self.router.ticketCleanupRetries($0,project:pid)}.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
     }
     func testByteDeletionProgressesUnderUnrelatedWritesButNewForeignReferenceFences() throws {
         let (p,t,a) = try fixture(),pid = p["id"] as! String
@@ -264,8 +256,9 @@ extension TicketLifecycleCleanupTests {
         }
         try pass()
         let maintenance = try call("ticket_cleanup_receipts",["project_id":p["id"]!])["maintenance"] as! JSON
-        XCTAssertEqual(maintenance["state"] as? String,"deferred")
-        XCTAssertEqual((maintenance["preparation"] as? JSON)?["last_failure_reason"] as? String,"CLEANUP_INVENTORY_LIMIT")
+        XCTAssertEqual(maintenance["state"] as? String,"scheduled")
+        XCTAssertEqual(Set(try router.dbQueue.read {try self.router.ticketCleanupRetries($0,project:p["id"] as! String)}.keys),[t["id"] as! String])
+        XCTAssertTrue(try receipts(p).flatMap {$0["items"] as? [JSON] ?? []}.contains {$0["reason"] as? String == "CLEANUP_INVENTORY_LIMIT"})
         try pass();try finish()
         XCTAssertFalse(try receipts(q).isEmpty)
         XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String));XCTAssertFalse(FileManager.default.fileExists(atPath:b["path"] as! String))
@@ -607,10 +600,14 @@ extension TicketLifecycleCleanupTests {
         let (p,t,_) = try fixture(),pid = p["id"] as! String
         let source = directory.appendingPathComponent("second.txt");try Data("second".utf8).write(to:source)
         _ = try call("attachment_add",["project_id":pid,"task_id":t["id"]!,"path":source.path,"mode":"managed_copy"])
+        let another = try call("task_create",["project_id":pid,"title":"A separate pending byte job"])
+        _ = try call("attachment_add",["project_id":pid,"task_id":another["id"]!,"path":source.path,"mode":"managed_copy"])
+        try mark(p,another,category:"done")
         try pass();_ = try configure(p)
         let before = try receipts(p).count
         router.ticketCleanupLifecycleTurn = false
         try router.runStorageMaintenance()
+        XCTAssertTrue(router.ticketCleanupLifecycleTurn,"After a byte cohort, the next due turn belongs to lifecycle planning")
         XCTAssertGreaterThan(try XCTUnwrap(router.ticketCleanupYieldAt).timeIntervalSinceNow,0)
         let expected = try XCTUnwrap(router.nextArchiveCleanupDeadline())
         XCTAssertGreaterThan(expected.timeIntervalSinceNow,0)
@@ -619,9 +616,9 @@ extension TicketLifecycleCleanupTests {
         XCTAssertEqual(try router.dbQueue.read {try self.router.ticketCleanupPreparationState($0,project:pid)["attempt_count"] as? Int},attempts,"Rest must not prepare another unit")
         router.ticketCleanupYieldAt = nil
         try router.runStorageMaintenance()
-        XCTAssertEqual(try receipts(p).count,before+1,"Due pass must run before the byte backlog drains")
+        XCTAssertEqual(try receipts(p).count,before+1,"The next due lifecycle pass runs even when a cohort drains the small backlog")
         let pending = try router.dbQueue.read {try self.router.records($0,type:"storage_job",project:pid).contains {$0["cause"] as? String == "done_evidence" && $0["state"] as? String == "pending"}}
-        XCTAssertTrue(pending)
+        XCTAssertFalse(pending,"The shared cohort drains this small byte backlog in one turn")
         try finish()
     }
 }

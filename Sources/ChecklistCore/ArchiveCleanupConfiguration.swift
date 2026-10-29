@@ -31,7 +31,9 @@ extension CommandRouter {
     func archiveRetentionFacts(_ db: Database,task: JSON,considerArchiving: Bool = false,currentGraph: [JSON]? = nil) throws -> [ArchiveAttachmentFact] {
         let attachments = try scopedTaskRows(db,type:"attachment",task:task).filter { !bool($0,"unlinked") }
         guard !attachments.isEmpty else { return [] }
-        let graph = try currentGraph ?? archiveCleanupRelevantReferenceRows(db,attachments:attachments)
+        // CL-344: a command's writer reuses the scan it prepared on a read snapshot
+        // after a cheap fence; other callers keep the scan in their own observation.
+        let graph = try currentGraph ?? preparedArchiveCleanupRows(db,task:task,attachments:attachments) ?? archiveCleanupRelevantReferenceRows(db,attachments:attachments)
         let index = try ArchiveCleanupReferenceIndex(graph)
         return try attachments.map { a in
             let mode: ArchiveAttachmentFact.Mode = a["mode"] as? String == "managed" ? .managed : .externalReference

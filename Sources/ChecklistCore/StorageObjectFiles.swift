@@ -7,6 +7,7 @@ import CryptoKit
 enum StorageSnapshotFailure: Error {
     case invalidFixture, unsupportedAuthority, sourceChanged, incomplete
     case limit, canceled, deadline, io, publicationUncertain
+    case freeSpace(measured: Int64)
 }
 
 /// Shared only by the synchronous snapshot attempt and its verification passes.
@@ -82,7 +83,7 @@ struct StorageSnapshotBudget {
         let needed = measured.addingReportingOverflow(margin), required = needed.overflow ? Int64.max : needed.partialValue
         let next = "Keep the store and existing backups. Free space on the backup volume, then retry. Do not delete retained captures or attachments to make it fit."
         return CoreError("BACKUP_CAPACITY_EXCEEDED",
-            "Backup stopped before copying store files: it needs at least \(required) free bytes on the backup volume (\(measured) measured store bytes plus a \(margin)-byte safety margin), but the volume has \(available) free bytes. " + next,
+            "Backup stopped: it needs at least \(required) free bytes on the backup volume (\(measured) measured store bytes plus a \(margin)-byte safety margin), but the volume has \(available) free bytes. " + next,
             details: ["reason": "snapshot_free_space", "measured_bytes": measured, "measured_objects": measurement.objects,
                       "required_free_bytes": required, "available_bytes": available, "free_space_margin_bytes": margin, "next_step": next])
     }
@@ -109,9 +110,10 @@ struct StorageSnapshotBudget {
     func reporting(_ error: Error) -> Error {
         guard let failure = error as? StorageSnapshotFailure else { return error }
         switch failure {
-        case .limit:
-            guard limitedByFreeSpace, let available = measurement.availableBytes else { return capacityFailure("snapshot_capacity") }
-            return freeSpaceFailure(measured: measurement.bytes, margin: Self.freeSpaceMinimumMarginBytes, available: available)
+        case .limit: return capacityFailure("snapshot_capacity")
+        case .freeSpace(let measured):
+            guard let available = measurement.availableBytes else { return capacityFailure("snapshot_capacity") }
+            return freeSpaceFailure(measured: measured, margin: Self.freeSpaceMinimumMarginBytes, available: available)
         case .deadline: return capacityFailure("snapshot_deadline")
         default: return error
         }
@@ -120,7 +122,10 @@ struct StorageSnapshotBudget {
     /// Logical published payload bytes, including intent/manifest and link text.
     func adding(_ bytes: Int64, to total: Int64) throws -> Int64 {
         let sum = total.addingReportingOverflow(bytes)
-        guard bytes >= 0, total >= 0, !sum.overflow, sum.partialValue <= effectiveMaximumBytes else { throw StorageSnapshotFailure.limit }
+        guard bytes >= 0, total >= 0, !sum.overflow, sum.partialValue <= maximumBytes else { throw StorageSnapshotFailure.limit }
+        // Preserve the cause: record, object and metadata limits also throw .limit.
+        // Carry the attempted total so the needed/free guidance describes this refusal.
+        guard sum.partialValue <= effectiveMaximumBytes else { throw StorageSnapshotFailure.freeSpace(measured: sum.partialValue) }
         return sum.partialValue
     }
 }
@@ -392,7 +397,7 @@ final class StorageObjectFiles {
         }
     }
 
-    func copy(_ path: String, to destination: StorageObjectFiles, expected: String?, budget: StorageSnapshotBudget, targetPath: String? = nil, executable: Bool = false) throws -> (String, Int64) {
+    func copy(_ path: String, to destination: StorageObjectFiles, expected: String?, budget: StorageSnapshotBudget, targetPath: String? = nil, executable: Bool = false, logicalBytesBeforeCopy: Int64? = nil) throws -> (String, Int64) {
         let target = targetPath ?? ("managed/" + path)
         let (directory, name) = try destination.parent(target, create: true); defer { Darwin.close(directory) }
         let output = openat(directory, name, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0o600)
@@ -408,7 +413,10 @@ final class StorageObjectFiles {
                 guard size >= 0 else { throw StorageSnapshotFailure.io }
                 if size == 0 { break }
                 total += Int64(size)
-                guard total <= budget.maximumObjectBytes else { throw StorageSnapshotFailure.limit }
+                guard total <= budget.maximumObjectBytes else { throw budget.capacityFailure("snapshot_object_bytes") }
+                // Snapshot callers supply the existing logical payload separately
+                // from the per-file limit; refuse before writing beyond either bound.
+                if let prefix = logicalBytesBeforeCopy { _ = try budget.adding(total, to: prefix) }
                 digest.update(data: buffer.prefix(size))
                 try buffer.withUnsafeBytes { raw in
                     var offset = 0

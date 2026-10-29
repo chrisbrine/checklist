@@ -562,6 +562,8 @@ struct CommandPreparation {
     var failedInventories: [String: CoreError] = [:]
     var referenceImport: PreparedReferenceImport?
     var humanRequestFiles: PreparedHumanRequestFiles?
+    /// CL-344: the archive cleanup reference scan made on a read snapshot.
+    var archiveCleanupScan: PreparedArchiveCleanupScan?
     var pending: [PendingSourceCapture] { captures.values.map(\.pending) }
 }
 

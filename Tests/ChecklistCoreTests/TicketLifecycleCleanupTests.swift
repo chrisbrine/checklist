@@ -20,13 +20,17 @@ final class TicketLifecycleCleanupTests: XCTestCase {
     func write(_ body: (Database) throws -> Void) throws {
         try ArchiveStorageGate.withExclusive(root:router.root) {_ in try router.dbQueue.writeWithoutTransaction {db in try router.withValidatedDomainTransaction(db) {try body(db);return .commit}}}
     }
-    func fixture(category: String = "done",age: Int = 0) throws -> (JSON,JSON,JSON) {
+    func fixture(category: String = "done",age: Int = 0,backed: Bool = true) throws -> (JSON,JSON,JSON) {
         let workspace = directory.appendingPathComponent("workspace-" + uuid());try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
         let p = try call("project_create",["name":"Synthetic lifecycle","key_prefix":"LC","root_path":workspace.path])
         let t = try call("task_create",["project_id":p["id"]!,"title":"Synthetic closed work"])
         let source = workspace.appendingPathComponent("evidence.txt");try Data("owned evidence".utf8).write(to:source)
         let a = try call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":source.path,"mode":"managed_copy"])
         try mark(p,t,category:category,age:age)
+        if backed {
+            let relative = try XCTUnwrap(ManagedPaths.relative(a["path"] as! String,family:"objects",root:router.root))
+            try ticketCleanupBackupTemplate(router,objects:[["relative_path":relative,"sha256":a["sha256"]!,"size":a["size"]!,"kind":"file"]])
+        }
         return (p,try read(t),a)
     }
     func read(_ task: JSON) throws -> JSON {try router.dbQueue.read {try router.record($0,task["id"] as! String,type:"task")}}
@@ -52,7 +56,21 @@ final class TicketLifecycleCleanupTests: XCTestCase {
         let current = try router.dbQueue.read {try router.record($0,p["id"] as! String,type:"project")}
         return try call("project_settings_save",["project_id":p["id"]!,"expected_revision":current["revision"]!,"ticket_cleanup":settings ?? defaults])
     }
-    func pass(at time: Date = Date()) throws {try router.runTicketLifecycleCleanup(at:time)}
+    func pass(at time: Date = Date()) throws {
+        // Unit fixtures use an independent-byte backup template. Some deliberate
+        // malformed capture/cache fixtures cannot form a full product snapshot;
+        // explicit backup/restore tests exercise the complete native route.
+        let objects = try router.readers!.read {db in
+            try self.router.records(db,type:"task").flatMap {task -> [JSON] in
+                guard let plan = try? self.router.ticketPurgePlan(db,task:task,doneEvidence:true) else {return []}
+                return plan.byteDeletion.objects
+            }
+        }
+        var unique: [String:JSON] = [:]
+        for object in objects {if let path = object["relative_path"] as? String {unique[path] = object}}
+        try ticketCleanupBackupTemplate(router,objects:Array(unique.values))
+        try router.runTicketLifecycleCleanup(at:time)
+    }
     func finish() throws {
         for _ in 0..<40 {
             let pending = try router.dbQueue.read {try router.records($0,type:"storage_job").contains {$0["kind"] as? String == "ticket_object_delete" && $0["state"] as? String == "pending"}}
@@ -174,8 +192,8 @@ final class TicketLifecycleCleanupTests: XCTestCase {
             let t = try call("task_create",["project_id":p["id"]!,"title":"Synthetic backlog"]);try mark(p,t,category:"canceled",age:20)
         }
         _ = try configure(p);let v = try selection(p)
-        XCTAssertEqual((v["items"] as? [JSON])?.filter {$0["action"] as? String == "purge"}.count,1)
-        try pass();XCTAssertEqual(try router.dbQueue.read {try router.records($0,type:"task",project:p["id"] as? String).filter {bool($0,"purged")}.count},1)
+        XCTAssertEqual((v["items"] as? [JSON])?.filter {$0["action"] as? String == "purge"}.count,13)
+        try pass();XCTAssertEqual(try router.dbQueue.read {try router.records($0,type:"task",project:p["id"] as? String).filter {bool($0,"purged")}.count},13)
         let root = router.root;try router.closeStore();router = nil;router = try TestStore.router(root:root)
         for i in 1...12 {try pass(at:Date().addingTimeInterval(Double(i)))};XCTAssertEqual(try router.dbQueue.read {try router.records($0,type:"task",project:p["id"] as? String).filter {bool($0,"purged")}.count},13)
     }
@@ -211,7 +229,7 @@ extension TicketLifecycleCleanupTests {
         let all = try receipts(p);XCTAssertGreaterThanOrEqual(all.count,2)
         XCTAssertTrue(all.contains {($0["summary"] as? JSON)?["removed_count"] as? Int == 1})
     }
-    func testExternalSharedAndBackupHeldBytesStayAndDisabledRuleStopsQueuedDeletion() throws {
+    func testExternalSharedAndDisabledRulesRetainBytesWhileCompletedBackupPermitsUnlink() throws {
         for protection in ["external","shared","backup","disable"] {
             let (p,t,a) = try fixture()
             if protection == "external" {
@@ -222,16 +240,19 @@ extension TicketLifecycleCleanupTests {
             } else if protection == "backup" {_ = try call("backup_create",["path":directory.appendingPathComponent("protected-" + uuid()).path])}
             let project = try configure(p);try pass();if protection == "shared" {try pass()}
             if protection == "disable" {_ = try call("project_settings_save",["project_id":p["id"]!,"expected_revision":project["revision"]!,"ticket_cleanup":["done_evidence_enabled":false,"closed_purge_enabled":false,"closed_days":15]])}
-            try finish();XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String),protection);XCTAssertFalse(bool(try read(t),"purged"))
+            try finish();XCTAssertEqual(FileManager.default.fileExists(atPath:a["path"] as! String),protection != "backup",protection);XCTAssertFalse(bool(try read(t),"purged"))
             let summary = try XCTUnwrap(receipts(p).first?["summary"] as? JSON)
-            XCTAssertGreaterThan(summary["retained_count"] as? Int ?? 0,0,protection)
+            if protection == "backup" {XCTAssertEqual(summary["removed_count"] as? Int,1)}
+            else {XCTAssertGreaterThan(summary["retained_count"] as? Int ?? 0,0,protection)}
         }
     }
     func testDoneTransitionCommitsRecoveryWakeAfterAnEarlierScan() throws {
         let (p,t,_) = try fixture(category:"queued");_ = try configure(p);try pass()
         try mark(p,t,category:"done")
         let next = try router.dbQueue.read {try String.fetchOne($0,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-next:" + (p["id"] as! String)])}
-        XCTAssertEqual(next,"0")
+        let wake = try router.dbQueue.read {try self.router.ticketCleanupRetries($0,project:p["id"] as! String)[t["id"] as! String]}
+        XCTAssertNotNil(wake);XCTAssertGreaterThan(try XCTUnwrap(wake),0)
+        XCTAssertEqual(Double(next ?? ""),wake)
         try pass();try finish()
         XCTAssertTrue(try receipts(p).contains {($0["summary"] as? JSON)?["removed_count"] as? Int == 1})
     }
@@ -640,7 +661,8 @@ extension TicketLifecycleCleanupTests {
             } else {
                 try write {db in try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["backup-generation:" + uuid(),try jsonString(["state":"complete","objects":[["path":path + "/target","sha256":ChecklistCore.hash(bytes),"size":bytes.count]]])])}
             }
-            try pass();try finish()
+            if hold == "backup" {try router.runTicketLifecycleCleanup()} else {try pass()}
+            try finish()
             XCTAssertTrue(try files.regularOrLinkExists(path + "/target"),hold)
             let objects = try receipts(p).flatMap {($0["items"] as? [JSON] ?? []).flatMap {(($0["byte_deletion"] as? JSON)?["objects"] as? [JSON]) ?? []}}
             XCTAssertTrue(objects.contains {$0["relative_path"] as? String == path + "/target" && $0["state"] as? String == "retained"},hold)

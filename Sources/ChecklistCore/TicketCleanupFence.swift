@@ -17,7 +17,7 @@ struct TicketCleanupChanges {
             CREATE TEMP TABLE ticket_cleanup_edges(target BLOB,held INTEGER,PRIMARY KEY(target,held)) WITHOUT ROWID;
             CREATE TEMP TABLE ticket_cleanup_uncertain(reason TEXT PRIMARY KEY) WITHOUT ROWID;
             """)
-        try db.execute(sql:"CREATE TEMP TABLE ticket_cleanup_budget(units INTEGER,bytes INTEGER); INSERT INTO ticket_cleanup_budget VALUES(0,0)")
+        try db.execute(sql:"CREATE TEMP TABLE ticket_cleanup_budget(units INTEGER,bytes INTEGER); INSERT INTO ticket_cleanup_budget VALUES(0,0); CREATE TEMP TABLE ticket_cleanup_accounting(active INTEGER); INSERT INTO ticket_cleanup_accounting VALUES(0)")
         for (table,key,size) in [("edges","target=NEW.target AND held=NEW.held","length(NEW.target)"),
                                  ("changes","kind=NEW.kind AND position=NEW.position AND id=NEW.id","length(NEW.id)+COALESCE(length(NEW.project),0)+COALESCE(length(NEW.type),0)")] {
             let exceeded = "units>=\(rowLimit) OR bytes+(\(size))>\(byteLimit)"
@@ -60,15 +60,31 @@ struct TicketCleanupChanges {
                         """
                     if kind == 1 {sql += "INSERT INTO ticket_cleanup_edges SELECT CAST(NEW.entity_id AS BLOB),0 WHERE NEW.entity_id IS NOT NULL ON CONFLICT DO NOTHING;"}
                 }
-                try db.execute(sql:"CREATE TEMP TRIGGER ticket_cleanup_\(table)_\(action.lowercased()) AFTER \(action) ON main.\(table) BEGIN " + sql + " END")
+                try db.execute(sql:"CREATE TEMP TRIGGER ticket_cleanup_\(table)_\(action.lowercased()) AFTER \(action) ON main.\(table) WHEN (SELECT active FROM ticket_cleanup_accounting)=0 BEGIN " + sql + " END")
             }
+        }
+    }
+    /// Only the byte executor's authority-neutral accounting belongs here:
+    /// receipt state, attachment availability and cleanup outcome events. The
+    /// writer is exclusively held, so another command can never be suppressed.
+    /// Their own paths/owners remain unchanged; external changes keep accumulating
+    /// in the original per-receipt fences for the complete bounded cohort.
+    static func deletionAccounting<T>(_ db: Database,_ body: () throws -> T) throws -> T {
+        try db.execute(sql:"UPDATE ticket_cleanup_accounting SET active=1")
+        do {
+            let result = try body()
+            try db.execute(sql:"UPDATE ticket_cleanup_accounting SET active=0")
+            return result
+        } catch {
+            try db.execute(sql:"UPDATE ticket_cleanup_accounting SET active=0")
+            throw error
         }
     }
     static func remove(_ db: Database) throws {
         for table in ["records","events","commands","metadata"] {
             for action in ["insert","update","delete"] {try db.execute(sql:"DROP TRIGGER IF EXISTS temp.ticket_cleanup_\(table)_\(action)")}
         }
-        try db.execute(sql:"DROP TABLE IF EXISTS temp.ticket_cleanup_edges; DROP TABLE IF EXISTS temp.ticket_cleanup_changes; DROP TABLE IF EXISTS temp.ticket_cleanup_uncertain; DROP TABLE IF EXISTS temp.ticket_cleanup_budget")
+        try db.execute(sql:"DROP TABLE IF EXISTS temp.ticket_cleanup_edges; DROP TABLE IF EXISTS temp.ticket_cleanup_changes; DROP TABLE IF EXISTS temp.ticket_cleanup_uncertain; DROP TABLE IF EXISTS temp.ticket_cleanup_budget; DROP TABLE IF EXISTS temp.ticket_cleanup_accounting")
     }
 }
 
@@ -80,8 +96,9 @@ struct TicketCleanupFence {
     let projectID: String
     let projectSettings: String
     let workspaceRoots: String
-    init(_ db: Database,inventory: TicketCleanupInventory,project: String,ids: [String],events: [Row] = [],commands: [Row] = []) throws {
-        self.inventory = inventory;projectID = project
+    let fencesScanMetadata: Bool
+    init(_ db: Database,inventory: TicketCleanupInventory,project: String,ids: [String],events: [Row] = [],commands: [Row] = [],fencesScanMetadata: Bool = true) throws {
+        self.inventory = inventory;projectID = project;self.fencesScanMetadata = fencesScanMetadata
         recordIDs = Set((inventory.rows.filter {$0.type != "project"}.map(\.id) + ids.filter {$0 != project}).map {Data($0.utf8)})
         workspaceRoots = try Self.roots(db)
         projectSettings = try String.fetchOne(db,sql:"SELECT json_quote(json_extract(data,'$.ticket_cleanup')) FROM records WHERE id=CAST(? AS TEXT) AND type='project'",arguments:[Data(project.utf8)]) ?? "missing"
@@ -122,9 +139,15 @@ struct TicketCleanupFence {
         let authority = MediaRecordRegistry.families.sorted()
         let types = try jsonString(["values":authority])
         if try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM ticket_cleanup_changes WHERE type IN (SELECT value FROM json_each(?,'$.values')))",arguments:[types]) == true {try refuse("project or media authority")}
-        if try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM ticket_cleanup_changes WHERE kind=3 AND (CAST(id AS TEXT) GLOB 'backup-generation:*' OR id=CAST('store_identity' AS BLOB) OR id=CAST(? AS BLOB) OR id=CAST(? AS BLOB)))",arguments:["ticket-cleanup-cursor:" + projectID,"ticket-cleanup-next:" + projectID]) == true {try refuse("storage metadata")}
+        if try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM ticket_cleanup_changes WHERE kind=3 AND (CAST(id AS TEXT) GLOB 'backup-generation:*' OR id=CAST('store_identity' AS BLOB) OR (? AND (id=CAST(? AS BLOB) OR id=CAST(? AS BLOB)))))",arguments:[fencesScanMetadata,"ticket-cleanup-cursor:" + projectID,"ticket-cleanup-next:" + projectID]) == true {try refuse("storage metadata")}
     }
 }
 protocol TicketCleanupPrepared {
     var fence: TicketCleanupFence {get}
+    func revalidated(_ db: Database,router: CommandRouter) throws -> Self
+}
+extension TicketCleanupPrepared {
+    func revalidated(_ db: Database,router: CommandRouter) throws -> Self {
+        try fence.validate(db);return self
+    }
 }

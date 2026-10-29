@@ -24,6 +24,12 @@ public enum StorageUpgradePreparation {
     }
 
     public static func prepare(root: URL) throws -> [String:Any] {
+        try prepare(root:root,requiringUpgrade:true)
+    }
+
+    /// Internal qualification seam exercises the identical preparation path on an
+    /// owned current-schema copy without falsifying its migration ledger.
+    static func prepare(root: URL,requiringUpgrade: Bool,qualificationBudget: StorageSnapshotBudget? = nil) throws -> [String:Any] {
         let root = StoreDirectory.anchoredRoot(root)
         var rootInfo = stat()
         if lstat(root.path,&rootInfo) != 0,errno == ENOENT {
@@ -41,13 +47,13 @@ public enum StorageUpgradePreparation {
         guard case .current(let identity) = state else {
             return ["needs_upgrade":true,"prepared":false,"expected_offline_seconds":900,"reason":"legacy_store_requires_offline_preparation"]
         }
-        guard identity.schema_revision < SchemaMigrations.currentSchema else {
+        guard !requiringUpgrade || identity.schema_revision < SchemaMigrations.currentSchema else {
             return ["needs_upgrade":false,"prepared":false,"expected_offline_seconds":30]
         }
         let external = try StoreIdentityReceipt.decode(files.read(StoreIdentityReceipt.fileName,maximum:4096))
         guard external == identity else { throw StoreRecovery.required("external_database_identity_mismatch") }
         return try StorageSnapshotRetention.withCapture(root:root) { retention in
-            let operation = UUID(), budget = StorageSnapshotBudget.production()
+            let operation = UUID(), budget = qualificationBudget ?? StorageSnapshotBudget.production()
             let (fd,_) = try files.parent("backups/.preupgrade",create:true);Darwin.close(fd)
             let parent = root.appendingPathComponent("backups")
             let started = ProcessInfo.processInfo.systemUptime
@@ -219,7 +225,7 @@ public enum StorageUpgradePreparation {
                 if version < 1 {try SchemaMigrations.adoptBaseline(db,identity:identity.withSchema(1),fresh:false)}
                 if version < 2 {try SchemaMigrations.upgradeProtocol(db,identity:identity.withSchema(2),protectedSnapshot:protected)}
                 if version < 3 {try SchemaMigrations.upgradeManagedPaths(db,identity:identity.withSchema(3),root:root,plan:plan,protectedSnapshot:protected)}
-                try SchemaMigrations.upgradeTriageMembership(db,identity:identity.withSchema(4),protectedSnapshot:protected)
+                if version < 4 {try SchemaMigrations.upgradeTriageMembership(db,identity:identity.withSchema(4),protectedSnapshot:protected)}
             }
             try candidate.read {db in _ = try SchemaMigrations.inspect(db);guard try String.fetchOne(db,sql:"PRAGMA integrity_check") == "ok" else {throw StoreRecovery.required("migration_rehearsal_integrity_failed")}}
             try candidate.close()

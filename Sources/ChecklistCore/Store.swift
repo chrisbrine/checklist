@@ -65,6 +65,9 @@ public final class CommandRouter: @unchecked Sendable {
     var ticketCleanupNeedsReader = false
     var ticketCleanupPreparingProject: String?
     let ticketCleanupMaintenanceLock = NSLock()
+    // CL-344: one archive cleanup scan journal on the writer at a time; tests may observe the scan.
+    let archiveCleanupScanLock = NSLock()
+    var archiveCleanupScanObserver: (() -> Void)?
     // One command's prepared files (CL-71) and the captures it created (CL-70). Set and
     // cleared inside the serialized writer; preparation itself never reads them.
     private var preparationStorage = CommandPreparation()
@@ -190,9 +193,14 @@ public final class CommandRouter: @unchecked Sendable {
         if type == "task",let pid = envelope.projectID,let statusID = value["status_id"] as? String,
            let prior = previous.map({ jsonObject($0["data"]) }),prior["status_id"] as? String != statusID,
            (try? record(db,statusID,type:"status"))?["category"] as? String == "done" {
-            // Commit a recovery wake with the Done transition. Startup or the
-            // background pump admits the usual durable byte job; no unlink here.
-            try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?, '0'), (?, '0')",arguments:["ticket-cleanup-cursor:" + pid,"ticket-cleanup-next:" + pid])
+            // Wake this exact ticket without resetting a sweep already underway.
+            // A fresh token prevents a concurrent preparation from erasing it.
+            let clock = Date()
+            var retries = try ticketCleanupRetryEntries(db,project:pid)
+            retries[id] = TicketCleanupRetry(at:clock)
+            try saveTicketCleanupRetries(db,project:pid,entries:retries)
+            let previous = Double(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-next:" + pid]) ?? "0") ?? 0
+            try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-next:" + pid,String(min(previous,clock.timeIntervalSince1970))])
         }
     }
     func event(_ db: Database, caller: Caller, project: String?, entity: String?, kind: String, data: JSON = [:]) throws {
@@ -415,6 +423,9 @@ public final class CommandRouter: @unchecked Sendable {
         }
         // CL-71: large file and git work runs before the object gate and the SQL writer.
         var preparation = try prepareCommandFiles(method:method,params:params,caller:caller)
+        // CL-344: archive cleanup's reference scan reads a snapshot before the writer.
+        preparation.archiveCleanupScan = prepareArchiveCleanupScan(method:method,params:params)
+        defer { finishArchiveCleanupScan(preparation.archiveCleanupScan) }
         if method == "human_request_answer" { preparation.humanRequestFiles = try prepareHumanRequestAnswerFiles(params:params,caller:caller) }
         defer { finishHumanAnswerImportStages(preparation.humanRequestFiles?.imports.values.map(\.params) ?? [],caller:caller) }
         var createdCaptures = preparation.pending, publishedExports: [ExportPublication] = []

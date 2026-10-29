@@ -1,6 +1,59 @@
 import Foundation
 import GRDB
 import CoreFoundation
+import Darwin
+
+/// Pins the backup's own named entry after checking its bytes on the read lane.
+/// The writer rechecks identity only; it never opens the original store as a
+/// fallback for a missing backup payload.
+final class TicketCleanupBackupCopy {
+    let files: StorageObjectFiles
+    let path: String
+    let identity: stat
+    let regular: TicketObjectRemovalVerification?
+    let manifest: TicketObjectRemovalVerification
+    let link: String?
+    init(root: URL,object: JSON,manifest: TicketObjectRemovalVerification,check: () throws -> Void = {}) throws {
+        guard let relative = object["relative_path"] as? String,let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value else {throw StorageSnapshotFailure.unsupportedAuthority}
+        files = try StorageObjectFiles(root:root,pinRootForGates:true);path = "managed/" + relative;self.manifest = manifest
+        guard manifest.root == Data(files.root.path.utf8),manifest.relative == Data("manifest.json".utf8) else {throw StorageSnapshotFailure.sourceChanged}
+        var beforeLink: stat?
+        if object["kind"] as? String == "symlink" {
+            let (parent,name) = try files.parent(path);defer {Darwin.close(parent)}
+            var before = stat()
+            guard fstatat(parent,name,&before,AT_SYMLINK_NOFOLLOW) == 0,before.st_mode & S_IFMT == S_IFLNK else {throw StorageSnapshotFailure.incomplete}
+            beforeLink = before
+            try check()
+            guard let target = object["link_target"] as? String,Int64(target.utf8.count) == size,hash(Data(target.utf8)) == sha,try files.linkTarget(path) == target else {throw StorageSnapshotFailure.sourceChanged}
+            regular = nil;link = target
+        } else {
+            guard let verified = try TicketObjectRemovalVerification(root:root,relative:path,sha256:sha,size:size,check:check) else {throw StorageSnapshotFailure.incomplete}
+            regular = verified;link = nil
+        }
+        let (parent,name) = try files.parent(path);defer {Darwin.close(parent)}
+        var entry = stat()
+        guard fstatat(parent,name,&entry,AT_SYMLINK_NOFOLLOW) == 0,entry.st_mode & S_IFMT == (link == nil ? S_IFREG : S_IFLNK) else {throw StorageSnapshotFailure.incomplete}
+        if let regular {guard TicketObjectRemovalVerification.same(regular.identity,entry) else {throw StorageSnapshotFailure.sourceChanged}}
+        if let beforeLink {guard Self.sameLink(beforeLink,entry) else {throw StorageSnapshotFailure.sourceChanged}}
+        identity = entry
+    }
+    func isCurrent() -> Bool {
+        do {
+            try files.requireNamedRoot(files.root)
+            let (manifestParent,manifestName) = try files.parent("manifest.json");defer {Darwin.close(manifestParent)}
+            var manifestEntry = stat()
+            guard fstatat(manifestParent,manifestName,&manifestEntry,AT_SYMLINK_NOFOLLOW) == 0,TicketObjectRemovalVerification.same(manifest.identity,manifestEntry) else {return false}
+            let (parent,name) = try files.parent(path);defer {Darwin.close(parent)}
+            var entry = stat()
+            guard fstatat(parent,name,&entry,AT_SYMLINK_NOFOLLOW) == 0 else {return false}
+            if let regular {return TicketObjectRemovalVerification.same(regular.identity,entry)}
+            return Self.sameLink(identity,entry)
+        } catch {return false}
+    }
+    private static func sameLink(_ a: stat,_ b: stat) -> Bool {
+        a.st_mode & S_IFMT == S_IFLNK && b.st_mode & S_IFMT == S_IFLNK && a.st_dev == b.st_dev && a.st_ino == b.st_ino && a.st_size == b.st_size && a.st_mtimespec.tv_sec == b.st_mtimespec.tv_sec && a.st_mtimespec.tv_nsec == b.st_mtimespec.tv_nsec && a.st_ctimespec.tv_sec == b.st_ctimespec.tv_sec && a.st_ctimespec.tv_nsec == b.st_ctimespec.tv_nsec
+    }
+}
 
 /// A captured authority, not a path sweep. The semantic transaction saves these
 /// descriptors before removing their canonical owners. Other ticket lifecycles
@@ -9,21 +62,29 @@ struct TicketObjectDeletionReferenceIndex {
     let graph: [JSON]
     let reverse: [Data:Set<Int>]
     let projects: Set<Int>
-    init(_ graph: [JSON], tokens: [Data:Set<Data>]? = nil) throws {
+    static let historyContainers: Set<String> = ["group","batch","batch_claim","delivery","cleanup_job","cleanup_preview"]
+    init(_ graph: [JSON], tokens: [Data:Set<Data>]? = nil,historicalOwners: Set<Data> = []) throws {
         self.graph = graph
         var reverse: [Data:Set<Int>] = [:],projects = Set<Int>(),edges = 0
         func visit(_ value: Any,row: Int,depth: Int = 0) throws {
             edges += 1
             guard depth <= 64,edges <= 2000000 else {throw CoreError("REFERENCE_GRAPH_LIMIT","The object ownership inventory exceeds the safe deletion limit.")}
-            if let s = value as? String {reverse[Data(s.utf8),default:[]].insert(row)}
+            if let s = value as? String {
+                let token = Data(s.utf8)
+                if !(Self.historyContainers.contains(graph[row]["record_type"] as? String ?? "") && historicalOwners.contains(token)) {reverse[token,default:[]].insert(row)}
+            }
             else if let a = value as? [Any] {for v in a {try visit(v,row:row,depth:depth+1)}}
-            else if let d = value as? JSON {for (key,v) in d {reverse[Data(key.utf8),default:[]].insert(row);try visit(v,row:row,depth:depth+1)}}
+            else if let d = value as? JSON {for (key,v) in d {
+                let token = Data(key.utf8)
+                if !(Self.historyContainers.contains(graph[row]["record_type"] as? String ?? "") && historicalOwners.contains(token)) {reverse[token,default:[]].insert(row)}
+                try visit(v,row:row,depth:depth+1)
+            }}
         }
         for (index,value) in graph.enumerated() {
             if value["record_type"] as? String == "project" {projects.insert(index)}
             if value["record_type"] as? String == "storage_job",["ticket_object_delete","archive_cleanup_delete","archive_cleanup_cursor"].contains(value["kind"] as? String ?? "") {continue}
             if let tokens,let id = value["id"] as? String {
-                for token in tokens[Data(id.utf8)] ?? [] {reverse[token,default:[]].insert(index)}
+                for token in tokens[Data(id.utf8)] ?? [] where !(Self.historyContainers.contains(value["record_type"] as? String ?? "") && historicalOwners.contains(token)) {reverse[token,default:[]].insert(index)}
             } else {try visit(value,row:index)}
         }
         self.reverse = reverse;self.projects = projects
@@ -37,6 +98,46 @@ struct TicketObjectDeletionPlan {
 
 extension CommandRouter {
     static let ticketObjectDeletionKind = "ticket_object_delete"
+    static let ticketObjectDeletionRetryReasons: Set<String> = ["backup_authority","remaining_record","backup_required","backup_copy_unavailable","backup_authority_unavailable"]
+    // The same readiness predicate drives selection and the one-shot deadline.
+    // A retained purge is observed once per completed backup generation, so an
+    // unavailable copy or a genuine shared owner cannot become a polling loop.
+    static let ticketObjectDeletionReadySQL = """
+        json_valid(records.data) AND json_extract(records.data,'$.kind')='ticket_object_delete' AND (
+            json_extract(records.data,'$.state')='pending' OR (
+                json_extract(records.data,'$.state')='completed' AND json_extract(records.data,'$.cause')='task_purge'
+                AND (COALESCE(json_extract(records.data,'$.cleanup_policy_version'),0)<2 OR COALESCE((SELECT CAST(value AS INTEGER) FROM metadata WHERE key='ticket-cleanup-backup-seen:'||records.id),-1)<COALESCE((SELECT MAX(rowid) FROM metadata WHERE key GLOB 'backup-generation:*' AND json_valid(value) AND json_extract(value,'$.state')='complete'),0))
+                AND EXISTS(SELECT 1 FROM json_each(records.data,'$.objects') object WHERE json_extract(object.value,'$.state')='retained'
+                    AND json_type(object.value,'$.reasons')='array' AND json_array_length(object.value,'$.reasons')>0
+                    AND NOT EXISTS(SELECT 1 FROM json_each(object.value,'$.reasons') reason WHERE reason.type!='text' OR reason.value NOT IN ('backup_authority','remaining_record','backup_required','backup_copy_unavailable','backup_authority_unavailable')))
+            ))
+        """
+    func ticketCleanupBackupGenerationRow(_ db: Database) throws -> Int64 {
+        try Int64.fetchOne(db,sql:"SELECT COALESCE(MAX(rowid),0) FROM metadata WHERE key GLOB 'backup-generation:*' AND json_valid(value) AND json_extract(value,'$.state')='complete'") ?? 0
+    }
+
+    /// Preserve transitive byte use by another real record. Batch/group/delivery
+    /// pointers keep historical metadata, while their direct pathname references
+    /// still participate in the ordinary final byte-reference index.
+    func ticketCleanupProtectedOwners(_ graph: [JSON],owners: Set<Data>,tokens: [Data:Set<Data>]? = nil) throws -> Set<Data> {
+        var edges: [Data:Set<Data>] = [:],protected = Set<Data>(),budget = 2000000
+        for value in graph {
+            guard let id = value["id"] as? String else {continue}
+            let key = Data(id.utf8),type = value["record_type"] as? String ?? ""
+            var references: Set<Data>
+            if let known = tokens?[key] {references = known.intersection(owners)}
+            else {
+                references = []
+                try TicketCleanupInventory.strings(value,{token in let bytes = Data(token.utf8);if owners.contains(bytes) {references.insert(bytes)}},budget:&budget)
+            }
+            edges[key] = references
+            let bookkeeping = TicketObjectDeletionReferenceIndex.historyContainers.contains(type) || type == "storage_job" && ([Self.ticketObjectDeletionKind,"archive_cleanup_delete","archive_cleanup_cursor"].contains(value["kind"] as? String ?? "") || value["kind"] as? String == "attachment_import" && ["committed","settled"].contains(value["state"] as? String ?? "")) || type == "storage_hold" && value["state"] as? String != "active"
+            if !owners.contains(key) && !bookkeeping {protected.formUnion(references)}
+        }
+        var pending = Array(protected)
+        while let key = pending.popLast() {for target in edges[key] ?? [] where protected.insert(target).inserted {pending.append(target)}}
+        return protected
+    }
 
     static func ticketObjectDeletionSummary(_ objects: [JSON]) -> JSON {
         var totals: JSON = [:]
@@ -149,7 +250,8 @@ extension CommandRouter {
         return [path] + closure.filter {$0 != path}.sorted()
     }
 
-    func ticketObjectDeletionPlan(_ db: Database, owned: [(String,JSON)], remaining: [JSON], referenceTokens: [Data:Set<Data>]? = nil) throws -> TicketObjectDeletionPlan {
+    /// Capture candidate descriptors once before a selected batch observes backup indexes.
+    func ticketObjectDeletionObjects(_ db: Database,owned: [(String,JSON)]) throws -> [JSON] {
         let files = try StorageObjectFiles(root:root)
         var objects: [String:JSON] = [:]
         func add(path: String?, family: String, owner: String, representation: String, sha: String? = nil, size: Int64? = nil, link: String? = nil, capture: String? = nil, executable: Bool = false, reason: String? = nil) throws {
@@ -215,12 +317,20 @@ extension CommandRouter {
         for item in try sourceBuildCacheDeletionObjects(db,owned:owned) {
             if let path = item["relative_path"] as? String {objects[path] = item}
         }
-        let backup = try? ticketCleanupBackupRetentionIndex(db,objects:Array(objects.values)),references = try TicketObjectDeletionReferenceIndex(remaining,tokens:referenceTokens)
-        let mediaAuthorityComplete = (try? ticketCleanupValidateMediaAuthority(db)) != nil
+        return Array(objects.values)
+    }
+
+    func ticketObjectDeletionPlan(_ db: Database, owned: [(String,JSON)], remaining: [JSON], referenceTokens: [Data:Set<Data>]? = nil,historicalOwners: Set<Data> = [],backupObservation: TicketCleanupBackupObservation? = nil,candidateObjects: [JSON]? = nil,mediaAuthorityComplete: Bool? = nil) throws -> TicketObjectDeletionPlan {
+        let objects = try candidateObjects ?? ticketObjectDeletionObjects(db,owned:owned)
+        let backup: StorageBackupRetentionIndex?
+        if let backupObservation {backup = backupObservation.index}
+        else {backup = try? ticketCleanupBackupRetentionIndex(db,objects:objects)}
+        let references = try TicketObjectDeletionReferenceIndex(remaining,tokens:referenceTokens,historicalOwners:historicalOwners)
+        let mediaComplete = mediaAuthorityComplete ?? ((try? ticketCleanupValidateMediaAuthority(db)) != nil)
         var result: [JSON] = []
-        for var item in objects.values {
+        for var item in objects {
             if item["state"] as? String == "pending" {
-                let holds = try ticketObjectDeletionHolds(db,object:item,references:references,backup:backup,mediaAuthorityComplete:mediaAuthorityComplete)
+                let holds = try ticketObjectDeletionHolds(db,object:item,references:references,backup:backup,mediaAuthorityComplete:mediaComplete)
                 if !holds.isEmpty {item["state"] = "retained";item["reasons"] = holds.sorted()}
             }
             result.append(item)
@@ -268,7 +378,9 @@ extension CommandRouter {
             if matched.contains(index) {holds.insert(type == "storage_job" ? "pending_storage_owner" : "remaining_record")}
         }
         if let backup {
-            if backup.originals.contains(StorageBackupRetentionIndex.key(path:relative,sha:sha,size:size)) {holds.insert("backup_authority")}
+            let key = StorageBackupRetentionIndex.key(path:relative,sha:sha,size:size)
+            if backup.copyPaths[key]?.isEmpty != false {holds.insert("backup_required")}
+            else if backup.checkedCopies.contains(key),backup.verifiedCopies[key]?.isCurrent() != true {holds.insert("backup_copy_unavailable")}
         } else {holds.insert("backup_authority_unavailable")}
         return holds
     }
@@ -276,8 +388,11 @@ extension CommandRouter {
     func enqueueTicketObjectDeletion(_ db: Database, project: String, task: String, cause: String, plan: TicketObjectDeletionPlan) throws -> JSON {
         guard db.isInsideTransaction else {throw CoreError("STORAGE_TRANSACTION_REQUIRED","Object deletion intent must commit with its semantic command.")}
         let id = uuid()
-        let receipt: JSON = ["id":id,"project_id":project,"task_id":task,"kind":Self.ticketObjectDeletionKind,"cause":cause,"state":plan.objects.contains {$0["state"] as? String == "pending"} ? "pending" : "completed","revision":1,"created_at":now(),"objects":plan.objects,"summary":plan.summary]
-        try save(db,receipt,type:"storage_job");return receipt
+        let generation = try ticketCleanupBackupGenerationRow(db)
+        let receipt: JSON = ["id":id,"project_id":project,"task_id":task,"kind":Self.ticketObjectDeletionKind,"cause":cause,"state":plan.objects.contains {$0["state"] as? String == "pending"} ? "pending" : "completed","revision":1,"created_at":now(),"objects":plan.objects,"summary":plan.summary,"cleanup_policy_version":2]
+        try save(db,receipt,type:"storage_job")
+        if cause == "task_purge" {try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-backup-seen:" + id,String(generation)])}
+        return receipt
     }
 
     /// A command retry keeps its original semantic receipt, and observes this

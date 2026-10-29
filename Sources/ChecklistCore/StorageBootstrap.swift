@@ -110,7 +110,8 @@ enum StorageBootstrap {
             catch { try? queue.close();throw StoreRecovery.required("compatible_bootstrap_transaction_failed") }
         }
     }
-    private static func prepareUpgrade(queue: DatabaseQueue, root: URL, identity: StoreIdentityReceipt, permit: ArchiveStoragePermit) throws -> JSON {
+    // Internal visibility allows owned-copy qualification of this exact protected path.
+    static func prepareUpgrade(queue: DatabaseQueue, root: URL, identity: StoreIdentityReceipt, permit: ArchiveStoragePermit, qualificationBudget: StorageSnapshotBudget? = nil) throws -> JSON {
         StorageUpgradeProgress.update(root:root,stage:"preparation_validation",seconds:90)
         var reason = "preparation_unavailable"
         do {
@@ -126,7 +127,7 @@ enum StorageBootstrap {
         let files = try StorageObjectFiles(root:root)
         let (parentFD,_) = try files.parent("backups/.preupgrade",create:true);Darwin.close(parentFD)
         // The bound covers every durable object copy and both verification passes.
-        let operation = UUID(), budget = StorageSnapshotBudget.production()
+        let operation = UUID(), budget = qualificationBudget ?? StorageSnapshotBudget.production()
         let source = try StorageSnapshotSource(source:root,parent:parent,storeID:identity.logical_store_id,permit:permit)
         let receipt = try StorageSnapshot.build(source,operation:operation,budget:budget)
         StorageUpgradeProgress.update(root:root,stage:"migration_rehearsal",seconds:360)

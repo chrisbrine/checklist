@@ -6,6 +6,25 @@ extension CommandRouter {
     /// references reachable from these originals. All queries share the caller's
     /// SQL observation, including foreign projects. Nothing is cached across it.
     func archiveCleanupRelevantReferenceRows(_ db: Database, attachments: [JSON]) throws -> [JSON] {
+        try archiveCleanupRelevantReferenceGraph(db,attachments:attachments).rows
+    }
+    /// The complete identity tokens of these originals: ids, stored paths and object paths.
+    func archiveCleanupTokens(_ attachments: [JSON]) throws -> Set<Data> {
+        var tokens = Set<Data>()
+        for a in attachments {
+            tokens.insert(Data(((try StoredRecord(a, family: "a").string("id"))).utf8))
+            if let path = a["path"] as? String,!path.isEmpty {
+                tokens.insert(Data(path.utf8))
+                if let relative = try? ManagedPaths.relative(path,family:"objects",root:root) {
+                    tokens.insert(Data(relative.utf8))
+                    tokens.insert(Data(root.appendingPathComponent(relative).path.utf8))
+                }
+            }
+        }
+        return tokens
+    }
+    /// The relevant rows and the identities selected along reverse references (CL-344 fences them).
+    func archiveCleanupRelevantReferenceGraph(_ db: Database, attachments: [JSON]) throws -> (rows: [JSON], selected: Set<Data>) {
         // Keep the original JSON tokens (not json_extract's coerced numbers),
         // duplicate envelope keys, and every field used by canonical ownership
         // validation. SQLite validates the complete JSON; the adapter validates
@@ -44,17 +63,7 @@ extension CommandRouter {
                 graph[Data(decoded.id.utf8)] = value
             }
         }
-        var pending = Set<Data>()
-        for a in attachments {
-            pending.insert(Data(((try StoredRecord(a, family: "a").string("id"))).utf8))
-            if let path = a["path"] as? String,!path.isEmpty {
-                pending.insert(Data(path.utf8))
-                if let relative = try? ManagedPaths.relative(path,family:"objects",root:root) {
-                    pending.insert(Data(relative.utf8))
-                    pending.insert(Data(root.appendingPathComponent(relative).path.utf8))
-                }
-            }
-        }
+        var pending = try archiveCleanupTokens(attachments)
         let tokenJSON = try jsonString(["tokens":pending.map { String(decoding:$0,as:UTF8.self) }])
         let excluded = ArchiveCleanupReferenceIndex.bookkeeping.sorted().map { "'" + $0 + "'" }.joined(separator:",")
         // Materialize the finite identity vocabulary once. Blob membership uses
@@ -95,6 +104,6 @@ extension CommandRouter {
             let decoded = try GRDBRecordEnvelopeAdapter.decode(row)
             var value = decoded.object;value["record_type"] = decoded.type;graph[id] = value
         }
-        return Array(graph.values)
+        return (Array(graph.values),selected)
     }
 }

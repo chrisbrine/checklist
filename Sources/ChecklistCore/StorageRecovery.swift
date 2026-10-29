@@ -2,11 +2,41 @@ import Foundation
 import GRDB
 import Darwin
 
-/// Historical verified-backup presence, not proof of current external bytes or
-/// physical allocation. Construct once for a scoped projection, never per item.
+/// `originals` is historical verified-backup accounting, not current bytes or
+/// physical allocation. Cleanup separately pins exact manifests and payloads.
+/// Construct once for a scoped projection or prepared batch, never per item.
 struct StorageBackupRetentionIndex {
     let originals: Set<Data>
     let root: URL
+    // Cleanup derives these only from completed self-contained backup receipts.
+    // Historical accounting indexes intentionally leave them empty.
+    var copyPaths: [Data:[URL]] = [:]
+    var copyManifests: [String:String] = [:]
+    var checkedCopies: Set<Data> = []
+    var verifiedCopies: [Data:TicketCleanupBackupCopy] = [:]
+    var verifiedManifests: [String:TicketObjectRemovalVerification] = [:]
+    var unavailableManifests: Set<String> = []
+    mutating func verifyCopy(for object: JSON,check: () throws -> Void = {}) {
+        guard let path = object["relative_path"] as? String,let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value else {return}
+        let key = Self.key(path:path,sha:sha,size:size)
+        checkedCopies.insert(key)
+        let paths = (copyPaths[key] ?? []).sorted {a,b in
+            let localA = a.path.hasPrefix(root.path + "/"),localB = b.path.hasPrefix(root.path + "/")
+            return localA != localB ? localA : a.path < b.path
+        }
+        for path in paths where !unavailableManifests.contains(path.path) {
+            do {
+                if verifiedManifests[path.path] == nil,let expected = copyManifests[path.path] {
+                    verifiedManifests[path.path] = try TicketObjectRemovalVerification(root:path,relative:"manifest.json",sha256:expected,check:check)
+                }
+                guard let manifest = verifiedManifests[path.path] else {unavailableManifests.insert(path.path);continue}
+                verifiedCopies[key] = try TicketCleanupBackupCopy(root:path,object:object,manifest:manifest,check:check);return
+            } catch {
+                if verifiedManifests[path.path] == nil {unavailableManifests.insert(path.path)}
+                continue
+            }
+        }
+    }
     static func key(path: String,sha: String,size: Int64) -> Data {
         Data((try! jsonString(["path":path,"sha256":sha,"size":size])).utf8)
     }
@@ -107,7 +137,7 @@ extension CommandRouter {
                 code = "BACKUP_CANCELED"; message = "Backup was canceled before completion. Existing data and backups are retained."
             case .publicationUncertain:
                 throw CoreError("OUTCOME_UNKNOWN","Backup publication could not be confirmed. Check the last change using the original command before retrying.",details:["command_id":params["command_id"] ?? "","command_outcome":"unknown","reason":"backup_publication_uncertain"])
-            case .limit, .deadline: throw reported // Converted by the shared budget above.
+            case .limit, .freeSpace, .deadline: throw reported // Converted by the shared budget above.
             }
             throw CoreError(code,message,details:["command_outcome":"rejected"])
         }
@@ -280,9 +310,7 @@ extension CommandRouter {
                     }) {db,_,value in try self.commitTicketLifecycleCleanup(db,prepared:value,at:Date())}
                 }
                 func deletion() throws {
-                    try withTicketCleanupPreparation({db in
-                        let result = try self.prepareTicketObjectDeletion(db);prepared = result != nil;return result
-                    }) {db,permit,value in try self.processTicketObjectDeletionIntents(db,permit:permit,prepared:value)}
+                    prepared = try self.runTicketObjectDeletionCohort()
                 }
                 // Fair turns: a large admitted byte job cannot starve a newly
                 // due settings/startup/Done pass, nor can passes starve unlinks.

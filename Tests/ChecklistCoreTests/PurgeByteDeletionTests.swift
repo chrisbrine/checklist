@@ -31,7 +31,11 @@ final class PurgeByteDeletionTests: XCTestCase {
     }
     func params(_ project: JSON,_ task: JSON) -> JSON {["project_id":project["id"]!,"task_id":task["id"]!,"expected_revision":task["revision"]!]}
     func trash(_ project: JSON,_ task: JSON) throws -> JSON {var p = params(project,task);p["action"] = "trash";return try call("task_archive",p)}
-    func preview(_ project: JSON,_ task: JSON) throws -> JSON {try call("task_purge_preview",params(project,task))}
+    func preview(_ project: JSON,_ task: JSON) throws -> JSON {
+        let first = try call("task_purge_preview",params(project,task))
+        try ticketCleanupBackupTemplate(router,objects:(first["impact"] as! JSON)["byte_deletion_objects"] as! [JSON])
+        return try call("task_purge_preview",params(project,task))
+    }
     func purge(_ project: JSON,_ task: JSON) throws -> JSON {let v = try preview(project,task);var p = params(project,task);p["preview_digest"] = v["digest"]!;return try call("task_purge",p)}
     func receipt(_ result: JSON) throws -> JSON {try router.dbQueue.read {try router.record($0,result["byte_deletion_receipt_id"] as! String,type:"storage_job")}}
     /// One explicitly fired byte-job step. Service pacing and lifecycle fairness
@@ -102,13 +106,13 @@ final class PurgeByteDeletionTests: XCTestCase {
             XCTAssertTrue(((done["objects"] as! [JSON])[0]["reasons"] as! [String]).contains(reason))
         }
     }
-    func testRetainedBackupAuthorityKeepsOriginalAndLeavesBackupUnchanged() throws {
+    func testRetainedBackupCopyAllowsOriginalRemovalAndLeavesBackupUnchanged() throws {
         let (p,t,a,_) = try fixture(),backup = directory.appendingPathComponent("backup")
         _ = try call("backup_create",["path":backup.path])
         let before = try Data(contentsOf:backup.appendingPathComponent("manifest.json"))
         let done = try finish(purge(p,trash(p,t)))
-        XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
-        XCTAssertTrue(((done["objects"] as! [JSON])[0]["reasons"] as! [String]).contains("backup_authority"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
+        XCTAssertEqual((done["summary"] as! JSON)["removed_count"] as? Int,1)
         XCTAssertEqual(before,try Data(contentsOf:backup.appendingPathComponent("manifest.json")))
     }
     func testCrashAfterSemanticCommitResumesWithFreshSharedOwnershipCheck() throws {
@@ -146,8 +150,8 @@ final class PurgeByteDeletionTests: XCTestCase {
         let backup = directory.appendingPathComponent("pending-backup")
         XCTAssertNoThrow(try call("backup_create",["path":backup.path]))
         let done = try finish(result)
-        XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
-        XCTAssertTrue(((done["objects"] as! [JSON])[0]["reasons"] as! [String]).contains("backup_authority"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
+        XCTAssertEqual((done["summary"] as! JSON)["removed_count"] as? Int,1)
         XCTAssertTrue(FileManager.default.fileExists(atPath:backup.appendingPathComponent("manifest.json").path))
     }
 
@@ -183,7 +187,7 @@ final class PurgeByteDeletionTests: XCTestCase {
         XCTAssertTrue(((done2["objects"] as! [JSON])[0]["reasons"] as! [String]).contains("backup_authority_unavailable"))
     }
 
-    func testBackupReferencesProtectCapturedSourceAndLinksWhileExclusiveSidecarDeletes() throws {
+    func testIndependentBackupCopiesAllowCapturedSourceLinksAndSidecarRemoval() throws {
         let (p,t,_,_) = try fixture(),cid = uuid(),pid = p["id"] as! String
         let path = "source-captures/" + pid + "/" + cid + "/source",bytes = Data("source".utf8)
         let capture: JSON = ["id":cid,"project_id":pid,"task_id":t["id"]!,"revision":1,"snapshot_path":path,"files":[["path":"file.txt","kind":"file","sha256":ChecklistCore.hash(bytes),"size":bytes.count,"executable":true],["path":"link.txt","kind":"symlink","target":"file.txt","sha256":ChecklistCore.hash(Data("file.txt".utf8))]]]
@@ -192,9 +196,9 @@ final class PurgeByteDeletionTests: XCTestCase {
         try write {try self.router.save($0,capture,type:"source_capture")}
         _ = try call("backup_create",["path":directory.appendingPathComponent("capture-backup").path])
         let done = try finish(purge(p,trash(p,t))),objects = done["objects"] as! [JSON]
-        XCTAssertTrue(try files.regularOrLinkExists(path + "/file.txt"));XCTAssertTrue(try files.regularOrLinkExists(path + "/link.txt"))
+        XCTAssertFalse(try files.regularOrLinkExists(path + "/file.txt"));XCTAssertFalse(try files.regularOrLinkExists(path + "/link.txt"))
         XCTAssertFalse(try files.regularOrLinkExists(sidecar))
-        for name in [path + "/file.txt",path + "/link.txt"] {XCTAssertTrue((objects.first {$0["relative_path"] as? String == name}?["reasons"] as? [String] ?? []).contains("backup_authority"))}
+        for name in [path + "/file.txt",path + "/link.txt"] {XCTAssertEqual(objects.first {$0["relative_path"] as? String == name}?["state"] as? String,"removed")}
         // Retained descriptor authority remains snapshot-compatible after the
         // canonical capture and the exclusive sidecar have gone.
         XCTAssertNoThrow(try call("backup_create",["path":directory.appendingPathComponent("retained-capture-backup").path]))
