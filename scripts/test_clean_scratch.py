@@ -23,7 +23,7 @@ class CleanScratchTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         self.assertNotIn('scratchpad', self.root.parts)
-        caller = patch.dict(os.environ, {'CODEX_THREAD_ID': 'session', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
+        caller = patch.dict(os.environ, {'CODEX_THREAD_ID': 'session', 'CLAUDE_SESSION_ID': '', 'CLAUDE_CODE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
         caller.start();self.addCleanup(caller.stop)
         self.repo = self.root / 'retained';self.repo.mkdir()
         self.package = b'let package = Package(name: "Checklist")\n'
@@ -295,7 +295,7 @@ class CleanScratchTests(unittest.TestCase):
         marker = cleanup.read_marker(root)
         self.assertEqual(marker['source_fingerprint'], 'b' * 64)
         self.assertFalse(marker['released'])
-        with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}):
+        with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CLAUDE_CODE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}):
             with self.assertRaisesRegex(ValueError, 'session unknown'):
                 cleanup.mark_qualification(root, 'b' * 64, 'missing owner')
         with self.assertRaisesRegex(ValueError, 'override'):
@@ -571,7 +571,7 @@ class CleanScratchTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as error:
                 cleanup.main()
             self.assertEqual(error.exception.code, 2)
-        with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), \
+        with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CLAUDE_CODE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), \
              patch.object(sys, 'argv', ['clean_scratch.py', '--preview']), patch('sys.stderr', io.StringIO()):
             with self.assertRaises(SystemExit) as error:
                 cleanup.main()

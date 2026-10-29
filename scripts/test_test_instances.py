@@ -77,7 +77,7 @@ class TestInstancesTests(unittest.TestCase):
             argv = ['test_instances.py', 'create', '--slot', '4', '--session-id', 'actual-session']
             if replace:
                 argv.append('--replace')
-            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), \
+            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CLAUDE_CODE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), \
                  patch.object(sys, 'argv', argv), patch.object(harness, 'checked'), \
                  patch.object(harness, 'locked', return_value=ExitStack()), patch.object(harness, 'create') as create:
                 harness.main()
@@ -350,7 +350,7 @@ class StopWaitTests(unittest.TestCase):
 
 class DestroyCleanupTests(unittest.TestCase):
     def setUp(self):
-        identity = patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
+        identity = patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CLAUDE_CODE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
         identity.start()
         self.addCleanup(identity.stop)
 
@@ -1153,7 +1153,7 @@ class RestoredSeedTests(unittest.TestCase):
             args = SimpleNamespace(slot=4, seed='restored:' + str(source), replace=True, session_id='fixture-session')
             # Marking is covered by the clean_scratch tests; a TMPDIR inside a session
             # scratchpad must not decide this copy-before-destroy case (CL-276 review).
-            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(stage, selected)), patch.object(harness, 'require_managed_path_support', return_value=4), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'signing_teams'), patch.object(harness, 'destroy', side_effect=destroy), patch.object(harness, 'run', side_effect=run), patch.object(harness, 'mark_qualification'):
+            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CLAUDE_CODE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(stage, selected)), patch.object(harness, 'require_managed_path_support', return_value=4), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'signing_teams'), patch.object(harness, 'destroy', side_effect=destroy), patch.object(harness, 'run', side_effect=run), patch.object(harness, 'mark_qualification'):
                 harness.create(args, p)
             seed = harness.load(p)['seed']
             self.assertEqual(seed['kind'], 'restored')
@@ -1168,7 +1168,7 @@ class RestoredSeedTests(unittest.TestCase):
             harness.save(p, {'slot': 4, 'build_id': 'old'})
             selected = {'source_fingerprint': 'b' * 64}
             args = SimpleNamespace(slot=4, seed='restored:' + str(base / 'not-restored'), replace=True, session_id='fixture-session')
-            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(base, selected)), patch.object(harness, 'require_managed_path_support', return_value=4), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'destroy') as destroy, patch.object(harness, 'run') as run:
+            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CLAUDE_CODE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(base, selected)), patch.object(harness, 'require_managed_path_support', return_value=4), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'destroy') as destroy, patch.object(harness, 'run') as run:
                 with self.assertRaises(ValueError): harness.create(args, p)
                 destroy.assert_not_called();run.assert_not_called()
             self.assertEqual(harness.load(p)['build_id'], 'old')
@@ -1459,7 +1459,7 @@ class SeedIsolationTests(unittest.TestCase):
             def run(command):
                 if command[0] == 'ditto': harness.shutil.copytree(command[1], command[2])
                 return subprocess.CompletedProcess(command, 0, '', '')
-            with patch.dict(os.environ, {'CODEX_THREAD_ID': 'slot-fixture', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(sys, 'argv', ['test_instances.py', 'create', '--slot', '4', '--stage', str(stage), '--seed', 'backup:' + str(source)]), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(stage, selected)), patch.object(harness, 'require_managed_path_support', return_value=4), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'signing_teams'), patch.object(harness, 'run', side_effect=run):
+            with patch.dict(os.environ, {'CODEX_THREAD_ID': 'slot-fixture', 'CLAUDE_SESSION_ID': '', 'CLAUDE_CODE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(sys, 'argv', ['test_instances.py', 'create', '--slot', '4', '--stage', str(stage), '--seed', 'backup:' + str(source)]), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(stage, selected)), patch.object(harness, 'require_managed_path_support', return_value=4), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'signing_teams'), patch.object(harness, 'run', side_effect=run):
                 harness.main()
             p = harness.checked(4);created = harness.load(p)
             self.assertEqual(created['mode'], 'stopped')
@@ -1880,7 +1880,7 @@ class SeedIsolationTests(unittest.TestCase):
             p = harness.checked(1)
             manifest = {'build_id': 'fixture', 'source_fingerprint': 'b' * 64}
             args = SimpleNamespace(slot=1, replace=False, seed='backup:' + str(source), session_id='slot-fixture')
-            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(base, manifest)), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'require_managed_path_support', return_value=4), patch.object(harness, 'run') as run:
+            with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CLAUDE_CODE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}), patch.object(harness, 'stopped'), patch.object(harness, 'stage_selection', return_value=(base, manifest)), patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'require_managed_path_support', return_value=4), patch.object(harness, 'run') as run:
                 with self.assertRaisesRegex(ValueError, 'managed.path contract'): harness.create(args, p)
                 marker = json.loads((p['folder'] / '.checklist-workspace.json').read_text())
                 self.assertFalse(marker['released'])
@@ -1892,7 +1892,7 @@ class SeedIsolationTests(unittest.TestCase):
 
     def test_create_with_tmpdir_in_another_marked_scratch_session(self):
         with test_directory() as directory, patch.dict(os.environ,
-                {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}):
+                {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CLAUDE_CODE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}):
             scratch = Path(directory) / 'other-session/scratchpad'
             scratch.mkdir(parents=True)
             harness.mark_qualification(scratch, 'b' * 64, 'fake caller scratch',
@@ -2221,7 +2221,7 @@ class SeedIsolationTests(unittest.TestCase):
 class LiveRootTests(unittest.TestCase):
     def setUp(self):
         # Root-admission cases supply their own creator; never inherit the host caller.
-        identity = patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
+        identity = patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CLAUDE_CODE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
         identity.start();self.addCleanup(identity.stop)
 
     def test_checked_refuses_another_slots_aliased_root(self):

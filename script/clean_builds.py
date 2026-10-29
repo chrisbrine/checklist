@@ -16,10 +16,7 @@ import stat
 import subprocess
 import sys
 
-from clean_scratch import (DEFAULT_BUDGET_GB, FINISHED, OWNER_RECORD, WORKSPACE_MARKER, background_sizes,
-                           cli_status_reader, du_sizes, inventory, read_owner_record, release_finished,
-                           running_paths, storage_groups, storage_report, ticket_roots, within,
-                           workspace_protection)
+from clean_scratch import (DEFAULT_BUDGET_GB, FINISHED, OWNER_RECORD, SESSION_VARIABLES, WORKSPACE_MARKER, background_sizes, cli_status_reader, du_sizes, inventory, native_session, read_owner_record, release_finished, running_paths, storage_groups, storage_report, ticket_roots, within, workspace_protection)
 from retire_old_bundles import trash, trash_many
 import test_instances as slots
 
@@ -852,11 +849,13 @@ def release_done(repo, environ=None, reader=None, sessions_root=None, qualificat
     happens at the next clean_scratch.py --apply, which still keeps a folder a
     running process uses. Folders of open tickets stay marked."""
     environ = os.environ if environ is None else environ
-    session = environ.get('CODEX_THREAD_ID') or environ.get('CLAUDE_SESSION_ID') or environ.get('CHECKLIST_SESSION_ID')
+    session = native_session(environ)
     if not session or session in {'.', '..'} or '/' in session:
         print(json.dumps({'action': 'release_done', 'status': 'skipped',
                           'reason': 'no caller session exported; run clean_scratch.py --release-done'}), flush=True)
-        return 0
+        print('WARNING: POST-INSTALL RELEASE SKIPPED: no caller session (' + ', '.join(SESSION_VARIABLES)
+              + ') is exported; run clean_scratch.py --release-done.', file=sys.stderr, flush=True)
+        return 2
     try:
         reader = reader or cli_status_reader(Path('/Applications/Checklist.app/Contents/MacOS/checklist'),
                                              release_workspace(repo, environ), environ.get('CHECKLIST_PROJECT_ID'))
@@ -896,8 +895,8 @@ def post_install(repo, capture, release=None):
         print(json.dumps({'action': 'release_done', 'status': 'failed',
                           'reason': f'{type(error).__name__}: {error}'}), flush=True)
     print(json.dumps({'action': 'post_install', 'build_cleanup': build_report,
-                      'release_done': {'status': 'failed' if release_status else 'ok_or_skipped'}}), flush=True)
-    return 1 if (build_status or release_status) else 0
+                      'release_done': {'status': {0: 'ok', 2: 'skipped'}.get(release_status, 'failed')}}), flush=True)
+    return 1 if (build_status or release_status == 1) else 0
 
 
 def main():

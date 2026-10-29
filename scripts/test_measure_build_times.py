@@ -18,7 +18,7 @@ class MeasurementTests(unittest.TestCase):
         # Fixture marker ownership must not inherit the caller scratch session.
         self.temporary = tempfile.TemporaryDirectory(dir='/private/tmp')
         self.addCleanup(self.temporary.cleanup)
-        caller = patch.dict(os.environ, {'CODEX_THREAD_ID': 'measurement-session', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': '',
+        caller = patch.dict(os.environ, {'CODEX_THREAD_ID': 'measurement-session', 'CLAUDE_SESSION_ID': '', 'CLAUDE_CODE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': '',
                                          'CHECKLIST_TICKETS': ''})
         caller.start();self.addCleanup(caller.stop)
         self.tickets = ['CL-359']
@@ -105,7 +105,7 @@ print('Staged '+str(capture/'Checklist.app'))
         self.assertEqual(mark.call_args.kwargs['tickets'], ['CL-1', 'CL-2'])
 
     def test_invalid_owner_or_fingerprint_cannot_create_an_unmarked_output(self):
-        with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}):
+        with patch.dict(os.environ, {'CODEX_THREAD_ID': '', 'CLAUDE_SESSION_ID': '', 'CLAUDE_CODE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''}):
             with self.assertRaisesRegex(ValueError, 'session unknown'):
                 self.run_measurement()
         self.assertFalse(self.output.exists())

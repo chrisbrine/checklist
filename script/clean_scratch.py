@@ -285,8 +285,18 @@ def validate_fingerprint(value):
     return value
 
 
+# The caller's own native session, in host order. Claude Code exports
+# CLAUDE_CODE_SESSION_ID (CL-359 review 40f793e6); CLAUDE_SESSION_ID is kept for older hosts.
+SESSION_VARIABLES = ('CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID', 'CHECKLIST_SESSION_ID')
+
+
+def native_session(environ=None):
+    environ = os.environ if environ is None else environ
+    return next((environ[name] for name in SESSION_VARIABLES if environ.get(name)), None)
+
+
 def caller_session(session_id=None):
-    native = os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID') or os.environ.get('CHECKLIST_SESSION_ID')
+    native = native_session()
     if native and session_id and native != session_id:
         raise ValueError('--session-id cannot override the host caller')
     value = native or session_id
@@ -1089,8 +1099,8 @@ def main():
                         help='warn when scratch, evidence, build and qualification folders exceed this size')
     parser.add_argument('--source-fingerprint', type=validate_fingerprint,
                         help='with --mark: bind a disposable qualification run to its exact build source fingerprint')
-    parser.add_argument('--session-id', default=os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID') or os.environ.get('CHECKLIST_SESSION_ID'),
-                        help='caller session (default: CODEX_THREAD_ID, CLAUDE_SESSION_ID or CHECKLIST_SESSION_ID); never name another session')
+    parser.add_argument('--session-id', default=native_session(),
+                        help='caller session (default: CODEX_THREAD_ID, CLAUDE_CODE_SESSION_ID, CLAUDE_SESSION_ID or CHECKLIST_SESSION_ID); never name another session')
     parser.add_argument('--include-released', action='store_true',
                         help='also inspect foreign roots explicitly released by their owning session')
     parser.add_argument('--sessions-root', type=Path, default=Path(f'/private/tmp/claude-{os.getuid()}'))
@@ -1100,8 +1110,8 @@ def main():
     parser.add_argument('--keep-qualified', type=Path, action='append', default=[],
                         help='also retain this exact qualified round or assigned persistent slot (repeatable)')
     args = parser.parse_args()
-    native_session = os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID') or os.environ.get('CHECKLIST_SESSION_ID')
-    if native_session and args.session_id != native_session:
+    host_session = native_session()
+    if host_session and args.session_id != host_session:
         parser.error('--session-id cannot override the host caller; use --include-released for released foreign roots')
     if not args.session_id or args.session_id in {'.', '..'} or '/' in args.session_id or not args.session_id.strip():
         parser.error('caller session unknown/invalid; --session-id must name your own session')

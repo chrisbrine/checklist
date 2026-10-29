@@ -19,11 +19,11 @@ import os
 from pathlib import Path, PurePosixPath
 import sys
 
-from clean_scratch import OWNER_KINDS, REPO, requested_tickets, write_owner_record
+from clean_scratch import OWNER_KINDS, REPO, native_session, requested_tickets, write_owner_record
 
 
 def caller():
-    return os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID') or os.environ.get('CHECKLIST_SESSION_ID')
+    return native_session()
 
 
 def new_evidence(repo, name, tickets, purpose=None, existing=False):

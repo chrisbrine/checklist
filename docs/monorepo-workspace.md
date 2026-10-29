@@ -178,7 +178,7 @@ is logged without turning a successful install into a failed installation.
 
 Each install is a round boundary (CL-359). After the build cleanup, also when that
 cleanup fails or is refused, the same hook runs the `clean_scratch.py --release-done` step for the installing session (the
-exported `CODEX_THREAD_ID`, `CLAUDE_SESSION_ID` or `CHECKLIST_SESSION_ID`): every
+exported `CODEX_THREAD_ID`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_SESSION_ID` or `CHECKLIST_SESSION_ID`): every
 marked folder of that session whose tickets are all Done or canceled is released.
 Release changes only the marker. The folder moves to the Trash at the next
 `clean_scratch.py --apply`, which still keeps a folder that a running process

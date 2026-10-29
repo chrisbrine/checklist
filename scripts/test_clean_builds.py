@@ -745,7 +745,7 @@ class CleanupTests(unittest.TestCase):
             summary=[r for r in rows if r.get('action')=='post_install'][0]
             self.assertEqual(summary['build_cleanup']['status'],'failed')
             self.assertIn('No such file or directory',summary['build_cleanup']['reason'])
-            self.assertEqual(summary['release_done']['status'],'failed' if release_result else 'ok_or_skipped')
+            self.assertEqual(summary['release_done']['status'],{0: 'ok', 2: 'skipped'}.get(release_result, 'failed'))
             self.assertFalse((self.build/'.build-lock').exists())
         # The default release hook (patched in setUp) also runs after a failure.
         with patch.object(clean,'Cleaner',return_value=self.cleaner), patch.object(self.cleaner,'builds',side_effect=broken), \
@@ -1201,10 +1201,21 @@ class ReleaseDoneAfterInstallTests(unittest.TestCase):
         decision = clean_scratch.plan(done, 'session', set(), [done], 'a'*64, now=time.time()+7200)
         self.assertIn('running process', decision['reason'])
 
+    def test_claude_code_session_alone_releases(self):
+        """CL-359 review 40f793e6: Claude Code exports only CLAUDE_CODE_SESSION_ID."""
+        done = self.work('done', ['CL-1'], session='installer')
+        result, rows = self.release({'CLAUDE_CODE_SESSION_ID': 'installer'}, {'CL-1': 'done'})
+        self.assertEqual(result, 0)
+        self.assertTrue(clean_scratch.ticket_released(done))
+        self.assertEqual(clean_scratch.native_session({'CLAUDE_CODE_SESSION_ID': 'installer'}), 'installer')
+
     def test_missing_session_skips_and_status_failure_reports(self):
         self.work('done', ['CL-1'])
-        result, rows = self.release({}, {})
-        self.assertEqual((result, rows[0]['status']), (0, 'skipped'))
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            result, rows = self.release({}, {})
+        self.assertEqual((result, rows[0]['status']), (2, 'skipped'))
+        self.assertIn('POST-INSTALL RELEASE SKIPPED', errors.getvalue())
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             result = clean.release_done(self.root, environ={'CODEX_THREAD_ID': 'installer'},

@@ -22,7 +22,7 @@ class EvidenceFolderTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(dir='/private/tmp'); self.addCleanup(self.temp.cleanup)
         self.repo = Path(self.temp.name).resolve() / 'repo'; self.repo.mkdir()
         environment = patch.dict(os.environ, {'CHECKLIST_TICKETS': '', 'CODEX_THREAD_ID': 'fixture-session',
-                                              'CLAUDE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
+                                              'CLAUDE_SESSION_ID': '', 'CLAUDE_CODE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
         environment.start(); self.addCleanup(environment.stop)
 
     def run_main(self, *argv):
