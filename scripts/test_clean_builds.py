@@ -701,9 +701,64 @@ class CleanupTests(unittest.TestCase):
 
     def test_post_install_requires_own_build_lease(self):
         (self.build/'.build-lock').mkdir()
-        with patch.object(clean,'Cleaner',return_value=self.cleaner):
-            with self.assertRaisesRegex(ValueError,'build lock held'):
-                clean.post_install(self.repo,self.build/self.ids[0])
+        output=io.StringIO()
+        with patch.object(clean,'Cleaner',return_value=self.cleaner), contextlib.redirect_stdout(output):
+            # A held lease refuses the build cleanup; the release still runs (CL-359).
+            self.assertEqual(clean.post_install(self.repo,self.build/self.ids[0]),1)
+        rows=[json.loads(line) for line in output.getvalue().splitlines() if line.startswith('{')]
+        failed=[r for r in rows if r.get('action')=='build_cleanup']
+        self.assertEqual(len(failed),1); self.assertIn('build lock held',failed[0]['reason'])
+        self.assertEqual(self.releases,[self.repo])
+        self.assertTrue((self.build/'.build-lock').is_dir())
+
+    def test_fingerprint_folder_with_only_build_info_is_kept_and_reported(self):
+        # Build 165 (2f7a90c3...) holds only build-info.json: kept, reported, and the pass goes on.
+        bare=self.build/('d'*64); bare.mkdir(); (bare/'build-info.json').write_text(json.dumps({'source_fingerprint':'d'*64}))
+        old=self.capture(self.ids[2])
+        for apply in (False,True):
+            rows=self.run_clean(self.cleaner.builds,apply)
+            kept=[r for r in rows if r.get('path')==str(bare)]
+            self.assertEqual(len(kept),1); self.assertEqual(kept[0]['action'],'kept')
+            self.assertIn('no capture manifest',kept[0]['reason'])
+        self.assertEqual((bare/'build-info.json').read_text(),json.dumps({'source_fingerprint':'d'*64}))
+        self.assertEqual(sorted(p.name for p in bare.iterdir()),['build-info.json'])
+        self.assertFalse((old/'source').exists()); self.assertTrue((old/'capture-manifest.json').exists())
+        # A malformed manifest is kept and reported the same way.
+        broken=self.build/('e'*64); broken.mkdir(); (broken/'capture-manifest.json').write_text('{')
+        rows=self.run_clean(self.cleaner.builds,True)
+        self.assertIn('unreadable capture manifest',[r for r in rows if r.get('path')==str(broken)][0]['reason'])
+        self.assertTrue(broken.exists())
+
+    def test_post_install_release_runs_when_build_cleanup_fails(self):
+        current=self.capture(self.ids[0]); self.cleaner.apply=True
+        def broken():
+            raise FileNotFoundError(2,'No such file or directory','capture-manifest.json')
+        for release_result,expected in ((0,1),(1,1)):
+            self.releases.clear(); output=io.StringIO()
+            calls=[]
+            release=lambda repo:calls.append(repo) or release_result
+            with patch.object(clean,'Cleaner',return_value=self.cleaner), patch.object(self.cleaner,'builds',side_effect=broken), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(clean.post_install(self.repo,current,release=release),expected)
+            self.assertEqual(calls,[self.repo])
+            rows=[json.loads(line) for line in output.getvalue().splitlines() if line.startswith('{')]
+            summary=[r for r in rows if r.get('action')=='post_install'][0]
+            self.assertEqual(summary['build_cleanup']['status'],'failed')
+            self.assertIn('No such file or directory',summary['build_cleanup']['reason'])
+            self.assertEqual(summary['release_done']['status'],'failed' if release_result else 'ok_or_skipped')
+            self.assertFalse((self.build/'.build-lock').exists())
+        # The default release hook (patched in setUp) also runs after a failure.
+        with patch.object(clean,'Cleaner',return_value=self.cleaner), patch.object(self.cleaner,'builds',side_effect=broken), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(clean.post_install(self.repo,current),1)
+        self.assertEqual(self.releases,[self.repo])
+        # A raising release is reported and never hides the build result.
+        def raising(repo): raise RuntimeError('status reader crashed')
+        output=io.StringIO()
+        with patch.object(clean,'Cleaner',return_value=self.cleaner), contextlib.redirect_stdout(output):
+            self.assertEqual(clean.post_install(self.repo,current,release=raising),1)
+        summary=[json.loads(l) for l in output.getvalue().splitlines() if l.startswith('{') and '"post_install"' in l][0]
+        self.assertEqual((summary['build_cleanup']['status'],summary['release_done']['status']),('ok','failed'))
 
     def test_build_info_inside_older_stage_is_preserved_before_trash(self):
         p=self.capture(self.ids[2]);(p/'build-info.json').unlink()

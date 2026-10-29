@@ -176,15 +176,19 @@ without a paired `lane-<id>/source`. Paired lanes for every configuration remain
 warm. Stage-only and failed install runs do not retire anything. Cleanup failure
 is logged without turning a successful install into a failed installation.
 
-Each install is a round boundary (CL-359). After the build cleanup, the same hook
-runs the `clean_scratch.py --release-done` step for the installing session (the
+Each install is a round boundary (CL-359). After the build cleanup, also when that
+cleanup fails or is refused, the same hook runs the `clean_scratch.py --release-done` step for the installing session (the
 exported `CODEX_THREAD_ID`, `CLAUDE_SESSION_ID` or `CHECKLIST_SESSION_ID`): every
 marked folder of that session whose tickets are all Done or canceled is released.
 Release changes only the marker. The folder moves to the Trash at the next
 `clean_scratch.py --apply`, which still keeps a folder that a running process
 uses. Folders of open or unknown tickets stay marked. With no exported session
 the hook reports `release_done` as skipped; a status read failure is reported in
-the same log and keeps every marker.
+the same log and keeps every marker. The last log line, `post_install`, reports
+both results (`build_cleanup` and `release_done`); a failure of either returns 1.
+A fingerprint folder without a readable `capture-manifest.json` (for example an
+old capture that holds only `build-info.json`) is kept and reported with the
+reason `no capture manifest`; it does not stop the build cleanup.
 Build outputs move in one native Trash batch (45-second transport timeout), with
 individual destinations/errors and confirmed logical-byte totals. A failed batch
 can have successful individual moves; those receipts remain in the report. Only
@@ -236,11 +240,15 @@ and the creating tool refuses a folder without keys:
 | Work folder | `clean_scratch.py --mark PATH --purpose TEXT --ticket KEY` | `.checklist-workspace.json` `tickets` |
 | Build folder | `build_and_run.sh --stage --ticket KEY` | `.local/build/<fingerprint>/owner.json` |
 | Slot store copy | `test_instances.py create --ticket KEY` | `slot.json` `tickets` and the slot marker |
+| P321g owned store copy | `prepare_p321g_copy.py SNAPSHOT RUNTIME --ticket KEY` | `RUNTIME/owner.json` (kind `qualification`), written before the copy |
 | Qualification cache | `measure_build_times.py --ticket KEY`, or `--mark` of a manual run | marker `tickets` |
 | Evidence folder | `script/evidence_folder.py new --ticket KEY NAME` | `.local/evidence/NAME/owner.json` |
 
 Each `--ticket` is repeatable; `CHECKLIST_TICKETS=CL-1,CL-2` supplies the keys
-when no `--ticket` is given. `evidence_folder.py new --existing NAME` registers an
+when no `--ticket` is given. `scripts/test_store_copy_registration.py` fails when
+a script under `script/` copies `database.sqlite`, `checklist.sqlite` or a
+`managed/` tree, or calls a slot store-copy helper, without `requested_tickets`
+and an owner-record write. `evidence_folder.py new --existing NAME` registers an
 evidence folder that already exists, and `evidence_folder.py register --kind KIND
 PATH` writes or extends `owner.json` in another folder. A later registration of
 the same kind adds keys; another kind is refused. `clean_builds.py` reads

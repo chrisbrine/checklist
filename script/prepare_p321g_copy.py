@@ -6,15 +6,26 @@ import json
 from pathlib import Path
 import sqlite3
 import subprocess
+import sys
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from clean_scratch import requested_tickets, write_owner_record  # noqa: E402
 
-def main():
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot", type=Path)
     parser.add_argument("runtime", type=Path)
     parser.add_argument("--finish-existing", action="store_true", help="Finish metadata after a successful copy interrupted before marker publication")
-    args = parser.parse_args()
+    parser.add_argument("--ticket", dest="tickets", action="append", default=[],
+                        help="owning ticket key (repeatable; or CHECKLIST_TICKETS=CL-1,CL-2); required")
+    args = parser.parse_args(argv)
+    # CL-359: a store copy is registered with its tickets before anything is created.
+    try:
+        tickets = requested_tickets(args.tickets)
+    except ValueError as error:
+        parser.error(str(error))
     source, runtime = args.snapshot.resolve(), args.runtime.resolve()
     if not str(source).startswith("/private/tmp/") or runtime.parent != source:
         parser.error("Use the independently copied snapshot and its immediate runtime child in /private/tmp.")
@@ -25,9 +36,15 @@ def main():
     for name in ("database.sqlite", "manifest.json", "managed"):
         if not (source / name).exists():
             parser.error(f"Copied snapshot lacks {name}")
+    if (source / "managed" / "owner.json").exists():
+        parser.error("Copied managed/ holds owner.json; the copy would replace its owner record.")
     started = time.monotonic()
     if not args.finish_existing:
         runtime.mkdir(mode=0o700)
+    # owner.json goes into the runtime folder before any store byte is copied;
+    # a resumed preparation adds its keys to the same qualification record.
+    owner = write_owner_record(runtime, tickets, "qualification", "P321g real-maintenance owned store copy")
+    if not args.finish_existing:
         subprocess.run(["/bin/cp", "-c", str(source / "database.sqlite"), str(runtime / "checklist.sqlite")], check=True)
         subprocess.run(["/bin/cp", "-cR", str(source / "managed") + "/.", str(runtime)], check=True)
     manifest = json.loads((source / "manifest.json").read_bytes())
@@ -46,6 +63,7 @@ def main():
     marker = {"purpose": "P321g-real-maintenance-owned-copy", "snapshot": str(source),
               "manifest_sha256": manifest_sha, "database_source": str(source / "database.sqlite"),
               "copy_method": "cp -c database; cp -cR managed/.", "database_mutated": False,
+              "tickets": owner["tickets"],
               "seconds": time.monotonic() - started,
               "load": subprocess.check_output(["/usr/sbin/sysctl", "-n", "vm.loadavg"], text=True).strip()}
     (runtime / ".p321g-owned-copy.json").write_text(json.dumps(marker, indent=2, sort_keys=True))

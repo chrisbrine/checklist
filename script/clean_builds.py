@@ -353,8 +353,18 @@ class Cleaner:
                     if why := unchanged_install(folder):
                         self.item(folder, 'build', reason=why, extra=owner)
                         continue
-                    manifest = read_json(folder / 'capture-manifest.json')
-                    if fingerprint(manifest) != folder.name:
+                    # A capture without a readable manifest (an old build-info-only
+                    # folder) is kept and reported; it never stops the build pass.
+                    try:
+                        manifest = read_json(folder / 'capture-manifest.json')
+                    except FileNotFoundError:
+                        self.item(folder, 'build', reason='no capture manifest; retain build', extra=owner)
+                        continue
+                    except (OSError, ValueError) as error:
+                        self.item(folder, 'build', reason='unreadable capture manifest; retain build: ' + str(error),
+                                  extra=owner)
+                        continue
+                    if not isinstance(manifest, dict) or manifest.get('source_fingerprint') != folder.name:
                         self.item(folder, 'build', reason='capture identity mismatch', extra=owner)
                         continue
                     if owner['registration'] == 'unregistered':
@@ -842,16 +852,35 @@ def release_done(repo, environ=None, reader=None, sessions_root=None, qualificat
 
 
 def post_install(repo, capture, release=None):
-    """Explicit background install step; acquire our own lease after installer exit."""
-    cleaner = Cleaner(Path(repo), Path('/Applications/Checklist.app'), apply=True)
-    with build_lock(cleaner.build, True):
-        ids, _ = installation(cleaner.build, cleaner.installed)
-        if fingerprint(read_json(Path(capture) / 'capture-manifest.json')) not in ids:
-            raise ValueError('installed build changed before cleanup')
-        cleaner.builds()
-    status = finish(cleaner)
+    """Explicit background install step; acquire our own lease after installer exit.
+    The build cleanup and the release are independent: a failed or refused build
+    cleanup still runs the release (CL-359), and the result line reports both."""
+    cleaner = None
+    try:
+        cleaner = Cleaner(Path(repo), Path('/Applications/Checklist.app'), apply=True)
+        with build_lock(cleaner.build, True):
+            ids, _ = installation(cleaner.build, cleaner.installed)
+            if fingerprint(read_json(Path(capture) / 'capture-manifest.json')) not in ids:
+                raise ValueError('installed build changed before cleanup')
+            cleaner.builds()
+        build_status = finish(cleaner)
+        build_report = {'status': 'failed' if build_status else 'ok'}
+    except Exception as error:  # report it, then still run the release
+        build_status = 1
+        build_report = {'status': 'failed', 'reason': f'{type(error).__name__}: {error}'}
+        print(json.dumps({'action': 'build_cleanup', **build_report}), flush=True)
+        if cleaner is not None:
+            finish(cleaner)  # bytes already moved before the failure, if any
     # The release runs after the build lease ends; a failure never undoes the build cleanup.
-    return (release or release_done)(repo) or status
+    try:
+        release_status = (release or release_done)(repo)
+    except Exception as error:
+        release_status = 1
+        print(json.dumps({'action': 'release_done', 'status': 'failed',
+                          'reason': f'{type(error).__name__}: {error}'}), flush=True)
+    print(json.dumps({'action': 'post_install', 'build_cleanup': build_report,
+                      'release_done': {'status': 'failed' if release_status else 'ok_or_skipped'}}), flush=True)
+    return 1 if (build_status or release_status) else 0
 
 
 def main():
