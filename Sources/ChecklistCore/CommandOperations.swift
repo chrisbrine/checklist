@@ -4,7 +4,8 @@ import GRDB
 
 /// Only scheduling state is process-local. Acceptance and terminal state live in
 /// SQLite; successful replies live exclusively in the ordinary command journal.
-/// The service supplies its existing utility lane. In-process domain callers may
+/// The service supplies its own concurrent command-operation queue, separate from
+/// storage maintenance. In-process domain callers may
 /// keep the synchronous router without installing a service scheduler.
 final class CommandOperations: @unchecked Sendable {
     struct Job: @unchecked Sendable {
