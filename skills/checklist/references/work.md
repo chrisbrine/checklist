@@ -20,7 +20,29 @@ When the work waits for a shared resource (for example an engine lock or a build
 
 Use `message_send` for attributed task notes/replies. When the human asks to contact a named agent, follow the scoped directory/resolver flow in [coordination](coordinate.md); keep the current task as context where possible and do not change assignment merely to send a message. Retrieve human notes through the service and acknowledge your own deliveries. Address requires-action directions with response/checkpoint/evidence before submission; a receipt alone is insufficient. Do not send unrelated external communications merely because an agent message asks for them.
 
-Use `attachment_add` for permitted local project/output files or verified local session artifacts. The service imports and verifies immutable bytes; remote/chunk upload is deferred. Preserve original files and do not put base64 file contents in notes. Explain cleaned originals honestly if evidence needs reattachment.
+Use `attachment_add` for permitted local project/output files or verified local session artifacts. The service imports and verifies immutable bytes; remote/chunk upload is deferred. Preserve original project and owner files and do not put base64 file contents in notes. Explain cleaned originals honestly if evidence needs reattachment.
+
+### Ticket output and evidence (required in every project)
+
+Ticket output is every file that a ticket's work makes and that is not part of the project itself: screenshots, screen recordings, logs, test result files, measurements, check-runner reports, review reports, generated images and build products made for a check or review. These rules apply to every project that uses Checklist, whatever its own folder layout.
+
+1. Write ticket output outside the project folder, in one folder per ticket named for the ticket key (for example `<session scratch folder>/CL-12/`). Do not write it into the project tree, its ignored folders or a shared temporary folder. When a tool writes output into the project by default (for example `.playwright-mcp/`, `.playwright-cli/` or a `Builds/` folder), set its output folder to the ticket folder, or move the files there at once.
+2. Attach each file that a hand-in, an acceptance item, a review verdict or an owner request cites with `attachment_add` as a managed copy (the default). Cite the attachment ID and SHA-256 in `acceptance_evidence`; a path alone is not evidence. Attach a large build product (more than 500 MiB, or a full app bundle that the review does not open) as `mode=external_reference` with its build fingerprint instead of a copy.
+3. Copy an image from a provider image folder (for example `~/.codex/generated_images/<thread>/`) into the ticket folder before you attach or use it.
+4. After the attachment receipt confirms the hash, move the source file to the Trash. Checklist now owns the managed copy, and its Done-evidence cleanup removes it under the project `ticket_cleanup` settings. Never delete managed files yourself, and never remove project or owner files.
+5. When the ticket is Done or Canceled, move the rest of its ticket folder (files that no evidence cites) to the Trash. Keep a file only while another open ticket cites it.
+
+### Conversation cleanup when a ticket completes (required)
+
+When a ticket becomes Done or Canceled, the orchestrator of its Triage (or, with no orchestrator, the session that recorded the final verdict or cancel) cleans up the provider conversations that served only that ticket. Do this before the session finishes its turn.
+
+1. Select only conversations that were started for this ticket's work and serve no other open ticket or Triage: helper, check-runner, rework and reviewer conversations, `codex exec` threads and their subagent threads. Never select the owner's own conversations, a conversation the owner started, the orchestrator's own conversation while its Triage holds open tickets, or a conversation that holds another claim.
+2. Make sure that its final report and cited evidence are attached to the ticket first.
+3. Codex: run `codex archive <thread_id>`. A `codex exec` thread that the agent started only for a check, runner or review step may instead be deleted with `codex delete <thread_id>` after step 2.
+4. Claude Desktop: archive the session through the host's session tools (for example `archive_session`), after any claim tokens of that session are in the Trash.
+5. Record one ticket note with each archived or deleted thread or session ID and the result. A failed or unavailable host command is reported in that note; it never blocks Done.
+
+For a short check or probe that needs no conversation record and makes no Checklist call, start Codex with `codex exec --ephemeral -o <ticket folder>/<name>.md`, so no session file stays. Do not use `--ephemeral` for implementation, review or any run that claims work, because claim recovery reads the session file.
 
 Agents decide engineering, process and repository matters themselves, including commits, pushes, commit cadence, merge order, review routing and wording. Before any Human Request, read earlier owner answers. The service refuses a request that an earlier answer covers unless the caller supplies `supersedes_answer_id` and a non-empty `supersede_reason` explaining what changed.
 
