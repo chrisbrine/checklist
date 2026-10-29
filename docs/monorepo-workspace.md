@@ -217,10 +217,18 @@ Captures used directly by running processes, or identified by running Checklist
 bundles (including test-slot and renamed app bundles), remain intact. Unknown
 build layouts are kept.
 
-Evidence is scoped by ticket keys in folder/file names and `files.json` ticket
+Evidence is scoped by ticket keys in the folder name and `files.json` ticket
 fields. A round folder may explicitly declare **every** owning ticket with
-`cleanup.json` containing `{"tickets":["CL-10","CL-11"]}`. Untagged containers
-and their logs stay; their ticket children can retire separately. Every owning
+`cleanup.json` containing `{"tickets":["CL-10","CL-11"]}` (strings or
+`{"key": ...}` rows). A `cleanup.json` without `tickets` is a cleanup receipt, not
+ownership. Untagged containers and their logs stay; their ticket children can
+retire separately. Every older `files.json` shape is read without an error: a list
+of entries, `{"files": [...]}`, a `{name: {...}}` map, and `ticket` (string or
+list) or `tickets` on an entry or at the top level. When the entries have no ticket
+key, the ticket keys in the folder name are the owners, and the note's
+`owner_basis` says so. Ticket keys in nested file names add owners but never
+establish ownership alone. A folder with no owner key ("unknown owner") or an
+unreadable record stays as `kept` and does not fail the run. Every owning
 ticket must have `status_category` `done` or `canceled` (CL-359); open, missing,
 ambiguous or unreadable statuses retain the evidence. The default status reader uses only
 `project_resolve` and paginated `task_list` calls through the installed CLI, with
@@ -232,8 +240,13 @@ list. This is an operator-supplied status snapshot; refresh it before applying.
 Evidence notes (CL-359): `--evidence-notes PATH` writes one JSON line per owning
 ticket for each evidence folder that retires. The note gives the folder name, file
 count, logical bytes, the SHA-256 of each `notes.md` and `report.md`, the
-`files.json` hand-in paths and the names of the files attached to the ticket
-(read-only `task_get` and `attachment_list`). With `--apply --post-notes`, the
+`files.json` hand-in paths, the owner basis and the names of the files attached
+to the ticket (read-only `attachment_list`, with task IDs from the same batched
+`task_list` status read). The preview reads all statuses in one batched read,
+reads attachments in parallel and runs the `du` sizes while it inspects the
+folders; apply reads each status again before a move. The notes file is written for
+every eligible folder even when another folder reports `kept_error`; the exit code is
+1 only for a real failure (status, process or file read, or a move). With `--apply --post-notes`, the
 command sends each note to its ticket with `message_send` (an agent action) before
 the folder moves. If a note fails, the folder stays and the run reports an error.
 Evidence of open tickets stays.

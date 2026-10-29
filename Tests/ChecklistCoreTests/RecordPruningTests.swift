@@ -94,6 +94,7 @@ extension CoreTests {
     }
 
     func testReadMethodsDoNotWaitForTheWriteLock() throws {
+        try QualificationSuite.requireEnabled()
         let p = try project(), t = try task(p)
         XCTAssertNotNil(router.readers)
         let file = directory.appendingPathComponent("read-path-original.txt"); try Data("original bytes".utf8).write(to: file)

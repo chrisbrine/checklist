@@ -4,13 +4,35 @@ import GRDB
 @testable import ChecklistCore
 
 final class TicketLifecycleCleanupTests: XCTestCase {
+    private static let prepared = TestStore.Template(name: "TicketLifecycleCleanupTests") { router, workspace in
+        let owner = Caller(role:"owner",installation:"lifecycle-fixture",projectIDs:[])
+        func call(_ method: String,_ input: JSON) throws -> JSON {
+            var input = input; input["command_id"] = uuid()
+            return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:input),caller:owner)["data"] as! JSON
+        }
+        let project = try call("project_create",["name":"Synthetic lifecycle","key_prefix":"LC","root_path":workspace.path])
+        let task = try call("task_create",["project_id":project["id"]!,"title":"Synthetic closed work"])
+        let source = workspace.appendingPathComponent("evidence.txt");try Data("owned evidence".utf8).write(to:source)
+        _ = try call("attachment_add",["project_id":project["id"]!,"task_id":task["id"]!,"path":source.path,"mode":"managed_copy"])
+        // Keep the original helper response, including its pre-capture counters.
+        try router.dbQueue.write {try $0.execute(sql:"INSERT INTO metadata(key,value) VALUES ('test-lifecycle-project',?)",arguments:[try jsonString(project)])}
+    }
+    private var preparedFixture: (JSON,JSON,JSON)?
     var directory: URL!
     var router: CommandRouter!
     let owner = Caller(role:"owner",installation:"lifecycle-fixture",projectIDs:[])
     let defaults: JSON = ["done_evidence_enabled":true,"closed_purge_enabled":true,"closed_days":15]
     override func setUpWithError() throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("checklist-lifecycle-" + uuid())
-        router = try TestStore.router(root:directory.appendingPathComponent("store"))
+        let workspace = directory.appendingPathComponent("workspace-prepared")
+        router = try TestStore.router(root:directory.appendingPathComponent("store"),template:Self.prepared,workspace:workspace)
+        preparedFixture = try router.dbQueue.read {db in
+            var project = jsonObject(try XCTUnwrap(String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='test-lifecycle-project'")))
+            project["root_path"] = workspace.resolvingSymlinksInPath().path
+            let task = try XCTUnwrap(router.records(db,type:"task").first)
+            let attachment = try XCTUnwrap(router.records(db,type:"attachment").first)
+            return (project,task,router.ownerManagedPathProjection(attachment,caller:owner))
+        }
     }
     override func tearDownWithError() throws {try router?.closeStore();router = nil;try? FileManager.default.removeItem(at:directory)}
     func call(_ method: String,_ p: JSON) throws -> JSON {
@@ -21,11 +43,17 @@ final class TicketLifecycleCleanupTests: XCTestCase {
         try ArchiveStorageGate.withExclusive(root:router.root) {_ in try router.dbQueue.writeWithoutTransaction {db in try router.withValidatedDomainTransaction(db) {try body(db);return .commit}}}
     }
     func fixture(category: String = "done",age: Int = 0,backed: Bool = true) throws -> (JSON,JSON,JSON) {
-        let workspace = directory.appendingPathComponent("workspace-" + uuid());try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
-        let p = try call("project_create",["name":"Synthetic lifecycle","key_prefix":"LC","root_path":workspace.path])
-        let t = try call("task_create",["project_id":p["id"]!,"title":"Synthetic closed work"])
-        let source = workspace.appendingPathComponent("evidence.txt");try Data("owned evidence".utf8).write(to:source)
-        let a = try call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":source.path,"mode":"managed_copy"])
+        let values: (JSON,JSON,JSON)
+        if let preparedFixture { values = preparedFixture;self.preparedFixture = nil }
+        else {
+            let workspace = directory.appendingPathComponent("workspace-" + uuid());try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
+            let p = try call("project_create",["name":"Synthetic lifecycle","key_prefix":"LC","root_path":workspace.path])
+            let t = try call("task_create",["project_id":p["id"]!,"title":"Synthetic closed work"])
+            let source = workspace.appendingPathComponent("evidence.txt");try Data("owned evidence".utf8).write(to:source)
+            let a = try call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":source.path,"mode":"managed_copy"])
+            values = (p,t,a)
+        }
+        let (p,t,a) = values
         try mark(p,t,category:category,age:age)
         if backed {
             let relative = try XCTUnwrap(ManagedPaths.relative(a["path"] as! String,family:"objects",root:router.root))
@@ -85,6 +113,7 @@ final class TicketLifecycleCleanupTests: XCTestCase {
         return try router.dbQueue.read {db in try summaries.map {try router.ticketCleanupPassProjection(db,receipt:router.record(db,$0["id"] as! String,type:"storage_job"))}}
     }
     func testDefaultsStartAutomaticallyWithoutPreviewOrActivationIncludingRestart() throws {
+        try QualificationSuite.requireEnabled()
         let (p,t,a) = try fixture(age:20)
         let settings = router.ticketCleanupSettings(p)
         XCTAssertEqual(settings["closed_days"] as? Int,15)
@@ -466,6 +495,7 @@ extension TicketLifecycleCleanupTests {
         XCTAssertTrue((batch["members"] as? [JSON] ?? []).isEmpty)
     }
     func testLargeFileVerificationYieldsWriterAndChangedPinnedFileIsRetained() throws {
+        try QualificationSuite.requireEnabled()
         let (p,t,a) = try fixture(),pid = p["id"] as! String,path = a["path"] as! String
         let bytes = Data(repeating:0x61,count:128 * 1024 * 1024),sha = ChecklistCore.hash(bytes)
         try bytes.write(to:URL(fileURLWithPath:path))
@@ -522,6 +552,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testSchemaThreeStartupWithProtectedSnapshotsSeveralProjectsAndCacheArmsWithoutOtherWork() throws {
+        try QualificationSuite.requireEnabled()
         let (p,_,_) = try fixture()
         _ = try fixture(category:"queued")
         _ = try fixture(category:"canceled")

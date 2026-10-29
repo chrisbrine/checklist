@@ -20,7 +20,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from index_store import (read_index_store, repository_path, DECLARATION, DEFINITION,
                          REFERENCE, CALL, CHILDOF, CALLEDBY, CONTAINEDBY,
-                         EXTENDEDBY, CALLABLE_KINDS)
+                         EXTENDEDBY, CALLABLE_KINDS, dispatch_edges)
 
 SCHEMA_VERSION = 1
 
@@ -205,6 +205,8 @@ def index_references(root, identifier, export, walk_stats=None):
                     or roles & (DECLARATION | DEFINITION) and relation['roles'] & CHILDOF
                     and kinds.get(parent) in CALLABLE_KINDS):
                 edges.setdefault(parent, set()).add(usr)
+    for origin, implementation in dispatch_edges(rows):
+        edges.setdefault(origin, set()).add(implementation)
     references, visited, frontier = set(files), set(), seeds
     edge_count = 0
     while frontier:
@@ -439,7 +441,7 @@ def main(argv=None):
                            collect_default_profiles(root, work / 'unattributed-profiles'))
     coverage_build_started = False
     prefix = ['bash', str(args.runner_wrapper.resolve())] if args.runner_wrapper else []
-    common = prefix + ['env', 'LLVM_PROFILE_FILE=' + str(work / 'build-%m-%p.profraw'), 'swift', 'test',
+    common = prefix + ['env', 'LLVM_PROFILE_FILE=' + str(work / 'build-%m-%p.profraw'), 'swift', 'test', '--skip-update',
               '--cache-path', str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
               '--enable-dependency-cache', '--scratch-path', str(scratch)]
     try:
@@ -454,7 +456,7 @@ def main(argv=None):
             index_path = index_scratch / 'index-store'
             # The Xcode SwiftPM backend can ignore -Xswiftc index flags. The
             # native backend honors the explicit path; never change warm scratch.
-            _run(prefix + ['swift', 'build', '--build-tests', '--build-system', 'native',
+            _run(prefix + ['swift', 'build', '--skip-update', '--build-tests', '--build-system', 'native',
                 '--enable-index-store', '--cache-path', str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
                 '--enable-dependency-cache', '--scratch-path', str(index_scratch),
                 '-Xswiftc', '-index-store-path', '-Xswiftc', str(index_path)],
@@ -648,6 +650,10 @@ def main(argv=None):
     temporary = output.with_suffix('.tmp')
     temporary.write_text(json.dumps(result, indent=2) + '\n')
     temporary.replace(output)
+    if result['complete']:
+        from auto_impact_map import atomic_json
+        atomic_json(scratch / 'affected-tests/test-impact-map.json', result)
+        atomic_json(work / 'map.json', result)
     print(json.dumps({'output': str(output), 'complete': result['complete'],
                       'generation_seconds': result['generation_seconds'], 'errors': errors}, indent=2))
     return 1 if errors or test_failures else 0

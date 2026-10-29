@@ -145,12 +145,14 @@ final class MediaListScaleTests: XCTestCase {
         _ = try timed("round view",bounded:false) {try f.router.dbQueue.read {try f.router.mediaRoundView($0,round:round,caller:f.owner)}}
     }
     func testThousandItemPublishedRoundListIsFast() throws {
+        try QualificationSuite.requireEnabled()
         let f = try Fixture(),type = try f.type(lists.schema());var round = try f.round(type)
         let start = Date();try publish(f,&round,count:1_000)
         print(String(format:"CL-307 seed 1000 items: %.1f s",Date().timeIntervalSince(start)))
         try measure(f,round,count:1_000,published:1_000)
     }
     func testFiveThousandItemPublishedRoundListIsFast() throws {
+        try QualificationSuite.requireEnabled()
         let f = try Fixture(),type = try f.type(lists.schema());var round = try f.round(type)
         let start = Date();try publish(f,&round,count:5_000,unpublished:200)
         print(String(format:"CL-307 seed 5000 items: %.1f s",Date().timeIntervalSince(start)))

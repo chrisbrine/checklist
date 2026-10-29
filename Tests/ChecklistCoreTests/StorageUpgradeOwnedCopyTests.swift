@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import Foundation
 import GRDB
@@ -8,6 +9,7 @@ import Darwin
 /// installed-root default, Keychain, native app or fabricated migration ledger.
 final class StorageUpgradeOwnedCopyTests: XCTestCase {
     func testProtectedPreupgradePathsOnOwnedCurrentSchemaCopy() throws {
+        try QualificationSuite.requireEnabled()
         let environment = ProcessInfo.processInfo.environment
         guard let path = environment["CHECKLIST_P340_OWNED_COPY"],
               let outputPath = environment["CHECKLIST_P340_RESULT"] else {

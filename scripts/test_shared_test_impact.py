@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'script'))
-from index_store import DEFINITION, REFERENCE, CALL, CHILDOF, CALLEDBY, CONTAINEDBY, EXTENDEDBY
+from index_store import DEFINITION, REFERENCE, CALL, CHILDOF, CALLEDBY, CONTAINEDBY, EXTENDEDBY, OVERRIDEOF, ACCESSOROF
 from shared_test_impact import shared_source_classes
 
 
@@ -61,11 +61,61 @@ class SharedSourceTests(unittest.TestCase):
                       self.row(self.first, 'core', roles=REFERENCE)]
         self.assertEqual(self.select(), {self.shared: ['ChecklistCoreTests.First']})
 
+    def test_dispatch_walk_follows_protocol_witness_and_framework_type_reference(self):
+        self.rows += [self.row(self.core, 'type', kind=6),
+                      self.row(self.core, 'requirement', kind=16),
+                      self.row(self.shared, 'witness', kind=19, roles=2562,
+                               relations=[self.relation('type', CHILDOF), self.relation('requirement', OVERRIDEOF)]),
+                      self.row(self.first, 'requirement', roles=REFERENCE | CALL, kind=16),
+                      self.row(self.second, 'type', roles=REFERENCE, kind=6)]
+        self.assertEqual(shared_source_classes(self.root, self.export(), [self.shared], include_dispatch=True),
+                         {self.shared: ['ChecklistCoreTests.First', 'ChecklistCoreTests.Second']})
+
+    def test_dispatch_walk_reaches_property_accessor_and_override_body(self):
+        self.rows += [self.row(self.core, 'base-method', kind=16),
+                      self.row(self.core, 'property', kind=19),
+                      self.row(self.shared, 'override', kind=16,
+                               relations=[self.relation('base-method', OVERRIDEOF)]),
+                      self.row(self.shared, 'getter', kind=16,
+                               relations=[self.relation('property', ACCESSOROF)]),
+                      self.row(self.first, 'base-method', roles=REFERENCE | CALL, kind=16),
+                      self.row(self.second, 'property', roles=REFERENCE, kind=19)]
+        self.assertEqual(shared_source_classes(self.root, self.export(), [self.shared], include_dispatch=True),
+                         {self.shared: ['ChecklistCoreTests.First', 'ChecklistCoreTests.Second']})
+
+    def test_xctest_synthesized_constructors_keep_concrete_receivers(self):
+        # Real IndexStore constructor shape from TestStoreTests.swift: the
+        # implicit NSObject.init override must not select unrelated NSObject users.
+        self.rows += [self.row(self.first, 'first-init', kind=22, roles=2818,
+                               relations=[self.relation('NSObject.init', OVERRIDEOF),
+                                          self.relation('first', CHILDOF)]),
+                      self.row(self.second, 'NSObject.init', kind=22, roles=REFERENCE | CALL)]
+        self.assertEqual(shared_source_classes(self.root, self.export(), [self.first], include_dispatch=True),
+                         {self.first: ['ChecklistCoreTests.First']})
+        # An explicit user of this concrete test class remains an actual consumer.
+        self.rows.append(self.row(self.second, 'first', kind=7, roles=REFERENCE))
+        self.assertEqual(shared_source_classes(self.root, self.export(), [self.first], include_dispatch=True),
+                         {self.first: ['ChecklistCoreTests.First', 'ChecklistCoreTests.Second']})
+
+    def test_callable_consumers_do_not_inherit_unrelated_witnesses_in_same_file(self):
+        self.rows += [self.row(self.shared, 'lookup-reader'),
+                      self.row(self.shared, 'unrelated-witness', kind=16,
+                               relations=[self.relation('Equatable.equal', OVERRIDEOF)]),
+                      self.row(self.first, 'Equatable.equal', kind=16, roles=REFERENCE | CALL),
+                      self.row(self.second, 'lookup-reader', roles=REFERENCE | CALL)]
+        precise = {'lookup-reader': []}
+        whole_file = shared_source_classes(self.root, self.export(), [self.shared],
+                                           include_dispatch=True, usr_results=precise)
+        self.assertEqual(whole_file[self.shared], ['ChecklistCoreTests.First', 'ChecklistCoreTests.Second'])
+        self.assertEqual(precise, {'lookup-reader': ['ChecklistCoreTests.Second']})
+
     def test_type_members_do_not_expand_from_type_reference(self):
         self.rows += [self.row(self.core, 'type', kind=6),
                       self.row(self.shared, 'member', relations=[self.relation('type', CHILDOF)]),
                       self.row(self.first, 'type', roles=REFERENCE, kind=6)]
         self.assertEqual(self.select(), {self.shared: []})
+        self.assertEqual(shared_source_classes(self.root, self.export(), [self.shared], include_dispatch=True),
+                         {self.shared: []})
 
     def test_contained_reference_and_test_extension_are_conservative(self):
         extension = 'Tests/ChecklistCoreTests/FirstExtension.swift'

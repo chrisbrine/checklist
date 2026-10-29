@@ -86,6 +86,7 @@ final class TriageListProjectionTests: XCTestCase {
 
 final class TriageListTimingTests: XCTestCase {
     func testProjectedRealSizeTriagesWithinServiceBudget() throws {
+        try QualificationSuite.requireEnabled()
         let f = try TriageListFixture(count:250)
         var samples: [Double] = []
         var load = [Double](repeating:0,count:3);getloadavg(&load,3)

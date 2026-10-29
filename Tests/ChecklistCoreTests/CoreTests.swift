@@ -20,7 +20,7 @@ final class CoreTests: XCTestCase {
         directory = qualificationRoot.appendingPathComponent("CoreTests-" + UUID().uuidString, isDirectory: true)
         router = try TestStore.router(root: directory)
     }
-    override func tearDownWithError() throws { router = nil; try? FileManager.default.removeItem(at:directory) }
+    override func tearDownWithError() throws { try router?.closeStore();router = nil; try? FileManager.default.removeItem(at:directory) }
     @discardableResult func call(_ method: String,_ p: JSON = [:],_ caller: Caller? = nil,_ command: String? = nil) throws -> JSON {
         var p = p
         if method == "work_submit" { p = try fixtureAcceptanceEvidence(router,input:p) }

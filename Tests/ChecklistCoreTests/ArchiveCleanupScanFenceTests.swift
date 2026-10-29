@@ -121,6 +121,7 @@ final class ArchiveCleanupScanFenceTests: XCTestCase {
     /// Scaled timing: 50,000 synthetic records. Before = the unchanged in-writer
     /// scan; after = the archive's writer phase (end of the snapshot scan to reply).
     func testScaledArchiveWriteHoldBeforeAndAfter() throws {
+        try QualificationSuite.requireEnabled()
         let f = try fixture(count:3),filler = try call("task_create",["project_id":f.project["id"]!,"title":"Filler owner"])
         let pid = f.project["id"] as! String,tid = filler["id"] as! String
         try router.dbQueue.writeWithoutTransaction {db in try self.router.withValidatedDomainTransaction(db) {

@@ -1,8 +1,17 @@
 import ChecklistTestSupport
 import XCTest
+import GRDB
 @testable import ChecklistCore
 
 final class EvidenceAuthorityTests: XCTestCase {
+    private static let prepared = TestStore.Template(name: "EvidenceAuthorityTests") { router, workspace in
+        let owner = Caller(role:"owner",installation:"evidence-owner",projectIDs:[])
+        let project = try router.handle(method:"project_create",params:["command_id":uuid(),"name":"Evidence fixture","key_prefix":"E","root_path":workspace.path],caller:owner)["data"] as! JSON
+        let epicOwner = Caller(role:"owner",installation:"required-epic-fixture",projectIDs:[])
+        _ = try router.handle(method:"epic_create",params:["command_id":uuid(),"project_id":project["id"]!,"name":"Fixture tickets"],caller:epicOwner)
+        try router.dbQueue.write {try $0.execute(sql:"INSERT INTO metadata(key,value) VALUES ('test-evidence-project',?)",arguments:[try jsonString(project)])}
+    }
+    private var preparedProject: JSON?
     var directory: URL!,workspace: URL!,router: CommandRouter!
     let owner = Caller(role:"owner",installation:"evidence-owner",projectIDs:[])
     override func setUpWithError() throws {
@@ -14,9 +23,14 @@ final class EvidenceAuthorityTests: XCTestCase {
         directory = parent.appendingPathComponent("EvidenceAuthorityTests-" + UUID().uuidString, isDirectory: true)
         workspace = directory.appendingPathComponent("workspace")
         try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
-        router = try TestStore.router(root:directory.appendingPathComponent("store"))
+        router = try TestStore.router(root:directory.appendingPathComponent("store"),template:Self.prepared,workspace:workspace)
+        preparedProject = try router.dbQueue.read {db in
+            var project = jsonObject(try XCTUnwrap(String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='test-evidence-project'")))
+            project["root_path"] = workspace.resolvingSymlinksInPath().path
+            return project
+        }
     }
-    override func tearDownWithError() throws { router = nil;try? FileManager.default.removeItem(at:directory) }
+    override func tearDownWithError() throws { try router?.closeStore();router = nil;try? FileManager.default.removeItem(at:directory) }
     @discardableResult func call(_ method: String,_ input: JSON,_ caller: Caller? = nil,command: String? = nil) throws -> JSON {
         var p = input
         if method == "work_submit" { p = try fixtureAcceptanceEvidence(router,input:p) }
@@ -24,7 +38,23 @@ final class EvidenceAuthorityTests: XCTestCase {
         if !CommandRouter.readMethods.contains(method) {p["command_id"] = command ?? UUID().uuidString}
         return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:caller ?? owner)["data"] as! JSON
     }
-    func project() throws -> JSON { try call("project_create",["name":"Evidence fixture","key_prefix":"E","root_path":workspace.path]) }
+    func project() throws -> JSON {
+        if var preparedProject {
+            let path = workspace.resolvingSymlinksInPath().path
+            if preparedProject["root_path"] as? String != path {
+                // Some fixtures choose a fresh workspace after setUp. Bind the
+                // still-unused copied project before exposing it, preserving
+                // the original project_create revision/counters and history.
+                try router.dbQueue.write {db in
+                    var stored = try router.record(db,preparedProject["id"] as! String,type:"project")
+                    stored["root_path"] = path;try router.save(db,stored,type:"project")
+                }
+                preparedProject["root_path"] = path
+            }
+            self.preparedProject = nil;return preparedProject
+        }
+        return try call("project_create",["name":"Evidence fixture","key_prefix":"E","root_path":workspace.path])
+    }
     func ready(_ project: JSON,kind: String = "work") throws -> JSON {
         let t = try call("task_create",["project_id":project["id"]!,"title":"Exact evidence","brief":"A bounded observable result","kind":kind])
         return try call("task_edit",["project_id":project["id"]!,"task_id":t["id"]!,"expected_revision":t["revision"]!,"patch":["readiness":"ready"]])

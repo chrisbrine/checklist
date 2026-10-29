@@ -6,6 +6,7 @@ import GRDB
 /// Opt-in measurement uses only an explicitly supplied owned store copy.
 final class TicketCleanupReceiptMeasurementTests: XCTestCase {
     func testOwnedStoreReceiptRead() throws {
+        try QualificationSuite.requireEnabled()
         guard let path = ProcessInfo.processInfo.environment["CHECKLIST_RECEIPT_MEASURE_ROOT"],
               let projectID = ProcessInfo.processInfo.environment["CHECKLIST_RECEIPT_MEASURE_PROJECT_ID"] else {throw XCTSkip("Requires an owned store copy and its project ID")}
         let router = try TestStore.router(root:URL(fileURLWithPath:path))

@@ -250,6 +250,7 @@ extension TicketLifecycleCleanupTests {
         XCTAssertTrue(bool(try read(next),"purged"));XCTAssertFalse(FileManager.default.fileExists(atPath:attachment["path"] as! String))
     }
     func testOversizedSelectedTicketReportsRefusalWithoutBlockingAnotherProject() throws {
+        try QualificationSuite.requireEnabled()
         let (p,t,a) = try fixture(),(q,_,b) = try fixture()
         try write {db in
             try self.router.save(db,["id":uuid(),"project_id":p["id"]!,"task_id":t["id"]!,"revision":1,"body":String(repeating:"selected",count:700000)],type:"message")

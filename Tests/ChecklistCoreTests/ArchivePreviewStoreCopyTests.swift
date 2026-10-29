@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -5,6 +6,7 @@ import GRDB
 /// Opt-in only: the path must name an owned qualification copy, never the installed store.
 final class ArchivePreviewStoreCopyTests: XCTestCase {
     func testCL24PreviewOnOwnedStoreCopy() throws {
+        try QualificationSuite.requireEnabled()
         let env = ProcessInfo.processInfo.environment
         guard let path = env["CHECKLIST_CL150_STORE_COPY"] else { throw XCTSkip("Set CHECKLIST_CL150_STORE_COPY to an owned store copy.") }
         let root = URL(fileURLWithPath:path).resolvingSymlinksInPath()

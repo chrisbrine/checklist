@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import Foundation
 @testable import ChecklistCore
@@ -15,6 +16,7 @@ final class StorageCompactManifestTests: XCTestCase {
     }
 
     func testTwoHundredThousandObjectTemplateFitsManifestBudgetWithoutLosingDescriptors() throws {
+        try QualificationSuite.requireEnabled()
         let manifest = template(200_000,format:2),start = ProcessInfo.processInfo.systemUptime
         let bytes = try StorageSnapshot.encoded(manifest)
         XCTAssertLessThan(bytes.count,32 * 1_048_576,"Repeated capture descriptors must have bounded compact metadata.")

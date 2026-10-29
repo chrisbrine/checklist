@@ -77,6 +77,33 @@ class SelectionTests(unittest.TestCase):
         return selector.select(self.root, self.shared_graph(), paths, self.root / '.build', full=full,
                                impact_map=impact_map or {'complete': False})
 
+    def test_static_runtime_lookup_fallback_survives_shared_index_merge(self):
+        import hashlib
+        path = 'Packages/ChecklistShared/Sources/ChecklistContracts/CommandMethods.swift'
+        test = 'Tests/ChecklistCoreTests/LeafTests.swift'
+        for name, text in [(path, 'public func read() {}'),
+                           (test, 'final class LeafTests: XCTestCase {}')]:
+            source = self.root / name
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(text)
+        export = {'schema_version': 1,
+                  'source_hashes': {name: hashlib.sha256((self.root / name).read_bytes()).hexdigest()
+                                    for name in [path, test, 'Sources/ChecklistCore/NativeOutcomeRecorder.swift',
+                                                 'Sources/ChecklistService/main.swift']},
+                  'occurrences': [
+                      {'file': path, 'usr': 'read', 'name': 'read', 'kind': 12, 'roles': 2},
+                      {'file': test, 'usr': 'class', 'name': 'LeafTests', 'kind': 7, 'roles': 2},
+                      {'file': test, 'usr': 'read', 'name': 'read', 'kind': 12, 'roles': 4}]}
+        measured = self.measured_map({path: {'classes': ['ChecklistCoreTests.LeafTests'],
+                                             'qualification_cases': []}})
+        measured.update(selection_source='index-store', static_fallback_sources=[path])
+        plan = selector.select(self.root, self.shared_graph(), [path], self.root / '.build',
+                               impact_map=measured, shared_index=export)
+        self.assertEqual(plan['shared_index_selections'], {path: ['ChecklistCoreTests.LeafTests']})
+        self.assertIn(path, plan['group_fallback_paths'])
+        self.assertNotIn('ChecklistCoreTests', plan['test_groups'])
+        self.assertIn('runtime-name lookup', plan['fallback_reasons'][path])
+
     def test_shared_source_uses_module_consumers_and_own_package_command(self):
         path = 'Packages/ChecklistShared/Sources/ChecklistContracts/CommandMethods.swift'
         plan = self.shared_plan(path)
@@ -89,7 +116,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(shared[shared.index('--scratch-path') + 1], str(self.root / '.build/packages/ChecklistShared'))
         self.assertIn('--enable-dependency-cache', shared)
         self.assertIn('HumanClaimsKeychainTests', shared)
-        self.assertIn(shared, plan['commands'])
+        self.assertTrue(any(command[-len(shared):] == shared for command in plan['commands']))
         self.assertNotIn('^ChecklistSharedTests\\.', plan['swift_commands'][0])
 
     def test_shared_measured_source_keeps_own_tests_and_narrows_root_classes(self):
@@ -216,7 +243,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(plan['qualification_tests'], [case])
         self.assertEqual(plan['qualification_reasons'][case], [path])
         self.assertEqual(plan['group_fallback_paths'], [])
-        self.assert_case_runs(plan, case)
+        self.assert_case_deferred(plan, case)
 
     def test_mapped_source_never_adds_unmeasured_module_consumers(self):
         path = 'Sources/ChecklistCore/Leaf.swift'
@@ -259,7 +286,7 @@ class SelectionTests(unittest.TestCase):
              patch.object(selector, 'load_impact_map', return_value=(measured, {'state': 'current'})), \
              redirect_stdout(output):
             selector.main(['--root', str(self.root), '--paths', referenced])
-        self.assertIn('Unmeasurable class index-store references: ' + group + ' <- ' + referenced,
+        self.assertIn('Compiler-index class references: ' + group + ' <- ' + referenced,
                       output.getvalue())
 
     def test_synthetic_index_export_selects_store_copy_classes_and_indirect_receipt(self):
@@ -631,8 +658,25 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(path=path):
                 plan = self.plan(path)
                 self.assertEqual(plan['python_tests'], sorted([expected] + (
-                    ['scripts/test_shared_test_impact.py'] if path == 'script/index_store.py' else [])))
+                    ['scripts/test_shared_test_impact.py', 'scripts/test_auto_impact_map.py'] if path == 'script/index_store.py' else [])))
                 self.assertFalse(plan['swift_commands'])
+
+    def test_executable_defaults_have_timing_guard_but_qualification_keeps_its_budget(self):
+        plan = self.plan('Sources/ChecklistCore/NativeOutcomeRecorder.swift')
+        defaults = plan['default_swift_commands']
+        guarded = plan['guarded_default_commands']
+        self.assertEqual(len(defaults), len(guarded))
+        for raw, command in zip(defaults, guarded):
+            self.assertEqual(command[:3], ['python3', 'script/check_test_timings.py', 'run'])
+            self.assertEqual(command[-len(raw):], raw)
+            self.assertIn(command, plan['commands'])
+            self.assertNotIn(raw, plan['commands'])
+        for command in plan['qualification_commands'] + plan['timing_commands']:
+            self.assertIn(command, plan['commands'])
+            self.assertNotIn('script/check_test_timings.py', command)
+        for command in plan['swift_commands']:
+            if 'swift' in command:
+                self.assertIn('--skip-update', command)
 
     def test_round_and_full_use_the_same_pinned_python(self):
         prefix = ['uv', 'run', '--no-project', '--python', '3.12',
@@ -640,7 +684,7 @@ class SelectionTests(unittest.TestCase):
         for full in [False, True]:
             with self.subTest(full=full):
                 plan = self.plan('scripts/test_test_instances.py', full=full)
-                commands = [command for command in plan['commands'] if command not in plan['swift_commands']]
+                commands = [command for command in plan['commands'] if command not in plan['swift_commands'] and command not in plan['guarded_default_commands']]
                 self.assertEqual(len(commands), len(plan['python_tests']) + 1)
                 for command in commands:
                     self.assertEqual(command[:-1], prefix)
@@ -768,7 +812,8 @@ class SelectionTests(unittest.TestCase):
         path.write_text('func ' + method + '() throws {\n try QualificationSuite.requireEnabled()\n}')
         plan = self.plan(path.relative_to(self.root).as_posix())
         self.assertIn('ChecklistCoreTests.MediaDecisionTests/' + method, plan['qualification_tests'])
-        self.assertTrue(plan['qualification_commands'])
+        self.assertTrue(plan['qualification_deferred'])
+        self.assertEqual(plan['qualification_commands'], [])
 
     def test_full_default_overrides_manifest_auto_qualification(self):
         plan = self.plan('Package.swift', full=True)
@@ -844,7 +889,8 @@ class SelectionTests(unittest.TestCase):
     def test_ipc_timing_qualification_follows_ipc_source(self):
         plan = self.plan('Sources/ChecklistIPC/ChecklistClient.swift')
         self.assertIn('ChecklistIPCTests.LongCommandTests/testCommandLongerThanOldDeadlineReturnsCommittedResultThroughRealClient', plan['qualification_tests'])
-        self.assertTrue(plan['qualification_commands'])
+        self.assertTrue(plan['qualification_deferred'])
+        self.assertEqual(plan['qualification_commands'], [])
 
     def test_changed_app_timing_fixture_selects_its_case(self):
         path = self.root / 'Tests/ChecklistAppTests/IsolatedDefaultsTests.swift'
@@ -886,6 +932,14 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(narrowed['timing_tests'], [])
         self.assertEqual(narrowed['timing_commands'], [])
 
+    def assert_case_deferred(self, plan, case):
+        self.assertIn(case, plan['qualification_tests'])
+        self.assertTrue(plan['qualification_deferred'])
+        self.assertEqual(plan['qualification_execution_tests'], [])
+        self.assertEqual(plan['qualification_commands'], [])
+        self.assertFalse(plan['qualification'])
+        self.assertIn(case, plan['skip'])
+
     def assert_case_runs(self, plan, case, commands_key='qualification_commands'):
         for command in plan[commands_key]:
             filters = [command[i + 1] for i, arg in enumerate(command) if arg == '--filter']
@@ -905,11 +959,11 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(default['qualification_commands'], [])
         qualified = self.plan(full=True, qualification=True)
         self.assert_case_runs(qualified, case)
-        # This ungated real-size fixture also runs when its own source changes.
+        # Its changed source retains candidates but cannot opt itself in.
         path = self.root / 'Tests/ChecklistCoreTests/StorageCompactManifestTests.swift'
         path.parent.mkdir(parents=True)
         path.write_text('final class StorageCompactManifestTests: XCTestCase { func ' + case.split('/')[1] + '() throws {} }')
-        self.assert_case_runs(self.plan(path.relative_to(self.root).as_posix()), case)
+        self.assert_case_deferred(self.plan(path.relative_to(self.root).as_posix()), case)
         self.assertEqual(len(set(selector.ISOLATED_TESTS)), len(selector.ISOLATED_TESTS))
         self.assertFalse(set(selector.ISOLATED_TESTS) & set(selector.QUALIFICATION_CASES))
 
@@ -922,16 +976,16 @@ class SelectionTests(unittest.TestCase):
         path = self.root / 'Tests/ChecklistCoreTests/ScreenReadQueryPlanTests.swift'
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('final class ScreenReadQueryPlanTests: XCTestCase { func testRealSizeScreenReadQueryPlans() throws {} }')
-        self.assert_case_runs(self.plan(path.relative_to(self.root).as_posix()), case)
-        self.assert_case_runs(self.plan('Sources/ChecklistCore/WorkspacePageRead.swift'), case)
+        self.assert_case_deferred(self.plan(path.relative_to(self.root).as_posix()), case)
+        self.assert_case_deferred(self.plan('Sources/ChecklistCore/WorkspacePageRead.swift'), case)
 
-    def test_manifest_production_change_runs_real_size_qualification(self):
+    def test_manifest_production_change_defers_real_size_qualification(self):
         case, = selector.REAL_SIZE_TESTS
         plan = self.plan('Sources/ChecklistCore/StorageCompactManifest.swift')
-        self.assertTrue(plan['qualification'])
+        self.assertFalse(plan['qualification'])
         self.assertIn(case, plan['qualification_tests'])
-        self.assertNotIn(case, plan['skip'])
-        self.assert_case_runs(plan, case)
+        self.assertIn(case, plan['skip'])
+        self.assert_case_deferred(plan, case)
         self.assertIn('^' + re.escape(case) + '(?:/|$)', plan['default_swift_commands'][0])
         self.assertTrue(plan['timing_deferred'])
         self.assertEqual(plan['timing_commands'], [])
@@ -949,10 +1003,12 @@ class SelectionTests(unittest.TestCase):
         for path in ['Tests/ChecklistAppTests/ScreenTimingTests.swift',
                      'Tests/ChecklistAppTests/PreviewAvailabilityTests.swift']:
             changed = self.plan(path)
-            self.assertFalse(changed['timing_deferred'])
+            self.assertTrue(changed['timing_deferred'])
+            self.assertEqual(changed['timing_commands'], [])
+            qualified = self.plan(path, qualification=True)
             for case in expected:
                 if '.HumanClaimsKeychainTests/' not in case:
-                    self.assert_case_runs(changed, case, 'timing_commands')
+                    self.assert_case_runs(qualified, case, 'timing_commands')
 
     def test_full_qualification_mode_is_explicit_or_last_round_and_not_target_limited(self):
         for options, mode in [({'qualification': True}, 'requested-full'),
@@ -1058,7 +1114,7 @@ class SelectionTests(unittest.TestCase):
         gated = []
         for source in (root / 'Tests').rglob('*.swift'):
             gated.extend(re.findall(r'func (test\w+)\(\) throws \{\s+try QualificationSuite.requireEnabled\(\)', source.read_text()))
-        registered = [name.split('/')[1] for name in selector.QUALIFICATION_TESTS]
+        registered = [name.split('/')[1] for name in selector.QUALIFICATION_CASES]
         self.assertCountEqual(gated, registered)
         self.assertEqual(len(set(registered)), len(registered))
 

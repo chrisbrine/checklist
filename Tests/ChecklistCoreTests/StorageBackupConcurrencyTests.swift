@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import Foundation
 import GRDB
@@ -49,6 +50,7 @@ final class StorageBackupConcurrencyTests: XCTestCase {
     }
 
     func testNotesEditsAndNewImportsFinishWhileCopyAndVerificationArePaused() throws {
+        try QualificationSuite.requireEnabled()
         let f = try StorageFixture(),p = try f.project(),t = try f.task(p),router = f.router!
         let source = f.workspace.appendingPathComponent("original.bin")
         try Data(repeating:7,count:128 * 1024).write(to:source)

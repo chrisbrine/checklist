@@ -11,16 +11,42 @@ import ChecklistProviders
 private final class TestStoreBundleMarker: NSObject {}
 
 public enum TestStore {
+    /// An immutable, populated unit fixture. Its workspace is always a sibling
+    /// of the template store; copies keep that separation and private bytes.
+    public final class Template: @unchecked Sendable {
+        fileprivate let source: Result<URL, Error>
+        public init(name: String, prepare: @escaping (CommandRouter, URL) throws -> Void) {
+            source = Result {
+                try TestStore.publishTemplate(name: name) { pending in
+                    let workspace = pending.appendingPathComponent("workspace", isDirectory: true)
+                    try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+                    let router = try CommandRouter(root: pending.appendingPathComponent("store"))
+                    do {
+                        try router.dbQueue.writeWithoutTransaction { try $0.execute(sql: "PRAGMA synchronous=NORMAL") }
+                        try prepare(router, workspace)
+                        try router.dbQueue.write {
+                            try $0.execute(sql: "INSERT INTO metadata(key,value) VALUES (?,?)",
+                                           arguments: [TestStore.workspaceKey, workspace.resolvingSymlinksInPath().path])
+                        }
+                        try router.closeStore()
+                    } catch { try? router.closeStore(); throw error }
+                }
+            }
+        }
+    }
+    private static let workspaceKey = "test-store-template-workspace"
+
     public static func router(root: URL, serviceLease: StorageServiceLease? = nil,
                               cliCommand: String = "/Applications/Checklist.app/Contents/MacOS/checklist",
                               providerPlugins: ProviderPluginRegistry = .bundled,
-                              durable: Bool = ProcessInfo.processInfo.environment["CHECKLIST_QUALIFICATION"] == "1") throws -> CommandRouter {
+                              durable: Bool = ProcessInfo.processInfo.environment["CHECKLIST_QUALIFICATION"] == "1",
+                              template: Template? = nil, workspace: URL? = nil) throws -> CommandRouter {
         let anchored = root.resolvingSymlinksInPath()
         // Reopen existing fixtures through production admission; never replace data.
         if !FileManager.default.fileExists(atPath: anchored.appendingPathComponent("checklist.sqlite").path),
            !FileManager.default.fileExists(atPath: anchored.appendingPathComponent(StoreIdentityReceipt.fileName).path) {
             try StoreDirectory(root: anchored).requireFreshScaffoldingOnly()
-            try seed(anchored)
+            try seed(anchored, template: template, workspace: workspace)
         }
         let router = try CommandRouter(root: root, serviceLease: serviceLease, cliCommand: cliCommand, providerPlugins: providerPlugins)
         if !durable {
@@ -47,7 +73,7 @@ public enum TestStore {
     /// The linked test bundle identity avoids reusing a seed after a rebuild.
     /// A single lock protects template publication across SwiftPM's test processes;
     /// no test writes a published template, and every destination is private.
-    private static func template() throws -> URL {
+    private static func publishTemplate(name: String, prepare: (URL) throws -> Void) throws -> URL {
         guard let executable = Bundle(for: TestStoreBundleMarker.self).executableURL else {
             throw CocoaError(.fileNoSuchFile)
         }
@@ -55,7 +81,7 @@ public enum TestStore {
         guard let modified = attributes[.modificationDate] as? Date, let size = attributes[.size] as? NSNumber else {
             throw CocoaError(.fileReadUnknown)
         }
-        let key = "\(executable.path):\(modified.timeIntervalSince1970):\(size)"
+        let key = "\(executable.path):\(modified.timeIntervalSince1970):\(size):\(name)"
         let digest = SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
         let cache = templateRoot.appendingPathComponent(digest, isDirectory: true)
         try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -68,8 +94,7 @@ public enum TestStore {
         if FileManager.default.fileExists(atPath: ready.path) { return ready }
         let pending = cache.appendingPathComponent("pending-" + UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: pending) }
-        let router = try CommandRouter(root: pending)
-        try router.closeStore() // Close/checkpoint before publishing copyable database bytes.
+        try prepare(pending) // Close/checkpoint before publishing copyable database bytes.
         try FileManager.default.moveItem(at: pending, to: ready)
         return ready
     }
@@ -77,17 +102,43 @@ public enum TestStore {
     // The loaded test image and its environment are fixed for this process.
     // Swift's lazy static initialization also shares publication across local
     // fixture threads; independent workers still take the publication file lock.
-    private static let publishedTemplate = Result { try template() }
+    private static let publishedTemplate = Result {
+        try publishTemplate(name: "empty") { pending in
+            let router = try CommandRouter(root: pending)
+            try router.closeStore()
+        }
+    }
 
-    private static func seed(_ root: URL) throws {
-        let source = try publishedTemplate.get()
+    private static func clone(_ source: URL, to destination: URL) throws {
+        let kind = try source.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .isRegularFileKey])
+        if kind.isDirectory == true && kind.isSymbolicLink != true {
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            for child in try FileManager.default.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) {
+                try clone(child, to: destination.appendingPathComponent(child.lastPathComponent))
+            }
+        } else if kind.isSymbolicLink == true {
+            try FileManager.default.copyItem(at: source, to: destination)
+        } else if kind.isRegularFile == true {
+            if clonefile(source.path, destination.path, 0) != 0 {
+                guard [ENOTSUP, EXDEV, ENOSYS, EINVAL].contains(errno) else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                try FileManager.default.copyItem(at: source, to: destination)
+            }
+        } else { throw CocoaError(.fileReadUnsupportedScheme) }
+    }
+
+    private static func seed(_ root: URL, template: Template?, workspace: URL?) throws {
+        let source: URL
+        if let template {
+            guard let workspace else { throw CocoaError(.fileNoSuchFile) }
+            let prepared = try template.source.get()
+            source = prepared.appendingPathComponent("store")
+            try clone(prepared.appendingPathComponent("workspace"), to: workspace)
+            try clone(source.appendingPathComponent("objects"), to: root.appendingPathComponent("objects"))
+        } else { source = try publishedTemplate.get() }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let database = root.appendingPathComponent("checklist.sqlite")
         let original = source.appendingPathComponent("checklist.sqlite")
-        if clonefile(original.path, database.path, 0) != 0 {
-            guard [ENOTSUP, EXDEV, ENOSYS, EINVAL].contains(errno) else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-            try FileManager.default.copyItem(at: original, to: database)
-        }
+        try clone(original, to: database)
         let identity = StoreIdentityReceipt(format_version: 1, logical_store_id: UUID().uuidString.lowercased(),
                                           incarnation: UUID().uuidString.lowercased(), database_generation: 1,
                                           schema_revision: SchemaMigrations.currentSchema, state: "ready")
@@ -101,6 +152,26 @@ public enum TestStore {
         let queue = try DatabaseQueue(path: database.path, configuration: configuration)
         do {
             try queue.write { db in
+                if template != nil, let workspace {
+                    let oldWorkspace = try String.fetchOne(db, sql: "SELECT value FROM metadata WHERE key=?", arguments: [workspaceKey]) ?? ""
+                    let oldIncarnation = try String.fetchOne(db, sql: "SELECT value FROM metadata WHERE key='incarnation'")
+                    guard !oldWorkspace.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
+                    // Relocate only canonical workspace authority. Descriptions,
+                    // evidence and command/event history remain literal source bytes.
+                    for row in try Row.fetchAll(db, sql: "SELECT id,type,data FROM records WHERE type IN ('project','storage_job')") {
+                        var value = jsonObject(row["data"])
+                        let type: String = row["type"]
+                        if type == "project", let path = value["root_path"] as? String,
+                           path == oldWorkspace || path.hasPrefix(oldWorkspace + "/") {
+                            value["root_path"] = workspace.resolvingSymlinksInPath().path + path.dropFirst(oldWorkspace.count)
+                        }
+                        if type == "storage_job", value["incarnation"] as? String == oldIncarnation {
+                            value["incarnation"] = identity.incarnation
+                        }
+                        try db.execute(sql: "UPDATE records SET data=? WHERE id=?", arguments: [try jsonString(value), row["id"] as String])
+                    }
+                    try db.execute(sql: "DELETE FROM metadata WHERE key=?", arguments: [workspaceKey])
+                }
                 try db.execute(sql: "UPDATE metadata SET value=? WHERE key='incarnation'", arguments: [identity.incarnation])
                 try db.execute(sql: "UPDATE metadata SET value=? WHERE key='store_identity'", arguments: [String(decoding: try identity.encoded(), as: UTF8.self)])
                 try db.execute(sql: "DELETE FROM metadata WHERE key='cursor_seal_key'")

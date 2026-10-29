@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import Foundation
 import GRDB
@@ -14,7 +15,7 @@ final class MediaFrozenIntakeTests: XCTestCase {
         var worker: Caller
         let project: String
         init() throws {
-            storage = try StorageFixture()
+            storage = try StorageFixture(fast:true)
             base = storage.base;workspace = storage.workspace;root = storage.root
             router = storage.router!;owner = storage.owner
             project = try storage.project()["id"] as! String
@@ -174,6 +175,7 @@ final class MediaFrozenIntakeTests: XCTestCase {
         XCTAssertTrue(try f.rows("attachment").isEmpty);XCTAssertTrue(try f.rows("media_item").isEmpty)
     }
     func testUnsupportedSparseSourcesConsumeAggregatePreviewBudgetWithoutWrites() throws {
+        try QualificationSuite.requireEnabled()
         let f = try Fixture(),round = try f.round(f.type(imageSchema()))
         let sources: [JSON] = try (0..<5).map {index in
             let path = f.workspace.appendingPathComponent("unsupported-\(index).bin")

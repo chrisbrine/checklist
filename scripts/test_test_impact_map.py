@@ -170,6 +170,23 @@ class CoverageMapTests(unittest.TestCase):
         self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export),
                          {selected, test})
 
+    def test_index_walk_reaches_protocol_witness_override_and_framework_receiver(self):
+        used = 'Sources/ChecklistCore/Used.swift'
+        witness = 'Sources/ChecklistCore/Unused.swift'
+        test = 'Tests/ChecklistCoreTests/CoreTests.swift'
+        export = self.class_index(
+            self.index_occurrence(used, 'Concrete', 'Concrete', kind=6),
+            self.index_occurrence(used, 'requirement', 'body', kind=19),
+            self.index_occurrence(witness, 'Concrete.body', 'body', kind=19, roles=2562,
+                                  relations=[{'usr': 'requirement', 'roles': 2048},
+                                             {'usr': 'Concrete', 'roles': 512}]),
+            self.index_occurrence(test, 'requirement', 'body', roles=36, kind=19))
+        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export),
+                         {used, witness, test})
+        export['occurrences'][-1] = self.index_occurrence(test, 'Concrete', 'Concrete', roles=4, kind=6)
+        self.assertEqual(impact.index_references(self.root, 'ChecklistCoreTests.CoreTests', export),
+                         {used, witness, test})
+
     def test_extension_type_alone_does_not_expand_to_all_its_files(self):
         used = 'Sources/ChecklistCore/Used.swift'
         unused = 'Sources/ChecklistCore/Unused.swift'

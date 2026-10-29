@@ -10,7 +10,7 @@ python3 script/affected_tests.py --paths-file changed-paths.txt --scratch-path <
 
 Script tests in both round checks and the background full suite use **uv-managed CPython 3.12**, selected explicitly with `uv run --no-project --python 3.12 --with jsonschema --with pyyaml python <script>`. The selector emits this same interpreter and dependency prefix for every Python test and `validate-plan.py`, including in `--full` mode. Use the emitted commands for both runs; an unpinned `uv run` or a bare `python3` test command can select a different interpreter. The `python3` commands above only launch the planner.
 
-The script prints commands; it does not execute them. JSON contains argv arrays in `commands`, plus `test_targets`, `affected_targets`, `python_tests`, `skip` and `fallback_paths`. `--paths-file -` reads newline-delimited paths from stdin. Paths are relative to the repository root. `--base` includes committed changes since the base, staged and unstaged changes, deletions, both rename endpoints and untracked files. Supply the union of all tickets' changed paths when planning a combined round.
+The script prints check commands and never executes test methods. It restores or regenerates its local cache from retained coverage or compiler-index evidence; stale compiler inputs can trigger one incremental native index build through a configured shared build-cap wrapper, using the assigned warm scratch path. JSON contains argv arrays in `commands`, plus `test_targets`, `affected_targets`, `python_tests`, `skip` and `fallback_paths`. `--paths-file -` reads newline-delimited paths from stdin. Paths are relative to the repository root. `--base` includes committed changes since the base, staged and unstaged changes, deletions, both rename endpoints and untracked files. Supply the union of all tickets' changed paths when planning a combined round.
 
 ## Target selection
 
@@ -74,19 +74,19 @@ alongside the parallel pass. `TIMING_TESTS` lists the ungated default-suite meth
 that assert a wall-clock budget of any size: the
 parallel pass skips them, and one separate `--num-workers 1` SwiftPM invocation
 (JSON `timing_commands` and `timing_tests`) runs them with unchanged assertions in
-qualification runs (`--qualification` or the final-round coverage refresh) and whenever a
-changed path is the test file of one of those classes. Ordinary default and affected
-plans skip them and report `timing_deferred: true`, because wall-clock budgets are
+qualification runs (`--qualification` or the final-round coverage refresh). Ordinary
+default and affected plans, including changes to a timing fixture itself, skip them
+and report `timing_deferred: true`, because wall-clock budgets are
 performance checks that belong with the opt-in qualification level (CL-266 item 2); `scripts/test_affected_tests.py` fails when such a
 test is in neither `TIMING_TESTS` nor the gated `QUALIFICATION_TESTS` (CL-275).
 The guard follows same-file helpers and local clock-derived values/sample arrays,
 including `XCTAssertTrue` upper bounds. It has no size floor: 5-second termination,
 8-second Git timeout and 300 ms cached-return assertions are isolated too.
-The media scale timing group includes `MediaListScaleTests` methods
+All Core timing methods are now environment-gated qualification (CL-358), including `MediaListScaleTests` methods
 `testThousandItemPublishedRoundListIsFast` and
 `testFiveThousandItemPublishedRoundListIsFast`, plus
 `MediaPreparationScaleTests/testLargeProjectPreparationReadsTouchedRecordsAndHoldsAtomicityReplayAndFencing`.
-The owned-copy preview/screen measurements also stay isolated and keep their
+The owned-copy preview/screen measurements also stay opt-in and keep their
 explicit private-input gates. Two cleanup-deadline checks are conservatively
 isolated because they compare a deadline with the real current time; injected
 clock/configuration assertions stay in the default suite. Core and MCPServer retain parallel workers for
@@ -139,13 +139,17 @@ use the planner to keep it out of a fast default run. The planner's single
 with this variable enabled. Scale/soak probes therefore do not compete with the
 default unit workers. The historical `default_swift_commands`/`swift_commands` fields contain the
 ordered native XCTest commands as well as SwiftPM argv arrays.
-JSON `qualification_commands` identifies qualification argv arrays;
+JSON `qualification_commands` identifies explicitly requested qualification argv arrays;
 they are also included in `swift_commands`/`commands`. The aggregate `skip` list
 names cases omitted across the whole plan, including qualification commands.
 The sustained-writer soak defaults to 360 seconds when qualification is enabled;
 `CL193_SOAK_SECONDS` may set a longer measurement (minimum 180 seconds).
-Affected qualification commands include only registered cases in the selected test targets,
-including App and IPC timing cases when their production dependencies change.
+Ordinary affected plans report only candidate cases for the changed paths; they
+execute no qualification or timing commands. `qualification_deferred` is true,
+`qualification_tests` and `qualification_reasons` retain the candidate inventory,
+and `qualification_execution_tests` is empty. Run the opt-in qualification group
+once per pass with `--qualification` or the final-round coverage refresh
+`--last-round`; changes to test fixtures cannot opt themselves in (CL-358).
 Small correctness cases in the same classes still run by default. Owned-copy
 qualifiers additionally require their existing explicitly selected private-copy
 inputs; the switch never selects a live store or fabricates those inputs.
@@ -168,7 +172,7 @@ or establish that a branch executed. Lexical symbol matching is not used.
 They are selected only when one of those indexed source files changes;
 `coverage_unmeasurable_classes` reports the selecting paths and `test_group_sources`
 names `index-store` for each selected class. No module closure adds unmeasured
-classes or qualification cases for a mapped file. Skipped coverage is never
+classes or qualification cases for a measured mapped file. Skipped coverage is never
 presented as measured coverage. The owner-forbidden keychain class uses the same
 index path without executing it. Missing index dependencies keep generation
 incomplete. Each class records a `walk` with `complete`, visited USR `nodes`,
@@ -183,10 +187,83 @@ The map records its Git commit, UTC generation timestamp, elapsed generation
 seconds, test inventories, input hashes and per-file source hashes. It is ignored
 local build output, never a checked-in declaration. The planner accepts a complete
 map for 24 hours by default (`--map-max-age-hours` overrides this), only from an
-ancestor commit with unchanged build inputs, unnamed runtime fixtures/resources and nested-package tests. Changed test-tree code and runtime inputs with named readers do not invalidate the map; the planner selects them directly (see below) and `impact_map_status.changed_test_inputs` lists them. Other dirty fixture data without a captured fingerprint conservatively falls back until refreshed after commit. Missing, incomplete, old,
-malformed or incompatible maps use module fallback and report the reason in
-`impact_map_status`. Changed source files already in a valid map keep measured
+ancestor commit with unchanged build inputs, unnamed runtime fixtures/resources and nested-package tests. Changed test-tree code and runtime inputs with named readers do not invalidate the map; the planner selects them directly (see below) and `impact_map_status.changed_test_inputs` lists them. Other dirty fixture data without a captured fingerprint conservatively falls back until refreshed after commit. Missing or stale maps first try the automatic recovery below. Incomplete,
+malformed or incompatible maps retain module fallback when no compatible evidence
+can regenerate them, with the reason in `impact_map_status`. Changed source files already in a valid map keep measured
 selection; `git diff` finds new files and untracked additions for fallback.
+
+### Automatic cache recovery (CL-358)
+
+A missing or stale map now triggers recovery before planning. A compatible copy
+at `<scratch>/affected-tests/test-impact-map.json` restores a missing checkout
+cache. Otherwise the planner derives a new map from a saved same-build semantic
+index: pass `--impact-index <index-export.json>`, or retain it at
+`<scratch>/affected-tests/index-export.json` or
+`.local/build/test-impact-index.json`. Existing generator profile directories are
+also searched. When no compatible evidence exists, a configured `--runner-wrapper`
+or `CHECKLIST_SWIFT_RUNNER` permits one incremental native `swift build
+--build-tests --build-system native --enable-index-store` in the same assigned
+scratch path, with `--skip-update` and the shared dependency cache flags. A native
+module cache and build database must already exist; the planner refuses a cold
+build. It then exports the current compiler index and regenerates the map. No test
+methods execute. `affected-tests/index-refresh.log` and its status receipt retain
+the command, timing and failure; identical failed inputs are not retried silently.
+`impact_map_status.regeneration` records restoration, regeneration, or the exact
+reason and refresh instruction when module fallback remains necessary.
+
+Index-derived maps have schema 2 and `selection_source: "index-store"`; their
+`measured_classes` and `measured_qualification_cases` are empty. Their source
+entries contain conservative class reachability through the same CL-294 compiler
+USR graph, plus source-inspection readers. A qualifying class conservatively
+selects its registered qualification cases; this is static reachability, not
+execution coverage. Schema 2 additionally follows override/protocol-witness, accessor and specialization
+relations. Referencing a concrete type conservatively includes its witnesses,
+because framework/generic calls may occur outside the repository index; unrelated
+ordinary members are not expanded. Concrete XCTest-class overrides, including
+synthesized XCTestCase/NSObject constructors, retain their receiver references
+without selecting unrelated users of the external base implementation. Runtime
+class/selector-name lookup readers start at the actual call's containing USR,
+rather than every definition sharing that file. They conservatively accompany
+mapped sources that can be loaded through their target dependencies or named
+runtime-consumer links. Independent test bundles do not load one another; explicit
+source-inspection readers are recorded separately. Same-target runtime fixtures
+still retain these readers. When an opaque lookup has no indexed call, the file's
+consumers remain conservative. Directly editing a production lookup implementation
+keeps module fallback. Current XCTest declarations and the
+root-target source inventory must be present in the index. Package manifests
+remain separately fingerprinted build inputs; dependency-package Tests remain
+snapshotted source inputs and run through their separate package commands, because
+a root `--build-tests` indexes dependency Sources but does not build those test targets. Production source and manifest/lockfile hashes must match exactly. Only explicitly
+selected test-tree edits may differ; an existing production file can add an
+extension, conformance or override unseen by the old graph, so selected production
+drift also keeps module fallback until a current export exists. Missing, malformed,
+unrelated stale inputs or missing class declarations preserve module fallback.
+Unindexed files without declarations also retain their normal fallback. Unselected
+test/source drift invalidates a static map. A selected changed shared test helper
+keeps its whole owning target when its indexed consumers are stale.
+
+`script/index_store.py` exports manifest hashes and writes a sibling
+`index-inputs.json` receipt for the explicitly selected completed build. If the
+portable export is later missing, recovery can reread those raw stores only when
+their signature still matches the receipt; it retains the original compiled
+source hashes even if requested edits are now dirty. A raw store without that
+receipt is insufficient: hashing sources when reading an old store cannot prove
+what was compiled. As before, export only from the same completed index build.
+`clean_builds.py` explicitly retains the canonical map, index export and input
+receipt. Profile directories keep their existing cleanup policy; no broad profile
+retention exemption is added. The independent scratch cache survives source-only
+workspace synchronization.
+
+`commands` wraps each default Swift/native invocation with
+`script/check_test_timings.py run`, which retains a log, load/wall timing receipt
+and SwiftPM per-case XML where applicable. It warns loudly above one second per
+default method or the 180-second default Core budget; `--strict` makes either a
+failure. `guarded_default_commands` names those executable wrappers; the existing
+`swift_commands` and `default_swift_commands` remain raw argv for inspection.
+Qualification and isolated timing commands retain their own intended budgets.
+Some SwiftPM parallel XML omits skip metadata. In that case the guard reports
+invocations with execution/skip counts unknown and labels durations as runner
+process time; it never treats an empty XML case as proof that assertions ran.
 
 ### Changed test files and new sources (CL-299)
 
@@ -297,7 +374,7 @@ same completed build inputs: read-time hashes do not establish compile-time
 freshness. The export remains local evidence.
 
 The refresh restores the ordinary uninstrumented build before publishing its map, so later affected tests and production builds reuse that configuration. No tests execute during either build-only filter. Coverage collection and this configuration restoration cost a full refresh and are outside the 1–2 minute
-affected-plan goal. A genuinely affected 360-second soak also cannot meet that
+affected-plan goal. An explicitly requested 360-second soak also cannot meet that
 goal; retain its real fixture and report its measured cost. Test filters govern
 execution, while SwiftPM may compile dependent modules incrementally.
 
@@ -336,7 +413,7 @@ narrow groups. Repository input consumers still supplement that selection.
 Generated coverage groups include classes in dependent targets. Mixed paths
 union those groups; an unmapped input broadens only the targets in that input's
 module closure. `default_swift_commands` is the ordinary component and
-`qualification_commands` is the affected scale/soak component, except during a
+`qualification_commands` is the opt-in scale/soak component, except during a
 final-round coverage refresh as described above. Changes to the observation
 environment other than the test files and named runtime inputs above require a
 refresh or conservative fallback.

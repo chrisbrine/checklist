@@ -7,7 +7,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from index_store import (repository_path, DECLARATION, DEFINITION, REFERENCE, CALL,
-                         CHILDOF, CALLEDBY, CONTAINEDBY, EXTENDEDBY, CALLABLE_KINDS)
+                         CHILDOF, CALLEDBY, CONTAINEDBY, EXTENDEDBY, CALLABLE_KINDS,
+                         dispatch_edges)
 
 
 def _test_classes(root):
@@ -29,7 +30,7 @@ def _test_classes(root):
     return classes
 
 
-def shared_source_classes(root, export, paths):
+def shared_source_classes(root, export, paths, include_dispatch=False, usr_results=None):
     """Return root Target.Class consumers, or reject an incomplete/stale export.
 
     This is index_references' finite declaration graph in reverse, built once
@@ -127,9 +128,27 @@ def shared_source_classes(root, export, paths):
                     and kinds.get(parent) in CALLABLE_KINDS):
                 callers.setdefault(usr, set()).add(parent)
 
-    result = {}
-    for path in sorted(paths):
-        visited, frontier, consumers = set(), set(definitions[path]), set()
+    # XCTest runs each concrete class independently. Changing one class's
+    # synthesized constructor or lifecycle override cannot change unrelated
+    # uses of the XCTestCase/NSObject base implementation.
+    # Keep its concrete receiver edges (including references from subclasses),
+    # without treating that implementation as a replacement for the base method.
+    test_types = {usr for usrs in class_usrs.values() for usr in usrs}
+    test_members = {item['usr'] for _, item in rows
+                    if item['roles'] & (DECLARATION | DEFINITION)
+                    and any(relation['roles'] & CHILDOF and relation['usr'] in test_types
+                            for relation in item.get('relations', []))}
+    if include_dispatch:
+        # Protocol witnesses/overrides are definitions related to the requirement
+        # USR. Calls through that requirement can reach every implementation.
+        # An external generic/framework caller is absent from this repository's
+        # index: referencing a concrete type can invoke its witnesses there too.
+        for origin, implementation in dispatch_edges(rows):
+            if implementation not in test_members or origin in test_types:
+                callers.setdefault(implementation, set()).add(origin)
+
+    def walk(frontier):
+        visited, frontier, consumers = set(), set(frontier), set()
         while frontier:
             usr = frontier.pop()
             if usr in visited:
@@ -137,5 +156,10 @@ def shared_source_classes(root, export, paths):
             visited.add(usr)
             consumers.update(seeds.get(usr, ()))
             frontier.update(callers.get(usr, set()) - visited)
-        result[path] = sorted(consumers)
+        return sorted(consumers)
+
+    result = {path: walk(definitions[path]) for path in sorted(paths)}
+    if usr_results is not None:
+        for usr in usr_results:
+            usr_results[usr] = walk({usr})
     return result

@@ -1,6 +1,7 @@
 import ChecklistTestSupport
 import XCTest
 import GRDB
+import Darwin
 @testable import ChecklistCore
 
 /// A completed-backup template for deletion-engine tests. Its managed payloads
@@ -9,16 +10,32 @@ import GRDB
 func ticketCleanupBackupTemplate(_ router: CommandRouter,objects: [JSON]) throws {
     let directory = router.root.appendingPathComponent("backups/template-" + uuid())
     try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true)
-    let source = try StorageObjectFiles(root:router.root),copy = try StorageObjectFiles(root:directory)
+    let source = try StorageObjectFiles(root:router.root),copy = try StorageObjectFiles(root:directory,batchSynchronization:true)
+    // These are unpublished synthetic backup bytes, not a power-loss fixture.
+    // Retain descriptor-relative/no-follow access and independent inodes without
+    // paying a production F_FULLFSYNC for every tiny fixture object.
+    func write(_ path: String,_ bytes: Data) throws {
+        let (parent,name) = try copy.parent(path,create:true);defer {Darwin.close(parent)}
+        let file = openat(parent,name,O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC,0o600)
+        guard file >= 0 else {throw StorageSnapshotFailure.io};defer {Darwin.close(file)}
+        try bytes.withUnsafeBytes {raw in
+            var offset = 0
+            while offset < raw.count {
+                let count = Darwin.write(file,raw.baseAddress!.advanced(by:offset),raw.count-offset)
+                if count < 0,errno == EINTR {continue}
+                guard count > 0 else {throw StorageSnapshotFailure.io};offset += count
+            }
+        }
+    }
     var entries: [JSON] = []
     for object in objects {
         guard let path = object["relative_path"] as? String,let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value,(try? source.regularOrLinkExists(path)) == true else {continue}
         if let target = object["link_target"] as? String {try copy.writeLink("managed/" + path,target:target)}
-        else {try copy.writeNew("managed/" + path,bytes:source.read(path,maximum:StorageSnapshotBudget.manifestByteLimit))}
+        else {try write("managed/" + path,source.read(path,maximum:StorageSnapshotBudget.manifestByteLimit))}
         entries.append(["path":path,"sha256":sha,"size":size])
     }
     let manifestBytes = Data("completed-backup-template".utf8),manifest = ChecklistCore.hash(manifestBytes)
-    try copy.writeNew("manifest.json",bytes:manifestBytes)
+    try write("manifest.json",manifestBytes)
     let generation: JSON = ["state":"complete","objects":entries,"manifest_sha256":manifest,"summary":["path":directory.path,"manifest_sha256":manifest,"verification":"manifest_database_managed_files"]]
     try router.dbQueue.write {try $0.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["backup-generation:" + uuid(),try jsonString(generation)])}
 }

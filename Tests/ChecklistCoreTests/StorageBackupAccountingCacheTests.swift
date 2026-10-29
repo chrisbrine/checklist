@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import Foundation
 import GRDB
@@ -105,6 +106,7 @@ extension ArchiveCleanupExecutionTests {
     /// The one-time background warm-up is a Debug full parse; under a 10-worker run it can
     /// exceed two minutes, so this perf case waits longer. Request timings stay bounded.
     func testScaledReceiptsListTiming() throws {
+        try QualificationSuite.requireEnabled()
         let f = try fixture();_ = try archive(f)
         try insertSyntheticReceipts(f,count:20,entries:20_000)
         let cold = try listObservation(f);XCTAssertEqual(cold.observation,"unavailable")

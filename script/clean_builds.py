@@ -5,6 +5,7 @@ Counts are logical bytes moved, not recovered APFS space. Unknown ownership/use
 is retained. Preview is read-only; apply recomputes every decision.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 import json
@@ -15,7 +16,7 @@ import stat
 import subprocess
 import sys
 
-from clean_scratch import (DEFAULT_BUDGET_GB, FINISHED, inventory, running_paths, storage_groups,
+from clean_scratch import (DEFAULT_BUDGET_GB, FINISHED, WORKSPACE_MARKER, du_sizes, inventory, running_paths, storage_groups,
                            storage_report, within, workspace_protection)
 from retire_old_bundles import trash, trash_many
 import test_instances as slots
@@ -169,15 +170,24 @@ class Cleaner:
         self.attachment_reader = attachment_reader
         self.reports = {}
         self.note_cache = {}
+        self.owners = {}
+        self.attachments = {}
+        self.sizer = None
+        self.protected_cache = None
+        self.status_cache = None
+        self.status_error = None
 
     def protected(self):
         # Even when installation receipts are unavailable, no path may alias live
         # data, the installed app, a rollback app or an explicitly retained copy.
+        # A preview lists them once per run; apply reads them fresh before each move.
+        if not self.apply and self.protected_cache is not None: return self.protected_cache
         result = [(slots.live_root(), 'live store retained'),
                   (self.installed, 'installed app retained')]
         result += [(p, 'previous/incoming app retained') for p in
                    self.installed.parent.glob('.Checklist-*.app')]
         result += [(p, 'explicitly retained work/evidence') for p in self.keep]
+        if not self.apply: self.protected_cache = result
         return result
 
     def processes(self):
@@ -302,6 +312,7 @@ class Cleaner:
             with receipt.open('xb') as output: output.write(data)
 
     def builds(self):
+        self.protected_cache = None
         retained, _ = installation(self.build, self.installed)
         processes = self.processes()
         running = running_bundle_builds(processes)
@@ -324,7 +335,9 @@ class Cleaner:
         try:
             self.process_snapshot = self.processes()
             for folder in sorted(self.build.iterdir()):
-                if FINGERPRINT.fullmatch(folder.name):
+                if folder.name in {'test-impact-map.json', 'test-impact-index.json', 'index-inputs.json'}:
+                    self.item(folder, 'test_selection_cache', reason='coverage/index selection evidence retained')
+                elif FINGERPRINT.fullmatch(folder.name):
                     if folder.name in retained:
                         self.item(folder, 'build', reason='installed/previous build retained')
                         continue
@@ -355,55 +368,77 @@ class Cleaner:
             self.preview_process_snapshot = None
             self.keep = old_keep
 
+    def evidence_plan(self, folder):
+        """Inventory one top-level tree once; aggregate container sizes bottom-up."""
+        entries = inventory(folder)
+        children, sizes, scoped, opaque = {}, {}, set(), set()
+        for path, metadata in entries.items():
+            children.setdefault(path.parent, []).append(path)
+            sizes[path] = 0 if stat.S_ISDIR(metadata[2]) else metadata[3]
+        for path in reversed(entries):
+            names = {p.name for p in children.get(path, [])}
+            if path.name in {'managed', 'source-captures', 'source', 'src', '.build'} or names & {'checklist.sqlite', 'database.sqlite'}:
+                opaque.add(path)
+            owns = bool(TICKET.search(path.name) or names & {'cleanup.json', 'files.json'})
+            if stat.S_ISDIR(entries[path][2]) and path not in opaque and (owns or any(p in scoped for p in children.get(path, []))):
+                scoped.add(path)
+            if path != folder: sizes[path.parent] += sizes[path]
+        def subtree(path):
+            yield path
+            for child in children.get(path, []):
+                yield from subtree(child)
+        def walk(path):
+            """('link'|'handin'|'container', path) in report order."""
+            names = {p.name for p in children.get(path, [])}
+            if stat.S_ISLNK(entries[path][2]):
+                yield 'link', path
+            elif stat.S_ISDIR(entries[path][2]) and path not in opaque and (TICKET.search(path.name) or names & {'cleanup.json', 'files.json'}):
+                yield 'handin', path
+            else:
+                yield 'container', path
+                if path in scoped:
+                    for child in children.get(path, []):
+                        if stat.S_ISDIR(entries[child][2]) or stat.S_ISLNK(entries[child][2]): yield from walk(child)
+        steps = []
+        for step, path in walk(folder):
+            before = {p: entries[p] for p in subtree(path)} if step == 'handin' else None
+            if step == 'handin': self.owners[path] = evidence_owners(path, before)
+            steps.append((step, path, before))
+        return entries, sizes, opaque, scoped, steps
+
     def evidence(self):
         root = safe(self.repo / '.local/evidence')
         if not root.exists(): return
-        # Inventory each top-level tree once. Aggregate container sizes bottom-up
-        # instead of inventorying the full subtree again at every ancestor.
         self.pending = [] if self.apply else None
         self.preview_process_snapshot = None
+        self.protected_cache = None
         try:
+            # Phase 1: inventory and owners for every hand-in, then one batched
+            # status read for all keys (CL-359: no per-folder CLI round trip).
+            plans = []
             for folder in sorted(root.iterdir()):
+                try: plans.append((folder, self.evidence_plan(folder)))
+                except (OSError, ValueError, KeyError, TypeError) as error: plans.append((folder, error))
+            keys = sorted({k for owners in self.owners.values() for k in owners[0]})
+            self.status_cache, self.status_error = {}, None
+            if keys:
+                try: self.status_cache = self.status_reader(keys)
+                except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+                    self.status_error = error
+            self.prefetch_attachments()
+            # Phase 2: report and, with --apply, select in the same order as before.
+            for folder, plan in plans:
                 try:
-                    entries = inventory(folder)
-                    children = {}
-                    sizes = {}
-                    scoped = set()
-                    opaque = set()
-                    for path, metadata in entries.items():
-                        children.setdefault(path.parent, []).append(path)
-                        sizes[path] = 0 if stat.S_ISDIR(metadata[2]) else metadata[3]
-                    for path in reversed(entries):
-                        names = {p.name for p in children.get(path, [])}
-                        if path.name in {'managed', 'source-captures', 'source', 'src', '.build'} or names & {'checklist.sqlite', 'database.sqlite'}:
-                            opaque.add(path)
-                        owns = bool(TICKET.search(path.name) or names & {'cleanup.json', 'files.json'})
-                        if stat.S_ISDIR(entries[path][2]) and path not in opaque and (owns or any(p in scoped for p in children.get(path, []))):
-                            scoped.add(path)
-                        if path != folder: sizes[path.parent] += sizes[path]
-                    def subtree(path):
-                        yield path
-                        for child in children.get(path, []):
-                            yield from subtree(child)
-                    def visit(path):
-                        names = {p.name for p in children.get(path, [])}
-                        if stat.S_ISLNK(entries[path][2]):
+                    if isinstance(plan, Exception): raise plan
+                    entries, sizes, opaque, scoped, steps = plan
+                    for step, path, before in steps:
+                        if step == 'link':
                             self.item(path, 'evidence', reason='symbolic link retained', entries={path: entries[path]})
-                        elif stat.S_ISDIR(entries[path][2]) and path not in opaque and (TICKET.search(path.name) or names & {'cleanup.json', 'files.json'}):
-                            before = {p: entries[p] for p in subtree(path)}
-                            def eligible(path=path, before=before):
-                                keys = evidence_keys(path, before)
-                                values = self.status_reader(keys)
-                                unresolved = sorted(k for k in keys if values.get(k) not in FINISHED)
-                                if unresolved:
-                                    return 'open or unknown ticket status: ' + ', '.join(unresolved)
-                                if self.notes_path is not None or self.note_poster:
-                                    self.evidence_notes(path, before)
-                                return None
+                        elif step == 'handin':
                             post = ((lambda path=path, before=before: self.post_notes(path, before))
                                     if self.note_poster else None)
-                            self.item(path, 'evidence', eligible=eligible, entries=before, before_move=post,
-                                      eligible_reason='all owning tickets are Done or canceled')
+                            self.item(path, 'evidence', eligible=self.evidence_check(path, before), entries=before,
+                                      before_move=post, eligible_reason='all owning tickets are Done or canceled')
                         else:
                             directory = stat.S_ISDIR(entries[path][2])
                             reason = ('store/source tree retained; no hand-in discovery' if path in opaque else
@@ -412,41 +447,85 @@ class Cleaner:
                                       'unscoped evidence retained')
                             print(json.dumps({'path': str(path), 'kind': 'evidence_container' if directory else 'evidence',
                                               'bytes': sizes[path], 'action': 'kept', 'reason': reason}, sort_keys=True))
-                            if path in scoped:
-                                for child in children.get(path, []):
-                                    if stat.S_ISDIR(entries[child][2]) or stat.S_ISLNK(entries[child][2]): visit(child)
-                    visit(folder)
                 except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
                     self.failed = True
                     print(json.dumps({'path': str(folder), 'kind': 'evidence', 'action': 'kept_error', 'bytes': None, 'reason': str(error)}))
             if self.apply and self.pending: self.flush_builds()
-            self.write_notes()
         finally:
             self.pending = None
             self.preview_process_snapshot = None
+            self.status_cache = None
+            # Notes for every eligible folder, even when another folder failed.
+            self.write_notes()
+
+    def prefetch_attachments(self, workers=8):
+        """Read attachment names for every ticket whose folder can retire, in parallel."""
+        self.attachments = {}
+        if not self.attachment_reader or self.status_error is not None or not self.status_cache: return
+        keys = sorted({k for keys, _, problems in self.owners.values()
+                       if keys and not problems and all(self.status_cache.get(k) in FINISHED for k in keys)
+                       for k in keys})
+        def read(key):
+            try: return self.attachment_reader(key)
+            except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error: return error
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            self.attachments = dict(zip(keys, pool.map(read, keys)))
+
+    def attached(self, key):
+        if not self.attachment_reader: return None
+        value = self.attachments[key] if key in self.attachments else self.attachment_reader(key)
+        if isinstance(value, Exception): raise value
+        return value
+
+    def evidence_check(self, path, before):
+        """Plan check reads the batched statuses; every later (pre-move) check reads fresh."""
+        state = {'fresh': False}
+        def eligible():
+            keys, basis, problems = self.owners.get(path) or evidence_owners(path, before)
+            if problems:
+                return 'ownership record unreadable; retained: ' + '; '.join(problems)
+            if not keys:
+                return 'unknown owner: no ticket key in files.json, cleanup.json or folder name; retained'
+            if state['fresh'] or self.status_cache is None:
+                values = self.status_reader(keys)
+            elif self.status_error is not None:
+                raise ValueError('ticket status read failed: ' + str(self.status_error))
+            else:
+                values = self.status_cache
+            state['fresh'] = True
+            unresolved = sorted(k for k in keys if values.get(k) not in FINISHED)
+            if unresolved:
+                return 'open or unknown ticket status: ' + ', '.join(unresolved)
+            if self.notes_path is not None or self.note_poster:
+                self.evidence_notes(path, before)
+            return None
+        return eligible
 
     def evidence_notes(self, path, entries):
-        """Per-ticket note text: folder, size, key-file SHA-256 and attached files."""
+        """Per-ticket note text: folder, size, owner basis, key-file SHA-256 and attached files."""
         if path in self.note_cache: return self.note_cache[path]
-        keys = sorted(evidence_keys(path, entries))
+        keys, basis, _ = self.owners.get(path) or evidence_owners(path, entries)
+        keys = sorted(keys)
         size = size_of(entries)
         count = sum(1 for e in entries.values() if not stat.S_ISDIR(e[2]))
         name = str(path.relative_to(self.repo / '.local/evidence'))
         hashes = [f'{p.relative_to(path)} sha256 {sha256(p)}' for p, e in sorted(entries.items())
                   if p.name in KEY_FILES and stat.S_ISREG(e[2])][:20]
-        handed = sorted({row['path'] for p in entries if p.name == 'files.json'
-                         for row in read_json(p) if isinstance(row.get('path'), str)})
+        handed = sorted({row['path'] for p, e in entries.items() if p.name == 'files.json' and stat.S_ISREG(e[2])
+                         for row in readable_rows(p) if isinstance(row.get('path'), str)})
         rows = []
         for key in keys:
-            attached = self.attachment_reader(key) if self.attachment_reader else None
+            attached = self.attached(key)
             text = (f'Evidence cleanup for {key}: folder .local/evidence/{name} ({count} files, {size} bytes) '
                     f'moves to the Trash because all its tickets ({", ".join(keys)}) are Done or canceled.\n'
+                    f'Owner basis: {basis}.\n'
                     f'Key files: {"; ".join(hashes) or "none"}.\n'
                     f'Hand-in files (files.json): {", ".join(handed[:50]) or "none"}'
                     f'{" and %d more" % (len(handed) - 50) if len(handed) > 50 else ""}.\n'
                     f'Files attached to {key}: '
                     f'{("none" if not attached else ", ".join(attached)) if attached is not None else "not read"}.')
-            rows.append({'ticket': key, 'folder': str(path), 'bytes': size, 'text': text, 'posted': False})
+            rows.append({'ticket': key, 'folder': str(path), 'bytes': size, 'owner_basis': basis,
+                         'text': text, 'posted': False})
         self.note_cache[path] = rows
         return rows
 
@@ -469,6 +548,7 @@ class Cleaner:
             for row in rows: output.write(json.dumps(row, sort_keys=True) + '\n')
 
     def test_slots(self):
+        self.protected_cache = None
         for number in range(1, 5):
             p = slots.checked(number)
             if not p['folder'].exists(): continue
@@ -481,6 +561,14 @@ class Cleaner:
                     return 'running or registered test slot retained'
                 return None
             if not self.apply:
+                # Preview fast path (CL-359): a marker-held slot reports from its
+                # marker and one du size, with no full inventory.
+                held = held_slot_reason(p['folder'])
+                if held:
+                    size = (self.sizer or du_sizes)([p['folder']]).get(p['folder'])
+                    print(json.dumps({'path': str(p['folder']), 'kind': 'test_slot', 'bytes': size,
+                                      'action': 'kept', 'reason': held}, sort_keys=True))
+                    continue
                 self.item(p['folder'], 'test_slot', eligible=eligible, eligible_reason='idle slot; no app/check or registered job uses it')
                 continue
             # Preview decisions never authorize stopping an app. Acquire the same
@@ -502,27 +590,111 @@ class Cleaner:
                 finally: self.mover = original
 
 
-def evidence_keys(folder, entries=None):
-    keys = set()
-    for path, entry in (inventory(folder) if entries is None else entries).items():
-        keys.update(TICKET.findall(path.name))
+def held_slot_reason(folder):
+    """The persistent-marker reason when the folder or an ancestor holds it, else None."""
+    if folder.is_symlink(): return None
+    marker = folder / WORKSPACE_MARKER
+    reason = workspace_protection(folder, {marker: None} if marker.is_file() else {})
+    return reason if reason and reason.startswith('persistent workspace marker') else None
+
+
+def background_sizes(groups, workers=8, chunk=16):
+    """Preview sizer for storage_report: du runs while the preview inspects folders.
+
+    A root directory is sized as its own block plus its children, in parallel du
+    calls of up to `chunk` children each (one large scratchpad took 27 s as one
+    du). A hard link shared by two chunks counts twice. A missing root is absent.
+    """
+    pool = ThreadPoolExecutor(max_workers=workers)
+    plans = {}
+    for path in {path for paths in groups.values() for path in paths}:
+        if not os.path.lexists(path): continue
+        try:
+            if path.is_symlink() or not path.is_dir(): raise NotADirectoryError(path)
+            own = path.lstat().st_blocks * 512
+            parts = sorted(path.iterdir())
+        except OSError:
+            own, parts = 0, [path]
+        plans[path] = (own, [pool.submit(du_sizes, parts[i:i + chunk]) for i in range(0, len(parts), chunk)])
+    pool.shutdown(wait=False)
+    def sizer(paths):
+        result = {}
+        for path in paths:
+            if path in plans:
+                own, futures = plans[path]
+                result[path] = own + sum(sum(f.result().values()) for f in futures)
+        return result
+    return sizer
+
+
+def ticket_values(value):
+    """Valid ticket keys from a string, a list of strings or a list of {"key": ...} rows."""
+    values = [value] if isinstance(value, (str, dict)) else value if isinstance(value, list) else []
+    result = set()
+    for item in values:
+        if isinstance(item, dict): item = item.get('key')
+        if isinstance(item, str) and TICKET.fullmatch(item): result.add(item)
+    return result
+
+
+def ownership_rows(data):
+    """Entry rows and record-level keys of every hand-in files.json shape seen under .local/evidence:
+    a list of entries, {"files": [...]}, a {name: {...}} map, or a top-level "ticket"/"tickets"."""
+    keys, rows = set(), []
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        keys = ticket_values(data.get('ticket')) | ticket_values(data.get('tickets'))
+        files = data.get('files')
+        rows = (files if isinstance(files, list) else list(files.values()) if isinstance(files, dict) else
+                [value for value in data.values() if isinstance(value, dict)])
+    return [row for row in rows if isinstance(row, dict)], keys
+
+
+def readable_rows(path):
+    try: return ownership_rows(read_json(path))[0]
+    except (OSError, ValueError): return []
+
+
+def evidence_owners(folder, entries=None):
+    """(keys, basis, problems) for one hand-in. Keys come from files.json entries
+    ("ticket" or "tickets"), cleanup.json "tickets" and the folder name (the fallback
+    when entries lack a ticket key). Ticket keys in nested file names add owners but
+    never establish ownership alone. No keys means unknown owner; an unreadable
+    record is a problem. Neither raises: both retain the folder."""
+    entries = inventory(folder) if entries is None else entries
+    keys, problems, named, recorded, nested = set(), [], set(), {}, set()
+    missing = 0
+    for path, entry in entries.items():
+        found = set(TICKET.findall(path.name))
+        if path == folder: keys |= found
+        else: nested |= found
+        if found: named.add('folder name' if path == folder else 'file names')
+        if not stat.S_ISREG(entry[2]) or path.name not in ('files.json', 'cleanup.json'): continue
+        try: data = read_json(path)
+        except (OSError, ValueError) as error:
+            problems.append(f'{path.relative_to(folder)}: {error}'); continue
         if path.name == 'files.json':
-            records = read_json(path)
-            if not isinstance(records, list) or not records:
-                raise ValueError('invalid hand-in files.json ownership')
-            for row in records:
-                value = row.get('ticket')
-                if not isinstance(value, str) or not TICKET.fullmatch(value):
-                    raise ValueError('hand-in entry lacks a ticket key')
-                keys.add(value)
-        elif path.name == 'cleanup.json':
-            values = read_json(path)['tickets']
-            if not isinstance(values, list) or not values or any(
-                    not isinstance(k, str) or not TICKET.fullmatch(k) for k in values):
-                raise ValueError('cleanup.json must list every owning ticket key')
-            keys.update(values)
-    if not keys: raise ValueError('evidence ticket ownership unknown')
-    return keys
+            rows, found = ownership_rows(data)
+            for row in rows:
+                tickets = ticket_values(row.get('ticket')) | ticket_values(row.get('tickets'))
+                found |= tickets
+                missing += not tickets
+        else:
+            # A cleanup.json without "tickets" is a scratch-cleanup receipt, not ownership.
+            found = ticket_values(data.get('tickets')) if isinstance(data, dict) else set()
+        if found: recorded[path.name] = True
+        keys |= found
+    if not keys: return set(), 'none', problems
+    keys |= nested
+    basis = sorted(recorded)
+    if named: basis.append(' and '.join(sorted(named)) + (f' ({missing} files.json entries have no ticket key)' if missing else ''))
+    elif missing and keys: basis.append(f'{missing} files.json entries have no ticket key')
+    return keys, ', '.join(basis) or 'none', problems
+
+
+def evidence_keys(folder, entries=None):
+    return evidence_owners(folder, entries)[0]
 
 
 def status_rows(payload, project):
@@ -556,16 +728,17 @@ def resolve_project(repo, cli, project):
     return projects[0]['id']
 
 
-def task_id(repo, cli, project, key):
+def task_id(repo, cli, project, key, ids=None):
+    if ids and key in ids: return ids[key]
     data = cli_call(repo, cli, 'task_get', {'project_id': project, 'key': key})
     if data.get('key') != key: raise ValueError('task_get returned another ticket for ' + key)
     return data['id']
 
 
-def attachment_reader(repo, cli, project):
-    """Read-only names of files attached to a ticket."""
+def attachment_reader(repo, cli, project, ids=None):
+    """Read-only names of files attached to a ticket; ids from the status read skip task_get."""
     def read(key):
-        rows = cli_call(repo, cli, 'attachment_list', {'project_id': project, 'task_id': task_id(repo, cli, project, key),
+        rows = cli_call(repo, cli, 'attachment_list', {'project_id': project, 'task_id': task_id(repo, cli, project, key, ids),
                                                        'limit': 100})['attachments']
         return sorted(str(r.get('filename') or r.get('name') or r.get('id')) for r in rows)
     return read
@@ -579,7 +752,7 @@ def note_poster(repo, cli, project):
     return post
 
 
-def status_reader(repo, cli, project, status_file=None):
+def status_reader(repo, cli, project, status_file=None, ids=None):
     def call(method, arguments):
         return cli_call(repo, cli, method, arguments)
     project = resolve_project(repo, cli, project)
@@ -595,6 +768,8 @@ def status_reader(repo, cli, project, status_file=None):
             while True:
                 data = call('task_list', arguments)
                 rows.extend(data['tasks'])
+                if ids is not None:
+                    ids.update({r['key']: r['id'] for r in data['tasks'] if isinstance(r.get('id'), str)})
                 if not data.get('has_more'): break
                 cursor = data.get('next_cursor')
                 if not cursor or cursor == arguments.get('cursor'): raise ValueError('incomplete ticket statuses')
@@ -657,6 +832,18 @@ def main():
     if args.post_notes and not (args.apply and args.evidence_notes):
         parser.error('--post-notes requires --apply and --evidence-notes')
     cleaner = Cleaner(args.repo, args.installed_app, args.apply, keep=args.keep, notes_path=args.evidence_notes)
+    # Report the folders this run covers; the default run covers all four groups.
+    groups = storage_groups(args.sessions_root.expanduser(), args.qualification_root.expanduser(), cleaner.repo)
+    if args.only != 'all':
+        groups = {name: paths for name, paths in groups.items() if name == {'builds': 'build'}.get(args.only, args.only)}
+    # Preview sizes the folders while it inspects them (CL-359: du was most of the
+    # real 72 s preview). Apply sizes after its moves.
+    slot_folders = []
+    if args.only in ['all', 'slots'] and not args.apply:
+        try: slot_folders = [f for f in (slots.checked(n)['folder'] for n in range(1, 5)) if f.exists()]
+        except (OSError, ValueError): slot_folders = []
+    sizer = background_sizes({**groups, 'slots': slot_folders}) if groups and not args.apply else None
+    cleaner.sizer = sizer
     if args.only in ['all', 'builds'] and cleaner.build.exists():
         try:
             with build_lock(cleaner.build, args.apply): cleaner.builds()
@@ -664,20 +851,17 @@ def main():
             cleaner.failed = True
             print(json.dumps({'kind': 'builds', 'action': 'kept_error', 'bytes': None, 'reason': str(error)}))
     if args.only in ['all', 'evidence']:
-        cleaner.status_reader = status_reader(cleaner.repo, args.cli, args.project_id, args.status_file)
+        ids = {}
+        project = resolve_project(cleaner.repo, args.cli, args.project_id)
+        cleaner.status_reader = status_reader(cleaner.repo, args.cli, project, args.status_file, ids)
         if args.evidence_notes and not args.status_file:
-            project = resolve_project(cleaner.repo, args.cli, args.project_id)
-            cleaner.attachment_reader = attachment_reader(cleaner.repo, args.cli, project)
+            cleaner.attachment_reader = attachment_reader(cleaner.repo, args.cli, project, ids)
             if args.post_notes: cleaner.note_poster = note_poster(cleaner.repo, args.cli, project)
         elif args.post_notes:
             parser.error('--post-notes needs the installed CLI; omit --status-file')
         cleaner.evidence()
     if args.only in ['all', 'slots']: cleaner.test_slots()
-    # Report the folders this run covers; the default run covers all four groups.
-    groups = storage_groups(args.sessions_root.expanduser(), args.qualification_root.expanduser(), cleaner.repo)
-    if args.only != 'all':
-        groups = {name: paths for name, paths in groups.items() if name == {'builds': 'build'}.get(args.only, args.only)}
-    if groups: storage_report(groups, args.budget_gb * 1e9)
+    if groups: storage_report(groups, args.budget_gb * 1e9, sizer)
     return finish(cleaner)
 
 

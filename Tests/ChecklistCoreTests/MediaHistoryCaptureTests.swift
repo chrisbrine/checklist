@@ -14,7 +14,7 @@ final class MediaHistoryCaptureTests: XCTestCase {
         let router: CommandRouter
         let project: String
         init() throws {
-            storage = try StorageFixture()
+            storage = try StorageFixture(fast:true)
             base = storage.base;root = storage.root;workspace = storage.workspace
             owner = storage.owner;router = storage.router!
             project = try storage.project()["id"] as! String

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Plan affected checks; never build, test or install. See docs/test-selection.md."""
+"""Plan affected checks; refresh a stale warm index when configured. Never run tests/install."""
 import argparse
 from fnmatch import fnmatchcase
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import shlex
 import subprocess
 import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 QUALIFICATION_TESTS = (
     'ChecklistCoreTests.TicketCleanupReceiptReadTests/testLatestSummaryPagesRetainFirstReceiptAndAreBoundedWithLargeItems',
@@ -46,37 +49,12 @@ QUALIFICATION_TESTS = (
     'ChecklistCoreTests.EvidenceAuthorityTests/testLargeSubmitBlocksOtherCommandsOnlyBriefly',
     'ChecklistCoreTests.EvidenceAuthorityTests/testLargeReferenceImportBlocksOtherCommandsOnlyBriefly',
     'ChecklistCoreTests.EvidenceAuthorityTests/testReviewClaimValidatesTheCapturedTargetBeforeTheWriter',
-)
-# Methods that assert a wall-clock budget, regardless of its size.
-# They keep their assertions unchanged but leave the parallel default pass and run in
-# one separate single-worker SwiftPM invocation, without sibling test work
-# competing for a frame or deadline budget (CL-275).
-# scripts/test_affected_tests.py fails when wall_clock_budget_cases finds an
-# ungated case missing here or in QUALIFICATION_TESTS.
-TIMING_TESTS = (
-    'ChecklistServiceTests.BootstrapAdmissionTests/testFreshBootstrapReadsAndTwoQueuedWritesFinishWhileActualWriterIsHeld',
-    'ChecklistAppTests.ApplicationTerminationTests/testOpenFloatingCaptureQuitsAndRestoresBlankTextAndFiles',
-    'ChecklistAppTests.CachedScreenReturnTests/testTemplateCatalogOverviewReturnNeedsNoReadOrCatalogReplay',
-    'ChecklistAppTests.MediaPlaybackComparisonTests/testNonloopingTakeRetainsCompletedItemAndReplaysWithoutUndoingPauseOrUnload',
-    'ChecklistAppTests.MediaPlaybackComparisonTests/testSyntheticWrittenMovieIsSelfContainedAndProbeMeasuresIt',
     'ChecklistCoreTests.EvidenceAuthorityTests/testGitCallsAreBoundedAndReadBothPipes',
     'ChecklistCoreTests.ArchivePreviewStoreCopyTests/testCL24PreviewOnOwnedStoreCopy',
     'ChecklistCoreTests.ScreenReadPerformanceTests/testOwnedStoreMeasurements',
     'ChecklistCoreTests.TicketLifecycleCleanupTests/testDefaultsStartAutomaticallyWithoutPreviewOrActivationIncludingRestart',
     'ChecklistCoreTests.TicketLifecycleCleanupTests/testSchemaThreeStartupWithProtectedSnapshotsSeveralProjectsAndCacheArmsWithoutOtherWork',
     'ChecklistCoreTests.TriageListTimingTests/testProjectedRealSizeTriagesWithinServiceBudget',
-    'ChecklistAppTests.HumanClaimsKeychainTests/testForeignACLReadReturnsNilWithinTwoSecondsInTemporaryKeychain',
-    'ChecklistAppTests.OverviewReadRecoveryTests/testCachedOverviewReturnRestoresMatchingGroupsSynchronously',
-    'ChecklistAppTests.OwnedStoreScreenCacheTests/testRealBackupColdOverviewAndCachedNavigation',
-    'ChecklistAppTests.RecordOrderingTests/testFiftyCoarseMessagesSortWithinFrameBudget',
-    'ChecklistAppTests.ScopedWorkspaceReadTests/testCachedProjectSwitchRestoresTicketsBeforeBackgroundReply',
-    'ChecklistAppTests.ScreenTimingTests/testCachedCleanupNativeFrame',
-    'ChecklistAppTests.ScreenTimingTests/testCachedEpicsNativeFrame',
-    'ChecklistAppTests.ScreenTimingTests/testCachedOverviewNativeFrame',
-    'ChecklistAppTests.ScreenTimingTests/testCachedProjectSwitchNativeFrame',
-    'ChecklistAppTests.ScreenTimingTests/testCachedTicketDetailNativeFrame',
-    'ChecklistAppTests.ScreenTimingTests/testCachedTicketsWithTriagesNativeFrame',
-    'ChecklistAppTests.ScreenTimingTests/testColdCleanupNativeFrame',
     'ChecklistCoreTests.CoreTests/testReadMethodsDoNotWaitForTheWriteLock',
     'ChecklistCoreTests.MediaListScaleTests/testThousandItemPublishedRoundListIsFast',
     'ChecklistCoreTests.MediaListScaleTests/testFiveThousandItemPublishedRoundListIsFast',
@@ -91,7 +69,42 @@ TIMING_TESTS = (
     'ChecklistCoreTests.StorageFolderAccessTests/testTimedOutUncommittedImportRetainsIntentAndSameIDRetryCommitsOnceAfterRestart',
     'ChecklistCoreTests.TicketCleanupReceiptMeasurementTests/testOwnedStoreReceiptRead',
     'ChecklistCoreTests.TicketLifecycleCleanupTests/testLargeFileVerificationYieldsWriterAndChangedPinnedFileIsRetained',
+    'ChecklistCoreTests.MediaPreparationScaleTests/testRoundAndIntakeAcceptMoreThanOneThousandItems',
+    'ChecklistCoreTests.MediaPreparationScaleTests/testCaptureChunkTimeDoesNotFollowProjectSize',
+    'ChecklistCoreTests.MediaFrozenIntakeTests/testUnsupportedSparseSourcesConsumeAggregatePreviewBudgetWithoutWrites',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testOversizedSelectedTicketReportsRefusalWithoutBlockingAnotherProject',
+    'ChecklistCoreTests.ArchiveCleanupExecutionTests/testScaledReceiptsListTiming',
+    'ChecklistCoreTests.ArchiveCleanupScanFenceTests/testScaledArchiveWriteHoldBeforeAndAfter',
+    'ChecklistCoreTests.StorageUpgradeOwnedCopyTests/testProtectedPreupgradePathsOnOwnedCurrentSchemaCopy',
+)
+# Methods that assert a wall-clock budget, regardless of its size.
+# They keep their assertions unchanged but leave the parallel default pass and run in
+# one separate single-worker SwiftPM invocation, without sibling test work
+# competing for a frame or deadline budget (CL-275).
+# scripts/test_affected_tests.py fails when wall_clock_budget_cases finds an
+# ungated case missing here or in QUALIFICATION_TESTS.
+TIMING_TESTS = (
+    'ChecklistServiceTests.BootstrapAdmissionTests/testFreshBootstrapReadsAndTwoQueuedWritesFinishWhileActualWriterIsHeld',
+    'ChecklistAppTests.ApplicationTerminationTests/testOpenFloatingCaptureQuitsAndRestoresBlankTextAndFiles',
+    'ChecklistAppTests.CachedScreenReturnTests/testTemplateCatalogOverviewReturnNeedsNoReadOrCatalogReplay',
+    'ChecklistAppTests.MediaPlaybackComparisonTests/testNonloopingTakeRetainsCompletedItemAndReplaysWithoutUndoingPauseOrUnload',
+    'ChecklistAppTests.MediaPlaybackComparisonTests/testSyntheticWrittenMovieIsSelfContainedAndProbeMeasuresIt',
+    'ChecklistAppTests.HumanClaimsKeychainTests/testForeignACLReadReturnsNilWithinTwoSecondsInTemporaryKeychain',
+    'ChecklistAppTests.OverviewReadRecoveryTests/testCachedOverviewReturnRestoresMatchingGroupsSynchronously',
+    'ChecklistAppTests.OwnedStoreScreenCacheTests/testRealBackupColdOverviewAndCachedNavigation',
+    'ChecklistAppTests.RecordOrderingTests/testFiftyCoarseMessagesSortWithinFrameBudget',
+    'ChecklistAppTests.ScopedWorkspaceReadTests/testCachedProjectSwitchRestoresTicketsBeforeBackgroundReply',
+    'ChecklistAppTests.ScreenTimingTests/testCachedCleanupNativeFrame',
+    'ChecklistAppTests.ScreenTimingTests/testCachedEpicsNativeFrame',
+    'ChecklistAppTests.ScreenTimingTests/testCachedOverviewNativeFrame',
+    'ChecklistAppTests.ScreenTimingTests/testCachedProjectSwitchNativeFrame',
+    'ChecklistAppTests.ScreenTimingTests/testCachedTicketDetailNativeFrame',
+    'ChecklistAppTests.ScreenTimingTests/testCachedTicketsWithTriagesNativeFrame',
+    'ChecklistAppTests.ScreenTimingTests/testColdCleanupNativeFrame',
     'ChecklistIPCTests.AsyncServiceCallTests/testMissingReplyReachesAsyncCallerAtItsDeadline',
+    'ChecklistIPCTests.ClientConnectionAdmissionTests/testSlowFirstCheckDoesNotHoldUpCachedClients',
+    'ChecklistMCPServerTests.ChecklistMCPServerTests/testStalledServiceInitializesWithinThreeSecondsAndFirstCallConnects',
+    'ChecklistMCPServerTests.ChecklistMCPServerTests/testTwentyConcurrentCallsEachGetTheirOwnReply',
 )
 # Load-sensitive cases without a wall-clock budget (a cancel-versus-copy race and an
 # idle-CPU bound); they run in the same single-worker command as TIMING_TESTS.
@@ -156,8 +169,9 @@ BUILD_SCRIPTS = ('script/build_', 'script/build_and_run.sh', 'scripts/compile-co
 PYTHON_TEST_OWNERS = {
     'scripts/validate-plan.py': [],  # Its own shape/reference checks run in VALIDATE.
     'script/verify_install.py': ['scripts/test_test_instances.py'],
-    'script/index_store.py': ['scripts/test_test_impact_map.py', 'scripts/test_shared_test_impact.py'],
-    'script/test_impact_map.py': ['scripts/test_test_impact_map.py', 'scripts/test_shared_test_impact.py'],
+    'script/index_store.py': ['scripts/test_test_impact_map.py', 'scripts/test_shared_test_impact.py', 'scripts/test_auto_impact_map.py'],
+    'script/test_impact_map.py': ['scripts/test_test_impact_map.py', 'scripts/test_shared_test_impact.py', 'scripts/test_auto_impact_map.py'],
+    'script/auto_impact_map.py': ['scripts/test_auto_impact_map.py', 'scripts/test_affected_tests.py'],
     'script/shared_test_impact.py': ['scripts/test_shared_test_impact.py', 'scripts/test_affected_tests.py'],
     'scripts/public_source_privacy.py': ['scripts/test_prepare_public_source.py'],
     'scripts/public-source-files.json': ['scripts/test_prepare_public_source.py'],
@@ -242,6 +256,7 @@ def test_file_selection(root, targets, owner, path, impact_map, cache):
     Returns {'fallback': reason} when the consumers cannot be determined.
     """
     entry = impact_map.get('sources', {}).get(path)
+    consumer_basis = 'indexed consumers' if impact_map.get('selection_source') == 'index-store' else 'measured consumers'
     classes, cases, broad = {}, set(), set()
 
     def add(group):
@@ -259,12 +274,15 @@ def test_file_selection(root, targets, owner, path, impact_map, cache):
     if not source.is_file():
         if entry is None:
             return {'fallback': 'deleted test file is not in the coverage map; its consumers are unknown'}
-        return {'reason': 'deleted test file: its measured consumers that still exist',
+        return {'reason': 'deleted test file: its ' + consumer_basis + ' that still exist',
                 'classes': classes, 'cases': cases, 'broad': broad}
     text = source.read_text(errors='replace')
     known = {group.split('.', 1)[1] for group in impact_map.get('class_inventory', []) +
              impact_map.get('measured_classes', []) if group.startswith(owner['name'] + '.')}
     own, shared = test_file_declarations(text, known)
+    if (impact_map.get('selection_source') == 'index-store' and shared
+            and impact_map.get('source_hashes', {}).get(path) != hashlib.sha256(source.read_bytes()).hexdigest()):
+        return {'fallback': 'changed shared test helper has no current indexed consumers'}
     if entry is None:
         if not own:
             return {'fallback': 'new test file declares no XCTestCase class'}
@@ -294,7 +312,7 @@ def test_file_selection(root, targets, owner, path, impact_map, cache):
                     broad.add(reader)
             reason += ' plus source-inspection readers of ' + prefix
     else:
-        reason = 'changed test file: its own classes and qualification cases plus measured consumers'
+        reason = 'changed test file: its own classes and qualification cases plus ' + consumer_basis
     for name in own:
         classes.setdefault(owner['name'], set()).add(name)
     for case in QUALIFICATION_CASES:
@@ -627,7 +645,7 @@ def wall_clock_budget_cases(root):
     return cases
 
 
-def load_impact_map(root, path=None, max_age_hours=24):
+def load_impact_map(root, path=None, max_age_hours=24, selected_paths=()):
     """Accept only a complete, recent map from an ancestor with stable test inputs.
 
     Production edits remain eligible for coverage selection; new files use module
@@ -641,7 +659,7 @@ def load_impact_map(root, path=None, max_age_hours=24):
     status = {'path': str(path), 'state': 'missing'}
     try:
         data = json.loads(Path(path).read_text())
-        if data.get('schema_version') != 1 or data.get('complete') is not True:
+        if data.get('schema_version') not in (1, 2) or data.get('complete') is not True:
             raise ValueError('incomplete or unsupported coverage map')
         generated = datetime.fromisoformat(data['generated_at'].replace('Z', '+00:00'))
         age = (datetime.now(timezone.utc) - generated).total_seconds()
@@ -650,6 +668,26 @@ def load_impact_map(root, path=None, max_age_hours=24):
         subprocess.run(['git', 'merge-base', '--is-ancestor', data['commit'], 'HEAD'],
                        cwd=root, check=True, capture_output=True)
         drift = changed_paths(root, data['commit'])
+        if data.get('schema_version') == 2:
+            from auto_impact_map import validate_inputs, generator_inputs
+            validate_inputs(root, data, selected_paths)
+            if (data.get('generator_inputs') != generator_inputs(root)
+                    or data.get('selection_source') != 'index-store'
+                    or set(data.get('qualification_case_inventory', [])) != set(QUALIFICATION_CASES)
+                    or not isinstance(data.get('sources'), dict)
+                    or data.get('measured_classes') or data.get('measured_qualification_cases')):
+                raise ValueError('invalid static index selection map')
+            for name, entry in data['sources'].items():
+                if (PurePosixPath(name).is_absolute() or '..' in PurePosixPath(name).parts
+                        or not isinstance(entry, dict) or not isinstance(entry.get('classes'), list)
+                        or any(not isinstance(group, str) or not re.fullmatch(r'\w+\.\w+', group) for group in entry['classes'])
+                        or not isinstance(entry.get('qualification_cases'), list)
+                        or any(case not in QUALIFICATION_CASES for case in entry['qualification_cases'])):
+                    raise ValueError('invalid static index source entry')
+            status.update(state='current', source='index-store', commit=data['commit'],
+                          generated_at=data['generated_at'], generation_seconds=data['generation_seconds'],
+                          changed_test_inputs=[name for name in drift if direct_test_input(name)])
+            return data, status
         invalidating = [name for name in drift if name.startswith('Tests/') or
                         (name.startswith('Packages/') and ('Tests' in PurePosixPath(name).parts or
                          PurePosixPath(name).name in ('Package.swift', 'Package.resolved'))) or
@@ -729,7 +767,7 @@ def load_impact_map(root, path=None, max_age_hours=24):
 def select(root, graph, paths, scratch, full=False, qualification=False, last_round=False, impact_map=None, runner_wrapper=None, shared_index=None):
     targets = {target['name']: target for target in graph['targets']}
     if impact_map is None:
-        impact_map, impact_status = load_impact_map(root)
+        impact_map, impact_status = load_impact_map(root, selected_paths=paths)
     else:
         impact_status = {'state': 'supplied' if impact_map.get('complete') else 'incomplete'}
         if not impact_map.get('complete'):
@@ -888,6 +926,8 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
             # Root coverage may inventory a shared declaration with no instrumented
             # hits. An empty entry does not prove that the module has no consumers.
             entry = None
+        if impact_map and path in impact_map.get('static_fallback_sources', ()):
+            entry = None
         owner = next((target for target in owners if path.startswith(target['path'] + '/')), None)
         if entry is not None:
             mapping = {}
@@ -913,6 +953,8 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
                                       else 'no current coverage map; module closure')
             if path in shared_paths:
                 fallback_reasons[path] = shared_index_reason
+            if impact_map and path in impact_map.get('static_fallback_sources', ()):
+                fallback_reasons[path] = 'runtime-name lookup has no compiler USR destination; module closure'
             if path in new_source_reasons:
                 fallback_reasons[path] += ' (' + new_source_reasons[path] + ')'
             for case in QUALIFICATION_CASES:
@@ -928,7 +970,8 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
                     reasons[case].append(path)
     qualification_tests = (list(QUALIFICATION_CASES) if explicitly_qualified else
                            [] if full else [case for case in QUALIFICATION_CASES if reasons[case]])
-    qualification = bool(qualification_tests)
+    qualification = explicitly_qualified and bool(qualification_tests)
+    qualification_deferred = bool(qualification_tests) and not explicitly_qualified
     tests = sorted(all_tests.intersection(affected))
     groups = {}
     if not full and not unknown and not last_round:
@@ -958,7 +1001,7 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
         groups = {name: selected for name, selected in groups.items() if name in tests}
     # Qualification is independent of unit group narrowing: an explicitly requested
     # full qualification includes Core/App/IPC cases even for a docs-only change.
-    skip = [case for case in QUALIFICATION_CASES if case not in qualification_tests] if tests else []
+    skip = [case for case in QUALIFICATION_CASES if qualification_deferred or case not in qualification_tests] if tests else []
     root_tests = [name for name in tests if not targets[name].get('package_path')]
     shared_tests = [name for name in tests if targets[name].get('package_path')]
     swift = []
@@ -966,7 +1009,7 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
     qualification_commands = []
     timing_tests, timing_commands, timing_deferred = [], [], False
     if root_tests or full or qualification_tests:
-        command = ['swift', 'test', '--parallel', '--num-workers', '10', '--cache-path',
+        command = ['swift', 'test', '--skip-update', '--parallel', '--num-workers', '10', '--cache-path',
                    str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
                    '--enable-dependency-cache', '--scratch-path', str(scratch), '--skip', 'HumanClaimsKeychainTests']
         if not full:
@@ -997,26 +1040,24 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
         timing_tests = [case for case in ISOLATED_TESTS if case.split('.')[0] in tests and (
             case.split('.')[0] not in groups or case.split('.')[1].split('/')[0] in groups[case.split('.')[0]])]
         # Wall-clock budgets are performance checks (CL-266 item 2): they run in
-        # full qualification runs (--qualification/--last-round) or when a
-        # timing test file itself changes; ordinary affected runs defer them.
-        timing_classes = {case.split('.')[1].split('/')[0] for case in timing_tests}
-        timing_changed = any(path.startswith('Tests/') and Path(path).stem in timing_classes for path in normalized)
-        timing_deferred = bool(timing_tests) and not (explicitly_qualified or timing_changed)
+        # full qualification runs (--qualification/--last-round). CL-358 keeps
+        # changed timing fixtures opt-in too; ordinary affected runs defer them.
+        timing_deferred = bool(timing_tests) and not explicitly_qualified
         if timing_tests and not timing_deferred:
             # Same environment and process-per-test isolation as the parallel
             # pass, but one worker: each budget is measured with no sibling test.
             timed = command[:command.index('swift') + 2]
-            timed.extend(['--parallel', '--num-workers', '1', '--cache-path',
+            timed.extend(['--skip-update', '--parallel', '--num-workers', '1', '--cache-path',
                           str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
                           '--enable-dependency-cache', '--scratch-path', str(scratch), '--skip', 'HumanClaimsKeychainTests'])
             for case in timing_tests:
                 timed.extend(['--filter', '^' + re.escape(case) + '$'])
             timing_commands.append(timed)
             swift.append(timed)
-        if qualification_tests:
+        if qualification_tests and explicitly_qualified:
             qualified = command[:command.index('swift') + 2]
             qualified = ['CHECKLIST_QUALIFICATION=1' if arg == 'CHECKLIST_QUALIFICATION=0' else arg for arg in qualified]
-            qualified.extend(['--parallel', '--num-workers', '1', '--cache-path',
+            qualified.extend(['--skip-update', '--parallel', '--num-workers', '1', '--cache-path',
                               str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
                               '--enable-dependency-cache', '--scratch-path', str(scratch), '--skip', 'HumanClaimsKeychainTests'])
             for case in qualification_tests:
@@ -1034,7 +1075,7 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
         timing_commands = []
     shared_commands = []
     for package_path in sorted({targets[name]['package_path'] for name in shared_tests}):
-        command = ['swift', 'test', '--package-path', str(root / package_path),
+        command = ['swift', 'test', '--skip-update', '--package-path', str(root / package_path),
                    '--cache-path', str(Path.home() / 'Library/Caches/ChecklistSwiftPM'),
                    '--enable-dependency-cache', '--scratch-path',
                    str(scratch / 'packages' / Path(package_path).name), '--skip', 'HumanClaimsKeychainTests']
@@ -1047,6 +1088,18 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
     swift.extend(shared_commands)
     # uv supplies the dependencies needed by the exporter/validator tests too.
     python_commands = [SCRIPT_PYTHON + [path] for path in sorted(python)]
+    defaults = [command for command in swift if command not in qualification_commands and command not in timing_commands]
+    guarded = [['python3', 'script/check_test_timings.py', 'run', '--log',
+                str(scratch / 'test-timings' / (hashlib.sha256(json.dumps(command).encode()).hexdigest()[:16] + '.log')),
+                '--core-budget', '180', '--'] + command for command in defaults]
+    executable = [guarded[defaults.index(command)] if command in defaults else command for command in swift]
+    group_sources = {group: {'source': 'index-store', 'paths': paths}
+                     for group, paths in sorted(selected_unmeasurable_classes.items())}
+    if impact_map and impact_map.get('selection_source') == 'index-store':
+        for target, classes in groups.items():
+            for cls in classes:
+                group_sources[target + '.' + cls] = {'source': 'index-store', 'paths': sorted(
+                    path for path, mapping in source_groups.items() if cls in mapping.get(target, ()))}
     return {'paths': normalized, 'affected_targets': sorted(affected), 'test_targets': tests,
             'python_tests': sorted(python), 'fallback_paths': unknown, 'skip': skip, 'full': full, 'qualification': qualification,
             'isolated_test_groups': isolated, 'test_groups': groups,
@@ -1064,17 +1117,19 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
                                                'referenced_by': users} for path, users in reached.items()},
             'qualification_fallback_cases': qualification_fallback_cases, 'coverage_fallback_classes': coverage_fallback_classes,
             'coverage_unmeasurable_classes': selected_unmeasurable_classes,
-            'test_group_sources': {group: {'source': 'index-store', 'paths': paths}
-                                   for group, paths in sorted(selected_unmeasurable_classes.items())},
+            'test_group_sources': group_sources,
             'qualification_reasons': {case: reasons[case] for case in qualification_tests},
             'default_swift_commands': [command for command in swift if command not in qualification_commands and command not in timing_commands],
             'qualification_commands': qualification_commands, 'qualification_tests': qualification_tests,
+            'qualification_deferred': qualification_deferred,
+            'qualification_execution_tests': qualification_tests if explicitly_qualified else [],
             'qualification_test_targets': sorted({case.split('.')[0] for case in qualification_tests}),
             'timing_commands': timing_commands, 'timing_tests': timing_tests, 'timing_deferred': timing_deferred,
             'shared_package_commands': shared_commands,
             'shared_index_selections': shared_classes, 'shared_index_fallback_reason': shared_index_reason if shared_paths and not shared_classes else None,
             'swift_commands': swift, 'coverage_refresh_commands': refresh_commands, 'impact_map_status': impact_status,
-            'commands': swift + refresh_commands + python_commands + [VALIDATE]}
+            'guarded_default_commands': guarded,
+            'commands': executable + refresh_commands + python_commands + [VALIDATE]}
 
 
 def main(argv=None):
@@ -1090,9 +1145,11 @@ def main(argv=None):
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument('--scratch-path', type=Path, default=Path('.build'))
     parser.add_argument('--shared-index', type=Path, help='portable compiler-index export for shared source consumers')
+    parser.add_argument('--impact-index', type=Path, help='saved same-build compiler-index export for automatic map regeneration')
     parser.add_argument('--impact-map', type=Path, help='coverage map (default .local/build/test-impact-map.json)')
     parser.add_argument('--map-max-age-hours', type=float, default=24)
-    parser.add_argument('--runner-wrapper', type=Path, help='shared build-cap wrapper for final-round refresh')
+    parser.add_argument('--runner-wrapper', type=Path, default=os.environ.get('CHECKLIST_SWIFT_RUNNER'),
+                        help='shared build-cap wrapper for automatic native-index/final-round refresh')
     args = parser.parse_args(argv)
     if not any((args.base, args.paths, args.paths_file, args.full, args.qualification, args.last_round)):
         parser.error('supply --base, --paths, --paths-file, --full, --qualification or --last-round')
@@ -1105,7 +1162,17 @@ def main(argv=None):
         elif args.paths_file:
             contents = sys.stdin.read() if str(args.paths_file) == '-' else args.paths_file.read_text()
             paths = contents.splitlines()
-        impact_map, impact_status = load_impact_map(root, args.impact_map, args.map_max_age_hours)
+        graph = package_graph(root, scratch)
+        impact_map, impact_status = load_impact_map(root, args.impact_map, args.map_max_age_hours, paths)
+        from auto_impact_map import regenerate, atomic_json
+        output_map = args.impact_map or root / '.local/build/test-impact-map.json'
+        if impact_map is None and not args.last_round:
+            regeneration = regenerate(root, scratch, output_map, QUALIFICATION_CASES, paths, args.impact_index, args.map_max_age_hours, args.runner_wrapper, graph)
+            if regeneration['state'] in ('restored', 'regenerated'):
+                impact_map, impact_status = load_impact_map(root, output_map, args.map_max_age_hours, paths)
+            impact_status['regeneration'] = regeneration
+        elif impact_map is not None:
+            atomic_json(scratch / 'affected-tests/test-impact-map.json', impact_map)
         index_path = args.shared_index or scratch / 'affected-tests/shared-index.json'
         shared_index = None
         if any(PurePosixPath(path.removeprefix('./')).as_posix().startswith(
@@ -1115,7 +1182,7 @@ def main(argv=None):
             except (OSError, ValueError):
                 # A damaged optional index must leave a runnable conservative plan.
                 shared_index = {'invalid': True}
-        plan = select(root, package_graph(root, scratch), paths, scratch, args.full, args.qualification, args.last_round,
+        plan = select(root, graph, paths, scratch, args.full, args.qualification, args.last_round,
                       impact_map if impact_map is not None else {'complete': False}, args.runner_wrapper, shared_index)
         plan['impact_map_status'] = impact_status
         if args.json:
@@ -1132,7 +1199,7 @@ def main(argv=None):
             for group, inputs in plan['coverage_fallback_classes'].items():
                 print('Unmeasured class fallback: ' + group + ' <- ' + ', '.join(inputs))
             for group, observation in plan['test_group_sources'].items():
-                print('Unmeasurable class index-store references: ' + group + ' <- ' +
+                print('Compiler-index class references: ' + group + ' <- ' +
                       ', '.join(observation['paths']))
             for path, classes in plan['shared_index_selections'].items():
                 print('Shared-package index: ' + path + ' -> ' + str(len(classes)) + ' root classes')
@@ -1153,6 +1220,8 @@ def main(argv=None):
                 print('Timing group: separate single-worker invocation')
             elif plan['timing_deferred']:
                 print('Timing group: deferred to qualification runs (--qualification)')
+            if plan['qualification_deferred']:
+                print('Qualification candidates: deferred to once-per-pass opt-in (--qualification or --last-round)')
             if plan['qualification_commands']:
                 print('Qualification suite: separate single-worker invocation')
             if plan['skip']:

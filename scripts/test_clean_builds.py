@@ -91,6 +91,18 @@ class CleanupTests(unittest.TestCase):
         with contextlib.redirect_stdout(output): method()
         return [json.loads(line) for line in output.getvalue().splitlines() if line.startswith('{')]
 
+    def test_coverage_and_index_selection_evidence_survives_preview_and_apply(self):
+        paths = [self.build / 'test-impact-map.json', self.build / 'test-impact-index.json',
+                 self.build / 'index-inputs.json']
+        for path in paths: path.write_text('selection evidence')
+        for apply in (False, True):
+            reports = self.run_clean(self.cleaner.builds, apply)
+            selected = [report for report in reports if report['kind'] == 'test_selection_cache']
+            self.assertEqual(len(selected), 3)
+            self.assertTrue(all(report['action'] == 'kept' for report in selected))
+            self.assertTrue(all(path.exists() for path in paths))
+        self.assertEqual(self.moves, [])
+
     def test_preview_changes_nothing_and_apply_preserves_both_builds_and_all_receipts(self):
         captures = [self.capture(key) for key in self.ids]
         before = {p: p.read_bytes() for p in self.repo.rglob('*') if p.is_file()}
@@ -421,10 +433,15 @@ class CleanupTests(unittest.TestCase):
         self.statuses['CL-2']='done';self.run_clean(self.cleaner.evidence,True);self.assertFalse(p.exists())
 
     def test_malformed_manifest_and_unscoped_evidence_are_retained(self):
-        p=self.handin();(p/'files.json').write_text('[{}]')
+        # CL-359 rework: an unreadable record or no owner retains the folder without failing the run.
+        p=self.handin();(p/'files.json').write_text('[{')
         unknown=self.evidence/'unknown';unknown.mkdir();(unknown/'report').write_text('retain')
-        self.run_clean(self.cleaner.evidence,True)
-        self.assertTrue(p.exists());self.assertTrue(unknown.exists());self.assertTrue(self.cleaner.failed)
+        reports=self.run_clean(self.cleaner.evidence,True)
+        self.assertTrue(p.exists());self.assertTrue(unknown.exists());self.assertFalse(self.cleaner.failed)
+        self.assertIn('ownership record unreadable', next(r for r in reports if r['path']==str(p))['reason'])
+        # An entry with no ticket key falls back to the folder name (CL-1 is done).
+        (p/'files.json').write_text('[{}]'); self.run_clean(self.cleaner.evidence,True)
+        self.assertFalse(p.exists());self.assertTrue(unknown.exists());self.assertFalse(self.cleaner.failed)
 
     def test_symlinked_roots_items_and_nested_links_never_escape(self):
         outside=self.root/'outside';outside.mkdir();(outside/'CL-1').mkdir()
@@ -893,6 +910,154 @@ class CleanupTests(unittest.TestCase):
                  contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as error: clean.main()
                 self.assertEqual(error.exception.code, 2)
+
+    # CL-359 rework (P359b): every hand-in files.json shape seen under .local/evidence.
+    SHAPES = {
+        'list-ticket': [{'path': 'a.py', 'ticket': 'CL-1'}],
+        'list-ticket-list': [{'path': 'a.py', 'ticket': ['CL-1']}],
+        'list-tickets': [{'path': 'a.py', 'tickets': ['CL-1']}],
+        'files-object': {'base': 'abc', 'files': [{'path': 'a.py', 'ticket': 'CL-1'}]},
+        'files-object-no-ticket': {'base': 'abc', 'files': [{'path': 'a.py', 'base_sha256': None}]},
+        'top-level-ticket': {'ticket': 'CL-1', 'changed': ['a.py'], 'sha256': {'a.py': 'f'}},
+        'name-map': {'final-slot-1.json': {'sha256': 'f', 'bytes': 1}},
+        'list-no-ticket': [{'path': 'a.py'}],
+        'list-of-strings': ['a.py'],
+        'empty-list': [],
+    }
+
+    def test_every_files_json_shape_reads_without_exceptions(self):
+        expected = {name: ({'CL-1'}, 'files.json') for name in
+                    ['list-ticket', 'list-ticket-list', 'list-tickets', 'files-object', 'top-level-ticket']}
+        for name, data in self.SHAPES.items():
+            for folder in ['integration-9/' + name + '-CL-1', 'integration-9/' + name]:
+                with self.subTest(shape=name, folder=folder):
+                    p = self.evidence / folder; p.mkdir(parents=True)
+                    (p / 'files.json').write_text(json.dumps(data))
+                    keys, basis, problems = clean.evidence_owners(p)
+                    self.assertEqual(problems, [])
+                    named = folder.endswith('CL-1')
+                    if name in expected:
+                        self.assertEqual(keys, {'CL-1'}); self.assertIn('files.json', basis)
+                    elif named:
+                        self.assertEqual(keys, {'CL-1'}); self.assertIn('folder name', basis)
+                    else:
+                        self.assertEqual((keys, basis), (set(), 'none'))
+        # Nested file names add owners but never establish ownership alone.
+        runner = self.evidence / 'integration-30/e2-abc'; runner.mkdir(parents=True)
+        (runner / 'files.json').write_text(json.dumps(self.SHAPES['name-map'])); (runner / 'CL-1-task.json').write_text('{}')
+        self.assertEqual(clean.evidence_owners(runner), (set(), 'none', []))
+        wider = self.evidence / 'integration-31/CL-1'; wider.mkdir(parents=True)
+        (wider / 'files.json').write_text('[{"path": "a"}]'); (wider / 'CL-2.log').write_text('log')
+        self.assertEqual(clean.evidence_owners(wider)[:2],
+                         ({'CL-1', 'CL-2'}, 'file names and folder name (1 files.json entries have no ticket key)'))
+        shutil.rmtree(runner); shutil.rmtree(wider)
+        reports = self.run_clean(self.cleaner.evidence)
+        self.assertFalse(self.cleaner.failed)
+        handins = {Path(r['path']).name: r for r in reports if r.get('kind') == 'evidence'}
+        self.assertEqual(len(handins), 2 * len(self.SHAPES))
+        for name in self.SHAPES:
+            self.assertEqual(handins[name + '-CL-1']['action'], 'eligible', name)
+            unowned = handins[name]
+            self.assertEqual(unowned['action'], 'eligible' if name in expected else 'kept', name)
+            if name not in expected: self.assertIn('unknown owner', unowned['reason'])
+
+    def test_cleanup_json_receipts_and_ticket_rows(self):
+        cases = {'cl173-timing': {'completed_at': 't', 'private_copies': []},
+                 'cl173-timing-r4': [{'source': '/private/tmp/x', 'trash_exists': True}],
+                 'pass1-enative': {'triage_key': 'CL-T102', 'tickets': [{'key': 'CL-1', 'status': 'Queued'}]},
+                 'round': {'tickets': ['CL-1', 'CL-2']}}
+        for name, data in cases.items():
+            p = self.evidence / 'integration-22' / name; p.mkdir(parents=True)
+            (p / 'cleanup.json').write_text(json.dumps(data))
+        owners = {name: clean.evidence_owners(self.evidence / 'integration-22' / name) for name in cases}
+        self.assertEqual(owners['cl173-timing'], (set(), 'none', []))
+        self.assertEqual(owners['cl173-timing-r4'], (set(), 'none', []))
+        self.assertEqual(owners['pass1-enative'][:2], ({'CL-1'}, 'cleanup.json'))
+        self.assertEqual(owners['round'][0], {'CL-1', 'CL-2'})
+        reports = {Path(r['path']).name: r for r in self.run_clean(self.cleaner.evidence) if r.get('kind') == 'evidence'}
+        self.assertFalse(self.cleaner.failed)
+        self.assertEqual(reports['pass1-enative']['action'], 'eligible')
+        self.assertIn('open or unknown ticket status: CL-2', reports['round']['reason'])
+        for name in ['cl173-timing', 'cl173-timing-r4']: self.assertIn('unknown owner', reports[name]['reason'])
+
+    def test_folder_name_fallback_is_marked_in_the_note(self):
+        p = self.handin('integration-10/CL-1-r1'); (p / 'files.json').write_text(json.dumps([{'path': 'a.py'}, {'path': 'b.py'}]))
+        notes = self.root / 'notes.jsonl'; self.cleaner.notes_path = notes
+        self.run_clean(self.cleaner.evidence)
+        rows = [json.loads(line) for line in notes.read_text().splitlines()]
+        self.assertEqual([(r['ticket'], r['action']) for r in rows], [('CL-1', 'eligible')])
+        self.assertEqual(rows[0]['owner_basis'], 'folder name (2 files.json entries have no ticket key)')
+        self.assertIn('Owner basis: folder name (2 files.json entries have no ticket key).', rows[0]['text'])
+        self.assertIn('a.py, b.py', rows[0]['text'])
+
+    def test_one_failed_folder_still_writes_notes_for_the_others(self):
+        good = self.handin('integration-1/CL-1'); bad = self.handin('integration-2/CL-1')
+        notes = self.root / 'notes.jsonl'; self.cleaner.notes_path = notes
+        native = clean.inventory
+        def inventory(path):
+            if path == self.evidence / 'integration-2': raise PermissionError('fixture unreadable folder')
+            return native(path)
+        with patch.object(clean, 'inventory', side_effect=inventory):
+            reports = self.run_clean(self.cleaner.evidence)
+        self.assertTrue(self.cleaner.failed)
+        self.assertEqual([r['action'] for r in reports if r['path'] == str(self.evidence / 'integration-2')], ['kept_error'])
+        rows = [json.loads(line) for line in notes.read_text().splitlines()]
+        self.assertEqual([(r['folder'], r['action']) for r in rows], [(str(good), 'eligible')])
+        self.assertTrue(bad.exists())
+
+    def test_preview_reads_all_ticket_statuses_in_one_batch(self):
+        for name in ['CL-1', 'integration-3/CL-2', 'integration-4/CL-1-CL-2']: self.handin(name)
+        calls = []
+        def reader(keys): calls.append(sorted(keys)); return dict(self.statuses)
+        self.cleaner.status_reader = reader
+        self.run_clean(self.cleaner.evidence)
+        self.assertEqual(calls, [['CL-1', 'CL-2']])
+        # Apply rechecks each selected folder with a fresh read before the move.
+        calls.clear(); self.run_clean(self.cleaner.evidence, True)
+        self.assertEqual(calls, [['CL-1', 'CL-2'], ['CL-1']])
+        self.assertFalse((self.evidence / 'CL-1').exists())
+
+    def test_batched_status_failure_retains_every_handin_as_error(self):
+        p = self.handin()
+        def reader(keys): raise subprocess.CalledProcessError(1, ['checklist', 'call', 'task_list'])
+        self.cleaner.status_reader = reader
+        reports = self.run_clean(self.cleaner.evidence, True)
+        self.assertTrue(p.exists()); self.assertTrue(self.cleaner.failed)
+        self.assertIn('ticket status read failed', reports[-1]['reason'])
+
+    def test_main_preview_exits_zero_with_old_shapes_and_writes_notes(self):
+        for name, data in [('integration-5/CL-1', {'files': [{'ticket': 'CL-1', 'path': 'a'}]}),
+                           ('integration-13/slot-disconnect', {'ticket': 'NEW', 'changed': ['a']}),
+                           ('integration-26/CL-2-timing', [{'source': 'x'}])]:
+            p = self.evidence / name; p.mkdir(parents=True); (p / 'files.json').write_text(json.dumps(data))
+        status = self.root / 'status.json'; notes = self.root / 'notes.jsonl'
+        status.write_text(json.dumps({'project_id': 'project', 'tasks': [{'key': 'CL-1', 'status_category': 'done'},
+                                                                        {'key': 'CL-2', 'status_category': 'canceled'}]}))
+        output = io.StringIO()
+        with patch.object(sys, 'argv', ['clean_builds.py', '--preview', '--only', 'evidence', '--repo', str(self.repo),
+                                        '--installed-app', str(self.installed), '--project-id', 'project',
+                                        '--status-file', str(status), '--evidence-notes', str(notes)]), \
+             patch.object(clean, 'storage_report'), contextlib.redirect_stdout(output):
+            self.assertEqual(clean.main(), 0)
+        rows = [json.loads(line) for line in notes.read_text().splitlines()]
+        self.assertEqual(sorted((Path(r['folder']).name, r['owner_basis']) for r in rows),
+                         [('CL-1', 'files.json, folder name'), ('CL-2-timing', 'folder name (1 files.json entries have no ticket key)')])
+        self.assertIn('unknown owner', output.getvalue())
+
+    def test_marked_slot_preview_needs_no_inventory(self):
+        p = self.slot(); self.marker(p['folder'])
+        with patch.object(clean, 'inventory', side_effect=AssertionError('inventory in preview')), \
+             patch.object(clean, 'du_sizes', return_value={p['folder']: 4096}):
+            reports = self.run_clean(self.cleaner.test_slots)
+        self.assertEqual([(r['action'], r['bytes']) for r in reports], [('kept', 4096)])
+        self.assertIn('persistent workspace marker', reports[0]['reason'])
+
+    def test_background_sizes_cover_every_group_path(self):
+        groups = {'evidence': [self.evidence], 'build': [self.build, self.root / 'missing']}
+        sizer = clean.background_sizes(groups)
+        totals = {label: sum(sizer(paths).values()) for label, paths in groups.items()}
+        self.assertEqual(set(totals), {'evidence', 'build'}); self.assertGreater(totals['build'], 0)
+        self.assertEqual(sizer([self.root / 'missing']), {})
 
 class TmpdirIsolationTests(unittest.TestCase):
     def test_cleanup_with_tmpdir_in_another_marked_scratch_session(self):

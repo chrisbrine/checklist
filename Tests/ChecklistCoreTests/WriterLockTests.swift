@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 @testable import ChecklistCore
 
@@ -221,6 +222,7 @@ extension EvidenceAuthorityTests {
     }
 
     func testGitCallsAreBoundedAndReadBothPipes() throws {
+        try QualificationSuite.requireEnabled()
         let scripts = directory.appendingPathComponent("fake-git"); try FileManager.default.createDirectory(at: scripts, withIntermediateDirectories: true)
         // A child that writes 1 MiB to stderr before stdout would block a parent that reads stdout first.
         let noisy = scripts.appendingPathComponent("noisy"), hanging = scripts.appendingPathComponent("hanging")

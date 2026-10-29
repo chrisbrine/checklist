@@ -18,7 +18,22 @@ DEFAULT_LIBRARY = Path('/Applications/Xcode.app/Contents/Developer/Toolchains/'
 DECLARATION, DEFINITION, REFERENCE, CALL = 1, 2, 4, 32
 CHILDOF, CALLEDBY, CONTAINEDBY = 1 << 9, 1 << 13, 1 << 16
 EXTENDEDBY = 1 << 14
+DYNAMIC, OVERRIDEOF, ACCESSOROF, SPECIALIZATIONOF = 1 << 6, 1 << 11, 1 << 15, 1 << 18
 CALLABLE_KINDS = {12, 16, 17, 18, 22, 23, 24}
+
+
+def dispatch_edges(rows):
+    """Forward requirement/receiver -> witness, override, accessor implementation."""
+    dispatch = {item['usr'] for _, item in rows if item['roles'] & (DECLARATION | DEFINITION)
+                and (item['roles'] & DYNAMIC or any(relation['roles'] & OVERRIDEOF
+                     for relation in item.get('relations', [])))}
+    for _, item in rows:
+        if not item['roles'] & (DECLARATION | DEFINITION):
+            continue
+        for relation in item.get('relations', []):
+            if (relation['roles'] & (OVERRIDEOF | ACCESSOROF | SPECIALIZATIONOF)
+                    or item['usr'] in dispatch and relation['roles'] & CHILDOF):
+                yield relation['usr'], item['usr']
 
 
 class StringRef(C.Structure):
@@ -179,8 +194,9 @@ def read_index_store(store_path, root, library=DEFAULT_LIBRARY, additional_store
         api.store_dispose(store)
     if not records or not occurrences:
         raise ValueError('index store contains no repository records')
+    from auto_impact_map import build_inputs
     result = {'schema_version': 1, 'source': 'index-store', 'store': str(store_path),
-            'library': str(library), 'generated_at': datetime.now(timezone.utc).isoformat(),
+            'build_inputs': build_inputs(root), 'library': str(library), 'generated_at': datetime.now(timezone.utc).isoformat(),
             'generation_seconds': round(time.monotonic() - started, 3),
             'unit_count': len(units), 'record_count': len(records), 'occurrences': occurrences,
             'source_hashes': {path: hashlib.sha256((root / path).read_bytes()).hexdigest()
@@ -214,6 +230,8 @@ def main():
     result = read_index_store(args.store, args.root, args.library, args.additional_store)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, separators=(',', ':')) + '\n')
+    from auto_impact_map import save_index_receipt
+    save_index_receipt(args.output, result)
     print(json.dumps({key: value for key, value in result.items()
                       if key not in ('occurrences', 'source_hashes')}))
 

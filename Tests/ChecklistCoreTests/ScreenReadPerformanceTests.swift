@@ -53,6 +53,7 @@ final class ScreenReadPerformanceTests: XCTestCase {
 
     /// Never bootstraps the real copy: production pure-read dispatch on a read-only pool.
     func testReadOnlyBackupScreenMeasurements() throws {
+        try QualificationSuite.requireEnabled()
         guard let path = ProcessInfo.processInfo.environment["CHECKLIST_READ_ONLY_DATABASE"],
               let pid = ProcessInfo.processInfo.environment["CHECKLIST_READ_BENCHMARK_PROJECT_ID"] else {
             throw XCTSkip("Requires an explicitly selected private backup copy and project")
@@ -89,6 +90,7 @@ final class ScreenReadPerformanceTests: XCTestCase {
     }
 
     func testOwnedStoreMeasurements() throws {
+        try QualificationSuite.requireEnabled()
         guard let path = ProcessInfo.processInfo.environment["CHECKLIST_READ_BENCHMARK_ROOT"],
               let pid = ProcessInfo.processInfo.environment["CHECKLIST_READ_BENCHMARK_PROJECT_ID"] else { throw XCTSkip("Requires an owned test-slot copy and its project ID") }
         let router = try TestStore.router(root:URL(fileURLWithPath:path))

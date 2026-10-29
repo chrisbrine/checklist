@@ -24,6 +24,7 @@ final class MediaPreparationScaleTests: XCTestCase {
     }
 
     func testLargeProjectPreparationReadsTouchedRecordsAndHoldsAtomicityReplayAndFencing() throws {
+        try QualificationSuite.requireEnabled()
         let f = try Fixture()
         addTeardownBlock { try? FileManager.default.removeItem(at:f.base) }
         let type = try f.type(checks.schema()),round = try f.round(type)
@@ -110,6 +111,7 @@ final class MediaPreparationScaleTests: XCTestCase {
     }
 
     func testRoundAndIntakeAcceptMoreThanOneThousandItems() throws {
+        try QualificationSuite.requireEnabled()
         let f = try Fixture()
         addTeardownBlock { try? FileManager.default.removeItem(at:f.base) }
         let type = try f.type(checks.schema()),round = try f.round(type)
@@ -141,6 +143,7 @@ final class MediaPreparationScaleTests: XCTestCase {
     /// CL-307 rework (V43A): a 200-row capture chunk takes about the same time in a small
     /// project and in one with 200,000+ unrelated records.
     func testCaptureChunkTimeDoesNotFollowProjectSize() throws {
+        try QualificationSuite.requireEnabled()
         let f = try Fixture()
         addTeardownBlock { try? FileManager.default.removeItem(at:f.base) }
         let type = try f.type(checks.schema())

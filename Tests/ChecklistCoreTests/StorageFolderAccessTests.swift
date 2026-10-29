@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import Darwin
 import GRDB
@@ -41,6 +42,7 @@ final class StorageFolderAccessTests: XCTestCase {
     }
 
     func testBlockedRootOpenEndsAndReapsChild() throws {
+        try QualificationSuite.requireEnabled()
         let f = try StorageFixture()
         try blocked(f.workspace) { access in
             XCTAssertThrowsError(try StorageObjectFiles(root:f.workspace,folderAccess:access)) {self.timeout($0,folder:f.workspace)}
@@ -122,6 +124,7 @@ final class StorageFolderAccessTests: XCTestCase {
     }
 
     func testBlockedManagedOwnerAnswerEndsBeforeSourceObservationAndRetryCommitsOnce() throws {
+        try QualificationSuite.requireEnabled()
         let f = try StorageFixture(),p = try f.project(),t = try f.task(p),source = f.workspace.appendingPathComponent("answer.bin")
         try Data([4,5,6]).write(to:source)
         let request = try XCTUnwrap(try f.call("human_request_create",["project_id":p["id"]!,"task_id":t["id"]!,"file_requests":[["id":"files","prompt":"Select a file","kind":"file"]]])["data"] as? JSON)
@@ -169,6 +172,7 @@ final class StorageFolderAccessTests: XCTestCase {
         XCTAssertEqual(opens,opened)
     }
     func testFIFOIsRefusedWithoutBlockingOnFinalOpen() throws {
+        try QualificationSuite.requireEnabled()
         let f = try StorageFixture(),source = f.workspace.appendingPathComponent("fifo")
         XCTAssertEqual(mkfifo(source.path,0o600),0)
         let started = ProcessInfo.processInfo.systemUptime
@@ -186,6 +190,7 @@ final class StorageFolderAccessTests: XCTestCase {
         XCTAssertTrue(try files.directoryExists("workspace"))
     }
     func testTimedOutUncommittedImportRetainsIntentAndSameIDRetryCommitsOnceAfterRestart() throws {
+        try QualificationSuite.requireEnabled()
         let f = try StorageFixture(),p = try f.project(),t = try f.task(p),source = f.workspace.appendingPathComponent("source.bin")
         try Data([1,2,3]).write(to:source)
         let command = UUID().uuidString,input: JSON = ["project_id":p["id"]!,"task_id":t["id"]!,"path":source.path,"command_id":command]
@@ -229,9 +234,11 @@ final class StorageFolderAccessTests: XCTestCase {
         XCTAssertEqual(first.attachment["sha256"] as? String,second.attachment["sha256"] as? String)
     }
     func testBlockedBackupDestinationEndsReleasesRetentionAndSameIDRetryCompletes() throws {
+        try QualificationSuite.requireEnabled()
         try blockedBackup(source:false)
     }
     func testBlockedBackupSourceEndsReleasesRetentionAndSameIDRetryCompletes() throws {
+        try QualificationSuite.requireEnabled()
         try blockedBackup(source:true)
     }
     private func blockedBackup(source: Bool) throws {

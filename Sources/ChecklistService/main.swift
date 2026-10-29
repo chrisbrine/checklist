@@ -90,6 +90,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     var storageWake: DispatchWorkItem?
     var storageWakePlan = StorageMaintenanceWakePlan()
     let storageQueue = DispatchQueue(label:"org.checklist.storage-maintenance",qos:.utility)
+    let commandOperationQueue = DispatchQueue(label:"org.checklist.command-operations",qos:.userInitiated,attributes:.concurrent)
     var storageRunning = false
     var storageWakePlanning = false
     var storageWakeReplan = false
@@ -116,7 +117,9 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         }
         self.expectedOwnerHash=(info as? [String:Any])?[kSecCodeInfoUnique as String] as? Data
         super.init()
-        router.configureCommandOperations(on:storageQueue) { [weak self] _,_ in
+        // Operations only decouple the reply; each runs on its own worker as the
+        // synchronous request did, never queued behind backups or maintenance.
+        router.configureCommandOperations(on:commandOperationQueue) { [weak self] _,_ in
             guard let self else {return}
             self.queue.async { [self] in
                 changed()
