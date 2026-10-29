@@ -1244,4 +1244,17 @@ class TmpdirIsolationTests(unittest.TestCase):
                           clean_scratch.workspace_protection(child, clean_scratch.inventory(child)))
 
 
+
+class ReleaseWorkspaceTests(unittest.TestCase):
+    """CL-359: an install built from an integration copy reads ticket statuses in the registered checkout."""
+    def test_environment_then_local_origin_then_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout, copy, plain = Path(tmp) / 'checkout', Path(tmp) / 'copy', Path(tmp) / 'plain'
+            for folder in (checkout, plain):
+                subprocess.run(['git', 'init', '-q', str(folder)], check=True)
+            subprocess.run(['git', 'clone', '-q', str(checkout), str(copy)], check=True, capture_output=True)
+            self.assertEqual(clean.release_workspace(copy, {'CHECKLIST_WORKSPACE': str(plain)}), plain.resolve())
+            self.assertEqual(clean.release_workspace(copy, {}), checkout.resolve())
+            self.assertEqual(clean.release_workspace(plain, {}), plain.resolve())
+
 if __name__ == '__main__': unittest.main()

@@ -829,6 +829,22 @@ def finish(cleaner):
     return 1 if cleaner.failed else 0
 
 
+def release_workspace(repo, environ):
+    """The registered project folder for the release status reads: CHECKLIST_WORKSPACE,
+    else the local origin checkout of an integration copy (installs built from a clone),
+    else the repo itself. The CLI binds its project scope to its working folder."""
+    if environ.get('CHECKLIST_WORKSPACE'):
+        return Path(environ['CHECKLIST_WORKSPACE']).resolve()
+    try:
+        origin = subprocess.run(['git', '-C', str(repo), 'remote', 'get-url', 'origin'],
+                                capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        origin = ''
+    if origin and os.path.isabs(origin) and (Path(origin) / '.git').exists():
+        return Path(origin).resolve()
+    return Path(repo).resolve()
+
+
 def release_done(repo, environ=None, reader=None, sessions_root=None, qualification_root=None):
     """CL-359 item 1: each install is a round boundary. Run clean_scratch.py
     --release-done for the installing session: release its marked folders whose
@@ -842,7 +858,8 @@ def release_done(repo, environ=None, reader=None, sessions_root=None, qualificat
                           'reason': 'no caller session exported; run clean_scratch.py --release-done'}), flush=True)
         return 0
     try:
-        reader = reader or cli_status_reader(Path('/Applications/Checklist.app/Contents/MacOS/checklist'), Path(repo).resolve())
+        reader = reader or cli_status_reader(Path('/Applications/Checklist.app/Contents/MacOS/checklist'),
+                                             release_workspace(repo, environ), environ.get('CHECKLIST_PROJECT_ID'))
         roots = ticket_roots(Path(sessions_root or f'/private/tmp/claude-{os.getuid()}'),
                              Path(qualification_root or Path.home() / 'Library/Caches/ChecklistQualification'), session)
         return release_finished(roots, session, reader)
