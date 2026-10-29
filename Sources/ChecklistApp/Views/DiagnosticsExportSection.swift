@@ -1,4 +1,5 @@
 import SwiftUI
+import ChecklistIPC
 import AppKit
 import UniformTypeIdentifiers
 
@@ -27,11 +28,14 @@ struct DiagnosticsExportSection: View {
         Task { @MainActor in
             defer { exporting = false }
             var summary: [String: Any]?
+            var upgrade = store.storageUpgradeStatus
             do { summary = try await store.request("diagnostics_summary") }
-            catch { DiagnosticsRecorder.shared.record(error.localizedDescription) }
+            catch { upgrade = StorageUpgradeStatus(error: error) ?? upgrade; DiagnosticsRecorder.shared.record(error.localizedDescription) }
             do {
                 try DiagnosticsExport.write(DiagnosticsExport.currentReport(serviceSummary: summary), to: destination)
-                result = summary == nil ? "Diagnostics saved. The service was unavailable, so record counts are omitted." : "Diagnostics saved on this Mac."
+                if summary == nil, let upgrade {
+                    result = "Diagnostics saved. Checklist is upgrading. " + upgrade.summary + " Record counts are omitted."
+                } else { result = summary == nil ? "Diagnostics saved. The service was unavailable, so record counts are omitted." : "Diagnostics saved on this Mac." }
             } catch { store.error = "Diagnostics could not be saved: \(PlainError.text(error))" }
         }
     }

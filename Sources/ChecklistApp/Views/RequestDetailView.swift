@@ -123,7 +123,7 @@ struct RequestDetailView: View {
                                     Text(response.bool("complete") ? "Answer saved" : "Response saved; dependency remains unresolved").checklistFont(.micro)
                                     if !response.records("inspected_images").isEmpty { Text("Inspected originals: \(response.records("inspected_images").count)").checklistFont(.micro) }
                                     if !response.string("explanation").isEmpty { RichTextView(text: response.string("explanation"), capability: .requestExplanation) }
-                                    let continuation = RequestAnswerDeliveryProjection.make(request: request, response: response, messages: request.records("detail_messages"), sessions: request.records("detail_sessions"), snapshotCurrent: store.connected)
+                                    let continuation = RequestAnswerDeliveryProjection.make(request: request, response: response, messages: request.records("detail_messages"), sessions: request.records("detail_sessions"), snapshotCurrent: store.connected, serviceUpgrading: store.storageUpgradeStatus != nil)
                                     ForEach(continuation.recipients) { recipient in
                                         Text("\(recipient.label) · \(recipient.receipt)").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                                     }

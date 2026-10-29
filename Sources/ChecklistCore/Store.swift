@@ -30,6 +30,7 @@ public final class CommandRouter: @unchecked Sendable {
     let cliCommand: String
     let serviceLease: StorageServiceLease?
     let storageAdmission = StorageAdmission()
+    let backupWrites = BackupWriteQueue()
     // Per-command/transaction state, accessed only on the sole writer connection.
     var taskReferenceFrame: TaskReferenceFrame?
     var managedAttachmentPreparation: ManagedAttachmentPreparation?
@@ -123,6 +124,8 @@ public final class CommandRouter: @unchecked Sendable {
             storageMaintenanceRetryAt = Date().addingTimeInterval(60)
         }
         try dbQueue.writeWithoutTransaction { try epicReferenceIndex.install($0) }
+        try backupWrites.restore(root:root,incarnation:incarnation,admission:storageAdmission)
+        backupWrites.resume(router:self)
     }
     static let canonicalRecordColumns = "id,project_id,type,revision,data,CAST(id AS BLOB) AS _envelope_id_bytes,CAST(project_id AS BLOB) AS _envelope_project_id_bytes,CAST(type AS BLOB) AS _envelope_type_bytes,CAST(data AS BLOB) AS _envelope_data_bytes"
     // CASE guards every JSON operation. A foreign malformed payload is never
@@ -284,7 +287,34 @@ public final class CommandRouter: @unchecked Sendable {
     public func handle(method: String, params: [String: Any], caller: Caller) throws -> [String: Any] {
         // Validation, preparation and owner projection also bridge Foundation
         // objects outside the SQL callbacks. Bound their lifetime on this thread.
+        try autoreleasepool {
+            guard ["owner","worker","assistant"].contains(caller.role),!caller.installation.isEmpty else {throw CoreError("FORBIDDEN","An authenticated connection is required.")}
+            guard let encoded = try? JSONSerialization.data(withJSONObject:params),encoded.count <= 2_000_000 else {throw CoreError("INVALID_INPUT","Command input is too large or invalid.")}
+            try validateInput(method,params,caller)
+            if method == "command_status" {return addingWriteAdmission(try backupCommandStatus(params:params,caller:caller))}
+            if !Self.readMethods.contains(method),method != "backup_create" {
+                switch try backupWrites.admit(method:method,params:params,caller:caller,admission:storageAdmission,authorization:{try backupWriteAuthorization(params:params,caller:caller)}) {
+                case .reply(let result):return result
+                case .run:break
+                }
+                defer {backupWrites.finishWrite()}
+                return addingWriteAdmission(try handleCommand(method:method,params:params,caller:caller))
+            }
+            return addingWriteAdmission(try handleCommand(method:method,params:params,caller:caller))
+        }
+    }
+    func executeBackupQueuedWrite(method: String,params: JSON,caller: Caller) throws -> JSON {
         try autoreleasepool {try handleCommand(method:method,params:params,caller:caller)}
+    }
+    /// Internal native-send fences require a committed receipt before external
+    /// I/O. Nil defers the entire send without creating an uncertainty record.
+    public func handleIfWriteAvailable(method: String,params: [String:Any],caller: Caller) throws -> [String:Any]? {
+        guard backupWrites.admitWithoutQueue() else {return nil}
+        defer {backupWrites.finishWrite()}
+        return addingWriteAdmission(try handleCommand(method:method,params:params,caller:caller))
+    }
+    public func withImmediateWriteAccess<T>(_ body: () throws -> T) rethrows -> T? {
+        try backupWrites.withImmediateAccess(body)
     }
     private func handleCommand(method: String, params: [String: Any], caller: Caller) throws -> [String: Any] {
         guard ["owner","worker","assistant"].contains(caller.role), !caller.installation.isEmpty else { throw CoreError("FORBIDDEN", "An authenticated connection is required.") }
@@ -292,6 +322,18 @@ public final class CommandRouter: @unchecked Sendable {
         try validateInput(method,params,caller)
         // CL-116 native owner media boundary prepares outside the ordinary writer.
         if Self.mediaOwnerMethods.contains(method) {
+            // These native reads use the writer connection or create/release
+            // reader holds. Admission also fences capture starting after this check.
+            let writerRead = Self.mediaOwnerReads.contains(method)
+            if writerRead {
+                try owner(caller)
+                _ = try backupWriteAuthorization(params:params,caller:caller)
+                switch backupWrites.admitWriterDependentRead() {
+                case .reply(let result):return result
+                case .run:break
+                }
+            }
+            defer {if writerRead {backupWrites.finishWrite()}}
             do {
                 let value = try executeMediaOwnerChannel(method:method,params:params,caller:caller)
                 var reply: JSON = ["data":value]
@@ -313,6 +355,17 @@ public final class CommandRouter: @unchecked Sendable {
             do { return ownerManagedPathProjection(try executePureRead(readers,method:method,params:params,caller:caller),caller:caller) }
             catch let error where Self.needsWriter(error) {}
         }
+        // A read-only attempt may discover a required hold, availability
+        // observation or first cleanup preview. Admit its writer continuation
+        // atomically with capture; a locked read is retryable, never a queued write.
+        let writerRead = Self.readMethods.contains(method)
+        if writerRead {
+            switch backupWrites.admitWriterDependentRead() {
+            case .reply(let result):return result
+            case .run:break
+            }
+        }
+        defer {if writerRead {backupWrites.finishWrite()}}
         // A crash-left export reserves its intent before any command's file preparation.
         // The shared transaction guard checks it again under the object gate.
         if !Self.readMethods.contains(method),let command = params["command_id"] as? String {

@@ -2382,6 +2382,19 @@ class SlotStartupTests(unittest.TestCase):
             self.assertTrue(all(line.startswith('slot 4: still starting (protected startup), ') and line.endswith(' min')
                                 for line in progress.getvalue().splitlines()))
 
+    def test_start_waits_for_upgrading_and_reports_changed_stage_and_estimate(self):
+        details = {'state': 'upgrading', 'stage': 'protected_snapshot', 'estimated_remaining_seconds': 900,
+                   'reason': 'store_changed_after_preparation'}
+        upgrading = {'error': {'code': 'STORAGE_UPGRADING', 'details': details}}
+        final = {'data': dict(details, stage='final_migration', estimated_remaining_seconds=30)}
+        with self.fixture([upgrading, upgrading, final, self.healthy()]) as (p, clock, calls, commands, output, progress):
+            harness.start(SimpleNamespace(slot=4, gui=False), p)
+            self.assertEqual(len(calls), 4)
+            self.assertEqual(progress.getvalue().count('protected_snapshot'), 1)
+            for text in ['estimated remaining 900s', 'store_changed_after_preparation', 'final_migration', 'estimated remaining 30s']:
+                self.assertIn(text, progress.getvalue())
+            self.assertIn('Slot 4 ready', output.getvalue())
+
     def test_recovery_definite_errors_and_invalid_health_fail_immediately(self):
         healthy = self.healthy()
         for payload in [{'state': 'recovery_required'}, {'data': {'state': 'recovery_required'}},
@@ -2452,6 +2465,56 @@ class SlotStartupTests(unittest.TestCase):
             self.assertFalse(json.loads((p['folder'] / 'slot.json').read_text())['checks']['passed'])
 
 
+class UpgradeInstallScriptTests(unittest.TestCase):
+    def test_preparation_finishes_before_stop_and_failure_never_reaches_stop(self):
+        script = (harness.REPO / 'script/build_and_run.sh').read_text()
+        start = script.index('# Complete the protected copy and rehearsal')
+        end = script.index('# Quiesce only this UI', start)
+        self.assertLess(end, script.index('os.kill(pid,signal.SIGTERM)', end))
+        block = script[start:end]
+        with test_directory() as directory:
+            base = Path(directory).resolve();incoming = base / 'incoming.app'
+            service = incoming / 'Contents/MacOS/ChecklistService';service.parent.mkdir(parents=True)
+            service.write_text('#!' + sys.executable + '\n' + """import json,os,sys
+assert sys.argv[1:]==['--prepare-upgrade']
+with open(os.environ['UPGRADE_TRACE'],'a') as output:output.write('prepare\\n')
+print(os.environ['UPGRADE_RECEIPT'])
+raise SystemExit(int(os.environ.get('UPGRADE_EXIT','0')))
+""")
+            service.chmod(0o755);trace = base / 'trace'
+            good = {'needs_upgrade': True, 'prepared': True, 'expected_offline_seconds': 90}
+            for receipt, code, succeeds in [(good, 0, True), (good, 1, False),
+                                             (dict(good, expected_offline_seconds='90'), 0, False),
+                                             (dict(good, prepared=1), 0, False)]:
+                with self.subTest(receipt=receipt, code=code):
+                    trace.write_text('')
+                    environment = dict(os.environ, INCOMING=str(incoming), UPGRADE_TRACE=str(trace),
+                                       UPGRADE_RECEIPT=json.dumps(receipt), UPGRADE_EXIT=str(code))
+                    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block + '\nprintf "stop\\n" >> "$UPGRADE_TRACE"'],
+                                            env=environment, text=True, capture_output=True)
+                    self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                    self.assertEqual(trace.read_text().splitlines(), ['prepare', 'stop'] if succeeds else ['prepare'])
+                    if succeeds:
+                        self.assertIn('Expected service offline window: about 90 s', result.stdout)
+                        self.assertIn('changed store uses the full protected startup', result.stdout)
+
+    def test_install_measurement_names_healthy_answer_and_failure_is_only_lower_bound(self):
+        script = (harness.REPO / 'script/build_and_run.sh').read_text()
+        start = script.index('# Installed verification is mandatory')
+        end = script.index('\nif [ "$HAD_PREVIOUS" = 1 ]; then echo "Previous bundle retained', start)
+        result = subprocess.run(['bash', '-c', 'set -euo pipefail\npython3() { :; }\nsleep() { :; }\ndate() { echo 109; }\n' + script[start:end]],
+                                env=dict(os.environ, MODE='--install-stage', ROOT_DIR='/fixture', DEST='/fixture/app',
+                                         INSTALL_STARTED='100', OFFLINE_STARTED='100'), text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Measured service offline window: 9 s (stop request to first healthy service answer)', result.stdout)
+        cleanup = script[script.index('cleanup() {'):script.index('\ntrap cleanup EXIT')]
+        result = subprocess.run(['bash', '-c', 'set -euo pipefail\ndate() { echo 109; }\n' + cleanup + '\ncleanup'],
+                                env=dict(os.environ, OFFLINE_STARTED='100', STAGE_ASSEMBLY='', VERIFICATION_RECEIPT='',
+                                         BUILD_LOCK_OWNED='0', INCOMING=''), text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('at least 9 s (no healthy service answer observed', result.stderr)
+
+
 class InstalledVerificationTests(unittest.TestCase):
     def setUp(self):
         # Startup timing fixtures use an imaginary bundle; exact metadata checks
@@ -2506,6 +2569,23 @@ class InstalledVerificationTests(unittest.TestCase):
         self.assertEqual(result['service_state'], 'healthy');self.assertEqual(len(timeouts), 7)
         self.assertTrue(all(0 < value <= 30 for value in timeouts))
         self.assertGreaterEqual(len(progress), 2);self.assertTrue(all('still starting' in line for line in progress))
+
+    def test_upgrading_replies_wait_and_report_stage_estimate_and_fallback_reason(self):
+        target = Path('/synthetic/Checklist.app');clock = self.Clock();progress = []
+        details = {'state': 'upgrading', 'stage': 'protected_snapshot', 'estimated_remaining_seconds': 900,
+                   'reason': 'store_changed_after_preparation'}
+        responses = iter([{'error': {'code': 'STORAGE_UPGRADING', 'details': details}},
+                          {'data': dict(details, stage='final_migration', estimated_remaining_seconds=30)}, self.status()])
+        def runner(command, **kwargs):
+            payload = next(responses)
+            return subprocess.CompletedProcess(command, 1 if 'error' in payload else 0, stdout=json.dumps(payload))
+        result = verify_install.verify(target, [str(target / 'Contents/MacOS/ChecklistApp')], runner,
+                                       clock=clock.monotonic, sleep=clock.sleep, progress=progress.append)
+        self.assertEqual(result['service_state'], 'healthy')
+        self.assertEqual(clock.now, 10)
+        for text in ['protected_snapshot', 'estimated remaining 900s', 'store_changed_after_preparation',
+                     'final_migration', 'estimated remaining 30s']:
+            self.assertIn(text, '\n'.join(progress))
 
     def test_deadline_expires_with_safe_guidance_and_caps_last_call(self):
         target = Path('/synthetic/Checklist.app');clock = self.Clock();timeouts = []

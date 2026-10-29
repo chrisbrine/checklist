@@ -84,6 +84,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     let queue = DispatchQueue(label: "org.checklist.commands", autoreleaseFrequency: .workItem)
     var enrollments: [String: Enrollment] = [:]
     var waiters: [UUID: () -> Void] = [:]
+    var backupDeferredCalls: [UUID: () -> Void] = [:]
     var nativeListener: NativeReplyListener?
     var nativeLifecycle = NativeLifecycleMonitor()
     var storageWake: DispatchWorkItem?
@@ -115,6 +116,20 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         }
         self.expectedOwnerHash=(info as? [String:Any])?[kSecCodeInfoUnique as String] as? Data
         super.init()
+        router.observeWriteAdmission { [weak self] in
+            guard let self else {return}
+            self.queue.async { [self] in
+                changed()
+                if self.router.writeAdmissionStatus["locked"] as? Bool != true {
+                    let deferred = Array(backupDeferredCalls.values);backupDeferredCalls.removeAll()
+                    for resume in deferred {resume()}
+                }
+                if enforcesQueueIsolation,self.router.writeAdmissionStatus["locked"] as? Bool != true {
+                    observeNativeConversationLifecycles();dispatchNative();armStorageWake()
+                    if workHealthWake == nil && workHealthFailures < 2 {runWorkHealth()}
+                }
+            }
+        }
         if let data = try? Data(contentsOf: enrollmentFile), let records = try? JSONDecoder().decode([String: Enrollment].self, from: data) { enrollments = records }
         listener.delegate = self
         if startBackgroundWork {
@@ -132,10 +147,11 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     func runWorkHealth() {
         requireCommandQueue()
         workHealthWake?.cancel(); workHealthWake = nil
+        guard router.writeAdmissionStatus["locked"] as? Bool != true else {return}
         let started = ProcessInfo.processInfo.systemUptime
         defer { if timingDiagnosticsEnabled { CallTimingLog.write(["scope":"work_health_maintenance","start_uptime_s":started,"duration_ms":(ProcessInfo.processInfo.systemUptime-started)*1000]) } }
         do {
-            let result = try router.runWorkHealthChecks()
+            guard let result = try router.withImmediateWriteAccess({try router.runWorkHealthChecks()}) else {return}
             workHealthFailures = 0
             if (result["changed"] as? Int ?? 0) > 0 { changed() }
             guard result["enabled"] as? Bool == true else { return }
@@ -279,11 +295,25 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     /// Resolves the caller and every coordinator-owned operation on the serial queue.
     /// A routed command needs only the router, which serializes its own writes.
     func route(_ request: [String: Any], connection: NSXPCConnection, timing: ServiceCallTiming? = nil) throws -> Routed {
+        let method = request["method"] as? String ?? ""
+        // Bootstrap checks an existing committed connection without the writer.
+        // Its registration/repair branches acquire their own immediate admission.
+        if ["connection_pair","connection_revoke"].contains(method) || (method == "project_create" && request["owner_channel"] as? Bool != true) {
+            guard let result = try router.withImmediateWriteAccess({try routeAdmitted(request,connection:connection,timing:timing)}) else {
+                throw CoreError("BACKUP_SERVICE_CALL_DEFERRED","Connection setup waits for the accepted backup write queue.")
+            }
+            return result
+        }
+        return try routeAdmitted(request,connection:connection,timing:timing)
+    }
+    private func routeAdmitted(_ request: [String: Any], connection: NSXPCConnection, timing: ServiceCallTiming? = nil) throws -> Routed {
         requireCommandQueue()
         ServiceCallTiming.measure(timing,"route_lifecycle_ms") { observeNativeConversationLifecycles() }
         if request["method"] as? String == "connection_bootstrap" {
             let result = try bootstrap(request["params"] as? [String:Any] ?? [:], connection:connection)
-            return .done(result.reply, runHooks:result.changed)
+            var reply = result.reply
+            reply["write_admission"] = router.writeAdmissionStatus
+            return .done(reply, runHooks:result.changed)
         }
         let method = request["method"] as? String ?? ""
         let params = request["params"] as? [String: Any] ?? [:]
@@ -420,6 +450,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     }
     func dispatchNative() {
         requireCommandQueue()
+        guard router.writeAdmissionStatus["locked"] as? Bool != true else {return}
         observeNativeConversationLifecycles()
         guard let listener=nativeListener else { return }
         let bridge=Caller(role:"owner",installation:"native-bridge",projectIDs:[])
@@ -438,7 +469,9 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
             guard lstat(endpoint,&attrs)==0,UInt64(attrs.st_dev)==enrollment.nativeDevice,UInt64(attrs.st_ino)==enrollment.nativeInode else { continue }
             attemptedDeliveries.insert(id)
             // Persist an uncertainty fence BEFORE external I/O. A process crash never retries the same native write.
-            do { _ = try router.handle(method:"delivery_record",params:["command_id":UUID().uuidString.lowercased(),"delivery_id":id,"state":"uncertain","receipt":["stage":"native_send_started","route_generation":enrollment.generation]],caller:bridge) }
+            do {
+                guard try router.handleIfWriteAvailable(method:"delivery_record",params:["command_id":UUID().uuidString.lowercased(),"delivery_id":id,"state":"uncertain","receipt":["stage":"native_send_started","route_generation":enrollment.generation]],caller:bridge) != nil else {attemptedDeliveries.remove(id);continue}
+            }
             catch { fputs("Native dispatch paused: its durable send fence could not be committed.\n",stderr);continue }
             // Offer a native reply only to the exact allowance holder and generation the service will accept;
             // other recipients of a fanned-out note get no invitation. The agent decides whether to use it.
@@ -597,12 +630,15 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
             if let timing { coordinator.timingDiagnosticsEnabled = true;CallTimingLog.write(["scope":"service_admission","request_id":timing.requestID,"method":object?["method"] as? String ?? "","received_uptime_s":received,"start_uptime_s":ProcessInfo.processInfo.systemUptime]) }
             if let object, object["method"] as? String == "changes_wait", let connection {
                 let id = UUID()
+                let admission = coordinator.router.writeAdmissionStatus
                 let heldConnection = DeferredConnection(connection,queue:coordinator.queue)
                 let finish: () -> Void = { [self] in autoreleasepool {
                     do {
                         let result = try coordinator.execute(object,connection:connection,timing:timing)
                         let payload = result["data"] as? [String:Any] ?? result
-                        if payload["changed"] as? Bool == true {
+                        let current = coordinator.router.writeAdmissionStatus
+                        let admissionChanged = current["generation"] as? String != admission["generation"] as? String || current["revision"] as? UInt64 != admission["revision"] as? UInt64
+                        if payload["changed"] as? Bool == true || admissionChanged {
                             coordinator.waiters.removeValue(forKey:id)
                             reply(Self.responseBytes(result,timing:timing))
                         }
@@ -627,6 +663,10 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
             do {
                 guard let connection, let object else { throw ChecklistError("INVALID_INPUT","Invalid command envelope.") }
                 routed = try ServiceCallTiming.measure(timing,"bootstrap_verification_ms") { try coordinator.route(object,connection:connection,timing:timing) }
+            } catch let error as CoreError where error.code == "BACKUP_SERVICE_CALL_DEFERRED" {
+                let id = UUID()
+                coordinator.backupDeferredCalls[id] = { [self] in execute(request,withReply:{reply($0)}) }
+                return
             } catch { finish(["error":Self.publicError(error)],timing:timing,runHooks:Self.requiresAfterCommand(object?["method"] as? String ?? ""),method:object?["method"] as? String ?? "",reply:reply);return }
             switch routed {
             case .done(let result,let runHooks): finish(result,timing:timing,runHooks:runHooks,method:object?["method"] as? String ?? "",reply:reply)
@@ -650,7 +690,7 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
                         result = try ServiceCallTiming.measure(timing,"execution_ms") { try router.handle(method:method,params:params,caller:caller) }
                     } catch { result = ["error":Self.publicError(error)] }
                     reply(Self.responseBytes(result,timing:timing))
-                    let succeeded = result["error"] == nil
+                    let succeeded = result["error"] == nil && result["command_outcome"] as? String != "queued"
                     coordinator.queue.async { [self] in autoreleasepool {afterCommand(succeeded:succeeded,runHooks:Self.requiresAfterCommand(method),timed:timing,method:method)} }
                 }}
             case .router(let method,let params,let caller):
@@ -668,8 +708,9 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
     /// On the serial queue.
     func finish(_ result:[String:Any],timing:ServiceCallTiming? = nil,runHooks:Bool = true,method:String = "",reply:(Data)->Void) {
         coordinator.requireCommandQueue()
+        var result = result;result["write_admission"] = coordinator.router.writeAdmissionStatus
         reply(Self.responseBytes(result,timing:timing))
-        afterCommand(succeeded:result["error"] == nil,runHooks:runHooks,timed:timing,method:method)
+        afterCommand(succeeded:result["error"] == nil && result["command_outcome"] as? String != "queued",runHooks:runHooks,timed:timing,method:method)
     }
     static func responseBytes(_ result:[String:Any],timing:ServiceCallTiming?) -> Data {
         if let timing {return (try? timing.encode(result)) ?? Data("{}".utf8)}
@@ -712,6 +753,19 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
         if PublicErrorText.containsSQL(String(describing:error)) { fputs("ChecklistService: storage failure withheld from client: \(error)\n",stderr) }
         if let e=error as? ChecklistError { return ["code":e.code,"message":PublicErrorText.scrubbed(e.message),"details":PublicErrorText.scrubbedValue(e.details)] }
         return PublicErrorText.payload(error)
+    }
+}
+
+// A bounded installer operation on the selected root; it neither bootstraps a
+// native session nor starts a second service or changes the source schema.
+if CommandLine.arguments.dropFirst().first == "--prepare-upgrade" {
+    do {
+        let result = try StorageUpgradePreparation.prepare(root:ChecklistPaths.root)
+        print(String(decoding:try JSONSerialization.data(withJSONObject:result,options:.sortedKeys),as:UTF8.self))
+        exit(0)
+    } catch {
+        fputs("Upgrade preparation failed; the old service and store were retained: \(error.localizedDescription)\n",stderr)
+        exit(1)
     }
 }
 

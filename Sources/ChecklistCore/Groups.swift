@@ -50,7 +50,7 @@ extension CommandRouter {
         return session
     }
     // CL-139: only a service-verified resumption of this exact native conversation
-    // can close its old generation. It never revives checkpoint/work authority.
+    // can finish or explicitly rebind its old orchestration. Work authority stays ended.
     func resumedTriageClosure(_ db: Database,_ orchestration: JSON,_ session: JSON,_ pid: String) throws -> String? {
         guard orchestration["session_id"] as? String == session["id"] as? String else { return nil }
         for id in strings(session,"prior_native_closure_refs") {
@@ -93,7 +93,7 @@ extension CommandRouter {
     func triageOrchestrate(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         try worker(c);let pid = try scope(db,p,c,write:true)
         let action = try text(p,"action")
-        guard ["start","checkpoint","finish","takeover"].contains(action) else { throw CoreError("INVALID_INPUT","Use start, checkpoint, finish or takeover for the actual orchestration session.") }
+        guard ["start","checkpoint","finish","takeover","resume"].contains(action) else { throw CoreError("INVALID_INPUT","Use start, checkpoint, finish, takeover or resume for the actual orchestration session.") }
         var group: JSON
         if p["triage_id"] == nil {
             // CL-125: start with no Triage creates the caller's Triage.
@@ -111,15 +111,24 @@ extension CommandRouter {
         guard group["kind"] as? String == "triage",!bool(group,"archived") else { throw CoreError("INVALID_TRANSITION","Use a current, unarchived Triage.") }
         var orchestration = group["orchestration"] as? JSON ?? [:]
         var notice: JSON?
-        if action == "start" || action == "takeover" {
+        if action == "start" || action == "takeover" || action == "resume" {
             let session = try eligibleTriageCoordinator(db,c,pid)
             try requireNoOtherOrchestratedTriage(db,project:pid,caller:c,except:gid)
             let previous = orchestration
             var reason: String?
-            if action == "takeover" {
+            var recoveryClosure: String?
+            if action == "resume" {
+                reason = try text(p,"reason",max:4000)
+                guard previous["state"] as? String == "active",
+                      previous["session_authorization_generation"] as? String != sessionGeneration(session),
+                      let closure = try resumedTriageClosure(db,previous,session,pid) else {
+                    throw CoreError("FORBIDDEN","Only the verified resumed conversation can rebind its own recovery_required orchestration. Use checkpoint for a current connection, or takeover for another conversation.")
+                }
+                recoveryClosure = closure
+            } else if action == "takeover" {
                 reason = try text(p,"reason",max:4000)
                 guard previous["state"] as? String == "active" else { throw CoreError("INVALID_TRANSITION","This Triage has no active orchestration to take over. Use start.") }
-                guard previous["session_id"] as? String != c.sessionID else { throw CoreError("INVALID_INPUT","This conversation already records the orchestration. Finish it before starting again; a verified resumed conversation can finish with a reason.") }
+                guard previous["session_id"] as? String != c.sessionID else { throw CoreError("INVALID_INPUT","This conversation already records the orchestration. A verified resumed conversation uses resume with a reason; a current connection uses checkpoint.") }
             } else if previous["state"] as? String == "active" { throw CoreError("CLAIM_CONFLICT","This Triage already records an active orchestration. Checkpoint, explicitly finish or take over that recorded coordination with a reason.") }
             orchestration = [
                 "id": uuid(), "session_id": c.sessionID!, "principal": c.principal, "session_authorization_generation": sessionGeneration(session),
@@ -128,7 +137,17 @@ extension CommandRouter {
                 "revision": 1,
             ]
             if let previousID = previous["id"] { orchestration["previous_orchestration_id"] = previousID }
-            if let reason {
+            if let recoveryClosure, let reason {
+                var ended = revised(previous);ended["state"] = "resumed";ended["finished_at"] = now()
+                ended["native_closure_ref"] = recoveryClosure;ended["resume_reason"] = reason
+                ended["resumed_by_orchestration_id"] = orchestration["id"]
+                ended["resumed_by_principal"] = c.principal
+                ended["resumed_by_authorization_generation"] = sessionGeneration(session)
+                orchestration["resumed_from_orchestration_id"] = previous["id"]
+                orchestration["native_closure_ref"] = recoveryClosure;orchestration["resume_reason"] = reason
+                if let progress = previous["progress"] { orchestration["progress"] = progress }
+                try event(db,caller:c,project:pid,entity:gid,kind:"triage_orchestration_rebound",data:["orchestration":ended,"member_claims_unchanged":true,"memberships_unchanged":true])
+            } else if let reason {
                 var ended = revised(previous);ended["state"] = "taken_over";ended["finished_at"] = now()
                 ended["takeover_reason"] = reason;ended["taken_over_by_orchestration_id"] = orchestration["id"]
                 ended["taken_over_by_session_id"] = c.sessionID!
@@ -165,7 +184,7 @@ extension CommandRouter {
         try save(db,group,type:"group")
         // CL-248: saved notes with no recipient reach the orchestrator once (at most 50 per pickup);
         // the current orchestrator's checkpoint continues the pickup while more remain.
-        let pickup = action == "start" || action == "takeover" || action == "checkpoint"
+        let pickup = action == "start" || action == "takeover" || action == "checkpoint" || action == "resume"
         let saved: (delivered: Int, hasMore: Bool) = pickup ? try deliverSavedTriageNotes(db,group:group) : (0,false)
         var result = try groupProjection(db,group)
         if let notice { result["takeover_notice"] = notice }

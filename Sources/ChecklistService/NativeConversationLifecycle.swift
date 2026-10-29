@@ -36,6 +36,7 @@ extension Coordinator {
     /// and by observed native process/registry events. main.swift owns the hooks.
     func observeNativeConversationLifecycles() {
         requireCommandQueue()
+        guard router.writeAdmissionStatus["locked"] as? Bool != true else {return}
         for enrollment in Array(enrollments.values) {
             guard enrollment.automatic == true, enrollment.role == "worker", enrollment.assistantRelay != true,
                   let plugin=ProviderPluginRegistry.bundled.plugin(enrollment.provider, requiring: .registryClosure),
@@ -76,8 +77,8 @@ extension Coordinator {
                         authorizationGeneration: generation,
                         processState: observation.process.rawValue, registryState: observation.registry.rawValue,
                         registryDigest: observation.registryDigest)
-                    let result = try router.reconcileVerifiedNativeClosure(proof,
-                        caller: Caller(role: "owner", installation: "native-lifecycle", projectIDs: []))
+                    guard let result = try router.withImmediateWriteAccess({try router.reconcileVerifiedNativeClosure(proof,
+                        caller: Caller(role: "owner", installation: "native-lifecycle", projectIDs: []))}) else {return}
                     if !(result["pending_attempt_ids"] as? [String] ?? []).isEmpty { pending = true }
                 }
                 nativeLifecycle.failures.removeValue(forKey: key)

@@ -83,10 +83,12 @@ struct ChecklistCommand {
         let started = ProcessInfo.processInfo.systemUptime
         defer { if CallTimingLog.enabled { CallTimingLog.write(["scope":"cli", "total_ms":(ProcessInfo.processInfo.systemUptime-started)*1000]) } }
         let instance = ChecklistInstance.current
+        var commandName: String?
         do {
             try DelegateInstanceExpectation.verifyIfPresent(instance: instance)
             let shimUpdate = ShimUpdateEnvironment.capture()
             let arguments = try Arguments(Array(CommandLine.arguments.dropFirst()))
+            commandName = arguments.command.first
             let bridge = Bridge(configuration: .init(installation: arguments.installation, workspace: arguments.workspace,
                 expectedSession: arguments.session, automatic: !arguments.installationExplicit,
                 assistantProject: arguments.assistant ? arguments.project : nil, command: arguments.command.first ?? ""),
@@ -115,7 +117,7 @@ struct ChecklistCommand {
                     throw CLIError("Usage: checklist service start|status [--installation NAME]")
                 }
                 // IPC cold-starts the same bundled singleton. There is no model/runtime launch.
-                try printJSON(await bridge.serviceInfo())
+                try printJSON(await serviceStatus(installation: arguments.installation, workspace: arguments.workspace))
             case "call":
                 try printJSON(await call(arguments:arguments,bridge:bridge))
             case "help", "--help", "-h": printHelp()
@@ -123,9 +125,26 @@ struct ChecklistCommand {
             default: throw CLIError("Unknown command. Run checklist help.")
             }
         } catch {
+            if let status = upgradeErrorOutput(error, command: commandName) { FileHandle.standardOutput.write(status); FileHandle.standardOutput.write(Data("\n".utf8)) }
             FileHandle.standardError.write(Data("Checklist: \(error.localizedDescription)\n".utf8))
             exit(1)
         }
+    }
+
+    /// Install probes need the same stage/estimate as the human diagnostic.
+    /// MCP stdout remains exclusively protocol frames, including startup failure.
+    static func upgradeErrorOutput(_ error: Error, command: String?) -> Data? {
+        guard command != "mcp", StorageUpgradeStatus(error: error) != nil, let error = error as? ChecklistError,
+              let bytes = try? JSONSerialization.data(withJSONObject: ["error": ["code": error.code, "message": error.message, "details": error.details]], options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) else { return nil }
+        return JSONOutput.escapingStringControls(bytes)
+    }
+
+    /// Startup readiness is the existing unenrolled service_info projection.
+    /// It neither bootstraps a session nor reads an installation credential.
+    static func serviceStatus(installation: String, workspace: String, platformServices: LocalPlatformServices = .macOS) async throws -> Value {
+        let client = ChecklistClient(installation: installation, workspace: workspace, usesStoredCredential: false, platformServices: platformServices)
+        let bytes = try await client.callAsyncData("service_info", Data("{}".utf8), replyTimeout: 10)
+        return try JSONDecoder().decode(Value.self, from: bytes)
     }
 
     static func call(arguments: Arguments, bridge: Bridge) async throws -> Value {

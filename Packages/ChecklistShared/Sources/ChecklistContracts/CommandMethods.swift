@@ -32,6 +32,7 @@ public enum CommandMethods {
         "cleanup_job_list",
         "workspace_page",
         "service_info",
+        "command_status",
         "tool_catalog",
         "snapshot",
         "changes_wait",

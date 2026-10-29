@@ -21,6 +21,7 @@ import ChecklistIPC
         var heldIdentity: CheckedContinuation<[String: Any], Never>?
         var identityReply: [String: Any]?
         var loseReply = false
+        var upgradingBeforeMutation = false
         var calls: [(String, [String: Any])] = []
         var removals = 0
         let incarnation: String
@@ -44,6 +45,9 @@ import ChecklistIPC
                            requestTransport: { [self] method, params in
                 calls.append((method, params))
                 if failRead, CommandReply.readMethods.contains(method) { throw ChecklistError("SERVICE_UNAVAILABLE", "Synthetic failed identity read") }
+                if upgradingBeforeMutation, !CommandReply.readMethods.contains(method) {
+                    throw StorageUpgradeStatus(stage:"final_migration",estimatedRemainingSeconds:90)!.error(commandID:params["command_id"] as? String)
+                }
                 var reply = try router.handle(method: method, params: appFixtureTaskInput(router,method:method,input:params), caller: owner)
                 if method == "service_info", let retryIncarnation {
                     var data = reply["data"] as! [String: Any]; data["store_incarnation"] = retryIncarnation; reply["data"] = data
@@ -101,6 +105,24 @@ import ChecklistIPC
         XCTAssertEqual(f.mutations[1].1["command_id"] as? String, original)
         let projects = try f.router.handle(method: "project_list", params: [:], caller: f.owner)["data"] as! [String: Any]
         XCTAssertEqual((projects["projects"] as? [[String: Any]])?.count, 1, "The original receipt prevents a duplicate project")
+    }
+
+    func testUpgradeBeforeRetryDoesNotEraseEarlierUnresolvedCommand() async throws {
+        let f = try Fixture(defaults:isolatedDefaults("PendingUpgradeRetry"));defer {f.cleanup()}
+        let store = f.store(restore:false);defer {store.stopWindowReads()}
+        await store.refresh();f.loseReply = true
+        store.run("project_create",["name":"Saved before upgrade"]);try await settled(store)
+        let original = try XCTUnwrap(store.pendingCommandID),saved = try XCTUnwrap(f.saved)
+        XCTAssertTrue(store.hasPendingMutation)
+        f.loseReply = false;f.upgradingBeforeMutation = true
+        store.retryPendingMutation();try await settled(store)
+        XCTAssertTrue(store.hasPendingMutation,"This retry was not sent, but the earlier attempt is still unresolved")
+        XCTAssertEqual(store.pendingCommandID,original);XCTAssertEqual(f.saved,saved);XCTAssertEqual(f.removals,0)
+        f.upgradingBeforeMutation = false;await store.refresh()
+        store.retryPendingMutation();try await settled(store)
+        XCTAssertFalse(store.hasPendingMutation);XCTAssertNil(f.saved);XCTAssertEqual(f.removals,1)
+        let projects = try f.router.handle(method:"project_list",params:[:],caller:f.owner)["data"] as! [String:Any]
+        XCTAssertEqual((projects["projects"] as? [[String:Any]])?.count,1,"Reconcile the original receipt without duplicating the project")
     }
 
     func testOlderIncarnationOtherServiceAndTestSlotAreIgnoredOnceAndNeverSent() async throws {

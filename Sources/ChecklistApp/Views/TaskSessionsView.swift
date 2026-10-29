@@ -2,6 +2,32 @@ import SwiftUI
 import AppKit
 import ChecklistCore
 
+struct NativeClosureReleasePresentation: Equatable {
+    let reason: String
+    static let title = "Claim released · Verified native closure"
+    init?(attempt: Record) {
+        guard attempt.string("state") == "released", !attempt.string("native_closure_ref").isEmpty else { return nil }
+        let recordedReason = attempt.string("reason")
+        reason = recordedReason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "Verified native process and registry closure." : recordedReason
+    }
+    static func latestRootRelease(attempts: [Record], activeAttemptID: String) -> Self? {
+        guard activeAttemptID.isEmpty,
+              let latest = attempts.first(where: { $0.string("parent_attempt_id").isEmpty }) else { return nil }
+        return Self(attempt: latest)
+    }
+}
+
+struct NativeClosureReleaseSummary: View {
+    let release: NativeClosureReleasePresentation
+    var body: some View {
+        VStack(alignment: .leading, spacing: Spacing.hairline) {
+            Text(NativeClosureReleasePresentation.title).checklistFont(.microEmphasis)
+            Text(release.reason).checklistFont(.callout).textSelection(.enabled)
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 struct TaskSessionsView: View {
     @EnvironmentObject var store: ChecklistStore
     let task: Record
@@ -31,6 +57,9 @@ struct TaskSessionsView: View {
         if !attempts.isEmpty || !links.isEmpty || task.bool("active_attention") {
             DetailSection(title: "Work on this ticket") {
                 WorkHealthSummary(health:task.object("work_health"))
+                if let release = NativeClosureReleasePresentation.latestRootRelease(attempts: attempts, activeAttemptID: task.string("active_attempt_id")) {
+                    NativeClosureReleaseSummary(release: release)
+                }
                 DisclosureGroup("Communication availability") {
                     VStack(alignment: .leading, spacing: Spacing.control) {
                         Text(NativeCommunicationRoutes.summary).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
@@ -88,7 +117,7 @@ struct TaskSessionsView: View {
             AccessibleHStack {
                 Text(sessionLabel(attempt, session)).checklistFont(.calloutStrong)
                 Spacer()
-                Text(attempt.id == task.string("active_attempt_id") ? "Current handler" : attempt.string("state") == "active" ? "Current contributor" : GlossaryText.humanize(attempt.string("state")).capitalized).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                Text(attempt.id == task.string("active_attempt_id") ? "Current handler" : attempt.string("state") == "active" ? "Current contributor" : (NativeClosureReleasePresentation(attempt: attempt) == nil ? GlossaryText.humanize(attempt.string("state")).capitalized : "Released · Native closure")).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             }
             Text("\(session?.string("provider").capitalized ?? (attempt.string("session_id") == "human" ? "You" : "Agent")) · \(attempt.string("phase", fallback: "implementation").capitalized)").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             if attempt.string("state") == "active", !attempt.string("waiting_for_resource").isEmpty {

@@ -160,6 +160,47 @@ extension EvidenceAuthorityTests {
         XCTAssertEqual(history.filter {$0["kind"] as? String == "triage_orchestration_start"}.count,2)
         XCTAssertEqual(try orchestrationProtectedRecords(p),protected)
     }
+    func testTriageResumeRebindsInOneCommandWithHistoryAndNoMemberAuthority() throws {
+        let (p, group, tasks) = try orchestrationFixture()
+        let old = try native(p,"one-step-resume",domain:"claude:123:5:0",provider:"claude")
+        let started = try orchestrate(p,group,"start",old), original = started["orchestration"] as! JSON
+        _ = try claim(p,tasks[0],caller:old)
+        let (resumed, closure) = try closeAndResumeOrchestrator(p,old)
+        let other = try native(p,"resume-foreign",domain:"host-other")
+        let protected = try orchestrationProtectedRecords(p)
+        let summary = try XCTUnwrap((call("service_info",[:],resumed)["native_recovery"] as? [JSON])?.first)
+        let recovery = try XCTUnwrap((summary["recovery_required_orchestrations"] as? [JSON])?.first)
+        XCTAssertEqual(recovery["triage_id"] as? String,group["id"] as? String)
+        XCTAssertEqual(recovery["key"] as? String,group["key"] as? String)
+        XCTAssertNotNil(recovery["recovery_required_at"])
+        XCTAssertTrue((recovery["recovery_step"] as? String ?? "").contains("action=resume"))
+        assertCode("FORBIDDEN") { _ = try self.orchestrate(p,group,"resume",other,reason:"Wrong conversation") }
+        assertCode("INVALID_INPUT") { _ = try self.orchestrate(p,group,"resume",resumed) }
+        assertCode("INVALID_INPUT") { _ = try self.orchestrate(p,group,"resume",resumed,reason:" ") }
+        let command = UUID().uuidString
+        let input: JSON = ["project_id":p["id"]!,"triage_id":group["id"]!,"expected_revision":recovery["expected_revision"]!,"action":"resume","reason":"Continue after native closure"]
+        let rebound = try call("triage_orchestrate",input,resumed,command:command)
+        let current = rebound["orchestration"] as! JSON
+        XCTAssertNotEqual(current["id"] as? String,original["id"] as? String)
+        XCTAssertEqual(current["previous_orchestration_id"] as? String,original["id"] as? String)
+        XCTAssertEqual(current["resumed_from_orchestration_id"] as? String,original["id"] as? String)
+        XCTAssertEqual(current["native_closure_ref"] as? String,closure)
+        XCTAssertEqual(current["principal"] as? String,resumed.principal)
+        XCTAssertEqual(rebound["orchestration_connection"] as? String,"current")
+        XCTAssertEqual(try jsonString(rebound["members"]!),try jsonString(started["members"]!))
+        XCTAssertEqual(try orchestrationProtectedRecords(p),protected)
+        XCTAssertEqual(try jsonString(call("triage_orchestrate",input,resumed,command:command)),try jsonString(rebound))
+        let history = try orchestrationHistory(p,group)
+        let ended = try XCTUnwrap(history.first {$0["kind"] as? String == "triage_orchestration_rebound"}?["data"] as? JSON)["orchestration"] as! JSON
+        XCTAssertEqual(ended["id"] as? String,original["id"] as? String)
+        XCTAssertEqual(ended["state"] as? String,"resumed")
+        XCTAssertEqual(ended["native_closure_ref"] as? String,closure)
+        let refreshed = try XCTUnwrap((call("service_info",[:],resumed)["native_recovery"] as? [JSON])?.first)
+        XCTAssertTrue((refreshed["recovery_required_orchestrations"] as! [JSON]).isEmpty)
+        assertCode("FORBIDDEN") { _ = try self.orchestrate(p,group,"resume",resumed,reason:"Already current") }
+        _ = try orchestrate(p,group,"checkpoint",resumed)
+        XCTAssertEqual(try orchestrationProtectedRecords(p),protected)
+    }
     func testTriageRecoveryRefusesUnverifiedGenerationRotationAndForeignClosure() throws {
         let (p, group, _) = try orchestrationFixture(), old = try native(p,"unverified-orchestrator",domain:"claude:123:5:0",provider:"claude")
         _ = try orchestrate(p,group,"start",old)
@@ -168,9 +209,11 @@ extension EvidenceAuthorityTests {
         session = try call("session_update",["project_id":p["id"]!,"session_id":old.sessionID!,"expected_revision":session["revision"]!,"state":"ended"])
         _ = try call("session_update",["project_id":p["id"]!,"session_id":old.sessionID!,"expected_revision":session["revision"]!,"state":"connected"])
         assertCode("FORBIDDEN") { _ = try self.orchestrate(p,group,"finish",old,reason:"Not a verified resumption") }
+        assertCode("FORBIDDEN") { _ = try self.orchestrate(p,group,"resume",old,reason:"Not a verified resumption") }
         // Even a real later closure does not match the orchestration's original generation.
         let (resumed, _) = try closeAndResumeOrchestrator(p,old)
         assertCode("FORBIDDEN") { _ = try self.orchestrate(p,group,"finish",resumed,reason:"Wrong closed generation") }
+        assertCode("FORBIDDEN") { _ = try self.orchestrate(p,group,"resume",resumed,reason:"Wrong closed generation") }
         _ = try orchestrate(p,group,"finish",reason:"Owner recovery stays available")
     }
 }

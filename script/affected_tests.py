@@ -54,6 +54,7 @@ QUALIFICATION_TESTS = (
 # scripts/test_affected_tests.py fails when wall_clock_budget_cases finds an
 # ungated case missing here or in QUALIFICATION_TESTS.
 TIMING_TESTS = (
+    'ChecklistServiceTests.BootstrapAdmissionTests/testFreshBootstrapReadsAndTwoQueuedWritesFinishWhileActualWriterIsHeld',
     'ChecklistAppTests.ApplicationTerminationTests/testOpenFloatingCaptureQuitsAndRestoresBlankTextAndFiles',
     'ChecklistAppTests.CachedScreenReturnTests/testTemplateCatalogOverviewReturnNeedsNoReadOrCatalogReplay',
     'ChecklistAppTests.MediaPlaybackComparisonTests/testSyntheticWrittenMovieIsSelfContainedAndProbeMeasuresIt',

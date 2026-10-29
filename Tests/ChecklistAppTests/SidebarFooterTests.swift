@@ -9,8 +9,7 @@ final class SidebarFooterTests: XCTestCase {
             .components(separatedBy: "/// An archived project")[0]
         XCTAssertFalse(footer.contains("AccessibleHStack"), "The footer must not become a vertical stack above 130% text")
         XCTAssertFalse(footer.contains("buildLabel"))
-        XCTAssertTrue(footer.contains("Service connected"))
-        XCTAssertTrue(footer.contains("Service disconnected"))
+        XCTAssertTrue(footer.contains("Text(store.serviceConnectionFooter)"))
         XCTAssertTrue(footer.contains(".fixedSize(horizontal: false, vertical: true)"), "Status text wraps at the narrow sidebar width")
         XCTAssertTrue(footer.contains("if store.sidebarLoading || (store.page == .media && mediaLoading) { ProgressView().controlSize(.mini).frame(width: 28, height: 28) }"))
         XCTAssertTrue(footer.contains("else { Button { Task { await store.refresh() } }"))

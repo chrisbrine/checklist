@@ -27,7 +27,7 @@ import uuid
 
 from clean_scratch import caller_session, mark_qualification, validate_fingerprint
 from verify_stage import sha, signing_teams, verify as verify_stage
-from verify_install import failure_guidance
+from verify_install import failure_guidance, upgrading_message, upgrading_status
 
 REPO = Path(__file__).resolve().parent.parent
 BASE = Path.home() / 'Library/Application Support/Checklist Test Instances'
@@ -1155,6 +1155,7 @@ def service_status(p, *, bound=None):
     bound = start_deadline_seconds() if bound is None else bound
     number = p['folder'].name.removeprefix('slot-')
     started = time.monotonic();deadline = started + bound;next_progress = started + 60
+    last_upgrade = None
     command = [p['bundle'] / 'Contents/MacOS/checklist', 'service', 'status']
     def expired():
         raise ValueError(f'Slot {number} startup deadline expired after {bound:g} seconds; '
@@ -1176,12 +1177,18 @@ def service_status(p, *, bound=None):
                 body = payload.get('data', payload) if isinstance(payload, dict) else None
                 if not isinstance(body, dict): raise ValueError('Slot service returned invalid status: ' + str(result.stdout))
                 states = [payload.get('state'), body.get('state')]
-                if any(state not in [None, 'ready', 'running', 'healthy', 'starting', 'unavailable'] for state in states):
+                if any(state not in [None, 'ready', 'running', 'healthy', 'starting', 'unavailable', 'upgrading'] for state in states):
                     raise ValueError('Slot service reported an error state: ' + result.stdout)
                 errors = [value['error'] for value in [payload, body] if 'error' in value]
-                if any(not isinstance(error, dict) or error.get('code') not in ['SERVICE_UNAVAILABLE', 'UNAVAILABLE'] for error in errors):
+                if any(not isinstance(error, dict) or error.get('code') not in ['SERVICE_UNAVAILABLE', 'UNAVAILABLE', 'STORAGE_UPGRADING'] for error in errors):
                     raise ValueError('Slot service returned an error status: ' + result.stdout)
-                if not errors and not any(state in ['starting', 'unavailable'] for state in states):
+                upgrade = upgrading_status(payload)
+                if upgrade is not None:
+                    message = upgrading_message(upgrade)
+                    if message != last_upgrade:
+                        print(f'slot {number}: {message}.', file=sys.stderr, flush=True)
+                        last_upgrade = message
+                if not errors and upgrade is None and not any(state in ['starting', 'unavailable', 'upgrading'] for state in states):
                     if (result.returncode or body.get('name') != 'Checklist' or not isinstance(body.get('version'), str)
                             or not body['version'] or not isinstance(body.get('capabilities'), list) or 'durable_store' not in body['capabilities']):
                         raise ValueError('Slot service is not healthy: ' + result.stdout)
@@ -1401,13 +1408,14 @@ def promote(arguments, p):
                 bundle_check(other, value)
             slots.append(value)
     gates = promotion_gates(selected, slots)
-    for gate, passed in gates.items(): print(f'{gate}: {"PASS" if passed else "FAIL"}')
+    for gate, passed in gates.items(): print(f'{gate}: {"PASS" if passed else "FAIL"}', flush=True)
     command = [str(REPO / 'script/build_and_run.sh'), '--install-stage', selected['stage_path']]
-    print('Planned action: ' + json.dumps(command))
+    print('Planned action: ' + json.dumps(command), flush=True)
     if not gates['live_snapshot_check_same_build']:
         print('Missing live-backup qualification: run a same-build live-backup-seeded slot check.')
     if not all(gates.values()): raise ValueError('Promotion refused: all gates must pass, including a live-backup-seeded check of this build. ' + RELOCATION_REQUIRED)
     if not arguments.dry_run:
+        print('Promotion: installer will print the expected offline window before stopping the service and the measured window after its first healthy answer.', flush=True)
         install_started = time.time()
         try:
             subprocess.run(command, check=True)

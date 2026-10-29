@@ -12,7 +12,7 @@ struct RequestAnswerDeliveryProjection {
     let recipients: [Recipient]
     let summary: String
 
-    static func make(request: Record, response: Record, messages: [Record], sessions: [Record], snapshotCurrent: Bool) -> Self {
+    static func make(request: Record, response: Record, messages: [Record], sessions: [Record], snapshotCurrent: Bool, serviceUpgrading: Bool = false) -> Self {
         func unavailable() -> Self {
             .init(recipients: [], summary: (snapshotCurrent ? "Current delivery status is unavailable." : "Last known delivery status is unavailable.") + " The saved answer is unchanged.")
         }
@@ -85,7 +85,7 @@ struct RequestAnswerDeliveryProjection {
             rows.append(.init(id: "unavailable-anchor:\(index)", label: historicalLabel(anchor), receipt: "Delivery status unavailable"))
         }
         guard !rows.isEmpty else { return unavailable() }
-        return .init(recipients: rows, summary: snapshotCurrent ? "Delivery status for this saved response." : "Last known delivery status. Checklist is disconnected; the saved answer is unchanged.")
+        return .init(recipients: rows, summary: snapshotCurrent ? "Delivery status for this saved response." : "Last known delivery status. Checklist is " + (serviceUpgrading ? "upgrading" : "disconnected") + "; the saved answer is unchanged.")
     }
 
     private struct Availability {

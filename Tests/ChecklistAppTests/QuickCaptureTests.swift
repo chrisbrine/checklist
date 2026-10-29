@@ -23,6 +23,26 @@ import ChecklistIPC
         QuickCaptureModel(journal: LocalDraftJournal(directory: root), preferences: preferences!, stagingDirectory: root.appendingPathComponent("staging"), transport: transport)
     }
 
+    func testProjectLoadShowsKnownUpgradeForBlankAndSavedDrafts() async throws {
+        let status = try XCTUnwrap(StorageUpgradeStatus(stage: "preparation_validation", estimatedRemainingSeconds: 30))
+        var upgrading = true
+        let quick = model { _, _ in
+            if upgrading { throw status.error() }
+            return ["projects": []]
+        }
+        await quick.loadProjects()
+        XCTAssertTrue(try XCTUnwrap(quick.projectUpgradeNotice).contains(status.summary))
+        XCTAssertEqual(quick.state, .editing)
+        quick.draft.title = "Saved during upgrade"
+        await quick.loadProjects()
+        guard case .notSent(let reason) = quick.state else { return XCTFail("The saved draft needs an upgrade notice") }
+        XCTAssertTrue(reason.contains("Checklist is upgrading")); XCTAssertTrue(reason.contains(status.summary))
+        XCTAssertEqual(quick.draft.title, "Saved during upgrade")
+        upgrading = false
+        await quick.loadProjects()
+        XCTAssertNil(quick.projectUpgradeNotice); XCTAssertEqual(quick.state, .editing)
+    }
+
     func testBlankNonemptyDraftStaysBlankThroughRestoreAndProjectRefresh() async throws {
         preferences.set("p1", forKey: QuickCaptureModel.lastProjectKey)
         let file = root.appendingPathComponent("capture.txt")

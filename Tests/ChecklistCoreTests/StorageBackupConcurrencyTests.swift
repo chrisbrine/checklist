@@ -5,6 +5,49 @@ import Darwin
 @testable import ChecklistCore
 
 final class StorageBackupConcurrencyTests: XCTestCase {
+    func testInventoryRunsAfterWriterAndObjectGateReleaseWithRetentionStillActive() throws {
+        let f = try StorageFixture(),p = try f.project(),t = try f.task(p),router = f.router!
+        let source = f.workspace.appendingPathComponent("inventory.bin"),bytes = Data(repeating:9,count:4096)
+        try bytes.write(to:source)
+        let original = try f.call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":source.path])["data"] as! JSON
+        let destination = f.base.appendingPathComponent("inventory-backup")
+        var budget = StorageSnapshotBudget.production(),events: [String] = []
+        budget.observe = {event in
+            events.append(event)
+            guard event == "inventory_started" else {return}
+            XCTAssertTrue(events.contains("writer_lease_released"))
+            XCTAssertTrue(events.contains("capture_released"))
+            XCTAssertTrue(try StorageSnapshotRetention.isActive(root:f.root))
+            let started = ProcessInfo.processInfo.systemUptime
+            _ = try f.call("message_send",["project_id":p["id"]!,"task_id":t["id"]!,"body":"Written before inventory","kind":"note"])
+            _ = try f.call("task_edit",["project_id":p["id"]!,"task_id":t["id"]!,"expected_revision":t["revision"]!,"title":"Edited before inventory"])
+            _ = try f.call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":source.path])
+            print("CL320 inventory-boundary writes_seconds=\(ProcessInfo.processInfo.systemUptime - started)")
+            try ArchiveStorageGate.withExclusive(root:f.root) {_ in
+                XCTAssertThrowsError(try StorageSnapshotRetention.requireNoCapture(root:f.root)) {
+                    XCTAssertEqual(($0 as? CoreError)?.code,"BACKUP_CAPTURE_ACTIVE")
+                }
+            }
+        }
+        _ = try router.executeStorageBackup(params:["command_id":UUID().uuidString,"path":destination.path],caller:f.owner,budget:budget)
+        XCTAssertTrue(events.contains("inventory_finished"))
+        XCTAssertGreaterThan(budget.measurement.writerLeaseSeconds,0)
+        XCTAssertFalse(try StorageSnapshotRetention.isActive(root:f.root))
+        let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self,from:Data(contentsOf:destination.appendingPathComponent("manifest.json")))
+        XCTAssertTrue(manifest.objects.contains {$0.descriptor.authorities.contains("attachment:" + (original["id"] as! String) + ":original")})
+        XCTAssertEqual(manifest.objects.filter {$0.descriptor.authorities.contains {$0.hasPrefix("attachment:") && $0.hasSuffix(":original")}}.count,1)
+        var configuration = Configuration();configuration.readonly = true;configuration.prepareDatabase {try SchemaMigrations.installStorageCollation($0)}
+        let copy = try DatabaseQueue(path:destination.appendingPathComponent("database.sqlite").path,configuration:configuration)
+        defer {try? copy.close()}
+        try copy.read {db in
+            XCTAssertEqual(try String.fetchOne(db,sql:"PRAGMA integrity_check"),"ok")
+            XCTAssertEqual(try router.record(db,t["id"] as! String,type:"task")["title"] as? String,"Storage invariant")
+            XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type='message' AND json_extract(data,'$.body')='Written before inventory'"),0)
+        }
+        _ = try StorageSnapshot.reconcile(parent:f.base,operation:UUID(uuidString:manifest.operationID)!,publicationName:destination.lastPathComponent,budget:.production())
+        print("CL320 template writer_lease_seconds=\(budget.measurement.writerLeaseSeconds)")
+    }
+
     func testNotesEditsAndNewImportsFinishWhileCopyAndVerificationArePaused() throws {
         let f = try StorageFixture(),p = try f.project(),t = try f.task(p),router = f.router!
         let source = f.workspace.appendingPathComponent("original.bin")

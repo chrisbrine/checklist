@@ -193,4 +193,23 @@ final class CommandOutcomeTests: XCTestCase {
         XCTAssertEqual(order, ["credential", "enrollment", "registration"])
         XCTAssertTrue(ConnectionCommit.registrationMatches(session, sessionID: sid, installation: "pair", generation: "new", role: "worker", provider: "codex", projects: [pid]))
     }
+    func testBackupQueueAcknowledgmentRequiresCorrelatedDurableAdmission() throws {
+        let command = UUID().uuidString
+        let admission: [String:Any] = ["locked":true,"queued":true,"reason":"backup_in_progress","estimated_remaining_seconds":NSNull()]
+        let accepted: [String:Any] = ["command_id":command,"command_outcome":"queued","write_admission":admission,
+                                   "data":["state":"queued","queued":true,"status_method":"command_status","command_id":command]]
+        let decoded = try CommandReply.decode(bytes(accepted),method:"message_send",commandID:command)
+        XCTAssertEqual(decoded["command_outcome"] as? String,"queued")
+        for field in ["command_outcome","write_admission","command_id"] {
+            var malformed = accepted;malformed.removeValue(forKey:field)
+            if field == "command_outcome" {continue} // A domain result may legitimately include a state field.
+            XCTAssertThrowsError(try CommandReply.decode(bytes(malformed),method:"message_send",commandID:command)) {XCTAssertTrue(CommandReply.shouldRetainPending(after:$0))}
+        }
+        for field in ["locked","queued","reason"] {
+            var malformed = accepted,varAdmission = admission;varAdmission.removeValue(forKey:field);malformed["write_admission"] = varAdmission
+            XCTAssertThrowsError(try CommandReply.decode(bytes(malformed),method:"message_send",commandID:command)) {XCTAssertTrue(CommandReply.shouldRetainPending(after:$0))}
+        }
+        XCTAssertFalse(CommandReply.expectsMutation("command_status"))
+    }
+
 }

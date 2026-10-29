@@ -41,6 +41,13 @@ public enum CommandReply {
         guard let data = object["data"] as? [String: Any] else { throw ambiguous("missing_result_data") }
         if expectsMutation(method) {
             guard let commandID, object["command_id"] as? String == commandID else { throw ambiguous("missing_mutation_identity") }
+            if object["command_outcome"] as? String == "queued" {
+                guard data["state"] as? String == "queued",data["queued"] as? Bool == true,
+                      data["command_id"] as? String == commandID,data["status_method"] as? String == "command_status",
+                      let admission = object["write_admission"] as? [String:Any],admission["queued"] as? Bool == true,
+                      admission["locked"] as? Bool == true,!(admission["reason"] as? String ?? "").isEmpty else {throw ambiguous("invalid_queued_receipt")}
+                return object
+            }
             // Live notices/cursors are observations, never the semantic result of
             // the pending mutation. Existing domain/form validation remains above.
             let observations: Set<String> = ["_checklist", "event_cursor", "pending_message_ids", "policy_changes", "next_cursor", "current_authority", "recovery_warning"]

@@ -10,7 +10,7 @@ struct AppSettingsView: View {
         TabView(selection: Binding(get: { ["general", "storage"].contains(selectedSection) ? selectedSection : "general" }, set: { selectedSection = $0 })) {
             GeneralSettingsView().tabItem { Label("General", systemImage: "gearshape") }.tag("general")
             StorageSettingsView().tabItem { Label("Storage", systemImage: "externaldrive") }.tag("storage")
-        }.frame(maxWidth: .infinity, maxHeight: .infinity).padding(Spacing.control).onAppear { if !["general", "storage"].contains(selectedSection) { selectedSection = "general" } }
+        }.frame(maxWidth: .infinity, maxHeight: .infinity).padding(Spacing.control).environment(\.checklistStorageUpgradeStatus, store.storageUpgradeStatus).onAppear { if !["general", "storage"].contains(selectedSection) { selectedSection = "general" } }
     }
 }
 
@@ -25,7 +25,7 @@ struct GeneralSettingsView: View {
             Section("Checklist") {
                 LabeledContent("Version", value: ChecklistBuildVersion.current.version).accessibilityIdentifier("checklistVersion")
                 LabeledContent("Installed build", value: store.buildLabel)
-                LabeledContent("Service", value: store.connected ? "Connected" : "Disconnected")
+                LabeledContent("Service", value: store.serviceConnectionLabel)
                 Text("Local macOS production checklist. Existing checklists have not been migrated.").checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
             }
             DiagnosticsExportSection()

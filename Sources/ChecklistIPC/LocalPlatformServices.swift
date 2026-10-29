@@ -88,7 +88,7 @@ public struct MacOSLocalCommandTransport: LocalCommandTransport {
 
     // Qualification supplies an anonymous listener to exercise the same native
     // transport without contacting the installed Mach service.
-    func request(_ bytes: Data, replyTimeout: TimeInterval?, connection suppliedConnection: NSXPCConnection?) throws -> [String: Any] {
+    func request(_ bytes: Data, replyTimeout: TimeInterval?, connection suppliedConnection: NSXPCConnection?, upgradeRoot: URL = ChecklistPaths.root) throws -> [String: Any] {
         if let replyTimeout, !replyTimeout.isFinite || replyTimeout < 0 {
             throw ChecklistError("INVALID_INPUT", "The reply timeout must be a finite, nonnegative number of seconds.")
         }
@@ -101,6 +101,8 @@ public struct MacOSLocalCommandTransport: LocalCommandTransport {
             CallTimingLog.write(diagnostic)
         } }
         let commandID = (request?["params"] as? [String: Any])?["command_id"] as? String
+        func upgradeStatus() -> StorageUpgradeStatus? { suppliedConnection == nil ? StorageUpgradeStatus.read(root: upgradeRoot) : nil }
+        if let upgrade = upgradeStatus() { throw upgrade.error(commandID: commandID) }
         let connection = suppliedConnection ?? NSXPCConnection(machServiceName: ChecklistInstance.current.machServiceName, options: [])
         connection.remoteObjectInterface = NSXPCInterface(with: ChecklistRPC.self)
         let semaphore = DispatchSemaphore(value: 0)
@@ -125,11 +127,13 @@ public struct MacOSLocalCommandTransport: LocalCommandTransport {
         remote.execute(bytes) { value in complete(value, nil) }
         let deadline: DispatchTime = replyTimeout.map { .now() + max(0, $0) } ?? .distantFuture
         guard semaphore.wait(timeout: deadline) == .success else {
+            if let upgrade = upgradeStatus() { throw upgrade.error(commandID: commandID, outcomeUnknown: true, transportReason: "reply_timeout") }
             throw CommandReply.unknown(commandID: commandID, reason: "reply_timeout")
         }
         let (received, failure) = outcome.withLock { ($0.response, $0.error) }
         guard let received else {
             // execute was already invoked; a proxy failure cannot prove noncommit.
+            if let upgrade = upgradeStatus() { throw upgrade.error(commandID: commandID, outcomeUnknown: true, transportReason: failure == nil ? "connection_ended" : "transport_error_after_send") }
             let error = CommandReply.unknown(commandID: commandID, reason: failure == nil ? "connection_ended" : "transport_error_after_send")
             if ChecklistInstance.current.slot != nil {
                 throw ChecklistError(error.code, error.message + " " + ChecklistInstance.current.startInstruction, details:error.details)

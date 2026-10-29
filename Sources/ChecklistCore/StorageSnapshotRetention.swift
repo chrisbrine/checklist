@@ -4,7 +4,8 @@ import Darwin
 /// A conservative hold over this root's immutable managed namespace. Metadata
 /// writes and new immutable publications remain admitted. All managed deletion
 /// paths refuse while capture is active; the ordinary object gate orders their
-/// final check/unlink against capture's SQLite copy and inventory.
+/// final check/unlink against capture's SQLite copy. Retention starts before
+/// that copy and protects the entire namespace while inventory runs outside it.
 ///
 /// The kernel releases this hold on process death. An interrupted stage is
 /// independent partial bytes, never resumed from an unprotected source: retry

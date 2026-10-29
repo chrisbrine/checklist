@@ -11,7 +11,7 @@ struct WorkspaceListState: View {
         if store.workspaceError != nil {
             EmptyView()
         } else if !store.workspacePageLoaded && store.showsOfflineBanner {
-            EmptyState(symbol: "bolt.horizontal.circle", title: "Checklist is offline", detail: "This list loads when Checklist reconnects. Your drafts stay on this Mac.")
+            EmptyState(symbol: "bolt.horizontal.circle", title: store.connectionBannerTitle, detail: store.storageUpgradeStatus == nil ? "This list loads when Checklist reconnects. Your drafts stay on this Mac." : store.connectionBannerMessage)
         } else if !store.workspacePageLoaded {
             ProgressView("Loading…").frame(maxWidth: .infinity).padding(.vertical, Spacing.group)
         } else {
@@ -38,7 +38,7 @@ struct DetailUnavailable: View {
     let title: String
     var body: some View {
         if store.showsOfflineBanner {
-            EmptyState(symbol: "bolt.horizontal.circle", title: "Checklist is offline", detail: "This detail loads when Checklist reconnects. Your drafts stay on this Mac.")
+            EmptyState(symbol: "bolt.horizontal.circle", title: store.connectionBannerTitle, detail: store.storageUpgradeStatus == nil ? "This detail loads when Checklist reconnects. Your drafts stay on this Mac." : store.connectionBannerMessage)
         } else if store.loading {
             ProgressView("Loading…").padding(Spacing.group)
         } else {

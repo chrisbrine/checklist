@@ -126,32 +126,52 @@ enum SchemaMigrations {
         try db.execute(sql:"PRAGMA user_version=3")
         guard case .current(let actual) = try inspect(db), actual == ready else { throw StoreRecovery.required("migration_result_invalid") }
     }
+    /// Exact typed SQL bytes in rowid order, streamed once. In particular, text
+    /// is never projected through a C string (embedded NULs) or hex-expanded.
+    /// This is local preparation evidence, not a persisted protocol checksum.
     static func contentFingerprint(_ db: Database) throws -> String {
         var digest = SHA256()
-        func feed(_ bytes: Data) { var length = UInt64(bytes.count).bigEndian;withUnsafeBytes(of:&length) { digest.update(data:Data($0)) };digest.update(data:bytes) }
+        func feed(_ bytes: Data) {
+            var length = UInt64(bytes.count).bigEndian
+            withUnsafeBytes(of:&length) { digest.update(data:Data($0)) }
+            digest.update(data:bytes)
+        }
+        feed(Data("typed-sql-bytes-v2".utf8))
         for table in ["metadata","records","commands","events","cursors","sqlite_sequence"] {
             feed(Data(table.utf8))
-            let rows = try Row.fetchCursor(db,sql:"SELECT rowid,* FROM " + table + " ORDER BY rowid")
-            while let row = try rows.next() {
-                for i in 0..<row.count {
-                    let value: DatabaseValue = row[i]
-                    switch value.storage {
-                    case .null: feed(Data([0]))
-                    case .int64(let n): feed(Data(("i" + String(n)).utf8))
-                    case .double(let n): var bits = n.bitPattern.bigEndian;feed(Data([2]));withUnsafeBytes(of:&bits) { feed(Data($0)) }
-                    case .string: // Obtain complete SQL bytes, not GRDB's cString projection.
-                        // The full-row snapshot uses witnesses; fingerprint uses SQL's hex
-                        // representation below instead of this lossy value.
-                        break
-                    case .blob(let bytes): feed(Data([4]));feed(bytes)
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db.sqliteConnection,"SELECT rowid,* FROM " + table + " ORDER BY rowid",-1,&statement,nil) == SQLITE_OK,
+                  let statement else { throw StoreRecovery.required("fingerprint_read_failed") }
+            defer { sqlite3_finalize(statement) }
+            let columns = sqlite3_column_count(statement)
+            for column in 0..<columns { feed(Data(String(cString:sqlite3_column_name(statement,column)).utf8)) }
+            var result = sqlite3_step(statement)
+            while result == SQLITE_ROW {
+                feed(Data([0xff]))
+                for column in 0..<columns {
+                    let type = sqlite3_column_type(statement,column)
+                    feed(Data([UInt8(type)]))
+                    switch type {
+                    case SQLITE_INTEGER:
+                        var value = sqlite3_column_int64(statement,column).bigEndian
+                        withUnsafeBytes(of:&value) { feed(Data($0)) }
+                    case SQLITE_FLOAT:
+                        var value = sqlite3_column_double(statement,column).bitPattern.bigEndian
+                        withUnsafeBytes(of:&value) { feed(Data($0)) }
+                    case SQLITE_TEXT,SQLITE_BLOB:
+                        let bytes = sqlite3_column_blob(statement,column)
+                        let count = Int(sqlite3_column_bytes(statement,column))
+                        // SQLite owns these bytes until the next step/conversion.
+                        if let bytes { feed(Data(bytesNoCopy:UnsafeMutableRawPointer(mutating:bytes),count:count,deallocator:.none)) }
+                        else { feed(Data()) }
+                    default: break // NULL is already distinguished by its type.
                     }
                 }
+                result = sqlite3_step(statement)
             }
-            let columns = try Row.fetchAll(db,sql:"PRAGMA table_info(" + table + ")").map { $0["name"] as String }
-            let textRows = try Row.fetchCursor(db,sql:"SELECT " + columns.map { "typeof(\"" + $0 + "\"),hex(CAST(\"" + $0 + "\" AS BLOB))" }.joined(separator:",") + " FROM " + table + " ORDER BY rowid")
-            while let row = try textRows.next() { for i in 0..<row.count { feed(Data((row[i] as String).utf8)) } }
+            guard result == SQLITE_DONE else { throw StoreRecovery.required("fingerprint_read_failed") }
         }
-        return digest.finalize().map { String(format:"%02x",$0) }.joined()
+        return StorageObjectFiles.hex(digest.finalize())
     }
     enum State { case legacy(String), current(StoreIdentityReceipt) }
 

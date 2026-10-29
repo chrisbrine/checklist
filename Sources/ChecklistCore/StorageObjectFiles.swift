@@ -15,6 +15,7 @@ final class StorageSnapshotMeasurement {
     var metadataBytes: Int64 = 0
     var objects: Int = 0
     var lowerBound = true
+    var writerLeaseSeconds: TimeInterval = 0
 }
 
 struct StorageSnapshotBudget {

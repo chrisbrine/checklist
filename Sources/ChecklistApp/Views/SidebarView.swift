@@ -55,7 +55,7 @@ struct SidebarView: View {
                 Divider()
                 HStack(spacing: Spacing.small) {
                     Circle().fill(store.connected ? Color.checklistAccentText : .orange).frame(width: 7, height: 7)
-                    Text(store.connected ? "Service connected" : "Service disconnected").checklistFont(.caption)
+                    Text(store.serviceConnectionFooter).checklistFont(.caption)
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 0)
                     HStack(spacing: Spacing.small) {

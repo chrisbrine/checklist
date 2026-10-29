@@ -11,6 +11,15 @@ import ChecklistBridges
 // host-exported context, not a cryptographically attested thread identity.
 extension Coordinator {
     struct BootstrapResult { let reply:[String:Any]; let changed:Bool }
+    /// A new transport can reuse current committed authority during capture.
+    /// Registration changes must never enqueue an owner write and then expose a
+    /// prepared enrollment as committed; retry the complete bootstrap on admission.
+    private func bootstrapWrite<T>(_ body: () throws -> T) throws -> T {
+        guard let result = try router.withImmediateWriteAccess(body) else {
+            throw CoreError("BACKUP_SERVICE_CALL_DEFERRED","Connection registration waits for the accepted backup write queue.")
+        }
+        return result
+    }
     func bootstrap(_ context:[String:Any], connection:NSXPCConnection) throws -> BootstrapResult {
         let native = try verifiedNativeWorkspace(context, connection: connection)
         return try bootstrapVerifiedWorkspace(context, native: native, readCredential: ChecklistKeychain.read)
@@ -69,21 +78,24 @@ extension Coordinator {
         }
         guard !enrollments.values.contains(where:{$0.sessionID == boundSessionID && $0.installation != installation}) else { throw ChecklistError("BINDING_CHANGED","This reported session is already bound to another connection. Use a thread created for this project.") }
         if var existing=enrollments[installation] {
-            var changed = false
             let session = try router.connectionSession(sessionID:boundSessionID,project:pid,caller:owner)
             if let session {
                 guard session["owner_revoked"] as? Bool != true else {
                     throw ChecklistError("CONNECTION_REVOKED","The owner disconnected this conversation in Checklist. It stays refused until the owner selects Allow again on its ticket.")
                 }
                 if session["owner_reconnect_allowed"] as? Bool == true {
-                    let resumed = try reconnectNativeSession(existing,project:pid,executionDomain:executionDomain,binding:binding,process:process,endpoint:context["native_endpoint"] as? String,owner:owner,ownerAllowed:true)
-                    return BootstrapResult(reply:connectionResult(resumed,project:pid),changed:true)
+                    return try bootstrapWrite {
+                        let resumed = try reconnectNativeSession(existing,project:pid,executionDomain:executionDomain,binding:binding,process:process,endpoint:context["native_endpoint"] as? String,owner:owner,ownerAllowed:true)
+                        return BootstrapResult(reply:connectionResult(resumed,project:pid),changed:true)
+                    }
                 }
             }
             if existing.revoked == true || existing.nativeExecutionDomain != executionDomain {
                 // A host resumed this conversation in a new process; never borrow the old generation.
-                let resumed=try reconnectNativeSession(existing,project:pid,executionDomain:executionDomain,binding:binding,process:process,endpoint:context["native_endpoint"] as? String,owner:owner)
-                return BootstrapResult(reply:connectionResult(resumed,project:pid),changed:true)
+                return try bootstrapWrite {
+                    let resumed=try reconnectNativeSession(existing,project:pid,executionDomain:executionDomain,binding:binding,process:process,endpoint:context["native_endpoint"] as? String,owner:owner)
+                    return BootstrapResult(reply:connectionResult(resumed,project:pid),changed:true)
+                }
             }
             guard existing.sessionID == boundSessionID,existing.workspace == binding,existing.provider == provider,relay || existing.projectIDs == [pid] else { throw ChecklistError("BINDING_CHANGED","The registered workspace changed. Review this connection in Checklist before reconnecting.") }
             guard (existing.assistantRelay == true) == relay else { throw ChecklistError("CONNECTION_MODE_MISMATCH","This native thread cannot change its access role.") }
@@ -92,40 +104,48 @@ extension Coordinator {
             if let session {
                 guard !["revoked","ended"].contains(session["state"] as? String ?? "") else { throw ChecklistError("CONNECTION_REVOKED","This thread was ended or disconnected. Its authority cannot be resumed automatically.") }
                 guard ConnectionCommit.registrationMatches(session, sessionID: existing.sessionID, installation: existing.installation, generation: existing.generation, role: existing.role, provider: existing.provider, projects: existing.projectIDs) else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This prepared connection does not match its committed session. Repair it in Checklist.") }
-            } else {
-                // Repair only an interrupted initial registration. Existing generations stay intact.
-                _ = try registerAutomatic(existing,project:pid,caller:owner);changed = true
             }
-            if relay,(existing.assistantGrants != grantMap || existing.relayPolicyRevisions != grantRevisions || existing.projectIDs != projectIDs) {
-                existing.assistantGrants=grantMap;existing.relayPolicyRevisions=grantRevisions;existing.relaySelector=selector;existing.projectIDs=projectIDs;existing.generation=UUID().uuidString
-                _ = try registerAutomatic(existing,project:pid,caller:owner);changed = true
-                enrollments[installation]=existing;try saveEnrollments()
+            let grantsChanged = relay && (existing.assistantGrants != grantMap || existing.relayPolicyRevisions != grantRevisions || existing.projectIDs != projectIDs)
+            if session == nil || grantsChanged {
+                return try bootstrapWrite {
+                    // Repair only an interrupted initial registration. Existing generations stay intact.
+                    if session == nil { _ = try registerAutomatic(existing,project:pid,caller:owner) }
+                    if grantsChanged {
+                        existing.assistantGrants=grantMap;existing.relayPolicyRevisions=grantRevisions;existing.relaySelector=selector;existing.projectIDs=projectIDs;existing.generation=UUID().uuidString
+                        _ = try registerAutomatic(existing,project:pid,caller:owner)
+                        enrollments[installation]=existing;try saveEnrollments()
+                    }
+                    try requireCommittedRegistration(existing, project: pid, caller: owner)
+                    return BootstrapResult(reply:connectionResult(existing, project:pid),changed:true)
+                }
             }
             try requireCommittedRegistration(existing, project: pid, caller: owner)
-            return BootstrapResult(reply:connectionResult(existing, project:pid),changed:changed)
+            return BootstrapResult(reply:connectionResult(existing, project:pid),changed:false)
         }
-        let snapshot=try router.handle(method:"snapshot",params:[:],caller:owner)
-        let records=(snapshot["data"] as? [String:Any] ?? snapshot)["sessions"] as? [[String:Any]] ?? []
-        guard !records.contains(where:{$0["id"] as? String == boundSessionID}) else { throw ChecklistError("SESSION_ID_CONFLICT","This reported session identifier already belongs to another connection. It cannot replace that connection.") }
-        var bytes=[UInt8](repeating:0,count:32)
-        guard SecRandomCopyBytes(kSecRandomDefault,bytes.count,&bytes)==errSecSuccess else { throw ChecklistError("RANDOM_FAILURE","Could not create the thread connection.") }
-        let token=Data(bytes).base64EncodedString()
-        let label=relay ? "Personal assistant helper · \(sid.prefix(8))":"\(plugin.manifest.displayName) thread \(sid.prefix(8))"
-        var enrollment=Enrollment(installation:installation,name:label,provider:provider,role:relay ? "assistant":"worker",projectIDs:projectIDs,sessionID:boundSessionID,workspace:binding,profileID:nil,tokenDigest:SHA256.hash(data:Data(token.utf8)).map{String(format:"%02x",$0)}.joined(),generation:UUID().uuidString)
-        enrollment.nativeSessionID=sid
-        enrollment.automatic=true;enrollment.revoked=false;enrollment.identityVerification=plugin.nativeHost?.identityVerification
-        enrollment.nativeExecutionDomain=executionDomain
-        enrollment.assistantRelay=relay
-        if relay { enrollment.assistantGrants=grantMap;enrollment.relayPolicyRevisions=grantRevisions;enrollment.relaySelector=selector;enrollment.identityVerification="native_codex_helper_not_dot_identity" }
-        if ProviderPluginRegistry.bundled.plugin(provider, requiring: .nativePeer) != nil,let endpoint=context["native_endpoint"] as? String { try bindProviderEndpoint(&enrollment,endpoint:endpoint,process:process) }
-        // Save no caller-supplied role, projects, profile, title or human provenance.
-        _ = try ConnectionCommit.perform(
-            saveCredential: { try ChecklistKeychain.write(installation, token) },
-            saveEnrollment: { enrollments[installation] = enrollment; try saveEnrollments() },
-            registerSession: { try registerAutomatic(enrollment, project: pid, caller: owner) },
-            rollback: { try ConnectionCommit.restore(enrollment: { enrollments.removeValue(forKey: installation); try saveEnrollments() }, credential: { try ChecklistKeychain.removeChecked(installation) }) })
-        try requireCommittedRegistration(enrollment, project: pid, caller: owner)
-        return BootstrapResult(reply:connectionResult(enrollment,project:pid),changed:true)
+        return try bootstrapWrite {
+            let snapshot=try router.handle(method:"snapshot",params:[:],caller:owner)
+            let records=(snapshot["data"] as? [String:Any] ?? snapshot)["sessions"] as? [[String:Any]] ?? []
+            guard !records.contains(where:{$0["id"] as? String == boundSessionID}) else { throw ChecklistError("SESSION_ID_CONFLICT","This reported session identifier already belongs to another connection. It cannot replace that connection.") }
+            var bytes=[UInt8](repeating:0,count:32)
+            guard SecRandomCopyBytes(kSecRandomDefault,bytes.count,&bytes)==errSecSuccess else { throw ChecklistError("RANDOM_FAILURE","Could not create the thread connection.") }
+            let token=Data(bytes).base64EncodedString()
+            let label=relay ? "Personal assistant helper · \(sid.prefix(8))":"\(plugin.manifest.displayName) thread \(sid.prefix(8))"
+            var enrollment=Enrollment(installation:installation,name:label,provider:provider,role:relay ? "assistant":"worker",projectIDs:projectIDs,sessionID:boundSessionID,workspace:binding,profileID:nil,tokenDigest:SHA256.hash(data:Data(token.utf8)).map{String(format:"%02x",$0)}.joined(),generation:UUID().uuidString)
+            enrollment.nativeSessionID=sid
+            enrollment.automatic=true;enrollment.revoked=false;enrollment.identityVerification=plugin.nativeHost?.identityVerification
+            enrollment.nativeExecutionDomain=executionDomain
+            enrollment.assistantRelay=relay
+            if relay { enrollment.assistantGrants=grantMap;enrollment.relayPolicyRevisions=grantRevisions;enrollment.relaySelector=selector;enrollment.identityVerification="native_codex_helper_not_dot_identity" }
+            if ProviderPluginRegistry.bundled.plugin(provider, requiring: .nativePeer) != nil,let endpoint=context["native_endpoint"] as? String { try bindProviderEndpoint(&enrollment,endpoint:endpoint,process:process) }
+            // Save no caller-supplied role, projects, profile, title or human provenance.
+            _ = try ConnectionCommit.perform(
+                saveCredential: { try ChecklistKeychain.write(installation, token) },
+                saveEnrollment: { enrollments[installation] = enrollment; try saveEnrollments() },
+                registerSession: { try registerAutomatic(enrollment, project: pid, caller: owner) },
+                rollback: { try ConnectionCommit.restore(enrollment: { enrollments.removeValue(forKey: installation); try saveEnrollments() }, credential: { try ChecklistKeychain.removeChecked(installation) }) })
+            try requireCommittedRegistration(enrollment, project: pid, caller: owner)
+            return BootstrapResult(reply:connectionResult(enrollment,project:pid),changed:true)
+        }
     }
 
     struct VerifiedNativeWorkspace {

@@ -65,7 +65,7 @@ enum StorageSnapshot {
     }
 
     /// Owner backup holds the crash-released retention barrier across capture,
-    /// copying and publication. Only capture occupies the ordinary object gate.
+    /// copying and publication. Only the database copy occupies the ordinary object gate.
     static func buildOnline(source: URL, parent: URL, storeID: String, publicationName: String,
                             operation: UUID, budget: StorageSnapshotBudget, retention: StorageSnapshotRetention) throws -> StorageSnapshotReceipt {
         try retention.requireRoot(source)
@@ -98,9 +98,13 @@ enum StorageSnapshot {
         writerConfiguration.prepareDatabase { db in try SchemaMigrations.installStorageCollation(db); try db.execute(sql: "PRAGMA foreign_keys=ON; PRAGMA busy_timeout=50") }
         let writer = try DatabaseQueue(path: StorageBootstrap.writableURI(fixture.source.appendingPathComponent("checklist.sqlite")), configuration: writerConfiguration)
         defer { try? writer.close() }
-        let (inventory, schema, families, tables, capturedAt) = try writer.writeWithoutTransaction { lease -> (StorageSnapshotInventory, Int, [String:Int], [String:Int], String) in
+        let capturedAt = try writer.writeWithoutTransaction { lease -> String in
             try lease.beginTransaction(.immediate)
-            defer { try? lease.rollback() }
+            let leaseStarted = budget.uptime()
+            defer {
+                try? lease.rollback()
+                budget.measurement.writerLeaseSeconds = budget.uptime() - leaseStarted
+            }
             try budget.observe("writer_lease_acquired")
             let capturedAt = now() // Source writes are fenced by this lease.
             // The source is a distinct read-only connection; the lease connection
@@ -109,9 +113,10 @@ enum StorageSnapshot {
             readConfiguration.prepareDatabase { db in try SchemaMigrations.installStorageCollation(db); try db.execute(sql: "PRAGMA busy_timeout=50") }
             let source = try DatabaseQueue(path: fixture.source.appendingPathComponent("checklist.sqlite").path, configuration: readConfiguration)
             defer { try? source.close() }
+            // Validate the completed copy below. A live quick_check scans the
+            // entire store and must not extend this consistent-copy lease.
             let pageSize = try source.read { db -> Int64 in
-                _ = try SchemaMigrations.inspect(db)
-                return try Int64.fetchOne(db, sql: "PRAGMA page_size") ?? 0
+                try Int64.fetchOne(db, sql: "PRAGMA page_size") ?? 0
             }
             guard pageSize > 0 else { throw StorageSnapshotFailure.incomplete }
             let destination = try DatabaseQueue(path: stage.root.appendingPathComponent("database.sqlite").path, configuration: writerConfiguration)
@@ -133,9 +138,21 @@ enum StorageSnapshot {
                 try budget.check()
                 if let callbackFailure { throw callbackFailure }
                 guard sawDone else { throw StorageSnapshotFailure.incomplete }
-                // Backup carries the WAL-format header. Normalize only this
-                // owned copy to a self-contained rollback-journal database
-                // before read-only reopening; no source PRAGMA is changed.
+            } catch { try? destination.close(); throw error }
+            try destination.close()
+            return capturedAt
+        }
+        try writer.close()
+        try budget.observe("writer_lease_released")
+        // The continuation runs after the ordinary gate is released for online
+        // capture. Retention protects the whole immutable namespace before its
+        // inventory is known, including pending imports and recovery objects.
+        return {
+            // Normalize only the owned copy after releasing the source writer.
+            // Backup carries the WAL-format header; read-only reopening requires
+            // a self-contained rollback-journal copy. No source PRAGMA changes.
+            let destination = try DatabaseQueue(path: stage.root.appendingPathComponent("database.sqlite").path, configuration: writerConfiguration)
+            do {
                 try destination.writeWithoutTransaction { db in
                     guard try String.fetchOne(db, sql: "PRAGMA journal_mode=DELETE")?.lowercased() == "delete" else { throw StorageSnapshotFailure.incomplete }
                 }
@@ -144,20 +161,19 @@ enum StorageSnapshot {
             } catch { try? destination.close(); throw error }
             budget.measurement.metadataBytes = try stage.size("database.sqlite") + intentSize
             budget.measurement.bytes = budget.measurement.metadataBytes
+            var readConfiguration = Configuration(); readConfiguration.readonly = true
+            readConfiguration.prepareDatabase { db in try SchemaMigrations.installStorageCollation(db); try db.execute(sql: "PRAGMA busy_timeout=50") }
             let copy = try DatabaseQueue(path: stage.root.appendingPathComponent("database.sqlite").path, configuration: readConfiguration)
             let inventory: StorageSnapshotInventory, schema: Int, families: [String:Int], tables: [String:Int]
             do {
+                try budget.observe("inventory_started")
                 (inventory, schema, families, tables) = try copy.read { db in
                     _ = try SchemaMigrations.inspect(db)
                     return (try StorageSnapshotAuthority.inventory(db, root: fixture.source, budget: budget, retainedExists: { try sourceFiles.regularOrLinkExists($0) }), try Int.fetchOne(db, sql: "PRAGMA user_version") ?? -1, try recordFamilyCounts(db), try tableCounts(db))
                 }
                 try copy.close()
+                try budget.observe("inventory_finished")
             } catch { try? copy.close(); throw error }
-            return (inventory, schema, families, tables, capturedAt)
-        }
-        // Close the SQLite lease and all live/copy read connections before the
-        // continuation, so ordinary writes and WAL checkpointing can proceed.
-        return {
             // Measure the complete closed inventory before expensive durable copies.
             // Lengths are descriptor-relative/no-follow; copy still rehashes and
             // checks identity, expected size and digest independently afterwards.

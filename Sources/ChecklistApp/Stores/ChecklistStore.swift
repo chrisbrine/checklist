@@ -73,7 +73,27 @@ final class ChecklistStore: ObservableObject {
     /// CL-60: an outage shows one offline banner (after the first connection attempt), never a repeated alert.
     @Published private(set) var connectionAttempted = false
     @Published private(set) var lastServiceFailure: String?
+    @Published private(set) var storageUpgradeStatus: StorageUpgradeStatus?
     var showsOfflineBanner: Bool { connectionAttempted && !connected }
+    var serviceConnectionLabel: String {
+        if let upgrade = storageUpgradeStatus { return "Upgrading. " + upgrade.summary }
+        return connected ? "Connected" : "Disconnected"
+    }
+    var serviceConnectionFooter: String {
+        if let upgrade = storageUpgradeStatus { return "Service upgrading. " + upgrade.summary }
+        return connected ? "Service connected" : "Service disconnected"
+    }
+    var serviceUnavailableReason: String { DisabledReasons.offline(upgrade: storageUpgradeStatus) }
+    var connectionBannerTitle: String { storageUpgradeStatus == nil ? "Checklist is offline" : "Checklist is upgrading" }
+    var connectionBannerMessage: String {
+        if let upgrade = storageUpgradeStatus { return upgrade.summary + " Your drafts stay on this Mac. Checklist reconnects automatically when the upgrade finishes." }
+        return "The Checklist service is not running or not reachable. Your drafts stay on this Mac. Checklist tries again every few seconds; changes and sending stay off until it reconnects."
+    }
+    @Published private(set) var writeAdmission: WriteAdmissionState?
+    @Published private(set) var queuedCommandIDs: Set<String> = []
+    private var admissionRequestSequence: UInt64 = 0
+    private var acceptedAdmissionRequest: UInt64 = 0
+    var showsWriteAdmissionBanner: Bool { connected && (writeAdmission?.locked == true || writeAdmission?.queued == true) }
     @Published var loading = false
     /// Activity for the visible workspace, not the idle live subscription or
     /// an obsolete reader belonging to a page the owner has already left.
@@ -87,6 +107,7 @@ final class ChecklistStore: ObservableObject {
     @Published var busy = false
     @Published var hasPendingMutation = false
     var pendingCommandID: String? { pendingMutation?.command.params["command_id"] as? String }
+    var pendingMutationQueued: Bool { pendingCommandID.map(queuedCommandIDs.contains) ?? false }
     private var pendingMutation: (command: PendingCommandRecovery, success: String?, completion: (([String: Any]) -> Void)?, failure: ((Error) -> Void)?)?
     private var recoveredCommand: (command: PendingCommandRecovery, marker: String)?
     @Published var notice: String? { didSet { if !informing { noticeIsWarning = false } } }
@@ -95,7 +116,7 @@ final class ChecklistStore: ObservableObject {
     @Published private(set) var noticeIsWarning = false
     /// CL-58: why a write cannot run now, in plain words; nil when it can.
     var writeBlockReason: String? {
-        if !connected { return DisabledReasons.offline }
+        if !connected { return serviceUnavailableReason }
         if hasPendingMutation { return DisabledReasons.uncheckedChange }
         if recoveredCommand != nil { return "Checklist is checking which saved change belongs to this store." }
         if busy { return DisabledReasons.saving }
@@ -1580,7 +1601,7 @@ final class ChecklistStore: ObservableObject {
         return cursors
     }
     func request(_ method: String, _ params: [String: Any] = [:], ifCurrent: () -> Bool) async throws -> [String: Any] {
-        guard connected || params["command_id"] == nil else { throw ChecklistError("SERVICE_UNAVAILABLE", "Reconnect and refresh before sending changes. Your local draft is preserved.") }
+        guard connected || params["command_id"] == nil || CommandReply.readMethods.contains(method) else { throw ChecklistError("SERVICE_UNAVAILABLE", "Reconnect and refresh before sending changes. Your local draft is preserved.") }
         try Task.checkCancellation()
         let family: NativeRenderMetrics.Family = method == "workspace_page" && params["surface"] as? String == "record" ? .selectedOther : .classify(method,detail:params["detail_level"] as? String)
         let metric=NativeRenderMetrics.startRequest(family)
@@ -1590,8 +1611,12 @@ final class ChecklistStore: ObservableObject {
         let coverageCursor = pendingCoverageCursor, coverageScope = pendingCoverageScope
         let transportStart = liveNow()
         let reply: [String:Any]
-        if let requestTransport {reply=try await requestTransport(method,params)}
-        else {reply=try await NativeServiceTransport.call(method,params)}
+        do {
+            reply = try await commandTransport(method, params)
+        } catch {
+            if !Task.isCancelled, ifCurrent(), StorageUpgradeStatus(error:error) != nil { recordServiceOutage(error) }
+            throw error
+        }
         let transportMS = Int((liveNow() - transportStart) * 1000)
         if ["task_list","workspace_page","task_context","changes_wait"].contains(method) {
             // Service timings are optional; -1 explicitly means not supplied.
@@ -1608,7 +1633,9 @@ final class ChecklistStore: ObservableObject {
             throw CancellationError()
         }
         if let failure = reply["error"] as? [String: Any] {
-            throw ChecklistError(failure["code"] as? String ?? "SERVICE_ERROR", (failure["message"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "The Checklist service could not complete this request (\(failure["code"] as? String ?? "no error code")).")
+            let error = ChecklistError(failure["code"] as? String ?? "SERVICE_ERROR", (failure["message"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "The Checklist service could not complete this request (\(failure["code"] as? String ?? "no error code")).", details:failure["details"] as? [String:Any] ?? [:])
+            if StorageUpgradeStatus(error:error) != nil { recordServiceOutage(error) }
+            throw error
         }
         // Do not compare randomized event cursor encodings as versions. The service's
         // read token is stable only for this exact caller/grant and database snapshot.
@@ -1696,6 +1723,41 @@ final class ChecklistStore: ObservableObject {
         return reply
     }
 
+    private func admissionTransport(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
+        admissionRequestSequence &+= 1
+        let sequence = admissionRequestSequence
+        let reply: [String: Any]
+        if let requestTransport { reply = try await requestTransport(method, params) }
+        else { reply = try await NativeServiceTransport.call(method, params) }
+        acceptWriteAdmission(reply, requestSequence: sequence)
+        return reply
+    }
+    private func commandTransport(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
+        let reply = try await admissionTransport(method, params)
+        return try await QueuedCommandReply.resolve(reply, method: method, params: params, pause: queuedCommandPause,
+            transport: { [self] in try await admissionTransport($0, $1) }, queued: { [self] command, active in
+                if active { queuedCommandIDs.insert(command) } else { queuedCommandIDs.remove(command) }
+            })
+    }
+
+    private func acceptWriteAdmission(_ reply: [String: Any], requestSequence: UInt64) {
+        guard let values = reply["write_admission"] as? [String: Any],
+              let state = WriteAdmissionState(values) else { return }
+        if let current = writeAdmission, !state.generation.isEmpty, state.generation == current.generation {
+            guard state.revision >= current.revision else { return }
+        } else {
+            // A service restart changes generation. A late reply from the old
+            // endpoint cannot replace a newer endpoint observation.
+            guard requestSequence >= acceptedAdmissionRequest else { return }
+        }
+        acceptedAdmissionRequest = max(acceptedAdmissionRequest, requestSequence)
+        if writeAdmission != state { writeAdmission = state }
+    }
+
+    /// The receipt wait for an accepted command, separate from the live
+    /// subscription. Tests replace only this pause; no model runtime is polled.
+    var queuedCommandPause: UInt64 = 250_000_000
+
     /// Cancellation is a caller/read lifecycle event, never service health evidence.
     private func isReadCancellation(_ error: Error) -> Bool {
         error is CancellationError || Task.isCancelled
@@ -1706,11 +1768,12 @@ final class ChecklistStore: ObservableObject {
         return timeout.code == "OUTCOME_UNKNOWN" && timeout.details["reason"] as? String == "reply_timeout" && timeout.details["command_id"] == nil
     }
     private func acceptServiceRead() {
-        connected = true; connectionAttempted = true; lastServiceFailure = nil
+        connected = true; connectionAttempted = true; lastServiceFailure = nil; storageUpgradeStatus = nil
         reconcileRecoveredCommand()
     }
     private func recordServiceOutage(_ error: Error) {
         connected = false; connectionAttempted = true; lastServiceFailure = error.localizedDescription
+        storageUpgradeStatus = StorageUpgradeStatus(error:error)
     }
 
     func refresh(quiet: Bool = false) async {
@@ -1868,7 +1931,7 @@ final class ChecklistStore: ObservableObject {
 
     func retryPendingMutation() {
         guard pendingMutation != nil else { return }
-        guard connected, !busy else { inform(connected ? DisabledReasons.saving : DisabledReasons.offline); return }
+        guard connected, !busy else { inform(connected ? DisabledReasons.saving : serviceUnavailableReason); return }
         error = nil; performPendingMutation(checkIdentity: true)
     }
     /// Apply the committed answer before any refresh can wait or fail. Counts come
@@ -1947,7 +2010,9 @@ final class ChecklistStore: ObservableObject {
             } catch {
                 guard pendingMutation != nil else { return }
                 pending.failure?(error)
-                if CommandReply.shouldRetainPending(after: error) {
+                // An unsent retry says nothing about its earlier unresolved
+                // attempt. Upgrade preflight cannot clear that original UUID.
+                if CommandReply.shouldRetainPending(after: error) || (checkIdentity && StorageUpgradeStatus(error:error) != nil) {
                     hasPendingMutation = true
                     self.error = "The service may already have saved this change. Use Check the last change before you make another change."
                 } else {

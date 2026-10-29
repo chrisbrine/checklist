@@ -19,8 +19,8 @@ public final class StorageDrainTicket: @unchecked Sendable {
 /// race to finish. The lease spans an entire operation, including its rollback
 /// and post-commit filesystem/outcome work.
 final class StorageOperationLease: @unchecked Sendable {
-    private let owner: StorageAdmission
-    private let id: UUID
+    fileprivate let owner: StorageAdmission
+    fileprivate let id: UUID
 
     fileprivate init(owner: StorageAdmission, id: UUID) {
         self.owner = owner
@@ -44,6 +44,7 @@ final class StorageAdmission: @unchecked Sendable {
     private let lock = NSLock()
     private var state: State = .bootstrapping
     private var active = Set<UUID>()
+    private let continuationKey = "ChecklistStorageContinuation-" + UUID().uuidString
 
     func openAfterBootstrap() throws {
         lock.lock(); defer { lock.unlock() }
@@ -57,12 +58,28 @@ final class StorageAdmission: @unchecked Sendable {
         case .bootstrapping:
             throw CoreError("STORAGE_NOT_READY", "Storage recovery must finish before this operation can start.")
         case .draining, .drained:
+            // A durable queued intent was admitted before the drain began. Its
+            // synchronous continuation may enter nested storage boundaries; this
+            // grants nothing to a new request on any other thread.
+            if let parent = Thread.current.threadDictionary[continuationKey] as? StorageOperationLease,
+               parent.owner === self,active.contains(parent.id) {
+                let id = UUID();active.insert(id);return StorageOperationLease(owner:self,id:id)
+            }
             throw CoreError("STORAGE_DRAINING", "Storage admission is paused. Preserve the original command and retry after recovery resumes.")
         case .admitting:
             let id = UUID()
             active.insert(id)
             return StorageOperationLease(owner: self, id: id)
         }
+    }
+
+    func withContinuation<T>(_ lease: StorageOperationLease,_ body: () throws -> T) throws -> T {
+        lock.lock();let valid = lease.owner === self && active.contains(lease.id);lock.unlock()
+        guard valid else {throw invalidDrain()}
+        let previous = Thread.current.threadDictionary[continuationKey]
+        Thread.current.threadDictionary[continuationKey] = lease
+        defer {if let previous {Thread.current.threadDictionary[continuationKey] = previous} else {Thread.current.threadDictionary.removeObject(forKey:continuationKey)}}
+        return try body()
     }
 
     fileprivate func finish(_ id: UUID) {

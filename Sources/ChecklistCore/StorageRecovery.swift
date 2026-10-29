@@ -79,6 +79,14 @@ extension CommandRouter {
     func executeStorageBackup(params: JSON, caller: Caller, budget: StorageSnapshotBudget = .production()) throws -> JSON {
         do {
             try dbQueue.read { try authorizeStorageBackup($0,params:params,caller:caller) }
+            try backupWrites.beginCapture()
+            defer {backupWrites.endBackup(router:self)}
+            var budget = budget
+            let observe = budget.observe
+            budget.observe = { event in
+                if event == "capture_released" {self.backupWrites.endCapture(router:self)}
+                try observe(event)
+            }
             return try StorageSnapshotRetention.withCapture(root:root) { retention in
                 try createStorageBackup(params:params,caller:caller,budget:budget,retention:retention)
             }
@@ -221,7 +229,8 @@ extension CommandRouter {
         let usage = try StorageCopyUsage.measure(files,paths:["database.sqlite","manifest.json","intent.json"] + manifest.objects.map {"managed/" + $0.descriptor.relativePath},budget:budget)
         let summary: JSON = ["kind":"backup","operation_id":receipt.operationID.uuidString.lowercased(),"path":destination.path,
             "source_root":manifest.sourceRoot,"store_id":manifest.storeID,"captured_at":manifest.capturedAt as Any? ?? NSNull(),
-            "verified_at":now(),"verification":"manifest_database_managed_files","manifest_sha256":receipt.manifestSHA256,"usage":usage]
+            "verified_at":now(),"verification":"manifest_database_managed_files","manifest_sha256":receipt.manifestSHA256,"usage":usage,
+            "writer_lease_seconds":budget.measurement.writerLeaseSeconds > 0 ? budget.measurement.writerLeaseSeconds as Any : NSNull()]
         let generation: JSON = ["summary":summary,"format":1,"state":"complete","operation_id":receipt.operationID.uuidString.lowercased(),"manifest_sha256":receipt.manifestSHA256,"known_at":now(),"current_physical_verified":false,"objects":indexedObjects]
         return (try jsonString(generation),summary,projectIDs)
     }
@@ -233,7 +242,7 @@ extension CommandRouter {
         try withValidatedDomainTransaction(db) {
             try authorizeStorageBackup(db,params:params,caller:caller)
             try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
-            let data: JSON = ["path":destination.path,"format":"checklist-store-snapshot","manifest_sha256":receipt.manifestSHA256,"operation_id":receipt.operationID.uuidString.lowercased(),"restore_supported":true,"status":"complete"]
+            let data: JSON = ["path":destination.path,"format":"checklist-store-snapshot","manifest_sha256":receipt.manifestSHA256,"operation_id":receipt.operationID.uuidString.lowercased(),"restore_supported":true,"status":"complete","writer_lease_seconds":summary["writer_lease_seconds"] ?? NSNull()]
             try event(db,caller:caller,project:params["project_id"] as? String,entity:nil,kind:"backup_created",data:["origin":caller.isOwner ? "human_ui" : "agent","session_id":caller.sessionID ?? "","command_id":command,"operation_id":receipt.operationID.uuidString.lowercased(),"manifest_sha256":receipt.manifestSHA256,"captured_at":summary["captured_at"] ?? NSNull(),"verified_at":summary["verified_at"] ?? NSNull(),"project_ids":caller.isOwner ? projectIDs : [],"reason":try text(params,"reason",max:4000,required:false)])
             output = ["data":data,"command_id":command,"event_cursor":try self.cursor(db,caller:caller,scope:self.authorizationScope(db,caller))]
             try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[caller.principal,command,digest,try jsonString(output)])

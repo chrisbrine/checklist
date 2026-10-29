@@ -54,6 +54,29 @@ def healthy_status(payload):
             and isinstance(body.get('capabilities'), list) and 'durable_store' in body['capabilities'])
 
 
+def upgrading_status(payload):
+    """Return the bounded startup progress supplied by the service/CLI."""
+    if not isinstance(payload, dict): return None
+    body = payload.get('data', payload)
+    if not isinstance(body, dict): return None
+    for value in [payload, body]:
+        error = value.get('error')
+        if isinstance(error, dict) and error.get('code') == 'STORAGE_UPGRADING':
+            details = error.get('details')
+            return details if isinstance(details, dict) else {'state': 'upgrading'}
+    return body if body.get('state') == 'upgrading' else None
+
+
+def upgrading_message(status):
+    stage = status.get('stage', 'protected_startup')
+    estimate = status.get('estimated_remaining_seconds')
+    message = 'upgrading: ' + str(stage)
+    if type(estimate) in [int, float] and math.isfinite(estimate) and estimate >= 0:
+        message += f'; estimated remaining {estimate:g}s'
+    if status.get('reason'): message += '; reason: ' + str(status['reason'])
+    return message
+
+
 def executable_paths():
     library = ctypes.CDLL('/usr/lib/libproc.dylib')
     for line in subprocess.check_output(['ps', '-axo', 'pid='], text=True).splitlines():
@@ -72,6 +95,7 @@ def verify(destination, paths=None, runner=subprocess.run, *, clock=time.monoton
     def fail(message):
         raise ValueError(message + '\n' + failure_guidance(install_started))
     bound = deadline_seconds();started = clock();deadline = started + bound;next_progress = started + 60
+    last_upgrade = None
     command = [str(destination / 'Contents/MacOS/checklist'), 'service', 'status']
     while True:
         if str(executable) not in (executable_paths() if paths is None else paths):
@@ -94,12 +118,18 @@ def verify(destination, paths=None, runner=subprocess.run, *, clock=time.monoton
                 state = body.get('state')
                 states = [payload.get('state'), state]
                 for value in states:
-                    if value not in [None, 'ready', 'running', 'healthy', 'starting', 'unavailable']:
+                    if value not in [None, 'ready', 'running', 'healthy', 'starting', 'unavailable', 'upgrading']:
                         fail('The installed Checklist service reported state ' + str(value) + '.')
                 errors = [value['error'] for value in [payload, body] if 'error' in value]
-                if any(not isinstance(error, dict) or error.get('code') not in ['SERVICE_UNAVAILABLE', 'UNAVAILABLE'] for error in errors):
+                if any(not isinstance(error, dict) or error.get('code') not in ['SERVICE_UNAVAILABLE', 'UNAVAILABLE', 'STORAGE_UPGRADING'] for error in errors):
                     fail('The installed Checklist service returned an error status.')
-                if not errors and not any(value in ['starting', 'unavailable'] for value in states):
+                upgrade = upgrading_status(payload)
+                if upgrade is not None:
+                    message = upgrading_message(upgrade)
+                    if message != last_upgrade:
+                        progress('Installed Checklist service ' + message + '.')
+                        last_upgrade = message
+                if not errors and upgrade is None and not any(value in ['starting', 'unavailable', 'upgrading'] for value in states):
                     if result.returncode or not healthy_status(payload):
                         fail('The installed Checklist service is not healthy (status command failed or invalid status).')
                     identity = verify_bundle(destination)

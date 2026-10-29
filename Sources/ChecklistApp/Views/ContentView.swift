@@ -80,9 +80,12 @@ struct ContentView: View {
             if store.hasPendingMutation { Button("Check the last change") { store.retryPendingMutation() } }
             Button("OK") { store.error = nil }
         } message: { Text(store.error ?? "") }
-        .safeAreaInset(edge: .top) { if store.showsOfflineBanner { OfflineBanner() } }
+        .safeAreaInset(edge: .top) {
+            if store.showsOfflineBanner { OfflineBanner() }
+            else if store.showsWriteAdmissionBanner, let admission = store.writeAdmission { WriteAdmissionBanner(state: admission) }
+        }
         .safeAreaInset(edge: .bottom) {
-            if store.hasPendingMutation { HStack { Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange); VStack(alignment: .leading, spacing: Spacing.hairline) { Text("The last change may already be saved. Check it before you make another change."); if let commandID = store.pendingCommandID { TechnicalDetails([("Command", commandID)]) } }.checklistFont(.callout); Spacer(); Button("Check the last change") { store.retryPendingMutation() }.checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)]) }.padding(Spacing.row).background(.bar) }
+            if store.hasPendingMutation && !store.pendingMutationQueued { HStack { Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange); VStack(alignment: .leading, spacing: Spacing.hairline) { Text("The last change may already be saved. Check it before you make another change."); if let commandID = store.pendingCommandID { TechnicalDetails([("Command", commandID)]) } }.checklistFont(.callout); Spacer(); Button("Check the last change") { store.retryPendingMutation() }.checklistDisabled([(!store.connected, DisabledReasons.offline), (store.busy, DisabledReasons.saving)]) }.padding(Spacing.row).background(.bar) }
         }
         .overlay(alignment: .bottomLeading) {
             if let notice = store.notice {
@@ -112,6 +115,7 @@ struct ContentView: View {
             Button("Search") { isSearchFocused = true }.keyboardShortcut("f").hidden()
         }
         .modifier(SettingsModalBackground(isPresented: settingsPresentation.isPresented))
+        .environment(\.checklistStorageUpgradeStatus, store.storageUpgradeStatus)
     }
 
     @ViewBuilder var mainContent: some View {
@@ -150,6 +154,25 @@ struct ContentView: View {
     func toggleSidebar() { withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) { sidebarVisible.toggle() } }
 }
 
+/// A backup pause is a reachable service state. The caller's original command
+/// remains pending until the service reports its applied result.
+struct WriteAdmissionBanner: View {
+    let state: WriteAdmissionState
+    var body: some View {
+        AccessibleHStack(alignment: .top, spacing: Spacing.control) {
+            Image(systemName: "lock.clock").foregroundStyle(.orange).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: Spacing.tight) {
+                Text(state.title).checklistFont(.bodyStrong)
+                Text(state.message).checklistFont(.callout).fixedSize(horizontal: false, vertical: true)
+                if let estimate = state.estimateText { Text(estimate).checklistFont(.callout) }
+            }
+            Spacer(minLength: Spacing.small)
+        }
+        .padding(Spacing.row).background(.bar).overlay(alignment: .bottom) { Divider() }
+        .accessibilityElement(children: .contain).accessibilityIdentifier("writeAdmissionBanner")
+    }
+}
+
 /// CL-60: one banner for the whole outage, with the recovery step; reconnection removes it.
 private struct OfflineBanner: View {
     @EnvironmentObject var store: ChecklistStore
@@ -157,8 +180,8 @@ private struct OfflineBanner: View {
         AccessibleHStack(alignment: .top, spacing: Spacing.control) {
             Image(systemName: "bolt.horizontal.circle").foregroundStyle(.orange).accessibilityHidden(true)
             VStack(alignment: .leading, spacing: Spacing.tight) {
-                Text("Checklist is offline").checklistFont(.bodyStrong)
-                Text("The Checklist service is not running or not reachable. Your drafts stay on this Mac. Checklist tries again every few seconds; changes and sending stay off until it reconnects.").checklistFont(.callout).fixedSize(horizontal: false, vertical: true)
+                Text(store.connectionBannerTitle).checklistFont(.bodyStrong)
+                Text(store.connectionBannerMessage).checklistFont(.callout).fixedSize(horizontal: false, vertical: true)
                 TechnicalDetails([("Last error", store.lastServiceFailure ?? "")])
             }
             Spacer(minLength: Spacing.small)

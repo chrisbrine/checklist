@@ -44,7 +44,8 @@ public struct NativeSessionResumption: Sendable {
 extension CommandRouter {
     /// Reconnects a conversation whose earlier process had a verified closure. The
     /// session gets a new authorization generation; released attempts, history and
-    /// deliveries queued for the ended generation stay with that generation.
+    /// deliveries queued for the ended generation stay fenced. Unacknowledged
+    /// notices get distinct receipts addressed only to this resumed generation.
     /// An owner disconnect (`revoked`) or a closure with work still stopping refuses.
     public func resumeVerifiedNativeSession(_ resumption: NativeSessionResumption, caller: Caller) throws -> [String: Any] {
         try owner(caller)
@@ -90,6 +91,7 @@ extension CommandRouter {
             session.removeValue(forKey: "native_closure_ref"); session.removeValue(forKey: "ended_at")
             session["resumed_at"] = now(); session["last_seen"] = now()
             session = revised(session); try save(db, session, type: "session")
+            try redeliverNativeClosureNotices(db, session: session, closure: observation)
             try event(db, caller: caller, project: resumption.projectID, entity: resumption.sessionID,
                       kind: "native_session_resumed", data: ["observation_ref": observationID, "ended_authorization_generation": endedGeneration])
             result = session
@@ -198,18 +200,21 @@ extension CommandRouter {
                     var request = try scoped(db, rid, proof.projectID, type: "review_request")
                     request["state"] = "queued"; try save(db, revised(request), type: "review_request")
                 }
-                attempt["state"] = "released"; attempt["reason"] = "Verified native process and registry closure."
+                attempt["state"] = "released"; attempt["released_at"] = now(); attempt["reason"] = "Verified native process and registry closure."
                 attempt["native_closure_ref"] = observationID; attempt.removeValue(forKey: "token_hash")
                 attempt.removeValue(forKey: "native_closure_pending"); attempt.removeValue(forKey: "native_closure_blocker")
                 try save(db, revised(attempt), type: "attempt")
                 var task = try scoped(db, (try StoredRecord(attempt, family: "native_record").string("task_id")), proof.projectID, type: "task")
+                var releaseData: JSON = ["attempt_id": aid, "observation_ref": observationID]
                 if task["active_attempt_id"] as? String == aid {
                     task.removeValue(forKey: "active_attempt_id"); task["status_id"] = try status(db, proof.projectID, "queued")["id"]
                     task = revised(task); try save(db, task, type: "task")
                     try recordTicketStatusAction(db, task: task, caller: caller)
+                    releaseData["reason"] = "Released: native closure of the conversation's earlier process."
+                    releaseData["actor_display"] = "Checklist"; releaseData["to_status_id"] = task["status_id"]
                 }
                 try event(db, caller: caller, project: proof.projectID, entity: task["id"] as? String,
-                          kind: "work_released_native_closure", data: ["attempt_id": aid, "observation_ref": observationID])
+                          kind: "work_released_native_closure", data: releaseData)
                 released.append(aid)
             }
             let nextState = pending.isEmpty ? "released" : "release_pending"

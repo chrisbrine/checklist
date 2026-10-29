@@ -33,7 +33,7 @@ private struct ProjectTicketContent: View {
             if let prepared = store.preparedTicketWorkspace {
                 preparedContent(prepared)
             } else if store.showsOfflineBanner {
-                EmptyState(symbol: "bolt.horizontal.circle", title: "Checklist is offline", detail: "Tickets load when Checklist reconnects. Your drafts stay on this Mac.").frame(maxWidth: .infinity, maxHeight: .infinity)
+                EmptyState(symbol: "bolt.horizontal.circle", title: store.connectionBannerTitle, detail: store.storageUpgradeStatus == nil ? "Tickets load when Checklist reconnects. Your drafts stay on this Mac." : store.connectionBannerMessage).frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let failure = store.ticketPageError {
                 VStack(spacing: Spacing.control) { Text(failure).checklistFont(.callout); Button("Retry ticket page") { store.retryTicketPage() } }.frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -98,7 +98,7 @@ private struct ProjectTicketContent: View {
                 HStack { Text("List updates are waiting while you interact.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText); Spacer(); Button("Apply updates") { stability.apply(freshRows) }.buttonStyle(.link) }.padding(.horizontal, Spacing.page).padding(.bottom, Spacing.small).checklistActionScroll()
             }
             if !store.connected {
-                Label("Showing saved state. Drafts stay on this Mac until the service reconnects.", systemImage: "wifi.slash").checklistFont(.callout).foregroundStyle(.orange).padding(.horizontal, Spacing.page).padding(.bottom, Spacing.row)
+                Label(store.storageUpgradeStatus == nil ? "Showing saved state. Drafts stay on this Mac until the service reconnects." : "Showing saved state. " + store.connectionBannerMessage, systemImage: "wifi.slash").checklistFont(.callout).foregroundStyle(.orange).padding(.horizontal, Spacing.page).padding(.bottom, Spacing.row)
             }
             if store.loading && !prepared.hasTasks { ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity) }
             else if stability.rows(freshRows, visibleRecordIDs: visibleTicketIDs).isEmpty && list.triages.isEmpty && overviewRequests.isEmpty {

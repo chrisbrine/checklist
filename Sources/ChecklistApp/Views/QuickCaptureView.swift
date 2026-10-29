@@ -78,11 +78,14 @@ struct QuickCaptureView: View {
         if model.draft.pendingCreate != nil {
             Text(QuickCaptureModel.newerEdits).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
         }
-        if case .uncertain(let reason) = model.state {
+        if model.state == .sending, let admission = model.writeAdmission, admission.locked || admission.queued {
+            WriteAdmissionBanner(state: admission)
+        } else if case .uncertain(let reason) = model.state {
             Text(reason).checklistFont(.callout).foregroundStyle(.orange).accessibilityIdentifier("quickCaptureUncertain")
         } else if case .filesPending(let reason) = model.state {
             Text(reason).checklistFont(.callout).foregroundStyle(.orange).accessibilityIdentifier("quickCaptureFilesPending")
         } else if case .notSent(let reason) = model.state { Text(reason).checklistFont(.callout).foregroundStyle(.orange).accessibilityIdentifier("quickCaptureNotSent") }
+        else if let upgrade = model.projectUpgradeNotice { Text(upgrade).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
         else if !model.projectsAvailable && model.projects.isEmpty { Text("Checklist's service is not available, so no projects are listed. Your draft is saved on this Mac.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
         if let problem = model.problem { Text(problem).checklistFont(.micro).foregroundStyle(.orange) }
         Spacer(minLength: 0)

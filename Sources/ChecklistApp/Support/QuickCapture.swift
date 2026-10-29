@@ -78,6 +78,8 @@ final class QuickCaptureModel: ObservableObject {
     @Published private(set) var projects: [QuickCaptureProject]
     @Published private(set) var state: State = .editing
     @Published private(set) var projectsAvailable = false
+    @Published private(set) var projectUpgradeNotice: String?
+    @Published private(set) var writeAdmission: WriteAdmissionState?
     @Published var problem: String?
     @Published private(set) var epics: [Record] = []
     @Published private(set) var epicLoading = false
@@ -91,12 +93,17 @@ final class QuickCaptureModel: ObservableObject {
     private let journal: LocalDraftJournal
     private let preferences: UserDefaults
     private let stagingDirectory: URL
-    private let transport: Transport
+    private let transport: Transport?
+    private let rawTransport: Transport
+    private var admissionRequestSequence: UInt64 = 0
+    private var acceptedAdmissionRequest: UInt64 = 0
+    var queuedCommandPause: UInt64 = 250_000_000
 
     init(journal: LocalDraftJournal = LocalDraftJournal(directory: LocalDraftJournal.defaultDirectory.appendingPathComponent("QuickCapture", isDirectory: true)),
          preferences: UserDefaults = .standard, stagingDirectory: URL = CaptureAttachment.staging,
-         transport: @escaping Transport = QuickCaptureModel.liveTransport) {
+         rawTransport: Transport? = nil, transport: Transport? = nil) {
         self.journal = journal; self.preferences = preferences; self.stagingDirectory = stagingDirectory; self.transport = transport
+        self.rawTransport = rawTransport ?? NativeServiceTransport.call
         draft = (try? journal.load(QuickCaptureDraft.self, kind: Self.journalKind))?["draft"] ?? QuickCaptureDraft()
         projects = (preferences.data(forKey: Self.projectsKey)).flatMap { try? JSONDecoder().decode([QuickCaptureProject].self, from: $0) } ?? []
         if draft.projectID.isEmpty, draft.pendingCreate == nil, draft.createdTaskID == nil, draft.isEmpty {
@@ -110,22 +117,41 @@ final class QuickCaptureModel: ObservableObject {
     /// The service connection that the app windows use; owner calls from the trusted app.
     static func liveTransport(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
         let reply = try await NativeServiceTransport.call(method, params)
-        if let failure = reply["error"] as? [String: Any] {
-            throw ChecklistError(failure["code"] as? String ?? "SERVICE_ERROR", failure["message"] as? String ?? "The Checklist service could not complete this request.", details: failure["details"] as? [String: Any] ?? [:])
+        let applied = try await QueuedCommandReply.resolve(reply, method: method, params: params, transport: NativeServiceTransport.call)
+        return try QueuedCommandReply.payload(applied)
+    }
+
+    private func rawRequest(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
+        admissionRequestSequence &+= 1
+        let sequence = admissionRequestSequence
+        let reply = try await rawTransport(method, params)
+        if let values = reply["write_admission"] as? [String: Any], let state = WriteAdmissionState(values) {
+            if let current = writeAdmission, !state.generation.isEmpty, state.generation == current.generation {
+                guard state.revision >= current.revision else { return reply }
+            } else { guard sequence >= acceptedAdmissionRequest else { return reply } }
+            acceptedAdmissionRequest = max(acceptedAdmissionRequest, sequence)
+            if writeAdmission != state { writeAdmission = state }
         }
-        return reply["data"] as? [String: Any] ?? [:]
+        return reply
+    }
+    private func request(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
+        if let transport { return try await transport(method, params) }
+        let reply = try await rawRequest(method, params)
+        let applied = try await QueuedCommandReply.resolve(reply, method: method, params: params, pause: queuedCommandPause,
+            transport: { [self] in try await rawRequest($0, $1) })
+        return try QueuedCommandReply.payload(applied)
     }
 
     /// Reads the current projects; offline, the last known list stays so the draft can still name its project.
     func loadProjects() async {
         do {
-            let reply = try await transport("project_list", [:])
+            let reply = try await request("project_list", [:])
             let rows = reply["projects"] as? [[String: Any]] ?? []
             let list = rows.filter { !($0["archived"] as? Bool ?? false) }.compactMap { row -> QuickCaptureProject? in
                 guard let id = row["id"] as? String, !id.isEmpty else { return nil }
                 return QuickCaptureProject(id: id, name: row["name"] as? String ?? id)
             }
-            projects = list; projectsAvailable = true
+            projects = list; projectsAvailable = true; projectUpgradeNotice = nil
             preferences.set(try? JSONEncoder().encode(list), forKey: Self.projectsKey)
             if draft.pendingCreate == nil, draft.createdTaskID == nil, !list.contains(where: { $0.id == draft.projectID }) {
                 // A missing destination requires a fresh choice for saved content.
@@ -134,11 +160,12 @@ final class QuickCaptureModel: ObservableObject {
             if case .notSent = state { state = .editing }
         } catch {
             projectsAvailable = false
-            if draft.pendingCreate == nil, draft.createdTaskID == nil, !draft.isEmpty { state = .notSent(Self.notSentOffline) }
+            projectUpgradeNotice = StorageUpgradeStatus(error: error).map { "Checklist is upgrading. " + $0.summary + " Your draft is saved on this Mac." }
+            if draft.pendingCreate == nil, draft.createdTaskID == nil, !draft.isEmpty { state = .notSent(projectUpgradeNotice ?? Self.notSentOffline) }
         }
     }
 
-    func createEpicRequest(_ method:String,_ params:[String:Any]) async throws -> [String:Any] {try await transport(method,params)}
+    func createEpicRequest(_ method:String,_ params:[String:Any]) async throws -> [String:Any] {try await request(method,params)}
     var availableEpics: [Record] { epics.filter { RecordIdentity($0.string("project_id")) == RecordIdentity(draft.projectID) } }
     func loadEpics(cursor: String? = nil) async {
         let project = draft.projectID, read = UUID(); epicRead = read
@@ -147,7 +174,7 @@ final class QuickCaptureModel: ObservableObject {
         epicLoading = true; epicError = nil
         do {
             let query = WorkspacePageQuery(surface: "epics", project: project)
-            let page = try WorkspacePage(await transport("workspace_page", query.parameters(cursor: cursor)), query: query)
+            let page = try WorkspacePage(await request("workspace_page", query.parameters(cursor: cursor)), query: query)
             guard !Task.isCancelled, epicRead == read, RecordIdentity(draft.projectID) == RecordIdentity(project) else { return }
             epics = page.rows; epicTotal = page.total; epicNext = page.next; epicPrevious = page.previous; epicLoading = false
         } catch {
@@ -223,7 +250,7 @@ final class QuickCaptureModel: ObservableObject {
                 // Never send a create whose exact intent has not reached the journal.
                 do { try journal.save(draft, kind: Self.journalKind, key: "draft") }
                 catch { throw ChecklistError("DRAFT_SAVE_FAILED", "The draft could not be saved on this Mac.", details: ["command_outcome": "not_sent"]) }
-                let reply = try await transport("task_create", draft.pendingCreate!.parameters)
+                let reply = try await request("task_create", draft.pendingCreate!.parameters)
                 let task = reply["task"] as? [String: Any] ?? reply
                 guard let id = task["id"] as? String, !id.isEmpty else { throw ChecklistError("INVALID_RESPONSE", "The service did not return the new ticket.") }
                 draft.createdTaskID = id; draft.createdKey = task["key"] as? String ?? ""
@@ -231,7 +258,7 @@ final class QuickCaptureModel: ObservableObject {
             let projectID = draft.pendingCreate?.projectID ?? draft.projectID
             for index in draft.files.indices where !draft.files[index].attached {
                 let file = draft.files[index]
-                _ = try await transport("attachment_add", ["command_id": file.commandID, "project_id": projectID, "task_id": draft.createdTaskID!, "path": file.path, "mode": "managed"])
+                _ = try await request("attachment_add", ["command_id": file.commandID, "project_id": projectID, "task_id": draft.createdTaskID!, "path": file.path, "mode": "managed"])
                 draft.files[index].attached = true
                 removeStaging(file)
             }

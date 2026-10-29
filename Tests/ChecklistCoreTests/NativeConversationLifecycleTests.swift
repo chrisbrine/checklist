@@ -222,12 +222,29 @@ extension EvidenceAuthorityTests {
         XCTAssertEqual(session["execution_domain"] as? String, "claude:200:7:0"); XCTAssertNil(session["native_closure_ref"])
         XCTAssertEqual(session["prior_native_closure_refs"] as? [String], [closed["observation_ref"] as! String])
         XCTAssertNotEqual(session["authorization_generation"] as? String, ended["authorization_generation"] as? String)
-        // The old generation keeps its released claim and queued delivery.
+        // The old generation keeps its released claim and fenced delivery; the resumed generation receives a new receipt.
         let resumed = Caller(role: "worker", installation: "fixture-resumed/2", projectIDs: [p["id"] as! String], sessionID: worker.sessionID!, workspace: workspace.path, executionDomain: "claude:200:7:0")
         var checkpoint = auth(p, a); checkpoint["progress"] = "old claim"
         assertCode("STALE_CLAIM") { _ = try self.call("work_checkpoint", checkpoint, resumed) }
         let inbox = try call("session_inbox", ["project_id": p["id"]!], resumed)["deliveries"] as! [JSON]
-        XCTAssertFalse(inbox.contains { $0["message_id"] as? String == note["id"] as? String })
+        let redelivered = try XCTUnwrap(inbox.first { $0["message_id"] as? String == note["id"] as? String })
+        XCTAssertEqual(redelivered["recipient_authorization_generation"] as? String, session["authorization_generation"] as? String)
+        XCTAssertNotNil(redelivered["resumed_from_delivery_id"])
+        XCTAssertEqual(redelivered["resumed_native_closure_ref"] as? String, closed["observation_ref"] as? String)
+        let info = try call("service_info", [:], resumed)
+        let summary = try XCTUnwrap((info["native_recovery"] as? [JSON])?.first)
+        let inboxSummary = try XCTUnwrap((call("session_inbox", ["project_id": p["id"]!], resumed)["native_recovery"] as? [JSON])?.first)
+        XCTAssertEqual(try jsonString(summary), try jsonString(inboxSummary))
+        let releasedClaim = try XCTUnwrap((summary["released_claims"] as? [JSON])?.first)
+        XCTAssertEqual(releasedClaim["attempt_id"] as? String, a["id"] as? String)
+        XCTAssertEqual(releasedClaim["key"] as? String, t["key"] as? String)
+        XCTAssertNotNil(releasedClaim["released_at"])
+        XCTAssertTrue((releasedClaim["recovery_step"] as? String ?? "").contains("work_claim"))
+        XCTAssertEqual((summary["fenced_notices"] as? [JSON])?.count, 1)
+        XCTAssertEqual((summary["fenced_notices"] as? [JSON])?.first?["body"] as? String, "Queued for the earlier process")
+        XCTAssertFalse(bool(summary, "claims_restored")); XCTAssertFalse(bool(summary, "reading_is_acknowledgment"))
+        // Repeated reads do not enqueue more copies or acknowledge either receipt.
+        XCTAssertEqual((try call("session_inbox", ["project_id": p["id"]!], resumed)["deliveries"] as? [JSON])?.count, 1)
         let oldReceipt = (try call("message_delivery_list", ["project_id": p["id"]!, "task_id": t["id"]!, "message_id": note["id"]!], resumed)["deliveries"] as! [JSON])[0]
         XCTAssertEqual(oldReceipt["state"] as? String, "fenced")
         XCTAssertEqual(oldReceipt["native_closure_ref"] as? String, closed["observation_ref"] as? String)
@@ -238,6 +255,89 @@ extension EvidenceAuthorityTests {
         // A repeated resume or a replayed old closure cannot change the new generation.
         assertCode("RECIPIENT_CHANGED") { _ = try self.router.resumeVerifiedNativeSession(self.resumption(p, worker), caller: self.bootstrapOwner) }
         assertCode("RECIPIENT_CHANGED") { _ = try self.router.reconcileVerifiedNativeClosure(self.closure(p, worker), caller: self.lifecycleOwner) }
+    }
+    func testResumptionRecoveryIsPrivateAndRetainsAllReleasedClaims() throws {
+        let p = try project(), tasks = try [ready(p), ready(p)]
+        let worker = try native(p, "private-recovery", domain: "claude:123:5:0", provider: "claude")
+        let attempts = try tasks.map { try claim(p, $0, caller: worker) }
+        let acknowledged = try call("message_send", ["project_id": p["id"]!, "task_id": tasks[0]["id"]!, "body": "Already read"])
+        let ack = try XCTUnwrap((acknowledged["deliveries"] as? [JSON])?.first)
+        _ = try call("message_ack", ["project_id": p["id"]!, "delivery_id": ack["id"]!, "stage": "acknowledged"], worker)
+        let notice = try call("message_send", ["project_id": p["id"]!, "task_id": tasks[1]["id"]!, "body": "Private stopped work notice"])
+        _ = try router.reconcileVerifiedNativeClosure(closure(p, worker), caller: lifecycleOwner)
+        let next = try router.resumeVerifiedNativeSession(resumption(p, worker), caller: bootstrapOwner)
+        let resumed = Caller(role: "worker", installation: "fixture-resumed/2", projectIDs: [p["id"] as! String], sessionID: worker.sessionID!, workspace: workspace.path, executionDomain: "claude:200:7:0")
+        let summary = try XCTUnwrap((call("service_info", [:], resumed)["native_recovery"] as? [JSON])?.first)
+        XCTAssertEqual(Set((summary["released_claims"] as? [JSON] ?? []).compactMap { $0["attempt_id"] as? String }), Set(attempts.compactMap { $0["id"] as? String }))
+        let inbox = try call("session_inbox", ["project_id": p["id"]!], resumed)
+        let deliveries = inbox["deliveries"] as! [JSON]
+        XCTAssertEqual(deliveries.count, 1)
+        XCTAssertEqual(deliveries[0]["message_id"] as? String, notice["id"] as? String)
+        let other = try native(p, "foreign-recovery", domain: "claude:123:6:0", provider: "claude")
+        XCTAssertTrue((try call("service_info", [:], other)["native_recovery"] as! [JSON]).isEmpty)
+        let foreignInbox = try call("session_inbox", ["project_id": p["id"]!], other)
+        XCTAssertTrue((foreignInbox["deliveries"] as! [JSON]).isEmpty)
+        XCTAssertTrue((foreignInbox["native_recovery"] as! [JSON]).isEmpty)
+        XCTAssertTrue((try call("service_info", [:], worker)["native_recovery"] as! [JSON]).isEmpty)
+        assertCode("FORBIDDEN") { _ = try self.call("session_inbox", ["project_id": p["id"]!], worker) }
+        let task = try call("task_get", ["project_id": p["id"]!, "task_id": tasks[0]["id"]!])
+        XCTAssertTrue(((task["status_reason"] as? JSON)?["text"] as? String ?? "").contains("native closure"))
+        // One more real mocked closure/resumption uses only that previous generation,
+        // and the unacknowledged copy survives without un-fencing the original.
+        _ = try router.reconcileVerifiedNativeClosure(closure(p, resumed), caller: lifecycleOwner)
+        _ = try router.resumeVerifiedNativeSession(resumption(p, resumed, installation: "fixture-resumed/3", domain: "claude:300:8:0"), caller: bootstrapOwner)
+        let third = Caller(role: "worker", installation: "fixture-resumed/3", projectIDs: [p["id"] as! String], sessionID: worker.sessionID!, workspace: workspace.path, executionDomain: "claude:300:8:0")
+        let latest = try XCTUnwrap((call("service_info", [:], third)["native_recovery"] as? [JSON])?.first)
+        XCTAssertNotEqual(latest["summary_id"] as? String, summary["summary_id"] as? String)
+        XCTAssertTrue((latest["released_claims"] as! [JSON]).isEmpty)
+        XCTAssertEqual((try call("session_inbox", ["project_id": p["id"]!], third)["deliveries"] as! [JSON]).count, 1)
+        XCTAssertNotEqual(next["authorization_generation"] as? String, latest["summary_id"] as? String)
+    }
+
+    func testResumptionSummarySupportsEarlierBuildAndExcludesWithdrawnDirections() throws {
+        let p = try project(), t = try ready(p), worker = try native(p,"legacy-summary",domain:"claude:123:5:0",provider:"claude")
+        _ = try claim(p,t,caller:worker)
+        let withdrawn = try call("message_send",["project_id":p["id"]!,"task_id":t["id"]!,"body":"Withdraw this action","requires_action":true])
+        _ = try call("message_send",["project_id":p["id"]!,"task_id":t["id"]!,"body":"Action withdrawn","correction_of":withdrawn["id"]!,"kind":"retraction"])
+        let addressed = try call("message_send",["project_id":p["id"]!,"task_id":t["id"]!,"body":"Already resolved","requires_action":true])
+        try router.dbQueue.write { db in
+            var message = try router.record(db,addressed["id"] as! String,type:"message")
+            message["addressed"] = true;try router.save(db,router.revised(message),type:"message")
+        }
+        let pending = try call("message_send",["project_id":p["id"]!,"task_id":t["id"]!,"body":"Still needs pickup"])
+        _ = try router.reconcileVerifiedNativeClosure(closure(p,worker),caller:lifecycleOwner)
+        let next = try router.resumeVerifiedNativeSession(resumption(p,worker),caller:bootstrapOwner)
+        let resumed = Caller(role:"worker",installation:"fixture-resumed/2",projectIDs:[p["id"] as! String],sessionID:worker.sessionID!,workspace:workspace.path,executionDomain:"claude:200:7:0")
+        let receipts = try call("session_inbox",["project_id":p["id"]!],resumed)["deliveries"] as! [JSON]
+        for id in [withdrawn["id"] as! String,addressed["id"] as! String] {
+            XCTAssertFalse(receipts.contains {$0["message_id"] as? String == id})
+        }
+        // Emulate the earlier build's resumed state: no fresh notice receipts.
+        try router.dbQueue.write { db in
+            for receipt in receipts { try db.execute(sql:"DELETE FROM records WHERE type='delivery' AND id=?",arguments:[receipt["id"] as! String]) }
+        }
+        let info = try call("service_info",[:],resumed), inbox = try call("session_inbox",["project_id":p["id"]!],resumed)
+        XCTAssertTrue((inbox["deliveries"] as! [JSON]).isEmpty)
+        let summary = try XCTUnwrap((info["native_recovery"] as? [JSON])?.first)
+        XCTAssertEqual(try jsonString(info["native_recovery"]!),try jsonString(inbox["native_recovery"]!))
+        let notices = summary["fenced_notices"] as! [JSON]
+        XCTAssertTrue(notices.contains {$0["message_id"] as? String == pending["id"] as? String})
+        for id in [withdrawn["id"] as! String,addressed["id"] as! String] { XCTAssertFalse(notices.contains {$0["message_id"] as? String == id}) }
+        XCTAssertEqual(try router.dbQueue.read {try router.sessionGeneration(router.record($0,worker.sessionID!,type:"session"))},next["authorization_generation"] as? String)
+    }
+    func testNativeClosureOfChildDoesNotLabelActiveRootTicketReleased() throws {
+        let p = try project(), t = try ready(p)
+        let parent = try native(p,"live-root",domain:"claude:123:5:0",provider:"claude")
+        let child = try native(p,"closed-child",domain:"claude:124:5:0",provider:"claude")
+        let root = try claim(p,t,files:[["path":"Sources","access":"write"]],caller:parent)
+        var input = auth(p,root);input["child_session_id"] = child.sessionID!;input["file_scopes"] = [["path":"Sources/Child.swift","access":"write"]]
+        let offered = try call("work_delegate",input,parent)
+        _ = try call("work_child_accept",["project_id":p["id"]!,"delegation_id":offered["id"]!],child)
+        _ = try router.reconcileVerifiedNativeClosure(closure(p,child),caller:lifecycleOwner)
+        let active = try call("task_get",["project_id":p["id"]!,"task_id":t["id"]!])
+        XCTAssertEqual(active["active_attempt_id"] as? String,root["id"] as? String)
+        XCTAssertEqual(active["status_category"] as? String,"active")
+        XCTAssertNil(active["status_reason"] as? JSON)
     }
     func testResumeRefusesOwnerDisconnectAndUnfinishedRelease() throws {
         let p = try project(), revoked = try native(p, "owner-revoked", domain: "claude:123:5:0", provider: "claude")

@@ -14,6 +14,7 @@ enum StorageBootstrap {
     }
     static func open(root: URL, serviceLease: StorageServiceLease? = nil, prepareDatabase: @escaping @Sendable (Database)throws->Void = { _ in }, observe: (Boundary)->Void = { _ in }) throws -> Opened {
         let root = StoreDirectory.anchoredRoot(root)
+        defer {StorageUpgradeProgress.clear(root:root)}
         let directory = try StoreDirectory(root:root)
         if let serviceLease { try serviceLease.requireRoot(root) }
         return try ArchiveStorageGate.withExclusive(root:root) { permit in
@@ -24,6 +25,9 @@ enum StorageBootstrap {
             guard hasDatabase || external == nil else { throw StoreRecovery.required("initialized_database_missing") }
             let identity: StoreIdentityReceipt, fresh: Bool
             if hasDatabase {
+                if let external,external.schema_revision < SchemaMigrations.currentSchema {
+                    StorageUpgradeProgress.update(root:root,stage:"preparation_validation",seconds:90)
+                }
                 switch try readOnlyPreflight(database) {
                 case .legacy(let incarnation):
                     guard serviceLease != nil else { throw StoreRecovery.required("upgrade_requires_exclusive_service") }
@@ -77,7 +81,8 @@ enum StorageBootstrap {
                         protected = try prepareUpgrade(queue:queue,root:root,identity:identity,permit:permit)
                     }
                     let prepared = identity.withSchema(SchemaMigrations.currentSchema).withState("preparing")
-                    let plan = try queue.read { try ManagedPathRelocation.plan($0, root: root, budget: .production()) }
+                    let plan = version < 3 ? try queue.read { try ManagedPathRelocation.plan($0, root: root, budget: .production()) } : ManagedPathRelocation.Plan(decisions:[:])
+                    if !fresh {StorageUpgradeProgress.update(root:root,stage:"final_migration",seconds:90)}
                     try directory.publishReceipt(prepared.encoded(),name:StoreIdentityReceipt.fileName,replacingPreparedReceipt:true)
                     try queue.write { db in
                         if let expected = protected["source_fingerprint"] as? String {
@@ -106,6 +111,17 @@ enum StorageBootstrap {
         }
     }
     private static func prepareUpgrade(queue: DatabaseQueue, root: URL, identity: StoreIdentityReceipt, permit: ArchiveStoragePermit) throws -> JSON {
+        StorageUpgradeProgress.update(root:root,stage:"preparation_validation",seconds:90)
+        var reason = "preparation_unavailable"
+        do {
+            if let prepared = try StorageUpgradePreparation.reusable(queue:queue,root:root,identity:identity) {return prepared}
+            if try StorageObjectFiles(root:root).regularOrLinkExists(StorageUpgradePreparation.receiptName) {reason = "source_changed_after_preparation"}
+        } catch {
+            // Invalid preparation is never permission to skip protection.
+            reason = "preparation_invalid"
+            fputs("Upgrade preparation cannot be reused; taking a fresh protected snapshot.\n",stderr)
+        }
+        StorageUpgradeProgress.update(root:root,stage:"protected_snapshot",seconds:900,reason:reason)
         let parent = root.appendingPathComponent("backups",isDirectory:true)
         let files = try StorageObjectFiles(root:root)
         let (parentFD,_) = try files.parent("backups/.preupgrade",create:true);Darwin.close(parentFD)
@@ -113,32 +129,8 @@ enum StorageBootstrap {
         let operation = UUID(), budget = StorageSnapshotBudget.production()
         let source = try StorageSnapshotSource(source:root,parent:parent,storeID:identity.logical_store_id,permit:permit)
         let receipt = try StorageSnapshot.build(source,operation:operation,budget:budget)
-        let generation = parent.appendingPathComponent(StorageSnapshot.names(operation).published,isDirectory:true)
-        let copyURL = generation.appendingPathComponent("database.sqlite")
-        var config = Configuration();config.readonly = true;config.prepareDatabase { try SchemaMigrations.installStorageCollation($0) }
-        let copy = try DatabaseQueue(path:copyURL.path,configuration:config)
-        let fingerprint = try copy.read { try SchemaMigrations.contentFingerprint($0) };try copy.close()
-        let protected: JSON = ["operation_id":operation.uuidString.lowercased(),"path":generation.path,"manifest_sha256":receipt.manifestSHA256,"source_fingerprint":fingerprint,"target_migration_checksum":SchemaMigrations.triageMembershipChecksum,"protected":true]
-        // Rehearse the exact migration on the closed, checksummed SQLite copy.
-        // This candidate is separate from both live store and protected backup.
-        let rehearsal = root.appendingPathComponent("staging/preupgrade-" + operation.uuidString.lowercased() + ".sqlite")
-        let (stageFD,_) = try files.parent("staging/.preupgrade",create:true);Darwin.close(stageFD)
-        try FileManager.default.copyItem(at:copyURL,to:rehearsal)
-        var writer = Configuration();writer.prepareDatabase { db in try SchemaMigrations.installStorageCollation(db);try db.execute(sql:"PRAGMA foreign_keys=ON;PRAGMA synchronous=FULL") }
-        let candidate = try DatabaseQueue(path:try writableURI(rehearsal),configuration:writer)
-        do {
-            let plan = try candidate.read { try ManagedPathRelocation.plan($0, root: root, budget: budget) }
-            try candidate.write { db in
-                if try Int.fetchOne(db,sql:"PRAGMA user_version") == 0 { try SchemaMigrations.adoptBaseline(db,identity:identity.withSchema(1),fresh:false) }
-                if try Int.fetchOne(db,sql:"PRAGMA user_version") == 1 { try SchemaMigrations.upgradeProtocol(db,identity:identity.withSchema(2),protectedSnapshot:protected) }
-                if try Int.fetchOne(db,sql:"PRAGMA user_version") == 2 { try SchemaMigrations.upgradeManagedPaths(db,identity:identity.withSchema(3),root:root,plan:plan,protectedSnapshot:protected) }
-                try SchemaMigrations.upgradeTriageMembership(db,identity:identity.withSchema(4),protectedSnapshot:protected)
-            }
-            try candidate.read { db in _ = try SchemaMigrations.inspect(db);guard try String.fetchOne(db,sql:"PRAGMA integrity_check") == "ok" else { throw StoreRecovery.required("migration_rehearsal_integrity_failed") } }
-            try candidate.close()
-        } catch { try? candidate.close();throw error }
-        try StorageObjectFiles(root:root).synchronizeOwnedFile("staging/" + rehearsal.lastPathComponent)
-        return protected
+        StorageUpgradeProgress.update(root:root,stage:"migration_rehearsal",seconds:360)
+        return try StorageUpgradePreparation.rehearse(root:root,identity:identity,operation:operation,manifestSHA256:receipt.manifestSHA256,budget:budget)
     }
     private static func readOnlyPreflight(_ database: URL) throws -> SchemaMigrations.State {
         var config = Configuration();config.readonly = true

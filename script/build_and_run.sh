@@ -21,12 +21,16 @@ INCOMING=""
 STAGE_ASSEMBLY=""
 BUILD_SOURCE=""
 VERIFICATION_RECEIPT=""
+OFFLINE_STARTED=""
 # Only generated output is made writable; never pass the immutable source here.
 remove_generated() { chmod -R u+w "$1" && rm -rf "$1"; }
 cleanup() {
   local status=$? cleanup_failed=0
   trap - EXIT
   trap '' HUP INT TERM
+  if [ -n "$OFFLINE_STARTED" ]; then
+    echo "Measured service offline window: at least $(( $(date +%s) - OFFLINE_STARTED )) s (no healthy service answer observed before installer exit)." >&2
+  fi
   if [ -n "$STAGE_ASSEMBLY" ] && [ -d "$STAGE_ASSEMBLY" ]; then
     remove_generated "$STAGE_ASSEMBLY" || { echo "Cleanup failed for generated stage: $STAGE_ASSEMBLY" >&2; cleanup_failed=1; }
   fi
@@ -341,8 +345,23 @@ if [ -e "$DEST" ]; then
 fi
 ditto "$STAGE" "$INCOMING"
 codesign --verify --deep --strict "$INCOMING"
+# Complete the protected copy and rehearsal while the old service still serves.
+# Startup revalidates this preparation after the old writer has stopped.
+UPGRADE_PREPARATION="$("$INCOMING/Contents/MacOS/ChecklistService" --prepare-upgrade)"
+python3 - "$UPGRADE_PREPARATION" <<'PYUPGRADE'
+import json,math,sys
+value=json.loads(sys.argv[1]);seconds=value.get('expected_offline_seconds')
+if (type(value.get('needs_upgrade')) is not bool or type(value.get('prepared')) is not bool
+    or type(seconds) not in [int,float] or not math.isfinite(seconds) or seconds<=0):
+ raise SystemExit('Invalid store-upgrade preparation receipt; the installed app is untouched.')
+print('Store upgrade preparation: '+json.dumps(value,sort_keys=True),flush=True)
+print(f'Expected service offline window: about {seconds:g} s; '+
+      ('the prepared store must still match at the swap. A changed store uses the full protected startup and reports its reason.'
+       if value['needs_upgrade'] and value['prepared'] else 'protected startup estimate.'),flush=True)
+PYUPGRADE
 # Quiesce only this UI and the process holding this installation's service lock.
 # Data remains in Application Support. This does not claim or create a database backup.
+OFFLINE_STARTED="$(date +%s)"
 python3 - "$ROOT_DIR" "$DEST" <<'PY'
 import ctypes,os,signal,subprocess,sys,time
 from pathlib import Path
@@ -419,6 +438,10 @@ case "$MODE" in
       echo "Previous bundle kept at $PREVIOUS; it does not restore the store." >&2
     fi
     exit 1
+  fi
+  if [ -n "${OFFLINE_STARTED:-}" ]; then
+    echo "Measured service offline window: $(( $(date +%s) - OFFLINE_STARTED )) s (stop request to first healthy service answer)."
+    OFFLINE_STARTED=""
   fi
   ;;
 esac

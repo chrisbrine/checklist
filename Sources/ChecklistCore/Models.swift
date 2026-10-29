@@ -3,7 +3,7 @@ import Foundation
 import CryptoKit
 import GRDB
 
-public struct Caller: Sendable {
+public struct Caller: Codable, Sendable {
     public var role: String
     public var installation: String
     public var projectIDs: [String]

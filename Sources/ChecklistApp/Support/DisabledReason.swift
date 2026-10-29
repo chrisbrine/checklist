@@ -1,11 +1,13 @@
 import SwiftUI
+import ChecklistIPC
 
 /// CL-58: a disabled control says why. The first true reason disables the control and shows as its
 /// tooltip and accessibility hint; a test forbids a plain `.disabled(...)` elsewhere in the app.
 struct DisabledReason: ViewModifier {
     let reason: String?
+    @Environment(\.checklistStorageUpgradeStatus) private var upgrade
     func body(content: Content) -> some View {
-        if let reason { content.disabled(true).help(reason).accessibilityHint(reason) } else { content }
+        if let reason = DisabledReasons.display(reason, upgrade: upgrade) { content.disabled(true).help(reason).accessibilityHint(reason) } else { content }
     }
 }
 
@@ -15,9 +17,24 @@ extension View {
     }
 }
 
+private struct ChecklistStorageUpgradeStatusKey: EnvironmentKey { static let defaultValue: StorageUpgradeStatus? = nil }
+extension EnvironmentValues {
+    var checklistStorageUpgradeStatus: StorageUpgradeStatus? {
+        get { self[ChecklistStorageUpgradeStatusKey.self] }
+        set { self[ChecklistStorageUpgradeStatusKey.self] = newValue }
+    }
+}
+
 /// Shared reasons for actions that write to the service.
 enum DisabledReasons {
     static let offline = "Checklist is offline. Changes and sending are off until it reconnects; your drafts stay on this Mac."
+    static func offline(upgrade: StorageUpgradeStatus?) -> String {
+        guard let upgrade else { return offline }
+        return "Checklist is upgrading. " + upgrade.summary + " Changes and sending resume when it finishes; your drafts stay on this Mac."
+    }
+    static func display(_ reason: String?, upgrade: StorageUpgradeStatus?) -> String? {
+        reason == offline ? offline(upgrade: upgrade) : reason
+    }
     static let saving = "Another change is still saving. Try again when it finishes."
     static let uncheckedChange = "The last change may already be saved. Use Check the last change first."
     static let ticketLoading = "The current version of this ticket is still loading."
