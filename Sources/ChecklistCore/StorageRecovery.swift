@@ -38,8 +38,13 @@ struct StorageBackupRetentionIndex {
         }
     }
     static func key(path: String,sha: String,size: Int64) -> Data {
-        Data((try! jsonString(["path":path,"sha256":sha,"size":size])).utf8)
+        // CL-355: byte-identical to jsonString (sorted keys, unescaped slashes) for
+        // printable ASCII without quote or backslash; every other string uses it.
+        func plain(_ value: String) -> Bool { value.utf8.allSatisfy {$0 >= 0x20 && $0 < 0x7F && $0 != 0x22 && $0 != 0x5C} }
+        guard plain(path),plain(sha) else {return Data((try! jsonString(["path":path,"sha256":sha,"size":size])).utf8)}
+        return Data(("{\"path\":\"" + path + "\",\"sha256\":\"" + sha + "\",\"size\":" + String(size) + "}").utf8)
     }
+    static func referenceKey(path: String,sha: String,size: Int64) -> Data { Data((try! jsonString(["path":path,"sha256":sha,"size":size])).utf8) }
     func knownRetainedLogicalBytes(for attachment: JSON) -> Int64 {
         guard attachment["mode"] as? String == "managed",let path = attachment["path"] as? String,let sha = attachment["sha256"] as? String,
               let number = attachment["size"] as? NSNumber,number.int64Value >= 0,
@@ -325,8 +330,12 @@ extension CommandRouter {
                 throw error
             }
         }
+        // CL-345: the archive cleanup reference scan reads a snapshot before the
+        // object gate and the writer; the executor's transactions check its fence.
+        let archiveScan = (storageMaintenanceRetryAt.map {$0 > Date()} ?? false) ? nil : prepareArchiveCleanupJobScan(nowMS:archiveCleanupNowMS())
+        defer {finishArchiveCleanupScan(archiveScan)}
         try ArchiveStorageGate.withExclusive(root:root) { permit in
-            dbQueue.writeWithoutTransaction { _ = self.performStorageMaintenance($0,permit:permit) }
+            dbQueue.writeWithoutTransaction { _ = self.performStorageMaintenance($0,permit:permit,archiveScan:archiveScan) }
         }
     }
 }

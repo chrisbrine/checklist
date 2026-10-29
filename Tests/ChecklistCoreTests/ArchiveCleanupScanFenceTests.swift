@@ -155,4 +155,129 @@ final class ArchiveCleanupScanFenceTests: XCTestCase {
         XCTAssertEqual(try jobs(f).first?.items.count,3)
         XCTAssertLessThan(after,before,"The archive writer phase must not include the reference scan")
     }
+
+    // MARK: CL-345: the cleanup executor scans a read snapshot before the writer.
+
+    func makeDue(_ f: (project: JSON,task: JSON,files: [JSON])) throws {
+        try router.dbQueue.writeWithoutTransaction {db in try self.router.withValidatedDomainTransaction(db) {
+            for listed in try self.router.records(db,type:"cleanup_job",project:f.project["id"] as? String) {
+                var j = try self.router.record(db,listed["id"] as! String,type:"cleanup_job")
+                j["enqueued_at_ms"] = Int64(1);j["not_before_ms"] = Int64(2);j["revision"] = try self.router.nextCleanupJobRevision(j)
+                try self.router.save(db,j,type:"cleanup_job")
+            }
+            return .commit
+        }}
+    }
+    func exists(_ file: JSON) -> Bool { FileManager.default.fileExists(atPath:file["path"] as! String) }
+    func deleteIntents() throws -> Int {
+        try router.dbQueue.read {try Int.fetchOne($0,sql:"SELECT COUNT(*) FROM records WHERE type='storage_job' AND json_extract(data,'$.kind')='archive_cleanup_delete'") ?? 0}
+    }
+    /// The fence miss left the item retryable: no failure, no hold, job not ended.
+    func assertRetryable(_ f: (project: JSON,task: JSON,files: [JSON]),file: StaticString = #filePath,line: UInt = #line) throws {
+        let job = try XCTUnwrap(try jobs(f).first,file:file,line:line),item = try XCTUnwrap(job.items.first,file:file,line:line)
+        XCTAssertTrue(exists(f.files[0]),"No deletion on a fence miss",file:file,line:line)
+        XCTAssertEqual(try deleteIntents(),0,"No deletion intent on a fence miss",file:file,line:line)
+        XCTAssertNil(item.failure,file:file,line:line);XCTAssertEqual(item.sameFailureCount,0,file:file,line:line);XCTAssertFalse(item.terminal,file:file,line:line)
+        XCTAssertFalse([.canceled,.completed,.suspended].contains(job.state),file:file,line:line)
+    }
+
+    func testExecutorScanRunsBeforeTheWriterAndUnrelatedWriteCommits() throws {
+        let f = try fixture(count:1),other = try call("task_create",["project_id":f.project["id"]!,"title":"Unrelated"])
+        try archive(f);try makeDue(f)
+        // A command's maintenance tail prepares no scan: the due item waits for the service turn.
+        _ = try call("task_create",["project_id":f.project["id"]!,"title":"Command tail"])
+        XCTAssertTrue(exists(f.files[0]));XCTAssertEqual(try deleteIntents(),0)
+        var observed = 0
+        router.archiveCleanupScanObserver = concurrently {
+            observed += 1
+            try self.writeTask(other["id"] as! String) {$0["title"] = "Written during executor scan"}
+        }
+        try router.runStorageMaintenance()
+        router.archiveCleanupScanObserver = nil
+        XCTAssertEqual(observed,1,"The service turn scans once, before the gate and the writer")
+        XCTAssertFalse(exists(f.files[0]),"An unrelated write does not miss the fence")
+        XCTAssertEqual(try jobs(f).first?.items.first?.terminal,true)
+        XCTAssertEqual(try call("task_get",["project_id":f.project["id"]!,"task_id":other["id"]!])["title"] as? String,"Written during executor scan")
+    }
+
+    func testExecutorFenceMissFromAnotherConnectionRetriesWithoutDeletion() throws {
+        let f = try fixture(count:1);try archive(f);try makeDue(f)
+        let path = router.root.appendingPathComponent("checklist.sqlite").path
+        router.archiveCleanupScanObserver = concurrently {
+            // Another SQLite connection commits while the scan hook runs: no write transaction is open.
+            var configuration = Configuration();configuration.busyMode = .timeout(5)
+            configuration.prepareDatabase {try SchemaMigrations.installStorageCollation($0)}
+            let other = try DatabaseQueue(path:path,configuration:configuration)
+            try other.write {try $0.execute(sql:"INSERT INTO metadata(key,value) VALUES('cl345-other-connection','1')")}
+            try other.close()
+        }
+        try router.runStorageMaintenance()
+        router.archiveCleanupScanObserver = nil
+        try assertRetryable(f)
+        try router.runStorageMaintenance()
+        XCTAssertFalse(exists(f.files[0]),"The next turn rescans and deletes")
+        XCTAssertEqual(try jobs(f).first?.items.first?.terminal,true)
+    }
+
+    func testExecutorRelevantChangeBetweenScanAndCommitRetriesWithoutDeletion() throws {
+        let f = try fixture(count:1);try archive(f);try makeDue(f)
+        router.archiveCleanupScanObserver = concurrently {
+            try self.writeTask(f.task["id"] as! String) {$0["title"] = "Changed during executor scan"}
+        }
+        try router.runStorageMaintenance()
+        router.archiveCleanupScanObserver = nil
+        try assertRetryable(f)
+        // A new payload naming the original during the scan also misses the fence.
+        router.archiveCleanupScanObserver = concurrently {
+            _ = try self.call("task_create",["project_id":f.project["id"]!,"title":f.files[0]["id"] as! String])
+        }
+        try router.runStorageMaintenance()
+        router.archiveCleanupScanObserver = nil
+        try assertRetryable(f)
+        // The retry decides exactly as the unchanged in-writer complete scan does now.
+        let expected = try router.dbQueue.read {db in
+            try self.router.completeArchiveCleanupHolds(db,attachment:self.router.record(db,f.files[0]["id"] as! String,type:"attachment"),task:self.router.record(db,f.task["id"] as! String,type:"task"))
+        }
+        try router.runStorageMaintenance()
+        XCTAssertEqual(exists(f.files[0]),!expected.isEmpty,"Holds \(expected)")
+        if !expected.isEmpty {XCTAssertEqual(Set(try XCTUnwrap(try jobs(f).first?.items.first).holds),expected)}
+    }
+
+    /// Scaled timing: 50,000 synthetic records. Before = one unchanged in-writer
+    /// executor admission (full graph, holds and facts); after = the service
+    /// turn's gate and writer phase (end of the snapshot scan to return).
+    func testScaledExecutorWriteHoldBeforeAndAfter() throws {
+        let f = try fixture(count:1),filler = try call("task_create",["project_id":f.project["id"]!,"title":"Filler owner"])
+        let pid = f.project["id"] as! String,tid = filler["id"] as! String
+        try router.dbQueue.writeWithoutTransaction {db in try self.router.withValidatedDomainTransaction(db) {
+            let template: JSON = ["id":"00000000-0000-4000-8000-000000000000","project_id":pid,"task_id":tid,"revision":1,"body":String(repeating:"synthetic note text ",count:50),"refs":["a","b","c"]]
+            try self.router.save(db,template,type:"message")
+            try db.execute(sql:"""
+                WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<49999)
+                INSERT INTO records(id,project_id,type,revision,data)
+                SELECT printf('00000000-0000-4000-8000-%012d',i),project_id,type,revision,json_set(data,'$.id',printf('00000000-0000-4000-8000-%012d',i))
+                FROM n,records WHERE records.id='00000000-0000-4000-8000-000000000000'
+                """)
+            return .commit
+        }}
+        try archive(f);try makeDue(f)
+        var start = ProcessInfo.processInfo.systemUptime
+        try router.dbQueue.writeWithoutTransaction {db in try self.router.withValidatedDomainTransaction(db) {
+            let task = try self.router.record(db,f.task["id"] as! String,type:"task"),a = try self.router.record(db,f.files[0]["id"] as! String,type:"attachment")
+            let graph = try self.router.archiveCleanupReferenceRows(db)
+            _ = try self.router.completeArchiveCleanupHolds(db,attachment:a,task:task,currentGraph:graph)
+            _ = try self.router.archiveRetentionFacts(db,task:task,currentGraph:graph);return .rollback
+        }}
+        let before = ProcessInfo.processInfo.systemUptime - start
+        var scanEnd: TimeInterval = 0
+        router.archiveCleanupScanObserver = {scanEnd = ProcessInfo.processInfo.systemUptime}
+        start = ProcessInfo.processInfo.systemUptime
+        try router.runStorageMaintenance()
+        let end = ProcessInfo.processInfo.systemUptime,after = end - scanEnd
+        router.archiveCleanupScanObserver = nil
+        print("CL-345 scaled records=50001 per_item_write_hold_before=\(before)s (one admission; the old final check scanned again) per_item_write_hold_after_upper_bound=\(after)s service_turn_total=\(end - start)s")
+        XCTAssertGreaterThan(scanEnd,0)
+        XCTAssertFalse(exists(f.files[0]))
+        XCTAssertLessThan(after,before,"The executor's writer phase must not include the reference scan")
+    }
 }

@@ -22,9 +22,17 @@ final class ChecklistMCPServerTests: XCTestCase {
         var responseText: String?
         var responseData: [String:Any]?
         var callHandler: ((String) throws -> Void)?
+        /// Runs outside the fixture lock, so a slow fake service call does not hold other calls.
+        var unlockedCallHandler: ((String) -> Void)?
         var requestHandler: ((String, [String:Any]) throws -> [String:Any])?
         var unregisteredWorkspace = false
         var projectCreationEnabled = false
+        var jobRunning: Bool? = true
+        private var starts = 0
+        var serviceStarts: Int { locked { starts } }
+        private var timeouts: [(String, TimeInterval?)] = []
+        var replyTimeouts: [(String, TimeInterval?)] { locked { timeouts } }
+        func recordReplyTimeout(_ method: String, _ value: TimeInterval?) { locked { timeouts.append((method, value)) } }
 
         init(provider: String = "claude") throws {
             let session = "a85c9a24-fce8-49ba-a738-67594bb90a67"
@@ -56,7 +64,7 @@ final class ChecklistMCPServerTests: XCTestCase {
                 }
             }, now: { self.time }, sleep: { self.advance($0) }, stderr: { line in
                 self.locked { self.stderrLines.append(line) }
-            })
+            }, serviceJobRunning: { self.locked { self.jobRunning } }, startService: { self.locked { self.starts += 1 } })
         }
 
         func bootstrap(_ budget: TimeInterval?) throws -> [String: Any] {
@@ -106,7 +114,9 @@ final class ChecklistMCPServerTests: XCTestCase {
             return try fixture.bootstrap(timeBudget)
         }
         func call(_ method: String, _ params: [String: Any], replyTimeout: TimeInterval?) throws -> [String: Any] {
-            try fixture.call(method, params: params, client: index)
+            fixture.recordReplyTimeout(method, replyTimeout)
+            fixture.unlockedCallHandler?(method)
+            return try fixture.call(method, params: params, client: index)
         }
     }
 
@@ -354,6 +364,123 @@ final class ChecklistMCPServerTests: XCTestCase {
         try await assertProtocolOnly(session)
     }
 
+    /// Counts calls that are in the fake service at the same time.
+    private final class InFlight: @unchecked Sendable {
+        private let lock = NSLock()
+        private var current = 0, highest = 0
+        var maximum: Int { lock.lock(); defer { lock.unlock() }; return highest }
+        func run(_ seconds: TimeInterval) {
+            lock.lock(); current += 1; highest = max(highest, current); lock.unlock()
+            Thread.sleep(forTimeInterval: seconds)
+            lock.lock(); current -= 1; lock.unlock()
+        }
+    }
+
+    private static func milliseconds(_ duration: Duration) -> Int {
+        Int(duration.components.seconds * 1000 + duration.components.attoseconds / 1_000_000_000_000_000)
+    }
+
+    // CL-352: a fast call answers while a slow call of the same conversation still runs.
+    func testFastServiceInfoAnswersWhileSlowCallOfSameConversationRuns() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        let session = try await start(fixture)
+        let client = session.client
+        let slowEntered = expectation(description: "slow call is in the fake service")
+        fixture.unlockedCallHandler = { name in
+            if name == "task_list" { slowEntered.fulfill(); Thread.sleep(forTimeInterval: 10) }
+        }
+        let clock = ContinuousClock(), slowStart = clock.now
+        let slow = Task { () -> (Bool, Duration) in
+            let result = try await client.callTool(name: "task_list")
+            return (result.isError == false && self.text(result.content).contains("task_list"), clock.now - slowStart)
+        }
+        await fulfillment(of: [slowEntered], timeout: 10)
+        let fastStart = clock.now
+        let fast = try await client.callTool(name: "service_info")
+        let fastTime = clock.now - fastStart
+        XCTAssertEqual(fast.isError, false)
+        XCTAssertTrue(text(fast.content).contains("synthetic"))
+        XCTAssertLessThan(fastTime, .seconds(1))
+        let (slowOK, slowTime) = try await slow.value
+        XCTAssertTrue(slowOK)
+        XCTAssertGreaterThanOrEqual(slowTime, .seconds(10))
+        XCTAssertLessThan(fastStart + fastTime, slowStart + slowTime)
+        print("CL-352 overlap: fast service_info \(Self.milliseconds(fastTime)) ms, started \(Self.milliseconds(fastStart - slowStart)) ms after the slow task_list; slow task_list \(Self.milliseconds(slowTime)) ms")
+        try await assertProtocolOnly(session)
+    }
+
+    // CL-352: concurrent calls are in flight together; each gets its own reply, with the
+    // same bound identity and its own unchanged command_id.
+    func testTwentyConcurrentCallsEachGetTheirOwnReply() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        let gauge = InFlight()
+        fixture.unlockedCallHandler = { name in if name == "task_get" { gauge.run(0.5) } }
+        fixture.requestHandler = { name, params in
+            if name == "tool_catalog" {
+                return ["data": ["tools": ["service_info", "task_get"].map {
+                    ["name": $0, "description": "Synthetic " + $0, "inputSchema": ["type": "object", "properties": [:], "additionalProperties": true]] as [String: Any]
+                }]]
+            }
+            return ["data": ["method": name, "n": params["n"] ?? NSNull(), "command_id": params["command_id"] ?? NSNull()]]
+        }
+        let session = try await start(fixture)
+        let client = session.client
+        let ids = (0..<20).map { _ in UUID().uuidString.lowercased() }
+        let clock = ContinuousClock(), started = clock.now
+        let replies = try await withThrowingTaskGroup(of: (Int, Bool, String).self) { group in
+            for (n, id) in ids.enumerated() {
+                group.addTask {
+                    let result = try await client.callTool(name: "task_get", arguments: ["n": .int(n), "command_id": .string(id)])
+                    return (n, result.isError == false, self.text(result.content))
+                }
+            }
+            return try await group.reduce(into: [:]) { $0[$1.0] = ($1.1, $1.2) }
+        }
+        let elapsed = clock.now - started
+        XCTAssertEqual(replies.count, 20)
+        for (n, id) in ids.enumerated() {
+            let reply = try XCTUnwrap(replies[n])
+            XCTAssertTrue(reply.0)
+            let data = try XCTUnwrap((try JSONSerialization.jsonObject(with: Data(reply.1.utf8)) as? [String: Any])?["data"] as? [String: Any])
+            XCTAssertEqual(data["n"] as? Int, n)
+            XCTAssertEqual(data["command_id"] as? String, id)
+            XCTAssertEqual(data["method"] as? String, "task_get")
+        }
+        let calls = fixture.calls.filter { $0.0 == "task_get" }
+        XCTAssertEqual(calls.count, 20)
+        XCTAssertTrue(calls.allSatisfy { $0.1.installation == "synthetic-thread" && $0.1.workspace == fixture.context.workspacePath && $0.1.nativeContext != nil })
+        XCTAssertGreaterThan(gauge.maximum, 1)
+        XCTAssertLessThan(elapsed, .seconds(5))
+        XCTAssertEqual(fixture.attempts.count, 1)
+        print("CL-352 concurrency: 20 calls of 0.5 s in \(Self.milliseconds(elapsed)) ms, at most \(gauge.maximum) in flight together")
+    }
+
+    // CL-352 with CL-346: calls that arrive while the service does not answer share one
+    // wait; the connect attempts are not repeated and the catalog notice is sent once.
+    func testConcurrentCallsShareOneServiceWait() async throws {
+        let fixture = try Fixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        fixture.bootstrapHandler = { _ in if fixture.time < 3 { throw CommandReply.unknown(commandID: nil, reason: "connection_ended") } }
+        let session = try await start(fixture)
+        let client = session.client
+        let results = try await withThrowingTaskGroup(of: Bool.self) { group in
+            for _ in 0..<5 {
+                group.addTask {
+                    let result = try await client.callTool(name: "task_list")
+                    return result.isError == false && self.text(result.content).contains("task_list")
+                }
+            }
+            return try await group.reduce(into: [Bool]()) { $0.append($1) }
+        }
+        XCTAssertEqual(results, Array(repeating: true, count: 5))
+        XCTAssertEqual(fixture.attempts.map { $0.0 }, [0, 0, 0.25, 0.75, 1.75, 3.75])
+        XCTAssertEqual(fixture.calls.filter { $0.0 == "task_list" }.count, 5)
+        let count = try await noticeCount(session)
+        XCTAssertEqual(count, 1)
+    }
+
     func testNativeSessionRequiredNamesExactReconnectAndDoesNotReplay() async throws {
         let fixture = try Fixture(provider:"codex")
         fixture.setDiscoveries([.available(fixture.context)])
@@ -489,7 +616,7 @@ final class ChecklistMCPServerTests: XCTestCase {
         try await session.client.ping()
         XCTAssertEqual(fixture.time, 0.5)
         XCTAssertEqual(fixture.attempts.count, 1)
-        XCTAssertEqual(fixture.attempts[0].1, 15)
+        XCTAssertEqual(fixture.attempts[0].1, Bridge.startupConnectBudget)
         XCTAssertEqual(fixture.stderr, ["Checklist: connected after 3 attempts in 500 ms; Claude's session registry was not ready at first (registry absent). Last reason: registry names another session.\n"])
         let count = await session.notifications.count
         XCTAssertEqual(count, 0)
@@ -607,21 +734,21 @@ final class ChecklistMCPServerTests: XCTestCase {
     func testSlowRetryBudgetReachesIPCSeamAndLazyAttemptKeepsDefault() async throws {
         let fixture = try Fixture()
         fixture.setDiscoveries([.available(fixture.context)])
+        // Each startup attempt uses its whole budget; MCP startup caps it at 2 s (CL-346).
         fixture.bootstrapHandler = { budget in
-            if fixture.attempts.count <= 2 { fixture.advance(budget ?? 9) }
+            if let budget { fixture.advance(budget) }
             throw ChecklistError(ClaudeRegistryStart.errorCode, ClaudeRegistryStart.registryMessage)
         }
         let session = try await start(fixture)
-        XCTAssertEqual(fixture.time, 20)
-        XCTAssertEqual(fixture.attempts.map { $0.0 }, [0, 9.25])
-        XCTAssertNil(fixture.attempts[0].1)
-        XCTAssertEqual(fixture.attempts[1].1, 10.75)
+        XCTAssertEqual(fixture.time, 11)
+        XCTAssertEqual(fixture.attempts.map { $0.0 }, [0, 2.25, 4.5, 6.75, 9])
+        XCTAssertTrue(fixture.attempts.allSatisfy { $0.1 == Bridge.startupConnectBudget })
         let tools = try await session.client.listTools()
         XCTAssertEqual(tools.tools.map(\.name), ["service_info"])
-        XCTAssertEqual(fixture.attempts.count, 3)
-        XCTAssertNil(fixture.attempts[2].1)
-        XCTAssertEqual(fixture.time, 20)
-        XCTAssertTrue(fixture.stderr[0].contains("2 attempts in 20000 ms; last reason: service registry mismatch"))
+        XCTAssertEqual(fixture.attempts.count, 6)
+        XCTAssertNil(fixture.attempts[5].1)
+        XCTAssertEqual(fixture.time, 11)
+        XCTAssertTrue(fixture.stderr[0].contains("5 attempts in 11000 ms; last reason: service registry mismatch"))
     }
 
     func testStrictCommandsPropagateRegistryErrorAtWindowEnd() async throws {
@@ -640,14 +767,176 @@ final class ChecklistMCPServerTests: XCTestCase {
         }
     }
 
+    // CL-346: a service that does not answer never ends MCP startup or needs a manual reconnect.
+    private func assertWaitedCall(_ session: Session, _ fixture: Fixture, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let limited = try await session.client.listTools()
+        XCTAssertEqual(limited.tools.map(\.name), ["service_info"], file: file, line: line)
+        XCTAssertTrue(limited.tools[0].description?.contains("connects by itself") == true, file: file, line: line)
+        let resources = try await session.client.listResources()
+        XCTAssertEqual(resources.resources.map(\.uri), ["checklist://service/status"], file: file, line: line)
+        let result = try await session.client.callTool(name: "task_list")
+        XCTAssertEqual(result.isError, false, text(result.content), file: file, line: line)
+        XCTAssertTrue(text(result.content).contains("task_list"), file: file, line: line)
+        let tools = try await session.client.listTools()
+        XCTAssertEqual(tools.tools.map(\.name), ["service_info", "task_list", "project_list"], file: file, line: line)
+        try await session.client.ping()
+        let count = await session.notifications.count
+        XCTAssertEqual(count, 1, file: file, line: line)
+        XCTAssertTrue(fixture.calls.filter { $0.0 == "task_list" }.allSatisfy { $0.1.nativeContext != nil && $0.1.installation == "synthetic-thread" }, file: file, line: line)
+        XCTAssertTrue(fixture.stderr.last?.hasPrefix("Checklist: connected after waiting") == true, file: file, line: line)
+        try await assertProtocolOnly(session, file: file, line: line)
+    }
+
+    func testServiceDownAtStartupListsToolsAndFirstCallWaitsThenSucceeds() async throws {
+        let fixture = try Fixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        fixture.bootstrapHandler = { _ in if fixture.time < 3 { throw CommandReply.unknown(commandID: nil, reason: "connection_ended") } }
+        let session = try await start(fixture)
+        XCTAssertTrue(session.initialization.instructions?.contains("Not connected yet") == true)
+        XCTAssertTrue(session.initialization.instructions?.contains("OUTCOME_UNKNOWN") == true)
+        try await assertWaitedCall(session, fixture)
+        XCTAssertEqual(fixture.attempts.map { $0.0 }, [0, 0, 0.25, 0.75, 1.75, 3.75])
+        XCTAssertEqual(fixture.serviceStarts, 0)
+    }
+
+    func testBootstrapTimeoutAtStartupStartsServerAndBusyServiceIsNotStartedAgain() async throws {
+        let fixture = try Fixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        fixture.jobRunning = false
+        fixture.bootstrapHandler = { budget in
+            if fixture.attempts.count <= 2 { fixture.advance(budget ?? 15); throw CommandReply.unknown(commandID: nil, reason: "reply_timeout") }
+        }
+        let session = try await start(fixture)
+        XCTAssertEqual(fixture.time, Bridge.startupConnectBudget)
+        try await assertWaitedCall(session, fixture)
+        XCTAssertEqual(fixture.attempts.map { $0.0 }, [0, 2, 17.25])
+        XCTAssertEqual(fixture.attempts.map { $0.1 }, [Bridge.startupConnectBudget, nil, nil])
+        XCTAssertEqual(fixture.serviceStarts, 0)
+    }
+
+    // CL-346 follow-up: the startup attempt has a 2 s budget, so initialize answers in
+    // about 2 s while the service stalls (Codex's default MCP startup limit is 10 s).
+    func testStalledServiceInitializesWithinThreeSecondsAndFirstCallConnects() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        // The service's bootstrap stalls for 15 s. The startup attempt really waits for its
+        // budget on the wall clock; the lazy attempt advances only the fake clock.
+        fixture.bootstrapHandler = { budget in
+            let stall = max(0, 15 - fixture.time)
+            guard stall > 0 else { return }
+            if let budget, budget < stall {
+                Thread.sleep(forTimeInterval: budget); fixture.advance(budget)
+                throw CommandReply.unknown(commandID: nil, reason: "reply_timeout")
+            }
+            fixture.advance(stall)
+        }
+        let started = ProcessInfo.processInfo.systemUptime
+        let session = try await start(fixture)
+        let initialize = ProcessInfo.processInfo.systemUptime - started
+        print("CL-346 stalled-service initialize wall time: \(Int((initialize * 1000).rounded())) ms")
+        XCTAssertLessThan(initialize, 3)
+        XCTAssertEqual(fixture.attempts.count, 1)
+        XCTAssertEqual(fixture.attempts[0].1, Bridge.startupConnectBudget)
+        XCTAssertTrue(session.initialization.instructions?.contains("Not connected yet") == true)
+        XCTAssertTrue(session.initialization.instructions?.contains("OUTCOME_UNKNOWN") == true)
+        try await assertWaitedCall(session, fixture)
+        XCTAssertEqual(fixture.attempts.map { $0.0 }, [0, 2])
+        XCTAssertNil(fixture.attempts[1].1)
+        XCTAssertEqual(fixture.time, 15)
+    }
+
+    func testFastServiceGivesFullCatalogAtInitializeWithinStartupBudget() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        let session = try await start(fixture, configuration: .init(workspace: fixture.context.workspacePath, expectedSession: fixture.context.nativeSessionID))
+        XCTAssertFalse(session.initialization.instructions?.contains("Not connected") == true)
+        XCTAssertEqual(fixture.attempts.count, 1)
+        XCTAssertEqual(fixture.attempts[0].1, Bridge.startupConnectBudget)
+        XCTAssertEqual(fixture.replyTimeouts.first { $0.0 == "service_info" }?.1, Bridge.startupConnectBudget)
+        let tools = try await session.client.listTools()
+        XCTAssertEqual(tools.tools.map(\.name), ["service_info", "task_list", "project_list"])
+        let result = try await session.client.callTool(name: "task_list")
+        XCTAssertEqual(result.isError, false)
+        try await session.client.ping()
+        let count = await session.notifications.count
+        XCTAssertEqual(count, 0)
+        XCTAssertEqual(fixture.attempts.count, 1)
+        XCTAssertEqual(fixture.time, 0)
+        try await assertProtocolOnly(session)
+    }
+
+    func testServiceRestartingAtStartupWaitsAndKeepsSessionVerification() async throws {
+        let fixture = try Fixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        fixture.callHandler = { name in
+            if name == "service_info", fixture.time < 1 { throw CommandReply.unknown(commandID: nil, reason: "connection_ended") }
+        }
+        let session = try await start(fixture, configuration: .init(workspace: fixture.context.workspacePath, expectedSession: fixture.context.nativeSessionID))
+        try await assertWaitedCall(session, fixture)
+        XCTAssertEqual(fixture.calls.filter { $0.0 == "service_info" }.count, 5)
+        XCTAssertEqual(fixture.serviceStarts, 0)
+    }
+
+    func testStoppedServiceJobIsStartedExactlyOnceAndCallSucceeds() async throws {
+        let fixture = try Fixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        fixture.jobRunning = false
+        fixture.bootstrapHandler = { _ in
+            if fixture.serviceStarts == 0 || fixture.time < 2 { throw ChecklistError("SERVICE_UNAVAILABLE", "synthetic stopped job") }
+        }
+        let session = try await start(fixture)
+        XCTAssertEqual(fixture.serviceStarts, 0)
+        try await assertWaitedCall(session, fixture)
+        XCTAssertEqual(fixture.serviceStarts, 1)
+    }
+
+    func testWaitBoundReturnsRetryableErrorAndNextCallConnectsByItself() async throws {
+        let fixture = try Fixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        fixture.jobRunning = nil
+        fixture.bootstrapHandler = { _ in if fixture.time < 125 { throw CommandReply.unknown(commandID: nil, reason: "connection_ended") } }
+        let session = try await start(fixture)
+        let failed = try await session.client.callTool(name: "task_list")
+        XCTAssertEqual(failed.isError, true)
+        XCTAssertEqual(fixture.time, 60)
+        XCTAssertTrue(text(failed.content).hasPrefix("SERVICE_NOT_READY: "))
+        XCTAssertTrue(text(failed.content).contains("No command was sent. Retry the request"))
+        do { _ = try await session.client.readResource(uri: "checklist://projects"); XCTFail("The bounded wait must end with an error") }
+        catch { XCTAssertTrue("\(error)".contains("SERVICE_NOT_READY"), "\(error)") }
+        XCTAssertEqual(fixture.time, 120)
+        XCTAssertFalse(fixture.calls.contains { $0.0 == "task_list" || $0.0 == "project_list" })
+        fixture.advance(10)
+        try await assertWaitedCall(session, fixture)
+        XCTAssertEqual(fixture.serviceStarts, 0)
+    }
+
+    func testHardSessionErrorAtStartupStaysAToolErrorWithoutRetry() async throws {
+        let fixture = try Fixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        let session = try await start(fixture, configuration: .init(workspace: fixture.context.workspacePath, expectedSession: "00000000-0000-0000-0000-000000000346"))
+        let tools = try await session.client.listTools()
+        XCTAssertEqual(tools.tools.map(\.name), ["service_info"])
+        XCTAssertTrue(tools.tools[0].description?.contains("SESSION_MISMATCH") == true)
+        let refused = try await session.client.callTool(name: "task_list")
+        XCTAssertEqual(refused.isError, true)
+        XCTAssertTrue(text(refused.content).contains("SESSION_MISMATCH"))
+        XCTAssertEqual(fixture.attempts.count, 1)
+        XCTAssertFalse(fixture.calls.contains { $0.0 == "task_list" })
+    }
+
     func testCodexAndUnregisteredWorkspaceKeepTheirStartupRules() async throws {
         let codex = try Fixture(provider: "codex")
         codex.setDiscoveries([.available(codex.context)])
         codex.bootstrapHandler = { _ in throw ChecklistError(ClaudeRegistryStart.errorCode, ClaudeRegistryStart.registryMessage) }
-        do { _ = try await start(codex); XCTFail("Codex must not retry") }
-        catch { XCTAssertEqual((error as? ChecklistError)?.code, "NATIVE_SESSION_MISMATCH") }
+        // A hard startup error never ends the MCP process; it stays a tool error without retry.
+        let codexSession = try await start(codex)
+        let codexTools = try await codexSession.client.listTools()
+        XCTAssertEqual(codexTools.tools.map(\.name), ["service_info"])
+        let refused = try await codexSession.client.callTool(name: "task_list")
+        XCTAssertEqual(refused.isError, true)
+        XCTAssertTrue(text(refused.content).contains("NATIVE_SESSION_MISMATCH: " + ClaudeRegistryStart.registryMessage))
         XCTAssertEqual(codex.attempts.count, 1); XCTAssertEqual(codex.time, 0)
-        XCTAssertNil(codex.attempts[0].1)
+        XCTAssertEqual(codex.attempts[0].1, Bridge.startupConnectBudget)
         let unregistered = try Fixture()
         unregistered.setDiscoveries([.available(unregistered.context)])
         unregistered.bootstrapHandler = { _ in throw ChecklistError("PROJECT_SETUP_REQUIRED", "synthetic unregistered folder") }

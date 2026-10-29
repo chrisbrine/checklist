@@ -1,0 +1,473 @@
+import ChecklistTestSupport
+import XCTest
+import Foundation
+import Dispatch
+import GRDB
+@testable import ChecklistCore
+
+/// Owned template stores only. Holding the utility lane proves acceptance does
+/// not execute the command, without a timing-sensitive slow-file fixture.
+final class CommandOperationTests: XCTestCase {
+    private final class HeldLane {
+        let queue = DispatchQueue(label:"checklist-command-operation-test-" + UUID().uuidString)
+        private var held = true
+        init(_ router: CommandRouter) {queue.suspend();router.configureCommandOperations(on:queue)}
+        func release() {if held {held = false;queue.resume()}}
+        func finish(file: StaticString = #filePath,line: UInt = #line) {
+            release()
+            let done = DispatchSemaphore(value:0)
+            queue.async {done.signal()}
+            XCTAssertEqual(done.wait(timeout:.now() + 30),.success,"Owned operation did not finish",file:file,line:line)
+        }
+        deinit {release()}
+    }
+    private func data(_ reply: JSON) throws -> JSON {try XCTUnwrap(reply["data"] as? JSON)}
+    private func assertPublicMetadata(_ value: JSON,file: StaticString = #filePath,line: UInt = #line) {
+        for key in ["digest","principal","caller","authorization_generation","incarnation","recoverable","reply_write_admission"] {
+            XCTAssertNil(value[key],"Operation metadata exposed internal \(key)",file:file,line:line)
+        }
+    }
+    private func read(_ f: StorageFixture,_ accepted: JSON,project: String? = nil,caller: Caller? = nil) throws -> JSON {
+        var params: JSON = ["operation_id":try XCTUnwrap(data(accepted)["operation_id"] as? String)]
+        params["project_id"] = project
+        return try data(f.call("operation_get",params,caller:caller))
+    }
+    private func assertAccepted(_ f: StorageFixture,_ reply: JSON,method: String,command: String,file: StaticString = #filePath,line: UInt = #line) throws {
+        let value = try data(reply),id = try XCTUnwrap(value["operation_id"] as? String,file:file,line:line)
+        XCTAssertEqual(reply["command_outcome"] as? String,"accepted",file:file,line:line)
+        XCTAssertEqual(reply["command_id"] as? String,command,file:file,line:line)
+        XCTAssertEqual(value["state"] as? String,"queued",file:file,line:line)
+        XCTAssertEqual(value["method"] as? String,method,file:file,line:line)
+        XCTAssertEqual(value["status_method"] as? String,"operation_get",file:file,line:line)
+        XCTAssertNotNil(value["created_at"],file:file,line:line)
+        XCTAssertNotNil(value["updated_at"],file:file,line:line)
+        assertPublicMetadata(value,file:file,line:line)
+        try f.router!.dbQueue.read {db in
+            let durable = try XCTUnwrap(f.router!.operationRecord(db,id:id),file:file,line:line)
+            XCTAssertEqual(durable["command_id"] as? String,command,file:file,line:line)
+            XCTAssertEqual(durable["principal"] as? String,f.owner.principal,file:file,line:line)
+            XCTAssertNotNil(durable["caller"],file:file,line:line)
+            XCTAssertEqual(durable["state"] as? String,"queued",file:file,line:line)
+            XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM commands WHERE principal=? AND command_id=?",arguments:[f.owner.principal,command]),0,file:file,line:line)
+        }
+    }
+    @discardableResult private func assertSucceeded(_ f: StorageFixture,_ accepted: JSON,project: String? = nil,file: StaticString = #filePath,line: UInt = #line) throws -> JSON {
+        let value = try read(f,accepted,project:project)
+        XCTAssertEqual(value["state"] as? String,"succeeded",file:file,line:line)
+        XCTAssertNotNil(value["started_at"],file:file,line:line)
+        XCTAssertNotNil(value["finished_at"],file:file,line:line)
+        let result = try XCTUnwrap(value["result"] as? JSON,file:file,line:line)
+        let command = try XCTUnwrap(data(accepted)["command_id"] as? String,file:file,line:line)
+        let raw = try f.router!.dbQueue.read {db in try XCTUnwrap(String.fetchOne(db,sql:"SELECT result FROM commands WHERE principal=? AND command_id=?",arguments:[f.owner.principal,command]),file:file,line:line)}
+        XCTAssertEqual(try jsonString(result),try jsonString(jsonObject(raw)),"Status must preserve the original complete command envelope",file:file,line:line)
+        XCTAssertNil(value["principal"],file:file,line:line)
+        XCTAssertNil(value["authorization_generation"],file:file,line:line)
+        XCTAssertNil(value["caller"],file:file,line:line)
+        assertPublicMetadata(value,file:file,line:line)
+        return result
+    }
+
+    func testBackupAndRestoreReturnBeforeLaneRunsThenExposeOriginalReplies() throws {
+        let f = try StorageFixture(fast:true);_ = try f.project()
+        let destination = f.base.appendingPathComponent("operation-backup"),command = uuid(),input: JSON = ["path":destination.path]
+        let lane = HeldLane(f.router!);defer {lane.finish()}
+        let accepted = try f.call("backup_create",input,command:command)
+        try assertAccepted(f,accepted,method:"backup_create",command:command)
+        XCTAssertFalse(FileManager.default.fileExists(atPath:destination.path))
+        XCTAssertEqual(try data(f.call("backup_create",input,command:command))["operation_id"] as? String,try data(accepted)["operation_id"] as? String)
+        XCTAssertEqual(try read(f,accepted)["state"] as? String,"queued")
+        lane.finish()
+        let backup = try data(assertSucceeded(f,accepted))
+        XCTAssertEqual(backup["status"] as? String,"complete")
+        XCTAssertTrue(FileManager.default.fileExists(atPath:destination.appendingPathComponent("manifest.json").path))
+        XCTAssertEqual(try data(f.call("backup_create",input,command:command))["operation_id"] as? String,try data(accepted)["operation_id"] as? String)
+        let status = try data(f.call("command_status",["command_id":command]))
+        XCTAssertEqual(status["operation_id"] as? String,try data(accepted)["operation_id"] as? String)
+
+        let previewLane = HeldLane(f.router!);defer {previewLane.finish()}
+        let pc = uuid(),previewInput: JSON = ["path":destination.path,"command_id":pc]
+        let previewAccepted = try f.call("restore_preview",previewInput,command:pc)
+        try assertAccepted(f,previewAccepted,method:"restore_preview",command:pc)
+        previewLane.finish()
+        let preview = try data(assertSucceeded(f,previewAccepted))
+        let restoreLane = HeldLane(f.router!);defer {restoreLane.finish()}
+        let rc = uuid(),restoreInput: JSON = ["path":destination.path,"manifest_sha256":preview["manifest_sha256"]!]
+        let restoreAccepted = try f.call("restore_create",restoreInput,command:rc)
+        try assertAccepted(f,restoreAccepted,method:"restore_create",command:rc)
+        restoreLane.finish()
+        let restored = try data(assertSucceeded(f,restoreAccepted))
+        XCTAssertNotEqual(restored["store_incarnation"] as? String,f.router!.incarnation)
+        XCTAssertEqual(try data(f.call("restore_create",restoreInput,command:rc))["operation_id"] as? String,try data(restoreAccepted)["operation_id"] as? String)
+    }
+
+    func testCleanupPreviewAndArchiveCleanupKeepTheirFinalDomainReplies() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),task = try f.task(project),pid = project["id"] as! String
+        let previewLane = HeldLane(f.router!);defer {previewLane.finish()}
+        let pc = uuid(),previewInput: JSON = ["project_id":pid,"task_id":task["id"]!,"command_id":pc]
+        let accepted = try f.call("attachment_cleanup_preview",previewInput,command:pc)
+        try assertAccepted(f,accepted,method:"attachment_cleanup_preview",command:pc)
+        previewLane.finish()
+        let preview = try data(assertSucceeded(f,accepted,project:pid))
+        XCTAssertNotNil(preview["cleanup_preview_id"])
+        XCTAssertEqual(try data(f.call("attachment_cleanup_preview",previewInput,command:pc))["operation_id"] as? String,try data(accepted)["operation_id"] as? String)
+        let lane = HeldLane(f.router!);defer {lane.finish()}
+        let command = uuid(),input: JSON = ["project_id":pid,"task_id":task["id"]!,"expected_revision":task["revision"]!,"action":"archive","cleanup":true,"cleanup_preview_id":preview["cleanup_preview_id"]!]
+        let archived = try f.call("task_archive",input,command:command)
+        try assertAccepted(f,archived,method:"task_archive",command:command)
+        XCTAssertFalse(bool(try data(f.call("task_get",["project_id":pid,"task_id":task["id"]!])),"archived"))
+        lane.finish()
+        _ = try assertSucceeded(f,archived,project:pid)
+        XCTAssertTrue(bool(try data(f.call("task_get",["project_id":pid,"task_id":task["id"]!])),"archived"))
+        XCTAssertEqual(try data(f.call("task_archive",input,command:command))["operation_id"] as? String,try data(archived)["operation_id"] as? String)
+    }
+
+    func testImportPreviewAndCommitKeepTheirFinalDomainReplies() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),pid = project["id"] as! String
+        let directory = f.workspace.appendingPathComponent("import")
+        try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true)
+        let document: JSON = ["format":"synthetic-board/1","items":[["id":"OP-1","title":"Operation import","state":"queued"]],"events":[]]
+        try JSONSerialization.data(withJSONObject:document,options:.sortedKeys).write(to:directory.appendingPathComponent("bundle.json"))
+        let epic = try f.router!.dbQueue.read {try f.router!.records($0,type:"group",project:pid).first {$0["kind"] as? String == "epic"}!}
+        let current = try f.router!.dbQueue.read {try f.router!.record($0,pid,type:"project")}
+        var input: JSON = ["project_id":pid,"path":directory.path,"source_format":"synthetic-board/1","source_namespace":"operation-fixture","expected_revision":current["revision"]!,"epic_id":epic["id"]!]
+        let previewLane = HeldLane(f.router!);defer {previewLane.finish()}
+        let pc = uuid();input["command_id"] = pc
+        let accepted = try f.call("import_preview",input,command:pc)
+        try assertAccepted(f,accepted,method:"import_preview",command:pc)
+        previewLane.finish()
+        let preview = try data(assertSucceeded(f,accepted,project:pid))
+        XCTAssertEqual(try data(f.call("import_preview",input,command:pc))["operation_id"] as? String,try data(accepted)["operation_id"] as? String)
+        input["preview_digest"] = preview["preview_digest"];input.removeValue(forKey:"command_id")
+        let lane = HeldLane(f.router!);defer {lane.finish()}
+        let command = uuid(),commit = try f.call("import_commit",input,command:command)
+        try assertAccepted(f,commit,method:"import_commit",command:command)
+        XCTAssertEqual(try f.router!.dbQueue.read {try f.router!.records($0,type:"task",project:pid).count},0)
+        lane.finish()
+        XCTAssertEqual(try data(assertSucceeded(f,commit,project:pid))["task_count"] as? Int,1)
+        XCTAssertEqual(try data(f.call("import_commit",input,command:command))["operation_id"] as? String,try data(commit)["operation_id"] as? String)
+    }
+
+    func testEveryAlwaysOperationMethodAndArchiveCleanupPersistFailureReplayAndRestartRecovery() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),pid = project["id"] as! String
+        let invalidSource = f.base.appendingPathComponent("invalid-source")
+        try Data([0]).write(to:invalidSource)
+        let methods = CommandRouter.alwaysOperationMethods.union(CommandRouter.operationEvidenceMethods).union(["task_archive","attachment_add","attachment_read","work_submit","batch_submit","project_edit","project_settings_save"])
+        for method in methods.sorted() {
+            let lane = HeldLane(f.router!);defer {lane.finish()}
+            let command = uuid()
+            let input: JSON = ["project_id":pid,"command_id":command,"path":invalidSource.path,"task_id":uuid(),"cleanup":true]
+            let accepted = try f.router!.acceptCommandOperation(method:method,params:input,caller:f.owner)
+            try assertAccepted(f,accepted,method:method,command:command)
+            let id = try XCTUnwrap(data(accepted)["operation_id"] as? String)
+            XCTAssertEqual(try data(f.call(method,input,command:command))["operation_id"] as? String,id,method)
+            lane.finish()
+            let failed = try read(f,accepted,project:pid)
+            assertPublicMetadata(failed)
+            XCTAssertEqual(failed["state"] as? String,"failed",method)
+            XCTAssertNotNil((failed["error"] as? JSON)?["code"],method)
+            XCTAssertNil(failed["result"],method)
+            XCTAssertNotNil(failed["finished_at"],method)
+            XCTAssertEqual(try data(f.call(method,input,command:command))["operation_id"] as? String,id,method)
+            XCTAssertEqual(try read(f,accepted,project:pid)["state"] as? String,"failed",method)
+            // Simulate process death after durable admission, with no live job
+            // or lease left behind. The next startup must retain a truthful error.
+            try f.router!.dbQueue.write {db in
+                var record = try XCTUnwrap(f.router!.operationRecord(db,id:id))
+                record["state"] = "running";record.removeValue(forKey:"error");record.removeValue(forKey:"finished_at")
+                try f.router!.saveOperation(db,record)
+            }
+            try f.reopen()
+            let recovered = try read(f,accepted,project:pid)
+            XCTAssertEqual(recovered["state"] as? String,"failed",method)
+            XCTAssertEqual((recovered["error"] as? JSON)?["code"] as? String,"OPERATION_INTERRUPTED",method)
+            let retryLane = HeldLane(f.router!);defer {retryLane.finish()}
+            let retry = try f.call(method,input,command:command)
+            XCTAssertEqual(try data(retry)["operation_id"] as? String,id,method)
+            XCTAssertEqual(try data(retry)["state"] as? String,"queued",method)
+            retryLane.finish()
+            XCTAssertEqual(try read(f,accepted,project:pid)["state"] as? String,"failed",method)
+        }
+    }
+
+    func testOperationScopeIntentReservationAndShortCommandsStaySynchronous() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),pid = project["id"] as! String
+        let lane = HeldLane(f.router!);defer {lane.finish()}
+        let command = uuid(),input: JSON = ["project_id":pid,"task_id":uuid(),"command_id":command]
+        let accepted = try f.call("attachment_cleanup_preview",input,command:command)
+        let foreign = Caller(role:"owner",installation:"different-owner",projectIDs:[])
+        XCTAssertThrowsError(try read(f,accepted,project:pid,caller:foreign)) {XCTAssertEqual(($0 as? CoreError)?.code,"NOT_FOUND")}
+        XCTAssertThrowsError(try read(f,accepted,project:uuid())) {XCTAssertEqual(($0 as? CoreError)?.code,"FORBIDDEN")}
+        var changed = input;changed["task_id"] = uuid()
+        XCTAssertThrowsError(try f.call("attachment_cleanup_preview",changed,command:command)) {XCTAssertEqual(($0 as? CoreError)?.code,"IDEMPOTENCY_CONFLICT")}
+        XCTAssertThrowsError(try f.call("task_create",["project_id":pid,"title":"Reused operation UUID"],command:command)) {XCTAssertEqual(($0 as? CoreError)?.code,"IDEMPOTENCY_CONFLICT")}
+        let short = try f.call("task_create",["project_id":pid,"title":"Synchronous edit"])
+        XCTAssertNotNil(try data(short)["id"])
+        XCTAssertNotEqual(short["command_outcome"] as? String,"accepted")
+        lane.finish()
+    }
+
+    func testAdmittedQueuedOperationKeepsDrainOpenUntilItsContinuationFinishes() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),pid = project["id"] as! String
+        let lane = HeldLane(f.router!);defer {lane.finish()}
+        let command = uuid(),accepted = try f.call("attachment_cleanup_preview",["project_id":pid,"task_id":uuid(),"command_id":command],command:command)
+        let drain = try f.router!.beginStorageDrain(caller:f.owner)
+        defer {try? f.router!.cancelStorageDrain(drain,caller:f.owner)}
+        XCTAssertFalse(try f.router!.waitForStorageDrain(drain,timeout:0,caller:f.owner))
+        XCTAssertThrowsError(try f.call("task_create",["project_id":pid,"title":"Rejected during drain"])) {XCTAssertEqual(($0 as? CoreError)?.code,"STORAGE_DRAINING")}
+        lane.finish()
+        XCTAssertTrue(try f.router!.waitForStorageDrain(drain,timeout:1,caller:f.owner))
+        // Reading is performed after returning admission, like the lifecycle owner.
+        try f.router!.cancelStorageDrain(drain,caller:f.owner)
+        XCTAssertEqual(try read(f,accepted,project:pid)["state"] as? String,"failed")
+    }
+
+    func testStartupRecoversQueuedAndRunningCanonicalReceiptsWithoutLosingFinalEnvelope() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),pid = project["id"] as! String
+        var replies: [(JSON,JSON)] = []
+        for state in ["queued","running"] {
+            let command = uuid(),id = CommandRouter.commandOperationID(principal:f.owner.principal,command:command)
+            let result: JSON = ["command_id":command,"data":["fixture":"canonical-" + state],"event_cursor":"retained-envelope"]
+            let record: JSON = ["operation_id":id,"command_id":command,"method":"import_commit","principal":f.owner.principal,"caller":["role":"owner","installation":f.owner.installation],"project_id":pid,"incarnation":f.router!.incarnation,"digest":"fixture-digest-" + state,"state":state,"created_at":now(),"updated_at":now()]
+            try f.router!.dbQueue.write {db in
+                try f.router!.saveOperation(db,record)
+                try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[f.owner.principal,command,record["digest"] as! String,try jsonString(result)])
+            }
+            replies.append((["data":["operation_id":id]],result))
+        }
+        try f.reopen()
+        for (accepted,expected) in replies {
+            let value = try read(f,accepted,project:pid)
+            XCTAssertEqual(value["state"] as? String,"succeeded")
+            XCTAssertEqual(try jsonString(XCTUnwrap(value["result"] as? JSON)),try jsonString(expected))
+        }
+    }
+
+    func testSourceTargetClassificationFindsNestedManifestEvidenceAndExplicitReferencedIDs() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),task = try f.task(project),router = f.router!,pid = project["id"] as! String,tid = task["id"] as! String
+        let params: JSON = ["project_id":pid,"task_id":tid]
+        XCTAssertFalse(try router.needsCommandOperation(method:"task_complete",params:params,caller:f.owner))
+        let manifestID = uuid()
+        let evidenceCases: [JSON] = [
+            ["source_capture":["id":uuid()]],
+            ["artifact_refs":[["artifact_id":uuid()]]],
+            ["playtest_bundle":["id":uuid()]],
+            ["acceptance_evidence":[["evidence_refs":[["kind":"attachment","attachment_id":uuid(),"sha256":String(repeating:"a",count:64)]]]]]
+        ]
+        // Classifier planning reads metadata only. Insert owned pseudo-manifests
+        // directly as matching SQL/JSON envelopes: these are deliberately not a
+        // complete runnable domain graph and are never reopened or executed.
+        for evidence in evidenceCases {
+            try router.dbQueue.write {db in
+                var current = try router.record(db,tid,type:"task")
+                current["current_manifest_id"] = manifestID
+                try db.execute(sql:"UPDATE records SET data=? WHERE id=?",arguments:[try jsonString(current),tid])
+                let manifest: JSON = ["id":manifestID,"project_id":pid,"task_id":tid,"revision":1,"evidence":evidence]
+                try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (?,?, 'manifest',1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",arguments:[manifestID,pid,try jsonString(manifest)])
+            }
+            for method in ["task_complete","review_context","review_prepare","review_batch_inputs","work_takeover"] {
+                XCTAssertTrue(try router.needsCommandOperation(method:method,params:params,caller:f.owner),method)
+            }
+            var completion = params;completion["include_completion_eligibility"] = true
+            XCTAssertTrue(try router.needsCommandOperation(method:"task_get",params:completion,caller:f.owner))
+            XCTAssertFalse(try router.needsCommandOperation(method:"task_get",params:params,caller:f.owner))
+            XCTAssertTrue(try router.needsCommandOperation(method:"work_claim",params:["project_id":pid,"task_id":tid,"phase":"review"],caller:f.owner))
+            XCTAssertFalse(try router.needsCommandOperation(method:"work_claim",params:["project_id":pid,"task_id":tid,"phase":"implementation"],caller:f.owner))
+        }
+        try router.dbQueue.write {db in
+            var current = try router.record(db,tid,type:"task")
+            current.removeValue(forKey:"current_manifest_id")
+            try db.execute(sql:"UPDATE records SET data=? WHERE id=?",arguments:[try jsonString(current),tid])
+        }
+        for key in ["artifact_id","attachment_id","source_capture_id"] {
+            var input = params
+            input["evidence_refs"] = [["nested":[key:uuid()]]]
+            XCTAssertTrue(try router.needsCommandOperation(method:"review_evidence_add",params:input,caller:f.owner),key)
+        }
+        XCTAssertFalse(try router.needsCommandOperation(method:"review_evidence_add",params:params,caller:f.owner))
+    }
+
+    func testPolicyAndProjectContextCascadesReturnOriginalRepliesWhileCosmeticEditsStaySynchronous() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),pid = project["id"] as! String
+        _ = try f.task(project)
+        let policy = project["policy"] as? JSON ?? [:]
+        let calls: [(String,JSON)] = [("policy_preview",["policy":policy]),("policy_propose",["policy":policy]),
+            ("policy_apply",["policy":policy]),("project_edit",["brief":"Owned context change"]),
+            ("project_settings_save",["pinned_decisions":["Owned decision"]]),("project_settings_save",["policy":policy])]
+        for (method,patch) in calls {
+            let current = try f.router!.dbQueue.read {try f.router!.record($0,pid,type:"project")}
+            var input = patch;input["project_id"] = pid;input["expected_revision"] = current["revision"]!
+            let lane = HeldLane(f.router!);defer {lane.finish()}
+            let command = uuid();input["command_id"] = command
+            let accepted = try f.call(method,input,command:command)
+            try assertAccepted(f,accepted,method:method,command:command)
+            lane.finish();_ = try assertSucceeded(f,accepted,project:pid)
+            XCTAssertEqual(try data(f.call(method,input,command:command))["operation_id"] as? String,try data(accepted)["operation_id"] as? String)
+        }
+        let current = try f.router!.dbQueue.read {try f.router!.record($0,pid,type:"project")}
+        let cosmetic = try f.call("project_edit",["project_id":pid,"expected_revision":current["revision"]!,"name":"Cosmetic update"])
+        XCTAssertNil(cosmetic["command_outcome"])
+        XCTAssertEqual((cosmetic["data"] as? JSON)?["name"] as? String,"Cosmetic update")
+        XCTAssertFalse(try f.router!.needsCommandOperation(method:"project_settings_save",params:["project_id":pid,"accent":"teal"],caller:f.owner))
+    }
+
+    func testMediaPublicationPreviewOperationKeepsReadEnvelopeAndCanonicalSemanticPayload() throws {
+        let media = try MediaRoundTests.Fixture(),f = media.storage
+        let schema: JSON = ["schema_version":1,"id":"server","name":"Operation preview","slots":[["id":"text","kind":"text","required":true]],"layout":["kind":"text_compare","primary_slot_id":"text"]]
+        let round = try media.round(media.type(schema)),input: JSON = ["project_id":media.project,"round_id":round["id"]!]
+        let lane = HeldLane(media.router);defer {lane.finish()}
+        let command = uuid();var selected = input;selected["command_id"] = command
+        let accepted = try f.call("media_publication_preview",selected,command:command)
+        try assertAccepted(f,accepted,method:"media_publication_preview",command:command)
+        lane.finish()
+        let status = try read(f,accepted,project:media.project)
+        XCTAssertEqual(status["state"] as? String,"succeeded",String(describing:status["error"]))
+        let reply = try XCTUnwrap(status["result"] as? JSON),semantic = try data(reply)
+        XCTAssertNil(reply["command_id"],"The former synchronous owner read has no command ID")
+        XCTAssertNotNil(semantic["items"])
+        let raw = try media.router.dbQueue.read {db in try XCTUnwrap(String.fetchOne(db,sql:"SELECT result FROM commands WHERE principal=? AND command_id=?",arguments:[f.owner.principal,command]))}
+        XCTAssertEqual(try jsonString(semantic),try jsonString(jsonObject(raw)))
+        XCTAssertNil(jsonObject(raw)["data"])
+    }
+
+    func testMediaOperationPreservesSemanticJournalAndProjectsExactlyOneEnvelope() throws {
+        let media = try MediaRoundTests.Fixture(),f = media.storage
+        let schema: JSON = ["schema_version":1,"id":"server","name":"Operation text","slots":[["id":"text","kind":"text","required":true]],"layout":["kind":"text_compare","primary_slot_id":"text"]]
+        let round = try media.round(media.type(schema)),command = uuid()
+        let input: JSON = ["project_id":media.project,"round_id":round["id"]!,"text":"one\ntwo\n"]
+        let lane = HeldLane(media.router);defer {lane.finish()}
+        let accepted = try f.call("media_intake_preview",input,command:command)
+        try assertAccepted(f,accepted,method:"media_intake_preview",command:command)
+        lane.finish()
+        let operation = try read(f,accepted,project:media.project)
+        XCTAssertEqual(operation["state"] as? String,"succeeded")
+        assertPublicMetadata(operation)
+        let reply = try XCTUnwrap(operation["result"] as? JSON),semantic = try data(reply)
+        let journal = try media.router.dbQueue.read {db in
+            try XCTUnwrap(String.fetchOne(db,sql:"SELECT result FROM commands WHERE principal=? AND command_id=?",arguments:[f.owner.principal,command]))
+        }
+        let raw = jsonObject(journal)
+        XCTAssertNotNil(raw["id"])
+        XCTAssertNil(raw["data"],"The media journal remains its original semantic payload")
+        XCTAssertNil(raw["command_id"])
+        XCTAssertEqual(try jsonString(semantic),try jsonString(raw))
+        XCTAssertEqual(reply["command_id"] as? String,command)
+        XCTAssertEqual(strings(semantic,"remaining_row_ids").count,2)
+        let replay = try f.call("media_intake_preview",input,command:command)
+        XCTAssertEqual(try data(replay)["operation_id"] as? String,try data(accepted)["operation_id"] as? String)
+        XCTAssertEqual(try media.router.dbQueue.read {try media.router.records($0,type:"media_intake",project:media.project).count},1)
+    }
+
+    func testWorkerGenerationChangeBeforeExecutionRejectsWithoutCreatingPreviewOrReply() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),task = try f.task(project),router = f.router!,pid = project["id"] as! String
+        let installation = "operation-generation-worker"
+        let session = try data(f.call("session_register",["project_id":pid,"label":"Operation worker","provider":"codex","role":"worker","installation":installation,"workspace":f.workspace.path]))
+        let worker = Caller(role:"worker",installation:installation,projectIDs:[pid],sessionID:session["id"] as? String,workspace:f.workspace.path)
+        let lane = HeldLane(router);defer {lane.finish()}
+        let command = uuid(),input: JSON = ["project_id":pid,"task_id":task["id"]!,"command_id":command]
+        let accepted = try f.call("attachment_cleanup_preview",input,command:command,caller:worker)
+        let id = try XCTUnwrap(data(accepted)["operation_id"] as? String)
+        XCTAssertEqual(try data(accepted)["state"] as? String,"queued")
+        try router.dbQueue.write {db in
+            var current = try router.record(db,worker.sessionID!,type:"session")
+            current["authorization_generation"] = uuid();try router.save(db,router.revised(current),type:"session")
+        }
+        lane.finish()
+        try router.dbQueue.read {db in
+            let failed = try XCTUnwrap(router.operationRecord(db,id:id))
+            XCTAssertEqual(failed["state"] as? String,"failed")
+            let errorCommand = try XCTUnwrap(failed["error_result_command_id"] as? String)
+            let errorReceipt = try XCTUnwrap(String.fetchOne(db,sql:"SELECT result FROM commands WHERE principal=? AND command_id=?",arguments:[worker.principal,errorCommand]))
+            XCTAssertEqual((jsonObject(errorReceipt)["error"] as? JSON)?["code"] as? String,"CONNECTION_REVOKED")
+            XCTAssertNil(failed["error"],"Private error details have one purge-governed journal owner")
+            XCTAssertEqual(try router.records(db,type:"cleanup_preview",project:pid).count,0)
+            XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM commands WHERE principal=? AND command_id=?",arguments:[worker.principal,command]),0)
+        }
+        XCTAssertThrowsError(try read(f,accepted,project:pid,caller:worker)) {XCTAssertEqual(($0 as? CoreError)?.code,"CONNECTION_REVOKED")}
+        XCTAssertThrowsError(try f.call("attachment_cleanup_preview",input,command:command,caller:worker)) {XCTAssertEqual(($0 as? CoreError)?.code,"CONNECTION_REVOKED")}
+    }
+    func testConcurrentDifferentIntentsCannotOwnBothAdmissionJournals() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),task = try f.task(project),pid = project["id"] as! String,router = f.router!
+        try router.backupWrites.beginCapture()
+        defer {router.backupWrites.endCapture(router:router);router.backupWrites.endBackup(router:router)}
+        let lane = HeldLane(router);defer {lane.finish()}
+        for _ in 0..<3 {
+            let command = uuid(),results = OperationAdmissionResults(),done = DispatchGroup(),caller = f.owner
+            let calls: [(String,JSON)] = [
+                ("attachment_cleanup_preview",["command_id":command,"project_id":pid,"task_id":task["id"]!]),
+                ("task_create",["command_id":command,"project_id":pid,"title":"Competing original intent"])]
+            // Freeze JSON before transfer to independent request lanes.
+            for (method,input) in calls {
+                let bytes = try JSONSerialization.data(withJSONObject:input)
+                done.enter()
+                DispatchQueue.global().async {
+                    defer {done.leave()}
+                    results.append(Result {try router.handle(method:method,params:JSONSerialization.jsonObject(with:bytes) as! JSON,caller:caller)})
+                }
+            }
+            XCTAssertEqual(done.wait(timeout:.now()+10),.success)
+            let outputs = results.values
+            XCTAssertEqual(outputs.count,2)
+            XCTAssertEqual(outputs.filter {if case .success = $0 {return true};return false}.count,1)
+            for output in outputs {if case .failure(let error) = output {XCTAssertEqual((error as? CoreError)?.code,"IDEMPOTENCY_CONFLICT")}}
+            let input: JSON = ["command_id":command]
+            let generic = try router.hasCommandOperation(params:input,caller:f.owner)
+            let fifo = router.backupWrites.hasReservedCommand(params:input,caller:f.owner)
+            XCTAssertNotEqual(generic,fifo,"Exactly one durable journal owns a caller/UUID")
+        }
+        let drained = expectation(description:"competing admissions finish their original FIFO")
+        let signal = OperationAdmissionSignal()
+        router.observeWriteAdmission { [weak router] in
+            guard let router,router.writeAdmissionStatus["locked"] as? Bool == false else {return}
+            router.resumeCommandOperations();signal.once {drained.fulfill()}
+        }
+        router.backupWrites.endCapture(router:router);router.backupWrites.endBackup(router:router)
+        wait(for:[drained],timeout:15)
+        lane.finish();router.observeWriteAdmission {}
+    }
+
+    func testLegacyBackupFIFOReservationKeepsItsIntentAndOriginalExecution() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),task = try f.task(project),pid = project["id"] as! String
+        let router = f.router!,command = uuid(),source = f.workspace.appendingPathComponent("legacy-attachment.txt")
+        try Data("Original queued bytes".utf8).write(to:source)
+        try router.backupWrites.beginCapture()
+        defer {router.backupWrites.endCapture(router:router);router.backupWrites.endBackup(router:router)}
+        let input: JSON = ["command_id":command,"project_id":pid,"task_id":task["id"]!,"path":source.path]
+        XCTAssertEqual(try f.call("attachment_add",input,command:command)["command_outcome"] as? String,"queued")
+        let lane = HeldLane(router);defer {lane.finish()}
+        XCTAssertEqual(try f.call("attachment_add",input,command:command)["command_outcome"] as? String,"queued")
+        for method in ["attachment_cleanup_preview","backup_create","task_create"] {
+            var other: JSON = ["project_id":pid,"task_id":task["id"]!,"path":source.path,"title":"Conflicting queued UUID"]
+            other["command_id"] = command
+            XCTAssertThrowsError(try f.call(method,other,command:command)) {XCTAssertEqual(($0 as? CoreError)?.code,"IDEMPOTENCY_CONFLICT",method)}
+        }
+        let drained = expectation(description:"legacy FIFO retains direct execution")
+        let signaled = OperationAdmissionSignal()
+        router.observeWriteAdmission { [weak router] in
+            guard let router,router.writeAdmissionStatus["locked"] as? Bool == false else {return}
+            signaled.once {drained.fulfill()}
+        }
+        router.backupWrites.endCapture(router:router)
+        wait(for:[drained],timeout:15)
+        router.observeWriteAdmission {}
+        let status = try f.call("command_status",["project_id":pid,"command_id":command])["data"] as! JSON
+        XCTAssertEqual(status["state"] as? String,"applied")
+        XCTAssertNil(status["operation_id"])
+        XCTAssertNotNil(((status["result"] as? JSON)?["data"] as? JSON)?["id"])
+        XCTAssertEqual(try f.call("attachment_add",input,command:command)["command_id"] as? String,command)
+        XCTAssertFalse(try router.hasCommandOperation(params:input,caller:f.owner))
+    }
+
+}
+
+private final class OperationAdmissionSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fulfilled = false
+    func once(_ body: () -> Void) {lock.withLock {if !fulfilled {fulfilled = true;body()}}}
+}
+
+private final class OperationAdmissionResults: @unchecked Sendable {
+    private let lock = NSLock()
+    private var outputs: [Result<JSON,Error>] = []
+    func append(_ output: Result<JSON,Error>) {lock.withLock {outputs.append(output)}}
+    var values: [Result<JSON,Error>] {lock.withLock {outputs}}
+}

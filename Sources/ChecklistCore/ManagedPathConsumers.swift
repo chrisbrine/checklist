@@ -31,6 +31,15 @@ extension CommandRouter {
         try StorageObjectFiles(root:root).openRegular(managedRelative(stored,family:family)) { FileIdentity(descriptor:$0) }
     }
 
+    /// An asynchronous command publishes the same relative reply first; its
+    /// result read applies the ordinary owner-only ephemeral URL projection.
+    func commandManagedPathProjection(_ source: JSON,caller: Caller,command: String? = nil) -> JSON {
+        if Thread.current.threadDictionary[commandOperations.contextKey] != nil {return source}
+        if let command = command ?? source["command_id"] as? String,
+           commandOperations.isExecuting(Self.commandOperationID(principal:caller.principal,command:command)) {return source}
+        return ownerManagedPathProjection(source,caller:caller)
+    }
+
     /// Only the owner receives local file URLs. Durable records and replay history keep
     /// their relative descriptors. This projection runs after command receipt commit.
     func ownerManagedPathProjection(_ source: JSON, caller: Caller) -> JSON {

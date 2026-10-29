@@ -6,6 +6,7 @@ is retained. Preview is read-only; apply recomputes every decision.
 """
 import argparse
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,8 @@ import stat
 import subprocess
 import sys
 
-from clean_scratch import inventory, running_paths, within, workspace_protection
+from clean_scratch import (DEFAULT_BUDGET_GB, FINISHED, inventory, running_paths, storage_groups,
+                           storage_report, within, workspace_protection)
 from retire_old_bundles import trash, trash_many
 import test_instances as slots
 
@@ -26,6 +28,8 @@ TICKET = re.compile(r'(?<![A-Za-z0-9])([A-Z][A-Z0-9]*-\d+)(?![A-Za-z0-9])')
 # Only known regenerable children are retired. Unknown files and ALL receipts stay.
 OUTPUTS = {'source', 'Checklist.app', '.build', 'bin', 'binaries', 'products',
            'ChecklistApp', 'ChecklistService', 'checklist'}
+# Key files whose SHA-256 the evidence note records before the folder moves (CL-359).
+KEY_FILES = {'notes.md', 'report.md'}
 
 
 def safe(path):
@@ -143,7 +147,8 @@ def protected_reason(path, entries, protected, processes, internal_links=False):
 
 class Cleaner:
     def __init__(self, repo, installed, apply=False, process_reader=running_paths,
-                 mover=trash, status_reader=None, keep=(), batch_mover=trash_many):
+                 mover=trash, status_reader=None, keep=(), batch_mover=trash_many,
+                 notes_path=None, note_poster=None, attachment_reader=None):
         self.repo = safe(repo)
         self.build = safe(self.repo / '.local/build')
         self.installed = safe(installed)
@@ -158,6 +163,12 @@ class Cleaner:
         self.keep = [safe(p) for p in keep]
         self.moved = 0
         self.failed = False
+        # Evidence notes (CL-359): written to notes_path; posted only by apply.
+        self.notes_path = notes_path
+        self.note_poster = note_poster
+        self.attachment_reader = attachment_reader
+        self.reports = {}
+        self.note_cache = {}
 
     def protected(self):
         # Even when installation receipts are unavailable, no path may alias live
@@ -190,6 +201,7 @@ class Cleaner:
             report = {'path': str(path), 'kind': kind, 'bytes': size_of(before),
                       'action': 'kept' if why else 'eligible',
                       'reason': why or eligible_reason}
+            self.reports[path] = report
             if not why and self.apply and self.pending is not None:
                 self.pending.append((path, before, report, eligible, internal_links, before_move))
                 return
@@ -382,10 +394,16 @@ class Cleaner:
                             def eligible(path=path, before=before):
                                 keys = evidence_keys(path, before)
                                 values = self.status_reader(keys)
-                                unresolved = sorted(k for k in keys if values.get(k) != 'done')
-                                return 'open or unknown ticket status: ' + ', '.join(unresolved) if unresolved else None
-                            self.item(path, 'evidence', eligible=eligible, entries=before,
-                                      eligible_reason='all owning tickets are Done')
+                                unresolved = sorted(k for k in keys if values.get(k) not in FINISHED)
+                                if unresolved:
+                                    return 'open or unknown ticket status: ' + ', '.join(unresolved)
+                                if self.notes_path is not None or self.note_poster:
+                                    self.evidence_notes(path, before)
+                                return None
+                            post = ((lambda path=path, before=before: self.post_notes(path, before))
+                                    if self.note_poster else None)
+                            self.item(path, 'evidence', eligible=eligible, entries=before, before_move=post,
+                                      eligible_reason='all owning tickets are Done or canceled')
                         else:
                             directory = stat.S_ISDIR(entries[path][2])
                             reason = ('store/source tree retained; no hand-in discovery' if path in opaque else
@@ -402,9 +420,53 @@ class Cleaner:
                     self.failed = True
                     print(json.dumps({'path': str(folder), 'kind': 'evidence', 'action': 'kept_error', 'bytes': None, 'reason': str(error)}))
             if self.apply and self.pending: self.flush_builds()
+            self.write_notes()
         finally:
             self.pending = None
             self.preview_process_snapshot = None
+
+    def evidence_notes(self, path, entries):
+        """Per-ticket note text: folder, size, key-file SHA-256 and attached files."""
+        if path in self.note_cache: return self.note_cache[path]
+        keys = sorted(evidence_keys(path, entries))
+        size = size_of(entries)
+        count = sum(1 for e in entries.values() if not stat.S_ISDIR(e[2]))
+        name = str(path.relative_to(self.repo / '.local/evidence'))
+        hashes = [f'{p.relative_to(path)} sha256 {sha256(p)}' for p, e in sorted(entries.items())
+                  if p.name in KEY_FILES and stat.S_ISREG(e[2])][:20]
+        handed = sorted({row['path'] for p in entries if p.name == 'files.json'
+                         for row in read_json(p) if isinstance(row.get('path'), str)})
+        rows = []
+        for key in keys:
+            attached = self.attachment_reader(key) if self.attachment_reader else None
+            text = (f'Evidence cleanup for {key}: folder .local/evidence/{name} ({count} files, {size} bytes) '
+                    f'moves to the Trash because all its tickets ({", ".join(keys)}) are Done or canceled.\n'
+                    f'Key files: {"; ".join(hashes) or "none"}.\n'
+                    f'Hand-in files (files.json): {", ".join(handed[:50]) or "none"}'
+                    f'{" and %d more" % (len(handed) - 50) if len(handed) > 50 else ""}.\n'
+                    f'Files attached to {key}: '
+                    f'{("none" if not attached else ", ".join(attached)) if attached is not None else "not read"}.')
+            rows.append({'ticket': key, 'folder': str(path), 'bytes': size, 'text': text, 'posted': False})
+        self.note_cache[path] = rows
+        return rows
+
+    def post_notes(self, path, before):
+        """Record each ticket note before the move; a failed note retains the evidence."""
+        for row in self.evidence_notes(path, before):
+            if row['posted']: continue
+            try:
+                self.note_poster(row['ticket'], row['text'])
+            except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
+                raise ValueError('evidence note not recorded; evidence retained: ' + str(error))
+            row['posted'] = True
+
+    def write_notes(self):
+        if self.notes_path is None: return
+        rows = [{**row, 'action': self.reports[path]['action']}
+                for path, rows in self.note_cache.items() for row in rows
+                if self.reports.get(path, {}).get('action') in ('eligible', 'trashed', 'kept_error')]
+        with Path(self.notes_path).open('w') as output:
+            for row in rows: output.write(json.dumps(row, sort_keys=True) + '\n')
 
     def test_slots(self):
         for number in range(1, 5):
@@ -474,15 +536,53 @@ def status_rows(payload, project):
     return result
 
 
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        for block in iter(lambda: source.read(1024 * 1024), b''): digest.update(block)
+    return digest.hexdigest()
+
+
+def cli_call(repo, cli, method, arguments):
+    result = subprocess.run([str(cli), 'call', method, json.dumps(arguments)],
+                            cwd=repo, capture_output=True, text=True, check=True, timeout=60)
+    return json.loads(result.stdout)['data']
+
+
+def resolve_project(repo, cli, project):
+    if project: return project
+    projects = cli_call(repo, cli, 'project_resolve', {'workspace_path': str(repo)})['projects']
+    if len(projects) != 1: raise ValueError('project scope ambiguous; supply --project-id')
+    return projects[0]['id']
+
+
+def task_id(repo, cli, project, key):
+    data = cli_call(repo, cli, 'task_get', {'project_id': project, 'key': key})
+    if data.get('key') != key: raise ValueError('task_get returned another ticket for ' + key)
+    return data['id']
+
+
+def attachment_reader(repo, cli, project):
+    """Read-only names of files attached to a ticket."""
+    def read(key):
+        rows = cli_call(repo, cli, 'attachment_list', {'project_id': project, 'task_id': task_id(repo, cli, project, key),
+                                                       'limit': 100})['attachments']
+        return sorted(str(r.get('filename') or r.get('name') or r.get('id')) for r in rows)
+    return read
+
+
+def note_poster(repo, cli, project):
+    """Agent action: one ticket note through message_send (default handler route)."""
+    def post(key, text):
+        return cli_call(repo, cli, 'message_send', {'project_id': project, 'task_id': task_id(repo, cli, project, key),
+                                                    'kind': 'note', 'body': text})
+    return post
+
+
 def status_reader(repo, cli, project, status_file=None):
     def call(method, arguments):
-        result = subprocess.run([str(cli), 'call', method, json.dumps(arguments)],
-                                cwd=repo, capture_output=True, text=True, check=True, timeout=60)
-        return json.loads(result.stdout)['data']
-    if not project:
-        projects = call('project_resolve', {'workspace_path': str(repo)})['projects']
-        if len(projects) != 1: raise ValueError('project scope ambiguous; supply --project-id')
-        project = projects[0]['id']
+        return cli_call(repo, cli, method, arguments)
+    project = resolve_project(repo, cli, project)
     def read(keys):
         if status_file:
             # Reload on each check so a changed supplied list is not cached.
@@ -544,8 +644,19 @@ def main():
     parser.add_argument('--project-id')
     parser.add_argument('--status-file', type=Path, help='explicit project_id/tasks status list, with status_category per key')
     parser.add_argument('--keep', type=Path, action='append', default=[], help='retain assigned slots, hand-ins or qualified copies (repeatable)')
+    parser.add_argument('--evidence-notes', type=Path,
+                        help='write one note per owning ticket (folder, size, SHA-256 of notes.md/report.md, attached files) for evidence that retires')
+    parser.add_argument('--post-notes', action='store_true',
+                        help='with --apply and --evidence-notes: send each note with message_send before the folder moves')
+    parser.add_argument('--sessions-root', type=Path, default=Path(f'/private/tmp/claude-{os.getuid()}'))
+    parser.add_argument('--qualification-root', type=Path, default=Path.home() / 'Library/Caches/ChecklistQualification')
+    parser.add_argument('--budget-gb', type=float,
+                        default=float(os.environ.get('CHECKLIST_CLEANUP_BUDGET_GB', DEFAULT_BUDGET_GB)),
+                        help='warn when scratch, evidence, build and qualification folders exceed this size')
     args = parser.parse_args()
-    cleaner = Cleaner(args.repo, args.installed_app, args.apply, keep=args.keep)
+    if args.post_notes and not (args.apply and args.evidence_notes):
+        parser.error('--post-notes requires --apply and --evidence-notes')
+    cleaner = Cleaner(args.repo, args.installed_app, args.apply, keep=args.keep, notes_path=args.evidence_notes)
     if args.only in ['all', 'builds'] and cleaner.build.exists():
         try:
             with build_lock(cleaner.build, args.apply): cleaner.builds()
@@ -554,8 +665,19 @@ def main():
             print(json.dumps({'kind': 'builds', 'action': 'kept_error', 'bytes': None, 'reason': str(error)}))
     if args.only in ['all', 'evidence']:
         cleaner.status_reader = status_reader(cleaner.repo, args.cli, args.project_id, args.status_file)
+        if args.evidence_notes and not args.status_file:
+            project = resolve_project(cleaner.repo, args.cli, args.project_id)
+            cleaner.attachment_reader = attachment_reader(cleaner.repo, args.cli, project)
+            if args.post_notes: cleaner.note_poster = note_poster(cleaner.repo, args.cli, project)
+        elif args.post_notes:
+            parser.error('--post-notes needs the installed CLI; omit --status-file')
         cleaner.evidence()
     if args.only in ['all', 'slots']: cleaner.test_slots()
+    # Report the folders this run covers; the default run covers all four groups.
+    groups = storage_groups(args.sessions_root.expanduser(), args.qualification_root.expanduser(), cleaner.repo)
+    if args.only != 'all':
+        groups = {name: paths for name, paths in groups.items() if name == {'builds': 'build'}.get(args.only, args.only)}
+    if groups: storage_report(groups, args.budget_gb * 1e9)
     return finish(cleaner)
 
 

@@ -17,7 +17,7 @@ extension CommandRouter {
         guard Self.mediaOwnerMethods.contains(method) else { throw CoreError("UNSUPPORTED_METHOD", "This media capability is not available in the native owner slice.") }
         let projections: [String: Set<String>] = [
             "media_navigation": [], "media_round_page": ["type_id", "state", "offset"],
-            "media_round_header": ["round_id"], "media_publication_preview": ["round_id"],
+            "media_round_header": ["round_id"], "media_publication_preview": ["round_id", "command_id"],
             "media_item_get": ["round_id", "item_id"], "media_original_read": ["round_id", "item_id", "target_id", "reference_id", "representation", "seconds"]
         ]
         if let fields = projections[method] {

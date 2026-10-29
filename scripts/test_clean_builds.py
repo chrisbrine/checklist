@@ -400,11 +400,10 @@ class CleanupTests(unittest.TestCase):
                     self.assertTrue(scratch.exists())
         self.assertEqual(self.moves, [])
 
-    def test_open_unknown_and_canceled_evidence_retained_only_all_done_trashed(self):
+    def test_open_and_unknown_evidence_retained_done_or_canceled_trashed(self):
         p=self.handin('CL-1-CL-2'); self.run_clean(self.cleaner.evidence,True); self.assertTrue(p.exists())
         self.statuses.pop('CL-2'); self.run_clean(self.cleaner.evidence,True); self.assertTrue(p.exists())
-        self.statuses['CL-2']='canceled'; self.run_clean(self.cleaner.evidence,True); self.assertTrue(p.exists())
-        self.statuses['CL-2']='done'; self.run_clean(self.cleaner.evidence,True); self.assertFalse(p.exists())
+        self.statuses['CL-2']='canceled'; self.run_clean(self.cleaner.evidence,True); self.assertFalse(p.exists())
         self.assertTrue(self.moves[0][1].exists())
 
     def test_manifest_mixed_tickets_override_folder_done_key(self):
@@ -836,6 +835,64 @@ class CleanupTests(unittest.TestCase):
         report=json.loads(output.getvalue());self.assertGreater(report['bytes_removed'],0)
         self.assertIn('Trash',report['meaning'])
 
+    # CL-359: canceled tickets retire evidence; a note records what it was.
+    def test_evidence_notes_record_folder_size_hashes_attachments_before_move(self):
+        import hashlib
+        p = self.handin('integration-9/CL-1')
+        (p/'files.json').write_text(json.dumps([{'ticket':'CL-1','path':'script/a.py'},{'ticket':'CL-1','path':'docs/b.md'}]))
+        (p/'notes.md').write_text('Implementer: fixture'); (p/'report.md').write_text('report')
+        kept = self.handin('integration-9/CL-2'); (kept/'files.json').write_text(json.dumps([{'ticket':'CL-2'}]))
+        notes = self.root/'notes.jsonl'; posted = []
+        self.cleaner.notes_path = notes
+        self.cleaner.attachment_reader = lambda key: ['screenshot.png']
+        self.cleaner.note_poster = lambda key, text: posted.append((key, text, p.exists()))
+        self.run_clean(self.cleaner.evidence, True)
+        self.assertFalse(p.exists()); self.assertTrue(kept.exists())
+        self.assertEqual([(k, existed) for k, _, existed in posted], [('CL-1', True)])
+        text = posted[0][1]
+        self.assertIn('notes.md sha256 ' + hashlib.sha256(b'Implementer: fixture').hexdigest(), text)
+        self.assertIn('report.md sha256 ' + hashlib.sha256(b'report').hexdigest(), text)
+        for part in ['/'.join(['.local', 'evidence', 'integration-9', 'CL-1']), '4 files', 'screenshot.png', 'docs/b.md, script/a.py']:
+            self.assertIn(part, text)
+        rows = [json.loads(line) for line in notes.read_text().splitlines()]
+        self.assertEqual([(r['ticket'], r['action'], r['posted']) for r in rows], [('CL-1', 'trashed', True)])
+        self.assertGreater(rows[0]['bytes'], 0)
+
+    def test_preview_writes_notes_without_posting_and_failed_post_retains_evidence(self):
+        p = self.handin(); notes = self.root/'n.jsonl'; self.cleaner.notes_path = notes
+        self.statuses['CL-1'] = 'canceled'
+        self.run_clean(self.cleaner.evidence)
+        self.assertTrue(p.exists())
+        rows = [json.loads(line) for line in notes.read_text().splitlines()]
+        self.assertEqual([(r['action'], r['posted']) for r in rows], [('eligible', False)])
+        self.assertIn('Files attached to CL-1: not read', rows[0]['text'])
+        def fail(key, text): raise subprocess.CalledProcessError(1, ['checklist', 'call', 'message_send'])
+        self.cleaner.note_poster = fail; self.cleaner.note_cache = {}
+        self.run_clean(self.cleaner.evidence, True)
+        self.assertTrue(p.exists()); self.assertTrue(self.cleaner.failed)
+        self.assertEqual(json.loads(notes.read_text())['action'], 'kept_error')
+
+    def test_cli_note_poster_and_attachment_reader_calls(self):
+        calls = []
+        def run(command, **kwargs):
+            self.assertEqual(kwargs['cwd'], self.repo)
+            method, args = command[2], json.loads(command[3]); calls.append((method, args))
+            data = {'task_get': {'key': 'CL-1', 'id': 'task-1'}, 'message_send': {'message_id': 'm'},
+                    'attachment_list': {'attachments': [{'filename': 'b.png'}, {'name': 'a.log'}]}}[method]
+            return subprocess.CompletedProcess(command, 0, json.dumps({'data': data}), '')
+        with patch.object(clean.subprocess, 'run', side_effect=run):
+            clean.note_poster(self.repo, Path('/CLI'), 'project')('CL-1', 'text')
+            self.assertEqual(clean.attachment_reader(self.repo, Path('/CLI'), 'project')('CL-1'), ['a.log', 'b.png'])
+        self.assertEqual([c[0] for c in calls], ['task_get', 'message_send', 'task_get', 'attachment_list'])
+        self.assertEqual(calls[1][1], {'project_id': 'project', 'task_id': 'task-1', 'kind': 'note', 'body': 'text'})
+
+    def test_post_notes_requires_apply_and_notes_file(self):
+        for extra in [['--preview', '--post-notes', '--evidence-notes', 'x'], ['--apply', '--post-notes']]:
+            with self.subTest(extra=extra), patch.object(sys, 'argv', ['clean_builds.py', *extra, '--only', 'evidence',
+                    '--repo', str(self.repo), '--installed-app', str(self.installed)]), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error: clean.main()
+                self.assertEqual(error.exception.code, 2)
 
 class TmpdirIsolationTests(unittest.TestCase):
     def test_cleanup_with_tmpdir_in_another_marked_scratch_session(self):

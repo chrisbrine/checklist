@@ -130,6 +130,15 @@ final class BackupWriteQueue: @unchecked Sendable {
     func setObserver(_ observer: @escaping @Sendable () -> Void) {condition.lock();self.observer = observer;condition.unlock()}
     private func notify() {condition.lock();let callback = observer;condition.unlock();callback?()}
 
+    /// Pre-upgrade accepted UUIDs remain owned by this journal, including their
+    /// original intent, generation and direct worker/replay behavior.
+    func hasReservedCommand(params: JSON,caller: Caller) -> Bool {
+        guard let command = params["command_id"] as? String else {return false}
+        let key = Self.key(caller,command)
+        condition.lock();defer {condition.unlock()}
+        return receipts[key] != nil || pending.contains {$0.key == key}
+    }
+
     func admit(method: String,params: JSON,caller: Caller,admission: StorageAdmission,authorization: () throws -> String?) throws -> Admission {
         condition.lock();defer {condition.unlock()}
         if Thread.current.threadDictionary[immediateContextKey] as? Bool == true {runningWrites += 1;return .run}
@@ -291,15 +300,16 @@ extension CommandRouter {
     public func observeWriteAdmission(_ observer: @escaping @Sendable () -> Void) {backupWrites.setObserver(observer)}
     func backupWriteAuthorization(params: JSON,caller: Caller) throws -> String? {
         guard !caller.isOwner,params["project_id"] != nil else {return nil}
-        var generation: String?
-        try readForPreparation {db in
-            let project = try self.scope(db,params,caller)
-            generation = try self.callerSessionGeneration(db,caller,project:project)
-            if let sessionID = caller.sessionID {
-                let session = try self.scoped(db,sessionID,project,type:"session")
-                guard session["installation"] as? String == caller.installation,session["role"] as? String == caller.role else {throw CoreError("CONNECTION_REVOKED","The queued command no longer matches this session registration.")}
-                if caller.role == "assistant",let grants = session["assistant_grants"] as? [String:[String:Bool]],grants != caller.assistantGrants {throw CoreError("CONNECTION_REVOKED","The assistant's project grants changed before application.")}
-            }
+        return try readForPreparation {try self.backupWriteAuthorization($0,params:params,caller:caller)}
+    }
+    func backupWriteAuthorization(_ db: Database,params: JSON,caller: Caller) throws -> String? {
+        guard !caller.isOwner,params["project_id"] != nil else {return nil}
+        let project = try scope(db,params,caller)
+        let generation = try callerSessionGeneration(db,caller,project:project)
+        if let sessionID = caller.sessionID {
+            let session = try scoped(db,sessionID,project,type:"session")
+            guard session["installation"] as? String == caller.installation,session["role"] as? String == caller.role else {throw CoreError("CONNECTION_REVOKED","The queued command no longer matches this session registration.")}
+            if caller.role == "assistant",let grants = session["assistant_grants"] as? [String:[String:Bool]],grants != caller.assistantGrants {throw CoreError("CONNECTION_REVOKED","The assistant's project grants changed before application.")}
         }
         return generation
     }

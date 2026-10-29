@@ -31,6 +31,7 @@ public final class CommandRouter: @unchecked Sendable {
     let serviceLease: StorageServiceLease?
     let storageAdmission = StorageAdmission()
     let backupWrites = BackupWriteQueue()
+    let commandOperations = CommandOperations()
     // Per-command/transaction state, accessed only on the sole writer connection.
     var taskReferenceFrame: TaskReferenceFrame?
     var managedAttachmentPreparation: ManagedAttachmentPreparation?
@@ -103,7 +104,10 @@ public final class CommandRouter: @unchecked Sendable {
         // Authority reconciliation must commit even when unrelated maintenance is broken.
         do {
             try ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { _ in
-                try dbQueue.write { db in try self.interruptSourceExecutionsAfterRestart(db) }
+                try dbQueue.write { db in
+                    try self.interruptSourceExecutionsAfterRestart(db)
+                    try self.recoverCommandOperations(db)
+                }
             }
         } catch {
             throw CoreError("RECOVERY_REQUIRED", "Cannot establish source-process restart fences. Preserve the store and reconcile recovery before work resumes.")
@@ -300,15 +304,28 @@ public final class CommandRouter: @unchecked Sendable {
             guard ["owner","worker","assistant"].contains(caller.role),!caller.installation.isEmpty else {throw CoreError("FORBIDDEN","An authenticated connection is required.")}
             guard let encoded = try? JSONSerialization.data(withJSONObject:params),encoded.count <= 2_000_000 else {throw CoreError("INVALID_INPUT","Command input is too large or invalid.")}
             try validateInput(method,params,caller)
-            if method == "command_status" {return addingWriteAdmission(try backupCommandStatus(params:params,caller:caller))}
-            if !Self.readMethods.contains(method),method != "backup_create" {
-                switch try backupWrites.admit(method:method,params:params,caller:caller,admission:storageAdmission,authorization:{try backupWriteAuthorization(params:params,caller:caller)}) {
-                case .reply(let result):return result
-                case .run:break
-                }
-                defer {backupWrites.finishWrite()}
-                return addingWriteAdmission(try handleCommand(method:method,params:params,caller:caller))
+            if method == "operation_get" {return addingWriteAdmission(try commandOperationRead(params:params,caller:caller)!)}
+            if method == "command_status" {
+                return addingWriteAdmission(try commandOperationRead(params:params,caller:caller,byCommand:true) ?? backupCommandStatus(params:params,caller:caller))
             }
+            var admittedWrite = false
+            let admittedReply: JSON? = try commandOperations.withAdmission(principal:caller.principal,command:params["command_id"] as? String) {
+                let legacyReserved = backupWrites.hasReservedCommand(params:params,caller:caller)
+                if commandOperations.enabled,Thread.current.threadDictionary[commandOperations.contextKey] == nil,
+                   try hasCommandOperation(params:params,caller:caller) || (!legacyReserved && needsCommandOperation(method:method,params:params,caller:caller)) {
+                    return try acceptCommandOperation(method:method,params:params,caller:caller)
+                }
+                if (!Self.readMethods.contains(method) && method != "backup_create") || legacyReserved {
+                    switch try backupWrites.admit(method:method,params:params,caller:caller,admission:storageAdmission,authorization:{try backupWriteAuthorization(params:params,caller:caller)}) {
+                    case .reply(let result):return result
+                    case .run:admittedWrite = true
+                    }
+                }
+                return nil
+            }
+            if let admittedReply {return addingWriteAdmission(admittedReply)}
+            // Admission locks never span file work or domain execution.
+            defer {if admittedWrite {backupWrites.finishWrite()}}
             return addingWriteAdmission(try handleCommand(method:method,params:params,caller:caller))
         }
     }
@@ -318,6 +335,9 @@ public final class CommandRouter: @unchecked Sendable {
     /// Internal native-send fences require a committed receipt before external
     /// I/O. Nil defers the entire send without creating an uncertainty record.
     public func handleIfWriteAvailable(method: String,params: [String:Any],caller: Caller) throws -> [String:Any]? {
+        // Native send fences need a committed result, never an operation's
+        // acceptance receipt or a second execution of an accepted intent.
+        if try hasCommandOperation(params:params,caller:caller) {return nil}
         guard backupWrites.admitWithoutQueue() else {return nil}
         defer {backupWrites.finishWrite()}
         return addingWriteAdmission(try handleCommand(method:method,params:params,caller:caller))
@@ -393,7 +413,7 @@ public final class CommandRouter: @unchecked Sendable {
         // writer. A read that turns out to write (for example a first cleanup preview) runs
         // again on the writer path below.
         if Self.pureReadMethods.contains(method),let readers {
-            do { return ownerManagedPathProjection(try executePureRead(readers,method:method,params:params,caller:caller),caller:caller) }
+            do { return commandManagedPathProjection(try executePureRead(readers,method:method,params:params,caller:caller),caller:caller,command:params["command_id"] as? String) }
             catch let error where Self.needsWriter(error) {}
         }
         // A read-only attempt may discover a required hold, availability
@@ -517,11 +537,11 @@ public final class CommandRouter: @unchecked Sendable {
             // Replayed commands observe current pending deliveries without replaying an answer.
             do { output = try self.addingHumanAnswerNotices(db,output:output,params:params,caller:caller) }
             catch { output = self.addingHumanAnswerNoticeFailure(output,caller:caller) }
-            return self.ownerManagedPathProjection(self.addingStorageMaintenanceNotice(output, warning: maintenanceWarning),caller:caller)
+            return self.commandManagedPathProjection(self.addingStorageMaintenanceNotice(output, warning: maintenanceWarning),caller:caller,command:params["command_id"] as? String)
         }}
     }
     }
-    private func refreshReplayedClaim(_ db: Database,method: String,output: inout JSON,caller: Caller) throws {
+    func refreshReplayedClaim(_ db: Database,method: String,output: inout JSON,caller: Caller) throws {
         guard ["work_claim","work_child_accept","work_handoff_accept","work_takeover"].contains(method),
               var data = output["data"] as? JSON,let id = data["id"] as? String,
               var attempt = try? record(db,id,type:"attempt"),attempt["state"] as? String == "active",

@@ -10,6 +10,14 @@
     {"method":"archive_storage_settings","params":{"project_id":"00000000-0000-4000-8000-000000000001","command_id":"00000000-0000-4000-8000-000000000007","expected_revision":2,"settings_revision":1,"archive_storage":{"preset":"clean_large_managed_on_archive","large_original_bytes":20971520,"retained_budget_bytes":52428800}}},
     {"method":"diagnostics_summary","params":{"project_id":"00000000-0000-4000-8000-000000000001"}}
   ],
+  "long_command_example": {
+    "description": "Synthetic envelopes only. Discover the installed catalog and use current actual IDs. Acceptance does not establish a completed backup. Explicitly read operation_get; do not create a schedule or replace the command UUID while waiting.",
+    "request": {"method":"backup_create","params":{"project_id":"00000000-0000-4000-8000-000000000001","command_id":"00000000-0000-4000-8000-000000000011","qualification_name":"synthetic","reason":"Synthetic operation example"}},
+    "accepted": {"command_id":"00000000-0000-4000-8000-000000000011","command_outcome":"accepted","data":{"operation_id":"00000000-0000-4000-8000-000000000012","command_id":"00000000-0000-4000-8000-000000000011","method":"backup_create","state":"queued","status_method":"operation_get","created_at":"2026-10-01T12:00:00Z"}},
+    "read": {"method":"operation_get","params":{"project_id":"00000000-0000-4000-8000-000000000001","operation_id":"00000000-0000-4000-8000-000000000012"}},
+    "succeeded": {"data":{"operation_id":"00000000-0000-4000-8000-000000000012","command_id":"00000000-0000-4000-8000-000000000011","method":"backup_create","state":"succeeded","created_at":"2026-10-01T12:00:00Z","started_at":"2026-10-01T12:00:01Z","finished_at":"2026-10-01T12:00:30Z","result":{"command_id":"00000000-0000-4000-8000-000000000011","data":{"path":"<service-selected-backup-destination>","format":"checklist-store-snapshot","manifest_sha256":"0000000000000000000000000000000000000000000000000000000000000000","operation_id":"00000000-0000-4000-8000-000000000013","restore_supported":true,"status":"complete","writer_lease_seconds":0.2}}}},
+    "replay": "Repeat the request with the same command_id and identical parameters to receive the same operation. Preserve its result's own snapshot operation_id separately from the command operation ID."
+  },
   "remaining_owner_only": {
     "project_edit.root_path": "Defines the filesystem authority boundary; explicit owner decision required.",
     "export_project": "Path-based destination publication and crash reconciliation need descriptor-relative confinement together.",

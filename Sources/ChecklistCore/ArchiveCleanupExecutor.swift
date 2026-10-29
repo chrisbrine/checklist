@@ -150,17 +150,34 @@ extension CommandRouter {
     /// Internal synchronous service pump: at most eight metadata admissions and
     /// one exact original per call. The service schedules a one-shot continuation.
     /// Persisted job, cursor and deletion intent survive router/process restart.
-    func processArchiveCleanupJobs(_ db: Database,permit: ArchiveStoragePermit,nowMS: Int64) throws {
-        try permit.requireRoot(root)
-        guard !db.isInsideTransaction else { throw CoreError("CLEANUP_TRANSACTION_REQUIRED", "Run cleanup after the semantic transaction commits.") }
-        guard try !StorageSnapshotRetention.isActive(root:root) else {return}
-        let ids = try String.fetchAll(db,sql:"""
+    func dueArchiveCleanupJobIDs(_ db: Database,nowMS: Int64) throws -> [String] {
+        try String.fetchAll(db,sql:"""
             SELECT j.id FROM records j LEFT JOIN records c ON c.id=('archive-cleanup-cursor:' || j.id) AND c.type='storage_job'
             WHERE j.rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='cleanup_job') AND CASE WHEN json_valid(j.data) THEN COALESCE(json_extract(j.data,'$.not_before_ms') <= ?,1) ELSE 1 END AND CASE WHEN json_valid(j.data) THEN json_extract(j.data,'$.state') NOT IN ('completed','canceled','suspended') ELSE 1 END
             ORDER BY CASE WHEN json_valid(c.data) THEN COALESCE(json_extract(c.data,'$.checked_at_ms'),0) ELSE 0 END,j.rowid LIMIT 8
             """,arguments:[nowMS])
-        var admissions = 0
-        for id in ids {
+    }
+    /// CL-345: the item's reference graph inside the writer transaction. With a
+    /// read pool it is only the prepared snapshot scan after a cheap fence check
+    /// (nil: no scan for this ticket, the item waits for the service continuation).
+    /// The first check covers the whole journal; this call holds the writer, so
+    /// later journal rows are its own bookkeeping writes. Without a read pool:
+    /// the in-writer scan.
+    private func archiveCleanupExecutorGraph(_ db: Database,job: ArchiveCleanupJob,task: JSON,prepared: PreparedArchiveCleanupScan?,fenced: inout Bool) throws -> ArchiveCleanupReferenceIndex? {
+        guard readers != nil else {return try ArchiveCleanupReferenceIndex(archiveCleanupReferenceRows(db))}
+        guard let prepared,cleanupJobEqual(job.taskID.text,prepared.taskID) else {return nil}
+        if let failure = prepared.failure {throw failure}
+        try prepared.validate(db,tokens:archiveCleanupTokens(archiveCleanupJobAttachments(db,job:job,task:task)),journal:!fenced)
+        fenced = true
+        return try prepared.index ?? ArchiveCleanupReferenceIndex(prepared.rows)
+    }
+    func processArchiveCleanupJobs(_ db: Database,permit: ArchiveStoragePermit,nowMS: Int64,prepared: PreparedArchiveCleanupScan? = nil) throws {
+        try permit.requireRoot(root)
+        guard !db.isInsideTransaction else { throw CoreError("CLEANUP_TRANSACTION_REQUIRED", "Run cleanup after the semantic transaction commits.") }
+        guard try !StorageSnapshotRetention.isActive(root:root) else {return}
+        let ids = try dueArchiveCleanupJobIDs(db,nowMS:nowMS)
+        var admissions = 0,fenced = false
+        jobs: for id in ids {
             var job = try cleanupJobDecode(record(db,id,type:"cleanup_job"))
             guard nowMS >= job.notBeforeMS else { continue }
             var cursor: JSON = (try archiveCleanupRecordIfPresent(db,archiveCleanupCursorID(job),type:"storage_job")) ?? ["id":archiveCleanupCursorID(job),"project_id":job.projectID.text,"task_id":job.taskID.text,"kind":"archive_cleanup_cursor","state":"idle","revision":0,"next_index":0]
@@ -173,19 +190,19 @@ extension CommandRouter {
                 var precedingFailure: ArchiveCleanupJob.Failure?
                 var precedingFailureCount = 0
                 do {
-                    var eligible = false
+                    var eligible = false,deferred = false
                     try withValidatedDomainTransaction(db) {
                         let raw = try self.record(db,id,type:"cleanup_job");job = try self.cleanupJobDecode(raw)
                         if let previous = job.items.first(where: {$0.original.id == item.original.id}) { precedingFailure = previous.failure;precedingFailureCount = previous.sameFailureCount }
                         let task = try self.scoped(db,job.taskID.text,job.projectID.text,type:"task")
                         if !bool(task,"archived") { _ = job.cancel();try self.save(db,job.record(revision:self.nextCleanupJobRevision(raw)),type:"cleanup_job");return .commit }
                         let a = try self.scoped(db,item.original.id.text,job.projectID.text,type:"attachment")
-                        let graph = try self.archiveCleanupReferenceRows(db)
-                        var holds = try self.completeArchiveCleanupHolds(db,attachment:a,task:task,currentGraph:graph)
+                        guard let graph = try self.archiveCleanupExecutorGraph(db,job:job,task:task,prepared:prepared,fenced:&fenced) else {deferred = true;return .commit}
+                        var holds = try self.completeArchiveCleanupHolds(db,attachment:a,task:task,currentGraph:graph.graph,currentIndex:graph)
                         let currentSize = try ArchiveCleanupJob.integer(a["size"]),currentRevision = try ArchiveCleanupJob.integer(a["revision"])
                         if !self.cleanupJobEqual(a["task_id"],job.taskID.text) || a["sha256"] as? String != item.original.sha256 || currentSize != item.original.logicalBytes || currentRevision != item.original.attachmentRevision { holds.insert(.changedIdentity) }
                         let project = try self.record(db,job.projectID.text,type:"project")
-                        let plan = try ArchiveRetentionPlanner.make(configuration:self.archiveRetentionConfiguration(project),facts:self.archiveRetentionFacts(db,task:task,currentGraph:graph))
+                        let plan = try ArchiveRetentionPlanner.make(configuration:self.archiveRetentionConfiguration(project),facts:self.archiveRetentionFacts(db,task:task,currentGraph:graph.graph,currentIndex:graph))
                         if !plan.selected.contains(where: {$0.id == item.original.id}) { holds.insert(.policyNoLongerSelects) }
                         try job.observe([.init(projectID:job.projectID,taskID:job.taskID,original:item.original,referencesComplete:true,holds:holds)],nowMS:nowMS)
                         if try jsonString(job.record(revision:ArchiveCleanupJob.integer(raw["revision"]))) != jsonString(raw) { try self.save(db,job.record(revision:self.nextCleanupJobRevision(raw)),type:"cleanup_job") }
@@ -197,16 +214,20 @@ extension CommandRouter {
                         }
                         return .commit
                     }
+                    // CL-345: no scan was prepared for this ticket; keep the cursor.
+                    if deferred { continue jobs }
                     if eligible {
-                        // Fresh complete graph inside an actual writer transaction,
-                        // after the durable intent and immediately before unlink.
+                        // Current complete graph inside an actual writer transaction,
+                        // after the durable intent and immediately before unlink: the
+                        // snapshot scan behind its fence (CL-345), or the in-writer scan.
                         try withValidatedDomainTransaction(db) {
                             let raw = try self.record(db,id,type:"cleanup_job");job = try self.cleanupJobDecode(raw)
                             guard ![.canceled,.completed,.suspended].contains(job.state),nowMS >= job.notBeforeMS else { return .commit }
                             let task = try self.scoped(db,job.taskID.text,job.projectID.text,type:"task")
                             guard bool(task,"archived") else { return .commit }
                             var a = try self.scoped(db,item.original.id.text,job.projectID.text,type:"attachment")
-                            guard try self.completeArchiveCleanupHolds(db,attachment:a,task:task).isEmpty,
+                            guard let graph = try self.archiveCleanupExecutorGraph(db,job:job,task:task,prepared:prepared,fenced:&fenced) else { return .commit }
+                            guard try self.completeArchiveCleanupHolds(db,attachment:a,task:task,currentGraph:graph.graph,currentIndex:graph).isEmpty,
                                   a["sha256"] as? String == item.original.sha256,try ArchiveCleanupJob.integer(a["revision"]) == item.original.attachmentRevision else { return .commit }
                             let relative = try self.archiveCleanupRelativePath(a)
                             let removed = try permit.removeOriginal(relative:relative,sha256:item.original.sha256,size:item.original.logicalBytes)
@@ -221,6 +242,9 @@ extension CommandRouter {
                         return
                     }
                 } catch {
+                    // CL-345: a fence miss is not an item failure and never a hold.
+                    // Nothing was deleted; the next turn rescans and retries this item.
+                    if (error as? CoreError)?.code == "CLEANUP_CONCURRENT_WRITE" { return }
                     // A failure after unlink may have rolled its SQL outcome back.
                     // The durable marked intent is preserved; retry verifies absence.
                     try withValidatedDomainTransaction(db) {

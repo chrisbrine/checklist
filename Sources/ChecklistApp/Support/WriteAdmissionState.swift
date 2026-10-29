@@ -30,7 +30,7 @@ struct WriteAdmissionState: Equatable {
     }
 }
 
-/// Both workspace windows and windowless capture must receive the applied
+/// Both workspace windows and windowless capture must receive the completed
 /// original result before clearing recovery data or deleting staged files.
 @MainActor enum QueuedCommandReply {
     typealias Transport = @MainActor (String, [String: Any]) async throws -> [String: Any]
@@ -42,9 +42,60 @@ struct WriteAdmissionState: Equatable {
         return reply["data"] as? [String: Any] ?? reply["result"] as? [String: Any] ?? reply
     }
 
+    private static func readStatus(_ method: String,_ params: [String:Any],commandID: String,operationID: String? = nil,
+                               transport: Transport) async throws -> [String:Any] {
+        do {return try payload(await transport(method,params))}
+        catch let error as CancellationError {throw error}
+        catch let error as ChecklistError {
+            // Failure to observe a receipt says nothing about the accepted
+            // original command. Only a terminal receipt can reject that work.
+            var details = error.details
+            details["command_outcome"] = "unknown";details["command_id"] = commandID;details["status_method"] = method
+            if let operationID {details["operation_id"] = operationID}
+            throw ChecklistError(error.code,error.message,details:details)
+        } catch {throw CommandReply.unknown(commandID:commandID,reason:"command_status_unavailable")}
+    }
+
     static func resolve(_ reply: [String: Any], method: String, params: [String: Any], pause: UInt64 = 250_000_000,
                         transport: Transport, queued: @MainActor (String, Bool) -> Void = { _, _ in },
                         allowOriginalRetry: Bool = true) async throws -> [String: Any] {
+        if reply["command_outcome"] as? String == "accepted" {
+            let bytes = try JSONSerialization.data(withJSONObject: reply)
+            _ = try CommandReply.decode(bytes, method: method, commandID: params["command_id"] as? String)
+            let acknowledgment = try payload(reply)
+            guard let commandID = reply["command_id"] as? String,
+                  let operationID = acknowledgment["operation_id"] as? String else {
+                throw CommandReply.unknown(commandID: params["command_id"] as? String, reason: "invalid_operation_receipt")
+            }
+            queued(commandID, true)
+            defer { queued(commandID, false) }
+            while true {
+                try await Task.sleep(nanoseconds: pause)
+                var statusParams: [String: Any] = ["operation_id": operationID]
+                if let project = params["project_id"] { statusParams["project_id"] = project }
+                let status = try await readStatus("operation_get",statusParams,commandID:commandID,operationID:operationID,transport:transport)
+                guard status["operation_id"] as? String == operationID,
+                      status["command_id"] as? String == commandID,
+                      status["method"] as? String == method,
+                      status["status_method"] as? String == "operation_get" else {
+                    throw CommandReply.unknown(commandID: commandID, reason: "operation_identity_mismatch")
+                }
+                switch status["state"] as? String {
+                case "queued", "running": continue
+                case "succeeded", "failed":
+                    let result: [String: Any]
+                    if status["state"] as? String == "succeeded", let original = status["result"] as? [String: Any] { result = original }
+                    else if status["state"] as? String == "failed", let failure = status["error"] as? [String: Any] { result = ["command_id": commandID, "error": failure] }
+                    else { throw CommandReply.unknown(commandID: commandID, reason: "missing_operation_result") }
+                    guard !["accepted", "queued"].contains(result["command_outcome"] as? String ?? "") else {
+                        throw CommandReply.unknown(commandID: commandID, reason: "operation_acknowledgment_is_not_completed")
+                    }
+                    return try CommandReply.decode(JSONSerialization.data(withJSONObject: result), method: method, commandID: commandID)
+                default:
+                    throw CommandReply.unknown(commandID: commandID, reason: "operation_status_unknown")
+                }
+            }
+        }
         guard reply["command_outcome"] as? String == "queued" else { return reply }
         guard let commandID = params["command_id"] as? String,
               reply["command_id"] as? String == commandID,
@@ -58,8 +109,12 @@ struct WriteAdmissionState: Equatable {
             try await Task.sleep(nanoseconds: pause)
             var statusParams: [String: Any] = ["command_id": commandID]
             if let project = params["project_id"] { statusParams["project_id"] = project }
-            let statusReply = try await transport("command_status", statusParams)
-            let status = try payload(statusReply)
+            let status = try await readStatus("command_status",statusParams,commandID:commandID,transport:transport)
+            if status["operation_id"] != nil {
+                return try await resolve(["command_id": commandID, "command_outcome": "accepted", "data": status],
+                    method: method, params: params, pause: pause, transport: transport, queued: queued,
+                    allowOriginalRetry: allowOriginalRetry)
+            }
             switch status["state"] as? String {
             case "queued": continue
             case "applied", "failed":
@@ -75,6 +130,10 @@ struct WriteAdmissionState: Equatable {
                 if let original = status["result"] as? [String: Any] { result = original }
                 else if let failure = status["error"] as? [String: Any] { result = ["command_id": commandID, "error": failure] }
                 else { throw CommandReply.unknown(commandID: commandID, reason: "missing_queued_command_result") }
+                if result["command_outcome"] as? String == "accepted" {
+                    return try await resolve(result, method: method, params: params, pause: pause,
+                        transport: transport, queued: queued, allowOriginalRetry: allowOriginalRetry)
+                }
                 guard result["command_outcome"] as? String != "queued" else {
                     throw CommandReply.unknown(commandID: commandID, reason: "queued_acknowledgment_is_not_applied")
                 }

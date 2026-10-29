@@ -65,7 +65,7 @@ final class StorageRecoveryServer: NSObject, NSXPCListenerDelegate {
     }
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
         guard connection.effectiveUserIdentifier == getuid() else { return false }
-        return clientIdentity.accept(connection) { StorageRecoveryPeer(state: state) }
+        return clientIdentity.accept(connection) { StorageRecoveryPeer(state: self.state) }
     }
 }
 final class StorageRecoveryPeer: NSObject, ChecklistRPC {
@@ -116,10 +116,21 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         }
         self.expectedOwnerHash=(info as? [String:Any])?[kSecCodeInfoUnique as String] as? Data
         super.init()
+        router.configureCommandOperations(on:storageQueue) { [weak self] _,_ in
+            guard let self else {return}
+            self.queue.async { [self] in
+                changed()
+                if enforcesQueueIsolation {
+                    dispatchNative();armStorageWake()
+                    if workHealthWake == nil && workHealthFailures < 2 {runWorkHealth()}
+                }
+            }
+        }
         router.observeWriteAdmission { [weak self] in
             guard let self else {return}
             self.queue.async { [self] in
                 changed()
+                self.router.resumeCommandOperations()
                 if self.router.writeAdmissionStatus["locked"] as? Bool != true {
                     let deferred = Array(backupDeferredCalls.values);backupDeferredCalls.removeAll()
                     for resume in deferred {resume()}
@@ -690,8 +701,9 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
                         result = try ServiceCallTiming.measure(timing,"execution_ms") { try router.handle(method:method,params:params,caller:caller) }
                     } catch { result = ["error":Self.publicError(error)] }
                     reply(Self.responseBytes(result,timing:timing))
-                    let succeeded = result["error"] == nil && result["command_outcome"] as? String != "queued"
-                    coordinator.queue.async { [self] in autoreleasepool {afterCommand(succeeded:succeeded,runHooks:Self.requiresAfterCommand(method),timed:timing,method:method)} }
+                    let succeeded = result["error"] == nil && !["queued","accepted"].contains(result["command_outcome"] as? String ?? "")
+                    let runHooks = Self.requiresAfterCommand(method) && result["command_outcome"] as? String != "accepted"
+                    coordinator.queue.async { [self] in autoreleasepool {afterCommand(succeeded:succeeded,runHooks:runHooks,timed:timing,method:method)} }
                 }}
             case .router(let method,let params,let caller):
                 let result: [String:Any]
@@ -703,14 +715,14 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
     /// These paths do not prepare managed reads/leases or repair availability.
     /// Keep hooks on other reads that can fall back to the writer.
     static func requiresAfterCommand(_ method:String) -> Bool {
-        !["service_info","tool_catalog","task_get","session_list","project_list","project_resolve","workspace_page","task_list","triage_list","epic_list"].contains(method)
+        !["service_info","tool_catalog","operation_get","command_status","task_get","session_list","project_list","project_resolve","workspace_page","task_list","triage_list","epic_list"].contains(method)
     }
     /// On the serial queue.
     func finish(_ result:[String:Any],timing:ServiceCallTiming? = nil,runHooks:Bool = true,method:String = "",reply:(Data)->Void) {
         coordinator.requireCommandQueue()
         var result = result;result["write_admission"] = coordinator.router.writeAdmissionStatus
         reply(Self.responseBytes(result,timing:timing))
-        afterCommand(succeeded:result["error"] == nil && result["command_outcome"] as? String != "queued",runHooks:runHooks,timed:timing,method:method)
+        afterCommand(succeeded:result["error"] == nil && !["queued","accepted"].contains(result["command_outcome"] as? String ?? ""),runHooks:runHooks && result["command_outcome"] as? String != "accepted",timed:timing,method:method)
     }
     static func responseBytes(_ result:[String:Any],timing:ServiceCallTiming?) -> Data {
         if let timing {return (try? timing.encode(result)) ?? Data("{}".utf8)}

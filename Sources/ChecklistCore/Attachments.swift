@@ -146,7 +146,11 @@ extension CommandRouter {
                     if let job = a["storage_job_id"] as? String { managedImportRecoveryFailures.removeValue(forKey:Data(job.utf8)) }
                 }
                 if c.isOwner {
-                    a["url"] = path
+                    // Durable operation replies keep managed descriptors; only
+                    // their owner result read projects an installation-local URL.
+                    if readsManaged,let command = p["command_id"] as? String,
+                       commandOperations.isExecuting(Self.commandOperationID(principal:c.principal,command:command)) {a["url"] = stored}
+                    else {a["url"] = path}
                     if representation == "original",a["mode"] as? String == "managed" {
                         let holdID = uuid(),expiry = Date().addingTimeInterval(300)
                         try save(db,

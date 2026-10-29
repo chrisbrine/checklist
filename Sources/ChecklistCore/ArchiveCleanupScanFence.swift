@@ -49,14 +49,20 @@ struct PreparedArchiveCleanupScan {
     let rows: [JSON]
     let failure: Error?
     let generation: Int?
+    /// CL-345: the cleanup executor's complete graph, indexed once on the snapshot.
+    var index: ArchiveCleanupReferenceIndex? = nil
 
-    func validate(_ db: Database,tokens current: Set<Data>) throws {
+    /// `journal: false` skips the journal: the cleanup executor already checked it
+    /// in this serialized writer turn, and every later journal row is its own
+    /// bookkeeping write (CL-345). Tokens and other connections are still checked.
+    func validate(_ db: Database,tokens current: Set<Data>,journal: Bool = true) throws {
         func refuse(_ source: String) throws -> Never {
             throw CoreError("CLEANUP_CONCURRENT_WRITE","The archive cleanup scan is out of date: \(source) changed before the archive committed. Nothing was archived and no original was deleted; retry the archive.",
                             details:["reason":"fenced by concurrent write to " + source,"retry":true])
         }
         guard current == tokens else {try refuse("the ticket's attachments")}
         guard try Int.fetchOne(db,sql:"PRAGMA data_version") == generation else {try refuse("another store connection")}
+        guard journal else {return}
         if try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM temp.archive_cleanup_scan_changes WHERE id IS NULL AND atom IS NULL)") == true {try refuse("an unindexed record payload")}
         let ids = try jsonString(["values":fenceIDs.map {String(decoding:$0,as:UTF8.self)}])
         if try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM temp.archive_cleanup_scan_changes WHERE id IN (SELECT CAST(value AS BLOB) FROM json_each(?,'$.values')))",arguments:[ids]) == true {try refuse("a scanned record")}
@@ -84,19 +90,86 @@ extension CommandRouter {
                 let task = try self.task(db,p,pid),tid = try StoredRecord(task,family:"task").string("id")
                 let attachments = try self.scopedTaskRows(db,type:"attachment",task:task).filter {!bool($0,"unlinked")}
                 guard !attachments.isEmpty else {return nil}
-                let tokens = try self.archiveCleanupTokens(attachments)
-                do {
-                    let graph = try self.archiveCleanupRelevantReferenceGraph(db,attachments:attachments)
-                    var fence = graph.selected.union(tokens);fence.insert(Data(tid.utf8))
-                    for row in graph.rows where graph.selected.contains(Data((row["id"] as? String ?? "").utf8)) {
-                        if let linked = row["task_id"] as? String {fence.insert(Data(linked.utf8))}
-                    }
-                    return .init(taskID:tid,tokens:tokens,fenceIDs:fence,targets:graph.selected.union(tokens),rows:graph.rows,failure:nil,generation:generation)
-                } catch is DatabaseError {
-                    return .init(taskID:tid,tokens:tokens,fenceIDs:[],targets:[],rows:[],failure:CoreError("CLEANUP_READ_LANE_UNAVAILABLE","Archive cleanup could not read a store snapshot. Nothing was archived; retry."),generation:generation)
-                } catch {
-                    return .init(taskID:tid,tokens:tokens,fenceIDs:[],targets:[],rows:[],failure:error,generation:generation)
+                return try self.scanArchiveCleanupSnapshot(db,taskID:tid,attachments:attachments,generation:generation)
+            }
+            if let scan {archiveCleanupScanObserver?();return scan}
+        } catch {}
+        if installed {try? dbQueue.writeWithoutTransaction {try ArchiveCleanupScanJournal.remove($0)}}
+        archiveCleanupScanLock.unlock()
+        return nil
+    }
+    /// The reference scan on a read snapshot and the fence that guards its reuse.
+    /// A scan failure is kept for the writer.
+    private func scanArchiveCleanupSnapshot(_ db: Database,taskID tid: String,attachments: [JSON],generation: Int?) throws -> PreparedArchiveCleanupScan {
+        let tokens = try archiveCleanupTokens(attachments)
+        do {
+            let graph = try archiveCleanupRelevantReferenceGraph(db,attachments:attachments)
+            var fence = graph.selected.union(tokens);fence.insert(Data(tid.utf8))
+            for row in graph.rows where graph.selected.contains(Data((row["id"] as? String ?? "").utf8)) {
+                if let linked = row["task_id"] as? String {fence.insert(Data(linked.utf8))}
+            }
+            return .init(taskID:tid,tokens:tokens,fenceIDs:fence,targets:graph.selected.union(tokens),rows:graph.rows,failure:nil,generation:generation)
+        } catch is DatabaseError {
+            return .init(taskID:tid,tokens:tokens,fenceIDs:[],targets:[],rows:[],failure:CoreError("CLEANUP_READ_LANE_UNAVAILABLE","Archive cleanup could not read a store snapshot. Nothing was archived; retry."),generation:generation)
+        } catch {
+            return .init(taskID:tid,tokens:tokens,fenceIDs:[],targets:[],rows:[],failure:error,generation:generation)
+        }
+    }
+    /// CL-345: the executor keeps its complete reference graph (every record, every
+    /// string), now read on a snapshot. The fence holds every row reached from the
+    /// originals along reverse references, the tickets those rows name, the ticket
+    /// and its originals; a new payload that names one of them is a new edge.
+    private func scanArchiveCleanupJobSnapshot(_ db: Database,taskID tid: String,attachments: [JSON],generation: Int?) throws -> PreparedArchiveCleanupScan {
+        let tokens = try archiveCleanupTokens(attachments)
+        do {
+            let index = try ArchiveCleanupReferenceIndex(archiveCleanupReferenceRows(db))
+            var pending = Array(tokens),seen = Set<Data>(),selected = Set<Data>(),fence = tokens
+            fence.insert(Data(tid.utf8))
+            while let token = pending.popLast() {
+                guard seen.insert(token).inserted else {continue}
+                for row in index.reverse[token] ?? [] {
+                    guard let id = index.graph[row]["id"] as? String,selected.insert(Data(id.utf8)).inserted else {continue}
+                    pending.append(Data(id.utf8))
+                    if let linked = index.graph[row]["task_id"] as? String {fence.insert(Data(linked.utf8))}
                 }
+            }
+            return .init(taskID:tid,tokens:tokens,fenceIDs:fence.union(selected),targets:selected.union(tokens),rows:index.graph,failure:nil,generation:generation,index:index)
+        } catch {
+            return .init(taskID:tid,tokens:tokens,fenceIDs:[],targets:[],rows:[],failure:error,generation:generation)
+        }
+    }
+    /// CL-345: the cleanup executor's attachments of one job: the ticket's linked
+    /// attachments and every job original that still has a record.
+    func archiveCleanupJobAttachments(_ db: Database,job: ArchiveCleanupJob,task: JSON) throws -> [JSON] {
+        var rows = try scopedTaskRows(db,type:"attachment",task:task).filter {!bool($0,"unlinked")}
+        for item in job.items where !rows.contains(where: {cleanupJobEqual($0["id"],item.original.id.text)}) {
+            if let a = try? scoped(db,item.original.id.text,job.projectID.text,type:"attachment") {rows.append(a)}
+        }
+        return rows
+    }
+    /// CL-345: runs in the service continuation before the object gate and the SQL
+    /// writer. It scans the first due job's ticket on a read snapshot; the executor
+    /// then only checks the fence. A returned scan holds archiveCleanupScanLock and
+    /// the writer journal until finishArchiveCleanupScan.
+    func prepareArchiveCleanupJobScan(nowMS: Int64) -> PreparedArchiveCleanupScan? {
+        guard let readers else {return nil}
+        archiveCleanupScanLock.lock()
+        var installed = false
+        do {
+            let generation = try dbQueue.writeWithoutTransaction {db -> Int? in
+                try db.inSavepoint {try ArchiveCleanupScanJournal.install(db);return .commit}
+                return try Int.fetchOne(db,sql:"PRAGMA data_version")
+            }
+            installed = true
+            let scan = try readers.read {db -> PreparedArchiveCleanupScan? in
+                for id in try self.dueArchiveCleanupJobIDs(db,nowMS:nowMS) {
+                    guard let job = try? self.cleanupJobDecode(self.record(db,id,type:"cleanup_job")),nowMS >= job.notBeforeMS,job.items.contains(where: {!$0.terminal}),
+                          let task = try? self.scoped(db,job.taskID.text,job.projectID.text,type:"task"),bool(task,"archived") else {continue}
+                    let attachments = try self.archiveCleanupJobAttachments(db,job:job,task:task)
+                    guard !attachments.isEmpty else {continue}
+                    return try self.scanArchiveCleanupJobSnapshot(db,taskID:job.taskID.text,attachments:attachments,generation:generation)
+                }
+                return nil
             }
             if let scan {archiveCleanupScanObserver?();return scan}
         } catch {}

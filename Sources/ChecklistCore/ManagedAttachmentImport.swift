@@ -43,6 +43,7 @@ extension CommandRouter {
     /// A pending parent owns its principal+UUID before there is a receipt.
     /// The caller's current scope is checked before any intent observation.
     func requirePendingCommandIntent(_ db: Database,command: String,digest: String,caller: Caller) throws {
+        try requirePendingOperationIntent(db,command:command,digest:digest,caller:caller)
         try requirePendingStorageCommand(db,command:command,digest:digest,caller:caller)
         try requirePendingExportIntent(command:command,digest:digest,caller:caller)
         let key = try managedImportKey(principal:caller.principal,command:command)

@@ -26,6 +26,7 @@ retains unknown identities/statuses/use and never stops a running slot. For an
 owned bounded check, save external evidence and use `check --destroy-after-check`
 or destroy its slot after the GUI closes; retain promotion slots until finished.
 See [local cleanup](../../../docs/monorepo-workspace.md#local-build-and-hand-in-cleanup).
+At each round boundary, run `python3 script/clean_scratch.py --release-done`, then `python3 script/clean_builds.py --apply --evidence-notes <round evidence>/evidence-notes.jsonl --post-notes` and the `clean_scratch.py --apply` step (CL-359); no manual Trash step is needed.
 This complements the session scratch cleanup below; neither command authorizes
 retiring an active pass or its evidence.
 

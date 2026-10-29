@@ -26,6 +26,10 @@ BUILD_NAMES = {'.build', 'CompilationCache.noindex', 'CompilationCache', 'module
 QUIET_SECONDS = 45 * 60
 UNMARKED_AGE_SECONDS = 7 * 24 * 60 * 60
 WORKSPACE_MARKER = '.checklist-workspace.json'
+TICKET = re.compile(r'[A-Z][A-Z0-9]*-\d+')
+# Status categories that end a ticket's work; its registered folders may retire (CL-359).
+FINISHED = {'done', 'canceled', 'cancelled'}
+DEFAULT_BUDGET_GB = 50.0
 # Bound memory and argv while amortizing process inspection and native Trash startup.
 ITEM_BATCH_SIZE = 32
 MOVE_BATCH_SIZE = 256
@@ -180,7 +184,17 @@ def read_marker(root):
         raise ValueError('invalid workspace marker: ' + str(path))
     if 'source_fingerprint' in value:
         validate_fingerprint(value['source_fingerprint'])
+    for field in ('tickets', 'released_for_tickets'):
+        if field in value:
+            validate_tickets(value[field])
     return value
+
+
+def validate_tickets(values):
+    if (not isinstance(values, list) or not values
+            or any(not isinstance(v, str) or not TICKET.fullmatch(v) for v in values)):
+        raise ValueError('ticket keys must be a nonempty list of keys such as CL-10')
+    return sorted(set(values))
 
 
 def validate_fingerprint(value):
@@ -199,12 +213,13 @@ def caller_session(session_id=None):
     return value
 
 
-def mark_qualification(root, fingerprint, purpose, session_id=None):
+def mark_qualification(root, fingerprint, purpose, session_id=None, tickets=None):
     return write_marker(root, caller_session(session_id), purpose,
-                        source_fingerprint=validate_fingerprint(fingerprint))
+                        source_fingerprint=validate_fingerprint(fingerprint), tickets=tickets)
 
 
-def write_marker(root, session_id, purpose=None, release=False, source_fingerprint=None):
+def write_marker(root, session_id, purpose=None, release=False, source_fingerprint=None,
+                 tickets=None, released_for_tickets=None):
     """Only the recorded owner marks/releases a workspace; interrupted writes keep safe."""
     if root.is_symlink() or not root.is_dir():
         raise ValueError('workspace must be an existing directory, not a link')
@@ -224,6 +239,13 @@ def write_marker(root, session_id, purpose=None, release=False, source_fingerpri
     value.update(version=1, session_id=session_id, purpose=previous['purpose'] if release else purpose)
     if source_fingerprint is not None:
         value['source_fingerprint'] = validate_fingerprint(source_fingerprint)
+    if tickets is not None:
+        value['tickets'] = validate_tickets(tickets)
+    if release and released_for_tickets is not None:
+        value['released_for_tickets'] = validate_tickets(released_for_tickets)
+    elif not release:
+        # Re-marking makes the folder persistent again; an earlier ticket release ends.
+        value.pop('released_for_tickets', None)
     value['released'] = release
     # Write beside the marker, then atomically publish. An interrupted temporary
     # file is preserved as unknown bytes; an existing protection stays in place.
@@ -235,6 +257,152 @@ def write_marker(root, session_id, purpose=None, release=False, source_fingerpri
         temporary = Path(output.name)
     os.replace(temporary, root / WORKSPACE_MARKER)
     return value
+
+
+def ticket_released(item):
+    """A root released because all its registered tickets ended retires whole (CL-359)."""
+    try:
+        marker = None if item.is_symlink() else read_marker(item)
+    except (OSError, ValueError):
+        return False
+    return bool(marker and marker['released'] and marker.get('tickets')
+                and marker.get('released_for_tickets') == marker['tickets'])
+
+
+def scratch_roots(sessions):
+    """Scratchpads of every session below Checklist and spare-process hosts."""
+    return [session / 'scratchpad' for host in children(sessions)
+            if 'Checklist' in host.name or 'spare-' in host.name
+            for session in children(host)
+            if not session.is_symlink() and not (session / 'scratchpad').is_symlink()
+            and (session / 'scratchpad').is_dir()]
+
+
+def ticket_roots(sessions, qualification, session_id):
+    """Marked roots in the caller's scratch (two levels) and qualification runs."""
+    found = []
+    for scratch in scratch_roots(sessions):
+        if scratch.parent.name != session_id:
+            continue
+        for item in children(scratch):
+            for path in (item, *children(item)):
+                if path.is_dir() and not path.is_symlink() and os.path.lexists(path / WORKSPACE_MARKER):
+                    found.append(path)
+    found += [item for item in children(qualification)
+              if item.is_dir() and not item.is_symlink() and os.path.lexists(item / WORKSPACE_MARKER)]
+    return found
+
+
+def release_finished(roots, session_id, read_status):
+    """Release each caller-owned root whose registered tickets are all Done or canceled."""
+    failed = False
+    for root in roots:
+        try:
+            marker = read_marker(root)
+            if not marker or marker['session_id'] != session_id:
+                continue
+            tickets = marker.get('tickets')
+            report = {'path': str(root), 'tickets': tickets or []}
+            if marker['released']:
+                report.update(action='already_released')
+            elif not tickets:
+                report.update(action='kept', reason='no ticket registered; re-mark with --ticket or release by hand')
+            else:
+                statuses = read_status(tickets)
+                unfinished = [key for key in tickets if statuses.get(key) not in FINISHED]
+                if unfinished:
+                    report.update(action='kept', reason='open or unknown ticket status: ' + ', '.join(unfinished))
+                else:
+                    write_marker(root, session_id, release=True, released_for_tickets=tickets)
+                    report.update(action='released',
+                                  reason='all tickets Done or canceled; the whole folder retires at the next apply')
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+            report = {'path': str(root), 'action': 'kept_error', 'reason': str(error)}
+            failed = True
+        print(json.dumps(report, sort_keys=True), flush=True)
+    return 1 if failed else 0
+
+
+def cli_status_reader(cli, repo, project_id=None):
+    """Read-only ticket statuses through the installed CLI, with cwd at the project folder."""
+    project = project_id
+    def call(method, arguments):
+        result = subprocess.run([str(cli), 'call', method, json.dumps(arguments)], cwd=repo,
+                                capture_output=True, text=True, check=True, timeout=60)
+        return json.loads(result.stdout)['data']
+    def read(keys):
+        nonlocal project
+        if not project:
+            projects = call('project_resolve', {'workspace_path': str(repo)})['projects']
+            if len(projects) != 1:
+                raise ValueError('project scope ambiguous; supply --project-id')
+            project = projects[0]['id']
+        result = {}
+        for key in keys:
+            data = call('task_get', {'project_id': project, 'key': key})
+            if data.get('key') != key:
+                raise ValueError('task_get returned another ticket for ' + key)
+            result[key] = data.get('status_category')
+        return result
+    return read
+
+
+def du_sizes(paths):
+    """Allocated sizes from one du call (no hashing); missing roots are absent."""
+    existing = [path for path in paths if os.path.lexists(path)]
+    if not existing:
+        return {}
+    result = subprocess.run(['/usr/bin/du', '-sk', *map(str, existing)], capture_output=True, text=True)
+    sizes = {}
+    for line in result.stdout.splitlines():
+        kilobytes, _, name = line.partition('\t')
+        if kilobytes.isdigit():
+            sizes[Path(name)] = int(kilobytes) * 1024
+    return sizes
+
+
+def storage_groups(sessions, qualification, repo):
+    return {'scratch': scratch_roots(sessions), 'evidence': [repo / '.local/evidence'],
+            'build': [repo / '.local/build'], 'qualification': [qualification]}
+
+
+def storage_report(groups, budget_bytes, sizer=None):
+    """Print one size line per run and warn loudly above the budget."""
+    sizer = sizer or du_sizes
+    totals = {label: sum(sizer(list(paths)).values()) for label, paths in groups.items()}
+    total = sum(totals.values())
+    report = {'action': 'size_report', 'groups': totals, 'total_bytes': total,
+              'budget_bytes': int(budget_bytes), 'over_budget': total > budget_bytes,
+              'size_method': 'du -sk (allocated bytes)',
+              'trash_note': 'bytes moved to the Trash stay on disk until the owner empties the Trash'}
+    print(json.dumps(report, sort_keys=True), flush=True)
+    if total > budget_bytes:
+        print('WARNING: CLEANUP BUDGET EXCEEDED: scratch, evidence, build and qualification folders use '
+              f'{total / 1e9:.1f} GB, above the {budget_bytes / 1e9:.0f} GB budget. Run --release-done, '
+              'then apply cleanup at this round boundary.', file=sys.stderr, flush=True)
+    return report
+
+
+def held_preview(item, kind, keep, sizer=None):
+    """Preview a held root from its marker and a du size: no inventory or hashing."""
+    if item.is_symlink():
+        return None
+    try:
+        marker = read_marker(item)
+    except (OSError, ValueError):
+        return None
+    if any(overlap(item, path) for path in keep):
+        reason = 'explicitly retained qualified copy or persistent build slot'
+    elif marker and not marker['released']:
+        reason = 'persistent workspace marker; retained: ' + str(item)
+    else:
+        return None
+    size = (sizer or du_sizes)([item]).get(item, 0)
+    return {'path': str(item), 'kind': kind, 'action': 'preview', 'reason': reason,
+            'total_bytes': size, 'kept_bytes': size, 'build_bytes': 0, 'git_redundant_source_bytes': 0,
+            'qualification_bytes': 0, 'reasons': {reason: size}, 'retained_legacy_paths': [],
+            'size_method': 'du -sk (allocated bytes)',
+            'tickets': (marker or {}).get('tickets', []), 'eligible_paths': [], 'planned_move_count': 0}
 
 
 def released_by(root, session_id=None):
@@ -282,7 +450,9 @@ def session_items(item):
         if (item.is_symlink() or not item.is_dir() or read_marker(item) is not None
                 or re.fullmatch(r'ws[a-z]*\d+', item.name) or private_copy(item)):
             return [item]
-        copies = [child for child in children(item) if private_copy(child)]
+        # A ticket-registered child (CL-359) is its own candidate, like a private copy.
+        copies = [child for child in children(item)
+                  if private_copy(child) or os.path.lexists(child / WORKSPACE_MARKER)]
         return copies or [item]
     except (OSError, ValueError):
         return [item]
@@ -359,9 +529,11 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
     files = {path: entry for path, entry in before.items() if not stat.S_ISDIR(entry[2])}
     size = sum(entry[3] for entry in files.values())
     reason = None
+    # A root released for ended tickets retires whole: no per-file hashing (CL-359).
+    ticket_retire = ticket_released(item)
     if item.is_symlink():
         reason = 'symbolic link; never followed'
-    elif kind == 'spare' and not any(
+    elif kind == 'spare' and not ticket_retire and not any(
         path.name == 'Package.swift' and stat.S_ISREG(entry[2]) and
         blob_id(path) in objects and b'"Checklist"' in path.read_bytes()
         for path, entry in files.items()
@@ -399,11 +571,14 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
     # Only an explicitly fingerprinted, released root authorizes disposal of
     # unique copied stores. Legacy workspace markers retain byte-only cleanup.
     retire_run = kind == 'qualification' and bool((read_marker(item) or {}).get('source_fingerprint'))
-    if retire_run and not reason and any(
+    whole = retire_run or ticket_retire
+    if retire_run and not ticket_retire and not reason and any(
             not stat.S_ISREG(entry[2]) or '.git' in path.relative_to(item).parts
             for path, entry in files.items()):
         reason = 'qualification run contains links, special files or Git metadata; retained'
     counts = Counter(build_bytes=0, git_redundant_source_bytes=0, qualification_bytes=0, kept_bytes=0)
+    if ticket_retire:
+        counts['ticket_bytes'] = 0
     reasons = Counter()
     removable = set()
     for path, entry in files.items():
@@ -415,7 +590,9 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
         if not why and any(within(path, root) for root in legacy):
             why = 'unmarked legacy persistent workspace; mark before retirement'
         if not why:
-            if retire_run:
+            if ticket_retire:
+                category, why = 'ticket_bytes', 'tickets Done or canceled; released folder retires whole'
+            elif retire_run:
                 category, why = 'qualification_bytes', 'released obsolete qualification run (including copied stores)'
             elif not stat.S_ISREG(entry[2]):
                 why = 'link or special file; never followed or moved'
@@ -447,7 +624,7 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None):
         # Empty folders can accompany an eligible tree, but never override an
         # item-wide hold or remove even empty Git metadata.
         removable_tree[path] = (not reason and not any(within(path, root) for root in legacy)
-                                 and '.git' not in (item.name,) + path.relative_to(item).parts
+                                 and (whole or '.git' not in (item.name,) + path.relative_to(item).parts)
                                  and all(removable_tree[p] for p in children_by_parent.get(path, []))
                                ) if stat.S_ISDIR(entry[2]) else path in removable
     def select(path):
@@ -678,6 +855,10 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
                 # An old --preview is never an executable deletion plan.
                 if not in_scope(item, kind, session_id, include_released):
                     raise ValueError('workspace ownership/release changed; retained')
+                # Preview reads a held root's marker and du size only (CL-359 speed).
+                if not apply and (held := held_preview(item, kind, keep)):
+                    print(json.dumps(held, sort_keys=True))
+                    continue
                 decision = plan(item, kind, objects, [item] if item in used else [], fingerprint, keep, clock())
                 public = {key: value for key, value in decision.items() if key not in {'inventory', 'moves', 'move_bytes'}}
                 public['action'] = 'preview'
@@ -709,9 +890,21 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--mark', type=Path, help='protect a persistent workspace owned by this session')
     mode.add_argument('--release', type=Path, help='release your marked workspace for later cleanup')
+    mode.add_argument('--release-ticket', action='append', metavar='KEY',
+                      help='release every marked folder of yours whose tickets are all named here (repeatable)')
+    mode.add_argument('--release-done', action='store_true',
+                      help='release every marked folder of yours whose tickets are all Done or canceled (read-only status check)')
     mode.add_argument('--preview', action='store_true')
     mode.add_argument('--apply', action='store_true', help='move eligible paths to macOS Trash; never permanently delete')
     parser.add_argument('--purpose', help='workspace purpose; required with --mark')
+    parser.add_argument('--ticket', action='append', metavar='KEY',
+                        help='with --mark: owning ticket key (repeatable); required for a new mark')
+    parser.add_argument('--cli', type=Path, default=Path('/Applications/Checklist.app/Contents/MacOS/checklist'),
+                        help='with --release-done: installed Checklist CLI used for read-only task_get calls')
+    parser.add_argument('--project-id', help='with --release-done: project ID (default: resolved from --repo)')
+    parser.add_argument('--budget-gb', type=float,
+                        default=float(os.environ.get('CHECKLIST_CLEANUP_BUDGET_GB', DEFAULT_BUDGET_GB)),
+                        help='warn when scratch, evidence, build and qualification folders exceed this size')
     parser.add_argument('--source-fingerprint', type=validate_fingerprint,
                         help='with --mark: bind a disposable qualification run to its exact build source fingerprint')
     parser.add_argument('--session-id', default=os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID') or os.environ.get('CHECKLIST_SESSION_ID'),
@@ -734,18 +927,44 @@ def main():
         parser.error('--source-fingerprint is only valid with --mark')
     if args.purpose is not None and args.mark is None:
         parser.error('--purpose is only valid with --mark')
+    if args.ticket is not None and args.mark is None:
+        parser.error('--ticket is only valid with --mark')
+    if args.ticket is not None and any(not TICKET.fullmatch(key) for key in args.ticket):
+        parser.error('--ticket must be a ticket key such as CL-10')
+    if args.mark is not None and not args.ticket:
+        try:
+            registered = (read_marker(args.mark.expanduser()) or {}).get('tickets')
+        except (OSError, ValueError):
+            registered = None
+        if not registered:
+            parser.error('--mark requires --ticket KEY (repeatable): register every new work folder with its tickets')
+    sessions = args.sessions_root.expanduser()
+    qualification = args.qualification_root.expanduser()
+    if args.release_ticket is not None or args.release_done:
+        if args.release_ticket is not None:
+            if any(not TICKET.fullmatch(key) for key in args.release_ticket):
+                parser.error('--release-ticket must be a ticket key such as CL-10')
+            named = set(args.release_ticket)
+            reader = lambda keys: {key: 'done' for key in keys if key in named}
+        else:
+            reader = cli_status_reader(args.cli.expanduser(), args.repo.expanduser().resolve(), args.project_id)
+        return release_finished(ticket_roots(sessions, qualification, args.session_id), args.session_id, reader)
     if args.mark is not None or args.release is not None:
         root = (args.mark if args.mark is not None else args.release).expanduser()
-        value = write_marker(root, args.session_id, args.purpose, args.release is not None, args.source_fingerprint)
+        value = write_marker(root, args.session_id, args.purpose, args.release is not None, args.source_fingerprint,
+                             tickets=args.ticket)
         print(json.dumps({'path': str(root.resolve()), 'action': 'released' if args.release else 'marked', **value}))
         return 0
     for root in [args.sessions_root.expanduser(), args.qualification_root.expanduser()]:
         if root.is_symlink():
             parser.error('scratch roots must not be symbolic links: ' + str(root))
-    return clean(args.sessions_root.expanduser().resolve(), args.qualification_root.expanduser().resolve(),
-                 args.repo.expanduser().resolve(), args.installed_info.expanduser(),
-                 [path.expanduser().resolve() for path in args.keep_qualified], args.apply,
-                 session_id=args.session_id, include_released=args.include_released)
+    result = clean(args.sessions_root.expanduser().resolve(), args.qualification_root.expanduser().resolve(),
+                   args.repo.expanduser().resolve(), args.installed_info.expanduser(),
+                   [path.expanduser().resolve() for path in args.keep_qualified], args.apply,
+                   session_id=args.session_id, include_released=args.include_released)
+    storage_report(storage_groups(sessions.resolve(), qualification.resolve(), args.repo.expanduser().resolve()),
+                   args.budget_gb * 1e9)
+    return result
 
 
 if __name__ == '__main__':

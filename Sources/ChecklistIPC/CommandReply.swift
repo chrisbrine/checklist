@@ -39,6 +39,21 @@ public enum CommandReply {
             throw ChecklistError(code, message, details: details)
         }
         guard let data = object["data"] as? [String: Any] else { throw ambiguous("missing_result_data") }
+        // Long reads and writes both return a durable acceptance receipt. Its
+        // metadata is not the original command's semantic result, even on replay.
+        if object["command_outcome"] as? String == "accepted" {
+            guard let identity = object["command_id"] as? String,
+                  UUID(uuidString: identity) != nil,
+                  data["command_id"] as? String == identity,
+                  let operation = data["operation_id"] as? String, UUID(uuidString: operation) != nil,
+                  data["method"] as? String == method,
+                  ["queued", "running", "succeeded", "failed"].contains(data["state"] as? String ?? ""),
+                  data["status_method"] as? String == "operation_get" else { throw ambiguous("invalid_operation_receipt") }
+            return object
+        }
+        if !["operation_get", "command_status"].contains(method), data["status_method"] as? String == "operation_get" {
+            throw ambiguous("missing_operation_acceptance")
+        }
         if expectsMutation(method) {
             guard let commandID, object["command_id"] as? String == commandID else { throw ambiguous("missing_mutation_identity") }
             if object["command_outcome"] as? String == "queued" {

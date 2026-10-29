@@ -7,7 +7,7 @@ extension CommandRouter {
     func toolCatalog(_ c: Caller) -> [JSON] {
         let common = ["project_id","command_id","expected_revision"]
         var fields: [String:[String]] = [
-            "service_info":[],"command_status":["command_id"],"project_list":["include_archived"],"project_resolve":["workspace_path"],"project_settings_get":[],"policy_get":["revision","task_id"],"taxonomy_get":["revision"],
+            "service_info":[],"command_status":["command_id"],"operation_get":["operation_id"],"project_list":["include_archived"],"project_resolve":["workspace_path"],"project_settings_get":[],"policy_get":["revision","task_id"],"taxonomy_get":["revision"],
             "session_attach_task":["task_id"],"session_register":["label","provider","workspace_path"],"session_update":["state","observation"],"session_list":["task_id",
                 "include_ended","cursor","limit"],"session_inbox":["cursor","attempt_id","limit"],"assistant_inbox":["task_id","cursor","limit"],"assistant_projects":[],
             "task_create":["title","brief","acceptance","kind","planned_assignee","assignment_reason","tag_ids","epic_id","owner_request_ref"],"task_get":["task_id","key"],
@@ -128,7 +128,7 @@ extension CommandRouter {
                 fields[method] = [] // Complete, closed schemas are shared with worker validation below.
             }
         }
-        let reader: Set<String> = ["service_info","command_status","project_list","project_resolve","project_settings_get","policy_get","taxonomy_get","session_list","task_create","task_get",
+        let reader: Set<String> = ["service_info","command_status","operation_get","project_list","project_resolve","project_settings_get","policy_get","taxonomy_get","session_list","task_create","task_get",
             "task_list","task_context","message_send","message_ack","message_delivery_list","history_list","agent_resolve","agent_message_send","attachment_list","attachment_read",
             "attachment_add","review_batch_inputs"]
         let assistants = reader.union(["assistant_projects","assistant_inbox"])
@@ -147,7 +147,7 @@ extension CommandRouter {
     }
     func catalogEntry(name: String, extra: [String], caller c: Caller, common: [String]) -> JSON {
         if c.role == "worker", let schema = MediaWorkerContract.inputSchema(name) {
-            return ["name":name,"description":description(name),"inputSchema":schema,
+            return ["name":name,"description":description(name) + (Self.alwaysOperationMethods.contains(name) || Self.sourceCaptureMethods.contains(name) || Self.operationEvidenceMethods.contains(name) || ["task_archive","attachment_add","attachment_read","project_edit","project_settings_save"].contains(name) ? " Potentially long work returns command_outcome=accepted with operation_id and state immediately; read operation_get with that ID and project_id until succeeded or failed. Reuse the original command_id for replay." : ""),"inputSchema":schema,
                 "annotations":["readOnlyHint":MediaWorkerContract.readMethods.contains(name),"idempotentHint":true,"openWorldHint":false]]
         }
         var properties: JSON = [:]
@@ -233,6 +233,7 @@ extension CommandRouter {
         var required: [String] = []
         if !Self.readMethods.contains(name) { required.append("command_id") }
         if name == "command_status" { required.append("command_id") }
+        if name == "operation_get" { required.append("operation_id") }
         if name == "policy_apply" && !c.isOwner { required.append("reason") }
         if name == "project_create" { required.append("name") }
         if !["service_info","project_list","assistant_projects","assistant_inbox","project_resolve","project_create"].contains(name) && !(c.isOwner && ["task_list",
@@ -253,7 +254,7 @@ extension CommandRouter {
             schema["allOf"] = [["oneOf":[["required":["triage_id"],"not":["required":["group_id"]]],["required":["group_id"],"not":["required":["triage_id"]]]]],
                 ["oneOf":[["required":["target_status_id"],"not":["required":["action"]]],["required":["action"],"not":["required":["target_status_id"]]]]]]
         }
-        return ["name":name,"description":description(name),"inputSchema":schema,"annotations":["readOnlyHint":Self.readMethods.contains(name),"idempotentHint":true,"openWorldHint":false]]
+        return ["name":name,"description":description(name) + (Self.alwaysOperationMethods.contains(name) || Self.sourceCaptureMethods.contains(name) || Self.operationEvidenceMethods.contains(name) || ["task_archive","attachment_add","attachment_read","project_edit","project_settings_save"].contains(name) ? " Potentially long work returns command_outcome=accepted with operation_id and state immediately; read operation_get with that ID and project_id until succeeded or failed. Reuse the original command_id for replay." : ""),"inputSchema":schema,"annotations":["readOnlyHint":Self.readMethods.contains(name),"idempotentHint":true,"openWorldHint":false]]
     }
 
     func validateInput(_ method: String,_ p: JSON,_ c: Caller) throws {
@@ -312,7 +313,8 @@ extension CommandRouter {
         case "task_bulk_edit":return "Preview or atomically apply one permitted change to up to 200 revision-checked tickets. Preview defaults true and reports every blocked row; apply (preview=false) changes nothing if any row conflicts. Retry an explicitly selected eligible subset with a new command ID. Status cancel/reopen require changes.reason (up to 4,000 bytes), recorded on every ticket. Status actions keep Triage membership; Done or cancel removes the ticket from its Triage. The returned command receipt supports guarded bulk Undo."
         case "task_bulk_undo":return "Preview or atomically compensate a bulk edit from this connection's original_command_id and current ticket revisions. Undo preserves newer field changes and refuses advanced ownership/review or active claims. Status compensation records a reason naming the original command, plus optional reason (combined limit 4,000 bytes). It adds history, never restores claims or cleaned files. Receipts expire under normal command-journal retention."
         case "service_info":return "Read this build's supported capabilities and current authenticated session. native_recovery lists claims released by this conversation's previous native closure, recovery_required orchestrations and fenced notices; read it before resuming work. Native push is separately qualified."
-        case "command_status":return "Read this caller's original command queued during a backup. Returns queued, applied with its original result envelope, failed with its actual error, or unknown. Supply the original command_id and project_id. Queue acceptance is not completion; never replace the original command UUID while waiting."
+        case "operation_get":return "Read this caller's durable long operation by operation_id and project_id. Returns queued, running, succeeded with the original result envelope, or failed with its error. Acceptance is not completion. Replay only the exact original method, parameters and command_id to reconcile an interrupted operation."
+        case "command_status":return "Read this caller's durable long operation (queued/running/succeeded/failed), or original backup-queued write (queued/applied/failed/unknown). Finished states include the original result envelope or actual error. Supply the original command_id and project_id. Queue acceptance is not completion; never replace the original command UUID while waiting."
         case "agent_resolve":return "Resolve an exact named agent in the enrolled project; duplicate names require disambiguation."
         case "agent_message_send":return "Save a message to a freshly resolved opaque recipient target. Stored pickup is not model acknowledgment."
         case "message_delivery_list":return "Read current delivery metadata for one ticket note with project_id, task_id and message_id, or one ticket-free Triage note with triage_id and message_id. Each delivery shows recipient_role (handler, registered_child, triage_orchestrator) and its copy label. Available to the sender, current handler and any agent with project read scope. Returns exact delivery/recipient/generation, state, push state, timestamps and native_closure_ref when fenced; no note bodies, inbox contents or credentials. No recipient yet returns saved_for_pickup with no invented delivery."

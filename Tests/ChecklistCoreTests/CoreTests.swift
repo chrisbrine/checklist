@@ -486,19 +486,19 @@ final class CoreTests: XCTestCase {
         let a = try call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":path.path]);let read = try call("attachment_read",["project_id":p["id"]!,"attachment_id":a["id"]!,"representation":"original"])
         XCTAssertNotNil(read["read_hold_id"])
         let job = try markCommittedCleanupForCrashFixture(taskID:t["id"] as! String,attachmentID:a["id"] as! String)
-        router = nil;router = try TestStore.router(root:directory)
+        router = nil;router = try TestStore.router(root:directory);try router.runStorageMaintenance() /* CL-345: the service turn scans */
         XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
         let held = try call("attachment_read",["project_id":p["id"]!,"attachment_id":a["id"]!,"representation":"metadata"]);XCTAssertEqual(held["availability"] as? String,"available");try assertCleanupJobHeld(job,attachmentID:a["id"] as! String,reason:.activeReader)
-        _ = try call("attachment_read_release",["project_id":p["id"]!,"read_hold_id":read["read_hold_id"]!]);XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
+        _ = try call("attachment_read_release",["project_id":p["id"]!,"read_hold_id":read["read_hold_id"]!]);try router.runStorageMaintenance();XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
         let t2 = try task(p);let a2 = try call("attachment_add",["project_id":p["id"]!,"task_id":t2["id"]!,"path":path.path]);let restoredJob = try markCommittedCleanupForCrashFixture(taskID:t2["id"] as! String,attachmentID:a2["id"] as! String,archived:false)
-        router = nil;router = try TestStore.router(root:directory);XCTAssertTrue(FileManager.default.fileExists(atPath:a2["path"] as! String));XCTAssertEqual(try call("cleanup_job_get",["project_id":p["id"]!,"cleanup_job_id":restoredJob["id"]!])["state"] as? String,"canceled");XCTAssertEqual(try call("attachment_read",["project_id":p["id"]!,"attachment_id":a2["id"]!])["availability"] as? String,"available")
+        router = nil;router = try TestStore.router(root:directory);try router.runStorageMaintenance() /* CL-345: the service turn scans */;XCTAssertTrue(FileManager.default.fileExists(atPath:a2["path"] as! String));XCTAssertEqual(try call("cleanup_job_get",["project_id":p["id"]!,"cleanup_job_id":restoredJob["id"]!])["state"] as? String,"canceled");XCTAssertEqual(try call("attachment_read",["project_id":p["id"]!,"attachment_id":a2["id"]!])["availability"] as? String,"available")
     }
     func testCleanupRestartRechecksPendingHumanInspection() throws {
         let p = try project();let t = try task(p);let path = directory.appendingPathComponent("inspection-held.bin");try Data(repeating:5,count:21*1024*1024).write(to:path)
         let a = try call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":path.path]);let request = try call("human_request_create",["project_id":p["id"]!,"task_id":t["id"]!,"target_attachment_id":a["id"]!,"questions":[["id":"inspect","type":"approval","prompt":"Inspect the original"]]])
-        let job = try markCommittedCleanupForCrashFixture(taskID:t["id"] as! String,attachmentID:a["id"] as! String);router = nil;router = try TestStore.router(root:directory)
+        let job = try markCommittedCleanupForCrashFixture(taskID:t["id"] as! String,attachmentID:a["id"] as! String);router = nil;router = try TestStore.router(root:directory);try router.runStorageMaintenance() /* CL-345: the service turn scans */
         XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String));let metadata = try call("attachment_read",["project_id":p["id"]!,"attachment_id":a["id"]!]);XCTAssertEqual(metadata["availability"] as? String,"available");try assertCleanupJobHeld(job,attachmentID:a["id"] as! String,reason:.pendingHumanInspection)
-        _ = try call("human_request_cancel",["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":1]);XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
+        _ = try call("human_request_cancel",["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":1]);try router.runStorageMaintenance();XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))
     }
     func testPolicyChangesApplyToFutureAttemptsWithoutRelaxingActiveTarget() throws {
         var p = try project();let t = try ready(p,task(p));let claim = try call("work_claim",["project_id":p["id"]!,"task_id":t["id"]!,"expected_revision":t["revision"]!])
@@ -583,7 +583,7 @@ final class CoreTests: XCTestCase {
     func testCleanupRestartProtectsCurrentQueuedReviewOriginal() throws {
         let value = try submittedArtifact(data:Data(repeating:8,count:21*1024*1024))
         let job = try markCommittedCleanupForCrashFixture(taskID:value.task["id"] as! String,attachmentID:value.artifact["id"] as! String)
-        router = nil;router = try TestStore.router(root:directory)
+        router = nil;router = try TestStore.router(root:directory);try router.runStorageMaintenance() /* CL-345: the service turn scans */
         XCTAssertTrue(FileManager.default.fileExists(atPath:value.artifact["path"] as! String))
         let metadata = try call("attachment_read",["project_id":value.project["id"]!,"attachment_id":value.artifact["id"]!]);XCTAssertEqual(metadata["availability"] as? String,"available");try assertCleanupJobHeld(job,attachmentID:value.artifact["id"] as! String,reason:.currentReview)
     }

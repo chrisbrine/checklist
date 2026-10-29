@@ -221,13 +221,30 @@ Evidence is scoped by ticket keys in folder/file names and `files.json` ticket
 fields. A round folder may explicitly declare **every** owning ticket with
 `cleanup.json` containing `{"tickets":["CL-10","CL-11"]}`. Untagged containers
 and their logs stay; their ticket children can retire separately. Every owning
-ticket must have `status_category: "done"`; open, canceled, missing, ambiguous or
-unreadable statuses retain the evidence. The default status reader uses only
+ticket must have `status_category` `done` or `canceled` (CL-359); open, missing,
+ambiguous or unreadable statuses retain the evidence. The default status reader uses only
 `project_resolve` and paginated `task_list` calls through the installed CLI, with
 its cwd set to the project folder. It never reads the live database directly.
 Alternatively, supply `--project-id ID --status-file PATH` with an explicit
 `{"project_id":"ID","tasks":[{"key":"CL-10","status_category":"done"}]}`
 list. This is an operator-supplied status snapshot; refresh it before applying.
+
+Evidence notes (CL-359): `--evidence-notes PATH` writes one JSON line per owning
+ticket for each evidence folder that retires. The note gives the folder name, file
+count, logical bytes, the SHA-256 of each `notes.md` and `report.md`, the
+`files.json` hand-in paths and the names of the files attached to the ticket
+(read-only `task_get` and `attachment_list`). With `--apply --post-notes`, the
+command sends each note to its ticket with `message_send` (an agent action) before
+the folder moves. If a note fails, the folder stays and the run reports an error.
+Evidence of open tickets stays.
+
+Size budget (CL-359): each `clean_builds.py` and `clean_scratch.py` run ends with
+one `size_report` JSON line. It gives the `du -sk` sizes of the session scratch
+folders, `.local/evidence`, `.local/build` and
+`~/Library/Caches/ChecklistQualification` (a `--only` run reports only its own
+group). Above `--budget-gb` (default 50, or `CHECKLIST_CLEANUP_BUDGET_GB`), the run
+also writes a `WARNING: CLEANUP BUDGET EXCEEDED` line to stderr. Bytes in the Trash
+stay on disk until the owner empties the Trash.
 
 Preview is read-only and apply computes new decisions, inventories and process
 observations. Preview caches one process snapshot for the pass; build apply

@@ -147,6 +147,8 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
         XCTAssertTrue(exists(a));let held = try record(job["id"] as! String,"cleanup_job")
         XCTAssertTrue(((held["items"] as? [JSON])?.first?["holds"] as? [String] ?? []).contains("activeReader"))
         _ = try call("attachment_read_release",["project_id":pid,"read_hold_id":read["read_hold_id"]!])
+        // CL-345: a command's maintenance tail prepares no reference scan; the service turn continues the job.
+        try router.runStorageMaintenance()
         XCTAssertFalse(exists(a));XCTAssertEqual(try record(a["id"] as! String,"attachment")["availability"] as? String,"original_cleaned")
         XCTAssertThrowsError(try call("attachment_read",["project_id":pid,"attachment_id":a["id"]!,"representation":"original"]))
         XCTAssertTrue(FileManager.default.fileExists(atPath:directory.appendingPathComponent("source-0.bin").path))
@@ -166,6 +168,8 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
         XCTAssertTrue(((held["items"] as? [JSON])?.first?["holds"] as? [String] ?? []).contains("activeBuild"))
         try transaction {db in var execution = try router.record(db,executionID,type:"source_execution");execution["state"] = "completed";try router.save(db,router.revised(execution),type:"source_execution")}
         _ = try call("task_archive",["project_id":other["id"]!,"task_id":t["id"]!,"expected_revision":t["revision"]!,"action":"archive","cleanup":false])
+        // CL-345: a command's maintenance tail prepares no reference scan; the service turn continues the job.
+        try router.runStorageMaintenance()
         XCTAssertFalse(exists(a))
     }
     func testHardlinkAndRealBackupSurviveWithNoInventedPhysicalReclaimCount() throws {
@@ -198,6 +202,8 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
         XCTAssertEqual(try record(a["id"] as! String,"attachment")["availability"] as? String,"available")
         router.dbQueue.writeWithoutTransaction { _ = sqlite3_set_authorizer($0.sqliteConnection,nil,nil) }
         router = nil;router = try TestStore.router(root:directory.appendingPathComponent("store"))
+        // CL-345: a command's maintenance tail prepares no reference scan; the service turn continues the job.
+        try router.runStorageMaintenance()
         let recovered = try call("cleanup_job_get",["project_id":f.project["id"]!,"cleanup_job_id":job["id"]!])
         XCTAssertEqual(recovered["state"] as? String,"completed")
         XCTAssertEqual(try ArchiveCleanupJob.integer(recovered["already_missing_logical_original_bytes"]),64)

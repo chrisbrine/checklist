@@ -22,7 +22,8 @@ func responseData(_ response: [String: Any]) -> [String: Any] {
 /// The synchronous IPC and installed-shim paths may wait on semaphores or child
 /// processes. Keep the actor's serial jobs on a dispatch worker rather than the
 /// cooperative executor. Actor isolation still owns all JSON and client state;
-/// only the runtime's Sendable job handle crosses to the queue.
+/// only the runtime's Sendable job handle crosses to the queue. A connected MCP
+/// tool call runs its service request or child CLI off this queue (CL-352).
 final class BridgeBlockingExecutor: SerialExecutor {
     let queue = DispatchQueue(label: "org.checklist.mcp.bridge-blocking")
 
@@ -56,8 +57,25 @@ public actor Bridge {
     private var setupCompletionPending = false
     private var registryStart = ClaudeRegistryStart()
     private(set) var setupNotice: String?
-    var connectionNotice: String? { registryStart.notice }
-    var connectionStartupNotice: String? { registryStart.startupNotice }
+    /// The last MCP connection attempt failed only because the service did not answer.
+    private var serviceError: Error?
+    /// A hard MCP startup error outside bootstrap; reported as a tool error, never retried.
+    private var startupError: Error?
+    /// The service wait in progress; concurrent requests share it instead of repeating it.
+    private var serviceWaitTask: Task<Bool, Error>?
+    public static let serviceWaitLimit: TimeInterval = 60
+    static let serviceWaitStep: TimeInterval = 2
+    /// The startup connection attempt's reply budget, so initialize answers in about
+    /// 3 s even while the service stalls (Codex's default MCP startup limit is 10 s).
+    public static let startupConnectBudget: TimeInterval = 2
+    private var waitNotice: String? {
+        if let serviceError {
+            return "This conversation is not connected yet. The Checklist service did not answer (\(serviceError.localizedDescription)) Each request waits for the service and connects by itself; no reconnect is needed."
+        }
+        return startupError.map { "This conversation is not connected yet. " + $0.localizedDescription }
+    }
+    var connectionNotice: String? { waitNotice ?? registryStart.notice }
+    var connectionStartupNotice: String? { waitNotice ?? registryStart.startupNotice }
 
     public init(configuration: BridgeConfiguration, environment: BridgeEnvironment = .init()) {
         self.environment = environment
@@ -74,7 +92,8 @@ public actor Bridge {
         if let notice = setupNotice ?? connectionStartupNotice { environment.stderr("Checklist: \(notice)\n") }
     }
 
-    public func connect(required: Bool = false) throws -> Value? {
+    /// `timeBudget` caps each bootstrap attempt's reply budget; nil keeps the client's default.
+    public func connect(required: Bool = false, timeBudget: TimeInterval? = nil) throws -> Value? {
         checkInstalledBuild()
         if delegating { return nil }
         if let bootstrapResponse { return bootstrapResponse }
@@ -95,7 +114,10 @@ public actor Bridge {
         }
         return try start.start(command: command, assistantRelay: assistantProject != nil,
             now: environment.now, sleep: environment.sleep, discover: { self.discover() },
-            bootstrap: { try self.bootstrap($0, required: required, timeBudget: $1) })
+            bootstrap: { observed, budget in
+                let capped = timeBudget.map { cap in budget.map { min($0, cap) } ?? cap } ?? budget
+                return try self.bootstrap(observed, required: required, timeBudget: capped)
+            })
     }
 
     private func discover() -> NativeSessionDiscovery {
@@ -187,9 +209,75 @@ public actor Bridge {
         return changed || (!hadSetupContext && setupContext != nil)
     }
 
-    public func verifySession() throws {
+    /// MCP startup never ends the process. A service that does not answer leaves a
+    /// limited catalog and a lazy wait; other errors stay visible as tool errors.
+    /// The attempt is bounded by `startupConnectBudget`; a reply timeout is a service
+    /// wait, so the first request connects lazily with the full wait.
+    public func startConnection() {
+        let started = environment.now()
+        do {
+            _ = try connect(timeBudget: Self.startupConnectBudget)
+            try verifySession(replyTimeout: max(0.5, Self.startupConnectBudget - (environment.now() - started)))
+        }
+        catch { recordConnectionFailure(error) }
+    }
+
+    private func recordConnectionFailure(_ error: Error) {
+        bootstrapResponse = nil
+        client = environment.makeClient(.init(workspace: requestedWorkspace, usesStoredCredential: false))
+        serviceError = ServiceWait.applies(error) ? error : nil
+        startupError = serviceError == nil && registryStart.error == nil ? error : nil
+    }
+
+    /// While the service does not answer, wait with backoff up to `limit`, start its
+    /// launchd job at most once when launchd reports it not running, and connect.
+    /// True: this request connected. After the bound: a retryable error; the next
+    /// request waits again.
+    /// A request that arrives during another request's wait shares that wait (one
+    /// connect attempt at a time) and gets false, so the catalog notice is sent once.
+    func awaitService(limit: TimeInterval = Bridge.serviceWaitLimit) async throws -> Bool {
+        if let serviceWaitTask { _ = try await serviceWaitTask.value; return false }
+        guard serviceError != nil else { return false }
+        let wait = Task { try await self.waitForService(limit: limit) }
+        serviceWaitTask = wait
+        defer { serviceWaitTask = nil }
+        return try await wait.value
+    }
+
+    private func waitForService(limit: TimeInterval) async throws -> Bool {
+        let started = environment.now()
+        var pause: TimeInterval = 0.25, startRequested = false
+        while true {
+            guard let failure = attemptService() else {
+                if registryStart.error == nil, startupError == nil { environment.stderr("Checklist: connected after waiting \(Int(((environment.now() - started) * 1000).rounded())) ms for the service.\n") }
+                return true
+            }
+            if !startRequested, ServiceWait.notRunning(failure), environment.serviceJobRunning() == false {
+                startRequested = true
+                do { try environment.startService() }
+                catch { environment.stderr("Checklist: The service job did not start yet: \(error.localizedDescription)\n") }
+            }
+            let left = limit - (environment.now() - started)
+            guard left > 0 else {
+                throw ChecklistError("SERVICE_NOT_READY", "The Checklist service did not answer within \(Int(limit)) s (\(failure.localizedDescription)) No command was sent. Retry the request; it waits for the service again and connects by itself.",
+                    details: ["retryable": true, "command_outcome": "not_sent", "command_executed": false, "last_code": (failure as? ChecklistError)?.code ?? "unknown"])
+            }
+            environment.sleep(min(pause, left)); pause = min(pause * 2, Self.serviceWaitStep)
+            await Task.yield()
+        }
+    }
+
+    /// One full startup connection attempt. Nil unless the service still does not answer.
+    private func attemptService() -> Error? {
+        do { _ = try connect(); try verifySession() }
+        catch { recordConnectionFailure(error); return serviceError }
+        serviceError = nil; startupError = nil
+        return nil
+    }
+
+    public func verifySession(replyTimeout: TimeInterval? = nil) throws {
         guard registryStart.error == nil else { return }
-        do { try verifyBoundSession() }
+        do { try verifyBoundSession(replyTimeout: replyTimeout) }
         catch let error as ChecklistError where error.code == ClientUpdateRequired.code && environment.shimUpdate != nil {
             checkInstalledBuild(force: true, refused: true)
         }
@@ -202,9 +290,9 @@ public actor Bridge {
         }
     }
 
-    private func verifyBoundSession() throws {
+    private func verifyBoundSession(replyTimeout: TimeInterval? = nil) throws {
         guard !delegating, let expectedSession else { return }
-        let info = responseData(try client.call("service_info"))
+        let info = responseData(try client.call("service_info", [:], replyTimeout: replyTimeout))
         let caller = info["caller"] as? [String: Any]
         let boundSession = info["session_id"] as? String ?? caller?["session_id"] as? String
         guard boundSession == expectedSession else {
@@ -269,11 +357,15 @@ public actor Bridge {
             if setupContext != nil { tools.append(Self.workspaceProjectCreate) }
             return tools
         }
+        return try Self.catalogTools(client)
+    }
+
+    private static func catalogTools(_ client: any BridgeClient) throws -> [Tool] {
         let catalog: [String: Any]
         do { catalog = responseData(try client.call("tool_catalog")) }
         catch let error as ChecklistError where error.code == "SETUP_REQUIRED" {
             // First connection still initializes cleanly and explains pairing.
-            return [Self.limitedServiceInfo("Read limited local service status. Connect from the current Codex or Claude conversation with checklist connect; no session-ID form is needed.")]
+            return [limitedServiceInfo("Read limited local service status. Connect from the current Codex or Claude conversation with checklist connect; no session-ID form is needed.")]
         }
         guard let rows = catalog["tools"] as? [[String: Any]] else {
             throw BridgeError("Checklist returned an invalid tool catalog. Repair or update the installed app.")
@@ -290,8 +382,77 @@ public actor Bridge {
         try forward(current: { try localCall(name, arguments) }, delegate: { try delegateCall(name, arguments) })
     }
 
+    /// What a tool call needs from actor state, captured so its blocking service
+    /// request or child CLI run happens off the actor's serial queue (CL-352).
+    private enum CallRoute: Sendable {
+        case service(any BridgeClient, checksCatalog: Bool)
+        case delegate(DelegateTarget)
+    }
+
+    /// Nil: the call needs actor state throughout (not connected, limited or setup states).
+    private func callRoute() -> CallRoute? {
+        if delegating { return .delegate(delegateTarget()) }
+        guard startupError == nil, serviceError == nil, registryStart.error == nil, registryStart.connection == nil,
+              connectionNotice == nil, setupNotice == nil, setupContext == nil else { return nil }
+        return .service(client, checksCatalog: command != "call")
+    }
+
+    /// The MCP tool call. Several calls of one conversation are in flight at once and
+    /// each waits only for its own reply. The route (bound client, identity, workspace
+    /// and native context) is read on the actor; the request runs on a dispatch worker;
+    /// notices are applied on the actor. The arguments, including command_id, pass unchanged.
+    public nonisolated func concurrentCall(_ name: String, _ arguments: Value) async throws -> Value {
+        guard let route = await callRoute() else { return try await call(name, arguments) }
+        let reply: Data
+        do {
+            switch route {
+            case .delegate(let target): return try await Self.offload { try Self.runDelegateCall(target, name, arguments) }
+            case .service(let client, let checksCatalog): reply = try await Self.offload { try Self.serviceCall(client, checksCatalog: checksCatalog, name, arguments) }
+            }
+        } catch let error as ChecklistError where error.code == ClientUpdateRequired.code {
+            if case .service = route, await refuseOutdatedClient() { return try await call(name, arguments) }
+            throw Self.reconnectGuidance(error)
+        } catch { throw Self.reconnectGuidance(error) }
+        return try await finishServiceCall(reply)
+    }
+
+    public nonisolated func concurrentReadResource(_ uri: String) async throws -> Value {
+        if uri == "checklist://projects" { return try await concurrentCall("project_list", .object([:])) }
+        return try await readResource(uri)
+    }
+
+    private static func serviceCall(_ client: any BridgeClient, checksCatalog: Bool, _ name: String, _ arguments: Value) throws -> Data {
+        if checksCatalog, try !catalogTools(client).contains(where: { $0.name == name }) {
+            throw BridgeError("METHOD_UNAVAILABLE: This tool is unavailable to the paired connection: \(name)")
+        }
+        guard let parameters = try jsonObject(arguments) as? [String: Any] else {
+            throw BridgeError("Tool arguments must be a JSON object.")
+        }
+        return try jsonData(client.call(name, parameters))
+    }
+
+    private func finishServiceCall(_ reply: Data) throws -> Value {
+        guard let response = try JSONSerialization.jsonObject(with: reply) as? [String: Any] else {
+            throw BridgeError("INVALID_RESPONSE: Checklist returned no result object.")
+        }
+        return try mcpValue(withSetupNotice(response))
+    }
+
+    /// Same as `forward`: a refused outdated client switches to the installed CLI.
+    private func refuseOutdatedClient() -> Bool {
+        guard environment.shimUpdate != nil else { return false }
+        checkInstalledBuild(force: true, refused: true)
+        return true
+    }
+
+    private static func offload<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { continuation.resume(with: Result { try work() }) }
+        }
+    }
+
     private func localCall(_ name: String, _ arguments: Value) throws -> Value {
-        if let error = registryStart.error, !ClaudeRegistryStart.limitedToolNames.contains(name) { throw error }
+        if let error = startupError ?? serviceError ?? registryStart.error, !ClaudeRegistryStart.limitedToolNames.contains(name) { throw error }
         // Direct CLI calls already bootstrap/verify. The service checks its current
         // caller, catalog/schema and grants for the actual command. Fetching and
         // decoding the entire catalog here adds a serialized round trip per call.
@@ -329,7 +490,9 @@ public actor Bridge {
     // Limited service status explains why the verified workspace has no project yet.
     private func withSetupNotice(_ response: [String: Any]) -> [String: Any] {
         let connection: [String: Any]
-        if let pending = registryStart.connection { connection = pending }
+        if serviceError != nil, let notice = connectionNotice { connection = ["connected": false, "state": "service_not_answering", "message": notice] }
+        else if startupError != nil, let notice = connectionNotice { connection = ["connected": false, "state": "connection_failed", "message": notice] }
+        else if let pending = registryStart.connection { connection = pending }
         else if let setupNotice { connection = ["connected":false,"state":setupCompletionPending ? "project_connection_pending":"project_setup_required","message":setupNotice] }
         else { return response }
         var response = response
@@ -373,17 +536,34 @@ public actor Bridge {
                 checkInstalledBuild(force: true, refused: true)
                 return try delegate()
             }
-        } catch let error as ChecklistError where error.code == "NATIVE_SESSION_REQUIRED" {
-            throw ChecklistError(error.code, "Restart the Checklist MCP connection: stop its running `checklist mcp` process and start `\(ChecklistInstance.current.cliCommand) mcp` from this same native conversation and project directory. Keep the original command_id when retrying a mutation. An installation label cannot authenticate a native session.", details:error.details)
-        }
+        } catch let error as ChecklistError where error.code == "NATIVE_SESSION_REQUIRED" { throw Self.reconnectGuidance(error) }
+    }
+
+    private static func reconnectGuidance(_ error: Error) -> Error {
+        guard let error = error as? ChecklistError, error.code == "NATIVE_SESSION_REQUIRED" else { return error }
+        return ChecklistError(error.code, "Restart the Checklist MCP connection: stop its running `checklist mcp` process and start `\(ChecklistInstance.current.cliCommand) mcp` from this same native conversation and project directory. Keep the original command_id when retrying a mutation. An installation label cannot authenticate a native session.", details:error.details)
+    }
+
+    private struct DelegateTarget: Sendable {
+        let update: ShimUpdateEnvironment?
+        let suffix: [String]
+    }
+
+    private func delegateTarget() -> DelegateTarget {
+        var suffix = ["--workspace", requestedWorkspace]
+        if let expectedSession { suffix += ["--session", expectedSession] }
+        if !automatic { suffix += ["--installation", installation] }
+        if let assistantProject { suffix += ["--assistant", "--project", assistantProject] }
+        return DelegateTarget(update: launchState == .unavailable ? nil : environment.shimUpdate, suffix: suffix)
     }
 
     private func delegate(_ route: [String], input: Data? = nil, commandID: String? = nil) throws -> Data {
-        guard let update = environment.shimUpdate, launchState != .unavailable else { throw ClientUpdateRequired.error }
-        var arguments = route + ["--workspace", requestedWorkspace]
-        if let expectedSession { arguments += ["--session", expectedSession] }
-        if !automatic { arguments += ["--installation", installation] }
-        if let assistantProject { arguments += ["--assistant", "--project", assistantProject] }
+        try Self.runDelegate(delegateTarget(), route, input: input, commandID: commandID)
+    }
+
+    private static func runDelegate(_ target: DelegateTarget, _ route: [String], input: Data?, commandID: String?) throws -> Data {
+        guard let update = target.update else { throw ClientUpdateRequired.error }
+        let arguments = route + target.suffix
         let result: ShimChildResult
         do { result = try update.run(arguments, input) }
         catch is ShimInstanceRefusal { throw ClientUpdateRequired.error }
@@ -433,6 +613,10 @@ public actor Bridge {
     }
 
     private func delegateCall(_ name: String, _ arguments: Value) throws -> Value {
+        try Self.runDelegateCall(delegateTarget(), name, arguments)
+    }
+
+    private static func runDelegateCall(_ target: DelegateTarget, _ name: String, _ arguments: Value) throws -> Value {
         guard case .object = arguments else { throw BridgeError("Tool arguments must be a JSON object.") }
         let data = try JSONEncoder().encode(arguments)
         guard data.count <= CallArgumentInput.limit else {
@@ -441,7 +625,7 @@ public actor Bridge {
         let commandID: String?
         if case .object(let values) = arguments, case .string(let id)? = values["command_id"] { commandID = id }
         else { commandID = nil }
-        return try JSONDecoder().decode(Value.self, from: delegate(["call", name, "-"], input: data, commandID: commandID))
+        return try JSONDecoder().decode(Value.self, from: runDelegate(target, ["call", name, "-"], input: data, commandID: commandID))
     }
 
     func readResource(_ uri: String) throws -> Value {

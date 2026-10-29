@@ -34,6 +34,7 @@ public enum CommandMethods {
         "workspace_page",
         "service_info",
         "command_status",
+        "operation_get",
         "tool_catalog",
         "snapshot",
         "changes_wait",

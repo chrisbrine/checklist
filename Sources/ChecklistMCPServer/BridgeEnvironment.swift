@@ -50,6 +50,10 @@ public struct BridgeEnvironment: Sendable {
     public var now: @Sendable () -> TimeInterval
     public var sleep: @Sendable (TimeInterval) -> Void
     public var stderr: @Sendable (String) -> Void
+    /// Nil when launchd cannot be asked.
+    public var serviceJobRunning: @Sendable () -> Bool?
+    /// The supported on-demand start of this installation's own launchd job.
+    public var startService: @Sendable () throws -> Void
 
     public init(
         shimUpdate: ShimUpdateEnvironment? = nil,
@@ -65,11 +69,48 @@ public struct BridgeEnvironment: Sendable {
         },
         now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         sleep: @escaping @Sendable (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
-        stderr: @escaping @Sendable (String) -> Void = { FileHandle.standardError.write(Data($0.utf8)) }
+        stderr: @escaping @Sendable (String) -> Void = { FileHandle.standardError.write(Data($0.utf8)) },
+        serviceJobRunning: @escaping @Sendable () -> Bool? = { LaunchdServiceJob.isRunning(label: ChecklistInstance.current.machServiceName) },
+        startService: @escaping @Sendable () throws -> Void = { try ChecklistClient.startService(timeLimit: 8) }
     ) {
         self.shimUpdate = shimUpdate
         self.makeClient = makeClient; self.discover = discover; self.now = now
         self.sleep = sleep; self.stderr = stderr
+        self.serviceJobRunning = serviceJobRunning; self.startService = startService
+    }
+}
+
+/// Errors that mean only that the service did not answer yet (stalled, stopped,
+/// restarting or upgrading its store). Other errors are configuration results.
+enum ServiceWait {
+    static func applies(_ error: Error) -> Bool {
+        guard let error = error as? ChecklistError else { return false }
+        return ["OUTCOME_UNKNOWN", "SERVICE_UNAVAILABLE"].contains(error.code) || StorageUpgradeStatus(error: error) != nil
+    }
+
+    /// No listener answered at all, as opposed to a reply timeout from a busy service.
+    static func notRunning(_ error: Error) -> Bool {
+        guard let error = error as? ChecklistError else { return false }
+        if error.code == "SERVICE_UNAVAILABLE" { return true }
+        return error.code == "OUTCOME_UNKNOWN" && ["connection_ended", "transport_error_after_send"].contains(error.details["reason"] as? String ?? "")
+    }
+}
+
+/// The launchd job label equals the instance's Mach service name.
+public enum LaunchdServiceJob {
+    public static func isRunning(label: String) -> Bool? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = ["print", "gui/\(getuid())/\(label)"]
+        let output = Pipe()
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return false }
+        return String(decoding: data, as: UTF8.self).contains("state = running")
     }
 }
 

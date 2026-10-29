@@ -80,7 +80,7 @@ extension TicketLifecycleCleanupTests {
         },observeSQL:{sql in
             if sql.contains("FROM records ORDER BY rowid") {corpus += 1}
             if sql.contains("FROM records WHERE type IN (") {media += 1}
-            if sql.hasPrefix("SELECT key,length(CAST(value AS BLOB)) AS bytes,") {generations += 1}
+            if sql.contains("octet_length(value) AS bytes") {generations += 1}
         }))
         XCTAssertGreaterThan(cohort.turns,2,"Writer chunks and the second candidate admission reuse the initial observation")
         XCTAssertEqual(corpus,1);XCTAssertEqual(media,1);XCTAssertEqual(generations,1)

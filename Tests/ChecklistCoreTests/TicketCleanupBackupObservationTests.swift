@@ -33,9 +33,12 @@ extension TicketLifecycleCleanupTests {
             try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["backup-generation:unwanted",try jsonString(["state":"complete","objects":entries])])
         }
         var normalized: [String] = []
-        let observation = try router.readers!.read {try self.router.ticketCleanupBackupRetentionIndex($0,objects:[wanted,other],observeCandidate:{normalized.append($0)})}
+        // CL-355: the reference full scan keeps its filter; the per-receipt index returns the same result.
+        let reference = try router.readers!.read {try self.router.ticketCleanupBackupRetentionIndexFullScan($0,objects:[wanted,other],observeCandidate:{normalized.append($0)})}
         XCTAssertEqual(Set(normalized),Set([path,router.root.standardizedFileURL.path + "/" + path]))
         XCTAssertEqual(normalized.count,2,"A thousand same-content aliases must never reach path normalization")
+        let observation = try router.readers!.read {try self.router.ticketCleanupBackupRetentionIndex($0,objects:[wanted,other])}
+        XCTAssertEqual(observation.originals,reference.originals);XCTAssertEqual(observation.copyPaths,reference.copyPaths);XCTAssertEqual(observation.copyManifests,reference.copyManifests)
         let key = StorageBackupRetentionIndex.key(path:path,sha:attachment["sha256"] as! String,size:(attachment["size"] as! NSNumber).int64Value)
         XCTAssertEqual(observation.originals,[key])
         let backup = try XCTUnwrap(observation.copyPaths[key]?.first)
@@ -56,13 +59,21 @@ extension TicketLifecycleCleanupTests {
         try mark(project,secondLocal,category:"done")
         var scans = 0
         let prepared = try router.readers!.read {db in
-            db.trace {if case .statement(let statement) = $0,statement.sql.contains("FROM metadata m,json_each(m.value,'$.objects')") {scans += 1}}
+            db.trace {if case .statement(let statement) = $0,statement.sql.contains(Self.receiptReadSQL) {scans += 1}}
             defer {db.trace(nil)}
             return try self.router.ticketCleanupSelection(db,project:project)
         }
         XCTAssertEqual(prepared.plans.count,2)
         XCTAssertNotNil(prepared.plans[first["id"] as! String]);XCTAssertNil(prepared.plans[second["id"] as! String])
-        XCTAssertEqual(scans,2,"Two completed generations are scanned once each for the complete selection")
+        XCTAssertLessThanOrEqual(scans,2,"Two completed generations are parsed at most once each for the complete selection")
+        // CL-355: a later selection with the same generations reads no receipt value.
+        scans = 0
+        _ = try router.readers!.read {db in
+            db.trace {if case .statement(let statement) = $0,statement.sql.contains(Self.receiptReadSQL) {scans += 1}}
+            defer {db.trace(nil)}
+            return try self.router.ticketCleanupSelection(db,project:project)
+        }
+        XCTAssertEqual(scans,0)
         // A subsequent selection must read the exact new generation contents.
         try write {db in try db.execute(sql:"UPDATE metadata SET value=? WHERE key GLOB 'backup-generation:*'",arguments:[try jsonString(["state":"complete","objects":[]])])}
         let refreshed = try router.readers!.read {try self.router.ticketCleanupSelection($0,project:project)}
@@ -75,7 +86,7 @@ extension TicketLifecycleCleanupTests {
         try write {db in try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["backup-generation:invalid",try jsonString(["state":"complete","objects":[["path":"objects/invalid"]]])])}
         var headers = 0
         let prepared = try router.readers!.read {db in
-            db.trace {if case .statement(let statement) = $0,statement.sql.contains("json_array_length(value,'$.objects') AS count") {headers += 1}}
+            db.trace {if case .statement(let statement) = $0,statement.sql.contains(Self.fingerprintSQL) {headers += 1}}
             defer {db.trace(nil)}
             return try self.router.ticketCleanupSelection(db,project:project)
         }
@@ -92,7 +103,7 @@ extension TicketLifecycleCleanupTests {
         let prepared = try router.readers!.read {db in
             db.trace {if case .statement(let statement) = $0 {
                 if statement.sql.contains("MAX(occurred_at)") || statement.sql.contains("FROM events WHERE project_id=? ORDER BY seq LIMIT 100001") {historyScans += 1}
-                if statement.sql.contains("FROM metadata m,json_each(m.value,'$.objects')") {backupScans += 1}
+                if statement.sql.contains(Self.fingerprintSQL) || statement.sql.contains(Self.receiptReadSQL) {backupScans += 1}
             }}
             defer {db.trace(nil)}
             return try self.router.ticketCleanupSelection(db,project:project)

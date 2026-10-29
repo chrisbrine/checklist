@@ -212,7 +212,39 @@ extension CommandRouter {
 
     func ticketPurgeExpiringCommands(_ db: Database,task: JSON,plan: TicketPurgePlan) throws -> [Row] {
         let removedIDs = Set(plan.removed.map(\.key)).union([Data(((try StoredRecord(task, family: "task").string("id"))).utf8)])
-        let receipts = try Row.fetchCursor(db,sql:"SELECT rowid AS cleanup_row,principal,command_id,CAST(principal AS BLOB) AS cleanup_principal,CAST(command_id AS BLOB) AS cleanup_command_id,result FROM commands LIMIT 100001")
+        struct CommandIdentity: Hashable {let principal: Data;let command: Data}
+        // Import previews contain source IDs, before commit assigns internal
+        // ticket UUIDs. They cannot be matched reliably by the removed-ID graph.
+        // Expire these newly durable snapshots conservatively on any purge.
+        var privateOperationReceipts = Set<CommandIdentity>()
+        let operations = try Row.fetchCursor(db,sql:"""
+            SELECT CAST(json_extract(value,'$.principal') AS BLOB) AS principal,
+                   CAST(json_extract(value,'$.command_id') AS BLOB) AS command,
+                   CAST(json_extract(value,'$.error_result_command_id') AS BLOB) AS error_command,
+                   json_extract(value,'$.method') AS method
+            FROM metadata WHERE key GLOB 'command-operation:*'
+              AND CASE WHEN json_valid(value) THEN
+                json_extract(value,'$.method')='import_preview' OR json_type(value,'$.error_result_command_id')='text'
+              ELSE 0 END
+            LIMIT 100001
+            """)
+        var operationCount = 0
+        while let row = try operations.next() {
+            operationCount += 1
+            guard operationCount <= 100000 else {throw CoreError("PURGE_LIMIT","The operation history exceeds the safe purge limit.")}
+            guard let principal = row["principal"] as Data?,let command = row["command"] as Data? else {throw StoreRecovery.required("command_operation_invalid")}
+            if row["method"] as String == "import_preview" {privateOperationReceipts.insert(.init(principal:principal,command:command))}
+            // Private error text need not contain a removed record ID. Retire
+            // every operation error snapshot conservatively on any purge.
+            if let error = row["error_command"] as Data? {privateOperationReceipts.insert(.init(principal:principal,command:error))}
+        }
+        let receipts = try Row.fetchCursor(db,sql:"""
+            SELECT rowid AS cleanup_row,principal,command_id,CAST(principal AS BLOB) AS cleanup_principal,
+                   CAST(command_id AS BLOB) AS cleanup_command_id,
+                   length(CAST(result AS BLOB)) AS result_bytes,
+                   CASE WHEN length(CAST(result AS BLOB))<=? THEN result END AS result
+            FROM commands LIMIT 100001
+            """,arguments:[TicketCleanupInventory.rowByteLimit])
         func containsRemoved(_ value: Any) -> Bool {
             if let s = value as? String {return removedIDs.contains(Data(s.utf8))}
             if let a = value as? [Any] {return a.contains {containsRemoved($0)}}
@@ -223,7 +255,27 @@ extension CommandRouter {
         while let row = try receipts.next() {
             count += 1
             guard count <= 100000 else {throw CoreError("PURGE_LIMIT","The command history exceeds the safe purge limit.")}
-            guard (row["result"] as String).utf8.count <= TicketCleanupInventory.rowByteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A command history row exceeds the memory bound.")}
+            if privateOperationReceipts.contains(.init(principal:row["cleanup_principal"] as Data,command:row["cleanup_command_id"] as Data)) {
+                bytes += min(row["result_bytes"] as Int,TicketCleanupInventory.rowByteLimit)
+                guard bytes <= TicketCleanupInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","Selected command history exceeds the memory bound.")}
+                selected.append(row.copy());continue
+            }
+            if row["result"] as String? == nil {
+                // Operation replies/errors can be larger than an ordinary
+                // domain receipt. Expire their snapshots conservatively without
+                // bringing the large private payload across the SQL boundary.
+                let operation = try Bool.fetchOne(db,sql:"""
+                    SELECT EXISTS(SELECT 1 FROM metadata WHERE key GLOB 'command-operation:*'
+                      AND CASE WHEN json_valid(value) THEN
+                        CAST(json_extract(value,'$.principal') AS BLOB)=? AND
+                        (CAST(json_extract(value,'$.command_id') AS BLOB)=? OR
+                         CAST(json_extract(value,'$.error_result_command_id') AS BLOB)=?) AND
+                        json_type(value,'$.method')='text'
+                      ELSE 0 END)
+                    """,arguments:[row["cleanup_principal"] as Data,row["cleanup_command_id"] as Data,row["cleanup_command_id"] as Data]) == true
+                guard operation else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A command history row exceeds the memory bound.")}
+                selected.append(row.copy());continue
+            }
             if autoreleasepool(invoking:{containsRemoved(jsonObject(row["result"]))}) {
                 bytes += (row["result"] as String).utf8.count
                 guard bytes <= TicketCleanupInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","Selected command history exceeds the memory bound.")}
@@ -245,6 +297,9 @@ extension CommandRouter {
         for receipt in receipts {
             try db.execute(sql:"UPDATE commands SET result=? WHERE principal=CAST(? AS TEXT) AND command_id=CAST(? AS TEXT)",arguments:[Self.prunedResult,receipt["cleanup_principal"] as Data,receipt["cleanup_command_id"] as Data])
         }
+        // Retire in-flight operation snapshots before they can publish private
+        // replies captured on the other side of this permanent-removal commit.
+        try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES ('command-operation-purge-epoch',?)",arguments:[uuid()])
         let expired = receipts.count
         let deletion = try enqueueTicketObjectDeletion(db,project:pid,task:tid,cause:"task_purge",plan:plan.byteDeletion)
         for row in plan.removed {try db.execute(sql:"DELETE FROM records WHERE id=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND type=CAST(? AS TEXT)",arguments:[Data(row.id.utf8),Data(pid.utf8),Data(row.type.utf8)])}

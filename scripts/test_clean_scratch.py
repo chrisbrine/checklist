@@ -319,7 +319,7 @@ class CleanScratchTests(unittest.TestCase):
                     cleanup.mark_qualification(root, 'c' * 64, 'must not change', explicit)
                 self.assertEqual((root / cleanup.WORKSPACE_MARKER).read_bytes(), before)
         with patch.dict(os.environ, {'CHECKLIST_SESSION_ID': 'session'}, clear=True), \
-             patch.object(sys, 'argv', ['clean_scratch.py', '--mark', str(root), '--purpose', 'env owner']), \
+             patch.object(sys, 'argv', ['clean_scratch.py', '--mark', str(root), '--purpose', 'env owner', '--ticket', 'CL-1']), \
              redirect_stdout(io.StringIO()):
             self.assertEqual(cleanup.main(), 0)
             self.assertEqual(cleanup.read_marker(root)['session_id'], 'session')
@@ -341,7 +341,7 @@ class CleanScratchTests(unittest.TestCase):
     def test_qualification_marker_cli_and_corrupt_or_linked_roots_fail_closed(self):
         root = self.item('marked-by-cli', qualification=True)
         with patch.object(sys, 'argv', ['clean_scratch.py', '--mark', str(root),
-                '--purpose', 'qualification', '--source-fingerprint', 'b' * 64]), redirect_stdout(io.StringIO()):
+                '--purpose', 'qualification', '--source-fingerprint', 'b' * 64, '--ticket', 'CL-1']), redirect_stdout(io.StringIO()):
             self.assertEqual(cleanup.main(), 0)
         self.assertEqual(cleanup.read_marker(root)['source_fingerprint'], 'b' * 64)
         linked = self.qualification / 'linked';linked.symlink_to(root)
@@ -481,12 +481,13 @@ class CleanScratchTests(unittest.TestCase):
     def test_mark_and_release_commands_keep_owner_and_require_purpose(self):
         item = self.item('rv2')
         argv = ['clean_scratch.py', '--session-id', 'session']
-        for mode in [['--mark', str(item), '--purpose', 'review slot'], ['--release', str(item)]]:
+        for mode in [['--mark', str(item), '--purpose', 'review slot', '--ticket', 'CL-7'], ['--release', str(item)]]:
             with patch.object(sys, 'argv', argv + mode), redirect_stdout(io.StringIO()), \
                  patch.object(cleanup, 'git_objects', side_effect=AssertionError('marker command used Git')):
                 self.assertEqual(cleanup.main(), 0)
         value = cleanup.read_marker(item)
-        self.assertEqual(value, {'version': 1, 'session_id': 'session', 'purpose': 'review slot', 'released': True})
+        self.assertEqual(value, {'version': 1, 'session_id': 'session', 'purpose': 'review slot', 'released': True,
+                                 'tickets': ['CL-7']})
         with self.assertRaisesRegex(ValueError, 'another scratch session'):
             cleanup.write_marker(item, 'foreign', release=True)
         with self.assertRaisesRegex(ValueError, 'nonblank'):
@@ -1245,6 +1246,162 @@ class CleanScratchTests(unittest.TestCase):
         self.assertEqual(runner.call_args.args[4:], ([self.root / 'keep'], False))
         self.assertEqual(runner.call_args.kwargs, {'session_id': 'session', 'include_released': False})
 
+    # CL-359: ticket registration, automatic release and size budget.
+    def ticket_item(self, name, tickets, files=True):
+        item = self.item(name)
+        if files:
+            self.write(item, 'src/.git/config', b'clone metadata')
+            self.write(item, 'notes.md', b'unique work ' + name.encode())
+            self.write(item, '.build/output.o', b'1234')
+            self.write(item, 'store/checklist.sqlite', b'copied store')
+        cleanup.write_marker(item, 'session', 'package workspace', tickets=tickets)
+        return item
+
+    def test_mark_cli_requires_ticket_and_records_sorted_keys(self):
+        item = self.item('P1')
+        base = ['clean_scratch.py', '--session-id', 'session']
+        for bad in [['--mark', str(item), '--purpose', 'package'],
+                    ['--mark', str(item), '--purpose', 'package', '--ticket', 'cl-1'],
+                    ['--preview', '--ticket', 'CL-1']]:
+            with self.subTest(bad=bad), patch.object(sys, 'argv', base + bad), \
+                 redirect_stdout(io.StringIO()), patch('sys.stderr', io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    cleanup.main()
+                self.assertEqual(error.exception.code, 2)
+        self.assertIsNone(cleanup.read_marker(item))
+        with patch.object(sys, 'argv', base + ['--mark', str(item), '--purpose', 'package',
+                                               '--ticket', 'CL-9', '--ticket', 'CL-10']), redirect_stdout(io.StringIO()):
+            self.assertEqual(cleanup.main(), 0)
+        self.assertEqual(cleanup.read_marker(item)['tickets'], ['CL-10', 'CL-9'])
+        # Re-marking a registered folder may omit --ticket; the registration stays.
+        with patch.object(sys, 'argv', base + ['--mark', str(item), '--purpose', 'package again']), redirect_stdout(io.StringIO()):
+            self.assertEqual(cleanup.main(), 0)
+        self.assertEqual(cleanup.read_marker(item)['tickets'], ['CL-10', 'CL-9'])
+        (item / cleanup.WORKSPACE_MARKER).write_text(json.dumps({'version': 1, 'session_id': 'session',
+            'purpose': 'x', 'released': False, 'tickets': ['bad key']}))
+        with self.assertRaisesRegex(ValueError, 'invalid|ticket keys'):
+            cleanup.read_marker(item)
+
+    def test_release_done_releases_only_finished_tickets_and_apply_trashes_whole_folders(self):
+        done = self.ticket_item('P-done', ['CL-1'])
+        canceled = self.ticket_item('P-canceled', ['CL-1', 'CL-2'])
+        mixed = self.ticket_item('P-mixed', ['CL-1', 'CL-3'])
+        unknown = self.ticket_item('P-unknown', ['CL-4'])
+        running = self.ticket_item('P-running', ['CL-2'])
+        untagged = self.item('P-untagged');self.write(untagged, 'notes.md', b'x')
+        cleanup.write_marker(untagged, 'session', 'old mark without ticket')
+        nested = self.item('container');nested_child = nested / 'P-nested';nested_child.mkdir()
+        self.write(nested_child, 'notes.md', b'nested work')
+        cleanup.write_marker(nested_child, 'session', 'nested package', tickets=['CL-1'])
+        foreign = self.item('P-foreign', session='other')
+        cleanup.write_marker(foreign, 'other', 'other session work', tickets=['CL-1'])
+        statuses = {'CL-1': 'done', 'CL-2': 'canceled', 'CL-3': 'active'}
+        asked = []
+        def reader(keys):
+            asked.append(list(keys))
+            return {k: statuses[k] for k in keys if k in statuses}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            roots = cleanup.ticket_roots(self.sessions, self.qualification, 'session')
+            self.assertEqual(cleanup.release_finished(roots, 'session', reader), 0)
+        reports = {Path(r['path']).name: r for r in map(json.loads, output.getvalue().splitlines())}
+        self.assertNotIn('P-foreign', reports)
+        self.assertEqual({n: r['action'] for n, r in reports.items()},
+                         {'P-done': 'released', 'P-canceled': 'released', 'P-mixed': 'kept', 'P-unknown': 'kept',
+                          'P-running': 'released', 'P-untagged': 'kept', 'P-nested': 'released'})
+        self.assertIn('CL-3', reports['P-mixed']['reason'])
+        self.assertIn('no ticket registered', reports['P-untagged']['reason'])
+        self.assertFalse(cleanup.read_marker(foreign)['released'])
+        self.assertEqual(cleanup.read_marker(done)['released_for_tickets'], ['CL-1'])
+        self.assertTrue(cleanup.ticket_released(done))
+        result, records = self.run_cleanup(apply=True, process_reader=lambda: [running / '.build/output.o'])
+        self.assertEqual(result, 0)
+        for path in [done, canceled, nested_child]:
+            self.assertFalse(path.exists(), path)
+        for path in [mixed, unknown, running, untagged, foreign]:
+            self.assertTrue(path.exists(), path)
+        by_path = {r['path']: r for r in records if 'ticket_bytes' in r}
+        self.assertEqual(by_path[str(done)]['ticket_bytes'], by_path[str(done)]['total_bytes'])
+        self.assertEqual(by_path[str(done)]['moved_count'], 1)
+        self.assertEqual(by_path[str(running)]['reason'], 'running process uses this item')
+        moved = {p.name.rsplit('-', 1)[0]: p for p in self.trash.iterdir()}
+        self.assertEqual(sorted(moved), ['P-canceled', 'P-done', 'P-nested'])
+        self.assertTrue((moved['P-done'] / 'src/.git/config').exists())
+        # Re-marking a released folder makes it persistent again.
+        cleanup.write_marker(unknown, 'session', 'reuse', release=True, released_for_tickets=['CL-4'])
+        cleanup.write_marker(unknown, 'session', 'reuse', tickets=['CL-5'])
+        self.assertNotIn('released_for_tickets', cleanup.read_marker(unknown))
+        self.assertFalse(cleanup.ticket_released(unknown))
+
+    def test_hand_release_keeps_byte_only_cleanup(self):
+        item = self.ticket_item('P-hand', ['CL-1'])
+        self.mark(item, release=True)
+        result, records = self.run_cleanup(apply=True)
+        self.assertEqual(result, 0)
+        self.assertTrue((item / 'notes.md').exists())
+        self.assertFalse((item / '.build').exists())
+
+    def test_release_ticket_and_release_done_cli_use_fake_read_only_cli(self):
+        first = self.ticket_item('P-a', ['CL-1'], files=False)
+        second = self.ticket_item('P-b', ['CL-7'], files=False)
+        third = self.ticket_item('P-c', ['CL-8'], files=False)
+        log = self.root / 'cli-calls.jsonl'
+        fake = self.root / 'fake-checklist'
+        fake.write_text('#!' + sys.executable + '\n' + '''import json, os, sys
+method, arguments = sys.argv[2], json.loads(sys.argv[3])
+with open(LOG, 'a') as out: out.write(json.dumps([os.getcwd(), sys.argv[1], method, arguments]) + "\\n")
+statuses = {"CL-1": "done", "CL-8": "active"}
+if method == "project_resolve": data = {"projects": [{"id": "project"}]}
+elif method == "task_get": data = {"key": arguments["key"], "status_category": statuses.get(arguments["key"])}
+else: sys.exit(3)
+print(json.dumps({"data": data}))
+'''.replace('LOG', repr(str(log))))
+        fake.chmod(0o755)
+        common = ['clean_scratch.py', '--session-id', 'session', '--sessions-root', str(self.sessions),
+                  '--qualification-root', str(self.qualification), '--repo', str(self.repo)]
+        with patch.object(sys, 'argv', common + ['--release-done', '--cli', str(fake)]), redirect_stdout(io.StringIO()):
+            self.assertEqual(cleanup.main(), 0)
+        calls = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual({c[2] for c in calls}, {'project_resolve', 'task_get'})
+        self.assertTrue(all(c[0] == str(self.repo) and c[1] == 'call' for c in calls))
+        self.assertTrue(cleanup.read_marker(first)['released'])
+        self.assertFalse(cleanup.read_marker(second)['released'])
+        self.assertFalse(cleanup.read_marker(third)['released'])
+        with patch.object(sys, 'argv', common + ['--release-ticket', 'CL-7']), redirect_stdout(io.StringIO()):
+            self.assertEqual(cleanup.main(), 0)
+        self.assertTrue(cleanup.ticket_released(second))
+        self.assertFalse(cleanup.read_marker(third)['released'])
+
+    def test_preview_of_held_and_ticket_released_roots_never_hashes(self):
+        held = self.ticket_item('P-held', ['CL-3'])
+        released = self.ticket_item('P-rel', ['CL-1'])
+        cleanup.write_marker(released, 'session', release=True, released_for_tickets=['CL-1'])
+        with patch.object(cleanup, 'blob_id', side_effect=AssertionError('preview hashed a held or released root')), \
+             patch.object(cleanup, 'inventory', wraps=cleanup.inventory) as walked:
+            result, records = self.run_cleanup()
+        self.assertEqual(result, 0)
+        self.assertNotIn(held, [c.args[0] for c in walked.call_args_list])
+        by_name = {Path(r['path']).name: r for r in records}
+        self.assertIn('persistent workspace marker', by_name['P-held']['reason'])
+        self.assertEqual(by_name['P-held']['tickets'], ['CL-3'])
+        self.assertGreater(by_name['P-held']['total_bytes'], 0)
+        self.assertEqual(by_name['P-rel']['eligible_paths'], [str(released)])
+
+    def test_size_report_totals_groups_and_warns_above_budget(self):
+        scratch = self.item('sized');self.write(scratch, 'blob', b'x' * 100000)
+        groups = cleanup.storage_groups(self.sessions, self.qualification, self.repo)
+        self.assertEqual(groups['scratch'], [self.sessions / '-Users-Checklist/session/scratchpad'])
+        sizes = cleanup.du_sizes(groups['scratch'] + [self.root / 'missing'])
+        self.assertGreaterEqual(sizes[groups['scratch'][0]], 100000)
+        for budget, warned in [(10, True), (10 ** 12, False)]:
+            output, errors = io.StringIO(), io.StringIO()
+            with redirect_stdout(output), patch('sys.stderr', errors):
+                report = cleanup.storage_report(groups, budget)
+            self.assertEqual(report['over_budget'], warned)
+            self.assertEqual(json.loads(output.getvalue())['groups']['evidence'], 0)
+            self.assertEqual('BUDGET EXCEEDED' in errors.getvalue(), warned)
+        fake = cleanup.storage_report({'a': ['x'], 'b': ['y']}, 50e9, sizer=lambda paths: {p: 30 * 10 ** 9 for p in paths})
+        self.assertEqual(fake['total_bytes'], 60 * 10 ** 9)
 
 def stat_mode_fifo(path):
     import stat

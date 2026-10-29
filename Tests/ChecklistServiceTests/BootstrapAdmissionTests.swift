@@ -75,7 +75,9 @@ final class BootstrapAdmissionTests: XCTestCase {
         let original = Data("Immutable original through a fresh bootstrap".utf8)
         let source = root.appendingPathComponent("source.bin")
         try original.write(to: source)
-        let attachment = try XCTUnwrap(try router.handle(method: "attachment_add", params: ["command_id": UUID().uuidString,
+        // Fixture setup executes the domain handler directly; the service wire
+        // command now returns an operation (covered by CommandOperationServiceTests).
+        let attachment = try XCTUnwrap(try router.executeBackupQueuedWrite(method: "attachment_add", params: ["command_id": UUID().uuidString,
             "project_id": project!, "task_id": task["id"]!, "path": source.path], caller: owner)["data"] as? [String: Any])
         task = try XCTUnwrap(try router.handle(method: "task_get", params: ["project_id": project!, "task_id": task["id"]!], caller: owner)["data"] as? [String: Any])
         try router.backupWrites.beginCapture()
@@ -100,7 +102,7 @@ final class BootstrapAdmissionTests: XCTestCase {
         let note = UUID().uuidString, edit = UUID().uuidString
         let commands: [(String, [String: Any])] = [
             ("task_get", ["project_id": project!, "task_id": task["id"]!]),
-            ("attachment_read", ["project_id": project!, "attachment_id": attachment["id"]!, "representation": "original"]),
+            ("attachment_read", ["project_id": project!, "attachment_id": attachment["id"]!, "representation": "metadata"]),
             ("message_send", ["project_id": project!, "task_id": task["id"]!, "body": "First accepted", "command_id": note]),
             ("task_edit", ["project_id": project!, "task_id": task["id"]!, "expected_revision": task["revision"]!, "patch": ["title": "Second accepted"], "command_id": edit])]
         for (method, params) in commands {
@@ -123,7 +125,9 @@ final class BootstrapAdmissionTests: XCTestCase {
             } else if method == "task_get" {
                 XCTAssertEqual((reply["data"] as? [String: Any])?["title"] as? String, "Before capture")
             } else {
-                XCTAssertEqual((reply["data"] as? [String: Any])?["content_base64"] as? String, original.base64EncodedString())
+                // Metadata remains a short synchronous read during capture. Original
+                // bytes use operation acceptance and are qualified separately.
+                XCTAssertEqual((reply["data"] as? [String: Any])?["id"] as? String, attachment["id"] as? String)
             }
         }
         XCTAssertEqual(coordinator.enrollments[enrollment.installation]?.generation, enrollment.generation)
