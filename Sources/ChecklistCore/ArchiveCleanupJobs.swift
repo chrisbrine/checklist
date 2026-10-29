@@ -74,14 +74,21 @@ extension CommandRouter {
         let pid = try scope(db,p,c,write:method == "cleanup_job_retry"); try requireAgentEditAuthority(db,project:try record(db,pid,type:"project"),caller:c)
         // Historical byte accounting grants no deletion authority. Its failure
         // must never prevent protective cancellation or invent a zero total.
-        let accounting: (StorageBackupRetentionIndex,[Data:JSON])? = try? {
-            let index = try storageBackupRetentionIndex(db)
-            let attachments = Dictionary(
-                uniqueKeysWithValues: try records(db, type: "attachment", project: pid).map { (Data(((try StoredRecord($0, family: "record").string("id"))).utf8), $0) })
-            return (index,attachments)
-        }()
+        // CL-343: built only for a returned job with items, from the warm process-wide
+        // index; a cold index answers "unavailable" at once and never blocks this read.
+        var accounting: (StorageBackupRetentionIndex,[Data:JSON])?? = nil
+        func lazyAccounting() -> (StorageBackupRetentionIndex,[Data:JSON])? {
+            if let accounting { return accounting }
+            let value: (StorageBackupRetentionIndex,[Data:JSON])? = try? { () throws -> (StorageBackupRetentionIndex,[Data:JSON])? in
+                guard let index = try storageBackupAccounting(db) else { return nil }
+                let attachments = Dictionary(
+                    uniqueKeysWithValues: try records(db, type: "attachment", project: pid).map { (Data(((try StoredRecord($0, family: "record").string("id"))).utf8), $0) })
+                return (index,attachments)
+            }()
+            accounting = .some(value);return value
+        }
         func projection(_ job: ArchiveCleanupJob,_ revision: Int64) throws -> JSON {
-            guard let (backupIndex,attachments) = accounting else { return try cleanupJobProjection(job,revision:revision) }
+            guard !job.items.isEmpty,let (backupIndex,attachments) = lazyAccounting() else { return try cleanupJobProjection(job,revision:revision) }
             let retained = try job.items.reduce(Int64(0)) { total,item in
                 guard let attachment = attachments[Data(item.original.id.text.utf8)],attachment["sha256"] as? String == item.original.sha256,
                       try ArchiveCleanupJob.integer(attachment["size"]) == item.original.logicalBytes else { return total }

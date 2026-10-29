@@ -83,4 +83,21 @@ final class StorageStatusTests: XCTestCase {
         XCTAssertTrue(usage["allocated_file_bytes_at_verification"] is NSNull)
         XCTAssertEqual(usage["availability"] as? String,"not_rechecked")
     }
+    /// CL-343: the legacy fallback checks the newest receipt first, one row at a time,
+    /// and gives the same reply as the old query that validated every receipt.
+    func testLegacyFallbackPicksNewestCompleteReceiptWithoutValidatingEveryReceipt() throws {
+        let f = try StorageFixture()
+        func insert(_ r: Int,_ value: String) throws {
+            try f.router!.dbQueue.write {db in try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["backup-generation:" + String(format:"00000000-0000-0000-0000-%012d",r),value])}
+        }
+        func receipt(_ r: Int,state: String) throws -> String {
+            try jsonString(["state":state,"operation_id":"op-\(r)","known_at":String(format:"2026-10-23T16:%02d:00Z",r),"manifest_sha256":String(repeating:"\(r)",count:64),"objects":(0..<200).map {["path":"objects/x/\($0)","sha256":"s","size":$0]}])
+        }
+        try insert(1,receipt(1,state:"complete"));try insert(2,receipt(2,state:"complete"))
+        try insert(3,receipt(3,state:"pending"));try insert(4,"{not json")
+        let old = try f.router!.dbQueue.read {db in try String.fetchOne(db,sql:"SELECT json_object('kind','backup','operation_id',json_extract(value,'$.operation_id'),'verified_at',json_extract(value,'$.known_at'),'manifest_sha256',json_extract(value,'$.manifest_sha256'),'usage',NULL,'verification','legacy_complete_receipt') FROM metadata WHERE key GLOB 'backup-generation:*' AND json_valid(value) AND json_extract(value,'$.state')='complete' ORDER BY json_extract(value,'$.known_at') DESC,key DESC LIMIT 1")}
+        let last = try XCTUnwrap((try f.call("storage_status")["data"] as! JSON)["last_verified_backup"] as? JSON)
+        XCTAssertEqual(last as NSDictionary,jsonObject(try XCTUnwrap(old)) as NSDictionary)
+        XCTAssertEqual(last["operation_id"] as? String,"op-2");XCTAssertEqual(last["verified_at"] as? String,"2026-10-23T16:02:00Z")
+    }
 }

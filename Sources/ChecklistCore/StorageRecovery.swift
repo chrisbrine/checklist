@@ -25,21 +25,21 @@ extension CommandRouter {
         StoreRecovery.recordFailure(root:root,error:failure)
         return failure
     }
+    /// Full decode of every receipt. CL-343: never on a request path; reads use
+    /// storageBackupAccounting, which shares receiptKeys with this reference.
     func storageBackupRetentionIndex(_ db: Database) throws -> StorageBackupRetentionIndex {
         var originals: Set<Data> = []
         let rows = try String.fetchCursor(db,sql:"SELECT value FROM metadata WHERE key GLOB 'backup-generation:*'")
-        while let raw = try rows.next() {
-            guard let value = try JSONSerialization.jsonObject(with:Data(raw.utf8)) as? JSON,
-                  value["state"] as? String == "complete",let entries = value["objects"] as? [JSON] else {throw StoreRecovery.required("backup_receipt_index_invalid")}
-            for entry in entries {
-                guard let path = entry["path"] as? String,let sha = entry["sha256"] as? String,let size = entry["size"] as? NSNumber,size.int64Value >= 0 else {throw StoreRecovery.required("backup_receipt_index_invalid")}
-                // Historical presence is metadata, not permission to open a backup or origin path.
-                if let relative = try? ManagedPaths.relative(path,family:path.contains("source-captures/") ? "source-captures" : path.contains("source-build-cache/") ? "source-build-cache" : "objects",root:root) {
-                    originals.insert(StorageBackupRetentionIndex.key(path:relative,sha:sha,size:size.int64Value))
-                }
-            }
-        }
+        while let raw = try rows.next() { originals.formUnion(try StorageBackupAccountingCache.receiptKeys(raw,root:root)) }
         return .init(originals:originals,root:root)
+    }
+    /// CL-343 request path: reads only the receipt fingerprint. Nil while the
+    /// process-wide index is cold or rebuilding off the request path ("unavailable").
+    func storageBackupAccounting(_ db: Database) throws -> StorageBackupRetentionIndex? {
+        try StorageBackupAccountingCache.shared(root:root).index(db,root:root,incarnation:incarnation) { [weak self] body in
+            guard let self else { throw CoreError("STORE_CLOSED","The store closed before backup accounting was built.") }
+            if let readers = self.readers { try readers.read(body) } else { try self.dbQueue.read(body) }
+        }
     }
     /// Pending namespace is the authenticated principal plus original UUID,
     /// never kind/project/digest. It cannot become a competing command owner.

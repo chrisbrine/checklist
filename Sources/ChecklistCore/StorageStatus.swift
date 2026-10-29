@@ -47,7 +47,13 @@ extension CommandRouter {
         }
         func summary(_ key: String) throws -> Any {
             if let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[key]) {return jsonObject(raw)}
-            if key == "storage-last-verified-backup",let raw = try String.fetchOne(db,sql:"SELECT json_object('kind','backup','operation_id',json_extract(value,'$.operation_id'),'verified_at',json_extract(value,'$.known_at'),'manifest_sha256',json_extract(value,'$.manifest_sha256'),'usage',NULL,'verification','legacy_complete_receipt') FROM metadata WHERE key GLOB 'backup-generation:*' AND json_valid(value) AND json_extract(value,'$.state')='complete' ORDER BY json_extract(value,'$.known_at') DESC,key DESC LIMIT 1") {return jsonObject(raw)}
+            if key == "storage-last-verified-backup" {
+                // CL-343: newest receipt first, one row per check; never json_valid over every receipt.
+                // Receipts are only inserted, so rowid order is their recording order.
+                for rowid in try Int64.fetchAll(db,sql:"SELECT rowid FROM metadata WHERE key GLOB 'backup-generation:*' ORDER BY rowid DESC") {
+                    if let raw = try String.fetchOne(db,sql:"SELECT json_object('kind','backup','operation_id',json_extract(value,'$.operation_id'),'verified_at',json_extract(value,'$.known_at'),'manifest_sha256',json_extract(value,'$.manifest_sha256'),'usage',NULL,'verification','legacy_complete_receipt') FROM metadata WHERE rowid=? AND key GLOB 'backup-generation:*' AND json_valid(value) AND json_extract(value,'$.state')='complete'",arguments:[rowid]) {return jsonObject(raw)}
+                }
+            }
             if key == "storage-last-verified-rehearsal",let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='preupgrade_snapshot'") {
                 let legacy = jsonObject(raw)
                 if bool(legacy,"protected") {return ["kind":"preupgrade_database_migration","path":legacy["path"] ?? NSNull(),"manifest_sha256":legacy["manifest_sha256"] ?? NSNull(),"verification":"migration_rehearsal_committed","verified_at":NSNull(),"usage":NSNull()] as JSON}
