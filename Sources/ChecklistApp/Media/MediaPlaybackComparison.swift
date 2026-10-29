@@ -107,6 +107,14 @@ struct MediaPlaybackTiming: Equatable, Sendable {
         }
         rate = Float(requestedRate)
     }
+
+    /// The encoded cadence of one video track. AVFoundation's nominal rate can understate it:
+    /// an 8-frame 12 fps H.264 take with reordered frames reported 10.67 fps, so each loop
+    /// played at 1.125x. The minimum frame duration is the per-frame interval actually encoded.
+    static func sourceFrameRate(nominal: Double?, minimumFrameDuration: Double?) -> Double? {
+        if let minimumFrameDuration, minimumFrameDuration.isFinite, minimumFrameDuration > 0 { return 1 / minimumFrameDuration }
+        return nominal
+    }
 }
 
 struct MediaPlaybackMeasurement: Equatable, Sendable {
@@ -258,10 +266,12 @@ enum MediaTakeLoader {
 
     static func timing(asset: AVAsset, frameRate: Double?) async throws -> MediaPlaybackTiming {
         let tracks = try await asset.loadTracks(withMediaType: .video)
-        let nominalRate: Double?
-        if let track = tracks.first { nominalRate = Double(try await track.load(.nominalFrameRate)) }
-        else { nominalRate = nil }
-        return try MediaPlaybackTiming(nominalFrameRate: nominalRate, declaredFrameRate: frameRate)
+        var sourceRate: Double?
+        if let track = tracks.first {
+            let (nominal, minimum) = try await track.load(.nominalFrameRate, .minFrameDuration)
+            sourceRate = MediaPlaybackTiming.sourceFrameRate(nominal: Double(nominal), minimumFrameDuration: minimum.seconds)
+        }
+        return try MediaPlaybackTiming(nominalFrameRate: sourceRate, declaredFrameRate: frameRate)
     }
 
     private static func milliseconds(_ duration: Duration) -> Int {

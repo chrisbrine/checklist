@@ -99,6 +99,11 @@ extension CommandRouter {
             if FileManager.default.fileExists(atPath:parentURL.appendingPathComponent(stageName).path) {
                 try parent.publish(stageName,as:".restore-incomplete-" + uuid())
             }
+            // CL-340: no fixed byte ceiling; the restored copy must fit the volume with a margin.
+            try budget.measureFreeSpace(parentURL)
+            var restoreBytes = manifest.databaseSize
+            for object in manifest.objects {let sum = restoreBytes.addingReportingOverflow(max(0,object.size));restoreBytes = sum.overflow ? .max : sum.partialValue}
+            try budget.requireFreeSpace(forMeasured:restoreBytes)
             let stage = try parent.makeDirectory(stageName, batchSynchronization: true)
             var databaseBudget = budget;databaseBudget.maximumObjectBytes = budget.maximumBytes
             _ = try source.copy("database.sqlite",to:stage,expected:manifest.databaseSHA256,budget:databaseBudget,targetPath:"checklist.sqlite")

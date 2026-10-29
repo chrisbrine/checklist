@@ -88,6 +88,7 @@ enum StorageSnapshot {
         guard budget.pagesPerStep > 0, budget.maximumBytes > 0, budget.maximumObjectBytes > 0,
               budget.maximumObjects > 0, budget.maximumRecords > 0, budget.maximumManifestBytes > 0 else { throw StorageSnapshotFailure.limit }
         let parent = try StorageObjectFiles(root: fixture.parent,folderAccess:budget.folderAccess), sourceFiles = try StorageObjectFiles(root: fixture.source,folderAccess:budget.folderAccess)
+        try budget.measureFreeSpace(fixture.parent)
         let names = names(operation, publicationName: fixture.publicationName), stage = try parent.makeDirectory(names.staging, batchSynchronization: true)
         let intent = ["format": "2", "kind": kind, "operation_id": operation.uuidString.lowercased(), "store_id": fixture.storeID, "source_root": fixture.source.path]
         let intentData = try encoded(intent)
@@ -195,6 +196,8 @@ enum StorageSnapshot {
             budget.measurement.objects = inventory.objects.count
             // Manifest bytes are added below, so this remains a lower bound.
             guard !oversized, measured <= budget.maximumBytes else { throw budget.capacityFailure("snapshot_capacity") }
+            // CL-340: refuse before copying when the store and margin do not fit the volume.
+            try budget.requireFreeSpace(forMeasured: measured)
             // Explicitly flush/close the copied DB before hashing it.
             try stage.synchronizeOwnedFile("database.sqlite")
             let database = try stage.digest("database.sqlite", budget: budget)
@@ -205,7 +208,7 @@ enum StorageSnapshot {
             for descriptor in inventory.objects where descriptor.kind == "file" {
                 try budget.check()
                 var remainingBudget = budget
-                remainingBudget.maximumObjectBytes = min(budget.maximumObjectBytes, budget.maximumBytes - total)
+                remainingBudget.maximumObjectBytes = min(budget.maximumObjectBytes, budget.effectiveMaximumBytes - total)
                 let value: (String, Int64)
                 if let expected = descriptor.expectedSHA256, let prior = copiedContent[expected] {
                     // Hash every source path: an expected hash alone never proves

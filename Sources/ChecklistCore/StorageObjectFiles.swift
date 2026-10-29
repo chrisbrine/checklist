@@ -16,12 +16,17 @@ final class StorageSnapshotMeasurement {
     var objects: Int = 0
     var lowerBound = true
     var writerLeaseSeconds: TimeInterval = 0
+    // CL-340: free bytes on the backup volume, measured once before copying.
+    var availableBytes: Int64?
 }
 
 struct StorageSnapshotBudget {
     // CL-163: bounded product policy, shared by owner backup and pre-upgrade.
     // CL-270: compact metadata and backup-local content sharing qualify capture growth.
-    static let byteLimit: Int64 = 8 * 1_073_741_824
+    // CL-340: no fixed logical byte ceiling. Free space on the backup volume, less
+    // a safety margin, bounds the bytes, so the limit grows with the store.
+    static let byteLimit: Int64 = .max
+    static let freeSpaceMinimumMarginBytes: Int64 = 1_073_741_824
     static let objectLimit = 500_000
     static let manifestByteLimit = 128 * 1_048_576
     static let productionSeconds: TimeInterval = 1_800
@@ -42,6 +47,45 @@ struct StorageSnapshotBudget {
     var pagesPerStep: Int32 = 64
     var folderAccess = StorageFolderAccess()
     var linkFile: (Int32, String, Int32, String) -> Int32 = { linkat($0, $1, $2, $3, 0) }
+    var availableBytes: (URL) throws -> Int64 = Self.volumeAvailableBytes
+
+    static func volumeAvailableBytes(_ url: URL) throws -> Int64 {
+        var info = statfs()
+        guard statfs(url.path, &info) == 0 else { throw StorageSnapshotFailure.io }
+        let free = Int64(clamping: info.f_bavail).multipliedReportingOverflow(by: Int64(info.f_bsize))
+        return free.overflow ? .max : free.partialValue
+    }
+    /// Safety margin kept free on the backup volume: 10% of the bytes, at least 1 GiB.
+    static func freeSpaceMargin(for bytes: Int64) -> Int64 { max(freeSpaceMinimumMarginBytes, bytes / 10) }
+    /// The fixed ceiling (none in production) and, once measured, the free
+    /// space on the backup volume less the minimum margin.
+    var effectiveMaximumBytes: Int64 {
+        guard let available = measurement.availableBytes else { return maximumBytes }
+        return min(maximumBytes, max(0, available - Self.freeSpaceMinimumMarginBytes))
+    }
+    private var limitedByFreeSpace: Bool { measurement.availableBytes != nil && effectiveMaximumBytes < maximumBytes }
+
+    /// Measures the backup volume once per attempt and refuses at once when
+    /// not even the minimum margin is free.
+    func measureFreeSpace(_ parent: URL) throws {
+        measurement.availableBytes = max(0, try availableBytes(parent))
+        try requireFreeSpace(forMeasured: 0)
+    }
+    /// Refuses before copying when the measured bytes plus the margin do not fit.
+    func requireFreeSpace(forMeasured bytes: Int64) throws {
+        guard let available = measurement.availableBytes else { return }
+        let margin = Self.freeSpaceMargin(for: bytes), needed = bytes.addingReportingOverflow(margin)
+        guard needed.overflow || needed.partialValue > available else { return }
+        throw freeSpaceFailure(measured: bytes, margin: margin, available: available)
+    }
+    func freeSpaceFailure(measured: Int64, margin: Int64, available: Int64) -> CoreError {
+        let needed = measured.addingReportingOverflow(margin), required = needed.overflow ? Int64.max : needed.partialValue
+        let next = "Keep the store and existing backups. Free space on the backup volume, then retry. Do not delete retained captures or attachments to make it fit."
+        return CoreError("BACKUP_CAPACITY_EXCEEDED",
+            "Backup stopped before copying store files: it needs at least \(required) free bytes on the backup volume (\(measured) measured store bytes plus a \(margin)-byte safety margin), but the volume has \(available) free bytes. " + next,
+            details: ["reason": "snapshot_free_space", "measured_bytes": measured, "measured_objects": measurement.objects,
+                      "required_free_bytes": required, "available_bytes": available, "free_space_margin_bytes": margin, "next_step": next])
+    }
 
     func check() throws {
         if canceled() { throw StorageSnapshotFailure.canceled }
@@ -50,11 +94,14 @@ struct StorageSnapshotBudget {
 
     func capacityFailure(_ reason: String) -> CoreError {
         let qualifier = measurement.lowerBound ? "at least " : ""
+        let limit = effectiveMaximumBytes
+        let bytesLimit = limit == .max ? "no fixed byte limit" : limitedByFreeSpace
+            ? "\(limit) bytes (free space on the backup volume less a \(Self.freeSpaceMinimumMarginBytes)-byte margin)" : "\(limit) bytes"
         let next = "Keep the store and existing backups. Retry on an idle Mac for a time limit; for a capacity limit, use a Checklist build supporting this store size. Do not delete retained captures or attachments to make it fit."
         return CoreError(reason == "snapshot_deadline" ? "BACKUP_DEADLINE_EXCEEDED" : "BACKUP_CAPACITY_EXCEEDED",
-            "Backup could not finish: \(qualifier)\(measurement.bytes) bytes in \(qualifier)\(measurement.objects) managed objects were measured. Limits: \(maximumBytes) bytes, \(maximumObjects) objects, \(maximumManifestBytes) manifest bytes, \(maximumObjectBytes) bytes per managed file, \(maximumRecords) records; owner and pre-upgrade backups allow \(Int(Self.productionSeconds)) seconds. " + next,
+            "Backup could not finish: \(qualifier)\(measurement.bytes) bytes in \(qualifier)\(measurement.objects) managed objects were measured. Limits: \(bytesLimit), \(maximumObjects) objects, \(maximumManifestBytes) manifest bytes, \(maximumObjectBytes) bytes per managed file, \(maximumRecords) records; owner and pre-upgrade backups allow \(Int(Self.productionSeconds)) seconds. " + next,
             details: ["reason": reason, "measured_bytes": measurement.bytes, "measured_objects": measurement.objects,
-                      "measurement_is_lower_bound": measurement.lowerBound, "maximum_bytes": maximumBytes,
+                      "measurement_is_lower_bound": measurement.lowerBound, "maximum_bytes": limit,
                       "maximum_objects": maximumObjects, "maximum_manifest_bytes": maximumManifestBytes,
                       "maximum_object_bytes": maximumObjectBytes, "maximum_records": maximumRecords,
                       "production_deadline_seconds": Int(Self.productionSeconds), "next_step": next])
@@ -62,7 +109,9 @@ struct StorageSnapshotBudget {
     func reporting(_ error: Error) -> Error {
         guard let failure = error as? StorageSnapshotFailure else { return error }
         switch failure {
-        case .limit: return capacityFailure("snapshot_capacity")
+        case .limit:
+            guard limitedByFreeSpace, let available = measurement.availableBytes else { return capacityFailure("snapshot_capacity") }
+            return freeSpaceFailure(measured: measurement.bytes, margin: Self.freeSpaceMinimumMarginBytes, available: available)
         case .deadline: return capacityFailure("snapshot_deadline")
         default: return error
         }
@@ -71,7 +120,7 @@ struct StorageSnapshotBudget {
     /// Logical published payload bytes, including intent/manifest and link text.
     func adding(_ bytes: Int64, to total: Int64) throws -> Int64 {
         let sum = total.addingReportingOverflow(bytes)
-        guard bytes >= 0, total >= 0, !sum.overflow, sum.partialValue <= maximumBytes else { throw StorageSnapshotFailure.limit }
+        guard bytes >= 0, total >= 0, !sum.overflow, sum.partialValue <= effectiveMaximumBytes else { throw StorageSnapshotFailure.limit }
         return sum.partialValue
     }
 }

@@ -138,6 +138,36 @@ import ChecklistCore
         control.play(); XCTAssertEqual(control.player.rate, 0)
     }
 
+    func testLoopingTakeCyclesEightFrameDurationsAtTheDeclaredRate() async throws {
+        // CL-335: R52C's ffmpeg take reported nominal 10.67 fps but 1/12 s frames; it must play at 1x.
+        let reordered = MediaPlaybackTiming.sourceFrameRate(nominal: 32.0 / 3, minimumFrameDuration: 1.0 / 12)
+        XCTAssertEqual(try XCTUnwrap(reordered), 12, accuracy: 0.0001)
+        XCTAssertEqual(try MediaPlaybackTiming(nominalFrameRate: reordered, declaredFrameRate: 12).rate, 1, accuracy: 0.0001)
+        XCTAssertEqual(MediaPlaybackTiming.sourceFrameRate(nominal: 24, minimumFrameDuration: .nan), 24)
+        XCTAssertNil(MediaPlaybackTiming.sourceFrameRate(nominal: nil, minimumFrameDuration: nil))
+        let url = try directory().appendingPathComponent("cadence-take.mp4")
+        try await Self.writeMovie(url, width: 64, height: 48, frames: 8)
+        let (asset, _, _) = try await MediaTakeLoader.probe(url: url, kind: "video")
+        let timing = try await MediaTakeLoader.timing(asset: asset, frameRate: 12)
+        let control = MediaNativeTakeControl(asset: asset, loop: true, playbackRate: timing.rate)
+        defer { control.unload() }
+        let looper = try XCTUnwrap(control.looper)
+        control.play()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+        while looper.loopCount < 2 || (control.player.currentItem?.timebase).map(CMTimebaseGetRate) ?? 0 == 0,
+              looper.status != .failed, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertGreaterThanOrEqual(looper.loopCount, 2, String(describing: looper.error))
+        // Read the item's own clock, not wall time: each loop is eight 1/12 s frames of
+        // source time, and that clock advances at exactly 1x, so one loop lasts 0.667 s.
+        let item = try XCTUnwrap(control.player.currentItem)
+        let clockRate = CMTimebaseGetRate(try XCTUnwrap(item.timebase))
+        XCTAssertEqual(item.duration.seconds, 8.0 / 12, accuracy: 0.002)
+        XCTAssertEqual(clockRate, 1, accuracy: 0.0001)
+        XCTAssertEqual(item.duration.seconds / clockRate, 8.0 / 12, accuracy: 0.002)
+    }
+
     func testNativeControlPlayKeepsDeclaredSpeedAndNonloopingTakeHasNoLooper() async throws {
         let url = try directory().appendingPathComponent("slower-take.mp4")
         try await Self.writeMovie(url, width: 64, height: 48, frames: 8)

@@ -36,11 +36,33 @@ final class StorageSnapshotCapacityTests: XCTestCase {
         func ownerBackup(_ name: String, command: String = UUID().uuidString) throws -> JSON {
             try router.handle(method: "backup_create", params: ["path": base.appendingPathComponent(name).path, "command_id": command], caller: owner)
         }
+        func ownerBackup(_ name: String, command: String = UUID().uuidString, budget: StorageSnapshotBudget) throws -> JSON {
+            try router.executeStorageBackup(params: ["path": base.appendingPathComponent(name).path, "command_id": command], caller: owner, budget: budget)
+        }
+        /// Synthetic sizes: sparse files cost no disk blocks until copied.
+        func sparseCapture(count: Int, size: Int64) throws -> URL {
+            let source = root.appendingPathComponent("source-captures/project/capture/source")
+            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+            var files: [JSON] = []
+            for i in 0..<count {
+                let name = "sparse-\(i)"
+                let fd = Darwin.open(source.appendingPathComponent(name).path, O_CREAT | O_EXCL | O_WRONLY, 0o600)
+                XCTAssertGreaterThanOrEqual(fd, 0)
+                XCTAssertEqual(ftruncate(fd, off_t(size)), 0); Darwin.close(fd)
+                files.append(["path": name, "kind": "file", "sha256": String(repeating: "0", count: 64), "size": size])
+            }
+            _ = try capture(files)
+            return source
+        }
     }
+    private struct StopBeforeCopy: Error {}
+    private static let gibibyte: Int64 = 1_073_741_824
 
     func testProductionCapacityAndSharedDeadlineHaveMeasuredHeadroom() throws {
         let before = ProcessInfo.processInfo.systemUptime, budget = StorageSnapshotBudget.production()
-        XCTAssertEqual(budget.maximumBytes, 8 * 1_073_741_824)
+        // CL-340: no fixed byte ceiling; free space on the backup volume bounds bytes.
+        XCTAssertEqual(budget.maximumBytes, .max)
+        XCTAssertEqual(budget.effectiveMaximumBytes, .max)
         XCTAssertEqual(budget.maximumObjects, 500_000)
         XCTAssertEqual(budget.maximumManifestBytes, 128 * 1_048_576)
         XCTAssertEqual(budget.maximumObjectBytes, 524_288_000)
@@ -83,38 +105,124 @@ final class StorageSnapshotCapacityTests: XCTestCase {
         }
     }
 
-    func testOwnerCapacityFailureMeasuresAllFilesAndPreservesStoreAndEarlierBackup() throws {
+    func testOwnerFreeSpaceRefusalMeasuresAllFilesAndPreservesStoreAndEarlierBackup() throws {
         let f = try Fixture()
         let earlier = try f.ownerBackup("earlier")
         let earlierSHA = (earlier["data"] as! JSON)["manifest_sha256"] as! String
-        let source = f.root.appendingPathComponent("source-captures/project/capture/source")
-        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
         let size: Int64 = 450 * 1_048_576
-        var files: [JSON] = []
-        for i in 0..<20 {
-            let name = "sparse-\(i)"
-            let fd = Darwin.open(source.appendingPathComponent(name).path, O_CREAT | O_EXCL | O_WRONLY, 0o600)
-            XCTAssertGreaterThanOrEqual(fd, 0)
-            XCTAssertEqual(ftruncate(fd, off_t(size)), 0); Darwin.close(fd)
-            files.append(["path": name, "kind": "file", "sha256": String(repeating: "0", count: 64), "size": size])
-        }
-        _ = try f.capture(files)
+        let source = try f.sparseCapture(count: 20, size: size)
         let command = UUID().uuidString
-        XCTAssertThrowsError(try f.ownerBackup("over-limit", command: command)) { error in
+        // 9 GiB of synthetic store bytes against 8 GiB free: refused before copying.
+        var budget = StorageSnapshotBudget.production()
+        budget.availableBytes = { _ in 8 * Self.gibibyte }
+        var reachedCopy = false
+        budget.observe = { if $0 == "copying_objects" { reachedCopy = true } }
+        XCTAssertThrowsError(try f.ownerBackup("over-limit", command: command, budget: budget)) { error in
             guard let e = error as? CoreError else { return XCTFail("\(error)") }
             XCTAssertEqual(e.code, "BACKUP_CAPACITY_EXCEEDED")
+            XCTAssertEqual(e.details["reason"] as? String, "snapshot_free_space")
             XCTAssertEqual(e.details["measured_objects"] as? Int, 20)
-            XCTAssertGreaterThanOrEqual(e.details["measured_bytes"] as? Int64 ?? 0, 20 * size)
-            XCTAssertTrue(e.message.contains("20 managed objects"))
-            XCTAssertTrue(e.message.contains("bytes"))
+            let measured = e.details["measured_bytes"] as? Int64 ?? 0, margin = e.details["free_space_margin_bytes"] as? Int64 ?? 0
+            XCTAssertGreaterThanOrEqual(measured, 20 * size)
+            XCTAssertEqual(margin, max(Self.gibibyte, measured / 10))
+            XCTAssertEqual(e.details["required_free_bytes"] as? Int64, measured + margin)
+            XCTAssertEqual(e.details["available_bytes"] as? Int64, 8 * Self.gibibyte)
+            XCTAssertTrue(e.message.contains("needs at least \(measured + margin) free bytes on the backup volume"))
+            XCTAssertTrue(e.message.contains("\(margin)-byte safety margin"))
+            XCTAssertTrue(e.message.contains("the volume has \(8 * Self.gibibyte) free bytes"))
             XCTAssertTrue(e.message.contains("Keep the store and existing backups"))
             XCTAssertTrue(e.message.contains("Do not delete retained captures or attachments"))
         }
+        XCTAssertFalse(reachedCopy)
         XCTAssertFalse(FileManager.default.fileExists(atPath: f.base.appendingPathComponent("over-limit").path))
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: source.path).count, 20)
         XCTAssertEqual(try StorageObjectFiles(root: f.base.appendingPathComponent("earlier")).digest("manifest.json", budget: .production()).0, earlierSHA)
         XCTAssertEqual(try f.router.dbQueue.read { try Int.fetchOne($0, sql: "SELECT count(*) FROM commands WHERE command_id=?", arguments: [command]) }, 0)
         XCTAssertEqual(try f.router.dbQueue.read { try String.fetchOne($0, sql: "PRAGMA integrity_check") }, "ok")
+    }
+
+    func testStoreAboveOldEightGiBLimitPassesCapacityChecksWhenFreeSpaceAllows() throws {
+        let f = try Fixture()
+        _ = try f.sparseCapture(count: 20, size: 450 * 1_048_576) // 9 GiB > old 8 GiB limit
+        var budget = StorageSnapshotBudget.production()
+        budget.availableBytes = { _ in 400 * Self.gibibyte }
+        // Stop at the first durable copy: every capacity check has passed by then.
+        budget.observe = { if $0 == "copying_objects" { throw StopBeforeCopy() } }
+        let operation = UUID()
+        XCTAssertThrowsError(try f.build(operation, budget)) { error in
+            XCTAssertTrue(error is StopBeforeCopy, "\(error)")
+        }
+        XCTAssertGreaterThan(budget.measurement.bytes, 8 * Self.gibibyte)
+        XCTAssertEqual(budget.measurement.objects, 20)
+        XCTAssertEqual(budget.measurement.availableBytes, 400 * Self.gibibyte)
+        XCTAssertEqual(budget.effectiveMaximumBytes, 399 * Self.gibibyte)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.base.appendingPathComponent(StorageSnapshot.names(operation).published).path))
+    }
+
+    func testFreeSpaceBudgetUsesTheLiveStoreSizes() throws {
+        // Measured on 28 Oct 2026: 8,626,903,735 bytes; about 410 GiB free.
+        let measured: Int64 = 8_626_903_735
+        var budget = StorageSnapshotBudget.production()
+        budget.availableBytes = { _ in 430_260_952 * 1_024 }
+        try budget.measureFreeSpace(URL(fileURLWithPath: "/unused"))
+        XCTAssertNoThrow(try budget.requireFreeSpace(forMeasured: measured))
+        XCTAssertNoThrow(try budget.adding(measured + 40_000_000, to: 0))
+        // The same store on a volume with only 9 GB free is refused with the needed bytes.
+        XCTAssertEqual(StorageSnapshotBudget.freeSpaceMargin(for: 20 * Self.gibibyte), 2 * Self.gibibyte)
+        budget = StorageSnapshotBudget.production()
+        budget.availableBytes = { _ in 9_000_000_000 }
+        try budget.measureFreeSpace(URL(fileURLWithPath: "/unused"))
+        XCTAssertThrowsError(try budget.requireFreeSpace(forMeasured: measured)) { error in
+            let e = error as? CoreError
+            XCTAssertEqual(e?.code, "BACKUP_CAPACITY_EXCEEDED")
+            XCTAssertEqual(e?.details["reason"] as? String, "snapshot_free_space")
+            XCTAssertEqual(e?.details["required_free_bytes"] as? Int64, 9_700_645_559)
+            XCTAssertEqual(e?.details["free_space_margin_bytes"] as? Int64, Self.gibibyte) // 10% is below the 1 GiB minimum
+            XCTAssertTrue(e?.message.contains("needs at least 9700645559 free bytes") == true)
+        }
+        // Growth past the volume during copying reports free space, not a fixed limit.
+        XCTAssertThrowsError(try budget.adding(9_000_000_000, to: 0)) { error in
+            guard case StorageSnapshotFailure.limit = error else { return XCTFail("\(error)") }
+            XCTAssertEqual((budget.reporting(error) as? CoreError)?.details["reason"] as? String, "snapshot_free_space")
+        }
+        // Less than the minimum margin free: refused before any staging directory exists.
+        let f = try Fixture(), operation = UUID()
+        budget = StorageSnapshotBudget.production()
+        budget.availableBytes = { _ in 512 * 1_048_576 }
+        XCTAssertThrowsError(try f.build(operation, budget)) { error in
+            XCTAssertEqual((error as? CoreError)?.details["reason"] as? String, "snapshot_free_space")
+            XCTAssertEqual((error as? CoreError)?.details["required_free_bytes"] as? Int64, Self.gibibyte)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.base.appendingPathComponent(StorageSnapshot.names(operation).staging).path))
+    }
+
+    func testFixedByteCeilingStillReportsSnapshotCapacity() throws {
+        let f = try Fixture()
+        var budget = StorageSnapshotBudget.production()
+        budget.availableBytes = { _ in 400 * Self.gibibyte }
+        budget.maximumBytes = 1
+        XCTAssertThrowsError(try f.build(UUID(), budget)) { error in
+            let e = error as? CoreError
+            XCTAssertEqual(e?.code, "BACKUP_CAPACITY_EXCEEDED")
+            XCTAssertEqual(e?.details["reason"] as? String, "snapshot_capacity")
+            XCTAssertEqual(e?.details["maximum_bytes"] as? Int64, 1)
+            XCTAssertTrue(e?.message.contains("Limits: 1 bytes, 500000 objects") == true)
+        }
+    }
+
+    func testRestoreRefusesWhenTheCopyDoesNotFitFreeSpace() throws {
+        let f = try Fixture()
+        let backup = f.base.appendingPathComponent("restorable")
+        _ = try f.ownerBackup("restorable")
+        let preview = try f.router.handle(method: "restore_preview", params: ["path": backup.path], caller: f.owner)["data"] as! JSON
+        var budget = StorageSnapshotBudget.production()
+        budget.availableBytes = { _ in 0 }
+        let params: JSON = ["path": backup.path, "manifest_sha256": preview["manifest_sha256"]!, "command_id": UUID().uuidString]
+        XCTAssertThrowsError(try f.router.executeStorageRestore(method: "restore_create", params: params, caller: f.owner, budget: budget)) { error in
+            XCTAssertEqual((error as? CoreError)?.details["reason"] as? String, "snapshot_free_space")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.root.appendingPathComponent("restore").path)
+            && (try? FileManager.default.contentsOfDirectory(atPath: f.root.appendingPathComponent("restore").path).contains { $0.hasPrefix("restored-") }) == true)
     }
 
     func testObjectAndManifestLimitsStillRefuseWithActionableCounts() throws {
