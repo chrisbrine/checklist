@@ -130,7 +130,7 @@ With `cursor_reset_twice` and `remaining=2`, the first record read resets, the e
 A stopped slot may keep its existing owned `data/` while replacing only its app:
 
 ```sh
-./script/test_instances.py restage --slot N --stage /absolute/verified-stage --seeded-commit <full-original-seeded-build-commit>
+./script/test_instances.py restage --slot N --stage /absolute/verified-stage --seeded-commit <full-original-seeded-build-commit> --backup-reply /absolute/saved-reply.json
 ./script/test_instances.py start --slot N --headless
 ./script/test_instances.py check --slot N
 ./script/test_instances.py promote --slot N --dry-run
@@ -144,14 +144,35 @@ and verifies the renamed test app before swapping it, preserves the seed/store,
 updates the workspace fingerprint and clears prior checks. Run fresh `start`
 and `check` for the exact replacement build before promotion.
 
-Reuse requires the original seed to be the **newest complete published live
-backup**, with the same manifest hash and source path. Both `snapshot-*` and
-`qualification-*/snapshot-*` publications count, ordered by manifest mtime with
-path as a tie-breaker. An unpaired manifest without publication intent is not
-complete. Existing seed validation supplied full database/managed-file hash
-verification; restage checks publication identity rather than rehashing every
-backup's managed payload. A newly published backup, changed seed manifest,
-foreign/slot/restored/empty seed or unverifiable publication refuses reuse.
+A seed qualifies for reuse when all of these are true at restage and again at
+promotion. A newer backup does not end reuse: every install is followed by a
+backup, so a newest-backup rule would stop reuse after each round.
+
+- **Complete.** The slot's seed came from `create --seed backup:...`, which
+  hashed every file, and its manifest hash is unchanged. `--backup-reply` names
+  the saved `backup_create` or `operation_get` reply for that seed. The reply
+  must report `status: complete` and name the same path, manifest hash and
+  snapshot operation. `slot.json.restage.seed_completion` keeps it, so later
+  restages of the slot do not need the flag.
+- **This store.** The seed is under this store's `backups/` folder. Its store ID
+  and the seeded copy's incarnation match the live
+  `checklist-store.identity.json`. The harness reads that file and the seed's
+  manifest and intent, and never the live database.
+- **Current schema.** The seed manifest, the live identity file and the replacement
+  stage name the same store schema.
+- **Age.** `capturedAt` in the seed manifest is at most 72 hours old
+  (`MAX_SEED_AGE_HOURS`). An older seed needs a fresh copy, also at promotion.
+- **No listed path.** The diff since the seed's commit has no `FRESH_COPY_PATHS`
+  match (below).
+
+No file marks a finished backup. The service renames a verified stage to its
+final `snapshot-*` name and then commits its receipt to SQL only. A crash between
+the two leaves a folder with a manifest, an intent and every file, but no receipt
+(`snapshot-5aca4aec`, CL-377). The harness therefore never reads completion from
+a folder. It accepts only the service's reply. `backup_create` answers with an
+accepted reply, so save the `operation_get` result when the operation finishes.
+`create --seed latest-backup` still selects by manifest time and verifies bytes, so a
+slot seeded from a generation with no reply can run checks but cannot restage.
 
 The seeded build's commit must be known. Existing captures have no commit field:
 supply its full SHA using `--seeded-commit`; a capture with `source_commit` can
@@ -173,10 +194,10 @@ previously started store cannot qualify those changes. Conservative matches may
 require a fresh copy even for an unrelated edit in a storage/startup file.
 
 `slot.json.restage` records the original capture/build/fingerprint/commit,
-replacement identity, backup manifest hash, changed paths and qualification
-reason. Repeated restaging always compares with the **original seeded build**,
+replacement identity, backup manifest hash, seed capture time, store schema, age
+limit, completion reply, changed paths and qualification reason. Repeated restaging always compares with the **original seeded build**,
 never just the prior replacement. Promotion re-verifies that cumulative proof
-and newest-backup identity and prints the recorded reason; stale/failed or
+and the seed rule above and prints the recorded reason; stale/failed or
 other-build checks cannot qualify. Dry run changes no slot metadata. A failed
 publication remains fenced as `restaging` with no passing checks, requiring
 explicit reconciliation; it cannot start as a healthy slot.

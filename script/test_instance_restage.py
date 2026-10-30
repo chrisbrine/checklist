@@ -1,4 +1,5 @@
 """Conservative CL-366 reuse policy. No store writes or native process operations."""
+from datetime import datetime, timedelta, timezone
 import fnmatch
 import hashlib
 import json
@@ -25,6 +26,10 @@ FRESH_COPY_PATHS = (
     'script/verify_stage.py', 'script/build_input_inventory.py', 'script/build_support.py',
 )
 FRESH_COPY = 'Fresh real-size live-backup copy required; create a new seeded slot and qualify startup/protected backup.'
+MAX_SEED_AGE_HOURS = 72
+REASON = ('complete backup of this store (saved backup_create reply); store schema {schema} equals the current schema; '
+          'captured within {hours} hours; verified seeded commit; no listed storage validation, migration, backup or '
+          'startup path changed since the seeded commit')
 
 
 def sensitive_paths(changed):
@@ -95,50 +100,92 @@ def stage_diff(before, after):
     return sorted(paths)
 
 
-def newest_complete_backup(live):
-    """Published manifest+intent pairs only, including named qualification backups.
+def backup_completion(reply_path):
+    """Read the saved backup_create or operation_get reply for one generation.
 
-    Full bytes were verified by snapshot_seed. Reuse checks publication identity
-    and the seed manifest hash, without rehashing every backup's managed payload.
+    No file marks a finished backup. The service renames a verified stage to its
+    final name first, then commits the receipt to SQL only (commands result,
+    backup-generation metadata, backup_created event). A crash between the two
+    leaves a final-name folder with every file (snapshot-5aca4aec, CL-377), so
+    folder contents cannot prove completion. The service's reply can.
     """
-    candidates = []
-    for pattern in ['snapshot-*/manifest.json', 'qualification-*/snapshot-*/manifest.json']:
-        for file in (live / 'backups').glob(pattern):
-            if file.is_symlink() or any(p.is_symlink() for p in file.parents):
-                raise ValueError('Linked backup publication. ' + FRESH_COPY)
-            intent_file = file.parent / 'intent.json'
-            if intent_file.is_symlink(): raise ValueError('Linked backup intent. ' + FRESH_COPY)
-            if not intent_file.is_file(): continue  # Never published.
-            manifest = json.loads(file.read_bytes())
-            intent = json.loads(intent_file.read_bytes())
-            expected = {'format': str(manifest['format']), 'kind': manifest['kind'],
-                        'operation_id': manifest['operationID'], 'store_id': manifest['storeID'],
-                        'source_root': manifest['sourceRoot']}
-            if (manifest['kind'] != 'checklist-store-snapshot' or manifest['format'] not in [1, 2]
-                    or intent != expected or Path(manifest['sourceRoot']).absolute() != live):
-                raise ValueError('Invalid live backup publication. ' + FRESH_COPY)
-            candidates.append(file)
-    if not candidates: raise ValueError('No complete live backup. ' + FRESH_COPY)
-    return max(candidates, key=lambda f: (f.stat().st_mtime_ns, str(f)))
+    try:
+        raw = Path(reply_path).read_bytes()
+        if len(raw) > 1_048_576: raise ValueError('reply is too large')
+        value = json.loads(raw)
+        operation = value['data'] if isinstance(value.get('data'), dict) and 'result' in value['data'] else value
+        if 'result' in operation or 'state' in operation:
+            if operation.get('method') != 'backup_create' or operation.get('state') != 'succeeded':
+                raise ValueError('operation state is ' + str(operation.get('state')) + ', not succeeded')
+            data = operation['result']['data']
+        else:
+            data = operation['data']
+        if data['status'] != 'complete' or data['format'] != 'checklist-store-snapshot':
+            raise ValueError('reply is not a complete backup')
+        return {'source': 'backup_create reply', 'reply_sha256': hashlib.sha256(raw).hexdigest(), 'path': data['path'],
+                'manifest_sha256': data['manifest_sha256'], 'operation_id': data['operation_id']}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise ValueError('No usable backup_create reply for the seed (' + str(error) + '). ' + FRESH_COPY) from error
 
 
-def reuse_proof(repo, live, seed, origin_capture, origin_manifest, target_capture, target_manifest, commit):
+def verify_seed(live, seed, completion, current_schema, when=None):
+    """A seed qualifies when it is a complete backup of this store, at the current schema, within the age limit.
+
+    snapshot_seed hashed every file at create. This check binds the seed to that
+    manifest and needs no database, so a backup published later does not end reuse.
+    """
     if seed.get('kind') != 'backup' or seed.get('live_snapshot') is not True:
         raise ValueError('Reuse requires a live-backup seed. ' + FRESH_COPY)
     try:
-        latest = newest_complete_backup(live)
+        backups = Path(live) / 'backups'
+        folder = Path(seed['source']).absolute()
+        parts = folder.relative_to(backups).parts
+        if not (len(parts) == 1 and parts[0].startswith('snapshot-')
+                or len(parts) == 2 and parts[0].startswith('qualification-') and parts[1].startswith('snapshot-')):
+            raise ValueError('seed folder is not a published backup')
+        chain = [folder / 'manifest.json', folder / 'intent.json', folder]
+        chain += [parent for parent in folder.parents if parent == backups or backups in parent.parents]
+        if any(path.is_symlink() for path in chain): raise ValueError('linked backup publication')
+        raw = (folder / 'manifest.json').read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest != seed['source_hash']: raise ValueError('seed manifest changed since slot create')
+        manifest = json.loads(raw)
+        intent = json.loads((folder / 'intent.json').read_bytes())
+        if (manifest['kind'] != 'checklist-store-snapshot' or manifest['format'] not in [1, 2]
+                or intent != {'format': str(manifest['format']), 'kind': manifest['kind'], 'operation_id': manifest['operationID'],
+                              'store_id': manifest['storeID'], 'source_root': manifest['sourceRoot']}):
+            raise ValueError('invalid backup publication')
+        if Path(completion['path']).absolute() != folder or completion['manifest_sha256'] != digest or completion['operation_id'] != manifest['operationID']:
+            raise ValueError('the backup_create reply names another backup')
+        identity = json.loads((Path(live) / 'checklist-store.identity.json').read_bytes())
+        if (Path(manifest['sourceRoot']).absolute() != Path(live) or manifest['storeID'] != identity['logical_store_id']
+                or seed['before_start']['identity']['incarnation'] != identity['incarnation']):
+            raise ValueError('seed is a backup of another store or incarnation')
+        schema = current_schema()
+        if not manifest['schema'] == identity['schema_revision'] == schema:
+            raise ValueError(f'seed schema {manifest["schema"]}, live schema {identity["schema_revision"]} and stage schema {schema} differ')
+        captured = datetime.fromisoformat(manifest['capturedAt'].replace('Z', '+00:00'))
+        age = (when or datetime.now(timezone.utc)) - captured
+        if age > timedelta(hours=MAX_SEED_AGE_HOURS) or age < timedelta(minutes=-5):
+            raise ValueError(f'seed captured at {manifest["capturedAt"]} is outside the {MAX_SEED_AGE_HOURS}-hour limit')
     except (ValueError, OSError, KeyError, TypeError) as error:
-        raise ValueError('Cannot verify the newest complete live backup: ' + str(error) + '. ' + FRESH_COPY) from error
-    if (Path(seed['source']).resolve() != latest.parent.resolve()
-            or seed['source_hash'] != hashlib.sha256(latest.read_bytes()).hexdigest()):
-        raise ValueError('Seed is no longer the newest complete live backup. ' + FRESH_COPY)
+        raise ValueError('Seed does not qualify: ' + str(error) + '. ' + FRESH_COPY) from error
+    return {'backup_manifest_sha256': digest, 'seed_captured_at': manifest['capturedAt'], 'seed_store_schema': schema,
+            'seed_max_age_hours': MAX_SEED_AGE_HOURS, 'seed_completion': completion}
+
+
+def reuse_proof(repo, live, seed, origin_capture, origin_manifest, target_capture, target_manifest, commit, completion, current_schema, when=None):
+    """current_schema is a callable: a listed path change must refuse by name before the schema source is parsed."""
+    if seed.get('kind') != 'backup' or seed.get('live_snapshot') is not True:
+        raise ValueError('Reuse requires a live-backup seed. ' + FRESH_COPY)
     commit = verify_seed_commit(repo, origin_manifest, commit)
     changed = stage_diff(origin_capture / 'source', target_capture / 'source')
     sensitive = sensitive_paths(changed)
     if sensitive:
         raise ValueError('Storage validation, migration, backup or startup paths changed: ' + ', '.join(sensitive) + '. ' + FRESH_COPY)
+    seed_proof = verify_seed(live, seed, completion, current_schema, when)
     return {'seeded_stage_path': str(origin_capture), 'seeded_build_id': origin_manifest['build_id'],
             'seeded_source_fingerprint': origin_manifest['source_fingerprint'], 'seeded_commit': commit,
             'target_build_id': target_manifest['build_id'], 'target_source_fingerprint': target_manifest['source_fingerprint'],
-            'backup_manifest_sha256': seed['source_hash'], 'changed_paths': changed,
-            'reason': 'newest complete live-backup seed; verified seeded commit; no storage validation, migration, backup or startup path changed'}
+            'changed_paths': changed, **seed_proof,
+            'reason': REASON.format(schema=seed_proof['seed_store_schema'], hours=MAX_SEED_AGE_HOURS)}

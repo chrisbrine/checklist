@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from contextlib import ExitStack, redirect_stdout
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'script'))
 import test_instance_restage as policy
@@ -31,7 +32,7 @@ class RestageTests(unittest.TestCase):
         self.command('config', 'user.name', 'Fixture')
         self.inputs = {'Sources/ChecklistApp/Views/View.swift': b'view',
                        'Sources/ChecklistCore/StorageBootstrap.swift': b'bootstrap',
-                       'Sources/ChecklistCore/SchemaMigrations.swift': b'migration'}
+                       'Sources/ChecklistCore/SchemaMigrations.swift': b'static let currentSchema = 4\nPRAGMA user_version=4\n'}
         for name, data in self.inputs.items():
             file = self.repo / name; file.parent.mkdir(parents=True, exist_ok=True); file.write_bytes(data)
         self.command('add', '.')
@@ -44,23 +45,39 @@ class RestageTests(unittest.TestCase):
                                            'executable': False} for name, data in self.inputs.items()], key=lambda e: e['path'])}
         self.target_manifest = dict(self.manifest, build_id='new', source_fingerprint='b' * 64)
         self.live = self.root / 'live'; self.snapshot = self.publish('snapshot-one', 10)
+        (self.live / 'checklist-store.identity.json').write_text(json.dumps(
+            {'logical_store_id': 'store', 'incarnation': 'inc', 'schema_revision': 4}))
         self.seed = {'kind': 'backup', 'live_snapshot': True, 'source': str(self.snapshot.parent),
-                     'source_hash': hashlib.sha256(self.snapshot.read_bytes()).hexdigest()}
+                     'source_hash': hashlib.sha256(self.snapshot.read_bytes()).hexdigest(),
+                     'before_start': {'identity': {'incarnation': 'inc'}}}
+        self.reply = self.root / 'reply.json'
+        self.reply.write_text(json.dumps(self.operation_reply()))
+        self.completion = policy.backup_completion(self.reply)
+        self.now = datetime(2026, 10, 30, 12, tzinfo=timezone.utc)
 
     def command(self, *args):
         return subprocess.check_output(['git', '-C', str(self.repo), *args], text=True)
 
-    def publish(self, name, stamp):
+    def publish(self, name, stamp, captured=None):
+        captured = captured or datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         folder = self.live / 'backups' / name; folder.mkdir(parents=True)
-        value = {'format': 1, 'kind': 'checklist-store-snapshot', 'operationID': name, 'storeID': 'store', 'sourceRoot': str(self.live)}
+        value = {'format': 1, 'kind': 'checklist-store-snapshot', 'operationID': name, 'storeID': 'store', 'sourceRoot': str(self.live),
+                 'schema': 4, 'capturedAt': captured}
         file = folder / 'manifest.json'; file.write_text(json.dumps(value)); os.utime(file, (stamp, stamp))
         (folder / 'intent.json').write_text(json.dumps({'format': '1', 'kind': value['kind'], 'operation_id': name,
                                                        'store_id': 'store', 'source_root': str(self.live)}))
         return file
 
-    def proof(self, commit=True):
+    def operation_reply(self, **changes):
+        data = {'status': 'complete', 'format': 'checklist-store-snapshot', 'path': str(self.snapshot.parent),
+                'manifest_sha256': hashlib.sha256(self.snapshot.read_bytes()).hexdigest(), 'operation_id': 'snapshot-one'}
+        data.update(changes)
+        return {'method': 'backup_create', 'state': 'succeeded', 'operation_id': 'job', 'result': {'data': data}}
+
+    def proof(self, commit=True, when=None, schema=4):
         return policy.reuse_proof(self.repo, self.live, self.seed, self.origin, self.manifest,
-                                  self.target, self.target_manifest, self.commit if commit else None)
+                                  self.target, self.target_manifest, self.commit if commit else None,
+                                  self.completion, lambda: schema, when)
 
     def test_safe_diff_records_original_target_commit_and_reason(self):
         (self.target / 'source/Sources/ChecklistApp/Views/View.swift').write_text('new view')
@@ -68,7 +85,10 @@ class RestageTests(unittest.TestCase):
         self.assertEqual(proof['changed_paths'], ['Sources/ChecklistApp/Views/View.swift'])
         self.assertEqual(proof['seeded_commit'], self.commit)
         self.assertEqual(proof['target_build_id'], 'new')
-        self.assertIn('newest complete', proof['reason'])
+        for text in ['complete backup of this store', 'schema 4', '72 hours', 'no listed storage']:
+            self.assertIn(text, proof['reason'])
+        self.assertEqual(proof['seed_completion'], self.completion)
+        self.assertEqual(proof['seed_max_age_hours'], 72)
 
     def test_every_policy_path_refuses_and_view_is_allowed(self):
         # Concrete guards against removing a critical family from the one policy list.
@@ -106,14 +126,83 @@ class RestageTests(unittest.TestCase):
         self.manifest['inputs'].pop()
         with self.assertRaisesRegex(ValueError, 'differs from captured'): self.proof()
 
-    def test_newer_named_backup_stale_hash_foreign_and_incomplete_refuse(self):
-        incomplete = self.live / 'backups/snapshot-incomplete'; incomplete.mkdir()
-        (incomplete / 'manifest.json').write_text('{unpublished partial')
-        self.proof()  # No publication intent: not a newer complete backup.
-        self.publish('qualification-round/snapshot-two', 20)
-        with self.assertRaisesRegex(ValueError, 'no longer the newest'): self.proof()
-        self.seed['source'] = str(self.live / 'backups/qualification-round/snapshot-two')
-        with self.assertRaisesRegex(ValueError, 'no longer the newest'): self.proof()
+    def test_newer_backup_does_not_end_reuse(self):
+        first = self.proof()
+        self.publish('snapshot-two', 20); self.publish('qualification-round/snapshot-three', 30)
+        self.assertEqual(self.proof(), first)
+
+    def test_named_qualification_backup_can_seed(self):
+        manifest = self.publish('qualification-round/snapshot-two', 20)
+        digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        self.seed.update(source=str(manifest.parent), source_hash=digest)
+        self.completion.update(path=str(manifest.parent), manifest_sha256=digest, operation_id='qualification-round/snapshot-two')
+        self.assertEqual(self.proof()['backup_manifest_sha256'], digest)
+
+    def test_age_limit_is_72_hours_with_a_small_clock_allowance(self):
+        captured = '2026-10-30T12:00:00Z'
+        self.rewrite_manifest(capturedAt=captured)
+        start = datetime(2026, 10, 30, 12, tzinfo=timezone.utc)
+        self.proof(when=start + timedelta(hours=72))
+        self.proof(when=start - timedelta(minutes=5))
+        with self.assertRaisesRegex(ValueError, '72-hour limit.*Fresh real-size'): self.proof(when=start + timedelta(hours=72, seconds=1))
+        with self.assertRaisesRegex(ValueError, '72-hour limit'): self.proof(when=start - timedelta(minutes=6))
+
+    def rewrite_manifest(self, **changes):
+        value = json.loads(self.snapshot.read_text()); value.update(changes)
+        self.snapshot.write_text(json.dumps(value))
+        digest = hashlib.sha256(self.snapshot.read_bytes()).hexdigest()
+        self.seed['source_hash'] = digest; self.completion['manifest_sha256'] = digest
+        return digest
+
+    def test_schema_must_equal_seed_live_and_stage(self):
+        with self.assertRaisesRegex(ValueError, 'schema.*differ.*Fresh real-size'): self.proof(schema=5)
+        self.rewrite_manifest(schema=3)
+        with self.assertRaisesRegex(ValueError, 'seed schema 3'): self.proof()
+        self.rewrite_manifest(schema=4)
+        (self.live / 'checklist-store.identity.json').write_text(json.dumps(
+            {'logical_store_id': 'store', 'incarnation': 'inc', 'schema_revision': 5}))
+        with self.assertRaisesRegex(ValueError, 'live schema 5'): self.proof()
+
+    def test_another_store_or_incarnation_refuses(self):
+        identity = self.live / 'checklist-store.identity.json'
+        for value in [{'logical_store_id': 'other', 'incarnation': 'inc', 'schema_revision': 4},
+                      {'logical_store_id': 'store', 'incarnation': 'restored', 'schema_revision': 4}]:
+            identity.write_text(json.dumps(value))
+            with self.assertRaisesRegex(ValueError, 'another store or incarnation'): self.proof()
+
+    def test_partial_generation_with_manifest_and_intent_is_not_complete(self):
+        # CL-377: a final-name folder with both files and no receipt. No reply exists, so it cannot qualify.
+        with self.assertRaisesRegex(ValueError, 'No usable backup_create reply'): policy.backup_completion(self.root / 'absent.json')
+        failed = {'method': 'backup_create', 'state': 'failed', 'result': {'data': self.operation_reply()['result']['data']}}
+        accepted = {'command_outcome': 'accepted', 'data': {'method': 'backup_create', 'state': 'queued'}}
+        incomplete = self.operation_reply(status='incomplete')
+        for value in [failed, accepted, incomplete, {'error': {'code': 'BACKUP_INCOMPLETE'}}]:
+            self.reply.write_text(json.dumps(value))
+            with self.assertRaisesRegex(ValueError, 'No usable backup_create reply'): policy.backup_completion(self.reply)
+        self.reply.write_text(json.dumps({'method': 'backup_create', 'state': 'failed', 'error': {'code': 'BACKUP_INCOMPLETE'}}))
+        with self.assertRaisesRegex(ValueError, 'operation state is failed'): policy.backup_completion(self.reply)
+        self.reply.write_text('{invalid')
+        with self.assertRaisesRegex(ValueError, 'No usable'): policy.backup_completion(self.reply)
+
+    def test_reply_shapes_and_reply_for_another_backup(self):
+        data = self.operation_reply()['result']['data']
+        for value in [self.operation_reply(), {'data': self.operation_reply()}, {'data': data}]:
+            self.reply.write_text(json.dumps(value))
+            self.assertEqual(policy.backup_completion(self.reply)['manifest_sha256'], data['manifest_sha256'])
+        for key, wrong in [('path', str(self.root / 'other')), ('manifest_sha256', 'f' * 64), ('operation_id', 'other')]:
+            self.completion = dict(data, source='backup_create reply', reply_sha256='x'); self.completion[key] = wrong
+            with self.assertRaisesRegex(ValueError, 'names another backup'): self.proof()
+
+    def test_seed_folder_must_be_published_unchanged_and_live(self):
+        good = self.proof()['backup_manifest_sha256']
+        self.seed['source_hash'] = 'f' * 64
+        with self.assertRaisesRegex(ValueError, 'changed since slot create'): self.proof()
+        self.seed['source_hash'] = good
+        source = self.seed['source']
+        for wrong in [str(self.live / 'backups/.snapshot-staging-one'), str(self.root / 'elsewhere/snapshot-one')]:
+            self.seed['source'] = wrong
+            with self.assertRaisesRegex(ValueError, 'Fresh real-size'): self.proof()
+        self.seed['source'] = source
         self.seed['live_snapshot'] = False
         with self.assertRaisesRegex(ValueError, 'live-backup seed'): self.proof()
 
@@ -124,7 +213,12 @@ class RestageTests(unittest.TestCase):
     def test_linked_publication_refuses(self):
         intent = self.snapshot.parent / 'intent.json'; data = intent.read_bytes(); intent.unlink()
         outside = self.root / 'intent'; outside.write_bytes(data); intent.symlink_to(outside)
-        with self.assertRaisesRegex(ValueError, 'Linked'): self.proof()
+        with self.assertRaisesRegex(ValueError, 'linked'): self.proof()
+
+    def test_listed_path_refuses_by_name_before_seed_or_schema_checks(self):
+        (self.target / 'source/Sources/ChecklistCore/StorageBootstrap.swift').write_text('changed')
+        self.seed['source_hash'] = 'f' * 64
+        with self.assertRaisesRegex(ValueError, 'Sources/ChecklistCore/StorageBootstrap.swift'): self.proof(schema=9)
 
     def metadata(self):
         return {'slot': 1, 'build_id': 'new', 'source_fingerprint': 'b' * 64, 'stage_path': str(self.target),
@@ -139,6 +233,7 @@ class RestageTests(unittest.TestCase):
         with patch.object(harness, 'REPO', self.repo), patch.object(harness, 'LIVE', self.live), \
              patch.object(harness, 'verify_stage', side_effect=self.verify), redirect_stdout(io.StringIO()) as output:
             self.assertTrue(all(harness.promotion_gates(metadata, [metadata]).values()))
+            self.assertIn('complete backup of this store', output.getvalue())
             self.assertIn('seeded_commit', output.getvalue())
             metadata['checks']['passed'] = False
             self.assertFalse(harness.promotion_gates(metadata, [metadata])['live_snapshot_check_same_build'])
@@ -149,15 +244,26 @@ class RestageTests(unittest.TestCase):
             fresh = dict(metadata); fresh.pop('restage')
             self.assertTrue(all(harness.promotion_gates(fresh, [fresh]).values()))
 
-    def test_promotion_new_backup_or_modified_proof_refuses(self):
+    def test_promotion_newer_backup_passes_old_seed_or_modified_proof_refuses(self):
         metadata = self.metadata()
         with patch.object(harness, 'REPO', self.repo), patch.object(harness, 'LIVE', self.live), \
-             patch.object(harness, 'verify_stage', side_effect=self.verify), redirect_stdout(io.StringIO()):
-            metadata['restage']['changed_paths'] = ['fabricated']
-            self.assertFalse(harness.promotion_gates(metadata, [metadata])['live_snapshot_check_same_build'])
-            metadata['restage'] = self.proof()
+             patch.object(harness, 'verify_stage', side_effect=self.verify), redirect_stdout(io.StringIO()) as output:
             self.publish('snapshot-new', 50)
+            self.assertTrue(harness.promotion_gates(metadata, [metadata])['live_snapshot_check_same_build'])
+            proof = metadata['restage']
+            metadata['restage'] = dict(proof, changed_paths=['fabricated'])
             self.assertFalse(harness.promotion_gates(metadata, [metadata])['live_snapshot_check_same_build'])
+            metadata['restage'] = proof
+            without = {k: v for k, v in proof.items() if k != 'seed_completion'}
+            metadata['restage'] = without
+            self.assertFalse(harness.promotion_gates(metadata, [metadata])['live_snapshot_check_same_build'])
+            self.assertIn('--backup-reply', output.getvalue())
+            metadata['restage'] = proof
+            late = datetime.now(timezone.utc) + timedelta(hours=73)
+            with patch.object(policy, 'datetime', wraps=datetime) as clock:
+                clock.now.return_value = late
+                self.assertFalse(harness.promotion_gates(metadata, [metadata])['live_snapshot_check_same_build'])
+            self.assertIn('72-hour limit', output.getvalue())
 
     def test_restage_preserves_store_clears_checks_and_uses_original_on_second_stage(self):
         with ExitStack() as stack:
@@ -180,12 +286,15 @@ class RestageTests(unittest.TestCase):
                 if command[0] == 'ditto': shutil.copytree(command[1], command[2])
                 else: self.assertEqual(command[0], 'codesign')
             stack.enter_context(patch.object(harness, 'run', side_effect=fake_run))
-            args = SimpleNamespace(slot=1, session_id='actual', seeded_commit=self.commit)
+            missing = SimpleNamespace(slot=1, session_id='actual', seeded_commit=self.commit, backup_reply=None)
+            with self.assertRaisesRegex(ValueError, '--backup-reply'): harness.restage(missing, p)
+            args = SimpleNamespace(slot=1, session_id='actual', seeded_commit=self.commit, backup_reply=self.reply)
             inode = store.stat().st_ino
             harness.restage(args, p)
             final = harness.load(p)
             self.assertEqual(store.read_bytes(), b'owned-store-do-not-copy'); self.assertEqual(store.stat().st_ino, inode)
             self.assertIsNone(final['checks']); self.assertEqual(final['restage']['seeded_stage_path'], str(self.origin))
+            self.reply.unlink()  # A later restage keeps the recorded completion.
             harness.restage(args, p)
             self.assertEqual(harness.load(p)['restage']['seeded_stage_path'], str(self.origin))
             (self.target / 'source/Sources/ChecklistCore/SchemaMigrations.swift').write_text('changed')
@@ -214,13 +323,13 @@ class RestageTests(unittest.TestCase):
     def test_cli_restage_dispatches_with_exact_stage_commit_and_owner(self):
         with patch.dict(os.environ, {k: '' for k in ['CODEX_THREAD_ID', 'CLAUDE_SESSION_ID', 'CLAUDE_CODE_SESSION_ID', 'CHECKLIST_SESSION_ID']}), \
              patch.object(sys, 'argv', ['test_instances.py', 'restage', '--slot', '1', '--stage', '/fake',
-                                        '--session-id', 'actual', '--seeded-commit', self.commit]), \
+                                        '--session-id', 'actual', '--seeded-commit', self.commit, '--backup-reply', '/reply.json']), \
              patch.object(harness, 'checked'), patch.object(harness, 'locked', return_value=ExitStack()), \
              patch.object(harness, 'restage') as restage:
             harness.main()
             args = restage.call_args.args[0]
             self.assertEqual(args.stage, Path('/fake')); self.assertEqual(args.seeded_commit, self.commit)
-            self.assertEqual(args.session_id, 'actual')
+            self.assertEqual(args.session_id, 'actual'); self.assertEqual(args.backup_reply, Path('/reply.json'))
 
     def test_cli_requires_stage_and_owner_identity_before_slot_access(self):
         with patch.dict(os.environ, {k: '' for k in ['CODEX_THREAD_ID', 'CLAUDE_SESSION_ID', 'CLAUDE_CODE_SESSION_ID', 'CHECKLIST_SESSION_ID']}), \

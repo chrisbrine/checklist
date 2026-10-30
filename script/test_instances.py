@@ -26,7 +26,7 @@ from urllib.parse import unquote, urlsplit
 import uuid
 
 from clean_scratch import caller_session, mark_qualification, read_marker, requested_tickets, validate_fingerprint
-from test_instance_restage import FRESH_COPY, reuse_proof
+from test_instance_restage import FRESH_COPY, backup_completion, reuse_proof
 from verify_stage import sha, signing_teams, verify as verify_stage
 from verify_install import failure_guidance, upgrading_message, upgrading_status
 
@@ -1115,7 +1115,7 @@ def create(arguments, p):
         print(f'Created slot {arguments.slot}: build {manifest["build_id"]}; seed {seed["kind"]}')
 
 
-def restage_qualification(metadata, capture=None, manifest=None, commit=None):
+def restage_qualification(metadata, capture=None, manifest=None, commit=None, reply=None):
     previous = metadata.get('restage') or {}
     origin_path = previous.get('seeded_stage_path', metadata['stage_path'])
     origin_capture, origin_manifest = verify_stage(origin_path)
@@ -1123,8 +1123,13 @@ def restage_qualification(metadata, capture=None, manifest=None, commit=None):
                      or origin_manifest['source_fingerprint'] != previous['seeded_source_fingerprint']):
         raise ValueError('Original seeded stage identity changed. ' + FRESH_COPY)
     if capture is None: capture, manifest = verify_stage(metadata['stage_path'])
+    completion = previous.get('seed_completion')
+    if completion is None:
+        if reply is None: raise ValueError('Reuse needs the saved backup_create reply for the seed; supply --backup-reply. ' + FRESH_COPY)
+        completion = backup_completion(reply)
     return reuse_proof(REPO, LIVE, metadata['seed'], origin_capture, origin_manifest,
-                       capture, manifest, previous.get('seeded_commit') or commit or origin_manifest.get('source_commit'))
+                       capture, manifest, previous.get('seeded_commit') or commit or origin_manifest.get('source_commit'),
+                       completion, lambda: storage_schema(Path(capture) / 'source' / SCHEMA_SOURCE))
 
 
 def restage(arguments, p):
@@ -1139,7 +1144,8 @@ def restage(arguments, p):
     bundle_check(p, metadata)
     capture, manifest = stage_selection(arguments)
     require_managed_path_support(capture, manifest)
-    proof = restage_qualification(metadata, capture, manifest, getattr(arguments, 'seeded_commit', None))
+    reply = getattr(arguments, 'backup_reply', None)
+    proof = restage_qualification(metadata, capture, manifest, getattr(arguments, 'seeded_commit', None), reply)
     identity = sign_identity(manifest)
     target = dict(metadata, build_id=manifest['build_id'], source_fingerprint=manifest['source_fingerprint'],
                   stage_path=str(capture), mode='stopped', checks=None, restage=proof, restaged_at=now())
@@ -1154,7 +1160,7 @@ def restage(arguments, p):
         run(['codesign', '--force', '--sign', identity, '--timestamp=none', '--identifier', p['identifier'], incoming])
         bundle_check(dict(p, bundle=incoming), target)
         # Recheck freshness after potentially slow signing, before any publication.
-        if restage_qualification(metadata, capture, manifest, proof['seeded_commit']) != proof:
+        if restage_qualification(metadata, capture, manifest, proof['seeded_commit'], reply) != proof:
             raise ValueError('Restage qualification changed. ' + FRESH_COPY)
         save(p, dict(metadata, mode='restaging', checks=None))
         previous = Path(temporary) / 'previous.app'
@@ -1450,7 +1456,7 @@ def promotion_gates(selected, slots):
             try:
                 proof = restage_qualification(value)
                 if proof != value['restage']: return False
-                print('Restaged live-backup qualification: ' + json.dumps(proof, sort_keys=True))
+                print('Restaged live-backup qualification: ' + proof['reason'] + '. Proof: ' + json.dumps(proof, sort_keys=True))
             except (ValueError, OSError, KeyError, subprocess.SubprocessError) as error:
                 print('Restaged live-backup qualification refused: ' + str(error))
                 return False
@@ -1501,6 +1507,7 @@ def main():
             command.add_argument('--stage', type=Path, required=True)
             command.add_argument('--session-id', help='actual owning session')
             command.add_argument('--seeded-commit', help='full known commit of original seeded capture (verified against all inputs)')
+            command.add_argument('--backup-reply', type=Path, help="saved backup_create or operation_get reply for the slot's seed; needed on the first restage of a slot")
         if name == 'create':
             source = command.add_mutually_exclusive_group()
             source.add_argument('--stage', type=Path); source.add_argument('--latest-stage', action='store_true')
