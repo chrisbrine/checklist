@@ -105,13 +105,13 @@ final class BackupWriteQueue: @unchecked Sendable {
         try files.writeNew("backup-write-queue/" + temporary,bytes:try StorageSnapshot.encoded(value))
         let (directory,final) = try files.parent("backup-write-queue/" + name(sequence,key,suffix))
         defer {Darwin.close(directory)}
-        guard renameatx_np(directory,temporary,directory,final,UInt32(RENAME_EXCL)) == 0,fsync(directory) == 0 else {throw StorageSnapshotFailure.io}
+        guard renameatx_np(directory,temporary,directory,final,UInt32(RENAME_EXCL)) == 0,fsync(directory) == 0 else {throw StorageSnapshotFailure.failed("renameatx_np",path:"backup-write-queue/" + final,root:files.root.path)}
     }
     private func removeIntent(_ intent: Intent) throws {
         guard let files else {throw StoreRecovery.required("backup_write_queue_not_ready")}
         let (directory,name) = try files.parent("backup-write-queue/" + name(intent.sequence,intent.key,"intent"))
         defer {Darwin.close(directory)}
-        guard (unlinkat(directory,name,0) == 0 || errno == ENOENT),fsync(directory) == 0 else {throw StorageSnapshotFailure.io}
+        guard (unlinkat(directory,name,0) == 0 || errno == ENOENT),fsync(directory) == 0 else {throw StorageSnapshotFailure.failed("unlinkat",path:"backup-write-queue/" + name,root:files.root.path)}
     }
 
     func status() -> JSON {

@@ -10,7 +10,9 @@ extension CommandRouter {
     static let mediaOwnerMethods = mediaOwnerReads.union([
         "media_type_create", "media_type_revise", "media_type_adopt", "media_type_retire", "media_round_create", "media_round_cancel", "media_round_archive", "media_item_create", "media_item_update", "media_round_publish", "media_intake_preview", "media_intake_revise", "media_intake_confirm", "media_intake_capture", "media_context_approve", "media_context_reconcile", "media_decide", "media_example_read_lease", "media_example_read_release", "media_original_read",
         // CL-300: owner screens for CL-118 rework Drafts, round closure and successor rounds.
-        "media_rework_create", "media_round_finish", "media_round_successor"
+        "media_rework_create", "media_round_finish", "media_round_successor",
+        // CL-318/CL-349: frozen bulk decisions and one-press suggestion adoption, owner only.
+        "media_bulk_prepare", "media_bulk_apply", "media_adopt_suggestion"
     ])
     func executeMediaOwnerChannel(method: String, params p: JSON, caller c: Caller) throws -> JSON {
         try owner(c)
@@ -18,7 +20,8 @@ extension CommandRouter {
         let projections: [String: Set<String>] = [
             "media_navigation": [], "media_round_page": ["type_id", "state", "offset"],
             "media_round_header": ["round_id"], "media_publication_preview": ["round_id", "command_id"],
-            "media_item_get": ["round_id", "item_id"], "media_original_read": ["round_id", "item_id", "target_id", "reference_id", "representation", "seconds"]
+            "media_item_get": ["round_id", "item_id"], "media_original_read": ["round_id", "item_id", "target_id", "reference_id", "representation", "seconds"],
+            "media_bulk_selection": ["round_id", "list", "filter", "item_ids"]
         ]
         if let fields = projections[method] {
             guard Set(p.keys).isSubset(of: fields.union(["project_id"])) else { throw CoreError("INVALID_INPUT", "Unknown media read fields.") }
@@ -43,7 +46,12 @@ extension CommandRouter {
                     return ["rows": Array(values.prefix(100)), "has_more": values.count > 100, "offset":offset]
                 }
                 let round = try self.scoped(db,text(p,"round_id"),project,type:"media_round")
-                if method == "media_round_header" { return try self.mediaOwnerHeader(db,round,c) }
+                if method == "media_round_header" {
+                    var header = try self.mediaOwnerHeader(db,round,c)
+                    if round["state"] as? String == "open" { header["closure_readiness"] = try self.mediaCloseReadiness(db,round:round) }
+                    return header
+                }
+                if method == "media_bulk_selection" { return try self.mediaBulkSelection(db,p,round:round,caller:c,project:project) }
                 if method == "media_publication_preview" {
                     let (type,context) = try self.mediaRoundParts(db,round)
                     let items = try self.mediaItems(db,round:round).map { item -> JSON in
@@ -103,6 +111,7 @@ extension CommandRouter {
             item["decision"] = decision
             item["disposition"] = decision["review_basis_signature"] as? String == target["review_basis_signature"] as? String ? (try StoredRecord(decision,
                  family: "media").requiredValue("disposition")) : "stale"
+            item["follow_up"] = try mediaFollowUpView(db,index:mediaFollowUpIndex(mediaReworkLinks(db,round:round)),decisionID:id,project:project)
         } else if member != nil,item["stale_predecessor_decision_id"] is String {
             // CL-118 successor with a changed basis: same Stale as the round view and item page.
             item["disposition"] = "stale"

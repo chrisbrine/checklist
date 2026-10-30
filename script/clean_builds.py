@@ -18,6 +18,7 @@ import sys
 
 from clean_scratch import (DEFAULT_BUDGET_GB, FINISHED, OWNER_RECORD, SESSION_VARIABLES, WORKSPACE_MARKER, background_sizes, cli_status_reader, du_sizes, inventory, native_session, read_owner_record, release_finished, running_paths, storage_groups, storage_report, ticket_roots, within, workspace_protection)
 from retire_old_bundles import trash, trash_many
+from cleanup_service_wait import ServiceReadiness
 import test_instances as slots
 
 REPO = Path(__file__).resolve().parents[1]
@@ -399,7 +400,8 @@ class Cleaner:
             if OWNER_RECORD not in names and (path.name in {'managed', 'source-captures', 'source', 'src', '.build'}
                                                or names & {'checklist.sqlite', 'database.sqlite'}):
                 opaque.add(path)
-            owns = bool(TICKET.search(path.name) or names & HANDIN_RECORDS)
+            owns = bool(TICKET.search(path.name) or names & HANDIN_RECORDS or
+                        (stat.S_ISDIR(entries[path][2]) and path not in opaque and names & {'report.md', 'notes.md'} and evidence_metadata_owners(path)[0]))
             if stat.S_ISDIR(entries[path][2]) and path not in opaque and (owns or any(p in scoped for p in children.get(path, []))):
                 scoped.add(path)
             if path != folder: sizes[path.parent] += sizes[path]
@@ -412,7 +414,7 @@ class Cleaner:
             names = {p.name for p in children.get(path, [])}
             if stat.S_ISLNK(entries[path][2]):
                 yield 'link', path
-            elif stat.S_ISDIR(entries[path][2]) and path not in opaque and (TICKET.search(path.name) or names & HANDIN_RECORDS):
+            elif stat.S_ISDIR(entries[path][2]) and path not in opaque and (TICKET.search(path.name) or names & HANDIN_RECORDS or (names & {'report.md', 'notes.md'} and evidence_metadata_owners(path)[0])):
                 yield 'handin', path
             else:
                 yield 'container', path
@@ -522,7 +524,8 @@ class Cleaner:
             state['fresh'] = True
             unresolved = sorted(k for k in keys if values.get(k) not in FINISHED)
             if unresolved:
-                return 'open or unknown ticket status: ' + ', '.join(unresolved)
+                return ('name-only ownership requires every named and enclosing ticket Done or canceled; '
+                        if 'names' in basis or basis.startswith('folder name') else '') + 'open or unknown ticket status: ' + ', '.join(unresolved)
             if self.notes_path is not None or self.note_poster:
                 self.evidence_notes(path, before)
             return None
@@ -678,48 +681,113 @@ def readable_rows(path):
     except (OSError, ValueError): return []
 
 
-def evidence_owners(folder, entries=None):
-    """(keys, basis, problems) for one hand-in. An owner.json registration decides
-    alone. Otherwise keys come from files.json entries
-    ("ticket" or "tickets"), cleanup.json "tickets" and the folder name (the fallback
-    when entries lack a ticket key). Ticket keys in nested file names add owners but
-    never establish ownership alone. No keys means unknown owner; an unreadable
-    record is a problem. Neither raises: both retain the folder."""
-    entries = inventory(folder) if entries is None else entries
-    # CL-359: the owner.json registration written at creation is read first.
-    if (folder / OWNER_RECORD) in entries:
-        try: record = read_owner_record(folder)
-        except (OSError, ValueError) as error: return set(), 'none', [f'{OWNER_RECORD}: {error}']
-        if record: return set(record['tickets']), OWNER_RECORD, []
-    keys, problems, named, recorded, nested = set(), [], set(), {}, set()
-    missing = 0
-    for path, entry in entries.items():
-        found = set(TICKET.findall(path.name))
-        if path == folder: keys |= found
-        else: nested |= found
-        if found: named.add('folder name' if path == folder else 'file names')
-        if not stat.S_ISREG(entry[2]) or path.name not in ('files.json', 'cleanup.json'): continue
-        try: data = read_json(path)
-        except (OSError, ValueError) as error:
-            problems.append(f'{path.relative_to(folder)}: {error}'); continue
-        if path.name == 'files.json':
-            rows, found = ownership_rows(data)
-            for row in rows:
-                tickets = ticket_values(row.get('ticket')) | ticket_values(row.get('tickets'))
-                found |= tickets
-                missing += not tickets
-        else:
-            # A cleanup.json without "tickets" is a scratch-cleanup receipt, not ownership.
-            found = ticket_values(data.get('tickets')) if isinstance(data, dict) else set()
-        if found: recorded[path.name] = True
-        keys |= found
-    if not keys: return set(), 'none', problems
-    keys |= nested
-    basis = sorted(recorded)
-    if named: basis.append(' and '.join(sorted(named)) + (f' ({missing} files.json entries have no ticket key)' if missing else ''))
-    elif missing and keys: basis.append(f'{missing} files.json entries have no ticket key')
-    return keys, ', '.join(basis) or 'none', problems
+def report_owner_keys(path):
+    """Read explicit legacy ownership headers, never arbitrary ticket mentions."""
+    safe(path)
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 2 * 1024 * 1024:
+        raise ValueError('invalid or oversized evidence ownership report: ' + str(path))
+    keys = set()
+    for line in path.read_text().splitlines()[:30]:
+        value = line.strip().strip('#').strip()
+        declaration = re.match(r'(?i)(?:owning )?tickets?\s*:\s*(.+)$', value)
+        if declaration:
+            named = set(TICKET.findall(declaration[1]))
+            remainder = TICKET.sub('', declaration[1]).strip(' ,;`*[]')
+            if named and not remainder:
+                keys |= named
+        verdict = re.match(r'^(CL-\d+):\s*(?:\d+\s+)?(?:PASS|FAIL|NOT SHOWN|NOT RUN|PARTIAL)\b', value)
+        if verdict:
+            keys.add(verdict[1])
+    return keys
 
+
+def evidence_metadata_owners(folder):
+    """Direct authoritative metadata, excluding names and nested fixture records."""
+    folder = Path(folder)
+    keys, sources, problems = set(), [], []
+    try:
+        record = read_owner_record(folder)
+    except (OSError, ValueError) as error:
+        return set(), OWNER_RECORD, [f'{OWNER_RECORD}: {error}']
+    if record:
+        return set(record['tickets']), OWNER_RECORD, []
+    for name in ('files.json', 'cleanup.json', 'report.md', 'notes.md'):
+        path = folder / name
+        if not path.exists() and not path.is_symlink():
+            continue
+        try:
+            if name in ('report.md', 'notes.md'):
+                found = report_owner_keys(path)
+            else:
+                data = read_json(path)
+                if name == 'files.json':
+                    rows, found = ownership_rows(data)
+                    for row in rows:
+                        found |= ticket_values(row.get('ticket')) | ticket_values(row.get('tickets'))
+                else:
+                    found = ticket_values(data.get('tickets')) if isinstance(data, dict) else set()
+            if found:
+                keys |= found
+                sources.append(name)
+        except (OSError, ValueError, UnicodeError) as error:
+            problems.append(f'{name}: {error}')
+    return keys, ', '.join(sources) or 'none', problems
+
+
+def evidence_owners(folder, entries=None):
+    """An enclosing evidence owner owns the whole tree; names cannot split it.
+
+    Without authoritative metadata, all names in this tree and its enclosing
+    folders contribute safety gates. A nested filename alone is never ownership.
+    """
+    folder = Path(folder)
+    ancestors = []
+    for parent in folder.parents:
+        if parent.name == 'evidence' and parent.parent.name == '.local':
+            break
+        ancestors.append(parent)
+    else:
+        ancestors = []  # Standalone fixtures never inspect arbitrary parents.
+    for parent in reversed(ancestors):
+        keys, basis, problems = evidence_metadata_owners(parent)
+        if keys or problems:
+            return keys, 'enclosing ' + str(parent) + ': ' + basis, problems
+    keys, basis, problems = evidence_metadata_owners(folder)
+    if problems or basis == OWNER_RECORD or 'report.md' in basis or 'notes.md' in basis:
+        return keys, basis, problems
+    entries = inventory(folder) if entries is None else entries
+    if keys:
+        # Legacy manifests retain their conservative union with names; only an
+        # explicit owner registration or a runner ownership header supersedes it.
+        nested = {key for path in entries if path != folder for key in TICKET.findall(path.name)}
+        own = set(TICKET.findall(folder.name))
+        keys |= own | nested
+        named = []
+        if nested: named.append('file names')
+        if own: named.append('folder name')
+        if named: basis += ', ' + ' and '.join(named)
+        return keys, basis, problems
+    enclosing = {key for parent in ancestors for key in TICKET.findall(parent.name)}
+    own = set(TICKET.findall(folder.name))
+    if not own and not enclosing:
+        return set(), 'none', []
+    nested = {key for path in entries if path != folder for key in TICKET.findall(path.name)}
+    keys = own | enclosing | nested
+    named = []
+    if nested: named.append('file names')
+    if own: named.append('folder name')
+    if enclosing: named.append('enclosing folder names')
+    missing = 0
+    record = folder / 'files.json'
+    if record in entries:
+        try:
+            missing = sum(not (ticket_values(row.get('ticket')) | ticket_values(row.get('tickets')))
+                          for row in ownership_rows(read_json(record))[0])
+        except (OSError, ValueError): pass  # Direct record errors already returned above.
+    label = ' and '.join(named)
+    if missing: label += f' ({missing} files.json entries have no ticket key)'
+    return keys, label, []
 
 def evidence_keys(folder, entries=None):
     return evidence_owners(folder, entries)[0]
@@ -857,11 +925,13 @@ def release_done(repo, environ=None, reader=None, sessions_root=None, qualificat
               + ') is exported; run clean_scratch.py --release-done.', file=sys.stderr, flush=True)
         return 2
     try:
+        readiness = ServiceReadiness()
         reader = reader or cli_status_reader(Path('/Applications/Checklist.app/Contents/MacOS/checklist'),
-                                             release_workspace(repo, environ), environ.get('CHECKLIST_PROJECT_ID'))
+                                             release_workspace(repo, environ), environ.get('CHECKLIST_PROJECT_ID'),
+                                             timeout=readiness.call_timeout)
         roots = ticket_roots(Path(sessions_root or f'/private/tmp/claude-{os.getuid()}'),
                              Path(qualification_root or Path.home() / 'Library/Caches/ChecklistQualification'), session)
-        return release_finished(roots, session, reader)
+        return release_finished(roots, session, lambda keys: readiness.read(reader, keys))
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         print(json.dumps({'action': 'release_done', 'status': 'failed', 'reason': str(error)}), flush=True)
         return 1

@@ -9,7 +9,6 @@ final class InstanceCacheRootTests: XCTestCase {
         for environment in [[:], ["CHECKLIST_DATA_ROOT": "/tmp/checklist-custom-service-root"]] {
             XCTAssertEqual(try ChecklistInstance(environment: environment).humanClaimService, "Checklist.HumanClaim")
         }
-        XCTAssertEqual(HumanClaims.service, "Checklist.HumanClaim")
     }
 
     func testLiveAndEverySlotHaveDistinctHumanClaimServices() throws {

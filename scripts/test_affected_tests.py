@@ -37,6 +37,11 @@ GRAPH = {'targets': [
 ]]}
 
 class SelectionTests(unittest.TestCase):
+    def test_once_per_pass_qualification_includes_the_cl371_load_cases(self):
+        for method in ('testLargeAutomaticFirstPassKeepsConcurrentReadAndWriteUnderTwoSeconds',
+                       'testSustainedWritersBoundRSSCPUAndBackoff'):
+            self.assertIn('ChecklistCoreTests.TicketLifecycleCleanupTests/' + method, selector.QUALIFICATION_CASES)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

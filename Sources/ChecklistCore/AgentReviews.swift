@@ -18,7 +18,7 @@ private final class UncommittedReviewReport: Sendable {
         let (directory,name) = try files.parent(relative)
         var identity = stat()
         guard fstatat(directory,name,&identity,AT_SYMLINK_NOFOLLOW) == 0,identity.st_mode & S_IFMT == S_IFREG else {
-            Darwin.close(directory);throw StorageSnapshotFailure.io
+            let code = errno;Darwin.close(directory);throw StorageSnapshotFailure.failed("fstatat",path:relative,root:root.path,code:code)
         }
         self.directory = directory;self.name = name;self.identity = identity
     }

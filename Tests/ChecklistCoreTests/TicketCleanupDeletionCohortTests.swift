@@ -270,6 +270,7 @@ extension TicketLifecycleCleanupTests {
     /// before teardown. Match launchd's soft limit and the measured service idle
     /// baseline, then exercise the real byte-turn preparation and unlink path.
     func testDeletionCohort256CandidatesAtLaunchdDescriptorLimit() throws {
+        try QualificationSuite.requireEnabled()
         let receipts = try deletionCohortFixture([256])
         var original = rlimit()
         XCTAssertEqual(getrlimit(RLIMIT_NOFILE,&original),0)

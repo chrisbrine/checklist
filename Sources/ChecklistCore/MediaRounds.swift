@@ -51,6 +51,7 @@ extension CommandRouter {
         "media_decide":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","items","disposition","winner_id","none_fit","note","no_follow_up_reason"],
         "media_adopt_suggestion":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","items","suggestion_id"],
         "media_round_finish":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest"],
+        "media_follow_up_record":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","items","task_id","reason"],
         "media_rework_preview":["round_id","epic_id","items"],
         "media_rework_create":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","epic_id","items","preview_digest"],
         "media_round_successor":["source_round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","title","items"]
@@ -398,6 +399,7 @@ extension CommandRouter {
             return try mediaPublishRound(db,p,c,project:pid,resources:resources)
         case "media_context_reconcile": return try mediaReconcile(db,p,c,project:pid)
         case "media_decide","media_suggest","media_adopt_suggestion": return try mediaDecision(db,p,c,project:pid,method:method)
+        case "media_follow_up_record": return try mediaFollowUpRecord(db,p,c,project:pid)
         case "media_round_finish":
             return try mediaFinishRound(db,p,c,project:pid)
         case "media_round_successor":
@@ -517,7 +519,9 @@ extension CommandRouter {
         for i in targets.indices {
             var item = targets[i].0
             let old = try scoped(db,(try StoredRecord(item, family: "media").string("draft_target_id")),pid,type:"media_item_target")
-            let shape = try mediaPublishOwnership(db,shape:targets[i].1,caller:c,resources:resources)
+            var shape = try mediaPublishOwnership(db,shape:targets[i].1,caller:c,resources:resources)
+            // CL-351: a Draft suggestion stays current only through this exact publication lineage.
+            shape["published_from_target_id"] = old["id"]
             let target = try mediaTarget(db,item:item,shape:shape,caller:c,previous:old)
             item["draft_target_id"] = target["id"];item["record_references"] = ((try StoredRecord(item, family: "media").objects("record_references"))) + [try mediaRef("media_item_target",target)]
             item = revised(item);try mediaWrite(db,item,type:"media_item");targets[i] = (item,target)
@@ -531,7 +535,7 @@ extension CommandRouter {
     private func mediaFinishRound(_ db: Database,_ p: JSON,_ c: Caller,project pid: String) throws -> JSON {
         try owner(c);var round = try scoped(db,try text(p,"round_id"),pid,type:"media_round")
         try mediaObserve(db,p,round:round,caller:c);let manifest = try mediaObservedManifest(db,p,round:round)
-        // CL-118: exact current dispositions; rework links and no-follow-up counted separately.
+        // CL-118/CL-350: exact current dispositions; follow-up kinds counted separately.
         let (closure,links) = try mediaClosure(db,round:round,manifest:manifest,caller:c)
         round["closure"] = closure
         round["record_references"] = (try StoredRecord(round, family: "media").objects("record_references")) + (try links.map {try mediaRef("media_rework_link",$0)})

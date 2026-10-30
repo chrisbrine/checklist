@@ -19,7 +19,7 @@ enum ArchiveStorageGate {
         if let pinned { try pinned.requireNamedRoot(root);files = pinned }
         else { files = try StorageObjectFiles(root:root) }
         let fd = openat(files.descriptor,".archive-storage.lock",O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC,0o600)
-        guard fd >= 0 else { throw CoreError("STORAGE_GATE_UNAVAILABLE", "The managed object gate cannot be opened.") }
+        guard fd >= 0 else { throw CoreError("STORAGE_GATE_UNAVAILABLE", "The managed object gate cannot be opened.",details:["posix_errno":errno]) }
         defer { Darwin.close(fd) }
         var info = stat()
         guard fstat(fd,&info) == 0,info.st_mode & S_IFMT == S_IFREG,info.st_nlink == 1 else { throw CoreError("STORAGE_GATE_UNAVAILABLE", "The managed object gate is not a private regular file.") }

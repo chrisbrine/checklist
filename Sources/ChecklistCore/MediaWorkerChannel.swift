@@ -68,7 +68,7 @@ extension CommandRouter {
             _ = try mediaWorkerAdoptedType(db,scoped(db,text(p,"type_id"),project,type:"media_review_type"),project:project)
             return
         }
-        if method == "media_suggest" {return}
+        if method == "media_suggest" || method == "media_follow_up_record" {return}
         let round: JSON
         if method == "media_intake_preview" {
             round = try scoped(db,text(p,"round_id"),project,type:"media_round")
@@ -104,6 +104,9 @@ extension CommandRouter {
         }
         result["observed_context_token"] = try mediaToken(db,round:round,caller:c)
         result["context_attention"] = !strings(round,"attention_ids").isEmpty
+        // CL-350: closure counts and the Needs look items stay readable after Close.
+        result["closure"] = round["closure"]
+        let followUps = mediaFollowUpIndex(try mediaReworkLinks(db,round:round))
         if let id = round["manifest_id"] as? String {
             let manifest = try scoped(db,id,project,type:"media_round_manifest")
             result["manifest"] = ["id":id,"digest":try StoredRecord(manifest,family:"media_round_manifest").requiredValue("digest")]
@@ -121,6 +124,7 @@ extension CommandRouter {
                 value["decision"] = mediaWorkerDecision(decision)
                 for key in ["winner_id","none_fit","note"] {value[key] = decision[key]}
                 value["decision_id"] = id;value["decided_at"] = decision["created_at"]
+                value["follow_up"] = try mediaFollowUpView(db,index:followUps,decisionID:id,project:project)
             }
             return value
         }
@@ -160,7 +164,8 @@ extension CommandRouter {
                     suggestion["source_label"] = sessionThreadLabel(session)
                 } else {suggestion["source_label"] = "Recorded worker"}
                 suggestion["display_only"] = true
-                suggestion["stale"] = suggestion["review_basis_signature"] as? String != target["review_basis_signature"] as? String
+                // CL-351: `stale` covers a changed target, not only a changed basis.
+                suggestion["stale"] = !mediaSuggestionCurrent(suggestion,target:target)
                 return suggestion
             }
     }

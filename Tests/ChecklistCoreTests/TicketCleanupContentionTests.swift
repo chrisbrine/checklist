@@ -521,9 +521,14 @@ extension TicketLifecycleCleanupTests {
                 try expireCleanupBackoff();_ = try configure(p)
                 try router.withTicketCleanupPreparation({db in
                     let prepared = try self.router.prepareTicketLifecycleCleanup(db)
-                    _ = try self.call("message_send",["project_id":pid,"task_id":t["id"]!,"body":"Deliberate selected-ticket conflict"])
+                    _ = try self.call("message_send",["project_id":pid,"task_id":t["id"]!,"body":"Deliberate unrelated-note traffic on the cleaned ticket"])
+                    // CL-371: a ticket conflict retries only that ticket and its pass
+                    // still commits (testSelectedTicketFenceRetriesOnlyThatTicketAndRetrySurvivesRestart).
+                    // Only a project fence refuses the whole attempt and arms the
+                    // durable backoff this soak measures.
+                    _ = try self.configure(p,settings:["done_evidence_enabled":true,"closed_purge_enabled":true,"closed_days":16 + refusals])
                     return prepared
-                }) {_,_,_ in XCTFail("Selected-ticket conflict cannot commit")}
+                }) {_,_,_ in XCTFail("Changed project cleanup settings cannot commit")}
                 let state = try router.dbQueue.read {try self.router.ticketCleanupPreparationState($0,project:pid)}
                 XCTAssertEqual(state["state"] as? String,"deferred")
                 let rss = TicketLifecycleCleanupTests.residentBytes()

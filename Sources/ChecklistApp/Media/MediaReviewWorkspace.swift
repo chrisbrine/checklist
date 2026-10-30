@@ -32,7 +32,7 @@ struct MediaTypeSettings: View {
                 Text("Story text").tag("text")
                 Text("Character animation images").tag("animation")
                 Text("Video takes").tag("video")
-                Text("Animation takes (12 fps)").tag("animation_video")
+                Text("Animation takes").tag("animation_video")
                 Text("Audio takes").tag("audio")
             }
             Button("Add review type") {
@@ -79,11 +79,17 @@ struct MediaTypeSettings: View {
             value["layout"]=["kind":starter+"_compare","primary_slot_id":"take","reference_slot_id":"reference"]
         }
         if starter == "animation_video" {
+            value["fields"]=[["id":"character","label":"Character","kind":"short_text","required":true,"material":true],
+                ["id":"animation_label","label":"Action","kind":"short_text","required":true,"material":true],
+                ["id":"direction","label":"Direction","kind":"choice","required":true,"material":true,"choices":["N","NE","E","SE","S","SW","W","NW"]],
+                ["id":"take","label":"Take","kind":"short_text","material":true],
+                ["id":"hint","label":"Hint","kind":"long_text","material":false],
+                ["id":"frame_rate","label":"Frame rate (fps)","kind":"number","material":true]]
             value["slots"]=[["id":"take","label":"Take","kind":"video","material":true],
                 ["id":"model_sheet","label":"Model sheet","kind":"image","material":true],
                 ["id":"concept_art","label":"Concept art","kind":"image","material":true],
                 ["id":"reference","label":"Earlier take","kind":"video","material":true]]
-            value["layout"]=["kind":"video_compare","primary_slot_id":"take","reference_slot_ids":["model_sheet","concept_art","reference"],"loop":true,"frame_rate":12]
+            value["layout"]=["kind":"video_compare","primary_slot_id":"take","reference_slot_ids":["model_sheet","concept_art","reference"],"loop":true,"frame_rate_field_id":"frame_rate"]
         }
         return value
     }
@@ -97,6 +103,7 @@ struct MediaReviewWorkspace: View {
     @State private var paste=""
     @State private var showPaste=false
     @State private var showList=false
+    @State private var directionGroup: MediaAnimationGroup?
     @State private var cancelReason=""
     @State private var confirmation: PendingConfirmation?
     var body: some View {
@@ -132,11 +139,25 @@ struct MediaReviewWorkspace: View {
                     ScrollView {roundControls}.frame(minHeight:60,maxHeight:190).accessibilityLabel("Round setup and frozen intake")
                     HSplitView {
                         itemList.frame(minWidth:175,idealWidth:220)
-                        ScrollView {MediaOwnerComparison(model:model).frame(maxWidth:.infinity,alignment:.leading).padding(8)}.frame(minWidth:280)
+                        ScrollView {
+                            if let group=directionGroup {
+                                MediaDirectionGrid(model:model,group:group,close:{directionGroup=nil}).id(model.projectID+":"+model.roundID+":"+group.id).padding(8)
+                            } else {
+                                VStack(alignment:.leading) {
+                                    if let group=MediaAnimationGroup(metadata:model.item.object("target")["metadata"] as? MediaValues ?? [:],schema:model.schema) {
+                                        Button("Open direction grid") {model.prepareForDirectionGrid();directionGroup=group}
+                                    }
+                                    MediaOwnerComparison(model:model)
+                                }.frame(maxWidth:.infinity,alignment:.leading).padding(8)
+                            }
+                        }.frame(minWidth:280)
                     }.frame(minHeight:150).layoutPriority(1)
                 } else {Text("Choose a round, or capture a title-only Draft round.").foregroundStyle(Color.checklistSecondaryText);Spacer()}
             } else {Spacer()} // No onboarding imposed on a project without enabled types.
         }.padding(12)
+        .onChange(of:model.roundID) {_,_ in directionGroup=nil}
+        .onChange(of:model.projectID) {_,_ in directionGroup=nil}
+        .onChange(of:model.selectedID) {_,_ in directionGroup=nil}
         .sheet(isPresented:$showPaste) {
             VStack(alignment:.leading) {
                 Text("Paste text list").font(.headline)
@@ -204,7 +225,7 @@ struct MediaReviewWorkspace: View {
             } else if !model.historyOnly && ["closed","canceled"].contains(model.header.string("state")) {
                 Button("Archive round and retain originals…") {confirmation = model.archiveRoundConfirmation()}.checklistDisabled([(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
             }
-            MediaRoundActions(model:model,confirmation:$confirmation)
+            MediaRoundActions(model:model)
             TechnicalDetails(raw: [("Round",model.header.values),("Publication preview",model.publication.map(\.values)),("Frozen intake",model.intake.values)]).id(model.roundID)
         }
     }
@@ -212,22 +233,41 @@ struct MediaReviewWorkspace: View {
         VStack {
             Picker("Disposition filter",selection:$model.filter) {ForEach(["all","pending","accepted","needs_look","changes_requested","excluded","stale"],id:\.self) {Text($0.replacingOccurrences(of:"_",with:" ").capitalized).tag($0)}}
                 .onChange(of:model.filter) {_,_ in Task {await model.reloadRows()}}
+            MediaBulkBar(model:model,confirmation:$confirmation)
             ScrollViewReader {scroll in
                 ScrollView {
                     LazyVStack(alignment:.leading,spacing:4) {
                         ForEach(MediaFlatRow.project(model.rows)) {row in
                             if let item=row.item {
-                                Button {Task {await model.select(item.id)}} label: {
+                                HStack(alignment:.top,spacing:4) {
+                                if model.bulk.selecting {
+                                    Toggle("",isOn:Binding(get:{model.bulk.ticks.contains(item.id)},set:{_ in model.toggleBulkTick(item.id)}))
+                                        .labelsHidden().accessibilityLabel("Select "+item.string("title"))
+                                }
+                                Button {directionGroup=nil;Task {await model.select(item.id)}} label: {
                                     VStack(alignment:.leading) {
                                         Text(row.title).lineLimit(2)
                                         Text(MediaReviewModel.dispositionLabel(item.string("disposition"))).font(.caption)
+                                        if !item.strings("agent_suggestions").isEmpty {Text("Agent suggests: "+item.strings("agent_suggestions").map(MediaReviewModel.dispositionLabel).joined(separator:", ")).font(.caption2)}
                                         Text((model.list["visible_columns"] as? [String] ?? item.object("metadata").keys.sorted()).compactMap {key in item.object("metadata")[key].map {key+": "+String(describing:$0)}}.joined(separator:" · ")).font(.caption2)
                                     }.frame(maxWidth:.infinity,alignment:.leading).padding(6)
                                         .background(model.selectedID==item.id ? Color.accentColor.opacity(0.16) : .clear,in:RoundedRectangle(cornerRadius:4))
                                 }.buttonStyle(.plain).id(item.id)
                                     .accessibilityLabel(Self.rowLabel(item))
                                     .accessibilityAddTraits(model.selectedID==item.id ? .isSelected : [])
-                            } else {Text(row.title).font(.caption.bold()).padding(.top,6).accessibilityAddTraits(.isHeader)}
+                                }
+                            } else if let group=MediaAnimationGroup(headerID:row.id,schema:model.schema) {
+                                Button {model.prepareForDirectionGrid();directionGroup=group} label: {Text(group.title).font(.caption.bold()).padding(.top,6)}
+                                    .buttonStyle(.plain).accessibilityLabel("Open direction grid, "+group.title)
+                                if model.bulk.selecting,let bulkGroup=MediaBulkGroup(title:row.title,path:row.group) {
+                                    Button("Select group") {model.selectBulkGroup(bulkGroup)}.font(.caption).accessibilityLabel("Select group "+row.title)
+                                }
+                            } else {
+                                Text(row.title).font(.caption.bold()).padding(.top,6).accessibilityAddTraits(.isHeader)
+                                if model.bulk.selecting,let group=MediaBulkGroup(title:row.title,path:row.group) {
+                                    Button("Select group") {model.selectBulkGroup(group)}.font(.caption).accessibilityLabel("Select group "+row.title)
+                                }
+                            }
                         }
                         if model.next != nil {Button("Load more items") {Task {await model.moreRows()}}}
                     }

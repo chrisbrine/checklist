@@ -407,7 +407,12 @@ SQLite `NORMAL` synchronization on their own writer, preserving WAL, foreign
 keys, transaction visibility and reopen behavior without a disk durability
 barrier per command. Qualification fixtures retain `FULL` (the helper's `durable`
 option also selects it explicitly). Direct production/storage/migration/crash
-constructors are unchanged. `TestStoreTests` checks this separation against a
+constructors are unchanged. `TestStore.router` also selects `SourceGitFixtureMemo` for
+that test (CL-363): the first Git request for an exact workspace state runs real,
+confined Git, and a later byte-identical state reuses the output with the workspace path
+rebound. Refusals, a workspace overlapping a protected root and a tree it cannot fully key
+(symlink, `.git` file, unreadable or large entry) always run real Git. Direct-constructor
+fixtures, `sourceGitMemo: false` and `CHECKLIST_QUALIFICATION=1` keep real Git. `TestStoreTests` checks this separation against a
 fresh production Router. The setup benchmark measures the actual unit helper
 with `durable: false` against fresh production setup. Reopening
 an existing fixture preserves its data. Fresh storage, migration, crash and

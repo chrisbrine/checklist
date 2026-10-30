@@ -262,8 +262,9 @@ final class MediaDecisionTests: XCTestCase {
                 }
             }
         }
+        // CL-349: the trusted owner channel only; agents have no route and no catalog entry.
         for method in ["media_bulk_prepare","media_bulk_get","media_bulk_apply"] {
-            checks.checkError("UNSUPPORTED_METHOD") {try f.router.handle(method:method,params:["command_id":uuid(),"project_id":f.project],caller:f.owner)}
+            checks.checkError("FORBIDDEN") {try f.router.handle(method:method,params:["command_id":uuid(),"project_id":f.project],caller:f.worker)}
         }
         let catalog = try f.router.handle(method:"tool_catalog",params:[:],caller:f.worker)
         XCTAssertFalse(try jsonString(catalog).contains("media_bulk_"))

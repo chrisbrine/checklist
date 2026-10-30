@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "id": "server-owned",
+  "name": "Animation takes",
+  "fields": [
+    {
+      "id": "character",
+      "label": "Character",
+      "kind": "short_text",
+      "required": true,
+      "material": true
+    },
+    {
+      "id": "animation_label",
+      "label": "Action",
+      "kind": "short_text",
+      "required": true,
+      "material": true
+    },
+    {
+      "id": "direction",
+      "label": "Direction",
+      "kind": "choice",
+      "required": true,
+      "material": true,
+      "choices": [
+        "N",
+        "NE",
+        "E",
+        "SE",
+        "S",
+        "SW",
+        "W",
+        "NW"
+      ]
+    },
+    {
+      "id": "take",
+      "label": "Take",
+      "kind": "short_text",
+      "material": true
+    },
+    {
+      "id": "hint",
+      "label": "Hint",
+      "kind": "long_text",
+      "material": false
+    },
+    {
+      "id": "frame_rate",
+      "label": "Frame rate (fps)",
+      "kind": "number",
+      "material": true
+    }
+  ],
+  "slots": [
+    {
+      "id": "take",
+      "label": "Take",
+      "kind": "video",
+      "material": true
+    },
+    {
+      "id": "model_sheet",
+      "label": "Model sheet",
+      "kind": "image",
+      "material": true
+    },
+    {
+      "id": "concept_art",
+      "label": "Concept art",
+      "kind": "image",
+      "material": true
+    },
+    {
+      "id": "reference",
+      "label": "Earlier take",
+      "kind": "video",
+      "material": true
+    }
+  ],
+  "layout": {
+    "kind": "video_compare",
+    "primary_slot_id": "take",
+    "reference_slot_ids": [
+      "model_sheet",
+      "concept_art",
+      "reference"
+    ],
+    "loop": true,
+    "frame_rate_field_id": "frame_rate"
+  }
+}

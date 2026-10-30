@@ -13,6 +13,7 @@ import ChecklistCore
     func unload() { unloads += 1; pause() }
 }
 @MainActor private final class Released { var ids: [String] = [] }
+@MainActor private final class NativeLoopEnds { var count = 0 }
 
 @MainActor final class MediaPlaybackComparisonTests: XCTestCase {
     private func take(_ key: String, bytes: Int = 1024, control: FakeTake = FakeTake()) -> MediaPreparedTake {
@@ -104,12 +105,12 @@ import ChecklistCore
         for unknown in [nil, 0, Double.nan, .infinity] as [Double?] {
             XCTAssertThrowsError(try MediaPlaybackTiming(nominalFrameRate: unknown, declaredFrameRate: 12))
         }
-        XCTAssertThrowsError(try MediaPlaybackTiming(nominalFrameRate: 1, declaredFrameRate: 12))
+        XCTAssertEqual(try MediaPlaybackTiming(nominalFrameRate: 1, declaredFrameRate: 12).rate, 12)
         XCTAssertEqual(MediaPlaybackLabels.playback(loop: true, frameRate: 12), "Loops at 12 fps")
         XCTAssertEqual(MediaPlaybackLabels.playback(loop: false, frameRate: nil), "Plays once at source speed")
     }
 
-    func testEightFrameVideoLoopsAtTwelveFPSAndPauseRetainsQueueUntilUnload() async throws {
+    func testEightFrameVideoLoopsAtTwelveFPSAndPauseRetainsItemUntilUnload() async throws {
         let url = try directory().appendingPathComponent("eight-frames.mp4")
         try await Self.writeMovie(url, width: 64, height: 48, frames: 8)
         let (asset, _, _) = try await MediaTakeLoader.probe(url: url, kind: "video")
@@ -117,28 +118,32 @@ import ChecklistCore
         XCTAssertEqual(try XCTUnwrap(timing.nominalFrameRate), 12, accuracy: 0.01)
         let control = MediaNativeTakeControl(asset: asset, loop: true, playbackRate: timing.rate)
         defer { control.unload() }
-        let looper = try XCTUnwrap(control.looper)
-        XCTAssertGreaterThanOrEqual(looper.loopingPlayerItems.count, 2)
+        let item = try XCTUnwrap(control.player.currentItem)
+        XCTAssertEqual(control.player.actionAtItemEnd, .none)
+        XCTAssertEqual(control.player.items().count, 1, "No future queue item may render before the retained take ends.")
+        let ends = NativeLoopEnds()
+        let token = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { _ in
+            MainActor.assumeIsolated { ends.count += 1 }
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
         control.play()
         let deadline = ContinuousClock.now.advanced(by: .seconds(8))
-        while looper.loopCount < 2, looper.status != .failed, ContinuousClock.now < deadline {
+        while ends.count < 3, control.player.status != .failed, ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(20))
         }
-        XCTAssertNotEqual(looper.status, .failed, String(describing: looper.error))
-        XCTAssertGreaterThanOrEqual(looper.loopCount, 2, "Generated 8-frame/12-fps take must advance through native queue replicas.")
-        XCTAssertNotNil(control.player.currentItem)
+        XCTAssertGreaterThanOrEqual(ends.count, 3, "The same eight-frame item must reach its end and replay repeatedly.")
+        XCTAssertTrue(control.player.currentItem === item)
+        XCTAssertEqual(control.player.items().count, 1)
         XCTAssertEqual(control.player.rate, 1, accuracy: 0.001)
         control.pause()
         XCTAssertEqual(control.player.rate, 0)
-        XCTAssertTrue(control.looper === looper)
-        XCTAssertFalse(control.player.items().isEmpty)
+        XCTAssertTrue(control.player.currentItem === item)
         control.unload()
-        XCTAssertNil(control.looper); XCTAssertTrue(control.player.items().isEmpty)
-        XCTAssertEqual(looper.status, .cancelled)
+        XCTAssertTrue(control.player.items().isEmpty)
         control.play(); XCTAssertEqual(control.player.rate, 0)
     }
 
-    func testLoopingTakeCyclesEightFrameDurationsAtTheDeclaredRate() async throws {
+    func testLoopingTakeRetainsEightFrameSourceDurationAndDeclaredClockRate() async throws {
         // CL-335: R52C's ffmpeg take reported nominal 10.67 fps but 1/12 s frames; it must play at 1x.
         let reordered = MediaPlaybackTiming.sourceFrameRate(nominal: 32.0 / 3, minimumFrameDuration: 1.0 / 12)
         XCTAssertEqual(try XCTUnwrap(reordered), 12, accuracy: 0.0001)
@@ -151,31 +156,36 @@ import ChecklistCore
         let timing = try await MediaTakeLoader.timing(asset: asset, frameRate: 12)
         let control = MediaNativeTakeControl(asset: asset, loop: true, playbackRate: timing.rate)
         defer { control.unload() }
-        let looper = try XCTUnwrap(control.looper)
+        let item = try XCTUnwrap(control.player.currentItem)
+        let ends = NativeLoopEnds()
+        let token = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { _ in
+            MainActor.assumeIsolated { ends.count += 1 }
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
         control.play()
         let deadline = ContinuousClock.now.advanced(by: .seconds(8))
-        while looper.loopCount < 2 || (control.player.currentItem?.timebase).map(CMTimebaseGetRate) ?? 0 == 0,
-              looper.status != .failed, ContinuousClock.now < deadline {
+        while ends.count < 2 || (control.player.currentItem?.timebase).map(CMTimebaseGetRate) ?? 0 == 0,
+              control.player.status != .failed, ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(20))
         }
-        XCTAssertGreaterThanOrEqual(looper.loopCount, 2, String(describing: looper.error))
-        // Read the item's own clock, not wall time: each loop is eight 1/12 s frames of
-        // source time, and that clock advances at exactly 1x, so one loop lasts 0.667 s.
-        let item = try XCTUnwrap(control.player.currentItem)
+        XCTAssertGreaterThanOrEqual(ends.count, 2, String(describing: control.player.error))
+        // This proves source duration and rate only. Native pixel measurements must
+        // account separately for the seek's boundary delay and observed loop cadence.
+        XCTAssertTrue(control.player.currentItem === item)
         let clockRate = CMTimebaseGetRate(try XCTUnwrap(item.timebase))
         XCTAssertEqual(item.duration.seconds, 8.0 / 12, accuracy: 0.002)
         XCTAssertEqual(clockRate, 1, accuracy: 0.0001)
         XCTAssertEqual(item.duration.seconds / clockRate, 8.0 / 12, accuracy: 0.002)
     }
 
-    func testNativeControlPlayKeepsDeclaredSpeedAndNonloopingTakeHasNoLooper() async throws {
+    func testNativeControlPlayKeepsDeclaredSpeedAndNonloopingTakeRetainsOneItem() async throws {
         let url = try directory().appendingPathComponent("slower-take.mp4")
         try await Self.writeMovie(url, width: 64, height: 48, frames: 8)
         let (asset, _, _) = try await MediaTakeLoader.probe(url: url, kind: "video")
         let timing = try await MediaTakeLoader.timing(asset: asset, frameRate: 6)
         let control = MediaNativeTakeControl(asset: asset, loop: false, playbackRate: timing.rate)
         defer { control.unload() }
-        XCTAssertNil(control.looper)
+        XCTAssertEqual(control.player.items().count, 1)
         XCTAssertEqual(control.player.defaultRate, 0.5)
         // Same entry point as AVKit's native Play, after the owner pauses.
         control.player.play()
@@ -243,6 +253,38 @@ import ChecklistCore
         control.play(); control.unload()
         try await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(control.player.rate, 0); XCTAssertNil(control.player.currentItem)
+    }
+
+    func testLoopEndNoticeCannotUndoPauseRewindMidTakeOrRepopulateUnloadedPlayer() async throws {
+        let url = try directory().appendingPathComponent("loop-end-fences.mp4")
+        try await Self.writeMovie(url, width: 64, height: 48, frames: 32)
+        let (asset, _, _) = try await MediaTakeLoader.probe(url: url, kind: "video")
+        let control = MediaNativeTakeControl(asset: asset, loop: true, playbackRate: 1)
+        defer { control.unload() }
+        let item = try XCTUnwrap(control.player.currentItem)
+        let duration = try await asset.load(.duration)
+        await control.player.seek(to: duration, toleranceBefore: .zero, toleranceAfter: .zero)
+        control.player.play()
+        XCTAssertGreaterThan(control.player.rate, 0)
+        NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: item)
+        control.pause()
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(control.player.rate, 0)
+        XCTAssertGreaterThanOrEqual(item.currentTime().seconds, duration.seconds - 0.002, "A queued loop-end notice must not rewind after Pause.")
+        await control.player.seek(to: CMTime(seconds: 0.25, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        control.play()
+        NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: item)
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertGreaterThanOrEqual(item.currentTime().seconds, 0.25, "A late notice from an earlier cycle cannot rewind the middle of a take.")
+        control.pause()
+        await control.player.seek(to: duration, toleranceBefore: .zero, toleranceAfter: .zero)
+        control.player.play()
+        XCTAssertGreaterThan(control.player.rate, 0)
+        NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: item)
+        control.unload()
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(control.player.rate, 0)
+        XCTAssertTrue(control.player.items().isEmpty)
     }
 
     static func writeMovie(_ url: URL, width: Int, height: Int, frames: Int) async throws {

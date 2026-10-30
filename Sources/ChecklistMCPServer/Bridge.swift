@@ -346,7 +346,10 @@ public actor Bridge {
     ]),annotations:.init(readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false))
 
     func tools() throws -> [Tool] {
-        try forward(current: { try localTools() }, delegate: { try delegateTools() })
+        let tools = try forward(current: { try localTools() }, delegate: { try delegateTools() })
+        // This adapter runs the wait on operation_get, for each caller allowed to read it (CL-364).
+        guard tools.contains(where: { $0.name == "operation_get" }), !tools.contains(where: { $0.name == OperationWait.toolName }) else { return tools }
+        return tools + [OperationWait.tool]
     }
 
     private func localTools() throws -> [Tool] {
@@ -402,6 +405,7 @@ public actor Bridge {
     /// and native context) is read on the actor; the request runs on a dispatch worker;
     /// notices are applied on the actor. The arguments, including command_id, pass unchanged.
     public nonisolated func concurrentCall(_ name: String, _ arguments: Value) async throws -> Value {
+        if name == OperationWait.toolName, await callRoute() != nil { return try await operationWaitTool(arguments) }
         guard let route = await callRoute() else { return try await call(name, arguments) }
         let reply: Data
         do {
@@ -414,6 +418,22 @@ public actor Bridge {
             throw Self.reconnectGuidance(error)
         } catch { throw Self.reconnectGuidance(error) }
         return try await finishServiceCall(reply)
+    }
+
+    /// One read of a wait loop (CL-364), with its own reply budget and no catalog check.
+    /// It runs on a dispatch worker, so other calls of this conversation continue.
+    nonisolated func statusRead(_ name: String, _ arguments: Value, budget: TimeInterval) async throws -> Value {
+        guard case .service(let client, _)? = await callRoute() else { return try await concurrentCall(name, arguments) }
+        do {
+            let reply = try await Self.offload { () throws -> Data in
+                guard let parameters = try jsonObject(arguments) as? [String: Any] else { throw BridgeError("Tool arguments must be a JSON object.") }
+                return try jsonData(client.call(name, parameters, replyTimeout: budget))
+            }
+            return try await finishServiceCall(reply)
+        } catch let error as ChecklistError where error.code == ClientUpdateRequired.code {
+            if await refuseOutdatedClient() { return try await concurrentCall(name, arguments) }
+            throw Self.reconnectGuidance(error)
+        } catch { throw Self.reconnectGuidance(error) }
     }
 
     public nonisolated func concurrentReadResource(_ uri: String) async throws -> Value {

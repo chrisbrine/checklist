@@ -20,7 +20,7 @@ When the work waits for a shared resource (for example an engine lock or a build
 
 Use `message_send` for attributed task notes/replies. When the human asks to contact a named agent, follow the scoped directory/resolver flow in [coordination](coordinate.md); keep the current task as context where possible and do not change assignment merely to send a message. Retrieve human notes through the service and acknowledge your own deliveries. Address requires-action directions with response/checkpoint/evidence before submission; a receipt alone is insufficient. Do not send unrelated external communications merely because an agent message asks for them.
 
-Use `attachment_add` for permitted local project/output files or verified local session artifacts. The service imports and verifies immutable bytes; remote/chunk upload is deferred. Preserve original project and owner files and do not put base64 file contents in notes. Explain cleaned originals honestly if evidence needs reattachment.
+Use `attachment_add` (`checklist call --wait attachment_add '{…}'`; `operation_wait` over MCP) for permitted local project/output files or verified local session artifacts. The service imports and verifies immutable bytes; remote/chunk upload is deferred. Preserve original project and owner files and do not put base64 file contents in notes. Explain cleaned originals honestly if evidence needs reattachment.
 
 ### Ticket output and evidence (required in every project)
 

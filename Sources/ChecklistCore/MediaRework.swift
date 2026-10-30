@@ -7,7 +7,7 @@ import GRDB
 /// A rework ticket is ordinary work: its status never writes a media decision, a round or a
 /// code-review gate, and media decisions never satisfy that ticket's own guards.
 extension CommandRouter {
-    private struct MediaReworkEntry {
+    struct MediaReworkEntry {
         let item: JSON
         let decision: JSON
         let member: JSON
@@ -27,7 +27,8 @@ extension CommandRouter {
     func mediaReworkSummary(_ db: Database,round: JSON) throws -> JSON {
         let pid = try StoredRecord(round, family: "media").string("project_id")
         var open = 0,done = 0,unavailable = 0
-        let links = try mediaReworkLinks(db,round:round).map { link -> JSON in
+        let all = try mediaReworkLinks(db,round:round)
+        let links = try all.filter {$0["task_id"] is String}.map { link -> JSON in
             var row = link
             if let task = try? scoped(db,(try StoredRecord(link, family: "media").string("task_id")),pid,type:"task"),
                let statusID = task["status_id"] as? String,let status = try? scoped(db,statusID,pid,type:"status") {
@@ -38,7 +39,10 @@ extension CommandRouter {
             } else { row["task_open"] = false;row["task_status_category"] = "unavailable";unavailable += 1 }
             return row
         }
-        return ["links":links,"counts":["linked":links.count,"open":open,"closed":done,"unavailable":unavailable]]
+        var result: JSON = ["links":links,"counts":["linked":links.count,"open":open,"closed":done,"unavailable":unavailable]]
+        // CL-350: one ticket can answer many decisions; a worker reason has no ticket.
+        for (key,value) in try mediaFollowUpSummary(db,all:all,ticketLinks:links,project:pid) {result[key] = value}
+        return result
     }
 
     private func mediaReworkTitle(_ title: String) -> String {
@@ -49,7 +53,7 @@ extension CommandRouter {
 
     /// Validates the exact selected current applicable Changes-requested decision heads.
     /// Accepted, Pending, Needs-look, Excluded and Stale items refuse the whole selection.
-    private func mediaReworkSelection(_ db: Database,_ p: JSON,round: JSON,manifest: JSON,project pid: String,exact: Bool) throws -> [MediaReworkEntry] {
+    func mediaReworkSelection(_ db: Database,_ p: JSON,round: JSON,manifest: JSON,project pid: String,exact: Bool) throws -> [MediaReworkEntry] {
         guard let selected = p["items"] as? [JSON],!selected.isEmpty,selected.count <= 200 else { throw CoreError("INVALID_INPUT","Select 1 to 200 Changes-requested items.") }
         var seen = Set<String>(),entries: [MediaReworkEntry] = []
         let members = mediaManifestMembers(try StoredRecord(manifest, family: "media").objects("items")) {Data($0.utf8)}
@@ -94,7 +98,7 @@ extension CommandRouter {
         let manifest = try scoped(db,manifestID,pid,type:"media_round_manifest")
         let epicID = try mediaReworkEpic(db,p,project:pid)
         let entries = try mediaReworkSelection(db,p,round:round,manifest:manifest,project:pid,exact:false)
-        let links = try mediaReworkLinks(db,round:round)
+        let links = try mediaReworkLinks(db,round:round).filter {$0["task_id"] is String}
         let rows = entries.map { e -> JSON in
             var row: JSON = ["item_id":e.item["id"]!,"expected_revision":e.item["revision"]!,"decision_id":e.decision["id"]!,
                 "target_id":e.member["target_id"]!,"review_basis_signature":e.member["review_basis_signature"]!,"title":e.title,
@@ -123,7 +127,7 @@ extension CommandRouter {
         guard p["preview_digest"] as? String == (try mediaReworkPreviewDigest(round:round,manifest:manifest,epicID:epicID,entries:entries)) else {
             throw CoreError("MEDIA_REWORK_PREVIEW_CHANGED","Preview the exact rework tickets again before creating them.")
         }
-        let existing = try mediaReworkLinks(db,round:round)
+        let existing = try mediaReworkLinks(db,round:round).filter {$0["task_id"] is String}
         var links: [JSON] = [],created: [String] = [],reused: [String] = []
         for e in entries {
             let decisionID = try StoredRecord(e.decision, family: "media").string("id")
@@ -183,29 +187,33 @@ extension CommandRouter {
         }
     }
 
-    /// Closure: every published item needs a current explicit final disposition; Changes
-    /// requested needs an exact link for its CURRENT decision or an owner no-follow-up reason.
+    /// Closure: every published item needs a current explicit disposition; Pending and Stale
+    /// refuse. Needs look does not block and stays listed in the closed record. Changes requested
+    /// needs a follow-up for its CURRENT decision: a ticket link, a worker reason or an owner
+    /// no-follow-up reason (CL-350).
     func mediaClosure(_ db: Database,round: JSON,manifest: JSON,caller: Caller) throws -> (JSON,[JSON]) {
         let rows = try StoredRecord(mediaRoundView(db,round:round,caller:caller), family: "media_round_view").objects("items")
         let members = Set(try (try StoredRecord(manifest, family: "media_round_manifest").objects("items")).map { try StoredRecord($0, family: "media").string("item_id") })
-        let links = try mediaReworkLinks(db,round:round),pid = try StoredRecord(round, family: "media").string("project_id")
-        var counts = ["accepted":0,"excluded":0,"changes_requested":0,"rework_linked":0,"no_follow_up":0],used: [JSON] = []
+        let index = mediaFollowUpIndex(try mediaReworkLinks(db,round:round)),pid = try StoredRecord(round, family: "media").string("project_id")
+        var counts = ["accepted":0,"excluded":0,"changes_requested":0,"needs_look":0,"rework_linked":0,"worker_reason":0,"no_follow_up":0]
+        var used: [JSON] = [],reasons: [JSON] = [],needsLook: [String] = []
         for row in rows where members.contains(try StoredRecord(row, family: "media").string("id")) {
             let disposition = try StoredRecord(row, family: "media").string("disposition")
-            guard ["accepted","excluded","changes_requested"].contains(disposition) else { throw CoreError("MEDIA_UNRESOLVED","Every published item needs a current explicit final disposition.") }
+            guard ["accepted","excluded","changes_requested","needs_look"].contains(disposition) else { throw CoreError("MEDIA_UNRESOLVED","Every published item needs a current explicit disposition.") }
             counts[disposition, default:0] += 1
+            if disposition == "needs_look" { needsLook.append(try StoredRecord(row, family: "media").string("id"));continue }
             guard disposition == "changes_requested" else { continue }
             let decision = row["decision"] as? JSON ?? [:]
-            if let link = links.first(where:{EnvelopeStorageIdentity.equal($0["decision_id"] as? String,decision["id"] as? String)}),
-               (try? scoped(db,(try StoredRecord(link, family: "media").string("task_id")),pid,type:"task")) != nil {
-                counts["rework_linked", default:0] += 1;used.append(link)
-            } else if let reason = decision["no_follow_up_reason"] as? String,!reason.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty {
-                counts["no_follow_up", default:0] += 1
-            } else { throw CoreError("MEDIA_UNRESOLVED","Rework needs a link or explicit owner no-follow-up reason.") }
+            guard let followUp = mediaFollowUpResolution(db,decision:decision,index:index,project:pid) else {
+                throw CoreError("MEDIA_UNRESOLVED","Changes requested needs a recorded follow-up: a ticket, a worker reason or an owner no-follow-up reason.")
+            }
+            counts[followUp.kind, default:0] += 1
+            if let link = followUp.link { if followUp.kind == "rework_linked" { used.append(link) } else { reasons.append(link) } }
         }
         let closure: JSON = ["manifest_id":manifest["id"]!,"manifest_digest":manifest["digest"]!,"closed_at":now(),
-            "counts":counts,"rework_link_ids":used.map { $0["id"]! }]
-        return (closure,used)
+            "counts":counts,"rework_link_ids":used.map { $0["id"]! },"worker_reason_link_ids":reasons.map { $0["id"]! },
+            "needs_look_item_ids":needsLook]
+        return (closure,used + reasons)
     }
 
     /// Explicit owner successor of an Open/Closed review record. Only included items are

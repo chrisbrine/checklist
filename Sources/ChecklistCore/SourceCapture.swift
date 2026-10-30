@@ -115,12 +115,12 @@ enum SourceGit {
 
     static func run(_ path: String, _ args: [String], protectedRoots: [String], executable: String? = nil, timeout: TimeInterval = defaultTimeout,
                     acceptedExitCodes: Set<Int32> = [0], additionalOwnerHome: String? = nil, inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment,
-                    processAdapter: any SourceGitProcessAdapter = MacOSSourceGitProcessAdapter()) throws -> Data {
+                    processAdapter: (any SourceGitProcessAdapter)? = nil) throws -> Data {
         let confinement = try Confinement(protectedRoots: protectedRoots, additionalOwnerHome: additionalOwnerHome)
         let executable = try executable.map { try trustedExecutable($0) } ?? resolve()
         do { _ = try trustedExecutable(Confinement.launcher) }
         catch { throw Confinement.unavailable() }
-        return try processAdapter.run(SourceGitProcessRequest(
+        return try (processAdapter ?? fixtureProcessAdapter.withLockUnchecked { $0 } ?? MacOSSourceGitProcessAdapter()).run(SourceGitProcessRequest(
             launcher: Confinement.launcher,
             arguments: ["-p", confinement.profile, executable, "-c", "core.fsmonitor=false", "-C", path] + args,
             environment: environment(inheritedEnvironment), timeout: timeout,

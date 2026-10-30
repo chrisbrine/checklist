@@ -19,6 +19,12 @@ protocol SourceGitProcessAdapter {
     func run(_ request: SourceGitProcessRequest) throws -> Data
 }
 
+extension SourceGit {
+    /// Internal test seam (CL-363), reachable only through `@testable import`. Nil
+    /// in the product. Confinement, trust and argv are still built before it runs.
+    static let fixtureProcessAdapter = OSAllocatedUnfairLock<(any SourceGitProcessAdapter)?>(uncheckedState: nil)
+}
+
 /// A platform without the protected-root launcher must fail closed. It must not
 /// run Git directly or introduce a different CLI/helper/model fallback.
 struct UnsupportedSourceGitProcessAdapter: SourceGitProcessAdapter {

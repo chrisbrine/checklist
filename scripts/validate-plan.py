@@ -67,6 +67,65 @@ def synthetic_project_cleanup_errors(body: str) -> list[int]:
     return lines
 
 
+SKILL_RULE_TEXT = {
+    'skills/checklist/references/coordinate.md': (
+        'a NOT SHOWN or FAIL item is never submitted as a limitation alone',
+        'measured step times of the current round',
+        'every unproven item that can move the time',
+        'Run no Swift build, store copy or package run beside a store copy or live backup',
+        'Record `sysctl -n vm.loadavg`',
+        'At the start of each turn, check whether a session or subthread',
+        'Pick the reasoning effort for each task',
+        'record the provider per run',
+        'A gate script stops on the first failed step',
+        'An install script reads the post-install report',
+        'Prove a fix under the conditions where the defect appears',
+    ),
+    'skills/checklist/references/review.md': (
+        'a NOT SHOWN or FAIL item is never submitted as a limitation alone',
+    ),
+    'skills/checklist/references/driven-sessions.md': (
+        'writes its hand-in skeleton first (`notes.md`, `files.json`)',
+        'a package small enough for its limit',
+        "packages a stopped helper's work from its report",
+        'A helper can start its own subagents for independent parts',
+        '## Reads that run as operations',
+    ),
+}
+
+
+def backticked(text: str) -> set[str]:
+    return set(re.findall(r'`([a-z_]+)`', text))
+
+
+def skill_reference_errors(root: Path) -> list[str]:
+    """Keep the shared skill rules, its reference index and its operation read table consistent."""
+    errors = []
+    for rel, rules in SKILL_RULE_TEXT.items():
+        body = (root / rel).read_text()
+        errors += [f'{rel}: missing process rule: {rule}' for rule in rules if rule not in body]
+    index = (root / 'skills/checklist/SKILL.md').read_text()
+    for path in sorted((root / 'skills/checklist/references').glob('*.md')):
+        if f'references/{path.name}' not in index:
+            errors.append(f'skills/checklist/SKILL.md: does not link references/{path.name}')
+    contract = (root / 'docs/mcp-contract.md').read_text()
+    reads = re.search(r'Read operations run exactly as their synchronous reads.*?(?=\. A backup capture)', contract, re.S)
+    always = re.search(r'The service always uses this route for .*?(?=\. `project_edit`)', contract, re.S)
+    body = (root / 'skills/checklist/references/driven-sessions.md').read_text()
+    section = re.search(r'^## Reads that run as operations\n(.*?)(?=^## )', body, re.M | re.S)
+    if not (reads and always and section):
+        return errors + ['Cannot compare the skill operation read table with docs/mcp-contract.md']
+    rows = re.findall(r'^\| `([a-z_]+)` \| (always|input) \|', section.group(1), re.M)
+    if len(rows) != len({name for name, _ in rows}):
+        errors.append('driven-sessions.md: operation read table repeats a method')
+    read_names = backticked(reads.group(0))
+    expected = {name: 'always' if name in backticked(always.group(0)) else 'input' for name in read_names}
+    if dict(rows) != expected:
+        difference = sorted(set(dict(rows).items()) ^ set(expected.items()))
+        errors.append(f'driven-sessions.md: operation read table differs from docs/mcp-contract.md: {difference}')
+    return errors
+
+
 def check() -> dict:
     errors: list[str] = []
     selected = public_files()
@@ -259,6 +318,8 @@ def check() -> dict:
                 errors.append(f'Line reference out of range: {path.relative_to(ROOT)}')
             if fragment and destination.suffix == '.md' and fragment not in headings(destination):
                 errors.append(f'Heading missing: {path.relative_to(ROOT)} -> {target}#{fragment}')
+
+    errors += skill_reference_errors(ROOT)
 
     concept_data = json.loads((ROOT / 'docs/design/prompts.json').read_text())
     outputs = [v for v in concept_data['outputs'] if v.get('selected')]

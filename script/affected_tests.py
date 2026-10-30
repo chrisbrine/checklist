@@ -14,6 +14,10 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 QUALIFICATION_TESTS = (
+    # CL-363: 40,133 objects in 23 backup generations; 256 live descriptors; 2,050 rows.
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testCleanupBackupIndexBoundsRepeatedCopiesAcrossTwentyThreeReceipts',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testDeletionCohort256CandidatesAtLaunchdDescriptorLimit',
+    'ChecklistCoreTests.ReadSnapshotCacheTests/testOversizedQueriesAndWriterReadsBypassRetention',
     'ChecklistCoreTests.TicketCleanupReceiptReadTests/testLatestSummaryPagesRetainFirstReceiptAndAreBoundedWithLargeItems',
     'ChecklistCoreTests.TestStoreTests/testWarmStoreSetupReportsPairedMedians',
     'ChecklistCoreTests.MediaListQueryTests/testExamplesStayCollapsedUntilShowThenCapPageAndNeverGrantApproval',

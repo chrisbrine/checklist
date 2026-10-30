@@ -1,7 +1,5 @@
 import ChecklistTestSupport
 import XCTest
-import LocalAuthentication
-import Security
 @testable import ChecklistApp
 @testable import ChecklistCore
 import ChecklistIPC
@@ -90,7 +88,7 @@ import ChecklistIPC
         try await settled(first)
         XCTAssertTrue(first.hasPendingMutation)
         let original = try XCTUnwrap(first.pendingCommandID), saved = try XCTUnwrap(f.saved)
-        let record = try XCTUnwrap(PendingCommandRecovery(saved: saved))
+        let record = try XCTUnwrap(PendingCommandRecovery(saved: saved, claimToken: { _ in nil }))
         XCTAssertEqual(record.storeIncarnation, f.incarnation); XCTAssertEqual(record.serviceIdentity, f.identity)
         XCTAssertEqual(record.params["command_id"] as? String, original)
         let restored = f.store(); defer { restored.stopWindowReads() }
@@ -234,23 +232,6 @@ import ChecklistIPC
         let first = f.store(), second = f.store(account: "different-window")
         defer { first.stopWindowReads(); second.stopWindowReads() }
         XCTAssertNotNil(first.notice); XCTAssertNotNil(second.notice)
-    }
-
-    func testKeychainRecoveryDistinguishesAbsenceFailureAndMalformedBytesWithoutUI() throws {
-        XCTAssertNil(try HumanClaims.readRecovery(query: [:], copyMatching: { query, _ in
-            XCTAssertTrue(((query as NSDictionary)[kSecUseAuthenticationContext] as? LAContext)?.interactionNotAllowed == true)
-            return errSecItemNotFound
-        }))
-        for status in [errSecInteractionNotAllowed, errSecAuthFailed, errSecNotAvailable] {
-            XCTAssertThrowsError(try HumanClaims.readRecovery(query: [:], copyMatching: { _, _ in status }))
-        }
-        XCTAssertThrowsError(try HumanClaims.readRecovery(query: [:], copyMatching: { _, item in
-            item.pointee = Data([0xff]) as CFData; return errSecSuccess
-        }))
-        XCTAssertThrowsError(try HumanClaims.readRecovery(query: [:], copyMatching: { _, _ in errSecSuccess }))
-        XCTAssertEqual(try HumanClaims.readRecovery(query: [:], copyMatching: { _, item in
-            item.pointee = Data("saved change".utf8) as CFData; return errSecSuccess
-        }), "saved change")
     }
 
     func testRecoveryIdentityComparisonsAreByteExact() {

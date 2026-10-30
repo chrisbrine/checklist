@@ -9,7 +9,8 @@ import XCTest
         XCTAssertEqual(parsed.layout.primarySlotID?.rawValue,"take")
         XCTAssertEqual(parsed.layout.referenceSlotIDs.map(\.rawValue),["model_sheet","concept_art","reference"])
         XCTAssertEqual(parsed.slots.map(\.kind),[.video,.image,.image,.video])
-        XCTAssertTrue(parsed.layout.loop);XCTAssertEqual(parsed.layout.frameRate,12)
+        XCTAssertTrue(parsed.layout.loop);XCTAssertNil(parsed.layout.frameRate)
+        XCTAssertEqual(parsed.layout.frameRateFieldID?.rawValue,"frame_rate")
     }
 
     func testOneCandidateProjectsTakeThenEveryMixedReferenceWithReadableRoles() async {

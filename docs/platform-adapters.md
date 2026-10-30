@@ -51,9 +51,10 @@ access; Finder panels and authorized preview copies remain in the AppKit shell.
 DesktopAlertSink/SystemDesktopAlertSink already separates notification effects.
 SafeFileRead is a compatibility facade over AuthorizedFileReading; its production
 implementation preserves the same kernel descriptor/path revalidation.
-Window/focus bridges, HumanClaims, DockBadge, redacted diagnostics and signed
-immutable packaging remain macOS-only. No UI runtime, credential format, database
-schema or on-disk format changes are introduced.
+Window/focus bridges, DockBadge, redacted diagnostics and signed immutable
+packaging remain macOS-only. HumanClaims and pending-command recovery use the
+macOS OwnerPrivateFileStore (CL-373), and the app makes no Keychain call. No UI
+runtime, database schema or service credential format changes are introduced.
 
 Unsupported capabilities fail explicitly: unavailable local IPC services report
 PLATFORM_CAPABILITY_UNAVAILABLE with the exact capability; unsupported native peer

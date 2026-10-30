@@ -36,7 +36,7 @@ extension CommandRouter {
             "workspace":c.workspace ?? "","generation":try callerSessionGeneration(db,c,project:project)]
         return SealedCursor.binding(principal:c.principal,scope:try MediaCanonical.signature(identity),incarnation:incarnation)
     }
-    private func mediaQuerySchema(_ db: Database,_ round: JSON) throws -> MediaReviewSchema {
+    func mediaQuerySchema(_ db: Database,_ round: JSON) throws -> MediaReviewSchema {
         let revision = try scoped(db,(try StoredRecord(round, family: "media").string("type_revision_id")),
             (try StoredRecord(round, family: "media").string("project_id")),type:"media_review_type_revision")
         return try MediaReviewSchema.parse((try StoredRecord(revision, family: "media").object("schema")))
@@ -84,7 +84,7 @@ extension CommandRouter {
     private var mediaDispositionSQL: String {
         "CASE WHEN d.id IS NULL AND i.member_item_id IS NOT NULL AND json_extract(i.data,'$.stale_predecessor_decision_id') IS NOT NULL THEN 'stale' WHEN d.id IS NULL OR i.member_item_id IS NULL THEN 'pending' WHEN json_extract(d.data,'$.review_basis_signature') IS NOT i.member_basis THEN 'stale' ELSE json_extract(d.data,'$.disposition') END"
     }
-    private func mediaListIndex(_ db: Database,_ p: JSON,round: JSON,list: MediaListConfiguration,schema: MediaReviewSchema) throws -> [JSON] {
+    func mediaListIndex(_ db: Database,_ p: JSON,round: JSON,list: MediaListConfiguration,schema: MediaReviewSchema) throws -> [JSON] {
         let (sql,args) = try mediaListIndexStatement(p,round:round,list:list,schema:schema)
         let rows = try Row.fetchAll(db,sql:sql,arguments:args)
         return rows.map {["id":$0["id"] as String,"revision":$0["revision"] as Int,"target_id":$0["target_id"] as String,
@@ -98,7 +98,7 @@ extension CommandRouter {
     /// included) and their values are those of the former LEFT JOIN.
     func mediaListIndexStatement(_ p: JSON,round: JSON,list: MediaListConfiguration,schema: MediaReviewSchema) throws -> (String,StatementArguments) {
         let filter = p["filter"] as? JSON ?? [:]
-        guard p["filter"] == nil || p["filter"] is JSON,Set(filter.keys).isSubset(of:["dispositions","metadata","hidden_item_ids"]) else {throw CoreError("INVALID_INPUT","Unsupported media filter.")}
+        guard p["filter"] == nil || p["filter"] is JSON,Set(filter.keys).isSubset(of:["dispositions","metadata","hidden_item_ids","has_agent_suggestion","agent_suggestion_excludes","has_note","note_item_ids"]) else {throw CoreError("INVALID_INPUT","Unsupported media filter.")}
         let dispositions = try MediaConfigurationValue.ids(filter["dispositions"],max:6,"filter.dispositions").map(\.rawValue)
         guard Set(dispositions).isSubset(of:["pending","accepted","needs_look","changes_requested","excluded","stale"]) else {throw CoreError("INVALID_INPUT","Unknown disposition.")}
         let hidden = try MediaConfigurationValue.ids(filter["hidden_item_ids"],max:Int.max,"filter.hidden_item_ids").map(\.rawValue)
@@ -116,8 +116,10 @@ extension CommandRouter {
         }
         if !hidden.isEmpty {predicates.append("i.id NOT IN (SELECT value FROM json_each(:hidden))");args += ["hidden":try jsonString(hidden)]}
         if !dispositions.isEmpty {predicates.append("(\(mediaDispositionSQL)) IN (SELECT value FROM json_each(:dispositions))");args += ["dispositions":try jsonString(dispositions)]}
+        let suggestions = try mediaSuggestionPredicates(filter,arguments:&args)
+        predicates += suggestions.predicates
         let sql = """
-        WITH member AS MATERIALIZED (
+        WITH \(suggestions.table)member AS MATERIALIZED (
           SELECT CAST(json_extract(entry.value,'$.item_id') AS TEXT) item_id,json_extract(entry.value,'$.target_id') target_id,
             json_extract(entry.value,'$.review_basis_signature') basis
           FROM records m,json_each(m.data,'$.items') entry
@@ -188,6 +190,7 @@ extension CommandRouter {
             value["group_path"] = list.groupBy.enumerated().map {level,id -> JSON in ["field_id":id.rawValue,"value":values[level],"item_count":row["g\(level)"] as Int]}
             return value
         }
+        if c.isOwner {result["rows"] = try mediaRowsWithSuggestions(db,rows:result["rows"] as? [JSON] ?? [],round:round,project:project)}
         let next = offset + rows.count
         result["has_more"] = next < index.count
         if next < index.count {
@@ -199,6 +202,11 @@ extension CommandRouter {
         }
         else {result["next_cursor"] = NSNull()}
         return result
+    }
+    /// CL-350: the unfiltered disposition index of one round, for the owner's Close readiness.
+    func mediaRoundDispositionIndex(_ db: Database,round: JSON) throws -> [JSON] {
+        let schema = try mediaQuerySchema(db,round)
+        return try mediaListIndex(db,[:],round:round,list:try MediaListConfiguration.parse([:],schema:schema),schema:schema)
     }
     private func sqlQuote(_ value: String) -> String { "'" + value.replacingOccurrences(of:"'",with:"''") + "'" }
 }

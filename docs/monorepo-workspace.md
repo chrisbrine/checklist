@@ -184,7 +184,11 @@ Release changes only the marker. The folder moves to the Trash at the next
 `clean_scratch.py --apply`, which still keeps a folder that a running process
 uses. Folders of open or unknown tickets stay marked. With no exported session
 the hook reports `release_done` as skipped; a status read failure is reported in
-the same log and keeps every marker. The last log line, `post_install`, reports
+the same log and keeps every marker. The release step retries its first complete
+ticket status read for up to 60 seconds while the new service starts, with each
+startup CLI call capped at 10 seconds and the remaining shared deadline. Its
+`release_done_service_wait` log reports attempts and measured elapsed seconds;
+timeout retains markers and reports failure. The last log line, `post_install`, reports
 both results (`build_cleanup` and `release_done`); a failure of either returns 1.
 A fingerprint folder without a readable `capture-manifest.json` (for example an
 old capture that holds only `build-info.json`) is kept and reported with the
@@ -262,19 +266,47 @@ the folder. Shared SwiftPM scratch and test-selection caches serve every ticket
 and are reported as `shared_cache`. Build captures keep their existing
 installed/previous and running-process rules; their ticket keys are reported only.
 
-Without `owner.json`, evidence is scoped by ticket keys in the folder name and `files.json` ticket
-fields. A round folder may explicitly declare **every** owning ticket with
-`cleanup.json` containing `{"tickets":["CL-10","CL-11"]}` (strings or
-`{"key": ...}` rows). A `cleanup.json` without `tickets` is a cleanup receipt, not
-ownership. Untagged containers and their logs stay; their ticket children can
-retire separately. Every older `files.json` shape is read without an error: a list
-of entries, `{"files": [...]}`, a `{name: {...}}` map, and `ticket` (string or
-list) or `tickets` on an entry or at the top level. When the entries have no ticket
-key, the ticket keys in the folder name are the owners, and the note's
-`owner_basis` says so. Ticket keys in nested file names add owners but never
-establish ownership alone. A folder with no owner key ("unknown owner") or an
-unreadable record stays as `kept` and does not fail the run. Every owning
-ticket must have `status_category` `done` or `canceled` (CL-359); open, missing,
+Evidence ownership is a tree boundary (CL-368). A direct `owner.json`, a
+`files.json` ticket declaration, a `cleanup.json` `tickets` declaration, or an
+explicit ownership header in the enclosing runner's `report.md`/hand-in
+`notes.md` owns its descendants. Discovery stops at that enclosing hand-in;
+`r58g/report.md` declaring `CL-344: 1 NOT SHOWN, ...` therefore keeps
+`r58g/alternative-CL-275` with CL-344, even if its fixture file names name other
+Done tickets. Direct `owner.json` decides alone. Legacy manifest ownership keeps
+the conservative union with its folder/file names. Explicit report ownership
+accepts `Ticket: CL-N`, `Tickets: CL-N, CL-M`, or leading `CL-N: PASS`, `FAIL`,
+`NOT SHOWN`, `NOT RUN` or `PARTIAL` summaries in the first 30 lines; arbitrary
+mentions and test-case prose do not establish ownership. Unreadable metadata
+retains the enclosing tree.
+
+Without authoritative metadata, a folder-name owner includes every ticket named
+in its descendant file/folder names **and every enclosing folder name**. Apply
+keeps it unless all those tickets are Done or canceled, and the report explains
+the name-only gate. Nested file names alone never establish ownership. Untagged
+containers and their logs stay; their separately scoped ticket children may
+retire. All older `files.json` shapes remain supported: entry lists,
+`{"files": [...]}`, `{name: {...}}` maps, and `ticket` (string/list) or `tickets`
+on an entry or at the top level. A `cleanup.json` without `tickets` is a receipt,
+not an ownership declaration. Unknown or unreadable ownership remains kept.
+
+The one-time legacy registration tool is read-only by default and uses explicit
+runner/hand-in declarations rather than guessing from names:
+
+```sh
+python3 script/register_legacy_evidence.py --repo "$PWD" > legacy-registration.json
+# Inspect proposed and unresolved rows; within explicit registration authorization:
+python3 script/register_legacy_evidence.py --repo "$PWD" --apply legacy-registration.json
+```
+
+The plan lists attributable enclosing folders and unresolved folders for an owner
+decision. Registered owners cover their descendants; store/source/managed trees
+are not separately discovered. Apply verifies the root, every source SHA-256 and
+the current ownership before writing any proposed `owner.json`, then rechecks
+immediately before each write. Changed sources or existing registrations refuse
+the saved plan. It never contacts Checklist, retires data, or writes unresolved
+records; a plan alone does not imply registrations were applied.
+
+Every owning ticket must have `status_category` `done` or `canceled` (CL-359); open, missing,
 ambiguous or unreadable statuses retain the evidence. The default status reader uses only
 `project_resolve` and paginated `task_list` calls through the installed CLI, with
 its cwd set to the project folder. It never reads the live database directly.

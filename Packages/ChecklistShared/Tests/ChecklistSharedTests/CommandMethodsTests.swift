@@ -21,7 +21,7 @@ final class CommandMethodsTests: XCTestCase {
             "media_item_page", "media_item_counts", "media_approved_examples",
         ])
         XCTAssertEqual(CommandMethods.mediaInternalReads.subtracting(CommandMethods.mediaOwnerReads),
-                       ["media_round_get", "media_bulk_get"])
+                       ["media_round_get"])
         for method in ["media_navigation", "media_original_read", "media_example_read_lease", "media_example_read_release"] {
             XCTAssertTrue(CommandMethods.mediaOwnerReads.contains(method))
             XCTAssertFalse(CommandMethods.mediaInternalReads.contains(method))

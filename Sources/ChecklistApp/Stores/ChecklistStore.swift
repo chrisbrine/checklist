@@ -8,7 +8,20 @@ struct PendingCommandPersistence {
     let read: (String)throws->String?
     let save: (String,String)throws->Void
     let remove: (String)->Void
-    static var keychain: Self {Self(read:HumanClaims.readRecovery,save:{try HumanClaims.save($0,attempt:$1)},remove:HumanClaims.remove)}
+    /// Resolves the credential that a saved record refers to. The record holds no token.
+    var claimToken: (String)->String? = { _ in nil }
+    /// The private folder of a file route. It is nil for a test fake.
+    var fileDirectory: URL? = nil
+    static var ownerFile: Self { ownerFile(for:ChecklistInstance.current) }
+    static func ownerFile(for instance: ChecklistInstance) -> Self {
+        let directory = OwnerPrivateFileStore.directory(for:instance)
+        return ownerFile(OwnerPrivateFileStore(directory:directory,kind:OwnerPrivateFileStore.pendingCommandKind),
+                         claims:OwnerPrivateFileStore(directory:directory,kind:OwnerPrivateFileStore.claimKind))
+    }
+    static func ownerFile(_ records: OwnerPrivateFileStore,claims: OwnerPrivateFileStore) -> Self {
+        Self(read:{try records.read($0)},save:{try records.save($0,key:$1)},remove:{records.remove($0)},
+             claimToken:{try? claims.read($0)},fileDirectory:records.directory)
+    }
 }
 
 @MainActor
@@ -133,6 +146,7 @@ final class ChecklistStore: ObservableObject {
     let mediaReview = MediaReviewModel()
     let screenTiming = ScreenTiming()
     let ticketCleanupReceipts = TicketCleanupReceiptObservation()
+    let longOperations = LongOperationLog()
     @Published var page: Page = .overview { didSet {
         if page != oldValue {
             // Only the versioned query cache may restore an off-screen page.
@@ -175,6 +189,7 @@ final class ChecklistStore: ObservableObject {
     var windowPreferences:UserDefaults {preferences}
     private let pendingCommandKey:String
     private let pendingCommandPersistence:PendingCommandPersistence
+    var pendingCommandFileDirectory: URL? { pendingCommandPersistence.fileDirectory }
     private let pendingCommandServiceIdentity: String
     private var ignoredRecoveryPreferenceKey: String { "ignored-recovery-" + pendingCommandKey }
     private var restoringPreferences = true
@@ -408,7 +423,7 @@ final class ChecklistStore: ObservableObject {
     var groupTaskLoading: Bool {groupTasksObservation.loading}
     var groupTaskError: String? {groupTasksObservation.error}
 
-    init(draftJournal: LocalDraftJournal = LocalDraftJournal(), preferences: UserDefaults = .standard, restorePendingCommand: Bool = true, desktopAlerts: DesktopAlertCoordinator? = nil, requestTransport: (@MainActor (String,[String:Any]) async throws -> [String:Any])? = nil, navigationMemory: DetailItemNavigationMemory? = nil, pendingCommandKey:String = WorkspaceWindowIdentity.primary.pendingCommandKey, pendingCommandPersistence:PendingCommandPersistence = .keychain, pendingCommandServiceIdentity: String = ChecklistInstance.current.machServiceName, qualificationFaults: QualificationFaults? = nil) {
+    init(draftJournal: LocalDraftJournal = LocalDraftJournal(), preferences: UserDefaults = .standard, restorePendingCommand: Bool = true, desktopAlerts: DesktopAlertCoordinator? = nil, requestTransport: (@MainActor (String,[String:Any]) async throws -> [String:Any])? = nil, navigationMemory: DetailItemNavigationMemory? = nil, pendingCommandKey:String = WorkspaceWindowIdentity.primary.pendingCommandKey, pendingCommandPersistence:PendingCommandPersistence = .ownerFile, pendingCommandServiceIdentity: String = ChecklistInstance.current.machServiceName, qualificationFaults: QualificationFaults? = nil) {
         let navigationMemory = navigationMemory ?? .shared
         self.qualificationFaults = qualificationFaults ?? .shared
         self.draftJournal = draftJournal; self.preferences = preferences; self.desktopAlerts = desktopAlerts ?? .shared;self.requestTransport = requestTransport;self.navigationMemory = navigationMemory;self.pendingCommandKey=pendingCommandKey;self.pendingCommandPersistence=pendingCommandPersistence;self.pendingCommandServiceIdentity=pendingCommandServiceIdentity
@@ -1733,11 +1748,21 @@ final class ChecklistStore: ObservableObject {
         return reply
     }
     private func commandTransport(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
+        let sent = liveNow()
         let reply = try await admissionTransport(method, params)
-        return try await QueuedCommandReply.resolve(reply, method: method, params: params, pause: queuedCommandPause,
-            transport: { [self] in try await admissionTransport($0, $1) }, queued: { [self] command, active in
-                if active { queuedCommandIDs.insert(command) } else { queuedCommandIDs.remove(command) }
-            })
+        var watched: String?
+        do {
+            return try await QueuedCommandReply.resolve(reply, method: method, params: params, pause: queuedCommandPause,
+                transport: { [self] in try await admissionTransport($0, $1) }, queued: { [self] command, active in
+                    if active { queuedCommandIDs.insert(command) } else { queuedCommandIDs.remove(command) }
+                }, observed: { [self] receipt in
+                    watched = receipt.operationID
+                    longOperations.observe(receipt, acceptedAfter: liveNow() - sent)
+                })
+        } catch {
+            if let watched { longOperations.stoppedWatching(watched) }
+            throw error
+        }
     }
 
     private func acceptWriteAdmission(_ reply: [String: Any], requestSequence: UInt64) {
@@ -1875,7 +1900,7 @@ final class ChecklistStore: ObservableObject {
                 preferences.removeObject(forKey: ignoredRecoveryPreferenceKey)
             }
             let marker = PendingCommandRecovery.marker(saved)
-            guard let command = PendingCommandRecovery(saved: saved) else {
+            guard let command = PendingCommandRecovery(saved: saved, claimToken: pendingCommandPersistence.claimToken) else {
                 ignoreSavedCommand(marker: marker, message: Self.unreadableRecoveryNotice)
                 return
             }
@@ -1913,8 +1938,8 @@ final class ChecklistStore: ObservableObject {
     func run(_ method: String, _ params: [String: Any] = [:], success: String? = nil, failure: ((Error) -> Void)? = nil, completion: (([String: Any]) -> Void)? = nil) {
         // CL-315: every early return reaches the caller's failure path, so a caller that shows
         // progress (a busy flag, a capture sequence) never waits for a command that was not sent.
-        let refuse = { (reason: String) in failure?(ChecklistError("WRITE_NOT_STARTED", reason)) }
-        if let reason = writeBlockReason { inform(reason); refuse(reason); return }
+        let refuse = { (reason: String, details: [String: Any]) in failure?(ChecklistError("WRITE_NOT_STARTED", reason, details: details)) }
+        if let reason = writeBlockReason { inform(reason); refuse(reason, [:]); return }
         var command = params
         if command["command_id"] == nil { command["command_id"] = UUID().uuidString }
         let recovery = PendingCommandRecovery(method: method, params: command, storeIncarnation: storeIncarnation, serviceIdentity: pendingCommandServiceIdentity)
@@ -1923,8 +1948,9 @@ final class ChecklistStore: ObservableObject {
             try pendingCommandPersistence.save(recovery.encoded(),pendingCommandKey)
             preferences.removeObject(forKey: ignoredRecoveryPreferenceKey)
         } catch {
-            let reason = "Cannot preserve the command for safe recovery: \(error.localizedDescription)"
-            pendingMutation = nil; self.error = reason; refuse(reason); return
+            let reason = "Cannot preserve the command for safe recovery, so Checklist did not send it. \(error.localizedDescription)"
+            pendingMutation = nil; self.error = reason
+            refuse(reason, (error as? OwnerPrivateFileError)?.details ?? ["domain": (error as NSError).domain, "code": (error as NSError).code]); return
         }
         performPendingMutation()
     }

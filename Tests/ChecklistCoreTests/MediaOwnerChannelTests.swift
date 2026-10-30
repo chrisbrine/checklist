@@ -26,7 +26,7 @@ final class MediaOwnerChannelTests: XCTestCase {
                 for method in ["media_round_publish","media_decide","media_type_adopt","media_context_approve"] {XCTAssertFalse(catalog.contains(method),method)}
             } else {XCTAssertFalse(catalog.contains("media_"))}
         }
-        for method in ["media_suggest","media_material_reference_adopt","media_bulk_apply"] {
+        for method in ["media_suggest","media_material_reference_adopt"] {
             XCTAssertThrowsError(try f.router.handle(method:method,params:["project_id":f.project,"command_id":uuid()],caller:f.owner))
         }
         XCTAssertThrowsError(try owner(f,"media_type_create",["title":"Story","origin":"human_ui"]))

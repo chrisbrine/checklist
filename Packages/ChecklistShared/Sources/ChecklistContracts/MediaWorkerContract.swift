@@ -8,7 +8,7 @@ public enum MediaWorkerContract {
     ]
     public static let methods: Set<String> = readMethods.union([
         "media_round_create", "media_intake_preview", "media_intake_revise",
-        "media_intake_confirm", "media_intake_capture", "media_suggest",
+        "media_intake_confirm", "media_intake_capture", "media_suggest", "media_follow_up_record",
     ])
 
     public struct ValidationError: Error, CustomStringConvertible, Sendable {
@@ -77,12 +77,25 @@ public enum MediaWorkerContract {
                 "item_id": text(4_000), "expected_revision": revision, "target_id": text(4_000),
                 "review_basis_signature": digest, "winner_id": text(4_000), "none_fit": ["type": "boolean"],
             ], required: ["item_id", "expected_revision", "target_id", "review_basis_signature"])]
-            required += ["round_id", "expected_revision", "observed_context_token", "manifest_id", "manifest_digest", "disposition", "items"]
+            // CL-351: a Draft round has no manifest yet; validate() keeps the pair together.
+            required += ["round_id", "expected_revision", "observed_context_token", "disposition", "items"]
+        case "media_follow_up_record":
+            properties["round_id"] = text(4_000); properties["expected_revision"] = revision
+            properties["observed_context_token"] = text(65_536)
+            properties["manifest_id"] = text(4_000); properties["manifest_digest"] = digest
+            properties["task_id"] = text(4_000); properties["reason"] = text(4_000)
+            properties["items"] = ["type": "array", "minItems": 1, "maxItems": 200, "items": object([
+                "item_id": text(4_000), "expected_revision": revision, "decision_id": text(4_000),
+            ], required: ["item_id", "expected_revision", "decision_id"])]
+            required += ["round_id", "expected_revision", "observed_context_token", "manifest_id", "manifest_digest", "items"]
         default: return nil
         }
         var schema = object(properties, required: required)
         if method == "media_intake_preview" {
             schema["oneOf"] = [["required": ["sources"]], ["required": ["text"]], ["required": ["tsv"]]]
+        }
+        if method == "media_follow_up_record" {
+            schema["oneOf"] = [["required": ["task_id"]], ["required": ["reason"]]]
         }
         return schema
     }
@@ -92,6 +105,12 @@ public enum MediaWorkerContract {
     public static func validate(_ method: String, parameters: [String: Any]) throws {
         guard let schema = inputSchema(method) else { throw ValidationError("Unsupported worker media command.") }
         try validate(parameters, against: schema, path: method)
+        if method == "media_suggest", (parameters["manifest_id"] == nil) != (parameters["manifest_digest"] == nil) {
+            throw ValidationError("manifest_id and manifest_digest are supplied together.")
+        }
+        if method == "media_follow_up_record", (parameters["task_id"] == nil) == (parameters["reason"] == nil) {
+            throw ValidationError("A follow-up names exactly one of task_id or reason.")
+        }
         if let selections = parameters["items"] as? [[String: Any]] {
             let ids = selections.compactMap { $0["item_id"] as? String }
             guard Set(ids).count == ids.count else { throw ValidationError("items must name distinct item IDs.") }

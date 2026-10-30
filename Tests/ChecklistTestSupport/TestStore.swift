@@ -56,7 +56,9 @@ public enum TestStore {
                               cliCommand: String = "/Applications/Checklist.app/Contents/MacOS/checklist",
                               providerPlugins: ProviderPluginRegistry = .bundled,
                               durable: Bool = ProcessInfo.processInfo.environment["CHECKLIST_QUALIFICATION"] == "1",
-                              template: Template? = nil, workspace: URL? = nil) throws -> CommandRouter {
+                              template: Template? = nil, workspace: URL? = nil,
+                              sourceGitMemo: Bool = ProcessInfo.processInfo.environment["CHECKLIST_QUALIFICATION"] != "1") throws -> CommandRouter {
+        SourceGitFixtureMemo.configure(enabled: sourceGitMemo)
         let anchored = root.resolvingSymlinksInPath()
         // Reopen existing fixtures through production admission; never replace data.
         if !FileManager.default.fileExists(atPath: anchored.appendingPathComponent("checklist.sqlite").path),

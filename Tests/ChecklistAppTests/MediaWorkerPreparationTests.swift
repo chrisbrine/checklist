@@ -56,8 +56,8 @@ extension MediaOwnerSliceTests {
     func testAgentSuggestionsHaveSourceChoiceNoteAndHistoricalWarningWithoutAdoptingOwnerDraft() async throws {
         let (peer,store,_,_)=fixture();let model=await setup(peer,store)
         let note="Keep the stronger silhouette.\nLiteral second line."
-        let suggestion:MediaValues=["id":"suggestion-current","origin":"agent","source_label":"Codex · abcdef12","created_at":"2026-10-28T18:00:00Z","target_id":"target","review_basis_signature":"basis","disposition":"accepted","winner_id":"second","note":note]
-        var earlier=suggestion;earlier["id"]="suggestion-earlier";earlier["target_id"]="old-target";earlier["winner_id"]="old-candidate"
+        let suggestion:MediaValues=["id":"suggestion-current","origin":"agent","source_label":"Codex · abcdef12","created_at":"2026-10-28T18:00:00Z","target_id":"target","review_basis_signature":"basis","disposition":"accepted","winner_id":"second","note":note,"stale":false]
+        var earlier=suggestion;earlier["id"]="suggestion-earlier";earlier["target_id"]="old-target";earlier["winner_id"]="old-candidate";earlier["stale"]=true
         var forged=suggestion;forged["id"]="not-an-agent-suggestion";forged["origin"]="human_ui"
         model.item=Record(values:["id":"item","disposition":"pending","target":["id":"target","review_basis_signature":"basis"],"candidates":[["id":"first"],["id":"second"]],"suggestions":[suggestion,earlier,forged]])
         model.draft.note="My unsent owner note";model.draft.winnerID="first"

@@ -110,6 +110,8 @@ final class StorageReadPerformanceTests: XCTestCase {
                         operand + #"\s+COLLATE\s+BINARY\s*=\s*"# + column]
         for url in try FileManager.default.contentsOfDirectory(at:sources,includingPropertiesForKeys:nil) where url.pathExtension == "swift" {
             let source = try String(contentsOf:url,encoding:.utf8)
+            // CL-363: every pattern needs this literal; most files need no regex scan.
+            guard source.range(of:"COLLATE",options:.caseInsensitive) != nil else {continue}
             for pattern in patterns {
                 let regex = try NSRegularExpression(pattern:pattern,options:.caseInsensitive)
                 XCTAssertNil(regex.firstMatch(in:source,range:NSRange(source.startIndex...,in:source)),url.lastPathComponent + " overrides indexed identity collation")

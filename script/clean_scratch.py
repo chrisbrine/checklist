@@ -415,12 +415,13 @@ def release_finished(roots, session_id, read_status):
     return 1 if failed else 0
 
 
-def cli_status_reader(cli, repo, project_id=None):
+def cli_status_reader(cli, repo, project_id=None, timeout=60):
     """Read-only ticket statuses through the installed CLI, with cwd at the project folder."""
     project = project_id
     def call(method, arguments):
         result = subprocess.run([str(cli), 'call', method, json.dumps(arguments)], cwd=repo,
-                                capture_output=True, text=True, check=True, timeout=60)
+                                capture_output=True, text=True, check=True,
+                                timeout=timeout() if callable(timeout) else timeout)
         return json.loads(result.stdout)['data']
     def read(keys):
         nonlocal project
@@ -453,33 +454,10 @@ def du_sizes(paths):
     return sizes
 
 
-def background_sizes(groups, workers=8, chunk=16):
-    """Preview sizer for storage_report: du runs while the preview inspects folders.
-
-    A root directory is sized as its own block plus its children, in parallel du
-    calls of up to `chunk` children each (one large scratchpad took 27 s as one
-    du). A hard link shared by two chunks counts twice. A missing root is absent.
-    """
-    pool = ThreadPoolExecutor(max_workers=workers)
-    plans = {}
-    for path in {path for paths in groups.values() for path in paths}:
-        if not os.path.lexists(path): continue
-        try:
-            if path.is_symlink() or not path.is_dir(): raise NotADirectoryError(path)
-            own = path.lstat().st_blocks * 512
-            parts = sorted(path.iterdir())
-        except OSError:
-            own, parts = 0, [path]
-        plans[path] = (own, [pool.submit(du_sizes, parts[i:i + chunk]) for i in range(0, len(parts), chunk)])
-    pool.shutdown(wait=False)
-    def sizer(paths):
-        result = {}
-        for path in paths:
-            if path in plans:
-                own, futures = plans[path]
-                result[path] = own + sum(sum(f.result().values()) for f in futures)
-        return result
-    return sizer
+def background_sizes(groups, workers=16, chunk=16, targets=()):
+    """Share one allocated-size scan between held rows and the size report."""
+    from cleanup_sizes import background_sizes as shared_sizes
+    return shared_sizes(groups, targets, size_reader=du_sizes, workers=workers, chunk=chunk)
 
 
 def storage_groups(sessions, qualification, repo):
@@ -653,6 +631,7 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
     reason = None
     # A root released for ended tickets retires whole: no per-file hashing (CL-359).
     ticket_retire = ticket_released(item)
+    released_retire = released_by(item)
     if item.is_symlink():
         reason = 'symbolic link; never followed'
     elif kind == 'spare' and not ticket_retire and not any(
@@ -690,10 +669,10 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
                           for entry in before.values()):
         reason = 'files or directories changed in the last 45 minutes'
 
-    # Only an explicitly fingerprinted, released root authorizes disposal of
-    # unique copied stores. Legacy workspace markers retain byte-only cleanup.
+    # Explicit root release authorizes whole-folder retirement. Fingerprinted
+    # qualification runs keep their additional links/Git guard unless ticket-released.
     retire_run = kind == 'qualification' and bool((read_marker(item) or {}).get('source_fingerprint'))
-    whole = retire_run or ticket_retire
+    whole = retire_run or released_retire
     if retire_run and not ticket_retire and not reason and any(
             not stat.S_ISREG(entry[2]) or '.git' in path.relative_to(item).parts
             for path, entry in files.items()):
@@ -710,6 +689,21 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
                 'reasons': {reason: size} if files else {},
                 'retained_legacy_paths': [str(p) for p in legacy], 'planned_move_count': 0,
                 'move_bytes': {}, 'moves': [], 'inventory': before}
+    if whole and not reason:
+        # An owner's root release authorizes one rename of the checked tree.
+        # Do not classify/hash its managed objects or split at Git/legacy paths:
+        # nested unreleased markers, use, quiet time and installed identity were
+        # checked above. Apply inventories the tree once more before that rename.
+        category = ('ticket_bytes' if ticket_retire else
+                    'qualification_bytes' if retire_run else 'released_bytes')
+        why = ('tickets Done or canceled; released folder retires whole' if ticket_retire else
+               'released obsolete qualification run (including copied stores)' if retire_run else
+               'owner released workspace; whole folder retires')
+        counts[category] = size
+        return {'path': str(item), 'kind': kind, **counts, 'total_bytes': size,
+                'reason': why, 'reasons': {why: size},
+                'retained_legacy_paths': [str(p) for p in legacy], 'planned_move_count': 1,
+                'move_bytes': {item: size}, 'moves': [item], 'inventory': before}
     reasons = Counter()
     removable = set()
     for path, entry in files.items():
@@ -794,13 +788,13 @@ def _set_preview_objects(objects):
     _PREVIEW_OBJECTS = objects
 
 
-def preview_one(item, kind, in_use, fingerprint, keep, now, session_id, include_released, objects=None):
+def preview_one(item, kind, in_use, fingerprint, keep, now, session_id, include_released, objects=None, sizer=None):
     """One read-only preview decision; module-level so a process pool can run it."""
     # An old --preview is never an executable deletion plan.
     if not in_scope(item, kind, session_id, include_released):
         raise ValueError('workspace ownership/release changed; retained')
     # Preview reads a held root's marker and du size only (CL-359 speed).
-    if held := held_preview(item, kind, keep):
+    if held := held_preview(item, kind, keep, sizer):
         return held
     return preview_public(plan(item, kind, _PREVIEW_OBJECTS if objects is None else objects,
                                [item] if in_use else [], fingerprint, keep, now))
@@ -817,7 +811,7 @@ def preview_executor(objects, workers=PREVIEW_WORKERS):
 
 
 def preview_items(items, objects, used, fingerprint, keep, clock, session_id, include_released,
-                  workers=PREVIEW_WORKERS, executor=None):
+                  workers=PREVIEW_WORKERS, executor=None, sizer=None):
     """Read-only preview: the same per-item decisions and output order as apply's
     planning, with held-root du sizes and item plans computed in parallel.
 
@@ -825,10 +819,19 @@ def preview_items(items, objects, used, fingerprint, keep, clock, session_id, in
     process pool from preview_executor()."""
     failed = False
     process_pool = executor is not None
-    with (executor(objects) if process_pool else ThreadPoolExecutor(max_workers=max(1, workers))) as pool:
-        futures = [(item, pool.submit(preview_one, item, kind, item in used, fingerprint, keep, clock(),
-                                      session_id, include_released, None if process_pool else objects))
-                   for item, kind in items]
+    with (executor(objects) if process_pool else ThreadPoolExecutor(max_workers=max(1, workers))) as pool, \
+            ThreadPoolExecutor(max_workers=max(1, workers)) as size_pool:
+        futures = []
+        for item, kind in items:
+            # Held roots use the very same background size futures as size_report;
+            # do not make each process launch a duplicate du of that subtree.
+            if sizer is not None and held_preview(item, kind, keep, lambda paths: {}):
+                future = size_pool.submit(preview_one, item, kind, item in used, fingerprint, keep, clock(),
+                                          session_id, include_released, objects, sizer)
+            else:
+                future = pool.submit(preview_one, item, kind, item in used, fingerprint, keep, clock(),
+                                     session_id, include_released, None if process_pool else objects)
+            futures.append((item, future))
         for item, future in futures:
             try:
                 print(json.dumps(future.result(), sort_keys=True), flush=True)
@@ -1040,12 +1043,11 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
     processes = process_reader() if items else []
     # Background du starts only after process inspection: its own command
     # arguments must never read as a running process using an item.
-    if after_inspection:
-        after_inspection()
+    sizer = after_inspection() if after_inspection else None
     used = used_items(processes, (item for item, _ in items))
     if not apply:
         return 1 if preview_items(items, objects, used, fingerprint, keep, clock, session_id,
-                                  include_released, executor=preview_pool) or failed else 0
+                                  include_released, executor=preview_pool, sizer=sizer) or failed else 0
     for offset in range(0, len(items), ITEM_BATCH_SIZE):
         pending = []
         for item, kind in items[offset:offset + ITEM_BATCH_SIZE]:
@@ -1156,12 +1158,18 @@ def main():
     # Preview sizes the folders in background du calls while it inspects items
     # (CL-359 speed), started after process inspection; apply sizes them after its moves.
     sizers = []
-    start_sizes = None if args.apply else lambda: sizers.append(background_sizes(groups))
+    def start_sizes():
+        # Candidate boundaries also partition nested held workspaces. du never
+        # walks their parent and then walks each held child again.
+        targets = [item for item, _ in candidates(sessions.resolve(), qualification.resolve(),
+                                                  args.session_id, args.include_released)]
+        sizers.append(background_sizes(groups, targets=targets))
+        return sizers[-1]
     result = clean(args.sessions_root.expanduser().resolve(), args.qualification_root.expanduser().resolve(),
                    args.repo.expanduser().resolve(), args.installed_info.expanduser(),
                    [path.expanduser().resolve() for path in args.keep_qualified], args.apply,
                    session_id=args.session_id, include_released=args.include_released,
-                   after_inspection=start_sizes, preview_pool=None if args.apply else preview_executor)
+                   after_inspection=None if args.apply else start_sizes, preview_pool=None if args.apply else preview_executor)
     storage_report(groups, args.budget_gb * 1e9, sizers[0] if sizers else None)
     return result
 

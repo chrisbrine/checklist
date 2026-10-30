@@ -18,6 +18,7 @@ struct MediaOwnerComparison: View {
                     Text("Last owner action: "+GlossaryText.title(decision.string("disposition"))+" · "+MediaComparisonLabels.time(decision.string("created_at"))+" · "+MediaComparisonLabels.origin(decision.string("origin"))).font(.caption).textSelection(.enabled)
                     Text(decision.string("note")).textSelection(.enabled)
                 }
+                if let followUp=MediaComparisonLabels.followUp(item:model.item) {Text(followUp).font(.caption).textSelection(.enabled)}
                 ForEach(MediaComparisonLabels.suggestions(item:model.item)) {suggestion in
                     VStack(alignment:.leading,spacing:4) {
                         Text("Agent suggestion").font(.headline)
@@ -25,6 +26,11 @@ struct MediaOwnerComparison: View {
                         Text(suggestion.choice)
                         if !suggestion.note.isEmpty {Text(suggestion.note).textSelection(.enabled)}
                         Text(suggestion.isCurrent ? "Advice only. Your decision remains separate." : "Earlier target or review context. Advice only.").font(.caption).foregroundStyle(Color.checklistSecondaryText)
+                        if suggestion.isCurrent && model.decisionEnabled {
+                            Button("Keep this suggestion") {model.adoptSuggestion(suggestion.id)}
+                                .accessibilityLabel("Keep agent suggestion: "+suggestion.choice)
+                                .checklistDisabled([(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
+                        }
                     }.padding(8).background(.quaternary.opacity(0.3),in:RoundedRectangle(cornerRadius:6))
                 }
                 ForEach(candidateChoices) {choice in
@@ -127,11 +133,21 @@ struct MediaSuggestionPresentation: Identifiable {
     let isCurrent:Bool
 }
 enum MediaComparisonLabels {
+    /// CL-350: the worker's recorded follow-up for the current decision, apart from the decision.
+    static func followUp(item:Record) -> String? {
+        let row=Record(values:item.object("follow_up"))
+        switch row.string("kind") {
+        case "ticket": return "Follow-up ticket: "+row.string("task_key")
+        case "worker_reason": return "Worker follow-up: "+row.string("reason")
+        default: return nil
+        }
+    }
     /// Suggestions remain attributed advice; this projection never changes the owner's draft.
     @MainActor static func suggestions(item:Record) -> [MediaSuggestionPresentation] {
         let target=Record(values:item.object("target")),candidates=item.records("candidates")
         return item.records("suggestions").filter {$0.string("origin")=="agent"}.map {suggestion in
-            let current=suggestion.string("target_id")==target.id && suggestion.string("review_basis_signature")==target.string("review_basis_signature")
+            // CL-351: the service holds the rule, including a Draft target's publication lineage.
+            let current=suggestion.values["stale"] as? Bool == false
             var choice=MediaReviewModel.dispositionLabel(suggestion.string("disposition"))
             let winner=suggestion.string("winner_id")
             if !winner.isEmpty {choice += candidates.firstIndex(where:{$0.id==winner}).map {" · Candidate \($0+1)"} ?? " · Earlier candidate"}
@@ -139,11 +155,13 @@ enum MediaComparisonLabels {
             return .init(id:suggestion.id,source:source,choice:choice,note:suggestion.string("note"),isCurrent:current)
         }
     }
-    static func playbackSettings(slotID: String,layout: MediaValues,historical: Bool) -> (loop: Bool,frameRate: Double?) {
+    static func playbackSettings(slotID: String,layout: MediaValues,historical: Bool,metadata: MediaValues = [:]) -> (loop: Bool,frameRate: Double?) {
         // Example queries carry historical attribution, not their historical schema.
         // Never reinterpret an accepted example at the current type's game speed.
         guard !historical,layout["primary_slot_id"] as? String == slotID else {return (false,nil)}
-        return (layout["loop"] as? Bool == true,(layout["frame_rate"] as? NSNumber)?.doubleValue)
+        let field = layout["frame_rate_field_id"] as? String
+        let rate = field.flatMap { metadata[$0] as? NSNumber }?.doubleValue ?? (layout["frame_rate"] as? NSNumber)?.doubleValue
+        return (layout["loop"] as? Bool == true,rate)
     }
     static func referenceSlotIDs(_ layout: MediaValues) -> [String] {
         if let references=layout["reference_slot_ids"] as? [String] {return references}
@@ -262,7 +280,7 @@ struct MediaSlotView: View {
     }
     var declaredKind:String {model.slots.first {$0.id==slot.string("slot_id")}?.string("kind") ?? ""}
     var layout:MediaValues {model.schema["layout"] as? MediaValues ?? [:]}
-    var playbackSettings:(loop:Bool,frameRate:Double?) {MediaComparisonLabels.playbackSettings(slotID:slot.string("slot_id"),layout:layout,historical:example != nil)}
+    var playbackSettings:(loop:Bool,frameRate:Double?) {MediaComparisonLabels.playbackSettings(slotID:slot.string("slot_id"),layout:layout,historical:example != nil,metadata:model.item.object("target")["metadata"] as? MediaValues ?? [:])}
     var role:String {MediaComparisonLabels.role(slotID:slot.string("slot_id"),candidateIndex:candidateIndex,layout:layout,historical:example != nil)}
     var imageKey:String {(original?.string("reference_id") ?? "")+":"+slot.string("slot_id")}
     var active:Bool {model.imageIsActive(imageKey,historical:example != nil)}

@@ -59,6 +59,8 @@ struct GeneralSettingsView: View {
 struct StorageSettingsView: View {
     @EnvironmentObject var store: ChecklistStore
     @StateObject private var observation = StorageSettingsObservation()
+    /// The folder choice. Tests supply a synthetic backup; the app uses the open panel.
+    var chooseBackup: (@MainActor (@escaping @MainActor (URL) -> Void) -> Void)? = nil
     private var info: [String:Any] {observation.info}
     private var restorePreview: [String:Any] {observation.restorePreview}
     var body: some View {
@@ -92,7 +94,12 @@ struct StorageSettingsView: View {
                 Button("Preview backup restore…") { previewRestore() }.checklistDisabled([(observation.backingUp || observation.restoring, "Wait for storage verification to finish."), (store.busy, "Wait for the current change to finish."), (store.hasPendingMutation, "Use Check the last change before starting another change.")])
                 if observation.restoring { ProgressView("Verifying and preparing restored copy…").controlSize(.small) }
                 Text("Restore prepares a separate data root and keeps this installation intact. Prior sessions need fresh connections, active work needs recovery and unresolved deliveries stay quarantined.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+                if !restorePreview.isEmpty && !observation.restoring {
+                    Text("Backup verified. Review it to prepare a restored copy.").checklistFont(.callout)
+                    Button("Review verified backup…") {observation.showingRestorePreview = true}
+                }
                 if !observation.result.isEmpty { Text(observation.result).checklistFont(.micro).textSelection(.enabled) }
+                LongOperationRows(log:store.longOperations)
             }
         }.formStyle(.grouped).sheet(isPresented:$observation.showingRestorePreview) {
             RestorePreviewSheet(preview:restorePreview,cancel:{observation.showingRestorePreview = false},confirm:{restoreCopy()})
@@ -101,24 +108,28 @@ struct StorageSettingsView: View {
     }
     func refreshStorageStatus() async {
         let scope = store.storeIncarnation;observation.changeScope(scope)
-        await observation.refreshStatus {try await store.request("storage_status",ifCurrent:{store.storeIncarnation == scope})}
+        await observation.refreshStatus {try await store.request("storage_status",ifCurrent:{StorageSettingsObservation.sameStore(store.storeIncarnation,scope)})}
     }
     func previewRestore() {
+        if let chooseBackup {chooseBackup {previewRestore(url:$0)};return}
         let panel = NSOpenPanel();panel.canChooseDirectories = true;panel.canChooseFiles = false;panel.allowsMultipleSelection = false
         panel.message = "Choose a completed Checklist backup folder to verify."
         panel.begin { response in
             guard response == .OK,let url = panel.url else {return}
-            let scope = store.storeIncarnation;observation.changeScope(scope)
-            Task {
-                guard store.storeIncarnation == scope else {return}
-                await observation.previewRestore {try await store.request("restore_preview",["path":url.path],ifCurrent:{store.storeIncarnation == scope})}
-            }
+            previewRestore(url:url)
+        }
+    }
+    private func previewRestore(url: URL) {
+        let scope = store.storeIncarnation;observation.changeScope(scope)
+        Task {
+            guard StorageSettingsObservation.sameStore(store.storeIncarnation,scope) else {return}
+            await observation.previewRestore {try await store.request("restore_preview",["path":url.path],ifCurrent:{StorageSettingsObservation.sameStore(store.storeIncarnation,scope)})}
         }
     }
     func restoreCopy() {
-        let scope = store.storeIncarnation
-        observation.showingRestorePreview = false;observation.result = ""
+        let scope = observation.scope
         let params: [String:Any] = ["command_id":UUID().uuidString,"path":restorePreview["path"] ?? "","manifest_sha256":restorePreview["manifest_sha256"] ?? ""]
+        observation.clearRestorePreview();observation.result = ""
         // Preserve the exact original command in the app's incarnation-bound
         // recovery journal if publication succeeds but its reply is lost.
         store.run("restore_create",params,failure:{error in
@@ -138,10 +149,10 @@ struct StorageSettingsView: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let scope = store.storeIncarnation;observation.changeScope(scope)
         Task {
-            guard store.storeIncarnation == scope else {return}
+            guard StorageSettingsObservation.sameStore(store.storeIncarnation,scope) else {return}
             await observation.backup(path:url.path,fetch:{
-                try await store.request("backup_create",["command_id":UUID().uuidString,"path":url.path],ifCurrent:{store.storeIncarnation == scope})
-            },status:{try await store.request("storage_status",ifCurrent:{store.storeIncarnation == scope})})
+                try await store.request("backup_create",["command_id":UUID().uuidString,"path":url.path],ifCurrent:{StorageSettingsObservation.sameStore(store.storeIncarnation,scope)})
+            },status:{try await store.request("storage_status",ifCurrent:{StorageSettingsObservation.sameStore(store.storeIncarnation,scope)})})
         }
     }
 }

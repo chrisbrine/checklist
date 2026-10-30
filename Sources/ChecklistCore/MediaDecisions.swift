@@ -14,13 +14,17 @@ extension CommandRouter {
         if method == "media_suggest" { guard !c.isOwner else { throw CoreError("FORBIDDEN","Suggestions retain actual worker provenance.") } }
         else { try owner(c) }
         let round = try scoped(db,try text(p,"round_id"),pid,type:"media_round")
-        try mediaObserve(db,p,round:round,caller:c);let manifest = try mediaObservedManifest(db,p,round:round)
+        try mediaObserve(db,p,round:round,caller:c)
+        // CL-351: a worker may suggest on exact Draft targets; no manifest exists before publication.
+        let draftSuggestion = method == "media_suggest" && round["state"] as? String == "draft"
+        let manifest = draftSuggestion ? try mediaDraftSuggestionMembers(db,p,project:pid) : try mediaObservedManifest(db,p,round:round)
         guard let selected = p["items"] as? [JSON],!selected.isEmpty,selected.count <= 200,Set(selected.compactMap {$0["item_id"] as? String}).count == selected.count else { throw CoreError("INVALID_INPUT","Select 1 to 200 distinct exact item bases.") }
         var input = p,adopted: JSON?
         if method == "media_adopt_suggestion" {
             guard selected.count == 1 else { throw CoreError("INVALID_INPUT","Adopt one exact suggestion at a time.") }
             adopted = try scoped(db,try text(p,"suggestion_id"),pid,type:"media_suggestion")
-            guard adopted?["round_id"] as? String == round["id"] as? String,adopted?["item_id"] as? String == selected[0]["item_id"] as? String,adopted?["target_id"] as? String == selected[0]["target_id"] as? String,adopted?["review_basis_signature"] as? String == selected[0]["review_basis_signature"] as? String else { throw CoreError("MEDIA_BASIS_CHANGED","A suggestion must still name this exact current target and basis.") }
+            let adoptedTarget = try scoped(db,try text(selected[0],"target_id"),pid,type:"media_item_target")
+            guard adopted?["round_id"] as? String == round["id"] as? String,adopted?["item_id"] as? String == selected[0]["item_id"] as? String,mediaSuggestionCurrent(adopted ?? [:],target:adoptedTarget),adopted?["review_basis_signature"] as? String == selected[0]["review_basis_signature"] as? String else { throw CoreError("MEDIA_BASIS_CHANGED","A suggestion must still name this exact current target and basis.") }
             for key in ["disposition","winner_id","none_fit","note","no_follow_up_reason"] { input[key] = adopted?[key] }
         }
         let disposition = try text(input,"disposition",max:32)
@@ -37,8 +41,6 @@ extension CommandRouter {
             var fields: JSON = ["round_id":(try StoredRecord(round, family: "media").requiredValue("id")),
                 "item_id":(try StoredRecord(original, family: "media").requiredValue("id")),
                 "target_id":(try StoredRecord(target, family: "media").requiredValue("id")),
-                "manifest_id":(try StoredRecord(manifest, family: "media").requiredValue("id")),
-                "manifest_digest":(try StoredRecord(manifest, family: "media").requiredValue("digest")),
                 "type_revision_id":(try StoredRecord(target, family: "media").requiredValue("type_revision_id")),
                 "context_id":(try StoredRecord(round, family: "media").requiredValue("context_id")),
                 "context_signature":(try StoredRecord(target, family: "media").requiredValue("context_signature")),
@@ -48,6 +50,10 @@ extension CommandRouter {
                 "review_basis_signature":(try StoredRecord(target, family: "media").requiredValue("review_basis_signature")),
                 "review_basis_base64":(try StoredRecord(target, family: "media").requiredValue("review_basis_base64")),
                 "disposition":disposition]
+            if draftSuggestion { fields["target_phase"] = "draft" } else {
+                fields["manifest_id"] = try StoredRecord(manifest, family: "media").requiredValue("id")
+                fields["manifest_digest"] = try StoredRecord(manifest, family: "media").requiredValue("digest")
+            }
             fields["item_revision"] = original["revision"]
             fields["selection_outcome"] = winner != nil ? "winner" : noneFit ? "none_fit" : "unselected"
             if noneFit { fields["none_fit"] = true }
@@ -57,8 +63,8 @@ extension CommandRouter {
             }
             for key in ["note","no_follow_up_reason"] where input[key] != nil { fields[key] = try text(input,key,max:4000) }
             var refs = [try mediaRef("media_round",round),try mediaRef("media_item",original),
-                try mediaRef("media_item_target",target),try mediaRef("media_round_manifest",
-                manifest),["type":"media_review_context","id":(try StoredRecord(round, family: "media").requiredValue("context_id")),
+                try mediaRef("media_item_target",target)] + (draftSuggestion ? [] : [try mediaRef("media_round_manifest",
+                manifest)]) + [["type":"media_review_context","id":(try StoredRecord(round, family: "media").requiredValue("context_id")),
                 "revision":1],["type":"media_review_type_revision","id":(try StoredRecord(target,
                  family: "media").requiredValue("type_revision_id")),"revision":1]]
             refs += strings(target,"candidate_ids").map {["type":"media_candidate","id":$0,"revision":1]}

@@ -15,6 +15,8 @@ struct Arguments: Sendable {
     var project: String?
     var installationExplicit = false
     var command: [String] = []
+    /// Seconds for `checklist call --wait[=SECONDS]`.
+    var wait: TimeInterval?
 
     init(_ arguments: [String]) throws {
         var index = 0
@@ -38,6 +40,15 @@ struct Arguments: Sendable {
                     guard project == nil else { throw CLIError("Specify --project only once.") }
                     project = arguments[index]
                 }
+            case "--wait":
+                guard wait == nil else { throw CLIError("Specify --wait only once.") }
+                wait = OperationWait.defaultCommandLineWait
+            case _ where argument.hasPrefix("--wait="):
+                guard wait == nil else { throw CLIError("Specify --wait only once.") }
+                guard let seconds = TimeInterval(argument.dropFirst("--wait=".count)), seconds.isFinite, seconds > 0, seconds <= OperationWait.longestCommandLineWait else {
+                    throw CLIError("--wait=SECONDS requires a number above 0 and at most \(Int(OperationWait.longestCommandLineWait)).")
+                }
+                wait = seconds
             case "--owner", "--token", "--role":
                 throw CLIError("\(argument) is not supported. Native conversations connect automatically; owner actions require the actual Checklist app.")
             default: command.append(argument)
@@ -49,6 +60,7 @@ struct Arguments: Sendable {
         else { throw CLIError("Installation must contain 1–80 ASCII letters, numbers, dots, underscores or hyphens.") }
         guard workspace.hasPrefix("/") else { throw CLIError("Workspace must be an absolute directory path.") }
         workspace = URL(fileURLWithPath: workspace).standardizedFileURL.resolvingSymlinksInPath().path
+        if wait != nil, command.first != "call" { throw CLIError("--wait is supported only by checklist call.") }
         if let task {
             guard command == ["connect"] else { throw CLIError("--task is supported only by checklist connect.") }
             guard !task.isEmpty, task.count <= 160, !task.contains(where: { $0.isWhitespace }), !task.hasPrefix("-") else {
@@ -86,14 +98,17 @@ struct ChecklistCommand {
         var commandName: String?
         do {
             try DelegateInstanceExpectation.verifyIfPresent(instance: instance)
-            let shimUpdate = ShimUpdateEnvironment.capture()
+            let instanceReady = ProcessInfo.processInfo.systemUptime
             let arguments = try Arguments(Array(CommandLine.arguments.dropFirst()))
+            let captureStarted = ProcessInfo.processInfo.systemUptime
+            let shimUpdate = CLIStartup.shimUpdate(for: arguments.command.first)
+            let captureFinished = ProcessInfo.processInfo.systemUptime
             commandName = arguments.command.first
             let bridge = Bridge(configuration: .init(installation: arguments.installation, workspace: arguments.workspace,
                 expectedSession: arguments.session, automatic: !arguments.installationExplicit,
                 assistantProject: arguments.assistant ? arguments.project : nil, command: arguments.command.first ?? ""),
                 environment: .init(shimUpdate: arguments.command.first == "mcp" ? shimUpdate : nil))
-            if CallTimingLog.enabled {CallTimingLog.write(["scope":"cli_setup","total_ms":(ProcessInfo.processInfo.systemUptime-started)*1000])}
+            if CallTimingLog.enabled {CallTimingLog.write(["scope":"cli_setup","main_entered_uptime_s":started,"instance_ms":(instanceReady-started)*1000,"arguments_ms":(captureStarted-instanceReady)*1000,"shim_capture_ms":(captureFinished-captureStarted)*1000,"bridge_ms":(ProcessInfo.processInfo.systemUptime-captureFinished)*1000,"total_ms":(ProcessInfo.processInfo.systemUptime-started)*1000])}
             switch arguments.command.first ?? "help" {
             case "connect":
                 guard arguments.command.count == 1 else { throw CLIError("Usage: checklist connect [--task KEY_OR_UUID] or checklist connect --assistant --project UUID_OR_EXACT_NAME") }
@@ -119,7 +134,9 @@ struct ChecklistCommand {
                 // IPC cold-starts the same bundled singleton. There is no model/runtime launch.
                 try printJSON(await serviceStatus(installation: arguments.installation, workspace: arguments.workspace))
             case "call":
-                try printJSON(await call(arguments:arguments,bridge:bridge))
+                let reply = try await call(arguments:arguments,bridge:bridge)
+                try printJSON(reply)
+                if arguments.wait != nil, OperationWait.isUnfinished(reply) { exit(OperationWait.unfinishedExitCode) }
             case "help", "--help", "-h": printHelp()
             case "version", "--version": print("Checklist \(ChecklistBuildVersion.current.version) · build \(ChecklistBuildVersion.current.buildID) (\(ChecklistBuildVersion.current.buildNumber)) · MCP Swift SDK 0.12.1")
             default: throw CLIError("Unknown command. Run checklist help.")
@@ -148,7 +165,7 @@ struct ChecklistCommand {
     }
 
     static func call(arguments: Arguments, bridge: Bridge) async throws -> Value {
-        guard arguments.command.count == 2 || arguments.command.count == 3 else { throw CLIError("Usage: checklist call METHOD '{JSON}' [--workspace PATH]") }
+        guard arguments.command.count == 2 || arguments.command.count == 3 else { throw CLIError("Usage: checklist call [--wait[=SECONDS]] METHOD '{JSON}' [--workspace PATH]") }
         let started = ProcessInfo.processInfo.systemUptime
         let data = try CallArgumentInput.read(arguments.command.count == 3 ? arguments.command[2] : "{}")
         let value = try JSONDecoder().decode(Value.self, from: data)
@@ -157,7 +174,11 @@ struct ChecklistCommand {
         try await bridge.verifySession()
         let bound = ProcessInfo.processInfo.systemUptime
         defer {if CallTimingLog.enabled {CallTimingLog.write(["scope":"cli_call","argument_decode_ms":(decoded-started)*1000,"bootstrap_session_ms":(bound-decoded)*1000,"command_ms":(ProcessInfo.processInfo.systemUptime-bound)*1000])}}
-        return try await bridge.call(arguments.command[1], value)
+        // operation_wait runs in this adapter, as it does for MCP.
+        let name = arguments.command[1]
+        let reply = name == OperationWait.toolName ? try await bridge.concurrentCall(name, value) : try await bridge.call(name, value)
+        guard let limit = arguments.wait else { return reply }
+        return try await bridge.finalReply(to: reply, arguments: value, limit: limit)
     }
 
     static func printJSON(_ value: Value, to output: FileHandle = .standardOutput) throws {
@@ -178,6 +199,7 @@ struct ChecklistCommand {
           checklist service start|status
           checklist call METHOD '{"parameter":"value"}' [--workspace /absolute/project]
           checklist call METHOD -    (read at most 1 MiB of JSON from stdin)
+          checklist call --wait[=SECONDS] METHOD '{"parameter":"value"}'
           checklist version
 
         Run connect from a Codex or Claude conversation in its project directory.
@@ -187,6 +209,9 @@ struct ChecklistCommand {
         The helper remains a local assistant relay, without claiming the cloud Dot's identity or delivery.
         MCP and call connect automatically when native context is available; no IDs or Settings form.
         In an unregistered folder, call project_create to create this conversation's own project and connect.
+        --wait (default 120 s) reads an accepted long command until its final reply, and prints that reply as
+        a plain call would. A failed command exits 1. After the wait it prints the operation with its state
+        and wait.finished=false and exits 124; the command can still be running, so read operation_get.
         Explicit --installation selects a previously configured nonautomatic integration.
         The MCP shim uses the official Swift MCP SDK over stdio; stdout contains only protocol frames.
         Existing checklists are never imported automatically. No model is launched.

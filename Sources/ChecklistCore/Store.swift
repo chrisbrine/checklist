@@ -300,6 +300,11 @@ public final class CommandRouter: @unchecked Sendable {
         return Int(sequence)
     }
     public func handle(method: String, params: [String: Any], caller: Caller) throws -> [String: Any] {
+        // CL-362: a transient descriptor shortage must not fail an ordinary attachment.
+        guard method == "attachment_add" else {return try handleAttempt(method:method,params:params,caller:caller)}
+        return try StorageFailureReport.retryingTransient {try handleAttempt(method:method,params:params,caller:caller)}
+    }
+    private func handleAttempt(method: String, params: [String: Any], caller: Caller) throws -> [String: Any] {
         // Validation, preparation and owner projection also bridge Foundation
         // objects outside the SQL callbacks. Bound their lifetime on this thread.
         try autoreleasepool {

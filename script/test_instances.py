@@ -25,7 +25,8 @@ import unicodedata
 from urllib.parse import unquote, urlsplit
 import uuid
 
-from clean_scratch import caller_session, mark_qualification, requested_tickets, validate_fingerprint
+from clean_scratch import caller_session, mark_qualification, read_marker, requested_tickets, validate_fingerprint
+from test_instance_restage import FRESH_COPY, reuse_proof
 from verify_stage import sha, signing_teams, verify as verify_stage
 from verify_install import failure_guidance, upgrading_message, upgrading_status
 
@@ -1003,7 +1004,7 @@ def slot_seed(other, destination, destination_root=None):
             elif not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
                 raise ValueError('Source slot contains a special file.')
     shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=True,
-                    ignore=lambda folder, names: {'connections.json'} if Path(folder) == source else set())
+                    ignore=lambda folder, names: {'connections.json', 'OwnerPrivate'} if Path(folder) == source else set())
     inspection = require_local_paths(destination / 'checklist.sqlite', destination_root or destination, immutable=False, source_root=source)
     inventory = [(str(file.relative_to(destination)), os.readlink(file) if file.is_symlink() else sha(file))
                  for file in sorted(destination.rglob('*')) if file.is_file() or file.is_symlink()]
@@ -1115,6 +1116,64 @@ def create(arguments, p):
         print(f'Created slot {arguments.slot}: build {manifest["build_id"]}; seed {seed["kind"]}')
 
 
+def restage_qualification(metadata, capture=None, manifest=None, commit=None):
+    previous = metadata.get('restage') or {}
+    origin_path = previous.get('seeded_stage_path', metadata['stage_path'])
+    origin_capture, origin_manifest = verify_stage(origin_path)
+    if previous and (origin_manifest['build_id'] != previous['seeded_build_id']
+                     or origin_manifest['source_fingerprint'] != previous['seeded_source_fingerprint']):
+        raise ValueError('Original seeded stage identity changed. ' + FRESH_COPY)
+    if capture is None: capture, manifest = verify_stage(metadata['stage_path'])
+    return reuse_proof(REPO, LIVE, metadata['seed'], origin_capture, origin_manifest,
+                       capture, manifest, previous.get('seeded_commit') or commit or origin_manifest.get('source_commit'))
+
+
+def restage(arguments, p):
+    session = caller_session(getattr(arguments, 'session_id', None))
+    stopped(p)
+    metadata = load(p)
+    marker = read_marker(p['folder'])
+    if not marker or marker['session_id'] != session or marker['released']:
+        raise ValueError('Restage requires the active owning session of this slot.')
+    if metadata['mode'] in ['incomplete', 'refused', 'restaging']:
+        raise ValueError('Incomplete slot cannot be restaged. ' + FRESH_COPY)
+    bundle_check(p, metadata)
+    capture, manifest = stage_selection(arguments)
+    require_managed_path_support(capture, manifest)
+    proof = restage_qualification(metadata, capture, manifest, getattr(arguments, 'seeded_commit', None))
+    identity = sign_identity(manifest)
+    target = dict(metadata, build_id=manifest['build_id'], source_fingerprint=manifest['source_fingerprint'],
+                  stage_path=str(capture), mode='stopped', checks=None, restage=proof, restaged_at=now())
+    # Prepare and verify before publishing. Never copy, rewrite or remove data/.
+    with tempfile.TemporaryDirectory(prefix='.restage-', dir=p['folder']) as temporary:
+        incoming = Path(temporary) / p['bundle'].name
+        run(['ditto', capture / 'Checklist.app', incoming])
+        info_file = incoming / 'Contents/Info.plist'
+        info_file.write_bytes(plistlib.dumps(rewrite_info(plistlib.loads(info_file.read_bytes()), arguments.slot)))
+        agents = incoming / 'Contents/Library/LaunchAgents'
+        if agents.exists(): shutil.rmtree(contained(agents, p['folder']))
+        run(['codesign', '--force', '--sign', identity, '--timestamp=none', '--identifier', p['identifier'], incoming])
+        bundle_check(dict(p, bundle=incoming), target)
+        # Recheck freshness after potentially slow signing, before any publication.
+        if restage_qualification(metadata, capture, manifest, proof['seeded_commit']) != proof:
+            raise ValueError('Restage qualification changed. ' + FRESH_COPY)
+        save(p, dict(metadata, mode='restaging', checks=None))
+        previous = Path(temporary) / 'previous.app'
+        p['bundle'].rename(previous)
+        try:
+            incoming.rename(p['bundle'])
+            mark_qualification(p['folder'], manifest['source_fingerprint'],
+                               'disposable test slot ' + str(arguments.slot), session, tickets=marker['tickets'])
+            save(p, target)
+        except BaseException:
+            # A failed metadata publication stays fenced as restaging, with no
+            # passing checks; restore the old bundle for explicit reconciliation.
+            if p['bundle'].exists(): p['bundle'].rename(incoming)
+            previous.rename(p['bundle'])
+            raise
+    print('Restaged slot ' + str(arguments.slot) + ': ' + proof['reason'] + '; checks cleared.')
+
+
 def executable_payload(path):
     # Outer signing changes the app's embedded signature, not its Mach-O payload.
     data = bytearray(path.read_bytes())
@@ -1212,7 +1271,7 @@ def service_status(p, *, bound=None):
 def start(arguments, p):
     bound = start_deadline_seconds()  # Reject invalid configuration before bootstrap.
     metadata = load(p)
-    if metadata['seed']['kind'] not in ['empty', 'backup', 'slot', 'restored'] or metadata['mode'] in ['incomplete', 'refused']:
+    if metadata['seed']['kind'] not in ['empty', 'backup', 'slot', 'restored'] or metadata['mode'] in ['incomplete', 'refused', 'restaging']:
         raise ValueError('Slot creation did not complete: ' + metadata['seed'].get('reason', 'incomplete seed'))
     manifest = bundle_check(p, metadata)
     if metadata['seed']['kind'] != 'empty':
@@ -1397,9 +1456,20 @@ def destroy(p, *, unused_only=False):
 def promotion_gates(selected, slots):
     def passed(value):
         checks = value.get('checks') or {}
-        return value.get('seed', {}).get('kind') not in ['incomplete', 'refused'] and checks.get('passed') is True and checks.get('build_id') == selected['build_id'] and checks.get('source_fingerprint') == selected['source_fingerprint'] and value.get('build_id') == selected['build_id'] and value.get('source_fingerprint') == selected['source_fingerprint']
+        return value.get('mode') not in ['incomplete', 'refused', 'restaging'] and value.get('seed', {}).get('kind') not in ['incomplete', 'refused'] and checks.get('passed') is True and checks.get('build_id') == selected['build_id'] and checks.get('source_fingerprint') == selected['source_fingerprint'] and value.get('build_id') == selected['build_id'] and value.get('source_fingerprint') == selected['source_fingerprint']
+    def live_qualified(value):
+        if not (passed(value) and value.get('seed', {}).get('kind') == 'backup' and value['seed'].get('live_snapshot') is True): return False
+        if value.get('restage') is not None:
+            try:
+                proof = restage_qualification(value)
+                if proof != value['restage']: return False
+                print('Restaged live-backup qualification: ' + json.dumps(proof, sort_keys=True))
+            except (ValueError, OSError, KeyError, subprocess.SubprocessError) as error:
+                print('Restaged live-backup qualification refused: ' + str(error))
+                return False
+        return True
     return {'selected_build_check': passed(selected),
-            'live_snapshot_check_same_build': any(passed(value) and value.get('seed', {}).get('kind') == 'backup' and value['seed'].get('live_snapshot') is True for value in slots)}
+            'live_snapshot_check_same_build': any(live_qualified(value) for value in slots)}
 
 
 def promote(arguments, p):
@@ -1435,11 +1505,15 @@ def promote(arguments, p):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ['create', 'start', 'status', 'check', 'stop', 'destroy', 'promote']:
+    for name in ['create', 'restage', 'start', 'status', 'check', 'stop', 'destroy', 'promote']:
         command = commands.add_parser(name)
-        command.add_argument('--slot', type=slot_number, required=name in ['create', 'start', 'check', 'promote'])
+        command.add_argument('--slot', type=slot_number, required=name in ['create', 'restage', 'start', 'check', 'promote'])
         if name in ['stop', 'destroy']: command.add_argument('--all', action='store_true')
         if name == 'status': command.add_argument('--json', action='store_true')
+        if name == 'restage':
+            command.add_argument('--stage', type=Path, required=True)
+            command.add_argument('--session-id', help='actual owning session')
+            command.add_argument('--seeded-commit', help='full known commit of original seeded capture (verified against all inputs)')
         if name == 'create':
             source = command.add_mutually_exclusive_group()
             source.add_argument('--stage', type=Path); source.add_argument('--latest-stage', action='store_true')
@@ -1458,6 +1532,8 @@ def main():
     arguments = parser.parse_args()
     if arguments.command == 'start' and arguments.appearance and not arguments.gui:
         parser.error('--appearance requires --gui.')
+    if arguments.command == 'restage':
+        arguments.session_id = caller_session(arguments.session_id)
     if arguments.command == 'create':
         # Identity first, then every source/destination's live-root admission, then locks/changes.
         arguments.session_id = caller_session(arguments.session_id)
@@ -1491,6 +1567,7 @@ def main():
         for number in numbers:
             p = checked(number)
             if arguments.command == 'create': create(arguments, p)
+            elif arguments.command == 'restage': restage(arguments, p)
             elif arguments.command == 'start': start(arguments, p)
             elif arguments.command == 'check':
                 try: check(p)

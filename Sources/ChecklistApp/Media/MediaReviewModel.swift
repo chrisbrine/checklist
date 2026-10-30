@@ -48,10 +48,12 @@ typealias MediaValues = [String: Any]
     @Published var reworkPreview = Record(values: [:])
     @Published var epics: [Record] = []
     @Published var successorItems: [String: MediaValues] = [:]
+    /// CL-318/CL-349 selection, list filters and bulk progress (MediaBulkActions.swift).
+    @Published var bulk = MediaBulkState()
     /// Audio/video takes: two verified copies, one preparation and one playing take at most.
     let playback = MediaPlaybackCoordinator()
     private(set) var projectID = ""
-    private weak var store: ChecklistStore?
+    private(set) weak var store: ChecklistStore?
     private var epoch = UUID()
     private var selectionEpoch = UUID()
     private var roundChoiceEpoch = UUID()
@@ -83,16 +85,21 @@ typealias MediaValues = [String: Any]
         }
         await refresh()
     }
-    func read(_ method: String,_ params: MediaValues = [:]) async throws -> MediaValues {
-        guard let store, !projectID.isEmpty else {throw ChecklistError("PROJECT_REQUIRED", "Select a project.")}
-        var params=params;params["project_id"]=projectID
+    func read(_ method: String,_ params: MediaValues = [:],projectID explicitProjectID: String? = nil) async throws -> MediaValues {
+        let project=explicitProjectID ?? projectID
+        guard let store, !project.isEmpty else {throw ChecklistError("PROJECT_REQUIRED", "Select a project.")}
+        var params=params;params["project_id"]=project
         return try await store.request(method,params)
     }
     func mutate(_ method: String,_ params: MediaValues,then: @escaping (MediaValues) throws -> Void = {_ in}) {
+        mutateReportingFailure(method,params,onFailure:nil,then:then)
+    }
+    func mutateReportingFailure(_ method: String,_ params: MediaValues,onFailure: ((Error) -> Void)?,then: @escaping (MediaValues) throws -> Void) {
         guard let store else {return}
         var params=params;params["project_id"]=projectID
         let project = projectID
         store.run(method,params,failure:{ [weak self] error in
+            onFailure?(error)
             guard let self,self.projectID == project else {return}
             self.capturing=false
             self.error=PlainError.text(error)
@@ -183,19 +190,21 @@ typealias MediaValues = [String: Any]
         // Refresh only the pages already inspected; keep their selection/scroll anchor.
         while epoch==token,next != nil,(rows.count<retainedCount || retainedSelection && !rows.contains {$0.id==selectedID}) {try await loadRows(append:true,token:token)}
         if !selectedID.isEmpty {await select(selectedID)}
+        await resumeBulkIfNeeded(round:id)
     }
     func reloadRows() async {store?.windowPreferences.set(list,forKey:"mediaList:"+listScope);let token=UUID();epoch=token;do {try await loadRows(append:false,token:token)} catch {self.error=PlainError.text(error)}}
     func moreRows() async {do {try await loadRows(append:true,token:epoch)} catch {self.error=PlainError.text(error)}}
     private func loadRows(append: Bool,token: UUID) async throws {
         guard !roundID.isEmpty,!append || next != nil else {return}
         var params: MediaValues=["round_id":roundID,"list":list,"limit":100]
-        if filter != "all" {params["filter"]=["dispositions":[filter]]}
+        let selection=currentListFilter
+        if !selection.isEmpty {params["filter"]=selection}
         if append {params["cursor"]=next}
         let result=try await read("media_item_page",params)
         guard epoch==token else {return}
         let values=(result["rows"] as? [MediaValues] ?? []).map(Record.init)
         if append {let existing=Set(rows.map(\.id));rows += values.filter {!existing.contains($0.id)}} else {rows=values}
-        if filter == "all" {counts=result["counts"] as? [String:Int] ?? [:]};next=result["next_cursor"] as? String
+        if selection.isEmpty {counts=result["counts"] as? [String:Int] ?? [:]};next=result["next_cursor"] as? String
     }
     func select(_ id: String) async {
         saveDraft();if selectedID != id {playback.releaseAll();clearImages();item=Record(values:[:]);contextConflict=false};selectedID=id
@@ -252,6 +261,7 @@ typealias MediaValues = [String: Any]
         return true
     }
     func endImage() {imageLoads=max(0,imageLoads-1)}
+    func prepareForDirectionGrid() {playback.releaseAll();clearImages()}
     private func clearImages() {currentImageReferences=[];currentImageReference="";historicalImageReference=""}
     /// Each load or Open original requests a fresh exact lease: the selected target's typed
     /// reference, or a historical example's exact accepted decision and winning reference.
@@ -268,10 +278,10 @@ typealias MediaValues = [String: Any]
         }
         return ("media_original_read",["round_id":roundID,"item_id":selectedID,"target_id":targetID,"reference_id":original.string("reference_id"),"representation":"lease","seconds":MediaPlaybackBudget.leaseSeconds])
     }
-    func releasePlaybackLease(_ id: String) async {_ = try? await read("media_example_read_release",["lease_id":id])}
+    func releasePlaybackLease(_ id: String,projectID: String? = nil) async {_ = try? await read("media_example_read_release",["lease_id":id],projectID:projectID)}
     func imageIsActive(_ key:String,historical:Bool) -> Bool {historical ? historicalImageReference==key : currentImageReferences.contains(key)}
     func observation() -> MediaValues {["round_id":roundID,"expected_revision":header.integer("revision"),"observed_context_token":header.string("observed_context_token")]}
-    static func decisionRequiresNote(_ disposition: String) -> Bool { ["changes_requested","excluded"].contains(disposition) }
+    nonisolated static func decisionRequiresNote(_ disposition: String) -> Bool { ["changes_requested","excluded"].contains(disposition) }
     func decide(_ choice: MediaAnimationReviewChoice) {
         let mapped=choice.mapping(note:draft.note)
         draft.note=mapped.note
@@ -389,12 +399,12 @@ typealias MediaValues = [String: Any]
     }
     func resumeIntake(_ id: String) async {do {intake=Record(values:try await read("media_intake_get",["intake_id":id]))} catch {self.error=PlainError.text(error)}}
     // CL-300: rework preview/create, closure and successor use the native owner channel only.
-    static func dispositionLabel(_ value: String) -> String { value.replacingOccurrences(of:"_",with:" ").capitalized }
+    nonisolated static func dispositionLabel(_ value: String) -> String { value.replacingOccurrences(of:"_",with:" ").capitalized }
     static func countsText(_ counts: [String: Int]) -> String { counts.keys.sorted().map { dispositionLabel($0)+": "+String(counts[$0] ?? 0) }.joined(separator:" · ") }
     var reworkAvailable: Bool { !historyOnly && header.string("state") == "open" }
     var successorAvailable: Bool { !historyOnly && ["open","closed"].contains(header.string("state")) }
     var reworkCandidates: [Record] { rows.filter { $0.string("disposition") == "changes_requested" } }
-    func clearRoundActions() { reworkSelection=[];reworkPreview=Record(values:[:]);successorItems=[:] }
+    func clearRoundActions() { reworkSelection=[];reworkPreview=Record(values:[:]);successorItems=[:];bulk=MediaBulkState() }
     /// Only a listed Changes-requested item can be selected; the service checks the exact decision.
     func toggleRework(_ row: Record) {
         if reworkSelection.contains(row.id) {reworkSelection.remove(row.id)}
@@ -435,19 +445,20 @@ typealias MediaValues = [String: Any]
             self?.reworkSelection=[];self?.reworkPreview=Record(values:[:])
         }
     }
-    /// Pending, Needs look and Stale each block closure with their own text.
+    /// CL-350: Pending, Stale and a Changes requested item with no follow-up each block closure
+    /// with their own text. Needs look does not block; it stays listed for the worker.
     static func closureBlockers(_ counts: [String: Int]) -> [(Bool, String)] {
-        let pending=counts["pending"] ?? 0,look=counts["needs_look"] ?? 0,stale=counts["stale"] ?? 0
+        let pending=counts["pending"] ?? 0,stale=counts["stale"] ?? 0,missing=counts["missing_follow_up"] ?? 0
         return [(pending>0,"\(pending) Pending item(s) need an owner decision before you close this round."),
-                (look>0,"\(look) Needs look item(s) need a final decision: Accepted, Excluded or Changes requested."),
-                (stale>0,"\(stale) Stale item(s) changed after their decision. Decide them again on the current material.")]
+                (stale>0,"\(stale) Stale item(s) changed after their decision. Decide them again on the current material."),
+                (missing>0,"\(missing) Changes requested item(s) have no follow-up yet. A worker records one, or you add a no-follow-up reason.")]
     }
-    func finishRoundConfirmation() -> PendingConfirmation {
-        let project=projectID,round=header,id=roundID,manifest=Record(values:header.object("manifest"))
-        return Confirmations.finishMediaRound(round.string("title")) { [weak self] in
-            guard let self,self.projectID==project else {return}
-            self.mutate("media_round_finish",["round_id":id,"expected_revision":round.integer("revision"),"observed_context_token":round.string("observed_context_token"),"manifest_id":manifest.id,"manifest_digest":manifest.string("digest")])
-        }
+    /// The service's unfiltered counts; the item list counts follow the current filter.
+    var closureCounts: [String: Int] { header.values["closure_readiness"] as? [String: Int] ?? counts }
+    /// One press closes the round. The service rechecks the exact round and every follow-up.
+    func finishRound() {
+        let manifest=Record(values:header.object("manifest"))
+        mutate("media_round_finish",["round_id":roundID,"expected_revision":header.integer("revision"),"observed_context_token":header.string("observed_context_token"),"manifest_id":manifest.id,"manifest_digest":manifest.string("digest")])
     }
     /// A carry names the item's current decision; Pending and Stale items have none to carry.
     static func canCarry(_ row: Record) -> Bool { ["accepted","excluded","changes_requested","needs_look"].contains(row.string("disposition")) && !row.string("decision_id").isEmpty }
@@ -467,6 +478,24 @@ typealias MediaValues = [String: Any]
             guard let self,let id=result["id"] as? String,!id.isEmpty else {return}
             then();self.roundState="draft";self.roundOffset=0;self.chooseRound(id)
         }
+    }
+    /// Direction cards share the same local per-item note journal as single-item review.
+    func ownerDraft(for item: Record, header: Record) -> MediaOwnerDraft {
+        let scope=projectID+":"+item.id
+        let saved=store?.windowPreferences.data(forKey:"mediaDraft:"+scope)
+        var value=drafts[scope] ?? saved.flatMap {try? JSONDecoder().decode(MediaOwnerDraft.self,from:$0)} ?? MediaOwnerDraft()
+        if value.basis.isEmpty {
+            let target=Record(values:item.object("target")),manifest=Record(values:header.object("manifest"))
+            value.basis=target.string("review_basis_signature");value.targetID=target.id
+            value.contextToken=header.string("observed_context_token");value.manifestID=manifest.id;value.manifestDigest=manifest.string("digest")
+        }
+        return value
+    }
+    func saveOwnerDraft(_ value: MediaOwnerDraft, itemID: String) {
+        let scope=projectID+":"+itemID
+        drafts[scope]=value
+        if let data=try? JSONEncoder().encode(value) {store?.windowPreferences.set(data,forKey:"mediaDraft:"+scope)}
+        if draftScope==scope {draft=value}
     }
     private func saveDraft() {guard !draftScope.isEmpty else {return};drafts[draftScope]=draft;if let data=try? JSONEncoder().encode(draft) {store?.windowPreferences.set(data,forKey:"mediaDraft:"+draftScope)}}
     static func defaultList(_ schema: MediaValues) -> MediaValues {
@@ -502,6 +531,8 @@ struct MediaFlatRow: Identifiable {
     let id:String
     let title:String
     let item:Record?
+    /// The header's metadata prefix, for selecting its whole group (CL-349).
+    var group:[MediaValues]=[]
     static func project(_ items:[Record]) -> [Self] {
         var result:[Self]=[],previous:[Data]=[]
         for item in items {
@@ -512,7 +543,7 @@ struct MediaFlatRow: Identifiable {
                 keys.append(bytes)
                 if level >= previous.count || previous[level] != bytes {
                     let value=group.values["value"].flatMap {$0 is NSNull ? nil : String(describing:$0)} ?? "No value"
-                    result.append(.init(id:"group:"+bytes.base64EncodedString(),title:group.string("field_id")+": "+value+" · "+String(group.integer("item_count")),item:nil))
+                    result.append(.init(id:"group:"+bytes.base64EncodedString(),title:group.string("field_id")+": "+value+" · "+String(group.integer("item_count")),item:nil,group:prefix))
                 }
             }
             previous=keys

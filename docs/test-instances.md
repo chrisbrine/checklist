@@ -26,11 +26,11 @@ Each folder is `~/Library/Application Support/Checklist Test Instances/slot-N/`;
 
 Slot attachment drafts and Open in… working copies use the sibling `caches/` folder outside `data/`, so destroying the slot removes them without touching the live app's cache folders.
 
-Secondary workspace windows keep slot preferences in the instance-specific suite `Checklist.Test<N>.Workspace.<window-uuid>`; live windows keep `Checklist.Workspace.<window-uuid>`. The standard preference domain follows the bundle ID (`org.checklist.app.testN`, live `org.checklist.app`); these files live separately in `~/Library/Preferences`. Human claims and pending commands use the Keychain service `Checklist.Test<N>.HumanClaim` (live `Checklist.HumanClaim`). `destroy` removes the slot's Keychain claims, preference domains and Saved Application State.
+Secondary workspace windows keep slot preferences in the instance-specific suite `Checklist.Test<N>.Workspace.<window-uuid>`; live windows keep `Checklist.Workspace.<window-uuid>`. The standard preference domain follows the bundle ID (`org.checklist.app.testN`, live `org.checklist.app`); these files live separately in `~/Library/Preferences`. Human claims and pending commands use private files in the slot's `data/OwnerPrivate/` folder (live `~/Library/Application Support/Checklist/OwnerPrivate/`), and each window has its own pending-command file. A slot seed does not copy this folder. `destroy` removes the folder with the slot, any leftover Keychain items of the service `Checklist.Test<N>.HumanClaim`, preference domains and Saved Application State.
 
-The app never prompts for the Keychain. Pending-command recovery uses `pending-command-v2` / `pending-command-v2-window-<uuid>` without reading or deleting legacy accounts. Each saved command records the connected store incarnation and the bundle-derived Mach service name. A recovery offer appears only after both match an accepted service read; **Check the last change** rechecks the incarnation before sending the original command UUID. A live command is refused by a test slot and a test command by live, even if a seed retained the same incarnation. An older incarnation, foreign service, malformed/unbound record or unreadable item is never sent and produces one plain-language in-app warning. Notice memory is local to the window account and survives relaunch; unreadable bytes share one warning interval until a readable/absent item or a new save is observed. No command is sent automatically. See [uncertain-command recovery](database-storage.md#uncertain-command-recovery-on-this-mac-cl-196).
+The app makes no Keychain call for pending commands or claims, so it never prompts for the Keychain. Pending-command recovery uses the key `pending-command-v2` / `pending-command-v2-window-<uuid>` in a mode 0600 file with no plain claim token. Each saved command records the connected store incarnation and the bundle-derived Mach service name. A recovery offer appears only after both match an accepted service read; **Check the last change** rechecks the incarnation before sending the original command UUID. A live command is refused by a test slot and a test command by live, even if a seed retained the same incarnation. An older incarnation, foreign service, malformed/unbound record or unreadable file is never sent and produces one plain-language in-app warning. Notice memory is local to the window key and survives relaunch; unreadable bytes share one warning interval until a readable/absent file or a new save is observed. No command is sent automatically. See [uncertain-command recovery](database-storage.md#uncertain-command-recovery-on-this-mac-cl-196).
 
-Ignored items remain in Keychain until replaced by a later save or explicitly removed. To remove one, quit the matching app and delete only its recovery item in Keychain Access, or run `security delete-generic-password -s Checklist.Test1.HumanClaim -a pending-command-v2` for slot 1; replace the slot number and use `pending-command-v2-window-<lowercase-window-uuid>` for a secondary window. Live uses service `Checklist.HumanClaim`. The owner can remove the stale pre-hotfix live item with `security delete-generic-password -s Checklist.HumanClaim -a pending-command`. Deleting an item does not undo a command that may already have committed.
+Ignored files stay until a later save replaces them. Deleting one does not undo a command that may already have committed. Leftover Keychain items are ignored and can stay: the app never reads or deletes `pending-command`, `pending-command-v2` or claim items of the services `Checklist.HumanClaim` and `Checklist.Test<N>.HumanClaim`.
 
 ## Seeds
 
@@ -125,6 +125,66 @@ defaults delete org.checklist.app.test1 checklistQualificationFaults
 
 With `cursor_reset_twice` and `remaining=2`, the first record read resets, the existing recovery fetches fresh context, and the one retry resets again. Observe the selected ticket's “context changed again” explanation and **Refresh selected ticket** action. With `fresh_context_fail` and `remaining=2`, observe the concrete “TEST FAULT: selected-ticket fresh context read failed” cause and the same refresh action. In both cases confirm the unsent draft is kept, the stored count is zero, the marker disappears and a subsequent refresh/read works. A budget of one injects only the initial reset; use two for the terminal-state check. These instructions prepare an observation; they do not establish an installed pass. The non-contributor runner must record the exact installed build and native result, then close the qualification slot app and restore the real Checklist window.
 
+## Reuse an owned live-backup slot (CL-366)
+
+A stopped slot may keep its existing owned `data/` while replacing only its app:
+
+```sh
+./script/test_instances.py restage --slot N --stage /absolute/verified-stage --seeded-commit <full-original-seeded-build-commit>
+./script/test_instances.py start --slot N --headless
+./script/test_instances.py check --slot N
+./script/test_instances.py promote --slot N --dry-run
+```
+
+The actual active marker owner must run `restage` (native session identity or
+`--session-id` follows `create`); stop app, service and CLI/MCP processes first.
+Restage never starts/stops processes, changes Keychain/preferences or copies the
+store. It verifies both original and incoming stages and signatures, prepares
+and verifies the renamed test app before swapping it, preserves the seed/store,
+updates the workspace fingerprint and clears prior checks. Run fresh `start`
+and `check` for the exact replacement build before promotion.
+
+Reuse requires the original seed to be the **newest complete published live
+backup**, with the same manifest hash and source path. Both `snapshot-*` and
+`qualification-*/snapshot-*` publications count, ordered by manifest mtime with
+path as a tie-breaker. An unpaired manifest without publication intent is not
+complete. Existing seed validation supplied full database/managed-file hash
+verification; restage checks publication identity rather than rehashing every
+backup's managed payload. A newly published backup, changed seed manifest,
+foreign/slot/restored/empty seed or unverifiable publication refuses reuse.
+
+The seeded build's commit must be known. Existing captures have no commit field:
+supply its full SHA using `--seeded-commit`; a capture with `source_commit` can
+supply it directly. The harness verifies **all** captured build-input membership,
+bytes and executable modes against that commit in the repository. A guessed,
+missing, unavailable or dirty/nonmatching seeded commit refuses; no override
+bypasses this proof. Keep the original capture and Git commit available.
+
+The cumulative `git diff --no-index --no-renames` between that verified seeded
+capture and the replacement capture decides whether a fresh copy is required,
+including added/deleted paths and captured uncommitted target edits. The single
+conservative path policy is `FRESH_COPY_PATHS` in
+`script/test_instance_restage.py`, covered by fake/temporary Git tests. It covers
+storage validation, migrations, backups, startup and their listed dependencies;
+add new implementation dependencies there when introducing them. A matching
+path requires a **fresh real-size live-backup copy and complete exact-stage
+startup/protected pre-upgrade backup qualification** under AGENTS.md. Reusing a
+previously started store cannot qualify those changes. Conservative matches may
+require a fresh copy even for an unrelated edit in a storage/startup file.
+
+`slot.json.restage` records the original capture/build/fingerprint/commit,
+replacement identity, backup manifest hash, changed paths and qualification
+reason. Repeated restaging always compares with the **original seeded build**,
+never just the prior replacement. Promotion re-verifies that cumulative proof
+and newest-backup identity and prints the recorded reason; stale/failed or
+other-build checks cannot qualify. Dry run changes no slot metadata. A failed
+publication remains fenced as `restaging` with no passing checks, requiring
+explicit reconciliation; it cannot start as a healthy slot.
+
+Record separate create/restage, start and check wall times and
+`sysctl -n vm.loadavg` for the real-size runner gate. Fake tests do not establish
+the minutes target or replace native/installed qualification.
+
 ## Promotion and cleanup
 
 ```sh
@@ -135,7 +195,7 @@ With `cursor_reset_twice` and `remaining=2`, the first record read resets, the e
 ./script/test_instances.py destroy --all
 ```
 
-Every promotion requires a passing check for the selected build and a passing check of that same fingerprint in a slot seeded from a snapshot of the live store. This gate applies to every build, even when no storage change is intended. Stale, failed and other-build checks do not qualify. The original stage and slot payload/signature are verified again. Dry run prints every gate and the exact planned install command without changing slot state or installing anything. Without passing live-backup qualification, it names the missing same-build live-backup slot check; there is no bypass. Accepted legacy paths alone do not qualify startup, durable protected copying, migration time or native behavior.
+Every promotion requires a passing check for the selected build and a passing check of that same fingerprint in a slot seeded from a snapshot of the live store. A restaged live-backup slot qualifies only under the reuse rule above, revalidated at promotion; storage/startup changes still require a fresh real-size copy. Stale, failed and other-build checks do not qualify. The original stage and slot payload/signature are verified again. Dry run prints every gate and the exact planned install command without changing slot state or installing anything. Without passing live-backup qualification, it names the missing same-build live-backup slot check; there is no bypass. Accepted legacy paths alone do not qualify startup, durable protected copying, migration time or native behavior.
 
 Promotion installs the original live stage through `script/build_and_run.sh --install-stage CAPTURE_DIR`; it never installs the renamed test bundle or transfers test data. That mode re-verifies the original capture and signatures before entering the existing install path. Before stopping the old service, it invokes the incoming service's `--prepare-upgrade`: an older schema receives a verified protected snapshot and rehearsal while the old service still serves. Preparation failures abort before the stop. The installer prints the expected offline window before the swap and the measured stop-request-to-first-healthy-answer window afterward; promotion forwards both. If no healthy answer is observed, the installer reports elapsed time rather than claiming recovery. Startup accepts preparation only if the stopped database and required managed files still match; otherwise a fresh protected snapshot and rehearsal preserve the swap-time store, with a reported upgrading stage, estimate and reason.
 

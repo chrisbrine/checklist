@@ -188,7 +188,7 @@ extension CommandRouter {
                 code = "BACKUP_SOURCE_CHANGED"; message = "Required backup data changed or did not match its recorded checksum. Check original availability before retrying."
             case .incomplete:
                 code = "BACKUP_INCOMPLETE"; message = "Backup is incomplete. A required file or completed snapshot is unavailable. Keep the store and existing backups."
-            case .io:
+            case .io,.systemCall:
                 code = "BACKUP_IO_ERROR"; message = "Backup could not read or copy every required file, or write its destination. Check original availability and destination access before retrying."
             case .canceled:
                 code = "BACKUP_CANCELED"; message = "Backup was canceled before completion. Existing data and backups are retained."
@@ -196,7 +196,15 @@ extension CommandRouter {
                 throw CoreError("OUTCOME_UNKNOWN","Backup publication could not be confirmed. Check the last change using the original command before retrying.",details:["command_id":params["command_id"] ?? "","command_outcome":"unknown","reason":"backup_publication_uncertain"])
             case .limit, .freeSpace, .deadline: throw reported // Converted by the shared budget above.
             }
-            throw CoreError(code,message,details:["command_outcome":"rejected"])
+            // CL-362: the path and errno stay in the reply and the log. This command
+            // ID is finished, so a retryable backup uses a new one.
+            let report = StorageFailureReport(failure)
+            report.log()
+            var details = report.details
+            details["command_outcome"] = "rejected"
+            if report.retryable {details["next_step"] = "Retry backup_create with a new command ID."}
+            let cause = report.system == nil ? "" : " " + report.explanation
+            throw CoreError(code,message + cause,details:details)
         }
     }
     private func createStorageBackup(params: JSON,caller: Caller,budget: StorageSnapshotBudget,retention: StorageSnapshotRetention) throws -> JSON {
@@ -439,6 +447,7 @@ enum TicketCleanupCopyFailure {
         let ns = error as NSError
         if ns.domain == NSPOSIXErrorDomain {return "backup_copy_unverified:POSIX_" + String(ns.code)}
         if let failure = error as? StorageSnapshotFailure {
+            if case .systemCall(let system) = failure {return "backup_copy_unverified:POSIX_" + String(system.code)}
             return "backup_copy_unverified:" + String(describing:failure)
         }
         return "backup_copy_unverified:" + ns.domain + "_" + String(ns.code)

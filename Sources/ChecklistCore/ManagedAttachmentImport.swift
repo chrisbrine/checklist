@@ -295,7 +295,9 @@ extension CommandRouter {
             }
             guard size <= 500 * 1024 * 1024 else { throw CoreError("FILE_TOO_LARGE", "This local importer accepts files up to 500 MiB.") }
             return try sourceFiles.read(sourceURL.lastPathComponent,maximum:500 * 1024 * 1024)
-        } catch StorageSnapshotFailure.io {
+        } catch let failure as StorageSnapshotFailure where failure.isIO {
+            // CL-362: too many open files in the service says nothing about the caller's folder.
+            if StorageFailureReport.isTransient(failure) {throw failure}
             throw CoreError("FILE_ACCESS_REQUIRED",
                 "The selected original ‘\(sourceURL.path)’ cannot be read. Check folder access or privacy/sync availability and retry the original command ID.")
         }

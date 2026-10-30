@@ -7,7 +7,7 @@ final class MediaWorkerContractTests: XCTestCase {
     private let fixtureDigest = String(repeating: "a", count: 64)
 
     func testClosedWorkerCatalogAndReadClassification() throws {
-        XCTAssertEqual(MediaWorkerContract.methods.count, 11)
+        XCTAssertEqual(MediaWorkerContract.methods.count, 12)
         XCTAssertEqual(CommandMethods.mediaWorkerReads, MediaWorkerContract.readMethods)
         XCTAssertTrue(CommandMethods.mediaWorkerReads.isSubset(of: CommandMethods.coreReads))
         for method in MediaWorkerContract.methods {
@@ -125,5 +125,30 @@ final class MediaWorkerContractTests: XCTestCase {
         XCTAssertThrowsError(try MediaWorkerContract.validate("media_suggest", parameters: p))
         p["items"] = [selection]; p.removeValue(forKey: "manifest_digest")
         XCTAssertThrowsError(try MediaWorkerContract.validate("media_suggest", parameters: p))
+        // CL-351: a Draft target has no manifest; the pair stays together.
+        p.removeValue(forKey: "manifest_id")
+        XCTAssertNoThrow(try MediaWorkerContract.validate("media_suggest", parameters: p))
+    }
+
+    func testFollowUpNamesExactlyOneTicketOrReasonAndExactDecisions() throws {
+        var p = write
+        let selection: [String: Any] = ["item_id": "item", "expected_revision": 3, "decision_id": "decision"]
+        p.merge(["round_id": "round", "expected_revision": 4, "observed_context_token": "opaque", "manifest_id": "manifest",
+            "manifest_digest": fixtureDigest, "items": [selection], "task_id": "task"]) { _, new in new }
+        XCTAssertNoThrow(try MediaWorkerContract.validate("media_follow_up_record", parameters: p))
+        p["reason"] = "Next production round"
+        XCTAssertThrowsError(try MediaWorkerContract.validate("media_follow_up_record", parameters: p))
+        p.removeValue(forKey: "task_id")
+        XCTAssertNoThrow(try MediaWorkerContract.validate("media_follow_up_record", parameters: p))
+        p.removeValue(forKey: "reason")
+        XCTAssertThrowsError(try MediaWorkerContract.validate("media_follow_up_record", parameters: p))
+        p["reason"] = "Next production round"; p["origin"] = "human_ui"
+        XCTAssertThrowsError(try MediaWorkerContract.validate("media_follow_up_record", parameters: p))
+        p.removeValue(forKey: "origin"); p["items"] = [["item_id": "item", "expected_revision": 3]]
+        XCTAssertThrowsError(try MediaWorkerContract.validate("media_follow_up_record", parameters: p))
+        p["items"] = [selection, selection]
+        XCTAssertThrowsError(try MediaWorkerContract.validate("media_follow_up_record", parameters: p))
+        p["items"] = [selection]; p.removeValue(forKey: "manifest_digest")
+        XCTAssertThrowsError(try MediaWorkerContract.validate("media_follow_up_record", parameters: p))
     }
 }

@@ -441,7 +441,7 @@ class CleanScratchTests(unittest.TestCase):
         self.assertEqual(self.run_cleanup(apply=True)[0], 0)
         self.assertFalse((item / '.build/object').exists())
         self.assertFalse((item / 'src/source.py').exists())
-        self.assertTrue((item / cleanup.WORKSPACE_MARKER).exists())
+        self.assertFalse(item.exists())  # Explicit root release retires the whole tree (CL-367).
 
     def test_foreign_root_requires_owning_sessions_release_and_explicit_scan(self):
         foreign = self.item('rv1', session='other-session')
@@ -453,6 +453,7 @@ class CleanScratchTests(unittest.TestCase):
         self.assertEqual(self.run_cleanup(apply=True, include_released=True)[0], 0)
         self.assertFalse((foreign / '.build/object').exists())
         # A purported release by an unrelated session is not the folder owner's release.
+        foreign.mkdir()
         self.write(foreign, cleanup.WORKSPACE_MARKER, json.dumps({'version': 1, 'session_id': 'intruder',
                    'purpose': 'wrong owner', 'released': True}).encode())
         self.assertEqual(list(cleanup.candidates(self.sessions, self.qualification, 'session', True)), [])
@@ -662,13 +663,13 @@ class CleanScratchTests(unittest.TestCase):
         self.assertEqual((item / 'unique-note').read_bytes(), b'keep')
 
     def test_ten_thousand_git_files_move_as_one_folder_with_exact_receipt_bytes(self):
-        item = self.item('ws1');self.mark(item, release=True)
+        item = self.item('copy'); note = self.write(item, 'ownership-note', b'private note')
         folder = item / 'store-copies/h1-receipts'
         contents = b'old source\n'
         for i in range(10_000):
             self.write(folder, f'file-{i:05d}', contents)
         (folder / 'empty/nested').mkdir(parents=True)
-        # The released ownership marker retains ws1, but not its eligible child.
+        # Unmarked scratch keeps unique evidence while coalescing eligible children.
         expected = item / 'store-copies'
         before = cleanup.inventory(item)
         result, preview = self.run_cleanup()
@@ -692,18 +693,18 @@ class CleanScratchTests(unittest.TestCase):
         self.assertEqual(summary['moved_count'], 1)
         self.assertEqual(summary['moved_bytes'], size)
         self.assertEqual(summary['git_redundant_source_bytes'], size)
-        self.assertEqual(summary['kept_bytes'], before[item / cleanup.WORKSPACE_MARKER][3])
+        self.assertEqual(summary['kept_bytes'], before[note][3])
         destination = Path(moves[0]['trash'])
         self.assertEqual(destination.parent, self.trash)
         files = [p for p in destination.rglob('*') if p.is_file()]
         self.assertEqual(len(files), 10_000)
         self.assertTrue(all(p.read_bytes() == contents for p in files))
         self.assertTrue((destination / 'h1-receipts/empty/nested').is_dir())
-        self.assertTrue((item / cleanup.WORKSPACE_MARKER).exists())
+        self.assertTrue(note.exists())
         print(f'CL-291 whole folder: 10,000 Git-redundant files, 1 move, {size} bytes, {elapsed:.3f}s apply')
 
     def test_mixed_folder_moves_largest_eligible_subtrees_with_exact_counts(self):
-        item = self.item('ws1');self.mark(item, release=True)
+        item = self.item('copy')
         folder = item / 'store-copies/h1-receipts'
         for i in range(10_000):
             self.write(folder, f'eligible/deep/file-{i:05d}', b'old source\n')
@@ -713,7 +714,7 @@ class CleanScratchTests(unittest.TestCase):
         link = folder / 'retained-link';link.symlink_to(self.repo / 'source.py')
         (folder / 'eligible/empty').mkdir()
         expected = [folder / 'eligible', folder / 'mixed/eligible', loose]
-        retained = {p: p.lstat() for p in [note, link, item / cleanup.WORKSPACE_MARKER]}
+        retained = {p: p.lstat() for p in [note, link]}
         started = time.monotonic()
         result, records = self.run_cleanup(apply=True)
         elapsed = time.monotonic() - started
@@ -821,7 +822,8 @@ class CleanScratchTests(unittest.TestCase):
         self.assertEqual(next(r for r in records if r.get('path') == str(first))['action'], 'trashed')
 
     def test_partial_folder_failure_counts_only_confirmed_moves_and_bytes(self):
-        item = self.item();self.mark(item, release=True)
+        item = self.item()
+        (item / '.git').mkdir()  # Private-copy layout keeps this unmarked item a single candidate.
         first = self.write(item, 'a/.build/output', b'first build')
         failed = self.write(item, 'b/.build/output', b'failed build')
         last = self.write(item, 'c/source.py', b'old source\n')
@@ -869,24 +871,18 @@ class CleanScratchTests(unittest.TestCase):
         self.assertEqual(records[0]['moved_bytes'], 0)
         self.assertTrue(item.exists())
 
-    def test_released_parent_reports_nested_legacy_but_only_keeps_legacy_subtree(self):
+    def test_released_parent_retires_nested_unmarked_legacy_whole(self):
         root = self.item('review');self.mark(root, release=True)
         nested = root / 'R17C/plan-fixtures/ws1'
-        self.write(nested, 'src/source.py', b'old source\n')
-        protected = self.write(nested, '.build/object', b'legacy warm build')
-        source = self.write(root, 'R17C/source.py', b'old source\n')
-        build = self.write(root, '.build/output', b'eligible output')
-        before = cleanup.inventory(nested)
+        self.write(nested, '.build/object', b'legacy output')
+        self.write(root, 'notes.md', b'externally preserved evidence')
         result, records = self.run_cleanup(apply=True)
         self.assertEqual(result, 0)
-        self.assertFalse(source.exists());self.assertFalse(build.exists())
-        self.assertTrue(protected.exists())
-        self.assertEqual(cleanup.inventory(nested), before)
-        self.assertTrue(any(str(nested) in json.dumps(r) and
-                            'unmarked legacy persistent workspace' in json.dumps(r) for r in records))
+        self.assertFalse(root.exists())
         summary = next(r for r in records if r.get('path') == str(root))
-        self.assertGreater(summary['build_bytes'], 0)
-        self.assertGreater(summary['kept_bytes'], 0)
+        self.assertEqual(summary['moved_count'], 1)
+        self.assertEqual(summary['released_bytes'], summary['total_bytes'])
+        self.assertEqual(summary['retained_legacy_paths'], [str(nested)])
 
     def test_released_outer_root_does_not_override_valid_nested_unreleased_marker(self):
         root = self.item('review');self.mark(root, release=True)
@@ -901,7 +897,7 @@ class CleanScratchTests(unittest.TestCase):
         self.assertIn('persistent workspace marker', records[0]['reason'])
 
     def test_readonly_parent_and_capture_folder_move_across_batches_and_workspaces(self):
-        root = self.item('released');self.mark(root, release=True)
+        root = self.item('unmarked')
         readonly_parent = root / 'diag1/src'
         first = self.write(root, 'diag1/src/source.py', b'old source\n')
         self.write(root, 'diag1/src/keep.md', b'private evidence')
@@ -945,7 +941,7 @@ class CleanScratchTests(unittest.TestCase):
 
     def test_foreign_released_readonly_copy_never_has_permissions_changed(self):
         foreign = self.item('foreign', session='other-session');self.mark(foreign, session='other-session', release=True)
-        protected = self.write(foreign, '.build/object').parent
+        protected = foreign  # Whole released root is the permission boundary.
         self.write(foreign, 'keep.md', b'private')
         protected.chmod(0o555)
         self.addCleanup(protected.chmod, 0o755)
@@ -1088,7 +1084,7 @@ class CleanScratchTests(unittest.TestCase):
         legacy = item / 'fixtures/ws1';legacy.mkdir(parents=True)
         output = self.write(item, '.build/object')
         result, records = self.run_cleanup(apply=True)
-        self.assertEqual(result, 0);self.assertFalse(output.exists());self.assertTrue(legacy.is_dir())
+        self.assertEqual(result, 0);self.assertFalse(output.exists());self.assertFalse(item.exists())
         summary = next(r for r in records if r.get('path') == str(item))
         self.assertEqual(summary['retained_legacy_paths'], [str(legacy)])
 
@@ -1337,13 +1333,13 @@ class CleanScratchTests(unittest.TestCase):
         self.assertNotIn('released_for_tickets', cleanup.read_marker(unknown))
         self.assertFalse(cleanup.ticket_released(unknown))
 
-    def test_hand_release_keeps_byte_only_cleanup(self):
+    def test_hand_release_retires_whole_folder(self):
         item = self.ticket_item('P-hand', ['CL-1'])
         self.mark(item, release=True)
         result, records = self.run_cleanup(apply=True)
         self.assertEqual(result, 0)
-        self.assertTrue((item / 'notes.md').exists())
-        self.assertFalse((item / '.build').exists())
+        self.assertFalse(item.exists())
+        self.assertEqual(next(r for r in records if r.get('path') == str(item))['moved_count'], 1)
 
     def test_release_ticket_and_release_done_cli_use_fake_read_only_cli(self):
         first = self.ticket_item('P-a', ['CL-1'], files=False)
@@ -1468,7 +1464,7 @@ print(json.dumps({"data": data}))
         self.ticket_item('P-held', ['CL-3'])
         outputs = []
         for workers in (1, 8):
-            with patch.object(cleanup.preview_items, '__defaults__', (workers, None)):
+            with patch.object(cleanup.preview_items, '__defaults__', (workers, None, None)):
                 result, records = self.run_cleanup()
             self.assertEqual(result, 0)
             outputs.append(records)

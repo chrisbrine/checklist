@@ -121,6 +121,7 @@ extension TicketLifecycleCleanupTests {
     /// CL-321: repeated completed backups must not multiply the memory retained
     /// for the same cleanup candidates. The installed failure had 23 receipts.
     func testCleanupBackupIndexBoundsRepeatedCopiesAcrossTwentyThreeReceipts() throws {
+        try QualificationSuite.requireEnabled()
         _ = try fixture(backed:false)
         let count = 40_133
         let entries = (0..<count).map {cleanupEntry("objects/p321h-repeated/\($0)",$0)}

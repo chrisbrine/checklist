@@ -10,8 +10,14 @@ public enum PublicErrorText {
 
     /// The `{"error": ...}` value for one failure.
     public static func payload(_ error: Error) -> [String: Any] {
+        if let failure = error as? StorageSnapshotFailure {
+            let report = StorageFailureReport(failure)
+            report.log()
+            return ["code": report.code, "message": scrubbed(report.message), "retryable": report.retryable, "details": scrubbedValue(report.details)]
+        }
         if let error = error as? CoreError {
-            return ["code": error.code, "message": scrubbed(error.message), "retryable": false, "details": scrubbedValue(error.details)]
+            let error = StorageFailureReport.annotated(error)
+            return ["code": error.code, "message": scrubbed(error.message), "retryable": error.details["retryable"] as? Bool ?? false, "details": scrubbedValue(error.details)]
         }
         if let error = error as? DatabaseError {
             return ["code": "STORAGE_ERROR", "message": storageMessage, "retryable": false, "details": ["sqlite_code": Int(error.resultCode.rawValue)]]

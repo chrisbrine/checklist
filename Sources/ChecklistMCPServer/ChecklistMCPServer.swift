@@ -39,9 +39,12 @@ public enum ChecklistMCPServer {
         }
         await server.withMethodHandler(CallTool.self) { parameters in
             do {
-                let result = try await request(server: server, bridge: bridge) {
-                    try await bridge.concurrentCall(parameters.name, .object(parameters.arguments ?? [:]))
+                let call: @Sendable () async throws -> Value = {
+                    try await request(server: server, bridge: bridge) {
+                        try await bridge.concurrentCall(parameters.name, .object(parameters.arguments ?? [:]))
+                    }
                 }
+                let result = parameters.name == OperationWait.toolName ? try await OperationWait.toolCall(call) : try await call()
                 let json = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
                 var content: [Tool.Content] = []
                 if let envelope = try jsonObject(result) as? [String:Any],let notice = HumanAnswerNoticePresentation.text(in:envelope) { content.append(.text(text:notice,annotations:nil,_meta:nil)) }

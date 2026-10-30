@@ -46,7 +46,7 @@ Owner direction, 24 October 2026; pinned project decision 12f3fa9c ("Fast rounds
    Default Swift commands in the executed selector plan are wrapped by `script/check_test_timings.py run`: keep its raw log, xUnit XML and JSON receipt with the hand-in/round evidence. It warns loudly for an executed default test over one second, or a default command containing Core tests over 180 seconds (target 120 seconds); opt-in qualification commands are separate. Treat a warning as a named fixture/performance follow-up, and record the load and reason rather than claiming the budget passed. Use `--strict` when the timing limit is a required gate. Parallel method durations overlap: use the measured command wall time for the run budget, never their sum. Incomplete output is unverified. A manually invoked serial Core measurement can be checked with `python3 script/check_test_timings.py check --log <core.log> --elapsed <seconds> --strict`; preserve its command and start/end load separately.
 2. Check acceptance before work starts. At claim, the orchestrator confirms that each acceptance item is true of the current code and can be checked under the owner's standing records: no system setting change (request c9aefe48 / response 0b39f7c9), no sleep or clock change (acb3fce6), no live app window. It fixes an item before work starts and records the reason and the owner record ID in the item.
 3. One check plan per round. List every acceptance item that needs an installed or native observation and its method, then split it into runners of at most 10 items and 60 minutes each, one slot each and up to four at once. Known methods: forced appearance with `./script/test_instances.py start --slot N --gui --appearance dark` (or `light`; quit the slot app before changing appearance); pop-up choices with an accessibility press; a pressed state with a held mouse-down event released outside the control; a loading state with `SIGSTOP` of the slot service (exact slot path only, then `SIGCONT`); help tags by hover; a Mission Control attempt; a "before" image from the base build in a second slot. When a comparison is needed, run the base build on the same seed in a parallel slot.
-4. Fresh backup each round. After each install, an agent makes a backup of the live store into the published backups folder through `backup_create`. Store-copy checks seed from it, so one check covers the storage gate and the promotion gate.
+4. Fresh backup each round. After each install, an agent makes a backup of the live store into the published backups folder through `backup_create` (`checklist call --wait=600 backup_create '{…}'`). Store-copy checks seed from it, so one check covers the storage gate and the promotion gate.
 5. Keep the checkout free for reviews. Compose, test, stage and qualify each round in the private integration copy (`CHECKLIST_BUILD_SCOPE=install ./script/build_and_run.sh --stage --ticket KEY` inside the copy, with the signing identity copied in). Write the shared checkout only in the install-and-commit slot, then submit all of the round's tickets together, so one review wave covers them.
 6. A prerequisite means implemented. A dependent ticket starts when the prerequisite's implementation is in the integration base. Use an ordering-only link (`task_link` with `required: false`); keep a required link only when the dependent needs the prerequisite Done.
 7. Batch rework. Start every rework as soon as its verdict arrives, and put it in the next combined round with the open pass work. Do not install a single-ticket round.
@@ -82,6 +82,51 @@ Use this sequence for each authorized combined round, under the fast round rules
    Never ask a covered question twice. On `COVERED_BY_EARLIER_ANSWER`, use the cited answer instead of repeating the request.
 9. Keep finished work moving through sequencing questions: choose the reversible option, record the decision and proceed within the authorized scope.
    Record genuine blockers with their next permitted step; a sequencing preference is no reason to park finished work.
+
+## Round discipline
+
+These rules apply in every project. Sources: process findings of 29 October 2026 and owner direction of 30 October 2026. A project's own rules can set other numbers, not remove a rule.
+
+### Submit only proven items
+
+Before submit, every acceptance item has passing evidence on the target or a recorded split or edit under the project's rules; a NOT SHOWN or FAIL item is never submitted as a limitation alone.
+
+- Next to each item in the hand-in notes and the submission report, write its proof kind: `native`, `installed`, `tests`, `carried` or `none`. The service does not read this field, so the pre-submit check does.
+- An item with `none` needs a recorded split (a follow-up ticket and an acceptance edit) or an acceptance edit that the project's rules permit, before submit. Otherwise keep the ticket in implementation.
+- A limitation can state how far a proof reaches. It cannot replace a proof.
+- Prove a fix under the conditions where the defect appears, before an install: the same open-file limit, the same data size, the same session environment. A pass under easier conditions is `none` for that item.
+- Write only measured numbers. When a value is not measured, say so.
+
+Pass 9 of the Checklist project submitted items this way, and 6 of 11 packets came back from review.
+
+### Gate and install scripts
+
+- A gate script stops on the first failed step and reports that step. It does not continue to later steps and report a summary.
+- An install script reads the post-install report and shows its failures. An exit code of 0 from the copy step does not prove the install.
+- A hand-in that adds or gates a test, adds a timing assertion or makes a test read a repository file runs the project's selector test on its tree (`scripts/test_affected_tests.py` in the Checklist project). The compose step runs it again on the composed tree before any build.
+
+### Measured estimates
+
+An ETA comes from the measured step times of the current round: build, tests, store copy, install, backup, packets and reviews. Use the latest measured time of each step, not a worst case from an earlier round. Name every unproven item that can move the time, and do not assume that every review passes. For a step with no measurement in this round, give the earlier measurement with its round, or say that no measurement exists.
+
+### Heavy-job lanes
+
+A heavy job is a Swift build or test compile, a store copy, a live backup or a package run that compiles.
+
+- Run no Swift build, store copy or package run beside a store copy or live backup. Each store copy and each live backup has its own lane.
+- Run at most 2 heavy jobs at once. The round plan states this number, and a project can state another number. A check runner in an empty-seeded test slot is not a heavy job; creating a slot from a store copy is.
+- Record `sysctl -n vm.loadavg` at the start and the end of each heavy job.
+- Lanes decide which jobs run together. Do not wait for a low load value. When load affects a measured case, rerun that case once and record both results.
+
+At host load 100, slot copies took 1,834 s against 867 s, and a live backup failed its 1,800 s deadline.
+
+### Orchestrator turns
+
+- At the start of each turn, check whether a session or subthread that you started has finished. Save its report, then close each finished one in that turn.
+- Pick the reasoning effort for each task: lower for docs and small scripts, the highest only for root-cause, storage or concurrency work.
+- When a project asks for a provider mix, record the provider per run in the hand-in or the ticket note.
+- A helper can start its own subagents; see [helper hand-ins and call limits](driven-sessions.md#helper-hand-ins-and-call-limits).
+- For a check of operation scheduling, choose a read from [reads that run as operations](driven-sessions.md#reads-that-run-as-operations).
 
 ## Coordination and communication
 

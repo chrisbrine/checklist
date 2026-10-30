@@ -1217,7 +1217,10 @@ class ReleaseDoneAfterInstallTests(unittest.TestCase):
         self.assertEqual((result, rows[0]['status']), (2, 'skipped'))
         self.assertIn('POST-INSTALL RELEASE SKIPPED', errors.getvalue())
         output = io.StringIO()
-        with contextlib.redirect_stdout(output):
+        clock = [0.0]
+        readiness = clean.ServiceReadiness(clock=lambda: clock[0],
+                                           sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+        with contextlib.redirect_stdout(output), patch.object(clean, 'ServiceReadiness', return_value=readiness):
             result = clean.release_done(self.root, environ={'CODEX_THREAD_ID': 'installer'},
                                         reader=lambda keys: (_ for _ in ()).throw(ValueError('service restarting')),
                                         sessions_root=self.sessions, qualification_root=self.qualification)

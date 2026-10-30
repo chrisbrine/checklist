@@ -8,6 +8,7 @@ enum StorageSnapshotFailure: Error {
     case invalidFixture, unsupportedAuthority, sourceChanged, incomplete
     case limit, canceled, deadline, io, publicationUncertain
     case freeSpace(measured: Int64)
+    case systemCall(StorageSystemFailure)
 }
 
 /// Shared only by the synchronous snapshot attempt and its verification passes.
@@ -52,7 +53,7 @@ struct StorageSnapshotBudget {
 
     static func volumeAvailableBytes(_ url: URL) throws -> Int64 {
         var info = statfs()
-        guard statfs(url.path, &info) == 0 else { throw StorageSnapshotFailure.io }
+        guard statfs(url.path, &info) == 0 else { throw StorageSnapshotFailure.failed("statfs") }
         let free = Int64(clamping: info.f_bavail).multipliedReportingOverflow(by: Int64(info.f_bsize))
         return free.overflow ? .max : free.partialValue
     }
@@ -154,7 +155,7 @@ final class StorageObjectFiles {
         // with O_NOFOLLOW, including the store's own final entry.
         var descriptorPath = self.root.path
         for alias in ["/tmp","/var"] where descriptorPath.hasPrefix(alias + "/") {
-            guard let physical = realpath(alias,nil) else { throw StorageSnapshotFailure.io }
+            guard let physical = realpath(alias,nil) else { throw StorageSnapshotFailure.failed("realpath",path:alias) }
             defer { free(physical) }
             let prefix = String(cString:physical)
             guard prefix == "/private" + alias else { throw StorageSnapshotFailure.io }
@@ -289,7 +290,7 @@ final class StorageObjectFiles {
         defer { Darwin.close(parentFD) }
         var info = stat()
         if fstatat(parentFD, name, &info, AT_SYMLINK_NOFOLLOW) != 0 {
-            if errno == ENOENT { return false }; throw StorageSnapshotFailure.io
+            if errno == ENOENT { return false }; throw StorageSnapshotFailure.failed("fstatat",path:path,root:root.path)
         }
         guard [S_IFREG,S_IFLNK].contains(info.st_mode & S_IFMT) else { throw StorageSnapshotFailure.unsupportedAuthority }
         return true
@@ -301,7 +302,7 @@ final class StorageObjectFiles {
         catch where StorageFolderAccess.isMissing(error) { return false }
         defer { Darwin.close(parent) }
         let opened = openat(parent,name,O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
-        guard opened >= 0 else { if errno == ENOENT { return false };throw StorageSnapshotFailure.io }
+        guard opened >= 0 else { if errno == ENOENT { return false };throw StorageSnapshotFailure.failed("openat",path:path,root:root.path) }
         Darwin.close(opened)
         return true
     }
@@ -309,7 +310,7 @@ final class StorageObjectFiles {
     func openRegular<T>(_ path: String, _ body: (Int32) throws -> T) throws -> T {
         let (directory, name) = try parent(path); defer { Darwin.close(directory) }
         let file = openat(directory, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
-        guard file >= 0 else { throw StorageSnapshotFailure.io }
+        guard file >= 0 else { throw StorageSnapshotFailure.failed("openat",path:path,root:root.path) }
         defer { Darwin.close(file) }
         var info = stat()
         guard fstat(file, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { throw StorageSnapshotFailure.unsupportedAuthority }
@@ -319,7 +320,7 @@ final class StorageObjectFiles {
     func size(_ path: String) throws -> Int64 {
         try openRegular(path) { file in
             var info = stat()
-            guard fstat(file, &info) == 0, info.st_size >= 0 else { throw StorageSnapshotFailure.io }
+            guard fstat(file, &info) == 0, info.st_size >= 0 else { throw StorageSnapshotFailure.failed("fstat",path:path,root:root.path) }
             return Int64(info.st_size)
         }
     }
@@ -330,7 +331,7 @@ final class StorageObjectFiles {
             while true {
                 let count = buffer.withUnsafeMutableBytes { Darwin.read(file, $0.baseAddress, $0.count) }
                 if count < 0, errno == EINTR { continue }
-                guard count >= 0 else { throw StorageSnapshotFailure.io }
+                guard count >= 0 else { throw StorageSnapshotFailure.failed("read",path:path,root:root.path) }
                 if count == 0 { return result }
                 guard result.count <= maximum - count else { throw StorageSnapshotFailure.limit }
                 result.append(contentsOf: buffer.prefix(count))
@@ -341,30 +342,30 @@ final class StorageObjectFiles {
     func writeNew(_ path: String, bytes: Data, permissions: mode_t = 0o600) throws {
         let (directory, name) = try parent(path, create: true); defer { Darwin.close(directory) }
         let file = openat(directory, name, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard file >= 0 else { throw StorageSnapshotFailure.io }
+        guard file >= 0 else { throw StorageSnapshotFailure.failed("openat",path:path,root:root.path) }
         defer { Darwin.close(file) }
         try bytes.withUnsafeBytes { raw in
             var offset = 0
             while offset < raw.count {
                 let count = Darwin.write(file, raw.baseAddress!.advanced(by: offset), raw.count - offset)
                 if count < 0, errno == EINTR { continue }
-                guard count > 0 else { throw StorageSnapshotFailure.io }; offset += count
+                guard count > 0 else { throw StorageSnapshotFailure.failed("write",path:path,root:root.path) }; offset += count
             }
         }
-        guard fchmod(file,permissions) == 0 else { throw StorageSnapshotFailure.io }
+        guard fchmod(file,permissions) == 0 else { throw StorageSnapshotFailure.failed("fchmod",path:path,root:root.path) }
         try Self.flush(file)
-        guard fsync(directory) == 0 else { throw StorageSnapshotFailure.io }
+        guard fsync(directory) == 0 else { throw StorageSnapshotFailure.failed("fsync",path:path,root:root.path) }
     }
 
     func synchronizeOwnedFile(_ path: String) throws {
         let (directory, name) = try parent(path); defer { Darwin.close(directory) }
         let file = openat(directory, name, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
-        guard file >= 0 else { throw StorageSnapshotFailure.io }
+        guard file >= 0 else { throw StorageSnapshotFailure.failed("openat",path:path,root:root.path) }
         defer { Darwin.close(file) }
         var info = stat()
         guard fstat(file, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { throw StorageSnapshotFailure.unsupportedAuthority }
         try Self.flush(file)
-        guard fsync(directory) == 0 else { throw StorageSnapshotFailure.io }
+        guard fsync(directory) == 0 else { throw StorageSnapshotFailure.failed("fsync",path:path,root:root.path) }
     }
 
     /// Only for the private destination after its last writable handle closes.
@@ -377,21 +378,21 @@ final class StorageObjectFiles {
         var info = stat()
         guard fstatat(descriptor, "database.sqlite-wal", &info, AT_SYMLINK_NOFOLLOW) != 0, errno == ENOENT else { throw StorageSnapshotFailure.incomplete }
         if fstatat(descriptor, "database.sqlite-shm", &info, AT_SYMLINK_NOFOLLOW) != 0 {
-            guard errno == ENOENT else { throw StorageSnapshotFailure.io }; return
+            guard errno == ENOENT else { throw StorageSnapshotFailure.failed("fstatat",root:root.path) }; return
         }
         guard info.st_mode & S_IFMT == S_IFREG,
-              unlinkat(descriptor, "database.sqlite-shm", 0) == 0, fsync(descriptor) == 0 else { throw StorageSnapshotFailure.io }
+              unlinkat(descriptor, "database.sqlite-shm", 0) == 0, fsync(descriptor) == 0 else { throw StorageSnapshotFailure.failed("fsync",root:root.path) }
     }
 
     func digest(_ path: String, budget: StorageSnapshotBudget) throws -> (String, Int64) {
         try openRegular(path) { file in
-            var before = stat(); guard fstat(file, &before) == 0 else { throw StorageSnapshotFailure.io }
+            var before = stat(); guard fstat(file, &before) == 0 else { throw StorageSnapshotFailure.failed("fstat",path:path,root:root.path) }
             var digest = SHA256(), count: Int64 = 0, buffer = Data(count: 65_536)
             while true {
                 try budget.check()
                 let size = buffer.withUnsafeMutableBytes { Darwin.read(file, $0.baseAddress, $0.count) }
                 if size < 0, errno == EINTR { continue }
-                guard size >= 0 else { throw StorageSnapshotFailure.io }
+                guard size >= 0 else { throw StorageSnapshotFailure.failed("read",path:path,root:root.path) }
                 if size == 0 { break }
                 count += Int64(size)
                 guard count <= budget.maximumBytes else { throw StorageSnapshotFailure.limit }
@@ -410,16 +411,16 @@ final class StorageObjectFiles {
         let target = targetPath ?? ("managed/" + path)
         let (directory, name) = try destination.parent(target, create: true); defer { Darwin.close(directory) }
         let output = openat(directory, name, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard output >= 0 else { throw StorageSnapshotFailure.io }
+        guard output >= 0 else { throw StorageSnapshotFailure.failed("openat",path:path,root:root.path) }
         defer { Darwin.close(output) }
         let copied = try openRegular(path) { file -> (String, Int64) in
-            var before = stat(); guard fstat(file, &before) == 0 else { throw StorageSnapshotFailure.io }
+            var before = stat(); guard fstat(file, &before) == 0 else { throw StorageSnapshotFailure.failed("fstat",path:path,root:root.path) }
             var digest = SHA256(), total: Int64 = 0, buffer = Data(count: 65_536)
             while true {
                 try budget.check()
                 let size = buffer.withUnsafeMutableBytes { Darwin.read(file, $0.baseAddress, $0.count) }
                 if size < 0, errno == EINTR { continue }
-                guard size >= 0 else { throw StorageSnapshotFailure.io }
+                guard size >= 0 else { throw StorageSnapshotFailure.failed("read",path:path,root:root.path) }
                 if size == 0 { break }
                 total += Int64(size)
                 guard total <= budget.maximumObjectBytes else { throw budget.capacityFailure("snapshot_object_bytes") }
@@ -432,7 +433,7 @@ final class StorageObjectFiles {
                     while offset < size {
                         let count = Darwin.write(output, raw.baseAddress!.advanced(by: offset), size - offset)
                         if count < 0, errno == EINTR { continue }
-                        guard count > 0 else { throw StorageSnapshotFailure.io }; offset += count
+                        guard count > 0 else { throw StorageSnapshotFailure.failed("write",path:path,root:root.path) }; offset += count
                     }
                 }
             }
@@ -444,11 +445,11 @@ final class StorageObjectFiles {
             return (Self.hex(digest.finalize()), total)
         }
         guard expected == nil || copied.0 == expected else { throw StorageSnapshotFailure.sourceChanged }
-        guard fchmod(output, executable ? 0o700 : 0o600) == 0 else {throw StorageSnapshotFailure.io}
+        guard fchmod(output, executable ? 0o700 : 0o600) == 0 else {throw StorageSnapshotFailure.failed("fchmod",path:path,root:root.path)}
         if destination.batchSynchronization {
-            guard fsync(output) == 0 else { throw StorageSnapshotFailure.io }
+            guard fsync(output) == 0 else { throw StorageSnapshotFailure.failed("fsync",path:path,root:root.path) }
         } else { try Self.flush(output) }
-        guard destination.batchSynchronization || fsync(directory) == 0 else { throw StorageSnapshotFailure.io }
+        guard destination.batchSynchronization || fsync(directory) == 0 else { throw StorageSnapshotFailure.failed("fsync",path:path,root:root.path) }
         let verified = try destination.digest(target, budget: budget)
         guard verified == copied else { throw StorageSnapshotFailure.sourceChanged }
         return copied
@@ -465,13 +466,13 @@ final class StorageObjectFiles {
                 // Keep owner destinations without hard links and saturated link
                 // groups usable; fallback copies retain all normal byte checks.
                 if [EMLINK, ENOTSUP, EPERM].contains(errno) { return false }
-                throw StorageSnapshotFailure.io
+                throw StorageSnapshotFailure.failed("linkat",path:path,root:root.path)
             }
             var pinned = stat(), linked = stat()
             guard fstat(file, &pinned) == 0, fstatat(destination, name, &linked, AT_SYMLINK_NOFOLLOW) == 0,
                   pinned.st_dev == linked.st_dev, pinned.st_ino == linked.st_ino,
                   linked.st_mode & S_IFMT == S_IFREG else { throw StorageSnapshotFailure.sourceChanged }
-            guard batchSynchronization || fsync(destination) == 0 else { throw StorageSnapshotFailure.io }
+            guard batchSynchronization || fsync(destination) == 0 else { throw StorageSnapshotFailure.failed("fsync",path:path,root:root.path) }
             return true
         }
     }
@@ -486,11 +487,11 @@ final class StorageObjectFiles {
     }
     func writeLink(_ path: String, target: String) throws {
         let (directory, name) = try parent(path, create: true); defer { Darwin.close(directory) }
-        guard symlinkat(target, directory, name) == 0, (batchSynchronization || fsync(directory) == 0) else { throw StorageSnapshotFailure.io }
+        guard symlinkat(target, directory, name) == 0, (batchSynchronization || fsync(directory) == 0) else { throw StorageSnapshotFailure.failed("symlinkat",path:path,root:root.path) }
     }
     func makeDirectory(_ name: String, batchSynchronization: Bool = false) throws -> StorageObjectFiles {
         _ = try Self.parts(name)
-        guard !name.contains("/"), mkdirat(descriptor, name, 0o700) == 0, fsync(descriptor) == 0 else { throw StorageSnapshotFailure.io }
+        guard !name.contains("/"), mkdirat(descriptor, name, 0o700) == 0, fsync(descriptor) == 0 else { throw StorageSnapshotFailure.failed("mkdirat",path:name,root:root.path) }
         return try StorageObjectFiles(root: root.appendingPathComponent(name, isDirectory: true),folderAccess:folderAccess,batchSynchronization:batchSynchronization)
     }
     /// Each regular file has already been fsynced. Sync all directory entries
@@ -499,21 +500,21 @@ final class StorageObjectFiles {
     /// A partial stage has no publication authority.
     func synchronizeCopiedDirectories(budget: StorageSnapshotBudget) throws {
         guard batchSynchronization else { return }
-        var rootInfo = stat(); guard fstat(descriptor, &rootInfo) == 0 else { throw StorageSnapshotFailure.io }
+        var rootInfo = stat(); guard fstat(descriptor, &rootInfo) == 0 else { throw StorageSnapshotFailure.failed("fstat",root:root.path) }
         for path in pendingDirectories.sorted(by: { $0.utf8.count > $1.utf8.count }) {
             try budget.check()
             let (directory, _) = try parent(path.isEmpty ? ".sync" : path + "/.sync")
             defer { Darwin.close(directory) }
             var info = stat()
             guard fstat(directory, &info) == 0, info.st_dev == rootInfo.st_dev else { throw StorageSnapshotFailure.unsupportedAuthority }
-            guard fsync(directory) == 0 else { throw StorageSnapshotFailure.io }
+            guard fsync(directory) == 0 else { throw StorageSnapshotFailure.failed("fsync",root:root.path) }
         }
         pendingDirectories.removeAll()
     }
 
     func publish(_ staging: String, as name: String, beforeFlush: () throws -> Void = {}) throws {
         guard !staging.contains("/"), !name.contains("/") else { throw StorageSnapshotFailure.io }
-        guard renameatx_np(descriptor, staging, descriptor, name, UInt32(RENAME_EXCL)) == 0 else { throw StorageSnapshotFailure.io }
+        guard renameatx_np(descriptor, staging, descriptor, name, UInt32(RENAME_EXCL)) == 0 else { throw StorageSnapshotFailure.failed("renameatx_np",path:name,root:root.path) }
         try synchronizePublicationDirectory(beforeFlush: beforeFlush)
     }
     func synchronizePublicationDirectory(beforeFlush: () throws -> Void = {}) throws {
@@ -533,13 +534,13 @@ final class StorageObjectFiles {
                 defer { Darwin.close(parent) }
                 directory = openat(parent,name,O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
             }
-            guard directory >= 0 else { throw StorageSnapshotFailure.io }
-            guard let entries = fdopendir(directory) else { Darwin.close(directory);throw StorageSnapshotFailure.io }
+            guard directory >= 0 else { throw StorageSnapshotFailure.failed("openat",root:root.path) }
+            guard let entries = fdopendir(directory) else { Darwin.close(directory);throw StorageSnapshotFailure.failed("fdopendir",root:root.path) }
             defer { closedir(entries) }
             while true {
                 errno = 0
                 guard let entry = readdir(entries) else {
-                    guard errno == 0 else { throw StorageSnapshotFailure.io }
+                    guard errno == 0 else { throw StorageSnapshotFailure.failed("readdir",root:root.path) }
                     break
                 }
                 try budget.check()
@@ -549,7 +550,7 @@ final class StorageObjectFiles {
                 if name == "." || name == ".." { continue }
                 let path = relative.isEmpty ? name : relative + "/" + name
                 var info = stat()
-                guard fstatat(dirfd(entries),name,&info,AT_SYMLINK_NOFOLLOW) == 0 else { throw StorageSnapshotFailure.io }
+                guard fstatat(dirfd(entries),name,&info,AT_SYMLINK_NOFOLLOW) == 0 else { throw StorageSnapshotFailure.failed("fstatat",root:root.path) }
                 switch info.st_mode & S_IFMT {
                 case S_IFDIR: directories.append(path)
                 case S_IFREG, S_IFLNK: files.insert(path)
@@ -561,7 +562,7 @@ final class StorageObjectFiles {
         return files
     }
     static func flush(_ file: Int32) throws {
-        guard fsync(file) == 0, fcntl(file, F_FULLFSYNC) == 0 else { throw StorageSnapshotFailure.io }
+        guard fsync(file) == 0, fcntl(file, F_FULLFSYNC) == 0 else { throw StorageSnapshotFailure.failed("fsync") }
     }
     static func hex<S: Sequence>(_ digest: S) -> String where S.Element == UInt8 {
         let digits = Array("0123456789abcdef".utf8)

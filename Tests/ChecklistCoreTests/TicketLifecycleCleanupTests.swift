@@ -385,7 +385,7 @@ extension TicketLifecycleCleanupTests {
         try QualificationSuite.requireEnabled()
         let (p,t,_) = try fixture(category:"queued"),pid = p["id"] as! String
         let files = try StorageObjectFiles(root:router.root),bytes = Data("x".utf8),sha = ChecklistCore.hash(bytes)
-        var captures: [JSON] = [],tasks: [JSON] = []
+        var captures: [JSON] = [],tasks: [JSON] = [],backedObjects: [JSON] = []
         let done = try router.dbQueue.read {try router.status($0,pid,"done")["id"]!}
         // 60 Done tickets, 30,000 actual managed source objects, plus sidecars.
         for n in 0..<60 {
@@ -397,6 +397,9 @@ extension TicketLifecycleCleanupTests {
                 let name = "file-" + String(i) + ".txt"
                 try bytes.write(to:fixtureDirectory.appendingPathComponent(name))
                 entries.append(["path":name,"kind":"file","size":1,"sha256":sha])
+                // CL-371: only completed-backup copies gain unlink authority (P321). The
+                // following pump deletes these; the other tickets stay live-only and retained.
+                if n == 0 {backedObjects.append(["relative_path":path + "/" + name,"sha256":sha,"size":1,"kind":"file"])}
             }
             let capture: JSON = ["id":cid,"project_id":pid,"task_id":tid,"revision":1,"snapshot_path":path,"files":entries]
             try files.writeNew(String(path.dropLast(7)) + "/manifest.json",bytes:Data(try jsonString(capture).utf8))
@@ -407,6 +410,7 @@ extension TicketLifecycleCleanupTests {
             for task in tasks {try self.router.save(db,task,type:"task")}
             for capture in captures {try self.router.save(db,capture,type:"source_capture")}
         }
+        try ticketCleanupBackupTemplate(router,objects:backedObjects)
         let prepared = DispatchSemaphore(value:0),release = DispatchSemaphore(value:0),finished = expectation(description:"background first pass")
         let fixtureRouter = router!
         DispatchQueue.global(qos:.utility).async {
@@ -416,7 +420,9 @@ extension TicketLifecycleCleanupTests {
                 // the request must still answer and a write must still commit.
                 try fixtureRouter.withTicketCleanupPreparation({db in
                     prepared.signal()
+                    let selecting = ProcessInfo.processInfo.systemUptime
                     let pass = try fixtureRouter.prepareTicketLifecycleCleanup(db)
+                    print("CL193_FIRST_PASS selection_seconds=\(ProcessInfo.processInfo.systemUptime-selecting)")
                     guard release.wait(timeout:.now()+10) == .success else {throw CoreError("FIXTURE_TIMEOUT","Concurrent fixture did not finish.")}
                     return pass
                 }) {db,_,pass in try fixtureRouter.commitTicketLifecycleCleanup(db,prepared:pass,at:Date())}
@@ -429,7 +435,13 @@ extension TicketLifecycleCleanupTests {
         let writing = Date()
         _ = try call("message_send",["project_id":pid,"task_id":t["id"]!,"body":"Concurrent ordinary write during first cleanup pass"])
         let writeSeconds = Date().timeIntervalSince(writing)
-        release.signal();wait(for:[finished],timeout:15)
+        release.signal()
+        // CL-371: this is a fixture limit, not the contract, which is the two
+        // bounds below. Selection of 30,000 objects outlives 15 s on a loaded host;
+        // continuing past it collided with the running pass on one writer connection.
+        guard XCTWaiter().wait(for:[finished],timeout:600) == .completed else {
+            XCTFail("Background first pass did not finish in 600 s");return
+        }
         XCTAssertLessThan(readSeconds,2);XCTAssertLessThan(writeSeconds,2)
         // Unrelated writes no longer discard this one-ticket pass. A following
         // pump deletes one file using its independently fenced read observation.

@@ -229,6 +229,7 @@ final class ReadSnapshotCacheTests: XCTestCase {
     }
 
     func testOversizedQueriesAndWriterReadsBypassRetention() throws {
+        try QualificationSuite.requireEnabled()
         let f = try ReadPerformanceFixture("CL-254-bounds"),r = f.router,reader = try XCTUnwrap(r.readers)
         try f.save((0..<2050).map {("message",["id":"large-\($0)","project_id":"project","revision":1] as JSON)})
         try reader.read {db in

@@ -1,20 +1,11 @@
 import SwiftUI
 
-extension Confirmations {
-    static func finishMediaRound(_ name: String, perform: @escaping () -> Void) -> PendingConfirmation {
-        PendingConfirmation(title: "Close the round \(name)?",
-                            effect: "The review record becomes Closed with its current dispositions and rework counts. Linked rework tickets stay ordinary work; originals and history stay.",
-                            confirmLabel: "Close round", keepLabel: "Keep round open", perform: perform, cancelIsDefault: true)
-    }
-}
-
 /// CL-300 owner screens for CL-118: rework Drafts from selected Changes-requested items,
 /// round closure with its own blocking text, live rework status and explicit successor inclusion.
 /// Every call goes through the native owner channel; nothing here assigns, readies or triages work.
 struct MediaRoundActions: View {
     @EnvironmentObject var store: ChecklistStore
     @ObservedObject var model: MediaReviewModel
-    @Binding var confirmation: PendingConfirmation?
     @State private var successorTitle = ""
     var body: some View {
         VStack(alignment:.leading,spacing:6) {
@@ -29,12 +20,15 @@ struct MediaRoundActions: View {
     private var writeBlock: (Bool, String) {(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)}
     @ViewBuilder private var reworkStatus: some View {
         let rework=Record(values:model.header.object("rework"))
-        if !rework.records("links").isEmpty {
-            let counts=rework.object("counts")
-            Text("Rework tickets · \(counts["open"] as? Int ?? 0) open · \(counts["closed"] as? Int ?? 0) closed · \(counts["unavailable"] as? Int ?? 0) unavailable").font(.caption)
-            ForEach(Array(rework.records("links").enumerated()),id:\.offset) {_,link in
-                Text(Self.reworkLinkLabel(link)).font(.caption2).textSelection(.enabled)
+        if !rework.records("tickets").isEmpty {
+            let counts=rework.object("ticket_counts")
+            Text("Follow-up tickets · \(counts["open"] as? Int ?? 0) open · \(counts["closed"] as? Int ?? 0) closed · \(counts["unavailable"] as? Int ?? 0) unavailable").font(.caption)
+            ForEach(Array(rework.records("tickets").enumerated()),id:\.offset) {_,ticket in
+                Text(Self.reworkLinkLabel(ticket)).font(.caption2).textSelection(.enabled)
             }
+        }
+        ForEach(Array(rework.records("worker_reasons").enumerated()),id:\.offset) {_,reason in
+            Text(Self.workerReasonLabel(reason)).font(.caption2).textSelection(.enabled)
         }
         if let counts=(model.header.values["closure"] as? MediaValues)?["counts"] as? [String:Int] {
             Text("Closed record · "+MediaReviewModel.countsText(counts)).font(.caption)
@@ -42,7 +36,11 @@ struct MediaRoundActions: View {
     }
     static func reworkLinkLabel(_ link: Record) -> String {
         let status=link.string("task_status_category")=="unavailable" ? "Unavailable" : (link.bool("task_open") ? "Open" : "Closed")
-        return link.string("task_key")+" "+link.string("task_title")+" · "+status
+        return link.string("task_key")+" "+link.string("task_title")+" · "+status+" · \(link.integer("decision_count")) decision(s)"
+    }
+    /// A worker reason keeps its worker attribution; it is never the owner's own reason.
+    static func workerReasonLabel(_ reason: Record) -> String {
+        "Worker follow-up · "+reason.string("source_label",fallback:"Recorded worker")+" · \(reason.integer("decision_count")) decision(s): "+reason.string("reason")
     }
     static func reworkPreviewLabel(_ row: Record) -> String {
         row.string("title")+" · "+(row.string("action")=="reuse" ? "Reuses its existing rework ticket" : "Creates a Draft ticket")
@@ -73,11 +71,11 @@ struct MediaRoundActions: View {
         }
     }
     private var closureSection: some View {
-        let blockers=MediaReviewModel.closureBlockers(model.counts)
-        return DisclosureGroup("Close this round") {
-            Text("Every published item needs Accepted, Excluded or Changes requested. Changes requested also needs a rework ticket for its current decision, or your no-follow-up reason in that decision.").font(.caption)
+        let counts=model.closureCounts,blockers=MediaReviewModel.closureBlockers(counts),look=counts["needs_look"] ?? 0
+        return VStack(alignment:.leading,spacing:4) {
             ForEach(Array(blockers.filter {$0.0}.enumerated()),id:\.offset) {_,blocker in Text(blocker.1).font(.caption).foregroundStyle(.orange)}
-            Button("Close round…") {confirmation=model.finishRoundConfirmation()}.checklistDisabled(blockers+[writeBlock])
+            if look>0 {Text("\(look) Needs look item(s) stay listed for the worker after you close this round.").font(.caption)}
+            Button("Close round") {model.finishRound()}.checklistDisabled(blockers+[writeBlock])
         }
     }
     private var successorSection: some View {

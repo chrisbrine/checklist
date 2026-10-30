@@ -13,12 +13,13 @@ import ChecklistCore
 extension MediaTakeControl { func unload() { pause() } }
 extension AVPlayer: MediaTakeControl {}
 
-/// Keeps the queue's replicas and looper alive while paused. Loop boundaries never
-/// seek or replace the displayed player, avoiding an end notification/poster reset.
+/// Retains one item through playback and pause. Native queue handoffs can display
+/// a future item's first frame before the current take ends (CL-341); rewind only
+/// after the retained item actually ends, without resuming from a seek completion.
 @MainActor final class MediaNativeTakeControl: MediaTakeControl {
     let player: AVQueuePlayer
     let playbackRate: Float
-    private(set) var looper: AVPlayerLooper?
+    private let loops: Bool
     private var rateObservation: AnyCancellable?
     private var endObservation: AnyCancellable?
     private var unloaded = false
@@ -26,12 +27,12 @@ extension AVPlayer: MediaTakeControl {}
     private var rewindPending = false
 
     init(asset: AVAsset, loop: Bool, playbackRate: Float) {
-        self.playbackRate = playbackRate
+        self.playbackRate = playbackRate; loops = loop
         player = AVQueuePlayer()
         player.defaultRate = playbackRate
         let item = AVPlayerItem(asset: asset)
-        if loop { looper = AVPlayerLooper(player: player, templateItem: item) }
-        else { player.actionAtItemEnd = .pause; player.insert(item, after: nil) }
+        player.actionAtItemEnd = loop ? .none : .pause
+        player.insert(item, after: nil)
         // Native AVKit controls may change rate directly rather than call play().
         // Keep the declared game speed, but never turn a native Pause into Play.
         rateObservation = player.publisher(for: \.rate).receive(on: DispatchQueue.main).sink { [weak self] _ in
@@ -43,14 +44,15 @@ extension AVPlayer: MediaTakeControl {}
                 if abs(self.player.rate - self.playbackRate) > 0.00001 { self.player.rate = self.playbackRate }
             }
         }
-        if !loop {
-            // Retain and rewind a completed single take for the next native Play.
-            // This seek never starts playback; looping takes use only the looper.
-            endObservation = NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime, object: item)
-                .receive(on: DispatchQueue.main).sink { [weak self] _ in
-                    MainActor.assumeIsolated { _ = self?.rewindAtEnd() }
+        endObservation = NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime, object: item)
+            .receive(on: DispatchQueue.main).sink { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, !self.loops || self.player.rate > 0 else { return }
+                    // A fresh end also releases a preceding seek's delayed completion.
+                    if self.loops { self.rewindPending = false }
+                    _ = self.rewindAtEnd()
                 }
-        }
+            }
     }
     func play() {
         guard !unloaded else { return }
@@ -64,7 +66,7 @@ extension AVPlayer: MediaTakeControl {}
         player.pause(); player.currentItem?.cancelPendingSeeks()
     }
     private func rewindAtEnd() -> Bool {
-        guard !unloaded, looper == nil, let item = player.currentItem else { return false }
+        guard !unloaded, let item = player.currentItem else { return false }
         let duration = item.duration.seconds, time = item.currentTime().seconds
         guard duration.isFinite, duration > 0, time.isFinite, time >= duration - 0.001 else { return false }
         guard !rewindPending else { return true }
@@ -81,7 +83,6 @@ extension AVPlayer: MediaTakeControl {}
     func unload() {
         guard !unloaded else { return }
         unloaded = true; rateObservation = nil; endObservation = nil; pause()
-        looper?.disableLooping(); looper = nil
         player.removeAllItems()
     }
     isolated deinit { unload() }
@@ -102,8 +103,8 @@ struct MediaPlaybackTiming: Equatable, Sendable {
             throw FilePreviewFailure("The video has no measurable nominal frame rate. Supply a video rendition encoded at the stated frame rate.")
         }
         let requestedRate = declaredFrameRate / nominalFrameRate
-        guard requestedRate > 0, requestedRate <= 2 else {
-            throw FilePreviewFailure("The declared frame rate requires playback above 2× source speed. Supply a video rendition encoded at the stated frame rate.")
+        guard requestedRate.isFinite, requestedRate > 0, requestedRate <= Double(Float.greatestFiniteMagnitude) else {
+            throw FilePreviewFailure("The stated frame rate cannot be represented as a playback rate.")
         }
         rate = Float(requestedRate)
     }
@@ -155,12 +156,15 @@ struct MediaPlaybackMeasurement: Equatable, Sendable {
     }
 }
 
-/// Owns every loaded take: at most two verified copies within the shared cache budget,
-/// one preparation at a time and exactly one playing take. Display state only.
+/// Owns verified copies within a bounded comparison or direction-grid budget.
+/// Both modes prepare one take at a time. Display state only.
 @MainActor final class MediaPlaybackCoordinator: ObservableObject {
     @Published private(set) var takes: [String: MediaPreparedTake] = [:]
     @Published private(set) var playingKey: String?
     @Published private(set) var preparing: String?
+    @Published private(set) var playingKeys = Set<String>()
+    let directionGrid: Bool
+    init(directionGrid: Bool = false) { self.directionGrid = directionGrid }
     private var order: [String] = []
     private var observations: [String: AnyCancellable] = [:]
 
@@ -171,9 +175,12 @@ struct MediaPlaybackMeasurement: Equatable, Sendable {
     }
     func endPreparation(_ key: String) { if preparing == key { preparing = nil } }
     /// Admits a prepared take, evicting the oldest non-playing take beyond the budget.
-    func admit(_ take: MediaPreparedTake) {
+    @discardableResult func admit(_ take: MediaPreparedTake) -> Bool {
         release(take.key)
-        while !order.isEmpty, takes.count >= MediaPlaybackBudget.preparedTakes || cachedBytes + take.measurement.bytes > MediaPlaybackBudget.cacheBytes {
+        if directionGrid, take.kind != "video" || !gridAllows(bytes:take.measurement.bytes,facts:take.measurement.facts) {
+            take.control.unload(); return false
+        }
+        while !directionGrid, !order.isEmpty, takes.count >= MediaPlaybackBudget.preparedTakes || cachedBytes + take.measurement.bytes > MediaPlaybackBudget.cacheBytes {
             release(order.first { $0 != playingKey } ?? order[0])
         }
         takes[take.key] = take; order.append(take.key)
@@ -185,6 +192,16 @@ struct MediaPlaybackMeasurement: Equatable, Sendable {
                 }
             }
         }
+        return true
+    }
+    /// Check before allocating a grid player, and again when admitting it.
+    func gridAllows(bytes: Int,facts: MediaPlaybackBudget.Facts) -> Bool {
+        guard takes.count < MediaPlaybackBudget.directionGridTakes,
+              bytes > 0,bytes <= MediaPlaybackBudget.directionGridOriginalBytes,
+              cachedBytes + bytes <= MediaPlaybackBudget.directionGridCacheBytes,
+              facts.width > 0,facts.height > 0,facts.width <= 1024,facts.height <= 1024 else {return false}
+        let pixels=takes.values.reduce(0) {$0 + $1.measurement.facts.width * $1.measurement.facts.height}
+        return pixels + facts.width * facts.height <= MediaPlaybackBudget.directionGridPixels
     }
     func play(_ key: String) {
         guard let take = takes[key] else { return }
@@ -193,15 +210,23 @@ struct MediaPlaybackMeasurement: Equatable, Sendable {
     func pause(_ key: String) { takes[key]?.control.pause(); didStop(key) }
     func didStart(_ key: String) {
         guard takes[key] != nil else { return }
-        for (other, take) in takes where other != key { take.control.pause() }
+        if !directionGrid {
+            for (other, take) in takes where other != key { take.control.pause() }
+            playingKeys = [key]
+        } else { playingKeys.insert(key) }
         playingKey = key
     }
-    func didStop(_ key: String) { if playingKey == key { playingKey = nil } }
+    func didStop(_ key: String) {
+        playingKeys.remove(key)
+        if playingKey == key { playingKey = playingKeys.sorted().first }
+    }
+    func playAll() { for key in order { play(key) } }
+    func pauseAll() { for key in order { pause(key) } }
     func release(_ key: String) {
         guard let take = takes.removeValue(forKey: key) else { return }
         observations[key] = nil; take.control.unload(); take.player?.replaceCurrentItem(with: nil)
         order.removeAll { $0 == key }
-        if playingKey == key { playingKey = nil }
+        didStop(key)
     }
     func releaseAll(prefix: String = "") {
         for key in Array(takes.keys) where key.hasPrefix(prefix) { release(key) }
@@ -213,13 +238,13 @@ struct MediaPlaybackMeasurement: Equatable, Sendable {
 enum MediaTakeLoader {
     struct Lease: Sendable { let id: String; let path: String; let size: Int; let name: String; let attachmentID: String }
 
-    static func verifiedCopy(expectedSHA256: String, lease: @MainActor () async throws -> Lease,
+    static func verifiedCopy(expectedSHA256: String, maximumBytes: Int = MediaPlaybackBudget.originalBytes, lease: @MainActor () async throws -> Lease,
                              release: @MainActor (String) async -> Void) async throws -> (AuthorizedPreviewFile, Int) {
         try Task.checkCancellation()
         let leased = try await lease()
         do {
-            guard leased.size > 0, leased.size <= MediaPlaybackBudget.originalBytes, leased.path.hasPrefix("/") else {
-                throw FilePreviewFailure("The original exceeds the 500 MiB playback bound or is unavailable.")
+            guard leased.size > 0, leased.size <= maximumBytes, leased.path.hasPrefix("/") else {
+                throw FilePreviewFailure("The original exceeds the \(maximumBytes / (1024 * 1024)) MiB playback bound or is unavailable.")
             }
             let source = try JSONSerialization.data(withJSONObject: ["id": leased.attachmentID, "size": leased.size, "sha256": expectedSHA256, "name": leased.name])
             let path = leased.path, start = ContinuousClock.now

@@ -29,7 +29,7 @@ public enum ManagedPaths {
         let (parent, name) = try files.parent(relative); defer { Darwin.close(parent) }
         var info = stat()
         guard fstatat(parent, name, &info, AT_SYMLINK_NOFOLLOW) == 0,
-              [S_IFREG, S_IFDIR].contains(info.st_mode & S_IFMT) else { throw StorageSnapshotFailure.io }
+              [S_IFREG, S_IFDIR].contains(info.st_mode & S_IFMT) else { throw StorageSnapshotFailure.failed("fstatat",path:relative,root:root.path) }
         return root.appendingPathComponent(relative)
     }
 }

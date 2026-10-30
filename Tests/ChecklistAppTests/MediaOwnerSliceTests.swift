@@ -18,6 +18,8 @@ import ChecklistCore
         /// Replies served in order for one method before `extra` applies (CL-307 chunk loop).
         var sequence:[String:[MediaValues]]=[:]
         var onRequest:((String)->Void)?
+        /// Errors served in order for one method (CL-318 lost chunk reply).
+        var failures:[String:[Error]]=[:]
         /// CL-315: the recovery journal cannot save, so ChecklistStore.run returns before sending.
         var saveFails=false
         var itemDisposition="pending"
@@ -27,6 +29,7 @@ import ChecklistCore
         var schema:MediaValues=MediaTypeSettings.schema(title:"Animation",starter:"animation")
         func request(_ method:String,_ params:MediaValues) async throws -> MediaValues {
             calls.append((method,params));onRequest?(method)
+            if var queue=failures[method],!queue.isEmpty {let failure=queue.removeFirst();failures[method]=queue;throw failure}
             let value:MediaValues
             switch method {
             case "media_navigation":value=["types":types]

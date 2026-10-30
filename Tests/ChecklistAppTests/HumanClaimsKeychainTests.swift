@@ -7,6 +7,37 @@ import os
 @testable import ChecklistIPC
 @testable import ChecklistApp
 
+/// CL-373: the app no longer uses this route. The old calls stay here only so that this
+/// skipped class keeps its record of the Keychain rules of KeychainWithoutUI (CL-374).
+private enum HumanClaims {
+    static var service: String { ChecklistInstance.current.humanClaimService }
+    static func query(_ attempt: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: attempt]
+    }
+    static func save(_ token: String, query: [String: Any]) throws {
+        KeychainWithoutUI.perform(query) { SecItemDelete($0) }
+        var entry = query
+        entry[kSecValueData as String] = Data(token.utf8)
+        entry[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let status = KeychainWithoutUI.perform(entry) { SecItemAdd($0, nil) }
+        guard status == errSecSuccess else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(status)) }
+    }
+    static func read(query: [String: Any]) -> String? { try? readRecovery(query: query) }
+    static func readRecovery(query: [String: Any]) throws -> String? {
+        var query = query
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        let status = KeychainWithoutUI.perform(query) { SecItemCopyMatching($0, &item) }
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = item as? Data, let value = String(data: data, encoding: .utf8) else {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+        }
+        return value
+    }
+    static func remove(query: [String: Any]) { KeychainWithoutUI.perform(query) { SecItemDelete($0) } }
+}
+
 final class HumanClaimsKeychainTests: XCTestCase {
     func testEveryOperationReceivesNoUIQueryAndRestoresInteractionSetting() throws {
         // The wrapper is used for every read/add/update/delete in both stores.

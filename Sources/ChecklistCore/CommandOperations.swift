@@ -64,7 +64,7 @@ final class CommandOperations: @unchecked Sendable {
         let temporaryName = String(temporary.split(separator:"/").last!)
         // Same-principal/UUID admission is already serialized. Replacement is
         // needed for a new recovery attempt after an earlier cleanup failure.
-        guard renameat(directory,temporaryName,directory,name) == 0,fsync(directory) == 0 else {throw StorageSnapshotFailure.io}
+        guard renameat(directory,temporaryName,directory,name) == 0,fsync(directory) == 0 else {throw StorageSnapshotFailure.failed("renameat",path:Self.admissionPath(id),root:root.path)}
         lock.withLock {stagedAdmissions[id] = StagedAdmission(operation:operation,baseHash:baseHash)}
     }
     func restoreAdmissions(root: URL,incarnation: String,validate: (JSON,String) throws -> Void) throws {
@@ -90,7 +90,7 @@ final class CommandOperations: @unchecked Sendable {
         do {
             let files = try StorageObjectFiles(root:root),(directory,name) = try files.parent(Self.admissionPath(id))
             defer {Darwin.close(directory)}
-            guard (unlinkat(directory,name,0) == 0 || errno == ENOENT),fsync(directory) == 0 else {throw StorageSnapshotFailure.io}
+            guard (unlinkat(directory,name,0) == 0 || errno == ENOENT),fsync(directory) == 0 else {throw StorageSnapshotFailure.failed("unlinkat",path:Self.admissionPath(id),root:root.path)}
             lock.withLock {_ = stagedAdmissions.removeValue(forKey:id)}
         } catch {StoreRecovery.recordFailure(root:root,error:error)}
     }
@@ -491,7 +491,7 @@ extension CommandRouter {
             } else {try markRunning()}
             commandOperations.executionProbe?(job.id)
             output = try handle(method:job.method,params:params,caller:job.caller)
-        } catch let error as CoreError {failure = error}
+        } catch let error as CoreError {failure = StorageFailureReport.annotated(error)}
         catch {
             let publicError = PublicErrorText.payload(error)
             var details = publicError["details"] as? JSON ?? [:]

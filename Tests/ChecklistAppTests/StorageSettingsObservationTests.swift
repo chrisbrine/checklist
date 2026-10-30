@@ -2,10 +2,10 @@ import XCTest
 @testable import ChecklistApp
 
 @MainActor final class StorageSettingsObservationTests: XCTestCase {
-    func testCanceledValidPreviewIsNeutralAndRetryCanPresentVerifiedContent() async {
+    func testRetiredPreviewNamesWhyAndRetryCanPresentVerifiedContent() async {
         let model = StorageSettingsObservation()
         await model.previewRestore {throw CancellationError()}
-        XCTAssertTrue(model.result.isEmpty);XCTAssertFalse(model.restoring)
+        XCTAssertEqual(model.result,StorageSettingsObservation.previewRetiredText);XCTAssertFalse(model.restoring)
         XCTAssertFalse(model.showingRestorePreview)
         await model.previewRestore {["path":"/verified","manifest_sha256":"digest"]}
         XCTAssertTrue(model.showingRestorePreview)
@@ -128,6 +128,23 @@ import XCTest
         continuation?.resume(returning:["path":"/old-store-preview"]);await old.value
         XCTAssertEqual(model.restorePreview["path"] as? String,"/new-store-preview")
         XCTAssertTrue(model.showingRestorePreview);XCTAssertTrue(model.result.isEmpty)
+    }
+    func testBlankIdentityKeepsPendingPreviewAndADifferentStoreNamesWhyItEnded() async {
+        let model = StorageSettingsObservation();model.changeScope("store")
+        var continuation: CheckedContinuation<[String:Any],Error>?
+        let read = Task {await model.previewRestore {try await withCheckedThrowingContinuation {continuation = $0}}}
+        for _ in 0..<100 {if continuation != nil {break};await Task.yield()}
+        XCTAssertNotNil(continuation)
+        model.changeScope("");XCTAssertTrue(model.restoring);XCTAssertEqual(model.scope,"store")
+        model.changeScope("store");XCTAssertTrue(model.restoring)
+        model.changeScope("other");XCTAssertFalse(model.restoring)
+        XCTAssertEqual(model.result,StorageSettingsObservation.storeChangedText)
+        continuation?.resume(returning:["path":"/old"]);await read.value
+        XCTAssertFalse(model.showingRestorePreview);XCTAssertTrue(model.restorePreview.isEmpty)
+    }
+    func testStoreIdentityComparison() {
+        XCTAssertTrue(StorageSettingsObservation.sameStore("","a"));XCTAssertTrue(StorageSettingsObservation.sameStore("a",""))
+        XCTAssertTrue(StorageSettingsObservation.sameStore("a","a"));XCTAssertFalse(StorageSettingsObservation.sameStore("b","a"))
     }
     func testAlreadyCanceledPreviewDoesNotHideAcceptedConfirmation() async {
         let model = StorageSettingsObservation()
