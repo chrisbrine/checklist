@@ -182,9 +182,17 @@ final class PurgeByteDeletionTests: XCTestCase {
         XCTAssertTrue(((done["objects"] as! [JSON])[0]["reasons"] as! [String]).contains("keep_original"))
         let (p2,t2,a2,_) = try fixture()
         try router.dbQueue.write {try $0.execute(sql:"INSERT INTO metadata(key,value) VALUES ('backup-generation:invalid','{}')")}
-        let done2 = try finish(purge(p2,trash(p2,t2)))
+        let secondResult = try purge(p2,trash(p2,t2)),done2 = try finish(secondResult)
+        let reason = "backup_index_error:RECOVERY_REQUIRED:backup_receipt_index_invalid"
         XCTAssertTrue(FileManager.default.fileExists(atPath:a2["path"] as! String))
-        XCTAssertTrue(((done2["objects"] as! [JSON])[0]["reasons"] as! [String]).contains("backup_authority_unavailable"))
+        XCTAssertTrue(((done2["objects"] as! [JSON])[0]["reasons"] as! [String]).contains(reason))
+        XCTAssertEqual((((done2["summary"] as! JSON)["retained_reasons"] as! JSON)[reason] as? JSON)?["count"] as? Int,1)
+        XCTAssertNil(try router.readers!.read {try self.router.prepareTicketObjectDeletion($0)},"A failure does not invent an immediate retry loop")
+        try write {try $0.execute(sql:"DELETE FROM metadata WHERE key='backup-generation:invalid'")}
+        try ticketCleanupBackupTemplate(router,objects:done2["objects"] as! [JSON])
+        try pumpByteDeletion()
+        XCTAssertEqual((try finish(secondResult)["summary"] as! JSON)["removed_count"] as? Int,1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath:a2["path"] as! String),"Both SQL selection and Swift reactivation admit an index-error retry after a new completed backup")
     }
 
     func testIndependentBackupCopiesAllowCapturedSourceLinksAndSidecarRemoval() throws {

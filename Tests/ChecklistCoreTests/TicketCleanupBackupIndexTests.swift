@@ -32,12 +32,20 @@ extension TicketLifecycleCleanupTests {
         }
         return (index,reads)
     }
+    func assertCleanupMembershipEquals(_ a: StorageBackupRetentionIndex,_ b: StorageBackupRetentionIndex,objects: [JSON],file: StaticString = #filePath,line: UInt = #line) {
+        for object in objects {
+            guard let path = object["relative_path"] as? String,let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value else {continue}
+            let key = StorageBackupRetentionIndex.key(path:path,sha:sha,size:size)
+            XCTAssertEqual(a.containsOriginal(key),b.containsOriginal(key),"historical presence for " + path,file:file,line:line)
+            XCTAssertEqual(a.hasIndependentCopy(key),b.hasIndependentCopy(key),"independent copy for " + path,file:file,line:line)
+        }
+    }
     func assertCleanupIndexEqualsFullScan(_ objects: [JSON],file: StaticString = #filePath,line: UInt = #line) {
         let new = Result {try router.readers!.read {try self.router.ticketCleanupBackupRetentionIndex($0,objects:objects)}}
         let old = Result {try router.readers!.read {try self.router.ticketCleanupBackupRetentionIndexFullScan($0,objects:objects)}}
         switch (new,old) {
         case (.success(let a),.success(let b)):
-            XCTAssertEqual(a.originals,b.originals,file:file,line:line);XCTAssertEqual(a.copyPaths,b.copyPaths,file:file,line:line);XCTAssertEqual(a.copyManifests,b.copyManifests,file:file,line:line)
+            assertCleanupMembershipEquals(a,b,objects:objects,file:file,line:line)
         case (.failure(let a),.failure(let b)):
             XCTAssertEqual("\(a)","\(b)",file:file,line:line)
         default: XCTFail("index \(new) differs from full scan \(old)",file:file,line:line)
@@ -52,14 +60,17 @@ extension TicketLifecycleCleanupTests {
         try insertCleanupReceipt("p355-b",objects:[cleanupEntry("objects/p355/k1",1),cleanupEntry(absolute + "objects/p355/k3",3),cleanupEntry("/elsewhere/objects/p355/k1",1)])
         try insertCleanupReceipt("p355-c",objects:[cleanupEntry("objects/p355/k2",2),cleanupEntry(absolute + "objects/p355/k3",3),cleanupEntry("objects/p355/alias",1),cleanupEntry("source-captures/p355/s1",5)],copy:"/tmp/p355-copy-c")
         try insertCleanupReceipt("p355-d",objects:[cleanupEntry("objects/p355/k2",2)],copy:"/tmp/p355-copy-a",manifest:String(repeating:"c",count:64))
-        try insertCleanupReceipt("p355-e",objects:[cleanupEntry("objects/p355/k1",1)],copy:"/tmp/p355-copy-e",summaryManifest:String(repeating:"d",count:64))
+        try insertCleanupReceipt("p355-e",objects:[cleanupEntry("objects/p355/k1",1),cleanupEntry("objects/p355/k5",5)],copy:"/tmp/p355-copy-e",summaryManifest:String(repeating:"d",count:64))
         let wanted: [JSON] = [cleanupWanted("objects/p355/k1",1),cleanupWanted("objects/p355/k2",2),cleanupWanted("objects/p355/k3",3),cleanupWanted("objects/p355/k4",4),cleanupWanted("source-captures/p355/s1",5),
-                              ["relative_path":real,"sha256":attachment["sha256"]!,"size":attachment["size"]!]]
+                              cleanupWanted("objects/p355/k5",5),["relative_path":real,"sha256":attachment["sha256"]!,"size":attachment["size"]!]]
         assertCleanupIndexEqualsFullScan(wanted);assertCleanupIndexEqualsFullScan([])
         let index = try cleanupLookup(wanted).index,k1 = StorageBackupRetentionIndex.key(path:"objects/p355/k1",sha:String(format:"%064x",1),size:1)
-        XCTAssertEqual(index.copyPaths[k1]?.map(\.path),["/tmp/p355-copy-a","/tmp/p355-copy-a"],"duplicate entries keep their multiplicity; a mismatched manifest is not independent")
+        XCTAssertTrue(index.containsOriginal(k1));XCTAssertTrue(index.hasIndependentCopy(k1))
+        XCTAssertTrue(index.originals.isEmpty);XCTAssertTrue(index.copyPaths.isEmpty,"duplicate entries must not materialize candidate URLs")
         XCTAssertEqual(index.copyManifests["/tmp/p355-copy-a"],String(repeating:"c",count:64));XCTAssertNil(index.copyManifests["/tmp/p355-copy-e"])
-        XCTAssertFalse(index.originals.contains(StorageBackupRetentionIndex.key(path:"objects/p355/k4",sha:String(format:"%064x",4),size:4)))
+        XCTAssertFalse(index.containsOriginal(StorageBackupRetentionIndex.key(path:"objects/p355/k4",sha:String(format:"%064x",4),size:4)))
+        let k5 = StorageBackupRetentionIndex.key(path:"objects/p355/k5",sha:String(format:"%064x",5),size:5)
+        XCTAssertTrue(index.containsOriginal(k5));XCTAssertFalse(index.hasIndependentCopy(k5),"a mismatched manifest is not independent")
         // An invalid receipt gives the same StoreRecovery outcome; the index never hides it.
         try insertCleanupReceipt("p355-z",objects:[["path":"objects/p355/bad","size":1]])
         assertCleanupIndexEqualsFullScan(wanted)
@@ -95,7 +106,7 @@ extension TicketLifecycleCleanupTests {
         try write {db in try db.execute(sql:"DELETE FROM metadata WHERE key='backup-generation:p355-a'")}
         XCTAssertEqual(try cleanupLookup(wanted).reads,0);XCTAssertEqual(backupIndexCache.parsedReceiptCount,parsed + 3)
         assertCleanupIndexEqualsFullScan(wanted)
-        XCTAssertNil(try cleanupLookup(wanted).index.copyPaths[StorageBackupRetentionIndex.key(path:"objects/p355/k2",sha:String(format:"%064x",2),size:2)])
+        XCTAssertFalse(try cleanupLookup(wanted).index.hasIndependentCopy(StorageBackupRetentionIndex.key(path:"objects/p355/k2",sha:String(format:"%064x",2),size:2)))
     }
 
     func testBackupRetentionKeyFastPathMatchesJSONEncoding() {
@@ -105,6 +116,94 @@ extension TicketLifecycleCleanupTests {
                 XCTAssertEqual(StorageBackupRetentionIndex.key(path:path,sha:sha,size:size),StorageBackupRetentionIndex.referenceKey(path:path,sha:sha,size:size),path)
             }
         }
+    }
+
+    /// CL-321: repeated completed backups must not multiply the memory retained
+    /// for the same cleanup candidates. The installed failure had 23 receipts.
+    func testCleanupBackupIndexBoundsRepeatedCopiesAcrossTwentyThreeReceipts() throws {
+        _ = try fixture(backed:false)
+        let count = 40_133
+        let entries = (0..<count).map {cleanupEntry("objects/p321h-repeated/\($0)",$0)}
+        try insertCleanupReceipt("p321h-repeated-00",objects:entries,copy:"/tmp/p321h-repeated-00")
+        // Reuse one serialized fixture instead of constructing 23 dictionary
+        // trees in the test. Each generation still has its own completed copy.
+        try write {db in
+            for receipt in 1..<23 {
+                let suffix = String(format:"%02d",receipt)
+                try db.execute(sql:"INSERT INTO metadata(key,value) SELECT ?,json_set(value,'$.summary.path',?) FROM metadata WHERE key=?",arguments:["backup-generation:p321h-repeated-" + suffix,"/tmp/p321h-repeated-" + suffix,"backup-generation:p321h-repeated-00"])
+            }
+        }
+        let wanted = (0..<count).map {cleanupWanted("objects/p321h-repeated/\($0)",$0)}
+        let index = try cleanupLookup(wanted).index
+        XCTAssertLessThanOrEqual(index.cleanupRetainedBytes,TicketCleanupBatchInventory.byteLimit)
+        XCTAssertTrue(index.originals.isEmpty);XCTAssertTrue(index.copyPaths.isEmpty)
+        for n in [0,count / 2,count - 1] {
+            let key = StorageBackupRetentionIndex.key(path:"objects/p321h-repeated/\(n)",sha:String(format:"%064x",n),size:Int64(n))
+            XCTAssertTrue(index.containsOriginal(key));XCTAssertTrue(index.hasIndependentCopy(key))
+        }
+    }
+
+    /// CL-321: a candidate list larger than the observation budget is streamed
+    /// in bounded chunks; its total size must not reject every candidate.
+    func testCleanupBackupIndexStreamsWantedSetBeyondMemoryBound() throws {
+        _ = try fixture(backed:false)
+        // Keep the fixture small in entry count while exceeding 64 MiB of the
+        // former wanted-key/path/content accounting. Components remain short.
+        let prefix = "objects/" + Array(repeating:String(repeating:"p",count:96),count:8).joined(separator:"/") + "/"
+        try insertCleanupReceipt("p321h-long-paths",objects:[cleanupEntry(prefix + "0",1),cleanupEntry(prefix + "24999",1)],copy:"/tmp/p321h-long-paths")
+        let wanted = (0..<25_000).map {cleanupWanted(prefix + String($0),1)}
+        let index = try cleanupLookup(wanted).index
+        XCTAssertLessThanOrEqual(index.cleanupRetainedBytes,TicketCleanupBatchInventory.byteLimit)
+        XCTAssertTrue(index.originals.isEmpty);XCTAssertTrue(index.copyPaths.isEmpty)
+        for n in [0,24_999] {
+            let key = StorageBackupRetentionIndex.key(path:prefix + String(n),sha:String(format:"%064x",1),size:1)
+            XCTAssertTrue(index.containsOriginal(key));XCTAssertTrue(index.hasIndependentCopy(key),"the last chunk must be observed too")
+        }
+    }
+
+    func testCleanupBackupIndexFallsBackAcrossCorruptManifestAndMissingPayload() throws {
+        let (_,_,attachment) = try fixture(backed:false)
+        let relative = try XCTUnwrap(ManagedPaths.relative(attachment["path"] as! String,family:"objects",root:router.root))
+        let wanted: JSON = ["relative_path":relative,"kind":"file","sha256":attachment["sha256"]!,"size":attachment["size"]!]
+        let entry: JSON = ["path":relative,"sha256":attachment["sha256"]!,"size":attachment["size"]!]
+        let manifest = Data("completed-backup-template".utf8),manifestSHA = ChecklistCore.hash(manifest)
+        let corrupt = router.root.appendingPathComponent("backups/00-p321h-corrupt"),missing = router.root.appendingPathComponent("backups/01-p321h-missing")
+        for copy in [corrupt,missing] {try FileManager.default.createDirectory(at:copy,withIntermediateDirectories:true)}
+        try StorageObjectFiles(root:corrupt).writeNew("manifest.json",bytes:Data("corrupt-manifest".utf8))
+        try StorageObjectFiles(root:missing).writeNew("manifest.json",bytes:manifest)
+        try insertCleanupReceipt("p321h-corrupt",objects:Array(repeating:entry,count:1024),copy:corrupt.path,manifest:manifestSHA)
+        try insertCleanupReceipt("p321h-missing",objects:[entry],copy:missing.path,manifest:manifestSHA)
+        try ticketCleanupBackupTemplate(router,objects:[wanted])
+        let key = StorageBackupRetentionIndex.key(path:relative,sha:attachment["sha256"] as! String,size:(attachment["size"] as! NSNumber).int64Value)
+        var index = try cleanupLookup([wanted]).index
+        XCTAssertTrue(index.hasIndependentCopy(key));XCTAssertTrue(index.copyPaths.isEmpty)
+        XCTAssertLessThan(index.cleanupRetainedBytes,1_048_576,"descriptor duplicates must not multiply observation memory")
+        index.verifyCopy(for:wanted)
+        let verified = try XCTUnwrap(index.verifiedCopies[key])
+        XCTAssertEqual(index.verifiedCopies.count,1);XCTAssertTrue(verified.isCurrent())
+        XCTAssertTrue(verified.files.root.lastPathComponent.hasPrefix("template-"))
+        XCTAssertTrue(index.unavailableManifests.contains(corrupt.path))
+        XCTAssertNotNil(index.verifiedManifests[missing.path],"a verified manifest does not imply that its missing payload is usable")
+        XCTAssertEqual(verified.regular?.sha256,attachment["sha256"] as? String)
+        XCTAssertEqual(verified.regular?.size,(attachment["size"] as! NSNumber).int64Value)
+        try Data("changed backup payload".utf8).write(to:verified.files.root.appendingPathComponent(verified.path))
+        XCTAssertFalse(verified.isCurrent(),"final deletion must reject a backup payload changed after verification")
+    }
+
+    func testCleanupBackupIndexKeepsImmutableSnapshotWhileCacheChanges() throws {
+        _ = try fixture(backed:false)
+        let first = cleanupWanted("objects/p321h-snapshot/first",1),second = cleanupWanted("objects/p321h-snapshot/second",2)
+        let firstKey = StorageBackupRetentionIndex.key(path:"objects/p321h-snapshot/first",sha:String(format:"%064x",1),size:1)
+        let secondKey = StorageBackupRetentionIndex.key(path:"objects/p321h-snapshot/second",sha:String(format:"%064x",2),size:2)
+        try insertCleanupReceipt("p321h-snapshot-a",objects:[cleanupEntry("objects/p321h-snapshot/first",1)],copy:"/tmp/p321h-snapshot-a")
+        let before = try cleanupLookup([first,second]).index
+        try write {db in try db.execute(sql:"DELETE FROM metadata WHERE key='backup-generation:p321h-snapshot-a'")}
+        try insertCleanupReceipt("p321h-snapshot-b",objects:[cleanupEntry("objects/p321h-snapshot/second",2)],copy:"/tmp/p321h-snapshot-b")
+        let after = try cleanupLookup([first,second]).index
+        XCTAssertTrue(before.containsOriginal(firstKey));XCTAssertTrue(before.hasIndependentCopy(firstKey))
+        XCTAssertFalse(before.containsOriginal(secondKey));XCTAssertFalse(before.hasIndependentCopy(secondKey))
+        XCTAssertFalse(after.containsOriginal(firstKey));XCTAssertFalse(after.hasIndependentCopy(firstKey))
+        XCTAssertTrue(after.containsOriginal(secondKey));XCTAssertTrue(after.hasIndependentCopy(secondKey))
     }
 
     /// Scaled per-step timing: 20 receipts x 20,000 entries, 200 wanted objects.
@@ -127,9 +226,9 @@ extension TicketLifecycleCleanupTests {
         for _ in 0..<5 {
             let (step,seconds) = try time {try cleanupLookup(wanted)}
             XCTAssertEqual(step.reads,0);warm.append(seconds)
-            XCTAssertEqual(step.index.originals,reference.originals);XCTAssertEqual(step.index.copyPaths,reference.copyPaths);XCTAssertEqual(step.index.copyManifests,reference.copyManifests)
+            assertCleanupMembershipEquals(step.index,reference,objects:wanted)
         }
-        XCTAssertEqual(cold.index.originals,reference.originals);XCTAssertEqual(reference.originals.count,195,"receipts cover keys 0..<39,000")
+        assertCleanupMembershipEquals(cold.index,reference,objects:wanted);XCTAssertEqual(reference.originals.count,195,"receipts cover keys 0..<39,000")
         XCTAssertEqual(backupIndexCache.parsedReceiptCount,parsed)
         try insert(20..<21)
         let (added,addedSeconds) = try time {try cleanupLookup(wanted)}

@@ -69,6 +69,9 @@ final class BackupWriteQueue: @unchecked Sendable {
         let directory = root.appendingPathComponent("backup-write-queue",isDirectory:true)
         let names = try FileManager.default.contentsOfDirectory(atPath:directory.path).sorted()
         for name in names {
+            // Command-operation admissions were validated and reconciled before
+            // this restore. A failed retirement cannot turn them into FIFO work.
+            if name.range(of:"^operation-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\\.intent$",options:.regularExpression) != nil {continue}
             // Unknown names are never followed or discarded as queue authority.
             if name.range(of:"^\\.pending-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",options:.regularExpression) != nil {continue} // Unacknowledged interrupted publication.
             guard name.range(of:"^[0-9]{20}-[a-f0-9]{64}\\.(intent|result)$",options:.regularExpression) != nil else {

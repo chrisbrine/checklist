@@ -103,12 +103,14 @@ public final class CommandRouter: @unchecked Sendable {
         self.readers = try? DatabasePool(path: root.appendingPathComponent("checklist.sqlite").path, configuration: readerConfiguration)
         // Authority reconciliation must commit even when unrelated maintenance is broken.
         do {
+            try commandOperations.restoreAdmissions(root:root,incarnation:incarnation) {try self.validateOperationRecord($0,id:$1)}
             try ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { _ in
                 try dbQueue.write { db in
                     try self.interruptSourceExecutionsAfterRestart(db)
                     try self.recoverCommandOperations(db)
                 }
             }
+            for id in commandOperations.stagedAdmissionIDs {commandOperations.retireAdmission(id,root:root)}
         } catch {
             throw CoreError("RECOVERY_REQUIRED", "Cannot establish source-process restart fences. Preserve the store and reconcile recovery before work resumes.")
         }

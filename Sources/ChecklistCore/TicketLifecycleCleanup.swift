@@ -138,7 +138,7 @@ extension CommandRouter {
         }
         observePhase?("candidate_objects")
         let summaries = candidateObjects.isEmpty ? [] : try Row.fetchAll(db,sql:"SELECT json_object('known_at',json_extract(value,'$.known_at'),'created_at',json_extract(value,'$.created_at')) AS value FROM metadata WHERE key LIKE 'backup-generation:%' ORDER BY key").map {jsonObject($0["value"])}
-        let backupObservation = TicketCleanupBackupObservation(index:candidateObjects.isEmpty ? nil : try? ticketCleanupBackupRetentionIndex(db,objects:candidateObjects.values.flatMap {$0}),summaries:summaries)
+        let backupObservation = TicketCleanupBackupObservation(index:candidateObjects.isEmpty ? nil : observeTicketCleanupBackupRetentionIndex(db,objects:candidateObjects.values.flatMap {$0}),summaries:summaries)
         let mediaAuthorityComplete = !candidateObjects.isEmpty && (try? ticketCleanupValidateMediaAuthority(db)) != nil
         observePhase?("backup_media")
         let historyObservation = try ticketCleanupEventObservation(db,tasks:candidates.filter {batch.errors[$0["id"] as? String ?? ""] == nil},inventories:batch.inventories,referenceGraphs:referenceGraphs)

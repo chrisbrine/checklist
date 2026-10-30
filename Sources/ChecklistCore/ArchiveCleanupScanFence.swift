@@ -4,27 +4,54 @@ import GRDB
 /// CL-344: a TEMP journal on the sole writer of every records-table write made
 /// while an archive cleanup reference scan reads its snapshot. It keeps changed
 /// identities and the text atoms of new payloads; an invalid payload or a full
-/// journal leaves an unknown marker that refuses. TEMP storage is
+/// journal leaves an unknown marker that refuses. Changed payloads and retained
+/// index bytes are bounded before parsing/copying on the writer. TEMP storage is
 /// connection-local and rebuildable, not a durable schema migration.
 struct ArchiveCleanupScanJournal {
     static let rowLimit = 262_144
+    static let byteLimit = 8 * 1024 * 1024
+    static let payloadByteLimit = 1024 * 1024
     static func install(_ db: Database) throws {
         try remove(db)
         try db.execute(sql:"""
             CREATE TEMP TABLE archive_cleanup_scan_changes(seq INTEGER PRIMARY KEY,id BLOB,atom BLOB);
-            CREATE INDEX temp.archive_cleanup_scan_changed_id ON archive_cleanup_scan_changes(id);
+            CREATE UNIQUE INDEX temp.archive_cleanup_scan_changed_id ON archive_cleanup_scan_changes(id,atom);
             CREATE INDEX temp.archive_cleanup_scan_changed_atom ON archive_cleanup_scan_changes(atom);
+            CREATE UNIQUE INDEX temp.archive_cleanup_scan_unique_atom ON archive_cleanup_scan_changes(atom) WHERE id IS NULL AND atom IS NOT NULL;
+            CREATE TEMP TABLE archive_cleanup_scan_budget(units INTEGER,bytes INTEGER);
+            INSERT INTO archive_cleanup_scan_budget VALUES(0,0);
             """)
-        let open = "(SELECT COALESCE(MAX(seq),0) FROM archive_cleanup_scan_changes)<\(rowLimit)"
-        let valid = "typeof(NEW.data)='text' AND json_valid(NEW.data)"
+        let size = "COALESCE(length(NEW.id),0)+COALESCE(length(NEW.atom),0)"
+        let exceeded = "units>=\(rowLimit) OR bytes+(\(size))>\(byteLimit)"
+        // A BEFORE INSERT guard is evaluated for every copied atom, including
+        // atoms from one INSERT SELECT. A scalar MAX(seq) subquery cannot supply
+        // that guarantee. Deduplicate exact bytes before charging the budget.
+        try db.execute(sql:"""
+            CREATE TEMP TRIGGER archive_cleanup_scan_bound BEFORE INSERT ON archive_cleanup_scan_changes
+            WHEN (NEW.id IS NOT NULL OR NEW.atom IS NOT NULL)
+                AND NOT EXISTS(SELECT 1 FROM archive_cleanup_scan_changes WHERE id IS NEW.id AND atom IS NEW.atom) BEGIN
+                INSERT INTO archive_cleanup_scan_changes(id,atom)
+                    SELECT NULL,NULL FROM archive_cleanup_scan_budget WHERE (\(exceeded))
+                    AND NOT EXISTS(SELECT 1 FROM archive_cleanup_scan_changes WHERE id IS NULL AND atom IS NULL);
+                SELECT RAISE(IGNORE) FROM archive_cleanup_scan_budget WHERE \(exceeded);
+            END;
+            CREATE TEMP TRIGGER archive_cleanup_scan_count AFTER INSERT ON archive_cleanup_scan_changes
+            WHEN NEW.id IS NOT NULL OR NEW.atom IS NOT NULL BEGIN
+                UPDATE archive_cleanup_scan_budget SET units=units+1,bytes=bytes+(\(size));
+            END;
+            """)
+        let open = "NOT EXISTS(SELECT 1 FROM archive_cleanup_scan_changes WHERE id IS NULL AND atom IS NULL)"
+        // CASE guarantees oversize/nontext input never reaches json_valid or
+        // json_tree. Legacy receipt settlement may rewrite up to 16 MiB at once.
+        let valid = "CASE WHEN typeof(NEW.data)='text' AND length(CAST(NEW.data AS BLOB))<=\(payloadByteLimit) THEN json_valid(NEW.data) ELSE 0 END"
         for action in ["INSERT","UPDATE","DELETE"] {
             var sql = ""
             for row in action == "INSERT" ? ["NEW"] : action == "DELETE" ? ["OLD"] : ["OLD","NEW"] {
-                sql += "INSERT INTO archive_cleanup_scan_changes(id,atom) VALUES(CAST(\(row).id AS BLOB),CAST(\(row).type AS BLOB));"
+                sql += "INSERT INTO archive_cleanup_scan_changes(id,atom) VALUES(CAST(\(row).id AS BLOB),CAST(\(row).type AS BLOB)) ON CONFLICT DO NOTHING;"
             }
             if action != "DELETE" {
-                sql += "INSERT INTO archive_cleanup_scan_changes(id,atom) SELECT NULL,NULL WHERE NOT (\(valid)) OR NOT \(open);"
-                sql += "INSERT INTO archive_cleanup_scan_changes(id,atom) SELECT NULL,CAST(j.atom AS BLOB) FROM json_tree(CASE WHEN \(valid) THEN NEW.data ELSE '{}' END) j WHERE j.type='text' AND \(open);"
+                sql += "INSERT INTO archive_cleanup_scan_changes(id,atom) SELECT NULL,NULL WHERE NOT (\(valid)) AND \(open);"
+                sql += "INSERT INTO archive_cleanup_scan_changes(id,atom) SELECT NULL,CAST(j.atom AS BLOB) FROM json_tree(CASE WHEN \(open) THEN CASE WHEN \(valid) THEN NEW.data ELSE '{}' END ELSE '{}' END) j WHERE j.type='text' ON CONFLICT DO NOTHING;"
             }
             try db.execute(sql:"CREATE TEMP TRIGGER archive_cleanup_scan_records_\(action.lowercased()) AFTER \(action) ON main.records BEGIN " + sql + " END")
         }
@@ -32,6 +59,7 @@ struct ArchiveCleanupScanJournal {
     static func remove(_ db: Database) throws {
         for action in ["insert","update","delete"] {try db.execute(sql:"DROP TRIGGER IF EXISTS temp.archive_cleanup_scan_records_\(action)")}
         try db.execute(sql:"DROP TABLE IF EXISTS temp.archive_cleanup_scan_changes")
+        try db.execute(sql:"DROP TABLE IF EXISTS temp.archive_cleanup_scan_budget")
     }
 }
 

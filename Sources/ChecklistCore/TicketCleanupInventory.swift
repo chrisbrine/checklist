@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import GRDB
 
 /// Read-lane, ticket-specific inventory. The corpus is streamed, never cached.
@@ -303,25 +304,27 @@ struct TicketCleanupBackupObservation {
 }
 
 extension CommandRouter {
-    /// CL-355: the cleanup's backup lookup. It charges the same candidate bytes
-    /// as the full scan below, then intersects the wanted keys with the
-    /// process-wide per-receipt index (StorageBackupAccountingCache). A warm step
-    /// reads only the receipt fingerprint; a cold one parses each new receipt once.
+    /// The observation shares immutable receipt state. Consumers process the
+    /// requested objects one key at a time, including lists larger than the old
+    /// 64 MiB wanted-set bound; no whole-step candidate allocation can overflow.
     func ticketCleanupBackupRetentionIndex(_ db: Database,objects: [JSON]) throws -> StorageBackupRetentionIndex {
-        var wanted = Set<Data>(),wantedPaths = Set<Data>(),contents = Set<Data>(),wantedBytes = 0
-        let limit = TicketCleanupBatchInventory.byteLimit
-        for object in objects {
-            guard let path = object["relative_path"] as? String,let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value else {continue}
-            let key = StorageBackupRetentionIndex.key(path:path,sha:sha,size:size)
-            if wanted.insert(key).inserted {wantedBytes += key.count + 128}
-            for candidate in [path,root.standardizedFileURL.path + "/" + path] {
-                let bytes = Data(candidate.utf8)
-                if wantedPaths.insert(bytes).inserted {wantedBytes += bytes.count + 96}
-            }
-            if contents.insert(Data((sha + "\u{0}" + String(size)).utf8)).inserted {wantedBytes += sha.utf8.count + 128}
-            guard wantedBytes <= limit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","Backup candidates exceed the cleanup memory bound; bytes retained.")}
+        try StorageBackupAccountingCache.shared(root:root).cleanupIndex(db,root:root,incarnation:incarnation,limit:TicketCleanupBatchInventory.byteLimit)
+    }
+    private static let cleanupBackupLogger = Logger(subsystem:"org.checklist",category:"TicketCleanup")
+    /// Never turn an index failure into an unexplained unavailable-authority hold.
+    /// The exact code/detail reaches durable object reasons and public diagnostics.
+    func observeTicketCleanupBackupRetentionIndex(_ db: Database,objects: [JSON]) -> StorageBackupRetentionIndex {
+        do {return try ticketCleanupBackupRetentionIndex(db,objects:objects)}
+        catch {
+            let code: String
+            if let failure = error as? CoreError {code = failure.code}
+            else if let failure = error as? DatabaseError {code = "SQLITE_" + String(failure.extendedResultCode.rawValue)}
+            else {code = "CLEANUP_INDEX_UNAVAILABLE_" + String((error as NSError).code)}
+            let detail = (error as? CoreError)?.details["reason"] as? String
+            let reason = "backup_index_error:" + code + (detail.map {":" + $0} ?? "")
+            Self.cleanupBackupLogger.error("\(reason,privacy:.public); \(String(describing:error),privacy:.private)")
+            return .init(originals:[],root:root,cleanupFailureReason:reason)
         }
-        return try StorageBackupAccountingCache.shared(root:root).cleanupIndex(db,root:root,incarnation:incarnation,wanted:wanted,retainedBytes:wantedBytes,limit:limit)
     }
     /// Reference only (CL-355 equality tests): the earlier per-step scan of every
     /// generation entry. Production cleanup uses ticketCleanupBackupRetentionIndex.

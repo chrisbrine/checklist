@@ -180,7 +180,7 @@ extension TicketLifecycleCleanupTests {
         }
         let cohort = try XCTUnwrap(deletionCohortPass(afterPreparation:{cohort in
             let backup = try XCTUnwrap(cohort.backup)
-            XCTAssertEqual(backup.originals.count,1,"Only still-pending objects consume the cohort backup proof budget")
+            XCTAssertTrue(backup.originals.isEmpty,"Candidate keys are evaluated on demand without an aggregate wanted set");XCTAssertLessThanOrEqual(backup.cleanupRetainedBytes,TicketCleanupBatchInventory.byteLimit)
             XCTAssertEqual(cohort.entries[0].fence.inventory.holdDigests.count,2,"Retained descriptors still participate in the independent authority fence")
         }))
         XCTAssertEqual(cohort.turns,1)

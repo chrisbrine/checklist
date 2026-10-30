@@ -99,6 +99,9 @@ struct TicketObjectDeletionPlan {
 extension CommandRouter {
     static let ticketObjectDeletionKind = "ticket_object_delete"
     static let ticketObjectDeletionRetryReasons: Set<String> = ["backup_authority","remaining_record","backup_required","backup_copy_unavailable","backup_authority_unavailable"]
+    static func ticketObjectDeletionReasonsRetryable(_ reasons: Set<String>) -> Bool {
+        !reasons.isEmpty && reasons.allSatisfy {ticketObjectDeletionRetryReasons.contains($0) || $0.hasPrefix("backup_index_error:")}
+    }
     // The same readiness predicate drives selection and the one-shot deadline.
     // A retained purge is observed once per completed backup generation, so an
     // unavailable copy or a genuine shared owner cannot become a polling loop.
@@ -109,7 +112,7 @@ extension CommandRouter {
                 AND (COALESCE(json_extract(records.data,'$.cleanup_policy_version'),0)<2 OR COALESCE((SELECT CAST(value AS INTEGER) FROM metadata WHERE key='ticket-cleanup-backup-seen:'||records.id),-1)<COALESCE((SELECT MAX(rowid) FROM metadata WHERE key GLOB 'backup-generation:*' AND json_valid(value) AND json_extract(value,'$.state')='complete'),0))
                 AND EXISTS(SELECT 1 FROM json_each(records.data,'$.objects') object WHERE json_extract(object.value,'$.state')='retained'
                     AND json_type(object.value,'$.reasons')='array' AND json_array_length(object.value,'$.reasons')>0
-                    AND NOT EXISTS(SELECT 1 FROM json_each(object.value,'$.reasons') reason WHERE reason.type!='text' OR reason.value NOT IN ('backup_authority','remaining_record','backup_required','backup_copy_unavailable','backup_authority_unavailable')))
+                    AND NOT EXISTS(SELECT 1 FROM json_each(object.value,'$.reasons') reason WHERE reason.type!='text' OR (reason.value NOT IN ('backup_authority','remaining_record','backup_required','backup_copy_unavailable','backup_authority_unavailable') AND reason.value NOT GLOB 'backup_index_error:*')))
             ))
         """
     func ticketCleanupBackupGenerationRow(_ db: Database) throws -> Int64 {
@@ -324,7 +327,7 @@ extension CommandRouter {
         let objects = try candidateObjects ?? ticketObjectDeletionObjects(db,owned:owned)
         let backup: StorageBackupRetentionIndex?
         if let backupObservation {backup = backupObservation.index}
-        else {backup = try? ticketCleanupBackupRetentionIndex(db,objects:objects)}
+        else {backup = observeTicketCleanupBackupRetentionIndex(db,objects:objects)}
         let references = try TicketObjectDeletionReferenceIndex(remaining,tokens:referenceTokens,historicalOwners:historicalOwners)
         let mediaComplete = mediaAuthorityComplete ?? ((try? ticketCleanupValidateMediaAuthority(db)) != nil)
         var result: [JSON] = []
@@ -379,7 +382,8 @@ extension CommandRouter {
         }
         if let backup {
             let key = StorageBackupRetentionIndex.key(path:relative,sha:sha,size:size)
-            if backup.copyPaths[key]?.isEmpty != false {holds.insert("backup_required")}
+            if let failure = backup.cleanupFailureReason {holds.insert(failure)}
+            else if !backup.hasIndependentCopy(key) {holds.insert("backup_required")}
             else if backup.checkedCopies.contains(key),backup.verifiedCopies[key]?.isCurrent() != true {holds.insert("backup_copy_unavailable")}
         } else {holds.insert("backup_authority_unavailable")}
         return holds

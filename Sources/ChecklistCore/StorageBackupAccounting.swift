@@ -138,43 +138,83 @@ final class StorageBackupAccountingCache: @unchecked Sendable {
         }
     }
 
-    /// CL-355 cleanup lookup: the same result as the full descriptor scan
-    /// (`ticketCleanupBackupRetentionIndexFullScan`) for this snapshot. A warm
-    /// step reads only the fingerprint and intersects `wanted` in memory; a cold
-    /// one first parses each missing receipt once, in its own short read on `db`.
-    func cleanupIndex(_ db: Database, root: URL, incarnation: String, wanted: Set<Data>, retainedBytes start: Int, limit: Int) throws -> StorageBackupRetentionIndex {
+    /// One immutable observation of the existing shared receipt index. Requested
+    /// objects are evaluated in key-sized chunks by CleanupLookup; neither a
+    /// wanted set nor the key x backup-copy product is materialized.
+    func cleanupIndex(_ db: Database, root: URL, incarnation: String, limit: Int) throws -> StorageBackupRetentionIndex {
         let target = try Self.fingerprint(db, incarnation: incarnation)
         guard target.rows.count <= 1024, target.rows.reduce(Int64(0), { $0 + $1.bytes }) <= 2 * 1024 * 1024 * 1024 else { throw CoreError("CLEANUP_INVENTORY_LIMIT", "Backup generation observation exceeds its bound; bytes retained.") }
-        // Old scan order: metadata key (BINARY collation).
         let ordered = target.rows.sorted { $0.key.utf8.lexicographicallyPrecedes($1.key.utf8) }
         for _ in 0..<3 {
             try sync(target, root: root, hook: nil) { row in try Self.extractReceipt(db, row: row, root: root) }
             state.lock()
             if ordered.contains(where: invalid.contains) { state.unlock(); throw StoreRecovery.required("backup_receipt_index_invalid") }
             let selected = ordered.compactMap { receipts[$0] }
-            let wantedIDs = wanted.compactMap { key in ids[key].map { (key, $0) } }
+            // Swift collections share immutable storage here. A later cache
+            // mutation copies its own storage, never changes this observation.
+            let snapshotIDs = ids
             state.unlock()
-            // A concurrent step with another snapshot removed a receipt; sync again.
             guard selected.count == ordered.count else { continue }
             guard selected.reduce(0, { $0 + $1.entries }) <= 10_000_000 else { throw CoreError("CLEANUP_INVENTORY_LIMIT", "Backup generation observation exceeds its bound; bytes retained.") }
-            var retained = Set<Data>(), copies: [Data: [URL]] = [:], manifests: [String: String] = [:], retainedBytes = start
-            for receipt in selected {
-                if let copy = receipt.copy { manifests[copy.path] = copy.manifest; retainedBytes += copy.path.utf8.count + 256 }
-                guard retainedBytes <= limit else { throw CoreError("CLEANUP_INVENTORY_LIMIT", "Backup descriptors exceed the cleanup memory bound; bytes retained.") }
-                for (key, id) in wantedIDs {
-                    let lower = Self.bound(receipt.ids, id, above: false), upper = Self.bound(receipt.ids, id, above: true)
-                    guard upper > lower else { continue }
-                    if retained.insert(key).inserted { retainedBytes += key.count + 128 }
-                    if let copy = receipt.copy {
-                        copies[key, default: []].append(contentsOf: repeatElement(URL(fileURLWithPath: copy.path, isDirectory: true), count: upper - lower))
-                        retainedBytes += 128 * (upper - lower)
-                    }
-                    guard retainedBytes <= limit else { throw CoreError("CLEANUP_INVENTORY_LIMIT", "Backup descriptors exceed the cleanup memory bound; bytes retained.") }
-                }
-            }
-            return .init(originals: retained, root: root, copyPaths: copies, copyManifests: manifests)
+            let lookup = CleanupLookup(ids:snapshotIDs,receipts:selected,root:root)
+            guard lookup.retainedBytes <= limit else { throw CoreError("CLEANUP_INVENTORY_LIMIT", "Backup descriptors exceed the cleanup memory bound; bytes retained.") }
+            return .init(originals:[],root:root,copyManifests:lookup.manifests,cleanupLookup:lookup)
         }
         throw CoreError("CLEANUP_INVENTORY_LIMIT", "Backup generations changed during the cleanup observation; bytes retained.")
+    }
+
+    /// Shares the already bounded per-receipt Int32 arrays and interned key map.
+    /// Only generation descriptors are added to a cleanup observation. One key
+    /// and one candidate URL survive each iterator step, even for an arbitrarily
+    /// large requested-object list. Alternatives are visited only if verification
+    /// needs them, preserving fallback when an older completed copy is missing.
+    final class CleanupLookup {
+        private let ids: [Data:Int32]
+        private let receipts: [Receipt]
+        private let independent: [Receipt]
+        let manifests: [String:String]
+        let retainedBytes: Int
+        init(ids: [Data:Int32],receipts: [Receipt],root: URL) {
+            self.ids = ids;self.receipts = receipts
+            var manifests: [String:String] = [:]
+            var bytes = 256 + receipts.count * 128
+            for receipt in receipts {
+                if let copy = receipt.copy {manifests[copy.path] = copy.manifest;bytes += copy.path.utf8.count + copy.manifest.utf8.count + 256}
+            }
+            self.manifests = manifests;self.retainedBytes = bytes
+            independent = receipts.filter {$0.copy != nil}.sorted {a,b in
+                let left = a.copy!.path,right = b.copy!.path
+                let localLeft = left.hasPrefix(root.path + "/"),localRight = right.hasPrefix(root.path + "/")
+                return localLeft != localRight ? localLeft : left < right
+            }
+        }
+        private func contains(_ receipt: Receipt,id: Int32) -> Bool {
+            let position = StorageBackupAccountingCache.bound(receipt.ids,id,above:false)
+            return position < receipt.ids.count && receipt.ids[position] == id
+        }
+        func containsOriginal(_ key: Data) -> Bool {
+            guard let id = ids[key] else {return false}
+            return receipts.contains {contains($0,id:id)}
+        }
+        func hasIndependentCopy(_ key: Data) -> Bool {
+            guard let id = ids[key] else {return false}
+            return independent.contains {contains($0,id:id)}
+        }
+        func copies(for key: Data) -> AnySequence<URL> {
+            guard let id = ids[key] else {return AnySequence([])}
+            return AnySequence { [self] in
+                var index = 0,previous: String?
+                return AnyIterator<URL> {
+                    while index < self.independent.count {
+                        let receipt = self.independent[index];index += 1
+                        guard self.contains(receipt,id:id),let path = receipt.copy?.path,path != previous else {continue}
+                        previous = path
+                        return URL(fileURLWithPath:path,isDirectory:true)
+                    }
+                    return nil
+                }
+            }
+        }
     }
     /// First index in sorted `ids` whose value is >= id (or > id when `above`).
     private static func bound(_ ids: [Int32], _ id: Int32, above: Bool) -> Int {

@@ -28,9 +28,9 @@ final class AuthorityTests: XCTestCase {
     override func tearDownWithError() throws {
         connection?.invalidate(); connection = nil
         // finish(runHooks:) plans the storage wake on storageQueue and installs it on queue.
-        // Drain that work (and one replan) before deleting its store: it must not read the store during removal.
+        // Drain both advisory/storage work (and one replan) before deleting its store.
         if let coordinator {
-            for _ in 0..<2 { coordinator.storageQueue.sync {}; coordinator.queue.sync {} }
+            for _ in 0..<2 { coordinator.workHealthQueue.sync {}; coordinator.storageQueue.sync {}; coordinator.queue.sync {} }
             coordinator.queue.sync { coordinator.storageWake?.cancel(); coordinator.workHealthWake?.cancel() }
         }
         coordinator = nil

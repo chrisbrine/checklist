@@ -138,7 +138,7 @@ extension CommandRouter {
             var objects = receipt["objects"] as? [JSON] ?? []
             for index in objects.indices where objects[index]["state"] as? String == "retained" {
                 let reasons = Set(objects[index]["reasons"] as? [String] ?? [])
-                if !reasons.isEmpty,reasons.isSubset(of:Self.ticketObjectDeletionRetryReasons) {objects[index]["state"] = "pending";objects[index].removeValue(forKey:"reasons")}
+                if Self.ticketObjectDeletionReasonsRetryable(reasons) {objects[index]["state"] = "pending";objects[index].removeValue(forKey:"reasons")}
             }
             receipt["objects"] = objects;receipt["state"] = "pending";receipt["summary"] = Self.ticketObjectDeletionSummary(objects)
         }
@@ -149,7 +149,7 @@ extension CommandRouter {
         let graph = try ticketCleanupDeletionReferences(db,receipt:receipt,inventory:inventory)
         let historicalOwners = receipt["cause"] as? String == "done_evidence" ? Set((receipt["owned_record_fingerprints"] as? [String:String] ?? [:]).keys.map {Data($0.utf8)}) : []
         let references = try TicketObjectDeletionReferenceIndex(graph,tokens:inventory.tokens,historicalOwners:historicalOwners)
-        var backup = try? ticketCleanupBackupRetentionIndex(db,objects:receipt["objects"] as? [JSON] ?? [])
+        var backup: StorageBackupRetentionIndex? = observeTicketCleanupBackupRetentionIndex(db,objects:receipt["objects"] as? [JSON] ?? [])
         let mediaComplete = (try? ticketCleanupValidateMediaAuthority(db)) != nil
         let fence = try TicketCleanupFence(
             db, inventory: inventory, project: (try StoredRecord(receipt, family: "receipt").string("project_id")),

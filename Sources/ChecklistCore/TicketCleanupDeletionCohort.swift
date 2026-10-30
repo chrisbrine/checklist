@@ -83,7 +83,7 @@ extension CommandRouter {
                 receipt["_cohort_reactivated"] = true
                 for i in objects.indices where objects[i]["state"] as? String == "retained" {
                     let reasons = Set(objects[i]["reasons"] as? [String] ?? [])
-                    if !reasons.isEmpty,reasons.isSubset(of:Self.ticketObjectDeletionRetryReasons) {objects[i]["state"] = "pending";objects[i].removeValue(forKey:"reasons")}
+                    if Self.ticketObjectDeletionReasonsRetryable(reasons) {objects[i]["state"] = "pending";objects[i].removeValue(forKey:"reasons")}
                 }
                 receipt["objects"] = objects;receipt["state"] = "pending";receipt["summary"] = Self.ticketObjectDeletionSummary(objects)
             }
@@ -108,7 +108,7 @@ extension CommandRouter {
         // inventory/fence, but must not exhaust the shared backup proof budget.
         // Reactivated purge objects were made pending before this observation.
         let pendingObjects = currentReceipts.flatMap {$0["objects"] as? [JSON] ?? []}.filter {$0["state"] as? String == "pending"}
-        let backup = currentReceipts.isEmpty ? nil : try? ticketCleanupBackupRetentionIndex(db,objects:pendingObjects)
+        let backup = currentReceipts.isEmpty ? nil : observeTicketCleanupBackupRetentionIndex(db,objects:pendingObjects)
         let mediaComplete = !currentReceipts.isEmpty && (try? ticketCleanupValidateMediaAuthority(db)) != nil
         var entries: [TicketCleanupPreparedDeletion] = [],referenceBytes = 0
         var refusals = inventories.errors.mapValues { $0.code }

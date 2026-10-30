@@ -488,6 +488,104 @@ final class CommandOperationTests: XCTestCase {
         for accepted in [first,second,write] {_ = try assertSucceeded(f,accepted,project:pid)}
     }
 
+    /// Unlike the earlier logical-capture test, this holds SQLite's real writer
+    /// lease. Accepting a new operation must not enter BEGIN IMMEDIATE here.
+    func testReadOperationAcceptedAndExecutedWhileCaptureOwnsSQLiteWriter() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),task = try f.task(project),router = f.router!,pid = project["id"] as! String
+        let source = f.workspace.appendingPathComponent("capture-original.txt"),bytes = Data("Original bytes during capture".utf8)
+        try bytes.write(to:source)
+        let attachment = try data(f.call("attachment_add",["project_id":pid,"task_id":task["id"]!,"path":source.path]))
+        let installation = "operation-capture-reader"
+        let session = try data(f.call("session_register",["project_id":pid,"label":"Capture reader","provider":"codex","role":"worker","installation":installation,"workspace":f.workspace.path]))
+        let worker = Caller(role:"worker",installation:installation,projectIDs:[pid],sessionID:session["id"] as? String,workspace:f.workspace.path)
+        let lane = HeldLane(router);defer {lane.finish()}
+        try router.backupWrites.beginCapture()
+        let entered = DispatchSemaphore(value:0),release = DispatchSemaphore(value:0),finished = DispatchSemaphore(value:0)
+        let blocker = try DatabaseQueue(path:router.root.appendingPathComponent("checklist.sqlite").path)
+        DispatchQueue.global().async {
+            do {
+                try blocker.writeWithoutTransaction {db in
+                    try db.beginTransaction(.immediate)
+                    entered.signal()
+                    _ = release.wait(timeout:.now()+20)
+                    try db.rollback()
+                }
+            } catch {XCTFail("Capture writer: \(error)")}
+            finished.signal()
+        }
+        XCTAssertEqual(entered.wait(timeout:.now()+5),.success)
+        defer {
+            release.signal();XCTAssertEqual(finished.wait(timeout:.now()+5),.success)
+            router.backupWrites.endCapture(router:router);router.backupWrites.endBackup(router:router)
+        }
+        let command = uuid(),params: JSON = ["project_id":pid,"attachment_id":attachment["id"]!,"representation":"original","command_id":command]
+        let accepted = try f.call("attachment_read",params,command:command,caller:worker)
+        let id = try XCTUnwrap(data(accepted)["operation_id"] as? String)
+        XCTAssertEqual(accepted["command_outcome"] as? String,"accepted")
+        let stagedPath = router.root.appendingPathComponent("backup-write-queue/operation-" + id + ".intent")
+        XCTAssertTrue(FileManager.default.fileExists(atPath:stagedPath.path),"Acceptance must be durable without SQLite's writer")
+        XCTAssertEqual(try data(f.call("attachment_read",params,command:command,caller:worker))["operation_id"] as? String,id)
+        XCTAssertEqual(try read(f,accepted,project:pid,caller:worker)["state"] as? String,"queued")
+        lane.finish()
+        XCTAssertEqual(try read(f,accepted,project:pid,caller:worker)["state"] as? String,"running")
+        XCTAssertNil(try read(f,accepted,project:pid,caller:worker)["result"],"The terminal write waits for capture release")
+        release.signal();XCTAssertEqual(finished.wait(timeout:.now()+5),.success)
+        // Balance the deferred wait without keeping a second writer alive.
+        finished.signal()
+        router.observeWriteAdmission { [weak router] in router?.resumeCommandOperations() }
+        defer {router.observeWriteAdmission {}}
+        router.backupWrites.endCapture(router:router);router.backupWrites.endBackup(router:router)
+        lane.finish()
+        let complete = try read(f,accepted,project:pid,caller:worker)
+        XCTAssertEqual(complete["state"] as? String,"succeeded")
+        let result = try XCTUnwrap((complete["result"] as? JSON)?["data"] as? JSON)
+        XCTAssertEqual(result["content_base64"] as? String,bytes.base64EncodedString())
+        XCTAssertFalse(FileManager.default.fileExists(atPath:stagedPath.path),"The canonical terminal commit retires the sidecar")
+    }
+
+    func testCaptureAdmissionRestartRecoversQueuedIntentAndPreservesCanonicalTerminal() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),pid = project["id"] as! String
+        func stage(_ router: CommandRouter) throws -> JSON {
+            let command = uuid(),id = CommandRouter.commandOperationID(principal:f.owner.principal,command:command)
+            let value: JSON = ["operation_id":id,"command_id":command,"method":"policy_preview","principal":f.owner.principal,
+                "digest":ChecklistCore.hash(Data(command.utf8)),"incarnation":router.incarnation,"state":"queued","project_id":pid,"created_at":now(),"updated_at":now()]
+            try router.commandOperations.stageAdmission(value,baseHash:nil,root:router.root)
+            return value
+        }
+        let queued = try stage(f.router!),committed = try stage(f.router!)
+        let original: JSON = ["data":["canonical":"terminal reply survives a stale sidecar"]]
+        try f.router!.dbQueue.write {db in
+            var value = committed;value["state"] = "succeeded";value["finished_at"] = now()
+            try f.router!.saveOperation(db,value)
+            try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",
+                arguments:[f.owner.principal,committed["command_id"] as! String,committed["digest"] as! String,try jsonString(original)])
+        }
+        try f.reopen()
+        let interrupted = try read(f,["data":queued],project:pid)
+        XCTAssertEqual(interrupted["state"] as? String,"failed")
+        let failure = try XCTUnwrap(interrupted["error"] as? JSON)
+        XCTAssertEqual(failure["code"] as? String,"OPERATION_INTERRUPTED")
+        XCTAssertEqual((failure["details"] as? JSON)?["command_outcome"] as? String,"rejected")
+        let terminal = try read(f,["data":committed],project:pid)
+        XCTAssertEqual(terminal["state"] as? String,"succeeded")
+        XCTAssertEqual(try jsonString(terminal["result"]!),try jsonString(original))
+        for value in [queued,committed] {
+            let id = value["operation_id"] as! String
+            XCTAssertFalse(FileManager.default.fileExists(atPath:f.root.appendingPathComponent("backup-write-queue/operation-" + id + ".intent").path))
+        }
+    }
+
+    func testMalformedStagedIdentityIsRefusedEvenWhenCanonicalTerminalExists() throws {
+        let f = try StorageFixture(fast:true),command = uuid()
+        let id = CommandRouter.commandOperationID(principal:f.owner.principal,command:command)
+        let valid: JSON = ["operation_id":id,"command_id":command,"method":"policy_preview","principal":f.owner.principal,
+            "digest":ChecklistCore.hash(Data(command.utf8)),"incarnation":f.router!.incarnation,"state":"succeeded","created_at":now(),"updated_at":now(),"finished_at":now()]
+        try f.router!.dbQueue.write {try f.router!.saveOperation($0,valid)}
+        var malformed = valid;malformed["state"] = "queued";malformed["principal"] = "foreign-principal"
+        try f.router!.commandOperations.stageAdmission(malformed,baseHash:nil,root:f.root)
+        XCTAssertThrowsError(try f.reopen()) {XCTAssertEqual(($0 as? CoreError)?.code,"RECOVERY_REQUIRED")}
+    }
+
     /// CL-353 F3: the contract lists every operation route the code uses.
     func testContractListsEveryOperationRouteAndReadOperation() throws {
         let root = URL(fileURLWithPath:#filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()

@@ -1,9 +1,11 @@
 import Foundation
 import Dispatch
+import Darwin
 import GRDB
 
-/// Only scheduling state is process-local. Acceptance and terminal state live in
-/// SQLite; successful replies live exclusively in the ordinary command journal.
+/// Scheduling state is process-local. Acceptance lives in durable journals;
+/// terminal state is canonical in SQLite. Successful replies live exclusively
+/// in the ordinary command journal.
 /// The service supplies its own concurrent command-operation queue, separate from
 /// storage maintenance. In-process domain callers may
 /// keep the synchronous router without installing a service scheduler.
@@ -34,6 +36,64 @@ final class CommandOperations: @unchecked Sendable {
         let startedAt: String
     }
     private var held: [String:(attempt: UUID,outcome: Outcome)] = [:]
+    /// Capture-time acceptance uses the existing private queue directory because
+    /// SQLite's source writer lease is intentionally unavailable. A canonical
+    /// record supersedes this metadata only when it advances beyond baseHash.
+    private struct StagedAdmission {
+        let operation: JSON
+        let baseHash: String?
+    }
+    private var stagedAdmissions: [String:StagedAdmission] = [:]
+    private static func admissionPath(_ id: String) -> String {"backup-write-queue/operation-" + id + ".intent"}
+    func stagedAdmission(_ id: String,canonical: String?) -> JSON? {
+        guard let staged = lock.withLock({stagedAdmissions[id]}) else {return nil}
+        guard staged.baseHash == canonical.map({hash(Data($0.utf8))}) else {return nil}
+        return staged.operation
+    }
+    var stagedAdmissionIDs: [String] {lock.withLock {Array(stagedAdmissions.keys)}}
+    func stageAdmission(_ operation: JSON,baseHash: String?,root: URL) throws {
+        let id = operation["operation_id"] as! String
+        var envelope: JSON = ["root":root.path,"operation":operation]
+        envelope["base_sha256"] = baseHash
+        let bytes = Data((try jsonString(envelope)).utf8)
+        guard bytes.count <= 2_000_000 else {throw StoreRecovery.required("command_operation_admission_invalid")}
+        let files = try StorageObjectFiles(root:root),temporary = "backup-write-queue/.pending-" + uuid()
+        try files.writeNew(temporary,bytes:bytes)
+        let (directory,name) = try files.parent(Self.admissionPath(id))
+        defer {Darwin.close(directory)}
+        let temporaryName = String(temporary.split(separator:"/").last!)
+        // Same-principal/UUID admission is already serialized. Replacement is
+        // needed for a new recovery attempt after an earlier cleanup failure.
+        guard renameat(directory,temporaryName,directory,name) == 0,fsync(directory) == 0 else {throw StorageSnapshotFailure.io}
+        lock.withLock {stagedAdmissions[id] = StagedAdmission(operation:operation,baseHash:baseHash)}
+    }
+    func restoreAdmissions(root: URL,incarnation: String,validate: (JSON,String) throws -> Void) throws {
+        let files = try StorageObjectFiles(root:root)
+        guard try files.directoryExists("backup-write-queue") else {return}
+        for name in try FileManager.default.contentsOfDirectory(atPath:root.appendingPathComponent("backup-write-queue").path) where name.hasPrefix("operation-") {
+            guard name.range(of:"^operation-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\\.intent$",options:.regularExpression) != nil else {throw StoreRecovery.required("command_operation_admission_invalid")}
+            let id = String(name.dropFirst("operation-".count).dropLast(".intent".count))
+            let bytes = try files.read("backup-write-queue/" + name,maximum:2_000_000)
+            guard let envelope = try JSONSerialization.jsonObject(with:bytes) as? JSON,
+                  EnvelopeStorageIdentity.equal(envelope["root"] as? String,root.path),
+                  let operation = envelope["operation"] as? JSON,operation["operation_id"] as? String == id,
+                  EnvelopeStorageIdentity.equal(operation["incarnation"] as? String,incarnation),
+                  envelope["base_sha256"] == nil || (envelope["base_sha256"] as? String)?.range(of:"^[a-f0-9]{64}$",options:.regularExpression) != nil else {throw StoreRecovery.required("command_operation_admission_invalid")}
+            try validate(operation,id)
+            lock.withLock {stagedAdmissions[id] = StagedAdmission(operation:operation,baseHash:envelope["base_sha256"] as? String)}
+        }
+    }
+    /// Canonical state was committed first. A failed retirement is harmless:
+    /// startup compares the base hash and keeps the advanced canonical record.
+    func retireAdmission(_ id: String,root: URL) {
+        guard lock.withLock({stagedAdmissions[id] != nil}) else {return}
+        do {
+            let files = try StorageObjectFiles(root:root),(directory,name) = try files.parent(Self.admissionPath(id))
+            defer {Darwin.close(directory)}
+            guard (unlinkat(directory,name,0) == 0 || errno == ENOENT),fsync(directory) == 0 else {throw StorageSnapshotFailure.io}
+            lock.withLock {_ = stagedAdmissions.removeValue(forKey:id)}
+        } catch {StoreRecovery.recordFailure(root:root,error:error)}
+    }
     private var probe: ((String) -> Void)?
     let contextKey = "ChecklistCommandOperation-" + UUID().uuidString
 
@@ -182,8 +242,8 @@ extension CommandRouter {
     }
     static func commandOperationKey(_ id: String) -> String {"command-operation:" + id.lowercased()}
     func operationRecord(_ db: Database,id: String) throws -> JSON? {
-        guard let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[Self.commandOperationKey(id)]) else {return nil}
-        let value = jsonObject(raw)
+        let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[Self.commandOperationKey(id)])
+        guard let value = commandOperations.stagedAdmission(id,canonical:raw) ?? raw.map(jsonObject) else {return nil}
         try validateOperationRecord(value,id:id)
         return value
     }
@@ -303,14 +363,14 @@ extension CommandRouter {
             guard previous["digest"] as? String == digest else {throw CoreError("IDEMPOTENCY_CONFLICT","This command ID was already accepted with different input.")}
             if previous["state"] as? String != "failed" || !bool(previous,"recoverable") {return operationAcknowledgment(previous)}
         }
-        let operation = try dbQueue.write {db -> JSON in
+        func accept(_ db: Database,persist: Bool) throws -> JSON {
                 if var previous = try self.operationRecord(db,id:id) {
                     try self.authorizeOperation(db,previous,params:params,caller:caller)
                     guard previous["digest"] as? String == digest else {throw CoreError("IDEMPOTENCY_CONFLICT","This command ID was already accepted with different input.")}
                     if previous["state"] as? String == "failed",bool(previous,"recoverable") {
                         previous["state"] = "queued";previous["updated_at"] = now();previous.removeValue(forKey:"error");previous.removeValue(forKey:"finished_at")
                         previous["recoverable"] = false
-                        try self.saveOperation(db,previous);schedule = true
+                        if persist {try self.saveOperation(db,previous)};schedule = true
                     }
                     return previous
                 }
@@ -326,8 +386,20 @@ extension CommandRouter {
                     guard !Self.isPrunedResult(jsonObject(receipt["result"])) else {throw Self.expiredCommandError(command)}
                     value["state"] = "succeeded";value["finished_at"] = now()
                 } else {schedule = true}
-                try self.saveOperation(db,value)
+                if persist {try self.saveOperation(db,value)}
                 return value
+        }
+        let operation: JSON
+        // Admission and the capture flag share one atomic writer count: capture
+        // cannot acquire its SQLite lease between this check and the SQL write.
+        if let canonical = try backupWrites.withImmediateAccess({try dbQueue.write {try accept($0,persist:true)}}) {operation = canonical}
+        else {
+            let staged = try readForPreparation {db -> (JSON,String?) in
+                let base = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[Self.commandOperationKey(id)])
+                return (try accept(db,persist:false),base.map {hash(Data($0.utf8))})
+            }
+            try commandOperations.stageAdmission(staged.0,baseHash:staged.1,root:root)
+            operation = staged.0
         }
         if schedule {
             let job = CommandOperations.Job(id:id,params:try JSONSerialization.data(withJSONObject:params),method:method,caller:caller,generation:generation,lease:lease)
@@ -346,14 +418,16 @@ extension CommandRouter {
     func runCommandOperation(_ job: CommandOperations.Job) -> Bool {
         do {
             return try storageAdmission.withContinuation(job.lease) {
-                if job.method == "backup_create" {try performCommandOperation(job);return true}
+                // A backup releases admission before beginning its own capture.
+                // Its brief marker and terminal publication still obey admission.
+                if job.method == "backup_create" {return try performReadOperation(job)}
                 // CL-353 F1: a read method runs exactly as its synchronous read:
                 // read pool, no backup write admission, so a capture never waits
                 // for it and it runs during a capture. A writer continuation inside
                 // it keeps admitWriterDependentRead. Only the operation's own
                 // running marker and terminal-state write take write admission.
                 if Self.readMethods.contains(job.method) {return try performReadOperation(job)}
-                return try backupWrites.withImmediateAccess {try performCommandOperation(job);return true} ?? false
+                return try backupWrites.withImmediateAccess {try performCommandOperation(job)} ?? false
             }
         } catch {
             // Persisting a terminal receipt can itself fail. Keep the original
@@ -365,21 +439,23 @@ extension CommandRouter {
             return true
         }
     }
-    private func performCommandOperation(_ job: CommandOperations.Job) throws {
-        try finishCommandOperation(job,executeCommandOperation(job))
+    private func performCommandOperation(_ job: CommandOperations.Job) throws -> Bool {
+        guard let outcome = try executeCommandOperation(job) else {return false}
+        try finishCommandOperation(job,outcome)
+        return true
     }
     /// The finished read reply stays in process memory while a capture or the
     /// FIFO queue closes write admission. The job then waits for the existing
     /// admission notification, without polling, and writes only its terminal state.
     private func performReadOperation(_ job: CommandOperations.Job) throws -> Bool {
-        let outcome = try commandOperations.heldOutcome(job) ?? executeCommandOperation(job)
+        guard let outcome = try commandOperations.heldOutcome(job) ?? executeCommandOperation(job) else {return false}
         guard try backupWrites.withImmediateAccess({try finishCommandOperation(job,outcome)}) != nil else {
             commandOperations.hold(job,outcome);return false
         }
         commandOperations.releaseHeld(job.id)
         return true
     }
-    private func executeCommandOperation(_ job: CommandOperations.Job) throws -> CommandOperations.Outcome {
+    private func executeCommandOperation(_ job: CommandOperations.Job) throws -> CommandOperations.Outcome? {
         let params = try JSONSerialization.jsonObject(with:job.params) as! JSON
         // GRDB executes callbacks on its own writer/reader threads. The
         // process-local admitted execution marker spans those callbacks; public
@@ -402,10 +478,11 @@ extension CommandRouter {
                     value["state"] = "running";value["started_at"] = startedAt;value["updated_at"] = now();try self.saveOperation(db,value)
                 }
             }
-            if Self.readMethods.contains(job.method) {
+            if Self.readMethods.contains(job.method) || job.method == "backup_create" {
                 // Never write during a capture. A read started while admission is
                 // closed checks authority on the pool; status reports it as running.
                 if try backupWrites.withImmediateAccess(markRunning) == nil {
+                    if job.method == "backup_create" {return nil}
                     try readForPreparation {db in
                         guard let value = try self.operationRecord(db,id:job.id) else {throw CoreError("OPERATION_MISSING","The accepted operation record is missing.")}
                         try self.authorizeOperation(db,value,params:params,caller:job.caller)
@@ -425,6 +502,11 @@ extension CommandRouter {
     }
     private func finishCommandOperation(_ job: CommandOperations.Job,_ outcome: CommandOperations.Outcome) throws {
         let output = outcome.output,failure = outcome.failure,purgeEpoch = outcome.purgeEpoch
+        let params = try JSONSerialization.jsonObject(with:job.params) as! JSON
+        let command = try text(params,"command_id",max:100)
+        // Same-ID recovery acceptance must not replace the sidecar between this
+        // terminal commit and retirement of the preceding attempt's admission.
+        try commandOperations.withAdmission(principal:job.caller.principal,command:command) {
         try dbQueue.write {db in
                 guard var value = try self.operationRecord(db,id:job.id) else {throw CoreError("OPERATION_MISSING","The accepted operation record is missing.")}
                 if let output {
@@ -472,11 +554,19 @@ extension CommandRouter {
                 if value["started_at"] == nil {value["started_at"] = outcome.startedAt}
                 value["finished_at"] = now();value["updated_at"] = now();try self.saveOperation(db,value)
         }
+        commandOperations.retireAdmission(job.id,root:root)
+        }
     }
     /// Runs before admission opens. Completed semantic transactions win over a
     /// lost operation acknowledgment. Other interrupted attempts fail explicitly;
     /// only exact original-intent replay can schedule reconciliation.
     func recoverCommandOperations(_ db: Database) throws {
+        // The accepted metadata was flushed independently of SQLite during a
+        // capture. Import it before applying the existing interruption rules.
+        for id in commandOperations.stagedAdmissionIDs {
+            guard let value = try operationRecord(db,id:id) else {throw StoreRecovery.required("command_operation_admission_invalid")}
+            try saveOperation(db,value)
+        }
         let rows = try Row.fetchCursor(db,sql:"SELECT key,value FROM metadata WHERE key GLOB 'command-operation:*'")
         while let row = try rows.next() {
             var value = jsonObject(row["value"])

@@ -16,14 +16,23 @@ struct StorageBackupRetentionIndex {
     var verifiedCopies: [Data:TicketCleanupBackupCopy] = [:]
     var verifiedManifests: [String:TicketObjectRemovalVerification] = [:]
     var unavailableManifests: Set<String> = []
+    var cleanupLookup: StorageBackupAccountingCache.CleanupLookup?
+    var cleanupFailureReason: String?
+    /// Additional observation metadata only; the shared receipt cache is separate.
+    var cleanupRetainedBytes: Int {cleanupLookup?.retainedBytes ?? 0}
+    func containsOriginal(_ key: Data) -> Bool {cleanupLookup?.containsOriginal(key) ?? originals.contains(key)}
+    func hasIndependentCopy(_ key: Data) -> Bool {
+        if let cleanupLookup {return cleanupLookup.hasIndependentCopy(key)}
+        return copyPaths[key]?.isEmpty == false
+    }
     mutating func verifyCopy(for object: JSON,check: () throws -> Void = {}) {
         guard let path = object["relative_path"] as? String,let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value else {return}
         let key = Self.key(path:path,sha:sha,size:size)
         checkedCopies.insert(key)
-        let paths = (copyPaths[key] ?? []).sorted {a,b in
+        let paths = cleanupLookup?.copies(for:key) ?? AnySequence((copyPaths[key] ?? []).sorted {a,b in
             let localA = a.path.hasPrefix(root.path + "/"),localB = b.path.hasPrefix(root.path + "/")
             return localA != localB ? localA : a.path < b.path
-        }
+        })
         for path in paths where !unavailableManifests.contains(path.path) {
             do {
                 if verifiedManifests[path.path] == nil,let expected = copyManifests[path.path] {
@@ -49,7 +58,7 @@ struct StorageBackupRetentionIndex {
         guard attachment["mode"] as? String == "managed",let path = attachment["path"] as? String,let sha = attachment["sha256"] as? String,
               let number = attachment["size"] as? NSNumber,number.int64Value >= 0,
               let relative = try? ManagedPaths.relative(path,family:"objects",root:root),
-              originals.contains(Self.key(path:relative,sha:sha,size:number.int64Value)) else {return 0}
+              containsOriginal(Self.key(path:relative,sha:sha,size:number.int64Value)) else {return 0}
         return number.int64Value
     }
 }

@@ -38,11 +38,13 @@ extension TicketLifecycleCleanupTests {
         XCTAssertEqual(Set(normalized),Set([path,router.root.standardizedFileURL.path + "/" + path]))
         XCTAssertEqual(normalized.count,2,"A thousand same-content aliases must never reach path normalization")
         let observation = try router.readers!.read {try self.router.ticketCleanupBackupRetentionIndex($0,objects:[wanted,other])}
-        XCTAssertEqual(observation.originals,reference.originals);XCTAssertEqual(observation.copyPaths,reference.copyPaths);XCTAssertEqual(observation.copyManifests,reference.copyManifests)
+        XCTAssertEqual(observation.copyManifests,reference.copyManifests)
         let key = StorageBackupRetentionIndex.key(path:path,sha:attachment["sha256"] as! String,size:(attachment["size"] as! NSNumber).int64Value)
-        XCTAssertEqual(observation.originals,[key])
-        let backup = try XCTUnwrap(observation.copyPaths[key]?.first)
-        XCTAssertEqual(observation.copyManifests[backup.path],ChecklistCore.hash(try Data(contentsOf:backup.appendingPathComponent("manifest.json"))))
+        XCTAssertTrue(observation.containsOriginal(key));XCTAssertTrue(observation.hasIndependentCopy(key))
+        let missing = StorageBackupRetentionIndex.key(path:other["relative_path"] as! String,sha:other["sha256"] as! String,size:99)
+        XCTAssertFalse(observation.containsOriginal(missing));XCTAssertFalse(observation.hasIndependentCopy(missing))
+        XCTAssertEqual(reference.originals,[key])
+        XCTAssertTrue(observation.originals.isEmpty,"The requested keys are processed on demand, not accumulated")
         var checked = observation
         checked.verifyCopy(for:wanted)
         XCTAssertEqual(checked.verifiedCopies[key]?.isCurrent(),true)
@@ -92,7 +94,7 @@ extension TicketLifecycleCleanupTests {
         }
         XCTAssertEqual(headers,1)
         let objects = try XCTUnwrap(prepared.plans[task["id"] as! String]?.byteDeletion.objects)
-        XCTAssertTrue(objects.contains {strings($0,"reasons").contains("backup_authority_unavailable")})
+        XCTAssertTrue(objects.contains {strings($0,"reasons").contains("backup_index_error:RECOVERY_REQUIRED:backup_receipt_index_invalid")})
     }
 }
 

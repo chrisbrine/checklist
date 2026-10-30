@@ -90,6 +90,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     var storageWake: DispatchWorkItem?
     var storageWakePlan = StorageMaintenanceWakePlan()
     let storageQueue = DispatchQueue(label:"org.checklist.storage-maintenance",qos:.utility)
+    let workHealthQueue = DispatchQueue(label:"org.checklist.work-health",qos:.utility,autoreleaseFrequency:.workItem)
     let commandOperationQueue = DispatchQueue(label:"org.checklist.command-operations",qos:.userInitiated,attributes:.concurrent)
     var storageRunning = false
     var storageWakePlanning = false
@@ -98,6 +99,8 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     var nativeInFlight: [String: NativeInFlight] = [:]
     var workHealthWake: DispatchWorkItem?
     var workHealthFailures = 0
+    var workHealthRunning = false
+    var workHealthRecheck = false
     var timingDiagnosticsEnabled = CallTimingLog.enabled
     let enrollmentFile: URL
     let expectedOwnerPath: String
@@ -158,26 +161,57 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
 
     /// Advisory database supervision only; never launches or polls a model.
     /// One bounded page per wake; persisted deadlines survive sleep/restart.
-    func runWorkHealth() {
+    /// Storage can hold a page for seconds, so it never owns request admission.
+    private enum WorkHealthOutcome: Sendable {
+        case deferred
+        case completed(enabled: Bool,changed: Int,hasMore: Bool)
+        case failed(String)
+    }
+    func runWorkHealth(check: (@Sendable () throws -> [String:Any])? = nil) {
         requireCommandQueue()
+        guard !workHealthRunning else {workHealthRecheck = true;return}
         workHealthWake?.cancel(); workHealthWake = nil
         guard router.writeAdmissionStatus["locked"] as? Bool != true else {return}
-        let started = ProcessInfo.processInfo.systemUptime
-        defer { if timingDiagnosticsEnabled { CallTimingLog.write(["scope":"work_health_maintenance","start_uptime_s":started,"duration_ms":(ProcessInfo.processInfo.systemUptime-started)*1000]) } }
-        do {
-            guard let result = try router.withImmediateWriteAccess({try router.runWorkHealthChecks()}) else {return}
-            workHealthFailures = 0
-            if (result["changed"] as? Int ?? 0) > 0 { changed() }
-            guard result["enabled"] as? Bool == true else { return }
-            let work = DispatchWorkItem { [weak self] in self?.runWorkHealth() }
+        workHealthRunning = true
+        let recordTiming = timingDiagnosticsEnabled
+        workHealthQueue.async { [self] in
+            let started = ProcessInfo.processInfo.systemUptime
+            let outcome: WorkHealthOutcome
+            do {
+                if let result = try router.withImmediateWriteAccess({if let check {return try check()};return try router.runWorkHealthChecks()}) {
+                    outcome = .completed(enabled:result["enabled"] as? Bool == true,changed:result["changed"] as? Int ?? 0,hasMore:result["has_more"] as? Bool == true)
+                } else {outcome = .deferred}
+            } catch {outcome = .failed(error.localizedDescription)}
+            if recordTiming {CallTimingLog.write(["scope":"work_health_maintenance","start_uptime_s":started,"duration_ms":(ProcessInfo.processInfo.systemUptime-started)*1000])}
+            queue.async { [self] in finishWorkHealth(outcome,check:check) }
+        }
+    }
+    private func finishWorkHealth(_ outcome: WorkHealthOutcome,check: (@Sendable () throws -> [String:Any])?) {
+        requireCommandQueue()
+        workHealthRunning = false
+        let recheck = workHealthRecheck;workHealthRecheck = false
+        func schedule(after delay: TimeInterval) {
+            let work = DispatchWorkItem { [weak self] in self?.runWorkHealth(check:check) }
             workHealthWake = work
-            queue.asyncAfter(deadline: .now() + ((result["has_more"] as? Bool == true) ? 0.1 : 30), execute: work)
-        } catch {
+            queue.asyncAfter(deadline:.now()+delay,execute:work)
+        }
+        switch outcome {
+        case .deferred:
+            // Capture can close admission between scheduling and the worker.
+            // Its existing unlock observer resumes us. Preserve an unlock that
+            // arrived while this worker was still returning its deferred result.
+            if recheck,router.writeAdmissionStatus["locked"] as? Bool != true,workHealthFailures < 2 {schedule(after:0.1)}
+        case .completed(let enabled,let changedCount,let hasMore):
+            workHealthFailures = 0
+            if changedCount > 0 {changed()}
+            guard !workHealthRunning else {return}
+            if enabled {schedule(after:hasMore ? 0.1 : 30)}
+            else if recheck,router.writeAdmissionStatus["locked"] as? Bool != true {schedule(after:0.1)}
+        case .failed(let message):
             workHealthFailures += 1
-            fputs("Work health check deferred; durable requests and claims retained: \(error.localizedDescription)\n", stderr)
+            fputs("Work health check deferred; durable requests and claims retained: \(message)\n",stderr)
             guard workHealthFailures < 2 else { return }
-            let work = DispatchWorkItem { [weak self] in self?.runWorkHealth() }
-            workHealthWake = work; queue.asyncAfter(deadline: .now() + 30, execute: work)
+            schedule(after:30)
         }
     }
 
