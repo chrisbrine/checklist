@@ -5,8 +5,10 @@ import Darwin
 /// One fixed canonical store. Existing bytes are opened read/write without
 /// CREATE only after read-only shape/integrity/version checks have passed.
 enum StorageBootstrap {
+    /// Internal owned-copy qualification only; production installs no callback.
+    nonisolated(unsafe) static var qualificationObserve: ((String,TimeInterval) -> Void)?
     enum Boundary { case upgradeBeforeCommit, upgradeCommitted }
-    struct Opened { let queue: DatabaseQueue; let incarnation: String }
+    struct Opened { let queue: DatabaseQueue; let incarnation: String; var completedProtectedBackupOperation: String? = nil }
     static func writableURI(_ database: URL) throws -> String {
         guard var value = URLComponents(url:database,resolvingAgainstBaseURL:false) else { throw StoreRecovery.required("database_location_unavailable") }
         value.queryItems = [URLQueryItem(name:"mode",value:"rw")]
@@ -61,6 +63,7 @@ enum StorageBootstrap {
             do { queue = try DatabaseQueue(path:writableURI(database),configuration:configuration) }
             catch { throw StoreRecovery.required("writable_database_unavailable") }
             do {
+                var protectedOperation: String?
                 let version = try queue.read { try Int.fetchOne($0,sql:"PRAGMA user_version") ?? -1 }
                 if version < 1 && fresh {
                     try queue.write { try SchemaMigrations.adoptBaseline($0,identity:identity.withSchema(1),fresh:fresh) }
@@ -80,6 +83,8 @@ enum StorageBootstrap {
                         try serviceLease.requireRoot(root)
                         protected = try prepareUpgrade(queue:queue,root:root,identity:identity,permit:permit)
                     }
+                    protectedOperation = protected["operation_id"] as? String
+                    if fresh { protectedOperation = nil }
                     let prepared = identity.withSchema(SchemaMigrations.currentSchema).withState("preparing")
                     let plan = version < 3 ? try queue.read { try ManagedPathRelocation.plan($0, root: root, budget: .production()) } : ManagedPathRelocation.Plan(decisions:[:])
                     if !fresh {StorageUpgradeProgress.update(root:root,stage:"final_migration",seconds:90)}
@@ -91,13 +96,21 @@ enum StorageBootstrap {
                         if version < 1 && !fresh { try SchemaMigrations.adoptBaseline(db,identity:identity.withSchema(1),fresh:false) }
                         if version < 2 { try SchemaMigrations.upgradeProtocol(db,identity:prepared,protectedSnapshot:protected) }
                         if version < 3 { try SchemaMigrations.upgradeManagedPaths(db,identity:prepared,root:root,plan:plan,protectedSnapshot:protected) }
-                        try SchemaMigrations.upgradeTriageMembership(db,identity:prepared,protectedSnapshot:protected)
+                        if version < 4 { try SchemaMigrations.upgradeTriageMembership(db,identity:prepared,protectedSnapshot:protected) }
+                        try SchemaMigrations.upgradeBackupReceipts(db,identity:prepared,root:root,protectedSnapshot:protected)
+                        if let protectedOperation { try CommandRouter.enqueueAutomaticBackupRetention(db,root:root,incarnation:identity.incarnation,operation:protectedOperation) }
                         observe(.upgradeBeforeCommit)
                     }
                     observe(.upgradeCommitted)
                 }
+                try StorageBackupReceiptMigration.finishCompaction(queue)
+                // Derived membership data is warmed before any maintenance turn.
+                // Missing historical backup bytes refuse accounting/cleanup, not
+                // access to the restored store's unrelated tickets.
+                do {try queue.read {try StorageBackupManifestIndex.warm($0,root:root)}}
+                catch {fputs("Backup membership indexes unavailable; cleanup will retain bytes.\n",stderr)}
                 let ready = identity.withSchema(SchemaMigrations.currentSchema).withState("ready")
-                // A crash after SQL COMMIT repairs only the external publication.
+                // A crash after SQL COMMIT finishes pending compaction/publication.
                 // Never restore an older snapshot over later committed work.
                 if external != ready {
                     try directory.publishReceipt(ready.encoded(),name:StoreIdentityReceipt.fileName,replacingPreparedReceipt:true)
@@ -105,7 +118,7 @@ enum StorageBootstrap {
                 // Group labels are an independent additive backfill. Protocol 3
                 // still fences earlier binaries from the managed-path representation.
                 try queue.write { try GroupKeys.backfill($0) }
-                return Opened(queue:queue,incarnation:identity.incarnation)
+                return Opened(queue:queue,incarnation:identity.incarnation,completedProtectedBackupOperation:protectedOperation)
             } catch let error as CoreError { try? queue.close();throw error }
             catch { try? queue.close();throw StoreRecovery.required("compatible_bootstrap_transaction_failed") }
         }
@@ -129,8 +142,13 @@ enum StorageBootstrap {
         // The bound covers every durable object copy and both verification passes.
         let operation = UUID(), budget = qualificationBudget ?? StorageSnapshotBudget.production()
         let source = try StorageSnapshotSource(source:root,parent:parent,storeID:identity.logical_store_id,permit:permit)
+        let snapshotStarted = ProcessInfo.processInfo.systemUptime
         let receipt = try StorageSnapshot.build(source,operation:operation,budget:budget)
+        qualificationObserve?("protected_snapshot",ProcessInfo.processInfo.systemUptime-snapshotStarted)
+        qualificationObserve?("writer_lease",budget.measurement.writerLeaseSeconds)
         StorageUpgradeProgress.update(root:root,stage:"migration_rehearsal",seconds:360)
+        let rehearsalStarted = ProcessInfo.processInfo.systemUptime
+        defer {qualificationObserve?("migration_rehearsal",ProcessInfo.processInfo.systemUptime-rehearsalStarted)}
         return try StorageUpgradePreparation.rehearse(root:root,identity:identity,operation:operation,manifestSHA256:receipt.manifestSHA256,budget:budget)
     }
     private static func readOnlyPreflight(_ database: URL) throws -> SchemaMigrations.State {

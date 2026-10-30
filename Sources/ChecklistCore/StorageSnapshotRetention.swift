@@ -22,11 +22,20 @@ final class StorageSnapshotRetention {
 
     private static func open(_ files: StorageObjectFiles) throws -> Int32 {
         let fd = openat(files.descriptor,".snapshot-retention.lock",O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC,0o600)
-        guard fd >= 0 else {throw CoreError("BACKUP_HOLD_UNAVAILABLE","The backup retention barrier cannot be opened; managed files were retained.")}
+        guard fd >= 0 else {
+            let code = errno
+            throw CoreError("BACKUP_HOLD_UNAVAILABLE","The backup retention barrier cannot be opened; managed files were retained.",details:["operation":"open_snapshot_retention","posix_errno":code])
+        }
         var info = stat()
-        guard fstat(fd,&info) == 0,info.st_mode & S_IFMT == S_IFREG,info.st_nlink == 1 else {
+        guard fstat(fd,&info) == 0 else {
+            let code = errno
+            let failure = CoreError("BACKUP_HOLD_UNAVAILABLE","The backup retention barrier is not a private regular file; managed files were retained.",details:["operation":"inspect_snapshot_retention","posix_errno":code])
             Darwin.close(fd)
-            throw CoreError("BACKUP_HOLD_UNAVAILABLE","The backup retention barrier is not a private regular file; managed files were retained.")
+            throw failure
+        }
+        guard info.st_mode & S_IFMT == S_IFREG,info.st_nlink == 1 else {
+            Darwin.close(fd)
+            throw CoreError("BACKUP_HOLD_UNAVAILABLE","The backup retention barrier is not a private regular file; managed files were retained.",details:["operation":"validate_snapshot_retention","reason":"unsafe_retention_lock"])
         }
         return fd
     }
@@ -44,7 +53,8 @@ final class StorageSnapshotRetention {
             let hold = try StorageSnapshotRetention(root:root)
             while flock(hold.descriptor,LOCK_EX | LOCK_NB) != 0 {
                 if errno == EINTR {continue}
-                guard errno == EWOULDBLOCK else {throw CoreError("BACKUP_HOLD_UNAVAILABLE","The backup retention barrier could not be acquired.")}
+                let code = errno
+                guard code == EWOULDBLOCK else {throw CoreError("BACKUP_HOLD_UNAVAILABLE","The backup retention barrier could not be acquired.",details:["operation":"acquire_snapshot_retention","posix_errno":code])}
                 throw CoreError("BACKUP_IN_PROGRESS","Another backup is still copying or verifying this store. Retry backup_create with a new command ID after it finishes.",details:["command_outcome":"rejected","next_step":"Retry backup_create with a new command ID after the other backup finishes."])
             }
             hold.active = true
@@ -58,7 +68,8 @@ final class StorageSnapshotRetention {
         defer {Darwin.close(fd)}
         while flock(fd,LOCK_EX | LOCK_NB) != 0 {
             if errno == EINTR {continue}
-            guard errno == EWOULDBLOCK else {throw CoreError("BACKUP_HOLD_UNAVAILABLE","Backup retention could not be checked; managed files were retained.")}
+            let code = errno
+            guard code == EWOULDBLOCK else {throw CoreError("BACKUP_HOLD_UNAVAILABLE","Backup retention could not be checked; managed files were retained.",details:["operation":"observe_snapshot_retention","posix_errno":code])}
             return true
         }
         return false // close releases this observation lock; caller retains the object gate.

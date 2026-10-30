@@ -31,6 +31,8 @@ public final class CommandRouter: @unchecked Sendable {
     let serviceLease: StorageServiceLease?
     let storageAdmission = StorageAdmission()
     let backupWrites = BackupWriteQueue()
+    let automaticBackupRetentionLock = NSLock()
+    var automaticBackupRetentionTrashRoot: URL? // Owned fixture directory only; nil uses the production Trash.
     let commandOperations = CommandOperations()
     // Per-command/transaction state, accessed only on the sole writer connection.
     var taskReferenceFrame: TaskReferenceFrame?
@@ -79,12 +81,13 @@ public final class CommandRouter: @unchecked Sendable {
     var inlineSourceCaptures: [PendingSourceCapture] = []
     var consumedSourceCaptures: Set<String> = []
     var exportPublications: [ExportPublication] = []
-    public init(root: URL, serviceLease: StorageServiceLease? = nil, cliCommand: String = "/Applications/Checklist.app/Contents/MacOS/checklist", providerPlugins: ProviderPluginRegistry = .bundled) throws {
+    public init(root: URL, serviceLease: StorageServiceLease? = nil, cliCommand: String = "/Applications/Checklist.app/Contents/MacOS/checklist", providerPlugins: ProviderPluginRegistry = .bundled, automaticBackupRetentionTrashRoot: URL? = nil) throws {
         let root = StoreDirectory.anchoredRoot(root)
         self.root = root
         self.serviceLease = serviceLease
         self.cliCommand = cliCommand
         self.providerPlugins = providerPlugins
+        self.automaticBackupRetentionTrashRoot = automaticBackupRetentionTrashRoot
         let opened: StorageBootstrap.Opened
         do { opened = try StorageBootstrap.open(root:root,serviceLease:serviceLease,prepareDatabase:{ Self.installTicketSearchFunctions($0) }) }
         catch { StoreRecovery.recordFailure(root:root,error:error);throw error }
@@ -135,6 +138,9 @@ public final class CommandRouter: @unchecked Sendable {
         try dbQueue.writeWithoutTransaction { try epicReferenceIndex.install($0) }
         try backupWrites.restore(root:root,incarnation:incarnation,admission:storageAdmission)
         backupWrites.resume(router:self)
+        // The bootstrap gate and any protected capture are released before
+        // retention reconciles an original intent or a just-completed backup.
+        applyAutomaticBackupRetention(after:opened.completedProtectedBackupOperation)
     }
     static let canonicalRecordColumns = "id,project_id,type,revision,data,CAST(id AS BLOB) AS _envelope_id_bytes,CAST(project_id AS BLOB) AS _envelope_project_id_bytes,CAST(type AS BLOB) AS _envelope_type_bytes,CAST(data AS BLOB) AS _envelope_data_bytes"
     // CASE guards every JSON operation. A foreign malformed payload is never
@@ -405,6 +411,7 @@ public final class CommandRouter: @unchecked Sendable {
         let operationLease = try storageAdmission.acquire()
         defer { operationLease.finish() }
         if Self.storageRestoreMethods.contains(method) {return try executeStorageRestore(method:method,params:params,caller:caller)}
+        if Self.storageBackupPruningMethods.contains(method) {return try executeStorageBackupPruning(method:method,params:params,caller:caller)}
         if Self.projectImportMethods.contains(method) {
             let writerRead = Self.readMethods.contains(method) && readers == nil
             if writerRead {

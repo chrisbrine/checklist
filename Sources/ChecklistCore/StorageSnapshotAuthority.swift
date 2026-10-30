@@ -63,7 +63,7 @@ enum StorageSnapshotAuthority {
     static func inventory(_ db: Database, root: URL, budget: StorageSnapshotBudget, objectRoot: URL? = nil, retainedExists: (String) throws -> Bool) throws -> StorageSnapshotInventory {
         var objects: [String: StorageSnapshotObject] = [:]
         var unavailable: [StorageSnapshotAbsence] = [], external: [String] = []
-        let relocation = try ManagedPathRelocation.plan(db, root: root, budget: budget, objectRoot: objectRoot)
+        let relocation = try ManagedPathRelocation.snapshotPlan(db, root: root, budget: budget, objectRoot: objectRoot)
         var recordCount = 0
         let databaseBytes = budget.measurement.metadataBytes
         var declaredObjectBytes: Int64 = 0
@@ -77,10 +77,13 @@ enum StorageSnapshotAuthority {
         }
         // Done cleanup keeps canonical evidence. Its durable exact outcomes explain
         // unavailable bytes without modifying immutable manifests or capture lists.
-        let cleanedRows = try Row.fetchAll(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND json_extract(data,'$.cause')='done_evidence'")
-        var cleaned: [String:[JSON]] = [:]
-        for row in cleanedRows {
-            let receipt = try GRDBRecordEnvelopeAdapter.decode(row).object
+        let cleanedRows = try Row.fetchCursor(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND json_extract(data,'$.cause')='done_evidence'")
+        var cleaned: [String:[JSON]] = [:],cleanedEnvelopes: [String:DecodedEnvelope] = [:]
+        while let row = try cleanedRows.next() {
+            try budget.check()
+            let envelope = try GRDBRecordEnvelopeAdapter.decode(row),receipt = envelope.object
+            guard cleanedEnvelopes.count < budget.maximumRecords else { throw StorageSnapshotFailure.limit }
+            cleanedEnvelopes[envelope.id] = envelope
             for object in receipt["objects"] as? [JSON] ?? [] where ["removed","already_missing"].contains(object["state"] as? String ?? "") {
                 if let path = object["relative_path"] as? String {cleaned[path,default:[]].append(object)}
             }
@@ -168,9 +171,17 @@ enum StorageSnapshotAuthority {
         while let row = try rows.next() {
             try budget.check(); recordCount += 1
             guard recordCount <= budget.maximumRecords else { throw StorageSnapshotFailure.limit }
-            let envelope = try GRDBRecordEnvelopeAdapter.decode(row)
+            let envelope: DecodedEnvelope
+            if let bytes: Data = row["_envelope_id_bytes"],let id = String(data:bytes,encoding:.utf8),let previous = cleanedEnvelopes[id],previous.original == (try GRDBRecordEnvelopeAdapter.input(row)) {
+                envelope = previous
+            } else { envelope = try GRDBRecordEnvelopeAdapter.decode(row) }
             let id = envelope.id, type = envelope.type, value = envelope.object
             guard knownTypes.contains(type) else { throw StorageSnapshotFailure.unsupportedAuthority }
+            // Keep the relocation plan's original field validation in this
+            // single decode pass, even when no new relocation can be established.
+            for field in try ManagedPathRelocation.fields(value,type:type) {
+                _ = try relocation.decision(field.stored,family:field.family,root:root)
+            }
             let authority = type + ":" + id
             switch type {
             case "attachment":
@@ -287,6 +298,15 @@ enum StorageSnapshotAuthority {
                 } else { unavailable.append(.init(authority: authority, reason: "output_not_recorded")) }
             default: break
             }
+        }
+        // Schema5 summaryless legacy receipts keep their exact historical list
+        // as a managed immutable catalog. It is history, never backup-copy authority.
+        let catalogs = try Row.fetchCursor(db,sql:"SELECT key,value AS catalog FROM metadata WHERE key GLOB 'backup-historical-catalog:*'")
+        while let row = try catalogs.next() {
+            let catalog = jsonObject(row["catalog"] as String)
+            guard let path = catalog["path"] as? String,path.hasPrefix("objects/backup-catalogs/"),let sha = catalog["sha256"] as? String,
+                  let size = catalog["size"] as? NSNumber,size.int64Value >= 0 else {throw StorageSnapshotFailure.unsupportedAuthority}
+            try regular(path:path,family:"objects",sha:try digest(sha),size:size.int64Value,authority:"metadata:" + (row["key"] as String) + ":historical_catalog")
         }
         let ordered = objects.values.sorted { $0.relativePath < $1.relativePath }
         try validateCapturedLinks(ordered)

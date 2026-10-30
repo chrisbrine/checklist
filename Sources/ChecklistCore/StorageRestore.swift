@@ -21,7 +21,9 @@ extension CommandRouter {
         }
         let source = URL(fileURLWithPath:try text(params,"path"),isDirectory:true).standardizedFileURL
         do {
-            let files = try StorageObjectFiles(root:source)
+            let useLease = try StorageBackupUseLease(root:source)
+            let files = useLease.files
+            defer {withExtendedLifetime(useLease) {}}
             let (manifest,manifestDigest) = try autoreleasepool {
                 let bytes = try files.read("manifest.json",maximum:budget.maximumManifestBytes)
                 return (try JSONDecoder().decode(StorageSnapshotManifest.self,from:bytes),hash(bytes))
@@ -107,17 +109,9 @@ extension CommandRouter {
             let stage = try parent.makeDirectory(stageName, batchSynchronization: true)
             var databaseBudget = budget;databaseBudget.maximumObjectBytes = budget.maximumBytes
             _ = try source.copy("database.sqlite",to:stage,expected:manifest.databaseSHA256,budget:databaseBudget,targetPath:"checklist.sqlite")
-            for object in manifest.objects {
-                try budget.check()
-                let descriptor = object.descriptor
-                if descriptor.kind == "file" {
-                    let copied = try source.copy("managed/" + descriptor.relativePath,to:stage,expected:object.sha256,budget:budget,targetPath:descriptor.relativePath,executable:descriptor.executable)
-                    guard copied.1 == object.size else {throw StorageSnapshotFailure.sourceChanged}
-                } else {
-                    guard try source.linkTarget("managed/" + descriptor.relativePath) == descriptor.linkTarget,let target = descriptor.linkTarget else {throw StorageSnapshotFailure.sourceChanged}
-                    try stage.writeLink(descriptor.relativePath,target:target)
-                }
-            }
+            try budget.notify("restore_objects_started")
+            try StorageSnapshotWork.restoreObjects(manifest.objects,source:source,destination:stage,budget:budget,logicalBytesBeforeCopy:manifest.databaseSize)
+            try budget.notify("restore_objects_finished")
             try stage.synchronizeCopiedDirectories(budget:budget)
             receipt = try fenceRestoredAuthority(stage:stage,params:params,caller:caller,manifest:manifest,manifestSHA:manifestSHA,intent:intent,budget:budget)
             try stage.writeNew(receiptName,bytes:Data((try jsonString(receipt)).utf8))
@@ -218,14 +212,8 @@ extension CommandRouter {
         let identity = try StoreIdentityReceipt.decode(files.read(StoreIdentityReceipt.fileName,maximum:16_384))
         guard identity.incarnation == receipt["incarnation"] as? String,identity.logical_store_id == manifest.storeID else {throw StorageSnapshotFailure.incomplete}
         var expected: Set<String> = ["checklist.sqlite",StoreIdentityReceipt.fileName,"restore-receipt.json"]
-        for object in manifest.objects {
-            let path = object.descriptor.relativePath;expected.insert(path)
-            if object.descriptor.kind == "file" {
-                guard try files.digest(path,budget:budget) == (object.sha256,object.size) else {throw StorageSnapshotFailure.sourceChanged}
-            } else {
-                guard try files.linkTarget(path) == object.descriptor.linkTarget else {throw StorageSnapshotFailure.sourceChanged}
-            }
-        }
+        for object in manifest.objects { expected.insert(object.descriptor.relativePath) }
+        _ = try StorageSnapshotWork.verifyObjects(manifest.objects,files:files,prefix:"",budget:budget)
         guard try files.listedFiles(budget:budget) == expected else {throw StorageSnapshotFailure.incomplete}
     }
 

@@ -143,6 +143,16 @@ enum ManagedPathRelocation {
         guard !indices.isEmpty else { throw StorageSnapshotFailure.unsupportedAuthority }
         return Set(indices.map { Data(("/" + parts.prefix($0).joined(separator: "/")).utf8) })
     }
+    /// Current schemas never establish a new relocation. Snapshot inventory
+    /// validates each record's fields during its existing envelope pass; scanning
+    /// and decoding the entire database here would produce the same bindings.
+    static func snapshotPlan(_ db: Database,root: URL,budget: StorageSnapshotBudget,objectRoot: URL? = nil) throws -> Plan {
+        if (try Int.fetchOne(db,sql:"PRAGMA user_version") ?? 0) >= 3 {
+            return Plan(decisions:try captureBindings(db,root:root).mapValues { Decision(relative:$0,reason:nil) })
+        }
+        return try plan(db,root:root,budget:budget,objectRoot:objectRoot)
+    }
+
     static func plan(_ db: Database, root: URL, budget: StorageSnapshotBudget, objectRoot: URL? = nil) throws -> Plan {
         var localFiles: StorageObjectFiles?
         let bindings = try captureBindings(db, root: root)

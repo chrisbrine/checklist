@@ -1,4 +1,6 @@
 import Foundation
+import ChecklistFileAccess
+import Darwin
 
 /// Canonical input adapter. Preserve SQL storage kinds before decoding;
 /// converting a REAL revision to Int64 at the caller would hide corruption.
@@ -21,7 +23,13 @@ enum EnvelopeSQLValue: Equatable {
 /// Unicode encodings. Keep original UTF-8; never normalize opaque keys.
 enum EnvelopeStorageIdentity {
     static func equal(_ left: String, _ right: String) -> Bool {
-        left.utf8.elementsEqual(right.utf8)
+        let direct: Bool?? = left.utf8.withContiguousStorageIfAvailable { a in
+            right.utf8.withContiguousStorageIfAvailable { b in
+                a.count == b.count && (a.isEmpty || memcmp(a.baseAddress!,b.baseAddress!,a.count) == 0)
+            }
+        }
+        if let available = direct,let equal = available { return equal }
+        return left.utf8.elementsEqual(right.utf8)
     }
     static func equal(_ left: String?, _ right: String?) -> Bool {
         switch (left, right) {
@@ -261,21 +269,9 @@ private enum EnvelopeJSONFields {
             throw EnvelopeFailure(.jsonObject)
         }
         func valueEnd() throws {
-            guard index < bytes.count else { throw EnvelopeFailure(.jsonObject) }
-            if bytes[index] == 34 { try stringEnd(); return }
-            if bytes[index] == 123 || bytes[index] == 91 {
-                var depth = 0
-                repeat {
-                    guard index < bytes.count else { throw EnvelopeFailure(.jsonObject) }
-                    let byte = bytes[index]
-                    if byte == 34 { try stringEnd(); continue }
-                    if byte == 123 || byte == 91 { depth += 1 }
-                    if byte == 125 || byte == 93 { depth -= 1 }
-                    index += 1
-                } while depth > 0
-            } else {
-                while index < bytes.count, ![9, 10, 13, 32, 44, 125].contains(bytes[index]) { index += 1 }
-            }
+            var end = index
+            guard checklist_json_value_end(bytes, bytes.count, index, &end) != 0 else { throw EnvelopeFailure(.jsonObject) }
+            index = end
         }
         whitespace(); guard index < bytes.count, bytes[index] == 123 else { throw EnvelopeFailure(.jsonObject) }; index += 1
         while true {

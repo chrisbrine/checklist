@@ -177,7 +177,7 @@ extension CommandRouter {
         return try readForPreparation {try self.operationRecord($0,id:id) != nil}
     }
     static let alwaysOperationMethods: Set<String> = [
-        "backup_create","restore_create","restore_preview","attachment_cleanup_preview",
+        "backup_create","restore_create","restore_preview","backup_prune_preview","backup_prune","attachment_cleanup_preview",
         "import_preview","import_commit","import_rollback","export_project",
         "media_intake_preview","media_intake_capture","media_intake_confirm","media_round_publish","media_context_reconcile","project_icon_import",
         "task_purge_preview","task_purge","epic_delete",
@@ -348,7 +348,7 @@ extension CommandRouter {
         if Self.readMethods.contains(method),params["command_id"] == nil {params["command_id"] = uuid()}
         let command = try text(params,"command_id",max:100)
         guard UUID(uuidString:command) != nil else {throw CoreError("INVALID_INPUT","command_id must be a UUID.")}
-        if Self.storageRestoreMethods.contains(method) {try owner(caller)}
+        if Self.storageRestoreMethods.contains(method) || Self.storageBackupPruningMethods.contains(method) {try owner(caller)}
         let generation = try backupWriteAuthorization(params:params,caller:caller)
         let id = Self.commandOperationID(principal:caller.principal,command:command)
         let digest = hash(Data((method + (try jsonString(params))).utf8))

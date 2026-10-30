@@ -30,6 +30,8 @@ final class StorageBackupAccountingCache: @unchecked Sendable {
     private(set) var parsedReceiptCount = 0
     /// Test seam: runs on the build queue before each receipt read.
     var beforeReceiptRead: (@Sendable () -> Void)?
+    /// Owned-copy diagnostics only: one observation per actual preparation/continuation.
+    var cleanupLookupObserver: ((TimeInterval,Int) -> Void)?
     /// CL-355: one parsed receipt. Key ids are sorted and keep duplicate entries;
     /// `copy` is the independent backup directory and manifest (cleanup rule).
     struct Receipt { let ids: [Int32]; let entries: Int; let copy: (path: String, manifest: String)? }
@@ -56,7 +58,18 @@ final class StorageBackupAccountingCache: @unchecked Sendable {
     /// `manifest_database_managed_files` and one 64-hex manifest digest in both places.
     static func parseReceipt(_ raw: String, root: URL) throws -> (keys: [Data], entries: Int, copy: (path: String, manifest: String)?) {
         guard let value = try JSONSerialization.jsonObject(with: Data(raw.utf8)) as? JSON,
-              value["state"] as? String == "complete", let entries = value["objects"] as? [JSON] else { throw StoreRecovery.required("backup_receipt_index_invalid") }
+              value["state"] as? String == "complete" else { throw StoreRecovery.required("backup_receipt_index_invalid") }
+        let entries: [JSON]
+        if value["format"] as? Int == 2,value["historical_catalog"] != nil {
+            let historical = value["historical_catalog"] as? JSON ?? [:]
+            let keyRoot = (historical["key_root"] as? String).map {URL(fileURLWithPath:$0,isDirectory:true)} ?? root
+            let parsed = try parseReceipt(StorageBackupManifestIndex.historicalRaw(value,root:root),root:keyRoot)
+            return (parsed.keys,parsed.entries,nil)
+        } else if value["format"] as? Int == 2 {
+            entries = try StorageBackupManifestIndex.manifest(value,root:root).objects.map {["path":$0.descriptor.relativePath,"sha256":$0.sha256,"size":$0.size]}
+        } else {
+            guard let objects = value["objects"] as? [JSON] else {throw StoreRecovery.required("backup_receipt_index_invalid")};entries = objects
+        }
         var keys: [Data] = []; keys.reserveCapacity(entries.count)
         for entry in entries {
             guard let path = entry["path"] as? String, let sha = entry["sha256"] as? String, let size = entry["size"] as? NSNumber, size.int64Value >= 0 else { throw StoreRecovery.required("backup_receipt_index_invalid") }
@@ -69,7 +82,12 @@ final class StorageBackupAccountingCache: @unchecked Sendable {
         var copy: (path: String, manifest: String)?
         if let path = summary?["path"] as? String, path.hasPrefix("/"), summary?["verification"] as? String == "manifest_database_managed_files",
            let manifest = value["manifest_sha256"] as? String, manifest.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
-           manifest == summary?["manifest_sha256"] as? String { copy = (path, manifest) }
+           manifest == summary?["manifest_sha256"] as? String {
+            let selected: String
+            if value["format"] as? Int == 2 {selected = try StorageBackupReceiptLocation.location(value,root:root).path}
+            else {selected = path}
+            copy = (selected, manifest)
+        }
         return (keys, entries.count, copy)
     }
 
@@ -78,6 +96,7 @@ final class StorageBackupAccountingCache: @unchecked Sendable {
     /// entry (no Foundation parse of the whole receipt). Nil when the row is gone;
     /// throws backup_receipt_index_invalid for any receipt receiptKeys would refuse.
     static func extractReceipt(_ db: Database, row: ReceiptRow, root: URL) throws -> Parsed? {
+        if let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE rowid=? AND key=? AND json_extract(value,'$.format')=2",arguments:[row.rowid,row.key]) {return try parseReceipt(raw,root:root)}
         guard let header = try Row.fetchOne(db, sql: "SELECT CASE WHEN json_valid(value) THEN COALESCE(json_extract(value,'$.state')='complete' AND json_type(value,'$.objects')='array',0) ELSE 0 END AS valid,json_extract(value,'$.summary.path') AS path,json_extract(value,'$.summary.verification') AS verification,json_extract(value,'$.manifest_sha256') AS manifest,json_extract(value,'$.summary.manifest_sha256') AS summary_manifest FROM metadata WHERE rowid=? AND key=?", arguments: [row.rowid, row.key]) else { return nil }
         guard header["valid"] as Bool? == true else { throw StoreRecovery.required("backup_receipt_index_invalid") }
         func text(_ column: String) -> String? { String.fromDatabaseValue(header[column] as DatabaseValue) }
@@ -142,8 +161,19 @@ final class StorageBackupAccountingCache: @unchecked Sendable {
     /// objects are evaluated in key-sized chunks by CleanupLookup; neither a
     /// wanted set nor the key x backup-copy product is materialized.
     func cleanupIndex(_ db: Database, root: URL, incarnation: String, limit: Int) throws -> StorageBackupRetentionIndex {
-        let target = try Self.fingerprint(db, incarnation: incarnation)
-        guard target.rows.count <= 1024, target.rows.reduce(Int64(0), { $0 + $1.bytes }) <= 2 * 1024 * 1024 * 1024 else { throw CoreError("CLEANUP_INVENTORY_LIMIT", "Backup generation observation exceeds its bound; bytes retained.") }
+        let started = ProcessInfo.processInfo.systemUptime,parsedBefore = parsedReceiptCount
+        defer {cleanupLookupObserver?(ProcessInfo.processInfo.systemUptime-started,parsedReceiptCount-parsedBefore)}
+        let all = try Self.fingerprint(db, incarnation: incarnation)
+        let compactDescriptors = try StorageBackupManifestIndex.preflight(db)
+        var compact: [StorageBackupManifestIndex.Lookup.Generation] = [],legacy: [ReceiptRow] = []
+        for row in all.rows {
+            if let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE rowid=? AND key=? AND json_extract(value,'$.format')=2",arguments:[row.rowid,row.key]) {
+                compact.append(try StorageBackupManifestIndex.generation(jsonObject(raw),root:root))
+            } else {legacy.append(row)}
+        }
+        StorageBackupManifestIndex.retainCached(root:root,manifests:Set(compact.map {$0.cacheBinding ?? $0.manifest}))
+        let target = Fingerprint(incarnation:incarnation,rows:legacy)
+        guard all.rows.count <= 1024, target.rows.reduce(Int64(0), { $0 + $1.bytes }) <= 2 * 1024 * 1024 * 1024 else { throw CoreError("CLEANUP_INVENTORY_LIMIT", "Backup generation observation exceeds its bound; bytes retained.") }
         let ordered = target.rows.sorted { $0.key.utf8.lexicographicallyPrecedes($1.key.utf8) }
         for _ in 0..<3 {
             try sync(target, root: root, hook: nil) { row in try Self.extractReceipt(db, row: row, root: root) }
@@ -155,10 +185,13 @@ final class StorageBackupAccountingCache: @unchecked Sendable {
             let snapshotIDs = ids
             state.unlock()
             guard selected.count == ordered.count else { continue }
-            guard selected.reduce(0, { $0 + $1.entries }) <= 10_000_000 else { throw CoreError("CLEANUP_INVENTORY_LIMIT", "Backup generation observation exceeds its bound; bytes retained.") }
+            guard selected.reduce(compactDescriptors, { $0 + $1.entries }) <= 10_000_000 else { throw CoreError("CLEANUP_INVENTORY_LIMIT", "Backup generation observation exceeds its bound; bytes retained.") }
             let lookup = CleanupLookup(ids:snapshotIDs,receipts:selected,root:root)
             guard lookup.retainedBytes <= limit else { throw CoreError("CLEANUP_INVENTORY_LIMIT", "Backup descriptors exceed the cleanup memory bound; bytes retained.") }
-            return .init(originals:[],root:root,copyManifests:lookup.manifests,cleanupLookup:lookup)
+            // Fingerprint rows retain receipt insertion order. Lookup visits
+            // these newest first, avoiding probes of missing older payloads.
+            let combined = StorageBackupManifestIndex.Lookup(generations:compact,legacy:lookup)
+            return .init(originals:[],root:root,copyManifests:combined.manifests,cleanupLookup:combined)
         }
         throw CoreError("CLEANUP_INVENTORY_LIMIT", "Backup generations changed during the cleanup observation; bytes retained.")
     }
@@ -168,7 +201,7 @@ final class StorageBackupAccountingCache: @unchecked Sendable {
     /// and one candidate URL survive each iterator step, even for an arbitrarily
     /// large requested-object list. Alternatives are visited only if verification
     /// needs them, preserving fallback when an older completed copy is missing.
-    final class CleanupLookup {
+    final class CleanupLookup: StorageBackupMembershipLookup {
         private let ids: [Data:Int32]
         private let receipts: [Receipt]
         private let independent: [Receipt]
@@ -227,6 +260,8 @@ final class StorageBackupAccountingCache: @unchecked Sendable {
     /// Nil means cold, rebuilding or an unreadable receipt ("unavailable").
     func index(_ db: Database, root: URL, incarnation: String, read: @escaping Reader) throws -> StorageBackupRetentionIndex? {
         let target = try Self.fingerprint(db, incarnation: incarnation)
+        let compact = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM metadata WHERE key GLOB 'backup-generation:*' AND json_extract(value,'$.format')=2") ?? 0
+        if compact > 0 && compact == target.rows.count {return try cleanupIndex(db,root:root,incarnation:incarnation,limit:64 * 1024 * 1024)}
         lock.lock()
         if let published, published.fingerprint == target { lock.unlock(); return published.originals.map { StorageBackupRetentionIndex(originals: $0, root: root) } }
         let start = !building

@@ -68,7 +68,7 @@ public enum StorageUpgradePreparation {
             let identities = try fileIdentities(root:root,generation:generation,manifest:manifest,budget:budget,verifySource:true)
             let receipt = Receipt(format:2,sourceRoot:root.path,identity:identity,operation:operation,
                 manifestSHA256:snapshot.manifestSHA256,sourceFingerprint:protected["source_fingerprint"] as! String,
-                targetChecksum:SchemaMigrations.triageMembershipChecksum,executableSHA256:try executableSHA256(),fileIdentities:identities)
+                targetChecksum:SchemaMigrations.backupReceiptChecksum,executableSHA256:try executableSHA256(),fileIdentities:identities)
             try publish(try StorageSnapshot.encoded(receipt),name:receiptName,root:root)
             let unchanged = try source.read { try SchemaMigrations.contentFingerprint($0) == receipt.sourceFingerprint }
             return ["needs_upgrade":true,"prepared":true,"expected_offline_seconds":unchanged ? 90 : 900,
@@ -83,16 +83,20 @@ public enum StorageUpgradePreparation {
         let receipt = try JSONDecoder().decode(Receipt.self,from:files.read(receiptName,maximum:16_384))
         guard receipt.format == 2,receipt.sourceRoot.utf8.elementsEqual(root.path.utf8),
               receipt.identity.withState("ready") == identity.withSchema(receipt.identity.schema_revision).withState("ready"),
-              receipt.targetChecksum == SchemaMigrations.triageMembershipChecksum,
+              receipt.targetChecksum == SchemaMigrations.backupReceiptChecksum,
               receipt.executableSHA256 == (try executableSHA256()) else {throw StorageSnapshotFailure.incomplete}
         guard try queue.read({try SchemaMigrations.contentFingerprint($0)}) == receipt.sourceFingerprint else {return nil}
-        let generationFiles = try StorageObjectFiles(root:receipt.generation)
+        let useLease = try StorageBackupUseLease(root:receipt.generation)
+        defer {withExtendedLifetime(useLease) {}}
+        let generationFiles = useLease.files
         let bytes = try generationFiles.read("manifest.json",maximum:StorageSnapshotBudget.manifestByteLimit)
+        try useLease.requireCurrent()
         guard StorageObjectFiles.sha(bytes) == receipt.manifestSHA256 else {throw StorageSnapshotFailure.sourceChanged}
         let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self,from:bytes)
         guard manifest.storeID == receipt.identity.logical_store_id,manifest.schema == receipt.identity.schema_revision,
               manifest.sourceRoot.utf8.elementsEqual(root.path.utf8),manifest.operationID == receipt.operation.uuidString.lowercased() else {throw StorageSnapshotFailure.incomplete}
         guard try fileIdentities(root:root,generation:receipt.generation,manifest:manifest,budget:.production(),verifySource:false) == receipt.fileIdentities else {throw StorageSnapshotFailure.sourceChanged}
+        try useLease.requireCurrent()
         return receipt.protected
     }
 
@@ -105,7 +109,10 @@ public enum StorageUpgradePreparation {
     }
 
     static func manifest(_ generation: URL) throws -> StorageSnapshotManifest {
-        try JSONDecoder().decode(StorageSnapshotManifest.self,from:StorageObjectFiles(root:generation).read("manifest.json",maximum:StorageSnapshotBudget.manifestByteLimit))
+        let useLease = try StorageBackupUseLease(root:generation)
+        let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self,from:useLease.files.read("manifest.json",maximum:StorageSnapshotBudget.manifestByteLimit))
+        try useLease.requireCurrent()
+        return manifest
     }
 
     /// The snapshot builder already durably verified backup bytes. Remember all
@@ -204,12 +211,15 @@ public enum StorageUpgradePreparation {
 
     static func rehearse(root: URL,identity: StoreIdentityReceipt,operation: UUID,manifestSHA256: String,budget: StorageSnapshotBudget) throws -> JSON {
         let generation = root.appendingPathComponent("backups/" + StorageSnapshot.names(operation).published)
+        let useLease = try StorageBackupUseLease(root:generation)
+        defer {withExtendedLifetime(useLease) {}}
+        guard try useLease.manifestSHA256() == manifestSHA256 else {throw StorageSnapshotFailure.sourceChanged}
         let copyURL = generation.appendingPathComponent("database.sqlite")
         var read = Configuration();read.readonly = true;read.prepareDatabase {try SchemaMigrations.installStorageCollation($0)}
         let copy = try DatabaseQueue(path:copyURL.path,configuration:read)
         let fingerprint = try copy.read {try SchemaMigrations.contentFingerprint($0)};try copy.close()
         let protected: JSON = ["operation_id":operation.uuidString.lowercased(),"path":generation.path,"manifest_sha256":manifestSHA256,
-            "source_fingerprint":fingerprint,"target_migration_checksum":SchemaMigrations.triageMembershipChecksum,"protected":true]
+            "source_fingerprint":fingerprint,"target_migration_checksum":SchemaMigrations.backupReceiptChecksum,"protected":true]
         let files = try StorageObjectFiles(root:root)
         let (fd,_) = try files.parent("staging/.preupgrade",create:true);Darwin.close(fd)
         let rehearsal = root.appendingPathComponent("staging/preupgrade-" + operation.uuidString.lowercased() + ".sqlite")
@@ -226,11 +236,14 @@ public enum StorageUpgradePreparation {
                 if version < 2 {try SchemaMigrations.upgradeProtocol(db,identity:identity.withSchema(2),protectedSnapshot:protected)}
                 if version < 3 {try SchemaMigrations.upgradeManagedPaths(db,identity:identity.withSchema(3),root:root,plan:plan,protectedSnapshot:protected)}
                 if version < 4 {try SchemaMigrations.upgradeTriageMembership(db,identity:identity.withSchema(4),protectedSnapshot:protected)}
+                if version < 5 {try SchemaMigrations.upgradeBackupReceipts(db,identity:identity.withSchema(5),root:root,protectedSnapshot:protected)}
             }
+            try StorageBackupReceiptMigration.finishCompaction(candidate)
             try candidate.read {db in _ = try SchemaMigrations.inspect(db);guard try String.fetchOne(db,sql:"PRAGMA integrity_check") == "ok" else {throw StoreRecovery.required("migration_rehearsal_integrity_failed")}}
             try candidate.close()
         } catch {try? candidate.close();throw error}
         try files.synchronizeOwnedFile("staging/" + rehearsal.lastPathComponent)
+        try useLease.requireCurrent()
         return protected
     }
 

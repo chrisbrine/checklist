@@ -111,11 +111,18 @@ final class TicketCleanupMaintenanceOwnedCopyTests: XCTestCase {
         XCTAssertEqual(manifestSHA,marker["manifest_sha256"] as? String)
         let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self,from:manifestData)
         let log = try Log(output.appendingPathExtension("jsonl"))
+        let databaseBefore = (try FileManager.default.attributesOfItem(atPath:root.appendingPathComponent("checklist.sqlite").path)[.size] as? NSNumber)?.int64Value ?? -1
         log.emit(["event":"startup_begin","phase":phase,"runtime":root.path,"snapshot":snapshot.path,"nofile_soft":descriptorLimit.rlim_cur,"nofile_hard":descriptorLimit.rlim_max])
+        StorageBackupReceiptMigration.observe = {phase,seconds in log.emit(["event":"schema5_upgrade_timing","phase":phase,"seconds":seconds])}
+        defer {StorageBackupReceiptMigration.observe = nil}
         let startup = ProcessInfo.processInfo.systemUptime
         let router = try CommandRouter(root:root,serviceLease:StorageServiceLease(root:root))
         defer {try? router.closeStore()}
-        log.emit(["event":"startup_end","seconds":ProcessInfo.processInfo.systemUptime-startup])
+        let databaseAfter = (try FileManager.default.attributesOfItem(atPath:root.appendingPathComponent("checklist.sqlite").path)[.size] as? NSNumber)?.int64Value ?? -1
+        log.emit(["event":"startup_end","seconds":ProcessInfo.processInfo.systemUptime-startup,"database_before_bytes":databaseBefore,"database_after_bytes":databaseAfter])
+        let cache = StorageBackupAccountingCache.shared(root:root)
+        cache.cleanupLookupObserver = {seconds,parsed in log.emit(["event":"backup_lookup","seconds":seconds,"legacy_receipts_parsed":parsed])}
+        defer {cache.cleanupLookupObserver = nil}
         if !preserveBackupReceipts {
             // Fixture-only metadata redirection. Historical objects/accounting remain
             // unchanged; no old external backup path can be opened by cleanup.
@@ -193,7 +200,8 @@ final class TicketCleanupMaintenanceOwnedCopyTests: XCTestCase {
         var baselineDescriptors: [Int32] = []
         defer {for descriptor in baselineDescriptors {Darwin.close(descriptor)}}
         var descriptorBaseline: JSON = [:]
-        if requireFullByteTurn {
+        if requireFullByteTurn || environment["CHECKLIST_P369_REAL_FD_BASELINE"] == "1" {
+            XCTAssertEqual(descriptorLimit.rlim_cur,256,"Use the actual service descriptor ceiling for this qualification.")
             func countOpenDescriptors() -> Int {
                 (0..<Int(descriptorLimit.rlim_cur)).reduce(0) {$0 + (fcntl(Int32($1),F_GETFD) >= 0 ? 1 : 0)}
             }
@@ -208,14 +216,27 @@ final class TicketCleanupMaintenanceOwnedCopyTests: XCTestCase {
             log.emit(["event":"descriptor_baseline","measurement":descriptorBaseline])
             XCTAssertGreaterThanOrEqual(after,98)
         }
+        let noteTraffic = environment["CHECKLIST_P369_NOTE_TRAFFIC"] == "1"
+        log.emit(["event":"traffic_scope","note_traffic":noteTraffic,"scope":"Owned-copy router only; no native service, transport delivery pump or model runtime is configured."])
         let traffic = DispatchGroup();traffic.enter()
         DispatchQueue.global(qos:.utility).async {
             defer {traffic.leave()}
             let owner = Caller(role:"owner",installation:"p321g-owned-copy",projectIDs:[])
+            var iteration = 0
             while log.active() {
                 let began = ProcessInfo.processInfo.systemUptime
                 do {_ = try router.handle(method:"task_get",params:trafficTask,caller:owner);log.recordRead(seconds:ProcessInfo.processInfo.systemUptime-began)}
                 catch {log.recordRead(seconds:ProcessInfo.processInfo.systemUptime-began,error:String(describing:error))}
+                if noteTraffic && iteration % 3 == 0 {
+                    let noteStart = ProcessInfo.processInfo.systemUptime
+                    var params = trafficTask
+                    params["command_id"] = uuid();params["body"] = "[Synthetic owned-copy traffic] P369 qualification note"
+                    do {
+                        _ = try router.handle(method:"message_send",params:params,caller:owner)
+                        log.emit(["event":"concurrent_note","seconds":ProcessInfo.processInfo.systemUptime-noteStart,"error":NSNull()])
+                    } catch {log.recordRead(seconds:ProcessInfo.processInfo.systemUptime-noteStart,error:"owned-copy note: " + String(describing:error))}
+                }
+                iteration += 1
                 Thread.sleep(forTimeInterval:1)
             }
         }
@@ -268,7 +289,9 @@ final class TicketCleanupMaintenanceOwnedCopyTests: XCTestCase {
             let backupReceiptsAfter = try backupReceiptInventory(router)
             let unchanged = try jsonString(backupReceiptsBefore) == jsonString(backupReceiptsAfter)
             report["backup_receipts_before"] = backupReceiptsBefore;report["backup_receipts_after"] = backupReceiptsAfter;report["all_original_backup_receipt_sha256_unchanged"] = unchanged
-            XCTAssertEqual(backupReceiptsBefore.count,marker["receipt_count"] as? Int);XCTAssertTrue(unchanged,"Every original backup receipt byte and path must remain exact.")
+            // Older prepare_p321g_copy markers predate the optional count field.
+            if let expected = marker["receipt_count"] as? Int {XCTAssertEqual(backupReceiptsBefore.count,expected)}
+            XCTAssertTrue(unchanged,"Every original backup receipt byte and path must remain exact.")
         }
         let candidateObservations = observations.filter {$0["phase"] as? String == "candidates"}
         let decisions = observations.filter {$0["phase"] as? String == "decision"}.compactMap {$0["turn"] as? String}
@@ -282,6 +305,7 @@ final class TicketCleanupMaintenanceOwnedCopyTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(proofs.count,256,"One descriptor-bounded byte turn must make at least 256 independently verified removals.")
             XCTAssertTrue(candidateObservations.allSatisfy {($0["failures"] as? JSON ?? [:]).isEmpty})
         }
+        report["synthetic_owned_copy_note_traffic"] = noteTraffic
         report["responsiveness_scope"] = "Concurrent task_get traffic covers scheduled real maintenance turns and production waits; excludes startup, raw receipt inventory hashes and the separate cold/warm index diagnostic."
         report["backup_index_diagnostic"] = diagnostic
         report["all_original_backup_receipts_preserved"] = preserveBackupReceipts

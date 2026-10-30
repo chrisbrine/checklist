@@ -74,7 +74,7 @@ enum StorageSnapshot {
                 try prepareGeneration(StorageSnapshotSource(source: source, parent: parent, storeID: storeID,
                     publicationName: publicationName, permit: permit), operation: operation, budget: budget)
             }
-            try budget.observe("capture_released")
+            try budget.notify("capture_released")
             return try finish()
         } catch { throw budget.reporting(error) }
     }
@@ -87,7 +87,7 @@ enum StorageSnapshot {
         try budget.check()
         guard budget.pagesPerStep > 0, budget.maximumBytes > 0, budget.maximumObjectBytes > 0,
               budget.maximumObjects > 0, budget.maximumRecords > 0, budget.maximumManifestBytes > 0 else { throw StorageSnapshotFailure.limit }
-        let parent = try StorageObjectFiles(root: fixture.parent,folderAccess:budget.folderAccess), sourceFiles = try StorageObjectFiles(root: fixture.source,folderAccess:budget.folderAccess)
+        let parent = try StorageObjectFiles(root: fixture.parent,folderAccess:budget.folderAccess), sourceFiles = try StorageObjectFiles(root: fixture.source,folderAccess:budget.folderAccess,walkDirectories:true)
         try budget.measureFreeSpace(fixture.parent)
         let names = names(operation, publicationName: fixture.publicationName), stage = try parent.makeDirectory(names.staging, batchSynchronization: true)
         let intent = ["format": "2", "kind": kind, "operation_id": operation.uuidString.lowercased(), "store_id": fixture.storeID, "source_root": fixture.source.path]
@@ -97,54 +97,9 @@ enum StorageSnapshot {
         // Do not clean staging in a defer. Restart must retain uncertain state.
         var writerConfiguration = Configuration()
         writerConfiguration.prepareDatabase { db in try SchemaMigrations.installStorageCollation(db); try db.execute(sql: "PRAGMA foreign_keys=ON; PRAGMA busy_timeout=50") }
-        let writer = try DatabaseQueue(path: StorageBootstrap.writableURI(fixture.source.appendingPathComponent("checklist.sqlite")), configuration: writerConfiguration)
-        defer { try? writer.close() }
-        let capturedAt = try writer.writeWithoutTransaction { lease -> String in
-            try lease.beginTransaction(.immediate)
-            let leaseStarted = budget.uptime()
-            defer {
-                try? lease.rollback()
-                budget.measurement.writerLeaseSeconds = budget.uptime() - leaseStarted
-            }
-            try budget.observe("writer_lease_acquired")
-            let capturedAt = now() // Source writes are fenced by this lease.
-            // The source is a distinct read-only connection; the lease connection
-            // never calls backup while it owns a source write transaction.
-            var readConfiguration = Configuration(); readConfiguration.readonly = true
-            readConfiguration.prepareDatabase { db in try SchemaMigrations.installStorageCollation(db); try db.execute(sql: "PRAGMA busy_timeout=50") }
-            let source = try DatabaseQueue(path: fixture.source.appendingPathComponent("checklist.sqlite").path, configuration: readConfiguration)
-            defer { try? source.close() }
-            // Validate the completed copy below. A live quick_check scans the
-            // entire store and must not extend this consistent-copy lease.
-            let pageSize = try source.read { db -> Int64 in
-                try Int64.fetchOne(db, sql: "PRAGMA page_size") ?? 0
-            }
-            guard pageSize > 0 else { throw StorageSnapshotFailure.incomplete }
-            let destination = try DatabaseQueue(path: stage.root.appendingPathComponent("database.sqlite").path, configuration: writerConfiguration)
-            var sawDone = false
-            var callbackFailure: Error?
-            do {
-                try source.backup(to: destination, pagesPerStep: budget.pagesPerStep) { progress in
-                    if progress.isCompleted { sawDone = true }
-                    do {
-                        try budget.observe(progress.isCompleted ? "backup_done" : "backup_step")
-                        try budget.check()
-                        let bound = Int64(progress.totalPageCount).multipliedReportingOverflow(by: pageSize)
-                        guard !bound.overflow else { throw StorageSnapshotFailure.limit }
-                        _ = try budget.adding(bound.partialValue, to: intentSize)
-                    } catch { callbackFailure = error; throw error }
-                }
-                // GRDB ignores a throw from a completed callback. This separate
-                // final check is required even when sawDone is true.
-                try budget.check()
-                if let callbackFailure { throw callbackFailure }
-                guard sawDone else { throw StorageSnapshotFailure.incomplete }
-            } catch { try? destination.close(); throw error }
-            try destination.close()
-            return capturedAt
-        }
-        try writer.close()
-        try budget.observe("writer_lease_released")
+        let capturedAt = try StorageDatabaseCapture.copy(source: fixture.source,
+            destination: stage.root.appendingPathComponent("database.sqlite"), configuration: writerConfiguration,
+            intentSize: intentSize, budget: budget)
         // The continuation runs after the ordinary gate is released for online
         // capture. Retention protects the whole immutable namespace before its
         // inventory is known, including pending imports and recovery objects.
@@ -167,13 +122,13 @@ enum StorageSnapshot {
             let copy = try DatabaseQueue(path: stage.root.appendingPathComponent("database.sqlite").path, configuration: readConfiguration)
             let inventory: StorageSnapshotInventory, schema: Int, families: [String:Int], tables: [String:Int]
             do {
-                try budget.observe("inventory_started")
+                try budget.notify("inventory_started")
                 (inventory, schema, families, tables) = try copy.read { db in
                     _ = try SchemaMigrations.inspect(db)
                     return (try StorageSnapshotAuthority.inventory(db, root: fixture.source, budget: budget, retainedExists: { try sourceFiles.regularOrLinkExists($0) }), try Int.fetchOne(db, sql: "PRAGMA user_version") ?? -1, try recordFamilyCounts(db), try tableCounts(db))
                 }
                 try copy.close()
-                try budget.observe("inventory_finished")
+                try budget.notify("inventory_finished")
             } catch { try? copy.close(); throw error }
             // Measure the complete closed inventory before expensive durable copies.
             // Lengths are descriptor-relative/no-follow; copy still rehashes and
@@ -203,33 +158,9 @@ enum StorageSnapshot {
             try stage.synchronizeOwnedFile("database.sqlite")
             let database = try stage.digest("database.sqlite", budget: budget)
             var total = try budget.adding(database.1, to: intentSize)
-            var materialized: [StorageSnapshotMaterializedObject] = []
-            var copiedContent: [String:(path: String, size: Int64)] = [:]
-            try budget.observe("copying_objects")
-            for descriptor in inventory.objects where descriptor.kind == "file" {
-                try budget.check()
-                let value: (String, Int64)
-                if let expected = descriptor.expectedSHA256, let prior = copiedContent[expected] {
-                    // Hash every source path: an expected hash alone never proves
-                    // its bytes. Only the owned backup shares inodes, never the store.
-                    value = try sourceFiles.digest(descriptor.relativePath, budget: budget)
-                    guard value == (expected, prior.size) else { throw StorageSnapshotFailure.sourceChanged }
-                    guard value.1 <= budget.maximumObjectBytes else { throw budget.capacityFailure("snapshot_object_bytes") }
-                    _ = try budget.adding(value.1, to: total)
-                    if try !stage.writeHardLink("managed/" + descriptor.relativePath, to: prior.path, link: budget.linkFile) {
-                        let copied = try sourceFiles.copy(descriptor.relativePath, to: stage, expected: expected, budget: budget, logicalBytesBeforeCopy: total)
-                        guard copied == value else { throw StorageSnapshotFailure.sourceChanged }
-                        copiedContent[expected] = ("managed/" + descriptor.relativePath, value.1)
-                    }
-                } else {
-                    value = try sourceFiles.copy(descriptor.relativePath, to: stage, expected: descriptor.expectedSHA256, budget: budget, logicalBytesBeforeCopy: total)
-                    copiedContent[value.0] = ("managed/" + descriptor.relativePath, value.1)
-                }
-                guard descriptor.expectedSize == nil || descriptor.expectedSize == value.1 else { throw StorageSnapshotFailure.sourceChanged }
-                total = try budget.adding(value.1, to: total)
-                materialized.append(.init(descriptor: descriptor, sha256: value.0, size: value.1))
-                try budget.observe("object_copied")
-            }
+            try budget.notify("copying_objects")
+            var materialized = try StorageSnapshotWork.materialize(inventory.objects,source:sourceFiles,destination:stage,budget:budget,logicalBytesBeforeCopy:total)
+            for object in materialized { total = try budget.adding(object.size,to:total) }
             for descriptor in inventory.objects where descriptor.kind == "symlink" {
                 try budget.check()
                 guard let target = descriptor.linkTarget, try sourceFiles.linkTarget(descriptor.relativePath) == target,
@@ -238,6 +169,8 @@ enum StorageSnapshot {
                 try stage.writeLink("managed/" + descriptor.relativePath, target: target)
                 materialized.append(.init(descriptor: descriptor, sha256: expected, size: Int64(target.utf8.count)))
             }
+            try sourceFiles.finishWalk()
+            try budget.notify("objects_finished")
             let manifest = StorageSnapshotManifest(format: 2, kind: kind, operationID: operation.uuidString.lowercased(),
                 storeID: fixture.storeID, sourceRoot: fixture.source.path, schema: schema, databaseSHA256: database.0,
                 databaseSize: database.1, objects: materialized.sorted { $0.descriptor.relativePath < $1.descriptor.relativePath },
@@ -248,17 +181,17 @@ enum StorageSnapshot {
             guard manifestData.count <= budget.maximumManifestBytes else { throw budget.capacityFailure("snapshot_manifest_capacity") }
             total = try budget.adding(Int64(manifestData.count), to: total)
             try stage.synchronizeCopiedDirectories(budget: budget)
-            try budget.observe("directories_synchronized")
+            try budget.notify("directories_synchronized")
             try budget.check()
             try stage.writeNew("manifest.json", bytes: manifestData)
-            try budget.observe("manifest_written")
+            try budget.notify("manifest_written")
             _ = try verify(stage, operation: operation, budget: budget)
             try budget.check()
             // After rename, a flush failure is publication-uncertain; it must
             // never trigger deletion of the published directory or source.
-            try budget.observe("before_publish")
+            try budget.notify("before_publish")
             try budget.check()
-            try parent.publish(names.staging, as: names.published) { try budget.observe("published_before_parent_flush") }
+            try parent.publish(names.staging, as: names.published) { try budget.notify("published_before_parent_flush") }
             return try reconcile(parent: fixture.parent, operation: operation, publicationName: fixture.publicationName, budget: budget)
         }
     }
@@ -292,7 +225,7 @@ enum StorageSnapshot {
         // Readability cannot establish the rename's required durability barrier.
         // Retry that barrier even when recovering a previously uncertain result.
         try containingDirectory.synchronizePublicationDirectory {
-            try budget.observe("reconcile_before_parent_flush")
+            try budget.notify("reconcile_before_parent_flush")
             try budget.check()
         }
         try budget.check()
@@ -327,6 +260,7 @@ enum StorageSnapshot {
     }
 
     static func verify(_ files: StorageObjectFiles, operation: UUID, budget: StorageSnapshotBudget) throws -> String {
+        try budget.notify("verify_started")
         try budget.check()
         let manifestSize = try files.size("manifest.json")
         guard manifestSize <= budget.maximumManifestBytes else { throw budget.capacityFailure("snapshot_manifest_capacity") }
@@ -343,12 +277,15 @@ enum StorageSnapshot {
         let intentData = try files.read("intent.json", maximum: 1024)
         let intent = try JSONDecoder().decode([String: String].self, from: intentData)
         guard intent == ["format": String(manifest.format), "kind": kind, "operation_id": manifest.operationID, "store_id": manifest.storeID, "source_root": manifest.sourceRoot] else { throw StorageSnapshotFailure.incomplete }
+        try budget.notify("verify_manifest_loaded")
         let database = try files.digest("database.sqlite", budget: budget)
+        try budget.notify("verify_database_hashed")
         guard database == (manifest.databaseSHA256, manifest.databaseSize) else { throw StorageSnapshotFailure.sourceChanged }
         var readConfiguration = Configuration(); readConfiguration.readonly = true
         readConfiguration.prepareDatabase { try SchemaMigrations.installStorageCollation($0) }
         let copy = try DatabaseQueue(path: files.root.appendingPathComponent("database.sqlite").path, configuration: readConfiguration)
         let required: StorageSnapshotInventory
+        let inventoryFiles = try StorageObjectFiles(copying:files)
         budget.measurement.metadataBytes = database.1 + Int64(intentData.count) + Int64(manifestData.count)
         budget.measurement.bytes = budget.measurement.metadataBytes
         do {
@@ -360,10 +297,12 @@ enum StorageSnapshot {
                 if let counts = manifest.tableRows { guard counts == (try tableCounts(db)) else {throw StorageSnapshotFailure.incomplete} }
                 guard try Int.fetchOne(db, sql: "PRAGMA user_version") == manifest.schema else { throw StorageSnapshotFailure.incomplete }
                 let sourceRoot = URL(fileURLWithPath: manifest.sourceRoot, isDirectory: true)
-                return try StorageSnapshotAuthority.inventory(db, root: sourceRoot, budget: budget, objectRoot: files.root.appendingPathComponent("managed"), retainedExists: { try files.regularOrLinkExists("managed/" + $0) })
+                return try StorageSnapshotAuthority.inventory(db, root: sourceRoot, budget: budget, objectRoot: files.root.appendingPathComponent("managed"), retainedExists: { try inventoryFiles.regularOrLinkExists("managed/" + $0) })
             }
+            try inventoryFiles.finishWalk()
             try copy.close()
         } catch { try? copy.close(); throw error }
+        try budget.notify("verify_inventory_finished")
         guard manifest.objects.map(\.descriptor).sorted(by: { $0.relativePath < $1.relativePath }) == required.objects,
               manifest.unavailable == required.unavailable, manifest.externalReferences == required.externalReferences else { throw StorageSnapshotFailure.incomplete }
         var paths: Set<String> = ["intent.json", "manifest.json", "database.sqlite"]
@@ -372,28 +311,18 @@ enum StorageSnapshot {
         total = try budget.adding(Int64(manifestData.count), to: total)
         try StorageSnapshotAuthority.validateCapturedLinks(manifest.objects.map(\.descriptor))
         for object in manifest.objects {
-            try budget.check()
             let path = "managed/" + object.descriptor.relativePath
             _ = try StorageObjectFiles.parts(path)
             guard paths.insert(path).inserted else { throw StorageSnapshotFailure.incomplete }
-            if object.descriptor.kind == "file" {
-                let value = try files.digest(path, budget: budget)
-                guard value == (object.sha256, object.size), value.1 <= budget.maximumObjectBytes,
-                      object.descriptor.expectedSHA256 == nil || object.descriptor.expectedSHA256 == value.0,
-                      object.descriptor.expectedSize == nil || object.descriptor.expectedSize == value.1 else { throw StorageSnapshotFailure.sourceChanged }
-                total = try budget.adding(value.1, to: total)
-            } else if object.descriptor.kind == "symlink" {
-                guard let target = object.descriptor.linkTarget, !target.hasPrefix("/"), !target.contains("\0"),
-                      try files.linkTarget(path) == target, StorageObjectFiles.sha(Data(target.utf8)) == object.sha256,
-                      object.sha256 == object.descriptor.expectedSHA256, object.size == Int64(target.utf8.count) else { throw StorageSnapshotFailure.sourceChanged }
-                total = try budget.adding(Int64(target.utf8.count), to: total)
-            } else { throw StorageSnapshotFailure.unsupportedAuthority }
         }
+        total = try budget.adding(StorageSnapshotWork.verifyObjects(manifest.objects,files:files,prefix:"managed/",budget:budget),to:total)
+        try budget.notify("verify_objects_finished")
         guard try files.listedFiles(budget: budget) == paths else { throw StorageSnapshotFailure.incomplete }
         budget.measurement.bytes = total
         budget.measurement.objects = manifest.objects.count
         budget.measurement.lowerBound = false
         try budget.check()
+        try budget.notify("verify_finished")
         return StorageObjectFiles.sha(manifestData)
     }
 }

@@ -182,9 +182,10 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
         XCTAssertFalse(exists(a));XCTAssertEqual(try Data(contentsOf:retained),Data(repeating:0,count:64))
         let relative = String(path.dropFirst(router.root.path.count + 1))
         XCTAssertEqual(try Data(contentsOf:backup.appendingPathComponent("managed").appendingPathComponent(relative)),Data(repeating:0,count:64))
-        // CL-343: the first read answers at once while the accounting index warms.
+        // Compact manifest indices answer historical accounting immediately;
+        // this says nothing about current backup presence or physical reclaim.
         let cold = try call("cleanup_job_get",["project_id":f.project["id"]!,"cleanup_job_id":job["id"]!])
-        XCTAssertEqual(cold["backup_retention_observation"] as? String,"unavailable");XCTAssertTrue(accountingCache.waitUntilIdle())
+        XCTAssertEqual(cold["backup_retention_observation"] as? String,"verified_at_backup_current_presence_unverified");XCTAssertTrue(accountingCache.waitUntilIdle())
         let projection = try call("cleanup_job_get",["project_id":f.project["id"]!,"cleanup_job_id":job["id"]!])
         XCTAssertEqual(try ArchiveCleanupJob.integer(projection["removed_logical_original_bytes"]),64)
         XCTAssertEqual(try ArchiveCleanupJob.integer(projection["known_backup_retained_logical_original_bytes"]),64)

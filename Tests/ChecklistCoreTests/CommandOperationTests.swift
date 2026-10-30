@@ -100,6 +100,25 @@ final class CommandOperationTests: XCTestCase {
         XCTAssertEqual(try data(f.call("restore_create",restoreInput,command:rc))["operation_id"] as? String,try data(restoreAccepted)["operation_id"] as? String)
     }
 
+    func testOwnerBackupPrunePreviewAndEmptyPruneUseOperationLane() throws {
+        let f = try StorageFixture(fast:true)
+        _ = try f.call("backup_retention_set",["newest_count":5,"daily_days":7])
+        let previewLane = HeldLane(f.router!);defer {previewLane.finish()}
+        let pc = uuid(),accepted = try f.call("backup_prune_preview",["command_id":pc],command:pc)
+        try assertAccepted(f,accepted,method:"backup_prune_preview",command:pc)
+        previewLane.finish()
+        let preview = try data(assertSucceeded(f,accepted))
+        XCTAssertEqual(preview["snapshot_count"] as? Int,0)
+        let lane = HeldLane(f.router!);defer {lane.finish()}
+        let command = uuid(),prune = try f.call("backup_prune",["preview_sha256":preview["preview_sha256"]!,"include_unrecorded":false],command:command)
+        try assertAccepted(f,prune,method:"backup_prune",command:command)
+        lane.finish()
+        XCTAssertEqual(try data(assertSucceeded(f,prune))["moved_count"] as? Int,0)
+        let worker = Caller(role:"worker",installation:"worker",projectIDs:[])
+        XCTAssertThrowsError(try f.router!.acceptCommandOperation(method:"backup_prune_preview",params:["command_id":uuid()],caller:worker)) {XCTAssertEqual(($0 as? CoreError)?.code,"HUMAN_CHANNEL_REQUIRED")}
+        XCTAssertThrowsError(try f.call("backup_prune_preview",caller:worker)) {XCTAssertEqual(($0 as? CoreError)?.code,"FORBIDDEN")}
+    }
+
     func testCleanupPreviewAndArchiveCleanupKeepTheirFinalDomainReplies() throws {
         let f = try StorageFixture(fast:true),project = try f.project(),task = try f.task(project),pid = project["id"] as! String
         let previewLane = HeldLane(f.router!);defer {previewLane.finish()}
@@ -153,6 +172,9 @@ final class CommandOperationTests: XCTestCase {
         try Data([0]).write(to:invalidSource)
         let methods = CommandRouter.alwaysOperationMethods.union(CommandRouter.operationEvidenceMethods).union(["task_archive","attachment_add","attachment_read","work_submit","batch_submit","project_edit","project_settings_save"])
         for method in methods.sorted() {
+            if method == "backup_prune_preview" {
+                try f.router!.dbQueue.write {db in try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('backup-retention-settings','{}') ON CONFLICT(key) DO UPDATE SET value=excluded.value")}
+            }
             let lane = HeldLane(f.router!);defer {lane.finish()}
             let command = uuid()
             let input: JSON = ["project_id":pid,"command_id":command,"path":invalidSource.path,"task_id":uuid(),"cleanup":true]
@@ -186,6 +208,9 @@ final class CommandOperationTests: XCTestCase {
             XCTAssertEqual(try data(retry)["state"] as? String,"queued",method)
             retryLane.finish()
             XCTAssertEqual(try read(f,accepted,project:pid)["state"] as? String,"failed",method)
+            if method == "backup_prune_preview" {
+                try f.router!.dbQueue.write {db in try db.execute(sql:"DELETE FROM metadata WHERE key='backup-retention-settings'")}
+            }
         }
     }
 

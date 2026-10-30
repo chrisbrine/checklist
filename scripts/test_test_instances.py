@@ -780,6 +780,72 @@ class SnapshotLogicTests(unittest.TestCase):
             self.assertEqual(json.loads((destination / 'checklist-store.identity.json').read_text()), identity)
 
 
+class SeedFilePerformanceTests(unittest.TestCase):
+    def test_inode_cache_is_pass_local_and_invalidates_even_with_restored_mtime(self):
+        with test_directory() as directory:
+            root = Path(directory).resolve(); (root / 'objects').mkdir()
+            first = root / 'objects/first'; first.write_bytes(b'first')
+            second = root / 'objects/second'; os.link(first, second)
+            with harness.SeedFileTree(root) as tree:
+                digest = tree.digest('objects/first')
+                self.assertEqual(tree.digest('objects/second'), digest)
+                self.assertEqual(tree.hashed_bytes, 5)
+                before = first.stat(); first.write_bytes(b'other')
+                os.utime(first, ns=(before.st_atime_ns, before.st_mtime_ns))
+                self.assertNotEqual(tree.digest('objects/second'), digest)
+            with harness.SeedFileTree(root) as independent:
+                self.assertEqual(independent.digest('objects/first'), (harness.sha(first), 5))
+                self.assertEqual(independent.hashed_bytes, 5)
+
+    def test_open_never_follows_file_or_directory_links(self):
+        with test_directory() as directory:
+            root = Path(directory).resolve(); outside = root / 'outside'; outside.mkdir()
+            (outside / 'file').write_bytes(b'outside')
+            (root / 'objects').symlink_to(outside)
+            (root / 'file').symlink_to(outside / 'file')
+            with harness.SeedFileTree(root) as tree:
+                for relative in ['objects/file', 'file', '../outside/file', '/outside/file']:
+                    with self.subTest(relative=relative), self.assertRaises(ValueError): tree.digest(relative)
+
+    def test_copy_independently_rejects_payload_changed_after_source_verification(self):
+        with test_directory() as directory:
+            source, destination, manifest = SnapshotLogicTests().fixture(Path(directory).resolve())
+            item = manifest['objects'][0]
+            entries = [('managed/objects/file', item['sha256'], item['size'], item['descriptor'])]
+            harness.verify_snapshot_files(source, entries)
+            (source / 'managed/objects/file').write_bytes(b'damaged')
+            with self.assertRaisesRegex(ValueError, 'Copy verification'):
+                harness.copy_snapshot_files(source, destination, entries)
+
+    def test_cached_directory_cannot_hide_a_replaced_path(self):
+        with test_directory() as directory:
+            root = Path(directory).resolve(); (root / 'objects').mkdir()
+            (root / 'objects/file').write_bytes(b'original')
+            with self.assertRaisesRegex(ValueError, 'directory changed'):
+                with harness.SeedFileTree(root) as tree:
+                    tree.digest('objects/file')
+                    (root / 'objects').rename(root / 'old')
+                    (root / 'objects').mkdir(); (root / 'objects/file').write_bytes(b'replacement')
+
+    def test_parallel_verification_and_copy_bound_directory_cache(self):
+        with test_directory() as directory:
+            root = Path(directory).resolve(); source = root / 'source'; source.mkdir()
+            destination = root / 'copy'; destination.mkdir(); entries = []
+            for n in range(320):
+                name = f'objects/directory-{n}/file'; path = source / name
+                path.parent.mkdir(parents=True); path.write_bytes(f'bytes-{n}'.encode())
+                descriptor = dict(relativePath=name, kind='file', executable=n % 2 == 0)
+                entries.append((name, harness.sha(path), path.stat().st_size, descriptor))
+            self.assertEqual(harness.verify_snapshot_files(source, entries)['entries'], 320)
+            harness.copy_snapshot_files(source, destination, entries)
+            for name, digest, size, descriptor in entries:
+                self.assertEqual((harness.sha(destination / name), (destination / name).stat().st_size), (digest, size))
+                self.assertEqual(bool((destination / name).stat().st_mode & 0o111), descriptor['executable'])
+            with harness.SeedFileTree(destination) as tree:
+                for name, *_ in entries: tree.digest(name)
+                self.assertLessEqual(len(tree.directories), 16)
+
+
 class RestoredSeedTests(unittest.TestCase):
     def setUp(self):
         # Origin discovery must never enumerate the developer's real backups.
@@ -2215,6 +2281,113 @@ class SeedIsolationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'verified schema-3'): harness.require_managed_path_support(base, manifest)
             manifest['inputs'][1]['sha256'] = harness.sha(migration)
             with self.assertRaisesRegex(ValueError, 'verified schema-3'): harness.require_managed_path_support(base, manifest)
+
+
+class BackupMetadataSeedIsolationTests(unittest.TestCase):
+    def database(self, base, key, value):
+        database = base / 'fixture.sqlite'
+        store_fixture(database, 5)
+        with closing(sqlite3.connect(database)) as db, db:
+            db.create_collation('checklist_storage_v2', lambda a, b: (a.encode() > b.encode()) - (a.encode() < b.encode()))
+            db.execute('INSERT INTO metadata VALUES (?,?)', (key, json.dumps(value)))
+        return database
+
+    def test_automatic_retention_receipt_is_inert_but_pending_authority_is_not(self):
+        with test_directory() as directory:
+            base = Path(directory).resolve(); origin = base / 'original'; origin.mkdir()
+            value = {'moved_to_trash': [{'path': str(origin / 'backups/snapshot-old'),
+                                        'trash_path': str(origin / '.Trash/snapshot-old')}],
+                     'owner_confirmation': {'source_root': str(origin)}}
+            database = self.database(base, 'backup-automatic-prune-last', value)
+            with patch.object(harness, 'LIVE', origin), patch.object(harness, 'checklist_root_overlap') as ancestry:
+                result = harness.require_local_paths(database, base / 'data')
+            self.assertEqual(result['inert_metadata_path_occurrences'], 3)
+            ancestry.assert_not_called()
+        with test_directory() as directory:
+            base = Path(directory).resolve(); origin = base / 'original'; origin.mkdir()
+            database = self.database(base, 'backup-automatic-prune-pending',
+                {'source_root': str(origin), 'params': {'command_id': 'command', 'preview_sha256': 'a' * 64}})
+            with patch.object(harness, 'LIVE', origin), self.assertRaisesRegex(ValueError, 'Checklist data root'):
+                harness.require_local_paths(database, base / 'data')
+
+    def test_bound_retention_consent_root_is_provenance_only_at_its_exact_field(self):
+        for value, allowed in [
+            ({'automatic_prune': True, 'owner_confirmation': {'source_root': '/historical/ChecklistRoot', 'incarnation': 'copy-fenced'}}, True),
+            ({'owner_confirmation': {'source_root': 'file:///historical/ChecklistRoot'}}, False),
+            ({'owner_confirmation': {'source_root': '/historical/../ChecklistRoot'}}, False),
+            ({'nested': {'owner_confirmation': {'source_root': '/historical/ChecklistRoot'}}}, False),
+        ]:
+            with self.subTest(value=value), test_directory() as directory:
+                base = Path(directory).resolve(); database = self.database(base, 'backup-retention-settings', value)
+                if allowed:
+                    with patch.object(harness, 'checklist_root_overlap') as ancestry:
+                        result = harness.require_local_paths(database, base / 'data')
+                    self.assertEqual(result['inert_metadata_path_occurrences'], 1); ancestry.assert_not_called()
+                else:
+                    with patch.object(harness, 'checklist_root_overlap', return_value='live'), self.assertRaises(ValueError):
+                        harness.require_local_paths(database, base / 'data')
+
+    def test_fenced_automatic_retention_intent_is_inert_audit_without_file_authority(self):
+        with test_directory() as directory:
+            base = Path(directory).resolve()
+            value = {'reason': 'installation_binding_changed',
+                     'original_intent': json.dumps({'source_root': '/historical/ChecklistRoot', 'params': {'command_id': 'old'}}),
+                     'owner_confirmation': {'source_root': '/historical/ChecklistRoot'}}
+            database = self.database(base, 'backup-automatic-prune-fenced:' + 'a' * 64, value)
+            with patch.object(harness, 'checklist_root_overlap') as ancestry:
+                result = harness.require_local_paths(database, base / 'data')
+            self.assertEqual(result['inert_metadata_path_occurrences'], 2); ancestry.assert_not_called()
+
+    def test_schema_five_snapshot_seed_keeps_catalog_and_protected_history_without_rewriting(self):
+        with test_directory() as directory:
+            base = Path(directory).resolve()
+            source, destination, manifest = SnapshotLogicTests.fixture(self, base, 5)
+            relative = 'objects/backup-catalogs/' + 'a' * 64 + '.json'
+            catalog_file = source / 'managed' / relative
+            catalog_file.parent.mkdir(); catalog_file.write_bytes(b'historical receipt')
+            catalog = {'path': relative, 'sha256': harness.sha(catalog_file), 'size': catalog_file.stat().st_size,
+                       'object_count': 1, 'key_root': '/historical/ChecklistRoot'}
+            with closing(sqlite3.connect(source / 'database.sqlite')) as db, db:
+                db.create_collation('checklist_storage_v2', lambda a, b: (a.encode() > b.encode()) - (a.encode() < b.encode()))
+                db.execute('INSERT INTO metadata VALUES (?,?)', ('backup-historical-catalog:old', json.dumps(catalog)))
+                db.execute('INSERT INTO metadata VALUES (?,?)', ('backup-protected-history', json.dumps([
+                    {'path': '/historical/ChecklistRoot/backups/snapshot-old', 'protected': True}])))
+            manifest['objects'].append({'sha256': harness.sha(catalog_file), 'size': catalog_file.stat().st_size,
+                                        'descriptor': {'kind': 'file', 'relativePath': relative, 'executable': False}})
+            manifest.update(databaseSHA256=harness.sha(source / 'database.sqlite'), databaseSize=(source / 'database.sqlite').stat().st_size)
+            (source / 'manifest.json').write_text(json.dumps(manifest))
+            with patch.object(harness, 'checklist_root_overlap', wraps=harness.checklist_root_overlap) as ancestry:
+                seed = harness.snapshot_seed(source, destination, current_schema=5)
+            self.assertEqual(seed['path_inspection']['managed_relative'], 1)
+            self.assertEqual(seed['path_inspection']['inert_metadata_path_occurrences'], 2)
+            self.assertEqual((destination / relative).read_bytes(), b'historical receipt')
+            self.assertEqual(harness.sha(destination / 'checklist.sqlite'), manifest['databaseSHA256'])
+            self.assertFalse(any(str(call.args[0]).startswith('/historical/') for call in ancestry.call_args_list))
+
+    def test_catalog_descriptor_remains_relative_in_its_family_and_local_symlinks_are_refused(self):
+        for path in ['objects/../outside', 'icons/catalog.json', '/historical/objects/backup-catalogs/catalog.json',
+                     'objects/backup-catalogs/catalog.json']:
+            with self.subTest(path=path), test_directory() as directory:
+                base = Path(directory).resolve()
+                if path == 'objects/backup-catalogs/catalog.json':
+                    (base / 'objects').mkdir()
+                    (base / 'objects/backup-catalogs').symlink_to('/historical/outside')
+                database = self.database(base, 'backup-historical-catalog:old',
+                    {'path': path, 'key_root': '/historical/ChecklistRoot'})
+                with self.assertRaises(ValueError): harness.require_local_paths(database, base / 'data')
+
+    def test_catalog_provenance_exception_stays_top_level_and_unknown_metadata_stays_strict(self):
+        for key, value in [
+            ('unknown', {'key_root': '/historical/ChecklistRoot'}),
+            ('backup-historical-catalog:old', {'nested': {'key_root': '/historical/ChecklistRoot'}}),
+            ('backup-historical-catalog:old', {'database_path': '/historical/database.sqlite'}),
+            ('backup-historical-catalog:old', {'key_root': 'file:///historical/ChecklistRoot'}),
+            ('backup-historical-catalog:old', {'key_root': '/historical/../ChecklistRoot'}),
+            ('backup-protected-history', [{'path': 'file:///historical/snapshot'}]),
+        ]:
+            with self.subTest(key=key, value=value), test_directory() as directory:
+                base = Path(directory).resolve(); database = self.database(base, key, value)
+                with self.assertRaises(ValueError): harness.require_local_paths(database, base / 'data')
 
 
 class LiveRootTests(unittest.TestCase):

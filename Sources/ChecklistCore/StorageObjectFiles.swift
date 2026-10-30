@@ -13,6 +13,8 @@ enum StorageSnapshotFailure: Error {
 
 /// Shared only by the synchronous snapshot attempt and its verification passes.
 final class StorageSnapshotMeasurement {
+    let checkLock = NSLock()
+    let observerLock = NSLock()
     var bytes: Int64 = 0
     var metadataBytes: Int64 = 0
     var objects: Int = 0
@@ -46,8 +48,10 @@ struct StorageSnapshotBudget {
     var maximumObjects: Int = Self.objectLimit
     var maximumManifestBytes: Int = Self.manifestByteLimit
     var maximumRecords: Int = 100_000
+    var parallelism: Int = 4
     var pagesPerStep: Int32 = 64
     var folderAccess = StorageFolderAccess()
+    var cloneFile: (Int32,Int32,String) -> Int32 = { fclonefileat($0,$1,$2,0) }
     var linkFile: (Int32, String, Int32, String) -> Int32 = { linkat($0, $1, $2, $3, 0) }
     var availableBytes: (URL) throws -> Int64 = Self.volumeAvailableBytes
 
@@ -89,7 +93,13 @@ struct StorageSnapshotBudget {
                       "required_free_bytes": required, "available_bytes": available, "free_space_margin_bytes": margin, "next_step": next])
     }
 
+    func notify(_ event: String) throws {
+        measurement.observerLock.lock(); defer { measurement.observerLock.unlock() }
+        try observe(event)
+    }
+
     func check() throws {
+        measurement.checkLock.lock(); defer { measurement.checkLock.unlock() }
         if canceled() { throw StorageSnapshotFailure.canceled }
         guard uptime() < deadlineUptime else { throw StorageSnapshotFailure.deadline }
     }
@@ -143,12 +153,19 @@ final class StorageObjectFiles {
     // Enabled only for a newly created, unpublished snapshot/restore stage.
     private let batchSynchronization: Bool
     private var pendingDirectories: Set<String> = []
+    private var walk: StorageObjectWalk?
+    private var hardLinkSource: StorageObjectFiles?
+    private let walkDirectories: Bool
+    private let reuseDigests: Bool
+    private var digests: [StorageFileDigestIdentity:(String,Int64)] = [:]
 
-    init(root: URL, folderAccess: StorageFolderAccess = .init(), pinRootForGates: Bool = false, batchSynchronization: Bool = false) throws {
+    init(root: URL, folderAccess: StorageFolderAccess = .init(), pinRootForGates: Bool = false, batchSynchronization: Bool = false, walkDirectories: Bool = false, reuseDigests: Bool = false) throws {
         guard root.isFileURL, root.path.hasPrefix("/") else { throw StorageSnapshotFailure.io }
         self.root = root.standardizedFileURL
         self.folderAccess = folderAccess
         self.batchSynchronization = batchSynchronization
+        self.walkDirectories = walkDirectories
+        self.reuseDigests = reuseDigests
         // Foundation standardization can turn physical /private/tmp and
         // /private/var paths back into these macOS aliases. Resolve ONLY the
         // verified platform prefix; all selected descendants still traverse
@@ -175,7 +192,17 @@ final class StorageObjectFiles {
             PinnedRoots.shared.insert(self,key:rootKey)
         }
     }
+    /// Operation-local duplicate of the already validated root, rather than a
+    /// second path lookup which could select a replacement root.
+    init(copying files: StorageObjectFiles, batchSynchronization: Bool = false, walkDirectories: Bool = true, reuseDigests: Bool = false) throws {
+        root = files.root;folderAccess = files.folderAccess;rootKey = files.rootKey
+        self.batchSynchronization = batchSynchronization;self.walkDirectories = walkDirectories;self.reuseDigests = reuseDigests
+        descriptor = fcntl(files.descriptor,F_DUPFD_CLOEXEC,0)
+        guard descriptor >= 0 else { throw StorageSnapshotFailure.failed("fcntl",root:files.root.path) }
+    }
+
     deinit {
+        walk = nil
         if gateAncestors != nil { PinnedRoots.shared.remove(self,key:rootKey) }
         for ancestor in gateAncestors ?? [] { Darwin.close(ancestor.parent) }
         Darwin.close(descriptor)
@@ -269,6 +296,10 @@ final class StorageObjectFiles {
             var prefix = ""; pendingDirectories.insert(prefix)
             for part in parts { prefix = prefix.isEmpty ? part : prefix + "/" + part; pendingDirectories.insert(prefix) }
         }
+        if walkDirectories {
+            if walk == nil { walk = StorageObjectWalk(root:descriptor,rootPath:root.path) }
+            if let directory = try walk!.parent(parts,create:create) { return (directory,name) }
+        }
         var current = dup(descriptor)
         guard current >= 0 else { throw CoreError("STORAGE_OBJECT_UNAVAILABLE","The managed object parent could not be opened safely.",details:["posix_errno":errno]) }
         do {
@@ -281,6 +312,11 @@ final class StorageObjectFiles {
             }
             return (current, name)
         } catch { Darwin.close(current); throw error }
+    }
+
+    func finishWalk() throws {
+        try walk?.finish()
+        try hardLinkSource?.finishWalk()
     }
 
     func regularOrLinkExists(_ path: String) throws -> Bool {
@@ -318,11 +354,11 @@ final class StorageObjectFiles {
     }
 
     func size(_ path: String) throws -> Int64 {
-        try openRegular(path) { file in
-            var info = stat()
-            guard fstat(file, &info) == 0, info.st_size >= 0 else { throw StorageSnapshotFailure.failed("fstat",path:path,root:root.path) }
-            return Int64(info.st_size)
-        }
+        let (directory,name) = try parent(path);defer { Darwin.close(directory) }
+        var info = stat()
+        guard fstatat(directory,name,&info,AT_SYMLINK_NOFOLLOW) == 0 else { throw StorageSnapshotFailure.failed("fstatat",path:path,root:root.path) }
+        guard info.st_mode & S_IFMT == S_IFREG,info.st_size >= 0 else { throw StorageSnapshotFailure.unsupportedAuthority }
+        return Int64(info.st_size)
     }
 
     func read(_ path: String, maximum: Int) throws -> Data {
@@ -387,6 +423,8 @@ final class StorageObjectFiles {
     func digest(_ path: String, budget: StorageSnapshotBudget) throws -> (String, Int64) {
         try openRegular(path) { file in
             var before = stat(); guard fstat(file, &before) == 0 else { throw StorageSnapshotFailure.failed("fstat",path:path,root:root.path) }
+            let identity = StorageFileDigestIdentity(before)
+            if reuseDigests,let cached = digests[identity] { try budget.check(); return cached }
             var digest = SHA256(), count: Int64 = 0, buffer = Data(count: 65_536)
             while true {
                 try budget.check()
@@ -403,64 +441,114 @@ final class StorageObjectFiles {
                   before.st_size == after.st_size, count == after.st_size,
                   before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec, before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
                   before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec, before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec else { throw StorageSnapshotFailure.sourceChanged }
-            return (Self.hex(digest.finalize()), count)
+            let value = (Self.hex(digest.finalize()),count)
+            if reuseDigests,digests.count < 131_072 { digests[identity] = value }
+            return value
         }
     }
 
     func copy(_ path: String, to destination: StorageObjectFiles, expected: String?, budget: StorageSnapshotBudget, targetPath: String? = nil, executable: Bool = false, logicalBytesBeforeCopy: Int64? = nil) throws -> (String, Int64) {
         let target = targetPath ?? ("managed/" + path)
-        let (directory, name) = try destination.parent(target, create: true); defer { Darwin.close(directory) }
-        let output = openat(directory, name, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard output >= 0 else { throw StorageSnapshotFailure.failed("openat",path:path,root:root.path) }
-        defer { Darwin.close(output) }
-        let copied = try openRegular(path) { file -> (String, Int64) in
-            var before = stat(); guard fstat(file, &before) == 0 else { throw StorageSnapshotFailure.failed("fstat",path:path,root:root.path) }
-            var digest = SHA256(), total: Int64 = 0, buffer = Data(count: 65_536)
-            while true {
-                try budget.check()
-                let size = buffer.withUnsafeMutableBytes { Darwin.read(file, $0.baseAddress, $0.count) }
-                if size < 0, errno == EINTR { continue }
-                guard size >= 0 else { throw StorageSnapshotFailure.failed("read",path:path,root:root.path) }
-                if size == 0 { break }
-                total += Int64(size)
-                guard total <= budget.maximumObjectBytes else { throw budget.capacityFailure("snapshot_object_bytes") }
-                // Snapshot callers supply the existing logical payload separately
-                // from the per-file limit; refuse before writing beyond either bound.
-                if let prefix = logicalBytesBeforeCopy { _ = try budget.adding(total, to: prefix) }
-                digest.update(data: buffer.prefix(size))
-                try buffer.withUnsafeBytes { raw in
-                    var offset = 0
-                    while offset < size {
-                        let count = Darwin.write(output, raw.baseAddress!.advanced(by: offset), size - offset)
-                        if count < 0, errno == EINTR { continue }
-                        guard count > 0 else { throw StorageSnapshotFailure.failed("write",path:path,root:root.path) }; offset += count
-                    }
+        let (directory,name) = try destination.parent(target,create:true);defer { Darwin.close(directory) }
+        return try openRegular(path) { file in
+            var before = stat();guard fstat(file,&before) == 0 else { throw StorageSnapshotFailure.failed("fstat",path:path,root:root.path) }
+            let identity = StorageFileDigestIdentity(before)
+            // A source which grew after inventory still uses the bounded byte
+            // loop; cloning it first would materialize beyond that logical cap.
+            let mayClone = before.st_size >= 0 && before.st_size <= budget.maximumObjectBytes &&
+                (try? budget.adding(Int64(before.st_size),to:logicalBytesBeforeCopy ?? 0)) != nil
+            let cloned = mayClone && budget.cloneFile(file,directory,name) == 0
+            let cloneErrno = errno
+            if mayClone,!cloned,![EXDEV,ENOTSUP,EINVAL,EPERM,ENOSYS].contains(cloneErrno) { throw StorageSnapshotFailure.failed("clonefile",path:path,root:root.path,code:cloneErrno) }
+            var cloneIdentity: StorageFileDigestIdentity?
+            var cloneMetadata: Int32 = -1
+            defer { if cloneMetadata >= 0 { Darwin.close(cloneMetadata) } }
+            if cloned {
+                // Clones can inherit read-only permissions. Pin the new inode
+                // while granting only this owned copy its normal writable mode.
+                let metadata = openat(directory,name,O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+                cloneMetadata = metadata
+                guard metadata >= 0 else { throw StorageSnapshotFailure.failed("openat",path:path,root:root.path) }
+                var info = stat()
+                let valid = fstat(metadata,&info) == 0 && info.st_mode & S_IFMT == S_IFREG &&
+                    (info.st_dev != before.st_dev || info.st_ino != before.st_ino) && fchmod(metadata,0o600) == 0
+                // Keep this descriptor pinned through output reopen/check so
+                // a removed clone's inode cannot be reused across that boundary.
+                guard valid else { throw StorageSnapshotFailure.sourceChanged }
+                cloneIdentity = StorageFileDigestIdentity(info)
+            }
+            let output = openat(directory,name,(cloned ? O_RDWR : O_CREAT | O_EXCL | O_WRONLY) | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK,0o600)
+            guard output >= 0 else { throw StorageSnapshotFailure.failed("openat",path:path,root:root.path) };defer { Darwin.close(output) }
+            if let cloneIdentity {
+                var info = stat()
+                guard fstat(output,&info) == 0,info.st_dev == cloneIdentity.device,info.st_ino == cloneIdentity.inode else { throw StorageSnapshotFailure.sourceChanged }
+                do {
+                    guard info.st_size <= budget.maximumObjectBytes else { throw budget.capacityFailure("snapshot_object_bytes") }
+                    _ = try budget.adding(Int64(info.st_size),to:logicalBytesBeforeCopy ?? 0)
+                } catch {
+                    // Even a concurrent growth during clone leaves a bounded
+                    // incomplete owned file, never an oversized partial payload.
+                    guard ftruncate(output,0) == 0 else { throw StorageSnapshotFailure.failed("ftruncate",path:path,root:root.path) }
+                    guard fsync(output) == 0 else { throw StorageSnapshotFailure.failed("fsync",path:path,root:root.path) }
+                    throw error
                 }
             }
-            var after = stat(); guard fstat(file, &after) == 0,
-                before.st_dev == after.st_dev, before.st_ino == after.st_ino, before.st_size == after.st_size,
-                before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec, before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
-                before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec, before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec,
-                total == after.st_size else { throw StorageSnapshotFailure.sourceChanged }
-            return (Self.hex(digest.finalize()), total)
+            let copied: (String,Int64)
+            if cloned,reuseDigests,let cached = digests[identity] { copied = cached }
+            else {
+                var digest = SHA256(),total: Int64 = 0,buffer = Data(count:65_536)
+                while true {
+                    try budget.check()
+                    let size = buffer.withUnsafeMutableBytes { Darwin.read(file,$0.baseAddress,$0.count) }
+                    if size < 0,errno == EINTR { continue }
+                    guard size >= 0 else { throw StorageSnapshotFailure.failed("read",path:path,root:root.path) };if size == 0 { break }
+                    total += Int64(size)
+                    guard total <= budget.maximumObjectBytes else { throw budget.capacityFailure("snapshot_object_bytes") }
+                    if let prefix = logicalBytesBeforeCopy { _ = try budget.adding(total,to:prefix) }
+                    digest.update(data:buffer.prefix(size))
+                    if !cloned {
+                        try buffer.withUnsafeBytes { raw in
+                            var offset = 0
+                            while offset < size {
+                                let count = Darwin.write(output,raw.baseAddress!.advanced(by:offset),size-offset)
+                                if count < 0,errno == EINTR { continue }
+                                guard count > 0 else { throw StorageSnapshotFailure.failed("write",path:path,root:root.path) };offset += count
+                            }
+                        }
+                    }
+                }
+                copied = (Self.hex(digest.finalize()),total)
+            }
+            var after = stat()
+            guard fstat(file,&after) == 0,StorageFileDigestIdentity(after) == identity,copied.1 == after.st_size else { throw StorageSnapshotFailure.sourceChanged }
+            guard copied.1 <= budget.maximumObjectBytes else { throw budget.capacityFailure("snapshot_object_bytes") }
+            if let prefix = logicalBytesBeforeCopy { _ = try budget.adding(copied.1,to:prefix) }
+            guard expected == nil || copied.0 == expected else { throw StorageSnapshotFailure.sourceChanged }
+            if reuseDigests,digests.count < 131_072 { digests[identity] = copied }
+            guard fchmod(output,executable ? 0o700 : 0o600) == 0 else { throw StorageSnapshotFailure.failed("fchmod",path:path,root:root.path) }
+            if destination.batchSynchronization {
+                guard fsync(output) == 0 else { throw StorageSnapshotFailure.failed("fsync",path:path,root:root.path) }
+            } else { try Self.flush(output) }
+            guard destination.batchSynchronization || fsync(directory) == 0 else { throw StorageSnapshotFailure.failed("fsync",path:path,root:root.path) }
+            // A clone's success or the source cache never attests destination
+            // bytes: independently hash the materialized inode in this pass.
+            let verified = try destination.digest(target,budget:budget)
+            guard verified == copied else { throw StorageSnapshotFailure.sourceChanged }
+            return copied
         }
-        guard expected == nil || copied.0 == expected else { throw StorageSnapshotFailure.sourceChanged }
-        guard fchmod(output, executable ? 0o700 : 0o600) == 0 else {throw StorageSnapshotFailure.failed("fchmod",path:path,root:root.path)}
-        if destination.batchSynchronization {
-            guard fsync(output) == 0 else { throw StorageSnapshotFailure.failed("fsync",path:path,root:root.path) }
-        } else { try Self.flush(output) }
-        guard destination.batchSynchronization || fsync(directory) == 0 else { throw StorageSnapshotFailure.failed("fsync",path:path,root:root.path) }
-        let verified = try destination.digest(target, budget: budget)
-        guard verified == copied else { throw StorageSnapshotFailure.sourceChanged }
-        return copied
     }
 
     /// A duplicate links only to already fsynced bytes inside this owned stage.
     /// Every pathname remains in the manifest and receives full verification.
     func writeHardLink(_ path: String, to existing: String,
                        link: (Int32, String, Int32, String) -> Int32) throws -> Bool {
-        return try openRegular(existing) { file in
-            let (source, sourceName) = try parent(existing); defer { Darwin.close(source) }
+        // Keep source and destination walks separate: alternating their paths
+        // otherwise reopens both ancestor chains for every duplicate payload.
+        // This duplicate still anchors the exact same owned stage inode.
+        if hardLinkSource == nil { hardLinkSource = try StorageObjectFiles(copying:self) }
+        let reader = hardLinkSource!
+        return try reader.openRegular(existing) { file in
+            let (source, sourceName) = try reader.parent(existing); defer { Darwin.close(source) }
             let (destination, name) = try parent(path, create: true); defer { Darwin.close(destination) }
             if link(source, sourceName, destination, name) != 0 {
                 // Keep owner destinations without hard links and saturated link

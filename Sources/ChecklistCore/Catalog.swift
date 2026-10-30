@@ -75,6 +75,13 @@ extension CommandRouter {
             fields["import_receipt_get"] = ["receipt_id"]
         }
         if c.role != "assistant" { fields["backup_create"] = ["qualification_name","reason"] }
+        if c.isOwner {
+            fields["backup_retention_get"] = []
+            fields["backup_retention_set"] = ["newest_count","daily_days"]
+            fields["backup_pin"] = ["path","pinned","retire_upgrade_protection"]
+            fields["backup_prune_preview"] = ["include_unrecorded"]
+            fields["backup_prune"] = ["preview_sha256","include_unrecorded"]
+        }
         let batchFields: [String:[String]] = [
             "review_batch_inputs":["triage_id"],"batch_prepare":["triage_id","phase","tasks","checks"],"batch_claim":["batch_id","policy_revision"],
             "batch_discard":["batch_id","reason"],"batch_get":["batch_id"],"batch_list":["triage_id"],
@@ -154,9 +161,9 @@ extension CommandRouter {
         let keys = Set(extra + (name == "project_create" ? ["command_id"] : (name == "service_info" || name == "project_list" || name == "assistant_projects" ? [] : common)))
         for key in keys {
             if ["limit","expected_revision","expected_task_revision","from_epic_revision","policy_revision","acceptance_revision","revision","settings_revision",
-                "sort_order"].contains(key) { properties[key] = ["type":"integer","minimum":0] }
+                "sort_order","newest_count","daily_days"].contains(key) { properties[key] = ["type":"integer","minimum":0] }
             else if ["archived","blocking","expects_reply","include_archived","include_ended","required","include_completion_eligibility","cleanup","preview","undo",
-                "retain_cited_files","snoozed"].contains(key) { properties[key] = ["type":"boolean"] }
+                "retain_cited_files","snoozed","pinned","include_unrecorded","retire_upgrade_protection"].contains(key) { properties[key] = ["type":"boolean"] }
             else if key == "ticket_cleanup" { properties[key] = Self.ticketCleanupSchema }
             else if key == "command_id" { properties[key] = ["type":"string","format":"uuid","maxLength":4000,
                 "description":"A new random UUID for each distinct command. Reuse the same UUID only to retry the same command with the same input."] }
@@ -230,13 +237,23 @@ extension CommandRouter {
             properties["section"] = ["type":"string","enum":["items","objects","source_build_cache"]]
             properties["limit"] = ["type":"integer","minimum":1,"maximum":50]
         }
+        if Self.storageBackupPruningMethods.contains(name) {
+            properties.removeValue(forKey:"project_id");properties.removeValue(forKey:"expected_revision")
+            if name == "backup_retention_set" {
+                properties["newest_count"] = ["type":"integer","minimum":1,"maximum":1000]
+                properties["daily_days"] = ["type":"integer","minimum":0,"maximum":366]
+            }
+            if name == "backup_prune" {properties["preview_sha256"] = ["type":"string","pattern":"^[0-9a-f]{64}$"]}
+        }
         var required: [String] = []
+        if name == "backup_pin" {required += ["path","pinned"]}
+        if name == "backup_prune" {required.append("preview_sha256")}
         if !Self.readMethods.contains(name) { required.append("command_id") }
         if name == "command_status" { required.append("command_id") }
         if name == "operation_get" { required.append("operation_id") }
         if name == "policy_apply" && !c.isOwner { required.append("reason") }
         if name == "project_create" { required.append("name") }
-        if !["service_info","project_list","assistant_projects","assistant_inbox","project_resolve","project_create"].contains(name) && !(c.isOwner && ["task_list",
+        if !Self.storageBackupPruningMethods.contains(name) && !["service_info","project_list","assistant_projects","assistant_inbox","project_resolve","project_create"].contains(name) && !(c.isOwner && ["task_list",
             "task_context"].contains(name)) { required.append("project_id") }
         if name == "batch_claim" { required.append("policy_revision");properties["policy_revision"] = ["type":"integer","minimum":1,"maximum":Int.max,
             "description":"Required positive policy_revision returned by batch_prepare."] }
@@ -304,6 +321,11 @@ extension CommandRouter {
         case "work_recover":return "Revoke a stopped attempt with explicit observation_refs and file_state_refs, action=confirm_stopped_revoke and reason. Name every unresolved source execution and its expected revision. Agent recovery is labeled as agent action; timeouts never prove a stop. Requires allowed agent_rule_changes."
         case "finding_waive","direction_waive":return "Record a reasoned waiver with caller provenance. Agent callers create agent waivers, never owner approvals. Requires allowed agent_rule_changes."
         case "project_icon_import":return "Import a PNG, JPEG or WebP up to 5 MiB from inside the caller's enrolled workspace. Requires current project revision and allowed agent_rule_changes."
+        case "backup_retention_get":return "Read the installation backup retention proposal or bound owner-confirmed setting, pins and recent automatic-retention history. Unconfirmed rules remove nothing."
+        case "backup_retention_set":return "Owner only: confirm newest_count (at least 1) plus the newest snapshot per UTC day in daily_days (0–366). This bound rule automatically moves older eligible snapshots to Trash after completed backups. Pinned and protected upgrade snapshots always stay."
+        case "backup_pin":return "Owner only: pin or unpin a snapshot by path and pinned boolean. Optional retire_upgrade_protection:true with pinned:false retires historical upgrade protection only; current and prepared upgrades stay protected independently."
+        case "backup_prune_preview":return "Owner only: inspect exact retention decisions and preview_sha256. Unrecorded/incomplete folders are counted and retained unless include_unrecorded is explicitly true; they are never offered as complete."
+        case "backup_prune":return "Owner only: apply an exact preview_sha256 under the confirmed setting; atomically move eligible snapshots into same-volume Trash and retire their records with a crash-recoverable intent. In-use snapshots stay. Reuse command_id after interruption. Emptying Trash remains the owner’s choice."
         case "backup_create":return "Create a verified full-store backup in the published backups folder. Optional qualification_name selects a named subfolder there (letters, numbers, underscore, hyphen; at most 64 characters). No arbitrary destination. Requires allowed agent_rule_changes in this enrolled project and records agent provenance. Restore remains owner-only."
         case "diagnostics_summary":return "Read aggregate diagnostics for the selected project only. Contains no file destination or record content. Agent callers require allowed agent_rule_changes."
         case "ticket_cleanup_receipts":return "Read bounded project-scoped automatic cleanup summaries. Supply receipt_id and page items, objects or source_build_cache with section, cursor and limit. Removed pathname bytes are not measured physical disk savings."

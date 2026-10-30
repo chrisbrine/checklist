@@ -40,7 +40,7 @@ final class TicketObjectRemovalVerification {
     let size: Int64
     let descriptor: Int32
     let identity: stat
-    init?(root: URL,relative: String,sha256: String? = nil,size: Int64? = nil,check: () throws -> Void = {}) throws {
+    init?(root: URL,relative: String,sha256: String? = nil,size: Int64? = nil,backupUse: Bool = false,check: () throws -> Void = {}) throws {
         let files = try StorageObjectFiles(root:root)
         let directory: Int32,name: String
         do {(directory,name) = try files.parent(relative)} catch {if StorageFolderAccess.isMissing(error) {return nil};throw error}
@@ -49,6 +49,13 @@ final class TicketObjectRemovalVerification {
         if fd < 0,errno == ENOENT {return nil}
         guard fd >= 0 else {throw CoreError("CLEANUP_OBJECT_UNAVAILABLE","The original could not be opened safely.",details:["posix_errno":errno])}
         do {
+            if backupUse {
+                while flock(fd,LOCK_SH | LOCK_NB) != 0 {
+                    if errno == EINTR {continue}
+                    if errno == EWOULDBLOCK {throw CoreError("BACKUP_IN_USE","The snapshot is being pruned; cleanup retained its bytes.")}
+                    throw CoreError("BACKUP_USE_UNAVAILABLE","The cleanup proof could not hold its backup manifest.",details:["posix_errno":errno])
+                }
+            }
             var before = stat(),after = stat()
             guard fstat(fd,&before) == 0 else {throw CoreError("CLEANUP_OBJECT_UNAVAILABLE","The original could not be inspected.",details:["posix_errno":errno])}
             guard before.st_mode & S_IFMT == S_IFREG,(size == nil || before.st_size == size) else {throw CoreError("CLEANUP_IDENTITY_CHANGED","Original identity changed; bytes retained.")}

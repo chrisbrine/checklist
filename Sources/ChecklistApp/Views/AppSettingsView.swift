@@ -85,6 +85,7 @@ struct StorageSettingsView: View {
                 Button("Refresh storage status") {Task {await refreshStorageStatus()}}
                 if !observation.statusError.isEmpty {Text(observation.statusError).checklistFont(.micro).textSelection(.enabled)}
             }
+            BackupRetentionSettingsView()
             Section("Export & backup") {
                 Button("Back up all projects…") { backup() }.checklistDisabled([(observation.backingUp || observation.restoring, "Wait for storage verification to finish.")])
                 if observation.backingUp {

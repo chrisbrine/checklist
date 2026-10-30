@@ -11,6 +11,7 @@ import subprocess
 # One policy list, shared by restage and promotion. Add new storage/startup
 # implementation paths here when introducing them; broad families cover splits.
 FRESH_COPY_PATHS = (
+    'Sources/ChecklistCore/TriageMembershipUpgrade.swift',
     'Sources/ChecklistCore/Storage*', 'Sources/ChecklistCore/SchemaMigrations.swift',
     'Sources/ChecklistCore/Store.swift', 'Sources/ChecklistCore/StoredRecord.swift',
     'Sources/ChecklistCore/LegacyStoredValue.swift', 'Sources/ChecklistCore/ManagedPath*',

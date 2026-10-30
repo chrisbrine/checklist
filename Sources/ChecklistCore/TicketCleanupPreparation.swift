@@ -53,10 +53,10 @@ extension CommandRouter {
                 }}
                 return
             };prepared = value}
-            catch is DatabaseError {
+            catch let error as DatabaseError {
                 ticketCleanupNeedsReader = true
                 try? ticketCleanupReaders?.close();ticketCleanupReaders = nil
-                throw CoreError("CLEANUP_READ_LANE_UNAVAILABLE","Cleanup will retry a separate read lane; bytes retained.")
+                throw CoreError("CLEANUP_READ_LANE_UNAVAILABLE","Cleanup will retry a separate read lane; bytes retained.",details:TicketCleanupFailureDiagnostics.details(error))
             }
             while true {
                 try ArchiveStorageGate.withExclusive(root:root) {permit in
@@ -83,6 +83,7 @@ extension CommandRouter {
             if let project = ticketCleanupPreparingProject {try dbQueue.writeWithoutTransaction {db in
                 var state = try self.ticketCleanupPreparationState(db,project:project)
                 state["state"] = "deferred";state["last_failed_at"] = now();state["last_failure_reason"] = reason;state["next_attempt_at"] = ISO8601DateFormatter().string(from:retry)
+                state["last_failure"] = TicketCleanupFailureDiagnostics.details(error)
                 try self.saveTicketCleanupPreparationState(db,project:project,state:state)
             }}
             // A fenced attempt is an expected refusal, never a successful pass.

@@ -41,6 +41,16 @@ do {
             try denied.write(to:base.appendingPathComponent("recovery-refusal.json"));exit(0)
         }
     }
+    if mode == "migration-catalog-staged" || mode == "migration-catalog-published" {
+        StorageBackupManifestIndex.historicalCatalogObserve = {phase in
+            if mode == "migration-" + phase.replacingOccurrences(of:"_",with:"-") {
+                try? Data(mode.utf8).write(to:base.appendingPathComponent("ready"))
+                _ = Darwin.kill(getpid(),SIGKILL);_exit(99)
+            }
+        }
+        _ = try StorageBootstrap.open(root:root,serviceLease:StorageServiceLease(root:root))
+        fail(3)
+    }
     if mode == "migration-before-commit" || mode == "migration-committed" {
         let lease = try StorageServiceLease(root:root)
         _ = try StorageBootstrap.open(root:root,serviceLease:lease,observe:{ boundary in

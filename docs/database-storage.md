@@ -233,14 +233,14 @@ Undo cancels a pending cleanup while bytes still exist. Unarchive restores task 
 
 ## Consistent backup
 
-Provide **Back up now** and automatic local backups. Proposed default: create the first backup after the first saved project; thereafter, when changes exist and the last successful backup is at least 24 hours old, request one bounded backup while the service is available. Evaluate after commits and at ordinary service startup; if it was closed, overdue work waits for that next startup. Coalesce concurrent requests; do not wake a model or install a recurring task. Retain **seven daily and four weekly successful generations**, plus a protected pre-upgrade/pre-restore rollback generation until its operation is verified. These are product defaults to validate, not existing automation. The owner can choose off, daily-on-change or a longer interval, change retention and choose an export destination. Local backups protect recovery from app mistakes; an owner-selected external copy protects against losing this Mac.
+Provide **Back up now** and automatic local backups. Proposed default: create the first backup after the first saved project; thereafter, when changes exist and the last successful backup is at least 24 hours old, request one bounded backup while the service is available. Evaluate after commits and at ordinary service startup; if it was closed, overdue work waits for that next startup. Coalesce concurrent requests; do not wake a model or install a recurring task. Backup creation cadence remains a proposal; the implemented, owner-confirmed snapshot retention rule is described under **Owner backup retention and Trash pruning** below. The owner can choose off, daily-on-change or a longer interval, change retention and choose an export destination. Local backups protect recovery from app mistakes; an owner-selected external copy protects against losing this Mac.
 
 Each completed backup directory is self-contained: consistent SQLite backup, versioned manifest/checksums, all managed originals/previews/icons recorded as available in that snapshot, and a non-secret settings/schema/build summary. Do not rely on the live store's future paths to make a backup restorable. External references remain references and are listed as requiring relink/access; secrets are excluded. A successful metadata-only export is not labeled a full backup.
 
 Use SQLite's documented [Online Backup API](https://sqlite.org/backup.html) and [WAL behavior](https://sqlite.org/wal.html) as the implementation basis. The completed database copy includes committed data; SQLite consistency alone is insufficient for the separate managed files. The following filesystem barrier is Checklist's additional design requirement, not a SQLite guarantee. Use the following storage barrier:
 
 1. Enter the backup job gate and pause physical object deletion; wait for any in-flight unlink to finish. New task writes/imports may continue. Staging and cleanup plans are not authority to delete during this barrier.
-2. Produce a bounded consistent SQLite backup through the backup API, with progress/cancellation. The SQLite `IMMEDIATE` writer lease covers only the consistent database copy, including its page-count budget checks. Release the writer lease and ordinary object gate before journal normalization, database validation, required-object inventory or object verification. Those checks run on the backup worker outside the service's ordinary write lane.
+2. Produce a bounded consistent SQLite backup through the backup API, with progress/cancellation. The SQLite `IMMEDIATE` writer lease establishes a pinned read transaction and then releases; the database copy, including every page-count budget check, reads that same transaction. The ordinary object gate remains held through the database copy. Release that gate before journal normalization, database validation, required-object inventory or object verification. Those checks run on the backup worker outside the service's ordinary write lane.
 3. Keep the root-wide capture retention barrier after releasing the ordinary object gate and SQLite writer lease. Normalize and open the copied database read-only and derive its exact required-object manifest from that snapshot, not from a second query of the changing live database. Retention begins before the database copy and protects the complete namespace before the inventory is known. The implemented barrier is a private no-follow, single-link `.snapshot-retention.lock` kernel lease; it conservatively protects the complete immutable managed namespace, including inventoried pending ordinary-import stages and finalized recovery files. Missing required bytes fail capture. Notes, ticket edits and new immutable imports proceed without holding the backup's file-copy or verification work in the database writer or service coordinator queue. Existing publications never overwrite an immutable name. Cleanup previews report a backup-capture hold, final managed unlink paths refuse `BACKUP_CAPTURE_ACTIVE`, and routine import/archive/purge maintenance waits without incrementing failure/suspension counters. A fresh UUID review-report file can still be removed by its creating transaction's rollback: its `O_EXCL` creation and inode-bound rollback callback remain under the object gate, so no capture could have inventoried it. No general retention bypass is exposed.
 4. Materialize immutable objects inside the staging backup. Same-volume hard links may be used only for immutable bytes; otherwise verified copies are valid. An APFS clone/copy optimization must retain checksum checks. Never hard-link a mutable live SQLite database. Finish the manifest and verify database integrity, object sizes/hashes and completeness. A link/copy failure or cancellation keeps the generation incomplete.
 5. Flush and atomically publish the completed backup directory; prepare the large receipt index outside the writer and record its successful receipt in a short gated transaction, then release capture retention. Concurrent owner backup requests refuse `BACKUP_IN_PROGRESS` and retain their original command identity. An incomplete generation cannot count toward retention or displace the last working backup. The kernel releases retention if its process dies: retry verifies a complete independent stage, or quarantines an incomplete stage and captures a fresh database/inventory under a new hold. It never resumes copying from an unprotected old source inventory. Cleanup's one-shot wake defers to a 60-second capture-lease recheck while capture is active and is rearmed after backup success or failure. Receipt reads expose the retention reason, unknown release time and dated next check even before a first pass exists. Protected pre-upgrade copying retains its exclusive-service drain and gate throughout; it does not admit production writes before migration.
@@ -263,7 +263,7 @@ If a backup cannot finish within its bounded work budget or required free space,
 
 Owner backups and protected pre-upgrade generations use the same explicit product policy in `StorageSnapshotBudget`: **no fixed logical byte ceiling** (CL-340; the earlier 8 GiB ceiling stopped every backup once the live store reached 8.6 GB), with the logical published bytes (database, managed objects, intent and manifest) bounded by the free space on the backup volume less a safety margin, **500,000 managed objects**, **128 MiB per manifest**, **500 MiB per managed file**, **100,000 canonical records**, and a **1,800-second cooperative deadline** for the complete snapshot build, including both full verification passes and publication. Every owner receipt/reconciliation manifest read uses the same manifest cap. These limits replace the earlier 1 GiB / 30,000-object / 8 MiB manifest caps and the 60-second owner / 300-second pre-upgrade deadlines. They are product bounds, not editable project retention rules. Existing generations remain readable under the larger bounds.
 
-The sizing basis is an owned retained-store copy needing roughly 1.7 GiB, 49,406–56,132 objects and a 35.3 MB manifest; earlier durable copying alone took 525–564 seconds on a heavily loaded Mac. The new byte/object/manifest bounds provide several times that observed capacity; the deadline must also cover exact inventory and digest verification. A fixed bounded deadline avoids treating an estimated throughput as a guarantee. Qualification measures actual copying, flushing, publication and reconciliation; inventory or SQL rehearsal alone does not qualify an installation. No APFS clone optimization or retention deletion is introduced: ordinary independent copies, `fsync`/`F_FULLFSYNC`, descriptor-relative `O_NOFOLLOW` access, the existing object permit/SQLite lease and exact database/inventory/object digests remain in force. No additional file work moves into a semantic command transaction. CL-320 releases the owner backup's object gate and SQLite lease after database copy, before normalization, validation and inventory; the root-wide retention lease protects managed copies through publication and receipt. Settings shows an indeterminate copying/verifying indicator and guidance that large stores can take about ten minutes, with the thirty-minute cooperative limit; it disables a duplicate backup click for that request. This is duration guidance, not measured percentage progress or a cancellation control.
+The sizing basis is an owned retained-store copy needing roughly 1.7 GiB, 49,406–56,132 objects and a 35.3 MB manifest; earlier durable copying alone took 525–564 seconds on a heavily loaded Mac. The new byte/object/manifest bounds provide several times that observed capacity; the deadline must also cover exact inventory and digest verification. A fixed bounded deadline avoids treating an estimated throughput as a guarantee. Qualification measures actual copying, flushing, publication and reconciliation; inventory or SQL rehearsal alone does not qualify an installation. APFS file clones are attempted with verified byte-copy fallback; every source content binding and independently hashed destination remains checked. `fsync`/`F_FULLFSYNC`, descriptor-relative `O_NOFOLLOW` access, the existing object permit/SQLite lease and exact database/inventory/object digests remain in force. Confirmed whole-snapshot retention is separate from these capacity bounds. No additional file work moves into a semantic command transaction. CL-320 releases the owner backup's object gate and SQLite lease after database copy, before normalization, validation and inventory; the root-wide retention lease protects managed copies through publication and receipt. Settings shows an indeterminate copying/verifying indicator and guidance that large stores can take about ten minutes, with the thirty-minute cooperative limit; it disables a duplicate backup click for that request. This is duration guidance, not measured percentage progress or a cancellation control.
 
 Before copying managed objects, the builder measures their full descriptor-relative lengths against the copied database inventory. Capacity failures return `BACKUP_CAPACITY_EXCEEDED` with logical byte/object counts, explicit limits and a next step; deadline failures return `BACKUP_DEADLINE_EXCEEDED`. An inventory stopped by its object/record safety bound reports an explicitly labeled lower bound, as does a pre-copy byte measurement that excludes the not-yet-encoded manifest. A completed manifest measurement includes all published bytes. These are logical lengths, not physical-allocation estimates. Before the database copy the builder measures the free space on the backup volume once (`statfs` available blocks) and refuses when less than the 1 GiB minimum margin is free; after the inventory measurement and before any managed object is copied it refuses when the measured bytes plus a safety margin (10% of the measured bytes, at least 1 GiB) exceed that free space. The refusal returns `BACKUP_CAPACITY_EXCEEDED` with reason `snapshot_free_space`, the needed bytes (`required_free_bytes`), the margin and the free bytes (`available_bytes`); during copying the running byte limit is the free space less the minimum margin. Only an exhausted byte-space budget reports `snapshot_free_space`; a free-space sample never reclassifies another bound. A configured fixed byte ceiling and the canonical-record limit report `snapshot_capacity` (including `maximum_records`); the object, manifest and per-file limits report `snapshot_object_capacity`, `snapshot_manifest_capacity` and `snapshot_object_bytes`, and the deadline reports `snapshot_deadline`. These refusals retain their measured counts and configured maxima. Restore applies the same free-space refusal to the restored copy. Preserve the store and existing backups; retry a time-limited attempt on an idle Mac, or use a build with sufficient supported capacity. Never delete retained captures or attachments merely to fit a snapshot. Partial/uncertain staging and previous completed generations retain the existing restart-safe behavior. Cooperative checks cannot interrupt a blocked filesystem call, SQLite integrity query or JSON encode/decode; a longer budget does not promise completion under arbitrary load or power-loss durability.
 
@@ -451,7 +451,7 @@ Byte-maintenance scheduling stores an internal project rotation and per-project 
 
 Manifests add `recordFamilies` (every registered canonical family, including zero counts) and `tableRows` (metadata, records, commands, events and cursors). The complete database SHA-256 covers every table and historical record; every required managed object retains its descriptor/hash/size and exact membership verification. Counts are checked against that same database. Earlier format-1 manifests remain verifiable by deriving the inventory from their database; no backup schema migration is introduced.
 
-The trusted native app verifies a selected backup before showing a restore confirmation. Only snapshots at the build's current schema (4 since CL-125) can be restored by this implementation; an older snapshot refuses with `RESTORE_SCHEMA_UNSUPPORTED` until an upgrade is qualified on a separate copy. The accepted digest is checked again on Create. The service copies the database and every managed file/link into an unpublished owned directory under `restore/`, preserving executable modes and confined capture links. It validates the complete relocated inventory and integrity before atomically publishing a **separate disposable data root**. Existing data and the backup are never replaced or edited. Unpublished interrupted stages are retained; an uncertain publish must reconcile the original command, never silently start a competing restore. A receipt identifies the source manifest and new incarnation. This is candidate restoration, not an in-place production replacement or automatic rollback switch.
+The trusted native app verifies a selected backup before showing a restore confirmation. Only snapshots at the build's current schema (5 since CL-360) can be restored by this implementation; an older snapshot refuses with `RESTORE_SCHEMA_UNSUPPORTED` until an upgrade is qualified on a separate copy. The accepted digest is checked again on Create. The service copies the database and every managed file/link into an unpublished owned directory under `restore/`, preserving executable modes and confined capture links. It validates the complete relocated inventory and integrity before atomically publishing a **separate disposable data root**. Existing data and the backup are never replaced or edited. Unpublished interrupted stages are retained; an uncertain publish must reconcile the original command, never silently start a competing restore. A receipt identifies the source manifest and new incarnation. This is candidate restoration, not an in-place production replacement or automatic rollback switch.
 
 A single transaction changes the candidate's incarnation and cursor seal key, drops legacy cursor rows, revokes every restored session generation/grant, removes session runtime endpoints and claim token hashes, and marks previously active work recovery-required without asserting external writers stopped. It retains active attempts/reservations until explicit recovery or authorized takeover. Restored unresolved deliveries become quarantined with their prior state recorded; acknowledged/addressed history is preserved. Current-generation delivery checks refuse those quarantined receipts even after a fresh session registration. Triage orchestration and pending handoff/session attachment intents retain quarantine/history rather than current execution authority. Native enrollment/credential files are outside the snapshot and are never copied. Restart cannot dispatch these historical messages; ordinary new native host bootstrap is required before new work.
 
@@ -474,7 +474,7 @@ Portable project exports recursively exclude structured credentials, session/gra
 ### Compact capture backups (CL-270)
 
 New snapshots use **manifest format 2**; the manifest change leaves the SQLite protocol
-(3 when CL-270 shipped, schema 4 since CL-125), canonical records and managed paths unchanged. Format-1 snapshots remain readable, fully
+(3 when CL-270 shipped, schema 4 since CL-125, schema 5 since CL-360), canonical records and managed paths unchanged. Format-1 snapshots remain readable, fully
 verifiable and restorable. Older binaries and seed tools that only understand
 format 1 cannot read new generations; preserve the older working bundle and its
 backup until qualification finishes. There is no live-store format migration.
@@ -548,3 +548,234 @@ Each verified regular-file candidate retains one open live-file descriptor and o
 Each admission computes its reserve once from the generation-root paths already present in the immutable manifest observation, without enumerating candidate-copy alternatives. The reserve covers 32 descriptors for ordinary service work, the maximum observed root depth capped at 64 (64 if no root is observed), and 12 temporary verification descriptors. Before admitting another candidate, cleanup counts free descriptor slots below `min(RLIMIT_NOFILE.soft, 4096)` against that reserve. A depleted budget ends admission with remaining objects pending, rather than treating descriptor exhaustion as missing backup bytes. The count and one-second verification limits, 128-object/25-ms writer chunks and ordinary cooperative yields still apply; hashing remains on the read lane.
 
 Backup-copy verification failures retain their cause as `backup_copy_unverified:<error-code>`, including `POSIX_<errno>` for system errors, rather than collapsing every failure to `backup_copy_unavailable`. `EMFILE` (`POSIX_24`), `ENFILE` (`POSIX_23`), `EINTR` (`POSIX_4`) and the verification deadline are retryable on the next ordinary byte turn without a new completed backup. Other failures remain explicit holds and retain the completed-purge generation retry rule. Existing policy-v2 Done-evidence and purge receipts, pending or completed, receive one generation-independent retry of old `backup_copy_unavailable` holds, tracked by the internal `ticket-cleanup-copy-retry-seen:<receipt-id>` marker. That retry rebuilds current authority and verifies bytes again; an object with a permanent mixed hold is never reset merely because it also has an old unavailable or transient reason. This adds no per-file polling timer or deletion authority.
+
+### Owner backup retention and Trash pruning (CL-360)
+
+Settings → Storage → Backup retention exposes the trusted owner controls for
+reading/saving the rule, pinning backups, previewing exact keep reasons and
+confirming Trash moves. Historical upgrade protection has its own explicit
+retirement confirmation; current and prepared upgrade protection stays read-only.
+`backup_retention_get` reads the installation setting. The proposed default keeps
+its newest five completed snapshots, the newest completed snapshot in each of the
+last seven UTC calendar days (including today), and every owner pin. An
+unconfirmed proposal removes nothing. Saving through the trusted owner channel
+confirms automatic application after every completed backup; its receipt binds
+the authenticated owner, command UUID, time, source root and store incarnation.
+Legacy manual rules and relocated/restored confirmations remain inactive until a
+new trusted confirmation. The owner can choose other values, including newest
+three plus one per day for three days. The trusted owner channel changes `newest_count`
+(1–1000) and `daily_days` (0–366) with `backup_retention_set`; `backup_pin(path,
+pinned)` saves or removes an explicit pin. Upgrade protection is independent of
+owner pins: current `preupgrade_snapshot`, retained protected upgrade history,
+and an installer preparation remain protected. The owner can retire historical
+upgrade protection with `backup_pin(pinned:false,retire_upgrade_protection:true)`;
+copied historical protections and pins conservatively cover the matching local
+`snapshot-<UUID>` folder too. This keep-only alias grants no foreign-path read
+or independent-copy authority. Explicit owner unpin/history-retire on that local
+path removes its copied binding in this store;
+this never releases current or prepared upgrade protection, and unpinning does
+not require the snapshot still to exist. Missing or unknown capture times
+and future timestamps retain their snapshots conservatively.
+
+After a completed backup releases its capture lease, the service applies the
+confirmed rule using the same digest-bound preview, journal and Trash machinery.
+A due trigger commits with the backup receipt or protected-upgrade transaction;
+startup resumes a bound due trigger or its original interrupted intent. Deferral
+preserves that trigger, and completion cannot consume a newer trigger. This is
+bounded startup/backup recovery, not a schedule or model runtime. Automatic runs
+use a service principal and never impersonate the owner. Settings exposes the
+last result and the newest 20 automatic history entries. No routine manual prune
+is needed after confirmation.
+
+For an immediate owner-requested prune, `backup_prune_preview` shows exact paths,
+states, keep reasons and `preview_sha256`; `backup_prune` takes that digest and a
+new command UUID. A changed plan refuses. The preview counts
+unrecorded/incomplete and failed-publication folders without offering them as
+complete backups; they stay by default. The owner may explicitly preview and
+apply `include_unrecorded:true` to retire those folders too. Missing/unreadable
+manifests, changed snapshots and folders outside this installation's managed
+`backups/` tree stay retained. A failure that left a manifest is not evidence of
+a completed backup.
+
+Prune takes the store's object gate and refuses during backup capture. Restore
+and cleanup proof hold a shared cross-process manifest lock for their complete
+use; prune takes its exclusive lock before any move, so an in-use snapshot stays.
+Installer upgrade preparation takes the same use lease, and the protected
+metadata/preparation remains a persistent hold. Cleanup uses its already-open
+shared manifest descriptor, adding no descriptor per verified payload.
+
+The supported prune records an exact durable intent, atomically renames each
+eligible directory into an owned folder in the same-volume Trash, flushes both
+parents, moves its derived content-addressed membership index to that same Trash
+folder when present, then retires its generation/accounting records and commits its receipt
+in one SQLite transaction. It never falls back to copy-and-delete across
+volumes. A retry rechecks the current owner rule, pins and upgrade protection for every
+source still present. A crash before rename leaves the source; a crash after rename leaves the
+intent and the exact moved inode/manifest. Retry the original UUID and parameters
+to reconcile and finish. A record can temporarily refer to an absent moved copy
+until reconciliation; it cannot authorize deletion without a newly verified
+payload. Uncertain intents are retained, never guessed complete. The receipt
+lists moved paths and snapshots retained as in use; prior command replay does
+not run pruning again. Trash moves do not free physical disk space until the
+owner empties Trash, and APFS shared extents prevent inferring physical savings
+from logical lengths. No live prune is part of source qualification.
+
+### Compact backup receipts and schema 5 (CL-360/CL-369)
+
+Each completed backup keeps its full object descriptors in its immutable, SHA-256-bound `manifest.json`. The database stores only its path, manifest digest, verification/usage summary, object count and logical byte count. A derived sorted 32-byte membership-key index under `backups/.indexes/` has its own digest in the receipt. This index accelerates historical accounting and cleanup selection; it never grants deletion authority. Final deletion still verifies the exact manifest and independent payload through pinned descriptors. Missing indexes can be rebuilt from the bound manifest; missing or changed manifests retain bytes and report unavailable authority. Initial rebuilding/validation is a separate cost from repeated lookups. Shared cached index bytes are dropped when receipts disappear, and prune moves unused generation indexes beside snapshots in the Trash.
+
+Schema 4→5 is a one-way installation-wide migration. Before deleting any receipt array, the protected snapshot/rehearsal path verifies every historical object triple against the manifest, including normalized historical root paths. The migration resolves the snapshot folder name under the current instance’s own `backups/` directory; a recorded absolute destination never grants access to another installation. Only an exact manifest SHA and matching operation, store, source-root and ordered object triples permit a compact manifest receipt. If that local manifest is unavailable or fails any binding, the exact raw receipt is retained as an immutable managed historical catalog with no independent-copy authority. The SQL receipt/schema change is atomic; death before commit rolls it back. A committed pending-compaction marker resumes checkpoint/VACUUM on restart before serving work, then repairs the external ready identity. Index files published before an interrupted SQL transaction may remain unused and are safe derived data. Compaction needs temporary space for SQLite's rewritten database; file size actually shrinks only after VACUUM completes. Prior protected upgrade snapshots remain in protected history. Rollback restores a protected schema-4 snapshot through the separately qualified restore/upgrade procedure; older binaries cannot open schema 5. No downgrade runs over current data.
+
+Qualification must measure the complete startup/protected backup and the migration/VACUUM cost on an owned live-size copy with all record families and required managed files, and record before/after database and receipt bytes, wall time and host load. Synthetic tests alone do not qualify the installation. Deferred cleanup preparations retain structured `last_failure` syscall/SQLite/domain diagnostics alongside `last_failure_reason`; generic historical stamps cannot retrospectively identify the original syscall.
+
+The first upgrade must durably capture and verify the larger schema-4 store before compaction can reduce later backup costs. A protected-copy deadline failure leaves that upgrade unqualified and stops before migration; a SQL-only measurement or a larger deadline is not evidence that the production startup path fits its budget. Derived membership files and their shared cached bytes cost 32 bytes per retained object entry, separately from the compact database headers, full manifests, protected rollback snapshot and SQLite's temporary compaction space. The existing 1,024-generation/10,000,000-entry observation limits still apply to compact and legacy generations together.
+
+A copied, restored or seeded store may lack historical snapshot manifests, and a summaryless legacy receipt may have no remaining independent snapshot. Schema5 preserves each such receipt’s exact original JSON in a hash-bound managed catalog under `objects/backup-catalogs/`, with a compact `backup-historical-catalog:*` metadata binding so every later backup and restore includes that catalog. Accounting reads its historical membership; it grants no independent backup-copy authority. This preserves every historical entry even when the old destination is gone or cannot be verified. The catalog is never independent-copy authority, including when its original JSON names a verified snapshot elsewhere. The migration reports catalog and manifest receipt counts separately. Catalogs move the raw JSON out of SQLite but retain those logical bytes in managed storage and every later backup; a seed without manifests therefore pays the full retained catalog cost plus derived membership indexes. Verified local manifests avoid that repeated catalog cost. Corrupt receipt headers or catalogs still refuse migration atomically.
+
+Historical catalogs also bind their original membership-key normalization root; rebuilding derived indexes after restore preserves absolute legacy path membership while retaining the raw catalog bytes unchanged.
+
+Current-schema copies and restores also resolve compact receipt manifests and cleanup-copy descriptors in their own backups namespace when the receipt’s original source root is absent or differs byte-for-byte. They never rebuild a missing index by reading the original installation. An intentional external backup remains usable only with an exact current-root source binding. Missing local manifests leave accounting and cleanup authority unavailable; startup still opens unrelated tickets and retains bytes. A retained index cannot redirect final payload proof to a foreign installation.
+
+Historical path parsing is lexical and rejects parent traversal before creating a local snapshot URL. Foreign provenance URLs explicitly specify directory semantics, avoiding Foundation's directory-type filesystem inference. Cleanup tries compact independent generations in reverse receipt insertion order so a fresh complete payload is considered before missing historical copies; every candidate still requires the same pinned manifest and payload checks, with older copies available as fallback.
+
+### Snapshot work and measured costs (CL-356)
+
+Object materialization is serial and admits each actual file size against one
+running logical-byte total; independent verification uses at most four joined
+readers. Each walk retains at most eight no-follow parent descriptors and
+checks every
+cached directory name against its pinned inode before release. Deep paths fall
+back to the original bounded walk. Source hashes may be reused only within the
+same pass for an opened inode with unchanged device/inode, size, mode, mtime and
+ctime. Materialization keeps the already-copied hardlink source walk separate
+from its destination walk; both are rebound before acceptance. A new generation
+or independent verification starts with an empty cache;
+a clone or expected content hash never attests destination bytes. Both complete
+generation verification passes, exact manifest/database binding, per-path
+size/hash checks, namespace closure and flush/publication barriers remain.
+Current-schema inventory decodes each record once while preserving all original
+field/path validation; cached cleanup envelopes require an exact full-row match.
+The envelope lexical skip uses a bounded C byte scan only after complete JSON
+validation; escaped duplicate identity fields and exact revision tokens retain
+their existing checks. Exact row/identity comparisons use length-bound contiguous
+UTF-8 byte comparison when available, retaining iterator fallback and distinguishing
+embedded NUL and canonically equivalent but byte-distinct Unicode.
+
+30 October 2026 owned-copy baseline: independent generation verification took
+462.737934 s for 287,467 managed objects / 7,095,545,717 managed bytes plus a
+2,689,601,536-byte database, at soft/hard NOFILE 256. Load was
+91.75/74.13/67.18 at start and 114.29/116.84/95.61 at finish. Phase costs were
+10.187515 s manifest parsing, 4.487681 s database hashing, 342.513371 s database
+validation/inventory, 89.472895 s descriptor/path and object checks, and
+8.449801 s final namespace enumeration. The whole baseline failed the 300 s
+target. The earlier inventory-walk target checked that same manifest in
+224.464520 s (249.355658 s including the Swift runner), with NOFILE 256 and
+at least 98 descriptors held open. Load was 188.40/193.18/172.61 →
+83.73/139.52/154.27. The measured phases were 2.994292 s manifest parsing,
+2.750602 s database hashing, 185.881127 s database validation/inventory,
+19.462463 s path/object verification, and 9.954613 s namespace enumeration;
+initial manifest discovery and final return account for the remainder. Every
+287,467 managed pathname retained its expected size/hash binding and the same
+manifest SHA. These are component measurements, not complete backup, restore,
+seed or startup times. A preceding optimized diagnostic exceeded five minutes
+and was interrupted; its sample identified repeated retained-path directory
+opens, fixed by a separate pinned inventory walk. It is not an integrity pass.
+These costs describe this owned corpus and observed host load, not a service
+latency guarantee. The final paired-walk/byte-comparison target independently
+verified the same generation in 131.791684 s (154.844775 s including runner),
+NOFILE 256 and at least 98 held descriptors, load 76.32/64.97/74.97 →
+105.85/79.85/79.41. Its phases were 3.117751 s manifest parsing, 2.320096 s
+database hashing, 91.909182 s validation/inventory, 20.129338 s object checks
+and 11.027819 s namespace enumeration. The initial protected-copy target completed
+both independent passes in 908.527505 s, with a 6.261588 s writer lease, load
+78.30/126.74/148.36 → 32.71/50.44/84.60: within the unchanged 1800 s
+production budget but FAIL against 300 s. The final paired-walk target completed
+in 1322.521058 s (1352.465271 s including runner),
+with a 10.306845 s writer lease at load
+145.38/100.30/87.39 → 266.62/226.95/188.02, NOFILE 256 and
+at least 98 held descriptors. Both complete verification passes and publication
+succeeded under the unchanged 1800 s production deadline, but the 300 s total
+and 8 s writer-lease targets both FAIL. Inventory cost
+208.447864 s; object materialization
+493.197454 s; manifest construction/remaining directory sync
+79.450040 s; first verification
+297.407211 s; second verification 197.219928 s.
+This directly invokes the protected snapshot builder on the owned schema-4
+runtime; it does not prove the whole backup command, receipt/automatic-prune
+path, startup rehearsal/migration, restore, preview or slot startup. No
+whole-operation success is inferred from independent-verifier time. No
+load-only rerun was made.
+
+The Python seed helper's independent source-file check improved from
+113.407380 s to 68.886352 s at NOFILE 256 over all 287,468 regular paths /
+9,785,147,253 bytes. Baseline load was 32.10/39.32/62.45 →
+33.61/36.75/58.46; final load was 96.08/70.23/65.35 →
+98.31/76.09/67.95. The optimized schema-4 database path inspection alone took
+310.195284 s at load 49.15/55.23/60.69 → 147.52/89.31/72.94 and still
+failed the 300 s target. Full slot creation/start is not established by those
+component measurements.
+
+P356b subsequently supplied only the exact 24 SHA-bound manifest files under the
+owned copy's matching backup folder names. Full protected startup at NOFILE 256
+and an initial 98 descriptors took 1845.065865s: protected snapshot 1207.974897s,
+rehearsal 323.204164s, actual migration/index 264.683231s and actual
+checkpoint/VACUUM 20.322793s, plus startup validation and warm-up. Phase loads
+were 125.37/165.88/189.94 before capture, 143.12/164.37/176.22 at capture end,
+110.60/136.22/159.19 at rehearsal end, 153.39/134.49/150.70 at actual
+migration end, and 157.11/137.67/151.22 at ready. SQLite shrank from
+2,689,601,536 to 1,126,182,912 bytes, saving 1,563,418,624 bytes. All 33,410 records
+in 37 populated families survived byte-exact and integrity_check returned ok.
+Twenty-four receipts use verified local manifests; one preserves 39,953,041 bytes
+of original raw JSON as a managed historical catalog. A second full startup,
+with no historical manifests, completed in 2275.956997s with all 25 receipts
+preserved as exact 1,556,349,128 bytes of managed catalogs; SQLite became
+1,126,207,488 bytes. Its protected snapshot took 1208.645337s, rehearsal
+458.736959s, actual SQL/index 558.357259s and compaction 14.490046s.
+Phase-end loads were 143.12/164.37/176.22, 113.01/124.23/150.57,
+128.58/131.69/143.92 and 126.74/131.04/143.40 respectively. All 37 families
+were byte-exact and integrity_check returned ok. This seed-shaped route retains
+the full raw catalog bytes in addition to compact indexes; SQLite shrink is
+not a claim of equal total storage reclamation. The protected-copy 1800 s
+budget passed; whole startup 300 s failed. This startup used the recorded earlier
+P356b executable. The later copied-schema-5 reader helper passed its focused
+cases and reopened that migrated copy in 8.269238 s at load
+149.81/148.28/147.53, retaining all 25 receipts and passing integrity_check.
+The equipped copy retained 39,953,041 catalog bytes plus 180,452,864 index
+bytes; the seed-shaped copy retained 1,556,349,128 catalog bytes plus
+180,443,648 index bytes. These are logical sizes. No installed/live
+qualification is inferred from these owned-copy results.
+
+
+The unchanged legacy lookup helper on the owned schema-4 representation took
+241.415338 s cold (25 receipts parsed) and 3.682598 s warm (none reparsed), at
+NOFILE 256 with98 descriptors. Cold phase load was112.08/166.79/191.20 →
+65.95/111.16/160.56; warm65.95/111.16/160.56 →65.07/110.22/159.94.
+The source database hash remained unchanged. A real cleanup preparation after
+compaction and a fresh backup looked up all26 receipts in0.099314 s with no
+legacy parsing (load140.71/144.12/144.43). These are lookup costs; they do not
+claim the same improvement for reference/fence preparation or total drain rate.
+
+A third live-size copy survived actual SIGKILL after the schema-5 commit with
+its external identity still preparing and compaction pending. Ordinary bootstrap
+resumed in 13.658347 s (load 124.20/124.14/135.90 → 120.41/123.27/135.39),
+compacted SQLite to 1,126,207,488 bytes and restored ready. Subsequent integrity,
+all 37 original family hashes and all 25 original raw-catalog hashes passed.
+This proves forward recovery at that boundary; the precommit crash checks use
+focused disposable fixtures.
+
+
+P356b writer-lease qualification on 30 October 2026 used the same owned
+2,689,601,536-byte database at NOFILE 256 and at least 98 held descriptors.
+The baseline writer lease was 6.833901 s; the pinned-reader implementation held
+it for 0.001396 s. Complete capture and normalization took 6.889035 s before
+and 7.759698 s after. Both captured databases have the same SHA-256 and all
+33,410 records in 37 populated families; integrity_check returned ok. Shell
+sysctl loads were 157.76/207.14/211.66 → 175.64/206.26/211.16 before,
+and 159.49/190.03/203.87 → 150.96/183.55/200.84 after (exact receipts are
+installation-specific evidence). Host cache state was not controlled.
+The implementation pins an actual SQLite read transaction while the writer
+fence is held, releases that fence, and copies from that same read transaction.
+Later writes cannot enter the captured database. The ordinary object gate
+still spans database copying, so this does not claim a shorter service write
+admission delay or a faster whole backup. Cancellation and completed-callback
+failure release both the writer fence and pinned reader.

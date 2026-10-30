@@ -6,8 +6,9 @@ import Darwin
 /// recovered by deleting a pathname. APFS extents may be shared across inodes.
 enum StorageCopyUsage {
     static func measure(_ files: StorageObjectFiles, paths: [String], budget: StorageSnapshotBudget) throws -> JSON {
+        let files = try StorageObjectFiles(copying:files)
         var logical: Int64 = 0, allocated: Int64 = 0, inodes = Set<String>()
-        for path in paths {
+        for path in paths.sorted() {
             try budget.check()
             let (parent,name) = try files.parent(path)
             defer { Darwin.close(parent) }
@@ -22,6 +23,7 @@ enum StorageCopyUsage {
                 allocated = sum.partialValue
             }
         }
+        try files.finishWalk()
         return ["logical_bytes":logical,"allocated_file_bytes":allocated,"file_count":paths.count,
                 "measured_at":now(),"scope":"verified_copy_files_excluding_directories",
                 "exclusive_physical_bytes":NSNull(),"physical_reclaimable_bytes":NSNull(),
