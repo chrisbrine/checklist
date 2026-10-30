@@ -1,6 +1,7 @@
 import ChecklistTestSupport
 import XCTest
 import GRDB
+import Darwin
 @testable import ChecklistCore
 
 extension TicketLifecycleCleanupTests {
@@ -128,7 +129,7 @@ extension TicketLifecycleCleanupTests {
         })
         let retained = try deletionCohortReceipt(receipt),objects = retained["objects"] as! [JSON]
         XCTAssertEqual(objects[0]["state"] as? String,"retained")
-        XCTAssertTrue((objects[0]["reasons"] as? [String] ?? []).contains("backup_copy_unavailable"))
+        XCTAssertTrue((objects[0]["reasons"] as? [String] ?? []).contains("backup_copy_unverified:sourceChanged"))
         XCTAssertTrue(FileManager.default.fileExists(atPath:objects[0]["stored_path"] as! String))
         try ticketCleanupBackupTemplate(router,objects:objects)
         XCTAssertTrue(try router.runTicketObjectDeletionCohort())
@@ -260,5 +261,40 @@ extension TicketLifecycleCleanupTests {
         XCTAssertTrue(FileManager.default.fileExists(atPath:attachment["path"] as! String))
         XCTAssertEqual((try deletionCohortReceipt(modern)["summary"] as? JSON)?["removed_count"] as? Int,1)
         XCTAssertNotNil(try router.dbQueue.read {try self.router.ticketCleanupRetryEntries($0,project:pid)[task["id"] as! String]})
+    }
+}
+
+
+extension TicketLifecycleCleanupTests {
+    /// The XCTest invocation is an isolated process; restore its original limit
+    /// before teardown. Match launchd's soft limit and the measured service idle
+    /// baseline, then exercise the real byte-turn preparation and unlink path.
+    func testDeletionCohort256CandidatesAtLaunchdDescriptorLimit() throws {
+        let receipts = try deletionCohortFixture([256])
+        var original = rlimit()
+        XCTAssertEqual(getrlimit(RLIMIT_NOFILE,&original),0)
+        var limited = original;limited.rlim_cur = 256
+        var padding: [Int32] = []
+        defer {
+            _ = setrlimit(RLIMIT_NOFILE,&original)
+            for fd in padding {Darwin.close(fd)}
+        }
+        func openCount() -> Int {(0..<256).filter {fcntl(Int32($0),F_GETFD) >= 0}.count}
+        while openCount() < 98 {
+            let fd = Darwin.open("/dev/null",O_RDONLY | O_CLOEXEC)
+            XCTAssertGreaterThanOrEqual(fd,0);guard fd >= 0 else {return}
+            padding.append(fd)
+        }
+        XCTAssertEqual(setrlimit(RLIMIT_NOFILE,&limited),0)
+        print("P321i descriptor fixture: soft=256 baseline=\(openCount()) candidates=256")
+        XCTAssertTrue(try router.runTicketObjectDeletionCohort())
+        let actual = try deletionCohortReceipt(receipts[0]),summary = actual["summary"] as? JSON ?? [:]
+        print("P321i descriptor result: \(try jsonString(summary))")
+        XCTAssertEqual(summary["removed_count"] as? Int,256)
+        XCTAssertEqual(summary["retained_count"] as? Int,0)
+        XCTAssertEqual(actual["state"] as? String,"completed")
+        for object in receipts[0]["objects"] as! [JSON] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath:object["stored_path"] as! String))
+        }
     }
 }

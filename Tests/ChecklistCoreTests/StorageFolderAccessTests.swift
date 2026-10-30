@@ -99,6 +99,63 @@ final class StorageFolderAccessTests: XCTestCase {
         catch { errno = ECHILD;XCTAssertTrue(StorageFolderAccess.isMissing(error)) }
         XCTAssertFalse(try files.regularOrLinkExists("missing/file"))
     }
+    func testFailedGateAncestorPinAtDescriptorLimitClosesRootAcrossRetries() throws {
+        let base = URL(fileURLWithPath:"/private/tmp",isDirectory:true).appendingPathComponent("checklist-pin-limit-" + UUID().uuidString,isDirectory:true)
+        let root = base.appendingPathComponent("one/two/three/four/five/six",isDirectory:true)
+        try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
+        defer {try? FileManager.default.removeItem(at:base)}
+        var access = StorageFolderAccess()
+        access.reusePinnedRoots = false
+        // Warm the real reusable opener before pressure. Its subsequent request
+        // only transfers one descriptor; no new helper pipes are required.
+        let warm = try access.open(path:root.path,folder:root)
+        Darwin.close(warm)
+
+        func constrainedAttempts() throws -> (rootOpenAdded: Int,baseline: Int,after: [Int],errors: [Error],successes: Int) {
+            var original = rlimit()
+            XCTAssertEqual(getrlimit(RLIMIT_NOFILE,&original),0)
+            var limited = original;limited.rlim_cur = 256
+            var padding: [Int32] = []
+            defer {
+                XCTAssertEqual(setrlimit(RLIMIT_NOFILE,&original),0)
+                for descriptor in padding {Darwin.close(descriptor)}
+            }
+            XCTAssertEqual(setrlimit(RLIMIT_NOFILE,&limited),0)
+            func openCount() -> Int {(0..<256).filter {fcntl(Int32($0),F_GETFD) >= 0}.count}
+            // Four free slots admit the selected root and several ancestor pins,
+            // but cannot hold this deep root's complete no-follow ancestry.
+            while openCount() < 252 {
+                let descriptor = Darwin.open("/dev/null",O_RDONLY | O_CLOEXEC)
+                guard descriptor >= 0 else {throw CoreError("TEST_PADDING_FAILED","Could not establish descriptor pressure.",details:["posix_errno":errno])}
+                padding.append(descriptor)
+            }
+            let baseline = openCount()
+            let probe = try access.open(path:root.path,folder:root)
+            let rootOpenAdded = openCount()-baseline
+            Darwin.close(probe)
+            var counts: [Int] = [],errors: [Error] = [],successes = 0
+            for _ in 0..<2 {
+                do {
+                    let files = try StorageObjectFiles(root:root,folderAccess:access,pinRootForGates:true)
+                    withExtendedLifetime(files) {};successes += 1
+                } catch {errors.append(error)}
+                counts.append(openCount())
+            }
+            return (rootOpenAdded,baseline,counts,errors,successes)
+        }
+        let result = try constrainedAttempts()
+        XCTAssertEqual(result.rootOpenAdded,1,"The existing root opener must succeed before ancestry pinning is exercised.")
+        XCTAssertEqual(result.baseline,252)
+        XCTAssertEqual(result.successes,0)
+        XCTAssertEqual(result.errors.count,2)
+        for error in result.errors {
+            let failure = try XCTUnwrap(error as? CoreError)
+            XCTAssertEqual(failure.code,"STORAGE_ROOT_UNAVAILABLE","A helper startup failure must not masquerade as failed ancestry pinning.")
+            XCTAssertEqual((failure.details["posix_errno"] as? NSNumber)?.int32Value,EMFILE)
+        }
+        XCTAssertEqual(result.after,[result.baseline,result.baseline],"A throwing initializer must release its selected root and every partial ancestor pin before retry.")
+    }
+
     func testPinnedStoreGateRefusesAncestorSymlinkEvenWhenRootInodeMatches() throws {
         let f = try StorageFixture(),ancestor = f.workspace.appendingPathComponent("ancestor"),root = ancestor.appendingPathComponent("store")
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
@@ -168,7 +225,11 @@ final class StorageFolderAccessTests: XCTestCase {
         let original = f.workspace.appendingPathComponent("one"),moved = f.workspace.appendingPathComponent("moved")
         try FileManager.default.moveItem(at:original,to:moved)
         try FileManager.default.createSymbolicLink(at:original,withDestinationURL:moved)
-        XCTAssertThrowsError(try files.parent("one/two/file")) { guard case StorageSnapshotFailure.io = $0 else { return XCTFail("Unexpected error: \($0)") } }
+        XCTAssertThrowsError(try files.parent("one/two/file")) { error in
+            let failure = error as? CoreError
+            XCTAssertEqual(failure?.code,"STORAGE_OBJECT_UNAVAILABLE")
+            XCTAssertTrue([ELOOP,ENOTDIR].contains((failure?.details["posix_errno"] as? NSNumber)?.int32Value ?? 0))
+        }
         XCTAssertEqual(opens,opened)
     }
     func testFIFOIsRefusedWithoutBlockingOnFinalOpen() throws {

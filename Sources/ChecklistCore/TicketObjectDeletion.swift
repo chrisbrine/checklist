@@ -13,15 +13,16 @@ final class TicketCleanupBackupCopy {
     let regular: TicketObjectRemovalVerification?
     let manifest: TicketObjectRemovalVerification
     let link: String?
-    init(root: URL,object: JSON,manifest: TicketObjectRemovalVerification,check: () throws -> Void = {}) throws {
+    init(root: URL,object: JSON,manifest: TicketObjectRemovalVerification,pinnedRoot: StorageObjectFiles? = nil,check: () throws -> Void = {}) throws {
         guard let relative = object["relative_path"] as? String,let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value else {throw StorageSnapshotFailure.unsupportedAuthority}
-        files = try StorageObjectFiles(root:root,pinRootForGates:true);path = "managed/" + relative;self.manifest = manifest
+        files = try pinnedRoot ?? StorageObjectFiles(root:root,pinRootForGates:true);path = "managed/" + relative;self.manifest = manifest
         guard manifest.root == Data(files.root.path.utf8),manifest.relative == Data("manifest.json".utf8) else {throw StorageSnapshotFailure.sourceChanged}
         var beforeLink: stat?
         if object["kind"] as? String == "symlink" {
             let (parent,name) = try files.parent(path);defer {Darwin.close(parent)}
             var before = stat()
-            guard fstatat(parent,name,&before,AT_SYMLINK_NOFOLLOW) == 0,before.st_mode & S_IFMT == S_IFLNK else {throw StorageSnapshotFailure.incomplete}
+            guard fstatat(parent,name,&before,AT_SYMLINK_NOFOLLOW) == 0 else {throw CoreError("CLEANUP_BACKUP_UNAVAILABLE","Backup link could not be checked.",details:["posix_errno":errno])}
+            guard before.st_mode & S_IFMT == S_IFLNK else {throw StorageSnapshotFailure.incomplete}
             beforeLink = before
             try check()
             guard let target = object["link_target"] as? String,Int64(target.utf8.count) == size,hash(Data(target.utf8)) == sha,try files.linkTarget(path) == target else {throw StorageSnapshotFailure.sourceChanged}
@@ -32,23 +33,28 @@ final class TicketCleanupBackupCopy {
         }
         let (parent,name) = try files.parent(path);defer {Darwin.close(parent)}
         var entry = stat()
-        guard fstatat(parent,name,&entry,AT_SYMLINK_NOFOLLOW) == 0,entry.st_mode & S_IFMT == (link == nil ? S_IFREG : S_IFLNK) else {throw StorageSnapshotFailure.incomplete}
+        guard fstatat(parent,name,&entry,AT_SYMLINK_NOFOLLOW) == 0 else {throw CoreError("CLEANUP_BACKUP_UNAVAILABLE","Backup payload could not be checked.",details:["posix_errno":errno])}
+        guard entry.st_mode & S_IFMT == (link == nil ? S_IFREG : S_IFLNK) else {throw StorageSnapshotFailure.incomplete}
         if let regular {guard TicketObjectRemovalVerification.same(regular.identity,entry) else {throw StorageSnapshotFailure.sourceChanged}}
         if let beforeLink {guard Self.sameLink(beforeLink,entry) else {throw StorageSnapshotFailure.sourceChanged}}
         identity = entry
     }
-    func isCurrent() -> Bool {
-        do {
-            try files.requireNamedRoot(files.root)
-            let (manifestParent,manifestName) = try files.parent("manifest.json");defer {Darwin.close(manifestParent)}
-            var manifestEntry = stat()
-            guard fstatat(manifestParent,manifestName,&manifestEntry,AT_SYMLINK_NOFOLLOW) == 0,TicketObjectRemovalVerification.same(manifest.identity,manifestEntry) else {return false}
-            let (parent,name) = try files.parent(path);defer {Darwin.close(parent)}
-            var entry = stat()
-            guard fstatat(parent,name,&entry,AT_SYMLINK_NOFOLLOW) == 0 else {return false}
-            if let regular {return TicketObjectRemovalVerification.same(regular.identity,entry)}
-            return Self.sameLink(identity,entry)
-        } catch {return false}
+    func isCurrent() -> Bool {(try? requireCurrent()) != nil}
+    func requireCurrent() throws {
+        try files.requireNamedRoot(files.root)
+        let (manifestParent,manifestName) = try files.parent("manifest.json");defer {Darwin.close(manifestParent)}
+        var manifestEntry = stat()
+        guard fstatat(manifestParent,manifestName,&manifestEntry,AT_SYMLINK_NOFOLLOW) == 0 else {
+            throw CoreError("CLEANUP_BACKUP_UNAVAILABLE","Backup manifest could not be rechecked.",details:["posix_errno":errno])
+        }
+        guard TicketObjectRemovalVerification.same(manifest.identity,manifestEntry) else {throw StorageSnapshotFailure.sourceChanged}
+        let (parent,name) = try files.parent(path);defer {Darwin.close(parent)}
+        var entry = stat()
+        guard fstatat(parent,name,&entry,AT_SYMLINK_NOFOLLOW) == 0 else {
+            throw CoreError("CLEANUP_BACKUP_UNAVAILABLE","Backup payload could not be rechecked.",details:["posix_errno":errno])
+        }
+        if let regular {guard TicketObjectRemovalVerification.same(regular.identity,entry) else {throw StorageSnapshotFailure.sourceChanged}}
+        else {guard Self.sameLink(identity,entry) else {throw StorageSnapshotFailure.sourceChanged}}
     }
     private static func sameLink(_ a: stat,_ b: stat) -> Bool {
         a.st_mode & S_IFMT == S_IFLNK && b.st_mode & S_IFMT == S_IFLNK && a.st_dev == b.st_dev && a.st_ino == b.st_ino && a.st_size == b.st_size && a.st_mtimespec.tv_sec == b.st_mtimespec.tv_sec && a.st_mtimespec.tv_nsec == b.st_mtimespec.tv_nsec && a.st_ctimespec.tv_sec == b.st_ctimespec.tv_sec && a.st_ctimespec.tv_nsec == b.st_ctimespec.tv_nsec
@@ -100,21 +106,49 @@ extension CommandRouter {
     static let ticketObjectDeletionKind = "ticket_object_delete"
     static let ticketObjectDeletionRetryReasons: Set<String> = ["backup_authority","remaining_record","backup_required","backup_copy_unavailable","backup_authority_unavailable"]
     static func ticketObjectDeletionReasonsRetryable(_ reasons: Set<String>) -> Bool {
-        !reasons.isEmpty && reasons.allSatisfy {ticketObjectDeletionRetryReasons.contains($0) || $0.hasPrefix("backup_index_error:")}
+        !reasons.isEmpty && reasons.allSatisfy {ticketObjectDeletionRetryReasons.contains($0) || $0.hasPrefix("backup_index_error:") || $0.hasPrefix("backup_copy_unverified:")}
     }
     // The same readiness predicate drives selection and the one-shot deadline.
-    // A retained purge is observed once per completed backup generation, so an
-    // unavailable copy or a genuine shared owner cannot become a polling loop.
+    // Permanent purge holds observe each completed generation once. Explicit
+    // transient errors and one-time legacy-copy recovery need no new backup.
     static let ticketObjectDeletionReadySQL = """
         json_valid(records.data) AND json_extract(records.data,'$.kind')='ticket_object_delete' AND (
             json_extract(records.data,'$.state')='pending' OR (
-                json_extract(records.data,'$.state')='completed' AND json_extract(records.data,'$.cause')='task_purge'
-                AND (COALESCE(json_extract(records.data,'$.cleanup_policy_version'),0)<2 OR COALESCE((SELECT CAST(value AS INTEGER) FROM metadata WHERE key='ticket-cleanup-backup-seen:'||records.id),-1)<COALESCE((SELECT MAX(rowid) FROM metadata WHERE key GLOB 'backup-generation:*' AND json_valid(value) AND json_extract(value,'$.state')='complete'),0))
+                json_extract(records.data,'$.state')='completed' AND json_extract(records.data,'$.cause') IN ('task_purge','done_evidence')
                 AND EXISTS(SELECT 1 FROM json_each(records.data,'$.objects') object WHERE json_extract(object.value,'$.state')='retained'
                     AND json_type(object.value,'$.reasons')='array' AND json_array_length(object.value,'$.reasons')>0
-                    AND NOT EXISTS(SELECT 1 FROM json_each(object.value,'$.reasons') reason WHERE reason.type!='text' OR (reason.value NOT IN ('backup_authority','remaining_record','backup_required','backup_copy_unavailable','backup_authority_unavailable') AND reason.value NOT GLOB 'backup_index_error:*')))
+                    AND NOT EXISTS(SELECT 1 FROM json_each(object.value,'$.reasons') reason WHERE reason.type!='text' OR (reason.value NOT IN ('backup_authority','remaining_record','backup_required','backup_copy_unavailable','backup_authority_unavailable') AND reason.value NOT GLOB 'backup_index_error:*' AND reason.value NOT GLOB 'backup_copy_unverified:*'))
+                    AND (
+                        (json_extract(records.data,'$.cause')='task_purge' AND (COALESCE(json_extract(records.data,'$.cleanup_policy_version'),0)<2 OR COALESCE((SELECT CAST(value AS INTEGER) FROM metadata WHERE key='ticket-cleanup-backup-seen:'||records.id),-1)<COALESCE((SELECT MAX(rowid) FROM metadata WHERE key GLOB 'backup-generation:*' AND json_valid(value) AND json_extract(value,'$.state')='complete'),0)))
+                        OR (COALESCE(json_extract(records.data,'$.cleanup_policy_version'),0)>=2
+                            AND NOT EXISTS(SELECT 1 FROM metadata WHERE key='ticket-cleanup-copy-retry-seen:'||records.id)
+                            AND EXISTS(SELECT 1 FROM json_each(object.value,'$.reasons') reason WHERE reason.value='backup_copy_unavailable'))
+                        OR EXISTS(SELECT 1 FROM json_each(object.value,'$.reasons') reason WHERE reason.value IN ('backup_copy_unverified:POSIX_24','backup_copy_unverified:POSIX_23','backup_copy_unverified:POSIX_4','backup_copy_unverified:deadline'))
+                    ))
             ))
         """
+    func rearmTicketObjectCopyFailures(_ db: Database,receipt: inout JSON,backupGenerationRow: Int64? = nil) throws {
+        guard let id = receipt["id"] as? String else {return}
+        let policy = int(receipt,"cleanup_policy_version")
+        var generationRetry = false
+        if receipt["state"] as? String == "completed",receipt["cause"] as? String == "task_purge" {
+            let seen = try Int64.fetchOne(db,sql:"SELECT CAST(value AS INTEGER) FROM metadata WHERE key=?",arguments:["ticket-cleanup-backup-seen:" + id]) ?? -1
+            let generation = try backupGenerationRow ?? ticketCleanupBackupGenerationRow(db)
+            generationRetry = policy < 2 || seen < generation
+        }
+        guard policy >= 2 || generationRetry else {return}
+        let copyRetrySeen = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM metadata WHERE key=?)",arguments:["ticket-cleanup-copy-retry-seen:" + id]) == true
+        let legacy = policy >= 2 && !copyRetrySeen
+        var objects = receipt["objects"] as? [JSON] ?? []
+        for i in objects.indices where objects[i]["state"] as? String == "retained" {
+            let reasons = Set(objects[i]["reasons"] as? [String] ?? [])
+            if Self.ticketObjectDeletionReasonsRetryable(reasons),
+               (generationRetry || legacy && reasons.contains("backup_copy_unavailable") || reasons.contains(where:TicketCleanupCopyFailure.isTransient)) {
+                objects[i]["state"] = "pending";objects[i].removeValue(forKey:"reasons")
+            }
+        }
+        receipt["objects"] = objects
+    }
     func ticketCleanupBackupGenerationRow(_ db: Database) throws -> Int64 {
         try Int64.fetchOne(db,sql:"SELECT COALESCE(MAX(rowid),0) FROM metadata WHERE key GLOB 'backup-generation:*' AND json_valid(value) AND json_extract(value,'$.state')='complete'") ?? 0
     }
@@ -384,7 +418,11 @@ extension CommandRouter {
             let key = StorageBackupRetentionIndex.key(path:relative,sha:sha,size:size)
             if let failure = backup.cleanupFailureReason {holds.insert(failure)}
             else if !backup.hasIndependentCopy(key) {holds.insert("backup_required")}
-            else if backup.checkedCopies.contains(key),backup.verifiedCopies[key]?.isCurrent() != true {holds.insert("backup_copy_unavailable")}
+            else if backup.checkedCopies.contains(key) {
+                if let copy = backup.verifiedCopies[key] {
+                    do {try copy.requireCurrent()} catch {holds.insert(TicketCleanupCopyFailure.reason(error))}
+                } else {holds.insert(backup.copyFailures[key] ?? "backup_copy_unverified:COPY_UNAVAILABLE")}
+            }
         } else {holds.insert("backup_authority_unavailable")}
         return holds
     }

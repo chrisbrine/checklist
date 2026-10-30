@@ -13,6 +13,9 @@ struct StorageBackupRetentionIndex {
     var copyPaths: [Data:[URL]] = [:]
     var copyManifests: [String:String] = [:]
     var checkedCopies: Set<Data> = []
+    var copyFailures: [Data:String] = [:]
+    var verifiedRoots: [String:StorageObjectFiles] = [:]
+    var manifestFailures: [String:String] = [:]
     var verifiedCopies: [Data:TicketCleanupBackupCopy] = [:]
     var verifiedManifests: [String:TicketObjectRemovalVerification] = [:]
     var unavailableManifests: Set<String> = []
@@ -33,18 +36,58 @@ struct StorageBackupRetentionIndex {
             let localA = a.path.hasPrefix(root.path + "/"),localB = b.path.hasPrefix(root.path + "/")
             return localA != localB ? localA : a.path < b.path
         })
-        for path in paths where !unavailableManifests.contains(path.path) {
+        for path in paths {
+            if unavailableManifests.contains(path.path) {
+                if copyFailures[key].map(TicketCleanupCopyFailure.isTransient) != true {
+                    copyFailures[key] = manifestFailures[path.path] ?? "backup_copy_unverified:MANIFEST_UNAVAILABLE"
+                }
+                continue
+            }
             do {
+                // Two reusable generation roots bound idle pins. Active copies
+                // retain their exact root even if its cache entry is evicted.
+                if verifiedRoots[path.path] == nil {
+                    if verifiedRoots.count >= 2,let evicted = verifiedRoots.keys.sorted().first {
+                        verifiedRoots.removeValue(forKey:evicted)
+                        verifiedManifests.removeValue(forKey:evicted)
+                    }
+                    verifiedRoots[path.path] = try StorageObjectFiles(root:path,pinRootForGates:true)
+                }
                 if verifiedManifests[path.path] == nil,let expected = copyManifests[path.path] {
                     verifiedManifests[path.path] = try TicketObjectRemovalVerification(root:path,relative:"manifest.json",sha256:expected,check:check)
                 }
-                guard let manifest = verifiedManifests[path.path] else {unavailableManifests.insert(path.path);continue}
-                verifiedCopies[key] = try TicketCleanupBackupCopy(root:path,object:object,manifest:manifest,check:check);return
+                guard let manifest = verifiedManifests[path.path] else {throw StorageSnapshotFailure.incomplete}
+                verifiedCopies[key] = try TicketCleanupBackupCopy(root:path,object:object,manifest:manifest,pinnedRoot:verifiedRoots[path.path],check:check)
+                copyFailures.removeValue(forKey:key);return
             } catch {
-                if verifiedManifests[path.path] == nil {unavailableManifests.insert(path.path)}
+                let reason = TicketCleanupCopyFailure.reason(error)
+                // A transient failure outranks a bad alternative: another turn
+                // may verify that alternative without a new backup generation.
+                if copyFailures[key] == nil || TicketCleanupCopyFailure.isTransient(reason) {copyFailures[key] = reason}
+                if verifiedManifests[path.path] == nil && !TicketCleanupCopyFailure.isTransient(reason) {
+                    unavailableManifests.insert(path.path);manifestFailures[path.path] = reason
+                    verifiedRoots.removeValue(forKey:path.path)
+                }
                 continue
             }
         }
+    }
+    /// Count available low-numbered slots, rather than assuming the shell's
+    /// much higher limit. Ignore slots above 4096 conservatively. Keep 32 for
+    /// normal service traffic plus enough for the next no-follow root walk,
+    /// payload/original/manifest opens and temporary directory descriptors.
+    var descriptorAdmissionReserve: Int {
+        // Generation paths already belong to this immutable observation; do not
+        // enumerate the lazy candidate-copy alternatives merely to budget FDs.
+        let depth = copyManifests.keys.reduce(0) {max($0,$1.split(separator:"/").count)}
+        return 32 + (depth == 0 ? 64 : min(64,depth)) + 12
+    }
+    func hasDescriptorBudget(reserving reserve: Int) -> Bool {
+        var limits = rlimit()
+        guard getrlimit(RLIMIT_NOFILE,&limits) == 0 else {return false}
+        let ceiling = Int(min(limits.rlim_cur,4096))
+        let available = (0..<ceiling).reduce(0) {$0 + (fcntl(Int32($1),F_GETFD) < 0 && errno == EBADF ? 1 : 0)}
+        return available >= reserve
     }
     static func key(path: String,sha: String,size: Int64) -> Data {
         // CL-355: byte-identical to jsonString (sorted keys, unescaped slashes) for
@@ -381,5 +424,27 @@ public struct StorageRecoveryReply: Sendable {
             payload = ["error":["code":"RECOVERY_REQUIRED","message":"Checklist preserved its storage and paused data access. Repair storage or install a compatible build, then restart the service.","details":["reason":reason,"storage_code":code,"restart_required":true,"command_outcome":"rejected"]]]
         }
         return (try? JSONSerialization.data(withJSONObject:payload,options:.sortedKeys)) ?? Data("{\"error\":{\"code\":\"RECOVERY_REQUIRED\",\"message\":\"Storage is paused.\"}}".utf8)
+    }
+}
+
+
+/// Durable reasons distinguish verified absence/corruption from resource errors.
+/// Only these transient causes are eligible on the next ordinary byte turn.
+enum TicketCleanupCopyFailure {
+    static func reason(_ error: Error) -> String {
+        if let core = error as? CoreError {
+            if let code = core.details["posix_errno"] as? NSNumber {return "backup_copy_unverified:POSIX_" + String(code.int32Value)}
+            return "backup_copy_unverified:" + core.code
+        }
+        let ns = error as NSError
+        if ns.domain == NSPOSIXErrorDomain {return "backup_copy_unverified:POSIX_" + String(ns.code)}
+        if let failure = error as? StorageSnapshotFailure {
+            return "backup_copy_unverified:" + String(describing:failure)
+        }
+        return "backup_copy_unverified:" + ns.domain + "_" + String(ns.code)
+    }
+    static func isTransient(_ reason: String) -> Bool {
+        [EMFILE,ENFILE,EINTR].contains {reason == "backup_copy_unverified:POSIX_" + String($0)}
+        || reason == "backup_copy_unverified:deadline"
     }
 }

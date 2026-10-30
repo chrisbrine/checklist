@@ -178,7 +178,7 @@ extension TicketLifecycleCleanupTests {
             XCTAssertTrue(FileManager.default.fileExists(atPath:attachment["path"] as! String))
             let summary = try XCTUnwrap(receipts(project).first?["summary"] as? JSON)
             XCTAssertEqual(summary["removed_count"] as? Int,0)
-            XCTAssertNotNil((summary["retained_reasons"] as? JSON)?["backup_copy_unavailable"])
+            XCTAssertTrue(((summary["retained_reasons"] as? JSON) ?? [:]).keys.contains { $0.hasPrefix("backup_copy_unverified:") })
         }
     }
 
@@ -212,7 +212,7 @@ extension TicketLifecycleCleanupTests {
         }) {db,permit,prepared in try self.router.processTicketObjectDeletionIntents(db,permit:permit,prepared:prepared)}
         XCTAssertTrue(FileManager.default.fileExists(atPath:attachment["path"] as! String))
         let summary = try XCTUnwrap(receipts(project).first?["summary"] as? JSON)
-        XCTAssertNotNil((summary["retained_reasons"] as? JSON)?["backup_copy_unavailable"])
+        XCTAssertTrue(((summary["retained_reasons"] as? JSON) ?? [:]).keys.contains { $0.hasPrefix("backup_copy_unverified:") })
         XCTAssertEqual(summary["removed_count"] as? Int,0)
     }
 

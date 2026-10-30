@@ -95,6 +95,10 @@ final class TicketCleanupMaintenanceOwnedCopyTests: XCTestCase {
     func testP321gRealMaintenanceOnExplicitOwnedSnapshot() throws {
         let environment = ProcessInfo.processInfo.environment
         let preserveBackupReceipts = environment["CHECKLIST_P321H_PRESERVE_RECEIPTS"] == "1"
+        let requireFullByteTurn = environment["CHECKLIST_P321I_REQUIRE_FULL_BYTE_TURN"] == "1"
+        var descriptorLimit = rlimit()
+        XCTAssertEqual(getrlimit(RLIMIT_NOFILE,&descriptorLimit),0)
+        if requireFullByteTurn {XCTAssertEqual(descriptorLimit.rlim_cur,256,"Run this owned-copy qualification under ulimit -n 256.")}
         guard let rawRoot = environment["CHECKLIST_P321G_STORE"],let rawOutput = environment["CHECKLIST_P321G_OUTPUT"],let phase = environment["CHECKLIST_P321G_PHASE"], ["baseline","after"].contains(phase) else {throw XCTSkip("Select explicit P321g runtime, output and baseline|after phase.")}
         let root = URL(fileURLWithPath:rawRoot,isDirectory:true).resolvingSymlinksInPath(),snapshot = root.deletingLastPathComponent()
         let temporary = URL(fileURLWithPath:"/private/tmp",isDirectory:true).resolvingSymlinksInPath().path
@@ -107,7 +111,7 @@ final class TicketCleanupMaintenanceOwnedCopyTests: XCTestCase {
         XCTAssertEqual(manifestSHA,marker["manifest_sha256"] as? String)
         let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self,from:manifestData)
         let log = try Log(output.appendingPathExtension("jsonl"))
-        log.emit(["event":"startup_begin","phase":phase,"runtime":root.path,"snapshot":snapshot.path])
+        log.emit(["event":"startup_begin","phase":phase,"runtime":root.path,"snapshot":snapshot.path,"nofile_soft":descriptorLimit.rlim_cur,"nofile_hard":descriptorLimit.rlim_max])
         let startup = ProcessInfo.processInfo.systemUptime
         let router = try CommandRouter(root:root,serviceLease:StorageServiceLease(root:root))
         defer {try? router.closeStore()}
@@ -181,9 +185,28 @@ final class TicketCleanupMaintenanceOwnedCopyTests: XCTestCase {
         // turn. Subsequent alternation, backoff and rest remain production code.
         let startByte = environment["CHECKLIST_P321G_START_BYTE"] != "0"
         if startByte {router.ticketCleanupLifecycleTurn = false}
+        if requireFullByteTurn {XCTAssertTrue(startByte)}
         let trafficTask = try router.readForPreparation {db -> JSON in
             let row = try XCTUnwrap(Row.fetchOne(db,sql:"SELECT t.id,t.project_id FROM records t JOIN records s ON s.id=json_extract(t.data,'$.status_id') WHERE t.type='task' AND s.type='status' AND json_extract(s.data,'$.category') NOT IN ('done','canceled') ORDER BY t.rowid LIMIT 1"))
             return ["project_id":row["project_id"] as String,"task_id":row["id"] as String]
+        }
+        var baselineDescriptors: [Int32] = []
+        defer {for descriptor in baselineDescriptors {Darwin.close(descriptor)}}
+        var descriptorBaseline: JSON = [:]
+        if requireFullByteTurn {
+            func countOpenDescriptors() -> Int {
+                (0..<Int(descriptorLimit.rlim_cur)).reduce(0) {$0 + (fcntl(Int32($1),F_GETFD) >= 0 ? 1 : 0)}
+            }
+            let before = countOpenDescriptors()
+            while countOpenDescriptors() < 98 {
+                let descriptor = Darwin.open("/dev/null",O_RDONLY | O_CLOEXEC)
+                guard descriptor >= 0 else {throw CoreError("QUALIFICATION_BASELINE_UNAVAILABLE","Could not pad the owned fixture's descriptor baseline.",details:["errno":errno])}
+                baselineDescriptors.append(descriptor)
+            }
+            let after = countOpenDescriptors()
+            descriptorBaseline = ["open_before":before,"open_after":after,"dev_null_padding":baselineDescriptors.count,"target":98]
+            log.emit(["event":"descriptor_baseline","measurement":descriptorBaseline])
+            XCTAssertGreaterThanOrEqual(after,98)
         }
         let traffic = DispatchGroup();traffic.enter()
         DispatchQueue.global(qos:.utility).async {
@@ -200,6 +223,8 @@ final class TicketCleanupMaintenanceOwnedCopyTests: XCTestCase {
         let maxTurns = min(3,max(1,Int(environment["CHECKLIST_P321G_TURNS"] ?? "2") ?? 2)),maxWait = max(0,Double(environment["CHECKLIST_P321G_MAX_WAIT"] ?? "60") ?? 60)
         var turns: [JSON] = [],prior = try jsonString(initialJobs),unchanged = 0,stopReason = "turn_bound",maintenanceSeconds = 0.0
         let started = ProcessInfo.processInfo.systemUptime
+        if requireFullByteTurn {XCTAssertEqual(maxTurns,1)}
+        var observations: [JSON] = []
         for index in 0..<maxTurns {
             let deadline = try router.nextArchiveCleanupDeadline(),wait = deadline.map {max(0,$0.timeIntervalSinceNow)} ?? 0
             log.emit(["event":"scheduled_turn","index":index,"deadline":deadline.map {ISO8601DateFormatter().string(from:$0)} as Any? ?? NSNull(),"wait_seconds":wait,"initial_byte_turn_override":index == 0 && startByte])
@@ -208,7 +233,7 @@ final class TicketCleanupMaintenanceOwnedCopyTests: XCTestCase {
             if wait > 0 {Thread.sleep(forTimeInterval:wait)}
             let tick = ProcessInfo.processInfo.systemUptime
             var failure: String?
-            do {try router.runStorageMaintenance(observe:{log.emit($0)})} catch {failure = String(describing:error)}
+            do {try router.runStorageMaintenance(observe:{observations.append($0);log.emit($0)})} catch {failure = String(describing:error)}
             let seconds = ProcessInfo.processInfo.systemUptime-tick;maintenanceSeconds += seconds
             let state = try jobs(router),signature = try jsonString(state)
             unchanged = signature == prior ? unchanged+1 : 0;prior = signature
@@ -238,12 +263,24 @@ final class TicketCleanupMaintenanceOwnedCopyTests: XCTestCase {
             proofs.append(proof);verified += 1
         }
         let wall = ProcessInfo.processInfo.systemUptime-started
-        var report: JSON = ["phase":phase,"runtime":root.path,"snapshot":snapshot.path,"manifest_sha256":manifestSHA,"initial_byte_turn_override":startByte,"production_rest_bypassed":false,"max_turns":maxTurns,"max_wait_seconds":maxWait,"stop_reason":stopReason,"seconds":wall,"maintenance_seconds":maintenanceSeconds,"new_removals":proofs.count,"backup_proofs_verified":verified,"files_removed_per_minute":wall > 0 ? Double(proofs.count)*60/wall : 0,"turns":turns,"final_jobs":finalJobs,"responsiveness":log.readSummary(),"fixture_limits":[preserveBackupReceipts ? "All original backup-generation receipts and physical backup paths preserved, no receipt added." : "Existing backup receipt paths redirected to an owned nonexistent directory; one owned copied-snapshot receipt added through router writer before maintenance.","No fixture writes to tickets, jobs, cleanup cursors, retries, holds or turn rest.","Initial byte turn optionally selected to reproduce the installed pending byte turn; subsequent turn alternation and deadlines run unchanged.","Post-run independent proof hashes each newly removed backup payload; production deletion path supplies pre-unlink verification.","P321h preserve mode keeps all 23 original receipt bytes/paths; diagnostic lookup warms the process cache before measured maintenance.","The snapshot predates live R59A pass 233eafcd; actual lifecycle maintenance creates snapshot-local passes without fixture job mutations.","Maintenance turn count and maximum individual scheduling wait are bounded; this is not a complete cleanup sweep."]]
+        var report: JSON = ["phase":phase,"runtime":root.path,"snapshot":snapshot.path,"manifest_sha256":manifestSHA,"nofile_soft":descriptorLimit.rlim_cur,"nofile_hard":descriptorLimit.rlim_max,"initial_byte_turn_override":startByte,"production_rest_bypassed":false,"max_turns":maxTurns,"max_wait_seconds":maxWait,"stop_reason":stopReason,"seconds":wall,"maintenance_seconds":maintenanceSeconds,"new_removals":proofs.count,"backup_proofs_verified":verified,"files_removed_per_minute":wall > 0 ? Double(proofs.count)*60/wall : 0,"turns":turns,"final_jobs":finalJobs,"responsiveness":log.readSummary(),"fixture_limits":[preserveBackupReceipts ? "All original backup-generation receipts and physical backup paths preserved, no receipt added." : "Existing backup receipt paths redirected to an owned nonexistent directory; one owned copied-snapshot receipt added through router writer before maintenance.","No fixture writes to tickets, jobs, cleanup cursors, retries, holds or turn rest.","Initial byte turn optionally selected to reproduce the installed pending byte turn; subsequent turn alternation and deadlines run unchanged.","Post-run independent proof hashes each newly removed backup payload; production deletion path supplies pre-unlink verification.","Preserve mode keeps every original receipt byte/path; diagnostic lookup warms the process cache before measured maintenance.","Snapshot-local maintenance uses the copied existing jobs without fixture job mutations.","Maintenance turn count and maximum individual scheduling wait are bounded; this is not a complete cleanup sweep."]]
         if preserveBackupReceipts {
             let backupReceiptsAfter = try backupReceiptInventory(router)
             let unchanged = try jsonString(backupReceiptsBefore) == jsonString(backupReceiptsAfter)
             report["backup_receipts_before"] = backupReceiptsBefore;report["backup_receipts_after"] = backupReceiptsAfter;report["all_original_backup_receipt_sha256_unchanged"] = unchanged
-            XCTAssertEqual(backupReceiptsBefore.count,23);XCTAssertTrue(unchanged,"All 23 original backup receipt bytes and paths must remain exact.")
+            XCTAssertEqual(backupReceiptsBefore.count,marker["receipt_count"] as? Int);XCTAssertTrue(unchanged,"Every original backup receipt byte and path must remain exact.")
+        }
+        let candidateObservations = observations.filter {$0["phase"] as? String == "candidates"}
+        let decisions = observations.filter {$0["phase"] as? String == "decision"}.compactMap {$0["turn"] as? String}
+        report["candidate_admissions"] = candidateObservations
+        report["maintenance_decisions"] = decisions
+        report["full_byte_turn_required"] = requireFullByteTurn
+        report["descriptor_baseline"] = descriptorBaseline
+        if requireFullByteTurn {
+            XCTAssertEqual(turns.count,1)
+            XCTAssertEqual(decisions,["deletion"],"Qualification must contain one production byte turn.")
+            XCTAssertGreaterThanOrEqual(proofs.count,256,"One descriptor-bounded byte turn must make at least 256 independently verified removals.")
+            XCTAssertTrue(candidateObservations.allSatisfy {($0["failures"] as? JSON ?? [:]).isEmpty})
         }
         report["responsiveness_scope"] = "Concurrent task_get traffic covers scheduled real maintenance turns and production waits; excludes startup, raw receipt inventory hashes and the separate cold/warm index diagnostic."
         report["backup_index_diagnostic"] = diagnostic

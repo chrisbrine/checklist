@@ -72,19 +72,18 @@ extension CommandRouter {
         // Filter individual overflows before LIMIT: even a run of oversized
         // receipts cannot hide a later bounded sibling in this project.
         let rows = try Row.fetchCursor(db,sql:"SELECT " + Self.canonicalRecordColumns + ",rowid AS cleanup_row,length(CAST(data AS BLOB)) AS cleanup_bytes FROM records WHERE " + ready + " AND project_id=? AND " + admissible + " ORDER BY CASE WHEN rowid>? THEN 0 ELSE 1 END,rowid LIMIT ?",arguments:[now(),project,after,TicketCleanupDeletionCohort.receiptLimit])
+        var retryGeneration: Int64?
         var receipts: [JSON] = [],receiptRows: [String:Int64] = [:],lastRow: Int64?,bytes = 0,count = 0
         while let raw = try rows.next() {
             let size: Int = raw["cleanup_bytes"]
             guard size <= TicketCleanupDeletionCohort.descriptorByteLimit,bytes + size <= TicketCleanupDeletionCohort.descriptorByteLimit else {break}
             var receipt = try GRDBRecordEnvelopeAdapter.decode(raw).object
-            var objects = receipt["objects"] as? [JSON] ?? []
+            if receipt["state"] as? String == "completed",receipt["cause"] as? String == "task_purge",retryGeneration == nil {retryGeneration = try ticketCleanupBackupGenerationRow(db)}
+            try rearmTicketObjectCopyFailures(db,receipt:&receipt,backupGenerationRow:retryGeneration)
+            let objects = receipt["objects"] as? [JSON] ?? []
             guard objects.count <= TicketCleanupDeletionCohort.objectLimit,count + objects.count <= TicketCleanupDeletionCohort.objectLimit else {break}
             if receipt["state"] as? String == "completed" {
                 receipt["_cohort_reactivated"] = true
-                for i in objects.indices where objects[i]["state"] as? String == "retained" {
-                    let reasons = Set(objects[i]["reasons"] as? [String] ?? [])
-                    if Self.ticketObjectDeletionReasonsRetryable(reasons) {objects[i]["state"] = "pending";objects[i].removeValue(forKey:"reasons")}
-                }
                 receipt["objects"] = objects;receipt["state"] = "pending";receipt["summary"] = Self.ticketObjectDeletionSummary(objects)
             }
             if receipt["cause"] as? String == "task_purge" {receipt["cleanup_policy_version"] = 2}
@@ -102,7 +101,7 @@ extension CommandRouter {
         let currentReceipts = receipts.filter {!Self.isLegacyDoneEvidenceDeletion($0)}
         let inventories = currentReceipts.isEmpty ? TicketCleanupBatchInventory() : try ticketCleanupDeletionInventories(db,receipts:currentReceipts)
         observe?(["phase":"inventories","admitted":Array(inventories.inventories.keys),"refused":inventories.errors.mapValues {String(describing:$0)}])
-        let generation = currentReceipts.isEmpty ? 0 : try ticketCleanupBackupGenerationRow(db)
+        let generation = currentReceipts.isEmpty ? 0 : try retryGeneration ?? ticketCleanupBackupGenerationRow(db)
         // Only pending objects can gain unlink authority in this cohort.
         // Historical retained/removed descriptors still participate in each
         // inventory/fence, but must not exhaust the shared backup proof budget.
@@ -167,11 +166,13 @@ extension CommandRouter {
                 return cohort
             }
         }
-        // At most 256 pinned payloads survive candidate admission. Manifests
-        // retain exact digests/identities for this cohort only (<=1024 generations).
+        // Release the preceding admission before counting free descriptors.
+        // Each snapshot root/ancestor chain is shared; at most two idle root
+        // and manifest pairs survive admissions within this cohort only.
         cohort.current = nil
         cohort.backup?.checkedCopies.removeAll(keepingCapacity:true)
         cohort.backup?.verifiedCopies.removeAll(keepingCapacity:true)
+        cohort.backup?.copyFailures.removeAll(keepingCapacity:true)
         cohort.current = try prepareTicketObjectDeletionCandidates(db,receipt:entry.receipt,reactivated:entry.reactivated,backupGenerationRow:entry.backupGenerationRow,references:entry.references,backup:&cohort.backup,mediaComplete:entry.mediaAuthorityComplete,fence:entry.fence)
         return cohort
     }

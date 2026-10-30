@@ -47,23 +47,25 @@ final class TicketObjectRemovalVerification {
         defer {Darwin.close(directory)}
         let fd = openat(directory,name,O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         if fd < 0,errno == ENOENT {return nil}
-        guard fd >= 0 else {throw CoreError("CLEANUP_OBJECT_UNAVAILABLE","The original could not be opened safely.")}
+        guard fd >= 0 else {throw CoreError("CLEANUP_OBJECT_UNAVAILABLE","The original could not be opened safely.",details:["posix_errno":errno])}
         do {
             var before = stat(),after = stat()
-            guard fstat(fd,&before) == 0,before.st_mode & S_IFMT == S_IFREG,(size == nil || before.st_size == size) else {throw CoreError("CLEANUP_IDENTITY_CHANGED","Original identity changed; bytes retained.")}
+            guard fstat(fd,&before) == 0 else {throw CoreError("CLEANUP_OBJECT_UNAVAILABLE","The original could not be inspected.",details:["posix_errno":errno])}
+            guard before.st_mode & S_IFMT == S_IFREG,(size == nil || before.st_size == size) else {throw CoreError("CLEANUP_IDENTITY_CHANGED","Original identity changed; bytes retained.")}
             var hasher = SHA256(),buffer = [UInt8](repeating:0,count:65536),counted: Int64 = 0
             while true {
                 try check()
                 let count = Darwin.read(fd,&buffer,buffer.count)
                 if count < 0,errno == EINTR {continue}
-                guard count >= 0 else {throw CoreError("CLEANUP_OBJECT_UNAVAILABLE","Original verification failed; bytes retained.")}
+                guard count >= 0 else {throw CoreError("CLEANUP_OBJECT_UNAVAILABLE","Original verification failed; bytes retained.",details:["posix_errno":errno])}
                 if count == 0 {break}
                 counted += Int64(count)
                 guard counted <= (size ?? before.st_size) else {throw CoreError("CLEANUP_IDENTITY_CHANGED","Original size changed; bytes retained.")}
                 hasher.update(data:Data(buffer.prefix(count)))
             }
             let digest = hasher.finalize().map {String(format:"%02x",$0)}.joined()
-            guard counted == (size ?? before.st_size),(sha256 == nil || digest == sha256),fstat(fd,&after) == 0,Self.same(before,after) else {throw CoreError("CLEANUP_IDENTITY_CHANGED","Original changed during verification; bytes retained.")}
+            guard fstat(fd,&after) == 0 else {throw CoreError("CLEANUP_OBJECT_UNAVAILABLE","The original could not be rechecked.",details:["posix_errno":errno])}
+            guard counted == (size ?? before.st_size),(sha256 == nil || digest == sha256),Self.same(before,after) else {throw CoreError("CLEANUP_IDENTITY_CHANGED","Original changed during verification; bytes retained.")}
             self.root = Data(root.standardizedFileURL.path.utf8);self.relative = Data(relative.utf8)
             self.sha256 = digest;self.size = counted;self.descriptor = fd;self.identity = after
         } catch {Darwin.close(fd);throw error}
@@ -393,6 +395,9 @@ extension CommandRouter {
         receipt["checked_at"] = now()
         receipt = revised(receipt)
         try save(db,receipt,type:"storage_job")
+        if let id = receipt["id"] as? String {
+            try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?, '1')",arguments:["ticket-cleanup-copy-retry-seen:" + id])
+        }
         if receipt["cause"] as? String == "task_purge",let id = receipt["id"] as? String {
             try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-backup-seen:" + id,String(backupGenerationRow)])
         }

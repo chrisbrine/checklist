@@ -1,5 +1,6 @@
 import Foundation
 import GRDB
+import Darwin
 
 struct TicketCleanupPreparedPass: TicketCleanupPrepared {
     let fence: TicketCleanupFence
@@ -133,13 +134,10 @@ extension CommandRouter {
     func prepareTicketObjectDeletion(_ db: Database) throws -> TicketCleanupPreparedDeletion? {
         guard let raw = try Row.fetchOne(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND (" + Self.ticketObjectDeletionReadySQL + ") AND NOT EXISTS(SELECT 1 FROM metadata m WHERE m.key='ticket-cleanup-preparation:'||records.project_id AND json_valid(m.value) AND json_extract(m.value,'$.next_attempt_at')>?) ORDER BY rowid LIMIT 1",arguments:[now()]) else {return nil}
         var receipt = try GRDBRecordEnvelopeAdapter.decode(raw).object
+        try rearmTicketObjectCopyFailures(db,receipt:&receipt)
         let reactivated = receipt["state"] as? String == "completed"
         if reactivated {
-            var objects = receipt["objects"] as? [JSON] ?? []
-            for index in objects.indices where objects[index]["state"] as? String == "retained" {
-                let reasons = Set(objects[index]["reasons"] as? [String] ?? [])
-                if Self.ticketObjectDeletionReasonsRetryable(reasons) {objects[index]["state"] = "pending";objects[index].removeValue(forKey:"reasons")}
-            }
+            let objects = receipt["objects"] as? [JSON] ?? []
             receipt["objects"] = objects;receipt["state"] = "pending";receipt["summary"] = Self.ticketObjectDeletionSummary(objects)
         }
         let backupGenerationRow = try ticketCleanupBackupGenerationRow(db)
@@ -172,10 +170,12 @@ extension CommandRouter {
         let targets = Self.retainTicketObjectDeletionLinkTargets(&objects)
         var candidates = Set<String>(),verifications: [String:TicketObjectRemovalVerification] = [:],failures: [String:Error] = [:]
         let started = ProcessInfo.processInfo.systemUptime
+        let descriptorReserve = backup?.descriptorAdmissionReserve ?? 108
         // Amortize the immutable reference/backup observation across a bounded
         // batch. Stop admitting after one second; a single large object's
         // cooperative verification retains the existing sixty-second ceiling.
         for object in objects where object["state"] as? String == "pending" && !targets.contains(object["relative_path"] as? String ?? "") {
+            if !candidates.isEmpty,backup?.hasDescriptorBudget(reserving:descriptorReserve) == false {break}
             if candidates.count >= 256 || !candidates.isEmpty && ProcessInfo.processInfo.systemUptime-started >= 1 {break}
             guard let path = object["relative_path"] as? String else {continue}
             candidates.insert(path)

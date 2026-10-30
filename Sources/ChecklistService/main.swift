@@ -805,6 +805,18 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
     }
 }
 
+// launchd commonly supplies a 256-descriptor soft limit. Raise only this
+// process's soft limit before opening storage, without changing system settings.
+do {
+    if let adjustment = try ServiceDescriptorLimit.raiseForStartup() {
+        fputs("ChecklistService: descriptor soft limit raised from \(adjustment.previous) to \(adjustment.current).\n",stderr)
+    }
+} catch {
+    // Headroom is a safety margin; bounded filesystem work must also function
+    // when the inherited limit cannot be raised.
+    fputs("ChecklistService: descriptor soft limit retained: \(error).\n",stderr)
+}
+
 // A bounded installer operation on the selected root; it neither bootstraps a
 // native session nor starts a second service or changes the source schema.
 if CommandLine.arguments.dropFirst().first == "--prepare-upgrade" {

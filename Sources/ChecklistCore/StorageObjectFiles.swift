@@ -166,10 +166,11 @@ final class StorageObjectFiles {
         if !pinRootForGates,folderAccess.reusePinnedRoots,let pinned = PinnedRoots.shared.root(for:rootKey) {
             try pinned.requireNamedRoot(self.root)
             descriptor = fcntl(pinned.descriptor,F_DUPFD_CLOEXEC,0)
-            guard descriptor >= 0 else { throw StorageSnapshotFailure.io }
+            guard descriptor >= 0 else { throw CoreError("STORAGE_ROOT_UNAVAILABLE","The pinned root could not be duplicated.",details:["posix_errno":errno]) }
         } else { descriptor = try folderAccess.open(path:descriptorPath,folder:self.root) }
         if pinRootForGates {
-            gateAncestors = try pinGateAncestors(descriptorPath)
+            do {gateAncestors = try pinGateAncestors(descriptorPath)}
+            catch {Darwin.close(descriptor);throw error}
             PinnedRoots.shared.insert(self,key:rootKey)
         }
     }
@@ -183,7 +184,7 @@ final class StorageObjectFiles {
         let parts = try Self.parts(physicalPath,absolute:true)
         guard parts.count <= 64 else { throw StorageSnapshotFailure.unsupportedAuthority }
         var ancestors: [GateAncestor] = [],current = Darwin.open("/",O_RDONLY | O_DIRECTORY | O_CLOEXEC),transferred = false
-        guard current >= 0 else { throw StorageSnapshotFailure.io }
+        guard current >= 0 else { throw CoreError("STORAGE_ROOT_UNAVAILABLE","The root ancestry could not be opened.",details:["posix_errno":errno]) }
         defer {
             Darwin.close(current)
             if !transferred { for ancestor in ancestors { Darwin.close(ancestor.parent) } }
@@ -191,14 +192,18 @@ final class StorageObjectFiles {
         for part in parts {
             // The complete root has already passed the bounded access boundary.
             let next = openat(current,part,O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
-            guard next >= 0 else { throw StorageSnapshotFailure.io }
+            guard next >= 0 else { throw CoreError("STORAGE_ROOT_UNAVAILABLE","The root ancestry could not be pinned.",details:["posix_errno":errno]) }
             var info = stat()
-            guard fstat(next,&info) == 0 else { Darwin.close(next);throw StorageSnapshotFailure.io }
+            guard fstat(next,&info) == 0 else {
+                let failure = CoreError("STORAGE_ROOT_UNAVAILABLE","The root ancestry could not be inspected.",details:["posix_errno":errno])
+                Darwin.close(next);throw failure
+            }
             ancestors.append(.init(parent:current,name:part,device:info.st_dev,inode:info.st_ino))
             current = next
         }
         var actual = stat(),pinned = stat()
-        guard fstat(current,&actual) == 0,fstat(descriptor,&pinned) == 0,actual.st_dev == pinned.st_dev,actual.st_ino == pinned.st_ino else { throw StorageSnapshotFailure.sourceChanged }
+        guard fstat(current,&actual) == 0,fstat(descriptor,&pinned) == 0 else {throw CoreError("STORAGE_ROOT_UNAVAILABLE","The pinned root could not be inspected.",details:["posix_errno":errno])}
+        guard actual.st_dev == pinned.st_dev,actual.st_ino == pinned.st_ino else {throw StorageSnapshotFailure.sourceChanged}
         transferred = true
         return ancestors
     }
@@ -207,19 +212,23 @@ final class StorageObjectFiles {
     /// the named directory still denotes that inode before lending the authority.
     /// This reuses no selected external source or backup destination descriptor.
     func requireNamedRoot(_ expected: URL) throws {
-        func changed() -> CoreError {
-            CoreError("STORAGE_GATE_UNAVAILABLE","The pinned store folder ‘\(root.path)’ changed or is unavailable. Preserve the store and restart Checklist.",details:["reason":"store_root_identity_changed"])
+        func changed(_ code: Int32? = nil) -> CoreError {
+            var details: JSON = ["reason":"store_root_identity_changed"]
+            if let code {details["posix_errno"] = code}
+            return CoreError("STORAGE_GATE_UNAVAILABLE","The pinned store folder ‘\(root.path)’ changed or is unavailable. Preserve the store and restart Checklist.",details:details)
         }
         guard Data(root.path.utf8) == Data(expected.standardizedFileURL.path.utf8),let ancestors = gateAncestors else { throw changed() }
         // Each lookup is relative to its retained parent descriptor. A rename
         // between checks cannot redirect the next lookup through a symlink.
         for ancestor in ancestors {
             var entry = stat()
-            guard fstatat(ancestor.parent,ancestor.name,&entry,AT_SYMLINK_NOFOLLOW) == 0,
-                  entry.st_mode & S_IFMT == S_IFDIR,entry.st_dev == ancestor.device,entry.st_ino == ancestor.inode else { throw changed() }
+            guard fstatat(ancestor.parent,ancestor.name,&entry,AT_SYMLINK_NOFOLLOW) == 0 else {throw changed(errno)}
+            guard entry.st_mode & S_IFMT == S_IFDIR,entry.st_dev == ancestor.device,entry.st_ino == ancestor.inode else { throw changed() }
         }
         var actual = stat()
-        guard let last = ancestors.last,fstat(descriptor,&actual) == 0,actual.st_dev == last.device,actual.st_ino == last.inode else { throw changed() }
+        guard let last = ancestors.last else {throw changed()}
+        guard fstat(descriptor,&actual) == 0 else {throw changed(errno)}
+        guard actual.st_dev == last.device,actual.st_ino == last.inode else {throw changed()}
     }
 
     private final class PinnedRoots: Sendable {
@@ -260,13 +269,13 @@ final class StorageObjectFiles {
             for part in parts { prefix = prefix.isEmpty ? part : prefix + "/" + part; pendingDirectories.insert(prefix) }
         }
         var current = dup(descriptor)
-        guard current >= 0 else { throw StorageSnapshotFailure.io }
+        guard current >= 0 else { throw CoreError("STORAGE_OBJECT_UNAVAILABLE","The managed object parent could not be opened safely.",details:["posix_errno":errno]) }
         do {
             for part in parts {
-                if create, mkdirat(current, part, 0o700) != 0, errno != EEXIST { throw StorageSnapshotFailure.io }
+                if create, mkdirat(current, part, 0o700) != 0, errno != EEXIST { throw CoreError("STORAGE_OBJECT_UNAVAILABLE","The managed object parent could not be opened safely.",details:["posix_errno":errno]) }
                 let next = openat(current, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-                guard next >= 0 else { throw StorageSnapshotFailure.io }
-                if create, !batchSynchronization, fsync(current) != 0 { Darwin.close(next); throw StorageSnapshotFailure.io }
+                guard next >= 0 else { throw CoreError("STORAGE_OBJECT_UNAVAILABLE","The managed object parent could not be opened safely.",details:["posix_errno":errno]) }
+                if create, !batchSynchronization, fsync(current) != 0 { Darwin.close(next); throw CoreError("STORAGE_OBJECT_UNAVAILABLE","The managed object parent could not be opened safely.",details:["posix_errno":errno]) }
                 Darwin.close(current); current = next
             }
             return (current, name)
@@ -471,6 +480,7 @@ final class StorageObjectFiles {
         let (directory, name) = try parent(path); defer { Darwin.close(directory) }
         var buffer = [UInt8](repeating: 0, count: 4097)
         let count = readlinkat(directory, name, &buffer, buffer.count)
+        guard count >= 0 else {throw CoreError("STORAGE_OBJECT_UNAVAILABLE","The managed link could not be read safely.",details:["posix_errno":errno])}
         guard count > 0, count < buffer.count, let value = String(bytes: buffer.prefix(count), encoding: .utf8) else { throw StorageSnapshotFailure.unsupportedAuthority }
         return value
     }
