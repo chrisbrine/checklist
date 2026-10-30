@@ -107,8 +107,12 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     let expectedOwnerHash: Data?
     let nativeCodeIdentity = NativeCodeIdentity()
     let clientIdentity = ClientCodeIdentity.bundledAdmission()
-    init(router: CommandRouter, enrollmentFile: URL = ChecklistPaths.root.appendingPathComponent("connections.json"), startBackgroundWork: Bool = true) {
+    /// A coordinator keeps credentials beside its enrollments. A temporary test root therefore
+    /// reaches neither the live credential folder nor Keychain.
+    let credentials: InstallationCredentialStore
+    init(router: CommandRouter, enrollmentFile: URL = ChecklistPaths.root.appendingPathComponent("connections.json"), startBackgroundWork: Bool = true, credentials: InstallationCredentialStore? = nil) {
         self.router = router
+        self.credentials = credentials ?? .production(root: enrollmentFile.deletingLastPathComponent())
         self.enforcesQueueIsolation = startBackgroundWork
         self.enrollmentFile = enrollmentFile
         let gui=ChecklistPaths.serviceExecutable.deletingLastPathComponent().appendingPathComponent("ChecklistApp").resolvingSymlinksInPath()
@@ -391,7 +395,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
             var priorEnrollment: Enrollment?, priorCredential: String?, snapshotTaken = false
             return .done(try router.commitConnectionRegistration(intent: originalIntent, caller: caller, preparePersistence: { operation in
                 priorEnrollment = enrollments[installation]
-                priorCredential = try ChecklistKeychain.read(installation)
+                priorCredential = try credentials.read(installation)
                 snapshotTaken = true
                 var random = [UInt8](repeating: 0, count: 32)
                 guard SecRandomCopyBytes(kSecRandomDefault, random.count, &random) == errSecSuccess else { throw ChecklistError("RANDOM_FAILURE", "Could not generate a pairing credential.") }
@@ -421,15 +425,15 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
                 var registration: [String: Any] = ["project_id": projects[0], "project_ids": projects, "session_id": enrollment.sessionID, "installation": installation + "/" + enrollment.generation, "provider": enrollment.provider, "name": enrollment.name, "role": role, "workspace": workspace ?? ""]
                 if let profile = enrollment.profileID { registration["profile_id"] = profile }
                 if let grants = enrollment.assistantGrants { registration["assistant_grants"] = grants }
-                try ChecklistKeychain.write(installation, token)
+                try credentials.write(installation, token)
                 enrollments[installation] = enrollment
                 try saveEnrollments()
                 return ConnectionRegistrationPreparation(sessionParameters: registration, installation: installation, mcpExecutable: ChecklistPaths.serviceExecutable.deletingLastPathComponent().appendingPathComponent("checklist").path)
             }, rollback: {
                 guard snapshotTaken else { return }
                 try ConnectionCommit.restore(enrollment: { enrollments[installation] = priorEnrollment; try saveEnrollments() }, credential: {
-                    if let priorCredential { try ChecklistKeychain.write(installation, priorCredential) }
-                    else { try ChecklistKeychain.removeChecked(installation) }
+                    if let priorCredential { try credentials.write(installation, priorCredential) }
+                    else { try credentials.removeChecked(installation) }
                 })
             }))
         }
@@ -451,7 +455,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
             }
             if var prior=enrollments[installation],prior.automatic == true { prior.revoked=true;prior.ownerRevoked=true;enrollments[installation]=prior }
             else { enrollments.removeValue(forKey:installation) }
-            try saveEnrollments(); ChecklistKeychain.remove(installation)
+            try saveEnrollments(); credentials.remove(installation)
             return .done(["data":["disconnected":true], "command_id":commandID])
         }
         return .router(method:method,params:params,caller:caller)

@@ -63,6 +63,7 @@ final class StorageFolderAccessTests: XCTestCase {
         XCTAssertEqual(opens,1,"Relative files/descendants must never spawn another root opener")
     }
     func testRepeatedStoreReadersReuseRouterPinnedRootWithoutChildren() throws {
+        try QualificationSuite.requireEnabled()
         let f = try StorageFixture(),bytes = Data([4,5,6])
         try bytes.write(to:f.root.appendingPathComponent("reader.bin"))
         var access = StorageFolderAccess(),opens = 0
@@ -71,6 +72,7 @@ final class StorageFolderAccessTests: XCTestCase {
         XCTAssertEqual(opens,0,"Short-lived managed readers must reuse the live router's verified store root")
     }
     func testSustainedRootOpensReuseOneHelperAndReapItsBlockedGeneration() throws {
+        try QualificationSuite.requireEnabled()
         let f = try StorageFixture(),bytes = Data([1,2,3])
         try bytes.write(to:f.workspace.appendingPathComponent("source"))
         var access = StorageFolderAccess(),children: [pid_t] = []

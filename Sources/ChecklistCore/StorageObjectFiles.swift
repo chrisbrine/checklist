@@ -82,7 +82,7 @@ struct StorageSnapshotBudget {
     }
     func freeSpaceFailure(measured: Int64, margin: Int64, available: Int64) -> CoreError {
         let needed = measured.addingReportingOverflow(margin), required = needed.overflow ? Int64.max : needed.partialValue
-        let next = "Keep the store and existing backups. Free space on the backup volume, then retry. Do not delete retained captures or attachments to make it fit."
+        let next = "Keep the store and existing backups. Free space on the backup volume, then retry backup_create with a new command ID. Do not delete retained captures or attachments to make it fit."
         return CoreError("BACKUP_CAPACITY_EXCEEDED",
             "Backup stopped: it needs at least \(required) free bytes on the backup volume (\(measured) measured store bytes plus a \(margin)-byte safety margin), but the volume has \(available) free bytes. " + next,
             details: ["reason": "snapshot_free_space", "measured_bytes": measured, "measured_objects": measurement.objects,
@@ -99,7 +99,7 @@ struct StorageSnapshotBudget {
         let limit = effectiveMaximumBytes
         let bytesLimit = limit == .max ? "no fixed byte limit" : limitedByFreeSpace
             ? "\(limit) bytes (free space on the backup volume less a \(Self.freeSpaceMinimumMarginBytes)-byte margin)" : "\(limit) bytes"
-        let next = "Keep the store and existing backups. Retry on an idle Mac for a time limit; for a capacity limit, use a Checklist build supporting this store size. Do not delete retained captures or attachments to make it fit."
+        let next = "Keep the store and existing backups. Retry backup_create with a new command ID on an idle Mac for a time limit; for a capacity limit, use a Checklist build supporting this store size. Do not delete retained captures or attachments to make it fit."
         return CoreError(reason == "snapshot_deadline" ? "BACKUP_DEADLINE_EXCEEDED" : "BACKUP_CAPACITY_EXCEEDED",
             "Backup could not finish: \(qualifier)\(measurement.bytes) bytes in \(qualifier)\(measurement.objects) managed objects were measured. Limits: \(bytesLimit), \(maximumObjects) objects, \(maximumManifestBytes) manifest bytes, \(maximumObjectBytes) bytes per managed file, \(maximumRecords) records; owner and pre-upgrade backups allow \(Int(Self.productionSeconds)) seconds. " + next,
             details: ["reason": reason, "measured_bytes": measurement.bytes, "measured_objects": measurement.objects,

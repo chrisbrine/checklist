@@ -22,7 +22,7 @@ public struct DelegateInstanceExpectation: Codable, Sendable {
                        details: ["command_outcome": "not_sent", "command_executed": false])
     }
 
-    /// Call immediately after resolving the current instance, before any IPC, Keychain or bootstrap.
+    /// Call immediately after resolving the current instance, before any IPC, credential read or bootstrap.
     public static func verifyIfPresent(instance: ChecklistInstance,
                                       executable: URL = ChecklistInstance.executableURL,
                                       environment: [String: String] = ProcessInfo.processInfo.environment) throws {

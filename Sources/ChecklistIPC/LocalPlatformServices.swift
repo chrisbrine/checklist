@@ -76,7 +76,7 @@ public struct UnavailableLocalPlatformServices: LocalCommandTransport, LocalServ
 public struct MacOSLocalCredentialReader: LocalCredentialReader {
     public init() {}
     public func readInstallationCredential(_ installation: String) throws -> String? {
-        try ChecklistKeychain.read(installation)
+        try InstallationCredentialStore.production().read(installation)
     }
 }
 

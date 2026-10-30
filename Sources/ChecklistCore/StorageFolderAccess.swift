@@ -18,16 +18,24 @@ struct StorageFolderAccess {
     func open(path: String, folder: URL) throws -> Int32 {
         let reaper = StorageFolderReaper.shared
         guard reaper.acquire(timeout:min(timeout,Self.seconds)) else {
-            throw CoreError("FOLDER_ACCESS_UNAVAILABLE","Checklist could not open the folder ‘\(folder.path)’ because its bounded file-access workers are busy. A prior privacy or sync-provider open may still be ending. Retry using the original command ID.",details:["folder":folder.path,"reason":"folder_opener_busy"])
+            throw CoreError("FOLDER_ACCESS_UNAVAILABLE","Checklist could not open the folder ‘\(folder.path)’ because its bounded file-access workers are busy. A prior privacy or sync-provider open may still be ending. Retry using the original command ID.",details:["folder":folder.path,"reason":"folder_opener_busy","command_outcome":"unknown"])
         }
         let (descriptor,failure,workers) = reaper.open(path:path,timeout:Int32(max(1,min(timeout,Self.seconds) * 1000)),barrier:blockingReadDescriptor(folder))
         for worker in workers { observeChild(worker) }
         guard descriptor >= 0 else {
             // Preserve ENOENT for descriptor-relative existence checks. Other
             // failures remain explicit rather than masquerading as missing data.
+            // CL-362: a missing folder is a finished rejection, so its command ID does not run
+            // again. Any other failure keeps an accepted operation recoverable under its ID.
+            if failure == ENOENT || failure == ENOTDIR {
+                let error = CoreError("FOLDER_ACCESS_UNAVAILABLE","Checklist could not open the folder ‘\(folder.path)’ because it does not exist. Choose an existing folder, then retry with a new command ID.",
+                    details:["folder":folder.path,"reason":"folder_open_failed","posix_errno":failure,"timeout_seconds":timeout,"command_outcome":"rejected","next_step":"Choose an existing folder, then retry with a new command ID."])
+                errno = failure
+                throw error
+            }
             let error = CoreError(failure == ETIMEDOUT ? "FOLDER_ACCESS_TIMED_OUT" : "FOLDER_ACCESS_UNAVAILABLE",
                 "Checklist could not open the folder ‘\(folder.path)’\(failure == ETIMEDOUT ? " within \(timeout) seconds" : ""). macOS privacy access or a cloud/sync provider may be waiting. Check folder access or use a local folder such as ~/Library/Caches, then reconcile using the original command ID.",
-                details:["folder":folder.path,"reason":failure == ETIMEDOUT ? "folder_open_timeout" : "folder_open_failed","posix_errno":failure,"timeout_seconds":timeout])
+                details:["folder":folder.path,"reason":failure == ETIMEDOUT ? "folder_open_timeout" : "folder_open_failed","posix_errno":failure,"timeout_seconds":timeout,"command_outcome":"unknown"])
             errno = failure
             throw error
         }

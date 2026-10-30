@@ -1,8 +1,5 @@
 import Foundation
-import Security
-import LocalAuthentication
 import Darwin
-import ChecklistLegacyKeychain
 
 @objc public protocol ChecklistRPC {
     func execute(_ request: Data, withReply reply: @escaping (Data) -> Void)
@@ -78,81 +75,4 @@ private indirect enum DiagnosticValue: Sendable {
         case .uuid(let value): value
         }
     }
-}
-
-/// Both the file-based login keychain and Data Protection keychain must fail
-/// without UI. The legacy interaction flag is process-wide, so serialize every
-/// Checklist keychain operation and restore the caller's setting afterwards.
-public enum KeychainWithoutUI {
-    private static let lock = NSLock()
-
-    @discardableResult
-    public static func perform(_ attributes: [String: Any], operation: (CFDictionary) -> OSStatus) -> OSStatus {
-        lock.lock()
-        defer { lock.unlock() }
-        var wasAllowed: DarwinBoolean = false
-        let status = ChecklistKeychainGetUserInteractionAllowed(&wasAllowed)
-        guard status == errSecSuccess else { return status }
-        let disabled = ChecklistKeychainSetUserInteractionAllowed(false)
-        guard disabled == errSecSuccess else { return disabled }
-        defer { ChecklistKeychainSetUserInteractionAllowed(wasAllowed.boolValue) }
-        var query = attributes
-        // LAContext is the supported SecItem no-UI mechanism. Keep the legacy
-        // guard above for file-based keychain ACLs, which do not honor it.
-        let context = LAContext()
-        context.interactionNotAllowed = true
-        query.removeValue(forKey: kSecUseAuthenticationUI as String)
-        query[kSecUseAuthenticationContext as String] = context
-        return operation(query as CFDictionary)
-    }
-}
-
-public enum ChecklistKeychain {
-    private static var service: String { ChecklistInstance.current.keychainService }
-    public static func read(_ account: String) throws -> String? {
-        try read(query: [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account])
-    }
-    // Tests scope the same production reader to their own temporary keychain.
-    static func read(query: [String: Any]) throws -> String? {
-        var query = query
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        let status = KeychainWithoutUI.perform(query) { SecItemCopyMatching($0, &result) }
-        if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess, let data = result as? Data, let value = String(data: data, encoding: .utf8) else {
-            throw ChecklistError("KEYCHAIN_UNAVAILABLE", "Cannot read the paired installation (\(status)).")
-        }
-        return value
-    }
-    public static func write(_ account: String, _ value: String) throws {
-        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
-        let values: [String: Any] = [kSecValueData as String: Data(value.utf8)]
-        var status = KeychainWithoutUI.perform(query) { SecItemUpdate($0, values as CFDictionary) }
-        if status == errSecItemNotFound {
-            var add = query.merging(values) { _, new in new }
-            add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            // Grant only the three signed executables from this exact installation.
-            let directory = ChecklistPaths.serviceExecutable.deletingLastPathComponent()
-            var trusted: [SecTrustedApplication] = []
-            for name in ["ChecklistApp", "ChecklistService", "checklist"] {
-                var application: SecTrustedApplication?
-                if ChecklistTrustedApplicationCreateFromPath(directory.appendingPathComponent(name).path, &application) == errSecSuccess, let application { trusted.append(application) }
-            }
-            if !trusted.isEmpty {
-                var access: SecAccess?
-                if ChecklistAccessCreate("Checklist paired local executables" as CFString, trusted as CFArray, &access) == errSecSuccess, let access { add[kSecAttrAccess as String] = access }
-            }
-            status = KeychainWithoutUI.perform(add) { SecItemAdd($0, nil) }
-        }
-        guard status == errSecSuccess else { throw ChecklistError("KEYCHAIN_UNAVAILABLE", "Cannot save pairing (\(status)).") }
-    }
-    public static func checkRemovalStatus(_ status: OSStatus) throws {
-        guard status == errSecSuccess || status == errSecItemNotFound else { throw ChecklistError("KEYCHAIN_UNAVAILABLE", "Cannot restore the previous paired credential (\(status)).") }
-    }
-    public static func removeChecked(_ account: String) throws {
-        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
-        try checkRemovalStatus(KeychainWithoutUI.perform(query) { SecItemDelete($0) })
-    }
-    public static func remove(_ account: String) { try? removeChecked(account) }
 }

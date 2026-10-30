@@ -6,13 +6,17 @@ import GRDB
 extension CommandRouter {
     private static let mediaSuggestedTable = """
     suggested AS MATERIALIZED (
-      SELECT CAST(json_extract(s.data,'$.item_id') AS TEXT) item_id,json_extract(s.data,'$.review_basis_signature') basis,
-        json_extract(s.data,'$.disposition') disposition,json_extract(s.data,'$.note') note
-      FROM records s WHERE s.type='media_suggestion' AND s.project_id=:project AND json_extract(s.data,'$.round_id')=:round),
+      SELECT item_id,target_id,COALESCE(basis,'') basis,phase,disposition,note FROM (
+        SELECT CAST(json_extract(s.data,'$.item_id') AS TEXT) item_id,json_extract(s.data,'$.target_id') target_id,
+          json_extract(s.data,'$.review_basis_signature') basis,json_extract(s.data,'$.target_phase') phase,
+          json_extract(s.data,'$.disposition') disposition,json_extract(s.data,'$.note') note
+        FROM records s WHERE s.type='media_suggestion' AND s.project_id=:project AND json_extract(s.data,'$.round_id')=:round)
+      WHERE item_id IS NOT NULL AND target_id IS NOT NULL),
 
     """
-    /// The filters "has agent suggestion" and "has note". A suggestion counts only on the
-    /// item's current published basis, so an earlier target's advice never selects an item.
+    /// The filters "has agent suggestion", "no such suggestion" and "has note". A suggestion
+    /// counts only when `mediaSuggestionCurrent` holds for the item's listed target, the same
+    /// rule as the item detail, so stale advice never selects or removes an item.
     /// `note_item_ids` names items with a note that is still local to the owner's window.
     func mediaSuggestionPredicates(_ filter: JSON,arguments args: inout StatementArguments) throws -> (table: String,predicates: [String]) {
         func flag(_ key: String) throws -> Bool? {
@@ -26,40 +30,62 @@ extension CommandRouter {
         let noteItems = try MediaConfigurationValue.ids(filter["note_item_ids"],max:Int.max,"filter.note_item_ids").map(\.rawValue)
         guard hasNote != nil || noteItems.isEmpty else {throw CoreError("INVALID_INPUT","note_item_ids applies only to has_note.")}
         guard hasSuggestion != nil || hasNote != nil || !excludes.isEmpty else {return ("",[])}
-        let current = "(i.id,COALESCE(i.member_basis,''))"
         var predicates: [String] = []
-        if let hasSuggestion {predicates.append("\(current) \(hasSuggestion ? "" : "NOT ")IN (SELECT item_id,basis FROM suggested)")}
+        if let hasSuggestion {predicates.append((hasSuggestion ? "" : "NOT ") + Self.mediaSuggestionCurrentSQL())}
         if !excludes.isEmpty {
-            predicates.append("\(current) NOT IN (SELECT item_id,basis FROM suggested WHERE disposition IN (SELECT value FROM json_each(:suggestion_excludes)))")
+            predicates.append("NOT " + Self.mediaSuggestionCurrentSQL(where:"disposition IN (SELECT value FROM json_each(:suggestion_excludes))"))
             args += ["suggestion_excludes":try jsonString(excludes)]
         }
         if let hasNote {
-            let noted = "(COALESCE(json_extract(d.data,'$.note'),'')<>'' OR \(current) IN (SELECT item_id,basis FROM suggested WHERE COALESCE(note,'')<>'') OR i.id IN (SELECT value FROM json_each(:note_items)))"
+            let noted = "(COALESCE(json_extract(d.data,'$.note'),'')<>'' OR \(Self.mediaSuggestionCurrentSQL(where:"COALESCE(note,'')<>''")) OR i.id IN (SELECT value FROM json_each(:note_items)))"
             predicates.append(hasNote ? noted : "NOT " + noted)
             args += ["note_items":try jsonString(noteItems)]
         }
         return (Self.mediaSuggestedTable,predicates)
     }
-    /// The dispositions of each item's current suggestions, read once for the round.
-    private func mediaCurrentSuggestionChoices(_ db: Database,round: JSON,project: String) throws -> [String:[(target: String,disposition: String)]] {
-        var choices: [String:[(target: String,disposition: String)]] = [:]
-        let rows = try Row.fetchAll(db,sql:"""
-        SELECT CAST(json_extract(data,'$.item_id') AS TEXT) item_id,CAST(json_extract(data,'$.target_id') AS TEXT) target_id,json_extract(data,'$.disposition') disposition
+    /// The dispositions of each listed entry's current suggestions, by exact item ID. One read
+    /// of the round's suggestions and one of the listed targets; `mediaSuggestionCurrent` decides.
+    private func mediaCurrentSuggestionChoices(_ db: Database,entries: [JSON],round: JSON,project: String) throws -> [Data:[String]] {
+        var byItem: [Data:[JSON]] = [:]
+        for row in try Row.fetchAll(db,sql:"""
+        SELECT CAST(json_extract(data,'$.item_id') AS TEXT) item_id,json_extract(data,'$.target_id') target_id,json_extract(data,'$.review_basis_signature') basis,
+          json_extract(data,'$.target_phase') phase,json_extract(data,'$.disposition') disposition
         FROM records WHERE type='media_suggestion' AND project_id=? AND json_extract(data,'$.round_id')=? ORDER BY rowid
-        """,arguments:[project,try StoredRecord(round,family:"media").string("id")])
-        for row in rows {choices[row["item_id"] as String,default:[]].append((row["target_id"] as String,row["disposition"] as String))}
+        """,arguments:[project,try StoredRecord(round,family:"media").string("id")]) {
+            var suggestion: JSON = ["target_id":row["target_id"] as String,"disposition":row["disposition"] as String]
+            suggestion["review_basis_signature"] = String.fromDatabaseValue(row["basis"] as DatabaseValue)
+            suggestion["target_phase"] = String.fromDatabaseValue(row["phase"] as DatabaseValue)
+            byItem[Data((row["item_id"] as String).utf8),default:[]].append(suggestion)
+        }
+        guard !byItem.isEmpty else {return [:]}
+        var targets: [Data:JSON] = [:]
+        for row in try Row.fetchAll(db,sql:"""
+        WITH selected AS MATERIALIZED (SELECT DISTINCT json_extract(value,'$.target_id') target_id FROM json_each(:entries))
+        SELECT t.id,json_extract(t.data,'$.review_basis_signature') basis,json_extract(t.data,'$.published_from_target_id') lineage
+        FROM selected CROSS JOIN records t ON t.id=selected.target_id AND t.project_id=:project AND t.type='media_item_target'
+        """,arguments:["entries":try jsonString(entries),"project":project]) {
+            var target: JSON = ["id":row["id"] as String]
+            target["review_basis_signature"] = String.fromDatabaseValue(row["basis"] as DatabaseValue)
+            target["published_from_target_id"] = String.fromDatabaseValue(row["lineage"] as DatabaseValue)
+            targets[Data((row["id"] as String).utf8)] = target
+        }
+        var choices: [Data:[String]] = [:]
+        for entry in entries {
+            let id = Data((entry["id"] as? String ?? "").utf8)
+            guard let target = targets[Data((entry["target_id"] as? String ?? "").utf8)] else {continue}
+            let current = (byItem[id] ?? []).filter {mediaSuggestionCurrent($0,target:target)}.compactMap {$0["disposition"] as? String}
+            if !current.isEmpty {choices[id] = current}
+        }
         return choices
     }
     /// Owner list rows name their current agent suggestions as display-only advice.
     func mediaRowsWithSuggestions(_ db: Database,rows: [JSON],round: JSON,project: String) throws -> [JSON] {
         guard !rows.isEmpty else {return rows}
-        let choices = try mediaCurrentSuggestionChoices(db,round:round,project:project)
+        let choices = try mediaCurrentSuggestionChoices(db,entries:rows,round:round,project:project)
         guard !choices.isEmpty else {return rows}
         return rows.map { row in
             var value = row
-            let target = row["target_id"] as? String,id = row["id"] as? String ?? ""
-            let current = (choices[id] ?? []).filter {$0.target == target}.map(\.disposition)
-            if !current.isEmpty {value["agent_suggestions"] = current}
+            if let current = choices[Data((row["id"] as? String ?? "").utf8)] {value["agent_suggestions"] = current}
             return value
         }
     }
@@ -101,14 +127,13 @@ extension CommandRouter {
             let ids = (try? JSONSerialization.jsonObject(with:Data((row["candidate_ids"] as String).utf8))) as? [String]
             candidates[row["id"] as String] = ids ?? []
         }
-        let suggestions = try mediaCurrentSuggestionChoices(db,round:round,project:project)
+        let suggestions = try mediaCurrentSuggestionChoices(db,entries:published,round:round,project:project)
         result["entries"] = try published.map { entry -> JSON in
             let id = try StoredRecord(entry,family:"media").string("id"),target = try StoredRecord(entry,family:"media").string("target_id")
             var value: JSON = ["item_id":id,"expected_revision":try StoredRecord(entry,family:"media").requiredValue("revision"),"target_id":target,
                 "review_basis_signature":try StoredRecord(members[id]!,family:"media").requiredValue("review_basis_signature"),
                 "candidate_ids":candidates[target] ?? [],"disposition":try StoredRecord(entry,family:"media").requiredValue("disposition")]
-            let advice = (suggestions[id] ?? []).filter {$0.target == target}.map(\.disposition)
-            if !advice.isEmpty {value["agent_suggestions"] = advice}
+            if let advice = suggestions[Data(id.utf8)] {value["agent_suggestions"] = advice}
             return value
         }
         result["unpublished"] = unpublished

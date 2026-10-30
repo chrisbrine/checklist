@@ -99,6 +99,18 @@ struct StorageFailureReport {
 
     var message: String {explanation + " " + nextStep}
 
+    /// backup_create records a rejected command as finished, so its command ID never
+    /// runs again. Every step that leads to a retry names a new ID.
+    var backupNextStep: String {
+        let retry = "retry backup_create with a new command ID."
+        switch reason {
+        case "disk_full","free_space": return "Free space on the volume, then " + retry
+        case "access_denied": return "Restore access to the folder, then " + retry
+        case "unsupported_entry": return "Do not retry until the entry is corrected, then " + retry + " Keep the store and report this command ID."
+        default: return retryable ? "Retry backup_create with a new command ID." : nextStep
+        }
+    }
+
     /// Safe for a reply: stable fields, the system error and the root-relative path.
     var details: JSON {
         var value: JSON = ["reason":reason,"next_step":nextStep,"retryable":retryable,"command_outcome":"unknown"]

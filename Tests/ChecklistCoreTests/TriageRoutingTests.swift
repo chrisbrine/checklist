@@ -23,14 +23,38 @@ extension EvidenceAuthorityTests {
     }
     /// Orchestrator O owns a Triage with a ticket held by H (Claude) with accepted subagent S.
     private func routeFixture() throws -> (p: JSON,triage: JSON,task: JSON,orchestrator: Caller,holder: Caller,child: Caller,peer: Caller) {
-        let p = try project(), o = try native(p,"orchestrator",domain:"host-o"), h = try native(p,"holder",domain:"host-h",provider:"claude")
-        let s = try native(p,"subagent",domain:"host-s"), peer = try native(p,"peer",domain:"host-p")
-        let triage = try routeStart(p,o), task = try ready(p)
-        try routeAdd(p,triage["id"]!,task,o)
-        let attempt = try claim(p,try routeFresh(task),caller:h)
-        let offer = try call("work_delegate",["project_id":p["id"]!,"attempt_id":attempt["id"]!,"claim_token":attempt["claim_token"]!,"child_session_id":s.sessionID!,"file_scopes":[],"lane_scopes":[],"brief":"Check one file"],h)
-        _ = try call("work_child_accept",["project_id":p["id"]!,"delegation_id":offer["id"]!],s)
-        return (p,triage,task,o,h,s,peer)
+        let f = try preparedPhase("triage-routing") { fixture in
+            let p = try fixture.project(), o = try fixture.native(p,"orchestrator",domain:"host-o"), h = try fixture.native(p,"holder",domain:"host-h",provider:"claude")
+            let s = try fixture.native(p,"subagent",domain:"host-s"), peer = try fixture.native(p,"peer",domain:"host-p")
+            let triage = try fixture.routeStart(p,o), task = try fixture.ready(p)
+            try fixture.routeAdd(p,triage["id"]!,task,o)
+            let attempt = try fixture.claim(p,fixture.routeFresh(task),caller:h)
+            let offer = try fixture.call("work_delegate",["project_id":p["id"]!,"attempt_id":attempt["id"]!,"claim_token":attempt["claim_token"]!,"child_session_id":s.sessionID!,"file_scopes":[],"lane_scopes":[],"brief":"Check one file"],h)
+            _ = try fixture.call("work_child_accept",["project_id":p["id"]!,"delegation_id":offer["id"]!],s)
+            return ["project":p,"triage":triage,"task":task,"orchestrator":o.sessionID!,"holder":h.sessionID!,"child":s.sessionID!,"peer":peer.sessionID!]
+        }
+        return (f["project"] as! JSON,f["triage"] as! JSON,f["task"] as! JSON,try phaseCaller(f["orchestrator"]!),try phaseCaller(f["holder"]!),try phaseCaller(f["child"]!),try phaseCaller(f["peer"]!))
+    }
+
+    private func savedNotePhase(count: Int, ownNotes: Bool) throws -> JSON {
+        try preparedPhase("saved-triage-notes-\(count)-\(ownNotes)") { fixture in
+            let p = try fixture.project(), o = try fixture.native(p,"orchestrator",domain:"host-o"), peer = try fixture.native(p,"peer",domain:"host-p")
+            let plan = try fixture.call("triage_create",["project_id":p["id"]!,"name":"Long plan"])
+            if !ownNotes {
+                let parked = try fixture.ready(p)
+                try fixture.routeAdd(p,plan["id"]!,parked,peer)
+            }
+            var saved: [String] = []
+            for _ in 0..<count { saved.append(try fixture.routeNote(p,nil,peer,["triage_id":plan["id"]!])["id"] as! String) }
+            var result: JSON = ["project":p,"orchestrator":o.sessionID!,"peer":peer.sessionID!,"plan":plan,"saved":saved]
+            if ownNotes {
+                let second = try fixture.call("triage_create",["project_id":p["id"]!,"name":"Own notes plan"])
+                for _ in 0..<50 { _ = try fixture.routeNote(p,nil,o,["triage_id":second["id"]!]) }
+                result["second"] = second
+                result["foreign"] = try fixture.routeNote(p,nil,peer,["triage_id":second["id"]!])["id"]!
+            }
+            return result
+        }
     }
 
     func testDefaultTicketNoteReachesHolderSubagentAndOrchestratorOnce() throws {
@@ -144,11 +168,9 @@ extension EvidenceAuthorityTests {
         let late = try call("message_delivery_list",["project_id":p["id"]!,"task_id":lone["id"]!,"message_id":early["id"]!],peer)["deliveries"] as! [JSON]
         XCTAssertEqual(late.compactMap {$0["recipient_session_id"] as? String},[h.sessionID!])
         // At most 50 saved notes per pickup; the rest are advertised.
-        let crowded = try call("triage_create",["project_id":p["id"]!,"name":"Crowded plan"]), parked = try ready(p)
-        try routeAdd(p,crowded["id"]!,parked,peer)
-        for _ in 0..<51 { _ = try routeNote(p,nil,peer,["triage_id":crowded["id"]!]) }
-        let helper = try native(p,"second-orchestrator",domain:"host-x")
-        let joined = try call("triage_orchestrate",["project_id":p["id"]!,"triage_id":crowded["id"]!,"expected_revision":try routeTriage(crowded["id"]!)["revision"]!,"action":"start"],helper)
+        let crowdedFixture = try savedNotePhase(count:51,ownNotes:false), cp = crowdedFixture["project"] as! JSON, crowded = crowdedFixture["plan"] as! JSON
+        let helper = try native(cp,"second-orchestrator",domain:"host-x")
+        let joined = try call("triage_orchestrate",["project_id":cp["id"]!,"triage_id":crowded["id"]!,"expected_revision":try routeTriage(crowded["id"]!)["revision"]!,"action":"start"],helper)
         XCTAssertEqual(joined["saved_notes_delivered"] as? Int,50);XCTAssertEqual(joined["saved_note_delivery_has_more"] as? Bool,true)
     }
 
@@ -172,10 +194,9 @@ extension EvidenceAuthorityTests {
     }
 
     func testCheckpointContinuesSavedTriageNotePickupFiftyAtATime() throws {
-        let p = try project(), o = try native(p,"orchestrator",domain:"host-o"), peer = try native(p,"peer",domain:"host-p")
-        let plan = try call("triage_create",["project_id":p["id"]!,"name":"Long plan"])
-        var saved: [String] = []
-        for _ in 0..<52 { saved.append(try routeNote(p,nil,peer,["triage_id":plan["id"]!])["id"] as! String) }
+        let f = try savedNotePhase(count:52,ownNotes:true), p = f["project"] as! JSON, o = try phaseCaller(f["orchestrator"]!)
+        let plan = f["plan"] as! JSON
+        var saved = f["saved"] as! [String]
         func orchestrate(_ action: String,command: String = UUID().uuidString) throws -> JSON {
             try call("triage_orchestrate",["project_id":p["id"]!,"triage_id":plan["id"]!,"expected_revision":try routeTriage(plan["id"]!)["revision"]!,"action":action],o,command:command)
         }
@@ -199,9 +220,7 @@ extension EvidenceAuthorityTests {
         let all = try delivered()
         XCTAssertEqual(all.count,52);XCTAssertEqual(Set(all),Set(saved))
         // The orchestrator's own saved notes never fill a page or reach it.
-        let second = try call("triage_create",["project_id":p["id"]!,"name":"Own notes plan"])
-        for _ in 0..<50 { _ = try routeNote(p,nil,o,["triage_id":second["id"]!]) }
-        let foreign = try routeNote(p,nil,peer,["triage_id":second["id"]!])["id"] as! String
+        let second = f["second"] as! JSON, foreign = f["foreign"] as! String
         _ = try call("triage_orchestrate",["project_id":p["id"]!,"triage_id":plan["id"]!,"expected_revision":try routeTriage(plan["id"]!)["revision"]!,"action":"finish","reason":"Moving on"],o)
         let joined = try call("triage_orchestrate",["project_id":p["id"]!,"triage_id":second["id"]!,"expected_revision":try routeTriage(second["id"]!)["revision"]!,"action":"start"],o)
         XCTAssertEqual(joined["saved_notes_delivered"] as? Int,1);XCTAssertEqual(joined["saved_note_delivery_has_more"] as? Bool,false)

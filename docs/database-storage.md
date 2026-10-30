@@ -87,13 +87,13 @@ Ship SQLite inside the native app's storage layer, using the pinned Swift wrappe
 
 Use an owner-only application directory and files appropriate to the final signing/sandbox setup. The service validates containment and rejects symlinks at managed storage boundaries. A helper may operate only on the exact app-owned paths granted to its job. It must not follow a ticket filename or external path into a deletion target.
 
-Keep rebuildable thumbnail/Quick Look caches under `~/Library/Caches/Checklist/`; their loss cannot remove an original or alter approval evidence. Keep provider credentials, pairing secrets and reusable transport tokens of the service in Keychain, never in ticket records or backup/export manifests; the native app's owner claim credentials use [private recovery files](#uncertain-command-recovery-on-this-mac-cl-196). Non-secret credential references can identify a registration but cannot recreate its authority. Runtime endpoint discovery is disposable authenticated IPC metadata, not a project file or a durable ticket attachment.
+Keep rebuildable thumbnail/Quick Look caches under `~/Library/Caches/Checklist/`; their loss cannot remove an original or alter approval evidence. Keep agent installation credentials, pairing secrets and reusable transport tokens of the service in [private credential files](#agent-installation-credentials-cl-374), never in ticket records or backup/export manifests; the native app's owner claim credentials use [private recovery files](#uncertain-command-recovery-on-this-mac-cl-196). Non-secret credential references can identify a registration but cannot recreate its authority. Runtime endpoint discovery is disposable authenticated IPC metadata, not a project file or a durable ticket attachment.
 
 V1 uses this fixed store location. A relocated project root changes a binding, not the database location. Moving the entire app store, network volumes and concurrent access from another Mac are deferred. Back up or export to an owner-selected destination through the native file picker; do not make a shared live database a collaboration mechanism.
 
 ## Isolated test stores
 
-[Test instances](test-instances.md) derive slots 1–4 from the signed bundle's `ChecklistInstanceSlot`. Each uses `~/Library/Application Support/Checklist Test Instances/slot-N/data`, a separate Mach service and Keychain service; test bundles ignore `CHECKLIST_DATA_ROOT`. The live root and identifiers stay unchanged. Test owner journals use `ChecklistPaths.root/OwnerDrafts`; live journals and the Finder data action retain their former fixed Library paths independently of `CHECKLIST_DATA_ROOT`.
+[Test instances](test-instances.md) derive slots 1–4 from the signed bundle's `ChecklistInstanceSlot`. Each uses `~/Library/Application Support/Checklist Test Instances/slot-N/data`, a separate Mach service and a separate credential folder; test bundles ignore `CHECKLIST_DATA_ROOT`. The live root and identifiers stay unchanged. Test owner journals use `ChecklistPaths.root/OwnerDrafts`; live journals and the Finder data action retain their former fixed Library paths independently of `CHECKLIST_DATA_ROOT`.
 
 The harness seeds only completed snapshots or stopped test slots, never the live SQLite/WAL or connection file. It verifies snapshot intent, exact file membership, hashes/sizes, safe captured links and read-only database integrity, then maps `database.sqlite` to `checklist.sqlite` and `managed/<relativePath>` to `<relativePath>`. An initialized snapshot's external identity receipt comes from its own `metadata.store_identity`; a legacy snapshot enters normal baseline adoption without a fabricated receipt. It preserves original database bytes and records snapshot age and manifest hash. Accepted seed schemas: a backup seed (`latest-backup` or `backup:`) has schema 0 up to the staged build's current schema (4 since CL-125, read from the stage's `SchemaMigrations.currentSchema`), and a `restored:` seed has schema 3 up to it. A seed with a newer schema refuses with a message that names both schemas. `current_schema_no_migration` is true only when the seed has the stage's current schema; an older seed migrates at first start. See [seeds](test-instances.md#seeds).
 
@@ -173,6 +173,36 @@ At launch the saved command remains unavailable until an accepted service read i
 An ignored file remains in the folder. The app shows one plain-language warning per item and window key, remembering only its SHA-256 notice marker in local preferences, not its parameters. An unreadable file has no accessible fingerprint: its warning is suppressed until a later launch observes a readable or absent file, or the window saves a new command. Clearing preferences also clears this notice memory. A successful newer save replaces the ignored file. Removing a recovery file only removes the retry offer; it neither rolls back nor proves the outcome of the original change.
 
 Leftover Keychain items are ignored and can stay. The native app makes no Keychain call for recovery or claims: it never reads, writes or deletes the old `Checklist.HumanClaim` / `Checklist.TestN.HumanClaim` items, and it offers no retry for a command that only such an item holds. Removing a leftover item is optional and changes nothing in the app.
+
+### Agent installation credentials (CL-374)
+
+Owner decision, 30 October 2026 (request `8e06c68a`, response `db9f7d73`): agent installation credentials leave Keychain. The owner's answer was "Keychain is unnecessary as this is on a local machine anyway."
+
+**Store.** `InstallationCredentialStore` keeps one file per installation, `installation_credential-<SHA-256 of the installation>.json`, in `OwnerPrivate/` under the instance's data root. The folder has mode 0700 and each file has mode 0600. Every path step in the folder uses no-follow descriptor calls. A save replaces the file atomically, flushes the file and the folder, and reads the value back. The service and the CLI use this store.
+
+**Why a file and not the database.** Database content goes into backups, restores and copied test slots. A credential must not travel with them. A backup lists only files that records own, and the slot seed leaves `OwnerPrivate/` out.
+
+**Protection.** Any program under the same Mac account can read these files. Keychain's executable access list no longer applies. The file permissions keep out other Mac accounts only. A credential alone grants nothing: the service still checks the caller's code signature, the native session and the enrollment digest. Each record also names its bundle identifier, data root and installation. A file that names another instance, root or installation gives `CREDENTIAL_INSTANCE_MISMATCH`. A file with wrong permissions, a link or unreadable content gives `CREDENTIAL_STORE_UNAVAILABLE`. Neither case falls back to Keychain.
+
+**Writes and rollback of a failed enrollment.** The credential write still comes before the enrollment write and the session registration. A failure restores the earlier value. A removal, and a rollback of a new connection, writes a `removed` record and not an absent file, because the old Keychain item stays and must not bring back a credential that an owner disconnected.
+
+**Migration of an existing installation.** A read uses the file if it exists. If no file exists, the live instance at its fixed data root, in a real bundle, reads the old Keychain item once with interaction turned off, and saves the value to the file. It never changes or deletes the item. If no item exists, a `no_legacy_item` record stops later Keychain reads. A failed read gives the existing `KEYCHAIN_UNAVAILABLE` error and no prompt, leaves no record, and the next read tries again. A test slot, a `CHECKLIST_DATA_ROOT` override and an unbundled executable never call Keychain. A failed save during migration does not fail the read, because a sandboxed CLI can read this folder and not write it.
+
+If the old item stays unreadable, the connection stays refused with that error. It recovers in two ways: a new conversation enrolls with a new credential, or the owner selects **Disconnect** and then **Allow again** on the conversation's ticket. Allow again issues a new credential to the file and does not need the old value.
+
+**Bundle rollback to a build that reads Keychain.** The previous bundle reads only the Keychain and the new build writes only the file.
+
+| Connection state at rollback | Result on the previous bundle |
+|---|---|
+| Credential not changed since the install | Works. The Keychain item is unchanged and matches the enrollment digest. No prompt. |
+| Rotated on the new build (reconnect or Allow again), same process | `CONNECTION_REPAIR_REQUIRED`. The Keychain value is older than the enrollment digest. |
+| Rotated on the new build, new process of the same conversation | After a verified closure of the earlier process: `CONNECTION_REVOKED` with the owner-disconnect text, because that build treats a credential mismatch as a disconnect. Before a verified closure: `NATIVE_SESSION_MISMATCH`. |
+| Created on the new build | The same two results as a rotated connection, because Keychain has no value. |
+| Disconnected by the owner on the new build | Still refused. The `ownerRevoked` flag is in `connections.json` and the Core session state stays revoked. |
+
+Recovery on the previous bundle: start a new conversation, or select Disconnect and then Allow again on the ticket, which writes a new Keychain item. Moving forward again, the file decides. A connection that the previous bundle created has no file and migrates from Keychain. A connection that the previous bundle rotated, and that already has a file, gets `CONNECTION_REPAIR_REQUIRED` and recovers in the same two ways.
+
+Leftover Keychain items stay. `LegacyKeychainCredentialMigration.swift` states the condition for its removal.
 
 ## Immutable files and crash consistency
 
@@ -380,7 +410,7 @@ A `StorageSnapshotFailure` never reaches a caller as an enum number. `StorageFai
 | `STORAGE_SOURCE_CHANGED`, `STORAGE_CANCELED`, `STORAGE_DEADLINE_EXCEEDED` | Named in the code | Same command ID |
 | `STORAGE_INVALID_STATE`, `STORAGE_UNSUPPORTED_ENTRY`, `STORAGE_INCOMPLETE`, `STORAGE_LIMIT_EXCEEDED` | Named in the code | No |
 
-`publicationUncertain` remains `OUTCOME_UNKNOWN`. `backup_create` keeps its `BACKUP_*` codes and `command_outcome: rejected`, adds the same details, and retries with a new command ID. An existing coded error whose `posix_errno` is transient (for example `STORAGE_OBJECT_UNAVAILABLE` with `EMFILE`) keeps its code and gains the reason, `retryable: true` and `command_outcome: unknown`, which makes an accepted operation recoverable with the same command ID.
+`publicationUncertain` remains `OUTCOME_UNKNOWN`. `backup_create` keeps its `BACKUP_*` codes and `command_outcome: rejected`, adds the same details, and every retry uses a new command ID, because the rejected operation stays failed with its stored error: after access is restored (`EACCES`, `EPERM`, `EROFS`) or space is freed (`ENOSPC`, `EDQUOT`, `BACKUP_CAPACITY_EXCEEDED`) as well as after a retryable failure or `BACKUP_IN_PROGRESS`. On other routes a `StorageSnapshotFailure` reports `command_outcome: unknown`, which keeps an accepted operation recoverable, so its same-ID step works; `attachment_add` source-read `FILE_ACCESS_REQUIRED` and `FOLDER_ACCESS_UNAVAILABLE` report the same outcome because a pending import resumes under its original command ID. A missing folder (`ENOENT`, `ENOTDIR`) is `command_outcome: rejected` and retries with a new command ID. An existing coded error whose `posix_errno` is transient (for example `STORAGE_OBJECT_UNAVAILABLE` with `EMFILE`) keeps its code and gains the reason, `retryable: true` and `command_outcome: unknown`, which makes an accepted operation recoverable with the same command ID.
 
 `attachment_add` repeats itself after 0.25 s, 1 s and 2 s when the failure is transient, because its durable job and command ID make a repeat safe. Other commands report the failure as retryable.
 

@@ -419,6 +419,31 @@ an existing fixture preserves its data. Fresh storage, migration, crash and
 failure qualifiers keep their original bootstrap path. `TestStoreTests` checks
 isolation, concurrent copies, reopen preservation and paired setup medians.
 
+Core batch/review, Evidence review/routing and media publication rollback tests
+also publish populated class/phase templates. Their builders run the original
+prerequisite commands once per linked image; every case or matrix branch gets
+private database, managed-object and workspace bytes. Store and workspace roots
+remain siblings. Canonical workspace authority is rebound to the private copy;
+literal event/command history and source content stay unchanged. Tested commands
+and assertions run on each copy. The first run pays phase publication; later
+warm runs reuse it. `CHECKLIST_TEST_PROFILE=1` emits per-case
+`CHECKLIST_FIXTURE_TIMING` JSON for `store.seed`, `store.open`, `git.key`,
+`git.real` and cold `template.open/prepare/close` components. Set
+`CHECKLIST_TEST_PROFILE_DIRECTORY` to retain per-process JSONL without mixing
+with XCTest output. These nested components are already included in XCTest method times.
+This profiling is test-support code and is off by default.
+
+The two 1,000-operation `StorageFolderAccessTests` probes and the two lifecycle
+maintenance boundary cases with over-4-MiB descriptor/inventory rows run in
+qualification. Their input sizes and assertions remain unchanged; small native
+folder-boundary and deletion-cohort/lifecycle correctness cases stay default.
+The CL-318/349 250-item owner action and 201-item cross-chunk retry, the
+CL-350 242-decision follow-up/closure measurement, and the four CL-362 real
+file-descriptor exhaustion/retry observations also run in qualification. Their
+large inputs, actual process limits, fixed retry conditions and assertions are
+unchanged. Small bulk/filter/adoption, worker follow-up and error-text/errno
+mapping correctness cases remain default.
+
 Logic-only cancellation and offline recovery tests use protocol-shaped replies
 through the existing page parser and request transport. Separate App/Core route
 contract tests retain actual Router coverage.

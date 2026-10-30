@@ -87,9 +87,8 @@ or concurrency warning suppression is used.
 
 | Target / calls | Compatibility reason |
 | --- | --- |
-| ChecklistLegacyKeychain: SecKeychainGetUserInteractionAllowed / SecKeychainSetUserInteractionAllowed | Read, disable and restore the process-wide file-keychain interaction flag; LAContext does not replace file-based ACL UI control. |
-| ChecklistLegacyKeychain: SecTrustedApplicationCreateFromPath / SecAccessCreate | Preserve the exact ChecklistApp/ChecklistService/checklist executable ACL for existing file-keychain items. Access groups/data protection would change credential placement and sharing. |
-| ChecklistKeychainTestFixture: SecKeychainCreate / SecKeychainDelete, with the production ACL/interaction wrappers | Create and remove only the isolated file-keychain fixture; retain old-item compatibility and denied foreign-ACL/no-prompt coverage. SecItem cannot create/delete this keychain. |
+| ChecklistLegacyKeychain: SecKeychainGetUserInteractionAllowed / SecKeychainSetUserInteractionAllowed | Read, disable and restore the process-wide file-keychain interaction flag for the one CL-374 migration read; LAContext does not replace file-based ACL UI control. |
+| ChecklistKeychainTestFixture: SecKeychainCreate / SecKeychainDelete, SecTrustedApplicationCreateFromPath / SecAccessCreate, with the production interaction wrappers | Create and remove only the isolated file-keychain fixture; retain old-item compatibility and denied foreign-ACL/no-prompt coverage. SecItem cannot create/delete this keychain. |
 | ChecklistAXTestSupport: NSObject accessibilityAttributeValue / accessibilitySetValue:forAttribute: | Read, enable and restore the literal AXEnhancedUserInterface fixture state. The modern NSAccessibility protocol has no equivalent property; removing setup changes native AX publication. |
 
 The exception contains SDK deprecation diagnostics at the compatibility boundary;

@@ -182,7 +182,8 @@ struct MediaAnimationGroup: Identifiable, Equatable {
         guard playback.gridAllows(bytes:original.integer("size"),facts:facts) else {
             throw ChecklistError("GRID_BUDGET","This take exceeds the direction-grid byte, pixel or decoder budget. Use item comparison.")
         }
-        let control=MediaNativeTakeControl(asset:asset,loop:true,playbackRate:timing.rate)
+        let control=try await MediaNativeTakeControl(asset:asset,loop:true,playbackRate:timing.rate)
+        try Task.checkCancellation();guard token==generation else {control.unload();throw CancellationError()}
         let take=MediaPreparedTake(key:card.key,label:card.direction,kind:"video",ids:["item_id":card.id,"target_id":card.target.id,"reference_id":original.string("reference_id"),"slot_id":slot.string("slot_id")],control:control,player:control.player,file:file,
             measurement:.init(copyMilliseconds:copyMS,probeMilliseconds:probeMS,bytes:original.integer("size"),facts:facts,loop:true,timing:timing))
         guard playback.admit(take) else {throw ChecklistError("GRID_BUDGET","This take exceeds the direction-grid byte, pixel or decoder budget. Use item comparison.")}

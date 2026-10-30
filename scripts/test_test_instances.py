@@ -267,6 +267,9 @@ class AdditionalGuardsTests(unittest.TestCase):
         with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()):
             other = harness.checked(2); other['data'].mkdir(parents=True)
             (other['data'] / 'connections.json').write_text('credential-reference')
+            # CL-374: the slot seed never copies agent credential files.
+            (other['data'] / 'OwnerPrivate').mkdir()
+            (other['data'] / 'OwnerPrivate' / 'installation_credential-synthetic.json').write_text('credential')
             store_fixture(other['data'] / 'checklist.sqlite', schema=2)
             harness.save(other, {'slot': 2, 'build_id': 'fixture'})
             destination = harness.BASE / 'destination'; destination.mkdir()
@@ -274,6 +277,8 @@ class AdditionalGuardsTests(unittest.TestCase):
                 seed = harness.slot_seed(other, destination)
             self.assertEqual(harness.sha(destination / 'checklist.sqlite'), harness.sha(other['data'] / 'checklist.sqlite'))
             self.assertFalse((destination / 'connections.json').exists())
+            self.assertFalse((destination / 'OwnerPrivate').exists())
+            self.assertEqual(list(destination.rglob('installation_credential-*')), [])
             self.assertEqual(seed['source_build_id'], 'fixture')
 
     def test_log_alias_is_refused_before_bootstrap(self):

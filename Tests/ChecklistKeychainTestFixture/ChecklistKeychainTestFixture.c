@@ -9,4 +9,11 @@ OSStatus ChecklistFixtureKeychainCreate(const char *path, UInt32 passwordLength,
 OSStatus ChecklistFixtureKeychainDelete(SecKeychainRef keychain) {
     return SecKeychainDelete(keychain);
 }
+// The old ACL shape of a pairing item, kept only for the skipped fixture class.
+OSStatus ChecklistTrustedApplicationCreateFromPath(const char *path, SecTrustedApplicationRef *application) {
+    return SecTrustedApplicationCreateFromPath(path, application);
+}
+OSStatus ChecklistAccessCreate(CFStringRef descriptor, CFArrayRef applications, SecAccessRef *access) {
+    return SecAccessCreate(descriptor, applications, access);
+}
 #pragma clang diagnostic pop

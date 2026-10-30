@@ -417,24 +417,29 @@ def release_finished(roots, session_id, read_status):
 
 def cli_status_reader(cli, repo, project_id=None, timeout=60):
     """Read-only ticket statuses through the installed CLI, with cwd at the project folder."""
+    from cleanup_service_wait import CLICallError, StatusRefusal
     project = project_id
     def call(method, arguments):
-        result = subprocess.run([str(cli), 'call', method, json.dumps(arguments)], cwd=repo,
-                                capture_output=True, text=True, check=True,
-                                timeout=timeout() if callable(timeout) else timeout)
+        try:
+            result = subprocess.run([str(cli), 'call', method, json.dumps(arguments)], cwd=repo,
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True,
+                                    timeout=timeout() if callable(timeout) else timeout)
+        except subprocess.CalledProcessError as error:
+            # Keep the CLI's own code and text: the installer log must show them (CL-372).
+            raise CLICallError(error.returncode, [str(cli), 'call', method], error.output, error.stderr) from error
         return json.loads(result.stdout)['data']
     def read(keys):
         nonlocal project
         if not project:
             projects = call('project_resolve', {'workspace_path': str(repo)})['projects']
             if len(projects) != 1:
-                raise ValueError('project scope ambiguous; supply --project-id')
+                raise StatusRefusal('PROJECT_SCOPE_AMBIGUOUS', 'project scope ambiguous; supply --project-id')
             project = projects[0]['id']
         result = {}
         for key in keys:
             data = call('task_get', {'project_id': project, 'key': key})
             if data.get('key') != key:
-                raise ValueError('task_get returned another ticket for ' + key)
+                raise StatusRefusal('WRONG_TICKET', 'task_get returned another ticket for ' + key)
             result[key] = data.get('status_category')
         return result
     return read

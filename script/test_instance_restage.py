@@ -15,6 +15,7 @@ FRESH_COPY_PATHS = (
     'Sources/ChecklistCore/LegacyStoredValue.swift', 'Sources/ChecklistCore/ManagedPath*',
     'Sources/ChecklistCore/GroupKeys.swift', 'Sources/ChecklistCore/GRDBRecordEnvelopeAdapter.swift',
     'Sources/ChecklistCore/RecordEnvelope.swift', 'Sources/ChecklistIPC/LocalPlatformServices.swift',
+    'Sources/ChecklistIPC/InstallationCredentialStore.swift', 'Sources/ChecklistIPC/LegacyKeychainCredentialMigration.swift',
     'Sources/ChecklistCore/FileDurability.swift', 'Sources/ChecklistCore/Backup*',
     'Sources/ChecklistCore/CommandOperations.swift', 'Sources/ChecklistCore/ArchiveStorage*',
     'Sources/ChecklistService/*', 'Sources/ChecklistIPC/ChecklistInstance.swift',

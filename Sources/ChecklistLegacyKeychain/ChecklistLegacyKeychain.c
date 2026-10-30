@@ -1,6 +1,6 @@
 #include "ChecklistLegacyKeychain.h"
-// File-based keychain ACLs ignore LAContext's no-UI setting. Preserve the
-// process interaction guard and exact signed-executable ACL compatibility.
+// File-based keychain ACLs ignore LAContext's no-UI setting. Keep the process
+// interaction guard for the one CL-374 migration read and its removal condition.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 OSStatus ChecklistKeychainGetUserInteractionAllowed(Boolean *state) {
@@ -8,11 +8,5 @@ OSStatus ChecklistKeychainGetUserInteractionAllowed(Boolean *state) {
 }
 OSStatus ChecklistKeychainSetUserInteractionAllowed(Boolean state) {
     return SecKeychainSetUserInteractionAllowed(state);
-}
-OSStatus ChecklistTrustedApplicationCreateFromPath(const char *path, SecTrustedApplicationRef *application) {
-    return SecTrustedApplicationCreateFromPath(path, application);
-}
-OSStatus ChecklistAccessCreate(CFStringRef descriptor, CFArrayRef applications, SecAccessRef *access) {
-    return SecAccessCreate(descriptor, applications, access);
 }
 #pragma clang diagnostic pop

@@ -184,7 +184,7 @@ final class HumanClaimsKeychainTests: XCTestCase {
             pairing.removeValue(forKey: key as String)
         }
         pairing[kSecMatchSearchList as String] = [keychain]
-        XCTAssertEqual(try ChecklistKeychain.read(query: pairing), "legacy-pairing")
+        XCTAssertEqual(try LegacyKeychainCredentialMigration.read(query: pairing), "legacy-pairing")
 
         // The stale account can coexist with the replacement recovery account.
         var own = HumanClaims.query(WorkspaceWindowIdentity.primary.pendingCommandKey)

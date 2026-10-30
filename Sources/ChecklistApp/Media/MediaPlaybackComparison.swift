@@ -13,9 +13,9 @@ import ChecklistCore
 extension MediaTakeControl { func unload() { pause() } }
 extension AVPlayer: MediaTakeControl {}
 
-/// Retains one item through playback and pause. Native queue handoffs can display
-/// a future item's first frame before the current take ends (CL-341); rewind only
-/// after the retained item actually ends, without resuming from a seek completion.
+/// One retained item avoids native queue handoffs (CL-341). Looping takes repeat
+/// inside a bounded composition, so ordinary cycle boundaries need no end seek.
+/// Only the entire timeline rewinds; a seek completion never resumes playback.
 @MainActor final class MediaNativeTakeControl: MediaTakeControl {
     let player: AVQueuePlayer
     let playbackRate: Float
@@ -26,11 +26,13 @@ extension AVPlayer: MediaTakeControl {}
     private var rewindGeneration = 0
     private var rewindPending = false
 
-    init(asset: AVAsset, loop: Bool, playbackRate: Float) {
+    init(asset: AVURLAsset, loop: Bool, playbackRate: Float) async throws {
+        let playbackAsset: AVAsset = loop ? try await Self.loopTimeline(asset: asset, playbackRate: playbackRate) : asset
+        try Task.checkCancellation()
         self.playbackRate = playbackRate; loops = loop
         player = AVQueuePlayer()
         player.defaultRate = playbackRate
-        let item = AVPlayerItem(asset: asset)
+        let item = AVPlayerItem(asset: playbackAsset)
         player.actionAtItemEnd = loop ? .none : .pause
         player.insert(item, after: nil)
         // Native AVKit controls may change rate directly rather than call play().
@@ -53,6 +55,33 @@ extension AVPlayer: MediaTakeControl {}
                     _ = self.rewindAtEnd()
                 }
             }
+    }
+    /// Reuse source samples rather than copying/decoding the take per repetition.
+    /// Aim for five minutes at the selected speed, bounded to 512 segments per track.
+    private static func loopTimeline(asset: AVURLAsset, playbackRate: Float) async throws -> AVComposition {
+        let duration = try await asset.load(.duration)
+        guard duration.isNumeric, duration.seconds > 0, playbackRate.isFinite, playbackRate > 0 else {
+            throw FilePreviewFailure("The looping take has no finite positive duration or playback rate.")
+        }
+        let repetitions = max(2, Int(ceil(min(512, 300 * Double(playbackRate) / duration.seconds))))
+        let composition = AVMutableComposition()
+        let range = CMTimeRange(start: .zero, duration: duration)
+        for index in 0..<repetitions {
+            try Task.checkCancellation()
+            try await composition.insertTimeRange(range, of: asset, at: CMTimeMultiply(duration, multiplier: Int32(index)))
+        }
+        // Asset-level insertion copies media, not track presentation properties.
+        let sourceTracks = try await asset.load(.tracks)
+        let sourcesByID = Dictionary(uniqueKeysWithValues: sourceTracks.map { ($0.trackID, $0) })
+        for timeline in composition.tracks {
+            let sourceIDs = Set(timeline.segments.filter { !$0.isEmpty }.map(\.sourceTrackID))
+            guard sourceIDs.count == 1, let id = sourceIDs.first, let source = sourcesByID[id], source.mediaType == timeline.mediaType else {
+                throw FilePreviewFailure("The looping take's tracks could not be preserved.")
+            }
+            let (transform, volume, enabled) = try await source.load(.preferredTransform, .preferredVolume, .isEnabled)
+            timeline.preferredTransform = transform; timeline.preferredVolume = volume; timeline.isEnabled = enabled
+        }
+        return composition
     }
     func play() {
         guard !unloaded else { return }
@@ -379,7 +408,8 @@ struct MediaPlaybackSlotView: View {
             let (asset, facts, probeMilliseconds) = try await MediaTakeLoader.probe(url: file.url, kind: kind)
             let timing = try await MediaTakeLoader.timing(asset: asset, frameRate: frameRate)
             try Task.checkCancellation()
-            let control = MediaNativeTakeControl(asset: asset, loop: loop, playbackRate: timing.rate)
+            let control = try await MediaNativeTakeControl(asset: asset, loop: loop, playbackRate: timing.rate)
+            try Task.checkCancellation()
             var ids = ["slot_id": slot.string("slot_id"), "reference_id": original.string("reference_id"), "attachment_id": original.string("attachment_id"), "sha256": slot.string("sha256")]
             if let example { ids["target_id"] = example.string("target_id"); ids["decision_id"] = example.string("decision_id") }
             else { ids["target_id"] = model.item.object("target")["id"] as? String ?? "" }

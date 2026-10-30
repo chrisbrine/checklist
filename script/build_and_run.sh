@@ -484,25 +484,46 @@ echo "After the installed checks pass, retire the previous bundle: python3 \"$RO
 # Keep cleanup after installed checks and off the installation result path.
 post_install_cleanup() {
   local cleanup_log="$CAPTURE_DIR/post-install-cleanup.jsonl"
+  local release_status=0
+  : >"$cleanup_log" 2>/dev/null || true
   # Hand back the installer lease before starting a separately leased cleanup.
   # A concurrent builder wins safely: cleanup refuses its held lock.
-  if ! rmdir "$BUILD_ROOT/.build-lock"; then
-    echo "Warning: build cleanup could not acquire its own lease; run script/clean_builds.py --preview." >&2
-    return 0
-  fi
-  BUILD_LOCK_OWNED=0
-  nohup python3 - "$ROOT_DIR" "$CAPTURE_DIR" >"$cleanup_log" 2>&1 <<'PYCLEAN' &
+  if rmdir "$BUILD_ROOT/.build-lock"; then
+    BUILD_LOCK_OWNED=0
+    nohup python3 - "$ROOT_DIR" "$CAPTURE_DIR" >>"$cleanup_log" 2>&1 <<'PYCLEAN' &
 import sys
 from pathlib import Path
 sys.path.insert(0,str(Path(sys.argv[1])/'script'))
-from clean_builds import post_install
+from clean_builds import post_install_build
 try:
-    sys.exit(post_install(*sys.argv[1:]))
+    sys.exit(post_install_build(*sys.argv[1:]))
 except Exception as error:
     print('Cleanup refused: '+str(error), file=sys.stderr)
     sys.exit(1)
 PYCLEAN
-  echo "Build cleanup started in background (pid $!); report: $cleanup_log"
+    echo "Build cleanup started in background (pid $!); report: $cleanup_log"
+  else
+    echo "Warning: build cleanup could not acquire its own lease; run script/clean_builds.py --preview." >&2
+  fi
+  # CL-372: the release's status reads stay in the foreground. The CLI finds its native
+  # session through its parent processes, and a process that outlives this script has none.
+  # Bounded: 60 s service wait, 90 s with the reads. A failure never fails the install.
+  python3 - "$ROOT_DIR" >>"$cleanup_log" <<'PYRELEASE' || release_status=$?
+import json, sys
+from pathlib import Path
+try:
+    sys.path.insert(0,str(Path(sys.argv[1])/'script'))
+    from clean_builds import post_install_release
+    sys.exit(post_install_release(sys.argv[1]))
+except Exception as error:
+    print(json.dumps({'action':'post_install_release','release_done':{'status':'failed','reason':f'{type(error).__name__}: {error}'}}), flush=True)
+    sys.exit(1)
+PYRELEASE
+  case "$release_status" in
+    0) echo "Post-install release finished; report: $cleanup_log" ;;
+    2) echo "Warning: post-install release skipped (no session exported); report: $cleanup_log" >&2 ;;
+    *) echo "Warning: post-install release failed and kept its markers; the install is not affected; report: $cleanup_log" >&2 ;;
+  esac
 }
 post_install_cleanup
 # Interactive modes can wait indefinitely; retire older bundles before entering them.

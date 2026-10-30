@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'script'))
 import clean_builds
 import clean_scratch
-from cleanup_service_wait import ServiceReadiness
+from cleanup_service_wait import CLICallError, ServiceReadiness, is_refusal
 
 
 class FakeClock:
@@ -143,6 +143,28 @@ class ServiceReadinessTests(unittest.TestCase):
         self.assertEqual(self.wait.call_timeout(), 60)
 
 
+class CLICallErrorTests(unittest.TestCase):
+    def test_stderr_gives_code_and_text_and_never_the_arguments(self):
+        error = CLICallError(1, ['checklist', 'call', 'task_get'], '', 'Checklist: METHOD_UNAVAILABLE: no such tool\n')
+        self.assertEqual((error.code, str(error)), ('METHOD_UNAVAILABLE', 'METHOD_UNAVAILABLE: no such tool'))
+        self.assertTrue(is_refusal(error))
+
+    def test_secrets_are_removed_and_the_text_is_bounded(self):
+        token = 'a1B2' * 16
+        error = CLICallError(1, ['checklist'], '', f'Checklist: BAD: credential={token} token: shortvalue {"x " * 400}\n')
+        self.assertNotIn(token, str(error))
+        self.assertNotIn('shortvalue', str(error))
+        self.assertLessEqual(len(error.text), 300)
+
+    def test_unready_and_uncoded_failures_stay_retryable(self):
+        for stderr in ('Checklist: SERVICE_UNAVAILABLE: x\n', 'Checklist: STORAGE_UPGRADING: x\n', '', 'Killed\n', None):
+            with self.subTest(stderr=stderr):
+                self.assertFalse(is_refusal(CLICallError(1, ['checklist'], '', stderr)))
+        self.assertFalse(is_refusal(ValueError('bad reply')))
+        self.assertFalse(is_refusal(subprocess.TimeoutExpired(['checklist'], 10)))
+        self.assertEqual(str(CLICallError(70, ['checklist'], '', 'Killed\n')), 'CLI exit status 70: Killed')
+
+
 class PostInstallServiceReadinessTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir='/private/tmp')
@@ -190,6 +212,103 @@ class PostInstallServiceReadinessTests(unittest.TestCase):
         self.assertEqual(self.clock.seconds, 2)
         wait = next(event for event in events if event['action'] == 'release_done_service_wait')
         self.assertEqual((wait['status'], wait['waited_seconds'], wait['attempts']), ('ready', 2.0, 3))
+
+    def fake_cli(self, *answers):
+        """A real executable: each call takes the next (exit, stderr) answer; the last repeats."""
+        state = self.root / 'calls'
+        script = self.root / 'checklist'
+        script.write_text('#!/usr/bin/env python3\n'
+                          'import json, pathlib, sys\n'
+                          f'state = pathlib.Path({str(state)!r})\n'
+                          'n = int(state.read_text()) if state.exists() else 0\n'
+                          'state.write_text(str(n + 1))\n'
+                          f'answers = {answers!r}\n'
+                          'code, text = answers[min(n, len(answers) - 1)]\n'
+                          'if code:\n'
+                          '    sys.stderr.write(text)\n'
+                          '    sys.exit(code)\n'
+                          'method, arguments = sys.argv[2], json.loads(sys.argv[3])\n'
+                          "data = {'projects': [{'id': 'p'}]} if method == 'project_resolve' else "
+                          "{'key': arguments['key'], 'status_category': 'done'}\n"
+                          "print(json.dumps({'data': data}))\n")
+        script.chmod(0o755)
+        return clean_scratch.cli_status_reader(script, self.root, timeout=self.wait.call_timeout), state
+
+    def test_cli_reader_that_is_unready_twice_then_answers_still_releases(self):
+        done = self.marked('finished', 'CL-372')
+        reader, state = self.fake_cli((1, 'Checklist: SERVICE_UNAVAILABLE: XPC service unavailable.\n'),
+                                      (1, 'Checklist: SERVICE_UNAVAILABLE: XPC service unavailable.\n'), (0, ''))
+        result, events = self.release(reader)
+        self.assertEqual(result, 0)
+        self.assertTrue(clean_scratch.read_marker(done)['released'])
+        self.assertEqual(self.clock.sleeps, [1.0, 1.0])
+        wait = next(event for event in events if event['action'] == 'release_done_service_wait')
+        self.assertEqual((wait['status'], wait['attempts']), ('ready', 3))
+
+    def test_definite_refusal_stops_without_retries_and_names_the_code(self):
+        for code, text in (('NATIVE_SESSION_MISMATCH', "Claude's current session registry does not match this native process and workspace."),
+                           ('SETUP_REQUIRED', "Use Checklist from a Codex or Claude thread in this project's workspace to connect automatically.")):
+            with self.subTest(code=code):
+                self.setUp()
+                paths = [self.marked('one', 'CL-372'), self.marked('two', 'CL-367')]
+                before = {path: (path / clean_scratch.WORKSPACE_MARKER).read_bytes() for path in paths}
+                reader, state = self.fake_cli((1, f'Checklist: {code}: {text}\n'))
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors):
+                    result, events = self.release(reader)
+                self.assertEqual(result, 1)
+                self.assertEqual(state.read_text(), '1')  # one CLI call in all, also for the second folder
+                self.assertEqual((self.clock.sleeps, self.clock.seconds), ([], 0))
+                wait = next(event for event in events if event['action'] == 'release_done_service_wait')
+                self.assertEqual((wait['status'], wait['attempts'], wait['code']), ('refused', 1, code))
+                self.assertEqual(wait['reason'], f'{code}: {text}')
+                final = [event for event in events if event['action'] == 'release_done'][-1]
+                self.assertEqual((final['status'], final['code'], final['attempts']), ('failed', code, 1))
+                self.assertIn(code, errors.getvalue())
+                self.assertEqual({path: (path / clean_scratch.WORKSPACE_MARKER).read_bytes() for path in paths}, before)
+
+    def test_timeout_event_names_the_last_cli_code(self):
+        self.marked('finished', 'CL-372')
+        reader, state = self.fake_cli((1, 'Checklist: SERVICE_UNAVAILABLE: The registered Mach service did not respond.\n'))
+        with contextlib.redirect_stderr(io.StringIO()):
+            result, events = self.release(reader)
+        self.assertEqual(result, 1)
+        wait = next(event for event in events if event['action'] == 'release_done_service_wait')
+        self.assertEqual((wait['status'], wait['code']), ('unavailable', 'SERVICE_UNAVAILABLE'))
+        self.assertIn('SERVICE_UNAVAILABLE: The registered Mach service', wait['reason'])
+        final = [event for event in events if event['action'] == 'release_done'][-1]
+        self.assertEqual(final['code'], 'SERVICE_UNAVAILABLE')
+
+    def test_ambiguous_project_is_a_refusal(self):
+        self.marked('finished', 'CL-372')
+        script = self.root / 'checklist'
+        script.write_text("#!/bin/sh\necho '{\"data\":{\"projects\":[]}}'\n")
+        script.chmod(0o755)
+        reader = clean_scratch.cli_status_reader(script, self.root, timeout=self.wait.call_timeout)
+        with contextlib.redirect_stderr(io.StringIO()):
+            result, events = self.release(reader)
+        self.assertEqual(result, 1)
+        self.assertEqual(self.clock.sleeps, [])
+        wait = next(event for event in events if event['action'] == 'release_done_service_wait')
+        self.assertEqual((wait['status'], wait['code']), ('refused', 'PROJECT_SCOPE_AMBIGUOUS'))
+
+    def test_all_status_reads_share_the_total_limit(self):
+        self.marked('one', 'CL-372')
+        self.marked('two', 'CL-367')
+        self.marked('three', 'CL-368')
+        calls = []
+
+        def reader(keys):
+            calls.append(keys)
+            self.clock.seconds += 50
+            return {key: 'active' for key in keys}
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            result, events = self.release(reader)
+        self.assertEqual((result, len(calls)), (1, 2))  # 100 s used at the third folder: no third read
+        self.assertEqual(self.wait.total_seconds, 90)
+        self.assertIn('read_budget_exhausted', {event.get('status') for event in events})
+        self.assertEqual(self.wait.failure.args[0], 'status reads did not finish within 90 seconds')
 
     def test_post_install_timeout_preserves_all_marker_bytes_and_reports_failure(self):
         paths = [self.marked('one', 'CL-372'), self.marked('two', 'CL-367')]

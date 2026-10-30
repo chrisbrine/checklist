@@ -14,6 +14,19 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 QUALIFICATION_TESTS = (
+    # CL-363: 201/242/250-item workflows and actual descriptor-exhaustion retries.
+    'ChecklistCoreTests.MediaBulkOwnerChannelTests/test250ItemRoundIsAcceptedInOneActionWithOwnerDecisionPerItem',
+    'ChecklistCoreTests.MediaBulkOwnerChannelTests/testFailedChunkRefreshesOnlyFailedItemsAndNeverRepeatsCommittedOnes',
+    'ChecklistCoreTests.MediaFollowUpTests/testFollowUpAndCloseAt242DecisionsStayExactAndRecordTheirTimes',
+    'ChecklistCoreTests.StorageFailureReportTests/testAttachmentAddReportsRetryableThenSameCommandSucceeds',
+    'ChecklistCoreTests.StorageFailureReportTests/testAttachmentAddRetriesWhileOpenFilesAreExhausted',
+    'ChecklistCoreTests.StorageFailureReportTests/testOperationRouteRequeuesSameCommandAfterExhaustion',
+    'ChecklistCoreTests.StorageFailureReportTests/testSmallWritesAtEveryHeadroomGiveCodedErrors',
+    # CL-363: native 1,000-request soaks and >4 MiB descriptor/inventory probes.
+    'ChecklistCoreTests.StorageFolderAccessTests/testRepeatedStoreReadersReuseRouterPinnedRootWithoutChildren',
+    'ChecklistCoreTests.StorageFolderAccessTests/testSustainedRootOpensReuseOneHelperAndReapItsBlockedGeneration',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testP321MaintenanceSkipsInventoryRefusedHeadAndRunsLaterReceipt',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testP321PreparationUnavailableStillYieldsToLifecycleTurn',
     # CL-363: 40,133 objects in 23 backup generations; 256 live descriptors; 2,050 rows.
     'ChecklistCoreTests.TicketLifecycleCleanupTests/testCleanupBackupIndexBoundsRepeatedCopiesAcrossTwentyThreeReceipts',
     'ChecklistCoreTests.TicketLifecycleCleanupTests/testDeletionCohort256CandidatesAtLaunchdDescriptorLimit',
@@ -133,6 +146,14 @@ TIMING_TESTS = (
     'ChecklistIPCTests.ClientConnectionAdmissionTests/testSlowFirstCheckDoesNotHoldUpCachedClients',
     'ChecklistMCPServerTests.ChecklistMCPServerTests/testStalledServiceInitializesWithinThreeSecondsAndFirstCallConnects',
     'ChecklistMCPServerTests.ChecklistMCPServerTests/testTwentyConcurrentCallsEachGetTheirOwnReply',
+    'ChecklistCLITests.OperationWaitCommandTests/testAReadThatDoesNotAnswerCannotHoldTheWaitPastItsLimit',
+    'ChecklistCLITests.OperationWaitCommandTests/testSlowOperationPrintsTheFinalReplyInTheSynchronousShape',
+    'ChecklistCLITests.OperationWaitCommandTests/testTimeoutPrintsTheOperationWithItsStateAndADistinctExit',
+    'ChecklistMCPServerTests.OperationWaitMCPTests/testBoundedReturnsAtItsLimitWhileTheWorkStillRuns',
+    'ChecklistMCPServerTests.OperationWaitMCPTests/testInvalidInputAndUnknownOperationAreRefusedAtOnce',
+    # Uses a virtual clock, but the static guard still flags it; registered, not rewritten (F63).
+    'ChecklistMCPServerTests.OperationWaitMCPTests/testToolLimitsStayBelowTheClientLimitWithAVirtualClock',
+    'ChecklistMCPServerTests.OperationWaitMCPTests/testWaitBoundsReturnsStateThenFinalReplyAndOtherCallsContinue',
 )
 # Load-sensitive cases without a wall-clock budget (a cancel-versus-copy race and an
 # idle-CPU bound); they run in the same single-worker command as TIMING_TESTS.
@@ -172,6 +193,10 @@ VALIDATION_ONLY_GLOBS = (
 FILE_TEST_CONSUMERS = {
     'Sources/ChecklistLegacyKeychain/ChecklistLegacyKeychain.c': ('ChecklistIPCTests',),
     'Sources/ChecklistLegacyKeychain/include/ChecklistLegacyKeychain.h': ('ChecklistIPCTests',),
+    'docs/database-storage.md': ('ChecklistAppTests',),
+    'docs/platform-adapters.md': ('ChecklistIPCTests',),
+    'docs/test-instances.md': ('ChecklistAppTests',),
+    'examples/media-animation-takes.json': ('ChecklistAppTests', 'ChecklistCoreTests'),
     'docs/integrations.md': ('ChecklistCoreTests',),
     'docs/mcp-contract.md': ('ChecklistCoreTests',),
     'examples/human-request.json': ('ChecklistCoreTests',),

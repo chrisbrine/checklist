@@ -70,7 +70,7 @@ The implemented [provider-plugin boundary](provider-plugins.md) adds `ChecklistP
 The detailed [database and storage specification](database-storage.md) defines table groups, composite keys/indexes, staging/commit/cleanup, consistent filesystem-inclusive backup, WAL/migration/restore and failure behavior. [Project settings](project-customization.md) and [assistant integration](assistant-plugin.md) share this same store. No plugin-specific database or per-project fake data location.
 
 
-Store data beneath `~/Library/Application Support/Checklist/`: the SQLite database, managed attachment copies, backups, and non-secret logs. Store provider credentials in Keychain. Keep IPC endpoint metadata and capability tokens out of project files, task exports, and normal logs. Directory permissions are owner-only.
+Store data beneath `~/Library/Application Support/Checklist/`: the SQLite database, managed attachment copies, backups, and non-secret logs. Store agent installation credentials in mode 0600 files in the private `OwnerPrivate/` folder ([protection and migration](database-storage.md#agent-installation-credentials-cl-374)), outside the database and its backups. Keep IPC endpoint metadata and capability tokens out of project files, task exports, and normal logs. Directory permissions are owner-only.
 
 Use foreign keys, WAL, bounded busy handling, and short write transactions. Every mutation writes current projections, append-only events, command receipt, and any outgoing deliveries atomically. External calls happen **after** commit. A crash after the provider accepts a message but before its receipt is stored is handled by an idempotent provider message ID where supported; otherwise mark delivery uncertain instead of blindly duplicating it.
 

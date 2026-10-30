@@ -53,9 +53,8 @@ extension CoreTests {
         orchestrateBatchTriages = true // CL-125 rule 6: claims keep tickets in an orchestrated Triage.
         let invalid: [Any?] = [nil,NSNull(),"1",true,false,1.5,0,-1,NSNumber(value:UInt64.max)]
         for value in invalid {
-            let p = try project(),tasks = try [ready(p,task(p)),ready(p,task(p))],group = try triage(p)
-            for task in tasks {try addTriage(p,group,task)}
-            let batch = try prepareImplementationBatch(p,group,tasks),before = try batchClaimState(p,batch)
+            let fixture = try preparedPolicyBatch(),p = fixture.project,tasks = fixture.tasks,group = fixture.group,batch = fixture.batch
+            let before = try batchClaimState(p,batch)
             var input: JSON = ["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":batch["revision"]!]
             input["policy_revision"] = value
             let rejectedCommand = UUID().uuidString
@@ -80,9 +79,7 @@ extension CoreTests {
     func testBatchClaimPolicyMismatchAndChangedProjectAreAtomic() throws {
         for changedProject in [false,true] {
             for sendsNewRevision in [false,true] {
-                let p = try project(),tasks = try [ready(p,task(p)),ready(p,task(p))],group = try triage(p)
-                for task in tasks {try addTriage(p,group,task)}
-                let batch = try prepareImplementationBatch(p,group,tasks),oldRevision = int(batch,"policy_revision")
+                let fixture = try preparedPolicyBatch(),p = fixture.project,batch = fixture.batch,oldRevision = int(batch,"policy_revision")
                 if changedProject { _ = try call("policy_apply",["project_id":p["id"]!,"expected_revision":p["revision"]!,"policy":["required_gates":[]]]) }
                 let before = try batchClaimState(p,batch)
                 let supplied = changedProject && !sendsNewRevision ? oldRevision : oldRevision+1
@@ -314,7 +311,7 @@ extension CoreTests {
             let verdict = kind == "implementation_blocked" ? "blocked" : kind
             let returned = kind != "blocked"
             for batched in [true,false] {
-                let value = try submittedArtifact(),p = value.project,group = try triage(p,phase:"review")
+                let value = try preparedSubmittedArtifact(),p = value.project,group = try triage(p,phase:"review")
                 try addTriage(p,group,value.task)
                 let reviewer = Caller(role:"owner",installation:"non-final-"+verdict,projectIDs:[]),batch = try prepareReviewBatch(p,group,[value.task],reviewer)
                 let claim = (try claimFixedBatch(p,batch,reviewer)["claims"] as! [JSON])[0]

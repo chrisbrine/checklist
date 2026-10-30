@@ -22,7 +22,7 @@ extension Coordinator {
     }
     func bootstrap(_ context:[String:Any], connection:NSXPCConnection) throws -> BootstrapResult {
         let native = try verifiedNativeWorkspace(context, connection: connection)
-        return try bootstrapVerifiedWorkspace(context, native: native, readCredential: ChecklistKeychain.read)
+        return try bootstrapVerifiedWorkspace(context, native: native, readCredential: credentials.read)
     }
 
     // Peer/process verification stays at the XPC boundary; this stage retains all grant checks.
@@ -139,10 +139,10 @@ extension Coordinator {
             if ProviderPluginRegistry.bundled.plugin(provider, requiring: .nativePeer) != nil,let endpoint=context["native_endpoint"] as? String { try bindProviderEndpoint(&enrollment,endpoint:endpoint,process:process) }
             // Save no caller-supplied role, projects, profile, title or human provenance.
             _ = try ConnectionCommit.perform(
-                saveCredential: { try ChecklistKeychain.write(installation, token) },
+                saveCredential: { try credentials.write(installation, token) },
                 saveEnrollment: { enrollments[installation] = enrollment; try saveEnrollments() },
                 registerSession: { try registerAutomatic(enrollment, project: pid, caller: owner) },
-                rollback: { try ConnectionCommit.restore(enrollment: { enrollments.removeValue(forKey: installation); try saveEnrollments() }, credential: { try ChecklistKeychain.removeChecked(installation) }) })
+                rollback: { try ConnectionCommit.restore(enrollment: { enrollments.removeValue(forKey: installation); try saveEnrollments() }, credential: { try credentials.removeChecked(installation) }) })
             try requireCommittedRegistration(enrollment, project: pid, caller: owner)
             return BootstrapResult(reply:connectionResult(enrollment,project:pid),changed:true)
         }
@@ -210,7 +210,7 @@ extension Coordinator {
         let caller=Caller(role:"worker",installation:boundInstallation+"/"+generation,projectIDs:projects,sessionID:native.session,workspace:native.workspace,executionDomain:native.executionDomain)
         var priorCredential:String?,snapshotTaken=false
         return try router.commitWorkspaceProjectCreation(intent:intent,caller:caller,provider:native.provider,preparePersistence:{ pid in
-            priorCredential=try ChecklistKeychain.read(boundInstallation);snapshotTaken=true
+            priorCredential=try credentials.read(boundInstallation);snapshotTaken=true
             var bytes=[UInt8](repeating:0,count:32)
             guard SecRandomCopyBytes(kSecRandomDefault,bytes.count,&bytes) == errSecSuccess else { throw ChecklistError("RANDOM_FAILURE","Could not create the thread connection.") }
             let token=Data(bytes).base64EncodedString()
@@ -220,14 +220,14 @@ extension Coordinator {
             enrollment.nativeExecutionDomain=native.executionDomain;enrollment.identityVerification=plugin.nativeHost?.identityVerification
             enrollment.assistantRelay=false
             if ProviderPluginRegistry.bundled.plugin(native.provider,requiring:.nativePeer) != nil,let endpoint=context["native_endpoint"] as? String { try bindProviderEndpoint(&enrollment,endpoint:endpoint,process:native.process) }
-            try ChecklistKeychain.write(boundInstallation,token)
+            try credentials.write(boundInstallation,token)
             enrollments[boundInstallation]=enrollment;try saveEnrollments()
             return ["project_id":pid,"project_ids":[pid],"session_id":native.session,"installation":caller.installation,"provider":native.provider,"role":"worker","workspace":native.workspace,"name":enrollment.name,"execution_domain":native.executionDomain]
         },rollback:{
             guard snapshotTaken else { return }
             try ConnectionCommit.restore(enrollment:{ enrollments[boundInstallation]=priorEnrollment;try saveEnrollments() },credential:{
-                if let priorCredential { try ChecklistKeychain.write(boundInstallation,priorCredential) }
-                else { try ChecklistKeychain.removeChecked(boundInstallation) }
+                if let priorCredential { try credentials.write(boundInstallation,priorCredential) }
+                else { try credentials.removeChecked(boundInstallation) }
             })
         })
     }
@@ -280,7 +280,10 @@ extension Coordinator {
         }
         guard existing.workspace == binding,existing.projectIDs == [project] else { throw ChecklistError("BINDING_CHANGED","The registered workspace changed. Review this connection in Checklist before reconnecting.") }
         // An owner disconnect before this build removed the saved credential; a verified closure kept it.
-        let priorCredential=try ChecklistKeychain.read(existing.installation)
+        // Allow again is the owner's explicit fresh bootstrap, so an unreadable old credential cannot block it.
+        let priorCredential:String?
+        do { priorCredential=try credentials.read(existing.installation) }
+        catch { if ownerAllowed { priorCredential=nil } else { throw error } }
         if !ownerAllowed {
             guard let priorCredential,SHA256.hash(data:Data(priorCredential.utf8)).map({String(format:"%02x",$0)}).joined() == existing.tokenDigest else { throw ownerDisconnected }
         }
@@ -296,15 +299,15 @@ extension Coordinator {
             oldInstallation:existing.installation+"/"+existing.generation,oldExecutionDomain:oldDomain,
             newInstallation:resumed.installation+"/"+resumed.generation,newExecutionDomain:executionDomain)
         _ = try ConnectionCommit.perform(
-            saveCredential: { try ChecklistKeychain.write(existing.installation, token) },
+            saveCredential: { try credentials.write(existing.installation, token) },
             saveEnrollment: { enrollments[existing.installation] = resumed; try saveEnrollments() },
             registerSession: {
                 if ownerAllowed { return try router.reconnectOwnerAllowedSession(resumption,caller:owner) }
                 return try router.resumeVerifiedNativeSession(resumption, caller: owner)
             },
             rollback: { try ConnectionCommit.restore(enrollment: { enrollments[existing.installation] = existing; try saveEnrollments() }, credential: {
-                if let priorCredential { try ChecklistKeychain.write(existing.installation, priorCredential) }
-                else { try ChecklistKeychain.removeChecked(existing.installation) }
+                if let priorCredential { try credentials.write(existing.installation, priorCredential) }
+                else { try credentials.removeChecked(existing.installation) }
             }) })
         try requireCommittedRegistration(resumed, project: project, caller: owner)
         return resumed

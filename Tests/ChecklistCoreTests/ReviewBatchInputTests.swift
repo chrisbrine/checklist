@@ -3,6 +3,13 @@ import XCTest
 
 extension CoreTests {
     func reviewBatchInputsFixture() throws -> (project: JSON,group: JSON,tasks: [JSON],reviewer: Caller) {
+        let fixture = try preparedCorePhase(orchestrateBatchTriages ? "review-inputs-orchestrated" : "review-inputs-plan") { [self] in
+            let value = try buildReviewBatchInputsFixture()
+            return ["project":value.project,"group":value.group,"tasks":value.tasks]
+        }
+        return (fixture["project"] as! JSON,fixture["group"] as! JSON,fixture["tasks"] as! [JSON],Caller(role:"owner",installation:"review-input-reader",projectIDs:[]))
+    }
+    private func buildReviewBatchInputsFixture() throws -> (project: JSON,group: JSON,tasks: [JSON],reviewer: Caller) {
         let p = try project(),tasks = try [ready(p,task(p,"Open request")),ready(p,task(p,"No open request")),ready(p,task(p,"Revision changes"))],implementation = try triage(p)
         for task in tasks {try addTriage(p,implementation,task)}
         let batch = try prepareImplementationBatch(p,implementation,tasks),claims = try claimFixedBatch(p,batch)["claims"] as! [JSON]

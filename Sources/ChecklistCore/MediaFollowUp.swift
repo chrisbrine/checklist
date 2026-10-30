@@ -162,4 +162,15 @@ extension CommandRouter {
         return suggestion["target_phase"] as? String == "draft" && target["published_from_target_id"] is String
             && EnvelopeStorageIdentity.equal(suggestion["target_id"] as? String,target["published_from_target_id"] as? String)
     }
+
+    /// The rule of `mediaSuggestionCurrent` for list filters: item `i` on its listed target `t`
+    /// has a current row in `suggested` that also meets `condition`. Each IN set is uncorrelated,
+    /// so SQLite builds it once, and the expression is never NULL, so NOT keeps its meaning.
+    /// `MediaBulkOwnerChannelTests` holds this expression and the function above to one answer.
+    static func mediaSuggestionCurrentSQL(where condition: String = "1") -> String {
+        let basis = "COALESCE(json_extract(t.data,'$.review_basis_signature'),'')"
+        return "((i.id,t.id,\(basis)) IN (SELECT item_id,target_id,basis FROM suggested WHERE \(condition))"
+            + " OR (COALESCE(json_type(t.data,'$.published_from_target_id'),'')='text'"
+            + " AND (i.id,json_extract(t.data,'$.published_from_target_id'),\(basis)) IN (SELECT item_id,target_id,basis FROM suggested WHERE phase='draft' AND \(condition))))"
+    }
 }

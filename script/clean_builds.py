@@ -18,7 +18,7 @@ import sys
 
 from clean_scratch import (DEFAULT_BUDGET_GB, FINISHED, OWNER_RECORD, SESSION_VARIABLES, WORKSPACE_MARKER, background_sizes, cli_status_reader, du_sizes, inventory, native_session, read_owner_record, release_finished, running_paths, storage_groups, storage_report, ticket_roots, within, workspace_protection)
 from retire_old_bundles import trash, trash_many
-from cleanup_service_wait import ServiceReadiness
+from cleanup_service_wait import ServiceReadiness, error_code
 import test_instances as slots
 
 REPO = Path(__file__).resolve().parents[1]
@@ -931,16 +931,22 @@ def release_done(repo, environ=None, reader=None, sessions_root=None, qualificat
                                              timeout=readiness.call_timeout)
         roots = ticket_roots(Path(sessions_root or f'/private/tmp/claude-{os.getuid()}'),
                              Path(qualification_root or Path.home() / 'Library/Caches/ChecklistQualification'), session)
-        return release_finished(roots, session, lambda keys: readiness.read(reader, keys))
+        status = release_finished(roots, session, lambda keys: readiness.read(reader, keys))
+        if readiness.failure is not None:
+            # The report and the installer's own output name the CLI's real error.
+            print(json.dumps({'action': 'release_done', 'status': 'failed', 'code': error_code(readiness.failure) or error_code(readiness.failure.__cause__),
+                              'reason': str(readiness.failure), 'attempts': readiness.attempts,
+                              'waited_seconds': round(readiness.waited_seconds, 3)}), flush=True)
+            print(f'WARNING: POST-INSTALL RELEASE FAILED: {readiness.failure}; markers kept; '
+                  'run clean_scratch.py --release-done from the session.', file=sys.stderr, flush=True)
+        return status
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         print(json.dumps({'action': 'release_done', 'status': 'failed', 'reason': str(error)}), flush=True)
         return 1
 
 
-def post_install(repo, capture, release=None):
-    """Explicit background install step; acquire our own lease after installer exit.
-    The build cleanup and the release are independent: a failed or refused build
-    cleanup still runs the release (CL-359), and the result line reports both."""
+def _build_cleanup(repo, capture):
+    """Acquire our own lease after the installer handed its lease back."""
     cleaner = None
     try:
         cleaner = Cleaner(Path(repo), Path('/Applications/Checklist.app'), apply=True)
@@ -949,23 +955,53 @@ def post_install(repo, capture, release=None):
             if fingerprint(read_json(Path(capture) / 'capture-manifest.json')) not in ids:
                 raise ValueError('installed build changed before cleanup')
             cleaner.builds()
-        build_status = finish(cleaner)
-        build_report = {'status': 'failed' if build_status else 'ok'}
-    except Exception as error:  # report it, then still run the release
-        build_status = 1
-        build_report = {'status': 'failed', 'reason': f'{type(error).__name__}: {error}'}
-        print(json.dumps({'action': 'build_cleanup', **build_report}), flush=True)
+        status = finish(cleaner)
+        return status, {'status': 'failed' if status else 'ok'}
+    except Exception as error:  # report it; the release does not depend on it
+        report = {'status': 'failed', 'reason': f'{type(error).__name__}: {error}'}
+        print(json.dumps({'action': 'build_cleanup', **report}), flush=True)
         if cleaner is not None:
             finish(cleaner)  # bytes already moved before the failure, if any
-    # The release runs after the build lease ends; a failure never undoes the build cleanup.
+        return 1, report
+
+
+def _release(repo, release):
     try:
-        release_status = (release or release_done)(repo)
+        return (release or release_done)(repo)
     except Exception as error:
-        release_status = 1
         print(json.dumps({'action': 'release_done', 'status': 'failed',
                           'reason': f'{type(error).__name__}: {error}'}), flush=True)
+        return 1
+
+
+def _release_report(status):
+    return {'status': {0: 'ok', 2: 'skipped'}.get(status, 'failed')}
+
+
+def post_install_build(repo, capture):
+    """The install hook's background step (under nohup). It holds the build lease and calls no CLI."""
+    status, report = _build_cleanup(repo, capture)
+    print(json.dumps({'action': 'post_install_build', 'build_cleanup': report}), flush=True)
+    return status
+
+
+def post_install_release(repo, release=None):
+    """The install hook's foreground step (CL-372). The CLI finds its native session
+    through its parent processes, so this runs while the installer is still alive:
+    after the installer exits, a reparented process gets a refusal, not a status."""
+    status = _release(repo, release)
+    print(json.dumps({'action': 'post_install_release', 'release_done': _release_report(status)}), flush=True)
+    return status
+
+
+def post_install(repo, capture, release=None):
+    """Both steps for a run by hand from a session. A failed or refused build cleanup
+    still runs the release (CL-359), and the result line reports both."""
+    build_status, build_report = _build_cleanup(repo, capture)
+    # The release runs after the build lease ends; a failure never undoes the build cleanup.
+    release_status = _release(repo, release)
     print(json.dumps({'action': 'post_install', 'build_cleanup': build_report,
-                      'release_done': {'status': {0: 'ok', 2: 'skipped'}.get(release_status, 'failed')}}), flush=True)
+                      'release_done': _release_report(release_status)}), flush=True)
     return 1 if (build_status or release_status == 1) else 0
 
 

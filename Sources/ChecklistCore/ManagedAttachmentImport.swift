@@ -299,7 +299,9 @@ extension CommandRouter {
             // CL-362: too many open files in the service says nothing about the caller's folder.
             if StorageFailureReport.isTransient(failure) {throw failure}
             throw CoreError("FILE_ACCESS_REQUIRED",
-                "The selected original ‘\(sourceURL.path)’ cannot be read. Check folder access or privacy/sync availability and retry the original command ID.")
+                "The selected original ‘\(sourceURL.path)’ cannot be read. Check folder access or privacy/sync availability and retry the original command ID.",
+                // The pending import keeps its attachment identity, so an accepted operation stays recoverable.
+                details:["command_outcome":"unknown","next_step":"Restore access to the file, then retry with the same command ID."])
         }
         catch StorageSnapshotFailure.unsupportedAuthority { throw CoreError("INVALID_INPUT", "Attach a regular file.") }
         catch StorageSnapshotFailure.limit { throw CoreError("FILE_TOO_LARGE", "This local importer accepts files up to 500 MiB.") }

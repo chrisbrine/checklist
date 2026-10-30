@@ -166,7 +166,7 @@ After a successful installation (and installed checks for `--verify` and
 explicit background `post_install_cleanup` step, printing its PID and
 `<capture>/post-install-cleanup.jsonl` report path. Cleanup acquires its own build
 lease; a concurrent builder makes it refuse safely. Installation returns without
-waiting for cleanup, and interactive modes do not hold its lease. Read the report
+waiting for this build cleanup, and interactive modes do not hold its lease. Read the report
 summary before treating retirement as complete; startup/refusal errors are in the
 same log. No schedule or persistent worker is created. Cleanup moves obsolete
 capture `source`, staged app, binaries and per-capture build outputs to the Trash, retaining the installed and immediate
@@ -176,20 +176,29 @@ without a paired `lane-<id>/source`. Paired lanes for every configuration remain
 warm. Stage-only and failed install runs do not retire anything. Cleanup failure
 is logged without turning a successful install into a failed installation.
 
-Each install is a round boundary (CL-359). After the build cleanup, also when that
-cleanup fails or is refused, the same hook runs the `clean_scratch.py --release-done` step for the installing session (the
+Each install is a round boundary (CL-359). After it hands back the installer lease and starts the
+build cleanup, also when that cleanup cannot start or fails, the same hook runs the `clean_scratch.py --release-done` step
+in the foreground of the installer (CL-372). The CLI finds its native session through its parent
+processes, so a process that outlives the installer gets a refusal, not a status. This step can add up to about 90 seconds
+to an install (60 for the service wait, 90 with the status reads), plus the scan of the
+marked folders. It covers the installing session (the
 exported `CODEX_THREAD_ID`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_SESSION_ID` or `CHECKLIST_SESSION_ID`): every
 marked folder of that session whose tickets are all Done or canceled is released.
 Release changes only the marker. The folder moves to the Trash at the next
 `clean_scratch.py --apply`, which still keeps a folder that a running process
 uses. Folders of open or unknown tickets stay marked. With no exported session
-the hook reports `release_done` as skipped; a status read failure is reported in
-the same log and keeps every marker. The release step retries its first complete
-ticket status read for up to 60 seconds while the new service starts, with each
-startup CLI call capped at 10 seconds and the remaining shared deadline. Its
-`release_done_service_wait` log reports attempts and measured elapsed seconds;
-timeout retains markers and reports failure. The last log line, `post_install`, reports
-both results (`build_cleanup` and `release_done`); a failure of either returns 1.
+the hook reports `release_done` as skipped and prints a warning; a status read failure is reported in
+the same log and on the installer's stderr, and keeps every marker. A release failure never fails the install. The release step retries its first complete
+ticket status read for up to 60 seconds only while the new service is unready (`UNREADY_CODES` in
+`script/cleanup_service_wait.py`, a CLI timeout, a CLI exit with no code or a bad reply), with each
+startup CLI call capped at 10 seconds and the remaining shared deadline. A definite refusal, for example
+`NATIVE_SESSION_MISMATCH` or `SETUP_REQUIRED`, stops at once with no retry. Its
+`release_done_service_wait` log reports the status (`ready`, `unavailable`, `refused`, `read_budget_exhausted`), attempts,
+measured elapsed seconds and the CLI's `code` and `reason` from stderr, bounded and with secrets
+removed; failure retains markers. All status reads share the 90-second limit. The foreground step ends with a
+`post_install_release` line and the background step with a `post_install_build` line, in either order;
+each reports its own result. `clean_builds.post_install` runs both steps for a run by hand from a session, and
+its `post_install` line reports both results; a failure of either returns 1.
 A fingerprint folder without a readable `capture-manifest.json` (for example an
 old capture that holds only `build-info.json`) is kept and reported with the
 reason `no capture manifest`; it does not stop the build cleanup.

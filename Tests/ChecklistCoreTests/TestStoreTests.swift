@@ -12,6 +12,10 @@ final class TestStoreTests: XCTestCase {
         let file = workspace.appendingPathComponent("evidence.txt");try Data("prepared bytes".utf8).write(to:file)
         _ = try router.handle(method:"attachment_add",params:["command_id":UUID().uuidString,"project_id":project["id"]!,"task_id":task["id"]!,"path":file.path],caller:owner)
         _ = try router.handle(method:"message_send",params:["command_id":UUID().uuidString,"project_id":project["id"]!,"task_id":task["id"]!,"body":"Literal workspace provenance: " + workspace.path],caller:owner)
+        let capture = router.root.appendingPathComponent("source-captures/prepared/source/input.txt")
+        try FileManager.default.createDirectory(at:capture.deletingLastPathComponent(),withIntermediateDirectories:true)
+        try Data("prepared source bytes".utf8).write(to:capture)
+
     }
     private func directory() -> URL {
         FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("CL266-" + UUID().uuidString)
@@ -66,6 +70,11 @@ final class TestStoreTests: XCTestCase {
         try Data("changed first managed object".utf8).write(to:first.root.appendingPathComponent(path))
         XCTAssertEqual(try Data(contentsOf:secondWorkspace.appendingPathComponent("evidence.txt")),Data("prepared bytes".utf8))
         XCTAssertEqual(try second.managedRead(path,family:"objects",maximum:1024),Data("prepared bytes".utf8))
+        let captured = "source-captures/prepared/source/input.txt"
+        XCTAssertEqual(try first.managedRead(captured,family:"source-captures",maximum:1024),Data("prepared source bytes".utf8))
+        try Data("private source mutation".utf8).write(to:first.root.appendingPathComponent(captured))
+        XCTAssertEqual(try second.managedRead(captured,family:"source-captures",maximum:1024),Data("prepared source bytes".utf8))
+
         try first.dbQueue.write {try $0.execute(sql:"DELETE FROM records WHERE type='message'")}
         XCTAssertEqual(try second.dbQueue.read {try second.records($0,type:"message").count},1)
         XCTAssertTrue(try second.dbQueue.read {db in
@@ -74,6 +83,8 @@ final class TestStoreTests: XCTestCase {
         let third = try TestStore.router(root:root.appendingPathComponent("third"),template:Self.populated,workspace:root.appendingPathComponent("third-workspace"))
         defer {try? third.closeStore()}
         XCTAssertEqual(try third.managedRead(path,family:"objects",maximum:1024),Data("prepared bytes".utf8),"Neither private copy may modify the published template")
+        XCTAssertEqual(try third.managedRead(captured,family:"source-captures",maximum:1024),Data("prepared source bytes".utf8))
+
 
         // Filesystem-only templates also copy into an existing workspace and
         // isolate private Git-like metadata from siblings and future copies.

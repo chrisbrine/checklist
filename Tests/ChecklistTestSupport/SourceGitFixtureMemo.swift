@@ -33,16 +33,16 @@ final class SourceGitFixtureMemo: SourceGitProcessAdapter, @unchecked Sendable {
     func run(_ request: SourceGitProcessRequest) throws -> Data {
         // Exact launcher shape from SourceGit.run: -p PROFILE GIT -c K=V -C PATH ARGS...
         let arguments = request.arguments
-        guard arguments.count >= 7, arguments[0] == "-p", arguments[3] == "-c", arguments[5] == "-C" else { return try real.run(request) }
+        guard arguments.count >= 7, arguments[0] == "-p", arguments[3] == "-c", arguments[5] == "-C" else { return try TestFixtureTimings.measure("git.real") { try real.run(request) } }
         let path = arguments[6], command = Array(arguments[7...])
-        let state = command == ["--version"] ? "" : Self.overlapsProtectedRoot(path, profile: arguments[1]) ? nil : Self.treeState(path)
-        guard let state else { return try real.run(request) }
+        let state = command == ["--version"] ? "" : Self.overlapsProtectedRoot(path, profile: arguments[1]) ? nil : TestFixtureTimings.measure("git.key") { Self.treeState(path) }
+        guard let state else { return try TestFixtureTimings.measure("git.real") { try real.run(request) } }
         let accepted = request.acceptedExitCodes.sorted().map(String.init).joined(separator: ",")
         let environment = request.environment.sorted { $0.key < $1.key }.map { $0.key + "=" + $0.value }.joined(separator: "\0")
         let key = ([request.gitExecutable, arguments[4], accepted, environment, state] + command).joined(separator: "\0")
         let physical = Darwin.realpath(path, nil).map { pointer -> String in defer { free(pointer) }; return String(cString: pointer) } ?? path
         if let stored = lock.withLock({ results[key] }) { return Self.replacing(Self.pathToken, with: Data(physical.utf8), in: stored) }
-        let output = try real.run(request)
+        let output = try TestFixtureTimings.measure("git.real") { try real.run(request) }
         var stored = Self.replacing(Data(physical.utf8), with: Self.pathToken, in: output)
         if physical != path { stored = Self.replacing(Data(path.utf8), with: Self.pathToken, in: stored) }
         lock.withLock { results[key] = stored }

@@ -4,13 +4,15 @@ import XCTest
 extension EvidenceAuthorityTests {
     private func returnedTask(_ p: JSON,_ t: JSON) throws -> JSON { try call("task_get",["project_id":p["id"]!,"task_id":t["id"]!]) }
     private func returnFixture() throws -> (JSON,JSON,JSON,JSON,Caller,Caller) {
-        workspace = directory.appendingPathComponent("return-workspace-"+UUID().uuidString)
-        try sourceFixture()
-        let p = try project(),author = try native(p,"return-author",domain:"codex:return-author"),reviewer = try native(p,"return-reviewer",domain:"claude:return-reviewer",provider:"claude")
-        let task = try ready(p),attempt = try claim(p,task,files:[["path":"tracked.txt","access":"write"]],caller:author)
-        var input = auth(p,attempt);input["acceptance_revision"] = 1;input["evidence_manifest"] = ["kind":"source","source_capture":[:]]
-        let submitted = try call("work_submit",input,author),review = try reviewClaim(p,submitted,reviewer)
-        return (p,task,attempt,review,author,reviewer)
+        let f = try preparedPhase("review-return") { fixture in
+            try fixture.sourceFixture()
+            let p = try fixture.project(),author = try fixture.native(p,"return-author",domain:"codex:return-author"),reviewer = try fixture.native(p,"return-reviewer",domain:"claude:return-reviewer",provider:"claude")
+            let task = try fixture.ready(p),attempt = try fixture.claim(p,task,files:[["path":"tracked.txt","access":"write"]],caller:author)
+            var input = fixture.auth(p,attempt);input["acceptance_revision"] = 1;input["evidence_manifest"] = ["kind":"source","source_capture":[:]]
+            let submitted = try fixture.call("work_submit",input,author),review = try fixture.reviewClaim(p,submitted,reviewer)
+            return ["project":p,"task":task,"attempt":attempt,"review":review,"author":author.sessionID!,"reviewer":reviewer.sessionID!]
+        }
+        return (f["project"] as! JSON,f["task"] as! JSON,f["attempt"] as! JSON,f["review"] as! JSON,try phaseCaller(f["author"]!),try phaseCaller(f["reviewer"]!))
     }
     private func returnInput(_ p: JSON,_ review: JSON,_ kind: String) -> JSON {
         var input = reviewInput(p,review,verdict:kind == "implementation_blocked" ? "blocked" : kind)

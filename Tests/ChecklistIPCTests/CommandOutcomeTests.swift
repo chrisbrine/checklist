@@ -152,9 +152,6 @@ final class CommandOutcomeTests: XCTestCase {
     }
 
     func testR1CheckedCredentialRemovalAndBothRestorationsReportFailure() throws {
-        XCTAssertNoThrow(try ChecklistKeychain.checkRemovalStatus(0))
-        XCTAssertNoThrow(try ChecklistKeychain.checkRemovalStatus(-25300))
-        XCTAssertThrowsError(try ChecklistKeychain.checkRemovalStatus(-25293))
         var attemptedCredential = false
         XCTAssertThrowsError(try ConnectionCommit.restore(enrollment: { throw CocoaError(.fileWriteOutOfSpace) }, credential: { attemptedCredential = true; throw CocoaError(.fileWriteNoPermission) }))
         XCTAssertTrue(attemptedCredential)

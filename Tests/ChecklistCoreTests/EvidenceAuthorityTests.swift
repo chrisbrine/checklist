@@ -42,6 +42,7 @@ final class EvidenceAuthorityTests: XCTestCase {
         try write("private/receipt.txt", "never captured")
     }
     private var preparedProject: JSON?
+    func clearPreparedProject() { preparedProject = nil }
     var directory: URL!,workspace: URL!,router: CommandRouter!
     let owner = Caller(role:"owner",installation:"evidence-owner",projectIDs:[])
     override func setUpWithError() throws {

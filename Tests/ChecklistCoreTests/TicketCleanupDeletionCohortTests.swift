@@ -195,6 +195,7 @@ extension TicketLifecycleCleanupTests {
 
 extension TicketLifecycleCleanupTests {
     func testP321MaintenanceSkipsInventoryRefusedHeadAndRunsLaterReceipt() throws {
+        try QualificationSuite.requireEnabled()
         let jobs = try deletionCohortFixture([1,1]),head = jobs[0],sibling = jobs[1]
         let path = (head["objects"] as! [JSON])[0]["relative_path"] as! String
         try write {db in
@@ -216,6 +217,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testP321PreparationUnavailableStillYieldsToLifecycleTurn() throws {
+        try QualificationSuite.requireEnabled()
         let jobs = try deletionCohortFixture([1]),head = jobs[0]
         try write {db in
             // Canonical but outside the per-receipt descriptor bound. A byte

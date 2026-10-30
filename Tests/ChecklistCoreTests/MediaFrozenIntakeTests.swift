@@ -8,21 +8,51 @@ final class MediaFrozenIntakeTests: XCTestCase {
     final class Fixture {
         // Reuse the established owned-store harness: Foundation rewrites every tmp
         // spelling to /tmp, which the real no-follow walker correctly refuses.
-        let storage: StorageFixture
+        let storage: StorageFixture?
         let base: URL,workspace: URL,root: URL
         var router: CommandRouter!
         let owner: Caller
         var worker: Caller
         let project: String
-        init() throws {
-            storage = try StorageFixture(fast:true)
-            base = storage.base;workspace = storage.workspace;root = storage.root
-            router = storage.router!;owner = storage.owner
-            project = try storage.project()["id"] as! String
+        init(template: TestStore.Template? = nil) throws {
+            let owned = try StorageFixture(open:template == nil,fast:true)
+            storage = owned
+            base = owned.base;workspace = owned.workspace;root = owned.root;owner = owned.owner
+            if let template {
+                // StorageFixture owns the lease and teardown, while TestStore
+                // supplies private APFS-cloned phase bytes and relocates the root.
+                try FileManager.default.removeItem(at:workspace)
+                let lease = try StorageServiceLease(root:root)
+                owned.lease = lease
+                let prepared = try TestStore.router(root:root,serviceLease:lease,template:template,workspace:workspace)
+                owned.router = prepared;router = prepared
+                project = try prepared.dbQueue.read {try XCTUnwrap(prepared.records($0,type:"project").first?["id"] as? String)}
+                try prepared.dbQueue.write {db in
+                    var session = try prepared.record(db,"media-fixture-worker",type:"session")
+                    session["workspace"] = owned.workspace.path
+                    try prepared.save(db,session,type:"session")
+                }
+            } else {
+                router = owned.router!
+                project = try owned.project()["id"] as! String
+                _ = try router.handle(method:"session_register",params:["command_id":uuid(),"project_id":project,"provider":"codex","label":"Actual fixture worker","session_id":"media-fixture-worker","workspace":workspace.path],caller:owner)
+            }
+            worker = Caller(role:"worker",installation:"media-owned-worker",projectIDs:[project],sessionID:"media-fixture-worker",workspace:workspace.path)
+        }
+        /// Template construction borrows the router which TestStore closes and
+        /// checkpoints before publishing. This adapter never owns or reopens it.
+        fileprivate init(router: CommandRouter,workspace: URL) throws {
+            storage = nil;self.router = router;self.workspace = workspace
+            root = router.root;base = root.deletingLastPathComponent()
+            owner = Caller(role:"owner",installation:"storage-fixture",projectIDs:[])
+            let value = try router.handle(method:"project_create",params:["command_id":uuid(),"name":"Storage fixture","key_prefix":"SF","root_path":workspace.path],caller:owner)["data"] as! JSON
+            project = value["id"] as! String
+            _ = try router.handle(method:"epic_create",params:["command_id":uuid(),"project_id":project,"name":"Storage fixture tickets"],caller:owner)
             let session = try router.handle(method:"session_register",params:["command_id":uuid(),"project_id":project,"provider":"codex","label":"Actual fixture worker","session_id":"media-fixture-worker","workspace":workspace.path],caller:owner)["data"] as! JSON
             worker = Caller(role:"worker",installation:"media-owned-worker",projectIDs:[project],sessionID:session["id"] as? String ?? "media-fixture-worker",workspace:workspace.path)
         }
         func reopen() throws {
+            let storage = try XCTUnwrap(storage,"Only an owned fixture may reopen its router")
             try storage.close();router = nil
             try storage.reopen();router = storage.router!
         }
@@ -280,6 +310,20 @@ final class MediaFrozenIntakeTests: XCTestCase {
         let tsv = try f.call("media_intake_preview",["round_id":tsvRound["id"]!,"tsv":"title\ttext\tgroup\nStory\ttake one\tg\nStory\ttake two\tg\n"],as:f.worker)
         _ = try capture(f,confirm(f,tsv));XCTAssertEqual(((try f.get(tsvRound))["items"] as! [JSON]).count,1)
     }
+    private static func publicationPhase(published: Bool) -> TestStore.Template {
+        TestStore.Template(name:"media-frozen-publication-" + (published ? "published" : "captured")) {router,workspace in
+            let checks = MediaFrozenIntakeTests(),f = try Fixture(router:router,workspace:workspace)
+            let round = try f.round(f.type(checks.imageSchema()))
+            let intake = try checks.capture(f,checks.confirm(f,checks.preview(f,round,[checks.source(f,"original.png",1)])))
+            if published { _ = try f.publish(round) }
+            try router.dbQueue.write {db in
+                try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('test-media-publication-intake',?)",arguments:[try jsonString(intake)])
+            }
+        }
+    }
+    private static let capturedPublicationPhase = publicationPhase(published:false)
+    private static let publishedPublicationPhase = publicationPhase(published:true)
+
     func testPublicationRollsBackAtEveryHandoverManifestAndReceiptStep() throws {
         let points = [
             ("INSERT","records","NEW.type='storage_job' AND json_extract(NEW.data,'$.owner_kind')='media_target'"),
@@ -291,11 +335,15 @@ final class MediaFrozenIntakeTests: XCTestCase {
             ("INSERT","events","1"),("INSERT","commands","1")
         ]
         for (operation,table,condition) in points {
-            let f = try Fixture(),round = try f.round(f.type(imageSchema()))
-            let intake = try capture(f,confirm(f,preview(f,round,[source(f,"original.png",1)])))
+            // The released-hold trigger needs prepublication; every other point
+            // starts from an earlier publication, as before. Only setup is cloned.
+            let unpublished = operation == "UPDATE" && condition.contains("storage_hold")
+            let f = try Fixture(template:unpublished ? Self.capturedPublicationPhase : Self.publishedPublicationPhase)
+            let round = try XCTUnwrap(f.rows("media_round").first)
+            let intake = try f.router.dbQueue.read {db in
+                try jsonObject(XCTUnwrap(String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='test-media-publication-intake'")))
+            }
             XCTAssertEqual(strings(intake,"committed_row_ids").count,1)
-            // Establish an earlier published state too: rollback must preserve it exactly.
-            if !(operation == "UPDATE" && condition.contains("storage_hold")) { _ = try f.publish(round) }
             let observed = try f.get(round),before = try f.allState()
             try f.router.dbQueue.write {try $0.execute(sql:"CREATE TRIGGER media_fail BEFORE \(operation) ON \(table) WHEN \(condition) BEGIN SELECT RAISE(ABORT,'publication interruption'); END")}
             var params = f.observation(observed);params["items"] = f.selection(observed,publish:true)

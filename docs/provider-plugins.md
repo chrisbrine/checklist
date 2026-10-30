@@ -17,7 +17,7 @@ The local source has a Foundation-only `ChecklistProviders` target with a small 
 | Service | Kernel/signature/workspace/credential/grant validation, committed registration, durable pre-I/O fence, callback attribution and transaction coordination using validated plugin contracts |
 | App | Generic provider presentation, eligible menus/settings, installed-app lookup, explicit composer/open/copy actions; no authority or model launching |
 
-The plugin interface does not take claim tokens, project grants or credentials. These remain with the existing service/Keychain and domain handlers. An observed session or manifest is not authentication. Verified principal/session, project grant, work role, model preference and optional orchestrator registration remain separate identities.
+The plugin interface does not take claim tokens, project grants or credentials. These remain with the existing service, its private credential files and domain handlers. An observed session or manifest is not authentication. Verified principal/session, project grant, work role, model preference and optional orchestrator registration remain separate identities.
 
 ## Audit and preserved behavior
 

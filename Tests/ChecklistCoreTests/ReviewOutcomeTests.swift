@@ -33,10 +33,8 @@ extension EvidenceAuthorityTests {
 
     // CL-41
     func testLegacyEvidenceMissingReturnsTheSameTargetForMoreEvidence() throws {
-        try sourceFixture()
-        let p = try project(), author = try native(p, "em-author", domain: "codex:4101:1:0")
-        let first = try native(p, "em-reviewer", domain: "claude:4102:1:0", provider: "claude"), second = Caller(role: "owner", installation: "em-second", projectIDs: [])
-        let t = try ready(p), submitted = try submit(p, t, author), review = try reviewClaim(p, submitted, first)
+        let (p,t,submitted,review,author,first) = try nativeSourceReviewPhase()
+        let second = Caller(role: "owner", installation: "em-second", projectIDs: [])
         var missing = reviewInput(p, review, verdict: "evidence_missing")
         assertCode("INVALID_INPUT") { _ = try self.call("review_record", missing, first) }
         missing["reason"] = "The build log for the release configuration is not attached."
@@ -96,10 +94,8 @@ extension EvidenceAuthorityTests {
 
     // CL-42
     func testAdviceFindingsStayVisibleAndDoNotBlockCompletion() throws {
-        try sourceFixture()
-        let p = try project(), author = try native(p, "adv-author", domain: "codex:4201:1:0")
-        let reviewer = try native(p, "adv-reviewer", domain: "claude:4202:1:0", provider: "claude"), other = try native(p, "adv-other", domain: "claude:4203:1:0", provider: "claude")
-        let t = try ready(p), submitted = try submit(p, t, author), review = try reviewClaim(p, submitted, reviewer)
+        let (p,t,submitted,review,author,reviewer) = try nativeSourceReviewPhase()
+        let other = try native(p, "adv-other", domain: "claude:4203:1:0", provider: "claude")
         var reject = reviewInput(p, review, verdict: "reject"); reject["findings"] = [finding("polish", try sourceRef(submitted))]
         let rejected = try call("review_record", reject, reviewer)
         let created = (rejected["findings"] as! [JSON])[0]
@@ -159,10 +155,8 @@ extension EvidenceAuthorityTests {
 
     // CL-44
     func testDraftVerdictHandoffNamesTheReviewerAndTheSubmitter() throws {
-        try sourceFixture()
-        let p = try project(), author = try native(p, "draft-author", domain: "codex:4401:1:0")
-        let reviewer = try native(p, "draft-reviewer", domain: "claude:4402:1:0", provider: "claude"), outsider = try native(p, "draft-outsider", domain: "claude:4403:1:0", provider: "claude")
-        let t = try ready(p), submitted = try submit(p, t, author), review = try reviewClaim(p, submitted, reviewer)
+        let (p,t,submitted,review,author,reviewer) = try nativeSourceReviewPhase()
+        let outsider = try native(p, "draft-outsider", domain: "claude:4403:1:0", provider: "claude")
         var draft = reviewInput(p, review, verdict: "reject"); draft["findings"] = [finding("draft-gap", try sourceRef(submitted))]; draft["final_report"] = "Stopped at my tool limit after checking the release build."
         var broken = draft; broken["verdict"] = "pass"
         assertCode("REVIEW_ASSESSMENT_REQUIRED") { _ = try self.call("review_draft_save", broken, reviewer) }
@@ -196,9 +190,7 @@ extension EvidenceAuthorityTests {
 
     /// Finding 6c13b7ee: a saved draft never revives a claim or an orchestration whose session generation ended.
     func testDraftSubmissionKeepsTheLiveClaimFences() throws {
-        try sourceFixture()
-        let p = try project(), author = try native(p, "fence-author", domain: "codex:4411:1:0"), reviewer = try native(p, "fence-reviewer", domain: "claude:4412:1:0", provider: "claude")
-        let t = try ready(p), submitted = try submit(p, t, author), review = try reviewClaim(p, submitted, reviewer)
+        let (p,t,_,review,author,reviewer) = try nativeSourceReviewPhase()
         var draft = reviewInput(p, review, verdict: "not_run"); draft["check"] = "device run"; draft["reason"] = "No device"
         let saved = try call("review_draft_save", draft, reviewer)
         let triage = try call("triage_create", ["project_id": p["id"]!, "name": "Fenced draft", "purpose": "Generation fences", "phase": "review"])

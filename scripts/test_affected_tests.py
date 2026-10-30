@@ -37,6 +37,23 @@ GRAPH = {'targets': [
 ]]}
 
 class SelectionTests(unittest.TestCase):
+    def test_once_per_pass_qualification_includes_native_soaks_and_oversized_descriptors(self):
+        cases = (
+            'StorageFolderAccessTests/testRepeatedStoreReadersReuseRouterPinnedRootWithoutChildren',
+            'StorageFolderAccessTests/testSustainedRootOpensReuseOneHelperAndReapItsBlockedGeneration',
+            'TicketLifecycleCleanupTests/testP321MaintenanceSkipsInventoryRefusedHeadAndRunsLaterReceipt',
+            'TicketLifecycleCleanupTests/testP321PreparationUnavailableStillYieldsToLifecycleTurn',
+            'MediaBulkOwnerChannelTests/test250ItemRoundIsAcceptedInOneActionWithOwnerDecisionPerItem',
+            'MediaBulkOwnerChannelTests/testFailedChunkRefreshesOnlyFailedItemsAndNeverRepeatsCommittedOnes',
+            'MediaFollowUpTests/testFollowUpAndCloseAt242DecisionsStayExactAndRecordTheirTimes',
+            'StorageFailureReportTests/testAttachmentAddReportsRetryableThenSameCommandSucceeds',
+            'StorageFailureReportTests/testAttachmentAddRetriesWhileOpenFilesAreExhausted',
+            'StorageFailureReportTests/testOperationRouteRequeuesSameCommandAfterExhaustion',
+            'StorageFailureReportTests/testSmallWritesAtEveryHeadroomGiveCodedErrors',
+        )
+        for case in cases:
+            self.assertIn('ChecklistCoreTests.' + case, selector.QUALIFICATION_CASES)
+
     def test_once_per_pass_qualification_includes_the_cl371_load_cases(self):
         for method in ('testLargeAutomaticFirstPassKeepsConcurrentReadAndWriteUnderTwoSeconds',
                        'testSustainedWritersBoundRSSCPUAndBackoff'):

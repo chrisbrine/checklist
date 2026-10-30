@@ -45,7 +45,7 @@ final class StorageSnapshotRetention {
             while flock(hold.descriptor,LOCK_EX | LOCK_NB) != 0 {
                 if errno == EINTR {continue}
                 guard errno == EWOULDBLOCK else {throw CoreError("BACKUP_HOLD_UNAVAILABLE","The backup retention barrier could not be acquired.")}
-                throw CoreError("BACKUP_IN_PROGRESS","Another backup is still copying or verifying this store. Retry this original command after it finishes.",details:["command_outcome":"rejected"])
+                throw CoreError("BACKUP_IN_PROGRESS","Another backup is still copying or verifying this store. Retry backup_create with a new command ID after it finishes.",details:["command_outcome":"rejected","next_step":"Retry backup_create with a new command ID after the other backup finishes."])
             }
             hold.active = true
             return hold

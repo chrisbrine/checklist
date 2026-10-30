@@ -10,11 +10,19 @@ remote API, plugin loader or claim of other-platform support.
 | Command transaction access | Core `TransactionStorage` / `GRDBTransactionAdapter` | StorageBootstrap, storage admission/archive gates, scoped command transaction |
 | Local command transport | IPC `LocalCommandTransport` / `MacOSLocalCommandTransport` | Service signed-XPC peer authentication and grants |
 | Local service preparation/registration/start | IPC `LocalServiceLifecycle` / `MacOSLocalServiceLifecycle` | Existing app identity, SMAppService registration and launchd singleton |
-| Installation credential read | IPC `LocalCredentialReader` / `MacOSLocalCredentialReader` | Existing KeychainWithoutUI/ChecklistKeychain, exact installation/account and signed executable ACLs |
+| Installation credential read | IPC `LocalCredentialReader` / `MacOSLocalCredentialReader` | `InstallationCredentialStore` private files, exact instance/root/installation binding, service code-signature and enrollment checks ([protection](database-storage.md#agent-installation-credentials-cl-374)) |
 | Native socket send | Bridges `NativePeerTransportEffects` / `MacOSNativePeerTransportEffects` | Bundled provider qualification, private socket, kernel UID/PID and native process/registry verification |
 | Confined source Git process | Core `SourceGitProcessAdapter` / `MacOSSourceGitProcessAdapter` | SourceGit executable/root/environment validation, protected-root confinement and existing error/stop handling |
 | Verified local file read | Core `AuthorizedFileReading` / `MacOSAuthorizedFileReader` | Descriptor identity, allowed roots, regular-file/size checks and no-follow open |
 | Owner draft file I/O | App `DraftFileStorage` / `MacOSDraftFileStorage` | Owner-local journal scope, atomic replacement, permissions, file/directory synchronization and readback |
+
+Remaining Keychain use in product code (owner decision, 30 October 2026, CL-374):
+
+| Use | File | Reason | Removal condition |
+|---|---|---|---|
+| One no-UI read of an old installation credential, when no file record exists, on the live instance only | `Sources/ChecklistIPC/LegacyKeychainCredentialMigration.swift` and its bridge `Sources/ChecklistLegacyKeychain/` (only the interaction flag calls) | Enrolled sessions of an existing installation keep working across the install with no prompt and no reconnect | Every live enrollment has a file record, and the owner keeps no bundle that reads Keychain for rollback |
+
+`InstallationCredentialStoreTests.testSourceKeepsKeychainCallsInTheOneMigrationFile` keeps every other Keychain call out of `Sources/` and `Packages/`. `script/test_instances.py destroy` still runs `security delete-generic-password` to remove items of older test slots; this is a development tool and not product code.
 
 The transaction adapter wraps the queue already opened by StorageBootstrap. It
 preserves synchronous GRDB read/write/writeWithoutTransaction/close semantics.

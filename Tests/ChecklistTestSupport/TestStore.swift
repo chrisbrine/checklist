@@ -36,15 +36,15 @@ public enum TestStore {
                 try TestStore.publishTemplate(name: name) { pending in
                     let workspace = pending.appendingPathComponent("workspace", isDirectory: true)
                     try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
-                    let router = try CommandRouter(root: pending.appendingPathComponent("store"))
+                    let router = try TestFixtureTimings.measure("template.open") { try CommandRouter(root: pending.appendingPathComponent("store")) }
                     do {
                         try router.dbQueue.writeWithoutTransaction { try $0.execute(sql: "PRAGMA synchronous=NORMAL") }
-                        try prepare(router, workspace)
+                        try TestFixtureTimings.measure("template.prepare") { try prepare(router, workspace) }
                         try router.dbQueue.write {
                             try $0.execute(sql: "INSERT INTO metadata(key,value) VALUES (?,?)",
                                            arguments: [TestStore.workspaceKey, workspace.resolvingSymlinksInPath().path])
                         }
-                        try router.closeStore()
+                        try TestFixtureTimings.measure("template.close") { try router.closeStore() }
                     } catch { try? router.closeStore(); throw error }
                 }
             }
@@ -64,9 +64,9 @@ public enum TestStore {
         if !FileManager.default.fileExists(atPath: anchored.appendingPathComponent("checklist.sqlite").path),
            !FileManager.default.fileExists(atPath: anchored.appendingPathComponent(StoreIdentityReceipt.fileName).path) {
             try StoreDirectory(root: anchored).requireFreshScaffoldingOnly()
-            try seed(anchored, template: template, workspace: workspace)
+            try TestFixtureTimings.measure("store.seed") { try seed(anchored, template: template, workspace: workspace) }
         }
-        let router = try CommandRouter(root: root, serviceLease: serviceLease, cliCommand: cliCommand, providerPlugins: providerPlugins)
+        let router = try TestFixtureTimings.measure("store.open") { try CommandRouter(root: root, serviceLease: serviceLease, cliCommand: cliCommand, providerPlugins: providerPlugins) }
         if !durable {
             // Disposable unit fixtures need transaction/reopen semantics, not a
             // power-loss durability barrier on every command. Qualification and
@@ -151,7 +151,15 @@ public enum TestStore {
             let prepared = try template.source.get()
             source = prepared.appendingPathComponent("store")
             try clone(prepared.appendingPathComponent("workspace"), to: workspace)
-            try clone(source.appendingPathComponent("objects"), to: root.appendingPathComponent("objects"))
+            // Populated phases may already contain captured source, icons or
+            // execution output as well as attachments. Copy private managed
+            // bytes before startup admission/recovery observes their records.
+            for family in ["objects", "icons", "source-captures", "source-executions", "source-build-cache"] {
+                let path = source.appendingPathComponent(family)
+                if FileManager.default.fileExists(atPath: path.path) {
+                    try clone(path, to: root.appendingPathComponent(family))
+                }
+            }
         } else { source = try publishedTemplate.get() }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let database = root.appendingPathComponent("checklist.sqlite")

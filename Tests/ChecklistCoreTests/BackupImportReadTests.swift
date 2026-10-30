@@ -139,13 +139,20 @@ final class BackupImportReadTests: XCTestCase {
         try helper.decide(f,round,ids[1],"accepted")
         let epic = try helper.epic(f),draft = try f.round(type),draftItem = try f.item(draft)
         let intake = try f.call("media_intake_preview",["round_id":draft["id"]!,"text":"Synthetic intake"])
+        // CL-318 bulk reads: a separate published round keeps the decided round's counts below exact.
+        let bulk = MediaBulkOwnerChannelTests(),bulkDraft = try f.round(type)
+        _ = try f.item(bulkDraft,title:"Bulk item",texts:["Exact bulk\r\n"])
+        let bulkRound = try f.publish(bulkDraft),bulkFilter: JSON = ["dispositions":["pending"]]
+        let selection = try bulk.owner(f,"media_bulk_selection",["round_id":bulkRound["id"]!,"filter":bulkFilter])
+        let bulkOperation = try bulk.owner(f,"media_bulk_prepare",bulk.prepareParams(selection))
         let routes: [(String,JSON)] = [
             ("media_navigation",[:]),("media_round_page",["type_id":type["id"]!,"state":"open"]),
             ("media_round_header",["round_id":round["id"]!]),("media_item_get",["round_id":round["id"]!,"item_id":ids[0]]),
             ("media_publication_preview",["round_id":draft["id"]!]),("media_type_get",["type_id":type["id"]!]),
             ("media_intake_get",["intake_id":intake["id"]!]),("media_item_page",["round_id":round["id"]!]),
             ("media_item_counts",["round_id":round["id"]!]),("media_approved_examples",["round_id":draft["id"]!,"item_id":draftItem["id"]!,"expanded":true,"examples":["enabled":true]]),
-            ("media_rework_preview",["round_id":round["id"]!,"epic_id":epic,"items":[["item_id":ids[0]]]])]
+            ("media_rework_preview",["round_id":round["id"]!,"epic_id":epic,"items":[["item_id":ids[0]]]]),
+            ("media_bulk_selection",["round_id":bulkRound["id"]!,"filter":bulkFilter]),("media_bulk_get",["operation_id":bulkOperation["id"]!])]
         XCTAssertEqual(Set(routes.map { $0.0 }),CommandRouter.mediaOwnerPoolReads)
         // CL-331/333 worker reads (PM1) use the same pooled snapshot with current worker authority.
         let ownIntake = try XCTUnwrap(f.router.handle(method:"media_intake_preview",params:["project_id":f.project,"command_id":uuid(),"round_id":draft["id"]!,"text":"Synthetic worker intake"],caller:f.worker)["data"] as? JSON)
@@ -164,6 +171,8 @@ final class BackupImportReadTests: XCTestCase {
                 XCTAssertNotEqual(data["state"] as? String,"locked",method)
                 if method == "media_publication_preview" {XCTAssertEqual((data["items"] as? [JSON])?.count,1)}
                 if method == "media_approved_examples" {XCTAssertEqual((data["examples"] as? [JSON])?.count,1);XCTAssertEqual(data["collapsed"] as? Bool,false)}
+                if method == "media_bulk_selection" {XCTAssertEqual((data["entries"] as? [JSON])?.count,1)}
+                if method == "media_bulk_get" {XCTAssertEqual(data["id"] as? String,bulkOperation["id"] as? String);XCTAssertEqual((data["uncommitted_item_ids"] as? [String])?.count,1)}
                 XCTAssertEqual((reply["write_admission"] as? JSON)?["reason"] as? String,"backup_in_progress",method)
                 // Owner-only routes stay refused for workers; shared names are checked below.
                 for caller in [f.worker,assistant] where caller.role == "assistant" || !CommandRouter.mediaWorkerReads.contains(method) {

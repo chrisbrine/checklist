@@ -215,6 +215,7 @@ final class MediaFollowUpTests: XCTestCase {
 
     /// Heir's round 2 had 242 items. Times are recorded, not asserted, because the host load varies.
     func testFollowUpAndCloseAt242DecisionsStayExactAndRecordTheirTimes() throws {
+        try QualificationSuite.requireEnabled()
         let (f,_,r,ids) = try rework.setup(242)
         var timed: [(String,Double)] = []
         func clock<T>(_ name: String,_ body: () throws -> T) rethrows -> T {

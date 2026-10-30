@@ -244,6 +244,11 @@ raise SystemExit(int(exit_code))
                         time.sleep(0.01)
                     self.assertIn('fixture cleanup exit '+str(cleanup),log.read_text())
                     self.assertFalse((build/'.build-lock').exists())
+                if not failed_verify:
+                    # CL-372: the release is in the foreground and the build cleanup in the background, in either order.
+                    deadline=time.monotonic()+3
+                    while time.monotonic()<deadline and trace.read_text().count('"-"')<2:
+                        time.sleep(0.01)
                 calls = [json.loads(line) for line in trace.read_text().splitlines()]
                 if mode in ['--verify', '--install-stage'] and verify:
                     self.assertEqual(result.returncode, 1)
@@ -258,9 +263,8 @@ raise SystemExit(int(exit_code))
                     if mode in ['--verify', '--install-stage']:
                         expected.append([str(REPO / 'script/verify_install.py'), environment['DEST'], '--install-started', '1234'])
                     expected.append([str(SCRIPT), '--after-install', '--keep', str(previous) if had_previous == '1' else ''])
-                    self.assertEqual(calls[:-1], expected)
-                    self.assertEqual(calls[-1][:3], ['-', str(REPO), str(capture)])
-                    self.assertEqual(len(calls[-1]), 3)
+                    self.assertEqual(calls[:-2], expected)
+                    self.assertCountEqual(calls[-2:], [['-', str(REPO), str(capture)], ['-', str(REPO)]])
                     self.assertIn('Build cleanup started in background', result.stdout)
                     self.assertEqual('Warning: old Checklist bundles' in result.stderr, bool(retire))
                     self.assertNotIn('Warning: build cleanup', result.stderr)

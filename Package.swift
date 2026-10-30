@@ -16,7 +16,7 @@ let package = Package(
     targets: [
         .target(name: "ChecklistProviders"),
         .target(name: "ChecklistFileAccess"),
-        // File-keychain ACL compatibility uses the original deprecated calls in a bounded C bridge.
+        // CL-374 one-time migration read: the deprecated no-UI flag calls in a bounded C bridge.
         .target(name: "ChecklistLegacyKeychain", linkerSettings: [.linkedFramework("Security")]),
         .target(name: "ChecklistKeychainTestFixture", path: "Tests/ChecklistKeychainTestFixture", linkerSettings: [.linkedFramework("Security")]),
         .target(name: "ChecklistAXTestSupport", linkerSettings: [.linkedFramework("AppKit")]),

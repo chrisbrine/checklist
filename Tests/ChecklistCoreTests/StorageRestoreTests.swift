@@ -65,9 +65,24 @@ final class StorageRestoreTests: XCTestCase {
         let note = try f.call("message_send",["project_id":pid,"task_id":tid,"body":"Pending at snapshot","kind":"note","recipient":["kind":"session","session_id":c.sessionID!]])
         let cursor = try f.call("project_list")["event_cursor"] as! String
         let originalIncarnation = router.incarnation
+        // CL-374: an agent credential file in the live root never travels with a backup or restore.
+        let credentialMarker = "cl374-credential-marker-" + UUID().uuidString
+        let credentialFolder = f.root.appendingPathComponent("OwnerPrivate",isDirectory:true)
+        try FileManager.default.createDirectory(at:credentialFolder,withIntermediateDirectories:true)
+        try Data(credentialMarker.utf8).write(to:credentialFolder.appendingPathComponent("installation_credential-synthetic.json"))
         let url = try backup(f),command = UUID().uuidString
         let restored = try restore(f,url,command:command)["data"] as! JSON
         let target = URL(fileURLWithPath:restored["path"] as! String)
+        for tree in [url,target] {
+            let walker = try XCTUnwrap(FileManager.default.enumerator(at:tree,includingPropertiesForKeys:[.isRegularFileKey]))
+            var scanned = 0
+            for case let file as URL in walker where (try file.resourceValues(forKeys:[.isRegularFileKey])).isRegularFile == true {
+                scanned += 1
+                XCTAssertFalse(file.path.contains("OwnerPrivate") || file.lastPathComponent.hasPrefix("installation_credential"),file.path)
+                XCTAssertFalse(try Data(contentsOf:file).range(of:Data(credentialMarker.utf8)) != nil,"\(file.path) holds the credential marker")
+            }
+            XCTAssertGreaterThan(scanned,0,tree.path)
+        }
         XCTAssertNotEqual(restored["store_incarnation"] as? String,originalIncarnation)
         XCTAssertEqual(router.incarnation,originalIncarnation)
         XCTAssertEqual(try f.call("task_get",["project_id":pid,"task_id":tid])["data"] as? JSON != nil,true)

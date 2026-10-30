@@ -197,14 +197,14 @@ extension CommandRouter {
             case .limit, .freeSpace, .deadline: throw reported // Converted by the shared budget above.
             }
             // CL-362: the path and errno stay in the reply and the log. This command
-            // ID is finished, so a retryable backup uses a new one.
+            // ID is finished (a rejected operation stays failed), so every retry uses a new one.
             let report = StorageFailureReport(failure)
             report.log()
             var details = report.details
             details["command_outcome"] = "rejected"
-            if report.retryable {details["next_step"] = "Retry backup_create with a new command ID."}
+            details["next_step"] = report.backupNextStep
             let cause = report.system == nil ? "" : " " + report.explanation
-            throw CoreError(code,message + cause,details:details)
+            throw CoreError(code,message + cause + " " + report.backupNextStep,details:details)
         }
     }
     private func createStorageBackup(params: JSON,caller: Caller,budget: StorageSnapshotBudget,retention: StorageSnapshotRetention) throws -> JSON {

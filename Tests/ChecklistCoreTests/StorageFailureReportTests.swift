@@ -112,6 +112,173 @@ final class StorageFailureReportTests: XCTestCase {
         XCTAssertTrue(lines.all.contains {$0.contains("BACKUP") || $0.contains("operation=openat")},"\(lines.all)")
     }
 
+    private func operationRoute(_ f: StorageFixture) -> () -> Void {
+        let queue = DispatchQueue(label:"checklist-cl362-" + UUID().uuidString)
+        f.router!.configureCommandOperations(on:queue)
+        return {queue.sync {}}
+    }
+    private func operation(_ f: StorageFixture,_ id: Any?,project: JSON? = nil,wait: () -> Void) throws -> JSON {
+        var value = JSON()
+        for _ in 0..<600 {
+            wait()
+            var input: JSON = ["operation_id":id ?? ""]
+            if let project {input["project_id"] = project["id"]}
+            value = try f.call("operation_get",input)["data"] as! JSON
+            if ["failed","succeeded"].contains(value["state"] as? String ?? "") {return value}
+            Thread.sleep(forTimeInterval:0.05)
+        }
+        return value
+    }
+
+    /// The reviewer's regression: a real EACCES on the backup destination. The stated
+    /// step works: the same ID keeps its stored failure, and a new ID succeeds.
+    func testBackupAccessDeniedRetriesWithNewCommandIDAfterAccessIsRestored() throws {
+        let f = try StorageFixture(open:true,fast:true)
+        let wait = operationRoute(f)
+        let parent = f.base.appendingPathComponent("locked-parent")
+        try FileManager.default.createDirectory(at:parent,withIntermediateDirectories:true)
+        chmod(parent.path,0o500)
+        defer {chmod(parent.path,0o700)}
+        let destination = parent.appendingPathComponent("backup"),command = UUID().uuidString.lowercased()
+        let input: JSON = ["path":destination.path]
+        let accepted = try f.call("backup_create",input,command:command)["data"] as! JSON
+        let failed = try operation(f,accepted["operation_id"],wait:wait)
+        XCTAssertEqual(failed["state"] as? String,"failed","\(failed)")
+        let error = failed["error"] as? JSON ?? [:],details = error["details"] as? JSON ?? [:]
+        XCTAssertEqual(error["code"] as? String,"BACKUP_IO_ERROR","\(error)")
+        XCTAssertEqual(details["errno_name"] as? String,"EACCES","\(error)")
+        XCTAssertEqual(details["retryable"] as? Bool,false)
+        XCTAssertEqual(details["command_outcome"] as? String,"rejected")
+        XCTAssertEqual(details["next_step"] as? String,"Restore access to the folder, then retry backup_create with a new command ID.")
+        XCTAssertTrue((error["message"] as? String ?? "").hasSuffix(details["next_step"] as? String ?? "?"),"\(error)")
+        XCTAssertFalse("\(error)".contains("same command ID"),"\(error)")
+        chmod(parent.path,0o700)
+        _ = try f.call("backup_create",input,command:command)
+        let repeated = try operation(f,accepted["operation_id"],wait:wait)
+        XCTAssertEqual(repeated["state"] as? String,"failed","The finished ID stays failed: \(repeated)")
+        let next = try f.call("backup_create",input,command:UUID().uuidString.lowercased())["data"] as! JSON
+        XCTAssertEqual(try operation(f,next["operation_id"],wait:wait)["state"] as? String,"succeeded")
+    }
+
+    /// Every backup step that leads to a retry names a new ID; a no-retry step stays one.
+    func testBackupStepsNeverOfferTheFinishedCommandID() throws {
+        let f = try StorageFixture(open:true,fast:true)
+        for (code,next) in [(ENOSPC,"Free space on the volume, then retry backup_create with a new command ID."),(EDQUOT,"Free space on the volume, then retry backup_create with a new command ID."),(EPERM,"Restore access to the folder, then retry backup_create with a new command ID."),(EROFS,"Restore access to the folder, then retry backup_create with a new command ID."),(ENOENT,"Do not retry. Keep the store and report this command ID."),(EMFILE,"Retry backup_create with a new command ID.")] {
+            var budget = StorageSnapshotBudget.production()
+            budget.observe = {if $0 == "copying_objects" {throw StorageSnapshotFailure.failed("write",path:"objects/a.log",root:f.root.path,code:code)}}
+            let destination = f.base.appendingPathComponent("step-" + UUID().uuidString)
+            XCTAssertThrowsError(try f.router!.executeStorageBackup(params:["command_id":UUID().uuidString,"path":destination.path],caller:f.owner,budget:budget)) {
+                let error = $0 as? CoreError
+                XCTAssertEqual(error?.code,"BACKUP_IO_ERROR")
+                XCTAssertEqual(error?.details["next_step"] as? String,next)
+                XCTAssertEqual(error?.details["retryable"] as? Bool,StorageFailureReport.transientErrnos.contains(code))
+                XCTAssertTrue(error?.message.hasSuffix(next) == true,error?.message ?? "")
+            }
+        }
+        let unsafe: [StorageSnapshotFailure] = [.invalidFixture,.unsupportedAuthority,.sourceChanged,.incomplete,.canceled,.io,.freeSpace(measured:1),.limit,.deadline,.failed("mkdirat",code:EACCES)]
+        for failure in unsafe {
+            XCTAssertFalse(StorageFailureReport(failure).backupNextStep.contains("same command ID"),"\(failure)")
+        }
+        let budget = StorageSnapshotBudget.production()
+        for error in [budget.freeSpaceFailure(measured:10,margin:1,available:2),budget.capacityFailure("snapshot_deadline")] {
+            XCTAssertTrue((error.details["next_step"] as? String ?? "").contains("new command ID"),error.message)
+            XCTAssertTrue(error.message.contains("new command ID"),error.message)
+        }
+    }
+
+    /// attachment_add keeps same-ID recovery: the unreadable source and the store-side
+    /// EACCES both leave a recoverable operation, which attaches once after the repair.
+    func testAttachmentAddSameCommandSucceedsAfterSourceAccessIsRestored() throws {
+        let f = try StorageFixture(open:true,fast:true)
+        let wait = operationRoute(f)
+        let p = try f.project(),t = try f.task(p),file = try source(f,"locked.log"),command = UUID().uuidString.lowercased()
+        chmod(file.path,0o000)
+        defer {chmod(file.path,0o600)}
+        let input: JSON = ["project_id":p["id"]!,"task_id":t["id"]!,"path":file.path]
+        let accepted = try f.call("attachment_add",input,command:command)["data"] as! JSON
+        let failed = try operation(f,accepted["operation_id"],project:p,wait:wait)
+        XCTAssertEqual(failed["state"] as? String,"failed","\(failed)")
+        let error = failed["error"] as? JSON ?? [:]
+        XCTAssertEqual(error["code"] as? String,"FILE_ACCESS_REQUIRED","\(error)")
+        chmod(file.path,0o600)
+        _ = try f.call("attachment_add",input,command:command)
+        let done = try operation(f,accepted["operation_id"],project:p,wait:wait)
+        XCTAssertEqual(done["state"] as? String,"succeeded","\(done)")
+        let listed = try f.call("attachment_list",["project_id":p["id"]!,"task_id":t["id"]!])["data"] as! JSON
+        XCTAssertEqual((listed["attachments"] as? [JSON])?.count,1,"\(listed)")
+    }
+
+    /// A store-side EACCES on the object folder is a finished rejection with no same-ID
+    /// step. After the repair, a new command ID attaches the file once.
+    func testAttachmentAddStoreAccessFailureOffersNoSameCommandAndNewCommandSucceeds() throws {
+        let f = try StorageFixture(open:true,fast:true)
+        let wait = operationRoute(f)
+        let p = try f.project(),t = try f.task(p),file = try source(f,"store-side.log"),command = UUID().uuidString.lowercased()
+        let objects = f.root.appendingPathComponent("objects")
+        try FileManager.default.createDirectory(at:objects,withIntermediateDirectories:true)
+        let mode = (try FileManager.default.attributesOfItem(atPath:objects.path)[.posixPermissions] as? NSNumber)?.uint16Value ?? 0o700
+        chmod(objects.path,0o500)
+        defer {chmod(objects.path,mode)}
+        let input: JSON = ["project_id":p["id"]!,"task_id":t["id"]!,"path":file.path]
+        let accepted = try f.call("attachment_add",input,command:command)["data"] as! JSON
+        let failed = try operation(f,accepted["operation_id"],project:p,wait:wait)
+        XCTAssertEqual(failed["state"] as? String,"failed","\(failed)")
+        let error = failed["error"] as? JSON ?? [:]
+        XCTAssertEqual(error["code"] as? String,"STORAGE_OBJECT_UNAVAILABLE","\(error)")
+        XCTAssertFalse("\(error)".contains("same command ID"),"\(error)")
+        chmod(objects.path,mode)
+        let next = try f.call("attachment_add",input,command:UUID().uuidString.lowercased())["data"] as! JSON
+        XCTAssertEqual(try operation(f,next["operation_id"],project:p,wait:wait)["state"] as? String,"succeeded")
+        let listed = try f.call("attachment_list",["project_id":p["id"]!,"task_id":t["id"]!])["data"] as! JSON
+        XCTAssertEqual((listed["attachments"] as? [JSON])?.count,1,"\(listed)")
+    }
+
+    /// The folder errors say what their command ID can do: a missing folder is finished.
+    func testMissingFolderIsRejectedWithNewCommandStep() throws {
+        let f = try StorageFixture(open:true,fast:true)
+        let wait = operationRoute(f)
+        let input: JSON = ["path":f.base.appendingPathComponent("absent/backup").path],command = UUID().uuidString.lowercased()
+        let accepted = try f.call("backup_create",input,command:command)["data"] as! JSON
+        let failed = try operation(f,accepted["operation_id"],wait:wait)
+        let error = failed["error"] as? JSON ?? [:],details = error["details"] as? JSON ?? [:]
+        XCTAssertEqual(error["code"] as? String,"FOLDER_ACCESS_UNAVAILABLE","\(error)")
+        XCTAssertEqual(details["command_outcome"] as? String,"rejected","\(error)")
+        XCTAssertTrue((details["next_step"] as? String ?? "").contains("new command ID"),"\(error)")
+        _ = try f.call("backup_create",input,command:command)
+        XCTAssertEqual(try operation(f,accepted["operation_id"],wait:wait)["state"] as? String,"failed")
+    }
+
+    /// Outside backup_create, the report keeps an accepted operation recoverable, so its same-ID steps work.
+    func testReportedAccessAndSpaceFailuresStayRecoverableOutsideBackup() {
+        for code in [EACCES,EPERM,EROFS,ENOSPC,EDQUOT] {
+            let details = PublicErrorText.payload(StorageSnapshotFailure.failed("write",path:"objects/a",code:code))["details"] as? JSON ?? [:]
+            XCTAssertEqual(details["command_outcome"] as? String,"unknown")
+            XCTAssertTrue((details["next_step"] as? String ?? "").hasSuffix("then retry with the same command ID."),"\(details)")
+        }
+    }
+
+    /// Default-group cover of the retry rule. The real-limit cases that wait through the
+    /// production pauses (over 1 s each) run in qualification.
+    func testTransientFailureRetriesWithoutPausesAndThenSucceeds() throws {
+        let lines = Lines();StorageFailureReport.setLogSink {lines.add($0)}
+        var attempts = 0
+        let value: Int = try StorageFailureReport.retryingTransient(pauses:[0,0]) {
+            attempts += 1
+            if attempts < 3 {throw StorageSnapshotFailure.failed("openat",path:"objects/a",code:EMFILE)}
+            return 7
+        }
+        XCTAssertEqual(value,7);XCTAssertEqual(attempts,3)
+        XCTAssertEqual(lines.all.filter {$0.contains("STORAGE_TRANSIENT_RETRY")}.count,2)
+        XCTAssertThrowsError(try StorageFailureReport.retryingTransient(pauses:[0]) {throw StorageSnapshotFailure.failed("openat",code:EMFILE)}) {
+            let details = PublicErrorText.payload($0)["details"] as? JSON ?? [:]
+            XCTAssertEqual(details["retryable"] as? Bool,true)
+            XCTAssertEqual(details["command_outcome"] as? String,"unknown")
+            XCTAssertEqual(details["next_step"] as? String,StorageFailureReport.retrySameCommand)
+        }
+        XCTAssertThrowsError(try StorageFailureReport.retryingTransient(pauses:[0,0]) {() throws -> Int in attempts += 1;throw StorageSnapshotFailure.failed("openat",code:EACCES)})
+        XCTAssertEqual(attempts,4,"A non-transient failure runs once")
+    }
+
     func testCleanupCopyReasonKeepsTransientErrno() {
         let reason = TicketCleanupCopyFailure.reason(StorageSnapshotFailure.failed("openat",code:EMFILE))
         XCTAssertEqual(reason,"backup_copy_unverified:POSIX_24")
@@ -121,6 +288,7 @@ final class StorageFailureReportTests: XCTestCase {
     /// The condition of the 29 Oct failure: no free descriptor while the command
     /// starts, and others release theirs a moment later. The service retries by itself.
     func testAttachmentAddRetriesWhileOpenFilesAreExhausted() throws {
+        try QualificationSuite.requireEnabled()
         let f = try StorageFixture(open:true,fast:true)
         let p = try f.project(),t = try f.task(p),file = try source(f,"core-restart-fix.log")
         let lines = Lines();StorageFailureReport.setLogSink {lines.add($0)}
@@ -135,6 +303,7 @@ final class StorageFailureReportTests: XCTestCase {
     /// Exhaustion that outlasts the bounded retries is reported as retryable, and
     /// the same command ID then attaches the file exactly once.
     func testAttachmentAddReportsRetryableThenSameCommandSucceeds() throws {
+        try QualificationSuite.requireEnabled()
         let f = try StorageFixture(open:true,fast:true)
         let p = try f.project(),t = try f.task(p),file = try source(f,"held.log"),command = UUID().uuidString.lowercased()
         let input: JSON = ["project_id":p["id"]!,"task_id":t["id"]!,"path":file.path]
@@ -155,6 +324,7 @@ final class StorageFailureReportTests: XCTestCase {
 
     /// Accepted-operation route: the failed operation stays recoverable, so the same ID runs again.
     func testOperationRouteRequeuesSameCommandAfterExhaustion() throws {
+        try QualificationSuite.requireEnabled()
         let f = try StorageFixture(open:true,fast:true)
         let p = try f.project(),t = try f.task(p),file = try source(f,"operation.log"),command = UUID().uuidString.lowercased()
         let queue = DispatchQueue(label:"checklist-cl362-" + UUID().uuidString)
@@ -185,6 +355,7 @@ final class StorageFailureReportTests: XCTestCase {
 
     /// The whole headroom range at the real limit: a caller never sees "error N".
     func testSmallWritesAtEveryHeadroomGiveCodedErrors() throws {
+        try QualificationSuite.requireEnabled()
         let f = try StorageFixture(open:true,fast:true)
         let p = try f.project(),t = try f.task(p)
         let lines = Lines();StorageFailureReport.setLogSink {_ in}
