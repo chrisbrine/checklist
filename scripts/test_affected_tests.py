@@ -267,6 +267,24 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(plan['group_fallback_paths'], [])
         self.assert_case_deferred(plan, case)
 
+    def test_app_source_change_always_names_the_source_guards(self):
+        path, core = 'Sources/ChecklistApp/View.swift', 'Sources/ChecklistCore/Leaf.swift'
+        self.write('Tests/ChecklistAppTests/Guards.swift', 'final class GlossaryTests: XCTestCase {}\n'
+                   '@MainActor final class ViewStateTests: XCTestCase {}\nfinal class LeafTests: XCTestCase {}\n')
+        measured = self.measured_map({path: {'classes': ['ChecklistAppTests.LeafTests'], 'qualification_cases': []},
+                                      core: {'classes': ['ChecklistAppTests.LeafTests'], 'qualification_cases': []}})
+        self.assertEqual(self.plan(path, impact_map=measured)['test_groups']['ChecklistAppTests'],
+                         ['GlossaryTests', 'LeafTests', 'ViewStateTests'])
+        self.assertEqual(self.plan(core, impact_map=measured)['test_groups']['ChecklistAppTests'], ['LeafTests'])
+        uncovered = self.measured_map({path: {'classes': [], 'qualification_cases': []}})
+        self.assertEqual(self.plan(path, impact_map=uncovered)['test_groups']['ChecklistAppTests'], ['GlossaryTests', 'ViewStateTests'])
+
+    def test_app_source_guard_classes_exist(self):
+        tests = Path(__file__).resolve().parents[1] / 'Tests/ChecklistAppTests'
+        declared = {name for source in tests.rglob('*.swift')
+                    for name in re.findall(r'\bfinal class (\w+)\s*:\s*XCTestCase', source.read_text(errors='replace'))}
+        self.assertEqual(sorted(set(selector.APP_SOURCE_GUARD_CLASSES) - declared), [])
+
     def test_mapped_source_never_adds_unmeasured_module_consumers(self):
         path = 'Sources/ChecklistCore/Leaf.swift'
         private = selector.QUALIFICATION_CASES[0]

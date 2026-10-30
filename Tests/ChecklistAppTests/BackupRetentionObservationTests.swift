@@ -42,6 +42,17 @@ import XCTest
         await model.loadPreview {throw NSError(domain:"preview",code:1)}
         XCTAssertFalse(model.canPrune);XCTAssertFalse(model.message.isEmpty)
     }
+    func testRuleSourceIsStatedInPlainWords() {
+        let model = BackupRetentionObservation();model.changeScope("store")
+        XCTAssertTrue(model.ruleSourceText.isEmpty)
+        model.acceptSettings(["newest_count":3,"daily_days":3,"owner_confirmed":true,"automatic_prune":true,"owner_confirmation":["source":"owner_answer","request_id":"request-1","response_id":"response-1","answered_at":"2026-10-30T16:23:00Z","confirmed_at":"2026-10-30T23:00:00Z"],"automatic_prune_history":[["id":"e1","occurred_at":"2026-10-30T23:00:00Z","status":"rule_confirmed_from_answer","newest_count":3,"daily_days":3]]])
+        XCTAssertTrue(model.ruleSourceText.contains("your answer to a ticket request"));XCTAssertTrue(model.ruleSourceText.contains("request-1"));XCTAssertTrue(model.ruleSourceText.contains("response-1"))
+        XCTAssertEqual(model.automaticHistory.first?.summary,"Rule set from your answer: newest 3, plus one per day for 3 days")
+        model.acceptSettings(["newest_count":7,"daily_days":2,"owner_confirmed":true,"automatic_prune":true,"owner_confirmation":["source":"authenticated_app","confirmed_at":"2026-10-30T23:30:00Z"]])
+        XCTAssertTrue(model.ruleSourceText.hasPrefix("Current rule: you saved it here in Settings"))
+        model.acceptSettings(["newest_count":7,"daily_days":2,"owner_confirmed":true,"automatic_prune":false,"owner_confirmation":["source":"owner_answer"]])
+        XCTAssertTrue(model.ruleSourceText.isEmpty)
+    }
     func testAutomaticRuleAndHistoryAreVisibleOnlyInTheirStoreScope() {
         let model = BackupRetentionObservation();model.changeScope("original")
         model.acceptSettings(["newest_count":3,"daily_days":3,"owner_confirmed":true,"automatic_prune":true,"last_automatic_prune":["status":"complete","moved_count":2],"automatic_prune_history":[["id":"event","occurred_at":"2026-10-30T12:00:00Z","status":"complete","moved_count":2]]])

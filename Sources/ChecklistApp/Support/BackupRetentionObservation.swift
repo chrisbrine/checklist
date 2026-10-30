@@ -9,6 +9,7 @@ import SwiftUI
     @Published private(set) var automaticPrune = false
     @Published private(set) var lastAutomaticPrune: [String:Any] = [:]
     @Published private(set) var automaticHistory: [BackupRetentionHistoryEntry] = []
+    @Published private(set) var ownerConfirmation: [String:Any] = [:]
     @Published private(set) var loaded = false
     @Published private(set) var loading = false
     @Published private(set) var preview: [String:Any] = [:]
@@ -24,7 +25,7 @@ import SwiftUI
     var snapshots: [BackupRetentionSnapshot] {(preview["snapshots"] as? [[String:Any]] ?? []).map(BackupRetentionSnapshot.init)}
     func changeScope(_ value: String) {
         guard scope != value else {return}
-        scope = value;cancelReads();loaded = false;ownerConfirmed = false;automaticPrune = false;lastAutomaticPrune = [:];automaticHistory = [];preview = [:];message = ""
+        scope = value;cancelReads();loaded = false;ownerConfirmed = false;automaticPrune = false;lastAutomaticPrune = [:];automaticHistory = [];ownerConfirmation = [:];preview = [:];message = ""
         newestCount = 5;dailyDays = 7;savedNewest = 5;savedDays = 7;includeUnrecorded = false
     }
     func cancelReads() {readID = UUID();loading = false}
@@ -37,7 +38,21 @@ import SwiftUI
         automaticPrune = value["automatic_prune"] as? Bool ?? false
         lastAutomaticPrune = value["last_automatic_prune"] as? [String:Any] ?? [:]
         automaticHistory = (value["automatic_prune_history"] as? [[String:Any]] ?? []).map(BackupRetentionHistoryEntry.init)
+        ownerConfirmation = value["owner_confirmation"] as? [String:Any] ?? [:]
         loaded = true;preview = [:]
+    }
+    /// Plain words for where the rule in force came from.
+    var ruleSourceText: String {
+        guard automaticPrune else {return ""}
+        func time(_ key: String) -> String {
+            let raw = ownerConfirmation[key] as? String ?? ""
+            return ISO8601DateFormatter().date(from:raw)?.formatted(date:.abbreviated,time:.shortened) ?? raw
+        }
+        switch ownerConfirmation["source"] as? String {
+        case "authenticated_app":return "Current rule: you saved it here in Settings on \(time("confirmed_at"))."
+        case "owner_answer":return "Current rule: your answer to a ticket request on \(time("answered_at")). An agent applied it on \(time("confirmed_at")). Request \(ownerConfirmation["request_id"] as? String ?? ""), response \(ownerConfirmation["response_id"] as? String ?? ""). Saving a rule here replaces it."
+        default:return ""
+        }
     }
     var automaticStatusText: String {
         switch lastAutomaticPrune["status"] as? String {
@@ -107,6 +122,9 @@ struct BackupRetentionHistoryEntry: Identifiable {
     var id: String {values["id"] as? String ?? ""}
     var occurredAt: String {values["occurred_at"] as? String ?? ""}
     var summary: String {
+        if values["status"] as? String == "rule_confirmed_from_answer" {
+            return "Rule set from your answer: newest \(values["newest_count"] as? Int ?? 0), plus one per day for \(values["daily_days"] as? Int ?? 0) days"
+        }
         if values["status"] as? String == "complete" {return "Moved \(values["moved_count"] as? Int ?? 0) backup folders to Trash"}
         return "Retention deferred; backups retained"
     }

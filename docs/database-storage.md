@@ -562,7 +562,14 @@ unconfirmed proposal removes nothing. Saving through the trusted owner channel
 confirms automatic application after every completed backup; its receipt binds
 the authenticated owner, command UUID, time, source root and store incarnation.
 Legacy manual rules and relocated/restored confirmations remain inactive until a
-new trusted confirmation. The owner can choose other values, including newest
+new trusted confirmation. The owner's complete `human_ui` answer that states
+`Newest N, plus one per day for D days` is also a trusted confirmation: an
+enrolled worker names the request and response with
+`backup_retention_apply_answer`, and the service reads the numbers from the answer
+and records `source: owner_answer`, the request and response IDs and the same root
+and incarnation binding (see the [command contract](mcp-contract.md#applying-the-owners-retention-answer-cl-360)).
+A later owner save replaces it, an older answer cannot replace a newer rule, and
+Settings states the source of the current rule. The owner can choose other values, including newest
 three plus one per day for three days. The trusted owner channel changes `newest_count`
 (1–1000) and `daily_days` (0–366) with `backup_retention_set`; `backup_pin(path,
 pinned)` saves or removes an explicit pin. Upgrade protection is independent of

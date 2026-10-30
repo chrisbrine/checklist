@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 QUALIFICATION_TESTS = (
     # CL-363: 201/242/250-item workflows and actual descriptor-exhaustion retries.
     'ChecklistCoreTests.MediaBulkOwnerChannelTests/test250ItemRoundIsAcceptedInOneActionWithOwnerDecisionPerItem',
+    'ChecklistCoreTests.MediaBulkOwnerChannelTests/test250ItemRoundWithCurrentSuggestionsKeepsFilterAndActionTime',
     'ChecklistCoreTests.MediaBulkOwnerChannelTests/testFailedChunkRefreshesOnlyFailedItemsAndNeverRepeatsCommittedOnes',
     'ChecklistCoreTests.MediaFollowUpTests/testFollowUpAndCloseAt242DecisionsStayExactAndRecordTheirTimes',
     'ChecklistCoreTests.StorageFailureReportTests/testAttachmentAddReportsRetryableThenSameCommandSucceeds',
@@ -129,6 +130,7 @@ TIMING_TESTS = (
     'ChecklistAppTests.ApplicationTerminationTests/testOpenFloatingCaptureQuitsAndRestoresBlankTextAndFiles',
     'ChecklistAppTests.CachedScreenReturnTests/testTemplateCatalogOverviewReturnNeedsNoReadOrCatalogReplay',
     'ChecklistAppTests.MediaPlaybackComparisonTests/testNonloopingTakeRetainsCompletedItemAndReplaysWithoutUndoingPauseOrUnload',
+    'ChecklistAppTests.MediaPlaybackComparisonTests/testLoopingTakeRetainsEightFrameSourceDurationAndDeclaredClockRate',
     'ChecklistAppTests.MediaPlaybackComparisonTests/testSyntheticWrittenMovieIsSelfContainedAndProbeMeasuresIt',
     'ChecklistAppTests.HumanClaimsKeychainTests/testForeignACLReadReturnsNilWithinTwoSecondsInTemporaryKeychain',
     'ChecklistAppTests.OverviewReadRecoveryTests/testCachedOverviewReturnRestoresMatchingGroupsSynchronously',
@@ -142,6 +144,10 @@ TIMING_TESTS = (
     'ChecklistAppTests.ScreenTimingTests/testCachedTicketDetailNativeFrame',
     'ChecklistAppTests.ScreenTimingTests/testCachedTicketsWithTriagesNativeFrame',
     'ChecklistAppTests.ScreenTimingTests/testColdCleanupNativeFrame',
+    # Each runs only with an explicit owned copy in its environment; otherwise it skips.
+    'ChecklistCoreTests.StoragePerformanceOwnedCopyTests/testIndependentVerificationOnOwnedSnapshot',
+    'ChecklistCoreTests.StoragePerformanceOwnedCopyTests/testProtectedSnapshotCopyOnOwnedUnmigratedStore',
+    'ChecklistCoreTests.StorageWriterLeaseTests/testCaptureOnOwnedLiveSizeDatabase',
     'ChecklistIPCTests.AsyncServiceCallTests/testMissingReplyReachesAsyncCallerAtItsDeadline',
     'ChecklistIPCTests.ClientConnectionAdmissionTests/testSlowFirstCheckDoesNotHoldUpCachedClients',
     'ChecklistMCPServerTests.ChecklistMCPServerTests/testStalledServiceInitializesWithinThreeSecondsAndFirstCallConnects',
@@ -218,6 +224,10 @@ SOURCE_TEST_CONSUMERS = {
     'Sources/ChecklistBridges/': ('ChecklistAppTests',),
     'Tests/ChecklistCoreTests/': ('ChecklistAppTests',),
 }
+# Guards that read the whole app source tree as text. Coverage and index maps never
+# reach them through a changed source, so a narrowed plan names them (F65).
+APP_SOURCE_GUARD_CLASSES = ('ConfirmationTests', 'GlossaryTests', 'OwnerPrivateFileStoreTests', 'PlainLanguageTests',
+                            'SelectableTextAccessibilityTests', 'TicketPurgePreviewTests', 'ViewStateTests')
 BUILD_SCRIPTS = ('script/build_', 'script/build_and_run.sh', 'scripts/compile-component.sh',
                  'scripts/test_build_and_run.py')
 PYTHON_TEST_OWNERS = {
@@ -1171,6 +1181,9 @@ def select(root, graph, paths, scratch, full=False, qualification=False, last_ro
                     relevant.append(None)
             if relevant and all(selected is not None for selected in relevant):
                 groups[name] = sorted({group for selected in relevant for group in selected})
+        if 'ChecklistAppTests' in groups and any(path.startswith('Sources/ChecklistApp/') and path.endswith('.swift') for path in normalized):
+            known = declared_test_classes(root, targets['ChecklistAppTests'], declared)
+            groups['ChecklistAppTests'] = sorted(set(groups['ChecklistAppTests']).union(known.intersection(APP_SOURCE_GUARD_CLASSES)))
         tests = [name for name in tests if name not in groups or groups[name]]
         groups = {name: selected for name, selected in groups.items() if name in tests}
     # Qualification is independent of unit group narrowing: an explicitly requested

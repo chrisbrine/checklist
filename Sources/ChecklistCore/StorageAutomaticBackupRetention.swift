@@ -2,16 +2,25 @@ import Foundation
 import CoreFoundation
 import GRDB
 
-/// Confirmation is written only by backup_retention_set on the authenticated
-/// owner channel. A legacy manual rule is not consent to automatic Trash moves.
+/// Confirmation is written by backup_retention_set on the authenticated owner
+/// channel, or by backup_retention_apply_answer from the owner's own recorded
+/// answer. A legacy manual rule is not consent to automatic Trash moves.
 enum StorageAutomaticBackupRetention {
+    static let answerRefused = "BACKUP_RETENTION_ANSWER_REFUSED"
+    private static func validSource(_ receipt: JSON) -> Bool {
+        switch receipt["source"] as? String {
+        case "authenticated_app":return true
+        case "owner_answer":return UUID(uuidString:receipt["request_id"] as? String ?? "") != nil && UUID(uuidString:receipt["response_id"] as? String ?? "") != nil
+        default:return false
+        }
+    }
     static func isConfirmed(_ settings: JSON,root: URL? = nil,incarnation: String? = nil) throws -> Bool {
         guard let raw = settings["automatic_prune"] else {return false}
         guard let enabled = raw as? NSNumber,CFGetTypeID(enabled) == CFBooleanGetTypeID() else {throw StoreRecovery.required("backup_retention_confirmation_invalid")}
         guard enabled.boolValue else {return false}
         guard let owner = settings["owner_confirmed"] as? NSNumber,CFGetTypeID(owner) == CFBooleanGetTypeID(),owner.boolValue,
               let receipt = settings["owner_confirmation"] as? JSON,
-              receipt["source"] as? String == "authenticated_app",
+              validSource(receipt),
               let principal = receipt["principal"] as? String,!principal.isEmpty,
               let command = receipt["command_id"] as? String,UUID(uuidString:command) != nil,
               let confirmed = receipt["confirmed_at"] as? String,ISO8601DateFormatter().date(from:confirmed) != nil,
@@ -27,6 +36,19 @@ enum StorageAutomaticBackupRetention {
     static func command(root: URL,incarnation: String,trigger: String) -> String {
         let chars = Array(hash(Data((root.path + "\n" + incarnation + "\n" + trigger).utf8)).prefix(32))
         return String(chars[0..<8]) + "-" + String(chars[8..<12]) + "-" + String(chars[12..<16]) + "-" + String(chars[16..<20]) + "-" + String(chars[20..<32])
+    }
+}
+
+extension StorageBackupRetentionPolicy {
+    /// The owner's words state the rule: "Newest N, plus one per day for D days",
+    /// optionally followed by one parenthetical note. Anything else states no rule.
+    static func stated(in value: String) -> StorageBackupRetentionPolicy? {
+        let line = value.trimmingCharacters(in:.whitespacesAndNewlines)
+        guard let regex = try? NSRegularExpression(pattern:#"^Newest ([1-9][0-9]{0,3}), plus one per day for ([1-9][0-9]{0,2}) days?( \([^()\n]*\))?$"#),
+              let match = regex.firstMatch(in:line,range:NSRange(line.startIndex...,in:line)),
+              let first = Range(match.range(at:1),in:line),let second = Range(match.range(at:2),in:line),
+              let newest = Int(line[first]),let days = Int(line[second]),newest <= 1000,days <= 366 else {return nil}
+        return .init(newestCount:newest,dailyDays:days)
     }
 }
 
@@ -50,6 +72,62 @@ extension CommandRouter {
         try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('backup-automatic-prune-due',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[try jsonString(due)])
     }
 
+    /// An agent names the owner's answer and the service reads the rule from it,
+    /// so an agent cannot choose the numbers. The generic write path supplies the
+    /// project grant check, command receipt and replay.
+    func backupRetentionApplyAnswer(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
+        guard c.role != "assistant" else {throw CoreError("FORBIDDEN","Only an enrolled worker can apply an owner answer.")}
+        func refuse(_ reason: String,_ message: String) -> CoreError {CoreError(StorageAutomaticBackupRetention.answerRefused,message,details:["reason":reason])}
+        let askAgain = "Ask the owner with a new request, or the owner can save a rule in Settings."
+        let pid = try text(p,"project_id"),requestID = try text(p,"request_id",max:100),responseID = try text(p,"response_id",max:100)
+        guard let request = try? scoped(db,requestID,pid,type:"request") else {throw refuse("request_not_in_project","This request is not in this project. Check project_id and request_id.")}
+        guard let response = (request["responses"] as? [JSON] ?? []).first(where:{$0["id"] as? String == responseID}) else {throw refuse("response_not_on_request","This response does not belong to this request. Check response_id.")}
+        guard response["origin"] as? String == "human_ui" else {throw refuse("response_not_from_owner","This response did not come from the owner in the app. " + askAgain)}
+        guard bool(response,"complete"),["answered","send"].contains(response["action"] as? String ?? ""),request["state"] as? String == "answered" else {throw refuse("answer_not_complete","This response is not a complete answer on an answered request. Wait for the owner's answer, or ask again.")}
+        guard int(response,"form_revision",default:1) == int(request,"form_revision",default:1) else {throw refuse("answer_for_old_form","This response answers an older form of the request. " + askAgain)}
+        guard (request["responses"] as? [JSON] ?? []).last(where:{bool($0,"complete")})?["id"] as? String == responseID else {throw refuse("answer_superseded","The owner gave a later answer on this request. Use the latest response.")}
+        let questions = request["questions"] as? [JSON] ?? []
+        var stated: [(newest:Int,days:Int)] = []
+        for answer in response["answers"] as? [JSON] ?? [] {
+            guard let question = questions.first(where:{$0["id"] as? String == answer["question_id"] as? String}) else {continue}
+            let options = question["options"] as? [JSON] ?? []
+            var words = (answer["option_ids"] as? [String] ?? []).compactMap {id in options.first(where:{$0["id"] as? String == id})?["label"] as? String}
+            if let custom = answer["custom_text"] as? String {words.append(custom)}
+            for word in words {
+                if let rule = StorageBackupRetentionPolicy.stated(in:word),!stated.contains(where:{$0.newest == rule.newestCount && $0.days == rule.dailyDays}) {stated.append((rule.newestCount,rule.dailyDays))}
+            }
+        }
+        guard stated.count == 1,let rule = stated.first else {throw refuse(stated.isEmpty ? "no_rule_in_answer" : "more_than_one_rule","The owner's answer must state one rule in the form \"Newest N, plus one per day for D days\", with N from 1 to 1000 and D from 1 to 366. " + askAgain)}
+        guard let answeredAt = response["created_at"] as? String,let answered = ISO8601DateFormatter().date(from:answeredAt) else {throw refuse("answer_time_unknown","This response has no readable answer time. " + askAgain)}
+        var settings = try backupRetentionSettings(db)
+        func summary(_ confirmedAt: Any?,alreadyApplied: Bool) -> JSON {
+            var value: JSON = ["status":"rule_confirmed_from_answer","newest_count":rule.newest,"daily_days":rule.days,"daily_timezone":"UTC","rule_source":"owner_answer","request_id":requestID,"response_id":responseID,"answered_at":answeredAt,"already_applied":alreadyApplied]
+            if let confirmedAt {value["confirmed_at"] = confirmedAt}
+            return value
+        }
+        if let current = settings["owner_confirmation"] as? JSON {
+            if current["source"] as? String == "owner_answer",current["response_id"] as? String == responseID {
+                guard current["source_root"] as? String == root.path,current["incarnation"] as? String == incarnation else {throw refuse("answer_from_other_installation","This answer was applied in another installation or before a restore, so it does not carry over. " + askAgain)}
+                return summary(current["confirmed_at"],alreadyApplied:true)
+            }
+            // A new command ID must not bring back an answer the owner already replaced.
+            if let raw = current["answered_at"] as? String ?? current["confirmed_at"] as? String,let newer = ISO8601DateFormatter().date(from:raw),answered <= newer {
+                throw refuse("newer_rule_exists","The owner set the current rule after this answer, so the current rule stays. " + askAgain)
+            }
+        }
+        let confirmedAt = now(),command = try text(p,"command_id",max:100)
+        let confirmation: JSON = ["principal":c.principal,"command_id":command,"confirmed_at":confirmedAt,"source":"owner_answer","project_id":pid,"task_id":request["task_id"] ?? NSNull(),"request_id":requestID,"response_id":responseID,"answered_at":answeredAt,"source_root":root.path,"incarnation":incarnation]
+        settings.merge(StorageBackupRetentionPolicy(newestCount:rule.newest,dailyDays:rule.days).json) {_,new in new}
+        settings["owner_confirmed"] = true
+        settings["automatic_prune"] = true
+        settings["owner_confirmation"] = confirmation
+        try fenceForeignAutomaticRetentionIntent(db,confirmation:confirmation)
+        try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('backup-retention-settings',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[try jsonString(settings)])
+        let result = summary(confirmedAt,alreadyApplied:false)
+        try event(db,caller:c,project:pid,entity:request["task_id"] as? String,kind:"backup_retention_answer_applied",data:result)
+        return result
+    }
+
     /// Only a new trusted confirmation may fence an inherited foreign marker.
     /// Preserve both the exact marker and the underlying prune journal: this
     /// records lost applicability, never completion of an uncertain old move.
@@ -69,8 +147,8 @@ extension CommandRouter {
 
     func automaticBackupRetentionHistory(_ db: Database) throws -> [JSON] {
         try Row.fetchAll(db,sql:"""
-            SELECT id,occurred_at,json_object('status',json_extract(data,'$.status'),'moved_count',json_extract(data,'$.moved_count'),'error_code',json_extract(data,'$.error_code'),'trigger_operation_id',json_extract(data,'$.trigger_operation_id'),'command_id',json_extract(data,'$.command_id')) AS summary
-            FROM events WHERE kind IN ('backup_pruned','backup_retention_deferred') AND json_extract(data,'$.origin')='automatic_backup_retention' ORDER BY seq DESC LIMIT 20
+            SELECT id,occurred_at,json_object('status',json_extract(data,'$.status'),'moved_count',json_extract(data,'$.moved_count'),'error_code',json_extract(data,'$.error_code'),'trigger_operation_id',json_extract(data,'$.trigger_operation_id'),'command_id',json_extract(data,'$.command_id'),'newest_count',json_extract(data,'$.newest_count'),'daily_days',json_extract(data,'$.daily_days'),'request_id',json_extract(data,'$.request_id'),'response_id',json_extract(data,'$.response_id')) AS summary
+            FROM events WHERE (kind IN ('backup_pruned','backup_retention_deferred') AND json_extract(data,'$.origin')='automatic_backup_retention') OR kind='backup_retention_answer_applied' ORDER BY seq DESC LIMIT 20
             """).map {row in var value = jsonObject(row["summary"]);value["id"] = row["id"] as String;value["occurred_at"] = row["occurred_at"] as String;return value}
     }
 

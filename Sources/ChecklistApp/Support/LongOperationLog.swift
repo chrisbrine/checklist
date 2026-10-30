@@ -80,8 +80,7 @@ struct LongOperationRows: View {
                 Text(operation.summary).checklistFont(.callout)
                 Text("Operation ID \(operation.operationID)").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText).textSelection(.enabled)
             }
-            .accessibilityElement(children:.ignore)
-            .accessibilityLabel("\(operation.summary) Operation ID \(operation.operationID)")
+            .accessibilityElement(children:.contain)
             .accessibilityIdentifier("longOperation-\(operation.operationID)")
         }
     }

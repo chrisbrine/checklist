@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import Darwin
 import XCTest
+import os
 @testable import ChecklistCore
 
 /// CL-363: fixture Git results keyed by every input Git reads from the tree.
@@ -21,11 +22,21 @@ final class SourceGitFixtureMemo: SourceGitProcessAdapter, @unchecked Sendable {
     private static let contentLimit = 256 * 1024
 
     /// Applies to the current test only: the observer clears it before the next test.
+    /// XCTest accepts an observer only on the main thread, and a main-thread wait here
+    /// could deadlock a test that waits for its workers. So a store opened on a worker
+    /// before any store on the main thread stays on real Git: nothing could clear the
+    /// memo before the next test, and the memo only saves time.
     static func configure(enabled: Bool) {
-        _ = testStartReset
-        SourceGit.fixtureProcessAdapter.withLockUnchecked { $0 = enabled ? shared : nil }
+        if Thread.isMainThread { _ = testStartReset }
+        let memo = enabled && clearsAtTestStart ? shared : nil
+        SourceGit.fixtureProcessAdapter.withLockUnchecked { $0 = memo }
     }
-    private static let testStartReset: Void = { XCTestObservationCenter.shared.addTestObserver(TestStartReset()) }()
+    static var clearsAtTestStart: Bool { observerInstalled.withLock { $0 } }
+    private static let observerInstalled = OSAllocatedUnfairLock(initialState: false)
+    private static let testStartReset: Void = {
+        XCTestObservationCenter.shared.addTestObserver(TestStartReset())
+        observerInstalled.withLock { $0 = true }
+    }()
     private final class TestStartReset: NSObject, XCTestObservation {
         func testCaseWillStart(_ testCase: XCTestCase) { SourceGit.fixtureProcessAdapter.withLockUnchecked { $0 = nil } }
     }

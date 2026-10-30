@@ -7,22 +7,24 @@ struct BackupRetentionSettingsView: View {
     @StateObject private var observation = BackupRetentionObservation()
     @State private var confirmSave = false
     @State private var confirmPrune = false
-    private var unavailable: Bool {observation.loading || store.busy || store.hasPendingMutation || !store.connected}
+    private var unavailable: [(Bool,String)] {[(!store.connected,DisabledReasons.offline),(store.hasPendingMutation,DisabledReasons.uncheckedChange),(store.busy,DisabledReasons.saving),(observation.loading,"Checklist is still reading the backups.")]}
+    private var ruleUnavailable: [(Bool,String)] {unavailable + [(!observation.loaded,"The retention rule is still loading.")]}
     var body: some View {
         Section("Backup retention") {
             Text(observation.automaticPrune ? "Your confirmed rule applies automatically after each completed backup. Older eligible backups move to Trash; the history records the result." : "Confirm a retention rule to have older eligible backups move to Trash automatically after each completed backup.")
                 .checklistFont(.callout).foregroundStyle(Color.checklistSecondaryText)
             Stepper("Newest backups: \(observation.newestCount)",value:Binding(get:{observation.newestCount},set:{observation.newestCount = $0;observation.invalidatePreview()}),in:1...1000)
-                .accessibilityIdentifier("backupRetentionNewestCount").disabled(unavailable || !observation.loaded)
+                .accessibilityIdentifier("backupRetentionNewestCount").checklistDisabled(ruleUnavailable)
             Stepper("Daily backups: \(observation.dailyDays) days",value:Binding(get:{observation.dailyDays},set:{observation.dailyDays = $0;observation.invalidatePreview()}),in:0...366)
-                .accessibilityIdentifier("backupRetentionDailyDays").disabled(unavailable || !observation.loaded)
+                .accessibilityIdentifier("backupRetentionDailyDays").checklistDisabled(ruleUnavailable)
             Text("Daily retention uses UTC calendar dates, including today. Your pins and protected upgrade backups stay. Incomplete and unrecorded folders need a separate reviewed Trash move.")
                 .checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             HStack {
                 Button("Save retention rule…") {confirmSave = true}
-                    .accessibilityIdentifier("saveBackupRetention").disabled(unavailable || !observation.loaded || observation.ownerConfirmed && observation.automaticPrune && !observation.dirty)
-                Button("Reload rule") {Task {await reload()}}.disabled(unavailable)
+                    .accessibilityIdentifier("saveBackupRetention").checklistDisabled(ruleUnavailable + [(observation.ownerConfirmed && observation.automaticPrune && !observation.dirty,"This retention rule is already saved and applies automatically.")])
+                Button("Reload rule") {Task {await reload()}}.checklistDisabled(unavailable)
             }
+            if !observation.ruleSourceText.isEmpty {Text(observation.ruleSourceText).checklistFont(.micro).textSelection(.enabled)}
             if !observation.automaticStatusText.isEmpty {Text(observation.automaticStatusText).checklistFont(.micro).textSelection(.enabled)}
             if !observation.automaticHistory.isEmpty {
                 DisclosureGroup("Automatic retention history") {
@@ -32,15 +34,15 @@ struct BackupRetentionSettingsView: View {
                 }
             }
             Toggle("Include incomplete and unrecorded backup folders in this preview",isOn:Binding(get:{observation.includeUnrecorded},set:{observation.includeUnrecorded = $0;observation.invalidatePreview()}))
-                .checklistFont(.micro).disabled(unavailable)
+                .checklistFont(.micro).checklistDisabled(unavailable)
             Button("Preview backups") {Task {await preview()}}
-                .accessibilityIdentifier("previewBackupRetention").disabled(unavailable || !observation.loaded || observation.dirty)
+                .accessibilityIdentifier("previewBackupRetention").checklistDisabled(ruleUnavailable + [(observation.dirty,"Save your rule before previewing the backups it keeps.")])
             if observation.dirty {Text("Save your rule before previewing the backups it keeps.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)}
             if observation.loading {ProgressView("Reading backups…").controlSize(.small)}
             if !observation.previewDigest.isEmpty {previewContent}
             if store.hasPendingMutation {
                 Text("The last change needs checking before another change can start.").checklistFont(.micro)
-                Button("Check the last change") {store.retryPendingMutation()}.disabled(store.busy || !store.connected)
+                Button("Check the last change") {store.retryPendingMutation()}.checklistDisabled([(!store.connected,DisabledReasons.offline),(store.busy,DisabledReasons.saving)])
             }
             if !observation.message.isEmpty {Text(observation.message).checklistFont(.micro).textSelection(.enabled)}
         }
@@ -63,14 +65,14 @@ struct BackupRetentionSettingsView: View {
             ScrollView {
                 VStack(alignment:.leading,spacing:Spacing.control) {
                     ForEach(observation.snapshots) {snapshot in
-                        BackupRetentionSnapshotRow(snapshot:snapshot,disabled:unavailable,pin:{value in pin(snapshot,value)},retire:{pin(snapshot,false,retire:true)})
+                        BackupRetentionSnapshotRow(snapshot:snapshot,unavailable:unavailable,pin:{value in pin(snapshot,value)},retire:{pin(snapshot,false,retire:true)})
                     }
                 }.frame(maxWidth:.infinity,alignment:.leading)
             }.frame(maxHeight:280)
             Text("Incomplete or unrecorded folders are never shown as completed backups. Moving folders to Trash does not free disk space until you empty Trash.")
                 .checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             Button("Move old backups to Trash…") {confirmPrune = true}
-                .accessibilityIdentifier("pruneOldBackups").disabled(unavailable || !observation.canPrune)
+                .accessibilityIdentifier("pruneOldBackups").checklistDisabled(ruleUnavailable + [(!observation.ownerConfirmed,"Save your retention rule first."),(observation.dirty,"Save your rule, then preview the backups again."),(observation.previewDigest.isEmpty,"Preview the backups first."),(observation.pruneCount <= 0,"This preview selects no backups for Trash.")])
         }
     }
     private func reload() async {
@@ -115,7 +117,7 @@ struct BackupRetentionSettingsView: View {
 
 private struct BackupRetentionSnapshotRow: View {
     let snapshot: BackupRetentionSnapshot
-    let disabled: Bool
+    let unavailable: [(Bool,String)]
     let pin: (Bool) -> Void
     let retire: () -> Void
     @State private var confirmRetire = false
@@ -126,10 +128,10 @@ private struct BackupRetentionSnapshotRow: View {
             Text(snapshot.reasonText).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             Text(snapshot.path).checklistFont(.micro).textSelection(.enabled)
             if snapshot.protectedUpgrade {Text("Upgrade protection stays in effect independently of your pin.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)}
-            Toggle("Keep this backup",isOn:Binding(get:{snapshot.pinned},set:pin)).disabled(disabled)
+            Toggle("Keep this backup",isOn:Binding(get:{snapshot.pinned},set:pin)).checklistDisabled(unavailable)
                 .accessibilityLabel("Keep \(snapshot.name)")
             if snapshot.historicalUpgrade {
-                Button("Retire historical upgrade protection…") {confirmRetire = true}.disabled(disabled)
+                Button("Retire historical upgrade protection…") {confirmRetire = true}.checklistDisabled(unavailable)
             }
         }.padding(.vertical,Spacing.compact)
         .alert("Retire this historical upgrade protection?",isPresented:$confirmRetire) {

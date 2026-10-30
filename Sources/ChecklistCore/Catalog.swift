@@ -75,6 +75,7 @@ extension CommandRouter {
             fields["import_receipt_get"] = ["receipt_id"]
         }
         if c.role != "assistant" { fields["backup_create"] = ["qualification_name","reason"] }
+        if c.role != "assistant" { fields["backup_retention_apply_answer"] = ["request_id","response_id"] }
         if c.isOwner {
             fields["backup_retention_get"] = []
             fields["backup_retention_set"] = ["newest_count","daily_days"]
@@ -246,6 +247,7 @@ extension CommandRouter {
             if name == "backup_prune" {properties["preview_sha256"] = ["type":"string","pattern":"^[0-9a-f]{64}$"]}
         }
         var required: [String] = []
+        if name == "backup_retention_apply_answer" {required += ["request_id","response_id"]}
         if name == "backup_pin" {required += ["path","pinned"]}
         if name == "backup_prune" {required.append("preview_sha256")}
         if !Self.readMethods.contains(name) { required.append("command_id") }
@@ -321,6 +323,7 @@ extension CommandRouter {
         case "work_recover":return "Revoke a stopped attempt with explicit observation_refs and file_state_refs, action=confirm_stopped_revoke and reason. Name every unresolved source execution and its expected revision. Agent recovery is labeled as agent action; timeouts never prove a stop. Requires allowed agent_rule_changes."
         case "finding_waive","direction_waive":return "Record a reasoned waiver with caller provenance. Agent callers create agent waivers, never owner approvals. Requires allowed agent_rule_changes."
         case "project_icon_import":return "Import a PNG, JPEG or WebP up to 5 MiB from inside the caller's enrolled workspace. Requires current project revision and allowed agent_rule_changes."
+        case "backup_retention_apply_answer":return "Apply the backup retention rule from the owner's own answer. Send request_id and response_id, never numbers. The service checks that the complete human_ui response belongs to this project's request and that the selected option label or custom text states \"Newest N, plus one per day for D days\"; it then records the rule as confirmed with those IDs. It moves no files; the rule applies after the next completed backup. A later owner save in Settings replaces it."
         case "backup_retention_get":return "Read the installation backup retention proposal or bound owner-confirmed setting, pins and recent automatic-retention history. Unconfirmed rules remove nothing."
         case "backup_retention_set":return "Owner only: confirm newest_count (at least 1) plus the newest snapshot per UTC day in daily_days (0–366). This bound rule automatically moves older eligible snapshots to Trash after completed backups. Pinned and protected upgrade snapshots always stay."
         case "backup_pin":return "Owner only: pin or unpin a snapshot by path and pinned boolean. Optional retire_upgrade_protection:true with pinned:false retires historical upgrade protection only; current and prepared upgrades stay protected independently."

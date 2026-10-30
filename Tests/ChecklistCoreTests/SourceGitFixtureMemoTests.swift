@@ -80,6 +80,22 @@ final class SourceGitFixtureMemoTests: XCTestCase {
         counting.launches = 0
         _ = try? run(memo,worktree,args);_ = try? run(memo,worktree,args);XCTAssertEqual(counting.launches,2)
     }
+    /// XCTest terminates the process when an observer is added off the main thread.
+    /// In a one-test process this first call is the one that used to crash (F65).
+    func testConfigureOffTheMainThreadNeverRegistersTheObserverOrLeavesAnUnclearableMemo() {
+        func configureOnWorker() {
+            let done = DispatchSemaphore(value:0)
+            Thread.detachNewThread {SourceGitFixtureMemo.configure(enabled:true);done.signal()}
+            done.wait()
+        }
+        configureOnWorker()
+        XCTAssertEqual(SourceGit.fixtureProcessAdapter.withLockUnchecked {$0 != nil},SourceGitFixtureMemo.clearsAtTestStart)
+        SourceGitFixtureMemo.configure(enabled:true)
+        XCTAssertTrue(SourceGitFixtureMemo.clearsAtTestStart)
+        configureOnWorker()
+        XCTAssertNotNil(SourceGit.fixtureProcessAdapter.withLockUnchecked {$0})
+        SourceGitFixtureMemo.configure(enabled:false)
+    }
     func testEachTestStartsWithoutTheMemoAndRouterOptOutKeepsItOff() throws {
         XCTAssertNil(SourceGit.fixtureProcessAdapter.withLockUnchecked {$0},"The previous test's router must not leak the memo")
         let store = directory.appendingPathComponent("opt-out")

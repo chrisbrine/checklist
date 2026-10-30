@@ -124,6 +124,7 @@ extension CommandRouter {
         case "history_list": return try history(db,p,c)
         case "profile_create", "profile_edit", "profile_archive": return try profileWrite(db,p,c,method)
         case "agent_resolve": return try resolve(db,p,c)
+        case "backup_retention_apply_answer": return try backupRetentionApplyAnswer(db,p,c)
         case "human_request_create", "human_request_answer", "human_request_cancel", "human_request_revise", "human_request_snooze": return try requestWrite(db,p,c,method)
         case "epic_create", "triage_create", "epic_edit", "triage_edit", "group_edit", "group_membership": return try groupWrite(db,p,c,method)
         case "epic_delete": return try epicDelete(db,p,c)

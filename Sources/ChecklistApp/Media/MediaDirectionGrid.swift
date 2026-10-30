@@ -100,7 +100,7 @@ struct MediaAnimationGroup: Identifiable, Equatable {
     func open(group: MediaAnimationGroup,model: MediaReviewModel) async {
         let previous=loadTask,project=model.projectID,round=model.roundID
         close();let token=generation;loading=true;error=nil
-        // A cancelled native probe may still be retiring. Never overlap it with a
+        // A canceled native probe may still be retiring. Never overlap it with a
         // replacement group's preparation or steal its single-preparation token.
         await previous?.value
         guard token==generation,!Task.isCancelled,model.projectID==project,model.roundID==round else {

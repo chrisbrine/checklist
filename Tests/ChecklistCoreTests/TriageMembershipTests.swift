@@ -309,12 +309,12 @@ extension EvidenceAuthorityTests {
     }
 
     func testSchemaLedgerAcceptsFourAndRefusesFutureVersions() throws {
-        XCTAssertEqual(SchemaMigrations.currentSchema,4)
+        XCTAssertEqual(SchemaMigrations.currentSchema,5)
         XCTAssertEqual(SchemaMigrations.ledgers(4).compactMap {$0["migration_id"] as? String}.last,"0004-triage-orchestrator-membership")
         XCTAssertEqual(SchemaMigrations.triageMembershipLedger["from_version"] as? Int,3)
         let queue = try DatabaseQueue()
         try queue.write { db in
-            try SchemaMigrations.installStorageCollation(db);try db.execute(sql:"PRAGMA user_version=5")
+            try SchemaMigrations.installStorageCollation(db);try db.execute(sql:"PRAGMA user_version=6")
             XCTAssertThrowsError(try SchemaMigrations.inspect(db))
         }
     }
