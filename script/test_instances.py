@@ -46,7 +46,6 @@ def live_root(environment=None):
 LIVE = live_root()
 BUILD = REPO / '.local/build'
 RELOCATION_REQUIRED = 'Seed path safety requires the instance-local managed-path contract; unsafe references and file URLs are refused.'
-KEYCHAIN_DELETE_LIMIT = 1024
 
 # A field name alone does not establish file authority. The inspector below
 # distinguishes canonical managed descriptors, project references, captured names
@@ -78,7 +77,7 @@ def paths(number):
     number = slot_number(number)
     folder = BASE / f'slot-{number}'
     return {'folder': folder, 'data': folder / 'data', 'bundle': folder / f'Checklist Test {number}.app',
-            'label': f'org.checklist.test{number}.coordination', 'keychain': f'org.checklist.test{number}.enrollments',
+            'label': f'org.checklist.test{number}.coordination',
             'identifier': f'org.checklist.app.test{number}'}
 
 
@@ -1371,18 +1370,6 @@ def stop(p):
     print('Stopped ' + p['label'])
 
 
-def delete_slot_keychain(number, service):
-    number = slot_number(number)
-    if not re.fullmatch(fr'(?:org\.checklist\.test{number}\.enrollments|Checklist\.Test{number}\.HumanClaim)', service):
-        raise ValueError('Refusing non-slot Keychain service identity: ' + service)
-    for count in range(KEYCHAIN_DELETE_LIMIT):
-        result = run(['security', 'delete-generic-password', '-s', service], check=False)
-        if result.returncode == 44: return count
-        if result.returncode:
-            raise ValueError(f'Cannot delete slot Keychain service {service} after {count} removals: ' + result.stderr)
-    raise ValueError(f'Keychain deletion limit {KEYCHAIN_DELETE_LIMIT} reached for {service}; slot folder preserved.')
-
-
 def destroy(p, *, unused_only=False):
     match = re.fullmatch(r'slot-([1-4])', p['folder'].name)
     if not match or p != paths(int(match[1])):
@@ -1402,9 +1389,9 @@ def destroy(p, *, unused_only=False):
     window_uuid = r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
     domain_rule = re.compile(fr'(?:org\.checklist\.app\.test{number}|Checklist\.Test{number}\.Workspace\.{window_uuid})')
     domains = {p['identifier']}  # Also delete a cached standard domain with no plist yet.
-    if preferences.exists():
-        domains.update(file.stem for file in preferences.iterdir()
-                       if file.suffix == '.plist' and domain_rule.fullmatch(file.stem))
+    # Only this slot's own suites match; no other domain's file is opened or changed (CL-379).
+    domains.update(file.stem for file in preferences.glob(f'Checklist.Test{number}.Workspace.*.plist')
+                   if domain_rule.fullmatch(file.stem))
     files = {}
     for domain in sorted(domains):
         if not domain_rule.fullmatch(domain): raise ValueError('Refusing non-slot preference domain: ' + domain)
@@ -1417,11 +1404,11 @@ def destroy(p, *, unused_only=False):
         raise ValueError('Refusing non-slot saved-state identity.')
     if saved.exists() and not saved.is_dir(): raise ValueError('Refusing non-directory saved state: ' + str(saved))
 
-    receipt = {'slot': number, 'keychain_items_removed': {}, 'preference_domains_removed': [],
+    # CL-379: destroy makes no Keychain call. Slots keep credentials in private files in the slot folder.
+    receipt = {'slot': number, 'keychain': 'not touched; a leftover item of an older slot is ignored',
+               'preference_domains_removed': [],
                'preference_domains_missing': [], 'trashed': []}
     if unused_only: require_unused()
-    for service in [p['keychain'], f'Checklist.Test{number}.HumanClaim']:
-        receipt['keychain_items_removed'][service] = delete_slot_keychain(number, service)
     for domain, file in files.items():
         had_plist = file.exists()
         result = run(['defaults', 'delete', domain], check=False)

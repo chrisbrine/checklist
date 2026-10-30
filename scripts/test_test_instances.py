@@ -124,7 +124,7 @@ class TestInstancesTests(unittest.TestCase):
             self.assertEqual(p['bundle'], p['folder'] / f'Checklist Test {number}.app')
             self.assertEqual(p['label'], f'org.checklist.test{number}.coordination')
             self.assertEqual(p['identifier'], f'org.checklist.app.test{number}')
-            self.assertEqual(p['keychain'], f'org.checklist.test{number}.enrollments')
+            self.assertNotIn('keychain', p)
             self.assertNotEqual(p['data'], harness.LIVE)
 
     def test_plist_rewrite_preserves_build(self):
@@ -383,22 +383,12 @@ class DestroyCleanupTests(unittest.TestCase):
             saved = saved_root / (p['identifier'] + '.savedState')
             preserved_state = [saved_root / (domain + '.savedState') for domain in preserved[:2]]
             for folder in preserved_state + ([saved] if populated else []): folder.mkdir()
-            claims = f'Checklist.Test{number}.HumanClaim'
-            counts = {p['keychain']: int(populated), claims: 2 if populated else 0}
             calls = []
             stopped = stack.enter_context(patch.object(harness, 'stop'))
             def run(command, **kwargs):
                 self.assertEqual(stopped.call_count, 1, 'cleanup must follow stop')
                 command = [str(value) for value in command]; calls.append(command)
-                if command[:2] == ['security', 'find-generic-password']:
-                    # The old implementation sees no enrollment and misses claims.
-                    return SimpleNamespace(returncode=44, stdout='', stderr='')
-                if command[:2] == ['security', 'delete-generic-password']:
-                    self.assertEqual(command[2], '-s'); self.assertEqual(len(command), 4)
-                    self.assertIn(command[3], counts)
-                    code = 0 if counts[command[3]] else 44
-                    if not code: counts[command[3]] -= 1
-                    return SimpleNamespace(returncode=code, stdout='', stderr='')
+                if command[0] == 'security': raise AssertionError('destroy must never run security: ' + str(command))
                 self.assertEqual(command[:2], ['defaults', 'delete'])
                 self.assertEqual(len(command), 3); self.assertIn(command[2], domains)
                 file = preferences / (command[2] + '.plist')
@@ -410,13 +400,12 @@ class DestroyCleanupTests(unittest.TestCase):
             output = stack.enter_context(redirect_stdout(io.StringIO()))
             yield SimpleNamespace(p=p, home=home, preferences=preferences, domains=domains,
                                   preserved=preserved, saved=saved, preserved_state=preserved_state,
-                                  counts=counts, calls=calls, output=output, stopped=stopped)
+                                  calls=calls, output=output, stopped=stopped)
 
     def test_destroy_cleans_only_the_exact_slot_names_after_stop(self):
         for number in range(1, 5):
             with self.subTest(slot=number), self.slot(number) as state:
                 receipt = harness.destroy(state.p)
-                self.assertTrue(all(count == 0 for count in state.counts.values()))
                 self.assertTrue(all(not (state.preferences / (domain + '.plist')).exists()
                                     for domain in state.domains))
                 self.assertTrue(all((state.preferences / (domain + '.plist')).read_text() == 'fixture'
@@ -426,16 +415,13 @@ class DestroyCleanupTests(unittest.TestCase):
                 trashed = list((state.home / '.Trash').iterdir())
                 self.assertEqual(len(trashed), 2)
                 self.assertTrue(any(path.name.startswith(state.saved.name + '-Checklist-') for path in trashed))
-                self.assertEqual(receipt['keychain_items_removed'],
-                                 {state.p['keychain']: 1, f'Checklist.Test{number}.HumanClaim': 2})
+                self.assertIn('ignored', receipt['keychain'])
+                self.assertNotIn('keychain_items_removed', receipt)
                 self.assertEqual(receipt['preference_domains_removed'], sorted(state.domains))
                 self.assertEqual(receipt['preference_domains_removed_count'], 2)
                 self.assertEqual(receipt['trashed_count'], 2)
                 self.assertIn('Destroy receipt:', state.output.getvalue())
-                self.assertEqual([call for call in state.calls if call[0] == 'security'],
-                                 [['security', 'delete-generic-password', '-s', service]
-                                  for service, count in receipt['keychain_items_removed'].items()
-                                  for _ in range(count + 1)])
+                self.assertEqual(sorted(state.calls), [['defaults', 'delete', domain] for domain in sorted(state.domains)])
 
     def test_replace_cleans_exact_slot_names_before_copying_stage(self):
         identities = [('explicit', {}, 'slot-fixture'),
@@ -450,7 +436,7 @@ class DestroyCleanupTests(unittest.TestCase):
                             'signing_profile': {}}
                 cleanup_run = harness.run
                 def run(command, **kwargs):
-                    if command[0] in ['security', 'defaults']:
+                    if command[0] == 'defaults':
                         return cleanup_run(command, **kwargs)
                     if command[0] == 'ditto':
                         marker_path = state.p['folder'] / '.checklist-workspace.json'
@@ -459,7 +445,6 @@ class DestroyCleanupTests(unittest.TestCase):
                         self.assertEqual(marker['tickets'], ['CL-359'])
                         self.assertFalse(marker['released'])
                         self.assertEqual(marker['source_fingerprint'], 'b' * 64)
-                        self.assertTrue(all(count == 0 for count in state.counts.values()))
                         self.assertTrue(all(not (state.preferences / (domain + '.plist')).exists()
                                             for domain in state.domains))
                         self.assertFalse(state.saved.exists())
@@ -468,8 +453,7 @@ class DestroyCleanupTests(unittest.TestCase):
                         self.assertTrue(all(folder.is_dir() for folder in state.preserved_state))
                         receipt = json.loads(state.output.getvalue().split('Destroy receipt: ')[1].splitlines()[0])
                         self.assertEqual(receipt, {
-                            'slot': number, 'keychain_items_removed': {
-                                state.p['keychain']: 1, f'Checklist.Test{number}.HumanClaim': 2},
+                            'slot': number, 'keychain': 'not touched; a leftover item of an older slot is ignored',
                             'preference_domains_removed': sorted(state.domains),
                             'preference_domains_missing': [], 'preference_domains_removed_count': 2,
                             'trashed': [str(state.saved), str(state.p['folder'])], 'trashed_count': 2})
@@ -545,13 +529,13 @@ class DestroyCleanupTests(unittest.TestCase):
              patch.object(harness, 'stage_selection', return_value=(state.home / 'stage', {'source_fingerprint': 'b' * 64})), \
              patch.object(harness, 'sign_identity', return_value='-'), \
              patch.object(harness, 'run', return_value=SimpleNamespace(
-                 returncode=36, stdout='', stderr='Keychain unavailable')) as run:
-            with self.assertRaisesRegex(ValueError, 'Keychain unavailable'):
+                 returncode=36, stdout='', stderr='preferences unavailable')) as run:
+            with self.assertRaisesRegex(ValueError, 'preferences unavailable'):
                 harness.create(SimpleNamespace(slot=4, replace=True, seed='empty', session_id='slot-fixture'), state.p)
             self.assertTrue(state.p['folder'].is_dir())
             self.assertEqual(harness.load(state.p), {'slot': 4})
             self.assertEqual(run.call_count, 1)
-            self.assertEqual(run.call_args.args[0][0], 'security')
+            self.assertEqual(run.call_args.args[0][0], 'defaults')
 
     def test_invalid_owner_or_round_refuses_before_replacing_slot(self):
         with self.slot() as state, patch.object(harness, 'stopped'), \
@@ -583,33 +567,46 @@ class DestroyCleanupTests(unittest.TestCase):
             state.stopped.reset_mock()
             second = harness.destroy(state.p)
             for receipt in [first, second]:
-                self.assertEqual(list(receipt['keychain_items_removed'].values()), [0, 0])
                 self.assertEqual(receipt['preference_domains_removed_count'], 0)
                 self.assertEqual(receipt['preference_domains_missing'], [state.p['identifier']])
             self.assertEqual(first['trashed_count'], 1)
             self.assertEqual(second['trashed_count'], 0)
 
-    def test_keychain_delete_loop_is_bounded_and_keeps_slot_on_failure(self):
-        for service in ['org.checklist.test4.enrollments', 'Checklist.Test4.HumanClaim']:
-            with self.subTest(service=service), self.slot() as state, patch.object(harness, 'KEYCHAIN_DELETE_LIMIT', 3):
-                def result(command, **kwargs):
-                    return SimpleNamespace(returncode=0 if command[-1] == service else 44, stdout='', stderr='')
-                with patch.object(harness, 'run', side_effect=result) as run:
-                    with self.assertRaisesRegex(ValueError, 'Keychain.*limit.*3'):
-                        harness.destroy(state.p)
-                self.assertEqual(sum(call.args[0][-1] == service for call in run.call_args_list), 3)
-                self.assertTrue(state.p['folder'].is_dir())
+    def test_destroy_of_a_slot_from_before_cl374_makes_no_keychain_call(self):
+        # The slot fake raises on security; a failed destroy would keep the folder.
+        with self.slot() as state:
+            metadata = harness.load(state.p)
+            metadata.update(keychain=f'org.checklist.test{state.p["folder"].name[-1]}.enrollments', build_id='before-cl-374')
+            harness.save(state.p, metadata)
+            receipt = harness.destroy(state.p)
+            self.assertEqual([call for call in state.calls if call[0] != 'defaults'], [])
+            self.assertFalse(state.p['folder'].exists())
+            self.assertEqual(receipt['keychain'], 'not touched; a leftover item of an older slot is ignored')
+            self.assertIn('a leftover item of an older slot is ignored', state.output.getvalue())
 
-    def test_other_keychain_error_keeps_slot(self):
-        with self.slot() as state, patch.object(harness, 'run', return_value=SimpleNamespace(
-                returncode=36, stdout='', stderr='Keychain unavailable')) as run:
-            with self.assertRaisesRegex(ValueError, 'Keychain unavailable'): harness.destroy(state.p)
-            self.assertEqual(run.call_count, 1)
-            self.assertTrue(state.p['folder'].is_dir())
+    def test_destroy_source_has_no_keychain_command(self):
+        source = Path(harness.__file__).read_text()
+        for text in ['delete-generic-password', 'find-generic-password', "'security'", '"security"']:
+            self.assertNotIn(text, source)
+
+    def test_destroy_reads_and_changes_only_the_slots_own_preference_suites(self):
+        with self.slot() as state:
+            (state.preferences / 'com.example.other.plist').write_bytes(plistlib.dumps({'a': 1}))
+            (state.preferences / 'org.checklist.app.plist').write_bytes(plistlib.dumps({'a': 1}))
+            opened, read_bytes = [], Path.read_bytes
+            def recording(path):
+                opened.append(path.name); return read_bytes(path)
+            with patch.object(Path, 'read_bytes', recording):
+                harness.destroy(state.p)
+            self.assertEqual({call[2] for call in state.calls}, set(state.domains))
+            self.assertTrue(all(call[:2] == ['defaults', 'delete'] for call in state.calls))
+            self.assertEqual([name for name in opened if name.endswith('.plist')], [])
+            self.assertTrue((state.preferences / 'com.example.other.plist').exists())
+            self.assertTrue((state.preferences / 'org.checklist.app.plist').exists())
 
     def test_changed_identity_is_refused_before_stop_or_cleanup(self):
-        for key, value in [('keychain', 'Checklist.HumanClaim'), ('identifier', 'org.checklist.app'),
-                           ('keychain', 'org.checklist.test3.enrollments'), ('folder', Path('/outside/slot-4'))]:
+        for key, value in [('label', 'org.checklist.coordination'), ('identifier', 'org.checklist.app'),
+                           ('label', 'org.checklist.test3.coordination'), ('folder', Path('/outside/slot-4'))]:
             with self.subTest(key=key, value=value), self.slot() as state, patch.object(harness, 'run') as run:
                 state.p[key] = value
                 with self.assertRaisesRegex(ValueError, 'identity'): harness.destroy(state.p)
@@ -631,8 +628,7 @@ class DestroyCleanupTests(unittest.TestCase):
         for code in [0, 1, 2]:
             with self.subTest(code=code), self.slot() as state:
                 def run(command, **kwargs):
-                    return SimpleNamespace(returncode=44 if command[0] == 'security' else code,
-                                           stdout='', stderr='defaults failed')
+                    return SimpleNamespace(returncode=code, stdout='', stderr='defaults failed')
                 with patch.object(harness, 'run', side_effect=run):
                     with self.assertRaisesRegex(ValueError, 'preference'): harness.destroy(state.p)
                 self.assertTrue(state.p['folder'].is_dir())
@@ -641,8 +637,6 @@ class DestroyCleanupTests(unittest.TestCase):
         for code in [0, 1]:
             with self.subTest(defaults_exit=code), self.slot() as state:
                 def run(command, **kwargs):
-                    if command[0] == 'security':
-                        return SimpleNamespace(returncode=44, stdout='', stderr='')
                     self.assertEqual(command[:2], ['defaults', 'delete'])
                     self.assertIn(command[2], state.domains)
                     (state.preferences / (command[2] + '.plist')).write_bytes(plistlib.dumps({}))

@@ -98,6 +98,129 @@ class EvidenceOwnershipTests(unittest.TestCase):
         runner = self.folder('runner'); (runner / 'CL-275.json').write_text('{}')
         self.assertEqual(clean.evidence_owners(runner), (set(), 'none', []))
 
+    def runner_with_child(self, report, name='report.md', runner='integration-62/round62/r62b'):
+        folder = self.folder(runner); (folder / name).write_text(report)
+        child = folder / 'alternative-CL-275'; child.mkdir()
+        (child / 'CL-52-task.json').write_text('{}')
+        return folder, child
+
+    def test_title_heading_report_keeps_child_until_its_ticket_is_finished(self):
+        self.statuses['CL-361'] = 'active'
+        runner, child = self.runner_with_child('## CL-361 "A title"\n\n| Item | Result |\n|---|---|\n| 1 | PASS |\n')
+        row = next(r for r in self.run_cleanup() if r['path'] == str(child))
+        self.assertEqual(self.moves, [])
+        self.assertEqual(row['action'], 'kept')
+        self.assertEqual(row['tickets'], ['CL-275', 'CL-361', 'CL-52'])
+        self.assertIn('report mentions', row['owner_basis'])
+        self.assertIn('every ticket a report or notes file mentions', row['reason'])
+        self.assertIn('open or unknown ticket status: CL-361', row['reason'])
+        self.statuses['CL-361'] = 'done'
+        self.run_cleanup()
+        self.assertEqual(self.moves, [child])
+
+    def test_results_below_report_keeps_child_until_every_mention_is_finished(self):
+        self.statuses.update({'CL-344': 'active', 'CL-345': 'done'})
+        runner, child = self.runner_with_child('CL-344 and CL-345 results below.\n')
+        row = next(r for r in self.run_cleanup() if r['path'] == str(child))
+        self.assertEqual(self.moves, [])
+        self.assertEqual(row['action'], 'kept')
+        self.assertIn('CL-344', row['reason'])
+        self.assertNotIn('CL-345', row['reason'])
+        self.assertEqual(sorted(row['tickets']), ['CL-275', 'CL-344', 'CL-345', 'CL-52'])
+        self.statuses['CL-344'] = 'canceled'
+        self.run_cleanup()
+        self.assertEqual(self.moves, [child])
+
+    def test_notes_and_higher_integrator_reports_also_gate(self):
+        for name in ('notes.md', 'integrator-report.md', 'round-notes.md'):
+            with self.subTest(name=name):
+                self.statuses['CL-361'] = 'active'
+                folder = self.folder('integration-' + name + '/round/deeper')
+                (folder.parent.parent / name).write_text('Later text.\n' * 40 + 'See CL-361 for this.\n')
+                child = folder / 'CL-275'; child.mkdir()
+                self.assertIn('CL-361', clean.evidence_owners(child)[0])
+
+    def test_mention_gate_ignores_other_key_shapes_and_creates_no_owner(self):
+        runner, child = self.runner_with_child('Hashes use SHA-256 and UTF-8 from GPT-6, Triage CL-T94; XCL-1 and CL-2x.\n')
+        self.assertEqual(clean.evidence_owners(child)[0], {'CL-275', 'CL-52'})
+        (runner / 'report.md').write_text('CL-361 and CL-362 results below.\n')
+        bare = runner / 'plain'; bare.mkdir(); (bare / 'files.json').write_text('[{"path":"a"}]')
+        self.assertEqual(clean.evidence_owners(bare), (set(), 'none', []))
+        self.assertEqual(clean.evidence_owners(runner), (set(), 'none', []))
+
+    def test_mention_gate_also_covers_a_ticket_manifest_and_the_folders_own_report(self):
+        self.statuses['CL-361'] = 'active'
+        runner = self.folder('integration-62/r62b'); (runner / 'report.md').write_text('## CL-361\n')
+        child = runner / 'hand-in'; child.mkdir(); (child / 'files.json').write_text('[{"ticket":"CL-275"}]')
+        keys, basis, _ = clean.evidence_owners(child)
+        self.assertEqual(keys, {'CL-275', 'CL-361'})
+        self.assertIn('report mentions', basis)
+        own = self.folder('integration-63/CL-275-r1'); (own / 'notes.md').write_text('Rechecked with CL-361.\n')
+        self.assertEqual(clean.evidence_owners(own)[0], {'CL-275', 'CL-361'})
+        self.run_cleanup()
+        self.assertEqual(self.moves, [])
+
+    def test_explicit_child_owner_is_not_widened_by_an_enclosing_mention(self):
+        runner = self.folder('integration-62/round'); (runner / 'integrator-report.md').write_text('CL-361 and CL-362\n')
+        child = runner / 'r62a'; child.mkdir(); (child / 'report.md').write_text('CL-275: PASS\nRead CL-52.\n')
+        self.assertEqual(clean.evidence_owners(child)[0], {'CL-275'})
+
+    def test_unreadable_enclosing_report_retains_the_child(self):
+        runner = self.folder('integration-62/r62b'); (runner / 'round-report.md').write_bytes(b'\xff\xfe CL-361')
+        child = runner / 'CL-275'; child.mkdir()
+        row = next(r for r in self.run_cleanup() if r['path'] == str(child))
+        self.assertEqual(self.moves, [])
+        self.assertEqual(row['registration'], 'invalid')
+        self.assertIn('ownership record unreadable', row['reason'])
+
+    def test_plan_proposes_attribution_from_first_lines_and_never_writes_it(self):
+        heading = self.folder('heading'); (heading / 'report.md').write_text('## CL-344 "A title"\n')
+        below = self.folder('below'); (below / 'notes.md').write_text('CL-344 and CL-275 results below.\n')
+        late = self.folder('late'); (late / 'report.md').write_text('line\n' * 8 + 'CL-344\n')
+        plain = self.folder('plain'); (plain / 'log.txt').write_text('CL-344')
+        hashes = self.folder('hashes'); (hashes / 'notes.md').write_text('SHA-256 from GPT-6\n')
+        plan = registration.registration_plan(self.repo)
+        rows = {Path(r['path']).name: r for r in plan['rows']}
+        self.assertEqual((plan['proposed_count'], plan['unresolved_count']), (0, 5))
+        self.assertEqual((plan['attribution_proposed_count'], plan['unattributed_count']), (2, 3))
+        self.assertEqual(rows['heading']['attribution']['tickets'], ['CL-344'])
+        self.assertEqual(rows['heading']['attribution']['lines'],
+                         [{'file': 'report.md', 'line': 1, 'text': '## CL-344 "A title"'}])
+        self.assertEqual(rows['below']['attribution']['tickets'], ['CL-275', 'CL-344'])
+        self.assertEqual(rows['below']['action'], 'unresolved')
+        for name in ('late', 'plain', 'hashes'): self.assertNotIn('attribution', rows[name])
+        self.assertNotIn('cleanup', rows['heading'])
+        self.assertEqual(registration.apply_plan(plan, self.repo), [])
+        self.assertEqual(list(self.evidence.rglob('owner.json')), [])
+
+    def test_plan_says_what_cleanup_would_do(self):
+        reads = []
+        def reader(keys):
+            reads.append(sorted(keys)); return dict(self.statuses)
+        finished = self.folder('finished'); (finished / 'notes.md').write_text('Ticket: CL-275\n')
+        opened = self.folder('open'); (opened / 'report.md').write_text('Ticket: CL-344\n')
+        attributed = self.folder('attributed'); (attributed / 'report.md').write_text('## CL-52 title\n')
+        blocked = self.folder('blocked'); (blocked / 'report.md').write_text('## CL-344 title\n')
+        unknown = self.folder('unknown'); (unknown / 'log.txt').write_text('data')
+        container = self.folder('container/round'); (container / 'report.md').write_text('Ticket: CL-275\n')
+        (self.evidence / 'container/log.txt').write_text('data')
+        plan = registration.registration_plan(self.repo, reader)
+        rows = {str(Path(r['path']).relative_to(self.evidence)): r['cleanup'] for r in plan['rows']}
+        self.assertEqual(rows['finished']['action'], 'moves_to_trash')
+        self.assertEqual(rows['finished']['tickets'], ['CL-275'])
+        self.assertIn('Trash', rows['finished']['reason'])
+        self.assertEqual(rows['open']['action'], 'kept')
+        self.assertIn('CL-344', rows['open']['reason'])
+        self.assertEqual(rows['attributed']['action'], 'kept')
+        self.assertEqual(rows['attributed']['if_attribution_registered'], 'moves_to_trash')
+        self.assertIn('kept; open or unknown ticket status: CL-344', rows['blocked']['if_attribution_registered'])
+        self.assertEqual(rows['unknown']['action'], 'kept')
+        self.assertIn('container retained; cleanup decides 1 hand-ins', rows['container']['reason'])
+        self.assertEqual(plan['cleanup_counts']['moves_to_trash_if_attribution_registered'], 1)
+        self.assertEqual(self.moves, [])
+        self.assertEqual(list(self.evidence.rglob('owner.json')), [])
+        self.assertEqual(len(reads), 1)
+
     def test_report_case_prose_does_not_register(self):
         runner = self.folder('runner'); (runner / 'report.md').write_text('Case CL-275\nA read of CL-52 succeeded.\n')
         plan = registration.registration_plan(self.repo)

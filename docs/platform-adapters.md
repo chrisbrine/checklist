@@ -22,7 +22,7 @@ Remaining Keychain use in product code (owner decision, 30 October 2026, CL-374)
 |---|---|---|---|
 | One no-UI read of an old installation credential, when no file record exists, on the live instance only | `Sources/ChecklistIPC/LegacyKeychainCredentialMigration.swift` and its bridge `Sources/ChecklistLegacyKeychain/` (only the interaction flag calls) | Enrolled sessions of an existing installation keep working across the install with no prompt and no reconnect | Every live enrollment has a file record, and the owner keeps no bundle that reads Keychain for rollback |
 
-`InstallationCredentialStoreTests.testSourceKeepsKeychainCallsInTheOneMigrationFile` keeps every other Keychain call out of `Sources/` and `Packages/`. `script/test_instances.py destroy` still runs `security delete-generic-password` to remove items of older test slots; this is a development tool and not product code.
+`InstallationCredentialStoreTests.testSourceKeepsKeychainCallsInTheOneMigrationFile` keeps every other Keychain call out of `Sources/` and `Packages/`. `script/test_instances.py destroy` makes no Keychain call and runs no `security` command (CL-379). A test slot keeps its credentials in private files in the slot folder, so a slot created before CL-374 is removed the same way, and a leftover item of an older slot is ignored.
 
 The transaction adapter wraps the queue already opened by StorageBootstrap. It
 preserves synchronous GRDB read/write/writeWithoutTransaction/close semantics.

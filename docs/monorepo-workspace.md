@@ -291,7 +291,12 @@ retains the enclosing tree.
 Without authoritative metadata, a folder-name owner includes every ticket named
 in its descendant file/folder names **and every enclosing folder name**. Apply
 keeps it unless all those tickets are Done or canceled, and the report explains
-the name-only gate. Nested file names alone never establish ownership. Untagged
+the name-only gate. The gate also includes every `CL-N` that a report or notes
+file (a `.md` file whose name contains `report` or `notes`) mentions, in the
+folder or any enclosing folder, when no explicit owner applies (CL-368). A report
+with a heading such as `## CL-361 "Title"` or a line such as `CL-344 and CL-345
+results below.` declares no owner, so its child stays until those tickets are Done
+or canceled. Nested file names or mentions alone never establish ownership. Untagged
 containers and their logs stay; their separately scoped ticket children may
 retire. All older `files.json` shapes remain supported: entry lists,
 `{"files": [...]}`, `{name: {...}}` maps, and `ticket` (string/list) or `tickets`
@@ -303,6 +308,7 @@ runner/hand-in declarations rather than guessing from names:
 
 ```sh
 python3 script/register_legacy_evidence.py --repo "$PWD" > legacy-registration.json
+# Add --read-statuses to say what cleanup would do with each folder (read-only).
 # Inspect proposed and unresolved rows; within explicit registration authorization:
 python3 script/register_legacy_evidence.py --repo "$PWD" --apply legacy-registration.json
 ```
@@ -312,8 +318,18 @@ decision. Registered owners cover their descendants; store/source/managed trees
 are not separately discovered. Apply verifies the root, every source SHA-256 and
 the current ownership before writing any proposed `owner.json`, then rechecks
 immediately before each write. Changed sources or existing registrations refuse
-the saved plan. It never contacts Checklist, retires data, or writes unresolved
-records; a plan alone does not imply registrations were applied.
+the saved plan. It never retires data or writes unresolved records; a plan alone
+does not imply registrations were applied.
+
+An unresolved row whose `report.md` or `notes.md` names a ticket in its first 8
+lines also carries an `attribution` proposal: the tickets and the lines that name
+them. Apply never writes that proposal; it needs a decision or a report that
+declares the owner. `attribution_proposed_count` and `unattributed_count` count
+these rows. With `--read-statuses` or `--status-file`, each row gets a `cleanup`
+field: `moves_to_trash` or `kept` with the reason, computed from the same hand-in
+discovery and ownership as cleanup, and `if_attribution_registered` for a proposal.
+`cleanup_counts` totals them. Only these options read from Checklist, and only
+ticket statuses.
 
 Every owning ticket must have `status_category` `done` or `canceled` (CL-359); open, missing,
 ambiguous or unreadable statuses retain the evidence. The default status reader uses only

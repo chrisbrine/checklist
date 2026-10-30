@@ -511,10 +511,8 @@ class Cleaner:
         state = {'fresh': False}
         def eligible():
             keys, basis, problems = self.owners.get(path) or evidence_owners(path, before)
-            if problems:
-                return 'ownership record unreadable; retained: ' + '; '.join(problems)
-            if not keys:
-                return 'unknown owner: no ticket key in files.json, cleanup.json or folder name; retained'
+            refusal = owner_refusal(keys, problems)
+            if refusal: return refusal
             if state['fresh'] or self.status_cache is None:
                 values = self.status_reader(keys)
             elif self.status_error is not None:
@@ -522,10 +520,8 @@ class Cleaner:
             else:
                 values = self.status_cache
             state['fresh'] = True
-            unresolved = sorted(k for k in keys if values.get(k) not in FINISHED)
-            if unresolved:
-                return ('name-only ownership requires every named and enclosing ticket Done or canceled; '
-                        if 'names' in basis or basis.startswith('folder name') else '') + 'open or unknown ticket status: ' + ', '.join(unresolved)
+            refusal = status_refusal(keys, basis, values)
+            if refusal: return refusal
             if self.notes_path is not None or self.note_poster:
                 self.evidence_notes(path, before)
             return None
@@ -640,6 +636,10 @@ def held_slot_reason(folder):
 
 
 HANDIN_RECORDS = {'cleanup.json', 'files.json', OWNER_RECORD}
+# CL-368: only this project's keys, so SHA-256, GPT-6 or UTF-8 in report text never gate a folder.
+MENTION = re.compile(r'(?<![A-Za-z0-9])(CL-\d+)(?![A-Za-z0-9])')
+REPORT_FILE = re.compile(r'(?i).*(?:report|notes).*\.md')
+MENTION_BASIS = 'report mentions'
 # Shared caches serve every ticket; they are never per-ticket registered.
 SHARED = {'registration': 'shared_cache', 'tickets': []}
 
@@ -702,6 +702,53 @@ def report_owner_keys(path):
     return keys
 
 
+def report_mention_keys(path):
+    """Every project ticket key a report mentions. A mention is a safety gate, never ownership."""
+    safe(path)
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 2 * 1024 * 1024:
+        raise ValueError('invalid or oversized evidence report: ' + str(path))
+    return set(MENTION.findall(path.read_text()))
+
+
+def mentioned_keys(folders):
+    """Keys mentioned by the report and notes files directly in these folders, and read problems."""
+    keys, problems = set(), []
+    for folder in folders:
+        try:
+            names = sorted(entry.name for entry in os.scandir(folder) if REPORT_FILE.fullmatch(entry.name))
+        except OSError as error:
+            problems.append(f'{folder}: {error}')
+            continue
+        for name in names:
+            try:
+                keys |= report_mention_keys(Path(folder) / name)
+            except (OSError, ValueError) as error:  # UnicodeError is a ValueError.
+                problems.append(f'{name}: {error}')
+    return keys, problems
+
+
+def owner_refusal(keys, problems):
+    """Why a hand-in stays whatever its tickets' statuses are, or None."""
+    if problems:
+        return 'ownership record unreadable; retained: ' + '; '.join(problems)
+    if not keys:
+        return 'unknown owner: no ticket key in files.json, cleanup.json or folder name; retained'
+    return None
+
+
+def status_refusal(keys, basis, values):
+    """Why a hand-in stays with these ticket statuses, or None when all are finished."""
+    unresolved = sorted(k for k in keys if values.get(k) not in FINISHED)
+    if not unresolved:
+        return None
+    gate = ''
+    if 'names' in basis or basis.startswith('folder name') or MENTION_BASIS in basis:
+        gate = 'name-only ownership requires every named and enclosing ticket Done or canceled'
+        gate += (', and every ticket a report or notes file mentions; ' if MENTION_BASIS in basis else '; ')
+    return gate + 'open or unknown ticket status: ' + ', '.join(unresolved)
+
+
 def evidence_metadata_owners(folder):
     """Direct authoritative metadata, excluding names and nested fixture records."""
     folder = Path(folder)
@@ -739,7 +786,10 @@ def evidence_owners(folder, entries=None):
     """An enclosing evidence owner owns the whole tree; names cannot split it.
 
     Without authoritative metadata, all names in this tree and its enclosing
-    folders contribute safety gates. A nested filename alone is never ownership.
+    folders contribute safety gates, and so does every ticket that a report or
+    notes file in this folder or an enclosing folder mentions (CL-368: that file
+    may have a format that declares no owner). A nested filename or a mention
+    alone is never ownership.
     """
     folder = Path(folder)
     ancestors = []
@@ -762,10 +812,12 @@ def evidence_owners(folder, entries=None):
         # explicit owner registration or a runner ownership header supersedes it.
         nested = {key for path in entries if path != folder for key in TICKET.findall(path.name)}
         own = set(TICKET.findall(folder.name))
-        keys |= own | nested
+        mentioned, problems = mentioned_keys([*ancestors, folder])
+        keys |= own | nested | mentioned
         named = []
         if nested: named.append('file names')
         if own: named.append('folder name')
+        if mentioned: named.append(MENTION_BASIS)
         if named: basis += ', ' + ' and '.join(named)
         return keys, basis, problems
     enclosing = {key for parent in ancestors for key in TICKET.findall(parent.name)}
@@ -773,11 +825,13 @@ def evidence_owners(folder, entries=None):
     if not own and not enclosing:
         return set(), 'none', []
     nested = {key for path in entries if path != folder for key in TICKET.findall(path.name)}
-    keys = own | enclosing | nested
+    mentioned, problems = mentioned_keys([*ancestors, folder])
+    keys = own | enclosing | nested | mentioned
     named = []
     if nested: named.append('file names')
     if own: named.append('folder name')
     if enclosing: named.append('enclosing folder names')
+    if mentioned: named.append(MENTION_BASIS)
     missing = 0
     record = folder / 'files.json'
     if record in entries:
@@ -787,7 +841,7 @@ def evidence_owners(folder, entries=None):
         except (OSError, ValueError): pass  # Direct record errors already returned above.
     label = ' and '.join(named)
     if missing: label += f' ({missing} files.json entries have no ticket key)'
-    return keys, label, []
+    return keys, label, problems
 
 def evidence_keys(folder, entries=None):
     return evidence_owners(folder, entries)[0]

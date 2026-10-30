@@ -655,9 +655,9 @@ class CleanupTests(unittest.TestCase):
 
     def test_unused_destroy_refuses_external_check_with_open_file(self):
         p=self.slot()
-        with patch.object(slots,'stopped'),patch.object(clean_scratch,'running_paths',return_value=[p['folder']/'report']),patch.object(slots,'delete_slot_keychain') as keychain:
+        with patch.object(slots,'stopped'),patch.object(clean_scratch,'running_paths',return_value=[p['folder']/'report']),patch.object(slots,'run') as run:
             with self.assertRaisesRegex(ValueError,'running app or check'):slots.destroy(p,unused_only=True)
-            keychain.assert_not_called()
+            run.assert_not_called()
 
     def test_slot_live_root_alias_is_refused(self):
         self.slot()
