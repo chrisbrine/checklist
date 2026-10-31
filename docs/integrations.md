@@ -107,6 +107,17 @@ The existing local native receipt listener backs off after non-timeout errors wi
 
 Credential/enrollment files and SQLite are not one transaction. A preparation or commit failure attempts both prior-state restorations; failed cleanup retains the original failure with an explicit repair requirement. Prepared artifacts after a process interruption remain fenced. Once a receipt committed, failure to refresh current state reports a recovery warning instead of rolling back or fabricating failure. The initial synchronous preparation callback is a bounded exception and does not solve long I/O under the writer. These are internal failure contracts; no new Settings pairing UI, grant, runtime or provider qualification is introduced.
 
+## Routes that start a Claude turn (CL-386)
+
+Two routes exist, and neither reads the Claude desktop app's wake count. The app holds its automatic "session finished a turn" wakes at 10 in a row with no message from the person (`wakeWaitsForPerson`, read from the app on 31 October 2026).
+
+| Route | Sender | Path | Result recorded |
+|---|---|---|---|
+| Checklist relay | The service | A `priority: next` frame to the engine socket `/tmp/cc-socks/<pid>.sock` | `transport_written`, `held`, `failed` or `delivery_uncertain` |
+| App tool `send_message` or `SendMessage` | A session only | The app's `sendPeerMessage` | The host's `delivered`, `queued` or `undelivered` text; Checklist records nothing |
+
+The service cannot call `send_message`, so a service message uses the relay and an agent milestone uses `send_message`. Neither result proves that the model read the message.
+
 ## Honest delivery
 
 Saving a note commits content and exact-recipient outbox atomically. Show **Saved / queued**, **held/refused**, **provider accepted**, **recipient acknowledged** and **addressed** separately. An acknowledgment names the actual recipient generation; a parent receipt is not its child's. A model report is not owner-read. Target the current attempt/explicit resolved host-assistant identity and enrolled route, not the most recently seen label.
@@ -154,7 +165,7 @@ The assistant plugin is generic; initial Dot is one adapter, not the product's u
 
 ## Work health pickup boundary
 
-System [work health](work-health.md) requests use exact-session MCP pickup with explicit native wake unavailable. A durable queue entry is neither a resumed host turn nor a response. Health checks do not install adapters, enroll sessions, enable assistants or launch/poll models. Current/native provider route qualifications remain unchanged; installed health visibility and actual host pickup need their own synthetic observation.
+System [work health](work-health.md) requests go once through the Claude relay when the exact session has a verified native endpoint (CL-386), and they stay on exact-session MCP pickup. A durable queue entry or relay write is neither a resumed host turn nor a response. Health checks do not install adapters, enroll sessions, enable assistants or launch/poll models. Current/native provider route qualifications remain unchanged; installed health visibility and actual host pickup need their own synthetic observation.
 
 ## Read-only message readiness (CL-37)
 

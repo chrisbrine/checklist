@@ -514,9 +514,9 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
                   let sid=delivery["recipient_session_id"] as? String,
                   let enrollment=enrollments.values.first(where:{$0.sessionID==sid && $0.nativeEndpoint != nil && $0.revoked != true}),let endpoint=enrollment.nativeEndpoint,
                   let message=delivery["message"] as? [String:Any],let mid=message["id"] as? String,let body=message["body"] as? String else { continue }
-            // Owner and agent ticket notes both use the relay. It always states its own restricted class
-            // (prompting) and the real author; it never claims an originating agent's permission class.
-            guard let origin=NativeRelayOrigin(rawValue:message["origin"] as? String ?? "") else { continue }
+            // Owner notes, agent ticket notes and work health requests use the relay. It always states its own
+            // restricted class (prompting) and the real author; it never claims an originating agent's permission class.
+            guard let origin=NativeRelayOrigin.forDispatch(messageOrigin:message["origin"] as? String,nativeRelay:delivery["native_relay"] as? String) else { continue }
             var attrs=stat()
             guard lstat(endpoint,&attrs)==0,UInt64(attrs.st_dev)==enrollment.nativeDevice,UInt64(attrs.st_ino)==enrollment.nativeInode else { continue }
             attemptedDeliveries.insert(id)

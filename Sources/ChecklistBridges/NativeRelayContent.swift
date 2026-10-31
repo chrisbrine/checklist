@@ -5,6 +5,14 @@ import ChecklistCore
 public enum NativeRelayOrigin: String, Sendable {
     case humanUI = "human_ui"
     case agent
+    case system
+
+    /// The relay origin of one delivery, or nil when it stays on Checklist pickup. A system message
+    /// relays only with its delivery's own marker, so requests queued by an earlier build are not sent late.
+    public static func forDispatch(messageOrigin: String?, nativeRelay: String?) -> NativeRelayOrigin? {
+        guard let origin = messageOrigin.flatMap(NativeRelayOrigin.init(rawValue:)) else { return nil }
+        return origin == .system && nativeRelay != "work_health" ? nil : origin
+    }
 }
 
 /// The service supplies this only after checking the exact recipient's one-reply allowance.
@@ -30,6 +38,7 @@ public enum NativeRelayContent {
         switch origin {
         case .humanUI: authorship = "human_ui (the owner, through the Checklist app)"
         case .agent: authorship = "agent (an agent-authored Checklist note)"
+        case .system: authorship = "system (an automatic Checklist work health request, written by no person or agent)"
         }
         let reply: String
         if let permittedReply {

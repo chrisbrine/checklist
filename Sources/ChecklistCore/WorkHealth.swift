@@ -150,7 +150,7 @@ extension CommandRouter {
         if !bool(selected,"active_attention") {
             value["state"] = "inactive"; value["attention"] = false; value.removeValue(forKey:"next_check_at")
         }
-        value["native_wake"] = "unavailable; MCP pickup only, no model runtime"
+        value["native_wake"] = "one relay write when the session has a verified native endpoint; otherwise MCP pickup; no model runtime"
         return value
     }
 
@@ -163,7 +163,9 @@ extension CommandRouter {
             let session = try scoped(db,sid,pid,type:"session")
             guard session["role"] as? String == "worker", canReceive(session,project:pid), sessionGeneration(session) == generation else { throw CoreError("RECIPIENT_CHANGED", "Health recipient authorization changed before pickup queueing.") }
             if deliveries.contains(where: { $0["recipient_session_id"] as? String == sid && $0["recipient_authorization_generation"] as? String == generation }) { continue }
-            var delivery: JSON = ["id":uuid(),"project_id":pid,"message_id":mid,"recipient_session_id":sid,"recipient_authorization_generation":generation,"recipient_role":recipient["recipient_role"] ?? "health_handler","state":"queued","push_state":"unavailable","push_reason":"System health requests have no qualified native wake; available on exact-session MCP pickup.","revision":1,"created_at":now()]
+            var delivery: JSON = ["id":uuid(),"project_id":pid,"message_id":mid,"recipient_session_id":sid,"recipient_authorization_generation":generation,"recipient_role":recipient["recipient_role"] ?? "health_handler","state":"queued","push_state":"unavailable","push_reason":"This work health notice waits for exact-session MCP pickup.","revision":1,"created_at":now()]
+            // Only the request relays. Its outcome and no-response notices must not start a turn for the session that replied.
+            if message["health_request"] != nil { delivery["native_relay"] = "work_health"; delivery["push_reason"] = "Relayed once when this session has a verified native endpoint; otherwise it waits for exact-session MCP pickup." }
             copyRoleLabel(recipient, into: &delivery)
             try save(db,delivery,type:"delivery");deliveries.append(delivery)
         }
@@ -317,7 +319,7 @@ extension CommandRouter {
         } else if date >= max(due, baseline.addingTimeInterval(interval)) {
             let deadline = healthStamp(date.addingTimeInterval(grace))
             let request: JSON = ["target": target, "task_revision": int(task, "revision"), "acceptance_revision": int(task, "acceptance_revision"), "manifest_id": task["current_manifest_id"] ?? NSNull(), "requested_at": stamp, "last_progress_at": progress.map(healthStamp) ?? NSNull(), "progress_token": progressToken, "deadline": deadline]
-            let note = try healthNote(db, task: task, body: "Work health check: does work continue? Last substantive progress: \(progress.map(healthStamp) ?? "not recorded"). Reply to this exact note with current progress or a known wait, or call work_health_respond with request_id from this note. Response due \(deadline). This is an advisory check, not a new claim. Native wake is unavailable; MCP pickup is queued when this exact session remains eligible.", target: target, request: request)
+            let note = try healthNote(db, task: task, body: "Work health check: does work continue? Last substantive progress: \(progress.map(healthStamp) ?? "not recorded"). Reply to this exact note with current progress or a known wait, or call work_health_respond with request_id from this note. Response due \(deadline). This is an advisory check, not a new claim. It is also available on MCP pickup while this exact session remains eligible.", target: target, request: request)
             health["request_id"] = note["id"]; health["deadline"] = deadline; health["next_check_at"] = deadline; health["state"] = "awaiting_response"; health["attention"] = target["kind"] as? String == "missing_handler"
         } else if health["request_id"] == nil {
             health["state"] = target["kind"] as? String == "missing_handler" ? "missing_handler" : "current"

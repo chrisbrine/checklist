@@ -179,6 +179,28 @@ extension EvidenceAuthorityTests {
         try checkHealth(); XCTAssertEqual(try health(p,t)["state"] as? String,"current")
         XCTAssertNil(try health(p,t)["request_id"])
     }
+    func testWorkHealthRequestIsOneRelayCandidateAndItsReplyStartsNoTurn() throws {
+        let p = try project(), t = try ready(p), w = try native(p,"health-relay",domain:"health-relay"), a = try claim(p,t,caller:w)
+        let bridge = Caller(role:"owner",installation:"native-bridge",projectIDs:[])
+        func candidates() throws -> [JSON] {
+            // The service applies NativeRelayOrigin.forDispatch to these: a system message relays only with its marker.
+            (try call("delivery_pending",["native_session_ids":[w.sessionID!],"native_dispatch_candidates":true],bridge)["deliveries"] as! [JSON])
+                .filter { ($0["message"] as? JSON)?["origin"] as? String != "system" || $0["native_relay"] != nil }
+        }
+        try ageHealthAttempt(a); try checkHealth()
+        let first = try XCTUnwrap(try candidates().first)
+        XCTAssertEqual(try candidates().count,1)
+        XCTAssertEqual(first["native_relay"] as? String,"work_health")
+        XCTAssertEqual((first["message"] as? JSON)?["origin"] as? String,"system")
+        _ = try call("delivery_record",["delivery_id":first["id"]!,"state":"transport_written","receipt":["bytes":1]],bridge)
+        try checkHealth()
+        XCTAssertTrue(try candidates().isEmpty,"A repeated tick keeps one request and one relay write")
+        let mid = try health(p,t)["request_id"] as! String
+        try checkHealth(at:Date().addingTimeInterval(1202))
+        XCTAssertTrue(try candidates().isEmpty,"The no-response notice stays on pickup")
+        XCTAssertEqual(try respondHealth(p,t,request:mid,caller:w)["outcome"] as? String,"resumed")
+        XCTAssertTrue(try candidates().isEmpty,"A reply starts no further turn for its author")
+    }
     func testWorkHealthLateReplyResumesCurrentHandlerAndIsIdempotent() throws {
         let p = try project(), t = try ready(p), w = try native(p,"health-late",domain:"health-Late"), a = try claim(p,t,caller:w)
         try ageHealthAttempt(a); try checkHealth()
@@ -243,7 +265,7 @@ extension EvidenceAuthorityTests {
         XCTAssertEqual(state["delivery_state"] as? String,"saved_for_pickup")
         XCTAssertEqual(state["session_state"] as? String,"ended")
         XCTAssertEqual(try healthTask(p,t)["active_attempt_id"] as? String,a["id"] as? String)
-        XCTAssertTrue((state["native_wake"] as? String ?? "").contains("unavailable"))
+        XCTAssertTrue((state["native_wake"] as? String ?? "").contains("otherwise MCP pickup"))
     }
     func testWorkHealthMCPDiscoveryAndSelectedNativeProjection() throws {
         let p = try project(), t = try ready(p), w = try native(p,"health-catalog",domain:"health-catalog")

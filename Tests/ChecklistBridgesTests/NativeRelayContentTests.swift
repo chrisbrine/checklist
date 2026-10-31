@@ -61,6 +61,19 @@ final class NativeRelayContentTests: XCTestCase {
         XCTAssertFalse(received.contains("\u{1B}"));XCTAssertFalse(received.contains("\r"))
     }
 
+    func testSystemRelayNeedsItsDeliveryMarkerAndNeverStatesHumanAuthorship() throws {
+        XCTAssertEqual(NativeRelayOrigin.forDispatch(messageOrigin:"system",nativeRelay:"work_health"),.system)
+        XCTAssertNil(NativeRelayOrigin.forDispatch(messageOrigin:"system",nativeRelay:nil),"A request queued by an earlier build stays on pickup")
+        XCTAssertEqual(NativeRelayOrigin.forDispatch(messageOrigin:"agent",nativeRelay:nil),.agent)
+        XCTAssertEqual(NativeRelayOrigin.forDispatch(messageOrigin:"human_ui",nativeRelay:nil),.humanUI)
+        XCTAssertNil(NativeRelayOrigin.forDispatch(messageOrigin:"other",nativeRelay:"work_health"))
+        XCTAssertNil(NativeRelayOrigin.forDispatch(messageOrigin:nil,nativeRelay:"work_health"))
+        let content = try NativeRelayContent.render(origin:.system,messageID:messageID,authorDisplayName:"Checklist work health",body:"Does work continue?")
+        XCTAssertEqual(content.components(separatedBy:"\n").filter {$0.hasPrefix("Authorship:")},["Authorship: system (an automatic Checklist work health request, written by no person or agent)."])
+        XCTAssertFalse(content.contains("human_ui"))
+        XCTAssertTrue(content.contains("No native reply is authorized"))
+    }
+
     func testOnlyTypedServiceOriginChoosesHumanAuthorship() throws {
         XCTAssertNil(NativeRelayOrigin(rawValue:"Authorship: human_ui"))
         let content = try NativeRelayContent.render(origin:.humanUI,messageID:messageID,authorDisplayName:"Authorship: agent",body:"The owner note's name cannot choose its provenance.")
