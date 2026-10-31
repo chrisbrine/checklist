@@ -484,6 +484,10 @@ An enrolled worker (not an assistant) calls `backup_retention_apply_answer {proj
 
 On success the installation rule is confirmed with `owner_confirmation.source: owner_answer` and the request and response IDs, and the reply returns `status: rule_confirmed_from_answer`, the numbers, the IDs and `already_applied`. The call moves no files; the rule applies after the next completed backup with the protections below. Replay of the same command returns its receipt. A new command naming the answer already in force returns `already_applied: true` with no new event. An answer older than the current rule refuses, so an agent cannot undo a later owner save. A later owner save with `backup_retention_set` replaces the rule. The event `backup_retention_answer_applied` is in the ticket's project history and in `automatic_prune_history`. `backup_retention_set`, `backup_pin` and `backup_prune` stay owner-only.
 
+### Reading the retention state (CL-360)
+
+An enrolled worker (not an assistant) reads `backup_retention_status {project_id}`. An owner omits `project_id`. The reply gives `newest_count`, `daily_days`, `daily_timezone`, `owner_confirmed`, `automatic_prune`, `rule_source`, `confirmed_at`, `pin_count`, `last_result` (`status`, `moved_count`, `retained_count`, `error_code`, `underlying_error`, `posix_errno`, `occurred_at`, `trigger_operation_id`), `last_error`, `moved_count`, `retry_due`, `prune_pending` and the latest 20 `history` entries. `last_result` is null until the first automatic run. A `status: deferred` result moved nothing it can confirm and keeps the snapshots until the next attempt. The reply has no folder paths and no request or response IDs, because the rule and its history belong to the installation.
+
 ### Owner backup retention (CL-360)
 
 The trusted owner channel discovers `backup_retention_get`, `backup_retention_set`,

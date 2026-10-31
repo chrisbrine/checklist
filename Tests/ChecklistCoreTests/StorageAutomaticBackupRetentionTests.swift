@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
 import GRDB
+import Darwin
 @testable import ChecklistCore
 
 final class StorageAutomaticBackupRetentionTests: XCTestCase {
@@ -214,6 +215,73 @@ final class StorageAutomaticBackupRetentionTests: XCTestCase {
         let moved = try XCTUnwrap((result["moved_to_trash"] as? [JSON])?.first)
         XCTAssertTrue((moved["trash_path"] as? String)?.hasPrefix(f.workspace.path + "/") == true)
         try f.router!.dbQueue.read {db in XCTAssertNil(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='backup-automatic-prune-due'"))}
+    }
+    /// macOS privacy refuses open(2) and listing of the real ~/.Trash for a process
+    /// with no grant, while it allows a path-based mkdir, rename and child open.
+    /// Mode 0300 gives the same refusal on a fixture, so any open of the root fails.
+    private func refusingTrash(_ f: StorageFixture) throws -> URL {
+        let trash = f.workspace.appendingPathComponent("Refusing Trash",isDirectory:true)
+        try FileManager.default.createDirectory(at:trash,withIntermediateDirectories:true)
+        XCTAssertEqual(chmod(trash.path,0o300),0)
+        addTeardownBlock {_ = chmod(trash.path,0o700)}
+        XCTAssertEqual(Darwin.open(trash.path,O_RDONLY | O_DIRECTORY),-1,"The fixture must refuse open as the real Trash does.")
+        f.router!.automaticBackupRetentionTrashRoot = trash
+        return trash
+    }
+    func testPruneReachesATrashWhoseRootRefusesOpen() throws {
+        let f = try fixture(),trash = try refusingTrash(f),old = try snapshot(f,"old");try age(f,old)
+        _ = try configure(f)
+        let latest = try snapshot(f,"latest"),result = try last(f)
+        XCTAssertEqual(result["status"] as? String,"complete",String(describing:result))
+        XCTAssertEqual(result["moved_count"] as? Int,1);XCTAssertTrue(exists(latest));XCTAssertFalse(exists(old))
+        let moved = try XCTUnwrap((result["moved_to_trash"] as? [JSON])?.first?["trash_path"] as? String)
+        XCTAssertTrue(moved.hasPrefix(trash.path + "/Checklist-backups-"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath:moved + "/manifest.json"),"The snapshot stays whole in the Trash.")
+        let owner = URL(fileURLWithPath:moved).deletingLastPathComponent().appendingPathComponent("prune-owner.json").path
+        XCTAssertTrue(FileManager.default.fileExists(atPath:owner))
+    }
+    func testInterruptedMoveReconcilesExactInodeWhenTrashRootRefusesOpen() throws {
+        let f = try fixture(),trash = try refusingTrash(f),old = try snapshot(f,"old");try age(f,old)
+        let latest = try snapshot(f,"latest");_ = try configure(f)
+        let deferred = f.router!.applyAutomaticBackupRetention(after:latest["operation_id"] as? String,observe:{if $0 == "prune_snapshot_moved" {throw StorageSnapshotFailure.canceled}})
+        XCTAssertEqual(deferred["status"] as? String,"deferred");XCTAssertFalse(exists(old))
+        try reopen(f);f.router!.automaticBackupRetentionTrashRoot = trash
+        _ = f.router!.applyAutomaticBackupRetention()
+        XCTAssertEqual(try last(f)["status"] as? String,"complete");XCTAssertEqual(try last(f)["moved_count"] as? Int,1)
+        XCTAssertEqual(f.router!.applyAutomaticBackupRetention(after:latest["operation_id"] as? String)["replayed"] as? Bool,true)
+    }
+    func testReconciliationRefusesAReplacedSnapshotInTrash() throws {
+        let f = try fixture(),trash = try refusingTrash(f),old = try snapshot(f,"old");try age(f,old)
+        let latest = try snapshot(f,"latest");_ = try configure(f)
+        _ = f.router!.applyAutomaticBackupRetention(after:latest["operation_id"] as? String,observe:{if $0 == "prune_snapshot_moved" {throw StorageSnapshotFailure.canceled}})
+        let raw = try f.router!.dbQueue.read {try XCTUnwrap(String.fetchOne($0,sql:"SELECT value FROM metadata WHERE key GLOB 'backup-prune-intent:*'"))}
+        let moved = try XCTUnwrap((jsonObject(raw)["entries"] as? [JSON])?.first?["trash_path"] as? String)
+        let aside = moved + "-aside"
+        XCTAssertEqual(rename(moved,aside),0)
+        try FileManager.default.createDirectory(atPath:moved,withIntermediateDirectories:false)
+        try Data("{}".utf8).write(to:URL(fileURLWithPath:moved + "/manifest.json"))
+        try reopen(f);f.router!.automaticBackupRetentionTrashRoot = trash
+        let result = f.router!.applyAutomaticBackupRetention()
+        XCTAssertEqual(result["status"] as? String,"deferred",String(describing:result))
+        XCTAssertEqual(result["underlying_error"] as? String,"BACKUP_PRUNE_SOURCE_CHANGED")
+    }
+    /// Proof run only, with CHECKLIST_P360D_REAL_TRASH=1: production Trash lookup and
+    /// a fixture store, so only this fixture's small snapshots reach the real Trash.
+    func testRealTrashProofRunOnly() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["CHECKLIST_P360D_REAL_TRASH"] == "1","Proof run only.")
+        let f = try fixture(),old = try snapshot(f,"old");try age(f,old)
+        f.router!.automaticBackupRetentionTrashRoot = nil
+        let trash = try FileManager.default.url(for:.trashDirectory,in:.userDomainMask,appropriateFor:f.root,create:true)
+        let probe = Darwin.open(trash.path,O_RDONLY | O_DIRECTORY);let refusal = errno
+        if probe >= 0 {Darwin.close(probe)}
+        print("P360D trash_root=\(trash.path) open_fd=\(probe) errno=\(refusal)")
+        _ = try configure(f)
+        _ = try snapshot(f,"new")
+        let result = try last(f)
+        print("P360D result=\(try jsonString(result))")
+        XCTAssertEqual(result["status"] as? String,"complete");XCTAssertFalse(exists(old))
+        let moved = try XCTUnwrap((result["moved_to_trash"] as? [JSON])?.first?["trash_path"] as? String)
+        XCTAssertTrue(moved.hasPrefix(trash.path + "/Checklist-backups-"));XCTAssertTrue(FileManager.default.fileExists(atPath:moved + "/manifest.json"))
     }
     func testDeferredAutomaticPruneKeepsDurableDueUntilRecoveryCompletes() throws {
         let f = try fixture(),old = try snapshot(f,"old");try age(f,old)

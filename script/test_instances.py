@@ -31,7 +31,7 @@ import uuid
 from clean_scratch import caller_session, mark_qualification, read_marker, requested_tickets, validate_fingerprint
 from test_instance_restage import FRESH_COPY, backup_completion, reuse_proof
 from verify_stage import sha, signing_teams, verify as verify_stage
-from verify_install import failure_guidance, upgrading_message, upgrading_status
+from verify_install import describe_status, failure_guidance, status_still_starting, upgrading_message, upgrading_status
 
 REPO = Path(__file__).resolve().parent.parent
 BASE = Path.home() / 'Library/Application Support/Checklist Test Instances'
@@ -1424,27 +1424,30 @@ def service_status(p, *, bound=None):
     bound = start_deadline_seconds() if bound is None else bound
     number = p['folder'].name.removeprefix('slot-')
     started = time.monotonic();deadline = started + bound;next_progress = started + 60
-    last_upgrade = None
+    last_upgrade = None;last_status = 'no status call finished'
     command = [p['bundle'] / 'Contents/MacOS/checklist', 'service', 'status']
     def expired():
         raise ValueError(f'Slot {number} startup deadline expired after {bound:g} seconds; '
                          'the slot service keeps running its protected startup. '
                          f'Run start --slot {number} again to keep waiting, '
                          f'or status --slot {number} to inspect it; '
-                         'destroying the slot during a protected snapshot discards that work.')
+                         'destroying the slot during a protected snapshot discards that work. '
+                         'Last status: ' + last_status)
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0: expired()
         try: result = run(command, timeout=min(30, remaining), check=False)
-        except subprocess.TimeoutExpired: pass
+        except subprocess.TimeoutExpired as error:
+            last_status = f'no reply within {error.timeout:g} seconds'
         else:
+            last_status = describe_status(result)
             try: payload = json.loads(result.stdout)
             except (ValueError, TypeError):
-                if not (result.returncode and 'unavailable' in ((result.stderr or '') + (result.stdout or '')).lower()):
-                    raise ValueError('Slot service returned invalid status: ' + str(result.stdout))
+                if not status_still_starting(result):
+                    raise ValueError('Slot service returned invalid status: ' + last_status)
             else:
                 body = payload.get('data', payload) if isinstance(payload, dict) else None
-                if not isinstance(body, dict): raise ValueError('Slot service returned invalid status: ' + str(result.stdout))
+                if not isinstance(body, dict): raise ValueError('Slot service returned invalid status: ' + last_status)
                 states = [payload.get('state'), body.get('state')]
                 if any(state not in [None, 'ready', 'running', 'healthy', 'starting', 'unavailable', 'upgrading'] for state in states):
                     raise ValueError('Slot service reported an error state: ' + result.stdout)

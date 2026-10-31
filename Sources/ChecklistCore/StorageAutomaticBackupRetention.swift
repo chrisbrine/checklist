@@ -128,6 +128,30 @@ extension CommandRouter {
         return result
     }
 
+    /// An agent reads whether the rule applies and whether the last prune ran. The
+    /// reply has no folder path and no request or response ID, because the rule and
+    /// its history belong to the installation and can come from another project.
+    func backupRetentionStatus(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
+        guard c.role != "assistant" else {throw CoreError("FORBIDDEN","Only an enrolled worker can read the retention state.")}
+        if !c.isOwner {_ = try scope(db,p,c)}
+        let settings = try backupRetentionSettings(db),confirmation = settings["owner_confirmation"] as? JSON
+        func metadata(_ key: String) throws -> String? {try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[key])}
+        var value: JSON = ["newest_count":settings["newest_count"] ?? NSNull(),"daily_days":settings["daily_days"] ?? NSNull(),"daily_timezone":"UTC","owner_confirmed":bool(settings,"owner_confirmed"),"automatic_prune":bool(settings,"automatic_prune"),"rule_source":confirmation?["source"] ?? NSNull(),"confirmed_at":confirmation?["confirmed_at"] ?? NSNull(),"pin_count":(settings["pins"] as? [JSON] ?? []).count]
+        var last: JSON = [:]
+        if let raw = try metadata("backup-automatic-prune-last") {
+            let result = jsonObject(raw)
+            for key in ["status","moved_count","error_code","underlying_error","posix_errno","occurred_at","trigger_operation_id"] {if let item = result[key] {last[key] = item}}
+            if let retained = result["retained_snapshots"] as? [JSON] {last["retained_count"] = retained.count}
+        }
+        value["last_result"] = last.isEmpty ? NSNull() : last
+        value["last_error"] = last["underlying_error"] ?? last["error_code"] ?? NSNull()
+        value["moved_count"] = last["moved_count"] ?? NSNull()
+        value["retry_due"] = try metadata("backup-automatic-prune-due") != nil
+        value["prune_pending"] = try metadata("backup-automatic-prune-pending") != nil
+        value["history"] = try automaticBackupRetentionHistory(db).map {$0.filter {!["request_id","response_id"].contains($0.key)}}
+        return value
+    }
+
     /// Only a new trusted confirmation may fence an inherited foreign marker.
     /// Preserve both the exact marker and the underlying prune journal: this
     /// records lost applicability, never completion of an uncertain old move.
@@ -147,7 +171,7 @@ extension CommandRouter {
 
     func automaticBackupRetentionHistory(_ db: Database) throws -> [JSON] {
         try Row.fetchAll(db,sql:"""
-            SELECT id,occurred_at,json_object('status',json_extract(data,'$.status'),'moved_count',json_extract(data,'$.moved_count'),'error_code',json_extract(data,'$.error_code'),'trigger_operation_id',json_extract(data,'$.trigger_operation_id'),'command_id',json_extract(data,'$.command_id'),'newest_count',json_extract(data,'$.newest_count'),'daily_days',json_extract(data,'$.daily_days'),'request_id',json_extract(data,'$.request_id'),'response_id',json_extract(data,'$.response_id')) AS summary
+            SELECT id,occurred_at,json_object('status',json_extract(data,'$.status'),'moved_count',json_extract(data,'$.moved_count'),'error_code',json_extract(data,'$.error_code'),'underlying_error',json_extract(data,'$.underlying_error'),'posix_errno',json_extract(data,'$.posix_errno'),'trigger_operation_id',json_extract(data,'$.trigger_operation_id'),'command_id',json_extract(data,'$.command_id'),'newest_count',json_extract(data,'$.newest_count'),'daily_days',json_extract(data,'$.daily_days'),'request_id',json_extract(data,'$.request_id'),'response_id',json_extract(data,'$.response_id')) AS summary
             FROM events WHERE (kind IN ('backup_pruned','backup_retention_deferred') AND json_extract(data,'$.origin')='automatic_backup_retention') OR kind='backup_retention_answer_applied' ORDER BY seq DESC LIMIT 20
             """).map {row in var value = jsonObject(row["summary"]);value["id"] = row["id"] as String;value["occurred_at"] = row["occurred_at"] as String;return value}
     }
@@ -231,6 +255,7 @@ extension CommandRouter {
         } catch {
             var data: JSON = ["status":"deferred","origin":"automatic_backup_retention","error_code":(error as? CoreError)?.code ?? "BACKUP_PRUNE_IO","occurred_at":now(),"moved_count":NSNull()]
             if let trigger = attempt?["trigger_operation_id"] {data["trigger_operation_id"] = trigger}
+            for key in ["underlying_error","posix_errno"] {if let value = (error as? CoreError)?.details[key] {data[key] = value}}
             // Keep an interrupted prune's exact UUID and parameters. If pruning
             // never committed its intent, the next completed backup may replan.
             try? ArchiveStorageGate.withExclusive(root:root) { _ in

@@ -34,6 +34,37 @@ final class BackupRetentionAnswerTests: XCTestCase {
         var input: JSON = ["project_id":project["id"]!,"request_id":request,"response_id":response];input.merge(extra) {_,new in new}
         return try f.call("backup_retention_apply_answer",input,command:command,caller:c)
     }
+    func testWorkerReadsRetentionStateWithNoPathsOrRequestIDs() throws {
+        let f = try fixture(),project = try f.project(),c = try worker(f,project)
+        let idle = try f.call("backup_retention_status",["project_id":project["id"]!],caller:c)["data"] as! JSON
+        XCTAssertEqual(idle["automatic_prune"] as? Bool,false);XCTAssertTrue(idle["last_result"] is NSNull);XCTAssertTrue(idle["rule_source"] is NSNull)
+        let r = try request(f,project,c,labels:[label]),response = try answer(f,r)
+        _ = try apply(f,project,c,request:r["id"] as! String,response:response)
+        try FileManager.default.createDirectory(at:f.root.appendingPathComponent("backups"),withIntermediateDirectories:true)
+        let old = try f.call("backup_create",["path":f.root.appendingPathComponent("backups/snapshot-old").path])["data"] as! JSON
+        try f.router!.dbQueue.write {db in
+            let key = "backup-generation:" + (old["operation_id"] as! String)
+            var receipt = jsonObject(try XCTUnwrap(String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[key])))
+            var summary = receipt["summary"] as! JSON;summary["captured_at"] = "2000-01-01T00:00:00Z";receipt["summary"] = summary
+            try db.execute(sql:"UPDATE metadata SET value=? WHERE key=?",arguments:[try jsonString(receipt),key])
+        }
+        // A worker reads the deferral: this Trash is a file, so the owned folder fails.
+        let blocked = f.workspace.appendingPathComponent("not-a-folder")
+        try Data().write(to:blocked);f.router!.automaticBackupRetentionTrashRoot = blocked
+        for name in ["a","b","c"] {_ = try f.call("backup_create",["path":f.root.appendingPathComponent("backups/snapshot-" + name).path])}
+        let deferred = try f.call("backup_retention_status",["project_id":project["id"]!],caller:c)["data"] as! JSON
+        let last = try XCTUnwrap(deferred["last_result"] as? JSON)
+        XCTAssertEqual(deferred["newest_count"] as? Int,3);XCTAssertEqual(deferred["daily_days"] as? Int,3);XCTAssertEqual(deferred["rule_source"] as? String,"owner_answer")
+        XCTAssertEqual(last["status"] as? String,"deferred");XCTAssertEqual(deferred["last_error"] as? String,"BACKUP_PRUNE_IO");XCTAssertEqual(last["posix_errno"] as? Int,Int(ENOTDIR))
+        f.router!.automaticBackupRetentionTrashRoot = f.workspace
+        _ = try f.call("backup_create",["path":f.root.appendingPathComponent("backups/snapshot-d").path])
+        let done = try f.call("backup_retention_status",["project_id":project["id"]!],caller:c)["data"] as! JSON
+        XCTAssertEqual((done["last_result"] as? JSON)?["status"] as? String,"complete");XCTAssertEqual(done["moved_count"] as? Int,2);XCTAssertTrue(done["last_error"] is NSNull)
+        // _checklist is the generic envelope that gives this caller its own pending answers.
+        let text = String(decoding:try JSONSerialization.data(withJSONObject:done.filter {$0.key != "_checklist"}),as:UTF8.self)
+        XCTAssertFalse(text.contains(f.root.path.replacingOccurrences(of:"/",with:"\\/")),text);XCTAssertFalse(text.contains("snapshot-"),text);XCTAssertFalse(text.contains(r["id"] as! String),text);XCTAssertFalse(text.contains(response),text)
+        XCTAssertThrowsError(try f.call("backup_retention_status",["project_id":UUID().uuidString.lowercased()],caller:c))
+    }
     private func refused(_ reason: String,file: StaticString = #filePath,line: UInt = #line,_ body: () throws -> Void) {
         XCTAssertThrowsError(try body(),file:file,line:line) {error in
             let core = error as? CoreError

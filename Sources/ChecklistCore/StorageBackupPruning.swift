@@ -86,6 +86,9 @@ extension CommandRouter {
     static let storageBackupPruningMethods: Set<String> = ["backup_retention_get","backup_retention_set","backup_pin","backup_prune_preview","backup_prune"]
     /// Test seam is an explicit owned directory, never the user's Trash. Production
     /// uses the filesystem's appropriate Trash and atomic same-volume rename only.
+    /// macOS privacy refuses open(2) and listing of ~/.Trash for a process with no
+    /// grant, but allows a path-based mkdir and open of a child, so no code here may
+    /// open or list the Trash root (CL-360).
     func executeStorageBackupPruning(method: String,params: JSON,caller: Caller,trashRoot: URL? = nil,automaticTrigger: String? = nil,observe: (String) throws -> Void = {_ in}) throws -> JSON {
         if automaticTrigger != nil {
             guard method == "backup_prune",caller.principal == Self.automaticBackupRetentionCaller.principal else {throw CoreError("FORBIDDEN","Automatic backup retention is an internal service operation.")}
@@ -168,14 +171,17 @@ extension CommandRouter {
                 else if let trashRoot {trash = trashRoot}
                 else {trash = try FileManager.default.url(for:.trashDirectory,in:.userDomainMask,appropriateFor:root,create:true)}
                 if let trash {
-                    let parent = try StorageObjectFiles(root:trash)
                     // A pre-intent crash may leave this owned empty Trash
                     // container. Its random identity never blocks original retry.
-                    let name = "Checklist-backups-" + command + "-" + uuid()
-                    let owned = try parent.makeDirectory(name)
+                    let ownedRoot = trash.appendingPathComponent("Checklist-backups-" + command + "-" + uuid(),isDirectory:true)
+                    guard mkdir(ownedRoot.path,0o700) == 0 else {throw CoreError("BACKUP_PRUNE_IO","The owned Trash folder could not be created; every snapshot was retained.",details:["posix_errno":errno])}
+                    let owned = try StorageObjectFiles(root:ownedRoot,folderAccess:.insideTrash)
                     let marker: JSON = ["principal":caller.principal,"digest":digest,"source_root":root.path]
                     try owned.writeNew("prune-owner.json",bytes:Data((try jsonString(marker)).utf8))
-                    try parent.synchronizePublicationDirectory()
+                    // The Trash root cannot be opened to flush its entry. This full
+                    // sync persists the earlier mkdir on the same device; if the
+                    // folder is lost anyway, its open fails and the source stays.
+                    try owned.synchronizePublicationDirectory()
                     for (index,candidate) in candidates.enumerated() {
                         var entry = candidate
                         entry["trash_path"] = owned.root.appendingPathComponent(String(index) + "-" + URL(fileURLWithPath:candidate["path"] as! String).lastPathComponent).path
@@ -399,7 +405,7 @@ extension CommandRouter {
         guard try files.regularOrLinkExists(relative) else {return} // Derived and regenerable.
         let (parent,name) = try files.parent(relative);defer {Darwin.close(parent)}
         let destination = URL(fileURLWithPath:entry["trash_path"] as! String).deletingLastPathComponent()
-        let trash = try StorageObjectFiles(root:destination),target = digest + ".keys"
+        let trash = try StorageObjectFiles(root:destination,folderAccess:.insideTrash),target = digest + ".keys"
         var info = stat()
         guard fstatat(parent,name,&info,AT_SYMLINK_NOFOLLOW) == 0,info.st_mode & S_IFMT == S_IFREG else {throw CoreError("BACKUP_PRUNE_INDEX_CHANGED","The derived backup index changed; retry the original prune command.")}
         // An already moved index reconciles normally. If a concurrent reader
@@ -413,13 +419,23 @@ extension CommandRouter {
         try requireManagedBackupPath(source)
         var sourceInfo = stat()
         let present = lstat(source.path,&sourceInfo) == 0
-        let location = present ? source : destination
-        let lease = try StorageBackupUseLease(root:location,exclusive:true)
-        var info = stat()
-        guard fstat(lease.files.descriptor,&info) == 0,Int64(info.st_dev) == (entry["device"] as? NSNumber)?.int64Value,UInt64(info.st_ino) == (entry["inode"] as? NSNumber)?.uint64Value,
-              try lease.manifestSHA256() == entry["manifest_sha256"] as? String else {throw CoreError("BACKUP_PRUNE_SOURCE_CHANGED","The snapshot changed; preserve the original prune command for reconciliation.")}
-        if !present {return} // Exact moved inode and manifest reconcile a crash after rename.
-        let parent = try StorageObjectFiles(root:source.deletingLastPathComponent()),trash = try StorageObjectFiles(root:destination.deletingLastPathComponent())
+        func changed() -> CoreError {CoreError("BACKUP_PRUNE_SOURCE_CHANGED","The snapshot changed; preserve the original prune command for reconciliation.")}
+        func exact(_ files: StorageObjectFiles,_ digest: () throws -> String) throws {
+            var info = stat()
+            guard fstat(files.descriptor,&info) == 0,Int64(info.st_dev) == (entry["device"] as? NSNumber)?.int64Value,UInt64(info.st_ino) == (entry["inode"] as? NSNumber)?.uint64Value,
+                  try digest() == entry["manifest_sha256"] as? String else {throw changed()}
+        }
+        guard present else {
+            // Exact moved inode and manifest reconcile a crash after rename. A use
+            // lease pins every ancestor, which would open the Trash root; nothing
+            // proves or restores from a moved copy, so this reads it by path.
+            let moved = try StorageObjectFiles(root:destination,folderAccess:.insideTrash)
+            try exact(moved) {hash(try moved.read("manifest.json",maximum:StorageSnapshotBudget.manifestByteLimit))}
+            return
+        }
+        let lease = try StorageBackupUseLease(root:source,exclusive:true)
+        try exact(lease.files) {try lease.manifestSHA256()}
+        let parent = try StorageObjectFiles(root:source.deletingLastPathComponent()),trash = try StorageObjectFiles(root:destination.deletingLastPathComponent(),folderAccess:.insideTrash)
         try lease.requireCurrent()
         guard renameatx_np(parent.descriptor,source.lastPathComponent,trash.descriptor,destination.lastPathComponent,UInt32(RENAME_EXCL)) == 0 else {throw CoreError("BACKUP_PRUNE_IO","Snapshot could not be moved atomically to the same-volume Trash; it was retained.",details:["posix_errno":errno])}
         try parent.synchronizePublicationDirectory();try trash.synchronizePublicationDirectory()

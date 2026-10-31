@@ -14,8 +14,22 @@ struct StorageFolderAccess {
     // Internal owned-fixture seam, never selected by an environment or client.
     var blockingReadDescriptor: (URL) -> Int32 = { _ in -1 }
     var observeChild: (pid_t) -> Void = { _ in }
+    var directOpen = false
+    /// macOS privacy refuses open(2) of ~/.Trash for a process with no grant, so the
+    /// no-follow walk fails there, yet the kernel still resolves a path through it.
+    /// This opens one owned folder inside the Trash by its whole path (CL-360). The
+    /// Trash is on the store volume, so this adds no volume the store does not need.
+    static var insideTrash: StorageFolderAccess {
+        var access = StorageFolderAccess();access.directOpen = true;access.reusePinnedRoots = false
+        return access
+    }
 
     func open(path: String, folder: URL) throws -> Int32 {
+        if directOpen {
+            let descriptor = Darwin.open(path,O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+            guard descriptor >= 0 else {throw CoreError("BACKUP_PRUNE_IO","The owned Trash folder could not be opened; its snapshot was retained or its move stays unconfirmed.",details:["posix_errno":errno])}
+            return descriptor
+        }
         let reaper = StorageFolderReaper.shared
         guard reaper.acquire(timeout:min(timeout,Self.seconds)) else {
             throw CoreError("FOLDER_ACCESS_UNAVAILABLE","Checklist could not open the folder ‘\(folder.path)’ because its bounded file-access workers are busy. A prior privacy or sync-provider open may still be ending. Retry using the original command ID.",details:["folder":folder.path,"reason":"folder_opener_busy","command_outcome":"unknown"])

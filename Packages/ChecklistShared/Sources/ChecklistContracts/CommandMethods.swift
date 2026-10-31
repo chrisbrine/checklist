@@ -44,7 +44,7 @@ public enum CommandMethods {
         "changes_wait",
         "delivery_pending",
         "storage_status",
-        "diagnostics_summary",
+        "diagnostics_summary","backup_retention_status",
         "project_list",
         "project_resolve",
         "project_settings_get",

@@ -2625,6 +2625,34 @@ class SlotStartupTests(unittest.TestCase):
             self.assertTrue(all(line.startswith('slot 4: still starting (protected startup), ') and line.endswith(' min')
                                 for line in progress.getvalue().splitlines()))
 
+    def test_start_treats_a_transient_empty_reply_as_still_starting(self):
+        no_answer = [subprocess.CompletedProcess([], 1, '', 'Checklist: OUTCOME_UNKNOWN: The service outcome is unknown. Start this test slot'),
+                     subprocess.CompletedProcess([], 1, '', ''), subprocess.CompletedProcess([], 0, '', None),
+                     subprocess.CompletedProcess([], 1, '', 'Checklist: STORAGE_NOT_READY: not ready')]
+        with self.fixture(no_answer + [self.healthy()]) as (p, clock, calls, commands, output, progress):
+            harness.start(SimpleNamespace(slot=4, gui=False), p)
+            self.assertEqual(len(calls), 5)
+            self.assertIn('Slot 4 ready (headless)', output.getvalue())
+
+    def test_start_deadline_reports_the_last_real_output(self):
+        empty = subprocess.CompletedProcess([], 1, '', 'Checklist: OUTCOME_UNKNOWN: The service outcome is unknown.')
+        with self.fixture([empty] * 20, environment={'CHECKLIST_START_DEADLINE_SECONDS': '60'}) as (p, clock, calls, commands, output, progress):
+            with self.assertRaises(ValueError) as error:
+                harness.start(SimpleNamespace(slot=4, gui=False), p)
+            self.assertIn('startup deadline expired after 60 seconds', str(error.exception))
+            self.assertIn('exit 1', str(error.exception));self.assertIn('OUTCOME_UNKNOWN', str(error.exception))
+            self.assertEqual(clock.now, 60)
+
+    def test_start_real_invalid_reply_still_fails_at_once_with_its_output(self):
+        for response in [subprocess.CompletedProcess([], 0, 'not json', ''), subprocess.CompletedProcess([], 1, 'garbage', 'Checklist: failed'),
+                         subprocess.CompletedProcess([], 1, '', 'Checklist: STORAGE_RECOVERY_REQUIRED: restore needed')]:
+            with self.subTest(response=response), self.fixture([response, self.healthy()]) as (p, clock, calls, commands, output, progress):
+                with self.assertRaises(ValueError) as error:
+                    harness.start(SimpleNamespace(slot=4, gui=False), p)
+                self.assertIn('invalid status', str(error.exception))
+                self.assertIn(response.stdout or response.stderr, str(error.exception))
+                self.assertEqual(len(calls), 1);self.assertEqual(clock.now, 0)
+
     def test_start_waits_for_upgrading_and_reports_changed_stage_and_estimate(self):
         details = {'state': 'upgrading', 'stage': 'protected_snapshot', 'estimated_remaining_seconds': 900,
                    'reason': 'store_changed_after_preparation'}
@@ -2841,6 +2869,37 @@ class InstalledVerificationTests(unittest.TestCase):
                                       clock=clock.monotonic, sleep=clock.sleep, progress=lambda line: None)
         self.assertEqual(clock.now, 61);self.assertEqual(timeouts, [30, 26])
         self.assertIn('61 seconds', str(error.exception));self.assert_safe_guidance(str(error.exception))
+
+    def test_transient_empty_reply_then_healthy_passes(self):
+        target = Path('/synthetic/Checklist.app');clock = self.Clock()
+        replies = iter([subprocess.CompletedProcess([], 1, '', 'Checklist: OUTCOME_UNKNOWN: The service outcome is unknown.'),
+                        subprocess.CompletedProcess([], 1, '', ''), subprocess.CompletedProcess([], 0, '', None),
+                        subprocess.CompletedProcess([], 0, json.dumps(self.status()), '')])
+        result = verify_install.verify(target, [str(target / 'Contents/MacOS/ChecklistApp')], lambda *a, **k: next(replies),
+                                       clock=clock.monotonic, sleep=clock.sleep, progress=lambda line: None)
+        self.assertEqual(result['service_state'], 'healthy');self.assertEqual(clock.sleeps, [5, 5, 5])
+
+    def test_deadline_reports_the_last_real_status_output(self):
+        target = Path('/synthetic/Checklist.app');clock = self.Clock()
+        response = subprocess.CompletedProcess([], 1, '', 'Checklist: OUTCOME_UNKNOWN: The service outcome is unknown.')
+        with patch.dict(os.environ, {'CHECKLIST_VERIFY_DEADLINE_SECONDS': '60'}), self.assertRaises(ValueError) as error:
+            verify_install.verify(target, [str(target / 'Contents/MacOS/ChecklistApp')], lambda *a, **k: response,
+                                  clock=clock.monotonic, sleep=clock.sleep, progress=lambda line: None)
+        self.assertIn('deadline expired', str(error.exception));self.assertIn('exit 1', str(error.exception))
+        self.assertIn('OUTCOME_UNKNOWN', str(error.exception));self.assert_safe_guidance(str(error.exception))
+        self.assertEqual(clock.now, 60)
+
+    def test_real_invalid_reply_fails_at_once_and_names_its_output(self):
+        target = Path('/synthetic/Checklist.app')
+        for response in [subprocess.CompletedProcess([], 0, 'not json', ''), subprocess.CompletedProcess([], 1, 'garbage', 'Checklist: failed'),
+                         subprocess.CompletedProcess([], 1, '', 'Checklist: STORAGE_RECOVERY_REQUIRED: restore needed')]:
+            with self.subTest(response=response):
+                clock = self.Clock()
+                with self.assertRaises(ValueError) as error:
+                    verify_install.verify(target, [str(target / 'Contents/MacOS/ChecklistApp')], lambda *a, **k: response,
+                                          clock=clock.monotonic, sleep=clock.sleep, progress=lambda line: None)
+                self.assertIn('invalid status', str(error.exception))
+                self.assertIn(response.stdout or response.stderr, str(error.exception));self.assertEqual(clock.now, 0)
 
     def test_unavailable_waits_to_minimum_deadline_and_default_is_45_minutes(self):
         target = Path('/synthetic/Checklist.app');paths = [str(target / 'Contents/MacOS/ChecklistApp')]

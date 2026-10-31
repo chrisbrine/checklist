@@ -611,9 +611,15 @@ Installer upgrade preparation takes the same use lease, and the protected
 metadata/preparation remains a persistent hold. Cleanup uses its already-open
 shared manifest descriptor, adding no descriptor per verified payload.
 
+macOS privacy refuses `open(2)` and listing of `~/.Trash` for a process with no
+grant, while it allows a path-based `mkdir` and opening a child. Pruning never opens or
+lists the Trash root, and the no-follow root walk cannot pass through it: pruning makes
+the owned folder by path, opens only that folder by its whole path, and
+reconciles a moved copy by its exact path, inode and manifest digest (CL-360).
+
 The supported prune records an exact durable intent, atomically renames each
-eligible directory into an owned folder in the same-volume Trash, flushes both
-parents, moves its derived content-addressed membership index to that same Trash
+eligible directory into an owned folder in the same-volume Trash, flushes the
+source parent and the owned folder, moves its derived content-addressed membership index to that same Trash
 folder when present, then retires its generation/accounting records and commits its receipt
 in one SQLite transaction. It never falls back to copy-and-delete across
 volumes. A retry rechecks the current owner rule, pins and upgrade protection for every
