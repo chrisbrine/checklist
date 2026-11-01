@@ -36,6 +36,23 @@ extension TicketLifecycleCleanupTests {
         XCTAssertEqual(served[0],served[2]);XCTAssertEqual(served[1],served[3]);XCTAssertNotEqual(served[0],served[1])
     }
 
+    func testCL392PreparationThatThrowsSpendsItsTurn() throws {
+        let (first,_,_) = try fixture(),(second,_,_) = try fixture()
+        let a = first["id"] as! String,b = second["id"] as! String
+        var served: [String] = []
+        for _ in 0..<2 {
+            try setDue(a);try setDue(b)
+            struct Failure: Error {}
+            XCTAssertThrowsError(try router.ticketCleanupMaintenanceLock.withLock {
+                try router.readers!.read {db in
+                    served.append(try XCTUnwrap(try self.router.prepareTicketLifecycleCleanup(db)?.selection["project_id"] as? String))
+                    throw Failure()
+                }
+            })
+        }
+        XCTAssertEqual(Set(served),[a,b])
+    }
+
     func testCL392EarliestDueProjectGoesFirstWhenNoneWasServed() throws {
         let (first,_,_) = try fixture(),(second,_,_) = try fixture()
         let a = first["id"] as! String,b = second["id"] as! String

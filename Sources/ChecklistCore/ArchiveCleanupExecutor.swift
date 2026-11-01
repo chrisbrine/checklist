@@ -294,9 +294,10 @@ extension CommandRouter {
             let pendingProjects = try String.fetchAll(db,sql:"SELECT DISTINCT project_id FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='storage_job') AND (" + Self.ticketObjectDeletionReadySQL + ")")
             let deletionDeadline = try pendingProjects.map {max(Int64((try self.ticketCleanupProjectRetry(db,project:$0) ?? .distantPast).timeIntervalSince1970 * 1000),nowMS + 50)}.min()
             let lifecycle = try self.nextTicketCleanupDeadline(db)
+            let evidenceBackup = try self.doneEvidenceBackupDeadline(db).map {max(Int64($0.timeIntervalSince1970 * 1000),nowMS + 50)}
             let retry = [self.ticketCleanupRetryAt,self.ticketCleanupYieldAt].compactMap {$0}.max().map {Int64($0.timeIntervalSince1970 * 1000)}
             let routineRetry = self.storageMaintenanceRetryAt.map {Int64($0.timeIntervalSince1970 * 1000)}
-            let next = [lifecycle.map { max(Int64($0.timeIntervalSince1970 * 1000),retry ?? 0,nowMS + 50) },deletionDeadline.map {max($0,retry ?? 0)},deadline.map { max($0,routineRetry ?? 0,nowMS + 50) },expiry.map { Int64($0 * 1000) },more ? max(routineRetry ?? 0,nowMS + 1000) : nil,routineRetry].compactMap {$0}.min()
+            let next = [evidenceBackup,lifecycle.map { max(Int64($0.timeIntervalSince1970 * 1000),retry ?? 0,nowMS + 50) },deletionDeadline.map {max($0,retry ?? 0)},deadline.map { max($0,routineRetry ?? 0,nowMS + 50) },expiry.map { Int64($0 * 1000) },more ? max(routineRetry ?? 0,nowMS + 1000) : nil,routineRetry].compactMap {$0}.min()
             return next.map { Date(timeIntervalSince1970:Double($0)/1000) }
         }
     }

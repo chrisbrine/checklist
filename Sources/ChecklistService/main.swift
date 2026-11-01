@@ -265,6 +265,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
                 defer {if recordTiming {CallTimingLog.write(["scope":"storage_maintenance","start_uptime_s":started,"duration_ms":(ProcessInfo.processInfo.systemUptime-started)*1000])}}
                 do { try self.router.runStorageMaintenance() }
                 catch { fputs("Storage maintenance deferred; its durable state was retained.\n",stderr) }
+                self.router.startDoneEvidenceBackupIfDue()
                 self.queue.async {self.storageRunning = false;self.armStorageWake()}
             }
         }

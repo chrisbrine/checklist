@@ -35,6 +35,7 @@ extension CommandRouter {
 
     private func ticketCleanupMaintenanceProjection(_ db: Database,project: String) throws -> JSON {
         var value = try ticketCleanupSchedulingProjection(db,project:project)
+        if let backup = try doneEvidenceBackupDeadline(db) {value["next_evidence_backup_at"] = ISO8601DateFormatter().string(from:backup)}
         var preparation = try ticketCleanupPreparationState(db,project:project)
         preparation.removeValue(forKey:"attempt_refused");value["preparation"] = preparation
         return value
