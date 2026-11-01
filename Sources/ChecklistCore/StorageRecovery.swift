@@ -346,7 +346,7 @@ extension CommandRouter {
             try event(db,caller:caller,project:params["project_id"] as? String,entity:nil,kind:"backup_created",data:["origin":caller.isOwner ? (caller.installation == Self.doneEvidenceBackupInstallation ? "service" : "human_ui") : "agent","session_id":caller.sessionID ?? "","command_id":command,"operation_id":receipt.operationID.uuidString.lowercased(),"manifest_sha256":receipt.manifestSHA256,"captured_at":summary["captured_at"] ?? NSNull(),"verified_at":summary["verified_at"] ?? NSNull(),"project_ids":caller.isOwner ? projectIDs : [],"reason":try text(params,"reason",max:4000,required:false)])
             output = ["data":data,"command_id":command,"event_cursor":try self.cursor(db,caller:caller,scope:self.authorizationScope(db,caller))]
             try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[caller.principal,command,digest,try jsonString(output)])
-            try wakeDoneEvidenceForBackup(db)
+            wakeDoneEvidenceForBackup(db)
             try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["backup-generation:" + receipt.operationID.uuidString.lowercased(),generation])
             try recordStorageCopyObservation(db,key:"backup",summary:summary)
             try Self.enqueueAutomaticBackupRetention(db,root:root,incarnation:identity.incarnation,operation:receipt.operationID.uuidString.lowercased())

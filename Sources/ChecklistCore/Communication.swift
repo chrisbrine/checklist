@@ -340,7 +340,7 @@ extension CommandRouter {
             fetched = try Row.fetchAll(db,sql:"""
                 SELECT seq,id,actor,kind,occurred_at,data FROM events
                 WHERE kind='backup_created' AND seq>? AND
-                    (project_id=? OR (project_id IS NULL AND json_extract(data,'$.origin')='human_ui'
+                    (project_id=? OR (project_id IS NULL AND json_extract(data,'$.origin') IN ('human_ui','service')
                         AND EXISTS (SELECT 1 FROM json_each(events.data,'$.project_ids') WHERE value=?)))
                 ORDER BY seq LIMIT ?
                 """,arguments:[after,pid,pid,limit+1])

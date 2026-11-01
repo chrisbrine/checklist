@@ -47,6 +47,10 @@ extension TicketLifecycleCleanupTests {
         XCTAssertEqual(try serviceBackupCount(),0)
         XCTAssertTrue(router.startDoneEvidenceBackupIfDue(at:due.addingTimeInterval(1)))
         XCTAssertEqual(try serviceBackupCount(),1)
+        // The project read names it, with the real origin.
+        let history = try call("history_list",["project_id":try read(task)["project_id"]!,"entity":"backup"])
+        let rows = (history["events"] as? [JSON] ?? []).filter {($0["data"] as? JSON)?["origin"] as? String == "service"}
+        XCTAssertEqual(rows.count,1);XCTAssertNotNil((rows.first?["data"] as? JSON)?["captured_at"] as? String)
         // The completed backup covers the file: nothing waits, and the ticket is woken.
         XCTAssertNil(try deadline())
         let pid = try XCTUnwrap(try read(task)["project_id"] as? String)
@@ -80,6 +84,58 @@ extension TicketLifecycleCleanupTests {
         let time = Date().addingTimeInterval(3600)
         try router.dbQueue.write {try $0.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES ('done-evidence-backup-attempt',?)",arguments:[ISO8601DateFormatter().string(from:time)])}
         XCTAssertEqual(try XCTUnwrap(try deadline()).timeIntervalSince(time),CommandRouter.doneEvidenceBackupInterval,accuracy:1)
+    }
+
+    func testCL393WakePlanSkipsTheJobScanWhileTheIntervalHolds() throws {
+        try confirmRetention()
+        _ = try waitingFile()
+        let time = Date().addingTimeInterval(3600)
+        try router.dbQueue.write {try $0.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES ('done-evidence-backup-attempt',?)",arguments:[ISO8601DateFormatter().string(from:time)])}
+        try router.dbQueue.read {db in
+            var scans = 0
+            db.trace {if case .statement(let statement) = $0,statement.sql.contains("ticket_object_delete") {scans += 1}}
+            let wake = try self.router.doneEvidenceBackupWake(db)
+            db.trace(nil)
+            XCTAssertEqual(scans,0)
+            XCTAssertEqual(try XCTUnwrap(wake).timeIntervalSince(time),CommandRouter.doneEvidenceBackupInterval,accuracy:1)
+        }
+    }
+
+    func testCL393FileAddedDuringACaptureStillWaits() throws {
+        try confirmRetention()
+        _ = try waitingFile()
+        // The newest backup completed after this job, but its capture started before it.
+        let job = Date().addingTimeInterval(-60),format = ISO8601DateFormatter()
+        try router.dbQueue.write {db in
+            let generation: JSON = ["state":"complete","known_at":format.string(from:Date().addingTimeInterval(60)),"summary":["captured_at":format.string(from:job.addingTimeInterval(-300))] as JSON]
+            try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["backup-generation:" + uuid(),try jsonString(generation)])
+        }
+        XCTAssertNotNil(try deadline())
+    }
+
+    func testCL393MalformedRetryEntryCannotFailAFinishedBackup() throws {
+        try confirmRetention()
+        let (project,_,_) = try waitingFile()
+        try router.dbQueue.write {try $0.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-retries:" + (project["id"] as! String),"{\"bad\":{}}"])}
+        XCTAssertNoThrow(try call("backup_create",["path":directory.appendingPathComponent("cl393-malformed").path]))
+    }
+
+    func testCL393StartRunsThroughTheOperationQueue() throws {
+        try confirmRetention()
+        _ = try waitingFile()
+        let lane = DispatchQueue(label:"cl393-operation")
+        router.configureCommandOperations(on:lane)
+        let due = try XCTUnwrap(try deadline())
+        XCTAssertTrue(router.startDoneEvidenceBackupIfDue(at:due.addingTimeInterval(1)))
+        let finished = expectation(description:"service backup")
+        DispatchQueue.global().async {
+            for _ in 0..<120 {
+                if (try? self.serviceBackupCount()) == 1 {finished.fulfill();return}
+                Thread.sleep(forTimeInterval:0.25)
+            }
+        }
+        wait(for:[finished],timeout:40)
+        lane.sync {}
     }
 
     func testCL393OwnerBackupKeepsItsOrigin() throws {
