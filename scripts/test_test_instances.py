@@ -2327,6 +2327,20 @@ class BackupMetadataSeedIsolationTests(unittest.TestCase):
                     with patch.object(harness, 'checklist_root_overlap', return_value='live'), self.assertRaises(ValueError):
                         harness.require_local_paths(database, base / 'data')
 
+    def test_retention_history_is_inert_and_other_metadata_paths_stay_refused(self):
+        moved = {'moved_to_trash': [{'path': '/historical/Trash/snapshot-a', 'generation_key': 'backup-generation:a'}], 'retained_snapshots': [{'path': '/historical/backups/snapshot-b'}]}
+        with test_directory() as directory:
+            base = Path(directory).resolve()
+            database = self.database(base, 'backup-pruned:' + 'a' * 36, moved)
+            with patch.object(harness, 'checklist_root_overlap') as ancestry:
+                result = harness.require_local_paths(database, base / 'data')
+            self.assertEqual(result['inert_metadata_path_occurrences'], 2); ancestry.assert_not_called()
+        with test_directory() as directory:
+            base = Path(directory).resolve()
+            database = self.database(base, 'backup-other:' + 'a' * 36, moved)
+            with patch.object(harness, 'checklist_root_overlap', return_value='live'), self.assertRaises(ValueError):
+                harness.require_local_paths(database, base / 'data')
+
     def test_fenced_automatic_retention_intent_is_inert_audit_without_file_authority(self):
         with test_directory() as directory:
             base = Path(directory).resolve()

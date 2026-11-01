@@ -697,7 +697,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
                     record_kind = 'storage_summary'
                 for column, value in zip(columns, row):
                     inert = (table == 'commands' and column == 'result') or (table == 'events' and column == 'data')
-                    if column == 'value' and metadata_key is not None and (metadata_key in {'preupgrade_snapshot', 'backup-protected-history', 'backup-automatic-prune-last'} or metadata_key.startswith(('backup-generation:', 'backup-automatic-prune-fenced:'))):
+                    if column == 'value' and metadata_key is not None and (metadata_key in {'preupgrade_snapshot', 'backup-protected-history', 'backup-automatic-prune-last'} or metadata_key.startswith(('backup-pruned:', 'backup-generation:', 'backup-automatic-prune-fenced:'))):
                         inert = 'metadata'
                     inspect(value, table + '.' + column, record_kind, policy(column, {}, table, record_kind), inert)
     except (UnicodeError, RecursionError) as error:

@@ -84,7 +84,7 @@ final class StorageSnapshotCapacityTests: XCTestCase {
         XCTAssertEqual(budget.maximumBytes, .max)
         XCTAssertEqual(budget.effectiveMaximumBytes, .max)
         XCTAssertEqual(budget.maximumObjects, 500_000)
-        XCTAssertEqual(budget.maximumManifestBytes, 128 * 1_048_576)
+        XCTAssertEqual(budget.maximumManifestBytes, 512 * 1_048_576)
         XCTAssertEqual(budget.maximumObjectBytes, 524_288_000)
         XCTAssertEqual(budget.maximumRecords, 100_000)
         let after = ProcessInfo.processInfo.systemUptime

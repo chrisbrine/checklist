@@ -27,6 +27,15 @@ final class StorageCompactManifestTests: XCTestCase {
         print("CL270 template objects=200000 manifest_bytes=\(bytes.count) encode_decode_seconds=\(ProcessInfo.processInfo.systemUptime-start)")
     }
 
+    func testManifestLimitHoldsTheObjectLimitAndItsCleanedEntries() throws {
+        // CL-387: scale a small sample. Each cleaned object leaves up to three absence entries.
+        let sample = 5_000,objects = try StorageSnapshot.encoded(template(sample,format:2)).count
+        let absences = (0..<sample).map { StorageSnapshotAbsence(authority:"source_capture:\(UUID().uuidString):\(UUID().uuidString):Sources/ChecklistApp/Views/RetainedSourceFile-\($0).swift",reason:"evidence_cleaned") }
+        let absenceBytes = try StorageSnapshot.encoded(absences).count
+        let limit = StorageSnapshotBudget.objectLimit,scale = limit / sample
+        XCTAssertLessThan(objects * scale + absenceBytes * scale * 3,StorageSnapshotBudget.manifestByteLimit)
+    }
+
     func testCompactUnicodeNilExpectationsAndMalformedIndices() throws {
         let d = StorageSnapshotObject(relativePath:"objects/é/文件",kind:"file",expectedSHA256:nil,expectedSize:nil,executable:true,linkTarget:nil,authorities:["attachment:é:preview","attachment:e\u{301}:preview"])
         let base = template(0,format:2)

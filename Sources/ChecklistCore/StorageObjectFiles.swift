@@ -32,7 +32,7 @@ struct StorageSnapshotBudget {
     static let byteLimit: Int64 = .max
     static let freeSpaceMinimumMarginBytes: Int64 = 1_073_741_824
     static let objectLimit = 500_000
-    static let manifestByteLimit = 128 * 1_048_576
+    static let manifestByteLimit = 512 * 1_048_576
     static let productionSeconds: TimeInterval = 1_800
     static func production() -> Self {
         .init(deadlineUptime: ProcessInfo.processInfo.systemUptime + productionSeconds, canceled: { false })
