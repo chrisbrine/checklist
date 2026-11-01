@@ -118,6 +118,16 @@ Two routes exist, and neither reads the Claude desktop app's wake count. The app
 
 The service cannot call `send_message`, so a service message uses the relay and an agent milestone uses `send_message`. Neither result proves that the model read the message.
 
+| Case | Result | Evidence |
+|---|---|---|
+| Relay past the wake count | Tested: a ticket note started the turn of an idle session at count 10, and the app held the automatic wake | CL-386, Desktop 4.4212.0, engine 2.1.309, build 253, bypass-mode recipient |
+| Relay, recipient in another permission class with no `crossSessionInbound` accept | Unqualified on this version; observed held on engine 2.1.299 | See the 17 October observation above |
+| Relay, process away | Unqualified: no verified endpoint, so the delivery stays on pickup | Source only |
+| Relay, archived target | Unqualified | None |
+| Tool `send_message` past the count, child to parent | Reported by another session: 12 of 12 messages started turns, 2 past the count | Report on CL-386; not repeated here |
+| Tool `send_message`, unrelated sender | Observed: the tool reported `delivered` between two unrelated sessions | CL-386; the recipient's turn start was not confirmed |
+| Tool `send_message`, another permission mode, archived target or process away | Unqualified | None |
+
 ## Honest delivery
 
 Saving a note commits content and exact-recipient outbox atomically. Show **Saved / queued**, **held/refused**, **provider accepted**, **recipient acknowledged** and **addressed** separately. An acknowledgment names the actual recipient generation; a parent receipt is not its child's. A model report is not owner-read. Target the current attempt/explicit resolved host-assistant identity and enrolled route, not the most recently seen label.
