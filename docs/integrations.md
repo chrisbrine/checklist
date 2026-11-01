@@ -176,7 +176,7 @@ The assistant plugin is generic; initial Dot is one adapter, not the product's u
 
 ## Work health pickup boundary
 
-System [work health](work-health.md) requests go once through the Claude relay when the exact session has a verified native endpoint (CL-386), and they stay on exact-session MCP pickup. It relays at most once per progress state, never during a known wait, at most 3 times per attempt and once per session in 20 minutes, to its handler only. A durable queue entry or relay write is neither a resumed host turn nor a response. Health checks do not install adapters, enroll sessions, enable assistants or launch/poll models. Current/native provider route qualifications remain unchanged; installed health visibility and actual host pickup need their own synthetic observation.
+System [work health](work-health.md) requests go through the Claude relay when the exact session has a verified native endpoint (CL-386), and they stay on exact-session MCP pickup. It relays at most once per progress state, never during a known wait, at most 3 times per attempt and once per session in 20 minutes, to its handler only. A durable queue entry or relay write is neither a resumed host turn nor a response. Health checks do not install adapters, enroll sessions, enable assistants or launch/poll models. Current/native provider route qualifications remain unchanged; installed health visibility and actual host pickup need their own synthetic observation.
 
 ## Read-only message readiness (CL-37)
 

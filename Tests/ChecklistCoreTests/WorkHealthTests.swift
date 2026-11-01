@@ -237,12 +237,41 @@ extension EvidenceAuthorityTests {
         }
         XCTAssertEqual(relays,3)
     }
+    func testWorkHealthRespondNamesAWaitThatStopsTheRelayUntilProgress() throws {
+        let p = try project(), t = try ready(p), w = try native(p,"health-named",domain:"health-named"), a = try claim(p,t,caller:w)
+        let bridge = Caller(role:"owner",installation:"native-bridge",projectIDs:[])
+        try ageHealthAttempt(a); try checkHealth()
+        let first = try XCTUnwrap(try healthRelays(w).first)
+        _ = try call("delivery_record",["delivery_id":first["id"]!,"state":"transport_written","receipt":["bytes":1]],bridge)
+        let mid = try health(p,t)["request_id"] as! String
+        XCTAssertEqual(try call("work_health_respond",["project_id":p["id"]!,"task_id":t["id"]!,"request_id":mid,"expected_revision":healthTask(p,t)["revision"]!,"progress":"Waiting","known_wait":"runner session"],w)["outcome"] as? String,"resumed")
+        let waits = try health(p,t)["known_waits"] as? [JSON]
+        XCTAssertEqual(waits?.first?["kind"] as? String,"reported");XCTAssertEqual(waits?.first?["reason"] as? String,"runner session")
+        try healthCheckpoint(p,t,a,w,step:1)
+        try checkHealth(at:Date().addingTimeInterval(4000))
+        XCTAssertTrue((try health(p,t)["known_waits"] as? [JSON] ?? []).isEmpty,"New progress clears a named wait")
+    }
+    func testWorkHealthDependencyWaitStopsTheRelay() throws {
+        let p = try project(), t = try ready(p), prerequisite = try ready(p), w = try native(p,"health-dep",domain:"health-dep"), a = try claim(p,t,caller:w)
+        try healthWrite { db in
+            try router.save(db,["id":uuid(),"project_id":p["id"]!,"source_task_id":t["id"]!,"target_task_id":prerequisite["id"]!,"relation":"depends_on","required":true,"state":"active","revision":1],type:"relation")
+        }
+        try ageHealthAttempt(a); try checkHealth()
+        let state = try health(p,t)
+        XCTAssertNotNil(state["request_id"]);XCTAssertTrue((state["known_waits"] as? [JSON] ?? []).contains { $0["kind"] as? String == "dependency" })
+        XCTAssertTrue(try healthRelays(w).isEmpty)
+    }
     func testWorkHealthRelaysOncePerSessionAcrossTicketsInItsInterval() throws {
         let p = try project(), w = try native(p,"health-many",domain:"health-many")
         let first = try ready(p), second = try ready(p), a = try claim(p,first,caller:w), b = try claim(p,second,caller:w)
         try ageHealthAttempt(a); try ageHealthAttempt(b); try checkHealth()
         XCTAssertNotNil(try health(p,first)["request_id"]); XCTAssertNotNil(try health(p,second)["request_id"])
+        let only = try XCTUnwrap(try healthRelays(w).first)
         XCTAssertEqual(try healthRelays(w).count,1)
+        let bridge = Caller(role:"owner",installation:"native-bridge",projectIDs:[])
+        _ = try call("delivery_record",["delivery_id":only["id"]!,"state":"transport_written","receipt":["bytes":1]],bridge)
+        let refused = (only["message"] as? JSON)?["task_id"] as? String == first["id"] as? String ? second : first
+        XCTAssertNil(try healthTask(p,refused)["work_health"].flatMap { ($0 as? JSON)?["relay_count"] },"A refused relay spends no count")
     }
     func testWorkHealthLateReplyResumesCurrentHandlerAndIsIdempotent() throws {
         let p = try project(), t = try ready(p), w = try native(p,"health-late",domain:"health-Late"), a = try claim(p,t,caller:w)

@@ -113,6 +113,20 @@ extension CommandRouter {
         return "missing"
     }
 
+    /// The one known-wait read for work_health_get and the relay check (CL-389).
+    private func healthKnownWaits(_ db: Database, task: JSON, selected: JSON) throws -> [JSON] {
+        let pid = (try StoredRecord(task, family: "task").string("project_id"))
+        var waits: [JSON] = []
+        if let aid = task["active_attempt_id"] as? String, let a = try? scoped(db, aid, pid, type: "attempt"), let resource = a["waiting_for_resource"] {
+            waits.append(["kind": "resource", "reason": resource, "since": a["waiting_since"] ?? NSNull()])
+        }
+        if let reported = (task["work_health"] as? JSON)?["reported_wait"] as? JSON { waits.append(["kind": "reported", "reason": reported["reason"] ?? "", "since": reported["since"] ?? NSNull()]) }
+        let requests = try scopedTaskRows(db, type: "request", task: task, predicate: "json_extract(data,'$.state')='pending' AND json_extract(data,'$.blocking')=1", limit: 25)
+        waits += try requests.map { ["kind": "human", "request_id": (try StoredRecord($0, family: "record").requiredValue("id")), "reason": $0["title"] ?? "Owner answer"] }
+        let blockers = selected["prerequisite_blockers"] as? [JSON] ?? []
+        waits += blockers.prefix(25).map { ["kind": "dependency", "detail": $0] }
+        return waits
+    }
     func workHealthView(_ db: Database, task: JSON, at date: Date = Date(), selectedProjection: JSON? = nil) throws -> JSON {
         let pid = (try StoredRecord(task, family: "task").string("project_id")), target = try workHealthTarget(db, task: task)
         let settings = workHealthSettings(try record(db, pid, type: "project"))
@@ -124,18 +138,8 @@ extension CommandRouter {
             value["session_state"] = session["state"] ?? "unknown"; value["last_seen"] = session["last_seen"] ?? NSNull()
         } else { value["session_state"] = target["session_id"] as? String == "human" ? "owner" : "unknown" }
         value["last_progress_at"] = try healthProgress(db, task: task, target: target).map(healthStamp) ?? NSNull()
-        var waits: [JSON] = []
-        if let aid = task["active_attempt_id"] as? String, let a = try? scoped(db, aid, pid, type: "attempt"), let resource = a["waiting_for_resource"] {
-            waits.append(["kind": "resource", "reason": resource, "since": a["waiting_since"] ?? NSNull()])
-        }
-        let requests = try scopedTaskRows(db, type: "request", task: task, predicate: "json_extract(data,'$.state')='pending' AND json_extract(data,'$.blocking')=1", limit: 25)
-        waits += try requests.map { ["kind": "human", "request_id": (try StoredRecord($0, family: "record").requiredValue("id")), "reason": $0["title"] ?? "Owner answer"] }
-        // A selected read has already built this task's status/dependency facts
-        // in the same transaction. Reuse that request-local value only; health
-        // and its time-sensitive fields are still computed on every read.
         let selected = try selectedProjection ?? selectedTaskHealthFacts(db,task:task)
-        let blockers = selected["prerequisite_blockers"] as? [JSON] ?? []
-        waits += blockers.prefix(25).map { ["kind": "dependency", "detail": $0] }
+        let waits = try healthKnownWaits(db, task: task, selected: selected)
         let jobs = try scopedTaskRows(db, type: "source_execution", task: task, predicate: "json_extract(data,'$.state') IN ('queued','running')", limit: 25)
         value["running_jobs"] = jobs.map { job -> JSON in
             var row: JSON = [:]; for key in ["id", "state", "started_at", "timeout_seconds", "attempt_id"] { row[key] = job[key] }; return row
@@ -165,11 +169,6 @@ extension CommandRouter {
            date >= last, date.timeIntervalSince(last) < Self.healthRelayInterval { return false }
         try db.execute(sql: "INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", arguments: [key, healthStamp(date)])
         return true
-    }
-    private func healthHasKnownWait(_ db: Database, task: JSON) throws -> Bool {
-        let pid = try StoredRecord(task, family: "task").string("project_id")
-        if let aid = task["active_attempt_id"] as? String, let attempt = try? scoped(db, aid, pid, type: "attempt"), attempt["waiting_for_resource"] != nil { return true }
-        return try !scopedTaskRows(db, type: "request", task: task, predicate: "json_extract(data,'$.state')='pending' AND json_extract(data,'$.blocking')=1", limit: 1).isEmpty
     }
     private func queueHealthDeliveries(_ db: Database, message: JSON, recipients: [JSON], at date: Date = Date()) throws -> [JSON] {
         let pid = (try StoredRecord(message, family: "message").string("project_id")), mid = (try StoredRecord(message, family: "message").string("id"))
@@ -323,13 +322,17 @@ extension CommandRouter {
             }
             health["settings_generation"] = configGeneration
         }
+        // New progress ends a wait named in a reply.
+        if (health["reported_wait"] as? JSON)?["progress_token"] as? String != progressToken, health["reported_wait"] != nil {
+            health.removeValue(forKey: "reported_wait"); task["work_health"] = health
+        }
         let baseline = max(healthTime(health["baseline_at"]) ?? date, min(progress ?? .distantPast, date))
         let due = healthTime(health["next_check_at"]) ?? baseline.addingTimeInterval(interval)
         if let mid = health["request_id"] as? String, var message = try? scoped(db, mid, (try StoredRecord(task, family: "task").string("project_id")), type: "message"),
             var request = message["health_request"] as? JSON, request["outcome"] == nil {
             if let progress, let sent = healthTime(request["requested_at"]), progress > sent || (request["progress_token"] as? String).map({ $0 != progressToken }) == true {
                 try healthOutcome(db, task: task, request: &request, outcome: "progress_observed", body: "Work health resumed: substantive progress from the current attempt or accepted child answered check \(mid). Work authority is unchanged.")
-                health.removeValue(forKey: "request_id"); health.removeValue(forKey: "deadline"); health["state"] = "current"; health["attention"] = false; health["baseline_at"] = healthStamp(progress); health["next_check_at"] = healthStamp(progress.addingTimeInterval(interval))
+                health.removeValue(forKey: "request_id"); health.removeValue(forKey: "deadline"); health.removeValue(forKey: "reported_wait"); health["state"] = "current"; health["attention"] = false; health["baseline_at"] = healthStamp(progress); health["next_check_at"] = healthStamp(progress.addingTimeInterval(interval))
             } else if let deadline = healthTime(request["deadline"]), date >= deadline, health["state"] as? String != "no_response" {
                 let note = try healthNote(db, task: task, body: "No response to work health check \(mid) by \(healthStamp(deadline)). Delivery is not acknowledgment or useful progress. The handler may be busy, waiting or unavailable; no abandonment, completion, release or reassignment is inferred.", target: nil)
                 try notifyHealthCoordinators(db, task: task, request: request, note: note)
@@ -340,10 +343,11 @@ extension CommandRouter {
             let deadline = healthStamp(date.addingTimeInterval(grace))
             // CL-389: a request relays only for new progress, never during a known wait, and at most three times per attempt.
             let relayTarget = target["id"] as? String, relayCount = health["relay_target"] as? String == relayTarget ? int(health, "relay_count", default: 0) : 0
-            let relayed = try target["session_id"] != nil && health["relayed_progress_token"] as? String != progressToken && relayCount < Self.maximumHealthRelays && !healthHasKnownWait(db, task: task)
+            let relayed = try target["session_id"] != nil && health["relayed_progress_token"] as? String != progressToken && relayCount < Self.maximumHealthRelays && healthKnownWaits(db, task: task, selected: selectedTaskHealthFacts(db,task:task)).isEmpty
             var request: JSON = ["target": target, "task_revision": int(task, "revision"), "acceptance_revision": int(task, "acceptance_revision"), "manifest_id": task["current_manifest_id"] ?? NSNull(), "requested_at": stamp, "last_progress_at": progress.map(healthStamp) ?? NSNull(), "progress_token": progressToken, "deadline": deadline]
-            if relayed { request["native_relay"] = true; health["relayed_progress_token"] = progressToken; health["relay_target"] = relayTarget ?? NSNull(); health["relay_count"] = relayCount + 1 }
-            let note = try healthNote(db, task: task, body: "Work health check: does work continue? Last substantive progress: \(progress.map(healthStamp) ?? "not recorded"). Reply to this exact note with current progress or a known wait, or call work_health_respond with request_id from this note. Response due \(deadline). This is an advisory check, not a new claim. It is also available on MCP pickup while this exact session remains eligible.", target: target, request: request, at: date)
+            if relayed { request["native_relay"] = true }
+            let note = try healthNote(db, task: task, body: "Work health check: does work continue? Last substantive progress: \(progress.map(healthStamp) ?? "not recorded"). Reply to this exact note with current progress, or call work_health_respond with request_id from this note and known_wait for a known wait. Response due \(deadline). This is an advisory check, not a new claim. It is also available on MCP pickup while this exact session remains eligible.", target: target, request: request, at: date)
+            if (note["deliveries"] as? [JSON])?.contains(where: { $0["native_relay"] != nil }) == true { health["relayed_progress_token"] = progressToken; health["relay_target"] = relayTarget ?? NSNull(); health["relay_count"] = relayCount + 1 }
             health["request_id"] = note["id"]; health["deadline"] = deadline; health["next_check_at"] = deadline; health["state"] = "awaiting_response"; health["attention"] = target["kind"] as? String == "missing_handler"
         } else if health["request_id"] == nil {
             health["state"] = target["kind"] as? String == "missing_handler" ? "missing_handler" : "current"
@@ -370,7 +374,16 @@ extension CommandRouter {
         let reply: JSON = ["id": uuid(), "project_id": pid, "task_id": (try StoredRecord(task, family: "record").requiredValue("id")), "reply_to": mid, "body": try text(p, "progress"),
             "author_session_id": c.sessionID ?? "human", "author": c.principal, "origin": "agent", "kind": "reply", "revision": 1, "created_at": now()]
         try save(db, reply, type: "message")
-        return try reconcileHealthReply(db, reply: reply, caller: c) ?? [:]
+        let result = try reconcileHealthReply(db, reply: reply, caller: c) ?? [:]
+        // A named wait stops further relays until new progress. A later answer with no wait clears it.
+        if result["outcome"] as? String == "resumed" {
+            var current = try scoped(db, (try StoredRecord(task, family: "record").string("id")), pid, type: "task"), health = current["work_health"] as? JSON ?? [:]
+            let before = health["reported_wait"] != nil
+            if p["known_wait"] != nil { health["reported_wait"] = ["reason": try text(p, "known_wait", max: 200), "since": now(), "request_id": mid, "progress_token": try healthProgressToken(db, task: current, target: workHealthTarget(db, task: current))] as JSON }
+            else { health.removeValue(forKey: "reported_wait") }
+            if before || p["known_wait"] != nil { current["work_health"] = health; try save(db, revised(current), type: "task") }
+        }
+        return result
     }
 
     /// Both MCP replies and qualified native reply receipts use this seam. The
