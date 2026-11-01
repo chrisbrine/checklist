@@ -40,6 +40,17 @@ A closed ticket unchanged for `closed_days` is purged by the existing CL-24 reco
 
 Done evidence has two steps. The pass admits the ticket at the next lifecycle turn after the Done wake. Turns alternate with byte deletion, and each turn rests for four times its own duration. The live copy is removed only when a completed backup holds the exact bytes, so bytes wait for the first backup that captures them.
 
+An admitted ticket's files join its project's byte queue. No design bound applies to this queue: the delay is the queue length divided by the removal rate. Measured on the live store (build 261, 1 Nov 2026, CL-395):
+
+| Step | Measured |
+| --- | --- |
+| Done to first admitting pass, during a backlog sweep | 34 min 33 s (CL-392), 9 min 2 s (CL-393) |
+| First service-started backup | Capture began 22:19:35 UTC, 2 hours after the capture before it; finished 22:26:33 UTC (6 min 58 s) |
+| Byte queue rate, one project | 1,353 files and 29.7 MB in 16 min 20 s (about 4,970 files per hour) |
+| Byte queue length at that rate | 114,659 files, about 23 hours |
+
+A file that a pending job holds with `backup_required` does not count as waiting until that job completes. It then waits for one more backup or the next daily sweep, even when an earlier backup holds its bytes.
+
 **Service-started backup (CL-393).** A file waits when its Done job holds it with `backup_required` and the job changed after the newest completed backup's capture began. The service then starts one ordinary `backup_create` when three conditions hold: the oldest wait is at least 15 minutes old, the newest completed backup is at least 2 hours old, and the last service attempt is at least 2 hours old. This bounds a wait to about 2 hours 15 minutes plus the backup and the following turns. A refused or failed attempt waits the full 2 hours. The service starts no backup on an installation whose retention rule has no owner confirmation for that store, so a restored copy or a test slot starts none, and each backup follows that rule. At most 12 service backups run per day, and only while Done files wait. The history records them with `origin=service`. Measured cost of one backup on the live store (build 260, 1 Nov 2026): 341 s, 2.2 GB on disk for 5.35 GB of logical data, and a writer lease of under 1 ms. Each backup can move one older snapshot to the Trash under the retention rule, so at 12 backups per day up to 26.4 GB per day can go there. A job changed during a capture counts as waiting even when that backup holds its file, which can cost one more backup and no repeat. `maintenance.next_evidence_backup_at` shows the next start time while files wait. A completed backup wakes the tickets it held, so they do not wait for the next daily sweep.
 
 A ticket refused by a limit (`PURGE_LIMIT`, `REFERENCE_GRAPH_LIMIT`, `CLEANUP_INVENTORY_LIMIT`) retries after 60 s, then doubles to a maximum of 1 hour, because the same inputs give the same refusal. A new Done wake starts the delay again at 60 s. A concurrent-write fence keeps its 60 s retry.
