@@ -138,7 +138,8 @@ extension CommandRouter {
         if let historyObservation {
             events = try historyObservation.events(task:tid,matching:removedKeys.union([taskKey]),tokenBudget:2000000-edgeBudget)
         } else {
-            let eventRows = try Row.fetchCursor(db,sql:"SELECT seq,id,entity_id,data FROM events WHERE project_id=? ORDER BY seq LIMIT 100001",arguments:[pid])
+            let historyKeys = try jsonString(removedKeys.union([taskKey]).map {String(decoding:$0,as:UTF8.self)})
+            let eventRows = try Row.fetchCursor(db,sql:"SELECT seq,id,entity_id,data FROM events WHERE project_id=? AND " + Self.ticketCleanupHistoryRowSQL + " ORDER BY seq LIMIT 100001",arguments:[pid,historyKeys,historyKeys,historyKeys])
             var selectedEvents: [Row] = [],eventCount = 0,historyBytes = 0
             while let row = try eventRows.next() {
                 eventCount += 1

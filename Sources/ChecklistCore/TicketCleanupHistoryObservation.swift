@@ -88,6 +88,12 @@ private struct CleanupHistoryRows {
 }
 
 extension CommandRouter {
+    /// Binds the removal keys as a JSON array three times. Cleanup writes one
+    /// outcome row per removed file, and those rows name a ticket and a receipt
+    /// only. A row that names no removal key cannot join the plan, so it costs
+    /// no scan budget: cleanup's own history must not stop later cleanup.
+    static let ticketCleanupHistoryRowSQL = "CASE WHEN kind<>'ticket_evidence_cleanup_outcome' OR NOT json_valid(data) THEN 1 WHEN CAST(entity_id AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?)) THEN 1 WHEN CAST(json_extract(data,'$.task_id') AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?)) THEN 1 WHEN CAST(json_extract(data,'$.receipt_id') AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?)) THEN 1 ELSE 0 END"
+
     /// Event payloads are parsed/tokenized once for the selected projects, then
     /// admitted only against the exact removal closure. History belonging to
     /// foreign-protected shared records cannot consume a ticket's history budget.
@@ -114,7 +120,8 @@ extension CommandRouter {
         guard !projects.isEmpty else {return result}
         for pid in projects.keys.sorted() {
             let targets = projects[pid] ?? []
-            let cursor = try Row.fetchCursor(db,sql:"SELECT project_id,seq,id,entity_id,data FROM events WHERE project_id=? ORDER BY seq LIMIT 100001",arguments:[pid])
+            let keys = try jsonString((needles[pid] ?? [:]).keys.map {String(decoding:$0,as:UTF8.self)})
+            let cursor = try Row.fetchCursor(db,sql:"SELECT project_id,seq,id,entity_id,data FROM events WHERE project_id=? AND " + Self.ticketCleanupHistoryRowSQL + " ORDER BY seq LIMIT 100001",arguments:[pid,keys,keys,keys])
             var count = 0
             while let row = try cursor.next() {
                 guard targets.contains(where:{result.selected.errors[$0] == nil}) else {break}

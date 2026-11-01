@@ -215,7 +215,7 @@ extension CommandRouter {
         observePhase?("fences")
         let end = (scanRows.last?["cleanup_row"] as Int64?) ?? cursor
         let more = retryOnly ? false : try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE type='task' AND project_id=? AND rowid>?)",arguments:[pid,end]) ?? false
-        let selection: JSON = ["project_id":pid,"settings":settings,"items":items,"next_cursor":more ? end : 0,"scan_cursor":cursor,"more":more,"attempted_retry_ids":Array(dueRetries),"retry_task_ids":planningRetries,"observed_retry_tokens":retryEntries.mapValues(\.token),"retry_only":retryOnly,"sweep_deadline":sweepDeadline,
+        let selection: JSON = ["project_id":pid,"settings":settings,"items":items,"next_cursor":more ? end : 0,"scan_cursor":cursor,"more":more,"attempted_retry_ids":Array(dueRetries),"retry_task_ids":planningRetries,"limit_retry_task_ids":planningRetries,"observed_retry_tokens":retryEntries.mapValues(\.token),"retry_only":retryOnly,"sweep_deadline":sweepDeadline,
             "selected_bytes":items.reduce(Int64(0)) {$0 + (((($1["summary"] as? JSON)?["pending_bytes"]) as? NSNumber)?.int64Value ?? 0)},"physical_reclamation":"unmeasured","source_build_cache":try sourceBuildCacheRetainedEntries(db,project:pid)]
         // Scan resets are scheduling, not deletion authority. Each selected
         // ticket fences its own records/references before any action commits.
@@ -224,22 +224,22 @@ extension CommandRouter {
         return TicketCleanupPreparedPass(fence:fence,project:project,selection:selection,plans:plans,expiredCommands:expired,itemFences:itemFences)
     }
 
+    /// Least recently served due project first. A project that stays due (a long
+    /// sweep, retries or a failing preparation) must not hold every other project's turn.
     func prepareTicketLifecycleCleanup(_ db: Database,at time: Date = Date()) throws -> TicketCleanupPreparedPass? {
+        var due: [(turn: Int,next: Double,id: String,project: JSON)] = []
         for project in try records(db,type:"project") {
             let settings = ticketCleanupSettings(project)
             guard bool(settings,"done_evidence_enabled") || bool(settings,"closed_purge_enabled") else {continue}
-            let next =
-                Double(
-                    try String.fetchOne(
-                        db, sql: "SELECT value FROM metadata WHERE key=?", arguments: ["ticket-cleanup-next:" + ((try StoredRecord(project, family: "project").string("id")))])
-                        ?? "0") ?? 0
-            if let retry = try ticketCleanupProjectRetry(db, project: (try StoredRecord(project, family: "project").string("id"))), retry > time { continue }
-            if time.timeIntervalSince1970 >= next {
-                try beginTicketCleanupPreparation(project: (try StoredRecord(project, family: "project").string("id")))
-                return try ticketCleanupSelection(db,project:project,at:time)
-            }
+            let id = try StoredRecord(project, family: "project").string("id")
+            let next = Double(try String.fetchOne(db, sql: "SELECT value FROM metadata WHERE key=?", arguments: ["ticket-cleanup-next:" + id]) ?? "0") ?? 0
+            if let retry = try ticketCleanupProjectRetry(db, project: id), retry > time { continue }
+            if time.timeIntervalSince1970 >= next {due.append((ticketCleanupProjectTurns[id] ?? 0,next,id,project))}
         }
-        return nil
+        guard let chosen = due.min(by:{($0.turn,$0.next) < ($1.turn,$1.next)}) else {return nil}
+        ticketCleanupTurnCount += 1;ticketCleanupProjectTurns[chosen.id] = ticketCleanupTurnCount
+        try beginTicketCleanupPreparation(project:chosen.id)
+        return try ticketCleanupSelection(db,project:chosen.project,at:time)
     }
 
     /// Only fresh preparation reaches this short semantic transaction. The pass
@@ -284,9 +284,12 @@ extension CommandRouter {
             try self.event(db,caller:Caller(role:"owner",installation:"storage",projectIDs:[]),project:pid,entity:pid,kind:"ticket_cleanup_pass",data:["origin":"automatic_cleanup","receipt_id":id,"admitted_count":items.filter {$0["action"] as? String != "keep"}.count])
             try db.execute(sql:"INSERT OR IGNORE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-first:" + pid,id])
             var retries = try ticketCleanupRetryEntries(db,project:pid)
-            let observedTokens = selection["observed_retry_tokens"] as? [String:String] ?? [:]
+            let observedTokens = selection["observed_retry_tokens"] as? [String:String] ?? [:],observed = retries.filter {$0.value.token == observedTokens[$0.key]}
+            let refused = Set(selection["limit_retry_task_ids"] as? [String] ?? [])
             for id in selection["attempted_retry_ids"] as? [String] ?? [] where retries[id]?.token == observedTokens[id] {retries.removeValue(forKey:id)}
-            for id in selection["retry_task_ids"] as? [String] ?? [] {retries[id] = TicketCleanupRetry(at:time.addingTimeInterval(60))}
+            for id in selection["retry_task_ids"] as? [String] ?? [] {
+                retries[id] = refused.contains(id) ? TicketCleanupRetry(refusedAfter:observed[id],at:time) : TicketCleanupRetry(at:time.addingTimeInterval(60))
+            }
             try saveTicketCleanupRetries(db,project:pid,entries:retries)
             let reset = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM ticket_cleanup_changes WHERE kind=3 AND id=CAST(? AS BLOB))",arguments:["ticket-cleanup-cursor:" + pid]) ?? false
             let cursor = reset ? 0 : ((selection["next_cursor"] as? Int64) ?? 0)

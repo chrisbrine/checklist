@@ -6,9 +6,17 @@ import GRDB
 struct TicketCleanupRetry {
     let deadline: Double
     let token: String
-    init(at time: Date) {deadline = time.timeIntervalSince1970;token = uuid()}
-    init(deadline: Double,token: String) {self.deadline = deadline;self.token = token}
-    var value: JSON {["deadline":deadline,"token":token]}
+    /// Limit refusals since the last wake. A refusal repeats until the ticket
+    /// or its project changes, so it must not cost a preparation every minute.
+    let refusals: Int
+    init(at time: Date) {deadline = time.timeIntervalSince1970;token = uuid();refusals = 0}
+    init(deadline: Double,token: String,refusals: Int = 0) {self.deadline = deadline;self.token = token;self.refusals = refusals}
+    /// 60 s, doubling to 1 hour. `prior` is nil when a new wake replaced the observed entry.
+    init(refusedAfter prior: TicketCleanupRetry?,at time: Date) {
+        let count = prior?.refusals ?? 0
+        self.init(deadline:time.addingTimeInterval(min(3600,60 * pow(2,Double(min(count,6))))).timeIntervalSince1970,token:uuid(),refusals:count + 1)
+    }
+    var value: JSON {refusals == 0 ? ["deadline":deadline,"token":token] : ["deadline":deadline,"token":token,"refusals":refusals]}
 }
 
 extension TicketCleanupPreparedPass {
@@ -45,7 +53,7 @@ extension CommandRouter {
             guard let entry = raw as? JSON,let deadline = entry["deadline"] as? Double,let token = entry["token"] as? String,!token.isEmpty else {
                 throw CoreError("CLEANUP_RETRY_INVALID","Cleanup retry scheduling needs repair; bytes retained.")
             }
-            return TicketCleanupRetry(deadline:deadline,token:token)
+            return TicketCleanupRetry(deadline:deadline,token:token,refusals:(entry["refusals"] as? Int) ?? 0)
         }
     }
     func ticketCleanupRetries(_ db: Database,project: String) throws -> [String:Double] {

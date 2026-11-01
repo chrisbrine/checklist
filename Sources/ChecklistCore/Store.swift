@@ -46,6 +46,9 @@ public final class CommandRouter: @unchecked Sendable {
     private var cleanupRetry: Date?
     private var cleanupYield: Date?
     var ticketCleanupLifecycleTurn = true // Serialized maintenance lane only.
+    // Owned only by the serialized maintenance lane; a restart starts every project level.
+    var ticketCleanupProjectTurns: [String:Int] = [:]
+    var ticketCleanupTurnCount = 0
     private var cleanupFailure: String?
     var storageMaintenanceRetryAt: Date? {
         get {maintenanceStateLock.withLock {routineRetry}}

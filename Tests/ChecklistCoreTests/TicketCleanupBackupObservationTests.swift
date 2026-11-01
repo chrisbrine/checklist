@@ -104,7 +104,7 @@ extension TicketLifecycleCleanupTests {
         var historyScans = 0,backupScans = 0
         let prepared = try router.readers!.read {db in
             db.trace {if case .statement(let statement) = $0 {
-                if statement.sql.contains("MAX(occurred_at)") || statement.sql.contains("FROM events WHERE project_id=? ORDER BY seq LIMIT 100001") {historyScans += 1}
+                if statement.sql.contains("MAX(occurred_at)") || statement.sql.contains("FROM events WHERE project_id=? AND CASE") {historyScans += 1}
                 if statement.sql.contains(Self.fingerprintSQL) || statement.sql.contains(Self.receiptReadSQL) {backupScans += 1}
             }}
             defer {db.trace(nil)}

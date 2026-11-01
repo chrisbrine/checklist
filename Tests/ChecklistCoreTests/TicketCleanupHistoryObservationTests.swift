@@ -29,7 +29,7 @@ extension TicketLifecycleCleanupTests {
             let tasks = [first,second],batch = try self.router.ticketCleanupInventories(db,tasks:tasks)
             let graphs = try self.p321HistoryReferenceGraphs(tasks,batch.inventories)
             var scans = 0
-            db.trace {if case .statement(let statement) = $0,statement.sql.contains("FROM events WHERE project_id=? ORDER BY seq LIMIT 100001") {scans += 1}}
+            db.trace {if case .statement(let statement) = $0,statement.sql.contains("FROM events WHERE project_id=? AND CASE") {scans += 1}}
             let observation = try self.router.ticketCleanupEventObservation(db,tasks:tasks,inventories:batch.inventories,referenceGraphs:graphs)
             db.trace(nil)
             XCTAssertEqual(scans,1);XCTAssertTrue(observation.errors.isEmpty)
