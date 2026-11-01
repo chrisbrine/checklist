@@ -1,7 +1,8 @@
 import Foundation
 
 // Format 2 retains every descriptor, but interns content and prefix-compresses
-// repeated paths/authority strings. Format 1 remains the original JSON array.
+// repeated paths/authority strings. Format 3 also prefix-compresses the sorted
+// unavailable list (CL-387). Format 1 remains the original JSON array.
 extension StorageSnapshotManifest {
     private enum CodingKeys: String, CodingKey {
         case format, kind, operationID, storeID, sourceRoot, schema, databaseSHA256, databaseSize
@@ -11,7 +12,7 @@ extension StorageSnapshotManifest {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         format = try c.decode(Int.self, forKey: .format)
-        guard [1, 2].contains(format) else { throw StorageSnapshotFailure.incomplete }
+        guard [1, 2, 3].contains(format) else { throw StorageSnapshotFailure.incomplete }
         kind = try c.decode(String.self, forKey: .kind)
         operationID = try c.decode(String.self, forKey: .operationID)
         storeID = try c.decode(String.self, forKey: .storeID)
@@ -21,7 +22,8 @@ extension StorageSnapshotManifest {
         databaseSize = try c.decode(Int64.self, forKey: .databaseSize)
         objects = format == 1 ? try c.decode([StorageSnapshotMaterializedObject].self, forKey: .objects)
             : try c.decode(StorageSnapshotObjectTable.self, forKey: .objects).materialized()
-        unavailable = try c.decode([StorageSnapshotAbsence].self, forKey: .unavailable)
+        unavailable = format >= 3 ? try c.decode(StorageSnapshotAbsenceTable.self, forKey: .unavailable).materialized()
+            : try c.decode([StorageSnapshotAbsence].self, forKey: .unavailable)
         externalReferences = try c.decode([String].self, forKey: .externalReferences)
         recordFamilies = try c.decodeIfPresent([String:Int].self, forKey: .recordFamilies)
         tableRows = try c.decodeIfPresent([String:Int].self, forKey: .tableRows)
@@ -30,16 +32,66 @@ extension StorageSnapshotManifest {
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
-        guard [1, 2].contains(format) else { throw StorageSnapshotFailure.incomplete }
+        guard [1, 2, 3].contains(format) else { throw StorageSnapshotFailure.incomplete }
         try c.encode(format, forKey: .format); try c.encode(kind, forKey: .kind)
         try c.encode(operationID, forKey: .operationID); try c.encode(storeID, forKey: .storeID)
         try c.encode(sourceRoot, forKey: .sourceRoot); try c.encode(schema, forKey: .schema)
         try c.encode(databaseSHA256, forKey: .databaseSHA256); try c.encode(databaseSize, forKey: .databaseSize)
         if format == 1 { try c.encode(objects, forKey: .objects) }
         else { try c.encode(StorageSnapshotObjectTable(objects), forKey: .objects) }
-        try c.encode(unavailable, forKey: .unavailable); try c.encode(externalReferences, forKey: .externalReferences)
+        if format >= 3 { try c.encode(StorageSnapshotAbsenceTable(unavailable), forKey: .unavailable) }
+        else { try c.encode(unavailable, forKey: .unavailable) }
+        try c.encode(externalReferences, forKey: .externalReferences)
         try c.encodeIfPresent(recordFamilies, forKey: .recordFamilies); try c.encodeIfPresent(tableRows, forKey: .tableRows)
         try c.encodeIfPresent(capturedAt, forKey: .capturedAt)
+    }
+}
+
+/// Each row is [reason index, bytes shared with the previous authority, the other bytes].
+private struct StorageSnapshotAbsenceTable: Codable {
+    struct Row: Codable {
+        let reason: Int
+        let bytes: Int
+        let suffix: String
+        init(_ reason: Int, _ bytes: Int, _ suffix: String) { self.reason = reason; self.bytes = bytes; self.suffix = suffix }
+        init(from decoder: Decoder) throws {
+            var c = try decoder.unkeyedContainer()
+            reason = try c.decode(Int.self); bytes = try c.decode(Int.self); suffix = try c.decode(String.self)
+            guard c.isAtEnd else { throw StorageSnapshotFailure.incomplete }
+        }
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.unkeyedContainer(); try c.encode(reason); try c.encode(bytes); try c.encode(suffix)
+        }
+    }
+    let reasons: [String]
+    let entries: [Row]
+
+    init(_ absences: [StorageSnapshotAbsence]) {
+        var indices: [String:Int] = [:], names: [String] = [], rows: [Row] = [], previous = Data()
+        rows.reserveCapacity(absences.count)
+        for absence in absences {
+            let reason: Int
+            if let known = indices[absence.reason] { reason = known }
+            else { reason = names.count; indices[absence.reason] = reason; names.append(absence.reason) }
+            let value = Data(absence.authority.utf8)
+            var n = zip(previous, value).prefix { $0 == $1 }.count
+            // Prefix length counts UTF-8 bytes and must end at a scalar boundary.
+            while n < value.count && n > 0 && value[n] & 0xc0 == 0x80 { n -= 1 }
+            rows.append(.init(reason, n, String(decoding: value.dropFirst(n), as: UTF8.self))); previous = value
+        }
+        reasons = names; entries = rows
+    }
+
+    func materialized() throws -> [StorageSnapshotAbsence] {
+        var previous = Data(), absences: [StorageSnapshotAbsence] = []
+        absences.reserveCapacity(entries.count)
+        for row in entries {
+            guard reasons.indices.contains(row.reason), row.bytes >= 0, row.bytes <= previous.count else { throw StorageSnapshotFailure.incomplete }
+            var value = Data(previous.prefix(row.bytes)); value.append(contentsOf: row.suffix.utf8)
+            guard let authority = String(data: value, encoding: .utf8) else { throw StorageSnapshotFailure.incomplete }
+            absences.append(.init(authority: authority, reason: reasons[row.reason])); previous = value
+        }
+        return absences
     }
 }
 

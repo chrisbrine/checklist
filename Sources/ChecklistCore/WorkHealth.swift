@@ -150,12 +150,28 @@ extension CommandRouter {
         if !bool(selected,"active_attention") {
             value["state"] = "inactive"; value["attention"] = false; value.removeValue(forKey:"next_check_at")
         }
-        value["native_wake"] = "one relay write when the session has a verified native endpoint; otherwise MCP pickup; no model runtime"
+        value["native_wake"] = NativeCommunicationRoutes.workHealthWake
         return value
     }
 
     /// Queue only this message's exact recipients; never load the project outbox.
-    private func queueHealthDeliveries(_ db: Database, message: JSON, recipients: [JSON]) throws -> [JSON] {
+    /// One relayed turn per session in this interval, whichever ticket asks (CL-389).
+    static let healthRelayInterval: TimeInterval = 1200
+    /// Relayed requests for one attempt, even when each follows new progress (CL-389).
+    static let maximumHealthRelays = 3
+    private func claimHealthRelay(_ db: Database, session: String, at date: Date) throws -> Bool {
+        let key = "work-health-relay:" + session
+        if let raw = try String.fetchOne(db, sql: "SELECT value FROM metadata WHERE key=?", arguments: [key]), let last = healthTime(raw),
+           date >= last, date.timeIntervalSince(last) < Self.healthRelayInterval { return false }
+        try db.execute(sql: "INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", arguments: [key, healthStamp(date)])
+        return true
+    }
+    private func healthHasKnownWait(_ db: Database, task: JSON) throws -> Bool {
+        let pid = try StoredRecord(task, family: "task").string("project_id")
+        if let aid = task["active_attempt_id"] as? String, let attempt = try? scoped(db, aid, pid, type: "attempt"), attempt["waiting_for_resource"] != nil { return true }
+        return try !scopedTaskRows(db, type: "request", task: task, predicate: "json_extract(data,'$.state')='pending' AND json_extract(data,'$.blocking')=1", limit: 1).isEmpty
+    }
+    private func queueHealthDeliveries(_ db: Database, message: JSON, recipients: [JSON], at date: Date = Date()) throws -> [JSON] {
         let pid = (try StoredRecord(message, family: "message").string("project_id")), mid = (try StoredRecord(message, family: "message").string("id"))
         var deliveries = try Row.fetchAll(db, sql: "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='delivery' AND project_id=? AND json_extract(data,'$.message_id')=? LIMIT 33", arguments:[pid,mid]).map { try GRDBRecordEnvelopeAdapter.decode($0).object }
         for recipient in recipients {
@@ -164,8 +180,12 @@ extension CommandRouter {
             guard session["role"] as? String == "worker", canReceive(session,project:pid), sessionGeneration(session) == generation else { throw CoreError("RECIPIENT_CHANGED", "Health recipient authorization changed before pickup queueing.") }
             if deliveries.contains(where: { $0["recipient_session_id"] as? String == sid && $0["recipient_authorization_generation"] as? String == generation }) { continue }
             var delivery: JSON = ["id":uuid(),"project_id":pid,"message_id":mid,"recipient_session_id":sid,"recipient_authorization_generation":generation,"recipient_role":recipient["recipient_role"] ?? "health_handler","state":"queued","push_state":"unavailable","push_reason":"This work health notice waits for exact-session MCP pickup.","revision":1,"created_at":now()]
-            // Only the request relays. Its outcome and no-response notices must not start a turn for the session that replied.
-            if message["health_request"] != nil { delivery["native_relay"] = "work_health"; delivery["push_reason"] = "Relayed once when this session has a verified native endpoint; otherwise it waits for exact-session MCP pickup." }
+            // Only a request chosen for the relay, and only to its handler. Outcome and no-response notices and the
+            // orchestrator's copy must not start a turn; the orchestrator cannot answer this request.
+            if (message["health_request"] as? JSON)?["native_relay"] as? Bool == true, recipient["recipient_role"] as? String ?? "health_handler" == "health_handler",
+               try claimHealthRelay(db, session: sid, at: date) {
+                delivery["native_relay"] = "work_health"; delivery["push_reason"] = "Relayed once when this session has a verified native endpoint; otherwise it waits for exact-session MCP pickup."
+            }
             copyRoleLabel(recipient, into: &delivery)
             try save(db,delivery,type:"delivery");deliveries.append(delivery)
         }
@@ -173,7 +193,7 @@ extension CommandRouter {
     }
 
     private var healthActor: Caller { Caller(role: "owner", installation: "work-health-service", projectIDs: []) }
-    @discardableResult private func healthNote(_ db: Database, task: JSON, body: String, target: JSON?, request: JSON? = nil) throws -> JSON {
+    @discardableResult private func healthNote(_ db: Database, task: JSON, body: String, target: JSON?, request: JSON? = nil, at date: Date = Date()) throws -> JSON {
         let pid = (try StoredRecord(task, family: "task").string("project_id"))
         var message: JSON = ["id": uuid(), "project_id": pid, "task_id": (try StoredRecord(task, family: "record").requiredValue("id")), "kind": "work_health", "origin": "system",
                              "body": body, "author": "work-health-service", "author_display": "Checklist work health", "author_session_id": "service",
@@ -196,7 +216,7 @@ extension CommandRouter {
            !recipients.contains(where: { $0["session_id"] as? String == copy["session_id"] as? String }) {
             recipients.append(copy)
         }
-        let deliveries = try queueHealthDeliveries(db, message: message, recipients: recipients)
+        let deliveries = try queueHealthDeliveries(db, message: message, recipients: recipients, at: date)
         try event(db, caller: healthActor, project: pid, entity: task["id"] as? String, kind: "work_health_note", data: ["message_id": (try StoredRecord(message,
             family: "record").requiredValue("id"))])
         message["deliveries"] = deliveries
@@ -318,8 +338,12 @@ extension CommandRouter {
             message["health_request"] = request; try save(db, message, type: "message")
         } else if date >= max(due, baseline.addingTimeInterval(interval)) {
             let deadline = healthStamp(date.addingTimeInterval(grace))
-            let request: JSON = ["target": target, "task_revision": int(task, "revision"), "acceptance_revision": int(task, "acceptance_revision"), "manifest_id": task["current_manifest_id"] ?? NSNull(), "requested_at": stamp, "last_progress_at": progress.map(healthStamp) ?? NSNull(), "progress_token": progressToken, "deadline": deadline]
-            let note = try healthNote(db, task: task, body: "Work health check: does work continue? Last substantive progress: \(progress.map(healthStamp) ?? "not recorded"). Reply to this exact note with current progress or a known wait, or call work_health_respond with request_id from this note. Response due \(deadline). This is an advisory check, not a new claim. It is also available on MCP pickup while this exact session remains eligible.", target: target, request: request)
+            // CL-389: a request relays only for new progress, never during a known wait, and at most three times per attempt.
+            let relayTarget = target["id"] as? String, relayCount = health["relay_target"] as? String == relayTarget ? int(health, "relay_count", default: 0) : 0
+            let relayed = try target["session_id"] != nil && health["relayed_progress_token"] as? String != progressToken && relayCount < Self.maximumHealthRelays && !healthHasKnownWait(db, task: task)
+            var request: JSON = ["target": target, "task_revision": int(task, "revision"), "acceptance_revision": int(task, "acceptance_revision"), "manifest_id": task["current_manifest_id"] ?? NSNull(), "requested_at": stamp, "last_progress_at": progress.map(healthStamp) ?? NSNull(), "progress_token": progressToken, "deadline": deadline]
+            if relayed { request["native_relay"] = true; health["relayed_progress_token"] = progressToken; health["relay_target"] = relayTarget ?? NSNull(); health["relay_count"] = relayCount + 1 }
+            let note = try healthNote(db, task: task, body: "Work health check: does work continue? Last substantive progress: \(progress.map(healthStamp) ?? "not recorded"). Reply to this exact note with current progress or a known wait, or call work_health_respond with request_id from this note. Response due \(deadline). This is an advisory check, not a new claim. It is also available on MCP pickup while this exact session remains eligible.", target: target, request: request, at: date)
             health["request_id"] = note["id"]; health["deadline"] = deadline; health["next_check_at"] = deadline; health["state"] = "awaiting_response"; health["attention"] = target["kind"] as? String == "missing_handler"
         } else if health["request_id"] == nil {
             health["state"] = target["kind"] as? String == "missing_handler" ? "missing_handler" : "current"

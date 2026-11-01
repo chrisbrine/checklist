@@ -200,6 +200,49 @@ extension EvidenceAuthorityTests {
         XCTAssertTrue(try candidates().isEmpty,"The no-response notice stays on pickup")
         XCTAssertEqual(try respondHealth(p,t,request:mid,caller:w)["outcome"] as? String,"resumed")
         XCTAssertTrue(try candidates().isEmpty,"A reply starts no further turn for its author")
+        try checkHealth(at:Date().addingTimeInterval(4000))
+        XCTAssertNotEqual(try health(p,t)["request_id"] as? String,mid,"A later request exists")
+        XCTAssertTrue(try candidates().isEmpty,"A later request with no new progress stays on pickup")
+    }
+    private func healthRelays(_ w: Caller) throws -> [JSON] {
+        let bridge = Caller(role:"owner",installation:"native-bridge",projectIDs:[])
+        return try (call("delivery_pending",["native_session_ids":[w.sessionID!],"native_dispatch_candidates":true],bridge)["deliveries"] as! [JSON]).filter { $0["native_relay"] != nil }
+    }
+    private func healthCheckpoint(_ p: JSON, _ t: JSON, _ a: JSON, _ w: Caller, wait: String? = nil, step: Int = 0) throws {
+        var input = auth(p,a); input["progress"] = "Substantive step \(step)"; input["direction_cursor"] = try call("task_context",["project_id":p["id"]!,"task_id":t["id"]!],w)["direction_cursor"]
+        if let wait { input["waiting_for_resource"] = wait }
+        _ = try call("work_checkpoint",input,w)
+    }
+    func testWorkHealthKnownWaitStopsTheRelayAndStaysVisible() throws {
+        let p = try project(), t = try ready(p), w = try native(p,"health-wait",domain:"health-wait"), a = try claim(p,t,caller:w)
+        try healthCheckpoint(p,t,a,w,wait:"runner session")
+        try checkHealth(at:Date().addingTimeInterval(1300))
+        let state = try health(p,t)
+        XCTAssertNotNil(state["request_id"],"The request stays available on pickup")
+        XCTAssertTrue(try healthRelays(w).isEmpty)
+        XCTAssertEqual((state["known_waits"] as? [JSON])?.first?["reason"] as? String,"runner session")
+    }
+    func testWorkHealthRelaysAtMostThreeTimesPerAttemptAcrossNewProgress() throws {
+        let p = try project(), t = try ready(p), w = try native(p,"health-cap",domain:"health-cap"), a = try claim(p,t,caller:w)
+        let bridge = Caller(role:"owner",installation:"native-bridge",projectIDs:[])
+        var relays = 0
+        for cycle in 1...5 {
+            try healthCheckpoint(p,t,a,w,step:cycle)
+            let date = Date().addingTimeInterval(Double(cycle) * 4000)
+            try checkHealth(at:date); try checkHealth(at:date.addingTimeInterval(1300))
+            for delivery in try healthRelays(w) {
+                relays += 1
+                _ = try call("delivery_record",["delivery_id":delivery["id"]!,"state":"transport_written","receipt":["bytes":1]],bridge)
+            }
+        }
+        XCTAssertEqual(relays,3)
+    }
+    func testWorkHealthRelaysOncePerSessionAcrossTicketsInItsInterval() throws {
+        let p = try project(), w = try native(p,"health-many",domain:"health-many")
+        let first = try ready(p), second = try ready(p), a = try claim(p,first,caller:w), b = try claim(p,second,caller:w)
+        try ageHealthAttempt(a); try ageHealthAttempt(b); try checkHealth()
+        XCTAssertNotNil(try health(p,first)["request_id"]); XCTAssertNotNil(try health(p,second)["request_id"])
+        XCTAssertEqual(try healthRelays(w).count,1)
     }
     func testWorkHealthLateReplyResumesCurrentHandlerAndIsIdempotent() throws {
         let p = try project(), t = try ready(p), w = try native(p,"health-late",domain:"health-Late"), a = try claim(p,t,caller:w)

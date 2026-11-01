@@ -279,6 +279,10 @@ final class StorageSnapshotCapacityTests: XCTestCase {
                 XCTAssertGreaterThan(e?.details["measured_bytes"] as? Int64 ?? 0, 0)
                 XCTAssertNotNil(e?.details["next_step"])
                 XCTAssertNil(e?.details["required_free_bytes"])
+                if kind == "manifest" {
+                    XCTAssertGreaterThan(e?.details["measured_manifest_bytes"] as? Int ?? 0, maximum)
+                    XCTAssertTrue(e?.message.contains("The manifest measured") == true)
+                }
             }
             XCTAssertFalse(FileManager.default.fileExists(atPath: f.base.appendingPathComponent(StorageSnapshot.names(operation).published).path))
         }
@@ -360,7 +364,7 @@ final class StorageSnapshotCapacityTests: XCTestCase {
         XCTAssertEqual(first.st_ino,second.st_ino);XCTAssertNotEqual(first.st_ino,original.st_ino)
         let manifestURL = backup.appendingPathComponent("manifest.json")
         let current = try JSONDecoder().decode(StorageSnapshotManifest.self,from:Data(contentsOf:manifestURL))
-        XCTAssertEqual(current.format,2);XCTAssertEqual(current.objects.count,2)
+        XCTAssertEqual(current.format,3);XCTAssertEqual(current.objects.count,2)
         XCTAssertEqual(try StorageSnapshot.reconcile(parent:f.base,operation:operation,budget:.production()).manifestSHA256,receipt.manifestSHA256)
         // Exercise a genuine format-1 generation through full verification and
         // disposable restore, including independent duplicate destination inodes.

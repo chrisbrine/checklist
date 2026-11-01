@@ -27,13 +27,44 @@ final class StorageCompactManifestTests: XCTestCase {
         print("CL270 template objects=200000 manifest_bytes=\(bytes.count) encode_decode_seconds=\(ProcessInfo.processInfo.systemUptime-start)")
     }
 
+    private func absences(_ count: Int) -> [StorageSnapshotAbsence] {
+        (0..<count).map { n in
+            let capture = String(format:"%08d-0000-0000-0000-000000000000",n / 600)
+            return .init(authority:"source_capture:\(capture):\(capture):Sources/ChecklistApp/Views/RetainedSourceFile-\(String(format:"%04d",n % 600)).swift",reason:n % 2 == 0 ? "evidence_cleaned" : "deletion_object_absent")
+        }
+    }
+    private func withAbsences(_ list: [StorageSnapshotAbsence], objects: Int = 0, format: Int) -> StorageSnapshotManifest {
+        let b = template(objects,format:format)
+        return .init(format:format,kind:b.kind,operationID:b.operationID,storeID:b.storeID,sourceRoot:b.sourceRoot,schema:3,databaseSHA256:b.databaseSHA256,databaseSize:1,objects:b.objects,unavailable:list,externalReferences:[],recordFamilies:nil,tableRows:nil,capturedAt:nil)
+    }
     func testManifestLimitHoldsTheObjectLimitAndItsCleanedEntries() throws {
-        // CL-387: scale a small sample. Each cleaned object leaves up to three absence entries.
-        let sample = 5_000,objects = try StorageSnapshot.encoded(template(sample,format:2)).count
-        let absences = (0..<sample).map { StorageSnapshotAbsence(authority:"source_capture:\(UUID().uuidString):\(UUID().uuidString):Sources/ChecklistApp/Views/RetainedSourceFile-\($0).swift",reason:"evidence_cleaned") }
-        let absenceBytes = try StorageSnapshot.encoded(absences).count
-        let limit = StorageSnapshotBudget.objectLimit,scale = limit / sample
-        XCTAssertLessThan(objects * scale + absenceBytes * scale * 3,StorageSnapshotBudget.manifestByteLimit)
+        // CL-387: the live store has 4.43 unavailable entries per object, with no bound. Scale a sample at six per object.
+        let sample = 2_000,bytes = try StorageSnapshot.encoded(withAbsences(absences(sample * 6),objects:sample,format:3)).count
+        XCTAssertLessThan(bytes * (StorageSnapshotBudget.objectLimit / sample),StorageSnapshotBudget.manifestByteLimit)
+    }
+    func testFormatThreeKeepsEveryUnavailableEntryAndReadsOlderFormats() throws {
+        var list = absences(1_200)
+        list.append(.init(authority:"attachment:é:original",reason:"original_cleaned"))
+        list.append(.init(authority:"attachment:e\u{301}:original",reason:"original_cleaned"))
+        let compact = try StorageSnapshot.encoded(withAbsences(list,format:3))
+        let copy = try JSONDecoder().decode(StorageSnapshotManifest.self,from:compact)
+        XCTAssertEqual(copy.format,3)
+        XCTAssertEqual(copy.unavailable.map {Data($0.authority.utf8)},list.map {Data($0.authority.utf8)})
+        XCTAssertEqual(copy.unavailable.map(\.reason),list.map(\.reason))
+        for format in [1,2] {
+            let older = try JSONDecoder().decode(StorageSnapshotManifest.self,from:StorageSnapshot.encoded(withAbsences(list,format:format)))
+            XCTAssertEqual(older.unavailable.map {Data($0.authority.utf8)},list.map {Data($0.authority.utf8)})
+        }
+        XCTAssertLessThan(compact.count * 3,try StorageSnapshot.encoded(withAbsences(list,format:2)).count)
+    }
+    func testFormatThreeRefusesMalformedUnavailableRows() throws {
+        let encoded = try StorageSnapshot.encoded(withAbsences(absences(3),format:3))
+        let shape = try JSONSerialization.jsonObject(with:encoded) as! [String:Any]
+        for row in [[9,0,"x"],[0,-1,"x"],[0,9_999,"x"],[0,0]] as [[Any]] {
+            var changed = shape,table = shape["unavailable"] as! [String:Any]
+            table["entries"] = [row];changed["unavailable"] = table
+            XCTAssertThrowsError(try JSONDecoder().decode(StorageSnapshotManifest.self,from:JSONSerialization.data(withJSONObject:changed)))
+        }
     }
 
     func testCompactUnicodeNilExpectationsAndMalformedIndices() throws {

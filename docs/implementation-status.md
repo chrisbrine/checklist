@@ -241,7 +241,7 @@ The ticket handoff separates preparation from app-opening outcomes. Opening fail
 
 ### Active work health (CL-129 source)
 
-Configurable local-service supervision records one correlated request after inactivity and one no-response note after grace, with 20-minute defaults. The MCP and native ticket section expose current-attempt/accepted-child progress separately from liveness, known waits, finite source jobs and exact delivery receipts. Pause/restart and correlated late replies preserve claim/status/Triage authority; changed ownership requires ordinary reconciliation. System requests use MCP pickup and explicitly lack native wake. Component/build evidence belongs to the implementation hand-in; installation, native pickup/UI and independent review remain with the orchestrator. See [work health](work-health.md).
+Configurable local-service supervision records one correlated request after inactivity and one no-response note after grace, with 20-minute defaults. The MCP and native ticket section expose current-attempt/accepted-child progress separately from liveness, known waits, finite source jobs and exact delivery receipts. Pause/restart and correlated late replies preserve claim/status/Triage authority; changed ownership requires ordinary reconciliation. System requests stay on MCP pickup, and the Claude relay carries them under the limits in work health (CL-386, CL-389). Component/build evidence belongs to the implementation hand-in; installation, native pickup/UI and independent review remain with the orchestrator. See [work health](work-health.md).
 
 ### Provider plugins and planned project conversations (CL-124, CL-128)
 

@@ -712,7 +712,7 @@ def snapshot_objects(manifest):
     """Expand the versioned compact table without changing descriptor authority."""
     if manifest['format'] == 1:
         return manifest['objects']
-    if manifest['format'] != 2:
+    if manifest['format'] not in [2, 3]:
         raise ValueError('Unsupported snapshot format.')
     table = manifest['objects']
     entries, contents, prefixes = table['entries'], table['contents'], table['strings']
@@ -932,7 +932,7 @@ def snapshot_seed(source, destination, destination_root=None, current_schema=Non
     contained(manifest_file, source)
     raw = manifest_file.read_bytes()
     manifest = json.loads(raw)
-    if manifest['format'] not in [1, 2] or manifest['kind'] != 'checklist-store-snapshot':
+    if manifest['format'] not in [1, 2, 3] or manifest['kind'] != 'checklist-store-snapshot':
         raise ValueError('Unsupported snapshot format/schema.')
     supported_schema(manifest['schema'], current_schema, 'snapshot')
     uuid.UUID(manifest['storeID']); uuid.UUID(manifest['operationID'])
@@ -1098,14 +1098,14 @@ def restored_source_manifest(source, receipt, schema):
             for file in sorted((root / 'backups').glob(pattern)):
                 try:
                     contained(file, root / 'backups')
-                    if not file.is_file() or file.stat().st_size > 128 * 1_048_576: continue
-                    with file.open('rb') as stream: raw = stream.read(128 * 1_048_576 + 1)
+                    if not file.is_file() or file.stat().st_size > 512 * 1_048_576: continue
+                    with file.open('rb') as stream: raw = stream.read(512 * 1_048_576 + 1)
                 except (OSError, ValueError):
                     continue
-                if len(raw) > 128 * 1_048_576 or hashlib.sha256(raw).hexdigest() != receipt['manifest_sha256']: continue
+                if len(raw) > 512 * 1_048_576 or hashlib.sha256(raw).hexdigest() != receipt['manifest_sha256']: continue
                 manifest = json.loads(raw)
                 origin = manifest.get('sourceRoot')
-                if (manifest.get('format') not in [1, 2] or manifest.get('kind') != 'checklist-store-snapshot'
+                if (manifest.get('format') not in [1, 2, 3] or manifest.get('kind') != 'checklist-store-snapshot'
                         or manifest.get('schema') != schema or manifest.get('storeID') != receipt['source_store_id']
                         or not isinstance(origin, str) or not origin.startswith('/') or '\0' in origin
                         or any(part in ['', '.', '..'] for part in origin.split('/')[1:])):

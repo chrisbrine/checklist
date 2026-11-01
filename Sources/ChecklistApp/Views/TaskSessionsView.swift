@@ -263,7 +263,7 @@ struct WorkHealthSummary: View {
             if let jobs = health["running_jobs"] as? [[String:Any]], !jobs.isEmpty { Text("Running source checks: \(jobs.count) · A running job does not prove substantive progress").checklistFont(.micro) }
             if let delivery = health["delivery_state"] as? String { Text("Health request: " + GlossaryText.humanize(delivery) + " · A queued or acknowledged note is not a response").checklistFont(.micro) }
             if health["response_without_new_progress"] as? Bool == true { Text("Handler replied; substantive progress is still overdue").checklistFont(.micro).foregroundStyle(.orange) }
-            Text("Native wake unavailable · MCP pickup only").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
+            Text(health["native_wake"] as? String ?? "MCP pickup only").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
         }.frame(maxWidth:.infinity, alignment:.leading)
     }
 }

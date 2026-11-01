@@ -152,7 +152,7 @@ def verify_seed(live, seed, completion, current_schema, when=None):
         if digest != seed['source_hash']: raise ValueError('seed manifest changed since slot create')
         manifest = json.loads(raw)
         intent = json.loads((folder / 'intent.json').read_bytes())
-        if (manifest['kind'] != 'checklist-store-snapshot' or manifest['format'] not in [1, 2]
+        if (manifest['kind'] != 'checklist-store-snapshot' or manifest['format'] not in [1, 2, 3]
                 or intent != {'format': str(manifest['format']), 'kind': manifest['kind'], 'operation_id': manifest['operationID'],
                               'store_id': manifest['storeID'], 'source_root': manifest['sourceRoot']}):
             raise ValueError('invalid backup publication')

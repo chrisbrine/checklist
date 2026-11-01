@@ -19,6 +19,7 @@ final class StorageSnapshotMeasurement {
     var metadataBytes: Int64 = 0
     var objects: Int = 0
     var lowerBound = true
+    var manifestBytes: Int?
     var writerLeaseSeconds: TimeInterval = 0
     // CL-340: free bytes on the backup volume, measured once before copying.
     var availableBytes: Int64?
@@ -110,12 +111,13 @@ struct StorageSnapshotBudget {
         let bytesLimit = limit == .max ? "no fixed byte limit" : limitedByFreeSpace
             ? "\(limit) bytes (free space on the backup volume less a \(Self.freeSpaceMinimumMarginBytes)-byte margin)" : "\(limit) bytes"
         let next = "Keep the store and existing backups. Retry backup_create with a new command ID on an idle Mac for a time limit; for a capacity limit, use a Checklist build supporting this store size. Do not delete retained captures or attachments to make it fit."
+        let manifestMeasure = measurement.manifestBytes.map { " The manifest measured \($0) bytes." } ?? ""
         return CoreError(reason == "snapshot_deadline" ? "BACKUP_DEADLINE_EXCEEDED" : "BACKUP_CAPACITY_EXCEEDED",
-            "Backup could not finish: \(qualifier)\(measurement.bytes) bytes in \(qualifier)\(measurement.objects) managed objects were measured. Limits: \(bytesLimit), \(maximumObjects) objects, \(maximumManifestBytes) manifest bytes, \(maximumObjectBytes) bytes per managed file, \(maximumRecords) records; owner and pre-upgrade backups allow \(Int(Self.productionSeconds)) seconds. " + next,
+            "Backup could not finish: \(qualifier)\(measurement.bytes) bytes in \(qualifier)\(measurement.objects) managed objects were measured.\(manifestMeasure) Limits: \(bytesLimit), \(maximumObjects) objects, \(maximumManifestBytes) manifest bytes, \(maximumObjectBytes) bytes per managed file, \(maximumRecords) records; owner and pre-upgrade backups allow \(Int(Self.productionSeconds)) seconds. " + next,
             details: ["reason": reason, "measured_bytes": measurement.bytes, "measured_objects": measurement.objects,
                       "measurement_is_lower_bound": measurement.lowerBound, "maximum_bytes": limit,
                       "maximum_objects": maximumObjects, "maximum_manifest_bytes": maximumManifestBytes,
-                      "maximum_object_bytes": maximumObjectBytes, "maximum_records": maximumRecords,
+                      "maximum_object_bytes": maximumObjectBytes, "maximum_records": maximumRecords, "measured_manifest_bytes": measurement.manifestBytes.map { $0 as Any } ?? NSNull(),
                       "production_deadline_seconds": Int(Self.productionSeconds), "next_step": next])
     }
     func reporting(_ error: Error) -> Error {

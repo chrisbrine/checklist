@@ -90,7 +90,7 @@ enum StorageSnapshot {
         let parent = try StorageObjectFiles(root: fixture.parent,folderAccess:budget.folderAccess), sourceFiles = try StorageObjectFiles(root: fixture.source,folderAccess:budget.folderAccess,walkDirectories:true)
         try budget.measureFreeSpace(fixture.parent)
         let names = names(operation, publicationName: fixture.publicationName), stage = try parent.makeDirectory(names.staging, batchSynchronization: true)
-        let intent = ["format": "2", "kind": kind, "operation_id": operation.uuidString.lowercased(), "store_id": fixture.storeID, "source_root": fixture.source.path]
+        let intent = ["format": "3", "kind": kind, "operation_id": operation.uuidString.lowercased(), "store_id": fixture.storeID, "source_root": fixture.source.path]
         let intentData = try encoded(intent)
         let intentSize = try budget.adding(Int64(intentData.count), to: 0)
         try stage.writeNew("intent.json", bytes: intentData)
@@ -171,13 +171,14 @@ enum StorageSnapshot {
             }
             try sourceFiles.finishWalk()
             try budget.notify("objects_finished")
-            let manifest = StorageSnapshotManifest(format: 2, kind: kind, operationID: operation.uuidString.lowercased(),
+            let manifest = StorageSnapshotManifest(format: 3, kind: kind, operationID: operation.uuidString.lowercased(),
                 storeID: fixture.storeID, sourceRoot: fixture.source.path, schema: schema, databaseSHA256: database.0,
                 databaseSize: database.1, objects: materialized.sorted { $0.descriptor.relativePath < $1.descriptor.relativePath },
                 unavailable: inventory.unavailable, externalReferences: inventory.externalReferences, recordFamilies: families, tableRows: tables, capturedAt: capturedAt)
             let manifestData = try encoded(manifest)
             budget.measurement.bytes = total + Int64(manifestData.count)
             budget.measurement.lowerBound = false
+            budget.measurement.manifestBytes = manifestData.count
             guard manifestData.count <= budget.maximumManifestBytes else { throw budget.capacityFailure("snapshot_manifest_capacity") }
             total = try budget.adding(Int64(manifestData.count), to: total)
             try stage.synchronizeCopiedDirectories(budget: budget)
@@ -263,13 +264,14 @@ enum StorageSnapshot {
         try budget.notify("verify_started")
         try budget.check()
         let manifestSize = try files.size("manifest.json")
+        budget.measurement.manifestBytes = Int(manifestSize)
         guard manifestSize <= budget.maximumManifestBytes else { throw budget.capacityFailure("snapshot_manifest_capacity") }
         let manifestData = try files.read("manifest.json", maximum: budget.maximumManifestBytes)
         guard let shape = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any], Set(shape.keys).subtracting(["recordFamilies","tableRows","capturedAt"]) == [
             "format", "kind", "operationID", "storeID", "sourceRoot", "schema", "databaseSHA256", "databaseSize", "objects", "unavailable", "externalReferences"
         ] else { throw StorageSnapshotFailure.incomplete }
         let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self, from: manifestData)
-        guard [1, 2].contains(manifest.format), manifest.kind == kind, manifest.operationID == operation.uuidString.lowercased(),
+        guard [1, 2, 3].contains(manifest.format), manifest.kind == kind, manifest.operationID == operation.uuidString.lowercased(),
               UUID(uuidString: manifest.storeID) != nil, (0...SchemaMigrations.currentSchema).contains(manifest.schema), manifest.objects.count <= budget.maximumObjects else { throw StorageSnapshotFailure.incomplete }
         if let capturedAt = manifest.capturedAt {
             guard capturedAt.utf8.count <= 40,ISO8601DateFormatter().date(from:capturedAt) != nil else {throw StorageSnapshotFailure.incomplete}

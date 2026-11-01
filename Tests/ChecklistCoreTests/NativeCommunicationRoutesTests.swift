@@ -58,7 +58,8 @@ final class NativeCommunicationRoutesTests: XCTestCase {
         let parent = try XCTUnwrap(NativeCommunicationRoutes.all.first { $0.id == "claude_idle_wake" })
         XCTAssertEqual(parent.mode, .recordedConfiguration)
         XCTAssertEqual(parent.qualifiedVersions["checklist_build"], "801d716c6c99cf40 (19)")
-        XCTAssertEqual(parent.qualificationReceipts, ["CL-5:note_C", "CL-5:note_D_idle"])
+        XCTAssertEqual(parent.qualificationReceipts, ["CL-5:note_C", "CL-5:note_D_idle", "CL-386:relay-past-cap", "CL-386:relay-past-cap-health"])
+        XCTAssertTrue(NativeCommunicationRoutes.summary.contains(NativeCommunicationRoutes.relayQualification))
         XCTAssertTrue(NativeCommunicationRoutes.summary.contains("Codex child closure remain unavailable"))
     }
 

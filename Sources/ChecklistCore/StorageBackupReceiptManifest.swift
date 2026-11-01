@@ -29,7 +29,7 @@ enum StorageBackupReceiptManifest {
         try useLease.requireCurrent()
         guard StorageObjectFiles.sha(bytes) == sha else {throw StoreRecovery.required("backup_receipt_migration_manifest_mismatch")}
         let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self,from:bytes)
-        guard [1,2].contains(manifest.format),manifest.kind == StorageSnapshot.kind,
+        guard [1,2,3].contains(manifest.format),manifest.kind == StorageSnapshot.kind,
               manifest.operationID.utf8.elementsEqual(operation.utf8),manifest.storeID.utf8.elementsEqual(identity.logical_store_id.utf8) else {throw StoreRecovery.required("backup_receipt_migration_manifest_mismatch")}
         if let stored = summary["store_id"] as? String,!stored.utf8.elementsEqual(manifest.storeID.utf8) {throw StoreRecovery.required("backup_receipt_migration_manifest_mismatch")}
         if let stored = summary["source_root"] as? String,!stored.utf8.elementsEqual(manifest.sourceRoot.utf8) {throw StoreRecovery.required("backup_receipt_migration_manifest_mismatch")}
