@@ -202,7 +202,7 @@ extension CommandRouter {
         if ["project_edit","project_settings_save"].contains(method),params["brief"] != nil || params["pinned_decisions"] != nil {return true}
         if method == "project_settings_save",params["policy"] != nil || params["policy_proposal_id"] != nil {return true}
         if method == "task_archive" {return (params["action"] as? String ?? "archive") == "archive" && bool(params,"cleanup")}
-        if method == "attachment_read" {return (params["representation"] as? String ?? "metadata") != "metadata"}
+        if method == "attachment_read" {return (params["representation"] as? String ?? "metadata") != "metadata" && params["offset"] == nil && params["length"] == nil}
         if method == "task_get",!bool(params,"include_completion_eligibility") {return false}
         if method == "human_request_create",params["target_attachment_id"] == nil,params["review_request_id"] == nil {return false}
         if method == "attachment_add" {return params["path"] != nil || (params["source"] as? JSON)?["path"] != nil}

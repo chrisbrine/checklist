@@ -116,6 +116,38 @@ extension TicketLifecycleCleanupTests {
         XCTAssertEqual(value.refusals,0);XCTAssertEqual(value.deadline,time.timeIntervalSince1970 + 60,accuracy:0.001)
     }
 
+    func testCL395ByteTurnsAlternateWithTheNewestReceiptAndKeepTheQueuePosition() throws {
+        let (project,firstTask,firstFile) = try fixture(),pid = project["id"] as! String
+        let second = try call("task_create",["project_id":pid,"title":"Later closed work"])
+        let source = URL(fileURLWithPath:project["root_path"] as! String).appendingPathComponent("later.txt");try Data("later evidence".utf8).write(to:source)
+        let secondFile = try call("attachment_add",["project_id":pid,"task_id":second["id"]!,"path":source.path,"mode":"managed_copy"])
+        try mark(project,second,category:"done")
+        try ticketCleanupBackupTemplate(router,objects:try [firstFile,secondFile].map {file in
+            ["relative_path":try XCTUnwrap(ManagedPaths.relative(file["path"] as! String,family:"objects",root:router.root)),"sha256":file["sha256"]!,"size":file["size"]!,"kind":"file"]
+        })
+        for _ in 0..<4 {try setDue(pid);router.ticketCleanupYieldAt = nil;try router.runTicketLifecycleCleanup()}
+        func selected() throws -> [String] {
+            var order: [String] = []
+            try router.ticketCleanupMaintenanceLock.withLock {
+                _ = try router.readers!.read {db in
+                    try self.router.prepareTicketObjectDeletionCohort(db) {value in
+                        if value["phase"] as? String == "selected" {order = (value["receipts"] as? [JSON] ?? []).compactMap {$0["task_id"] as? String}}
+                    }
+                }
+            }
+            return order
+        }
+        let a = firstTask["id"] as! String,b = second["id"] as! String
+        router.ticketCleanupByteNewestTurns = [:]
+        XCTAssertEqual(try selected().prefix(2),[a,b])
+        let cursor = try router.dbQueue.read {try String.fetchOne($0,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-byte-cursor:" + pid])}
+        XCTAssertEqual(try selected().prefix(2),[b,a])
+        XCTAssertEqual(try router.dbQueue.read {try String.fetchOne($0,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-byte-cursor:" + pid])},cursor)
+        try finish()
+        XCTAssertFalse(FileManager.default.fileExists(atPath:firstFile["path"] as! String))
+        XCTAssertFalse(FileManager.default.fileExists(atPath:secondFile["path"] as! String))
+    }
+
     func testCL392OutcomeRowsOfOtherTicketsDoNotCountAgainstTheHistoryLimit() throws {
         let (project,task,_) = try fixture(),pid = project["id"] as! String
         let foreign = "{\"origin\":\"automatic_cleanup\",\"receipt_id\":\"\(uuid())\",\"removed_bytes\":1,\"state\":\"removed\",\"task_id\":\"\(uuid())\"}"

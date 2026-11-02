@@ -49,6 +49,7 @@ public final class CommandRouter: @unchecked Sendable {
     // Owned only by the serialized maintenance lane; a restart starts every project level.
     var ticketCleanupProjectTurns: [String:Int] = [:]
     var ticketCleanupTurnCount = 0
+    var ticketCleanupByteNewestTurns: [String:Bool] = [:]
     private var cleanupFailure: String?
     var storageMaintenanceRetryAt: Date? {
         get {maintenanceStateLock.withLock {routineRetry}}

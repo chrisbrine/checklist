@@ -40,14 +40,14 @@ A closed ticket unchanged for `closed_days` is purged by the existing CL-24 reco
 
 Done evidence has two steps. The pass admits the ticket at the next lifecycle turn after the Done wake. Turns alternate with byte deletion, and each turn rests for four times its own duration. The live copy is removed only when a completed backup holds the exact bytes, so bytes wait for the first backup that captures them.
 
-An admitted ticket's files join its project's byte queue. No design bound applies to this queue: the delay is the queue length divided by the removal rate. Measured on the live store (build 261, 1 Nov 2026, CL-395):
+An admitted ticket's files join its project's byte queue. A project's byte turns alternate between its queue position and its newest receipt (CL-395), so a backlog cannot delay a ticket that just closed. The older files still wait for the queue: their delay is the queue length divided by the removal rate. Measured on the live store (build 261, 1 Nov 2026, CL-395):
 
 | Step | Measured |
 | --- | --- |
 | Done to first admitting pass, during a backlog sweep | 34 min 33 s (CL-392), 9 min 2 s (CL-393) |
 | First service-started backup | Capture began 22:19:35 UTC, 2 hours after the capture before it; finished 22:26:33 UTC (6 min 58 s) |
-| Byte queue rate, one project | 1,353 files and 29.7 MB in 16 min 20 s (about 4,970 files per hour) |
-| Byte queue length at that rate | 114,659 files, about 23 hours |
+| Byte queue rate, one project | 1,353 files in 16 min 20 s (about 4,970 per hour); 9,264 files in 58 min 7 s (about 9,560 per hour) |
+| Byte queue length, before the newest-receipt turns | 106,748 files at 23:39 UTC, 11 to 21 hours at those rates |
 
 A file that a pending job holds with `backup_required` does not count as waiting until that job completes. It then waits for one more backup or the next daily sweep, even when an earlier backup holds its bytes.
 

@@ -377,6 +377,24 @@ final class StorageObjectFiles {
         }
     }
 
+    /// One range of a regular file. A size other than the recorded one means the file changed.
+    func read(_ path: String, offset: Int64, length: Int, expectedSize: Int64) throws -> Data {
+        try openRegular(path) { file in
+            var info = stat()
+            guard fstat(file, &info) == 0 else { throw StorageSnapshotFailure.failed("fstat",path:path,root:root.path) }
+            guard info.st_size == expectedSize else { throw StorageSnapshotFailure.sourceChanged }
+            var result = Data(count: length), filled = 0
+            while filled < length {
+                let count = result.withUnsafeMutableBytes { pread(file, $0.baseAddress!.advanced(by: filled), length - filled, offset + Int64(filled)) }
+                if count < 0, errno == EINTR { continue }
+                guard count >= 0 else { throw StorageSnapshotFailure.failed("pread",path:path,root:root.path) }
+                if count == 0 { break }
+                filled += count
+            }
+            return result.prefix(filled)
+        }
+    }
+
     func writeNew(_ path: String, bytes: Data, permissions: mode_t = 0o600) throws {
         let (directory, name) = try parent(path, create: true); defer { Darwin.close(directory) }
         let file = openat(directory, name, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0o600)

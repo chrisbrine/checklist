@@ -515,6 +515,9 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
             # CL-298: a submitted check result names its report file relative
             # to the project root (for example TestResults/run.xml).
             if record_kind == 'manifest' and location.endswith('.evidence.checks[]'): return ('evidence_relative', None)
+            # CL-399: a submitted file list names files relative to the project root.
+            # An absolute path keeps the slot-contained rule.
+            if record_kind == 'manifest' and location.endswith('.evidence.files[]'): return ('evidence_relative', None)
             # CL-339: submitters list the source files they changed (often in a
             # private scratch folder) with their digests. Core never opens them.
             if record_kind == 'manifest' and location.endswith('.evidence.source_files[]'): return ('inert_history', None)

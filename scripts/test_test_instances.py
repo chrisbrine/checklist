@@ -1860,6 +1860,21 @@ class SeedIsolationTests(unittest.TestCase):
         with test_directory() as directory, self.assertRaisesRegex(ValueError, 'relative, malformed or traversing'):
             self.inspect(Path(directory).resolve(), record('TestResults/run.xml', 'results'))
 
+    def test_manifest_evidence_files_may_be_project_relative(self):
+        # CL-399: a project-relative file list in submitted evidence must not block a seed.
+        def record(entries, kind='manifest'):
+            return [(kind, {'id': 'record', 'evidence': {'files': entries}})]
+        with test_directory() as directory:
+            counts = self.inspect(Path(directory).resolve(), record([{'path': 'unity/Assets/Tests/A.cs', 'sha256': 'a' * 64}]))
+            self.assertEqual((counts['inert_history_path_occurrences'], counts['relative_evidence_paths']), (0, 1))
+        # A traversal, a file URL and the same field on another record kind stay refused.
+        with test_directory() as directory, self.assertRaisesRegex(ValueError, 'relative, malformed or traversing'):
+            self.inspect(Path(directory).resolve(), record([{'path': '../outside/A.cs'}]))
+        with test_directory() as directory, self.assertRaisesRegex(ValueError, 'stored file URL'):
+            self.inspect(Path(directory).resolve(), record([{'path': 'file:///outside/A.cs'}]))
+        with test_directory() as directory, self.assertRaisesRegex(ValueError, 'relative, malformed or traversing'):
+            self.inspect(Path(directory).resolve(), record([{'path': 'unity/A.cs'}], 'results'))
+
     def test_manifest_evidence_source_files_are_inert_history(self):
         # CL-339: submitted evidence lists changed source files by absolute
         # scratch path and digest. They seed as inert history, never opened.

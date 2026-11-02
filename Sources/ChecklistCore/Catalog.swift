@@ -25,7 +25,7 @@ extension CommandRouter {
                 "agent_resolve":["name","agent_profile_id","task_id"],"agent_message_send":["recipient_target","body","expects_reply","task_id","reply_to","owner_request_ref"],
                 "human_request_create":["task_id","title","blocking","questions","file_requests","target_attachment_id","review_request_id","target_manifest_id"],
                 "attachment_add":["task_id","source","path","name","expected_sha256","description","mode"],"attachment_list":["task_id","cursor","limit"],
-                "attachment_read":["attachment_id","representation"],"attachment_cleanup_preview":["task_id"],"triage_list":["key","triage_id","fields"],"epic_list":["key"],
+                "attachment_read":["attachment_id","representation","offset","length"],"attachment_cleanup_preview":["task_id"],"triage_list":["key","triage_id","fields"],"epic_list":["key"],
                 "epic_delete":["epic_id"],"epic_create":["name","brief","description"],"triage_create":["name","purpose"],"triage_transition":["triage_id","group_id",
                 "target_status_id","action","reason","expected_member_revisions"],"epic_edit":["group_id","epic_id","name","brief","description"],"triage_edit":["group_id",
                 "triage_id","name","purpose"],"group_membership":["group_id","task_id","action","expected_task_revision","from_epic_id","from_epic_revision","handling_phase","exit_milestone"]]
@@ -191,6 +191,8 @@ extension CommandRouter {
             else if name == "history_list" && key == "entity" { properties[key] = ["type":"string","enum":c.role == "assistant" ? ["project"] : ["project","backup"],
                 "description":"Read the scoped project entity or backup receipts; mutually exclusive with task/group/conversation selectors."] }
             else if name == "attachment_read" && key == "representation" { properties[key] = ["type":"string","enum":["metadata","preview","original"],"default":"metadata"] }
+            else if name == "attachment_read" && key == "offset" { properties[key] = ["type":"integer","minimum":0] }
+            else if name == "attachment_read" && key == "length" { properties[key] = ["type":"integer","minimum":1,"maximum":Self.attachmentChunkLimit] }
             else if key == "host_outcome" { properties[key] = ["type":"string","enum":Self.codexThreadOutcomes.sorted()] }
             else if key == "blocked_on" { properties[key] = ["type":"string","enum":["implementation","reviewer"]] }
             else if key == "verdict" { properties[key] = ["type":"string","enum":Self.reviewVerdicts.sorted()] }
@@ -309,7 +311,7 @@ extension CommandRouter {
     }
     func description(_ method: String) -> String {
         switch method {
-        case "attachment_read":return "Read one attachment of this project. representation is metadata (default), preview or original. Preview and original return content_base64, at most 8 MiB per file for an agent; a larger file returns FILE_TOO_LARGE with limit_bytes and size_bytes and stays available."
+        case "attachment_read":return "Read one attachment of this project. representation is metadata (default), preview or original. Preview and original return content_base64, at most 8 MiB per file for an agent; a larger file returns FILE_TOO_LARGE with limit_bytes and size_bytes and stays available. To read a larger managed original, pass representation=original with offset and length (at most 8 MiB per range), join the ranges until eof is true and compare them with sha256."
         case "media_type_list":return "Discover this enrolled project's adopted enabled media types with their IDs, titles, immutable revisions and schemas. Returns types only; Draft definitions, owner adoption records and retired types are excluded."
         case "media_type_get":return "Read the adopted enabled media type's schema and immutable revision in this enrolled project. Does not expose Draft type revisions or grant adoption authority."
         case "media_round_create":return "Create an attributed Draft media round in an adopted enabled type. Prepare files and metadata through media_intake_*; publication requires the owner's single Publish action."

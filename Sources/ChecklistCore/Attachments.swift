@@ -93,6 +93,7 @@ extension CommandRouter {
             guard a["task_id"] is String else { throw CoreError("ATTACHMENT_REFERENCE_REQUIRED","Taskless originals require a current owner reference; media commands are not enabled.") }
             let representation = p["representation"] as? String ?? "metadata"
             guard ["metadata","preview","original"].contains(representation) else { throw CoreError("INVALID_INPUT","representation must be metadata, preview or original.") }
+            if p["offset"] != nil || p["length"] != nil { return try attachmentChunk(a,p,representation:representation) }
             if representation == "metadata" { if !c.isOwner { a.removeValue(forKey:"path"); a.removeValue(forKey:"preview_path") }; return a }
             let selected = representation == "preview" ? (a["preview_path"] as? String ?? a["path"] as? String) : a["path"] as? String
             let managedOriginal = representation == "original" && a["mode"] as? String == "managed"
@@ -132,7 +133,7 @@ extension CommandRouter {
                 }
                 catch let refusal as CoreError where !c.isOwner && refusal.code == "FILE_TOO_LARGE" { throw CoreError("FILE_TOO_LARGE","This file exceeds the bounded MCP read limit.",details:["limit_bytes":readLimit,"size_bytes":a["size"] ?? NSNull()]) }
                 // A file over the read limit is healthy, so this records no availability change.
-                catch StorageSnapshotFailure.limit { throw CoreError("FILE_TOO_LARGE","This file exceeds the bounded read limit.",details:["limit_bytes":readLimit,"size_bytes":a["size"] ?? NSNull()]) }
+                catch StorageSnapshotFailure.limit where ((a["size"] as? NSNumber)?.intValue ?? Int.max) > readLimit { throw CoreError("FILE_TOO_LARGE","This file exceeds the bounded read limit. Read it in ranges with offset and length.",details:["limit_bytes":readLimit,"size_bytes":a["size"] ?? NSNull()]) }
                 catch {
                     guard managedOriginal else { throw error }
                     // Attribute only the actual managed-original open/read. Raw
@@ -178,6 +179,26 @@ extension CommandRouter {
         let t = try task(db,p,pid); let attachments = try records(db,type:"attachment",project:pid).filter { $0["task_id"] as? String == t["id"] as? String && !bool($0,"unlinked") }
         if method == "attachment_cleanup_preview" { return try cleanupPreview(db,task:t) }
         return ["attachments":attachments.map { a -> JSON in var a = a; if !c.isOwner { a.removeValue(forKey:"path"); a.removeValue(forKey:"preview_path") }; return a }]
+    }
+    static let attachmentChunkLimit = 8 * 1024 * 1024
+    /// CL-397: one bounded range of a managed original. The caller joins the ranges
+    /// and checks the whole-file sha256. This runs as a plain read, so no file bytes
+    /// enter the command journal.
+    private func attachmentChunk(_ attachment: JSON,_ p: JSON,representation: String) throws -> JSON {
+        guard representation == "original",attachment["mode"] as? String == "managed" else { throw CoreError("INVALID_INPUT","offset and length read the original of a managed attachment only.") }
+        guard let offset = p["offset"] as? Int,let length = p["length"] as? Int,offset >= 0,(1...Self.attachmentChunkLimit).contains(length) else { throw CoreError("INVALID_INPUT","offset must be 0 or more and length must be 1 to \(Self.attachmentChunkLimit).") }
+        guard let stored = attachment["path"] as? String else { throw CoreError("ORIGINAL_CLEANED","The original is unavailable; its metadata is retained.") }
+        let size = (attachment["size"] as? NSNumber)?.int64Value ?? 0
+        guard Int64(offset) < size || (offset == 0 && size == 0) else { throw CoreError("INVALID_INPUT","offset is past the end of this \(size)-byte file.") }
+        let bytes: Data
+        do { bytes = try StorageObjectFiles(root:root).read(try managedRelative(stored,family:"objects"),offset:Int64(offset),length:length,expectedSize:size) }
+        catch StorageSnapshotFailure.sourceChanged { throw CoreError("SOURCE_CHANGED","The original no longer matches its immutable identity.") }
+        catch { throw CoreError("MANAGED_ORIGINAL_UNAVAILABLE","The managed original could not be read.",details:["reason":"original_open_or_read_failed"]) }
+        var reply = attachment
+        reply.removeValue(forKey:"path");reply.removeValue(forKey:"preview_path")
+        reply["content_base64"] = bytes.base64EncodedString();reply["offset"] = offset;reply["length"] = bytes.count
+        reply["chunk_sha256"] = hash(bytes);reply["eof"] = Int64(offset + bytes.count) >= size
+        return reply
     }
     /// An agent may read only where its actual workspace and the enrolled project root overlap.
     func agentReadRoots(_ c: Caller,project: JSON) -> [String] {
