@@ -190,6 +190,7 @@ extension CommandRouter {
                 "an owner note or direction."] }
             else if name == "history_list" && key == "entity" { properties[key] = ["type":"string","enum":c.role == "assistant" ? ["project"] : ["project","backup"],
                 "description":"Read the scoped project entity or backup receipts; mutually exclusive with task/group/conversation selectors."] }
+            else if name == "attachment_read" && key == "representation" { properties[key] = ["type":"string","enum":["metadata","preview","original"],"default":"metadata"] }
             else if key == "host_outcome" { properties[key] = ["type":"string","enum":Self.codexThreadOutcomes.sorted()] }
             else if key == "blocked_on" { properties[key] = ["type":"string","enum":["implementation","reviewer"]] }
             else if key == "verdict" { properties[key] = ["type":"string","enum":Self.reviewVerdicts.sorted()] }
@@ -308,6 +309,7 @@ extension CommandRouter {
     }
     func description(_ method: String) -> String {
         switch method {
+        case "attachment_read":return "Read one attachment of this project. representation is metadata (default), preview or original. Preview and original return content_base64, at most 8 MiB per file for an agent; a larger file returns FILE_TOO_LARGE with limit_bytes and size_bytes and stays available."
         case "media_type_list":return "Discover this enrolled project's adopted enabled media types with their IDs, titles, immutable revisions and schemas. Returns types only; Draft definitions, owner adoption records and retired types are excluded."
         case "media_type_get":return "Read the adopted enabled media type's schema and immutable revision in this enrolled project. Does not expose Draft type revisions or grant adoption authority."
         case "media_round_create":return "Create an attributed Draft media round in an adopted enabled type. Prepare files and metadata through media_intake_*; publication requires the owner's single Publish action."

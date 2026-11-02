@@ -92,6 +92,7 @@ extension CommandRouter {
             var a = try scoped(db,try text(p,"attachment_id"),pid,type:"attachment")
             guard a["task_id"] is String else { throw CoreError("ATTACHMENT_REFERENCE_REQUIRED","Taskless originals require a current owner reference; media commands are not enabled.") }
             let representation = p["representation"] as? String ?? "metadata"
+            guard ["metadata","preview","original"].contains(representation) else { throw CoreError("INVALID_INPUT","representation must be metadata, preview or original.") }
             if representation == "metadata" { if !c.isOwner { a.removeValue(forKey:"path"); a.removeValue(forKey:"preview_path") }; return a }
             let selected = representation == "preview" ? (a["preview_path"] as? String ?? a["path"] as? String) : a["path"] as? String
             let managedOriginal = representation == "original" && a["mode"] as? String == "managed"
@@ -116,9 +117,10 @@ extension CommandRouter {
             if !readsManaged,!FileManager.default.fileExists(atPath:path) { throw try observed(CoreError("ORIGINAL_CLEANED","The original is unavailable; its metadata is retained."),path:path) }
             if representation != "metadata" {
                 let bytes: Data
+                let readLimit = c.isOwner ? 500 * 1024 * 1024 : 8 * 1024 * 1024
                 do {
                     if readsManaged {
-                        bytes = try managedRead(stored,family:"objects",maximum:c.isOwner ? 500 * 1024 * 1024 : 8 * 1024 * 1024)
+                        bytes = try managedRead(stored,family:"objects",maximum:readLimit)
                     } else if c.isOwner { bytes = try Data(contentsOf:URL(fileURLWithPath:path),options:.mappedIfSafe) }
                     else {
                         // Agents receive the bytes. A stored path is opened without following a
@@ -128,7 +130,9 @@ extension CommandRouter {
                         bytes = try SafeFileRead.read(path,maximum:8 * 1024 * 1024,allowedRoots:roots).bytes
                     }
                 }
-                catch let refusal as CoreError where !c.isOwner && refusal.code == "FILE_TOO_LARGE" { throw CoreError("FILE_TOO_LARGE","This file exceeds the bounded MCP read limit.") }
+                catch let refusal as CoreError where !c.isOwner && refusal.code == "FILE_TOO_LARGE" { throw CoreError("FILE_TOO_LARGE","This file exceeds the bounded MCP read limit.",details:["limit_bytes":readLimit,"size_bytes":a["size"] ?? NSNull()]) }
+                // A file over the read limit is healthy, so this records no availability change.
+                catch StorageSnapshotFailure.limit { throw CoreError("FILE_TOO_LARGE","This file exceeds the bounded read limit.",details:["limit_bytes":readLimit,"size_bytes":a["size"] ?? NSNull()]) }
                 catch {
                     guard managedOriginal else { throw error }
                     // Attribute only the actual managed-original open/read. Raw
