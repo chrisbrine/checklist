@@ -87,3 +87,15 @@ process's entire lifetime and cannot be reset by a read. An older PID's peak is
 not an after-change measure. A backup's complete receipt and retention result are
 separate from a memory read. This procedure does not authorize starting a live
 backup.
+
+## Installed measure (CL-406, 2 November 2026)
+
+The footprint of the installed service, sampled every few seconds from service start through a complete post-install backup, with 281 s of backup in both cases:
+
+| Build | Peak footprint | Footprint after the backup |
+| --- | ---: | ---: |
+| 265 | 13,167 MiB | 1,449 MiB (13 s after the backup), about 2,000 MiB later |
+| 266 | 1,574 MiB | 700 MiB (5 min after start) |
+
+Build 265 was sampled from 5 minutes after start, so its peak is the kernel's lifetime value. Build 266 has the sampled timeline. The change between the builds is that automatic retention streams each retained manifest's hash. On an owned copy with ten older backups, that change alone took the peak from 2,674 to 1,456 MiB, so it does not explain every byte of the difference on the live service. The first run of build 265 also retired legacy command replies. The peak is a single install's result: a later service backup can differ. Read it with `footprint -p PID -f bytes`.
+
