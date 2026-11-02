@@ -343,7 +343,7 @@ extension CommandRouter {
         case "diagnostics_summary":return "Read aggregate diagnostics for the selected project only. Contains no file destination or record content. Agent callers require allowed agent_rule_changes."
         case "ticket_cleanup_receipts":return "Read bounded project-scoped automatic cleanup summaries. Supply receipt_id and page items, objects or source_build_cache with section, cursor and limit. Removed pathname bytes are not measured physical disk savings."
         case "work_health_get":return "Read advisory work health, exact handler or the Triage orchestrator, substantive progress, separate liveness, known waits, correlated request/deadline, delivery and next check. Timeout changes no workflow authority."
-        case "work_health_respond":return "Answer this exact request_id with current progress and current task expected_revision. known_wait (at most 200 bytes) records a known wait, which stops further relayed requests until new progress. Rechecks session generation, current attempt/phase and material revisions. Late replies retain newer ownership and require ordinary fresh claim/handoff when authority changed. A reply is not substantive progress or a new claim."
+        case "work_health_respond":return "Answer this exact request_id with progress, known_wait or both, and current task expected_revision. known_wait (at most 200 bytes) records a known wait, with or without progress, which stops further requests until new progress. A Queued ticket with no active attempt gets no check. Rechecks session generation, current attempt/phase and material revisions. Late replies retain newer ownership and require ordinary fresh claim/handoff when authority changed. A reply is not substantive progress or a new claim."
         case "human_request_create":return "Create an owner input request with flat task_id, title, explanation, questions, file_requests, blocking (Boolean), command, target_attachment_id, review_request_id and target_manifest_id fields. No request_spec wrapper. Questions require id and prompt; type=text|choice|approval|check (default text), required (default true), multiple, allow_custom, options=[{id,label}] for choice, optional command. Files require id and prompt; kind (or selection)=file|directory|either. At least one question or file, at most 30 each. command={text,working_directory,expected_result,reason?} describes instructions, never executes them. Exact human gate binding requires one approval question and its managed attachment target. Earlier answered approvals on this ticket or normalized title/question matches in this project refuse with COVERED_BY_EARLIER_ANSWER and matching answers. Continue only with supersedes_answer_id naming a matched answer/request and supersede_reason explaining what changed."
         case "human_request_revise":return "Revise a pending owner request with request_id, expected_revision, a non-empty patch and optional reason. patch accepts title, explanation, questions, file_requests, blocking, command, target_attachment_id, review_request_id and target_manifest_id, using the same form types as human_request_create. Preserve old form history and atomically validate/rebind any exact human gate. There is no human_request_edit or request_spec wrapper."
         case "task_bulk_edit":return "Preview or atomically apply one permitted change to up to 200 revision-checked tickets. Preview defaults true and reports every blocked row; apply (preview=false) changes nothing if any row conflicts. Retry an explicitly selected eligible subset with a new command ID. Status cancel/reopen require changes.reason (up to 4,000 bytes), recorded on every ticket. Status actions keep Triage membership; Done or cancel removes the ticket from its Triage. The returned command receipt supports guarded bulk Undo."
@@ -412,6 +412,26 @@ extension CommandRouter {
     }
     func pendingNativeDeliveries(_ db: Database, _ p: JSON) throws -> JSON {
         let includeAcknowledged = bool(p,"include_acknowledged")
+        // One exact record, for a relay that waits. It never expands open deliveries.
+        if let id = p["delivery_id"] as? String {
+            let delivery = try record(db,id,type:"delivery")
+            let projected = try deliveryReceiptProjection(db,delivery)["state"] as? String ?? "queued"
+            let current = try deliveryCurrent(db,delivery)
+            let state = ["acknowledged","addressed"].contains(projected) ? "acknowledged" :
+                (["fenced","quarantined"].contains(projected) || !current) ? "changed" : "current"
+            return ["route_state":state]
+        }
+        // Startup only: a Codex queue wait that the last service run did not finish.
+        if bool(p,"codex_queue_open_followups") {
+            let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='delivery' AND CASE WHEN json_valid(data) THEN " +
+                "json_extract(data,'$.transport_receipt.route')='codex_app_queue' AND json_extract(data,'$.transport_receipt.queue_poll_result')='not_started' " +
+                "AND json_extract(data,'$.transport_receipt.stage') IN ('native_send_started','codex_queue_command_exited_zero') ELSE 0 END ORDER BY rowid LIMIT 512")
+            return ["deliveries":try rows.map { row -> JSON in
+                let d = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"delivery").object
+                return ["id":d["id"] ?? "","push_state":d["push_state"] ?? "","transport_receipt":d["transport_receipt"] ?? [:]]
+            }]
+        }
+        let createdMin = p["created_at_min"] as? String
         let nativeSessions: [String]?
         if let value = p["native_session_ids"] {
             guard let ids = value as? [String],ids.count <= 4096,
@@ -426,11 +446,19 @@ extension CommandRouter {
         let nativeSelection = try nativeSessions.map {try jsonString($0)}
         let nativeCandidates = bool(p,"native_dispatch_candidates")
         guard !nativeCandidates || nativeSessions != nil else {throw CoreError("INVALID_INPUT","Native candidates require exact session selection.")}
-        let deliveries = try readSnapshotCache.records(db,key:["pending-deliveries",includeAcknowledged ? "all":"open",nativeSelection,nativeCandidates ? "candidates":"pending"]) {
+        let deliveries = try readSnapshotCache.records(db,key:["pending-deliveries",includeAcknowledged ? "all":"open",nativeSelection,nativeCandidates ? "candidates":"pending",createdMin ?? ""]) {
             var sql = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='delivery'"
             var arguments = StatementArguments()
             if !includeAcknowledged {
                 sql += " AND CASE WHEN json_valid(data) THEN COALESCE(json_extract(data,'$.state') NOT IN ('acknowledged','addressed'),1) ELSE 1 END"
+            }
+            // A rowid window: `records` holds every record type, and no index starts at
+            // type. This read runs after commands, so it must not scan the whole table.
+            // The age test comes before the session match, so old deliveries cost no JSON expansion.
+            if let createdMin {
+                sql += " AND rowid>(SELECT COALESCE(MAX(rowid),0) FROM records)-4096"
+                sql += " AND CASE WHEN json_valid(data) THEN COALESCE(json_extract(data,'$.created_at')>=?,0) ELSE 0 END"
+                arguments += [createdMin]
             }
             if let nativeSelection {
                 // Bind bytes to preserve NUL and Unicode identity. Every duplicate
@@ -462,8 +490,39 @@ extension CommandRouter {
         if method == "delivery_pending" { return try pendingNativeDeliveries(db,p) }
         if method == "delivery_record" {
             var d = try record(db,try text(p,"delivery_id"),type:"delivery")
-            let state = try text(p,"state"); if state == "uncertain",!(try deliveryCurrent(db,d)) { throw CoreError("RECIPIENT_CHANGED",
-                "The recipient authorization changed before native submission.") }; guard ["transport_written","held","failed","uncertain","provider_accepted",
+            let receiptFields = p["receipt"] as? JSON
+            let queueStage = receiptFields?["route"] as? String == "codex_app_queue" && receiptFields?["stage"] as? String == "native_send_started"
+            let queueFenceStart = queueStage && receiptFields?["queue_poll_result"] as? String == "not_started"
+            // The final receipt of a fence that a crash left open. It starts nothing, so it is not refused.
+            let queueFenceFinal = queueStage && !queueFenceStart
+            let state = try text(p,"state"); if state == "uncertain",!queueFenceFinal,!(try deliveryCurrent(db,d)) { throw CoreError("RECIPIENT_CHANGED",
+                "The recipient authorization changed before native submission.") }
+            // A refused Codex queue check after the fence returns the delivery as it was.
+            if bool(p,"release_queue_fence") {
+                let held = d["transport_receipt"] as? JSON
+                // An acknowledgment during the fence stays: the release never sets it back to queued.
+                guard !["acknowledged","addressed"].contains(d["state"] as? String ?? ""),d["push_state"] as? String == "uncertain",held?["route"] as? String == "codex_app_queue",held?["stage"] as? String == "native_send_started",
+                      let prior = d["queue_fence_prior_state"] as? String else { return d }
+                d["state"] = prior;d["push_state"] = "unavailable";d["transport_receipt"] = nil;d["queue_fence_prior_state"] = nil
+                d = revised(d);try save(db,d,type:"delivery");return d
+            }
+            // Fences outrank a late receipt: its write keeps this delivery unchanged.
+            if ["fenced","quarantined"].contains(try deliveryReceiptProjection(db,d)["state"] as? String ?? "") || d["restore_incarnation"] != nil {
+                if state == "uncertain",!queueFenceFinal { throw CoreError("RECIPIENT_CHANGED","The delivery was fenced before native submission.") }
+                return d
+            }
+            // A stated Codex queue refusal: the receipt holds the reason, and the delivery's state stays.
+            if bool(p,"queue_refusal_receipt") {
+                guard d["push_state"] as? String == "unavailable",(d["transport_receipt"] as? JSON)?["reason_code"] as? String != receiptFields?["reason_code"] as? String else { return d }
+                d["transport_receipt"] = receiptFields
+                d = revised(d);try save(db,d,type:"delivery");return d
+            }
+            if state == "uncertain",queueFenceStart {
+                // A hook and a queue never both start for one note.
+                guard d["hook_state"] == nil,d["push_state"] as? String == "unavailable" else { throw CoreError("RECIPIENT_CHANGED","Another route took this delivery.") }
+                d["queue_fence_prior_state"] = d["state"]
+            }
+            guard ["transport_written","held","failed","uncertain","provider_accepted",
                 "unavailable"].contains(state) else { throw CoreError("INVALID_INPUT","A bridge cannot fabricate recipient acknowledgment.") }
             // Actual transport evidence is retained independently from recipient acknowledgment.
             d["push_state"] = state; d["transport_receipt"] = p["receipt"] ?? [:]

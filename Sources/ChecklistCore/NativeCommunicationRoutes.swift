@@ -26,15 +26,17 @@ public enum NativeCommunicationRoutes {
         public let qualifiedVersions: [String: String]
         public let qualificationReceipts: [String]
         public let mode: Mode
-        public var status: String { qualified ? "qualified" : "unavailable" }
+        /// A route that runs from the source and has no real test yet. It is not qualified.
+        public let sourceEnabled: Bool
+        public var status: String { qualified ? "qualified" : sourceEnabled ? "source_enabled" : "unavailable" }
         public var qualified: Bool { !qualifiedVersions.isEmpty && !qualificationReceipts.isEmpty }
-        public var statusLabel: String { qualified ? mode.label : "Unavailable" }
+        public var statusLabel: String { qualified ? mode.label : sourceEnabled ? "Source enabled; real test pending" : "Unavailable" }
 
         init(id: String, provider: String, direction: String, title: String, reason: String,
-             qualifiedVersions: [String: String] = [:], qualificationReceipts: [String] = [], mode: Mode = .recordedConfiguration) {
+             qualifiedVersions: [String: String] = [:], qualificationReceipts: [String] = [], mode: Mode = .recordedConfiguration, sourceEnabled: Bool = false) {
             self.id = id; self.provider = provider; self.direction = direction
             self.title = title; self.reason = reason
-            self.mode = mode
+            self.mode = mode; self.sourceEnabled = sourceEnabled
             self.qualifiedVersions = qualifiedVersions; self.qualificationReceipts = qualificationReceipts
         }
 
@@ -48,8 +50,8 @@ public enum NativeCommunicationRoutes {
 
     /// One statement of the CL-386 result, shared by the route summary and the work health view.
     public static let relayQualification = "Observed on Desktop 4.4212.0 / engine 2.1.309 / Checklist 253 with a bypass recipient and crossSessionInbound=accept, past the app wake count; other versions, modes and settings are unqualified."
-    public static let workHealthWake = "A work health request relays at most once per progress state, never during a known wait, at most 3 times per attempt and once per session in 20 minutes, to its handler only, when that session has a verified native endpoint; otherwise MCP pickup; no model runtime. " + relayQualification
-    public static let summary = "Messages are available when agents check Checklist. Claude parent delivery is qualified only for its recorded versions and configuration. Recorded Codex child/host relay and linked Claude Desktop child routes are qualified for explicit Checklist pickup and acknowledgment only. Autonomous child push/wake, Claude parent relay and Codex child closure remain unavailable; untested modes are unqualified. " + workHealthWake + " A relay write alone does not prove a started turn."
+    public static let workHealthWake = "A work health request relays at most once per progress state, never during a known wait, at most 3 times per attempt and once per session in 20 minutes, to its handler only, when that session has a verified native endpoint; otherwise MCP pickup; no model runtime. A Codex app thread has no such endpoint and never gets this request by its queue relay, because a service timer starts no Codex turn: the request stays on session_inbox pickup. " + relayQualification
+    public static let summary = "Messages are available when agents check Checklist. Claude parent delivery is qualified only for its recorded versions and configuration. Recorded Codex child/host relay and linked Claude Desktop child routes are qualified for explicit Checklist pickup and acknowledgment only. The Codex app thread relay is source enabled, and its real test is pending. Autonomous child push/wake, Claude parent relay and Codex child closure remain unavailable; untested modes are unqualified. " + workHealthWake + " A relay write alone does not prove a started turn."
     // Private originals stay outside the product. Publish redacted aliases and immutable report references.
     private static let codexVersions = ["checklist_build": "d9ef8900fed26778 (111)", "codex_cli": "0.159.0", "desktop_app": "not established; no desktop endpoint qualified"]
     private static let claudeVersions = ["checklist_build": "d9ef8900fed26778 (111)", "receipt_read_build": "60394b4fa961cb6b (112); historical receipts only", "desktop_app": "3.1623.0", "engine": "2.1.304", "peer_protocol": "1"]
@@ -57,7 +59,7 @@ public enum NativeCommunicationRoutes {
     private static let claudeReport = "CL-83:claude-child-report; attachment=15d8b2ff-e222-45f6-8b5b-9708b259781c; sha256=8746c94cbd3bc302f3b31bf3c01aa62c71d1eddb4bc51f730059de9a12f93ef8"
     private static let claudeParentage = "CL-83:claude-host-parentage; attachment=9cfc8395-2193-4e8e-9407-a919fbb89d24; sha256=625e8a65cd916613915f69780c8cd5baa5d6842453e46c019380159b1891904d"
     public static let all: [Route] = [
-        Route(id: "codex_idle_wake", provider: "codex", direction: "service_to_session", title: "Codex idle wake-up", reason: "No qualified native desktop wake route; authenticated MCP pickup does not wake a conversation."),
+        Route(id: "codex_idle_wake", provider: "codex", direction: "service_to_session", title: "Codex idle wake-up", reason: "Source enabled; real test pending. The service relays a recent note to an enrolled source=vscode app thread with codex queue, and opens an unloaded thread once. It refuses exec, mcp and subagent threads and a thread that a codex exec holds. This route is not qualified.", sourceEnabled: true),
         Route(id: "claude_idle_wake", provider: "claude", direction: "service_to_session", title: "Claude parent idle wake-up", reason: "CL-5 observed an exact parent recipient and correlated native reply in a bypass conversation with crossSessionInbound=accept. CL-386 repeated this past the app wake count. \(relayQualification) These are carried results, not a check of the current recipient or host version.", qualifiedVersions: ["engine": "claude-code 2.1.299", "desktop_app": "2.42304.0", "peer_protocol": "1", "checklist_build": "801d716c6c99cf40 (19)", "relay_engine": "claude-code 2.1.309", "relay_desktop_app": "4.4212.0", "relay_checklist_build": "ec8f218ab59776f9 (253)"], qualificationReceipts: ["CL-5:note_C", "CL-5:note_D_idle", "CL-386:relay-past-cap", "CL-386:relay-past-cap-health"]),
         Route(id: "codex_child_inbound", provider: "codex", direction: "to_child", title: "Codex direct delivery to child", reason: "Explicit child CLI pickup and the child’s own service acknowledgment on build 111 / codex-cli 0.159.0. Native child push/wake and untested idle/busy modes remain unavailable.", qualifiedVersions: codexVersions, qualificationReceipts: ["CL-83:codex-direct-child-inbound; sha256=625d644b98f44de6d59fed0bb0b52f53920a0db807331b3a90c04b67bab4f410", codexReport], mode: .explicitPickup),
         Route(id: "codex_child_outbound", provider: "codex", direction: "from_child", title: "Codex direct delivery from child", reason: "Actual child origin and selected enrolled recipient’s own service acknowledgment on build 111 / codex-cli 0.159.0. No autonomous push/wake or untested mode is qualified.", qualifiedVersions: codexVersions, qualificationReceipts: ["CL-83:codex-direct-child-outbound; sha256=4228cd1fec1e44bb93c95ce1d47b39499207c5704f6607d280bbd4fc2c58c19c", codexReport], mode: .explicitPickup),

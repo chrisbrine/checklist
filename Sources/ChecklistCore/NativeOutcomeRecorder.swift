@@ -48,6 +48,7 @@ public struct NativeOutcomeRecorder {
         }
         var receipt: [String: Any] = ["stage": Self.stage(method), "failed_write": method, "attempts": Self.attemptLimit]
         if let routeGeneration { receipt["route_generation"] = routeGeneration }
+        if let route = (input["receipt"] as? [String: Any])?["route"] { receipt["route"] = route }
         if method == "delivery_host_status", let status = input["status"] as? String { receipt["host_status"] = status }
         let fallback: [String: Any] = ["command_id": UUID().uuidString.lowercased(), "delivery_id": deliveryID, "state": "uncertain", "receipt": receipt]
         switch attempt("delivery_record", fallback, deliveryID: deliveryID) {

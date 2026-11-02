@@ -9,15 +9,19 @@ public enum PendingNoteNoticePresentation {
         if notice["status"] as? String == "unavailable" {
             return "Checklist could not refresh pending note notices. Your command result is unchanged. Read your authenticated session_inbox before continuing."
         }
-        guard notice["status"] as? String == "pending_pickup",let items = notice["items"] as? [[String:Any]],!items.isEmpty else { return nil }
+        let skipped = notice["skipped_malformed"] as? Int ?? 0
+        let unreadable = skipped > 0 ? " Checklist could not read \(skipped) pending notes." : ""
+        guard notice["status"] as? String == "pending_pickup",let items = notice["items"] as? [[String:Any]] else { return nil }
         let references = items.prefix(8).compactMap { item -> String? in
             guard let project = item["project_id"] as? String,let message = item["message_id"] as? String,
                   UUID(uuidString:project) != nil,UUID(uuidString:message) != nil else { return nil }
             let subject = item["subject"] as? [String:Any] ?? [:]
             return AgentReference.text(key:subject["key"] as? String,title:subject["title"] as? String ?? "") + " (project \(project), message \(message))"
         }
-        guard !references.isEmpty else { return nil }
         let more = notice["has_more"] as? Bool == true ? " More notes are available." : ""
-        return "Checklist has pending notes: \(references.joined(separator:"; ")).\(more) Read session_inbox in the named project before continuing, then acknowledge only your own delivery after reading it. This notice is not acknowledgment or new work authority."
+        guard !references.isEmpty else {
+            return unreadable.isEmpty && more.isEmpty ? nil : "Checklist has pending notes.\(unreadable)\(more) Read your authenticated session_inbox before continuing."
+        }
+        return "Checklist has pending notes: \(references.joined(separator:"; ")).\(unreadable)\(more) Read session_inbox in the named project before continuing, then acknowledge only your own delivery after reading it. This notice is not acknowledgment or new work authority."
     }
 }

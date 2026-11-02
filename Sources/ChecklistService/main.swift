@@ -33,6 +33,8 @@ struct Enrollment: Codable, Sendable {
     var relayPolicyRevisions: [String:Int]?
     var relaySelector: String?
     var nativeSessionID: String?
+    // Codex only: set at bootstrap. True when the registered process was the app host and held this thread's rollout.
+    var codexAppHostProven: Bool?
     // Prepared manual pairing remains unusable without its committed Core receipt.
     var pairingCommandID: String?
     var pairingIntentDigest: String?
@@ -96,6 +98,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     var storageWakePlanning = false
     var storageWakeReplan = false
     var attemptedDeliveries = Set<String>()
+    lazy var codexRoute = CodexQueueRouteState(markerFile:enrollmentFile.deletingLastPathComponent().appendingPathComponent("codex-queue-route.json"),effects:enforcesQueueIsolation ? .live : .unavailable)
     var nativeInFlight: [String: NativeInFlight] = [:]
     var workHealthWake: DispatchWorkItem?
     var workHealthFailures = 0
@@ -469,10 +472,10 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         let directory=URL(fileURLWithPath:"/tmp/cc-socks",isDirectory:true)
         if !FileManager.default.fileExists(atPath:directory.path) { try? FileManager.default.createDirectory(at:directory,withIntermediateDirectories:false,attributes:[.posixPermissions:0o700]) }
         do { nativeListener=try NativeReplyListener(path:directory.appendingPathComponent("\(getpid()).sock").path) }
-        catch { fputs("Native reply listener unavailable: \(error.localizedDescription)\n",stderr);return }
+        catch { fputs("Native reply listener unavailable: \(error.localizedDescription)\n",stderr) } // The Codex queue route needs no reply listener, so its startup pass still runs.
         // Startup owns one pending-delivery pass; ordinary pure reads no longer
         // provide incidental dispatch after a service restart.
-        queue.async { [self] in autoreleasepool {dispatchNative()} }
+        queue.async { [self] in autoreleasepool {recordInterruptedCodexQueueFollowups();dispatchNative()} }
         guard let listener = nativeListener else { return }
         DispatchQueue.global(qos:.utility).async { [self, listener] in
             NativeReplyLoop.run(shouldContinue: { queue.sync { self.nativeListener != nil } },
@@ -501,7 +504,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     func nativeDispatchDeliveries(endpointAvailable: (Enrollment)->Bool = Coordinator.nativeEndpointAvailable,
                                   load: ([String:Any]) -> [String:Any]?) -> [[String:Any]] {
         requireCommandQueue()
-        let sessions = enrollments.values.filter {($0.nativeEndpoint != nil || Self.codexQueueRegistration($0) != nil) && $0.revoked != true && endpointAvailable($0)}.map { $0.sessionID }
+        let sessions = enrollments.values.filter {$0.nativeEndpoint != nil && Self.codexQueueRegistration($0) == nil && $0.revoked != true && endpointAvailable($0)}.map { $0.sessionID }
         var pending: [[String:Any]] = []
         // Bound each internal request without imposing a new installation-wide
         // enrollment limit. An empty route set performs no outbox projection.
@@ -509,31 +512,40 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
             let selected = Array(sessions[start..<min(start+256,sessions.count)])
             pending += load(["native_session_ids":selected,"native_dispatch_candidates":true])?["deliveries"] as? [[String:Any]] ?? []
         }
+        if let selection = codexQueueSelection() {
+            pending += load(["native_session_ids":selection.ids,"native_dispatch_candidates":true,"created_at_min":selection.createdMin])?["deliveries"] as? [[String:Any]] ?? []
+        }
         return pending
     }
     func dispatchNative() {
         requireCommandQueue()
         guard router.writeAdmissionStatus["locked"] as? Bool != true else {return}
         observeNativeConversationLifecycles()
-        guard let listener=nativeListener else { return }
         let bridge=Caller(role:"owner",installation:"native-bridge",projectIDs:[])
         let pending = nativeDispatchDeliveries { params in
             (try? router.handle(method:"delivery_pending",params:params,caller:bridge))?["data"] as? [String:Any]
         }
+        var codexPass = CodexQueuePass()
         for delivery in pending {
             guard let id=delivery["id"] as? String,!attemptedDeliveries.contains(id), delivery["push_state"] as? String == "unavailable",
                   let sid=delivery["recipient_session_id"] as? String,
                   let enrollment=enrollments.values.first(where:{$0.sessionID==sid && $0.revoked != true && Self.nativeEndpointAvailable($0)}),
                   let message=delivery["message"] as? [String:Any],let mid=message["id"] as? String,let body=message["body"] as? String else { continue }
-            // Owner notes, agent ticket notes and work health requests use the relay. It always states its own
+            // Owner notes, agent ticket notes and work health requests use the relay, but a work health request never uses the Codex queue branch. It always states its own
             // restricted class (prompting) and the real author; it never claims an originating agent's permission class.
             guard let origin=NativeRelayOrigin.forDispatch(messageOrigin:message["origin"] as? String,nativeRelay:delivery["native_relay"] as? String) else { continue }
-            let queueRegistration = Self.codexQueueRegistration(enrollment)
-            let endpoint = enrollment.nativeEndpoint ?? ""
-            if queueRegistration == nil {
-                var attrs=stat()
-                guard lstat(endpoint,&attrs)==0,UInt64(attrs.st_dev)==enrollment.nativeDevice,UInt64(attrs.st_ino)==enrollment.nativeInode else { continue }
+            let author = message["author_display"] as? String ?? "unknown session"
+            // JSON metadata never crosses the queue as an Any-valued dictionary.
+            let subjectBytes = (delivery["subject"] as? [String:Any]).flatMap { try? JSONSerialization.data(withJSONObject:$0) }
+            let ticketBytes = (delivery["ticket"] as? [String:Any]).flatMap { try? JSONSerialization.data(withJSONObject:$0) }
+            if let queueRegistration = Self.codexQueueRegistration(enrollment) {
+                guard enrollment.nativeEndpoint == nil,codexQueueAdmit(threadID:queueRegistration.sessionID,delivery:delivery,message:message,pass:&codexPass) else { continue }
+                startCodexQueueDelivery(.init(deliveryID:id,messageID:mid,enrollment:enrollment,registration:queueRegistration,origin:origin,author:author,body:body,subject:subjectBytes,ticket:ticketBytes,createdAt:message["created_at"] as? String ?? ""))
+                continue
             }
+            guard let endpoint = enrollment.nativeEndpoint,let listener=nativeListener else { continue }
+            var attrs=stat()
+            guard lstat(endpoint,&attrs)==0,UInt64(attrs.st_dev)==enrollment.nativeDevice,UInt64(attrs.st_ino)==enrollment.nativeInode else { continue }
             attemptedDeliveries.insert(id)
             // Persist an uncertainty fence BEFORE external I/O. A process crash never retries the same native write.
             do {
@@ -547,14 +559,8 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
                 && message["reply_recipient_authorization_generation"] as? String == delivery["recipient_authorization_generation"] as? String
             let peerPID=NativeProviderTransport.endpointPID(provider:enrollment.provider,endpoint:endpoint) ?? 0
             // Registered before I/O: Claude can report a hold before this write's outcome is recorded.
-            if queueRegistration == nil {
-                nativeInFlight[id]=NativeInFlight(deliveryID:id,messageID:mid,peerPID:peerPID,routeGeneration:enrollment.generation,startedAt:Date())
-            }
+            nativeInFlight[id]=NativeInFlight(deliveryID:id,messageID:mid,peerPID:peerPID,routeGeneration:enrollment.generation,startedAt:Date())
             let replyAddress = listener.address
-            // JSON metadata never crosses the queue as an Any-valued dictionary.
-            let author = message["author_display"] as? String ?? "unknown session"
-            let subjectBytes = (delivery["subject"] as? [String:Any]).flatMap { try? JSONSerialization.data(withJSONObject:$0) }
-            let ticketBytes = (delivery["ticket"] as? [String:Any]).flatMap { try? JSONSerialization.data(withJSONObject:$0) }
             DispatchQueue.global(qos:.utility).async { [self] in
                 let state:String;let receipt:[String:Any]
                 do {
@@ -565,54 +571,21 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
                         return deliveries.contains { $0["id"] as? String == id }
                     } }
                     guard authorized() else { throw ChecklistError("RECIPIENT_REVOKED","Native send canceled before I/O because the route was revoked.") }
-                    let content=try NativeRelayContent.render(origin:origin,messageID:mid,authorDisplayName:author,body:body,subject:subjectBytes.flatMap { (try? JSONSerialization.jsonObject(with:$0)) as? [String:Any] },ticket:ticketBytes.flatMap { (try? JSONSerialization.jsonObject(with:$0)) as? [String:Any] },permittedReply:queueRegistration == nil && replyPermitted ? NativeRelayReply(address:replyAddress):nil)
-                    if let queueRegistration {
-                        let sent = try CodexQueueRelay.send(content:content,registration:queueRegistration)
-                        var accepted: [String:Any] = ["stage":"codex_queue_command_exited_zero","exit_status":sent.exitStatus,"bytes":sent.byteCount,
-                            "route_generation":enrollment.generation,"model_acknowledged":false,"route":"codex_app_queue","result":"provider_accepted",
-                            "observer":"codex_state_5_threads_source","source":"vscode","reason_code":"source_vscode",
-                            "queue_poll_result":"not_started","open_result":"not_started"]
-                        if let item = sent.itemID { accepted["queued_item_id"] = item }
-                        // Preserve queue acceptance before the bounded wait. A crash
-                        // cannot send this delivery again or mint acknowledgment.
-                        let acceptedBytes = try JSONSerialization.data(withJSONObject:accepted)
-                        let recorded = queue.sync { () -> Bool in
-                            let fields = (try? JSONSerialization.jsonObject(with:acceptedBytes)) as? [String:Any] ?? [:]
-                            if case .recorded = nativeOutcomes().record("delivery_record",params:["delivery_id":id,"state":"provider_accepted","receipt":fields],deliveryID:id,routeGeneration:enrollment.generation) { changed();return true }
-                            return false
-                        }
-                        if recorded {
-                            let followup = CodexQueueFollowup.finish(itemID:sent.itemID,registration:queueRegistration,authorized:authorized)
-                            accepted.merge(followup.metadata) { _,new in new }
-                        } else {
-                            accepted["queue_poll_result"] = "authorization_changed";accepted["open_result"] = "authorization_changed"
-                        }
-                        state="provider_accepted";receipt=accepted
-                    } else {
-                        guard enrollment.automatic == true,
-                              let plugin=ProviderPluginRegistry.bundled.plugin(enrollment.provider, requiring: .nativePeer),
-                              enrollment.identityVerification == plugin.nativeHost?.identityVerification,
-                              peerPID > 1,let domain = enrollment.nativeExecutionDomain,
-                              let registration = NativeLifecycleRegistration(provider:enrollment.provider,
-                                sessionID:enrollment.nativeSessionID ?? enrollment.sessionID,executionDomain:domain,
-                                registryPath:plugin.nativeHost?.registryPath(processID:peerPID)) else {
-                            throw ChecklistError("NATIVE_REGISTRATION_UNPROVEN","Native push requires the current verified native registration; this note remains available through Checklist pickup.")
-                        }
-                        let sent=try NativeProviderTransport.send(provider:enrollment.provider,content:content,messageID:mid,replyAddress:replyAddress,displayName:"Checklist",endpoint:endpoint,expectedPeerPID:peerPID,expectedRegistration:registration)
-                        state="transport_written";receipt=["bytes":sent.byteCount,"socket_device":sent.socketDevice,"socket_inode":sent.socketInode,"route_generation":enrollment.generation]
+                    let content=try NativeRelayContent.render(origin:origin,messageID:mid,authorDisplayName:author,body:body,subject:subjectBytes.flatMap { (try? JSONSerialization.jsonObject(with:$0)) as? [String:Any] },ticket:ticketBytes.flatMap { (try? JSONSerialization.jsonObject(with:$0)) as? [String:Any] },permittedReply:replyPermitted ? NativeRelayReply(address:replyAddress):nil)
+                    guard enrollment.automatic == true,
+                          let plugin=ProviderPluginRegistry.bundled.plugin(enrollment.provider, requiring: .nativePeer),
+                          enrollment.identityVerification == plugin.nativeHost?.identityVerification,
+                          peerPID > 1,let domain = enrollment.nativeExecutionDomain,
+                          let registration = NativeLifecycleRegistration(provider:enrollment.provider,
+                            sessionID:enrollment.nativeSessionID ?? enrollment.sessionID,executionDomain:domain,
+                            registryPath:plugin.nativeHost?.registryPath(processID:peerPID)) else {
+                        throw ChecklistError("NATIVE_REGISTRATION_UNPROVEN","Native push requires the current verified native registration; this note remains available through Checklist pickup.")
                     }
+                    let sent=try NativeProviderTransport.send(provider:enrollment.provider,content:content,messageID:mid,replyAddress:replyAddress,displayName:"Checklist",endpoint:endpoint,expectedPeerPID:peerPID,expectedRegistration:registration)
+                    state="transport_written";receipt=["bytes":sent.byteCount,"socket_device":sent.socketDevice,"socket_inode":sent.socketInode,"route_generation":enrollment.generation]
                 } catch {
                     state=(error as? NativeBridgeError)?.deliveryMayHaveOccurred == true ? "uncertain":"failed"
-                    var failure: [String:Any] = ["reason":PublicErrorText.describe(error),"route_generation":enrollment.generation]
-                    if queueRegistration != nil {
-                        failure.merge(["route":"codex_app_queue","result":state == "uncertain" ? "uncertain" : "failed",
-                            "observer":"codex_state_5_threads_source","reason_code":state == "uncertain" ? "queue_outcome_unknown" : "queue_command_failed",
-                            "queue_poll_result":"not_started","open_result":"refused"]) { _,new in new }
-                        if let refusal = error as? CodexQueueRefusal {
-                            failure.merge(refusal.observation.receipt) { _,new in new };failure["result"] = "refused"
-                        }
-                    }
-                    receipt=failure
+                    receipt=["reason":PublicErrorText.describe(error),"route_generation":enrollment.generation]
                 }
                 let receiptBytes = (try? JSONSerialization.data(withJSONObject:receipt)) ?? Data("{}".utf8)
                 queue.async { [self] in

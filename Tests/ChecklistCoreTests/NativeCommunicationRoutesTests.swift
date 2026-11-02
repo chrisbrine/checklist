@@ -51,7 +51,8 @@ final class NativeCommunicationRoutesTests: XCTestCase {
             }
         }
         for route in NativeCommunicationRoutes.all where !route.qualified {
-            XCTAssertEqual(route.statusLabel, "Unavailable")
+            XCTAssertEqual(route.statusLabel, route.id == "codex_idle_wake" ? "Source enabled; real test pending" : "Unavailable")
+            XCTAssertEqual(route.status, route.id == "codex_idle_wake" ? "source_enabled" : "unavailable")
             XCTAssertTrue(route.qualifiedVersions.isEmpty)
             XCTAssertTrue(route.qualificationReceipts.isEmpty)
         }

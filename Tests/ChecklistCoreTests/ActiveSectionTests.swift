@@ -140,7 +140,7 @@ final class ActiveSectionTests: XCTestCase {
 }
 
 extension EvidenceAuthorityTests {
-    func testActiveSectionKeepsOrchestratedQueuedWorkHealth() throws {
+    func testActiveSectionOrchestratedQueuedTicketHasNoWorkHealthCheck() throws {
         let project = try project(), task = try ready(project), sibling = try ready(project)
         let coordinator = try native(project, "active-section-health", domain: "active-section-health")
         var group = try call("triage_create", ["project_id": project["id"]!, "name": "Advisory attention", "phase": "implementation"])
@@ -151,7 +151,8 @@ extension EvidenceAuthorityTests {
         _ = try router.runWorkHealthChecks(at: Date().addingTimeInterval(1202))
         let health = try call("work_health_get", ["project_id": project["id"]!, "task_id": task["id"]!])
         XCTAssertEqual((health["current_target"] as? JSON)?["kind"] as? String, "orchestration")
-        XCTAssertEqual((health["deliveries"] as? [JSON])?.first?["recipient_session_id"] as? String, coordinator.sessionID)
+        XCTAssertNil(health["request_id"], "CL-414: a Queued ticket that no one holds gets no check")
+        XCTAssertEqual(health["state"] as? String, "inactive")
         let active = try call("task_list", ["project_id": project["id"]!, "view": ["surface": "tickets", "status_filter": "active", "tag_filter": "all", "group_by": "status", "order_by": "manual"]])["tickets_page"] as! JSON
         XCTAssertEqual(active["matched_count"] as? Int, 0)
     }

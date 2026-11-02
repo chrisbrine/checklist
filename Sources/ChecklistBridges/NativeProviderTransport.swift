@@ -92,8 +92,8 @@ public struct CodexQueueRefusal: LocalizedError, Sendable {
 }
 
 public enum CodexQueueRelay {
-    /// Off until CL-413 installs. While off, no Codex enrollment joins native dispatch and no queue call runs.
-    public static let enabled = false
+    /// A compile-time constant with no per-project setting. While off, no Codex enrollment joins native dispatch and no queue call runs.
+    public static let enabled = true
     /// Source switch: disabling it keeps accepted queue writes and inbox pickup.
     public static let openUnloadedThreads = true
 
@@ -101,15 +101,11 @@ public enum CodexQueueRelay {
         guard registration.provider == "codex",UUID(uuidString:registration.sessionID) != nil else { return .init(reason:.recipientInvalid) }
         return CodexQueueStore.current?.observe(threadID:registration.sessionID) ?? .init(reason:.databaseReadError)
     }
-    public static func observedHost(_ registration: NativeLifecycleRegistration) -> CodexQueueHost { observation(registration).host }
-    public static func available(_ registration: NativeLifecycleRegistration) -> Bool { enabled && observedHost(registration) == .nativeApp }
 
-    public static func send(content: String, registration: NativeLifecycleRegistration,
-                            timeout: TimeInterval = 5,
-                            effects: any CodexQueueTransportEffects = MacOSCodexQueueTransportEffects()) throws -> CodexQueueReceipt {
-        try send(content:content,registration:registration,observation:observation(registration),enabled:enabled,timeout:timeout,effects:effects)
+    public static func send(content: String, registration: NativeLifecycleRegistration, observation: CodexQueueObservation,
+                            timeout: TimeInterval = 5, effects: any CodexQueueTransportEffects) throws -> CodexQueueReceipt {
+        try send(content:content,registration:registration,observation:observation,enabled:enabled,timeout:timeout,effects:effects)
     }
-
     static func send(content: String, registration: NativeLifecycleRegistration, observation: CodexQueueObservation,
                      enabled: Bool, timeout: TimeInterval, effects: any CodexQueueTransportEffects) throws -> CodexQueueReceipt {
         guard registration.provider == "codex",UUID(uuidString:registration.sessionID) != nil else { throw CodexQueueRefusal(observation:.init(reason:.recipientInvalid)) }

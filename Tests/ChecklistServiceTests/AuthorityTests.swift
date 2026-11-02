@@ -79,6 +79,15 @@ final class AuthorityTests: XCTestCase {
         XCTAssertTrue(coordinator.nativeDispatchDeliveries { _ in XCTFail("A revoked route cannot be projected");return nil }.isEmpty)
     }
 
+    /// Fake effects: no test reads the owner's Codex database.
+    private func useFakeCodexRoute(thread: String) throws {
+        var effects = CodexQueueRouteEffects.unavailable
+        effects.enabled = true;effects.readAppThreads = { _ in [thread] }
+        let marker = root.appendingPathComponent("codex-queue-route.json")
+        try JSONSerialization.data(withJSONObject:["activated_at":ISO8601DateFormatter().string(from:Date().addingTimeInterval(-300))]).write(to:marker)
+        coordinator.codexRoute = CodexQueueRouteState(markerFile:marker,effects:effects)
+        _ = coordinator.codexRoute.appThreads();Thread.sleep(forTimeInterval:0.05)
+    }
     func testCodexQueueCandidatesReachWorkerForExplicitSourceRefusalReceipt() throws {
         var current = enrollment()
         current.sessionID = "00000000-0000-4000-8000-000000000413"
@@ -86,6 +95,7 @@ final class AuthorityTests: XCTestCase {
         current.nativeExecutionDomain = "codex:24680:5:0"
         coordinator.enrollments = [current.installation:current]
         XCTAssertNotNil(Coordinator.codexQueueRegistration(current))
+        try useFakeCodexRoute(thread:current.sessionID)
         var projected = 0
         // The enabled double. The production switch has its own test below.
         let rows = coordinator.nativeDispatchDeliveries(endpointAvailable:{ Coordinator.codexQueueRegistration($0) != nil }) { params in
@@ -98,7 +108,7 @@ final class AuthorityTests: XCTestCase {
         // database or invoke the queue/open effects. The worker records refusal.
     }
 
-    func testProductionSwitchOffKeepsACodexRecipientOutOfDispatchAndItsDeliveryUnchanged() throws {
+    func testProductionSwitchOnSelectsACodexRecipientAndLeavesItsDeliveryUnchanged() throws {
         var current = enrollment()
         current.sessionID = "00000000-0000-4000-8000-000000000410"
         current.automatic = true;current.identityVerification = "native_process_verified_thread_observed"
@@ -114,16 +124,15 @@ final class AuthorityTests: XCTestCase {
         let bridge = Caller(role:"owner",installation:"native-bridge",projectIDs:[])
         func load(_ params: [String:Any]) -> [String:Any]? { (try? coordinator.router.handle(method:"delivery_pending",params:params,caller:bridge))?["data"] as? [String:Any] }
 
+        try useFakeCodexRoute(thread:current.sessionID)
         // The enabled double selects this delivery, so the next check is not empty by accident.
         XCTAssertEqual(coordinator.nativeDispatchDeliveries(endpointAvailable:{ Coordinator.codexQueueRegistration($0) != nil },load:load).count,1)
 
-        XCTAssertFalse(CodexQueueRelay.enabled)
+        // CL-413 turned the production switch on. With a false value, this function refuses the enrollment.
+        XCTAssertTrue(CodexQueueRelay.enabled)
         XCTAssertNotNil(Coordinator.codexQueueRegistration(current))
-        XCTAssertFalse(Coordinator.nativeEndpointAvailable(current))
-        var projected = 0
-        XCTAssertTrue(coordinator.nativeDispatchDeliveries { projected += 1;return load($0) }.isEmpty)
-        XCTAssertEqual(projected,0,"With the switch off, no Codex enrollment joins dispatch.")
-        XCTAssertEqual(try stored(),before,"The delivery row does not change.")
+        XCTAssertTrue(Coordinator.nativeEndpointAvailable(current))
+        XCTAssertEqual(try stored(),before,"The selection does not change the delivery row.")
         let delivery = try XCTUnwrap(JSONSerialization.jsonObject(with:Data(before[0].utf8)) as? [String:Any])
         XCTAssertEqual(delivery["state"] as? String,"queued","The app label for this state is Queued for agent pickup.")
         XCTAssertEqual(delivery["push_state"] as? String,"unavailable")

@@ -9,6 +9,10 @@ public enum CodexQueueReason: String, Sendable {
     case databaseLocked = "database_locked", schemaUnrecognized = "schema_unrecognized"
     case databaseReadError = "database_read_error", databaseUnsafe = "database_unsafe"
     case recipientInvalid = "recipient_invalid", routeDisabled = "route_disabled"
+    case threadArchived = "thread_archived", hostNotRunning = "host_not_running", registrationUnproven = "registration_unproven"
+    case hostSignatureInvalid = "host_signature_invalid", hostChanged = "host_changed"
+    case queueOccupied = "queue_occupied", authorizationChanged = "authorization_changed", fenceNotRecorded = "fence_not_recorded"
+    case holderExec = "holder_exec", holderUnclassified = "holder_unclassified", holderUnreadable = "holder_unreadable"
 
     public var explanation: String {
         switch self {
@@ -26,6 +30,17 @@ public enum CodexQueueReason: String, Sendable {
         case .databaseUnsafe: "The Codex database path is not an owned regular file with safe write permissions."
         case .recipientInvalid: "The recipient is not an exact registered Codex thread UUID."
         case .routeDisabled: "The Codex queue route is disabled."
+        case .threadArchived: "Codex records this thread as archived."
+        case .hostNotRunning: "No Codex app host is running, so no process can take a queue item."
+        case .hostSignatureInvalid: "The running app host failed the Codex signing check, so the service does not run its executable."
+        case .hostChanged: "The app host that would take this thread changed after its signing check."
+        case .queueOccupied: "This thread still has a queue item. Codex starts one turn per item, so no second item is added."
+        case .authorizationChanged: "The enrollment changed or was revoked before the send fence."
+        case .fenceNotRecorded: "The durable send fence could not be written, so no queue call ran."
+        case .registrationUnproven: "The registered process was not proven to be the app host that holds this thread."
+        case .holderExec: "A codex exec process holds this thread's rollout, or a codex process other than the app host names this thread or --last in its arguments. A queue item can be lost when an exec process exits."
+        case .holderUnclassified: "A process other than the app host holds this thread's rollout."
+        case .holderUnreadable: "The processes that can hold this thread's rollout could not be read."
         }
     }
 }
@@ -34,8 +49,9 @@ public struct CodexQueueObservation: Equatable, Sendable {
     public let host: CodexQueueHost
     public let reason: CodexQueueReason
     public let source: String?
-    public init(host: CodexQueueHost = .unproven, reason: CodexQueueReason, source: String? = nil) {
-        self.host = host; self.reason = reason; self.source = source
+    public let rolloutPath: String?
+    public init(host: CodexQueueHost = .unproven, reason: CodexQueueReason, source: String? = nil, rolloutPath: String? = nil) {
+        self.host = host; self.reason = reason; self.source = source; self.rolloutPath = rolloutPath
     }
     public var receipt: [String:Any] {
         var result: [String:Any] = ["route":"codex_app_queue", "observer":"codex_state_5_threads_source", "reason_code":reason.rawValue]
@@ -59,14 +75,18 @@ public struct CodexQueueStore: Sendable {
         guard let thread = UUID(uuidString:threadID) else { return .init(reason:.recipientInvalid) }
         do {
             return try read(file:"state_5.sqlite", stem:"state", version:5) { db in
-                try validate(db, table:"threads", required:["id":("TEXT",true),"source":("TEXT",false),"originator":("TEXT",false)])
-                let rows = try Row.fetchAll(db, sql:"SELECT id,source,originator FROM threads WHERE id=? COLLATE BINARY LIMIT 2",arguments:[thread.uuidString.lowercased()])
+                try validate(db, table:"threads", required:threadColumns)
+                let rows = try Row.fetchAll(db,sql:"SELECT id,source,originator,archived,rollout_path FROM threads WHERE id=? COLLATE BINARY LIMIT 2",arguments:[thread.uuidString.lowercased()])
                 guard let row = rows.first else { return .init(reason:.threadMissing) }
                 let idValue: DatabaseValue = row["id"],sourceValue: DatabaseValue = row["source"]
                 guard rows.count == 1,case .string(let id) = idValue.storage,UUID(uuidString:id) == thread,
                       case .string(let source) = sourceValue.storage else { throw ReadFailure(.schemaUnrecognized) }
                 switch source {
-                case "vscode": return .init(host:.nativeApp,reason:.sourceVscode,source:"vscode")
+                case "vscode":
+                    let archived: DatabaseValue = row["archived"],rollout: DatabaseValue = row["rollout_path"]
+                    guard case .int64(let flag) = archived.storage else { throw ReadFailure(.schemaUnrecognized) }
+                    if flag != 0 { return .init(reason:.threadArchived,source:"vscode") }
+                    return .init(host:.nativeApp,reason:.sourceVscode,source:"vscode",rolloutPath:safeRollout(rollout,thread:thread))
                 case "exec": return .init(host:.exec,reason:.sourceExec,source:"exec")
                 case "mcp": return .init(reason:.sourceMCP,source:"mcp")
                 default:
@@ -78,8 +98,54 @@ public struct CodexQueueStore: Sendable {
         } catch { return .init(reason:reason(error)) }
     }
 
-    enum Item: Equatable { case pending, removed, failed(CodexQueueReason) }
-    func item(_ item: String, threadID: String) -> Item {
+    /// Bounded by `limit`: the route selects from this set, never from all sessions.
+    public func recentAppThreads(updatedSince: Int64, limit: Int) -> Set<String>? {
+        try? read(file:"state_5.sqlite",stem:"state",version:5) { db in
+            try validate(db,table:"threads",required:threadColumns)
+            let rows = try Row.fetchAll(db,sql:"SELECT id FROM threads WHERE source='vscode' COLLATE BINARY AND archived=0 AND updated_at>=? ORDER BY updated_at DESC LIMIT ?",arguments:[updatedSince,limit])
+            return Set(rows.compactMap { row -> String? in
+                let value: DatabaseValue = row["id"]
+                guard case .string(let id) = value.storage else { return nil }
+                return UUID(uuidString:id)?.uuidString.lowercased()
+            })
+        }
+    }
+
+    /// An enrolled app thread that the recent set leaves out. `stale` means no update since the limit;
+    /// otherwise the newest-first limit left it out.
+    public struct OmittedThread: Equatable, Sendable {
+        public let id: String
+        public let stale: Bool
+        public init(id: String, stale: Bool) { self.id = id; self.stale = stale }
+    }
+    /// Names only unarchived `source=vscode` rows, so an enrolled exec thread is never reported.
+    public func omittedAppThreads(candidates: [String], updatedSince: Int64) -> [OmittedThread]? {
+        let ids = candidates.prefix(1024).compactMap { UUID(uuidString:$0)?.uuidString.lowercased() }
+        guard !ids.isEmpty else { return [] }
+        return try? read(file:"state_5.sqlite",stem:"state",version:5) { db in
+            try validate(db,table:"threads",required:threadColumns)
+            let rows = try Row.fetchAll(db,sql:"SELECT id,updated_at FROM threads WHERE source='vscode' COLLATE BINARY AND archived=0 AND id IN (\(databaseQuestionMarks(count:ids.count)))",arguments:StatementArguments(ids))
+            return rows.compactMap { row -> OmittedThread? in
+                let value: DatabaseValue = row["id"]
+                guard case .string(let id) = value.storage,let thread = UUID(uuidString:id) else { return nil }
+                let updated: Int64? = row["updated_at"]
+                return .init(id:thread.uuidString.lowercased(),stale:(updated ?? 0) < updatedSince)
+            }.sorted { $0.id < $1.id }
+        }
+    }
+
+    private var threadColumns: [String:(String,Bool)] {
+        ["id":("TEXT",true),"source":("TEXT",false),"originator":("TEXT",false),"archived":("INTEGER",false),"rollout_path":("TEXT",false),"updated_at":("INTEGER",false)]
+    }
+
+    private func safeRollout(_ value: DatabaseValue, thread: UUID) -> String? {
+        guard case .string(let path) = value.storage,path.hasPrefix(directory.appendingPathComponent("sessions").path+"/"),!path.contains("/../"),
+              path.hasSuffix("-\(thread.uuidString.lowercased()).jsonl") else { return nil }
+        return path
+    }
+
+    public enum Item: Equatable, Sendable { case pending, removed, failed(CodexQueueReason) }
+    public func item(_ item: String, threadID: String) -> Item {
         guard let thread = UUID(uuidString:threadID) else { return .failed(.recipientInvalid) }
         do {
             return try read(file:"queue_1.sqlite",stem:"queue",version:1) { db in
@@ -89,6 +155,24 @@ public struct CodexQueueStore: Sendable {
                 return rows.isEmpty ? .removed : .pending
             }
         } catch { return .failed(reason(error)) }
+    }
+
+    public enum ThreadItems: Equatable, Sendable { case empty, occupied(Int), failed(CodexQueueReason) }
+    /// Counts by the exact thread ID only. Codex starts one turn per item, and a thread stopped
+    /// with Stop takes none, so the route adds no item while this is not `.empty`.
+    public func threadItems(threadID: String) -> ThreadItems {
+        guard let thread = UUID(uuidString:threadID) else { return .failed(.recipientInvalid) }
+        do {
+            return try read(file:"queue_1.sqlite",stem:"queue",version:1) { db in
+                try validate(db,table:"queued_items",required:["id":("TEXT",true),"thread_id":("TEXT",false)])
+                let count = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM queued_items WHERE thread_id=? COLLATE BINARY",arguments:[thread.uuidString.lowercased()]) ?? 0
+                return count == 0 ? .empty : .occupied(count)
+            }
+        } catch {
+            // Codex creates this file at its first queue call, so an existing Codex home with no file holds no item.
+            if reason(error) == .databaseMissing,FileManager.default.fileExists(atPath:directory.path) { return .empty }
+            return .failed(reason(error))
+        }
     }
 
     private struct ReadFailure: Error { let reason: CodexQueueReason; init(_ reason: CodexQueueReason) { self.reason = reason } }

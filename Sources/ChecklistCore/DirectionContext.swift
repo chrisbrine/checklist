@@ -72,10 +72,14 @@ extension CommandRouter {
     /// CL-403: a write within 30 seconds before a recorded closure observation may still
     /// have been unread in the old process. Replay it conservatively. Missing timing
     /// also permits replay; pickup and acknowledgment remain stronger evidence.
+    /// CL-413: a Codex queue row survives the process, and an uncertain call can have written
+    /// it, so an uncertain or accepted queue receipt counts whatever the closure time.
     static func earlierReceiptOfNote(_ deliveries: [JSON], session: String) -> JSON? {
         deliveries.first { delivery in
             guard delivery["recipient_session_id"] as? String == session else { return false }
             if ["acknowledged", "addressed", "delivered"].contains(delivery["state"] as? String ?? "") { return true }
+            if (delivery["transport_receipt"] as? JSON)?["route"] as? String == "codex_app_queue",
+               ["uncertain", "provider_accepted"].contains(delivery["push_state"] as? String ?? "") { return true }
             guard ["transport_written", "provider_accepted"].contains(delivery["push_state"] as? String ?? ""), delivery["host_status"] == nil else { return false }
             guard delivery["native_closure_ref"] != nil else { return true }
             let formatter = ISO8601DateFormatter()

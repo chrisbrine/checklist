@@ -405,6 +405,38 @@ extension EvidenceAuthorityTests {
         let list = try call("message_delivery_list", ["project_id": p["id"]!, "task_id": t["id"]!, "message_id": note["id"]!], current)["deliveries"] as! [JSON]
         XCTAssertEqual(list.filter { $0["recipient_session_id"] as? String == worker.sessionID }.count, 3)
     }
+    /// F4: a queue row survives the process, so a new generation never queues this note again.
+    func testUncertainCodexQueueReceiptStopsANewGeneration() throws { try assertQueueReceiptStopsANewGeneration("uncertain") }
+    func testAcceptedCodexQueueReceiptNearClosureStopsANewGeneration() throws { try assertQueueReceiptStopsANewGeneration("provider_accepted") }
+    private func assertQueueReceiptStopsANewGeneration(_ state: String) throws {
+        let p = try project(), t = try ready(p), worker = try native(p, "queue-near-closure", domain: "claude:123:5:0", provider: "claude")
+        _ = try claim(p, t, caller: worker)
+        let note = try call("message_send", ["project_id": p["id"]!, "task_id": t["id"]!, "body": "Queue \(state)"])
+        let first = try XCTUnwrap((note["deliveries"] as? [JSON])?.first { $0["recipient_session_id"] as? String == worker.sessionID })
+        // The write is within 30 seconds before the closure, the time that replays a host write.
+        _ = try call("delivery_record", ["delivery_id": first["id"]!, "state": state, "receipt": ["route": "codex_app_queue", "stage": "native_send_started", "queue_poll_result": "not_started"]], relayBridge)
+        let current = try closeAndResume(p, worker, cycle: 41)
+        XCTAssertFalse(try relayCandidates(worker.sessionID!).contains { $0["message_id"] as? String == note["id"] as? String })
+        let receipt = try inboxReceipt(p, note, current)
+        XCTAssertEqual(receipt["push_state"] as? String, "relay_skipped")
+        XCTAssertEqual(receipt["relay_skipped_for_delivery_id"] as? String, first["id"] as? String)
+    }
+    func testCodexQueueEvidenceRulesOfEarlierReceipt() {
+        let queue: JSON = ["route": "codex_app_queue"]
+        let closure: JSON = ["id": "d", "recipient_session_id": "s", "state": "delivery_uncertain", "native_closure_ref": "c", "fenced_at": "2026-11-01T12:00:30Z", "updated_at": "2026-11-01T12:00:29Z"]
+        for state in ["uncertain", "provider_accepted"] {
+            var row = closure;row["push_state"] = state;row["transport_receipt"] = queue
+            XCTAssertNotNil(CommandRouter.earlierReceiptOfNote([row], session: "s"), state)
+            row["host_status"] = "error"
+            XCTAssertNotNil(CommandRouter.earlierReceiptOfNote([row], session: "s"), state)
+        }
+        for state in ["failed", "unavailable"] {
+            var row = closure;row["push_state"] = state;row["transport_receipt"] = queue
+            XCTAssertNil(CommandRouter.earlierReceiptOfNote([row], session: "s"), state)
+        }
+        var other = closure;other["push_state"] = "uncertain"
+        XCTAssertNil(CommandRouter.earlierReceiptOfNote([other], session: "s"), "Another route keeps its rule")
+    }
     func testResumedConversationReplaysWriteNearClosureAndThenSkipsAnOlderWrite() throws {
         let p = try project(), t = try ready(p), worker = try native(p, "relay-near-closure", domain: "claude:123:5:0", provider: "claude")
         _ = try claim(p, t, caller: worker)

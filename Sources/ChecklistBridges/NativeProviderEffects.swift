@@ -171,30 +171,21 @@ public protocol CodexQueueTransportEffects {
     func queue(content: String, registration: NativeLifecycleRegistration, timeout: TimeInterval) throws -> CodexQueueReceipt
 }
 
-/// One bounded invocation of the registered host's own executable. No shell,
-/// model start, remote endpoint, retry or caller-selected executable is used.
+/// One bounded invocation of the running app host's own executable. An idle thread
+/// cannot register again after an app restart, so the registered PID does not select it.
+/// No shell, model start, remote endpoint, retry or caller-selected executable is used.
+/// The preflight checked this path's signature. A file swapped in after that check is not seen.
 public struct MacOSCodexQueueTransportEffects: CodexQueueTransportEffects {
-    public init() {}
+    let executable: String
+    public init(executable: String) { self.executable = executable }
     public func queue(content: String, registration: NativeLifecycleRegistration, timeout: TimeInterval) throws -> CodexQueueReceipt {
-        guard registration.provider == "codex",
-              NativeLifecycleInspector.inspect(registration).process == .running else {
-            throw NativeBridgeError.invalid("RECIPIENT_CHANGED: registered Codex host process is no longer current.")
-        }
-        var path = [CChar](repeating:0,count:4096)
-        guard proc_pidpath(registration.processID,&path,UInt32(path.count)) > 0 else {
-            throw NativeBridgeError.invalid("CODEX_QUEUE_EXECUTABLE_UNPROVEN: registered Codex executable cannot be observed.")
-        }
-        let executable = String(decoding:path.prefix { $0 != 0 }.map { UInt8(bitPattern:$0) },as:UTF8.self)
-        guard URL(fileURLWithPath:executable).lastPathComponent == "codex" else {
-            throw NativeBridgeError.invalid("CODEX_QUEUE_EXECUTABLE_UNPROVEN: registered host is not the Codex executable.")
+        guard registration.provider == "codex",URL(fileURLWithPath:executable).lastPathComponent == "codex" else {
+            throw NativeBridgeError.invalid("CODEX_QUEUE_EXECUTABLE_UNPROVEN: the app host is not the Codex executable.")
         }
         guard UUID(uuidString:registration.sessionID) != nil else {
             throw NativeBridgeError.invalid("CODEX_QUEUE_THREAD_INVALID: registered thread is not a UUID.")
         }
         let environment = try CodexCommandEnvironment.current()
-        guard NativeLifecycleInspector.inspect(registration).process == .running else {
-            throw NativeBridgeError.invalid("RECIPIENT_CHANGED: registered Codex host process changed before queue execution.")
-        }
         let result = try BoundedCodexCommand.run(executable:executable,
             arguments:["queue","--thread",registration.sessionID,"--message",content],
             environment:environment,timeout:timeout,captureOutput:true)

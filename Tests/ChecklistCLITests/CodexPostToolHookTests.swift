@@ -192,6 +192,21 @@ final class CodexPostToolHookTests: XCTestCase {
         try value(["data": ["pending_notes": ["items": [["delivery_id": "d1", "project_id": "p1", "message_id": "m1", "body": "One"], ["delivery_id": "d2", "project_id": "p1", "message_id": "m2", "body": "Two"]]]]])
     }
 
+    func testUnreadableNotesPrintOneFixedLineAndConfirmNothing() async throws {
+        let reply = try value(["data": ["pending_notes": ["status": "pending_pickup", "items": [], "skipped_malformed": 2]]])
+        let text = String(decoding: try XCTUnwrap(try CodexPostToolHook.output(reply)), as: UTF8.self)
+        XCTAssertTrue(text.contains("session_inbox"))
+        XCTAssertFalse(text.contains("2 "), "The line is fixed. The reply holds the count.")
+        let calls = Calls()
+        try await CodexPostToolHook.deliver(reply, write: { _ in calls.order.append("write") }, confirm: { _ in calls.order.append("confirm") })
+        XCTAssertEqual(calls.order, ["write"], "No delivery to confirm")
+    }
+
+    func testHasMoreWithNoItemsStillTellsTheModel() throws {
+        let reply = try value(["data": ["pending_notes": ["status": "pending_pickup", "items": [], "has_more": true, "skipped_malformed": 0]]])
+        XCTAssertTrue(String(decoding: try XCTUnwrap(try CodexPostToolHook.output(reply)), as: UTF8.self).contains("session_inbox"))
+    }
+
     func testConfirmRunsOnlyAfterStdoutWasWritten() async throws {
         let calls = Calls()
         try await CodexPostToolHook.deliver(deliveryReply(), write: { _ in calls.order.append("write") }, confirm: { calls.order.append("confirm"); calls.confirmed = $0 })

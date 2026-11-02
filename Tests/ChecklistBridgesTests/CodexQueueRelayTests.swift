@@ -20,15 +20,14 @@ final class CodexQueueRelayTests: XCTestCase {
             executionDomain:"\(provider):24680:5:0",registryPath:nil))
     }
 
-    func testProductionSwitchOffRefusesAnAppThreadWithZeroQueueCalls() throws {
+    func testSwitchOffRefusesAnAppThreadWithZeroQueueCalls() throws {
         let effects = Effects()
-        XCTAssertFalse(CodexQueueRelay.enabled,"The route stays off until CL-413 installs.")
+        XCTAssertTrue(CodexQueueRelay.enabled,"CL-413 turned the production route on.")
         XCTAssertThrowsError(try CodexQueueRelay.send(content:"Synthetic",registration:registration(),observation:.init(host:.nativeApp,reason:.sourceVscode),
-            enabled:CodexQueueRelay.enabled,timeout:5,effects:effects)) {
+            enabled:false,timeout:5,effects:effects)) {
             XCTAssertEqual(($0 as? CodexQueueRefusal)?.observation.reason,.routeDisabled)
         }
         XCTAssertEqual(effects.calls,0)
-        XCTAssertFalse(CodexQueueRelay.available(try registration()))
     }
 
     func testEnabledDoubleWithMissingFixtureRefusesWithoutQueueIO() throws {

@@ -65,7 +65,7 @@ extension CommandRouter {
         statement["add_command"] = ["method": "group_membership", "arguments": [
             "project_id": pid, "group_id": mine["id"] ?? NSNull(), "task_id": tid, "action": "add", "expected_revision": mine["revision"] ?? NSNull()
         ] as JSON] as JSON
-        statement["text"] = "\(current) You orchestrate \(try agentReference(db, mine)). Use add_command to add this ticket. Do not add a split or follow-up ticket that goes to the next unstarted plan."
+        statement["text"] = "\(current) You orchestrate \(try agentReference(db, mine)). Use add_command to add this ticket, and supply a new UUID as its command_id. Do not add a split or follow-up ticket that goes to the next unstarted plan."
         return statement
     }
     func currentTriages(_ db: Database, project pid: String, taskID tid: String) throws -> [JSON] {

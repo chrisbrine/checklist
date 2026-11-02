@@ -82,6 +82,7 @@ extension EvidenceAuthorityTests {
         let other = try call("task_create",["project_id":p["id"]!,"title":"Added later"],a)
         let command = try XCTUnwrap((other["triage_membership"] as? JSON)?["add_command"] as? JSON)
         XCTAssertEqual(command["method"] as? String,"group_membership")
+        XCTAssertTrue(((other["triage_membership"] as? JSON)?["text"] as? String ?? "").contains("supply a new UUID as its command_id"))
         _ = try call("group_membership",try XCTUnwrap(command["arguments"] as? JSON),a)
         XCTAssertEqual(try memberIDs(p,triage["id"]!),[other["id"] as! String])
     }

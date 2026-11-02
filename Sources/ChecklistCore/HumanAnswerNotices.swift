@@ -40,9 +40,8 @@ extension CommandRouter {
                     (json_extract(d.data,'$.recipient_session_id') = CAST(? AS TEXT) COLLATE BINARY
                      AND json_extract(d.data,'$.recipient_authorization_generation') = CAST(? AS TEXT) COLLATE BINARY
                      AND COALESCE(json_extract(d.data,'$.state'),'queued') NOT IN ('acknowledged','addressed'))
-                    ELSE 1 END ELSE 1 END
-                  AND CASE WHEN m.id IS NULL THEN
-                    CASE WHEN json_valid(d.data) THEN CASE WHEN json_type(d.data)='object' THEN 0 ELSE 1 END ELSE 1 END
+                    ELSE 0 END ELSE 0 END
+                  AND CASE WHEN m.id IS NULL THEN 0
                     WHEN json_valid(m.data) THEN CASE WHEN json_type(m.data)='object' THEN
                       (json_extract(m.data,'$.origin')='human_ui'
                        AND json_type(m.data,'$.human_request_id')='text'
@@ -51,9 +50,11 @@ extension CommandRouter {
                 ORDER BY d.rowid LIMIT 9
                 """,arguments:[Data(pid.utf8),Data(pid.utf8),Data(sid.utf8),Data(generation.utf8)])
             for row in rows {
-                // Unknown malformed local candidates cannot establish an empty
-                // pickup observation; the enclosing post-commit decorator marks
-                // this unavailable. Foreign payload inspection is always guarded.
+                // A malformed delivery names no recipient, so no route can give it to this
+                // worker, and treating it as a candidate would hide every good answer in the
+                // project (CL-414). A valid delivery to this worker with a malformed message can
+                // be an answer. It cannot establish an empty pickup observation; the enclosing
+                // post-commit decorator marks this unavailable for this worker alone.
                 let delivery = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"delivery").object
                 guard delivery["recipient_session_id"] as? String == sid,
                       delivery["recipient_authorization_generation"] as? String == generation,

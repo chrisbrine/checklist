@@ -353,6 +353,7 @@ extension EvidenceAuthorityTests {
         var group = try call("triage_create",["project_id":p["id"]!,"name":"Health phase","phase":"implementation"])
         for task in [t,sibling] { group = try call("group_membership",["project_id":p["id"]!,"group_id":group["id"]!,"expected_revision":group["revision"]!,"task_id":task["id"]!,"action":"add"]) }
         group = try call("triage_orchestrate",["project_id":p["id"]!,"triage_id":group["id"]!,"expected_revision":group["revision"]!,"action":"start","progress":"Coordinating this implementation phase"],worker)
+        try setHealthStatus(t,"review")
         let membership = try jsonString(group["members"]!)
         try checkHealth(at:Date().addingTimeInterval(1202))
         let view = try health(p,t), mid = try XCTUnwrap(view["request_id"] as? String)
@@ -366,7 +367,7 @@ extension EvidenceAuthorityTests {
         let after = try router.dbQueue.read {try router.record($0,group["id"] as! String,type:"group")}
         XCTAssertEqual(try jsonString(after["members"]!),membership)
         XCTAssertEqual(after["revision"] as? Int,group["revision"] as? Int)
-        XCTAssertEqual(try healthTask(p,t)["status_category"] as? String,"queued")
+        XCTAssertEqual(try healthTask(p,t)["status_category"] as? String,"review")
     }
     func testWorkHealthMaterialRevisionChangeRequiresFreshReconciliation() throws {
         let p = try project(), t = try ready(p), w = try native(p,"health-material",domain:"health-material"), a = try claim(p,t,caller:w)
@@ -476,6 +477,14 @@ extension EvidenceAuthorityTests {
     // CL-412: a ticket with no active attempt in an actively orchestrated Triage.
     private static let orchestratedProgress = "Coordinating this implementation phase"
     private func healthStamp(_ date: Date) -> String { ISO8601DateFormatter().string(from:date) }
+    /// A ticket with no active attempt in another status: for example, submitted work that waits for a reviewer.
+    private func setHealthStatus(_ t: JSON, _ category: String) throws {
+        try healthWrite { db in
+            var row = try router.record(db,t["id"] as! String,type:"task")
+            row["status_id"] = try XCTUnwrap(try router.records(db,type:"status",project:t["project_id"] as? String).first {$0["category"] as? String == category})["id"]
+            try router.save(db,row,type:"task")
+        }
+    }
     private func orchestratedHealthTriage(_ p: JSON, _ tasks: [JSON], _ orchestrator: Caller) throws -> JSON {
         var group = try call("triage_create",["project_id":p["id"]!,"name":"Health clock","phase":"implementation"])
         for task in tasks { group = try call("group_membership",["project_id":p["id"]!,"group_id":group["id"]!,"expected_revision":group["revision"]!,"task_id":task["id"]!,"action":"add"]) }
@@ -568,6 +577,7 @@ extension EvidenceAuthorityTests {
         let group = try orchestratedHealthTriage(p,[own,quiet],o), a = try claim(p,own,caller:w)
         try releaseHealthAttempt(p,a,w)
         try setAttemptClock(a,now.addingTimeInterval(-3000)); try setTriageClock(group,now.addingTimeInterval(-6000))
+        try setHealthStatus(own,"review"); try setHealthStatus(quiet,"review")
         let b = try claim(p,active,caller:w)
         try ageHealthAttempt(b,by:3000)
         try checkHealth(at:now)
@@ -583,14 +593,15 @@ extension EvidenceAuthorityTests {
         let p = try project(), t = try ready(p), now = Date(), bridge = Caller(role:"owner",installation:"native-bridge",projectIDs:[])
         let o = try native(p,"relay-orchestrator",domain:"relay-o"), w = try native(p,"relay-worker",domain:"relay-w")
         let group = try orchestratedHealthTriage(p,[t],o)
+        let a = try claim(p,healthTask(p,t),caller:w)
+        try releaseHealthAttempt(p,a,w)
+        try setAttemptClock(a,now.addingTimeInterval(-3500)); try setHealthStatus(t,"review")
         try setTriageClock(group,now.addingTimeInterval(-3000))
         try checkHealth(at:now.addingTimeInterval(-600))
         let first = try XCTUnwrap(try healthRelays(o).first,"The first request relays to the orchestrator")
         _ = try call("delivery_record",["delivery_id":first["id"]!,"state":"transport_written","receipt":["bytes":1]],bridge)
         let mid = try XCTUnwrap(try health(p,t)["request_id"] as? String)
         // An attempt older than the request does not answer it.
-        let a = try claim(p,healthTask(p,t),caller:w)
-        try releaseHealthAttempt(p,a,w)
         try setAttemptClock(a,now.addingTimeInterval(-1000))
         try checkHealth(at:now.addingTimeInterval(-500))
         XCTAssertEqual(try health(p,t)["request_id"] as? String,mid)
@@ -613,17 +624,267 @@ extension EvidenceAuthorityTests {
         let p = try project(), t = try ready(p), now = Date()
         let o = try native(p,"wait-orchestrator",domain:"wait-o"), w = try native(p,"wait-worker",domain:"wait-w")
         let group = try orchestratedHealthTriage(p,[t],o)
+        let a = try claim(p,healthTask(p,t),caller:w)
+        try releaseHealthAttempt(p,a,w)
+        try setAttemptClock(a,now.addingTimeInterval(-3500)); try setHealthStatus(t,"review")
         try setTriageClock(group,now.addingTimeInterval(-3000))
         try checkHealth(at:now.addingTimeInterval(-600))
         let mid = try XCTUnwrap(try health(p,t)["request_id"] as? String)
         XCTAssertEqual(try call("work_health_respond",["project_id":p["id"]!,"task_id":t["id"]!,"request_id":mid,"expected_revision":healthTask(p,t)["revision"]!,"progress":"Waiting","known_wait":"runner session"],o)["outcome"] as? String,"resumed")
-        let a = try claim(p,healthTask(p,t),caller:w)
-        try releaseHealthAttempt(p,a,w)
         try setAttemptClock(a,now.addingTimeInterval(-3000))
         try checkHealth(at:now.addingTimeInterval(5))
         XCTAssertEqual((try health(p,t)["known_waits"] as? [JSON])?.first?["kind"] as? String,"reported","An older attempt does not clear the wait")
         try setAttemptClock(a,now.addingTimeInterval(30))
         try checkHealth(at:now.addingTimeInterval(40))
         XCTAssertTrue((try health(p,t)["known_waits"] as? [JSON] ?? []).isEmpty,"Progress of the ticket clears a named wait")
+    }
+
+    // CL-414: a Queued ticket that no one holds has no work to check.
+    private func healthNotes(_ t: JSON) throws -> [JSON] { try healthRows("message",task:t).filter {$0["kind"] as? String == "work_health"} }
+
+    func testWorkHealthQueuedTicketWithNoAttemptGetsNoRequestAndNoRelay() throws {
+        let p = try project(), t = try ready(p), now = Date()
+        let o = try native(p,"queued-orchestrator",domain:"queued-o")
+        let group = try orchestratedHealthTriage(p,[t],o)
+        try setTriageClock(group,now.addingTimeInterval(-6000))
+        // One tick past each interval, with a changed Triage checkpoint before the later ticks.
+        for (index,seconds) in [0.0,1300,2600,10000].enumerated() {
+            if index > 0 { try triageCheckpoint(p,group,o,progress:"Triage step \(index)") }
+            try checkHealth(at:now.addingTimeInterval(seconds))
+            XCTAssertTrue(try healthNotes(t).isEmpty,"No health note at tick \(index)")
+            XCTAssertTrue(try healthRelays(o).isEmpty,"No relay at tick \(index)")
+        }
+        let view = try health(p,t)
+        XCTAssertEqual(view["state"] as? String,"inactive"); XCTAssertEqual(view["attention"] as? Bool,false)
+        XCTAssertNil(view["next_check_at"]); XCTAssertNil(view["request_id"])
+        XCTAssertEqual((view["current_target"] as? JSON)?["kind"] as? String,"orchestration","The view still names the orchestrator")
+        XCTAssertEqual(try healthTask(p,t)["status_category"] as? String,"queued")
+        XCTAssertTrue((try router.dbQueue.read {try router.record($0,group["id"] as! String,type:"group")}["members"] as? [JSON] ?? []).count == 1,"Membership stays")
+    }
+
+    /// B2: a Codex app thread gets no queue relay, so the request stays on pickup, unchanged.
+    func testWorkHealthRequestStaysInTheInboxWithItsPushState() throws {
+        let p = try project(), t = try ready(p), w = try native(p,"health-inbox",domain:"health-inbox"), a = try claim(p,t,caller:w)
+        try ageHealthAttempt(a); try checkHealth()
+        let inbox = try call("session_inbox",["project_id":p["id"]!],w)
+        let delivery = try XCTUnwrap((inbox["deliveries"] as! [JSON]).first { ($0["message"] as? JSON)?["origin"] as? String == "system" })
+        XCTAssertEqual(delivery["push_state"] as? String,"unavailable");XCTAssertEqual(delivery["state"] as? String,"queued")
+        XCTAssertTrue((delivery["push_reason"] as? String ?? "").contains("gets no queue relay"))
+        XCTAssertTrue((try health(p,t)["native_wake"] as? String ?? "").contains("never gets this request by its queue relay"))
+    }
+    /// CL-414: a repeat of an answered check cannot set a wait on the next holder.
+    func testWorkHealthRepeatedAnswerAfterTakeoverChangesNothing() throws {
+        let p = try project(), t = try ready(p), first = try native(p,"repeat-old",domain:"repeat-old"), next = try native(p,"repeat-new",domain:"repeat-new")
+        let a = try claim(p,t,caller:first); try ageHealthAttempt(a); try checkHealth()
+        let mid = try health(p,t)["request_id"] as! String
+        XCTAssertEqual(try respondHealth(p,t,request:mid,caller:first)["outcome"] as? String,"resumed")
+        _ = try call("work_takeover",["project_id":p["id"]!,"task_id":t["id"]!,"expected_revision":healthTask(p,t)["revision"]!,"reason":"Explicit takeover for this fixture"],next)
+        let before = try healthTask(p,t), messages = try healthRows("message",task:t).count
+        let replay = try call("work_health_respond",["project_id":p["id"]!,"task_id":t["id"]!,"request_id":mid,"expected_revision":before["revision"]!,"known_wait":"Old holder wait"],first)
+        XCTAssertEqual(replay["outcome"] as? String,"stale_request");XCTAssertEqual(replay["replayed"] as? Bool,true)
+        let after = try healthTask(p,t)
+        XCTAssertEqual(after["revision"] as? Int,before["revision"] as? Int);XCTAssertEqual(try healthRows("message",task:t).count,messages,"No reply row")
+        XCTAssertNil((after["work_health"] as? JSON)?["reported_wait"]);XCTAssertTrue((try health(p,t)["known_waits"] as? [JSON] ?? []).isEmpty)
+    }
+    func testWorkHealthRepeatedAnswerOfAnOlderCheckLeavesTheOpenCheck() throws {
+        let p = try project(), t = try ready(p), w = try native(p,"repeat-older",domain:"repeat-older"), a = try claim(p,t,caller:w)
+        try ageHealthAttempt(a); try checkHealth()
+        let older = try health(p,t)["request_id"] as! String
+        XCTAssertEqual(try respondHealth(p,t,request:older,caller:w)["outcome"] as? String,"resumed")
+        // The same holder repeats its answer with no newer check: this stays a valid repeat.
+        let same = try call("work_health_respond",["project_id":p["id"]!,"task_id":t["id"]!,"request_id":older,"expected_revision":healthTask(p,t)["revision"]!,"known_wait":"Runner"],w)
+        XCTAssertEqual(same["outcome"] as? String,"resumed");XCTAssertEqual((try health(p,t)["known_waits"] as? [JSON])?.first?["reason"] as? String,"Runner")
+        _ = try call("work_health_respond",["project_id":p["id"]!,"task_id":t["id"]!,"request_id":older,"expected_revision":healthTask(p,t)["revision"]!,"progress":"The wait ended"],w)
+        try checkHealth(at:Date().addingTimeInterval(4000))
+        let newer = try XCTUnwrap(try health(p,t)["request_id"] as? String)
+        XCTAssertNotEqual(newer,older)
+        let stale = try call("work_health_respond",["project_id":p["id"]!,"task_id":t["id"]!,"request_id":older,"expected_revision":healthTask(p,t)["revision"]!,"known_wait":"Runner"],w)
+        XCTAssertEqual(stale["outcome"] as? String,"stale_request");XCTAssertEqual(try health(p,t)["request_id"] as? String,newer)
+        XCTAssertNil((try healthTask(p,t)["work_health"] as? JSON)?["reported_wait"])
+    }
+    /// CL-414: a named wait stops requests, not visibility.
+    func testWorkHealthKnownWaitAfterACheckpointKeepsANextCheckAndRaisesAttention() throws {
+        let p = try project(), t = try ready(p), w = try native(p,"wait-visible",domain:"wait-visible"), a = try claim(p,t,caller:w), now = Date()
+        try ageHealthAttempt(a); try checkHealth()
+        let mid = try health(p,t)["request_id"] as! String
+        try healthCheckpoint(p,t,a,w,step:1)
+        XCTAssertEqual(try call("work_health_respond",["project_id":p["id"]!,"task_id":t["id"]!,"request_id":mid,"expected_revision":healthTask(p,t)["revision"]!,"known_wait":"Runner"],w)["outcome"] as? String,"resumed")
+        var view = try health(p,t)
+        XCTAssertNotNil(view["next_check_at"]);XCTAssertEqual(view["attention"] as? Bool,false);XCTAssertNil(view["request_id"])
+        let notes = try healthNotes(t).count
+        try checkHealth(at:now.addingTimeInterval(120))
+        view = try health(p,t)
+        XCTAssertNotNil(view["next_check_at"]);XCTAssertEqual(view["attention"] as? Bool,false)
+        let revision = try healthTask(p,t)["revision"] as? Int
+        try checkHealth(at:now.addingTimeInterval(180))
+        XCTAssertEqual(try healthTask(p,t)["revision"] as? Int,revision,"An unchanged tick writes nothing")
+        try checkHealth(at:now.addingTimeInterval(1300))
+        view = try health(p,t)
+        XCTAssertEqual(view["attention"] as? Bool,true,"A stall stays visible");XCTAssertEqual(view["reported_wait_overdue"] as? Bool,true)
+        XCTAssertNotNil(view["next_check_at"]);XCTAssertNil(view["request_id"]);XCTAssertEqual(try healthNotes(t).count,notes,"The wait still stops requests")
+        try healthCheckpoint(p,t,a,w,step:2)
+        try checkHealth(at:now.addingTimeInterval(1400))
+        view = try health(p,t)
+        XCTAssertEqual(view["attention"] as? Bool,false);XCTAssertNil(view["reported_wait_overdue"]);XCTAssertTrue((view["known_waits"] as? [JSON] ?? []).isEmpty);XCTAssertNotNil(view["next_check_at"])
+    }
+    func testWorkHealthResumeAfterAPauseStartsTheNamedWaitIntervalAgain() throws {
+        let p = try project(), t = try ready(p), w = try native(p,"wait-pause",domain:"wait-pause"), a = try claim(p,t,caller:w), now = Date()
+        try ageHealthAttempt(a); try checkHealth()
+        let mid = try health(p,t)["request_id"] as! String
+        try healthCheckpoint(p,t,a,w,step:1)
+        XCTAssertEqual(try call("work_health_respond",["project_id":p["id"]!,"task_id":t["id"]!,"request_id":mid,"expected_revision":healthTask(p,t)["revision"]!,"known_wait":"Runner"],w)["outcome"] as? String,"resumed")
+        XCTAssertEqual(try health(p,t)["attention"] as? Bool,false)
+        let paused = try call("project_settings_save",["project_id":p["id"]!,"expected_revision":p["revision"]!,"work_health_settings":["enabled":false,"inactivity_minutes":15,"response_grace_minutes":15]])
+        _ = try call("project_settings_save",["project_id":p["id"]!,"expected_revision":paused["revision"]!,"work_health_settings":["enabled":true,"inactivity_minutes":15,"response_grace_minutes":15]])
+        let notes = try healthNotes(t).count
+        // The wait is older than one 900 s interval here, and the resume starts the interval at this page.
+        try checkHealth(at:now.addingTimeInterval(1300))
+        var view = try health(p,t)
+        XCTAssertEqual(view["attention"] as? Bool,false,"A resume does not raise the flag at once");XCTAssertNil(view["reported_wait_overdue"]);XCTAssertFalse((view["known_waits"] as? [JSON] ?? []).isEmpty)
+        try checkHealth(at:now.addingTimeInterval(2100))
+        XCTAssertEqual(try health(p,t)["attention"] as? Bool,false,"Still inside the new interval")
+        try checkHealth(at:now.addingTimeInterval(2300))
+        view = try health(p,t)
+        XCTAssertEqual(view["attention"] as? Bool,true,"A full interval after the resume the stall shows");XCTAssertEqual(view["reported_wait_overdue"] as? Bool,true)
+        XCTAssertNil(view["request_id"]);XCTAssertEqual(try healthNotes(t).count,notes,"The wait still stops requests")
+    }
+    func testWorkHealthParkedAndBlockedTicketsWithNoHolderGetNoCheck() throws {
+        let p = try project(), now = Date()
+        for category in ["parked","blocked"] {
+            let t = try ready(p), o = try native(p,"\(category)-orchestrator",domain:"\(category)-o")
+            let group = try orchestratedHealthTriage(p,[t],o)
+            try setHealthStatus(t,category)
+            try setTriageClock(group,now.addingTimeInterval(-6000))
+            try checkHealth(at:now);try checkHealth(at:now.addingTimeInterval(1300))
+            XCTAssertTrue(try healthNotes(t).isEmpty,category);XCTAssertEqual(try health(p,t)["state"] as? String,"inactive");XCTAssertNil(try health(p,t)["next_check_at"])
+            // An open check ends with its own outcome.
+            let open = try ready(p)
+            let g2 = try orchestratedHealthTriage(p,[open],try native(p,"\(category)-second",domain:"\(category)-s"))
+            try setHealthStatus(open,"active");try setTriageClock(g2,now.addingTimeInterval(-6000))
+            try checkHealth(at:now);try checkHealth(at:now.addingTimeInterval(1300))
+            let mid = try XCTUnwrap(try health(p,open)["request_id"] as? String)
+            try setHealthStatus(open,category);try checkHealth(at:now.addingTimeInterval(1400))
+            XCTAssertEqual((try router.dbQueue.read {try router.record($0,mid,type:"message")}["health_request"] as? JSON)?["outcome"] as? String,"ticket_\(category)")
+            XCTAssertNil(try health(p,open)["request_id"])
+        }
+    }
+    func testWorkHealthHeldAndReviewTicketsKeepChecksAndRelayLimits() throws {
+        let p = try project(), held = try ready(p), review = try ready(p), queued = try ready(p), now = Date()
+        let bridge = Caller(role:"owner",installation:"native-bridge",projectIDs:[])
+        let o = try native(p,"limits-orchestrator",domain:"limits-o"), w = try native(p,"limits-worker",domain:"limits-w")
+        let group = try orchestratedHealthTriage(p,[held,review,queued],o), a = try claim(p,held,caller:w)
+        try setHealthStatus(review,"review")
+        try setHealthStatus(held,"queued") // A held ticket keeps its check whatever its status says.
+        try ageHealthAttempt(a,by:3000); try setTriageClock(group,now.addingTimeInterval(-3000))
+        var relays = 0
+        for cycle in 1...5 {
+            try triageCheckpoint(p,group,o,progress:"Triage cycle \(cycle)")
+            let date = now.addingTimeInterval(Double(cycle) * 4000)
+            try checkHealth(at:date); try checkHealth(at:date.addingTimeInterval(1300))
+            for delivery in try healthRelays(o) {
+                relays += 1
+                XCTAssertEqual(delivery["task_id"] as? String ?? (delivery["message"] as? JSON)?["task_id"] as? String,review["id"] as? String)
+                _ = try call("delivery_record",["delivery_id":delivery["id"]!,"state":"transport_written","receipt":["bytes":1]],bridge)
+            }
+        }
+        XCTAssertEqual(relays,3,"The CL-389 limit per target stays")
+        XCTAssertEqual((try health(p,review)["current_target"] as? JSON)?["kind"] as? String,"orchestration")
+        XCTAssertNotNil(try health(p,review)["request_id"])
+        XCTAssertEqual((try health(p,held)["current_target"] as? JSON)?["kind"] as? String,"attempt")
+        XCTAssertEqual(try healthNotes(held).first?["kind"] as? String,"work_health")
+        XCTAssertEqual(try healthRelays(w).count,1,"One request relays to the holder until its progress changes")
+        XCTAssertTrue(try healthNotes(queued).isEmpty)
+    }
+
+    func testWorkHealthOpenRequestEndsWhenTheTicketBecomesQueued() throws {
+        let p = try project(), t = try ready(p), now = Date()
+        let o = try native(p,"ended-orchestrator",domain:"ended-o")
+        let group = try orchestratedHealthTriage(p,[t],o)
+        try setHealthStatus(t,"review"); try setTriageClock(group,now.addingTimeInterval(-3000))
+        try checkHealth(at:now)
+        let mid = try XCTUnwrap(try health(p,t)["request_id"] as? String)
+        XCTAssertEqual(try healthRelays(o).count,1,"A relay waits for the bridge")
+        try setHealthStatus(t,"queued")
+        try checkHealth(at:now.addingTimeInterval(30))
+        XCTAssertTrue(try healthRelays(o).isEmpty,"The ended request starts no turn")
+        let request = try XCTUnwrap(try router.dbQueue.read {try router.record($0,mid,type:"message")}["health_request"] as? JSON)
+        XCTAssertEqual(request["outcome"] as? String,"ticket_queued"); XCTAssertNotNil(request["outcome_note_id"])
+        let view = try health(p,t)
+        XCTAssertNil(view["request_id"]); XCTAssertNil(view["deadline"]); XCTAssertEqual(view["state"] as? String,"inactive"); XCTAssertEqual(view["attention"] as? Bool,false)
+        let notes = try healthNotes(t)
+        XCTAssertEqual(notes.count,2,"The request and one outcome note")
+        XCTAssertTrue(try XCTUnwrap(notes.first {$0["id"] as? String == request["outcome_note_id"] as? String}?["body"] as? String).contains("Queued"))
+        let revision = try healthTask(p,t)["revision"] as? Int
+        try checkHealth(at:now.addingTimeInterval(5000))
+        XCTAssertEqual(try healthNotes(t).count,2,"No later check"); XCTAssertEqual(try healthTask(p,t)["revision"] as? Int,revision,"A later tick writes nothing")
+        XCTAssertTrue(try healthRelays(o).isEmpty)
+        let late = try respondHealth(p,t,request:mid,caller:o)
+        XCTAssertEqual(late["outcome"] as? String,"ticket_queued"); XCTAssertEqual(late["replayed"] as? Bool,true)
+    }
+
+    func testWorkHealthReleasedAttemptRequestOutsideATriageEndsWithAnOutcome() throws {
+        let p = try project(), t = try ready(p), w = try native(p,"ended-worker",domain:"ended-w"), a = try claim(p,t,caller:w)
+        try ageHealthAttempt(a); try checkHealth()
+        let mid = try XCTUnwrap(try health(p,t)["request_id"] as? String)
+        try releaseHealthAttempt(p,a,w)
+        XCTAssertEqual(try healthTask(p,t)["status_category"] as? String,"queued")
+        try checkHealth(at:Date().addingTimeInterval(30))
+        XCTAssertEqual((try router.dbQueue.read {try router.record($0,mid,type:"message")}["health_request"] as? JSON)?["outcome"] as? String,"ticket_queued")
+        XCTAssertNil(try health(p,t)["request_id"])
+        XCTAssertTrue(try healthRelays(w).isEmpty)
+    }
+
+    func testWorkHealthAttentionFromAnEarlierReplyClearsWhenQueued() throws {
+        let p = try project(), t = try ready(p), now = Date()
+        let o = try native(p,"attention-orchestrator",domain:"attention-o")
+        let group = try orchestratedHealthTriage(p,[t],o)
+        try setHealthStatus(t,"review"); try setTriageClock(group,now.addingTimeInterval(-3000))
+        try checkHealth(at:now)
+        _ = try respondHealth(p,t,request:try health(p,t)["request_id"] as! String,caller:o)
+        XCTAssertEqual((try healthTask(p,t)["work_health"] as? JSON)?["attention"] as? Bool,true,"A reply is not progress")
+        try setHealthStatus(t,"queued")
+        let notes = try healthNotes(t).count
+        try checkHealth(at:now.addingTimeInterval(30))
+        XCTAssertEqual((try healthTask(p,t)["work_health"] as? JSON)?["attention"] as? Bool,false)
+        XCTAssertEqual(try healthNotes(t).count,notes,"No open request, so no outcome note")
+    }
+
+    func testWorkHealthRespondAcceptsKnownWaitWithNoProgressAndStopsRequestsUntilProgress() throws {
+        let p = try project(), t = try ready(p), w = try native(p,"wait-only",domain:"wait-only"), a = try claim(p,t,caller:w), now = Date()
+        try ageHealthAttempt(a); try checkHealth()
+        let mid = try XCTUnwrap(try health(p,t)["request_id"] as? String)
+        var input: JSON = ["project_id":p["id"]!,"task_id":t["id"]!,"request_id":mid,"expected_revision":try healthTask(p,t)["revision"]!]
+        assertCode("INVALID_INPUT") { _ = try self.call("work_health_respond",input,w) }
+        input["known_wait"] = "   "
+        assertCode("INVALID_INPUT") { _ = try self.call("work_health_respond",input,w) }
+        input["known_wait"] = "runner session"
+        XCTAssertEqual(try call("work_health_respond",input,w)["outcome"] as? String,"resumed")
+        var view = try health(p,t)
+        XCTAssertEqual((view["known_waits"] as? [JSON])?.first?["reason"] as? String,"runner session")
+        let reply = try XCTUnwrap(try healthRows("message",task:t).first {$0["reply_to"] as? String == mid})
+        XCTAssertTrue(try XCTUnwrap(reply["body"] as? String).contains("runner session"))
+        let notes = try healthNotes(t).count
+        for seconds in [4000.0,8000,20000] { try checkHealth(at:now.addingTimeInterval(seconds)) }
+        XCTAssertEqual(try healthNotes(t).count,notes,"No further request during the wait")
+        view = try health(p,t)
+        XCTAssertNil(view["request_id"]); XCTAssertNotNil(view["next_check_at"],"The wait stops requests, not the next check")
+        XCTAssertEqual(view["attention"] as? Bool,true);XCTAssertEqual((view["known_waits"] as? [JSON])?.count,1)
+        // New progress ends the wait, and the next check is due again.
+        try healthCheckpoint(p,t,a,w,step:7)
+        try checkHealth(at:now.addingTimeInterval(24000))
+        view = try health(p,t)
+        XCTAssertTrue((view["known_waits"] as? [JSON] ?? []).isEmpty)
+        XCTAssertNotNil(view["request_id"]); XCTAssertGreaterThan(try healthNotes(t).count,notes)
+    }
+
+    func testWorkHealthCatalogAndCheckTextAgreeOnKnownWait() throws {
+        let p = try project(), t = try ready(p), w = try native(p,"catalog-wait",domain:"catalog-wait"), a = try claim(p,t,caller:w)
+        let tool = try XCTUnwrap((try call("tool_catalog",[:],w)["tools"] as! [JSON]).first {$0["name"] as? String == "work_health_respond"})
+        let schema = try XCTUnwrap(tool["inputSchema"] as? JSON), properties = try XCTUnwrap(schema["properties"] as? JSON)
+        XCTAssertNotNil(properties["known_wait"]); XCTAssertNotNil(properties["progress"])
+        XCTAssertFalse((schema["required"] as? [String] ?? []).contains("progress"))
+        XCTAssertTrue(try XCTUnwrap(tool["description"] as? String).contains("progress, known_wait or both"))
+        try ageHealthAttempt(a); try checkHealth()
+        XCTAssertTrue(try XCTUnwrap(try healthNotes(t).first?["body"] as? String).contains("known_wait for a known wait"))
     }
 }

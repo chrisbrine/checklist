@@ -78,7 +78,8 @@ enum CodexPostToolHook {
         let items = try pendingItems(reply).items
         guard let output = try output(reply) else { return }
         try write(output)
-        try await confirm(items.compactMap { $0["delivery_id"] as? String })
+        let deliveries = items.compactMap { $0["delivery_id"] as? String }
+        if !deliveries.isEmpty { try await confirm(deliveries) }
     }
 
     /// After stdout has the bytes, the confirmation gets `confirmLimit`, whatever time the read used.
@@ -103,9 +104,13 @@ enum CodexPostToolHook {
         return (pending, items)
     }
 
+    /// The reply holds the count of skipped rows. This line stays fixed.
+    static let unreadableNotesLine = "Checklist could not read one or more pending notes. Read checklist call session_inbox '{}' from this project before the next main step."
+
     static func output(_ reply: Value) throws -> Data? {
         let (pending, items) = try pendingItems(reply)
-        guard !items.isEmpty else { return nil }
+        let skipped = (pending["skipped_malformed"] as? Int ?? 0) > 0, more = pending["has_more"] as? Bool == true
+        guard !items.isEmpty || skipped || more else { return nil }
         var blocks: [String] = []
         for item in items {
             guard let body = item["body"] as? String,
@@ -115,8 +120,9 @@ enum CodexPostToolHook {
             blocks.append(try CodexHookNoteContent.render(origin: item["origin"] as? String, authorDisplay: item["author_display"] as? String, projectID: project,
                 messageID: message, deliveryID: delivery, subject: item["subject"], body: body, bodyTruncated: item["body_truncated"] as? Bool == true))
         }
-        blocks.append(CodexHookNoteContent.footer)
-        if pending["has_more"] as? Bool == true { blocks.append("More notes remain. Read checklist call session_inbox '{}' from this project before the next main step.") }
+        if !items.isEmpty { blocks.append(CodexHookNoteContent.footer) }
+        if skipped { blocks.append(unreadableNotesLine) }
+        if more { blocks.append("More notes remain. Read checklist call session_inbox '{}' from this project before the next main step.") }
         let object: [String: Any] = ["hookSpecificOutput": ["hookEventName": "PostToolUse", "additionalContext": blocks.joined(separator: "\n\n")]]
         var result = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
         result.append(0x0a)

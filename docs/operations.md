@@ -34,7 +34,7 @@ Use native multi-select for tags, planned assignment, epic/triage membership, pe
 
 ## Session coordination
 
-Routine coordination between actual enrolled sessions involved in the same authorized Checklist project, task or Triage has standing authorization and needs no per-message permission question. Use existing scope/grants and current handler/session identities; a message never enrolls a session, launches a model, changes an assignee or expands authority.
+Routine coordination between actual enrolled sessions involved in the same authorized Checklist project, task or Triage has standing authorization and needs no per-message permission question. Use existing scope/grants and current handler/session identities; a message never enrolls a session, launches a model, changes an assignee or expands authority. Exception: the service's Codex app queue route (CL-413) may start a turn in an existing enrolled app thread to relay a note, as the Claude relay does. It launches no new conversation, grants nothing and is not acknowledgment.
 
 When another ticket or session is waiting, completion, handoff or a meaningful blocker change includes a concise note on that waiting ticket routed to its current handler. An active status does not mean it is free of dependencies. Include the source ticket, outcome/evidence and next permitted step; use the same note for durable history and outbox delivery, and deduplicate existing notices. Do not rely on the source ticket's status or final chat reply to notify others, send repeated unchanged updates, or mistake queued delivery for acknowledgment. Follow the [shared coordination rule](policies.md#involved-session-coordination).
 

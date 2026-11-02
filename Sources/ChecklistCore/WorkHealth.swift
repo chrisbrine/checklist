@@ -46,8 +46,7 @@ extension CommandRouter {
     /// Exact task/attempt queries; no project message/event corpus is decoded.
     func workHealthTarget(_ db: Database, task: JSON) throws -> JSON {
         let pid = (try StoredRecord(task, family: "task").string("project_id"))
-        if let aid = task["active_attempt_id"] as? String,
-           let attempt = try? scoped(db, aid, pid, type: "attempt"), attempt["state"] as? String == "active" {
+        if let aid = task["active_attempt_id"] as? String, let attempt = healthActiveAttempt(db, task: task, project: pid) {
             return ["kind": "attempt", "id": aid, "phase": attempt["phase"] ?? "implementation",
                     "session_id": attempt["session_id"] ?? "human", "generation": attempt["session_authorization_generation"] ?? "",
                     "started_at": attempt["started_at"] ?? NSNull()]
@@ -65,6 +64,20 @@ extension CommandRouter {
         return ["kind": "missing_handler", "id": "missing", "phase": "unknown", "session_id": "",
                 "generation": "", "reason": coordinators.isEmpty ? "No current handler or active phase orchestrator." : coordinators.count > 1 ? "Multiple active phase orchestrators; choose a handler explicitly." : "Active orchestration has no complete durable phase/session identity; refresh the actual orchestration."]
     }
+    private func healthActiveAttempt(_ db: Database, task: JSON, project pid: String) -> JSON? {
+        guard let aid = task["active_attempt_id"] as? String, let attempt = try? scoped(db, aid, pid, type: "attempt"),
+              attempt["state"] as? String == "active" else { return nil }
+        return attempt
+    }
+    /// CL-414: no one holds a Queued, Parked or Blocked ticket with no active attempt, so no work can be late.
+    /// Returns that status category. A Review ticket keeps its check: its orchestrator handles it.
+    private func healthUnheldCategory(_ db: Database, task: JSON) throws -> String? {
+        let pid = try StoredRecord(task, family: "task").string("project_id")
+        guard let category = (try? scoped(db, task["status_id"] as? String ?? "", pid, type: "status"))?["category"] as? String,
+              Self.unheldHealthCategories.contains(category) else { return nil }
+        return healthActiveAttempt(db, task: task, project: pid) == nil ? category : nil
+    }
+    private static let unheldHealthCategories: Set<String> = ["queued", "parked", "blocked"]
     private func sameHealthTarget(_ a: JSON, _ b: JSON) -> Bool {
         ["kind", "id", "phase", "session_id", "generation"].allSatisfy { (a[$0] as? String ?? "").utf8.elementsEqual((b[$0] as? String ?? "").utf8) }
     }
@@ -165,8 +178,8 @@ extension CommandRouter {
             value["deliveries"] = deliveries
             value["delivery_state"] = deliveries.first?["state"] ?? "saved_for_pickup"
         }
-        // Health deliberately includes orchestrated/unclaimed members, beyond Active status.
-        if !bool(selected,"active_attention") {
+        // Health deliberately includes orchestrated/unclaimed members, beyond Active status, but not a Queued, Parked or Blocked ticket with no attempt (CL-414).
+        if try !bool(selected,"active_attention") || healthUnheldCategory(db, task: task) != nil {
             value["state"] = "inactive"; value["attention"] = false; value.removeValue(forKey:"next_check_at")
         }
         value["native_wake"] = NativeCommunicationRoutes.workHealthWake
@@ -198,7 +211,7 @@ extension CommandRouter {
             // orchestrator's copy must not start a turn; the orchestrator cannot answer this request.
             if (message["health_request"] as? JSON)?["native_relay"] as? Bool == true, recipient["recipient_role"] as? String ?? "health_handler" == "health_handler",
                try claimHealthRelay(db, session: sid, at: date) {
-                delivery["native_relay"] = "work_health"; delivery["push_reason"] = "Relayed once when this session has a verified native endpoint; otherwise it waits for exact-session MCP pickup."
+                delivery["native_relay"] = "work_health"; delivery["push_reason"] = "Relayed once when this session has a verified native endpoint. A Codex app thread has none and gets no queue relay, because a service timer starts no Codex turn. Otherwise it waits for exact-session MCP pickup."
             }
             copyRoleLabel(recipient, into: &delivery)
             try save(db,delivery,type:"delivery");deliveries.append(delivery)
@@ -244,6 +257,32 @@ extension CommandRouter {
             return ["session_id": id, "generation": o["session_authorization_generation"] ?? ""]
         }
     }
+    /// CL-414: ends an open check on a Queued, Parked or Blocked ticket with no attempt and clears its advisory state.
+    /// Status, claims and Triage membership stay. The outcome note stays on pickup.
+    private func endUnheldWorkHealth(_ db: Database, task original: JSON, category: String) throws -> Bool {
+        var task = original
+        guard var health = task["work_health"] as? JSON else { return false }
+        let previous = health, pid = try StoredRecord(task, family: "task").string("project_id")
+        if let mid = health["request_id"] as? String, var message = try? scoped(db, mid, pid, type: "message"),
+           var request = message["health_request"] as? JSON, request["outcome"] == nil {
+            try healthOutcome(db, task: task, request: &request, outcome: "ticket_\(category)", body: "Work health check \(mid) ended: this ticket is \(category.capitalized) and no one holds it, so no check applies. Work authority is unchanged.")
+            message["health_request"] = request; try save(db, revised(message), type: "message")
+            // A relay that the bridge did not write starts no turn for an ended request.
+            let rows = try Row.fetchAll(db, sql: "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='delivery' AND project_id=? AND json_extract(data,'$.message_id')=? LIMIT 33", arguments: [pid, mid])
+            for var delivery in try rows.map({ try GRDBRecordEnvelopeAdapter.decode($0).object }) where delivery["native_relay"] != nil && delivery["push_state"] as? String == "unavailable" {
+                delivery.removeValue(forKey: "native_relay"); delivery["push_reason"] = "This work health request ended before its relay. It waits for exact-session MCP pickup."
+                try save(db, revised(delivery), type: "delivery")
+            }
+        }
+        for key in ["request_id", "deadline", "next_check_at", "reported_wait", "reported_wait_overdue", "response_without_new_progress"] { health.removeValue(forKey: key) }
+        health["state"] = "inactive"; health["attention"] = false
+        guard try jsonString(health) != jsonString(previous) else { return false }
+        health["observed_at"] = healthStamp(Date()); task["work_health"] = health
+        try save(db, revised(task), type: "task")
+        try event(db, caller: healthActor, project: pid, entity: task["id"] as? String, kind: "work_health_changed")
+        return true
+    }
+
     private func healthOutcome(_ db: Database, task: JSON, request: inout JSON, outcome: String, body: String) throws {
         guard request["outcome"] == nil else { return }
         request["outcome"] = outcome; request["outcome_at"] = now()
@@ -291,14 +330,17 @@ extension CommandRouter {
                     AND COALESCE(json_extract(r.data,'$.archived'),0)=0 AND COALESCE(json_extract(r.data,'$.trashed'),0)=0
                     AND (json_extract(r.data,'$.active_attempt_id') IS NOT NULL
                          OR EXISTS (SELECT 1 FROM records s WHERE s.id=json_extract(r.data,'$.status_id') AND s.type='status' AND s.project_id=r.project_id AND json_extract(s.data,'$.category')='active')
-                         OR EXISTS (SELECT 1 FROM triage_members m WHERE m.project_id=r.project_id AND m.task_id=r.id))
+                         OR EXISTS (SELECT 1 FROM triage_members m WHERE m.project_id=r.project_id AND m.task_id=r.id)
+                         OR (json_extract(r.data,'$.work_health.request_id') IS NOT NULL AND EXISTS (SELECT 1 FROM records s WHERE s.id=json_extract(r.data,'$.status_id') AND s.type='status' AND s.project_id=r.project_id AND json_extract(s.data,'$.category') IN ('queued','parked','blocked'))))
                     ORDER BY r.rowid LIMIT ?
                     """, arguments: [workHealthScanPosition,pageLimit])
                 var inspected = 0, changed = 0
                 for row in rows {
                     let task = try GRDBRecordEnvelopeAdapter.decode(row).object
+                    if let category = try healthUnheldCategory(db,task:task) {
+                        if try endUnheldWorkHealth(db,task:task,category:category) { changed += 1 }
                     // Advisory attention retains orchestration/sibling handling; it is not the Active filter.
-                    if try selectedTaskActiveAttention(db,task:task) {
+                    } else if try selectedTaskActiveAttention(db,task:task) {
                         if try checkWorkHealth(db, task: task, at: date) { changed += 1 }; inspected += 1
                     }
                 }
@@ -340,7 +382,7 @@ extension CommandRouter {
         // New progress ends a wait named in a reply.
         let waitSince = healthTime((health["reported_wait"] as? JSON)?["since"])
         if health["reported_wait"] != nil, (health["reported_wait"] as? JSON)?["progress_token"] as? String != progressToken || (waitSince != nil && (progress ?? .distantPast) > waitSince!) {
-            health.removeValue(forKey: "reported_wait"); task["work_health"] = health
+            health.removeValue(forKey: "reported_wait"); health.removeValue(forKey: "reported_wait_overdue"); health.removeValue(forKey: "response_without_new_progress"); health["attention"] = false; task["work_health"] = health
         }
         let baseline = max(healthTime(health["baseline_at"]) ?? date, min(progress ?? .distantPast, date))
         let due = healthTime(health["next_check_at"]) ?? baseline.addingTimeInterval(interval)
@@ -355,7 +397,8 @@ extension CommandRouter {
                 health["state"] = "no_response"; health.removeValue(forKey: "next_check_at"); health["attention"] = true; health["no_response_note_id"] = note["id"]
             }
             message["health_request"] = request; try save(db, message, type: "message")
-        } else if date >= max(due, baseline.addingTimeInterval(interval)) {
+        // A wait named in a reply stops further requests until new progress (CL-414).
+        } else if health["reported_wait"] == nil, date >= max(due, baseline.addingTimeInterval(interval)) {
             let deadline = healthStamp(date.addingTimeInterval(grace))
             // CL-389: a request relays only for new progress, never during a known wait, and at most three times per attempt.
             let relayTarget = target["id"] as? String, relayCount = health["relay_target"] as? String == relayTarget ? int(health, "relay_count", default: 0) : 0
@@ -368,7 +411,13 @@ extension CommandRouter {
         } else if health["request_id"] == nil {
             health["state"] = target["kind"] as? String == "missing_handler" ? "missing_handler" : "current"
             if target["kind"] as? String == "missing_handler" { health["attention"] = true }
-            health["next_check_at"] = healthStamp(max(due, baseline.addingTimeInterval(interval)))
+            // CL-414: a named wait stops requests, not visibility. Past one interval with no progress, it raises attention.
+            if health["reported_wait"] != nil {
+                // A pause or a clock rebase moves the baseline, so the interval starts again from there.
+                let overdueAt = max(waitSince ?? baseline, baseline).addingTimeInterval(interval)
+                health["next_check_at"] = healthStamp(overdueAt)
+                if date >= overdueAt { health["attention"] = true; health["reported_wait_overdue"] = true }
+            } else { health["next_check_at"] = healthStamp(max(due, baseline.addingTimeInterval(interval))) }
         }
         // No unchanged tick writes/events. observed_at anchors clock rollback only
         // when something meaningful in this advisory state actually changes.
@@ -387,17 +436,25 @@ extension CommandRouter {
         try revision(p, task)
         let mid = try text(p, "request_id"), message = try scoped(db, mid, pid, type: "message")
         guard message["task_id"] as? String == task["id"] as? String, message["health_request"] != nil else { throw CoreError("INVALID_INPUT", "Select this ticket's correlated work health request.") }
-        let reply: JSON = ["id": uuid(), "project_id": pid, "task_id": (try StoredRecord(task, family: "record").requiredValue("id")), "reply_to": mid, "body": try text(p, "progress"),
+        // A known wait answers the check by itself; the check text offers it with no progress (CL-414).
+        guard p["progress"] != nil || p["known_wait"] != nil else { throw CoreError("INVALID_INPUT", "Answer with progress, known_wait or both.") }
+        let knownWait: String? = try p["known_wait"] == nil ? nil : text(p, "known_wait", max: 200)
+        let body = try p["progress"] == nil ? "Known wait: " + (knownWait ?? "") : text(p, "progress")
+        let reply: JSON = ["id": uuid(), "project_id": pid, "task_id": (try StoredRecord(task, family: "record").requiredValue("id")), "reply_to": mid, "body": body,
             "author_session_id": c.sessionID ?? "human", "author": c.principal, "origin": "agent", "kind": "reply", "revision": 1, "created_at": now()]
-        try save(db, reply, type: "message")
         let result = try reconcileHealthReply(db, reply: reply, caller: c) ?? [:]
-        // A named wait stops further relays until new progress. A later answer with no wait clears it.
+        // CL-414: a repeat of an answered check that no longer applies changes nothing.
+        if result["stale"] as? Bool == true { return ["outcome": "stale_request", "request_id": mid, "replayed": true] }
+        try save(db, reply, type: "message")
+        // A named wait stops further requests until new progress. A replayed answer with no wait clears it.
         if result["outcome"] as? String == "resumed" {
             var current = try scoped(db, (try StoredRecord(task, family: "record").string("id")), pid, type: "task"), health = current["work_health"] as? JSON ?? [:]
             let before = health["reported_wait"] != nil
-            if p["known_wait"] != nil { health["reported_wait"] = ["reason": try text(p, "known_wait", max: 200), "since": now(), "request_id": mid, "progress_token": try healthProgressToken(db, task: current, target: workHealthTarget(db, task: current))] as JSON }
-            else { health.removeValue(forKey: "reported_wait") }
-            if before || p["known_wait"] != nil { current["work_health"] = health; try save(db, revised(current), type: "task") }
+            if let knownWait {
+                health["reported_wait"] = ["reason": knownWait, "since": now(), "request_id": mid, "progress_token": try healthProgressToken(db, task: current, target: workHealthTarget(db, task: current))] as JSON
+                health["next_check_at"] = healthStamp(Date().addingTimeInterval(TimeInterval(int(workHealthSettings(try record(db, pid, type: "project")), "inactivity_minutes") * 60)))
+            } else { health.removeValue(forKey: "reported_wait"); health.removeValue(forKey: "reported_wait_overdue") }
+            if before || knownWait != nil { current["work_health"] = health; try save(db, revised(current), type: "task") }
         }
         return result
     }
@@ -411,9 +468,17 @@ extension CommandRouter {
         guard reply["author_session_id"] as? String == target["session_id"] as? String else { throw CoreError("FORBIDDEN", "Only the exact requested handler may answer this work health check.") }
         let sid = (try StoredRecord(target, family: "health_target").string("session_id"))
         guard let session = try? scoped(db, sid, pid, type: "session"), canReceive(session, project: pid), sessionGeneration(session) == target["generation"] as? String else { throw CoreError("STALE_CLAIM", "The requested session generation is no longer eligible; use ordinary fresh claim/handoff recovery.") }
-        if let outcome = request["outcome"] { return ["outcome": outcome, "request_id": mid, "replayed": true] }
         var task = try scoped(db, (try StoredRecord(message, family: "message").string("task_id")), pid, type: "task")
         let current = try workHealthTarget(db, task: task)
+        if let outcome = request["outcome"] {
+            var replay: JSON = ["outcome": outcome, "request_id": mid, "replayed": true]
+            // CL-414: a repeat of "resumed" acts only for the target that it answered. A newer holder or a newer check is not its to change.
+            if outcome as? String == "resumed" {
+                let open = (task["work_health"] as? JSON)?["request_id"] as? String
+                if !sameHealthTarget(target, current) || int(request, "acceptance_revision") != int(task, "acceptance_revision") || (request["manifest_id"] as? String) != (task["current_manifest_id"] as? String) || (open != nil && open != mid) { replay["stale"] = true }
+            }
+            return replay
+        }
         var authorized = sameHealthTarget(target, current) && int(request, "acceptance_revision") == int(task, "acceptance_revision") && (request["manifest_id"] as? String) == (task["current_manifest_id"] as? String)
         if authorized, target["kind"] as? String == "orchestration" {
             let project = try record(db,pid,type:"project"), policy = effectivePolicy(project["policy"] as? JSON ?? [:],kind:"")

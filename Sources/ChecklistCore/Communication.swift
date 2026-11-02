@@ -277,10 +277,10 @@ extension CommandRouter {
             "source":["vscode","exec","mcp","subagent","unknown"],
             "reason_code":["source_vscode","source_exec","source_mcp","source_subagent","source_unknown","thread_missing",
                 "database_missing","database_version_unsupported","database_locked","schema_unrecognized","database_read_error",
-                "database_unsafe","recipient_invalid","route_disabled","queue_command_failed","queue_outcome_unknown","recipient_changed"],
-            "queue_poll_result":["not_started","item_unconfirmed","removed","pending_after_20s","database_missing",
-                "database_version_unsupported","database_locked","schema_unrecognized","database_read_error","database_unsafe","authorization_changed"],
-            "open_result":["not_started","not_needed","disabled","refused","authorization_changed","exited_zero","failed","outcome_unknown"]
+                "database_unsafe","recipient_invalid","route_disabled","registration_unproven","queue_command_failed","queue_outcome_unknown"],
+            "queue_poll_result":["not_started","item_unconfirmed","removed","removed_exec_holder","pending_after_20s","database_missing",
+                "database_version_unsupported","database_locked","schema_unrecognized","database_read_error","database_unsafe","authorization_changed","acknowledged","service_restarted"],
+            "open_result":["not_started","not_needed","loaded_pending","state_unknown","exec_holder","disabled","refused","authorization_changed","exited_zero","failed","outcome_unknown"]
         ]
         var result: JSON = ["route":"codex_app_queue"]
         for (field,values) in allowed { if let value = receipt[field] as? String,values.contains(value) { result[field] = value } }
@@ -321,14 +321,25 @@ extension CommandRouter {
         guard let sid = c.sessionID else { throw CoreError("FORBIDDEN","This connection has no bound recipient.") }
         let pids: [String]
         if p["project_id"] != nil { pids = [try scope(db,p,c)] } else { pids = c.projectIDs.filter { c.role != "assistant" || (c.assistantGrants[$0]?["read"] == true && c.assistantGrants[$0]?["receive_messages"] == true) } }
-        var deliveries: [JSON] = []
-        for pid in pids { try assistantPermission(c,pid,"receive_messages"); for var d in try records(db,type:"delivery",project:pid) where d["recipient_session_id"] as? String == sid {
-            guard try deliveryCurrent(db,d) else { continue }
-            var message = try scoped(db,StoredRecord(d, family: "delivery").string("message_id"),pid,type:"message")
-            let subject = try subject(db,message:message);message["subject"] = subject;d["subject"] = subject
-            d["message"] = message; deliveries.append(d)
-        } }
-        return ["deliveries":deliveries,"messages":deliveries.compactMap { $0["message"] as? JSON },
+        var deliveries: [JSON] = [],skippedMalformed = 0
+        for pid in pids {
+            try assistantPermission(c,pid,"receive_messages")
+            // CASE, not AND: SQLite does not guarantee term order. A row that names no recipient can be this session's, so it comes back and counts.
+            let rows = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='delivery' AND project_id=CAST(? AS TEXT) AND CASE WHEN json_valid(data) THEN CASE WHEN json_type(data)='object' THEN COALESCE(json_extract(data,'$.recipient_session_id')=CAST(? AS TEXT) COLLATE BINARY,1) ELSE 1 END ELSE 1 END ORDER BY rowid",arguments:[Data(pid.utf8),Data(sid.utf8)])
+            for row in rows {
+                // The hook sends a worker here when it skips an unreadable note, so that note costs only its own row (CL-414).
+                do {
+                    var d = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"delivery").object
+                    guard d["recipient_session_id"] as? String == sid,try deliveryCurrent(db,d) else { continue }
+                    var message: JSON
+                    do { message = try scoped(db,StoredRecord(d, family: "delivery").string("message_id"),pid,type:"message") }
+                    catch let error as CoreError where error.code == "NOT_FOUND" { continue } // The same read rule as pending notes: no message, nothing to show.
+                    let subject = try subject(db,message:message);message["subject"] = subject;d["subject"] = subject
+                    d["message"] = message; deliveries.append(d)
+                } catch let error as CoreError where error.code == "CANONICAL_RECORD_INVALID" { skippedMalformed += 1 }
+            }
+        }
+        return ["deliveries":deliveries,"messages":deliveries.compactMap { $0["message"] as? JSON },"skipped_malformed":skippedMalformed,
             "native_recovery":try nativeResumptionRecovery(db,caller:c,projects:pids)]
     }
     private func backupHistoryData(_ db: Database,_ row: Row) throws -> JSON {

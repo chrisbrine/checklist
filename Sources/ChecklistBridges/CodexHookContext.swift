@@ -31,7 +31,7 @@ extension NativeSessionContext {
         return id
     }
 
-    private struct RolloutFile: Equatable {
+    struct RolloutFile: Equatable {
         let path: String
         let inode: UInt64
         let device: Int32
@@ -44,7 +44,7 @@ extension NativeSessionContext {
         return "\(info.pbi_start_tvsec):\(info.pbi_start_tvusec)"
     }
 
-    private static func codexRolloutFiles(process: Int32, rootDirectory: String) -> [RolloutFile]? {
+    static func codexRolloutFiles(process: Int32, rootDirectory: String) -> [RolloutFile]? {
         // Foundation normalizes macOS /private aliases differently from the vnode
         // paths returned by libproc. POSIX realpath uses the same physical path.
         guard let physicalRoot = realpath(rootDirectory, nil) else { return nil }

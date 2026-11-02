@@ -279,4 +279,99 @@ extension HumanAnswerNoticeTests {
         XCTAssertEqual((output["data"] as! JSON)["id"] as? String,f.task["id"] as? String)
         XCTAssertEqual(pendingNotes(output)?["status"] as? String,"unavailable")
     }
+
+    private func breakMessage(_ note: JSON) throws {
+        try router.dbQueue.write { try $0.execute(sql:"UPDATE records SET data='{not json' WHERE id=? AND type='message'",arguments:[note["id"] as! String]) }
+    }
+    private func detachDeliveries(keeping kept: [String]) throws {
+        try router.dbQueue.write { db in
+            for id in try String.fetchAll(db,sql:"SELECT id FROM records WHERE type='delivery'") where !kept.contains(id) {
+                try db.execute(sql:"UPDATE records SET data=json_set(data,'$.message_id','no-such-message') WHERE id=?",arguments:[id])
+            }
+        }
+    }
+
+    func testAMalformedMessageOfOneDeliveryIsSkippedCountedAndBlocksNoNote() throws {
+        let f = try fixture()
+        let old = try sendNote(f,body:"older note"),bad = try sendNote(f,body:"lost note"),new = try sendNote(f,body:"newer note")
+        try breakMessage(bad)
+        let picked = try pickup(f.requester)
+        XCTAssertEqual((picked["items"] as! [JSON]).map { $0["message_id"] as? String },[new["id"] as? String,old["id"] as? String])
+        XCTAssertEqual(picked["skipped_malformed"] as? Int,1);XCTAssertEqual(picked["status"] as? String,"pending_pickup")
+        let output = try envelope("service_info",[:],f.requester),metadata = try XCTUnwrap(pendingNotes(output))
+        XCTAssertEqual((metadata["items"] as! [JSON]).count,2);XCTAssertEqual(metadata["skipped_malformed"] as? Int,1)
+        XCTAssertTrue(try XCTUnwrap(PendingNoteNoticePresentation.text(in:output)).contains("could not read 1"))
+        // The route that the hook line names works, and states the same count.
+        let inbox = try call("session_inbox",["project_id":f.project["id"]!],f.requester)
+        XCTAssertEqual(inbox["skipped_malformed"] as? Int,1)
+        XCTAssertEqual(Set((inbox["messages"] as! [JSON]).map { $0["body"] as? String }),["older note","newer note"])
+        XCTAssertEqual(try pickup(f.other)["skipped_malformed"] as? Int,0,"Another worker has no such row.")
+    }
+
+    func testOnlyAMalformedMessageStillTellsTheWorker() throws {
+        let f = try fixture()
+        try breakMessage(try sendNote(f,body:"lost note"))
+        let picked = try pickup(f.requester)
+        XCTAssertEqual((picked["items"] as! [JSON]).count,0);XCTAssertEqual(picked["status"] as? String,"pending_pickup");XCTAssertEqual(picked["skipped_malformed"] as? Int,1)
+        let output = try envelope("service_info",[:],f.requester),metadata = try XCTUnwrap(pendingNotes(output))
+        XCTAssertEqual(metadata["status"] as? String,"pending_pickup");XCTAssertEqual(metadata["skipped_malformed"] as? Int,1)
+        XCTAssertTrue(try XCTUnwrap(PendingNoteNoticePresentation.text(in:output)).contains("session_inbox"))
+    }
+
+    func testNineRowsThatTheFiltersDropDoNotHideAnOlderNote() throws {
+        let f = try fixture(),old = try sendNote(f,body:"older good note")
+        for index in 0..<9 { _ = try sendNote(f,body:"dropped \(index)") }
+        try detachDeliveries(keeping:[(old["deliveries"] as! [JSON])[0]["id"] as! String])
+        let picked = try pickup(f.requester)
+        XCTAssertEqual((picked["items"] as! [JSON]).map { $0["body"] as? String },["older good note"]);XCTAssertEqual(picked["has_more"] as? Bool,false)
+        let metadata = try XCTUnwrap(pendingNotes(try envelope("service_info",[:],f.requester)))
+        XCTAssertEqual((metadata["items"] as! [JSON]).map { $0["message_id"] as? String },[old["id"] as? String]);XCTAssertEqual(metadata["has_more"] as? Bool,false)
+    }
+
+    func testRowsPastTheScanBoundReportHasMore() throws {
+        let f = try fixture(),old = try sendNote(f,body:"older good note")
+        for index in 0..<(CommandRouter.pendingNoteScanRows + 1) { _ = try sendNote(f,body:"dropped \(index)") }
+        try detachDeliveries(keeping:[(old["deliveries"] as! [JSON])[0]["id"] as! String])
+        let picked = try pickup(f.requester)
+        XCTAssertTrue((picked["items"] as! [JSON]).isEmpty);XCTAssertEqual(picked["has_more"] as? Bool,true);XCTAssertEqual(picked["status"] as? String,"pending_pickup")
+        let metadata = try XCTUnwrap(pendingNotes(try envelope("service_info",[:],f.requester)))
+        XCTAssertEqual(metadata["has_more"] as? Bool,true)
+        XCTAssertTrue(try jsonString(try call("session_inbox",["project_id":f.project["id"]!],f.requester)).contains("older good note"),"The inbox keeps the note past the bound.")
+    }
+
+    func testAMalformedDeliveryOfAnyRecipientHidesNoHumanAnswer() throws {
+        let f = try fixture(),r = try request(f);_ = try answer(f,r)
+        try router.dbQueue.write { db in
+            for (id,data) in [("malformed-delivery","{not json"),("array-delivery","[1]")] {
+                try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (?,?,'delivery',1,?)",arguments:[id,f.project["id"] as! String,data])
+            }
+        }
+        let output = try envelope("service_info",[:],f.requester)
+        XCTAssertEqual(notice(output)?["status"] as? String,"pending_pickup");XCTAssertEqual((notice(output)?["items"] as? [JSON])?.count,1)
+        XCTAssertNil(notice(try envelope("service_info",[:],f.other)),"Another worker has no answer and no unavailable notice.")
+    }
+
+    func testAMalformedMessageOfThisWorkersDeliveryKeepsTheAnswerNoticeUnavailable() throws {
+        let f = try fixture()
+        try breakMessage(try sendNote(f))
+        XCTAssertEqual(notice(try envelope("service_info",[:],f.requester))?["status"] as? String,"unavailable","It can be an answer, so the notice claims no empty inbox.")
+        XCTAssertNil(notice(try envelope("service_info",[:],f.other)),"Only the named recipient sees that.")
+    }
+
+    func testOneMalformedDeliveryCostsOnlyItsRowInTheInbox() throws {
+        let f = try fixture()
+        let old = try sendNote(f,body:"older note"),bad = try sendNote(f,body:"lost note"),new = try sendNote(f,body:"newer note")
+        _ = (old,new)
+        try router.dbQueue.write { try $0.execute(sql:"UPDATE records SET data='{not json' WHERE type='delivery' AND json_extract(data,'$.message_id')=?",arguments:[bad["id"] as! String]) }
+        let inbox = try call("session_inbox",["project_id":f.project["id"]!],f.requester)
+        XCTAssertEqual(inbox["skipped_malformed"] as? Int,1)
+        XCTAssertEqual(Set((inbox["messages"] as! [JSON]).map { $0["body"] as? String }),["older note","newer note"])
+        XCTAssertEqual((inbox["deliveries"] as! [JSON]).count,2)
+    }
+    func testAnotherRecipientsWellFormedDeliveryIsNotCounted() throws {
+        let f = try fixture()
+        _ = try sendNote(f,body:"for the requester")
+        XCTAssertEqual(try call("session_inbox",["project_id":f.project["id"]!],f.other)["skipped_malformed"] as? Int,0)
+        XCTAssertEqual(try call("session_inbox",["project_id":f.project["id"]!],f.requester)["skipped_malformed"] as? Int,0)
+    }
 }

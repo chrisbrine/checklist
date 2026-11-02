@@ -105,6 +105,12 @@ extension Coordinator {
                 guard !["revoked","ended"].contains(session["state"] as? String ?? "") else { throw ChecklistError("CONNECTION_REVOKED","This thread was ended or disconnected. Its authority cannot be resumed automatically.") }
                 guard ConnectionCommit.registrationMatches(session, sessionID: existing.sessionID, installation: existing.installation, generation: existing.generation, role: existing.role, provider: existing.provider, projects: existing.projectIDs) else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This prepared connection does not match its committed session. Repair it in Checklist.") }
             }
+            // A thread can connect before its rollout exists, and an older enrollment has no value.
+            if provider == "codex",!relay,existing.codexAppHostProven != true,
+               codexRoute.effects.provesRegistrationDomain(session:existing.nativeSessionID ?? existing.sessionID,domain:executionDomain) {
+                storeCodexAppHostProof(installation:installation,generation:existing.generation)
+                existing.codexAppHostProven=true
+            }
             let grantsChanged = relay && (existing.assistantGrants != grantMap || existing.relayPolicyRevisions != grantRevisions || existing.projectIDs != projectIDs)
             if session == nil || grantsChanged {
                 return try bootstrapWrite {
@@ -134,6 +140,7 @@ extension Coordinator {
             enrollment.nativeSessionID=sid
             enrollment.automatic=true;enrollment.revoked=false;enrollment.identityVerification=plugin.nativeHost?.identityVerification
             enrollment.nativeExecutionDomain=executionDomain
+            enrollment.codexAppHostProven=provider == "codex" && !relay ? codexRoute.effects.provesRegistrationDomain(session:sid,domain:executionDomain) : nil
             enrollment.assistantRelay=relay
             if relay { enrollment.assistantGrants=grantMap;enrollment.relayPolicyRevisions=grantRevisions;enrollment.relaySelector=selector;enrollment.identityVerification="native_codex_helper_not_dot_identity" }
             if ProviderPluginRegistry.bundled.plugin(provider, requiring: .nativePeer) != nil,let endpoint=context["native_endpoint"] as? String { try bindProviderEndpoint(&enrollment,endpoint:endpoint,process:process) }
@@ -217,6 +224,7 @@ extension Coordinator {
             let plugin=ProviderPluginRegistry.bundled.plugin(native.provider,requiring:.workSession)!
             var enrollment=Enrollment(installation:boundInstallation,name:"\(plugin.manifest.displayName) thread \(native.session.prefix(8))",provider:native.provider,role:"worker",projectIDs:[pid],sessionID:native.session,workspace:native.workspace,profileID:nil,tokenDigest:SHA256.hash(data:Data(token.utf8)).map{String(format:"%02x",$0)}.joined(),generation:generation)
             enrollment.nativeSessionID=native.session;enrollment.automatic=true;enrollment.revoked=false
+            enrollment.codexAppHostProven=native.provider == "codex" ? codexRoute.effects.provesRegistrationDomain(session:native.session,domain:native.executionDomain) : nil
             enrollment.nativeExecutionDomain=native.executionDomain;enrollment.identityVerification=plugin.nativeHost?.identityVerification
             enrollment.assistantRelay=false
             if ProviderPluginRegistry.bundled.plugin(native.provider,requiring:.nativePeer) != nil,let endpoint=context["native_endpoint"] as? String { try bindProviderEndpoint(&enrollment,endpoint:endpoint,process:native.process) }
@@ -291,6 +299,7 @@ extension Coordinator {
         guard SecRandomCopyBytes(kSecRandomDefault,bytes.count,&bytes)==errSecSuccess else { throw ChecklistError("RANDOM_FAILURE","Could not create the thread connection.") }
         let token=Data(bytes).base64EncodedString()
         var resumed=existing
+        resumed.codexAppHostProven=existing.provider == "codex" ? codexRoute.effects.provesRegistrationDomain(session:existing.nativeSessionID ?? existing.sessionID,domain:executionDomain) : nil
         resumed.generation=UUID().uuidString;resumed.nativeExecutionDomain=executionDomain;resumed.revoked=false;resumed.ownerRevoked=false
         resumed.tokenDigest=SHA256.hash(data:Data(token.utf8)).map{String(format:"%02x",$0)}.joined()
         resumed.nativeEndpoint=nil;resumed.nativeDevice=nil;resumed.nativeInode=nil
