@@ -26,8 +26,22 @@ enum MediaRecordRegistry {
     /// (CL-307: preparation validates the rows it writes against their dependency closure).
     static func validate(_ envelopes: [DecodedEnvelope], dependencies: [DecodedEnvelope] = []) throws {
         let byID = Dictionary((envelopes + dependencies).map { (Data($0.id.utf8), $0) }, uniquingKeysWith: { first, _ in first })
+        try validate(envelopes,resolve:{byID[Data($0.utf8)]})
+    }
+
+    /// Snapshot inventory already streams every canonical row. Resolve only the
+    /// dependencies this row actually names, inside the same SQLite observation.
+    /// Never materialize the complete store merely to validate media references.
+    static func validateSnapshotEnvelope(_ envelope: DecodedEnvelope,db: Database) throws {
+        try validate([envelope],resolve:{id in
+            guard let row = try Row.fetchOne(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE id=CAST(? AS TEXT)",arguments:[Data(id.utf8)]) else {return nil}
+            return try GRDBRecordEnvelopeAdapter.decode(row)
+        })
+    }
+
+    private static func validate(_ envelopes: [DecodedEnvelope],resolve: (String) throws -> DecodedEnvelope?) throws {
         func dependency(_ id: String, type: String, project: String?, revision: Int64? = nil) throws -> DecodedEnvelope {
-            guard let target = byID[Data(id.utf8)], EnvelopeStorageIdentity.equal(target.type,type),
+            guard let target = try resolve(id), EnvelopeStorageIdentity.equal(target.type,type),
                   EnvelopeStorageIdentity.equal(target.projectID,project), revision == nil || target.revision == revision else {
                 throw CoreError("MEDIA_CAPTURE_INCOMPLETE", "A required same-project media record or exact revision is unavailable.")
             }

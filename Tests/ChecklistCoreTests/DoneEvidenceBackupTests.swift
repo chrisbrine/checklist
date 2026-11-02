@@ -282,4 +282,62 @@ extension TicketLifecycleCleanupTests {
         XCTAssertEqual(try serviceBackupCount(),0)
     }
 
+    func testCL403LegacySuccessfulAttemptReadsItsCommittedServiceBackup() throws {
+        let (project,_,_) = try fixture()
+        let attempted = ISO8601DateFormatter().string(from:Date().addingTimeInterval(-1)),command = uuid()
+        try router.dbQueue.write {try $0.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES ('done-evidence-backup-attempt',?)",arguments:[attempted])}
+        _ = try router.handle(method:"backup_create",params:["command_id":command,"path":directory.appendingPathComponent("cl403-service").path],caller:Caller(role:"owner",installation:CommandRouter.doneEvidenceBackupInstallation,projectIDs:[]))
+        let status = try evidenceBackupMaintenance(project)
+        XCTAssertEqual(status["state"] as? String,"complete")
+        XCTAssertEqual(status["command_id"] as? String,command)
+        XCTAssertEqual(status["outcome_source"] as? String,"backup_receipt")
+        XCTAssertNil(status["reason"])
+    }
+
+    func testCL403OtherBackupCannotCompleteAnUnknownServiceAttempt() throws {
+        let (project,_,_) = try fixture()
+        let attempted = ISO8601DateFormatter().string(from:Date().addingTimeInterval(-1))
+        try router.dbQueue.write {try $0.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES ('done-evidence-backup-attempt',?)",arguments:[attempted])}
+        _ = try call("backup_create",["path":directory.appendingPathComponent("cl403-owner").path])
+        XCTAssertEqual(try evidenceBackupMaintenance(project)["state"] as? String,"unknown")
+        // Even another service success cannot replace an exact failed command.
+        _ = try router.handle(method:"backup_create",params:["command_id":uuid(),"path":directory.appendingPathComponent("cl403-other-service").path],caller:Caller(role:"owner",installation:CommandRouter.doneEvidenceBackupInstallation,projectIDs:[]))
+        try router.dbQueue.write {try $0.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES ('done-evidence-backup-status',?)",arguments:[try jsonString(["state":"starting","attempted_at":attempted,"command_id":uuid()])])}
+        XCTAssertEqual(try evidenceBackupMaintenance(project)["state"] as? String,"unknown")
+    }
+
+    func testCL403SuccessfulServiceReceiptCommitsAttemptOutcome() throws {
+        let (project,_,_) = try fixture(),command = uuid()
+        let attempted = ISO8601DateFormatter().string(from:Date().addingTimeInterval(-1))
+        try router.dbQueue.write {try $0.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES ('done-evidence-backup-status',?)",arguments:[try jsonString(["state":"starting","attempted_at":attempted,"command_id":command])])}
+        _ = try router.handle(method:"backup_create",params:["command_id":command,"path":directory.appendingPathComponent("cl403-atomic-status").path],caller:Caller(role:"owner",installation:CommandRouter.doneEvidenceBackupInstallation,projectIDs:[]))
+        let stored = try router.dbQueue.read {jsonObject(try XCTUnwrap(String.fetchOne($0,sql:"SELECT value FROM metadata WHERE key='done-evidence-backup-status'")))}
+        XCTAssertEqual(stored["state"] as? String,"complete")
+        XCTAssertEqual(stored["outcome_source"] as? String,"backup_receipt")
+        XCTAssertEqual(try evidenceBackupMaintenance(project)["state"] as? String,"complete")
+    }
+
+    func testCL403PendingJobRecheckKeepsBytesWithoutACompleteBackup() throws {
+        let (_,job,file) = try pendingWaitingFiles()
+        let path = file["path"] as! String,before = try Data(contentsOf:URL(fileURLWithPath:path))
+        XCTAssertTrue(try router.runTicketObjectDeletionCohort())
+        XCTAssertEqual(try Data(contentsOf:URL(fileURLWithPath:path)),before)
+        let result = try router.dbQueue.read {try self.router.record($0,job["id"] as! String,type:"storage_job")}
+        let relative = try ManagedPaths.relative(path,family:"objects",root:router.root)
+        let held = try XCTUnwrap((result["objects"] as? [JSON])?.first {$0["relative_path"] as? String == relative})
+        XCTAssertEqual(held["state"] as? String,"retained")
+        XCTAssertTrue(strings(held,"reasons").contains("backup_required"))
+        XCTAssertEqual((result["summary"] as? JSON)?["removed_count"] as? Int,1,"Only the backed sibling may leave")
+    }
+
+    func testCL403PendingJobRecheckDoesNotRearmANonRetryableReason() throws {
+        let (_,job,_) = try pendingWaitingFiles()
+        var held = job,objects = job["objects"] as! [JSON]
+        let index = try XCTUnwrap(objects.firstIndex {$0["state"] as? String == "retained"})
+        objects[index]["reasons"] = ["backup_required","active_reader"]
+        held["objects"] = objects
+        try router.readers!.read {try self.router.rearmTicketObjectCopyFailures($0,receipt:&held,backupGenerationRow:Int64.max)}
+        XCTAssertEqual(try jsonString(held["objects"]!),try jsonString(objects),"A new complete generation must not rearm a non-retryable hold")
+    }
+
 }

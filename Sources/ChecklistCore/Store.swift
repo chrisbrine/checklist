@@ -85,6 +85,8 @@ public final class CommandRouter: @unchecked Sendable {
     var inlineSourceCaptures: [PendingSourceCapture] = []
     var consumedSourceCaptures: Set<String> = []
     var exportPublications: [ExportPublication] = []
+    /// Internal phase observer for explicit owned-copy memory qualification.
+    nonisolated(unsafe) static var qualificationStartupObserve: ((String) -> Void)?
     public init(root: URL, serviceLease: StorageServiceLease? = nil, cliCommand: String = "/Applications/Checklist.app/Contents/MacOS/checklist", providerPlugins: ProviderPluginRegistry = .bundled, automaticBackupRetentionTrashRoot: URL? = nil) throws {
         let root = StoreDirectory.anchoredRoot(root)
         self.root = root
@@ -95,9 +97,11 @@ public final class CommandRouter: @unchecked Sendable {
         let opened: StorageBootstrap.Opened
         do { opened = try StorageBootstrap.open(root:root,serviceLease:serviceLease,prepareDatabase:{ Self.installTicketSearchFunctions($0) }) }
         catch { StoreRecovery.recordFailure(root:root,error:error);throw error }
+        Self.qualificationStartupObserve?("bootstrap_end")
         let gateFiles = try StorageObjectFiles(root:root,pinRootForGates:true)
         self.gateFiles = gateFiles
         self.managedCapturePaths = try opened.queue.read { try ManagedPathRelocation.captureBindings($0, root: root) }
+        Self.qualificationStartupObserve?("capture_bindings_end")
         self.dbQueue = GRDBTransactionAdapter(queue: opened.queue)
         self.incarnation = opened.incarnation
         self.cursorKey = (try? ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { _ in try opened.queue.write { db in try SealedCursor.storeKey(db) } }) ?? SymmetricKey(size: .bits256)
@@ -121,6 +125,7 @@ public final class CommandRouter: @unchecked Sendable {
         } catch {
             throw CoreError("RECOVERY_REQUIRED", "Cannot establish source-process restart fences. Preserve the store and reconcile recovery before work resumes.")
         }
+        Self.qualificationStartupObserve?("recovery_end")
         try storageAdmission.openAfterBootstrap()
         do {
             let startupLease = try storageAdmission.acquire()
@@ -130,8 +135,11 @@ public final class CommandRouter: @unchecked Sendable {
                     // CL-70: files left by commands that never committed, before any new command.
                     try? self.sweepPendingSourceCaptures(db)
                     try? self.sweepPendingExports(db)
+                    Self.qualificationStartupObserve?("pending_files_end")
                     try? self.sweepAbandonedManagedImports(db)
+                    Self.qualificationStartupObserve?("abandoned_imports_end")
                     _ = self.performStorageMaintenance(db, permit: permit)
+                    Self.qualificationStartupObserve?("storage_maintenance_end")
                     _ = self.pruneRoutineRecordsIfDue(db)
                 }
             }

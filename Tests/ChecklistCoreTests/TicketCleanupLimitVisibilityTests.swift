@@ -80,4 +80,24 @@ extension TicketLifecycleCleanupTests {
         try write {try self.router.save($0,current,type:"task")}
         try run();XCTAssertEqual(try count(),first + 1)
     }
+    func testCL403IdenticalMultiChunkSweepSkipsEachReceiptAndChangedChunkWritesOne() throws {
+        let (project,_,_) = try fixture(category:"queued"),pid = project["id"] as! String
+        for index in 0..<32 {_ = try call("task_create",["project_id":pid,"title":"Open sweep member \(index)"])}
+        func count() throws -> Int {try router.dbQueue.read {try Int.fetchOne($0,sql:"SELECT count(*) FROM events WHERE kind='ticket_cleanup_pass' AND project_id=?",arguments:[pid])!}}
+        func sweep() throws {
+            for _ in 0..<2 {
+                try router.dbQueue.write {try $0.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,'0')",arguments:["ticket-cleanup-next:" + pid])}
+                try router.runTicketLifecycleCleanup()
+            }
+        }
+        try sweep();XCTAssertEqual(try count(),2)
+        try sweep();XCTAssertEqual(try count(),2,"Both unchanged chunks must skip, even though their selected tickets differ")
+        try write {db in
+            var changed = try XCTUnwrap(self.router.records(db,type:"task",project:pid).last)
+            changed["revision"] = int(changed,"revision") + 1
+            try self.router.save(db,changed,type:"task")
+        }
+        try sweep();XCTAssertEqual(try count(),3,"Only the changed chunk writes again")
+    }
+
 }

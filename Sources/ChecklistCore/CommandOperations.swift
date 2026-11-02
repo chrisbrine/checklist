@@ -5,7 +5,7 @@ import GRDB
 
 /// Scheduling state is process-local. Acceptance lives in durable journals;
 /// terminal state is canonical in SQLite. Successful replies live exclusively
-/// in the ordinary command journal.
+/// in the ordinary command journal, with byte-free attachment read descriptors.
 /// The service supplies its own concurrent command-operation queue, separate from
 /// storage maintenance. In-process domain callers may
 /// keep the synchronous router without installing a service scheduler.
@@ -277,8 +277,11 @@ extension CommandRouter {
             let command = operation["command_id"] as! String
             guard let receipt = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[caller.principal,command]) else {throw Self.expiredCommandError(command)}
             guard receipt["digest"] as String == operation["digest"] as? String else {throw CoreError("IDEMPOTENCY_CONFLICT","The operation's command receipt no longer matches its accepted intent.")}
-            let result = jsonObject(receipt["result"])
+            var result = jsonObject(receipt["result"])
             guard !Self.isPrunedResult(result) else {throw Self.expiredCommandError(command)}
+            if operation["method"] as? String == "attachment_read" {
+                result = try self.attachmentOperationResult(db,result,operation:operation,caller:caller)
+            }
             if Self.mediaOwnerMethods.contains(operation["method"] as? String ?? "") || Self.mediaWorkerMethods.contains(operation["method"] as? String ?? "") {
                 var envelope: JSON = ["data":result]
                 if !Self.readMethods.contains(operation["method"] as? String ?? "") {envelope["command_id"] = command}
@@ -514,6 +517,9 @@ extension CommandRouter {
                     // final transaction publishes both reply and terminal state.
                     var durable = output
                     if var data = durable["data"] as? JSON {data.removeValue(forKey:"claim_token");durable["data"] = self.redactBatchClaims(data)}
+                    if job.method == "attachment_read",!job.caller.isOwner {
+                        durable = try self.attachmentOperationReceipt(durable,params:params,operation:&value)
+                    }
                     let existing = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[job.caller.principal,value["command_id"] as! String])
                     if let existing {
                         guard existing["digest"] as String == value["digest"] as? String else {throw CoreError("IDEMPOTENCY_CONFLICT","The operation receipt no longer matches its accepted intent.")}

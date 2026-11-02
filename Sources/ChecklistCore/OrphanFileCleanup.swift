@@ -111,41 +111,63 @@ extension CommandRouter {
     func sweepAbandonedManagedImports(_ db: Database, now current: Date = Date()) throws {
         let files = try StorageObjectFiles(root: root)
         let formatter = ISO8601DateFormatter()
-        for var job in try records(db, type: "storage_job") where job["kind"] as? String == "attachment_import" {
-            if job["settled_reason"] as? String == "canceled_media_staging" {
-                // Cancellation already committed its fence. Retry only its own
-                // incomplete staging cleanup, without the abandonment grace period.
-                if job["cancellation_cleanup_complete"] as? Bool != true { _ = try? finishCanceledMediaImport(db,job:job) }
-                continue
+        // Cleanup receipts can contain hundreds of MB of unrelated object history.
+        // Select import jobs before canonical decoding and drain each row's
+        // Foundation temporaries rather than retaining the whole job corpus.
+        // Malformed JSON still reaches canonical validation and refuses the sweep.
+        // Fetch only integer identities before any recovery transaction writes.
+        // GRDB cursors have undefined remaining rows after records are changed.
+        let candidates = try Int64.fetchAll(db,sql:"""
+            SELECT rowid FROM records
+            WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='storage_job')
+              AND CASE WHEN json_valid(data) THEN CASE WHEN json_type(data)='object'
+                  THEN json_extract(data,'$.kind')='attachment_import' ELSE 1 END ELSE 1 END
+            ORDER BY rowid
+            """)
+        for rowID in candidates {
+            try autoreleasepool {
+                guard let row = try Row.fetchOne(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE rowid=? AND type='storage_job'",arguments:[rowID]) else {return}
+                var job = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"storage_job").object
+                guard job["kind"] as? String == "attachment_import" else {return}
+                try sweepAbandonedManagedImport(db,files:files,formatter:formatter,current:current,job:&job)
             }
-            guard ["reserved", "staging", "finalized"].contains(job["state"] as? String ?? "") else { continue }
-            guard let created = (job["created_at"] as? String).flatMap(formatter.date(from:)), current.timeIntervalSince(created) >= Self.abandonedImportGrace,
-                  let principal = job["parent_principal"] as? String, let command = job["parent_command_id"] as? String, let digest = job["intent_digest"] as? String,
-                  let attachmentID = job["attachment_id"] as? String, let pid = job["project_id"] as? String else { continue }
-            let jobID = try StoredRecord(job, family: "storage_job").string("id")
-            do {
-                guard try managedImportReceipt(db, principal: principal, command: command, digest: digest) == nil,
-                      (try? scoped(db, attachmentID, pid, type: "attachment")) == nil else { continue }
-                for object in (job["objects"] as? [JSON] ?? []) {
-                    for field in ["stage", "final"] {
-                        guard let path = object[field] as? String, path.hasPrefix(field == "stage" ? "staging/attachment-imports/" : "objects/") else { continue }
-                        try removeManagedImportStage(db, files: files, path: path)
-                    }
+        }
+    }
+
+    private func sweepAbandonedManagedImport(_ db: Database,files: StorageObjectFiles,formatter: ISO8601DateFormatter,current: Date,job: inout JSON) throws {
+        if job["settled_reason"] as? String == "canceled_media_staging" {
+            // Cancellation already committed its fence. Retry only its own
+            // incomplete staging cleanup, without the abandonment grace period.
+            if job["cancellation_cleanup_complete"] as? Bool != true { _ = try? finishCanceledMediaImport(db,job:job) }
+            return
+        }
+        guard ["reserved", "staging", "finalized"].contains(job["state"] as? String ?? "") else { return }
+        guard let created = (job["created_at"] as? String).flatMap(formatter.date(from:)), current.timeIntervalSince(created) >= Self.abandonedImportGrace,
+              let principal = job["parent_principal"] as? String, let command = job["parent_command_id"] as? String, let digest = job["intent_digest"] as? String,
+              let attachmentID = job["attachment_id"] as? String, let pid = job["project_id"] as? String else { return }
+        let jobID = try StoredRecord(job, family: "storage_job").string("id")
+        do {
+            guard try managedImportReceipt(db, principal: principal, command: command, digest: digest) == nil,
+                  (try? scoped(db, attachmentID, pid, type: "attachment")) == nil else { return }
+            for object in (job["objects"] as? [JSON] ?? []) {
+                for field in ["stage", "final"] {
+                    guard let path = object[field] as? String, path.hasPrefix(field == "stage" ? "staging/attachment-imports/" : "objects/") else { continue }
+                    try removeManagedImportStage(db, files: files, path: path)
                 }
-                // Job-owned partial stages from an interrupted rename.
-                let stageDirectory = "staging/attachment-imports/" + (jobID)
-                for name in (try? managedDirectoryEntries(files, relative: stageDirectory)) ?? [] where name.contains(".partial-") {
-                    _ = try removeManagedFile(files, relative: stageDirectory + "/" + name)
-                }
-                try withValidatedDomainTransaction(db) {
-                    let latest = try self.record(db, jobID, type: "storage_job")
-                    guard int(latest, "revision") == int(job, "revision") else { return .rollback }
-                    job["state"] = "settled"; job["settled_reason"] = "abandoned_without_receipt"; job["settled_at"] = now()
-                    try self.save(db, self.revised(job), type: "storage_job"); return .commit
-                }
-            } catch {
-                // Kept for a later startup; a referenced object stops the sweep for this job.
             }
+            // Job-owned partial stages from an interrupted rename.
+            let stageDirectory = "staging/attachment-imports/" + (jobID)
+            for name in (try? managedDirectoryEntries(files, relative: stageDirectory)) ?? [] where name.contains(".partial-") {
+                _ = try removeManagedFile(files, relative: stageDirectory + "/" + name)
+            }
+            try withValidatedDomainTransaction(db) {
+                let latest = try self.record(db, jobID, type: "storage_job")
+                guard int(latest, "revision") == int(job, "revision") else { return .rollback }
+                job["state"] = "settled"; job["settled_reason"] = "abandoned_without_receipt"; job["settled_at"] = now()
+                try self.save(db, self.revised(job), type: "storage_job"); return .commit
+            }
+        } catch {
+            // Kept for a later startup; a referenced object stops the sweep for this job.
         }
     }
 

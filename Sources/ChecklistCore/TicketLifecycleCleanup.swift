@@ -285,8 +285,15 @@ extension CommandRouter {
             // A matching no-admission pass updates only bounded metadata.
             let fingerprint = hash(Data(try jsonString(["settings":settings,"items":passItems.sorted {($0["task_id"] as? String ?? "") < ($1["task_id"] as? String ?? "")},"source_build_cache":selection["source_build_cache"] ?? []]).utf8))
             let prior = jsonObject(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-planning:" + pid]) ?? "{}")
-            let writeReceipt = admitted > 0 || prior["result_fingerprint"] as? String != fingerprint
-            var receiptID = prior["receipt_id"] as? String
+            // Keep a bounded history by selected ticket set, so alternating
+            // chunks of the same sweep do not displace each other's result.
+            let resultKey = "ticket-cleanup-pass-results:" + pid
+            let chunk = hash(Data(try jsonString(passItems.compactMap {$0["task_id"] as? String}.sorted()).utf8))
+            var results = jsonObject(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[resultKey]) ?? "{}")
+            var recent = results["recent"] as? [JSON] ?? []
+            let previous = recent.first {$0["chunk"] as? String == chunk}
+            let writeReceipt = admitted > 0 || (previous?["fingerprint"] as? String ?? prior["result_fingerprint"] as? String) != fingerprint
+            var receiptID = previous?["receipt_id"] as? String ?? prior["receipt_id"] as? String
             if writeReceipt {
                 let id = uuid();receiptID = id
                 let receipt: JSON = [
@@ -298,6 +305,11 @@ extension CommandRouter {
                 try self.event(db,caller:Caller(role:"owner",installation:"storage",projectIDs:[]),project:pid,entity:pid,kind:"ticket_cleanup_pass",data:["origin":"automatic_cleanup","receipt_id":id,"admitted_count":admitted])
                 try db.execute(sql:"INSERT OR IGNORE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-first:" + pid,id])
             }
+            recent.removeAll {$0["chunk"] as? String == chunk}
+            var result: JSON = ["chunk":chunk,"fingerprint":fingerprint]
+            if let receiptID {result["receipt_id"] = receiptID}
+            recent.insert(result,at:0);results["recent"] = Array(recent.prefix(128))
+            try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:[resultKey,try jsonString(results)])
             let refused = items.filter {["PURGE_LIMIT","REFERENCE_GRAPH_LIMIT","CLEANUP_INVENTORY_LIMIT"].contains($0["reason"] as? String ?? "")}
             let limits: [JSON] = Dictionary(grouping:refused,by:{$0["limit"] as? String ?? ($0["reason"] as? String ?? "unknown")}).sorted {$0.key < $1.key}.map {name,items in
                 var limit: JSON = ["name":name,"code":items[0]["reason"] ?? "unknown","ticket_count":items.count]

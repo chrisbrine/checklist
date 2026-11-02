@@ -78,21 +78,33 @@ enum StorageSnapshotAuthority {
         // Done cleanup keeps canonical evidence. Its durable exact outcomes explain
         // unavailable bytes without modifying immutable manifests or capture lists.
         let cleanedRows = try Row.fetchCursor(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND json_extract(data,'$.cause')='done_evidence'")
-        var cleaned: [String:[JSON]] = [:],cleanedEnvelopes: [String:DecodedEnvelope] = [:]
+        struct CleanedObject: Hashable {
+            let sha: String?
+            let size: Int64?
+            let kind: String?
+        }
+        // A receipt can repeat the same removed descriptor across many historical
+        // passes. Retain only the exact matching fields, once per path/descriptor.
+        // Full canonical envelopes are checked again by the streaming pass below.
+        var cleaned: [String:Set<CleanedObject>] = [:],cleanedCount = 0
         while let row = try cleanedRows.next() {
-            try budget.check()
-            let envelope = try GRDBRecordEnvelopeAdapter.decode(row),receipt = envelope.object
-            guard cleanedEnvelopes.count < budget.maximumRecords else { throw StorageSnapshotFailure.limit }
-            cleanedEnvelopes[envelope.id] = envelope
-            for object in receipt["objects"] as? [JSON] ?? [] where ["removed","already_missing"].contains(object["state"] as? String ?? "") {
-                if let path = object["relative_path"] as? String {cleaned[path,default:[]].append(object)}
+            try autoreleasepool {
+                try budget.check()
+                let receipt = try GRDBRecordEnvelopeAdapter.decode(row).object
+                guard cleanedCount < budget.maximumRecords else { throw StorageSnapshotFailure.limit }
+                cleanedCount += 1
+                for object in receipt["objects"] as? [JSON] ?? [] where ["removed","already_missing"].contains(object["state"] as? String ?? "") {
+                    if let path = object["relative_path"] as? String {
+                        cleaned[path,default:[]].insert(.init(sha:object["sha256"] as? String,size:(object["size"] as? NSNumber)?.int64Value,kind:object["kind"] as? String))
+                    }
+                }
             }
         }
         func add(_ value: StorageSnapshotObject) throws {
             if cleaned[value.relativePath]?.contains(where: {object in
-                (value.expectedSHA256 == nil || object["sha256"] as? String == value.expectedSHA256) &&
-                (value.expectedSize == nil || (object["size"] as? NSNumber)?.int64Value == value.expectedSize) &&
-                object["kind"] as? String == value.kind
+                (value.expectedSHA256 == nil || object.sha == value.expectedSHA256) &&
+                (value.expectedSize == nil || object.size == value.expectedSize) &&
+                object.kind == value.kind
             }) == true, try !retainedExists(value.relativePath) {
                 for authority in value.authorities {unavailable.append(.init(authority:authority,reason:"evidence_cleaned"))}
                 return
@@ -166,137 +178,136 @@ enum StorageSnapshotAuthority {
                 if let size = object.expectedSize, size > budget.maximumObjectBytes { throw budget.capacityFailure("snapshot_object_bytes") }
             }
         }
-        try MediaRecordRegistry.validate(MediaRecordRegistry.envelopes(db,limit:budget.maximumRecords,check:budget.check))
         let rows = try Row.fetchCursor(db, sql: "SELECT " + CommandRouter.canonicalRecordColumns + " FROM records ORDER BY id")
         while let row = try rows.next() {
-            try budget.check(); recordCount += 1
-            guard recordCount <= budget.maximumRecords else { throw StorageSnapshotFailure.limit }
-            let envelope: DecodedEnvelope
-            if let bytes: Data = row["_envelope_id_bytes"],let id = String(data:bytes,encoding:.utf8),let previous = cleanedEnvelopes[id],previous.original == (try GRDBRecordEnvelopeAdapter.input(row)) {
-                envelope = previous
-            } else { envelope = try GRDBRecordEnvelopeAdapter.decode(row) }
-            let id = envelope.id, type = envelope.type, value = envelope.object
-            guard knownTypes.contains(type) else { throw StorageSnapshotFailure.unsupportedAuthority }
-            // Keep the relocation plan's original field validation in this
-            // single decode pass, even when no new relocation can be established.
-            for field in try ManagedPathRelocation.fields(value,type:type) {
-                _ = try relocation.decision(field.stored,family:field.family,root:root)
-            }
-            let authority = type + ":" + id
-            switch type {
-            case "attachment":
-                let mode = try text(value, "mode")
-                if mode == "external_reference" { external.append(authority); continue }
-                guard mode == "managed" else { throw StorageSnapshotFailure.unsupportedAuthority }
-                _ = try text(value, "project_id")
-                let availability = try text(value, "availability")
-                if availability == "available" {
-                    guard let size = (value["size"] as? NSNumber)?.int64Value else { throw StorageSnapshotFailure.unsupportedAuthority }
-                    try regular(path: try text(value, "path"), family: "objects",
-                        sha: try digest(value["sha256"]), size: size, authority: authority + ":original")
-                } else if ["original_cleaned", "original_missing", "unavailable", "damaged"].contains(availability) {
-                    unavailable.append(.init(authority: authority, reason: availability))
-                } else { throw StorageSnapshotFailure.unsupportedAuthority }
-                if value["preview_path"] != nil {
-                    let preview = try text(value, "preview_path")
-                    try regular(path: preview, family: "objects", sha: nil, size: nil, authority: authority + ":preview")
+            try autoreleasepool {
+                try budget.check(); recordCount += 1
+                guard recordCount <= budget.maximumRecords else { throw StorageSnapshotFailure.limit }
+                let envelope = try GRDBRecordEnvelopeAdapter.decode(row)
+                try MediaRecordRegistry.validateSnapshotEnvelope(envelope,db:db)
+                let id = envelope.id, type = envelope.type, value = envelope.object
+                guard knownTypes.contains(type) else { throw StorageSnapshotFailure.unsupportedAuthority }
+                // Keep the relocation plan's original field validation in this
+                // single decode pass, even when no new relocation can be established.
+                for field in try ManagedPathRelocation.fields(value,type:type) {
+                    _ = try relocation.decision(field.stored,family:field.family,root:root)
                 }
-            case "project":
-                if let rawAsset = value["icon_asset"] {
-                    guard let asset = rawAsset as? [String: Any] else { throw StorageSnapshotFailure.unsupportedAuthority }
-                    _ = try text(asset, "id")
-                    try regular(path: try text(value, "icon_path"), family: "icons",
-                        sha: try digest(asset["sha256"]), size: nil, authority: authority + ":icon")
-                } else if value["icon_path"] != nil { throw StorageSnapshotFailure.unsupportedAuthority }
-            case "storage_job":
-                let kind = try text(value, "kind")
-                if kind == CommandRouter.ticketObjectDeletionKind {
-                    guard let entries = value["objects"] as? [JSON],entries.count <= 100000 else {throw StorageSnapshotFailure.unsupportedAuthority}
-                    for entry in entries where ["pending","retained"].contains(entry["state"] as? String ?? "") {
-                        if entry["representation"] as? String == "source_build_cache" {
-                            guard let path = entry["relative_path"] as? String else {throw StorageSnapshotFailure.unsupportedAuthority}
-                            let parts = try StorageObjectFiles.parts(path)
-                            guard parts.count >= 2,parts[0] == "source-build-cache",parts[1].range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil else {throw StorageSnapshotFailure.unsupportedAuthority}
-                            // Rebuildable cache is not required backup payload.
-                            // Preserve its durable ownership/outcome metadata.
-                            unavailable.append(.init(authority:authority + ":" + path,reason:"rebuildable_source_build_cache"));continue
-                        }
-                        guard let path = entry["relative_path"] as? String,let sha = entry["sha256"] as? String,let size = (entry["size"] as? NSNumber)?.int64Value else {continue}
-                        guard path.hasPrefix("objects/") || path.hasPrefix("source-captures/"),size >= 0 else {throw StorageSnapshotFailure.unsupportedAuthority}
-                        if try retainedExists(path) {
-                            try add(.init(relativePath:path,kind:try text(entry,"kind"),expectedSHA256:try digest(sha),expectedSize:entry["kind"] as? String == "symlink" ? nil : size,executable:entry["executable"] as? Bool == true,linkTarget:entry["link_target"] as? String,authorities:[authority + ":pending_deletion"]))
-                        } else {unavailable.append(.init(authority:authority + ":" + path,reason:"deletion_object_absent"))}
+                let authority = type + ":" + id
+                switch type {
+                case "attachment":
+                    let mode = try text(value, "mode")
+                    if mode == "external_reference" { external.append(authority); return }
+                    guard mode == "managed" else { throw StorageSnapshotFailure.unsupportedAuthority }
+                    _ = try text(value, "project_id")
+                    let availability = try text(value, "availability")
+                    if availability == "available" {
+                        guard let size = (value["size"] as? NSNumber)?.int64Value else { throw StorageSnapshotFailure.unsupportedAuthority }
+                        try regular(path: try text(value, "path"), family: "objects",
+                            sha: try digest(value["sha256"]), size: size, authority: authority + ":original")
+                    } else if ["original_cleaned", "original_missing", "unavailable", "damaged"].contains(availability) {
+                        unavailable.append(.init(authority: authority, reason: availability))
+                    } else { throw StorageSnapshotFailure.unsupportedAuthority }
+                    if value["preview_path"] != nil {
+                        let preview = try text(value, "preview_path")
+                        try regular(path: preview, family: "objects", sha: nil, size: nil, authority: authority + ":preview")
                     }
-                    break
-                }
-                if ["archive_cleanup_delete", "archive_cleanup_cursor", "media_attachment_owner"].contains(kind) { break }
-                guard kind == "attachment_import", let state = value["state"] as? String,
-                      ["reserved", "staging", "finalized", "committed", "repair_required", "settled"].contains(state) else { throw StorageSnapshotFailure.unsupportedAuthority }
-                if value["attachment_owner_id"] is String {
-                    // Media staging is not committed ownership. Preserve job/plan metadata,
-                    // and retain already published finals only as uncommitted recovery bytes.
-                    // Successful reconciliation settles committed imports without a
-                    // reason. Canceled/abandoned settled jobs remain recovery-only.
-                    // Repair-required jobs also belong to canonical attachments,
-                    // whose availability is authoritative for backup.
-                    let captured = ["committed","repair_required"].contains(state) || state == "settled" && value["settled_reason"] == nil
-                    if !captured, let raw = value["objects"] {
-                        guard let entries = raw as? [JSON] else { throw StorageSnapshotFailure.unsupportedAuthority }
-                        for object in entries {
-                            let final = try text(object,"final")
-                            guard final.hasPrefix("objects/") else { throw StorageSnapshotFailure.unsupportedAuthority }
-                            _ = try StorageObjectFiles.parts(final)
-                            if try retainedExists(final) {
-                                guard let size = object["size"] as? NSNumber else { throw StorageSnapshotFailure.unsupportedAuthority }
-                                try regular(path:root.appendingPathComponent(final).path,family:"objects",sha:try digest(object["sha256"]),size:size.int64Value,authority:authority + ":uncommitted_recovery:" + (object["representation"] as? String ?? ""))
+                case "project":
+                    if let rawAsset = value["icon_asset"] {
+                        guard let asset = rawAsset as? [String: Any] else { throw StorageSnapshotFailure.unsupportedAuthority }
+                        _ = try text(asset, "id")
+                        try regular(path: try text(value, "icon_path"), family: "icons",
+                            sha: try digest(asset["sha256"]), size: nil, authority: authority + ":icon")
+                    } else if value["icon_path"] != nil { throw StorageSnapshotFailure.unsupportedAuthority }
+                case "storage_job":
+                    let kind = try text(value, "kind")
+                    if kind == CommandRouter.ticketObjectDeletionKind {
+                        guard let entries = value["objects"] as? [JSON],entries.count <= 100000 else {throw StorageSnapshotFailure.unsupportedAuthority}
+                        for entry in entries where ["pending","retained"].contains(entry["state"] as? String ?? "") {
+                            if entry["representation"] as? String == "source_build_cache" {
+                                guard let path = entry["relative_path"] as? String else {throw StorageSnapshotFailure.unsupportedAuthority}
+                                let parts = try StorageObjectFiles.parts(path)
+                                guard parts.count >= 2,parts[0] == "source-build-cache",parts[1].range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil else {throw StorageSnapshotFailure.unsupportedAuthority}
+                                // Rebuildable cache is not required backup payload.
+                                // Preserve its durable ownership/outcome metadata.
+                                unavailable.append(.init(authority:authority + ":" + path,reason:"rebuildable_source_build_cache"));continue
                             }
+                            guard let path = entry["relative_path"] as? String,let sha = entry["sha256"] as? String,let size = (entry["size"] as? NSNumber)?.int64Value else {continue}
+                            guard path.hasPrefix("objects/") || path.hasPrefix("source-captures/"),size >= 0 else {throw StorageSnapshotFailure.unsupportedAuthority}
+                            if try retainedExists(path) {
+                                try add(.init(relativePath:path,kind:try text(entry,"kind"),expectedSHA256:try digest(sha),expectedSize:entry["kind"] as? String == "symlink" ? nil : size,executable:entry["executable"] as? Bool == true,linkTarget:entry["link_target"] as? String,authorities:[authority + ":pending_deletion"]))
+                            } else {unavailable.append(.init(authority:authority + ":" + path,reason:"deletion_object_absent"))}
                         }
-                        unavailable.append(.init(authority:authority,reason:"uncommitted_media_capture_staging_excluded"))
+                        break
                     }
-                    break
-                }
-                // Receipt-less finalization is retained authority. Missing pending
-                // stages are absence, never permission to sweep unrelated files.
-                if ["reserved", "staging", "finalized"].contains(state) {
-                    if let raw = value["objects"] {
-                        guard let entries = raw as? [JSON] else { throw StorageSnapshotFailure.unsupportedAuthority }
-                        for object in entries {
-                            let sha = try digest(object["sha256"])
-                            guard let size = object["size"] as? NSNumber else { throw StorageSnapshotFailure.unsupportedAuthority }
-                            for field in ["stage", "final"] {
-                                let path = try text(object,field)
-                                guard path.hasPrefix(field == "stage" ? "staging/attachment-imports/" : "objects/") else { throw StorageSnapshotFailure.unsupportedAuthority }
-                                _ = try StorageObjectFiles.parts(path)
-                                if try retainedExists(path) {
-                                    try regular(path: root.appendingPathComponent(path).path, family: field == "stage" ? "staging" : "objects", sha: sha, size: size.int64Value, authority: authority + ":" + field + ":" + (object["representation"] as? String ?? ""))
-                                } else {
-                                    guard !(state == "finalized" && field == "final" && object["representation"] as? String == "original") else { throw StorageSnapshotFailure.incomplete }
-                                    unavailable.append(.init(authority:authority + ":" + field + ":" + (object["representation"] as? String ?? ""), reason:"pending_not_materialized"))
+                    if ["archive_cleanup_delete", "archive_cleanup_cursor", "media_attachment_owner"].contains(kind) { break }
+                    guard kind == "attachment_import", let state = value["state"] as? String,
+                          ["reserved", "staging", "finalized", "committed", "repair_required", "settled"].contains(state) else { throw StorageSnapshotFailure.unsupportedAuthority }
+                    if value["attachment_owner_id"] is String {
+                        // Media staging is not committed ownership. Preserve job/plan metadata,
+                        // and retain already published finals only as uncommitted recovery bytes.
+                        // Successful reconciliation settles committed imports without a
+                        // reason. Canceled/abandoned settled jobs remain recovery-only.
+                        // Repair-required jobs also belong to canonical attachments,
+                        // whose availability is authoritative for backup.
+                        let captured = ["committed","repair_required"].contains(state) || state == "settled" && value["settled_reason"] == nil
+                        if !captured, let raw = value["objects"] {
+                            guard let entries = raw as? [JSON] else { throw StorageSnapshotFailure.unsupportedAuthority }
+                            for object in entries {
+                                let final = try text(object,"final")
+                                guard final.hasPrefix("objects/") else { throw StorageSnapshotFailure.unsupportedAuthority }
+                                _ = try StorageObjectFiles.parts(final)
+                                if try retainedExists(final) {
+                                    guard let size = object["size"] as? NSNumber else { throw StorageSnapshotFailure.unsupportedAuthority }
+                                    try regular(path:root.appendingPathComponent(final).path,family:"objects",sha:try digest(object["sha256"]),size:size.int64Value,authority:authority + ":uncommitted_recovery:" + (object["representation"] as? String ?? ""))
                                 }
                             }
+                            unavailable.append(.init(authority:authority,reason:"uncommitted_media_capture_staging_excluded"))
                         }
-                    } else if state == "finalized" { throw StorageSnapshotFailure.unsupportedAuthority }
-                }
-            case "source_capture": try capture(value, attribution: authority)
-            case "manifest":
-                if let rawEvidence = value["evidence"] {
-                    guard let evidence = rawEvidence as? [String: Any] else { throw StorageSnapshotFailure.unsupportedAuthority }
-                    if let rawSource = evidence["source_capture"] {
-                        guard let source = rawSource as? [String: Any] else { throw StorageSnapshotFailure.unsupportedAuthority }
-                        try capture(source, attribution: authority)
+                        break
                     }
+                    // Receipt-less finalization is retained authority. Missing pending
+                    // stages are absence, never permission to sweep unrelated files.
+                    if ["reserved", "staging", "finalized"].contains(state) {
+                        if let raw = value["objects"] {
+                            guard let entries = raw as? [JSON] else { throw StorageSnapshotFailure.unsupportedAuthority }
+                            for object in entries {
+                                let sha = try digest(object["sha256"])
+                                guard let size = object["size"] as? NSNumber else { throw StorageSnapshotFailure.unsupportedAuthority }
+                                for field in ["stage", "final"] {
+                                    let path = try text(object,field)
+                                    guard path.hasPrefix(field == "stage" ? "staging/attachment-imports/" : "objects/") else { throw StorageSnapshotFailure.unsupportedAuthority }
+                                    _ = try StorageObjectFiles.parts(path)
+                                    if try retainedExists(path) {
+                                        try regular(path: root.appendingPathComponent(path).path, family: field == "stage" ? "staging" : "objects", sha: sha, size: size.int64Value, authority: authority + ":" + field + ":" + (object["representation"] as? String ?? ""))
+                                    } else {
+                                        guard !(state == "finalized" && field == "final" && object["representation"] as? String == "original") else { throw StorageSnapshotFailure.incomplete }
+                                        unavailable.append(.init(authority:authority + ":" + field + ":" + (object["representation"] as? String ?? ""), reason:"pending_not_materialized"))
+                                    }
+                                }
+                            }
+                        } else if state == "finalized" { throw StorageSnapshotFailure.unsupportedAuthority }
+                    }
+                case "source_capture": try capture(value, attribution: authority)
+                case "manifest":
+                    if let rawEvidence = value["evidence"] {
+                        guard let evidence = rawEvidence as? [String: Any] else { throw StorageSnapshotFailure.unsupportedAuthority }
+                        if let rawSource = evidence["source_capture"] {
+                            guard let source = rawSource as? [String: Any] else { throw StorageSnapshotFailure.unsupportedAuthority }
+                            try capture(source, attribution: authority)
+                        }
+                    }
+                case "source_execution":
+                    let state = try text(value, "state")
+                    guard ["passed", "failed", "stale", "completed", "canceled", "stopped"].contains(state),
+                          value["process_stop_unverified"] as? Bool != true else { throw StorageSnapshotFailure.unsupportedAuthority }
+                    if value["output_path"] != nil {
+                        let output = try text(value, "output_path")
+                        _ = try text(value, "project_id")
+                        try regular(path: output, family: "source-executions",
+                            sha: try digest(value["output_sha256"]), size: nil, authority: authority + ":output")
+                    } else { unavailable.append(.init(authority: authority, reason: "output_not_recorded")) }
+                default: break
                 }
-            case "source_execution":
-                let state = try text(value, "state")
-                guard ["passed", "failed", "stale", "completed", "canceled", "stopped"].contains(state),
-                      value["process_stop_unverified"] as? Bool != true else { throw StorageSnapshotFailure.unsupportedAuthority }
-                if value["output_path"] != nil {
-                    let output = try text(value, "output_path")
-                    _ = try text(value, "project_id")
-                    try regular(path: output, family: "source-executions",
-                        sha: try digest(value["output_sha256"]), size: nil, authority: authority + ":output")
-                } else { unavailable.append(.init(authority: authority, reason: "output_not_recorded")) }
-            default: break
             }
         }
         // Schema5 summaryless legacy receipts keep their exact historical list

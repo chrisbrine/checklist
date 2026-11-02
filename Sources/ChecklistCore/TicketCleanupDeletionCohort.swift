@@ -66,14 +66,19 @@ extension CommandRouter {
         // its newest receipt, so a backlog cannot delay a ticket that just closed.
         let newestFirst = ticketCleanupByteNewestTurns[project] ?? false
         ticketCleanupByteNewestTurns[project] = !newestFirst
+        if let cohort = try prepareTicketObjectDeletionCohort(db,project:project,firstRow:first["cleanup_row"],after:after,newestFirst:newestFirst,observe:observe) {return cohort}
+        guard newestFirst else {return nil}
+        return try prepareTicketObjectDeletionCohort(db,project:project,firstRow:first["cleanup_row"],after:after,newestFirst:false,observe:observe)
+    }
+
+    private func prepareTicketObjectDeletionCohort(_ db: Database,project: String,firstRow: Int64,after: Int64,newestFirst: Bool,observe: ((JSON) -> Void)?) throws -> TicketCleanupDeletionCohort? {
+        let ready = "type='storage_job' AND (" + Self.ticketObjectDeletionReadySQL + ") AND NOT EXISTS(SELECT 1 FROM metadata m WHERE m.key='ticket-cleanup-preparation:'||records.project_id AND json_valid(m.value) AND json_extract(m.value,'$.next_attempt_at')>?)"
         // These are scheduling positions, never deletion authority. Persist a
         // position even when this project's head cannot be admitted, so another
         // project/receipt gets a fresh preparation on the next byte turn.
-        try dbQueue.writeWithoutTransaction {db in try self.advanceTicketObjectDeletionQueue(db,project:project,row:newestFirst ? after : first["cleanup_row"] as Int64)}
+        try dbQueue.writeWithoutTransaction {db in try self.advanceTicketObjectDeletionQueue(db,project:project,row:newestFirst ? after : firstRow)}
         let admissible = "length(CAST(data AS BLOB))<=\(TicketCleanupDeletionCohort.descriptorByteLimit) AND COALESCE(json_array_length(data,'$.objects'),0)<=\(TicketCleanupDeletionCohort.objectLimit)"
-        if try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE " + ready + " AND project_id=? AND NOT (" + admissible + "))",arguments:[now(),project]) == true {
-            try recordTicketCleanupPreparationRefusal(project:project,reason:"individual byte receipt exceeds its descriptor bound")
-        }
+        let descriptorRefused = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE " + ready + " AND project_id=? AND NOT (" + admissible + "))",arguments:[now(),project]) == true
         // Filter individual overflows before LIMIT: even a run of oversized
         // receipts cannot hide a later bounded sibling in this project.
         let rowArguments: StatementArguments = newestFirst ? [now(),project,TicketCleanupDeletionCohort.receiptLimit] : [now(),project,after,TicketCleanupDeletionCohort.receiptLimit]
@@ -98,7 +103,11 @@ extension CommandRouter {
             if let id = receipt["id"] as? String {receiptRows[id] = row}
         }
         if let lastRow,!newestFirst {try dbQueue.writeWithoutTransaction {db in try self.advanceTicketObjectDeletionQueue(db,project:project,row:lastRow)}}
-        guard !receipts.isEmpty else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The selected byte receipt exceeds its cohort bound; bytes retained.")}
+        guard !receipts.isEmpty else {
+            if newestFirst {return nil}
+            if descriptorRefused {try recordTicketCleanupPreparationRefusal(project:project,reason:"individual byte receipt exceeds its descriptor bound")}
+            throw CoreError("CLEANUP_INVENTORY_LIMIT","The selected byte receipt exceeds its cohort bound; bytes retained.")
+        }
         observe?(["phase":"selected","project_id":project,"receipts":receipts.map {["id":$0["id"] ?? "","task_id":$0["task_id"] ?? "","summary":$0["summary"] ?? [:],"policy":$0["cleanup_policy_version"] ?? 0]},"bytes":bytes,"objects":count])
         // Legacy Done intents have incomplete ownership fingerprints. Retire
         // their pending accounting without any unlink, then wake a current plan.
@@ -141,6 +150,14 @@ extension CommandRouter {
                 refusals[id] = error.code
             }
         }
+        // An all-refused newest window must not arm a retry ahead of older
+        // viable jobs. Spend this turn at the queue position before recording
+        // a project refusal; the queue keeps the same inventory/deletion guards.
+        if entries.isEmpty,newestFirst {
+            observe?(["phase":"newest_refused","project_id":project,"refused":refusals])
+            return nil
+        }
+        if descriptorRefused {try recordTicketCleanupPreparationRefusal(project:project,reason:"individual byte receipt exceeds its descriptor bound")}
         if let first = refusals.keys.sorted().first {try recordTicketCleanupPreparationRefusal(project:project,reason:"byte receipt " + first + ": " + refusals[first]!)}
         guard !entries.isEmpty else {throw inventories.errors.values.first ?? CoreError("CLEANUP_INVENTORY_LIMIT","No byte receipt fits its inventory bound.")}
         let cohort = TicketCleanupDeletionCohort(entries:entries,backup:backup)

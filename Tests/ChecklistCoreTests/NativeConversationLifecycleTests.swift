@@ -351,8 +351,16 @@ extension EvidenceAuthorityTests {
     private func relayCandidates(_ session: String) throws -> [JSON] {
         try call("delivery_pending", ["native_session_ids": [session], "native_dispatch_candidates": true], relayBridge)["deliveries"] as! [JSON]
     }
-    private func recordRelayWrite(_ delivery: Any?) throws {
+    private func recordRelayWrite(_ delivery: Any?, age: TimeInterval = 60) throws {
         _ = try call("delivery_record", ["delivery_id": delivery as! String, "state": "transport_written", "receipt": ["bytes": 12]], relayBridge)
+        // Source-only fixtures need no sleep to put a write outside the closure replay window.
+        if age != 0 {
+            try router.dbQueue.write { db in
+                var stored = try router.record(db, delivery as! String, type: "delivery")
+                stored["updated_at"] = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-age))
+                try router.save(db, stored, type: "delivery")
+            }
+        }
     }
     /// Closes the current process and resumes the same conversation in a new one.
     private func closeAndResume(_ p: JSON, _ worker: Caller, cycle: Int) throws -> Caller {
@@ -396,6 +404,40 @@ extension EvidenceAuthorityTests {
         }
         let list = try call("message_delivery_list", ["project_id": p["id"]!, "task_id": t["id"]!, "message_id": note["id"]!], current)["deliveries"] as! [JSON]
         XCTAssertEqual(list.filter { $0["recipient_session_id"] as? String == worker.sessionID }.count, 3)
+    }
+    func testResumedConversationReplaysWriteNearClosureAndThenSkipsAnOlderWrite() throws {
+        let p = try project(), t = try ready(p), worker = try native(p, "relay-near-closure", domain: "claude:123:5:0", provider: "claude")
+        _ = try claim(p, t, caller: worker)
+        let note = try call("message_send", ["project_id": p["id"]!, "task_id": t["id"]!, "body": "May still be in the old process socket"])
+        let first = try XCTUnwrap((note["deliveries"] as? [JSON])?.first { $0["recipient_session_id"] as? String == worker.sessionID })
+        try recordRelayWrite(first["id"], age: 0)
+        let resumed = try closeAndResume(p, worker, cycle: 31)
+        let candidate = try XCTUnwrap(try relayCandidates(worker.sessionID!).first { $0["message_id"] as? String == note["id"] as? String })
+        XCTAssertEqual(candidate["resumed_from_delivery_id"] as? String, first["id"] as? String)
+        // An older qualifying write in the new process stops replay, despite the earlier risky write.
+        try recordRelayWrite(candidate["id"])
+        let next = try closeAndResume(p, resumed, cycle: 32)
+        XCTAssertFalse(try relayCandidates(worker.sessionID!).contains { $0["message_id"] as? String == note["id"] as? String })
+        XCTAssertEqual(try inboxReceipt(p, note, next)["relay_skipped_for_delivery_id"] as? String, candidate["id"] as? String)
+    }
+    func testEarlierReceiptOfNoteClosureTiming() {
+        var receipt: JSON = ["id": "d1", "recipient_session_id": "s", "state": "queued", "push_state": "transport_written",
+                             "native_closure_ref": "closure", "fenced_at": "2026-11-01T12:00:30Z"]
+        for written in ["2026-11-01T12:00:31Z", "2026-11-01T12:00:30Z", "2026-11-01T12:00:01Z", "2026-11-01T12:00:00Z", "invalid"] {
+            receipt["updated_at"] = written
+            XCTAssertNil(CommandRouter.earlierReceiptOfNote([receipt], session: "s"), written)
+        }
+        receipt.removeValue(forKey: "updated_at")
+        XCTAssertNil(CommandRouter.earlierReceiptOfNote([receipt], session: "s"))
+        receipt["updated_at"] = "2026-11-01T11:59:59Z"
+        XCTAssertNotNil(CommandRouter.earlierReceiptOfNote([receipt], session: "s"))
+        receipt.removeValue(forKey: "fenced_at")
+        XCTAssertNil(CommandRouter.earlierReceiptOfNote([receipt], session: "s"))
+        // Stronger recipient evidence does not depend on a transport/closure timestamp.
+        for state in ["delivered", "acknowledged", "addressed"] {
+            receipt["state"] = state
+            XCTAssertNotNil(CommandRouter.earlierReceiptOfNote([receipt], session: "s"), state)
+        }
     }
     func testResumedConversationIsStillRelayedANoteWithNoWriteEvidence() throws {
         let p = try project()

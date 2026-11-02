@@ -327,4 +327,80 @@ final class TicketCleanupMaintenanceOwnedCopyTests: XCTestCase {
             if preserveBackupReceipts {XCTAssertEqual(diagnostic["result"] as? String,"available","The large lookup must fit despite all original backup copies.")}
         }
     }
+    /// CL-400: one process, exact owned seed, explicit startup/idle/cleanup/backup
+    /// boundaries. Opt-in only; no default store, app or credential is accessed.
+    func testP400MemoryPhasesOnExplicitOwnedSnapshot() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let path = env["CHECKLIST_P400_STORE"],let outputPath = env["CHECKLIST_P400_OUTPUT"] else {
+            throw XCTSkip("Requires an explicit P321g owned runtime and memory output prefix.")
+        }
+        let root = URL(fileURLWithPath:path).resolvingSymlinksInPath()
+        let snapshot = root.deletingLastPathComponent()
+        let marker = try XCTUnwrap(JSONSerialization.jsonObject(with:Data(contentsOf:root.appendingPathComponent(".p321g-owned-copy.json"))) as? JSON)
+        let markedSnapshot = URL(fileURLWithPath:try XCTUnwrap(marker["snapshot"] as? String)).resolvingSymlinksInPath()
+        let temporary = URL(fileURLWithPath:"/private/tmp",isDirectory:true).resolvingSymlinksInPath()
+        guard marker["purpose"] as? String == "P321g-real-maintenance-owned-copy",root.pathComponents.starts(with:temporary.pathComponents),markedSnapshot.path.trimmingCharacters(in:CharacterSet(charactersIn:"/")) == snapshot.path.trimmingCharacters(in:CharacterSet(charactersIn:"/")) else {throw StorageSnapshotFailure.invalidFixture}
+        let manifest = try Data(contentsOf:snapshot.appendingPathComponent("manifest.json"))
+        guard ChecklistCore.hash(manifest) == marker["manifest_sha256"] as? String else {throw StorageSnapshotFailure.invalidFixture}
+        let output = URL(fileURLWithPath:outputPath)
+        let log = try Log(output.appendingPathExtension("jsonl"))
+        let started = ProcessInfo.processInfo.systemUptime
+        var sequence = 0
+        func measure(_ phase: String) {
+            var usage = task_vm_info_data_t()
+            var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+            let status = withUnsafeMutablePointer(to:&usage) {$0.withMemoryRebound(to:integer_t.self,capacity:Int(count)) {task_info(mach_task_self_,task_flavor_t(TASK_VM_INFO),$0,&count)}}
+            XCTAssertEqual(status,KERN_SUCCESS,"A failed memory read cannot supply qualification evidence.")
+            log.emit(["event":phase,"elapsed_seconds":ProcessInfo.processInfo.systemUptime-started,"pid":getpid(),"resident_bytes":Self.residentBytes(),"phys_footprint_bytes":usage.phys_footprint,"task_info_status":status])
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath:"/usr/bin/footprint")
+            process.arguments = ["-p",String(getpid())]
+            let url = URL(fileURLWithPath:outputPath + "." + String(sequence) + "." + phase + ".footprint.txt")
+            sequence += 1
+            FileManager.default.createFile(atPath:url.path,contents:nil)
+            if let handle = try? FileHandle(forWritingTo:url) {
+                defer {try? handle.close()}
+                process.standardOutput = handle;process.standardError = handle
+                do {try process.run();process.waitUntilExit()} catch {log.emit(["event":"footprint_error","error":String(describing:error)])}
+            }
+        }
+        measure("startup_begin")
+        CommandRouter.qualificationStartupObserve = {measure($0)}
+        defer {CommandRouter.qualificationStartupObserve = nil}
+        let router = try CommandRouter(root:root,serviceLease:StorageServiceLease(root:root),automaticBackupRetentionTrashRoot:root.appendingPathComponent("qualification-trash"))
+        defer {try? router.closeStore()}
+        measure("startup_end")
+        Thread.sleep(forTimeInterval:30)
+        measure("idle_end")
+        for lifecycle in [true,false] {
+            // Select each production turn once. Only rest/retry scheduling is
+            // bypassed in this diagnostic; no job or authority data is changed.
+            router.ticketCleanupLifecycleTurn = lifecycle
+            router.ticketCleanupYieldAt = nil;router.ticketCleanupRetryAt = nil
+            let name = lifecycle ? "lifecycle" : "byte"
+            measure(name + "_begin")
+            do {try router.runStorageMaintenance(observe:{log.emit($0)})}
+            catch {log.emit(["event":name + "_error","error":String(describing:error)])}
+            measure(name + "_end")
+        }
+        measure("backup_begin")
+        var budget = StorageSnapshotBudget.production()
+        budget.observe = {phase in
+            if !["object_copied","object_verified","backup_step"].contains(phase) {measure("backup_" + phase)}
+        }
+        do {
+            let destination = root.appendingPathComponent("backups/snapshot-" + UUID().uuidString.lowercased())
+            try FileManager.default.createDirectory(at:destination.deletingLastPathComponent(),withIntermediateDirectories:true)
+            let result = try autoreleasepool {
+                try router.executeStorageBackup(params:["command_id":UUID().uuidString,"path":destination.path],caller:Caller(role:"owner",installation:"p400-owned-copy",projectIDs:[]),budget:budget)
+            }
+            log.emit(["event":"backup_receipt","reply":result,"scope":"Full owned-router backup command, receipt/accounting and automatic retention; no native IPC."])
+        } catch {log.emit(["event":"backup_error","error":String(describing:error)]);XCTFail("Owned backup failed: \(error)")}
+        measure("backup_end")
+        Thread.sleep(forTimeInterval:30)
+        measure("final_idle_end")
+        try router.closeStore()
+        measure("store_closed")
+    }
+
 }

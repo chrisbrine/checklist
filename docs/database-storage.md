@@ -792,3 +792,15 @@ Later writes cannot enter the captured database. The ordinary object gate
 still spans database copying, so this does not claim a shorter service write
 admission delay or a faster whole backup. Cancellation and completed-callback
 failure release both the writer fence and pinned reader.
+
+### Byte-free whole-file read receipts (CL-401)
+
+New agent whole-file `attachment_read` operations store no `content_base64` in `commands`. A private descriptor stores the selected representation, the delivered bytes' SHA-256 and a deadline 24 hours after terminal publication. `operation_get` exposes that deadline as `result_expires_at`, rechecks operation and current attachment/project authority, reads the currently authorized file and verifies the delivered hash. Only the file bytes are projected into the original reply metadata. Service restart retains this route; a changed file, cleaned/missing original or expired reply refuses explicitly. Reader holds and file retention are separate.
+
+No schema migration is used. Existing byte-bearing operation receipts are retired immediately because their selected representation cannot be recovered reliably. Status reads return `ATTACHMENT_READ_EXPIRED` even before cleanup. Routine pruning at startup and after commands scrubs at most four legacy read receipts per pass. It matches operation principal, command ID and digest, removes only the base64 field and sets an explicit read-expired marker. New byte-free receipts and unrelated commands stay unchanged. Command identities, digests and operation history stay reserved; ordinary 30-day command retention still applies. This maintenance deletes no managed files and changes no retained backup. SQLite can reuse freed pages; database file length need not shrink, and this path does not run VACUUM.
+
+CL-400 bounds transient startup and snapshot decoding by selecting import jobs
+before decoding, streaming canonical backup validation and retaining only unique
+removed-evidence matching facts. The [memory qualification procedure](service-memory.md)
+records phase footprints, allocator versus mapped pages, fixture limits and the
+required exact-stage installation gate. No schema migration or deletion rule changes.

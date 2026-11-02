@@ -47,7 +47,16 @@ extension CommandRouter {
             if let aid = recipient["attempt_id"] { delivery["recipient_attempt_id"] = aid }
             // CL-398: a new generation of the same conversation keeps this receipt for pickup,
             // but the relay selects only push_state "unavailable", so it does not send the note again.
-            if let earlier = Self.earlierReceiptOfNote(deliveries, session: sid) {
+            let priorReceipts = try deliveries.map { prior -> JSON in
+                var prior = prior
+                if prior["recipient_session_id"] as? String == sid,
+                   let closure = try deliveryNativeClosure(db,prior) {
+                    prior["native_closure_ref"] = closure["id"]
+                    prior["fenced_at"] = closure["observed_at"]
+                }
+                return prior
+            }
+            if let earlier = Self.earlierReceiptOfNote(priorReceipts, session: sid) {
                 delivery["push_state"] = "relay_skipped"; delivery["relay_skipped_for_delivery_id"] = earlier["id"]
                 delivery["push_reason"] = "The relay already wrote this note to this conversation, or the conversation received it. It stays available through Checklist pickup."
             }
@@ -60,11 +69,19 @@ extension CommandRouter {
     /// CL-398: a receipt of one note, in any generation, that shows this conversation has the note:
     /// a pickup or acknowledgment, or a relay write with no host notice. A held, refused, expired,
     /// failed or uncertain write is not evidence, so the relay can still send that note.
+    /// CL-403: a write within 30 seconds before a recorded closure observation may still
+    /// have been unread in the old process. Replay it conservatively. Missing timing
+    /// also permits replay; pickup and acknowledgment remain stronger evidence.
     static func earlierReceiptOfNote(_ deliveries: [JSON], session: String) -> JSON? {
         deliveries.first { delivery in
             guard delivery["recipient_session_id"] as? String == session else { return false }
             if ["acknowledged", "addressed", "delivered"].contains(delivery["state"] as? String ?? "") { return true }
-            return ["transport_written", "provider_accepted"].contains(delivery["push_state"] as? String ?? "") && delivery["host_status"] == nil
+            guard ["transport_written", "provider_accepted"].contains(delivery["push_state"] as? String ?? ""), delivery["host_status"] == nil else { return false }
+            guard delivery["native_closure_ref"] != nil else { return true }
+            let formatter = ISO8601DateFormatter()
+            guard let written = delivery["updated_at"] as? String, let writtenAt = formatter.date(from: written),
+                  let closed = delivery["fenced_at"] as? String, let closedAt = formatter.date(from: closed) else { return false }
+            return closedAt.timeIntervalSince(writtenAt) > 30
         }
     }
 

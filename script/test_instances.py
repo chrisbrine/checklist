@@ -380,6 +380,11 @@ class ManagedPathMapping:
         return None
 
 
+# Core reads source bytes or selects attachment bytes through these manifest fields.
+# Keep this inventory with docs/test-instances.md when adding a Core consumer.
+MANIFEST_FILE_EVIDENCE_FIELDS = frozenset({'source_capture', 'artifact_refs', 'playtest_bundle', 'acceptance_evidence'})
+
+
 def require_local_paths(database, destination, immutable=True, source_root=None,
                         summary_source_root=None, summary_source_paths=None):
     """Read-only seed inspection. Never open a stored managed absolute path.
@@ -512,15 +517,6 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
             return ('slot_summary', None)
         if key == 'path':
             if parent.get('mode') == 'managed': return ('managed', 'objects')
-            # CL-298: a submitted check result names its report file relative
-            # to the project root (for example TestResults/run.xml).
-            if record_kind == 'manifest' and location.endswith('.evidence.checks[]'): return ('evidence_relative', None)
-            # CL-399: a submitted file list names files relative to the project root.
-            # An absolute path keeps the slot-contained rule.
-            if record_kind == 'manifest' and location.endswith('.evidence.files[]'): return ('evidence_relative', None)
-            # CL-339: submitters list the source files they changed (often in a
-            # private scratch folder) with their digests. Core never opens them.
-            if record_kind == 'manifest' and location.endswith('.evidence.source_files[]'): return ('inert_history', None)
             if parent.get('mode') in {'reference', 'external_reference'}: return ('binding', None)
             if '.file_scopes[]' in location: return ('recursive_binding', None)
             if (capture and location.endswith('.files[]')) or any(name in location for name in ['.project_instruction_refs[]', '.instruction_coverage[]', '.link_chain[]']):
@@ -537,11 +533,6 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
             return ('managed', 'staging' if key == 'stage' else None)
         if key in {'object_relative_path', 'relative_path'}: return ('managed', None)
         if key == 'additional_paths' and capture: return ('project_relative', parent.get('source_root'))
-        # CL-298: submit evidence keeps the submitter's project-relative
-        # additional_paths verbatim (for example kind "artifact"). They name
-        # files under the manifest project's root; Core never resolves them.
-        if key == 'additional_paths' and record_kind == 'manifest' and location.endswith('.evidence'):
-            return ('evidence_relative', parent.get('source_root'))
         if key in {'root_path', 'source_root', 'workspace', 'workspace_path', 'canonical_key', 'additional_paths'}:
             return ('recursive_binding_optional' if key in {'workspace', 'workspace_path'} else 'recursive_binding', None)
         if key == 'paths': return ('binding', None)
@@ -567,9 +558,27 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
             return ('text', None)
         return (None, None)
 
+    def inspect_evidence_data(value, key=None):
+        # No spelling, symlink, URL or serialized payload in free-form evidence
+        # grants file authority. Never pass its descendants back to policy().
+        if isinstance(value, dict):
+            for name, child in value.items(): inspect_evidence_data(child, name)
+        elif isinstance(value, list):
+            for child in value: inspect_evidence_data(child, key)
+        elif isinstance(value, str) and (key in PATH_FIELDS | PATH_LIST_FIELDS | ABSOLUTE_PATH_FIELDS
+                or value.startswith('/') or re.search(r'\bfile:', value, re.IGNORECASE)):
+            counts['inert_history_path_occurrences'] += 1
+
     def inspect(value, location, record_kind=None, rule=(None, None), inert=False):
         if isinstance(value, bytes): value = value.decode('utf-8')
         if isinstance(value, dict):
+            if record_kind == 'manifest' and location == 'records.data.evidence':
+                for key, child in value.items():
+                    if key in MANIFEST_FILE_EVIDENCE_FIELDS:
+                        inspect(child, location + '.' + key, record_kind, policy(key, value, location, record_kind), inert)
+                    else:
+                        inspect_evidence_data(child, key)
+                return
             for key, child in value.items():
                 key_rule = ('binding', None) if location.endswith('.path_sha256') else (None, None)
                 inspect(key, location, record_kind, key_rule, inert)
@@ -641,18 +650,6 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
                 if not isinstance(family, str): refuse(location, 'a project-relative source path without its source root')
                 source = check_absolute(family, location)
                 check_binding(str(source / value), location)
-            elif kind == 'evidence_relative':
-                # Same spelling safety as capture project-relative paths. A
-                # leading slash keeps the slot-contained absolute rule; nothing
-                # outside the slot is opened or resolved.
-                if value.startswith('/'):
-                    check_slot_absolute(value, location)
-                elif '\0' in value or any(x in ['', '.', '..'] for x in value.split('/')):
-                    refuse(location, 'a relative, malformed or traversing stored file path')
-                elif isinstance(family, str):
-                    check_binding(str(check_absolute(family, location) / value), location)
-                else:
-                    counts['relative_evidence_paths'] += 1
             elif kind in {'captured', 'captured_link'}:
                 if not value or value.startswith('/') or '\0' in value or (kind == 'captured' and any(x in ['', '.', '..'] for x in value.split('/'))):
                     refuse(location, 'an unsafe captured relative path')

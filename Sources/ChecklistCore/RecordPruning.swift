@@ -71,7 +71,7 @@ extension CommandRouter {
     static let cursorPruneBatch = 20_000
     static let prunedResult = "{\"pruned\":true,\"retention_days\":30}"
 
-    struct PruneCounts: Equatable { var cursors = 0, commandResults = 0, cleanupPreviews = 0 }
+    struct PruneCounts: Equatable { var cursors = 0, commandResults = 0, cleanupPreviews = 0, attachmentReadResults = 0 }
 
     /// Runs when the interval passed; returns nil when it did not run.
     func pruneRoutineRecordsIfDue(_ db: Database, now: Date = Date()) -> PruneCounts? {
@@ -111,6 +111,10 @@ extension CommandRouter {
                   LIMIT ?)
                 """, arguments: [cutoff, Self.pruneBatch])
             counts.cleanupPreviews = db.changesCount
+            return .commit
+        }
+        try db.inTransaction {
+            counts.attachmentReadResults = try pruneAttachmentReadResults(db)
             return .commit
         }
         return counts

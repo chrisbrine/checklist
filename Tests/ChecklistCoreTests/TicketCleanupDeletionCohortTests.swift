@@ -216,6 +216,42 @@ extension TicketLifecycleCleanupTests {
         XCTAssertTrue(FileManager.default.fileExists(atPath:router.root.appendingPathComponent(path).path))
     }
 
+    func testCL403InventoryRefusedNewestWindowRunsTheOlderQueueWithoutRetry() throws {
+        try QualificationSuite.requireEnabled()
+        let jobs = try deletionCohortFixture([1,1]),queued = jobs[0],newest = jobs[1]
+        let pid = queued["project_id"] as! String
+        let held = (newest["objects"] as! [JSON])[0]
+        var refused = [newest]
+        try write {db in
+            // The queue receipt fills one descriptor window, while the newest
+            // 32 individually bounded receipts all share an oversized reference.
+            var value = self.router.revised(queued);value["padding"] = ""
+            value["padding"] = String(repeating:"x",count:TicketCleanupDeletionCohort.descriptorByteLimit - (try jsonString(value).utf8.count))
+            try self.router.save(db,value,type:"storage_job")
+            for _ in 1..<TicketCleanupDeletionCohort.receiptLimit {
+                var copy = newest;copy["id"] = uuid();copy["task_id"] = uuid()
+                try self.router.save(db,copy,type:"storage_job");refused.append(copy)
+            }
+            try self.router.save(db,["id":uuid(),"project_id":pid,"revision":1,"path":held["relative_path"]!,"padding":String(repeating:"x",count:TicketCleanupInventory.rowByteLimit+1)],type:"message")
+        }
+        router.ticketCleanupByteNewestTurns[pid] = true
+        var newestRefusals: [String:String] = [:],selected: [[String]] = []
+        XCTAssertTrue(try router.runTicketObjectDeletionCohort {value in
+            if value["phase"] as? String == "newest_refused" {newestRefusals = value["refused"] as? [String:String] ?? [:]}
+            if value["phase"] as? String == "selected" {selected.append((value["receipts"] as? [JSON] ?? []).compactMap {$0["id"] as? String})}
+        })
+        XCTAssertEqual(newestRefusals.count,TicketCleanupDeletionCohort.receiptLimit)
+        XCTAssertTrue(newestRefusals.values.allSatisfy {$0 == "CLEANUP_INVENTORY_LIMIT"})
+        XCTAssertEqual(selected.count,2)
+        XCTAssertEqual(selected.first?.count,TicketCleanupDeletionCohort.receiptLimit)
+        XCTAssertEqual(selected.last,[queued["id"] as! String])
+        XCTAssertNil(router.ticketCleanupRetryAt,"A refused newest window must not arm the global retry ahead of the queue")
+        XCTAssertNil(try router.dbQueue.read {try self.router.ticketCleanupProjectRetry($0,project:pid)},"A successful queue fallback needs no project retry")
+        XCTAssertEqual((try deletionCohortReceipt(queued)["summary"] as? JSON)?["removed_count"] as? Int,1)
+        for receipt in refused {XCTAssertEqual(try deletionCohortReceipt(receipt)["state"] as? String,"pending")}
+        XCTAssertTrue(FileManager.default.fileExists(atPath:held["stored_path"] as! String),"Inventory refusals retain the original bytes")
+    }
+
     func testP321PreparationUnavailableStillYieldsToLifecycleTurn() throws {
         try QualificationSuite.requireEnabled()
         let jobs = try deletionCohortFixture([1]),head = jobs[0]

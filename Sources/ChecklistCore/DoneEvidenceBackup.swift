@@ -63,12 +63,18 @@ extension CommandRouter {
         if let raw = value["attempted_at"] as? String,let time = ISO8601DateFormatter().date(from:raw) {
             value["retry_not_before"] = ISO8601DateFormatter().string(from:time.addingTimeInterval(Self.doneEvidenceBackupInterval))
         }
+        // Older builds saved only the attempt clock. Recover success from a
+        // committed service receipt, never from an unrelated owner's backup.
+        if value["state"] as? String == "unknown" || value["state"] as? String == "starting" {
+            if let completed = try completedDoneEvidenceBackup(db,attempt:value) {return completed}
+        }
         guard let command = value["command_id"] as? String else {return value}
         let caller = Caller(role:"owner",installation:Self.doneEvidenceBackupInstallation,projectIDs:[])
         let id = Self.commandOperationID(principal:caller.principal,command:command)
         guard let operation = try operationRecord(db,id:id) else {
             if value["operation_id"] != nil {value["state"] = "unknown";value["reason"] = "operation_state_unavailable"}
             else if value["state"] as? String == "starting" {value["state"] = "unknown";value["reason"] = "attempt_outcome_not_recorded"}
+            if value["state"] as? String == "unknown" {return try completedDoneEvidenceBackup(db,attempt:value) ?? value}
             return value
         }
         value["operation_id"] = id
@@ -84,6 +90,39 @@ extension CommandRouter {
         }
         return value
     }
+    private func completedDoneEvidenceBackup(_ db: Database,attempt: JSON) throws -> JSON? {
+        guard let attempted = attempt["attempted_at"] as? String,
+              ISO8601DateFormatter().date(from:attempted) != nil else {return nil}
+        // Bound legacy recovery. Normal new attempts commit their status with
+        // the backup receipt and need no history read.
+        let rows = try Row.fetchAll(db,sql:"SELECT data FROM (SELECT kind,data FROM events WHERE project_id IS NULL AND entity_id IS NULL ORDER BY seq DESC LIMIT 128) WHERE kind='backup_created'")
+        for row in rows {
+            let event = jsonObject(row["data"] as String)
+            guard event["origin"] as? String == "service",let command = event["command_id"] as? String,
+                  attempt["command_id"] == nil || attempt["command_id"] as? String == command,
+                  let captured = event["captured_at"] as? String,captured >= attempted,
+                  let operation = event["operation_id"] as? String,
+                  let raw = try String.fetchOne(db,sql:"SELECT json_object('state',json_extract(value,'$.state')) FROM metadata WHERE key=? AND json_valid(value)",arguments:["backup-generation:" + operation]),
+                  jsonObject(raw)["state"] as? String == "complete" else {continue}
+            var result = attempt
+            result["state"] = "complete";result["command_id"] = command
+            result["finished_at"] = event["verified_at"];result["outcome_source"] = "backup_receipt"
+            result.removeValue(forKey:"reason")
+            return result
+        }
+        return nil
+    }
+
+    /// The successful backup receipt and attempt outcome have one commit. A
+    /// crash before the caller saves its return value cannot hide that success.
+    func recordDoneEvidenceBackupCompletion(_ db: Database,command: String,summary: JSON) throws {
+        var status = jsonObject(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[Self.doneEvidenceBackupStatusKey]) ?? "{}")
+        guard status["command_id"] as? String == command else {return}
+        status["state"] = "complete";status["finished_at"] = summary["verified_at"]
+        status["outcome_source"] = "backup_receipt";status.removeValue(forKey:"reason")
+        try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:[Self.doneEvidenceBackupStatusKey,try jsonString(status)])
+    }
+
     private func addDoneEvidenceBackupFailure(_ error: JSON,to value: inout JSON) {
         value["error_code"] = error["code"]
         let details = error["details"] as? JSON ?? [:]
