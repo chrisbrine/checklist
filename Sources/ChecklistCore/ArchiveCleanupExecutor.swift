@@ -406,7 +406,7 @@ extension CommandRouter {
         if let id = receipt["id"] as? String {
             try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?, '1')",arguments:["ticket-cleanup-copy-retry-seen:" + id])
         }
-        if receipt["cause"] as? String == "task_purge",let id = receipt["id"] as? String {
+        if ["task_purge","done_evidence"].contains(receipt["cause"] as? String ?? ""),let id = receipt["id"] as? String {
             try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-backup-seen:" + id,String(backupGenerationRow)])
         }
         if receipt["cause"] as? String == "done_evidence",receipt["state"] as? String == "completed",int(receipt,"cleanup_policy_version") < 2,let project = receipt["project_id"] as? String,let task = receipt["task_id"] as? String {

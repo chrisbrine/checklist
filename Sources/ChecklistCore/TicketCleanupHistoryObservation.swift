@@ -16,7 +16,7 @@ struct TicketCleanupEventObservation {
         // The original planner does not traverse a payload whose entity alone
         // matches. Preserve its aggregate traversal bound without re-tokenizing.
         let direct = keys.reduce(0) {$0 + (entityTokenCounts[project]?[$1] ?? 0)}
-        guard (tokenCounts[project] ?? 0) - direct <= tokenBudget else {throw CoreError("PURGE_LIMIT","The reference inventory exceeds the safe purge limit. No content was removed.")}
+        guard (tokenCounts[project] ?? 0) - direct <= tokenBudget else {throw CoreError("PURGE_LIMIT","The reference inventory exceeds the safe purge limit. No content was removed.",details:["limit":"history_tokens","maximum":2000000])}
         var bytes = 0
         return try (selected.members[task] ?? []).compactMap {index in
             guard let observed = selected.rows[index] else {return nil}
@@ -127,7 +127,7 @@ extension CommandRouter {
                 guard targets.contains(where:{result.selected.errors[$0] == nil}) else {break}
                 count += 1
                 guard count <= 100000 else {
-                    result.selected.fail(targets,CoreError("PURGE_LIMIT","The ticket history exceeds the safe purge limit."));break
+                    result.selected.fail(targets,CoreError("PURGE_LIMIT","The ticket history exceeds the safe purge limit.",details:["limit":"history_rows","maximum":100000]));break
                 }
                 try autoreleasepool {
                     let data: String = row["data"],bytes = data.utf8.count
@@ -135,7 +135,8 @@ extension CommandRouter {
                         result.selected.fail(targets,CoreError("CLEANUP_INVENTORY_LIMIT","A history row exceeds the memory bound."));return
                     }
                     var tokens = Set<Data>(),budget = 2000000
-                    try TicketCleanupInventory.strings(jsonObject(data),{tokens.insert(Data($0.utf8))},budget:&budget)
+                    do {try TicketCleanupInventory.strings(jsonObject(data),{tokens.insert(Data($0.utf8))},budget:&budget)}
+                    catch let error as CoreError {throw CoreError(error.code,error.message,details:["limit":budget < 0 ? "history_row_tokens" : "history_row_depth","maximum":budget < 0 ? 2000000 : 64])}
                     let tokenCount = 2000000-budget
                     result.tokenCounts[pid,default:0] += tokenCount
                     var matched = Set<String>()
@@ -172,14 +173,15 @@ extension CommandRouter {
         while let row = try cursor.next() {
             guard targets.contains(where:{selected.errors[$0] == nil}) else {break}
             count += 1
-            guard count <= 100000 else {selected.fail(targets,CoreError("PURGE_LIMIT","The command history exceeds the safe purge limit."));break}
+            guard count <= 100000 else {selected.fail(targets,CoreError("PURGE_LIMIT","The command history exceeds the safe purge limit.",details:["limit":"command_rows","maximum":100000]));break}
             try autoreleasepool {
                 let data: String = row["result"],bytes = data.utf8.count
                 guard bytes <= TicketCleanupInventory.rowByteLimit else {
                     selected.fail(targets,CoreError("CLEANUP_INVENTORY_LIMIT","A command history row exceeds the memory bound."));return
                 }
                 var tokens = Set<Data>(),budget = 2000000
-                try TicketCleanupInventory.strings(jsonObject(data),{tokens.insert(Data($0.utf8))},budget:&budget)
+                do {try TicketCleanupInventory.strings(jsonObject(data),{tokens.insert(Data($0.utf8))},budget:&budget)}
+                catch let error as CoreError {throw CoreError(error.code,error.message,details:["limit":budget < 0 ? "command_row_tokens" : "command_row_depth","maximum":budget < 0 ? 2000000 : 64])}
                 var matched = Set<String>()
                 for key in tokens {matched.formUnion(needles[key] ?? [])}
                 selected.add(row,tokens:[],bytes:bytes,tasks:matched,retainTokens:false)

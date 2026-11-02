@@ -8,7 +8,7 @@ enum TicketCleanupFailureDiagnostics {
     static func details(_ error: Error) -> JSON {
         if let failure = error as? CoreError {
             var result: JSON = ["code":failure.code]
-            for key in ["operation","reason","posix_errno","sqlite_result_code","sqlite_extended_result_code","error_domain","error_code"] {
+            for key in ["limit","maximum","operation","reason","posix_errno","sqlite_result_code","sqlite_extended_result_code","error_domain","error_code"] {
                 if let value = failure.details[key] as? String {result[key] = String(value.prefix(512))}
                 else if let value = failure.details[key] as? NSNumber {result[key] = value}
             }

@@ -131,7 +131,11 @@ extension CommandRouter {
         guard let id = receipt["id"] as? String else {return}
         let policy = int(receipt,"cleanup_policy_version")
         var generationRetry = false
-        if receipt["state"] as? String == "completed",receipt["cause"] as? String == "task_purge" {
+        // A pending Done job can already retain one file while its other files
+        // continue. Recheck its retryable holds once per completed generation;
+        // older jobs without a marker get one check against existing backups.
+        let pendingDone = policy >= 2 && receipt["state"] as? String == "pending" && receipt["cause"] as? String == "done_evidence"
+        if pendingDone || receipt["state"] as? String == "completed" && receipt["cause"] as? String == "task_purge" {
             let seen = try Int64.fetchOne(db,sql:"SELECT CAST(value AS INTEGER) FROM metadata WHERE key=?",arguments:["ticket-cleanup-backup-seen:" + id]) ?? -1
             let generation = try backupGenerationRow ?? ticketCleanupBackupGenerationRow(db)
             generationRetry = policy < 2 || seen < generation
@@ -433,7 +437,7 @@ extension CommandRouter {
         let generation = try ticketCleanupBackupGenerationRow(db)
         let receipt: JSON = ["id":id,"project_id":project,"task_id":task,"kind":Self.ticketObjectDeletionKind,"cause":cause,"state":plan.objects.contains {$0["state"] as? String == "pending"} ? "pending" : "completed","revision":1,"created_at":now(),"objects":plan.objects,"summary":plan.summary,"cleanup_policy_version":2]
         try save(db,receipt,type:"storage_job")
-        if cause == "task_purge" {try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-backup-seen:" + id,String(generation)])}
+        if cause == "task_purge" || cause == "done_evidence" {try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-backup-seen:" + id,String(generation)])}
         return receipt
     }
 

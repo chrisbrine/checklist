@@ -36,6 +36,8 @@ extension CommandRouter {
     private func ticketCleanupMaintenanceProjection(_ db: Database,project: String) throws -> JSON {
         var value = try ticketCleanupSchedulingProjection(db,project:project)
         if let backup = try doneEvidenceBackupDeadline(db) {value["next_evidence_backup_at"] = ISO8601DateFormatter().string(from:backup)}
+        value["planning"] = jsonObject(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-planning:" + project]) ?? "{}")
+        value["evidence_backup"] = try doneEvidenceBackupProjection(db)
         var preparation = try ticketCleanupPreparationState(db,project:project)
         preparation.removeValue(forKey:"attempt_refused");value["preparation"] = preparation
         return value
@@ -191,6 +193,7 @@ extension CommandRouter {
                 } catch let error as CoreError {
                     if ["CLEANUP_INVENTORY_LIMIT","REFERENCE_GRAPH_LIMIT","PURGE_LIMIT"].contains(error.code) {planningRetries.append(tid)}
                     item["action"] = "keep";item["reason"] = error.code
+                    if let limit = error.details["limit"] {item["limit"] = limit;item["limit_maximum"] = error.details["maximum"]}
                 }
             }
             item["retry"] = retryIDs.contains(tid)
@@ -205,6 +208,7 @@ extension CommandRouter {
             let tid = try StoredRecord(items[index],family:"cleanup_selection_item").string("task_id")
             if let error = commands.errors[tid] {
                 items[index]["action"] = "keep";items[index]["reason"] = error.code
+                if let limit = error.details["limit"] {items[index]["limit"] = limit;items[index]["limit_maximum"] = error.details["maximum"]}
                 planningRetries.append(tid);plans[tid] = nil
                 continue
             }
@@ -275,21 +279,42 @@ extension CommandRouter {
                 }
                 items[index]["byte_deletion_receipt_id"] = (try StoredRecord(deletion, family: "deletion").requiredValue("id"))
             }
-            let id = uuid()
-            let receipt: JSON = [
-                "id": id, "project_id": pid, "kind": Self.ticketObjectDeletionKind, "cause": "ticket_cleanup_pass", "origin": "automatic_cleanup", "state": "completed",
-                "revision": 1, "created_at": now(), "selected_bytes": (try StoredRecord(selection, family: "selection").requiredValue("selected_bytes")), "settings": settings,
-                "items": ticketCleanupPassItems(items), "objects": [], "summary": Self.ticketObjectDeletionSummary([]), "source_build_cache": selection["source_build_cache"] ?? [],
-            ]
-            try self.save(db,receipt,type:"storage_job")
-            try self.event(db,caller:Caller(role:"owner",installation:"storage",projectIDs:[]),project:pid,entity:pid,kind:"ticket_cleanup_pass",data:["origin":"automatic_cleanup","receipt_id":id,"admitted_count":items.filter {$0["action"] as? String != "keep"}.count])
-            try db.execute(sql:"INSERT OR IGNORE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-first:" + pid,id])
+            let admitted = items.filter {$0["action"] as? String != "keep"}.count
+            let passItems = ticketCleanupPassItems(items)
+            // Scheduling tokens/cursors and timestamps are not semantic results.
+            // A matching no-admission pass updates only bounded metadata.
+            let fingerprint = hash(Data(try jsonString(["settings":settings,"items":passItems.sorted {($0["task_id"] as? String ?? "") < ($1["task_id"] as? String ?? "")},"source_build_cache":selection["source_build_cache"] ?? []]).utf8))
+            let prior = jsonObject(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-planning:" + pid]) ?? "{}")
+            let writeReceipt = admitted > 0 || prior["result_fingerprint"] as? String != fingerprint
+            var receiptID = prior["receipt_id"] as? String
+            if writeReceipt {
+                let id = uuid();receiptID = id
+                let receipt: JSON = [
+                    "id": id, "project_id": pid, "kind": Self.ticketObjectDeletionKind, "cause": "ticket_cleanup_pass", "origin": "automatic_cleanup", "state": "completed",
+                    "revision": 1, "created_at": now(), "selected_bytes": (try StoredRecord(selection, family: "selection").requiredValue("selected_bytes")), "settings": settings,
+                    "items": passItems, "objects": [], "summary": Self.ticketObjectDeletionSummary([]), "source_build_cache": selection["source_build_cache"] ?? [],
+                ]
+                try self.save(db,receipt,type:"storage_job")
+                try self.event(db,caller:Caller(role:"owner",installation:"storage",projectIDs:[]),project:pid,entity:pid,kind:"ticket_cleanup_pass",data:["origin":"automatic_cleanup","receipt_id":id,"admitted_count":admitted])
+                try db.execute(sql:"INSERT OR IGNORE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-first:" + pid,id])
+            }
+            let refused = items.filter {["PURGE_LIMIT","REFERENCE_GRAPH_LIMIT","CLEANUP_INVENTORY_LIMIT"].contains($0["reason"] as? String ?? "")}
+            let limits: [JSON] = Dictionary(grouping:refused,by:{$0["limit"] as? String ?? ($0["reason"] as? String ?? "unknown")}).sorted {$0.key < $1.key}.map {name,items in
+                var limit: JSON = ["name":name,"code":items[0]["reason"] ?? "unknown","ticket_count":items.count]
+                if let maximum = items[0]["limit_maximum"] {limit["maximum"] = maximum}
+                return limit
+            }
+            var planning: JSON = ["state":refused.isEmpty ? (admitted > 0 ? "admitted" : "idle") : (admitted > 0 ? "partial" : "refused"),"checked_at":now(),"admitted_count":admitted,"refused_count":refused.count,"limits":limits,"receipt_written":writeReceipt,"result_fingerprint":fingerprint]
+            if let receiptID {planning["receipt_id"] = receiptID}
+            if refused.isEmpty {planning["last_refusal"] = prior["last_refusal"]}
+            else {planning["last_refusal"] = ["checked_at":now(),"refused_count":refused.count,"limits":limits] as JSON}
+            try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-planning:" + pid,try jsonString(planning)])
             var retries = try ticketCleanupRetryEntries(db,project:pid)
             let observedTokens = selection["observed_retry_tokens"] as? [String:String] ?? [:],observed = retries.filter {$0.value.token == observedTokens[$0.key]}
-            let refused = Set(selection["limit_retry_task_ids"] as? [String] ?? [])
+            let refusedIDs = Set(selection["limit_retry_task_ids"] as? [String] ?? [])
             for id in selection["attempted_retry_ids"] as? [String] ?? [] where retries[id]?.token == observedTokens[id] {retries.removeValue(forKey:id)}
             for id in selection["retry_task_ids"] as? [String] ?? [] {
-                retries[id] = refused.contains(id) ? TicketCleanupRetry(refusedAfter:observed[id],at:time) : TicketCleanupRetry(at:time.addingTimeInterval(60))
+                retries[id] = refusedIDs.contains(id) ? TicketCleanupRetry(refusedAfter:observed[id],at:time) : TicketCleanupRetry(at:time.addingTimeInterval(60))
             }
             try saveTicketCleanupRetries(db,project:pid,entries:retries)
             let reset = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM ticket_cleanup_changes WHERE kind=3 AND id=CAST(? AS BLOB))",arguments:["ticket-cleanup-cursor:" + pid]) ?? false

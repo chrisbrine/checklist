@@ -45,10 +45,27 @@ extension CommandRouter {
             if deliveries.contains(where: {$0["recipient_session_id"] as? String == sid && $0["recipient_authorization_generation"] as? String == generation}) { continue }
             var delivery: JSON = ["id":uuid(),"project_id":pid,"message_id":mid,"recipient_session_id":sid,"recipient_authorization_generation":generation,"recipient_role":recipient["recipient_role"] ?? "recipient","recipient_display":recipient["display_name"] ?? session["label"] ?? "Worker","state":"queued","push_state":"unavailable","push_reason":"Native push is unqualified; available on recipient MCP pickup.","revision":1,"created_at":now()]
             if let aid = recipient["attempt_id"] { delivery["recipient_attempt_id"] = aid }
+            // CL-398: a new generation of the same conversation keeps this receipt for pickup,
+            // but the relay selects only push_state "unavailable", so it does not send the note again.
+            if let earlier = Self.earlierReceiptOfNote(deliveries, session: sid) {
+                delivery["push_state"] = "relay_skipped"; delivery["relay_skipped_for_delivery_id"] = earlier["id"]
+                delivery["push_reason"] = "The relay already wrote this note to this conversation, or the conversation received it. It stays available through Checklist pickup."
+            }
             copyRoleLabel(recipient, into: &delivery)
             try save(db,delivery,type:"delivery"); deliveries.append(delivery)
         }
         return deliveries
+    }
+
+    /// CL-398: a receipt of one note, in any generation, that shows this conversation has the note:
+    /// a pickup or acknowledgment, or a relay write with no host notice. A held, refused, expired,
+    /// failed or uncertain write is not evidence, so the relay can still send that note.
+    static func earlierReceiptOfNote(_ deliveries: [JSON], session: String) -> JSON? {
+        deliveries.first { delivery in
+            guard delivery["recipient_session_id"] as? String == session else { return false }
+            if ["acknowledged", "addressed", "delivered"].contains(delivery["state"] as? String ?? "") { return true }
+            return ["transport_written", "provider_accepted"].contains(delivery["push_state"] as? String ?? "") && delivery["host_status"] == nil
+        }
     }
 
     @discardableResult

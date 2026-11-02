@@ -517,7 +517,7 @@ struct MessageRow: View {
                         }
                     }
                     if delivery.string("recipient_role") == "triage_orchestrator", !delivery.string("label").isEmpty { Text(delivery.string("label")).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText) }
-                    if ["queued", "pending", "saved", "saved_for_pickup"].contains(delivery.string("state")), delivery.string("push_state") == "unavailable" {
+                    if ["queued", "pending", "saved", "saved_for_pickup"].contains(delivery.string("state")), ["unavailable", "relay_skipped"].contains(delivery.string("push_state")) {
                         Text("Saved for the agent’s next Checklist check.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                     } else if !delivery.string("reason", fallback: delivery.string("push_reason")).isEmpty && !delivery.string("reason", fallback: delivery.string("push_reason")).contains("Native push is unqualified") {
                         Text(delivery.string("reason", fallback: delivery.string("push_reason"))).checklistFont(.micro).foregroundStyle(.orange)

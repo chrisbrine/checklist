@@ -125,6 +125,7 @@ The service cannot call `send_message`, so a service message uses the relay and 
 | Relay, recipient in another permission class with no `crossSessionInbound` accept | Unqualified on this version; observed held on engine 2.1.299 | See the 17 October observation above |
 | Relay, process away | Unqualified: no verified endpoint, so the delivery stays on pickup | Source only |
 | Relay, archived target | Unqualified | None |
+| Relay, same note after a resumed process | Not sent again when an earlier receipt shows a pickup, an acknowledgment or a relay write with no host notice; the note stays on pickup (`relay_skipped`). A note with no such receipt is still sent. An MCP reconnect in the same process keeps the generation and makes no new receipt | CL-398 unit tests; source for the reconnect |
 | Tool `send_message` past the count, child to parent | Reported by another session: 12 of 12 messages started turns, 2 past the count | Report on CL-386; not repeated here |
 | Tool `send_message`, unrelated sender | Observed: the tool reported `delivered` between two unrelated sessions | CL-386 receipt message d7ccb350; the recipient's turn start was not confirmed |
 | Tool `send_message`, another permission mode, archived target or process away | Unqualified | None |

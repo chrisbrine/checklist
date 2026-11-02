@@ -9,11 +9,12 @@ extension CommandRouter {
     /// Lets tickets that close together share one backup.
     static let doneEvidenceBackupSettle: TimeInterval = 900
     private static let doneEvidenceBackupAttemptKey = "done-evidence-backup-attempt"
+    private static let doneEvidenceBackupStatusKey = "done-evidence-backup-status"
     static let doneEvidenceBackupInstallation = "storage"
 
     private static let waitingDoneEvidenceSQL = """
         rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='storage_job') AND json_valid(data)
-        AND json_extract(data,'$.kind')='ticket_object_delete' AND json_extract(data,'$.cause')='done_evidence' AND json_extract(data,'$.state')='completed'
+        AND json_extract(data,'$.kind')='ticket_object_delete' AND json_extract(data,'$.cause')='done_evidence' AND json_extract(data,'$.state') IN ('pending','completed')
         AND COALESCE(json_extract(data,'$.updated_at'),json_extract(data,'$.created_at'))>?
         AND EXISTS(SELECT 1 FROM json_each(data,'$.objects') object,json_each(object.value,'$.reasons') reason WHERE json_extract(object.value,'$.state')='retained' AND reason.value='backup_required')
         """
@@ -44,13 +45,59 @@ extension CommandRouter {
     func doneEvidenceBackupDeadline(_ db: Database) throws -> Date? {
         guard doneEvidenceBackupsConfirmed(db) else {return nil}
         let latest = try latestCompleteBackupTime(db),format = ISO8601DateFormatter()
-        guard let oldest = try String.fetchOne(db,sql:"SELECT MIN(COALESCE(json_extract(data,'$.updated_at'),json_extract(data,'$.created_at'))) FROM records WHERE " + Self.waitingDoneEvidenceSQL,arguments:[latest]),
+        // A progressing pending job revises updated_at on every byte chunk.
+        // Admission is its stable settle clock; otherwise it could never become due.
+        guard let oldest = try String.fetchOne(db,sql:"SELECT MIN(CASE WHEN json_extract(data,'$.state')='pending' THEN json_extract(data,'$.created_at') ELSE COALESCE(json_extract(data,'$.updated_at'),json_extract(data,'$.created_at')) END) FROM records WHERE " + Self.waitingDoneEvidenceSQL,arguments:[latest]),
               let waiting = format.date(from:oldest) else {return nil}
         return [waiting.addingTimeInterval(Self.doneEvidenceBackupSettle),try doneEvidenceBackupHold(db)].compactMap {$0}.max()
     }
 
+    /// Read the latest service attempt and its exact operation, including an
+    /// asynchronous refusal. No command-history or backup-result scan is needed.
+    func doneEvidenceBackupProjection(_ db: Database) throws -> JSON {
+        let attempt = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[Self.doneEvidenceBackupAttemptKey])
+        var value = jsonObject(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[Self.doneEvidenceBackupStatusKey]) ?? "{}")
+        guard !value.isEmpty || attempt != nil else {return [:]}
+        if value.isEmpty {value = ["state":"unknown","reason":"attempt_outcome_not_recorded"]}
+        value["attempted_at"] = value["attempted_at"] ?? attempt
+        if let raw = value["attempted_at"] as? String,let time = ISO8601DateFormatter().date(from:raw) {
+            value["retry_not_before"] = ISO8601DateFormatter().string(from:time.addingTimeInterval(Self.doneEvidenceBackupInterval))
+        }
+        guard let command = value["command_id"] as? String else {return value}
+        let caller = Caller(role:"owner",installation:Self.doneEvidenceBackupInstallation,projectIDs:[])
+        let id = Self.commandOperationID(principal:caller.principal,command:command)
+        guard let operation = try operationRecord(db,id:id) else {
+            if value["operation_id"] != nil {value["state"] = "unknown";value["reason"] = "operation_state_unavailable"}
+            else if value["state"] as? String == "starting" {value["state"] = "unknown";value["reason"] = "attempt_outcome_not_recorded"}
+            return value
+        }
+        value["operation_id"] = id
+        let state = operation["state"] as? String ?? "unknown"
+        value["state"] = state == "succeeded" ? "complete" : state
+        if state == "queued",commandOperations.isActive(id) {value["state"] = "running"}
+        for key in ["started_at","finished_at"] {value[key] = operation[key]}
+        if state == "failed" {
+            do {
+                let payload = try operationPayload(db,operation,caller:caller)
+                if let error = payload["error"] as? JSON {addDoneEvidenceBackupFailure(error,to:&value)}
+            } catch {addDoneEvidenceBackupFailure(PublicErrorText.payload(error),to:&value)}
+        }
+        return value
+    }
+    private func addDoneEvidenceBackupFailure(_ error: JSON,to value: inout JSON) {
+        value["error_code"] = error["code"]
+        let details = error["details"] as? JSON ?? [:]
+        for key in ["reason","next_step","command_outcome"] {value[key] = details[key]}
+    }
+    private func saveDoneEvidenceBackupStatus(_ value: JSON) throws {
+        try dbQueue.writeWithoutTransaction {db in
+            try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:[Self.doneEvidenceBackupStatusKey,try jsonString(value)])
+        }
+    }
+
     /// The attempt time commits first, so a refused or failed backup waits one
-    /// interval and cannot repeat at the maintenance rate.
+    /// interval and cannot repeat at the maintenance rate. Its outcome is visible
+    /// without writing a separate history event or receipt.
     @discardableResult
     public func startDoneEvidenceBackupIfDue(at time: Date = Date()) -> Bool {
         do {
@@ -59,10 +106,27 @@ extension CommandRouter {
                       if let hold = try self.doneEvidenceBackupHold(db),hold > time {return nil}
                       return try self.doneEvidenceBackupDeadline(db)
                   }),deadline <= time else {return false}
-            try dbQueue.writeWithoutTransaction {db in
-                try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:[Self.doneEvidenceBackupAttemptKey,ISO8601DateFormatter().string(from:time)])
+            let command = uuid(),attempted = ISO8601DateFormatter().string(from:time)
+            var status: JSON = ["command_id":command,"attempted_at":attempted,"state":"starting"]
+            try dbQueue.write {db in
+                try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?),(?,?)",arguments:[Self.doneEvidenceBackupAttemptKey,attempted,Self.doneEvidenceBackupStatusKey,try jsonString(status)])
             }
-            _ = try handle(method:"backup_create",params:["command_id":uuid(),"reason":"Done ticket files wait for a backup"],caller:Caller(role:"owner",installation:Self.doneEvidenceBackupInstallation,projectIDs:[]))
+            let reply: JSON
+            do {
+                reply = try handle(method:"backup_create",params:["command_id":command,"reason":"Done ticket files wait for a backup"],caller:Caller(role:"owner",installation:Self.doneEvidenceBackupInstallation,projectIDs:[]))
+            } catch {
+                status["state"] = "failed";status["finished_at"] = now()
+                addDoneEvidenceBackupFailure(PublicErrorText.payload(error),to:&status)
+                try saveDoneEvidenceBackupStatus(status)
+                fputs("Done evidence backup deferred; its durable state was retained.\n",stderr)
+                return false
+            }
+            if reply["command_outcome"] as? String == "accepted",let operation = reply["data"] as? JSON {
+                status["state"] = operation["state"] ?? "queued";status["operation_id"] = operation["operation_id"]
+            } else {status["state"] = "complete";status["finished_at"] = now()}
+            // The backup's result is already known. A later status-write failure
+            // must not turn its successful result into an invented backup failure.
+            do {try saveDoneEvidenceBackupStatus(status)} catch {fputs("Done evidence backup status could not be updated.\n",stderr)}
             return true
         } catch {
             fputs("Done evidence backup deferred; its durable state was retained.\n",stderr)

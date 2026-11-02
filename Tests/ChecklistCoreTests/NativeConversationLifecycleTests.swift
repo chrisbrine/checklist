@@ -346,6 +346,111 @@ extension EvidenceAuthorityTests {
         XCTAssertEqual(active["status_category"] as? String,"active")
         XCTAssertNil(active["status_reason"] as? JSON)
     }
+    // CL-398: only a resumed process rotates the generation, and only the relay filter is under test here.
+    private var relayBridge: Caller { Caller(role: "owner", installation: "native-bridge", projectIDs: []) }
+    private func relayCandidates(_ session: String) throws -> [JSON] {
+        try call("delivery_pending", ["native_session_ids": [session], "native_dispatch_candidates": true], relayBridge)["deliveries"] as! [JSON]
+    }
+    private func recordRelayWrite(_ delivery: Any?) throws {
+        _ = try call("delivery_record", ["delivery_id": delivery as! String, "state": "transport_written", "receipt": ["bytes": 12]], relayBridge)
+    }
+    /// Closes the current process and resumes the same conversation in a new one.
+    private func closeAndResume(_ p: JSON, _ worker: Caller, cycle: Int) throws -> Caller {
+        _ = try router.reconcileVerifiedNativeClosure(closure(p, worker), caller: lifecycleOwner)
+        let installation = "\(worker.installation)-r\(cycle)", domain = "claude:\(300 + cycle):7:0"
+        _ = try router.resumeVerifiedNativeSession(resumption(p, worker, installation: installation, domain: domain), caller: bootstrapOwner)
+        return Caller(role: "worker", installation: installation, projectIDs: [p["id"] as! String], sessionID: worker.sessionID!, workspace: workspace.path, executionDomain: domain)
+    }
+    private func inboxReceipt(_ p: JSON, _ note: JSON, _ caller: Caller) throws -> JSON {
+        let inbox = try call("session_inbox", ["project_id": p["id"]!], caller)["deliveries"] as! [JSON]
+        return try XCTUnwrap(inbox.first { $0["message_id"] as? String == note["id"] as? String })
+    }
+    private func markDoneWithNoHolder(_ p: JSON, _ t: JSON) throws {
+        try router.dbQueue.writeWithoutTransaction { db in try router.withValidatedDomainTransaction(db) {
+            var task = try router.scoped(db, t["id"] as! String, p["id"] as! String, type: "task")
+            task["status_id"] = try router.status(db, p["id"] as! String, "done")["id"]!
+            task.removeValue(forKey: "active_attempt_id")
+            try router.save(db, router.revised(task), type: "task")
+            return .commit
+        } }
+    }
+    func testResumedConversationIsNotRelayedANoteTheRelayAlreadyWrote() throws {
+        let p = try project(), t = try ready(p), worker = try native(p, "relay-once", domain: "claude:123:5:0", provider: "claude")
+        _ = try claim(p, t, caller: worker)
+        let note = try call("message_send", ["project_id": p["id"]!, "task_id": t["id"]!, "body": "Written once"])
+        let first = try XCTUnwrap((note["deliveries"] as? [JSON])?.first { $0["recipient_session_id"] as? String == worker.sessionID })
+        XCTAssertTrue(try relayCandidates(worker.sessionID!).contains { $0["id"] as? String == first["id"] as? String })
+        try recordRelayWrite(first["id"])
+        var current = worker
+        // Two cycles: a skipped receipt carries no write, so the rule must read every earlier receipt.
+        for cycle in 1...2 {
+            current = try closeAndResume(p, current, cycle: cycle)
+            XCTAssertFalse(try relayCandidates(worker.sessionID!).contains { $0["message_id"] as? String == note["id"] as? String })
+            // The note is not dropped: pickup and the recovery summary still hold it.
+            let receipt = try inboxReceipt(p, note, current)
+            XCTAssertEqual(receipt["push_state"] as? String, "relay_skipped")
+            XCTAssertEqual(receipt["relay_skipped_for_delivery_id"] as? String, first["id"] as? String)
+            XCTAssertEqual(receipt["state"] as? String, "queued")
+            let recovery = try call("session_inbox", ["project_id": p["id"]!], current)["native_recovery"] as! [JSON]
+            XCTAssertTrue(((recovery.first?["fenced_notices"] as? [JSON]) ?? []).contains { $0["message_id"] as? String == note["id"] as? String })
+        }
+        let list = try call("message_delivery_list", ["project_id": p["id"]!, "task_id": t["id"]!, "message_id": note["id"]!], current)["deliveries"] as! [JSON]
+        XCTAssertEqual(list.filter { $0["recipient_session_id"] as? String == worker.sessionID }.count, 3)
+    }
+    func testResumedConversationIsStillRelayedANoteWithNoWriteEvidence() throws {
+        let p = try project()
+        for (index, outcome) in ["none", "uncertain", "failed", "held"].enumerated() {
+            let t = try ready(p), worker = try native(p, "relay-\(outcome)", domain: "claude:12\(index):5:0", provider: "claude")
+            _ = try claim(p, t, caller: worker)
+            let note = try call("message_send", ["project_id": p["id"]!, "task_id": t["id"]!, "body": "Outcome \(outcome)"])
+            let first = try XCTUnwrap((note["deliveries"] as? [JSON])?.first { $0["recipient_session_id"] as? String == worker.sessionID })
+            switch outcome {
+            case "uncertain", "failed": _ = try call("delivery_record", ["delivery_id": first["id"]!, "state": outcome, "receipt": ["stage": "fixture"]], relayBridge)
+            case "held":
+                try recordRelayWrite(first["id"])
+                _ = try call("delivery_host_status", ["delivery_id": first["id"]!, "status": "held", "receipt": ["host_status": "held"]], relayBridge)
+            default: break
+            }
+            let resumed = try closeAndResume(p, worker, cycle: 10 + index)
+            let candidate = try XCTUnwrap(try relayCandidates(worker.sessionID!).first { $0["message_id"] as? String == note["id"] as? String }, outcome)
+            XCTAssertEqual(candidate["resumed_from_delivery_id"] as? String, first["id"] as? String, outcome)
+            // Its one actual write ends the repeats on the next resumption.
+            try recordRelayWrite(candidate["id"])
+            _ = try closeAndResume(p, resumed, cycle: 20 + index)
+            XCTAssertFalse(try relayCandidates(worker.sessionID!).contains { $0["message_id"] as? String == note["id"] as? String }, outcome)
+        }
+    }
+    func testDoneTicketNoteWithNoHolderIsNotRelayedAgainButAnUnsentOneIsRelayedOnce() throws {
+        let p = try project()
+        for (index, written) in [true, false].enumerated() {
+            let t = try ready(p), worker = try native(p, "relay-done-\(written)", domain: "claude:13\(index):5:0", provider: "claude")
+            _ = try claim(p, t, caller: worker)
+            let note = try call("message_send", ["project_id": p["id"]!, "task_id": t["id"]!, "body": "On a ticket that becomes Done"])
+            let first = try XCTUnwrap((note["deliveries"] as? [JSON])?.first { $0["recipient_session_id"] as? String == worker.sessionID })
+            if written { try recordRelayWrite(first["id"]) }
+            _ = try router.reconcileVerifiedNativeClosure(closure(p, worker), caller: lifecycleOwner)
+            try markDoneWithNoHolder(p, t)
+            let installation = "relay-done-\(index)/2", domain = "claude:14\(index):7:0"
+            _ = try router.resumeVerifiedNativeSession(resumption(p, worker, installation: installation, domain: domain), caller: bootstrapOwner)
+            let resumed = Caller(role: "worker", installation: installation, projectIDs: [p["id"] as! String], sessionID: worker.sessionID!, workspace: workspace.path, executionDomain: domain)
+            let candidate = try relayCandidates(worker.sessionID!).first { $0["message_id"] as? String == note["id"] as? String }
+            XCTAssertEqual(candidate != nil, !written)
+            XCTAssertEqual(try inboxReceipt(p, note, resumed)["push_state"] as? String, written ? "relay_skipped" : "unavailable")
+        }
+    }
+    func testEarlierReceiptOfNoteEvidence() {
+        let sid = "session-a"
+        func receipt(_ fields: JSON) -> [JSON] { var d: JSON = ["id": "d1", "recipient_session_id": sid, "state": "queued", "push_state": "unavailable"]; d.merge(fields) { $1 }; return [d] }
+        for fields: JSON in [["push_state": "transport_written"], ["push_state": "provider_accepted"], ["state": "acknowledged"], ["state": "addressed"], ["state": "delivered"]] {
+            XCTAssertEqual(CommandRouter.earlierReceiptOfNote(receipt(fields), session: sid)?["id"] as? String, "d1")
+        }
+        for fields: JSON in [[:], ["push_state": "uncertain"], ["push_state": "failed"], ["push_state": "held"], ["push_state": "relay_skipped"], ["push_state": "quarantined"],
+                             ["push_state": "transport_written", "host_status": "held"], ["push_state": "transport_written", "host_status": "refused"], ["push_state": "transport_written", "host_status": "expired"]] {
+            XCTAssertNil(CommandRouter.earlierReceiptOfNote(receipt(fields), session: sid))
+        }
+        // Another conversation's receipt is no evidence for this one.
+        XCTAssertNil(CommandRouter.earlierReceiptOfNote(receipt(["push_state": "transport_written"]), session: "session-b"))
+    }
     func testResumeRefusesOwnerDisconnectAndUnfinishedRelease() throws {
         let p = try project(), revoked = try native(p, "owner-revoked", domain: "claude:123:5:0", provider: "claude")
         let current = try router.dbQueue.read { try router.record($0, revoked.sessionID!, type: "session") }

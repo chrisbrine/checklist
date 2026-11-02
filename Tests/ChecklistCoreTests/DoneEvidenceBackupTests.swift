@@ -143,4 +143,143 @@ extension TicketLifecycleCleanupTests {
         _ = try call("backup_create",["path":directory.appendingPathComponent("cl393-owner").path])
         XCTAssertEqual(try router.dbQueue.read {try String.fetchOne($0,sql:"SELECT json_extract(data,'$.origin') FROM events WHERE kind='backup_created' ORDER BY seq DESC LIMIT 1")},"human_ui")
     }
+
+    /// One file is retained for a backup while its backed sibling is pending.
+    /// This is the mixed state that the old completed-only query missed.
+    private func pendingWaitingFiles() throws -> (JSON,JSON,JSON) {
+        let (project,task,first) = try fixture(backed:false)
+        let source = directory.appendingPathComponent("pending-backed-evidence.txt")
+        try Data("a backed sibling".utf8).write(to:source)
+        let second = try call("attachment_add",["project_id":project["id"]!,"task_id":task["id"]!,"path":source.path,"mode":"managed_copy"])
+        let relative = try XCTUnwrap(ManagedPaths.relative(second["path"] as! String,family:"objects",root:router.root))
+        try ticketCleanupBackupTemplate(router,objects:[["relative_path":relative,"sha256":second["sha256"]!,"size":second["size"]!,"kind":"file"]])
+        _ = try configure(project);try router.runTicketLifecycleCleanup()
+        let job = try router.dbQueue.read {db in
+            try XCTUnwrap(self.router.records(db,type:"storage_job").first {$0["kind"] as? String == "ticket_object_delete" && $0["task_id"] as? String == task["id"] as? String})
+        }
+        XCTAssertEqual(job["state"] as? String,"pending")
+        XCTAssertTrue((job["objects"] as? [JSON] ?? []).contains {($0["reasons"] as? [String] ?? []).contains("backup_required")})
+        return (project,job,first)
+    }
+    private func evidenceBackupMaintenance(_ project: JSON) throws -> JSON {
+        let read = try call("ticket_cleanup_receipts",["project_id":project["id"]!])
+        return try XCTUnwrap((read["maintenance"] as? JSON)?["evidence_backup"] as? JSON)
+    }
+    private func blockServiceBackupFolder() throws {
+        let backups = router.root.appendingPathComponent("backups")
+        if FileManager.default.fileExists(atPath:backups.path) {
+            try FileManager.default.moveItem(at:backups,to:directory.appendingPathComponent("preserved-backups"))
+        }
+        try Data("not a directory".utf8).write(to:backups)
+    }
+
+    func testCL394PendingJobHasABackupDeadline() throws {
+        try confirmRetention()
+        _ = try pendingWaitingFiles()
+        XCTAssertNotNil(try deadline())
+        XCTAssertEqual(try serviceBackupCount(),0)
+    }
+
+    func testCL394ProgressingPendingJobKeepsItsBackupSettleDeadline() throws {
+        try confirmRetention()
+        let (_,job,_) = try pendingWaitingFiles()
+        let original = try XCTUnwrap(try deadline())
+        try router.dbQueue.write {db in
+            var progress = job
+            progress["updated_at"] = ISO8601DateFormatter().string(from:original.addingTimeInterval(3600))
+            progress["revision"] = int(progress,"revision") + 1
+            try self.router.save(db,progress,type:"storage_job")
+        }
+        XCTAssertEqual(try deadline(),original,"Byte progress must not postpone a pending job's stable admission-based settle clock")
+    }
+
+    func testCL394InterruptedServiceBackupAttemptHasUnknownOutcome() throws {
+        let (project,_,_) = try fixture()
+        let attempted = ISO8601DateFormatter().string(from:Date()),command = uuid()
+        try router.dbQueue.write {db in
+            try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?),(?,?)",arguments:["done-evidence-backup-attempt",attempted,"done-evidence-backup-status",try jsonString(["state":"starting","attempted_at":attempted,"command_id":command])])
+        }
+        let status = try evidenceBackupMaintenance(project)
+        XCTAssertEqual(status["state"] as? String,"unknown")
+        XCTAssertEqual(status["reason"] as? String,"attempt_outcome_not_recorded")
+        XCTAssertEqual(status["command_id"] as? String,command)
+        XCTAssertNotNil(status["retry_not_before"] as? String)
+    }
+
+    func testCL394PendingJobUsesNewBackupWithoutASecondBackupOrSweep() throws {
+        try confirmRetention()
+        let (_,job,file) = try pendingWaitingFiles()
+        let due = try XCTUnwrap(try deadline())
+        XCTAssertTrue(router.startDoneEvidenceBackupIfDue(at:due.addingTimeInterval(1)))
+        XCTAssertEqual(try serviceBackupCount(),1)
+        // Finish only the existing byte job. Do not run lifecycle selection.
+        XCTAssertTrue(try router.runTicketObjectDeletionCohort())
+        XCTAssertFalse(FileManager.default.fileExists(atPath:file["path"] as! String))
+        let result = try router.dbQueue.read {try self.router.record($0,job["id"] as! String,type:"storage_job")}
+        XCTAssertEqual(result["state"] as? String,"completed")
+        XCTAssertEqual((result["summary"] as? JSON)?["removed_count"] as? Int,2)
+        XCTAssertEqual(try serviceBackupCount(),1)
+        XCTAssertNil(try deadline())
+    }
+
+    func testCL394PendingJobUsesAnAlreadyCompletedBackup() throws {
+        let (_,job,file) = try pendingWaitingFiles()
+        let relative = try XCTUnwrap(ManagedPaths.relative(file["path"] as! String,family:"objects",root:router.root))
+        // The completed copy exists before the pending job's next turn. There
+        // is no completion callback or lifecycle wake in this fixture seam.
+        try ticketCleanupBackupTemplate(router,objects:[["relative_path":relative,"sha256":file["sha256"]!,"size":file["size"]!,"kind":"file"]])
+        XCTAssertTrue(try router.runTicketObjectDeletionCohort())
+        XCTAssertFalse(FileManager.default.fileExists(atPath:file["path"] as! String))
+        let result = try router.dbQueue.read {try self.router.record($0,job["id"] as! String,type:"storage_job")}
+        XCTAssertEqual(result["state"] as? String,"completed")
+        XCTAssertEqual((result["summary"] as? JSON)?["removed_count"] as? Int,2)
+        XCTAssertEqual(try serviceBackupCount(),0)
+    }
+
+    func testCL394LegacyPendingDoneJobKeepsEarlierRetainedOutcomes() throws {
+        let (_,job,_) = try pendingWaitingFiles()
+        var legacy = job;legacy.removeValue(forKey:"cleanup_policy_version")
+        let before = try jsonString(legacy["objects"]!)
+        try router.readers!.read {try self.router.rearmTicketObjectCopyFailures($0,receipt:&legacy,backupGenerationRow:Int64.max)}
+        XCTAssertEqual(try jsonString(legacy["objects"]!),before,"Legacy settlement may retire pending descriptors only; earlier outcomes stay unchanged")
+    }
+
+    func testCL394RefusedServiceBackupIsVisibleInMaintenance() throws {
+        try confirmRetention()
+        let (project,_,_) = try waitingFile()
+        XCTAssertTrue(try evidenceBackupMaintenance(project).isEmpty)
+        try blockServiceBackupFolder()
+        let due = try XCTUnwrap(try deadline())
+        XCTAssertFalse(router.startDoneEvidenceBackupIfDue(at:due.addingTimeInterval(1)))
+        let status = try evidenceBackupMaintenance(project)
+        XCTAssertEqual(status["state"] as? String,"failed")
+        XCTAssertEqual(status["error_code"] as? String,"STORAGE_OBJECT_UNAVAILABLE")
+        XCTAssertNotNil(status["command_id"] as? String)
+        let floor = try XCTUnwrap(ISO8601DateFormatter().date(from:try XCTUnwrap(status["retry_not_before"] as? String)))
+        XCTAssertEqual(floor.timeIntervalSince(due.addingTimeInterval(1)),CommandRouter.doneEvidenceBackupInterval,accuracy:1)
+        XCTAssertEqual(try serviceBackupCount(),0)
+    }
+
+    func testCL394AsynchronousBackupFailureIsVisibleInMaintenance() throws {
+        try confirmRetention()
+        let (project,_,_) = try waitingFile()
+        try blockServiceBackupFolder()
+        let lane = DispatchQueue(label:"cl394-backup-failure")
+        lane.suspend();var suspended = true
+        defer {if suspended {lane.resume()}}
+        router.configureCommandOperations(on:lane)
+        let due = try XCTUnwrap(try deadline())
+        XCTAssertTrue(router.startDoneEvidenceBackupIfDue(at:due.addingTimeInterval(1)))
+        let accepted = try evidenceBackupMaintenance(project)
+        XCTAssertEqual(accepted["state"] as? String,"queued")
+        XCTAssertNotNil(accepted["operation_id"] as? String)
+        lane.resume();suspended = false;lane.sync {}
+        let status = try evidenceBackupMaintenance(project)
+        XCTAssertEqual(status["state"] as? String,"failed")
+        XCTAssertEqual(status["error_code"] as? String,"STORAGE_OBJECT_UNAVAILABLE")
+        XCTAssertEqual(status["operation_id"] as? String,accepted["operation_id"] as? String)
+        XCTAssertNotNil(status["finished_at"] as? String)
+        XCTAssertEqual(try serviceBackupCount(),0)
+    }
+
 }
