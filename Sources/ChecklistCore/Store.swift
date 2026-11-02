@@ -32,6 +32,7 @@ public final class CommandRouter: @unchecked Sendable {
     let storageAdmission = StorageAdmission()
     let backupWrites = BackupWriteQueue()
     let automaticBackupRetentionLock = NSLock()
+    var qualificationBackupPruneListedURL: ((URL,URL) -> URL)? // Test-only URL spelling seam; nil keeps filesystem enumeration.
     var automaticBackupRetentionTrashRoot: URL? // Owned fixture directory only; nil uses the production Trash.
     let commandOperations = CommandOperations()
     // Per-command/transaction state, accessed only on the sole writer connection.

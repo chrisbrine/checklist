@@ -178,7 +178,9 @@ extension CommandRouter {
                 try createStorageBackup(params:params,caller:caller,budget:budget,retention:retention)
             }
             if let data = result["data"] as? JSON,let operation = data["operation_id"] as? String {
-                result["backup_retention"] = applyAutomaticBackupRetention(after:operation)
+                try budget.observe("retention_begin")
+                result["backup_retention"] = applyAutomaticBackupRetention(after:operation,observe:{try budget.observe("retention_" + $0)})
+                try budget.observe("retention_end")
             }
             return result
         } catch {
@@ -252,7 +254,9 @@ extension CommandRouter {
               !destination.path.hasPrefix(root.standardizedFileURL.path + "/source-captures/") else { throw CoreError("INVALID_INPUT","Choose a separate backup destination.") }
         let parent = destination.deletingLastPathComponent(), name = destination.lastPathComponent
         func commitBackup(_ receipt: StorageSnapshotReceipt) throws -> JSON {
+            try budget.observe("receipt_prepare_begin")
             let prepared = try prepareStorageBackupReceipt(destination:destination,receipt:receipt,identity:identity,budget:budget)
+            try budget.observe("receipt_prepare_end")
             return try ArchiveStorageGate.withExclusive(root:root) { permit in
                 try dbQueue.writeWithoutTransaction { db in
                     try self.commitStorageBackupReceipt(db,params:params,caller:caller,permit:permit,command:command,digest:digest,key:key,destination:destination,receipt:receipt,identity:identity,generation:prepared.generation,summary:prepared.summary,projectIDs:prepared.projectIDs)
@@ -323,9 +327,12 @@ extension CommandRouter {
             }
             try copy.close()
         } catch {try? copy.close();throw error}
+        try budget.observe("receipt_manifest_loaded")
         let manifestIndex = try StorageBackupManifestIndex.prepare(root:root,manifest:manifest,manifestSHA256:receipt.manifestSHA256)
+        try budget.observe("receipt_index_prepared")
         let files = try StorageObjectFiles(root:destination)
         let usage = try StorageCopyUsage.measure(files,paths:["database.sqlite","manifest.json","intent.json"] + manifest.objects.map {"managed/" + $0.descriptor.relativePath},budget:budget)
+        try budget.observe("receipt_usage_measured")
         let summary: JSON = ["kind":"backup","operation_id":receipt.operationID.uuidString.lowercased(),"path":destination.path,
             "source_root":manifest.sourceRoot,"store_id":manifest.storeID,"captured_at":manifest.capturedAt as Any? ?? NSNull(),
             "verified_at":now(),"verification":"manifest_database_managed_files","manifest_sha256":receipt.manifestSHA256,"usage":usage,

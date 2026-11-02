@@ -7,6 +7,8 @@ import Darwin
 /// immutable manifest; deletion still pins and verifies that manifest and payload.
 /// Receipts bind both digests so a cache can never substitute another generation.
 enum StorageBackupManifestIndex {
+    /// Internal phase seam for an explicit owned-copy memory check.
+    nonisolated(unsafe) static var qualificationObserve: ((String) -> Void)?
     /// Internal crash/fault seam; production installs no callback.
     nonisolated(unsafe) static var historicalCatalogObserve: ((String) throws -> Void)?
     static func prepare(root: URL, manifest: StorageSnapshotManifest, manifestSHA256: String) throws -> JSON {
@@ -181,6 +183,8 @@ enum StorageBackupManifestIndex {
         for key in cache.keys where key.hasPrefix(prefix) && !manifests.contains(where:{key.hasPrefix(prefix + $0 + ".keys:")}) {cache.removeValue(forKey:key)}
     }
     static func generation(_ value: JSON,root: URL) throws -> Lookup.Generation {
+        qualificationObserve?("index_generation_begin")
+        defer {qualificationObserve?("index_generation_end")}
         guard let descriptor = value["manifest_index"] as? JSON,let relative = descriptor["path"] as? String,
               relative.hasPrefix("backups/.indexes/"),let digest = descriptor["sha256"] as? String,
               let count = descriptor["count"] as? Int,count >= 0,count <= 1_000_000,

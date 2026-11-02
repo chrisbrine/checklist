@@ -7,6 +7,8 @@ import CoreFoundation
 /// snapshot: read-only backup volumes remain usable. Every supported pruner takes
 /// the exclusive lease before moving its directory; proof/restore take shared.
 final class StorageBackupUseLease {
+    /// Internal owned-copy memory phase seam; production installs no observer.
+    nonisolated(unsafe) static var qualificationObserve: ((String) -> Void)?
     let files: StorageObjectFiles
     private let descriptor: Int32
     private let identity: stat
@@ -37,8 +39,18 @@ final class StorageBackupUseLease {
               TicketObjectRemovalVerification.same(identity,actual) else {throw StorageSnapshotFailure.sourceChanged}
     }
     func manifestSHA256() throws -> String {
-        let bytes = try files.read("manifest.json",maximum:StorageSnapshotBudget.manifestByteLimit)
-        try requireCurrent();return hash(bytes)
+        Self.qualificationObserve?("retention_manifest_begin")
+        defer {Self.qualificationObserve?("retention_manifest_end")}
+        let digest = try Self.manifestSHA256(files)
+        try requireCurrent();return digest
+    }
+    /// Hash complete manifests without allocating a manifest-sized Data value.
+    /// Retention had no time/cancellation budget; preserve that behavior and the
+    /// exact byte admission while using the existing 64 KiB, identity-checked reader.
+    static func manifestSHA256(_ files: StorageObjectFiles) throws -> String {
+        var budget = StorageSnapshotBudget(deadlineUptime:.infinity,canceled:{false})
+        budget.maximumBytes = Int64(StorageSnapshotBudget.manifestByteLimit)
+        return try autoreleasepool {try files.digest("manifest.json",budget:budget).0}
     }
 }
 
@@ -341,7 +353,8 @@ extension CommandRouter {
         if FileManager.default.fileExists(atPath:parent.path) {
             let files = try StorageObjectFiles(root:parent,pinRootForGates:true)
             func scan(_ base: URL,_ depth: Int) throws {
-                for url in try FileManager.default.contentsOfDirectory(at:base,includingPropertiesForKeys:nil) {
+                for listed in try FileManager.default.contentsOfDirectory(at:base,includingPropertiesForKeys:nil) {
+                    let url = qualificationBackupPruneListedURL?(base,listed) ?? listed
                     var info = stat()
                     guard lstat(url.path,&info) == 0,info.st_mode & S_IFMT == S_IFDIR else {continue}
                     if url.lastPathComponent.hasPrefix("qualification-"),depth == 0 {try scan(url,1);continue}
@@ -430,7 +443,9 @@ extension CommandRouter {
             // lease pins every ancestor, which would open the Trash root; nothing
             // proves or restores from a moved copy, so this reads it by path.
             let moved = try StorageObjectFiles(root:destination,folderAccess:.insideTrash)
-            try exact(moved) {hash(try moved.read("manifest.json",maximum:StorageSnapshotBudget.manifestByteLimit))}
+            try exact(moved) {
+                try StorageBackupUseLease.manifestSHA256(moved)
+            }
             return
         }
         let lease = try StorageBackupUseLease(root:source,exclusive:true)
