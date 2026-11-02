@@ -90,7 +90,7 @@ backup.
 
 ## Installed measure (CL-406, 2 November 2026)
 
-The footprint of the installed service, sampled every few seconds from service start through a complete post-install backup, with 281 s of backup in both cases:
+The footprint of the installed service through a complete post-install backup, with 281 s of backup in both cases:
 
 | Build | Peak footprint | Footprint after the backup |
 | --- | ---: | ---: |
