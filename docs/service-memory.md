@@ -97,5 +97,15 @@ The footprint of the installed service, sampled every few seconds from service s
 | 265 | 13,167 MiB | 1,449 MiB (13 s after the backup), about 2,000 MiB later |
 | 266 | 1,574 MiB | 700 MiB (5 min after start) |
 
-Build 265 was sampled from 5 minutes after start, so its peak is the kernel's lifetime value. Build 266 has the sampled timeline. The change between the builds is that automatic retention streams each retained manifest's hash. On an owned copy with ten older backups, that change alone took the peak from 2,674 to 1,456 MiB, so it does not explain every byte of the difference on the live service. The first run of build 265 also retired legacy command replies. The peak is a single install's result: a later service backup can differ. Read it with `footprint -p PID -f bytes`.
+Build 265 was sampled from 5 minutes after start, so its peak is the kernel's lifetime value. Build 266 has the sampled timeline. The change between the builds is that automatic retention streams each retained manifest's hash.
+
+The live peak fell by 11,592.8 MiB. Owned-copy measures with ten older backups give the change only part of that fall, and they overlap, so they do not add:
+
+| Owned measure | Build 265 peak | Build 266 peak | Difference |
+| --- | ---: | ---: | ---: |
+| One backup with automatic retention | 2,674 MiB | 1,456 MiB | 1,218.5 MiB |
+| Two backups, byte turns and reads (the build 266 run stopped at its own time limit during backup 2) | 2,894.9 MiB | 1,565.0 MiB | 1,329.9 MiB |
+| One real retention move with replay | 2,471.1 MiB | 230.4 MiB | 2,240.7 MiB |
+
+So the measured share is 11% to 19%. The other 9,352 to 10,374 MiB (81% to 89%) has no measured cause, and none of these measures approaches 13 GB. CL-409 holds that remainder and the conditions that a measure did not reproduce. The fall on the live service can come from a condition that this one install did not repeat, so a later service backup can differ. Read the peak with `footprint -p PID -f bytes`.
 
