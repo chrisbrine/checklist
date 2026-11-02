@@ -254,8 +254,9 @@ extension CommandRouter {
         let deliveries = try rows.map { row -> JSON in
             let delivery = try deliveryReceiptProjection(db,GRDBRecordEnvelopeAdapter.decode(row,expectedType:"delivery").object)
             // Keep transport receipts, reply allowances, note bodies and credentials private.
-            let fields = ["id","message_id","recipient_session_id","recipient_authorization_generation","recipient_role","label","push_state","host_status","created_at","updated_at","delivered_at","acknowledged_at","addressed_at","host_status_at","native_closure_ref","owner_disconnect_ref","fenced_at","resumed_from_delivery_id","relay_skipped_for_delivery_id","resumed_native_closure_ref"]
+            let fields = ["id","message_id","recipient_session_id","recipient_authorization_generation","recipient_role","label","push_state","host_status","created_at","updated_at","delivered_at","acknowledged_at","addressed_at","host_status_at","native_closure_ref","owner_disconnect_ref","fenced_at","resumed_from_delivery_id","relay_skipped_for_delivery_id","resumed_native_closure_ref","hook_route","hook_state","hook_written_at","hook_reason"]
             var result = delivery.filter { fields.contains($0.key) }
+            if let receipt = codexQueueRouteReceipt(delivery["transport_receipt"] as? JSON) { result["route_receipt"] = receipt }
             let state = delivery["state"] as? String ?? "queued"
             result["state"] = ["fenced","quarantined"].contains(state) ? state : ["acknowledged","addressed"].contains(state) ? "acknowledged" : (state == "delivered" ? "delivered" : "queued")
             return result
@@ -263,6 +264,32 @@ extension CommandRouter {
         var result: JSON = ["message_id":mid,subjectKey:subjectID,"deliveries":deliveries]
         // No recipient exists yet; do not invent a delivery ID or generation.
         if deliveries.isEmpty { result["delivery_status"] = "saved_for_pickup"; result["created_at"] = message["created_at"] }
+        return result
+    }
+
+    /// Public route evidence is a closed vocabulary. Transport diagnostics can
+    /// contain local paths, note text and credentials; never copy them wholesale.
+    func codexQueueRouteReceipt(_ receipt: JSON?) -> JSON? {
+        guard let receipt,receipt["route"] as? String == "codex_app_queue" else { return nil }
+        let allowed: [String:Set<String>] = [
+            "result":["provider_accepted","refused","failed","uncertain"],
+            "observer":["codex_state_5_threads_source"],
+            "source":["vscode","exec","mcp","subagent","unknown"],
+            "reason_code":["source_vscode","source_exec","source_mcp","source_subagent","source_unknown","thread_missing",
+                "database_missing","database_version_unsupported","database_locked","schema_unrecognized","database_read_error",
+                "database_unsafe","recipient_invalid","route_disabled","queue_command_failed","queue_outcome_unknown","recipient_changed"],
+            "queue_poll_result":["not_started","item_unconfirmed","removed","pending_after_20s","database_missing",
+                "database_version_unsupported","database_locked","schema_unrecognized","database_read_error","database_unsafe","authorization_changed"],
+            "open_result":["not_started","not_needed","disabled","refused","authorization_changed","exited_zero","failed","outcome_unknown"]
+        ]
+        var result: JSON = ["route":"codex_app_queue"]
+        for (field,values) in allowed { if let value = receipt[field] as? String,values.contains(value) { result[field] = value } }
+        if let item = receipt["queued_item_id"] as? String,(1...160).contains(item.utf8.count),
+           item.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 95 || $0 == 45 }) {
+            result["queued_item_id"] = item
+        }
+        if let number = receipt["open_exit_status"] as? NSNumber,CFGetTypeID(number) != CFBooleanGetTypeID(),
+           let status = Int(number.stringValue),(-1...255).contains(status) { result["open_exit_status"] = status }
         return result
     }
 

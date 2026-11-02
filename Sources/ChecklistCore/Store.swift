@@ -341,7 +341,13 @@ public final class CommandRouter: @unchecked Sendable {
                    try hasCommandOperation(params:params,caller:caller) || (!legacyReserved && needsCommandOperation(method:method,params:params,caller:caller)) {
                     return try acceptCommandOperation(method:method,params:params,caller:caller)
                 }
-                if (!Self.readMethods.contains(method) && method != "backup_create") || legacyReserved {
+                // CL-410: a hook confirmation is refused during a capture and never queued. The note repeats at a later tool call.
+                if method == "codex_hook_confirm",!legacyReserved {
+                    switch backupWrites.admitWriterDependentRead() {
+                    case .reply(var result):result["command_id"] = params["command_id"];return result
+                    case .run:admittedWrite = true
+                    }
+                } else if (!Self.readMethods.contains(method) && method != "backup_create") || legacyReserved {
                     switch try backupWrites.admit(method:method,params:params,caller:caller,admission:storageAdmission,authorization:{try backupWriteAuthorization(params:params,caller:caller)}) {
                     case .reply(let result):return result
                     case .run:admittedWrite = true
@@ -483,7 +489,9 @@ public final class CommandRouter: @unchecked Sendable {
             try? ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { _ in try dbQueue.writeWithoutTransaction { db in try self.recordManagedImportPreparationFailure(db,method:method,params:params,caller:caller,error:error) } }
             throw error
         }
-        return try ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { permit in
+        // CL-410 F6: with a reader pool, the recipient scans run after the writer and the object gate are free.
+        var noticesAfterWriter = false
+        let writerOutput: JSON = try ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { permit in
         return try dbQueue.writeWithoutTransaction { db in try autoreleasepool {
             // Decode/encode temporaries belong to this command, including its
             // post-commit maintenance and notices. Drain on the writer's thread;
@@ -562,11 +570,25 @@ public final class CommandRouter: @unchecked Sendable {
             catch {maintenanceWarning = maintenanceWarning ?? .retryPending}
             // Dynamic recipient notices are not part of the durable command outcome.
             // Replayed commands observe current pending deliveries without replaying an answer.
-            do { output = try self.addingHumanAnswerNotices(db,output:output,params:params,caller:caller) }
-            catch { output = self.addingHumanAnswerNoticeFailure(output,caller:caller) }
+            if !CommandMethods.codexHookOnly.contains(method) {
+                if self.readers == nil {
+                    do { output = try self.addingHumanAnswerNotices(db,output:output,params:params,caller:caller) }
+                    catch { output = self.addingHumanAnswerNoticeFailure(db,output,caller:caller) }
+                } else { noticesAfterWriter = true }
+            }
             return self.commandManagedPathProjection(self.addingStorageMaintenanceNotice(output, warning: maintenanceWarning),caller:caller,command:params["command_id"] as? String)
         }}
     }
+        guard noticesAfterWriter,let readers else { return writerOutput }
+        return autoreleasepool { addingRecipientNotices(readers,output:writerOutput,params:params,caller:caller) }
+    }
+    private func addingRecipientNotices(_ readers: DatabasePool,output: JSON,params: JSON,caller: Caller) -> JSON {
+        do {
+            return try readers.read { db in
+                do { return try self.addingHumanAnswerNotices(db,output:output,params:params,caller:caller) }
+                catch { return self.addingHumanAnswerNoticeFailure(db,output,caller:caller) }
+            }
+        } catch { return addingRecipientNoticesUnavailable(output,caller:caller) }
     }
     func refreshReplayedClaim(_ db: Database,method: String,output: inout JSON,caller: Caller) throws {
         guard ["work_claim","work_child_accept","work_handoff_accept","work_takeover"].contains(method),
@@ -611,8 +633,9 @@ public final class CommandRouter: @unchecked Sendable {
             }
             let data = try self.dispatch(db,method:method,p:params,c:caller)
             var output: JSON = ["data":data,"event_cursor":try self.cursor(db,caller:caller,scope:try self.authorizationScope(db,caller))]
+            if CommandMethods.codexHookOnly.contains(method) { return output }
             do { output = try self.addingHumanAnswerNotices(db,output:output,params:params,caller:caller) }
-            catch { output = self.addingHumanAnswerNoticeFailure(output,caller:caller) }
+            catch { output = self.addingHumanAnswerNoticeFailure(db,output,caller:caller) }
             return output
         }}
     }

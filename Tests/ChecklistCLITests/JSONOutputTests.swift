@@ -33,6 +33,14 @@ final class JSONOutputTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(Value.self, from: parsed), value)
     }
 
+    func testCallWriterPreservesPendingNoteMetadata() throws {
+        let value: Value = .object(["data":.object(["id":.string("command-result"),"_checklist":.object([
+            "pending_notes":.object(["schema_version":.int(1),"status":.string("pending_pickup"),"items":.array([
+                .object(["message_id":.string("note-id"),"task_key":.string("SYN-1"),"project_id":.string("project-id")])]),"has_more":.bool(false)])])])])
+        let parsed = try strictlyParse { try ChecklistCommand.printJSON(value,to:$0) }
+        XCTAssertEqual(try JSONDecoder().decode(Value.self,from:parsed),value)
+    }
+
     func testGuardEscapesRawControlsInKeysAndNestedValuesWithoutChangingFormattingOrEscapes() throws {
         let raw = Data(("{\n\t\"" + controls + "\": [\"prefix \\\" \\\\ \\n \\u001f " + controls + " é🧪\"]\r\n}").utf8)
         let safe = JSONOutput.escapingStringControls(raw)

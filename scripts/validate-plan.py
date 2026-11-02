@@ -68,6 +68,16 @@ def synthetic_project_cleanup_errors(body: str) -> list[int]:
 
 
 SKILL_RULE_TEXT = {
+    'skills/checklist/SKILL.md': (
+        "the orchestrator holds the Triage and gets all of its messages; each thread claims its own ticket and gets that ticket's messages.",
+        'An orchestrator adds a ticket that it creates during a pass',
+        'docs/triage-orchestrators.md',
+    ),
+    'skills/checklist/references/setup.md': (
+        "the orchestrator holds the Triage and gets all of its messages; each thread claims its own ticket and gets that ticket's messages.",
+        'An orchestrator adds a ticket that it creates during a pass',
+        'docs/triage-orchestrators.md',
+    ),
     'skills/checklist/references/coordinate.md': (
         'a NOT SHOWN or FAIL item is never submitted as a limitation alone',
         'measured step times of the current round',
@@ -123,6 +133,19 @@ def skill_reference_errors(root: Path) -> list[str]:
     if dict(rows) != expected:
         difference = sorted(set(dict(rows).items()) ^ set(expected.items()))
         errors.append(f'driven-sessions.md: operation read table differs from docs/mcp-contract.md: {difference}')
+    return errors
+
+
+def task_create_triage_errors(root: Path) -> list[str]:
+    """CL-411: the contract and the tool catalog agree on the optional task_create Triage field."""
+    errors = []
+    row = re.search(r'^\| `task_create` \|.*$', (root / 'docs/mcp-contract.md').read_text(), re.M)
+    if not row or 'triage_id' not in row.group(0) or '`triage_membership`' not in row.group(0):
+        errors.append('docs/mcp-contract.md: task_create row does not state triage_id and triage_membership')
+    catalog = (root / 'Sources/ChecklistCore/Catalog.swift').read_text()
+    fields = re.search(r'"task_create":\[([^\]]*)\]', catalog)
+    if not fields or '"triage_id"' not in fields.group(1):
+        errors.append('Sources/ChecklistCore/Catalog.swift: task_create fields do not include triage_id')
     return errors
 
 
@@ -320,6 +343,7 @@ def check() -> dict:
                 errors.append(f'Heading missing: {path.relative_to(ROOT)} -> {target}#{fragment}')
 
     errors += skill_reference_errors(ROOT)
+    errors += task_create_triage_errors(ROOT)
 
     concept_data = json.loads((ROOT / 'docs/design/prompts.json').read_text())
     outputs = [v for v in concept_data['outputs'] if v.get('selected')]

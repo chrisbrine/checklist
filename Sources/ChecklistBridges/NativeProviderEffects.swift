@@ -155,3 +155,188 @@ enum NativeSocketIO {
         }
     }
 }
+
+/// Exit success records queue-command acceptance only. It does not prove that
+/// the thread received the note, started a turn, read it or acknowledged it.
+public struct CodexQueueReceipt: Equatable, Sendable {
+    public let exitStatus: Int32
+    public let byteCount: Int
+    public let itemID: String?
+    public init(exitStatus: Int32, byteCount: Int, itemID: String? = nil) {
+        self.exitStatus = exitStatus; self.byteCount = byteCount; self.itemID = itemID
+    }
+}
+
+public protocol CodexQueueTransportEffects {
+    func queue(content: String, registration: NativeLifecycleRegistration, timeout: TimeInterval) throws -> CodexQueueReceipt
+}
+
+/// One bounded invocation of the registered host's own executable. No shell,
+/// model start, remote endpoint, retry or caller-selected executable is used.
+public struct MacOSCodexQueueTransportEffects: CodexQueueTransportEffects {
+    public init() {}
+    public func queue(content: String, registration: NativeLifecycleRegistration, timeout: TimeInterval) throws -> CodexQueueReceipt {
+        guard registration.provider == "codex",
+              NativeLifecycleInspector.inspect(registration).process == .running else {
+            throw NativeBridgeError.invalid("RECIPIENT_CHANGED: registered Codex host process is no longer current.")
+        }
+        var path = [CChar](repeating:0,count:4096)
+        guard proc_pidpath(registration.processID,&path,UInt32(path.count)) > 0 else {
+            throw NativeBridgeError.invalid("CODEX_QUEUE_EXECUTABLE_UNPROVEN: registered Codex executable cannot be observed.")
+        }
+        let executable = String(decoding:path.prefix { $0 != 0 }.map { UInt8(bitPattern:$0) },as:UTF8.self)
+        guard URL(fileURLWithPath:executable).lastPathComponent == "codex" else {
+            throw NativeBridgeError.invalid("CODEX_QUEUE_EXECUTABLE_UNPROVEN: registered host is not the Codex executable.")
+        }
+        guard UUID(uuidString:registration.sessionID) != nil else {
+            throw NativeBridgeError.invalid("CODEX_QUEUE_THREAD_INVALID: registered thread is not a UUID.")
+        }
+        let environment = try CodexCommandEnvironment.current()
+        guard NativeLifecycleInspector.inspect(registration).process == .running else {
+            throw NativeBridgeError.invalid("RECIPIENT_CHANGED: registered Codex host process changed before queue execution.")
+        }
+        let result = try BoundedCodexCommand.run(executable:executable,
+            arguments:["queue","--thread",registration.sessionID,"--message",content],
+            environment:environment,timeout:timeout,captureOutput:true)
+        guard result.exitedNormally, result.exitStatus == 0 else {
+            // A failed process can have committed its queue write before failure.
+            throw NativeBridgeError.outcomeUnknown("Codex queue ended without a successful exit (status \(result.exitStatus)).")
+        }
+        // Codex 0.159.0 prints this receipt on stdout. Invalid/truncated output
+        // cannot identify the item, but does not undo successful queue acceptance.
+        let itemID = result.outputOverflow ? nil : CodexQueueOutput.itemID(result.output,threadID:registration.sessionID)
+        return CodexQueueReceipt(exitStatus:0,byteCount:content.utf8.count,itemID:itemID)
+    }
+}
+
+public protocol CodexThreadOpenEffects {
+    func open(threadID: String, timeout: TimeInterval) throws -> Int32
+}
+
+/// The relay authorizes this effect only after an accepted queue item remains.
+/// An argument array and a canonical UUID prevent URL/command injection.
+public struct MacOSCodexThreadOpenEffects: CodexThreadOpenEffects {
+    public init() {}
+    public func open(threadID: String, timeout: TimeInterval) throws -> Int32 {
+        let arguments = try Self.arguments(threadID:threadID)
+        let result = try BoundedCodexCommand.run(executable:"/usr/bin/open",arguments:arguments,
+            environment:try CodexCommandEnvironment.current(),timeout:timeout,captureOutput:false)
+        guard result.exitedNormally else {
+            throw NativeBridgeError.outcomeUnknown("Codex thread open terminated without a normal exit.")
+        }
+        return result.exitStatus
+    }
+
+    static func arguments(threadID: String) throws -> [String] {
+        guard let uuid = UUID(uuidString:threadID) else {
+            throw NativeBridgeError.invalid("CODEX_OPEN_THREAD_INVALID: thread is not a UUID.")
+        }
+        return ["-g","codex://threads/"+uuid.uuidString.lowercased()]
+    }
+}
+
+enum CodexQueueOutput {
+    static func itemID(_ output: Data, threadID: String) -> String? {
+        guard let expected = UUID(uuidString:threadID),
+              var line = String(data:output,encoding:.utf8) else { return nil }
+        if line.hasSuffix("\n") { line.removeLast() }
+        guard !line.contains("\n"), !line.contains("\r"),
+              line.hasPrefix("Queued message "), line.hasSuffix(".") else { return nil }
+        let content = line.dropFirst("Queued message ".count).dropLast()
+        let parts = content.components(separatedBy:" for thread ")
+        guard parts.count == 2, UUID(uuidString:parts[1]) == expected,
+              !parts[0].isEmpty, parts[0].utf8.count <= 160,
+              parts[0].utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) ||
+                  (97...122).contains($0) || $0 == 45 || $0 == 95 }) else { return nil }
+        return parts[0]
+    }
+}
+
+/// Derive the same on-disk home as the production observer from the OS account,
+/// never from a caller's HOME or CODEX_HOME override.
+enum CodexCommandEnvironment {
+    static func current() throws -> [String:String] {
+        var account = passwd()
+        var found: UnsafeMutablePointer<passwd>?
+        var buffer = [CChar](repeating:0,count:16_384)
+        let capacity = buffer.count
+        let status = getpwuid_r(getuid(),&account,&buffer,capacity,&found)
+        guard status == 0, found != nil, let directory = account.pw_dir else {
+            throw NativeBridgeError.invalid("CODEX_HOME_UNAVAILABLE: OS account home cannot be resolved.")
+        }
+        return try pinned(ProcessInfo.processInfo.environment,home:String(cString:directory))
+    }
+
+    static func pinned(_ environment: [String:String], home: String) throws -> [String:String] {
+        guard home.hasPrefix("/"), !home.utf8.contains(0) else {
+            throw NativeBridgeError.invalid("CODEX_HOME_UNAVAILABLE: OS account home is invalid.")
+        }
+        var result = environment
+        result["HOME"] = home
+        result["CODEX_HOME"] = URL(fileURLWithPath:home).appendingPathComponent(".codex").path
+        return result
+    }
+}
+
+/// Drain without waiting for EOF: a descendant may retain stdout after its
+/// parent exits. Output is bounded even if the child writes continuously.
+enum BoundedCodexCommand {
+    struct Result {
+        let exitStatus: Int32
+        let exitedNormally: Bool
+        let output: Data
+        let outputOverflow: Bool
+    }
+
+    static func run(executable: String, arguments: [String], environment: [String:String],
+                    timeout: TimeInterval, captureOutput: Bool) throws -> Result {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath:executable)
+        process.arguments = arguments
+        process.environment = environment
+        process.standardInput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        let output = Pipe()
+        process.standardOutput = captureOutput ? output.fileHandleForWriting : FileHandle.nullDevice
+        defer { try? output.fileHandleForReading.close(); try? output.fileHandleForWriting.close() }
+        if captureOutput {
+            let descriptor = output.fileHandleForReading.fileDescriptor
+            guard fcntl(descriptor,F_SETFL,O_NONBLOCK) == 0 else { throw NativeBridgeError.system("fcntl queue output",errno) }
+        }
+        let finished = DispatchSemaphore(value:0)
+        process.terminationHandler = { _ in finished.signal() }
+        try process.run()
+        if captureOutput { try? output.fileHandleForWriting.close() }
+        let deadline = ProcessInfo.processInfo.systemUptime + min(max(timeout,0.05),5)
+        var bytes = Data()
+        var overflow = false
+        func drain() {
+            guard captureOutput else { return }
+            var chunk = [UInt8](repeating:0,count:4096)
+            for _ in 0..<16 {
+                let capacity = chunk.count
+                let count = Darwin.read(output.fileHandleForReading.fileDescriptor,&chunk,capacity)
+                guard count > 0 else { break }
+                let room = max(0,4096-bytes.count)
+                bytes.append(contentsOf:chunk.prefix(min(room,count)))
+                if count > room { overflow = true }
+            }
+        }
+        while true {
+            drain()
+            if finished.wait(timeout:.now()) == .success { break }
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            guard remaining > 0 else {
+                if process.isRunning { process.terminate() }
+                if finished.wait(timeout:.now()+0.1) != .success, process.isRunning {
+                    _ = kill(process.processIdentifier,SIGKILL)
+                }
+                throw NativeBridgeError.outcomeUnknown("Codex command exceeded its bounded deadline; its effect may already have occurred.")
+            }
+            if finished.wait(timeout:.now()+min(remaining,0.01)) == .success { break }
+        }
+        drain()
+        return Result(exitStatus:process.terminationStatus,exitedNormally:process.terminationReason == .exit,
+                      output:bytes,outputOverflow:overflow)
+    }
+}

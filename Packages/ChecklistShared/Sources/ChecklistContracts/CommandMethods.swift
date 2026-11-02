@@ -25,7 +25,10 @@ public enum CommandMethods {
         "media_example_read_lease",
         "media_example_read_release",
     ]
+    /// CL-410: reachable only by the `codex-post-tool` CLI hook. Hidden from the model-visible catalog.
+    public static let codexHookOnly: Set<String> = ["codex_hook_pickup", "codex_hook_confirm"]
     public static let coreReads: Set<String> = mediaOwnerReads.union(mediaWorkerReads).union([
+        "codex_hook_pickup",
         "import_preview",
         "import_receipt_get",
         "restore_preview",

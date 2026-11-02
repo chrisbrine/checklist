@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import MCP
 import ChecklistIPC
@@ -284,6 +285,55 @@ public actor Bridge {
         reportConnectionRecovery()
     }
 
+    /// One bounded hook pickup, through the same native discovery and authenticated
+    /// bootstrap as `call`. No stdin/session argument can select the recipient.
+    /// The hook environment cannot start the service. It reads the credential of the
+    /// installation that bootstrap named, from the credential file, with no Keychain path.
+    public func codexHookPickup(timeBudget: TimeInterval, hookSessionID: String) throws -> Value {
+        guard command == "codex-post-tool", automatic, expectedSession == nil, assistantProject == nil,
+              let context = discover().context, context.provider == "codex",
+              UUID(uuidString: hookSessionID) == UUID(uuidString: context.nativeSessionID) else {
+            throw BridgeError("NATIVE_CONTEXT_REQUIRED: The PostToolUse hook requires its actual native Codex worker.")
+        }
+        let deadline = environment.now() + timeBudget
+        func remaining() throws -> TimeInterval {
+            let left = deadline - environment.now()
+            guard left > 0 else { throw BridgeError("HOOK_TIMEOUT: The pickup budget expired.") }
+            return left
+        }
+        // Bootstrap the exact observation checked above. A second discovery could
+        // select another host rollout between validation and pickup.
+        guard try bootstrap(context, required: true, timeBudget: remaining()) != nil,
+              !delegating, setupContext == nil else {
+            throw BridgeError("NATIVE_CONTEXT_REQUIRED: The hook did not obtain a native worker binding.")
+        }
+        return try mcpValue(client.call("codex_hook_pickup", [:], replyTimeout: remaining()))
+    }
+
+    /// The step after stdout is written. Only this step stamps. The command ID derives from the
+    /// delivery IDs, so a retry of the same set replays. A failure leaves the note unconfirmed,
+    /// and it shows again at a later tool call.
+    public func codexHookConfirm(deliveryIDs: [String], timeBudget: TimeInterval) throws -> Value {
+        guard command == "codex-post-tool", automatic, expectedSession == nil, assistantProject == nil, !deliveryIDs.isEmpty else {
+            throw BridgeError("NATIVE_CONTEXT_REQUIRED: Only the PostToolUse hook confirms its output.")
+        }
+        guard timeBudget > 0 else { throw BridgeError("HOOK_TIMEOUT: The confirmation budget expired.") }
+        let ordered = deliveryIDs.sorted()
+        return try mcpValue(client.call("codex_hook_confirm", ["command_id": Self.codexHookConfirmCommandID(ordered), "delivery_ids": ordered], replyTimeout: timeBudget))
+    }
+
+    public static func codexHookConfirmCommandID(_ deliveryIDs: [String]) -> String {
+        var bytes = Array(SHA256.hash(data: Data(("codex_hook_confirm\n" + deliveryIDs.sorted().joined(separator: "\n")).utf8)).prefix(16))
+        bytes[6] = (bytes[6] & 0x0f) | 0x50
+        bytes[8] = (bytes[8] & 0x3f) | 0x80
+        return UUID(uuid: (bytes[0],bytes[1],bytes[2],bytes[3],bytes[4],bytes[5],bytes[6],bytes[7],bytes[8],bytes[9],bytes[10],bytes[11],bytes[12],bytes[13],bytes[14],bytes[15])).uuidString.lowercased()
+    }
+
+    /// A model that runs `checklist call` or an MCP tool cannot reach the hook commands.
+    private static func refuseHookOnly(_ name: String) throws {
+        if CommandReply.codexHookOnlyMethods.contains(name) { throw BridgeError("METHOD_UNAVAILABLE: Only the Checklist hook uses this command: \(name)") }
+    }
+
     private func reportConnectionRecovery() {
         if let summary = registryStart.takeRecoverySummary() {
             environment.stderr("Checklist: \(summary)\n")
@@ -442,6 +492,7 @@ public actor Bridge {
     }
 
     private static func serviceCall(_ client: any BridgeClient, checksCatalog: Bool, _ name: String, _ arguments: Value) throws -> Data {
+        try refuseHookOnly(name)
         if checksCatalog, try !catalogTools(client).contains(where: { $0.name == name }) {
             throw BridgeError("METHOD_UNAVAILABLE: This tool is unavailable to the paired connection: \(name)")
         }
@@ -472,6 +523,7 @@ public actor Bridge {
     }
 
     private func localCall(_ name: String, _ arguments: Value) throws -> Value {
+        try Self.refuseHookOnly(name)
         if let error = startupError ?? serviceError ?? registryStart.error, !ClaudeRegistryStart.limitedToolNames.contains(name) { throw error }
         // Direct CLI calls already bootstrap/verify. The service checks its current
         // caller, catalog/schema and grants for the actual command. Fetching and

@@ -4,13 +4,13 @@ import ChecklistProviders
 import GRDB
 
 extension CommandRouter {
-    func toolCatalog(_ c: Caller) -> [JSON] {
+    func toolCatalog(_ c: Caller, includingHookOnly: Bool = false) -> [JSON] {
         let common = ["project_id","command_id","expected_revision"]
         var fields: [String:[String]] = [
             "service_info":[],"command_status":["command_id"],"operation_get":["operation_id"],"project_list":["include_archived"],"project_resolve":["workspace_path"],"project_settings_get":[],"policy_get":["revision","task_id"],"taxonomy_get":["revision"],
             "session_attach_task":["task_id"],"session_register":["label","provider","workspace_path"],"session_update":["state","observation"],"session_list":["task_id",
                 "include_ended","cursor","limit"],"session_inbox":["cursor","attempt_id","limit"],"assistant_inbox":["task_id","cursor","limit"],"assistant_projects":[],
-            "task_create":["title","brief","acceptance","kind","planned_assignee","assignment_reason","tag_ids","epic_id","owner_request_ref"],"task_get":["task_id","key"],
+            "task_create":["title","brief","acceptance","kind","planned_assignee","assignment_reason","tag_ids","epic_id","triage_id","owner_request_ref"],"task_get":["task_id","key"],
                 "task_list":["text","status_ids","archived","triage_id","epic_id","keys","fields","cursor","limit"],"task_context":["task_id","history_cursor","detail_level"],
                 "task_edit":["task_id","patch"],"task_transition":["task_id","action","reason","target_status_id"],
             "work_claim":["task_id","phase","policy_revision","file_scopes","lane_scopes","review_request_id","target_manifest_id","gate"],"work_checkpoint":["attempt_id",
@@ -92,6 +92,8 @@ extension CommandRouter {
         ]
         fields["triage_orchestrate"] = ["triage_id","action","progress","reason","name"]
         fields["source_execution_get"] = ["execution_id"]
+        fields["codex_hook_pickup"] = []
+        fields["codex_hook_confirm"] = ["delivery_ids"]
         fields["work_health_get"] = ["task_id"]
         fields["work_health_respond"] = ["task_id","request_id","progress","known_wait"]
         fields.merge(batchFields) { _,new in new }
@@ -149,7 +151,8 @@ extension CommandRouter {
             if !readable.contains(where: {$0.value["post_notes_on_request"] == true}) { allowed.subtract(["message_send","agent_resolve","agent_message_send","attachment_add"]) }
             if !readable.contains(where: {$0.value["receive_messages"] == true}) { allowed.subtract(["assistant_inbox","message_ack"]) }
         }
-        return allowed.sorted().compactMap { name in
+        // CL-410: the two hook commands stay validated here but are never advertised, so a model does not see them.
+        return (includingHookOnly ? allowed : allowed.subtracting(CommandMethods.codexHookOnly)).sorted().compactMap { name in
             guard let extra = fields[name] else { return nil }
             return catalogEntry(name: name, extra: extra, caller: c, common: common)
         }
@@ -259,8 +262,9 @@ extension CommandRouter {
         if name == "operation_get" { required.append("operation_id") }
         if name == "policy_apply" && !c.isOwner { required.append("reason") }
         if name == "project_create" { required.append("name") }
-        if !Self.storageBackupPruningMethods.contains(name) && !["service_info","project_list","assistant_projects","assistant_inbox","project_resolve","project_create"].contains(name) && !(c.isOwner && ["task_list",
+        if !Self.storageBackupPruningMethods.contains(name) && !["service_info","project_list","assistant_projects","assistant_inbox","project_resolve","project_create","codex_hook_pickup","codex_hook_confirm"].contains(name) && !(c.isOwner && ["task_list",
             "task_context"].contains(name)) { required.append("project_id") }
+        if name == "codex_hook_confirm" { required.append("delivery_ids");properties["delivery_ids"] = ["type":"array","items":["type":"string"],"minItems":1,"maxItems":8] }
         if name == "batch_claim" { required.append("policy_revision");properties["policy_revision"] = ["type":"integer","minimum":1,"maximum":Int.max,
             "description":"Required positive policy_revision returned by batch_prepare."] }
         if name == "epic_delete" { required += ["epic_id","expected_revision"] }
@@ -293,7 +297,7 @@ extension CommandRouter {
         if method == "message_send" { _ = try explicitMessageRecipient(p); _ = try ticketAudience(p) }
         if c.isOwner { return }
         if method == "tool_catalog" { guard p.isEmpty else { throw CoreError("INVALID_INPUT","tool_catalog takes no arguments.") }; return }
-        guard let tool = toolCatalog(c).first(where: {$0["name"] as? String == method}),let schema = tool["inputSchema"] as? JSON,let properties = schema["properties"] as? JSON else { throw CoreError("FORBIDDEN","This command is not available to this connection role.") }
+        guard let tool = toolCatalog(c,includingHookOnly:CommandMethods.codexHookOnly.contains(method)).first(where: {$0["name"] as? String == method}),let schema = tool["inputSchema"] as? JSON,let properties = schema["properties"] as? JSON else { throw CoreError("FORBIDDEN","This command is not available to this connection role.") }
         guard Set(p.keys).isSubset(of:Set(properties.keys)) else { throw CoreError("INVALID_INPUT","Unknown fields are not accepted by this command.") }
         for key in strings(schema,"required") where !(method == "task_create" && key == "epic_id") { guard p[key] != nil else { throw CoreError("INVALID_INPUT","\(key) is required.") } }
         for (key,value) in p {
@@ -353,7 +357,7 @@ extension CommandRouter {
         case "message_ack":return "Record this exact recipient's explicit acknowledgment, optionally with one reaction: thumbs_up (seen, no reply needed), thumbs_down (no), done, looking or question. Reading an inbox is not acknowledgment; a reaction never addresses a direction or completes a ticket."
         case "message_mentions_prepare":return "Parse and resolve ordinary ticket-note tags in project scope. Ambiguity requires exact selection; a prepared token binds this body and current recipients, and sends nothing. Pickup is not acknowledgment."
         case "message_send":return "Cite tickets, Triages and Epics as KEY \"Title\" (their name for groups), with project name when needed. Keep stable IDs in tool arguments. Optional triage_id or epic_id names the note subject; triage_id with no task_id is a Triage note to that Triage's orchestrator or an exact recipient. Omit recipient to reach the ticket holder (with its accepted subagents) and the Triage orchestrator, one copy each and none for you; audience=holder|orchestrator narrows an ordinary note. Save a scoped ticket/project coordination note with honest delivery receipts. Routine coordination between actual involved Checklist sessions has standing authorization; no per-message human permission is needed within their existing project/task/Triage grants. Omit recipient for current handlers/pickup, or use exactly recipient={\"kind\":\"session\",\"session_id\":\"<verified scoped session>\"}. Malformed explicit routes are rejected. Inspect returned deliveries for the intended recipient; saved/queued is not acknowledgment and grants no work role or new access."
-        case "task_create":return "Capture a ticket with title and required primary epic_id in Queued status with Draft readiness. Choose an existing Epic or create one for this concrete ticket first. Draft means the brief still needs refinement. When the brief states a concrete outcome (acceptance items help), mark it Ready with task_edit patch readiness=ready; open prerequisites do not prevent Ready. Assistant captures never assign work."
+        case "task_create":return "Capture a ticket with title and required primary epic_id in Queued status with Draft readiness. Choose an existing Epic or create one for this concrete ticket first. Draft means the brief still needs refinement. When the brief states a concrete outcome (acceptance items help), mark it Ready with task_edit patch readiness=ready; open prerequisites do not prevent Ready. A new ticket joins no Triage by itself: optional triage_id adds it under the group_membership add guards (TRIAGE_ORCHESTRATED; a refusal creates no ticket), and the reply field triage_membership states the membership. An orchestrator adds a ticket that it creates during a pass, except a split or follow-up ticket that goes to the next unstarted plan. Assistant captures never assign work."
         case "task_edit":return "Edit ticket fields (see patch). Metadata edits, including readiness, keep Triage membership. Draft = needs refinement; Ready = refined. Prerequisites never block Ready; they gate claim, pickup and completion. A superseded duplicate cannot become Ready."
         case "task_transition":return "Individually mark a ticket's status, including its current status. Triage membership stays; Done or Canceled removes the ticket from its Triage. Notes and metadata edits never change membership. Queue works while prerequisites are open. Cancel and reopen require a reason; active work needs work_release, work_takeover or verified-stop recovery first. Reopen returns to Queued. Protected work/review/Done states require their real workflow commands."
         case "task_purge_preview":return "Owner-only current impact preview for a trashed ticket. Lists removed records, exclusive bytes queued for deletion, retained byte reasons and known backup observations. Existing backups and exports are never changed."
@@ -388,6 +392,8 @@ extension CommandRouter {
         case "epic_delete":return "Delete a mistaken active or archived Epic only if it never held a ticket and has no references. Requires epic_id, expected_revision and allowed agent_rule_changes. Removes its own events, retaining one project-level deletion entry with agent provenance. Refuses current/historical membership, unproved legacy history, references, stale revision or denied authority. Read epic_list first."
         case "epic_list":return "List project Epics with stable IDs, key and name; optional key is exact and case-insensitive, with ambiguity refused. Cite KEY \"Name\" in reports; use IDs in tool arguments."
         case "epic_create","epic_edit","triage_edit":return "Create or edit a project group. The service assigns immutable Epic PREFIX-E<n> and Triage PREFIX-T<n> keys from separate project counters. Results include key and name. Cite KEY \"Name\" in notes and reports; use IDs in tool arguments."
+        case "codex_hook_pickup":return "Read at most eight unconfirmed pending notes for this authenticated Codex worker PostToolUse hook. This read writes nothing. Used only by the checklist codex-post-tool hook."
+        case "codex_hook_confirm":return "Record that the checklist codex-post-tool hook wrote these deliveries to its stdout. This is not model receipt or acknowledgment. Used only by that hook."
         case "session_inbox":return "Read current recipient deliveries and messages plus native_recovery for this verified resumed conversation (released claims, orchestrations and fenced-notice summary; reading acknowledges nothing). Each message has subject {kind,id,key,title,project_id,project_name}. Cite KEY \"Title\" in notes, checkpoints, final reports and messages; IDs remain tool arguments."
         case "task_list":return "List project tickets. Optional triage_id selects current Triage members; epic_id selects a primary Epic; keys selects exact case-insensitive ticket keys (at most 200, empty selects none). Filters combine with AND and text, status_ids and archived before paging. Optional fields returns only named top-level row fields plus id, key and revision; empty fields returns all. Unknown fields refuse with INVALID_INPUT and sorted valid names. Page metadata stays outside rows. Owner view defaults remain unchanged."
         case "triage_list":return "Optional triage_id selects exactly one scoped Triage. Optional fields returns only named top-level row fields plus id, key and revision; empty fields returns all. Unknown fields refuse with INVALID_INPUT and sorted valid names. Returns key and name. Optional key is exact and case-insensitive; ambiguous keys are refused. Cite KEY \"Name\" in reports; use IDs for tool arguments. Read each Triage's orchestrator (null for a plan), plan state, member_counts_by_status, current members, derived member status and phase (a history label on older Triages only). Active attention includes work in progress or membership in an actively orchestrated Triage."

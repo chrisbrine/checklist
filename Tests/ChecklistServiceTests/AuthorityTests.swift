@@ -3,6 +3,7 @@ import CryptoKit
 @testable import ChecklistCore
 import ChecklistIPC
 @testable import ChecklistService
+import ChecklistBridges
 
 /// Exercise the service's real caller/router boundary without starting a listener,
 /// observing host sessions, reading live enrollments or touching the keychain.
@@ -76,6 +77,56 @@ final class AuthorityTests: XCTestCase {
         XCTAssertTrue(coordinator.nativeDispatchDeliveries(endpointAvailable:{_ in false}) { _ in XCTFail("An absent endpoint cannot be projected");return nil }.isEmpty)
         current.revoked = true;coordinator.enrollments[current.installation] = current
         XCTAssertTrue(coordinator.nativeDispatchDeliveries { _ in XCTFail("A revoked route cannot be projected");return nil }.isEmpty)
+    }
+
+    func testCodexQueueCandidatesReachWorkerForExplicitSourceRefusalReceipt() throws {
+        var current = enrollment()
+        current.sessionID = "00000000-0000-4000-8000-000000000413"
+        current.automatic = true;current.identityVerification = "native_process_verified_thread_observed"
+        current.nativeExecutionDomain = "codex:24680:5:0"
+        coordinator.enrollments = [current.installation:current]
+        XCTAssertNotNil(Coordinator.codexQueueRegistration(current))
+        var projected = 0
+        // The enabled double. The production switch has its own test below.
+        let rows = coordinator.nativeDispatchDeliveries(endpointAvailable:{ Coordinator.codexQueueRegistration($0) != nil }) { params in
+            projected += 1
+            XCTAssertEqual(params["native_session_ids"] as? [String],[current.sessionID])
+            return ["deliveries":[["id":"synthetic-source-check-candidate"]]]
+        }
+        XCTAssertEqual(projected,1);XCTAssertEqual(rows.count,1)
+        // This is candidate selection only: it must not observe the live Codex
+        // database or invoke the queue/open effects. The worker records refusal.
+    }
+
+    func testProductionSwitchOffKeepsACodexRecipientOutOfDispatchAndItsDeliveryUnchanged() throws {
+        var current = enrollment()
+        current.sessionID = "00000000-0000-4000-8000-000000000410"
+        current.automatic = true;current.identityVerification = "native_process_verified_thread_observed"
+        current.nativeExecutionDomain = "codex:24680:5:0"
+        try register(current)
+        _ = try coordinator.router.handle(method:"message_send",params:["command_id":UUID().uuidString,"project_id":project!,"body":"Synthetic note",
+            "recipient":["kind":"session","session_id":current.sessionID]],caller:owner)
+        func stored() throws -> [String] {
+            try coordinator.router.dbQueue.read { try String.fetchAll($0,sql:"SELECT data FROM records WHERE type='delivery'") }
+        }
+        let before = try stored()
+        XCTAssertEqual(before.count,1)
+        let bridge = Caller(role:"owner",installation:"native-bridge",projectIDs:[])
+        func load(_ params: [String:Any]) -> [String:Any]? { (try? coordinator.router.handle(method:"delivery_pending",params:params,caller:bridge))?["data"] as? [String:Any] }
+
+        // The enabled double selects this delivery, so the next check is not empty by accident.
+        XCTAssertEqual(coordinator.nativeDispatchDeliveries(endpointAvailable:{ Coordinator.codexQueueRegistration($0) != nil },load:load).count,1)
+
+        XCTAssertFalse(CodexQueueRelay.enabled)
+        XCTAssertNotNil(Coordinator.codexQueueRegistration(current))
+        XCTAssertFalse(Coordinator.nativeEndpointAvailable(current))
+        var projected = 0
+        XCTAssertTrue(coordinator.nativeDispatchDeliveries { projected += 1;return load($0) }.isEmpty)
+        XCTAssertEqual(projected,0,"With the switch off, no Codex enrollment joins dispatch.")
+        XCTAssertEqual(try stored(),before,"The delivery row does not change.")
+        let delivery = try XCTUnwrap(JSONSerialization.jsonObject(with:Data(before[0].utf8)) as? [String:Any])
+        XCTAssertEqual(delivery["state"] as? String,"queued","The app label for this state is Queued for agent pickup.")
+        XCTAssertEqual(delivery["push_state"] as? String,"unavailable")
     }
 
     func testOwnerFlagCannotMintHumanAuthority() throws {

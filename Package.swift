@@ -27,7 +27,7 @@ let package = Package(
             "ChecklistProviders", "ChecklistFileAccess", .product(name: "GRDB", package: "GRDB.swift")
         ]),
         .target(name: "ChecklistIPC", dependencies: ["ChecklistLegacyKeychain", .product(name: "ChecklistContracts", package: "ChecklistShared")]),
-        .target(name: "ChecklistBridges", dependencies: ["ChecklistCore", "ChecklistIPC", "ChecklistProviders"]),
+        .target(name: "ChecklistBridges", dependencies: ["ChecklistCore", "ChecklistIPC", "ChecklistProviders", .product(name: "GRDB", package: "GRDB.swift")]),
         .target(name: "ChecklistMCPServer", dependencies: ["ChecklistIPC", "ChecklistBridges", .product(name: "MCP", package: "swift-sdk")]),
         .executableTarget(name: "ChecklistService", dependencies: ["ChecklistCore", "ChecklistIPC", "ChecklistBridges", "ChecklistProviders"]),
         .executableTarget(name: "ChecklistCLI", dependencies: ["ChecklistProviders", "ChecklistIPC", "ChecklistBridges", "ChecklistMCPServer", .product(name: "MCP", package: "swift-sdk")]),

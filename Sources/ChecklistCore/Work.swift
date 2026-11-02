@@ -755,6 +755,8 @@ extension CommandRouter {
         t = revised(t)
         try save(db, t, type: "task")
         a["state"] = "submitted"
+        // CL-412: a submission is progress of the ticket. The token reads no submitted attempt of an orchestrated ticket.
+        a["health_progress_at"] = now()
         a.removeValue(forKey: "token_hash")
         try save(db, revised(a), type: "attempt")
         var requestIDs: [String] = []

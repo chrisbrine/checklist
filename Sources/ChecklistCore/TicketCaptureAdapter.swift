@@ -9,7 +9,7 @@ extension CommandRouter {
         let pid = try scope(db, p, c, write: true)
         var project = try record(db, pid, type: "project")
         if c.role == CallerRole.assistant.rawValue,
-           p["planned_assignee"] != nil || p["key"] != nil || p["epic_id"] != nil {
+           p["planned_assignee"] != nil || p["key"] != nil || p["epic_id"] != nil || p["triage_id"] != nil {
             throw CoreError("FORBIDDEN", "Assistants capture Drafts without work assignment.")
         }
         try assistantPermission(c, pid, "create_drafts_on_request")
@@ -55,6 +55,7 @@ extension CommandRouter {
             throw CoreError("INVALID_INPUT", "Choose a current Epic in this project.")
         }
         for tag in input.tagIDs { _ = try scoped(db, tag, pid, type: "tag") }
+        let triage = try triageForNewTicket(db, value: p["triage_id"], project: pid, caller: c)
         try validateTaskPolicyAssignment(db, project: project, task: &task, input: p, caller: c)
         task["created_by"] = c.principal
         task["origin"] = c.isOwner ? "human_ui" : c.role
@@ -63,7 +64,10 @@ extension CommandRouter {
         try save(db, task, type: "task")
         _ = try syncEpic(db, try scoped(db, epicID, pid, type: "group"), taskOverride: task, tasks: existingTasks)
         try event(db, caller: c, project: pid, entity: state.ticketID, kind: "task_created", data: ["key": plan.key])
-        return try taskProjection(db, task)
+        let joined = try triage.map { try joinTriage(db, group: $0, taskID: state.ticketID, caller: c, reason: "explicit_add") }
+        var reply = try taskProjection(db, task)
+        reply["triage_membership"] = try taskCreateTriageMembership(db, task: task, joined: joined, caller: c)
+        return reply
     }
 
     private func captureOperation<T>(_ operation: () throws -> T) throws -> T {

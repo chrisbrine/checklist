@@ -48,6 +48,7 @@ public enum ChecklistMCPServer {
                 let json = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
                 var content: [Tool.Content] = []
                 if let envelope = try jsonObject(result) as? [String:Any],let notice = HumanAnswerNoticePresentation.text(in:envelope) { content.append(.text(text:notice,annotations:nil,_meta:nil)) }
+                if let envelope = try jsonObject(result) as? [String:Any],let notice = PendingNoteNoticePresentation.text(in:envelope) { content.append(.text(text:notice,annotations:nil,_meta:nil)) }
                 content.append(.text(text:json,annotations:nil,_meta:nil))
                 return CallTool.Result(content:content, structuredContent:.some(result), isError:false)
             } catch {

@@ -82,7 +82,7 @@ public struct NativeSessionContext: Equatable, Sendable {
                                     workspacePath: observation.workspace, nativeEndpoint: observation.endpoint, hostTitle: observation.title)
     }
 
-    private static func closestNativeHost(providerRegistry: ProviderPluginRegistry) -> (provider: String, pid: Int32)? {
+    static func closestNativeHost(providerRegistry: ProviderPluginRegistry) -> (provider: String, pid: Int32)? {
         var pid = getppid()
         var visited = Set<Int32>()
         for _ in 0..<32 {

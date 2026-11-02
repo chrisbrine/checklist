@@ -32,6 +32,42 @@ extension CommandRouter {
             "This conversation already orchestrates \(try agentReference(db, other)) in this project. One conversation orchestrates at most one Triage per project: finish that Triage before you start or take over another.",
             details: ["triage_id": other["id"] ?? NSNull()])
     }
+    /// The guards of a Triage add, shared by `group_membership` and `task_create`.
+    /// CL-125 rule 5: only the orchestrator or the owner adds tickets to an orchestrated Triage; anyone eligible edits plans.
+    func requireTriageAddAllowed(_ group: JSON, caller c: Caller) throws {
+        guard !bool(group, "archived") else { throw CoreError("INVALID_TRANSITION", "Restore this Triage before adding or updating its tickets.") }
+        if let orchestrator = triageOrchestratorSession(group), !c.isOwner, c.sessionID != orchestrator {
+            throw CoreError("TRIAGE_ORCHESTRATED", "Only this Triage's orchestrator or the owner adds or updates its tickets. Send a note to the orchestrator instead.", details: ["orchestrator_session_id": orchestrator])
+        }
+    }
+    /// CL-411: the Triage named by `task_create`. Every refusal comes before the ticket exists.
+    func triageForNewTicket(_ db: Database, value: Any?, project pid: String, caller c: Caller) throws -> JSON? {
+        guard let value else { return nil }
+        guard let gid = value as? String else { throw CoreError("INVALID_INPUT", "triage_id must be a Triage ID in this project.") }
+        let group = try scoped(db, gid, pid, type: "group")
+        guard group["kind"] as? String == "triage" else { throw CoreError("INVALID_INPUT", "triage_id must be a Triage ID in this project.") }
+        try requireTriageAddAllowed(group, caller: c)
+        return group
+    }
+    /// CL-411: the `task_create` reply states the membership of the new ticket. A new ticket
+    /// joins no Triage by itself, because split and follow-up tickets go to an unstarted plan.
+    func taskCreateTriageMembership(_ db: Database, task: JSON, joined: JSON?, caller c: Caller) throws -> JSON {
+        let tid = try StoredRecord(task, family: "task").string("id"), pid = try StoredRecord(task, family: "task").string("project_id")
+        let key = task["key"] as? String ?? tid
+        var statement: JSON = ["state": "none", "text": "\(key) is in no Triage."]
+        if let joined {
+            statement = ["state": "member", "triage_id": joined["id"] ?? NSNull(), "key": joined["key"] ?? NSNull(), "name": joined["name"] ?? NSNull(),
+                         "plan": triageOrchestratorSession(joined) == nil, "text": "\(key) is in \(try agentReference(db, joined))."]
+        }
+        guard let mine = try callerOrchestratedTriage(db, project: pid, caller: c), mine["id"] as? String != joined?["id"] as? String else { return statement }
+        let current = statement["text"] as? String ?? ""
+        statement["caller_triage"] = ["triage_id": mine["id"] ?? NSNull(), "key": mine["key"] ?? NSNull(), "name": mine["name"] ?? NSNull()]
+        statement["add_command"] = ["method": "group_membership", "arguments": [
+            "project_id": pid, "group_id": mine["id"] ?? NSNull(), "task_id": tid, "action": "add", "expected_revision": mine["revision"] ?? NSNull()
+        ] as JSON] as JSON
+        statement["text"] = "\(current) You orchestrate \(try agentReference(db, mine)). Use add_command to add this ticket. Do not add a split or follow-up ticket that goes to the next unstarted plan."
+        return statement
+    }
     func currentTriages(_ db: Database, project pid: String, taskID tid: String) throws -> [JSON] {
         try records(db, type: "group", project: pid).filter { $0["kind"] as? String == "triage" && triageMemberIDs($0).contains(tid) }
     }

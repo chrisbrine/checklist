@@ -57,6 +57,95 @@ extension EvidenceAuthorityTests {
         XCTAssertEqual((try startOwn(p,orchestrator)["orchestrator"] as? JSON)?["session_id"] as? String,orchestrator.sessionID)
     }
 
+    // CL-411: `task_create` `triage_id` and the reply statement.
+    private func taskCount(_ p: JSON) throws -> Int { try router.dbQueue.read { try router.records($0,type:"task",project:p["id"] as? String).count } }
+    private func nextNumber(_ p: JSON) throws -> Int { try router.dbQueue.read { try router.record($0,p["id"] as! String,type:"project")["next_number"] as? Int ?? 0 } }
+
+    func testTaskCreateWithoutTriageIDStaysOutAndNamesTheCallersTriage() throws {
+        let p = try project(), a = try native(p,"orchestrator-a",domain:"host-a"), helper = try native(p,"helper",domain:"host-h")
+        let triage = try startOwn(p,a), plan = try call("triage_create",["project_id":p["id"]!,"name":"Pass 9"])
+        // A session that orchestrates nothing and the owner get a plain statement.
+        for caller in [helper,owner] {
+            let plain = try XCTUnwrap(try call("task_create",["project_id":p["id"]!,"title":"Plain"],caller)["triage_membership"] as? JSON)
+            XCTAssertEqual(plain["state"] as? String,"none");XCTAssertNil(plain["caller_triage"]);XCTAssertNil(plain["add_command"])
+        }
+        // An orchestrator's follow-up stays out of its Triage, so it can still go to a plan.
+        let created = try call("task_create",["project_id":p["id"]!,"title":"Follow-up"],a)
+        let statement = try XCTUnwrap(created["triage_membership"] as? JSON)
+        XCTAssertEqual(statement["state"] as? String,"none")
+        XCTAssertEqual((statement["caller_triage"] as? JSON)?["triage_id"] as? String,triage["id"] as? String)
+        XCTAssertTrue((statement["text"] as? String ?? "").contains(triage["key"] as! String))
+        XCTAssertEqual(try memberIDs(p,triage["id"]!),[])
+        _ = try add(p,plan["id"]!,created,a)
+        XCTAssertEqual(try memberIDs(p,plan["id"]!),[created["id"] as! String])
+        // The named command works as written, and moves the ticket from the plan.
+        let other = try call("task_create",["project_id":p["id"]!,"title":"Added later"],a)
+        let command = try XCTUnwrap((other["triage_membership"] as? JSON)?["add_command"] as? JSON)
+        XCTAssertEqual(command["method"] as? String,"group_membership")
+        _ = try call("group_membership",try XCTUnwrap(command["arguments"] as? JSON),a)
+        XCTAssertEqual(try memberIDs(p,triage["id"]!),[other["id"] as! String])
+    }
+
+    func testTaskCreateWithTriageIDJoinsOnceAndStatesMembership() throws {
+        let p = try project(), a = try native(p,"orchestrator-a",domain:"host-a"), helper = try native(p,"helper",domain:"host-h")
+        let triage = try startOwn(p,a), plan = try call("triage_create",["project_id":p["id"]!,"name":"Pass 9"])
+        let input: JSON = ["project_id":p["id"]!,"title":"In my Triage","triage_id":triage["id"]!], commandID = UUID().uuidString
+        let created = try call("task_create",input,a,command:commandID)
+        let statement = try XCTUnwrap(created["triage_membership"] as? JSON)
+        XCTAssertEqual(statement["state"] as? String,"member");XCTAssertEqual(statement["triage_id"] as? String,triage["id"] as? String)
+        XCTAssertEqual(statement["plan"] as? Bool,false);XCTAssertNil(statement["add_command"])
+        XCTAssertEqual(try memberIDs(p,triage["id"]!),[created["id"] as! String])
+        let joinedRevision = try triageRecord(p,triage["id"]!)["revision"] as? Int, count = try taskCount(p)
+        XCTAssertEqual((try triageRecord(p,triage["id"]!)["members"] as? [JSON])?.first?["join_reason"] as? String,"explicit_add")
+        // A retry with the same command ID returns the receipt and adds no second membership.
+        let retried = try call("task_create",input,a,command:commandID)
+        XCTAssertEqual(retried["id"] as? String,created["id"] as? String)
+        XCTAssertEqual((retried["triage_membership"] as? JSON)?["state"] as? String,"member")
+        XCTAssertEqual(try memberIDs(p,triage["id"]!),[created["id"] as! String])
+        XCTAssertEqual(try triageRecord(p,triage["id"]!)["revision"] as? Int,joinedRevision);XCTAssertEqual(try taskCount(p),count)
+        let intervals = try router.dbQueue.read { try router.records($0,type:"triage_membership_interval",project:p["id"] as? String) }
+        XCTAssertEqual(intervals.filter {$0["task_id"] as? String == created["id"] as? String}.count,1)
+        // A plan accepts any eligible agent. An orchestrator that picks a plan still gets the add command.
+        let planned = try XCTUnwrap(try call("task_create",["project_id":p["id"]!,"title":"Planned","triage_id":plan["id"]!],helper)["triage_membership"] as? JSON)
+        XCTAssertEqual(planned["state"] as? String,"member");XCTAssertEqual(planned["plan"] as? Bool,true);XCTAssertNil(planned["add_command"])
+        let split = try XCTUnwrap(try call("task_create",["project_id":p["id"]!,"title":"Split","triage_id":plan["id"]!],a)["triage_membership"] as? JSON)
+        XCTAssertEqual(split["triage_id"] as? String,plan["id"] as? String)
+        XCTAssertEqual((split["caller_triage"] as? JSON)?["triage_id"] as? String,triage["id"] as? String);XCTAssertNotNil(split["add_command"])
+        // The owner adds to an orchestrated Triage.
+        XCTAssertEqual((try call("task_create",["project_id":p["id"]!,"title":"Owner add","triage_id":triage["id"]!],owner)["triage_membership"] as? JSON)?["state"] as? String,"member")
+    }
+
+    func testTaskCreateRefusesBadTriageAndCreatesNoTicket() throws {
+        let p = try project(), a = try native(p,"orchestrator-a",domain:"host-a"), helper = try native(p,"helper",domain:"host-h")
+        let triage = try startOwn(p,a)
+        let foreignRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: foreignRoot,withIntermediateDirectories:true)
+        defer { try? FileManager.default.trashItem(at: foreignRoot,resultingItemURL:nil) }
+        let foreignProject = try call("project_create",["name":"Foreign fixture","key_prefix":"F","root_path":foreignRoot.path])
+        let foreign = try call("triage_create",["project_id":foreignProject["id"]!,"name":"Foreign plan"])
+        let epic = try call("epic_create",["project_id":p["id"]!,"name":"Not a Triage"])
+        let archived = try call("triage_create",["project_id":p["id"]!,"name":"Old plan"])
+        _ = try call("triage_edit",["project_id":p["id"]!,"triage_id":archived["id"]!,"expected_revision":archived["revision"]!,"archived":true])
+        _ = try call("task_create",["project_id":p["id"]!,"title":"Sets the epic fixture"])
+        let count = try taskCount(p), number = try nextNumber(p), revision = try triageRecord(p,triage["id"]!)["revision"] as? Int
+        let refusals: [(Any,Caller?,String)] = [(triage["id"]!,helper,"TRIAGE_ORCHESTRATED"),(foreign["id"]!,a,"NOT_FOUND"),(UUID().uuidString,a,"NOT_FOUND"),
+                                                (epic["id"]!,a,"INVALID_INPUT"),(archived["id"]!,a,"INVALID_TRANSITION"),("",a,"NOT_FOUND"),(7,a,"INVALID_INPUT")]
+        for (value,caller,code) in refusals {
+            assertCode(code) { _ = try self.call("task_create",["project_id":p["id"]!,"title":"Refused","triage_id":value],caller) }
+        }
+        let assistant = Caller(role:"assistant",installation:"assistant-fixture",projectIDs:[p["id"] as! String],assistantGrants:[p["id"] as! String:["read":true,"create_drafts_on_request":true]])
+        assertCode("FORBIDDEN") { _ = try self.router.handle(method:"task_create",params:["command_id":UUID().uuidString,"project_id":p["id"]!,"title":"Refused","triage_id":triage["id"]!],caller:assistant) }
+        XCTAssertEqual(try taskCount(p),count);XCTAssertEqual(try nextNumber(p),number)
+        XCTAssertEqual(try triageRecord(p,triage["id"]!)["revision"] as? Int,revision);XCTAssertEqual(try memberIDs(p,triage["id"]!),[])
+    }
+
+    func testTaskCreateCatalogListsTriageID() throws {
+        let p = try project(), a = try native(p,"orchestrator-a",domain:"host-a")
+        let tool = try XCTUnwrap(router.toolCatalog(a).first {$0["name"] as? String == "task_create"})
+        XCTAssertNotNil(((tool["inputSchema"] as? JSON)?["properties"] as? JSON)?["triage_id"])
+        XCTAssertFalse(strings(tool["inputSchema"] as? JSON ?? [:],"required").contains("triage_id"))
+    }
+
     func testOrchestratorClaimsMoveTicketsAndOtherSessionsKeepMembership() throws {
         let p = try project(), a = try native(p,"orchestrator-a",domain:"host-a"), b = try native(p,"orchestrator-b",domain:"host-b"), helper = try native(p,"helper",domain:"host-h")
         let triageA = try startOwn(p,a), triageB = try startOwn(p,b)

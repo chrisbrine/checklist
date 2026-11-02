@@ -4,6 +4,7 @@ import ChecklistContracts
 /// Wire ambiguity is separate from a definitive semantic rejection.
 public enum CommandReply {
     public static let readMethods = CommandMethods.serviceReads
+    public static let codexHookOnlyMethods = CommandMethods.codexHookOnly
     public static func expectsMutation(_ method: String) -> Bool { !readMethods.contains(method) && method != "connection_bootstrap" }
 
     public static func unknown(commandID: String?, reason: String) -> ChecklistError {

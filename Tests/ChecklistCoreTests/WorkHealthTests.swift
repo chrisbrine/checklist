@@ -472,4 +472,158 @@ extension EvidenceAuthorityTests {
         XCTAssertFalse(quiet.contains {$0["id"] as? String == t["id"] as? String})
         XCTAssertEqual(try healthRows("message",task:t).filter {$0["kind"] as? String == "work_health"}.count,2)
     }
+
+    // CL-412: a ticket with no active attempt in an actively orchestrated Triage.
+    private static let orchestratedProgress = "Coordinating this implementation phase"
+    private func healthStamp(_ date: Date) -> String { ISO8601DateFormatter().string(from:date) }
+    private func orchestratedHealthTriage(_ p: JSON, _ tasks: [JSON], _ orchestrator: Caller) throws -> JSON {
+        var group = try call("triage_create",["project_id":p["id"]!,"name":"Health clock","phase":"implementation"])
+        for task in tasks { group = try call("group_membership",["project_id":p["id"]!,"group_id":group["id"]!,"expected_revision":group["revision"]!,"task_id":task["id"]!,"action":"add"]) }
+        return try call("triage_orchestrate",["project_id":p["id"]!,"triage_id":group["id"]!,"expected_revision":group["revision"]!,"action":"start","progress":Self.orchestratedProgress],orchestrator)
+    }
+    private func setTriageClock(_ group: JSON, _ date: Date) throws {
+        try healthWrite { db in
+            var row = try router.record(db,group["id"] as! String,type:"group"), o = row["orchestration"] as! JSON
+            o["health_progress_at"] = healthStamp(date); o["started_at"] = healthStamp(date); row["orchestration"] = o
+            try router.save(db,row,type:"group")
+        }
+    }
+    private func setAttemptClock(_ a: JSON, _ date: Date) throws {
+        try healthWrite { db in
+            var row = try router.record(db,a["id"] as! String,type:"attempt")
+            row["started_at"] = healthStamp(date); row["health_progress_at"] = healthStamp(date)
+            try router.save(db,row,type:"attempt")
+        }
+    }
+    private func releaseHealthAttempt(_ p: JSON, _ a: JSON, _ w: Caller) throws {
+        var input = auth(p,a); input["reason"] = "Released for the fixture observation"
+        _ = try call("work_release",input,w)
+    }
+    private func triageCheckpoint(_ p: JSON, _ group: JSON, _ o: Caller, progress: String) throws {
+        let current = try router.dbQueue.read {try router.record($0,group["id"] as! String,type:"group")}
+        _ = try call("triage_orchestrate",["project_id":p["id"]!,"triage_id":group["id"]!,"expected_revision":current["revision"]!,"action":"checkpoint","progress":progress],o)
+    }
+
+    func testWorkHealthUnclaimedMemberReadsNewestOfTriageCheckpointAndOwnAttempts() throws {
+        let p = try project(), t = try ready(p), now = Date()
+        let o = try native(p,"clock-orchestrator",domain:"clock-o"), w = try native(p,"clock-worker",domain:"clock-w")
+        let group = try orchestratedHealthTriage(p,[t],o), a = try claim(p,t,caller:w)
+        try healthCheckpoint(p,t,a,w,step:1)
+        let ticketTime = now.addingTimeInterval(-3000), oldTriage = now.addingTimeInterval(-6000)
+        try setAttemptClock(a,ticketTime)
+        try healthCheckpoint(p,t,a,w,step:1)
+        try releaseHealthAttempt(p,a,w)
+        try setTriageClock(group,oldTriage)
+        XCTAssertNil(try healthTask(p,t)["active_attempt_id"])
+        var view = try health(p,t)
+        XCTAssertEqual((view["current_target"] as? JSON)?["kind"] as? String,"orchestration")
+        XCTAssertEqual(view["last_progress_at"] as? String,healthStamp(ticketTime),"A released attempt and not the older Triage checkpoint; a repeated checkpoint does not advance it")
+        XCTAssertEqual(view["last_progress_clock"] as? String,"ticket_attempt")
+        // A read and a heartbeat do not advance it. Neither does a repeated Triage checkpoint.
+        let session = try router.dbQueue.read {try router.record($0,o.sessionID!,type:"session")}
+        _ = try call("session_update",["project_id":p["id"]!,"expected_revision":session["revision"]!,"state":"connected"],o)
+        _ = try healthTask(p,t)
+        try triageCheckpoint(p,group,o,progress:Self.orchestratedProgress)
+        view = try health(p,t)
+        XCTAssertEqual(view["last_progress_at"] as? String,healthStamp(ticketTime))
+        // A newer Triage checkpoint is the newest clock.
+        let newTriage = now.addingTimeInterval(-1000)
+        try setTriageClock(group,newTriage)
+        view = try health(p,t)
+        XCTAssertEqual(view["last_progress_at"] as? String,healthStamp(newTriage))
+        XCTAssertEqual(view["last_progress_clock"] as? String,"triage_checkpoint")
+    }
+
+    func testWorkHealthMalformedAttemptRecordCannotRollBackTheHealthPage() throws {
+        let p = try project(), t = try ready(p)
+        let o = try native(p,"malformed-orchestrator",domain:"malformed-o"), w = try native(p,"malformed-worker",domain:"malformed-w")
+        let group = try orchestratedHealthTriage(p,[t],o), a = try claim(p,t,caller:w)
+        try healthCheckpoint(p,t,a,w,step:1)
+        try releaseHealthAttempt(p,a,w)
+        try setTriageClock(group,Date().addingTimeInterval(-6000))
+        try router.dbQueue.write { db in
+            try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES ('malformed-attempt',?,'attempt',1,'{not json')",arguments:[p["id"] as! String])
+        }
+        let view = try health(p,t)
+        XCTAssertEqual((view["current_target"] as? JSON)?["kind"] as? String,"orchestration")
+        XCTAssertEqual(view["last_progress_clock"] as? String,"ticket_attempt")
+        XCTAssertNoThrow(try checkHealth())
+    }
+
+    func testWorkHealthSubmissionIsProgressOfTheTicket() throws {
+        try sourceFixture()
+        let p = try project(), t = try ready(p), now = Date()
+        let o = try native(p,"submit-orchestrator",domain:"submit-o")
+        let group = try orchestratedHealthTriage(p,[t],o), a = try claim(p,t)
+        try setAttemptClock(a,now.addingTimeInterval(-3000)); try setTriageClock(group,now.addingTimeInterval(-6000))
+        _ = try submitSource(p,a)
+        let view = try health(p,t), read = try XCTUnwrap(view["last_progress_at"] as? String)
+        XCTAssertGreaterThan(try XCTUnwrap(ISO8601DateFormatter().date(from:read)),now.addingTimeInterval(-60))
+        XCTAssertEqual(view["last_progress_clock"] as? String,"ticket_attempt")
+    }
+
+    func testWorkHealthNoteStatesTheClockItRead() throws {
+        let p = try project(), own = try ready(p), quiet = try ready(p), active = try ready(p), now = Date()
+        let o = try native(p,"note-orchestrator",domain:"note-o"), w = try native(p,"note-worker",domain:"note-w")
+        let group = try orchestratedHealthTriage(p,[own,quiet],o), a = try claim(p,own,caller:w)
+        try releaseHealthAttempt(p,a,w)
+        try setAttemptClock(a,now.addingTimeInterval(-3000)); try setTriageClock(group,now.addingTimeInterval(-6000))
+        let b = try claim(p,active,caller:w)
+        try ageHealthAttempt(b,by:3000)
+        try checkHealth(at:now)
+        func request(_ task: JSON) throws -> JSON { try XCTUnwrap(healthRows("message",task:task).first {$0["kind"] as? String == "work_health"}) }
+        XCTAssertTrue(try XCTUnwrap(request(own)["body"] as? String).contains(healthStamp(now.addingTimeInterval(-3000)) + " (the ticket's own attempt)."))
+        XCTAssertTrue(try XCTUnwrap(request(quiet)["body"] as? String).contains(healthStamp(now.addingTimeInterval(-6000)) + " (the Triage checkpoint)."))
+        XCTAssertTrue(try XCTUnwrap(request(active)["body"] as? String).contains("(the ticket's own attempt)."))
+        XCTAssertEqual((try request(own)["health_request"] as? JSON)?["progress_clock"] as? String,"ticket_attempt")
+        XCTAssertEqual((try request(quiet)["health_request"] as? JSON)?["progress_clock"] as? String,"triage_checkpoint")
+    }
+
+    func testWorkHealthTicketProgressAnswersThePendingCheckAndStartsNoNewRelay() throws {
+        let p = try project(), t = try ready(p), now = Date(), bridge = Caller(role:"owner",installation:"native-bridge",projectIDs:[])
+        let o = try native(p,"relay-orchestrator",domain:"relay-o"), w = try native(p,"relay-worker",domain:"relay-w")
+        let group = try orchestratedHealthTriage(p,[t],o)
+        try setTriageClock(group,now.addingTimeInterval(-3000))
+        try checkHealth(at:now.addingTimeInterval(-600))
+        let first = try XCTUnwrap(try healthRelays(o).first,"The first request relays to the orchestrator")
+        _ = try call("delivery_record",["delivery_id":first["id"]!,"state":"transport_written","receipt":["bytes":1]],bridge)
+        let mid = try XCTUnwrap(try health(p,t)["request_id"] as? String)
+        // An attempt older than the request does not answer it.
+        let a = try claim(p,healthTask(p,t),caller:w)
+        try releaseHealthAttempt(p,a,w)
+        try setAttemptClock(a,now.addingTimeInterval(-1000))
+        try checkHealth(at:now.addingTimeInterval(-500))
+        XCTAssertEqual(try health(p,t)["request_id"] as? String,mid)
+        // Progress of the ticket after the request answers it.
+        try setAttemptClock(a,now.addingTimeInterval(-100))
+        try checkHealth(at:now)
+        let answered = try router.dbQueue.read {try router.record($0,mid,type:"message")}["health_request"] as? JSON
+        XCTAssertEqual(answered?["outcome"] as? String,"progress_observed")
+        var view = try health(p,t)
+        XCTAssertNil(view["request_id"]); XCTAssertEqual(view["state"] as? String,"current")
+        // The next request is past the session interval and still does not relay: the token did not change.
+        try checkHealth(at:now.addingTimeInterval(1400))
+        view = try health(p,t)
+        XCTAssertNotNil(view["request_id"]); XCTAssertNotEqual(view["request_id"] as? String,mid)
+        XCTAssertTrue(try healthRelays(o).isEmpty,"Progress of the ticket starts no new relay")
+        XCTAssertEqual(try healthTask(p,t)["work_health"].flatMap {($0 as? JSON)?["relay_count"] as? Int},1)
+    }
+
+    func testWorkHealthTicketProgressClearsAWaitNamedByTheOrchestrator() throws {
+        let p = try project(), t = try ready(p), now = Date()
+        let o = try native(p,"wait-orchestrator",domain:"wait-o"), w = try native(p,"wait-worker",domain:"wait-w")
+        let group = try orchestratedHealthTriage(p,[t],o)
+        try setTriageClock(group,now.addingTimeInterval(-3000))
+        try checkHealth(at:now.addingTimeInterval(-600))
+        let mid = try XCTUnwrap(try health(p,t)["request_id"] as? String)
+        XCTAssertEqual(try call("work_health_respond",["project_id":p["id"]!,"task_id":t["id"]!,"request_id":mid,"expected_revision":healthTask(p,t)["revision"]!,"progress":"Waiting","known_wait":"runner session"],o)["outcome"] as? String,"resumed")
+        let a = try claim(p,healthTask(p,t),caller:w)
+        try releaseHealthAttempt(p,a,w)
+        try setAttemptClock(a,now.addingTimeInterval(-3000))
+        try checkHealth(at:now.addingTimeInterval(5))
+        XCTAssertEqual((try health(p,t)["known_waits"] as? [JSON])?.first?["kind"] as? String,"reported","An older attempt does not clear the wait")
+        try setAttemptClock(a,now.addingTimeInterval(30))
+        try checkHealth(at:now.addingTimeInterval(40))
+        XCTAssertTrue((try health(p,t)["known_waits"] as? [JSON] ?? []).isEmpty,"Progress of the ticket clears a named wait")
+    }
 }

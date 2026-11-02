@@ -6,6 +6,15 @@ extension CommandRouter {
     /// Live delivery observation, added after command receipt persistence, including on replay.
     /// It never acknowledges a delivery, changes a request or grants work authority.
     func addingHumanAnswerNotices(_ db: Database, output: JSON, params: JSON, caller: Caller) throws -> JSON {
+        // CL-410 F8: each step reports its own failure. A failed note step keeps a good answer notice.
+        var result = output
+        do { result = try humanAnswerNotices(db, output:output, params:params, caller:caller) }
+        catch { result = addingNoticeFailure(db, output, caller:caller, keys:["pending_human_answers"]) }
+        do { return try addingPendingNoteNotices(db, output:result, params:params, caller:caller) }
+        catch { return addingNoticeFailure(db, result, caller:caller, keys:["pending_notes"]) }
+    }
+
+    private func humanAnswerNotices(_ db: Database, output: JSON, params: JSON, caller: Caller) throws -> JSON {
         guard caller.role == "worker",let sid = caller.sessionID else { return output }
         let requested = params["project_id"] as? String
         var seenProjects: Set<Data> = []
@@ -71,7 +80,7 @@ extension CommandRouter {
         guard !pending.isEmpty else { return output }
         let notices: JSON = ["schema_version":1,"status":"pending_pickup","observation":"live_recipient_delivery_state_not_cached_command_outcome","channel":"authenticated_tool_result","native_codex_wake_qualified":false,"items":Array(pending.prefix(8)),"has_more":pending.count > 8]
         var result = output
-        if var data = result["data"] as? JSON { data["_checklist"] = ["pending_human_answers":notices];result["data"] = data }
+        if var data = result["data"] as? JSON { var metadata = data["_checklist"] as? JSON ?? [:];metadata["pending_human_answers"] = notices;data["_checklist"] = metadata;result["data"] = data }
         return result
     }
 
@@ -80,11 +89,34 @@ extension CommandRouter {
         catch let error as CoreError where error.code == "NOT_FOUND" { return nil }
     }
 
-    func addingHumanAnswerNoticeFailure(_ output: JSON, caller: Caller) -> JSON {
-        guard caller.role == "worker",caller.sessionID != nil,!caller.projectIDs.isEmpty else { return output }
+    func addingHumanAnswerNoticeFailure(_ db: Database, _ output: JSON, caller: Caller) -> JSON {
+        addingNoticeFailure(db,output,caller:caller,keys:["pending_human_answers","pending_notes"])
+    }
+
+    private func addingNoticeFailure(_ db: Database, _ output: JSON, caller: Caller, keys: [String]) -> JSON {
+        guard caller.role == "worker",let sid = caller.sessionID,caller.projectIDs.contains(where: { pid in
+            let session: JSON
+            do { session = try scoped(db,sid,pid,type:"session") }
+            catch let error as CoreError where ["FORBIDDEN","ROOT_MISMATCH","NOT_FOUND"].contains(error.code) { return false }
+            catch { return true } // A session read error is no proof of an empty inbox.
+            return session["provider"] as? String == "codex" && canReceive(session,project:pid)
+        }) else { return output }
+        return markingNotices(output,keys:keys)
+    }
+
+    /// No read connection was available, so the provider cannot be read. A worker sees unavailable, not an empty inbox.
+    func addingRecipientNoticesUnavailable(_ output: JSON, caller: Caller) -> JSON {
+        guard caller.role == "worker",caller.sessionID != nil else { return output }
+        return markingNotices(output,keys:["pending_human_answers","pending_notes"])
+    }
+
+    private func markingNotices(_ output: JSON, keys: [String]) -> JSON {
         var result = output
         if var data = result["data"] as? JSON {
-            data["_checklist"] = ["pending_human_answers":["schema_version":1,"status":"unavailable","channel":"authenticated_tool_result","native_codex_wake_qualified":false,"items":[],"has_more":false]]
+            var metadata = data["_checklist"] as? JSON ?? [:]
+            let unavailable: JSON = ["schema_version":1,"status":"unavailable","channel":"authenticated_tool_result","native_codex_wake_qualified":false,"items":[],"has_more":false]
+            for key in keys { metadata[key] = unavailable }
+            data["_checklist"] = metadata
             result["data"] = data
         }
         return result

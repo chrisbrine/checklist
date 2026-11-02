@@ -69,28 +69,41 @@ extension CommandRouter {
         ["kind", "id", "phase", "session_id", "generation"].allSatisfy { (a[$0] as? String ?? "").utf8.elementsEqual((b[$0] as? String ?? "").utf8) }
     }
     private func healthProgress(_ db: Database, task: JSON, target: JSON) throws -> Date? {
+        try healthProgressReading(db, task: task, target: target).at
+    }
+    /// The newest substantive clock, and which clock it is: `ticket_attempt` or `triage_checkpoint` (CL-412).
+    private func healthProgressReading(_ db: Database, task: JSON, target: JSON) throws -> (at: Date?, clock: String?) {
         let pid = (try StoredRecord(task, family: "task").string("project_id"))
         if target["kind"] as? String == "attempt" {
             // The accepted tree is capped at 32 descendants by work authority.
             // Include released accepted children too: their completed work is progress.
             let sql = """
                 WITH RECURSIVE tree(id,data) AS (
-                  SELECT id,data FROM records WHERE type='attempt' AND project_id=? AND id=?
-                  UNION ALL SELECT a.id,a.data FROM records a JOIN tree p ON json_extract(a.data,'$.parent_attempt_id')=p.id
-                  WHERE a.type='attempt' AND a.project_id=? AND json_extract(a.data,'$.task_id')=?
+                  SELECT id,data FROM records WHERE type='attempt' AND project_id=? AND id=? AND CASE WHEN json_valid(data) THEN 1 ELSE 0 END
+                  UNION ALL SELECT a.id,a.data FROM records a JOIN tree p ON CASE WHEN json_valid(a.data) THEN json_extract(a.data,'$.parent_attempt_id') END=p.id
+                  WHERE a.type='attempt' AND a.project_id=? AND CASE WHEN json_valid(a.data) THEN json_extract(a.data,'$.task_id') END=?
                 ) SELECT data FROM tree
                 """
             let latest = try Double.fetchOne(db,
                 sql: "SELECT MAX(checklist_timestamp(COALESCE(json_extract(data,'$.health_progress_at'),json_extract(data,'$.last_checkpoint'),json_extract(data,'$.started_at')))) FROM (" + sql +
                     ")", arguments: [pid, (try StoredRecord(target, family: "health_target").string("id")), pid, (try StoredRecord(task, family: "task").string("id"))])
-            return latest.map { Date(timeIntervalSince1970: $0) }
+            return (latest.map { Date(timeIntervalSince1970: $0) }, "ticket_attempt")
         }
         if let gid = target["triage_id"] as? String,
            let orchestration = try scoped(db, gid, pid, type: "group")["orchestration"] as? JSON {
-            return healthTime(orchestration["health_progress_at"] ?? orchestration["started_at"])
+            let triage = healthTime(orchestration["health_progress_at"] ?? orchestration["started_at"])
+            // Every attempt of this ticket, whatever its state. The same clock fields as above, so a repeated checkpoint does not advance it.
+            // json_valid guard: one malformed attempt record cannot roll back the health page.
+            let own = try Double.fetchOne(db,
+                sql: "SELECT MAX(checklist_timestamp(COALESCE(json_extract(data,'$.health_progress_at'),json_extract(data,'$.last_checkpoint'),json_extract(data,'$.started_at')))) FROM records WHERE type='attempt' AND project_id=? AND CASE WHEN json_valid(data) THEN json_extract(data,'$.task_id') END=?",
+                arguments: [pid, (try StoredRecord(task, family: "task").string("id"))]).map { Date(timeIntervalSince1970: $0) }
+            if let own, own >= triage ?? .distantPast { return (own, "ticket_attempt") }
+            return (triage, "triage_checkpoint")
         }
-        return nil
+        return (nil, nil)
     }
+    /// CL-412: for kind orchestration this stays the Triage checkpoint alone. Progress of the ticket
+    /// answers a request through the time in checkWorkHealth; a changed token would permit a new relay.
     private func healthProgressToken(_ db: Database, task: JSON, target: JSON) throws -> String {
         let pid = (try StoredRecord(task, family: "task").string("project_id"))
         if target["kind"] as? String == "attempt" {
@@ -98,9 +111,9 @@ extension CommandRouter {
             // change the token once the substantive clock has been initialized.
             let sql = """
                 WITH RECURSIVE tree(id,data) AS (
-                  SELECT id,data FROM records WHERE type='attempt' AND project_id=? AND id=?
-                  UNION ALL SELECT a.id,a.data FROM records a JOIN tree p ON json_extract(a.data,'$.parent_attempt_id')=p.id
-                  WHERE a.type='attempt' AND a.project_id=? AND json_extract(a.data,'$.task_id')=?
+                  SELECT id,data FROM records WHERE type='attempt' AND project_id=? AND id=? AND CASE WHEN json_valid(data) THEN 1 ELSE 0 END
+                  UNION ALL SELECT a.id,a.data FROM records a JOIN tree p ON CASE WHEN json_valid(a.data) THEN json_extract(a.data,'$.parent_attempt_id') END=p.id
+                  WHERE a.type='attempt' AND a.project_id=? AND CASE WHEN json_valid(a.data) THEN json_extract(a.data,'$.task_id') END=?
                 ) SELECT json_group_array(json_array(id,COALESCE(json_extract(data,'$.health_progress_at'),json_extract(data,'$.last_checkpoint'),json_extract(data,'$.started_at')),json_extract(data,'$.health_progress_id'))) FROM (SELECT * FROM tree ORDER BY id)
                 """
             return hash(Data((try String.fetchOne(db,sql:sql,arguments:[pid,(try StoredRecord(target, family: "health_target").string("id")),pid,(try StoredRecord(task,
@@ -137,7 +150,9 @@ extension CommandRouter {
         if let sid = target["session_id"] as? String, let session = try? scoped(db, sid, pid, type: "session") {
             value["session_state"] = session["state"] ?? "unknown"; value["last_seen"] = session["last_seen"] ?? NSNull()
         } else { value["session_state"] = target["session_id"] as? String == "human" ? "owner" : "unknown" }
-        value["last_progress_at"] = try healthProgress(db, task: task, target: target).map(healthStamp) ?? NSNull()
+        let reading = try healthProgressReading(db, task: task, target: target)
+        value["last_progress_at"] = reading.at.map(healthStamp) ?? NSNull()
+        value["last_progress_clock"] = reading.at == nil ? NSNull() : reading.clock ?? NSNull()
         let selected = try selectedProjection ?? selectedTaskHealthFacts(db,task:task)
         let waits = try healthKnownWaits(db, task: task, selected: selected)
         let jobs = try scopedTaskRows(db, type: "source_execution", task: task, predicate: "json_extract(data,'$.state') IN ('queued','running')", limit: 25)
@@ -302,7 +317,7 @@ extension CommandRouter {
         let project = try record(db, (try StoredRecord(task, family: "task").string("project_id")), type: "project"), settings = workHealthSettings(project)
         guard bool(settings, "enabled") else { return false }
         let target = try workHealthTarget(db, task: task), stamp = healthStamp(date)
-        let progress = try healthProgress(db, task: task, target: target)
+        let reading = try healthProgressReading(db, task: task, target: target), progress = reading.at
         let progressToken = try healthProgressToken(db, task: task, target: target)
         var health = task["work_health"] as? JSON ?? [:]
         let previous = health
@@ -323,7 +338,8 @@ extension CommandRouter {
             health["settings_generation"] = configGeneration
         }
         // New progress ends a wait named in a reply.
-        if (health["reported_wait"] as? JSON)?["progress_token"] as? String != progressToken, health["reported_wait"] != nil {
+        let waitSince = healthTime((health["reported_wait"] as? JSON)?["since"])
+        if health["reported_wait"] != nil, (health["reported_wait"] as? JSON)?["progress_token"] as? String != progressToken || (waitSince != nil && (progress ?? .distantPast) > waitSince!) {
             health.removeValue(forKey: "reported_wait"); task["work_health"] = health
         }
         let baseline = max(healthTime(health["baseline_at"]) ?? date, min(progress ?? .distantPast, date))
@@ -331,7 +347,7 @@ extension CommandRouter {
         if let mid = health["request_id"] as? String, var message = try? scoped(db, mid, (try StoredRecord(task, family: "task").string("project_id")), type: "message"),
             var request = message["health_request"] as? JSON, request["outcome"] == nil {
             if let progress, let sent = healthTime(request["requested_at"]), progress > sent || (request["progress_token"] as? String).map({ $0 != progressToken }) == true {
-                try healthOutcome(db, task: task, request: &request, outcome: "progress_observed", body: "Work health resumed: substantive progress from the current attempt or accepted child answered check \(mid). Work authority is unchanged.")
+                try healthOutcome(db, task: task, request: &request, outcome: "progress_observed", body: "Work health resumed: substantive progress from \(reading.clock == "triage_checkpoint" ? "the Triage checkpoint" : "the ticket's own attempt") answered check \(mid). Work authority is unchanged.")
                 health.removeValue(forKey: "request_id"); health.removeValue(forKey: "deadline"); health.removeValue(forKey: "reported_wait"); health["state"] = "current"; health["attention"] = false; health["baseline_at"] = healthStamp(progress); health["next_check_at"] = healthStamp(progress.addingTimeInterval(interval))
             } else if let deadline = healthTime(request["deadline"]), date >= deadline, health["state"] as? String != "no_response" {
                 let note = try healthNote(db, task: task, body: "No response to work health check \(mid) by \(healthStamp(deadline)). Delivery is not acknowledgment or useful progress. The handler may be busy, waiting or unavailable; no abandonment, completion, release or reassignment is inferred.", target: nil)
@@ -344,9 +360,9 @@ extension CommandRouter {
             // CL-389: a request relays only for new progress, never during a known wait, and at most three times per attempt.
             let relayTarget = target["id"] as? String, relayCount = health["relay_target"] as? String == relayTarget ? int(health, "relay_count", default: 0) : 0
             let relayed = try target["session_id"] != nil && health["relayed_progress_token"] as? String != progressToken && relayCount < Self.maximumHealthRelays && healthKnownWaits(db, task: task, selected: selectedTaskHealthFacts(db,task:task)).isEmpty
-            var request: JSON = ["target": target, "task_revision": int(task, "revision"), "acceptance_revision": int(task, "acceptance_revision"), "manifest_id": task["current_manifest_id"] ?? NSNull(), "requested_at": stamp, "last_progress_at": progress.map(healthStamp) ?? NSNull(), "progress_token": progressToken, "deadline": deadline]
+            var request: JSON = ["target": target, "task_revision": int(task, "revision"), "acceptance_revision": int(task, "acceptance_revision"), "manifest_id": task["current_manifest_id"] ?? NSNull(), "requested_at": stamp, "last_progress_at": progress.map(healthStamp) ?? NSNull(), "progress_clock": progress == nil ? NSNull() : reading.clock ?? NSNull(), "progress_token": progressToken, "deadline": deadline]
             if relayed { request["native_relay"] = true }
-            let note = try healthNote(db, task: task, body: "Work health check: does work continue? Last substantive progress: \(progress.map(healthStamp) ?? "not recorded"). Reply to this exact note with current progress, or call work_health_respond with request_id from this note and known_wait for a known wait. Response due \(deadline). This is an advisory check, not a new claim. It is also available on MCP pickup while this exact session remains eligible.", target: target, request: request, at: date)
+            let note = try healthNote(db, task: task, body: "Work health check: does work continue? Last substantive progress: \(progress.map { healthStamp($0) + (reading.clock == "triage_checkpoint" ? " (the Triage checkpoint)" : " (the ticket's own attempt)") } ?? "not recorded"). Reply to this exact note with current progress, or call work_health_respond with request_id from this note and known_wait for a known wait. Response due \(deadline). This is an advisory check, not a new claim. It is also available on MCP pickup while this exact session remains eligible.", target: target, request: request, at: date)
             if (note["deliveries"] as? [JSON])?.contains(where: { $0["native_relay"] != nil }) == true { health["relayed_progress_token"] = progressToken; health["relay_target"] = relayTarget ?? NSNull(); health["relay_count"] = relayCount + 1 }
             health["request_id"] = note["id"]; health["deadline"] = deadline; health["next_check_at"] = deadline; health["state"] = "awaiting_response"; health["attention"] = target["kind"] as? String == "missing_handler"
         } else if health["request_id"] == nil {

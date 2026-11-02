@@ -92,6 +92,12 @@ struct CLIError: LocalizedError {
 @main
 struct ChecklistCommand {
     static func main() async {
+        // Hooks must always exit successfully and keep stdout empty on errors,
+        // including malformed arguments and startup failures.
+        if CommandLine.arguments.dropFirst().first == CodexPostToolHook.command {
+            await CodexPostToolHook.main(Array(CommandLine.arguments.dropFirst()))
+            return
+        }
         let started = ProcessInfo.processInfo.systemUptime
         defer { if CallTimingLog.enabled { CallTimingLog.write(["scope":"cli", "total_ms":(ProcessInfo.processInfo.systemUptime-started)*1000]) } }
         let instance = ChecklistInstance.current
@@ -200,6 +206,7 @@ struct ChecklistCommand {
           checklist call METHOD '{"parameter":"value"}' [--workspace /absolute/project]
           checklist call METHOD -    (read at most 1 MiB of JSON from stdin)
           checklist call --wait[=SECONDS] METHOD '{"parameter":"value"}'
+          checklist codex-post-tool    (Codex PostToolUse hook; reads hook JSON from stdin)
           checklist version
 
         Run connect from a Codex or Claude conversation in its project directory.

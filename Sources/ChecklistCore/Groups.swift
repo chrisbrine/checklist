@@ -399,16 +399,14 @@ extension CommandRouter {
             try event(db,caller:c,project:pid,entity:gid,kind:"epic_member_"+action,data:["task_id":tid,"from_epic_id":old ?? NSNull()]);return group
         }
         guard ["add","update","remove"].contains(action) else { throw CoreError("INVALID_INPUT","Triage membership supports add, update or remove.") }
-        guard !bool(group,"archived") || action == "remove" else { throw CoreError("INVALID_TRANSITION","Restore this Triage before adding or updating its tickets.") }
         let prior = triageMember(group,taskID:tid)
         if action == "remove" {
             if prior != nil { group = try leaveTriage(db,group:group,taskID:tid,caller:c,reason:"removed",extra:["label":c.isOwner ? "Owner removed from Triage" : "Manually removed from Triage"]) }
             else { group = revised(group);try save(db,group,type:"group") }
             try event(db,caller:c,project:pid,entity:gid,kind:"triage_member_removed",data:["task_id":tid]);return try groupProjection(db,group)
         }
-        // CL-125 rule 5: only the orchestrator or the owner adds tickets to an orchestrated Triage; anyone eligible edits plans.
+        try requireTriageAddAllowed(group,caller:c)
         let orchestrator = triageOrchestratorSession(group)
-        if let orchestrator,!c.isOwner,c.sessionID != orchestrator { throw CoreError("TRIAGE_ORCHESTRATED","Only this Triage's orchestrator or the owner adds or updates its tickets. Send a note to the orchestrator instead.",details:["orchestrator_session_id":orchestrator]) }
         if let prior {
             var member = prior;member["updated_at"] = now()
             member["membership_id"] = try ensureTriageMembershipInterval(db,group:group,member:prior,caller:c)["id"]

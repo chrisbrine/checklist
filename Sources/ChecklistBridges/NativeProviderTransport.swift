@@ -77,3 +77,48 @@ public enum NativeProviderTransport {
         registry.plugin(provider, requiring: .nativePeer) as? ClaudeProviderPlugin
     }
 }
+
+/// Queue delivery needs proof of the exact thread's current host. A native
+/// process and a thread UUID alone do not distinguish an app thread from exec.
+public enum CodexQueueHost: String, Sendable {
+    case nativeApp = "native_app"
+    case exec
+    case unproven
+}
+
+public struct CodexQueueRefusal: LocalizedError, Sendable {
+    public let observation: CodexQueueObservation
+    public var errorDescription: String? { observation.reason.rawValue + ": " + observation.reason.explanation }
+}
+
+public enum CodexQueueRelay {
+    /// Off until CL-413 installs. While off, no Codex enrollment joins native dispatch and no queue call runs.
+    public static let enabled = false
+    /// Source switch: disabling it keeps accepted queue writes and inbox pickup.
+    public static let openUnloadedThreads = true
+
+    public static func observation(_ registration: NativeLifecycleRegistration) -> CodexQueueObservation {
+        guard registration.provider == "codex",UUID(uuidString:registration.sessionID) != nil else { return .init(reason:.recipientInvalid) }
+        return CodexQueueStore.current?.observe(threadID:registration.sessionID) ?? .init(reason:.databaseReadError)
+    }
+    public static func observedHost(_ registration: NativeLifecycleRegistration) -> CodexQueueHost { observation(registration).host }
+    public static func available(_ registration: NativeLifecycleRegistration) -> Bool { enabled && observedHost(registration) == .nativeApp }
+
+    public static func send(content: String, registration: NativeLifecycleRegistration,
+                            timeout: TimeInterval = 5,
+                            effects: any CodexQueueTransportEffects = MacOSCodexQueueTransportEffects()) throws -> CodexQueueReceipt {
+        try send(content:content,registration:registration,observation:observation(registration),enabled:enabled,timeout:timeout,effects:effects)
+    }
+
+    static func send(content: String, registration: NativeLifecycleRegistration, observation: CodexQueueObservation,
+                     enabled: Bool, timeout: TimeInterval, effects: any CodexQueueTransportEffects) throws -> CodexQueueReceipt {
+        guard registration.provider == "codex",UUID(uuidString:registration.sessionID) != nil else { throw CodexQueueRefusal(observation:.init(reason:.recipientInvalid)) }
+        guard enabled else { throw CodexQueueRefusal(observation:.init(reason:.routeDisabled)) }
+        guard observation.host == .nativeApp else { throw CodexQueueRefusal(observation:observation) }
+        guard timeout.isFinite else { throw NativeBridgeError.invalid("Codex queue deadline must be finite.") }
+        guard !content.isEmpty,!content.utf8.contains(0),content.utf8.count <= ClaudeLocalBridge.maximumContentUTF8Bytes else {
+            throw NativeBridgeError.invalid("Codex queue content is empty, contains NUL or exceeds the 128 KiB content cap.")
+        }
+        return try effects.queue(content:content,registration:registration,timeout:min(max(timeout,0.05),5))
+    }
+}

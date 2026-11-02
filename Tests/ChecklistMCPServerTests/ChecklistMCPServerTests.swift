@@ -924,6 +924,21 @@ final class ChecklistMCPServerTests: XCTestCase {
         XCTAssertFalse(fixture.calls.contains { $0.0 == "task_list" })
     }
 
+    func testPendingNoteMetadataSurvivesNativeMCPResultAndText() async throws {
+        let fixture = try Fixture(provider:"codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        let session = try await start(fixture)
+        fixture.responseData = ["id":"result","_checklist":["pending_notes":["schema_version":1,"status":"pending_pickup","has_more":false,"items":[[
+            "project_id":"00000000-0000-0000-0000-000000000410","message_id":"00000000-0000-0000-0000-000000000411",
+            "subject":["kind":"ticket","key":"SYN-1","title":"Synthetic note"]]]]]]
+        let reply = try await session.client.callTool(name:"service_info")
+        XCTAssertNotEqual(reply.isError,true)
+        let rendered = text(reply.content)
+        XCTAssertTrue(rendered.contains("Checklist has pending notes"))
+        XCTAssertTrue(rendered.contains("pending_notes"));XCTAssertTrue(rendered.contains("SYN-1"))
+        XCTAssertTrue(rendered.contains("00000000-0000-0000-0000-000000000411"))
+    }
+
     func testCodexAndUnregisteredWorkspaceKeepTheirStartupRules() async throws {
         let codex = try Fixture(provider: "codex")
         codex.setDiscoveries([.available(codex.context)])

@@ -484,14 +484,24 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     /// Selection only. Core rechecks the delivery's current session/grant, and
     /// delivery_record plus the existing pre-I/O check retain the durable fence.
     static func nativeEndpointAvailable(_ enrollment: Enrollment) -> Bool {
+        if codexQueueRegistration(enrollment) != nil { return CodexQueueRelay.enabled }
         guard let path = enrollment.nativeEndpoint else {return false}
         var attrs = stat()
         return lstat(path,&attrs) == 0 && UInt64(attrs.st_dev) == enrollment.nativeDevice && UInt64(attrs.st_ino) == enrollment.nativeInode
     }
+    /// Codex candidates enter the worker so a refused source lookup gets a receipt.
+    /// The read-only source check runs there, before any queue I/O, not on this queue.
+    static func codexQueueRegistration(_ enrollment: Enrollment) -> NativeLifecycleRegistration? {
+        guard enrollment.provider == "codex", enrollment.automatic == true,
+              enrollment.identityVerification == ProviderPluginRegistry.bundled.plugin("codex",requiring:.workSession)?.nativeHost?.identityVerification,
+              let domain = enrollment.nativeExecutionDomain else { return nil }
+        return NativeLifecycleRegistration(provider:"codex",sessionID:enrollment.nativeSessionID ?? enrollment.sessionID,
+            executionDomain:domain,registryPath:nil)
+    }
     func nativeDispatchDeliveries(endpointAvailable: (Enrollment)->Bool = Coordinator.nativeEndpointAvailable,
                                   load: ([String:Any]) -> [String:Any]?) -> [[String:Any]] {
         requireCommandQueue()
-        let sessions = enrollments.values.filter {$0.nativeEndpoint != nil && $0.revoked != true && endpointAvailable($0)}.map { $0.sessionID }
+        let sessions = enrollments.values.filter {($0.nativeEndpoint != nil || Self.codexQueueRegistration($0) != nil) && $0.revoked != true && endpointAvailable($0)}.map { $0.sessionID }
         var pending: [[String:Any]] = []
         // Bound each internal request without imposing a new installation-wide
         // enrollment limit. An empty route set performs no outbox projection.
@@ -513,13 +523,17 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         for delivery in pending {
             guard let id=delivery["id"] as? String,!attemptedDeliveries.contains(id), delivery["push_state"] as? String == "unavailable",
                   let sid=delivery["recipient_session_id"] as? String,
-                  let enrollment=enrollments.values.first(where:{$0.sessionID==sid && $0.nativeEndpoint != nil && $0.revoked != true}),let endpoint=enrollment.nativeEndpoint,
+                  let enrollment=enrollments.values.first(where:{$0.sessionID==sid && $0.revoked != true && Self.nativeEndpointAvailable($0)}),
                   let message=delivery["message"] as? [String:Any],let mid=message["id"] as? String,let body=message["body"] as? String else { continue }
             // Owner notes, agent ticket notes and work health requests use the relay. It always states its own
             // restricted class (prompting) and the real author; it never claims an originating agent's permission class.
             guard let origin=NativeRelayOrigin.forDispatch(messageOrigin:message["origin"] as? String,nativeRelay:delivery["native_relay"] as? String) else { continue }
-            var attrs=stat()
-            guard lstat(endpoint,&attrs)==0,UInt64(attrs.st_dev)==enrollment.nativeDevice,UInt64(attrs.st_ino)==enrollment.nativeInode else { continue }
+            let queueRegistration = Self.codexQueueRegistration(enrollment)
+            let endpoint = enrollment.nativeEndpoint ?? ""
+            if queueRegistration == nil {
+                var attrs=stat()
+                guard lstat(endpoint,&attrs)==0,UInt64(attrs.st_dev)==enrollment.nativeDevice,UInt64(attrs.st_ino)==enrollment.nativeInode else { continue }
+            }
             attemptedDeliveries.insert(id)
             // Persist an uncertainty fence BEFORE external I/O. A process crash never retries the same native write.
             do {
@@ -533,7 +547,9 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
                 && message["reply_recipient_authorization_generation"] as? String == delivery["recipient_authorization_generation"] as? String
             let peerPID=NativeProviderTransport.endpointPID(provider:enrollment.provider,endpoint:endpoint) ?? 0
             // Registered before I/O: Claude can report a hold before this write's outcome is recorded.
-            nativeInFlight[id]=NativeInFlight(deliveryID:id,messageID:mid,peerPID:peerPID,routeGeneration:enrollment.generation,startedAt:Date())
+            if queueRegistration == nil {
+                nativeInFlight[id]=NativeInFlight(deliveryID:id,messageID:mid,peerPID:peerPID,routeGeneration:enrollment.generation,startedAt:Date())
+            }
             let replyAddress = listener.address
             // JSON metadata never crosses the queue as an Any-valued dictionary.
             let author = message["author_display"] as? String ?? "unknown session"
@@ -542,28 +558,61 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
             DispatchQueue.global(qos:.utility).async { [self] in
                 let state:String;let receipt:[String:Any]
                 do {
-                    let stillAuthorized=queue.sync { () -> Bool in
+                    let authorized: () -> Bool = { [self] in queue.sync { () -> Bool in
                         guard self.enrollments[enrollment.installation]?.generation == enrollment.generation,
                               self.enrollments[enrollment.installation]?.revoked != true,
                               let current=try? self.router.handle(method:"delivery_pending",params:["native_session_ids":[sid]],caller:bridge),let data=current["data"] as? [String:Any],let deliveries=data["deliveries"] as? [[String:Any]] else { return false }
                         return deliveries.contains { $0["id"] as? String == id }
+                    } }
+                    guard authorized() else { throw ChecklistError("RECIPIENT_REVOKED","Native send canceled before I/O because the route was revoked.") }
+                    let content=try NativeRelayContent.render(origin:origin,messageID:mid,authorDisplayName:author,body:body,subject:subjectBytes.flatMap { (try? JSONSerialization.jsonObject(with:$0)) as? [String:Any] },ticket:ticketBytes.flatMap { (try? JSONSerialization.jsonObject(with:$0)) as? [String:Any] },permittedReply:queueRegistration == nil && replyPermitted ? NativeRelayReply(address:replyAddress):nil)
+                    if let queueRegistration {
+                        let sent = try CodexQueueRelay.send(content:content,registration:queueRegistration)
+                        var accepted: [String:Any] = ["stage":"codex_queue_command_exited_zero","exit_status":sent.exitStatus,"bytes":sent.byteCount,
+                            "route_generation":enrollment.generation,"model_acknowledged":false,"route":"codex_app_queue","result":"provider_accepted",
+                            "observer":"codex_state_5_threads_source","source":"vscode","reason_code":"source_vscode",
+                            "queue_poll_result":"not_started","open_result":"not_started"]
+                        if let item = sent.itemID { accepted["queued_item_id"] = item }
+                        // Preserve queue acceptance before the bounded wait. A crash
+                        // cannot send this delivery again or mint acknowledgment.
+                        let acceptedBytes = try JSONSerialization.data(withJSONObject:accepted)
+                        let recorded = queue.sync { () -> Bool in
+                            let fields = (try? JSONSerialization.jsonObject(with:acceptedBytes)) as? [String:Any] ?? [:]
+                            if case .recorded = nativeOutcomes().record("delivery_record",params:["delivery_id":id,"state":"provider_accepted","receipt":fields],deliveryID:id,routeGeneration:enrollment.generation) { changed();return true }
+                            return false
+                        }
+                        if recorded {
+                            let followup = CodexQueueFollowup.finish(itemID:sent.itemID,registration:queueRegistration,authorized:authorized)
+                            accepted.merge(followup.metadata) { _,new in new }
+                        } else {
+                            accepted["queue_poll_result"] = "authorization_changed";accepted["open_result"] = "authorization_changed"
+                        }
+                        state="provider_accepted";receipt=accepted
+                    } else {
+                        guard enrollment.automatic == true,
+                              let plugin=ProviderPluginRegistry.bundled.plugin(enrollment.provider, requiring: .nativePeer),
+                              enrollment.identityVerification == plugin.nativeHost?.identityVerification,
+                              peerPID > 1,let domain = enrollment.nativeExecutionDomain,
+                              let registration = NativeLifecycleRegistration(provider:enrollment.provider,
+                                sessionID:enrollment.nativeSessionID ?? enrollment.sessionID,executionDomain:domain,
+                                registryPath:plugin.nativeHost?.registryPath(processID:peerPID)) else {
+                            throw ChecklistError("NATIVE_REGISTRATION_UNPROVEN","Native push requires the current verified native registration; this note remains available through Checklist pickup.")
+                        }
+                        let sent=try NativeProviderTransport.send(provider:enrollment.provider,content:content,messageID:mid,replyAddress:replyAddress,displayName:"Checklist",endpoint:endpoint,expectedPeerPID:peerPID,expectedRegistration:registration)
+                        state="transport_written";receipt=["bytes":sent.byteCount,"socket_device":sent.socketDevice,"socket_inode":sent.socketInode,"route_generation":enrollment.generation]
                     }
-                    guard stillAuthorized else { throw ChecklistError("RECIPIENT_REVOKED","Native send canceled before I/O because the route was revoked.") }
-                    guard enrollment.automatic == true,
-                          let plugin=ProviderPluginRegistry.bundled.plugin(enrollment.provider, requiring: .nativePeer),
-                          enrollment.identityVerification == plugin.nativeHost?.identityVerification,
-                          peerPID > 1,let domain = enrollment.nativeExecutionDomain,
-                          let registration = NativeLifecycleRegistration(provider:enrollment.provider,
-                            sessionID:enrollment.nativeSessionID ?? enrollment.sessionID,executionDomain:domain,
-                            registryPath:plugin.nativeHost?.registryPath(processID:peerPID)) else {
-                        throw ChecklistError("NATIVE_REGISTRATION_UNPROVEN","Native push requires the current verified native registration; this note remains available through Checklist pickup.")
-                    }
-                    let content=try NativeRelayContent.render(origin:origin,messageID:mid,authorDisplayName:author,body:body,subject:subjectBytes.flatMap { (try? JSONSerialization.jsonObject(with:$0)) as? [String:Any] },ticket:ticketBytes.flatMap { (try? JSONSerialization.jsonObject(with:$0)) as? [String:Any] },permittedReply:replyPermitted ? NativeRelayReply(address:replyAddress):nil)
-                    let sent=try NativeProviderTransport.send(provider:enrollment.provider,content:content,messageID:mid,replyAddress:replyAddress,displayName:"Checklist",endpoint:endpoint,expectedPeerPID:peerPID,expectedRegistration:registration)
-                    state="transport_written";receipt=["bytes":sent.byteCount,"socket_device":sent.socketDevice,"socket_inode":sent.socketInode,"route_generation":enrollment.generation]
                 } catch {
                     state=(error as? NativeBridgeError)?.deliveryMayHaveOccurred == true ? "uncertain":"failed"
-                    receipt=["reason":PublicErrorText.describe(error),"route_generation":enrollment.generation]
+                    var failure: [String:Any] = ["reason":PublicErrorText.describe(error),"route_generation":enrollment.generation]
+                    if queueRegistration != nil {
+                        failure.merge(["route":"codex_app_queue","result":state == "uncertain" ? "uncertain" : "failed",
+                            "observer":"codex_state_5_threads_source","reason_code":state == "uncertain" ? "queue_outcome_unknown" : "queue_command_failed",
+                            "queue_poll_result":"not_started","open_result":"refused"]) { _,new in new }
+                        if let refusal = error as? CodexQueueRefusal {
+                            failure.merge(refusal.observation.receipt) { _,new in new };failure["result"] = "refused"
+                        }
+                    }
+                    receipt=failure
                 }
                 let receiptBytes = (try? JSONSerialization.data(withJSONObject:receipt)) ?? Data("{}".utf8)
                 queue.async { [self] in

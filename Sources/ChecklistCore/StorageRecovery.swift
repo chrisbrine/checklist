@@ -362,7 +362,7 @@ extension CommandRouter {
         }
         let warning = performStorageMaintenance(db,permit:permit)
         do { output = try addingHumanAnswerNotices(db,output:output,params:params,caller:caller) }
-        catch { output = addingHumanAnswerNoticeFailure(output,caller:caller) }
+        catch { output = addingHumanAnswerNoticeFailure(db,output,caller:caller) }
         return addingStorageMaintenanceNotice(output,warning:warning)
     }
 
