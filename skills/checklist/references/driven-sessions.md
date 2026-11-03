@@ -1,6 +1,6 @@
 # Sessions that another agent starts (optional)
 
-Read this only when an orchestrator starts a provider session outside that provider's own desktop or terminal host, for example `codex exec` started from a Claude conversation or a script. A native Codex or Claude conversation, including a Triage that Codex itself orchestrates, uses its MCP connection; it needs only [helper hand-ins and call limits](#helper-hand-ins-and-call-limits) and [reads that run as operations](#reads-that-run-as-operations) from this reference.
+Read this only when an orchestrator starts a provider session outside that provider's own desktop or terminal host, for example `codex exec` started from a Claude conversation or a script. A native Codex or Claude conversation, including a Triage that Codex itself orchestrates, uses its MCP connection; it needs only [helper hand-ins and call limits](#helper-hand-ins-and-call-limits), [reads that run as operations](#reads-that-run-as-operations) and the [brief templates](#brief-templates-and-the-triage-pre-step) from this reference. A native Codex or Claude orchestrator uses the brief templates for every helper session that it starts, on any host.
 
 Each host has its own section. A host without a section here is not supported for this route until someone observes and records it.
 
@@ -128,11 +128,33 @@ Before any SwiftPM build/test in these briefs, set `export CHECKLIST_SWIFTPM_CAC
 
 Set `export CHECKLIST_COMPILATION_CACHE_MAX_BYTES=10737418240` (10 GiB allocated) as the round's CompilationCache budget. At each step boundary, record `du -sk "$HOME/Library/Developer/Xcode/DerivedData/CompilationCache.noindex"` when present and compare KiB × 1024 to `$CHECKLIST_COMPILATION_CACHE_MAX_BYTES`; include any per-run CompilationCache folders in that budget. If over budget, pause further cache-producing qualification work until the orchestrator reconciles idle disposable runs. The variable is a workflow budget, not a claimed compiler environment switch or automatic eviction mechanism. Do not alter global Xcode settings or remove a shared active compiler cache through this script. Any separately authorized global cache pruning uses the toolchain's supported cache operation while users are idle. Record before/after allocated bytes, build time and dependency-fetch reuse in a later measured round; this setting alone proves no speed or disk-saving result.
 
+### Brief templates and the Triage pre-step
+
+The implementer, reviewer, check-runner and rework templates below apply to every orchestrator, native or driven. A claim by a session that orchestrates no Triage never puts a ticket into a Triage, so each template starts with an orchestrator pre-step and gives the helper one Triage line. Fill `<ticket>` with the ticket's `KEY "Title"` and `<triage_key>` with the key of your own Triage (see the [orchestrator first steps](../SKILL.md#checklist)).
+
+### Implementer brief template
+
+Orchestrator pre-step: add `<ticket>` to your Triage `<triage_key>` with `group_membership` before you start this session. Fill `<project folder>`, `<project_id>`, `<ticket>`, `<task_id>`, `<triage_key>`, `<checklist CLI>`, `<scratch folder>`, `<base>`, `<acceptance items>`, `<handoff folder>` and `<submit rule>`. `<scratch folder>` is an assigned persistent slot outside `~/Documents` with `src/` and sibling `.build/`, marked by its owning session before assignment. `<submit rule>` says whether the helper submits or the orchestrator composes the round first.
+
+You implement `<ticket>` in a private copy. Your claim keeps the ticket in `<triage_key>`. Do not call `triage_orchestrate`. If the claim reply's `triage_membership.state` is `none`, send a note to the orchestrator.
+
+1. Read `<project folder>/AGENTS.md`, `skills/checklist/references/work.md`, the [fast round rules](coordinate.md#fast-round-rules) and this reference first.
+2. Run ticket service calls from `<project folder>` (`<checklist CLI> call <tool> '<json>'` for a driven session, or the MCP tools in a native session). The first call is `service_info`. Continue only if `caller.session_id` is your actual session and `project_ids` contains `<project_id>`. Each write has a new random UUID `command_id`; reuse it only for an exact retry.
+3. Read `task_context` for `<task_id>`. Check `<acceptance items>` against the brief before you start; report a gap at once. Claim with `work_claim`, current revisions and the file scopes of your change. Read `triage_membership` in the claim reply as stated above. Keep claim tokens out of prompts, notes, logs and reports.
+4. Write the hand-in skeleton first (`notes.md`, `files.json`) in `<handoff folder>`. Sync `<scratch folder>/src` to `<base>` and verify it before you edit. Write only under `<scratch folder>` and `<handoff folder>`; the shared checkout stays read-only. Reuse the fixed `--scratch-path <scratch folder>/.build`; never delete the slot cache.
+5. Implement only `<ticket>`. Use `work_checkpoint` at side-effect boundaries, with `waiting_for_resource` while you wait for a shared resource.
+6. Prove the hand-in under rule 1 of the [fast round rules](coordinate.md#fast-round-rules): run the test groups that `script/affected_tests.py` selects, with wall times, and run every touched script test twice (normally and with session identity variables unset).
+7. Hand in final and base bytes, hashes, commands, results and limits in `<handoff folder>`, then send a note to the orchestrator. Follow `<submit rule>`. Do not commit, install, write the shared checkout or run scratch cleanup outside `<scratch folder>`.
+
+Final report: `<ticket>`, the hand-in path, each acceptance item with its proof, test commands with result lines and wall times, the claim reply's `triage_membership.state`, and what is not proved.
+
 ### Reviewer brief template
 
 Fill the placeholders before starting a fresh Codex thread on `gpt-6.1-sol` for one batch: `<project folder>`, `<project_id>`, `<triage_id>`, `<build ID>`, `<checklist CLI>`, `<source capture>`, `<scratch folder>`, `<handoff details>` and `<contributors>`. `<scratch folder>` is an assigned persistent build slot outside `~/Documents`, containing `src/` and sibling `.build/`; implementer and integrator briefs use the same layout. Follow [combined build rounds](coordinate.md#combined-build-rounds) when preparing the round.
 
-You are an independent reviewer. You did not contribute to these tickets. Find real defects and pass a ticket only when evidence and your own checks prove every acceptance item and applicable project requirement. Recorded contributors include `<contributors>`; their reports remain attributed to them.
+Orchestrator pre-step: add each `<ticket>` of the batch to your Triage `<triage_key>` with `group_membership` before you start this session; `<triage_id>` is that Triage.
+
+You are an independent reviewer. You did not contribute to these tickets. Find real defects and pass a ticket only when evidence and your own checks prove every acceptance item and applicable project requirement. Recorded contributors include `<contributors>`; their reports remain attributed to them. Your claim keeps each ticket in `<triage_key>`. Do not call `triage_orchestrate`. If a claim reply's `triage_membership.state` is `none`, send a note to the orchestrator.
 
 1. Read `<project folder>/AGENTS.md`, `skills/checklist/references/review.md` and this reference first.
 2. Run ticket service calls from `<project folder>` as `<checklist CLI> call <tool> '<json>'`. The first call is `service_info '{}'`. Continue only if `caller.session_id` equals your actual Codex thread ID and `project_ids` contains `<project_id>`. Use `<checklist CLI> tools` to read current schemas. Each write has a new random UUID `command_id`; reuse it only for an exact retry.
@@ -154,7 +176,9 @@ Final report: one line per ticket with key/title, verdict, review ID and finding
 
 Fill `<project folder>`, `<project_id>`, `<task_id>`, `<acceptance items>`, `<build ID>`, `<checklist CLI>`, `<slot>`, `<slot CLI>`, `<slot project_id>`, `<scratch folder>`, `<evidence folder>` and `<check plan>`. The implementation orchestrator supplies a prepared test slot of that build, created with its actual native session identity (`CHECKLIST_SESSION_ID` or `create --session-id <actual session ID>` only when no native ID is exported), verifies its owning-session/fingerprint root marker, and seeds it empty or with small synthetic fixtures unless a named acceptance item or required storage gate needs a verified real-store backup. Keep installed slot folders outside `~/Documents`, as [test instances](../../../docs/test-instances.md) specifies. Have the owning session mark `<scratch folder>` when created as described above; only that session releases it when its assignment is retired. Any source build uses an assigned persistent `<scratch folder>/src` plus `<scratch folder>/.build` outside `~/Documents`, synced with `rsync -a --delete --checksum --exclude .build --exclude .local` and reused with the fixed `--scratch-path`; never delete the cache or start each task cold. Up to four runners use separate slots in parallel.
 
-You are a fresh non-contributor Codex check runner on `gpt-6.1-sol`. Record installed-app observations for `<acceptance items>` on `<build ID>`. You do not claim work, review or record verdicts. Your only real-ticket write is attaching the requested evidence to `<task_id>`.
+Orchestrator pre-step: add `<ticket>` (the ticket of `<task_id>`) to your Triage `<triage_key>` with `group_membership` before you start this session.
+
+You are a fresh non-contributor Codex check runner on `gpt-6.1-sol`. Record installed-app observations for `<acceptance items>` on `<build ID>`. You do not claim work, review or record verdicts. Your only real-ticket write is attaching the requested evidence to `<task_id>`. You make no claim; the ticket stays in `<triage_key>`. Do not call `triage_orchestrate`. If `task_context` shows `<task_id>` in no Triage, send a note to the orchestrator.
 
 1. Read `<project folder>/AGENTS.md`, `docs/test-instances.md` and `<check plan>`. Keep the shared checkout and source captures read-only. Write scratch and reports only under `<scratch folder>` and `<evidence folder>`, outside the shared checkout.
 2. Run ticket evidence calls from `<project folder>` with `<checklist CLI> call <tool> '<json>'`. First call `service_info '{}'`; continue only if `caller.session_id` equals your actual Codex thread ID and `project_ids` contains `<project_id>`. Read schemas with `<checklist CLI> tools`. Each write has a new random UUID `command_id`; reuse it only for the same input. Keep claim tokens out of shared outputs.
@@ -171,7 +195,9 @@ Final report: actual Codex thread identity; build ID and slot; each acceptance i
 
 ### Rework brief template
 
-Fill `<project folder>`, `<scratch folder>`, `<qualified round>`, `<ticket keys>`, `<failed cases>` and `<handoff folder>`. Work only on the assigned failed/remaining tickets and preserve valid passing evidence with its original producer, target and hash.
+Orchestrator pre-step: add each `<ticket>` to your Triage `<triage_key>` with `group_membership` before you start this session. A returned ticket usually comes back to its return Triage; check `triage_membership` first and add only a ticket that is not there.
+
+Fill `<project folder>`, `<scratch folder>`, `<qualified round>`, `<ticket keys>`, `<triage_key>`, `<failed cases>` and `<handoff folder>`. Work only on the assigned failed/remaining tickets and preserve valid passing evidence with its original producer, target and hash. Your claim keeps each ticket in `<triage_key>`. Do not call `triage_orchestrate`. If the claim reply's `triage_membership.state` is `none`, send a note to the orchestrator.
 
 1. Read the current tickets, findings and project instructions. Verify the assigned persistent workspace was marked by its owning session before source sync (including migration of existing assigned slots); keep it marked until that session retires it. Sync the assigned persistent slot's `src/` to the named rework base, preserving sibling `.build/`; verify the expected base before editing.
 2. Use the [shared cache settings](#scratch-cleanup-and-cache-settings) for SwiftPM commands, including `--cache-path "$CHECKLIST_SWIFTPM_CACHE_PATH" --enable-dependency-cache` and the fixed `--scratch-path <scratch folder>/.build`. Follow the round's compiler slot cap. Never delete the warm slot cache.

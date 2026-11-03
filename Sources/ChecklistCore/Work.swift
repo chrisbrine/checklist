@@ -513,7 +513,7 @@ extension CommandRouter {
         if p["phase"] as? String != "review",
             let returned = try pickupReturnedImplementation(db, params: p, task: t, caller: c)
         {
-            return returned
+            return try addingClaimTriageMembership(db, reply: returned, task: t, caller: c)
         }
         guard t["active_attempt_id"] == nil, t["active_verification_request_id"] == nil else {
             throw CoreError("CLAIM_CONFLICT", "Another session already holds this task.")
@@ -634,6 +634,7 @@ extension CommandRouter {
             let context = try compactTaskContext(db, task: t, caller: c, directionAttempt: a)
             a["task"] = context["task"]
             a["context"] = context
+            a = try addingClaimTriageMembership(db, reply: a, task: t, caller: c)
         }
         return a
     }

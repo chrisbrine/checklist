@@ -224,6 +224,7 @@ extension CommandRouter {
         (try StoredRecord(a, family: "WorkAuthority").string("task_id")),pid,
         type:"task");a["context"] = try compactTaskContext(db,task:task,caller:c);
         a["direction_cursor"] = (a["context"] as? JSON)?["direction_cursor"];
+        if !isChild && a["parent_attempt_id"] == nil { a = try addingClaimTriageMembership(db,reply:a,task:task,caller:c) }
         return a
     }
 
@@ -325,7 +326,7 @@ extension CommandRouter {
         let notices = try roleChangeNotices(db,task:t,earlier:holders,body:body,caller:c)
         a.removeValue(forKey:"token_hash");a["claim_token"] = token;a["task"] = try taskProjection(db,t);a["context"] = try compactTaskContext(db,task:t,caller:c)
         a["takeover_notices"] = notices.map { ["message_id":$0["id"] ?? NSNull(),"deliveries":$0["deliveries"] ?? []] as JSON }
-        return a
+        return try addingClaimTriageMembership(db,reply:a,task:t,caller:c)
     }
 }
 

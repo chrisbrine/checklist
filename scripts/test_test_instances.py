@@ -1348,6 +1348,28 @@ class SeedIsolationTests(unittest.TestCase):
                     with self.subTest(value=value), self.assertRaises(ValueError):
                         harness.require_local_paths(database, base / 'data')
 
+    def test_media_intake_source_paths_are_external_references(self):
+        # CL-424: intake rows keep each worker-selected source file; the seed counts it and never opens it.
+        with test_directory() as directory:
+            base = Path(directory).resolve();live = base / 'Checklist';live.mkdir();slots = base / 'slots'
+            with patch.object(harness, 'LIVE', live), patch.object(harness, 'DEFAULT_LIVE', live), patch.object(harness, 'BASE', slots):
+                source = str(base / 'project/takes/walk-n.mp4')
+                counts = self.inspect(base, [('media_intake_row', {'id': 'row', 'path': source, 'stem': 'walk-n'}),
+                                             ('media_intake', {'id': 'intake', 'sources': [{'path': source}]}),
+                                             ('media_intake_plan', {'id': 'plan', 'rows': [{'path': source, 'stem': 'walk-n'}]})])
+                self.assertEqual(counts['external_project_path_occurrences'], 3)
+                for value in [str(live / 'objects/file'), 'FiLe:///outside/file', '../file']:
+                    database = base / ('bad-' + str(len(list(base.glob('bad-*')))) + '.sqlite')
+                    store_fixture(database, 3, [('media_intake_row', {'id': 'row', 'path': value})])
+                    with self.subTest(value=value), self.assertRaises(ValueError):
+                        harness.require_local_paths(database, base / 'data')
+                # Other record kinds keep the strict rule, and a refusal names the record kind, never the value.
+                database = base / 'strict.sqlite'
+                store_fixture(database, 3, [('task', {'id': 'task', 'details': {'path': '/outside/file'}})])
+                with self.assertRaisesRegex(ValueError, r'records\.data\.details\.path.*Record kind: task\.') as raised:
+                    harness.require_local_paths(database, base / 'data')
+                self.assertNotIn('/outside/file', str(raised.exception))
+
     def test_retained_recovery_references_are_inert_not_file_authority(self):
         values = ['/outside/evidence/', '/usr/bin/trash --stopOnError printed success', '/outside/../evidence']
         for kind in ['attempt', 'source_execution']:

@@ -477,6 +477,11 @@ esac
 echo "Installed $DEST"
 if [ "$HAD_PREVIOUS" = 1 ]; then echo "Previous bundle retained at $PREVIOUS; it does not restore the store."; fi
 if [ "$HAD_PREVIOUS" != 1 ]; then PREVIOUS=""; fi
+# CL-423: Claude (~/.claude/skills) and Codex (~/.agents/skills) load their own skill copies.
+# Copy the installed bundle skill there; a user-changed or foreign copy is reported, not replaced.
+# Report only: a skill install failure never fails the app install.
+python3 "$ROOT_DIR/script/install_skill.py" --apply --source "$DEST/Contents/Resources/skills/checklist" >"$CAPTURE_DIR/skill-install.jsonl" 2>&1 || echo "Warning: the Checklist skill copies were not all installed; report: $CAPTURE_DIR/skill-install.jsonl" >&2
+echo "Skill install report: $CAPTURE_DIR/skill-install.jsonl"
 if ! python3 "$ROOT_DIR/script/retire_old_bundles.py" --after-install --keep "$PREVIOUS"; then
   echo "Warning: old Checklist bundles could not all move to the Trash; see the retirement output." >&2
 fi

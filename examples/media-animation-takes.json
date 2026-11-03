@@ -88,6 +88,7 @@
       "reference"
     ],
     "loop": true,
-    "frame_rate_field_id": "frame_rate"
+    "frame_rate_field_id": "frame_rate",
+    "review_in_draft": true
   }
 }

@@ -68,6 +68,45 @@ extension CommandRouter {
         statement["text"] = "\(current) You orchestrate \(try agentReference(db, mine)). Use add_command to add this ticket, and supply a new UUID as its command_id. Do not add a split or follow-up ticket that goes to the next unstarted plan."
         return statement
     }
+    /// CL-423: observe membership after the claim move; this never groups a helper's ticket.
+    func claimTriageMembership(_ db: Database, task: JSON, caller c: Caller) throws -> JSON {
+        let stored = StoredRecord(task, family: "task")
+        let tid = try stored.string("id"), pid = try stored.string("project_id")
+        let key = AgentReference.sanitized(try stored.string("key"), maximumCharacters: 80, maximumUTF8Bytes: 320)
+        if let joined = try currentTriages(db, project: pid, taskID: tid).first {
+            // Returned-claim token pickup keeps its existing membership. The
+            // orchestrator may have finished since the claim was returned.
+            guard triageOrchestratorSession(joined) != nil else {
+                return try taskCreateTriageMembership(db, task: task, joined: joined, caller: c)
+            }
+            let mine = triageOrchestratorSession(joined) == c.sessionID
+            let reference = AgentReference.text(joined)
+            return ["state": "member", "triage_id": joined["id"] ?? NSNull(), "key": joined["key"] ?? NSNull(),
+                    "name": joined["name"] ?? NSNull(), "plan": triageOrchestratorSession(joined) == nil,
+                    "text": mine ? "\(key) is in your Triage \(reference)." : "\(key) stays in \(reference), which another conversation orchestrates. You are the ticket holder; its notes reach you and that orchestrator."]
+        }
+        if try callerOrchestratedTriage(db, project: pid, caller: c) != nil {
+            return try taskCreateTriageMembership(db, task: task, joined: nil, caller: c)
+        }
+        return ["state": "none",
+                "text": "\(key) is in no Triage, so only you get its notes. If a conversation sent you this work, ask it to add \(key) to its Triage (group_membership add). If you orchestrate this work, call triage_orchestrate action=start without triage_id, then use add_command.",
+                "start_command": ["method": "triage_orchestrate", "arguments": ["project_id": pid, "action": "start", "command_id": uuid()]] as JSON,
+                "add_command": ["method": "group_membership", "arguments": ["project_id": pid, "group_id": "<triage_id from start_command>", "task_id": tid,
+                    "action": "add", "expected_revision": "<revision from start_command>", "command_id": "<new UUID>"]] as JSON]
+    }
+
+    func addingClaimTriageMembership(_ db: Database, reply: JSON, task: JSON, caller: Caller) throws -> JSON {
+        var result = reply
+        let statement = try claimTriageMembership(db, task: task, caller: caller)
+        result["triage_membership"] = statement
+        if let text = statement["text"] as? String, statement["start_command"] != nil {
+            var metadata = result["_checklist"] as? JSON ?? [:]
+            metadata["notices"] = (metadata["notices"] as? [String] ?? []) + [text]
+            result["_checklist"] = metadata
+        }
+        return result
+    }
+
     func currentTriages(_ db: Database, project pid: String, taskID tid: String) throws -> [JSON] {
         try records(db, type: "group", project: pid).filter { $0["kind"] as? String == "triage" && triageMemberIDs($0).contains(tid) }
     }

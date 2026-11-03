@@ -212,6 +212,31 @@ final class MediaReviewSchemaTests: XCTestCase {
         XCTAssertThrowsError(try MediaReviewSchema.parse(raw))
     }
 
+    func testReviewInDraftIsStrictBooleanForEveryLayoutAndDefaultsToFalse() throws {
+        XCTAssertFalse(try MediaReviewSchema.parse(base()).layout.reviewInDraft)
+        for (kind, slotKind) in [("generic", "image"), ("image_compare", "image"),
+                                 ("video_compare", "video"), ("audio_compare", "audio"), ("text_compare", "text")] {
+            var raw = base(); raw["slots"] = [slot("current", kind: slotKind)]
+            var layout: [String: Any] = ["kind": kind]
+            raw["layout"] = kind
+            XCTAssertFalse(try MediaReviewSchema.parse(raw).layout.reviewInDraft, kind)
+            raw["layout"] = layout
+            XCTAssertFalse(try MediaReviewSchema.parse(raw).layout.reviewInDraft, kind)
+            let original = try definition(raw, slots: ["current"])
+            for value in [true, false] {
+                layout["review_in_draft"] = value; raw["layout"] = layout
+                XCTAssertEqual(try MediaReviewSchema.parse(raw).layout.reviewInDraft, value, kind)
+                XCTAssertEqual(try definition(raw, slots: ["current"]), original, "Review timing is presentation only: " + kind)
+            }
+            for invalid in ["true", 1, 0, NSNull()] as [Any] {
+                layout["review_in_draft"] = invalid; raw["layout"] = layout
+                XCTAssertThrowsError(try MediaReviewSchema.parse(raw), kind) {
+                    XCTAssertEqual($0 as? MediaSchemaError, .invalid("type.layout.review_in_draft", "expected Boolean"))
+                }
+            }
+        }
+    }
+
     func testCosmeticAndUnusedOptionalChangesDoNotChangeMaterialDefinition() throws {
         var raw = base(); raw["fields"] = [field("used"), field("unused")]
         raw["slots"] = [slot("current"), slot("unused")]; raw["layout"] = "generic"

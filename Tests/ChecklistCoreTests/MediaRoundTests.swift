@@ -223,6 +223,34 @@ final class MediaRoundTests: XCTestCase {
         XCTAssertTrue((changed["items"] as! [JSON]).allSatisfy {$0["disposition"] as? String == "stale"})
         XCTAssertEqual(try f.rows("media_owner_decision").count,2)
     }
+
+    func testReviewInDraftRevisionPreservesItemReviewBasisAndAcceptedDecision() throws {
+        let f = try Fixture(),t = try f.type(schema()),r = try f.round(t)
+        let item = try f.item(r)
+        _ = try f.publish(r);try f.acceptEach(r)
+        let original = try XCTUnwrap((try f.get(r)["items"] as? [JSON])?.first?["published_target"] as? JSON)
+        let previous = try f.record(t["adopted_revision_id"] as! String,"media_review_type_revision")
+        var definition = previous["schema"] as! JSON,layout = definition["layout"] as! JSON
+        layout["review_in_draft"] = true;definition["layout"] = layout
+        let proposed = try revise(f,t,definition)
+        let next = try f.record(proposed["draft_revision_id"] as! String,"media_review_type_revision")
+        XCTAssertNotEqual(previous["id"] as? String,next["id"] as? String)
+        XCTAssertNotEqual(previous["definition_signature"] as? String,next["definition_signature"] as? String)
+        let candidates = try f.rows("media_candidate"),context = try f.record(original["context_id"] as! String,"media_review_context")
+        let shape = try f.router.dbQueue.read { db in
+            try f.router.mediaTargetShape(db,item:item,title:original["title"] as! String,metadata:original["metadata"] as! JSON,
+                candidates:candidates,typeRevision:next,context:context)
+        }
+        for key in ["material_definition_signature","review_basis_signature","review_basis_base64"] {
+            XCTAssertEqual(original[key] as? String,shape[key] as? String,key)
+        }
+        _ = try f.adoptType(proposed)
+        let unchanged = try f.get(r),row = try XCTUnwrap((unchanged["items"] as? [JSON])?.first)
+        XCTAssertTrue(strings(unchanged,"attention_ids").isEmpty)
+        XCTAssertEqual(row["disposition"] as? String,"accepted")
+        XCTAssertEqual((row["published_target"] as? JSON)?["id"] as? String,original["id"] as? String)
+        XCTAssertEqual(try f.rows("media_owner_decision").count,1)
+    }
     func testWorkerReplacementDoesNotMoveActiveTargetAndPublicationStalesOnlyChangedItem() throws {
         let f = try Fixture(),t = try f.type(schema()),r = try f.round(t)
         let a = try f.item(r),b = try f.item(r,title:"B");_ = try f.publish(r);try f.acceptEach(r)

@@ -136,11 +136,14 @@ extension CommandRouter {
                 "batch_id": (try StoredRecord(batch, family: "batch").requiredValue("id")), "claim_id": (try StoredRecord(receipt, family: "receipt").requiredValue("id")),
                 "attempt_ids": (try StoredRecord(receipt, family: "receipt").requiredValue("attempt_ids")),
             ])
-        return [
+        var result: JSON = [
             "triage_id": batch["triage_id"] ?? NSNull(), "triage_key": batchTriageKey(db, batch) as Any? ?? NSNull(), "triage_name": batch["triage_name"] ?? "",
             "batch_id": (try StoredRecord(batch, family: "batch").requiredValue("id")), "digest": (try StoredRecord(batch, family: "batch").requiredValue("digest")),
             "claim_id": (try StoredRecord(receipt, family: "receipt").requiredValue("id")), "claims": claims, "triage_effect": "retained_by_batch_workflow",
         ]
+        let notices = claims.flatMap { ($0["_checklist"] as? JSON)?["notices"] as? [String] ?? [] }
+        if !notices.isEmpty { result["_checklist"] = ["notices": notices] }
+        return result
     }
 
     /// The complete active frozen set continues atomically. A batch ID alone never retains an individual ticket.

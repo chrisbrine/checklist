@@ -198,7 +198,7 @@ struct MediaReviewWorkspace: View {
                     if model.intake.id != intake.id {Button("Resume intake "+String(index+1)+" · "+GlossaryText.title(intake.string("state"))) {Task {await model.resumeIntake(intake.id)}}}
                 }
                 if model.fields.contains(where:{$0.id=="character"}) {Toggle("Map character__animation_label__direction filename tokens",isOn:$model.mapsAnimationNames).font(.caption)}
-                if let project=store.currentProject {Button("Approve current project context for media review") {model.mutate("media_context_approve",["kind":"project","expected_project_revision":project.integer("revision")])}.checklistDisabled([(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])}
+                if store.currentProject != nil {Button("Approve current project context for media review") {Task {try? await model.approveProjectContext()}}.checklistDisabled([(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])}
                 if !model.intake.id.isEmpty {MediaFrozenIntakeView(model:model)}
                 if !model.publication.isEmpty {
                     Text("Frozen publication preview · \(model.publication.count) items · \(model.publication.filter {!$0.bool("publication_ready")}.count) incomplete").font(.caption)

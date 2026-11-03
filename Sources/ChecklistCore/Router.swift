@@ -13,6 +13,24 @@ extension CommandRouter {
         switch method {
         case "service_info":
             var info: JSON = ["session_id":c.sessionID ?? "","caller":["session_id":c.sessionID ?? "","role":c.role,"installation":c.installation],"name":"Checklist","version":ChecklistBuildVersion.current.version,"build_id":ChecklistBuildVersion.current.buildID,"build_number":ChecklistBuildVersion.current.buildNumber,"store_incarnation":incarnation,"role":c.role,"project_ids":c.projectIDs,"capabilities":["durable_store","project_isolation","pickup_inbox","named_contacts","human_requests","managed_attachments","scope_reservations","captured_source_review","triage_batches","phase_triages","triage_orchestration","typed_relations","policy_reconciliation","request_revisions"],"provider_plugins":providerPlugins.summaries,"native_push":false,"native_push_status":NativeCommunicationRoutes.summary,"native_routes":NativeCommunicationRoutes.serviceInfo,"unsupported":["automatic_model_launch","native_idle_push","MCP_events"]]
+            var callerInfo = info["caller"] as? JSON ?? [:]
+            callerInfo["orchestrated_triage"] = NSNull()
+            // A workspace-less connection must select its project explicitly. Never
+            // substitute the app selection or the service working directory.
+            let boundProject: String?
+            if p["project_id"] != nil {
+                boundProject = try scope(db, p, c)
+            } else if c.role == "worker", let workspace = c.workspace {
+                let matches = try projects(db, c).filter {
+                    guard let root = $0["root_path"] as? String, !root.isEmpty else { return false }
+                    return containsPath(root, canonical(workspace))
+                }
+                boundProject = matches.count == 1 ? try scope(db, ["project_id": matches[0]["id"]!], c) : nil
+            } else { boundProject = nil }
+            if let pid = boundProject, let triage = try callerOrchestratedTriage(db, project: pid, caller: c) {
+                callerInfo["orchestrated_triage"] = ["triage_id": triage["id"] ?? NSNull(), "key": triage["key"] ?? NSNull(), "name": triage["name"] ?? NSNull()] as JSON
+            }
+            info["caller"] = callerInfo
             info["native_reply_listener"] = nativeReplyListenerStatus.serviceInfo
             info["native_recovery"] = try nativeResumptionRecovery(db,caller:c,projects:c.projectIDs)
             if let version = readSnapshotCache.readVersion(db) {info["read_version"] = version}

@@ -51,6 +51,28 @@ final class MediaWorkerContractTests: XCTestCase {
         XCTAssertThrowsError(try MediaWorkerContract.validate("media_intake_preview", parameters: p))
     }
 
+    func testTypeCreateAndReviseAcceptReviewInDraftThroughJSON() throws {
+        for method in ["media_type_create", "media_type_revise"] {
+            for enabled: Bool? in [true, false, nil] {
+                var schema = MediaStarterCatalog.schema(title: "Animation takes", starter: "animation_video")
+                var layout = try XCTUnwrap(schema["layout"] as? [String: Any])
+                layout["review_in_draft"] = enabled
+                schema["layout"] = layout
+                var parameters = write
+                parameters["schema"] = schema
+                if method == "media_type_create" {
+                    parameters["title"] = "Animation takes"
+                } else {
+                    parameters["type_id"] = "type"
+                    parameters["expected_revision"] = 1
+                }
+                let encoded = try JSONSerialization.data(withJSONObject: parameters)
+                let decoded = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+                XCTAssertNoThrow(try MediaWorkerContract.validate(method, parameters: decoded), "\(method), review_in_draft=\(String(describing: enabled))")
+            }
+        }
+    }
+
     func testCaptureRequiresOriginalDistinctBoundedRowsAndRevision() throws {
         var p = write
         p.merge(["intake_id": "intake", "expected_revision": 2, "plan_id": "plan", "row_ids": ["a", "b", "c"]]) { _, new in new }

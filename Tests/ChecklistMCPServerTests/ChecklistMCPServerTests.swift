@@ -656,6 +656,8 @@ final class ChecklistMCPServerTests: XCTestCase {
 
     func testPersistentMismatchStartsLimitedAndNeverUsesStoredCredential() async throws {
         let fixture = try Fixture(), session = try await start(fixture)
+        XCTAssertTrue(session.initialization.instructions?.contains("start it with triage_orchestrate action=start (no triage_id) before you hand out work") == true)
+        XCTAssertTrue(session.initialization.instructions?.contains("A claim by a session that orchestrates no Triage never puts a ticket into a Triage.") == true)
         XCTAssertTrue(session.initialization.instructions?.contains("Not connected yet") == true)
         let tools = try await session.client.listTools()
         XCTAssertEqual(tools.tools.map(\.name), ["service_info"])

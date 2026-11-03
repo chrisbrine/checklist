@@ -56,7 +56,7 @@ public enum MediaStarterCatalog {
                 ["id": "concept_art", "label": "Concept art", "kind": "image", "material": true],
                 ["id": "reference", "label": "Earlier take", "kind": "video", "material": true]]
             value["layout"] = ["kind": "video_compare", "primary_slot_id": "take", "reference_slot_ids": ["model_sheet", "concept_art", "reference"],
-                "loop": true, "frame_rate_field_id": "frame_rate"]
+                "loop": true, "frame_rate_field_id": "frame_rate", "review_in_draft": true]
         }
         return value
     }

@@ -61,6 +61,22 @@ enum MediaSimpleLayout {
     }
     /// The three owner decisions on every card. No direction grid or other screen comes first.
     static let decisions: [MediaSimpleDecision] = [.init(title:"Accept",disposition:"accepted"),.init(title:"Changes requested",disposition:"changes_requested"),.init(title:"Needs look",disposition:"needs_look")]
+    /// CL-422: the type schema's `layout.review_in_draft` Boolean. An absent key means false.
+    static func reviewInDraft(_ schema: MediaValues) -> Bool {(schema["layout"] as? MediaValues)?["review_in_draft"] as? Bool ?? false}
+    /// How a card's decision is sent. `open`: a published item in an open round (`media_decide`).
+    /// `firstDraft`: an unpublished item of a Draft round whose type sets `review_in_draft`; the
+    /// first decision publishes the round first. `unavailable`: no decision control works.
+    enum DecisionRoute: Equatable {case open,firstDraft,unavailable}
+    static func decisionRoute(state: String,published: Bool,schema: MediaValues,historyOnly: Bool) -> DecisionRoute {
+        guard !historyOnly else {return .unavailable}
+        if state=="open",published {return .open}
+        if state=="draft",!published,reviewInDraft(schema) {return .firstDraft}
+        return .unavailable
+    }
+    @MainActor static func schema(_ card: MediaDirectionCard,fallback: MediaValues) -> MediaValues {card.header.object("type_revision")["schema"] as? MediaValues ?? fallback}
+    @MainActor static func decisionRoute(_ card: MediaDirectionCard,model: MediaReviewModel) -> DecisionRoute {
+        decisionRoute(state:card.header.string("state"),published:card.item.bool("published"),schema:schema(card,fallback:model.schema),historyOnly:model.historyOnly)
+    }
 }
 struct MediaSimpleDecision: Identifiable, Equatable {
     let title: String
@@ -199,6 +215,9 @@ struct MediaSimpleReference {
     }
     @Published private(set) var order: [String] = []
     @Published var pausedByOwner = false
+    /// CL-422: a first Draft decision that waits for the one-time project context approval.
+    struct ContextApproval: Equatable {let cardID: String;let disposition: String}
+    @Published var contextApproval: ContextApproval?
     private(set) var cards: [String: MediaDirectionCard] = [:]
     private(set) var stale = Set<String>()
     private(set) var visible = Set<String>()
@@ -253,6 +272,7 @@ struct MediaSimpleReference {
         pump?.cancel();pump=nil;pumpGeneration+=1;playback.releaseAll()
         cards=[:];rowValues=[:];groupTitles=[:];stale=[];visible=[];focus=nil;failedKeys=[];referenceImages=[:]
         if !order.isEmpty {order=[]}
+        if contextApproval != nil {contextApproval=nil}
     }
     /// A changed round header moves into each card in place; an unchanged one changes nothing.
     func update(header next: Record) {
@@ -310,7 +330,10 @@ struct MediaSimpleReference {
             for key in previous where !current.contains(key) {playback.release(key)}
             schedule()
         }
-        if card.draft.basis.isEmpty,!card.target.id.isEmpty {card.inspectCurrentBasis()}
+        // CL-422: a target published from the exact Draft target that this card showed keeps the
+        // owner's look; the card takes the open round's basis at once.
+        let lineage=card.target.string("published_from_target_id")
+        if !card.target.id.isEmpty,card.draft.basis.isEmpty || (!lineage.isEmpty && lineage==card.draft.targetID) {card.inspectCurrentBasis()}
     }
 
     /// The order indices of the cards that keep a take: the visible cards and `preloadCards` on each side.
@@ -511,6 +534,73 @@ struct MediaSimpleReference {
             }
         } catch {card.status=PlainError.text(error)}
     }
+    /// The card's decision press. An open round sends `media_decide`. A Draft round whose type
+    /// sets `review_in_draft` publishes first (CL-422).
+    func press(_ disposition: String,card: MediaDirectionCard,model: MediaReviewModel) async {
+        if MediaSimpleLayout.decisionRoute(card,model:model) == .firstDraft {await decideFromDraft(disposition,card:card,model:model,approved:false)}
+        else {await decide(disposition,card:card,model:model)}
+    }
+    /// CL-422: one press publishes the Draft's publication-ready items (this card's item with the
+    /// Draft target the owner saw must be one of them), reads the open round and this item again,
+    /// and then records the decision through `decide`. A refused publication records no decision.
+    /// `MEDIA_PROJECT_CONTEXT_REQUIRED` stops here and asks for the one-time approval.
+    func decideFromDraft(_ disposition: String,card: MediaDirectionCard,model: MediaReviewModel,approved: Bool) async {
+        guard !card.sending else {return}
+        if MediaReviewModel.decisionRequiresNote(disposition),card.draft.note.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty {
+            card.status="Enter what should change in the owner note.";return
+        }
+        let viewed=card.target.id,scope=scope,round=card.header.id
+        guard !viewed.isEmpty,card.basisMatches else {card.status="Inspect this take before deciding.";return}
+        card.sending=true;card.status="Publishing this round for review…"
+        let published: [Record]
+        do {
+            published=try await model.publishFrozenPreview(onlyReady:true,required:(card.id,viewed))
+        } catch let error as ChecklistError where error.code=="MEDIA_PROJECT_CONTEXT_REQUIRED" && !approved {
+            card.sending=false
+            guard self.scope==scope else {return}
+            card.status="Approve the project context to publish this round."
+            contextApproval=ContextApproval(cardID:card.id,disposition:disposition);return
+        } catch {
+            card.sending=false
+            if self.scope==scope,!(error is CancellationError) {card.status="Not published. No decision recorded. "+PlainError.text(error)}
+            return
+        }
+        card.status="Saving decision…"
+        do {
+            let frozen=published.first {$0.string("item_id")==card.id}
+            let header=Record(values:try await model.read("media_round_header",["round_id":round]))
+            let item=Record(values:try await model.read("media_item_get",["round_id":round,"item_id":card.id]))
+            guard self.scope==scope,cards[card.id]===card else {card.sending=false;return}
+            let target=Record(values:item.object("target")),lineage=target.string("published_from_target_id")
+            guard header.id==round,header.string("state")=="open",item.bool("published"),!target.id.isEmpty,
+                  target.string("review_basis_signature")==frozen?.string("review_basis_signature"),lineage.isEmpty || lineage==viewed else {
+                throw ChecklistError("MEDIA_CONTEXT_CHANGED","The round is published, but this take changed. Look at it again before deciding.")
+            }
+            update(header:header);apply(item,to:card);card.inspectCurrentBasis()
+        } catch {
+            card.sending=false;card.status="Published. No decision recorded. "+PlainError.text(error);return
+        }
+        await model.waitUntilWritable()
+        card.sending=false
+        await decide(disposition,card:card,model:model)
+    }
+    /// The owner approved the project context: approve it once, then publish and decide.
+    func approveContextAndDecide(_ pending: ContextApproval,model: MediaReviewModel) async {
+        if contextApproval==pending {contextApproval=nil}
+        guard let card=cards[pending.cardID],!card.sending else {return}
+        card.sending=true;card.status="Approving the project context…"
+        do {try await model.approveProjectContext()}
+        catch {card.sending=false;card.status="Not approved. No decision recorded. "+PlainError.text(error);return}
+        await model.waitUntilWritable()
+        card.sending=false
+        await decideFromDraft(pending.disposition,card:card,model:model,approved:true)
+    }
+    /// The owner closed the approval without approving.
+    func dismissContextApproval() {
+        guard let pending=contextApproval else {return}
+        contextApproval=nil
+        if let card=cards[pending.cardID],!card.sending {card.status="Not published. No decision recorded."}
+    }
 }
 
 /// CL-421: the default review of an "Animation takes" round. Each card plays its take at once,
@@ -549,6 +639,12 @@ struct MediaSimpleReview: View {
         .onReceive(model.$header) {simple.update(header:$0)}
         .onReceive(model.$rows) {rows in sync(rows)}
         .onDisappear {simple.reset()}
+        .confirmationDialog("Approve the project context for media review?",isPresented:Binding(get:{simple.contextApproval != nil},set:{if !$0 {simple.dismissContextApproval()}}),titleVisibility:.visible,presenting:simple.contextApproval) {pending in
+            Button("Approve current project context for media review") {Task {await simple.approveContextAndDecide(pending,model:model)}}
+            Button("Cancel",role:.cancel) {simple.dismissContextApproval()}
+        } message: {_ in
+            Text("This project has a brief or pinned decisions that media review has not approved yet. Approve them once. Then Checklist publishes this round and records your decision.")
+        }
     }
     func sync(_ rows: [Record]) {
         if simple.source == nil {
@@ -578,6 +674,7 @@ private struct MediaSimpleCardView: View {
     @State private var showDetails = false
     var schema: MediaValues {card.header.object("type_revision")["schema"] as? MediaValues ?? model.schema}
     var layout: MediaValues {schema["layout"] as? MediaValues ?? [:]}
+    var route: MediaSimpleLayout.DecisionRoute {MediaSimpleLayout.decisionRoute(card,model:model)}
     var body: some View {
         VStack(alignment:.leading,spacing:6) {
             HStack(alignment:.firstTextBaseline) {
@@ -602,11 +699,12 @@ private struct MediaSimpleCardView: View {
             }
             HStack {
                 ForEach(MediaSimpleLayout.decisions) {choice in
-                    Button(choice.title) {Task {await simple.decide(choice.disposition,card:card,model:model)}}
+                    Button(choice.title) {Task {await simple.press(choice.disposition,card:card,model:model)}}
                         .checklistDisabled([(MediaReviewModel.decisionRequiresNote(choice.disposition) && card.draft.note.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty,"Enter what should change in the owner note.")])
                         .accessibilityLabel(choice.title+", "+card.label)
                 }
-            }.checklistDisabled([(card.sending,"Wait for this decision to finish."),(card.target.id.isEmpty,"This item is still loading."),(!card.basisMatches || !card.item.bool("published") || card.header.string("state") != "open" || model.historyOnly,"Inspect a published item in an open round before deciding."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
+                if card.sending {ProgressView().controlSize(.small).accessibilityLabel("Working on this decision")}
+            }.checklistDisabled([(card.sending,"Wait for this decision to finish."),(card.target.id.isEmpty,"This item is still loading."),(route == .unavailable && card.header.string("state") == "draft","Publish this Draft round before deciding."),(!card.basisMatches || route == .unavailable,"Inspect a published item in an open round before deciding."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
             if !card.status.isEmpty {Text(card.status).font(.caption).textSelection(.enabled)}
         }
         .padding(8).background(.quaternary.opacity(0.3),in:RoundedRectangle(cornerRadius:6))

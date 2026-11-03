@@ -523,6 +523,10 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
                 return ('captured', None)
             if record_kind == 'request' and '.files[]' in location: return ('binding', None)
             if parent.get('kind') == 'workspace_file': return ('binding', None)
+            # CL-424: media intake records (intake, plan, row) keep each worker-selected source
+            # file as an external reference; capture copies the bytes into managed originals.
+            # The slot never opens or follows this path. Managed modes are decided above.
+            if record_kind is not None and record_kind.startswith('media_intake'): return ('binding', None)
         if key == 'preview_path' and parent.get('mode') == 'managed': return ('managed', 'objects')
         if key == 'icon_path' and record_kind == 'project': return ('managed', 'icons')
         if key == 'snapshot_path' and (capture or record_kind == 'manifest'): return ('managed', 'source-captures')
@@ -699,7 +703,11 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
                     inert = (table == 'commands' and column == 'result') or (table == 'events' and column == 'data')
                     if column == 'value' and metadata_key is not None and (metadata_key in {'preupgrade_snapshot', 'backup-protected-history', 'backup-automatic-prune-last'} or metadata_key.startswith(('backup-pruned:', 'backup-generation:', 'backup-automatic-prune-fenced:'))):
                         inert = 'metadata'
-                    inspect(value, table + '.' + column, record_kind, policy(column, {}, table, record_kind), inert)
+                    try: inspect(value, table + '.' + column, record_kind, policy(column, {}, table, record_kind), inert)
+                    except ValueError as error:
+                        # CL-424: name the record kind, never the value, so that a refusal shows its cause.
+                        if table != 'records' or record_kind is None: raise
+                        raise ValueError(f'{error} Record kind: {record_kind}.') from error
     except (UnicodeError, RecursionError) as error:
         raise ValueError('Seed values cannot be safely inspected. ' + RELOCATION_REQUIRED) from error
     finally:

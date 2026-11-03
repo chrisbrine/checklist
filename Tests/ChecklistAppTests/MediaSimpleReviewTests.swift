@@ -425,3 +425,182 @@ import ChecklistIPC
         XCTAssertTrue(MediaReviewModel.assignIfChanged(&rows,[row("E",disposition:"accepted"),row("N")]),"A new order is a change")
     }
 }
+
+@MainActor private final class DraftNoAlerts: DesktopAlertSink {
+    func authorization() async -> DesktopAlertAuthorization {.denied}
+    func requestAuthorizationFromOwnerAction() async throws -> Bool {false}
+    func send(_ alert: DesktopAlert) async throws {}
+    func remove(_ identifiers: [String]) {}
+}
+
+/// CL-422: a fake service with one Draft round. It records every call in order. Publication
+/// opens the round; refusals carry `command_outcome: rejected`, as the service sends them.
+@MainActor private final class DraftService {
+    var calls: [(String,MediaValues)] = []
+    var state = "draft"
+    var reviewInDraft: Bool? = true
+    var publishFailures: [Error] = []
+    let ready = ["N":true,"E":true,"SE":false]
+    var writes: [String] {calls.map(\.0).filter {["media_round_publish","media_context_approve","media_decide"].contains($0)}}
+    func params(_ method: String) -> [MediaValues] {calls.filter {$0.0==method}.map(\.1)}
+    var schema: MediaValues {
+        var schema=MediaTypeSettings.schema(title:"Animation",starter:"animation_video")
+        var layout=schema["layout"] as? MediaValues ?? [:]
+        // The Animation takes starter sets review_in_draft (CL-422 Core); nil means the key is absent.
+        if let reviewInDraft {layout["review_in_draft"]=reviewInDraft} else {layout.removeValue(forKey:"review_in_draft")}
+        schema["layout"]=layout;return schema
+    }
+    var header: MediaValues {
+        state=="draft" ? ["id":"round","title":"Takes","state":"draft","origin":"agent","revision":1,"observed_context_token":"draft-context","manifest":[:] as MediaValues,"attention":[] as [MediaValues],"type_revision":["schema":schema]]
+            : ["id":"round","title":"Takes","state":"open","revision":2,"observed_context_token":"open-context","manifest":["id":"manifest","digest":"digest"],"attention":[] as [MediaValues],"type_revision":["schema":schema]]
+    }
+    func item(_ direction: String) -> MediaValues {
+        let metadata: MediaValues=["character":"Hero","animation_label":"walk_cycle","direction":direction,"take":"1"]
+        let target: MediaValues=state=="draft" ? ["id":"draft-"+direction,"review_basis_signature":"draft-basis-"+direction,"metadata":metadata,"candidate_ids":["candidate-"+direction]]
+            : ["id":"pub-"+direction,"review_basis_signature":"published-basis-"+direction,"published_from_target_id":"draft-"+direction,"metadata":metadata,"candidate_ids":["candidate-"+direction]]
+        return ["id":"item-"+direction,"title":"hero__walk_cycle__"+direction+".mp4","revision":state=="draft" ? 2 : 3,"published":state=="open","disposition":"pending",
+                "target":target,"candidates":[["id":"candidate-"+direction,"slots":[] as [MediaValues]]],"originals":[] as [MediaValues]]
+    }
+    func request(_ method: String,_ params: MediaValues) throws -> MediaValues {
+        calls.append((method,params))
+        switch method {
+        case "media_navigation":return ["types":[["id":"type","title":"Animation","enabled":true]]]
+        case "media_round_page":return ["rows":[["id":"round","title":"Takes","state":state]],"has_more":false]
+        case "media_round_header":return header
+        case "media_item_page":return ["rows":[] as [MediaValues],"counts":[:] as MediaValues]
+        case "media_item_get":return item(String((params["item_id"] as? String ?? "").dropFirst(5)))
+        case "media_publication_preview":
+            return ["round":header,"items":["N","E","SE"].map {d -> MediaValues in ["item_id":"item-"+d,"target_id":"draft-"+d,"expected_revision":2,"review_basis_signature":"published-basis-"+d,"title":d,"publication_ready":ready[d]!]}]
+        case "media_round_publish":
+            if !publishFailures.isEmpty {throw publishFailures.removeFirst()}
+            state="open";return header
+        case "media_decide":
+            let selection=(params["items"] as? [MediaValues])?.first ?? [:]
+            return ["decisions":[["id":"decision","item_id":selection["item_id"]!,"target_id":selection["target_id"]!,"disposition":params["disposition"]!]]]
+        default:return [:]
+        }
+    }
+}
+
+extension MediaSimpleReviewTests {
+    private func settle(_ condition: () -> Bool) async throws {
+        for _ in 0..<1200 where !condition() {try await Task.sleep(for:.milliseconds(5))}
+        XCTAssertTrue(condition(),"The condition did not hold within 6 s")
+    }
+    /// A loaded simple review of a Draft round, wired to the fake service through the store's command journal.
+    private func draftReview(_ service: DraftService) async -> (MediaSimpleReviewModel,MediaReviewModel,ChecklistStore) {
+        let defaults=isolatedDefaults("SimpleDraft"),directory=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let store=ChecklistStore(draftJournal:LocalDraftJournal(directory:directory),preferences:defaults.preferences,restorePendingCommand:false,
+            desktopAlerts:DesktopAlertCoordinator(sink:DraftNoAlerts()),requestTransport:{method,params in ["data":try service.request(method,params)]},
+            navigationMemory:DetailItemNavigationMemory(),pendingCommandPersistence:PendingCommandPersistence(read:{_ in nil},save:{_,_ in},remove:{_ in}))
+        store.data=["service":["store_incarnation":"synthetic"],"projects":[["id":"project","name":"Synthetic","revision":4]]];store.connected=true;store.projectID="project"
+        let model=store.mediaReview;await model.connect(store:store);model.roundID="round"
+        let review=MediaSimpleReviewModel()
+        review.update(header:Record(values:service.header))
+        review.sync(scope:"project:round",rows:["N","E","SE"].map {Record(values:["id":"item-"+$0,"revision":2,"metadata":["direction":$0]])},draft:{_ in MediaOwnerDraft()},saveDraft:{_,_ in})
+        await review.readStale {id in Record(values:service.item(String(id.dropFirst(5))))}
+        service.calls=[]
+        return (review,model,store)
+    }
+
+    func testReviewInDraftShowsDecisionsOnDraftCardsOnlyWhenTheTypeSaysSo() async throws {
+        let on=DraftService(),off=DraftService();off.reviewInDraft=nil
+        XCTAssertEqual(MediaSimpleLayout.decisionRoute(state:"draft",published:false,schema:on.schema,historyOnly:false),.firstDraft)
+        XCTAssertEqual(MediaSimpleLayout.decisionRoute(state:"draft",published:false,schema:off.schema,historyOnly:false),.unavailable,"An absent key means false")
+        off.reviewInDraft=false
+        XCTAssertEqual(MediaSimpleLayout.decisionRoute(state:"draft",published:false,schema:off.schema,historyOnly:false),.unavailable)
+        XCTAssertEqual(MediaSimpleLayout.decisionRoute(state:"draft",published:false,schema:on.schema,historyOnly:true),.unavailable)
+        XCTAssertEqual(MediaSimpleLayout.decisionRoute(state:"open",published:true,schema:on.schema,historyOnly:false),.open)
+        XCTAssertEqual(MediaSimpleLayout.decisionRoute(state:"open",published:true,schema:off.schema,historyOnly:false),.open)
+        let (review,model,_)=await draftReview(on)
+        let card=try XCTUnwrap(review.cards["item-N"])
+        XCTAssertEqual(MediaSimpleLayout.decisionRoute(card,model:model),.firstDraft);XCTAssertTrue(card.basisMatches)
+        // A type without the key keeps today's Draft flow: no decision is sent from a Draft card.
+        let plain=DraftService();plain.reviewInDraft=nil
+        let (plainReview,plainModel,plainStore)=await draftReview(plain)
+        let plainCard=try XCTUnwrap(plainReview.cards["item-N"])
+        XCTAssertEqual(MediaSimpleLayout.decisionRoute(plainCard,model:plainModel),.unavailable)
+        await plainReview.press("accepted",card:plainCard,model:plainModel)
+        XCTAssertEqual(plain.writes,[]);XCTAssertFalse(plainCard.status.isEmpty)
+        XCTAssertEqual(plain.calls.count,0,"The route refuses before any read");withExtendedLifetime(plainStore) {}
+    }
+    func testFirstDraftDecisionPublishesThenDecidesAndLaterDecisionOnlyDecides() async throws {
+        let service=DraftService()
+        let (review,model,store)=await draftReview(service)
+        let north=try XCTUnwrap(review.cards["item-N"])
+        await review.press("accepted",card:north,model:model)
+        try await settle {!north.sending && service.writes.contains("media_decide")}
+        XCTAssertEqual(service.writes,["media_round_publish","media_decide"])
+        let publish=try XCTUnwrap(service.params("media_round_publish").first)
+        XCTAssertEqual(publish["round_id"] as? String,"round");XCTAssertEqual(publish["expected_revision"] as? Int,1)
+        XCTAssertEqual(publish["observed_context_token"] as? String,"draft-context")
+        let published=publish["items"] as? [MediaValues] ?? []
+        XCTAssertEqual(published.map {$0["item_id"] as? String},["item-N","item-E"],"Only the publication-ready items are published")
+        XCTAssertEqual(published.map {$0["target_id"] as? String},["draft-N","draft-E"])
+        XCTAssertEqual(published.map {$0["review_basis_signature"] as? String},["published-basis-N","published-basis-E"])
+        let decide=try XCTUnwrap(service.params("media_decide").first)
+        XCTAssertNotNil(decide["command_id"],"The decision uses the native command journal")
+        XCTAssertEqual(decide["round_id"] as? String,"round");XCTAssertEqual(decide["expected_revision"] as? Int,2)
+        XCTAssertEqual(decide["observed_context_token"] as? String,"open-context")
+        XCTAssertEqual(decide["manifest_id"] as? String,"manifest");XCTAssertEqual(decide["manifest_digest"] as? String,"digest")
+        XCTAssertEqual(decide["disposition"] as? String,"accepted");XCTAssertEqual(decide["winner_id"] as? String,"candidate-N")
+        let selection=try XCTUnwrap((decide["items"] as? [MediaValues])?.first)
+        XCTAssertEqual(selection["item_id"] as? String,"item-N");XCTAssertEqual(selection["target_id"] as? String,"pub-N")
+        XCTAssertEqual(selection["review_basis_signature"] as? String,"published-basis-N");XCTAssertEqual(selection["expected_revision"] as? Int,3)
+        XCTAssertEqual(north.item.string("disposition"),"accepted");XCTAssertEqual(north.status,"Saved: Accepted")
+        XCTAssertTrue(review.cards["item-N"] === north,"The card is kept by item ID")
+        // A later decision on the open round sends only media_decide.
+        await model.waitUntilWritable();XCTAssertFalse(store.hasPendingMutation)
+        review.sync(scope:"project:round",rows:["N","E","SE"].map {Record(values:["id":"item-"+$0,"revision":3,"metadata":["direction":$0]])},draft:{_ in MediaOwnerDraft()},saveDraft:{_,_ in})
+        await review.readStale {id in Record(values:service.item(String(id.dropFirst(5))))}
+        let east=try XCTUnwrap(review.cards["item-E"])
+        XCTAssertEqual(MediaSimpleLayout.decisionRoute(east,model:model),.open)
+        XCTAssertTrue(east.basisMatches,"A target published from the Draft target this card showed takes the open basis")
+        service.calls=[]
+        await review.press("needs_look",card:east,model:model)
+        try await settle {!east.sending && service.writes.contains("media_decide")}
+        XCTAssertEqual(service.writes,["media_decide"])
+        XCTAssertEqual((service.params("media_decide").first?["items"] as? [MediaValues])?.first?["target_id"] as? String,"pub-E")
+    }
+    func testRefusedPublicationRecordsNoDecisionAndShowsTheError() async throws {
+        let service=DraftService()
+        service.publishFailures=[ChecklistError("MEDIA_BASIS_CHANGED","The exact complete target must match the publication preview.",details:["command_outcome":"rejected"])]
+        // The model holds the store weakly: the test keeps it, as the app does.
+        let (review,model,store)=await draftReview(service)
+        let north=try XCTUnwrap(review.cards["item-N"])
+        await review.press("accepted",card:north,model:model)
+        try await settle {!north.sending}
+        XCTAssertEqual(service.writes,["media_round_publish"])
+        await model.waitUntilWritable();XCTAssertFalse(store.hasPendingMutation,"The refusal leaves no pending command")
+        XCTAssertTrue(north.status.hasPrefix("Not published. No decision recorded."),north.status)
+        XCTAssertTrue(north.status.contains("publication preview"),north.status)
+        XCTAssertNil(review.contextApproval);XCTAssertEqual(north.item.string("disposition"),"pending")
+        // A card whose item is not publication-ready sends nothing at all.
+        service.calls=[]
+        let southEast=try XCTUnwrap(review.cards["item-SE"])
+        await review.press("needs_look",card:southEast,model:model)
+        XCTAssertEqual(service.writes,[]);XCTAssertTrue(southEast.status.hasPrefix("Not published."),southEast.status)
+        XCTAssertEqual(service.calls.map(\.0),["media_publication_preview"],"Only the preview is read");XCTAssertNotNil(model.store)
+        withExtendedLifetime(store) {}
+    }
+    func testProjectContextRequiredAsksForApprovalThenPublishesAndDecides() async throws {
+        let service=DraftService()
+        service.publishFailures=[ChecklistError("MEDIA_PROJECT_CONTEXT_REQUIRED","Explicitly adopt the observed project context before the first publication.",details:["command_outcome":"rejected"])]
+        let (review,model,store)=await draftReview(service)
+        let north=try XCTUnwrap(review.cards["item-N"])
+        await review.press("accepted",card:north,model:model)
+        try await settle {!north.sending}
+        XCTAssertEqual(service.writes,["media_round_publish"],"No decision before the approval")
+        let pending=try XCTUnwrap(review.contextApproval)
+        XCTAssertEqual(pending,.init(cardID:"item-N",disposition:"accepted"))
+        await model.waitUntilWritable();XCTAssertFalse(store.hasPendingMutation)
+        await review.approveContextAndDecide(pending,model:model)
+        try await settle {!north.sending && service.writes.contains("media_decide")}
+        XCTAssertNil(review.contextApproval)
+        XCTAssertEqual(service.writes,["media_round_publish","media_context_approve","media_round_publish","media_decide"])
+        let approve=try XCTUnwrap(service.params("media_context_approve").first)
+        XCTAssertEqual(approve["kind"] as? String,"project");XCTAssertEqual(approve["expected_project_revision"] as? Int,4)
+        XCTAssertEqual((service.params("media_decide").first?["items"] as? [MediaValues])?.first?["target_id"] as? String,"pub-N")
+        XCTAssertEqual(north.status,"Saved: Accepted")
+    }
+}

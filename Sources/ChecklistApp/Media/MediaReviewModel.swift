@@ -5,6 +5,13 @@ import ChecklistCore
 
 typealias MediaValues = [String: Any]
 
+/// Resumes an awaited owner mutation once: when it is committed or when it is refused.
+@MainActor final class MediaResumeOnce {
+    private var continuation: CheckedContinuation<Void,Error>?
+    init(_ continuation: CheckedContinuation<Void,Error>) {self.continuation=continuation}
+    func resume(_ result: Result<Void,Error>) {continuation?.resume(with:result);continuation=nil}
+}
+
 /// Display state is local and nonmaterial. Every decision carries the service's
 /// observed manifest/basis; refresh never retargets an unsent owner's draft.
 @MainActor final class MediaReviewModel: ObservableObject {
@@ -105,7 +112,10 @@ typealias MediaValues = [String: Any]
             self.error=PlainError.text(error)
             if ["MEDIA_CONTEXT_CHANGED","MEDIA_CONTEXT_ATTENTION","MEDIA_BASIS_CHANGED","REVISION_CONFLICT"].contains((error as? ChecklistError)?.code ?? "") {self.contextConflict=true}
         }) { [weak self] result in
-            guard let self,self.projectID == project else {return}
+            guard let self,self.projectID == project else {
+                // The command was committed, but its project is no longer shown: no follow-up step runs.
+                onFailure?(ChecklistError("MEDIA_PROJECT_CHANGED","The project changed. Checklist saved the change but did not continue."));return
+            }
             do {
                 try then(result)
                 Task {await self.refresh()}
@@ -377,20 +387,54 @@ typealias MediaValues = [String: Any]
         let project=projectID,round=roundID,choice=roundChoiceEpoch
         publishingPrepared=true
         defer {publishingPrepared=false}
-        do {
-            let preview=try await read("media_publication_preview",["round_id":round])
-            guard projectID==project,roundID==round,roundChoiceEpoch==choice,!Task.isCancelled else {return}
-            let frozen=Record(values:preview["round"] as? MediaValues ?? [:])
-            let items=(preview["items"] as? [MediaValues] ?? []).map(Record.init)
-            guard frozen.id==round,frozen.string("state")=="draft" else {throw ChecklistError("MEDIA_ROUND_CHANGED","This prepared round changed. Refresh before publishing.")}
-            guard !items.isEmpty,items.allSatisfy({$0.bool("publication_ready")}) else {throw ChecklistError("MEDIA_UNRESOLVED","The agent must capture all required originals before this round can be published.")}
-            let params:MediaValues=["round_id":round,"expected_revision":frozen.integer("revision"),"observed_context_token":frozen.string("observed_context_token"),
-                "items":items.map {row -> MediaValues in ["item_id":row.string("item_id"),"expected_revision":row.integer("expected_revision"),"target_id":row.string("target_id"),"review_basis_signature":row.string("review_basis_signature")]}]
-            mutate("media_round_publish",params) { [weak self] _ in
-                guard let self,self.roundID==round,self.roundChoiceEpoch==choice else {return}
-                self.publication=[];self.roundState="open"
-            }
-        } catch {if projectID==project,roundID==round,roundChoiceEpoch==choice {self.error=PlainError.text(error)}}
+        do {try await publishFrozenPreview(onlyReady:false)}
+        catch is CancellationError {}
+        catch {if projectID==project,roundID==round,roundChoiceEpoch==choice {self.error=PlainError.text(error)}}
+    }
+    /// The exact Draft publication: it reads the frozen publication preview and submits its item
+    /// revisions, Draft targets and prospective bases through `media_round_publish`, then waits
+    /// for the committed reply. Without `onlyReady` every item must be publication-ready (the
+    /// Publish action). With `onlyReady` it publishes the ready items, and `required` (CL-422)
+    /// must be one of them with the Draft target that the owner saw; otherwise nothing is sent.
+    /// It returns the preview rows that it published.
+    @discardableResult func publishFrozenPreview(onlyReady: Bool,required: (itemID: String,targetID: String)? = nil) async throws -> [Record] {
+        let project=projectID,round=roundID,choice=roundChoiceEpoch
+        let preview=try await read("media_publication_preview",["round_id":round])
+        guard projectID==project,roundID==round,roundChoiceEpoch==choice,!Task.isCancelled else {throw CancellationError()}
+        let frozen=Record(values:preview["round"] as? MediaValues ?? [:])
+        let all=(preview["items"] as? [MediaValues] ?? []).map(Record.init)
+        guard frozen.id==round,frozen.string("state")=="draft" else {throw ChecklistError("MEDIA_ROUND_CHANGED","This prepared round changed. Refresh before publishing.")}
+        let items=onlyReady ? all.filter {$0.bool("publication_ready")} : all
+        guard !items.isEmpty,items.allSatisfy({$0.bool("publication_ready")}) else {throw ChecklistError("MEDIA_UNRESOLVED","The agent must capture all required originals before this round can be published.")}
+        if let required,!items.contains(where:{$0.string("item_id")==required.itemID && $0.string("target_id")==required.targetID}) {
+            throw ChecklistError("MEDIA_UNRESOLVED","This take is not ready for publication, or it changed. Refresh and look at it again.")
+        }
+        let params:MediaValues=["round_id":round,"expected_revision":frozen.integer("revision"),"observed_context_token":frozen.string("observed_context_token"),
+            "items":items.map {row -> MediaValues in ["item_id":row.string("item_id"),"expected_revision":row.integer("expected_revision"),"target_id":row.string("target_id"),"review_basis_signature":row.string("review_basis_signature")]}]
+        try await mutateAwaiting("media_round_publish",params)
+        if projectID==project,roundID==round,roundChoiceEpoch==choice {publication=[];roundState="open"}
+        return items
+    }
+    /// The one-time project context approval (`media_context_approve`, kind project) for the
+    /// observed project revision. A failure also shows in `error`.
+    func approveProjectContext() async throws {
+        guard let project=store?.currentProject else {throw ChecklistError("PROJECT_REQUIRED","Select a project.")}
+        try await mutateAwaiting("media_context_approve",["kind":"project","expected_project_revision":project.integer("revision")])
+    }
+    /// Waits (at most 10 s) until the store can accept the next change of a sequence (CL-422).
+    func waitUntilWritable() async {
+        for _ in 0..<40 {
+            guard let store,store.writeBlockReason != nil || store.hasPendingMutation,!Task.isCancelled else {return}
+            try? await Task.sleep(nanoseconds:250_000_000)
+        }
+    }
+    /// The awaited form of `mutateReportingFailure`: it returns when the command is committed, or throws the refusal.
+    func mutateAwaiting(_ method: String,_ params: MediaValues) async throws {
+        guard store != nil else {throw ChecklistError("WRITE_NOT_STARTED","Checklist is not connected.")}
+        return try await withCheckedThrowingContinuation {continuation in
+            let once=MediaResumeOnce(continuation)
+            mutateReportingFailure(method,params,onFailure:{once.resume(.failure($0))}) {_ in once.resume(.success(()))}
+        }
     }
     func previewIntake(_ params: MediaValues) {var p=params;p["round_id"]=roundID
         let isFiles=params["sources"] != nil

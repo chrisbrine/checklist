@@ -147,4 +147,53 @@ final class MediaAgentTypeChangeTests: XCTestCase {
         // Decisions stay with the owner.
         checks.checkError("FORBIDDEN") {try worker(f,"media_decide",["round_id":round["id"]!])}
     }
+
+    func testAgentCreatesAndRevisesReviewInDraftWithAllowedRuleChanges() throws {
+        let f = try Fixture()
+        try setAgentRuleChanges(f,"allowed")
+        var schema = checks.schema(),layout = schema["layout"] as! JSON
+        layout["review_in_draft"] = true;schema["layout"] = layout
+        let created = try worker(f,"media_type_create",["title":"Draft review","schema":schema])
+        let first = try XCTUnwrap(created["draft_revision"] as? JSON)
+        XCTAssertEqual(((first["schema"] as? JSON)?["layout"] as? JSON)?["review_in_draft"] as? Bool,true)
+        let adopted = try worker(f,"media_type_adopt",["type_id":created["id"]!,"expected_revision":created["revision"]!,
+            "type_revision_id":created["draft_revision_id"]!,"observed_type_token":created["observed_type_token"]!])
+        let read = try worker(f,"media_type_get",["type_id":created["id"]!])
+        let listed = try XCTUnwrap((try worker(f,"media_type_list")["types"] as? [JSON])?.first {$0["id"] as? String == created["id"] as? String})
+        for view in [read,listed] {
+            XCTAssertEqual(((view["schema"] as? JSON)?["layout"] as? JSON)?["review_in_draft"] as? Bool,true)
+        }
+
+        schema = first["schema"] as! JSON;layout = schema["layout"] as! JSON
+        layout["review_in_draft"] = false;schema["layout"] = layout
+        let revised = try worker(f,"media_type_revise",["type_id":created["id"]!,"expected_revision":adopted["revision"]!,"schema":schema])
+        let second = try XCTUnwrap(revised["draft_revision"] as? JSON)
+        XCTAssertNotEqual(revised["draft_revision_id"] as? String,created["draft_revision_id"] as? String)
+        let firstStored = try f.record(created["draft_revision_id"] as! String,"media_review_type_revision")
+        let secondStored = try f.record(revised["draft_revision_id"] as! String,"media_review_type_revision")
+        XCTAssertNotEqual(secondStored["definition_signature"] as? String,firstStored["definition_signature"] as? String)
+        XCTAssertEqual(((second["schema"] as? JSON)?["layout"] as? JSON)?["review_in_draft"] as? Bool,false)
+        let readopted = try worker(f,"media_type_adopt",["type_id":created["id"]!,"expected_revision":revised["revision"]!,
+            "type_revision_id":revised["draft_revision_id"]!,"observed_type_token":revised["observed_type_token"]!])
+        let reread = try worker(f,"media_type_get",["type_id":created["id"]!])
+        XCTAssertEqual(((reread["schema"] as? JSON)?["layout"] as? JSON)?["review_in_draft"] as? Bool,false)
+        let stored = try f.record(revised["draft_revision_id"] as! String,"media_review_type_revision")
+        XCTAssertEqual(((stored["schema"] as? JSON)?["layout"] as? JSON)?["review_in_draft"] as? Bool,false)
+        XCTAssertEqual(stored["origin"] as? String,"agent")
+        XCTAssertEqual(stored["author_session_id"] as? String,f.worker.sessionID)
+
+        layout["review_in_draft"] = nil;schema["layout"] = layout
+        let omitted = try worker(f,"media_type_revise",["type_id":created["id"]!,"expected_revision":readopted["revision"]!,"schema":schema])
+        let omittedSchema = (omitted["draft_revision"] as! JSON)["schema"] as! JSON
+        XCTAssertNil((omittedSchema["layout"] as! JSON)["review_in_draft"])
+        XCTAssertFalse(try MediaReviewSchema.parse(omittedSchema).layout.reviewInDraft)
+
+        let before = try f.allState()
+        for invalid in ["true", 1] as [Any] {
+            layout["review_in_draft"] = invalid;schema["layout"] = layout
+            checks.checkError("INVALID_INPUT") {try worker(f,"media_type_create",["title":"Invalid","schema":schema])}
+            checks.checkError("INVALID_INPUT") {try worker(f,"media_type_revise",["type_id":created["id"]!,"expected_revision":omitted["revision"]!,"schema":schema])}
+        }
+        XCTAssertEqual(try f.allState(),before)
+    }
 }
