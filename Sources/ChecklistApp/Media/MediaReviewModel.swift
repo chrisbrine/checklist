@@ -137,23 +137,47 @@ typealias MediaValues = [String: Any]
             self.mutate("media_round_archive", ["round_id":id,"expected_revision":round.integer("revision")])
         }
     }
+    /// CL-421: a live change refreshes quietly and in place. A refresh shows its loading
+    /// line only for data that was never loaded; unchanged values are never reassigned,
+    /// so an unchanged refresh publishes nothing and redraws nothing.
     func refresh() async {
         guard !projectID.isEmpty else {return}
-        let token=UUID();epoch=token;loading=true
-        defer {if epoch==token {loading=false}}
+        let token=UUID();epoch=token
+        if types.isEmpty || (!roundID.isEmpty && header.id != roundID) {loading=true}
+        defer {if epoch==token,loading {loading=false}}
         do {
             let nav=try await read("media_navigation")
             guard epoch==token else {return}
-            types=(nav["types"] as? [MediaValues] ?? []).map(Record.init)
+            Self.assignIfChanged(&types,(nav["types"] as? [MediaValues] ?? []).map(Record.init))
             if !historyOnly && !enabledTypes.contains(where:{$0.id == typeID}) {typeID=enabledTypes.first?.id ?? ""}
             if !hasMedia && !historyOnly {if store?.page == .media {store?.page = .tasks};return}
             if !typeID.isEmpty {
                 let result=try await read("media_round_page",["type_id":typeID,"state":roundState,"offset":roundOffset])
-                guard epoch==token else {return};roundsHaveMore=result["has_more"] as? Bool ?? false;rounds=(result["rows"] as? [MediaValues] ?? []).map(Record.init)
+                guard epoch==token else {return}
+                let more=result["has_more"] as? Bool ?? false
+                if roundsHaveMore != more {roundsHaveMore=more}
+                Self.assignIfChanged(&rounds,(result["rows"] as? [MediaValues] ?? []).map(Record.init))
             }
             if !roundID.isEmpty {try await loadRound(token:token)}
-            error=nil
+            if error != nil {error=nil}
         } catch {if epoch==token {self.error=PlainError.text(error)}}
+    }
+    /// A live service change (any project event) asks for one quiet refresh. Changes that
+    /// arrive while a refresh runs coalesce into one more refresh, never a queue of reads.
+    func liveRefresh() async {
+        guard !liveRefreshRunning else {liveRefreshPending=true;return}
+        liveRefreshRunning=true
+        defer {liveRefreshRunning=false}
+        repeat {liveRefreshPending=false;await refresh()} while liveRefreshPending && !Task.isCancelled
+    }
+    private var liveRefreshRunning=false
+    private var liveRefreshPending=false
+    nonisolated static func sameRecord(_ a: Record,_ b: Record) -> Bool { NSDictionary(dictionary:a.values).isEqual(to:b.values) }
+    nonisolated static func sameRecords(_ a: [Record],_ b: [Record]) -> Bool { a.count==b.count && zip(a,b).allSatisfy {sameRecord($0,$1)} }
+    /// Assign only a changed list, so SwiftUI keeps every row, player and scroll anchor.
+    @discardableResult static func assignIfChanged(_ target: inout [Record],_ value: [Record]) -> Bool {
+        guard !sameRecords(target,value) else {return false}
+        target=value;return true
     }
     func createRound(title: String, then: @escaping () -> Void = {}) {
         mutate("media_round_create", ["type_id":typeID,"title":title]) { [weak self] result in
@@ -178,33 +202,51 @@ typealias MediaValues = [String: Any]
         let id=roundID
         let result=try await read("media_round_header",["round_id":id])
         guard epoch==token,roundID==id else {return}
-        header=Record(values:result)
+        let nextHeader=Record(values:result)
+        if !Self.sameRecord(header,nextHeader) {header=nextHeader}
         let scope=projectID+":"+typeID
         if listScope != scope {listScope=scope;list=(store?.windowPreferences.dictionary(forKey:"mediaList:"+scope)) ?? Self.defaultList(schema)}
         if list.isEmpty {list=Self.defaultList(schema)}
         let total=try await read("media_item_counts",["round_id":roundID,"list":list])
-        guard epoch==token else {return};counts=total["counts"] as? [String:Int] ?? [:]
+        guard epoch==token else {return}
+        let totals=total["counts"] as? [String:Int] ?? [:]
+        if counts != totals {counts=totals}
         let retainedCount=rows.count
         let retainedSelection=rows.contains {$0.id==selectedID}
-        try await loadRows(append:false,token:token)
         // Refresh only the pages already inspected; keep their selection/scroll anchor.
-        while epoch==token,next != nil,(rows.count<retainedCount || retainedSelection && !rows.contains {$0.id==selectedID}) {try await loadRows(append:true,token:token)}
+        try await loadRows(append:false,token:token,keepCount:retainedCount,keepID:retainedSelection ? selectedID : "")
         if !selectedID.isEmpty {await select(selectedID)}
         await resumeBulkIfNeeded(round:id)
     }
     func reloadRows() async {store?.windowPreferences.set(list,forKey:"mediaList:"+listScope);let token=UUID();epoch=token;do {try await loadRows(append:false,token:token)} catch {self.error=PlainError.text(error)}}
     func moreRows() async {do {try await loadRows(append:true,token:epoch)} catch {self.error=PlainError.text(error)}}
-    private func loadRows(append: Bool,token: UUID) async throws {
+    /// CL-421: every page a refresh needs is read first and the list is assigned once, only
+    /// when it changed. The list never shrinks to one page and grows again (no scroll jump).
+    private func loadRows(append: Bool,token: UUID,keepCount: Int = 0,keepID: String = "") async throws {
         guard !roundID.isEmpty,!append || next != nil else {return}
-        var params: MediaValues=["round_id":roundID,"list":list,"limit":100]
         let selection=currentListFilter
-        if !selection.isEmpty {params["filter"]=selection}
-        if append {params["cursor"]=next}
-        let result=try await read("media_item_page",params)
+        func page(_ cursor: String?) async throws -> MediaValues {
+            var params: MediaValues=["round_id":roundID,"list":list,"limit":100]
+            if !selection.isEmpty {params["filter"]=selection}
+            if let cursor {params["cursor"]=cursor}
+            return try await read("media_item_page",params)
+        }
+        var result=try await page(append ? next : nil)
         guard epoch==token else {return}
-        let values=(result["rows"] as? [MediaValues] ?? []).map(Record.init)
-        if append {let existing=Set(rows.map(\.id));rows += values.filter {!existing.contains($0.id)}} else {rows=values}
-        if selection.isEmpty {counts=result["counts"] as? [String:Int] ?? [:]};next=result["next_cursor"] as? String
+        var collected=append ? rows : [],seen=Set(collected.map(\.id))
+        func add(_ result: MediaValues) {
+            for row in (result["rows"] as? [MediaValues] ?? []).map(Record.init) where seen.insert(row.id).inserted {collected.append(row)}
+        }
+        add(result)
+        while !append,result["next_cursor"] as? String != nil,collected.count<keepCount || (!keepID.isEmpty && !seen.contains(keepID)) {
+            result=try await page(result["next_cursor"] as? String)
+            guard epoch==token else {return}
+            add(result)
+        }
+        Self.assignIfChanged(&rows,collected)
+        if selection.isEmpty {let totals=result["counts"] as? [String:Int] ?? [:];if counts != totals {counts=totals}}
+        let cursor=result["next_cursor"] as? String
+        if next != cursor {next=cursor}
     }
     func select(_ id: String) async {
         saveDraft();if selectedID != id {playback.releaseAll();clearImages();item=Record(values:[:]);contextConflict=false};selectedID=id
@@ -221,7 +263,8 @@ typealias MediaValues = [String: Any]
             let priorTarget=item.object("target")["id"] as? String ?? ""
             let nextTarget=(result["target"] as? MediaValues)?["id"] as? String ?? ""
             if !priorTarget.isEmpty,priorTarget != nextTarget {playback.releaseAll();clearImages()}
-            item=Record(values:result)
+            let nextItem=Record(values:result)
+            if !Self.sameRecord(item,nextItem) {item=nextItem}
             // A refresh may reveal new content; never silently rebase an existing draft.
             let basis=item.object("target")["review_basis_signature"] as? String ?? ""
             if draft.basis.isEmpty {draft.basis=basis;draft.targetID=item.object("target")["id"] as? String ?? "";draft.contextToken=header.string("observed_context_token");draft.manifestID=Record(values:header.object("manifest")).id;draft.manifestDigest=Record(values:header.object("manifest")).string("digest")}
@@ -251,7 +294,10 @@ typealias MediaValues = [String: Any]
             let result=try await read("media_approved_examples",p)
             guard examplesShown,selectedID==selected,roundID==round else {return}
             let values=(result["examples"] as? [MediaValues] ?? []).map {raw -> Record in var raw=raw;raw["id"]=raw["target_id"];return Record(values:raw)}
-            if more {historicalImageReference=""};examples=values;examplesNext=result["next_cursor"] as? String
+            if more {historicalImageReference=""}
+            Self.assignIfChanged(&examples,values)
+            let cursor=result["next_cursor"] as? String
+            if examplesNext != cursor {examplesNext=cursor}
         } catch {self.error=PlainError.text(error)}
     }
     func beginImage(_ key:String,historical:Bool) -> Bool {

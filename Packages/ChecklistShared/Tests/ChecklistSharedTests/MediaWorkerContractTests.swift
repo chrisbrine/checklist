@@ -7,7 +7,9 @@ final class MediaWorkerContractTests: XCTestCase {
     private let fixtureDigest = String(repeating: "a", count: 64)
 
     func testClosedWorkerCatalogAndReadClassification() throws {
-        XCTAssertEqual(MediaWorkerContract.methods.count, 12 + MediaWorkerContract.settingMethods.count, "CL-419 adds the setting methods to the 12 worker methods")
+        XCTAssertEqual(MediaWorkerContract.methods.count, 13 + MediaWorkerContract.settingMethods.count, "CL-419/CL-420 add the setting methods and the rework preview read to the 12 worker methods")
+        XCTAssertEqual(MediaWorkerContract.settingMethods.count, 13)
+        XCTAssertTrue(MediaWorkerContract.readMethods.contains("media_rework_preview"))
         XCTAssertEqual(CommandMethods.mediaWorkerReads, MediaWorkerContract.readMethods)
         XCTAssertTrue(CommandMethods.mediaWorkerReads.isSubset(of: CommandMethods.coreReads))
         for method in MediaWorkerContract.methods {
@@ -18,8 +20,10 @@ final class MediaWorkerContractTests: XCTestCase {
         }
         // CL-419: media type changes and publication are worker setting commands; decisions stay owner only.
         XCTAssertTrue(MediaWorkerContract.settingMethods.isSubset(of: MediaWorkerContract.methods))
-        XCTAssertEqual(MediaWorkerContract.settingMethods, ["media_type_adopt_starter", "media_type_create", "media_type_revise", "media_type_adopt", "media_type_retire", "media_round_publish"])
-        for method in ["media_decide", "media_adopt_suggestion", "media_item_create", "media_context_approve", "media_context_reconcile"] {
+        XCTAssertEqual(MediaWorkerContract.settingMethods, ["media_type_adopt_starter", "media_type_create", "media_type_revise", "media_type_adopt", "media_type_retire", "media_round_publish",
+            "media_round_cancel", "media_round_archive", "media_round_finish", "media_round_successor", "media_rework_create", "media_type_restore", "media_adopt_suggestion"])
+        // CL-420: media decisions and context approval are the owner's own answers and approvals.
+        for method in ["media_decide", "media_item_create", "media_context_approve", "media_context_reconcile", "media_bulk_prepare", "media_bulk_apply"] {
             XCTAssertNil(MediaWorkerContract.inputSchema(method), method)
             XCTAssertThrowsError(try MediaWorkerContract.validate(method, parameters: write), method)
         }

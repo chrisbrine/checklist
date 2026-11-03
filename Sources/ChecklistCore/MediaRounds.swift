@@ -36,6 +36,7 @@ extension CommandRouter {
         "media_intake_confirm":["intake_id","expected_revision","plan_id","plan_digest"],
         "media_intake_capture":["intake_id","expected_revision","plan_id","row_ids"],
         "media_type_retire":["type_id","expected_revision"],
+        "media_type_restore":["type_id","expected_revision"],
         "media_round_cancel":["round_id","expected_revision","reason"],
         "media_round_archive":["round_id","expected_revision"],
         "media_type_create":["title","schema","rubric"], "media_type_get":["type_id"],
@@ -84,7 +85,7 @@ extension CommandRouter {
         guard UUID(uuidString:command) != nil else { throw CoreError("INVALID_INPUT","command_id must be a UUID.") }
         let digest = hash(Data((method + (try jsonString(p))).utf8))
         // Rework capture writes ordinary tickets, which the media-only preparation cannot hold.
-        if method == "media_rework_create" {return try mediaReworkCreateCommand(params:p,caller:c,command:command,digest:digest)}
+        if method == "media_rework_create" {return try mediaReworkCreateCommand(params:p,caller:c,command:command,digest:digest,workerChannel:workerChannel)}
         var resources = try prepareMediaResources(method:method,params:p,caller:c,workerChannel:workerChannel)
         resources.nativeOwnerProjection = nativeOwnerProjection
         let prepared = try prepareMediaCommand(method:method,params:p,caller:c,resources:resources)
@@ -348,15 +349,32 @@ extension CommandRouter {
             type["enabled"] = false;type["state"] = "retired"
             if resources.workerChannel { type["retired_by"] = mediaAgentActor(c) }
             type = revised(type);try mediaWrite(db,type,type:"media_review_type");return type
+        case "media_type_restore":
+            // CL-420: restore is the explicit reverse of retire. It returns the type to its adopted
+            // revision (or to Draft when it never had one) under the same eight enabled types bound.
+            if !resources.workerChannel { try owner(c) }
+            var type = try scoped(db,try text(p,"type_id"),pid,type:"media_review_type");try mediaRevision(p,type)
+            guard type["state"] as? String == "retired" else {throw CoreError("MEDIA_TYPE_NOT_RETIRED","Only a retired type can be restored.")}
+            let adopted = type["adopted_revision_id"] is String
+            if adopted,try records(db,type:"media_review_type",project:pid).filter({bool($0,"enabled")}).count >= 8 {
+                throw CoreError("CAPACITY_EXCEEDED","A project supports eight enabled media types.")
+            }
+            type["state"] = adopted ? "adopted" : "draft";type["enabled"] = adopted
+            let restoration: JSON = resources.workerChannel ? mediaAgentActor(c) : ["actor":c.principal,"actor_kind":"owner","origin":"human_ui","at":now()]
+            type["restorations"] = (type["restorations"] as? [JSON] ?? []) + [restoration]
+            type = revised(type);try mediaWrite(db,type,type:"media_review_type");return type
         case "media_round_cancel", "media_round_archive":
-            try owner(c)
+            // CL-420: the worker channel already applied the agent_rule_changes gate.
+            if !resources.workerChannel { try owner(c) }
             var round = try scoped(db,try text(p,"round_id"),pid,type:"media_round");try mediaRevision(p,round)
             if method == "media_round_cancel" {
                 guard ["draft","open"].contains(round["state"] as? String ?? "") else {throw CoreError("MEDIA_ROUND_CLOSED","Only a Draft or Open round can be canceled.")}
                 round["cancellation_reason"] = try text(p,"reason",max:4000);round["state"] = "canceled"
+                if resources.workerChannel { round["canceled_by"] = mediaAgentActor(c) }
             } else {
                 guard ["closed","canceled"].contains(round["state"] as? String ?? "") else {throw CoreError("MEDIA_ROUNDS_REMAIN","Finish or explicitly cancel this round before archiving.")}
                 round["state"] = "archived"
+                if resources.workerChannel { round["archived_by"] = mediaAgentActor(c) }
             }
             round = revised(round);try mediaWrite(db,round,type:"media_round");return round
         case "media_type_create":
@@ -398,12 +416,12 @@ extension CommandRouter {
         case "media_round_publish":
             return try mediaPublishRound(db,p,c,project:pid,resources:resources)
         case "media_context_reconcile": return try mediaReconcile(db,p,c,project:pid)
-        case "media_decide","media_suggest","media_adopt_suggestion": return try mediaDecision(db,p,c,project:pid,method:method)
+        case "media_decide","media_suggest","media_adopt_suggestion": return try mediaDecision(db,p,c,project:pid,method:method,agent:resources.workerChannel)
         case "media_follow_up_record": return try mediaFollowUpRecord(db,p,c,project:pid)
         case "media_round_finish":
-            return try mediaFinishRound(db,p,c,project:pid)
+            return try mediaFinishRound(db,p,c,project:pid,agent:resources.workerChannel)
         case "media_round_successor":
-            return try mediaSuccessorRound(db,p,c,project:pid)
+            return try mediaSuccessorRound(db,p,c,project:pid,agent:resources.workerChannel)
         default: throw CoreError("UNSUPPORTED_METHOD","Internal media command is unavailable.")
         }
     }
@@ -435,7 +453,7 @@ extension CommandRouter {
                 ($0 as String).caseInsensitiveCompare(existing["title"] as? String ?? "") == .orderedSame }
             guard same else { continue }
             if existing["state"] as? String == "retired" {
-                throw CoreError("MEDIA_TYPE_RETIRED","This starter's type is retired. A retired type is historical.",details:["type_id":existing["id"] ?? NSNull()])
+                throw CoreError("MEDIA_TYPE_RETIRED","This starter's type is retired. Restore it with media_type_restore.",details:["type_id":existing["id"] ?? NSNull()])
             }
             throw CoreError("MEDIA_TYPE_ALREADY_ADOPTED","This project already has this starter's type.",details:["type_id":existing["id"] ?? NSNull()])
         }
@@ -575,14 +593,16 @@ extension CommandRouter {
             round:round,caller:c)
     }
 
-    private func mediaFinishRound(_ db: Database,_ p: JSON,_ c: Caller,project pid: String) throws -> JSON {
-        try owner(c);var round = try scoped(db,try text(p,"round_id"),pid,type:"media_round")
+    private func mediaFinishRound(_ db: Database,_ p: JSON,_ c: Caller,project pid: String,agent: Bool = false) throws -> JSON {
+        // CL-420: the worker channel already applied the agent_rule_changes gate; the closure checks are shared.
+        if !agent { try owner(c) };var round = try scoped(db,try text(p,"round_id"),pid,type:"media_round")
         try mediaObserve(db,p,round:round,caller:c);let manifest = try mediaObservedManifest(db,p,round:round)
         // CL-118/CL-350: exact current dispositions; follow-up kinds counted separately.
         let (closure,links) = try mediaClosure(db,round:round,manifest:manifest,caller:c)
         round["closure"] = closure
         round["record_references"] = (try StoredRecord(round, family: "media").objects("record_references")) + (try links.map {try mediaRef("media_rework_link",$0)})
-        round["state"] = "closed";round = revised(round);try mediaWrite(db,round,type:"media_round");return round
+        round["state"] = "closed";if agent { round["closed_by"] = mediaAgentActor(c) }
+        round = revised(round);try mediaWrite(db,round,type:"media_round");return round
     }
 
     func mediaObservedManifest(_ db: Database,_ p: JSON,round: JSON) throws -> JSON {

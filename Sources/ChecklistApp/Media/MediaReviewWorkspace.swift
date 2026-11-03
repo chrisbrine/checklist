@@ -82,6 +82,8 @@ struct MediaReviewWorkspace: View {
     @State private var showPaste=false
     @State private var showList=false
     @State private var directionGroup: MediaAnimationGroup?
+    /// CL-421: an "Animation takes" round opens on its cards. Item comparison stays one press away.
+    @State private var itemComparison=false
     @State private var cancelReason=""
     @State private var confirmation: PendingConfirmation?
     var body: some View {
@@ -112,8 +114,21 @@ struct MediaReviewWorkspace: View {
                     Button("Add Draft round") {model.createRound(title:roundTitle) {roundTitle=""}}.checklistDisabled([(roundTitle.isEmpty,"Enter a round title."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
                 }}
                 if let error=model.error {Text(error).foregroundStyle(.orange).textSelection(.enabled)}
-                if model.loading {ProgressView("Refreshing media review")}
-                if !model.roundID.isEmpty {
+                // Shown only for data never loaded; a live refresh changes values in place (CL-421).
+                if model.loading {ProgressView("Loading media review")}
+                if !model.roundID.isEmpty && MediaSimpleLayout.usesCards(model.schema) && !itemComparison {
+                    HStack {
+                        Text(model.header.string("title")+" · "+GlossaryText.title(model.header.string("state"))).font(.headline)
+                        Spacer()
+                        Picker("Disposition filter",selection:$model.filter) {ForEach(["all","pending","accepted","needs_look","changes_requested","excluded","stale"],id:\.self) {Text($0.replacingOccurrences(of:"_",with:" ").capitalized).tag($0)}}
+                            .frame(maxWidth:220).onChange(of:model.filter) {_,_ in Task {await model.reloadRows()}}
+                        Button("Item comparison") {itemComparison=true}.help("Show the item list, item comparison and the direction grid")
+                    }
+                    DisclosureGroup("Round setup and actions") {ScrollView {roundControls}.frame(maxHeight:190)}
+                        .accessibilityLabel("Round setup and frozen intake")
+                    MediaSimpleReview(model:model).frame(minHeight:150).layoutPriority(1)
+                } else if !model.roundID.isEmpty {
+                    if MediaSimpleLayout.usesCards(model.schema) {Button("Back to cards") {model.prepareForDirectionGrid();directionGroup=nil;itemComparison=false}}
                     ScrollView {roundControls}.frame(minHeight:60,maxHeight:190).accessibilityLabel("Round setup and frozen intake")
                     HSplitView {
                         itemList.frame(minWidth:175,idealWidth:220)
@@ -133,7 +148,7 @@ struct MediaReviewWorkspace: View {
                 } else {Text("Choose a round, or capture a title-only Draft round.").foregroundStyle(Color.checklistSecondaryText);Spacer()}
             } else {Spacer()} // No onboarding imposed on a project without enabled types.
         }.padding(12)
-        .onChange(of:model.roundID) {_,_ in directionGroup=nil}
+        .onChange(of:model.roundID) {_,_ in directionGroup=nil;itemComparison=false}
         .onChange(of:model.projectID) {_,_ in directionGroup=nil}
         .onChange(of:model.selectedID) {_,_ in directionGroup=nil}
         .sheet(isPresented:$showPaste) {

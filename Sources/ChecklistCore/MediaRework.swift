@@ -91,8 +91,9 @@ extension CommandRouter {
     }
 
     /// Read-only owner preview: what would be created and which exact links are reused.
-    func mediaReworkPreview(_ db: Database,_ p: JSON,_ c: Caller,project pid: String) throws -> JSON {
-        try owner(c)
+    func mediaReworkPreview(_ db: Database,_ p: JSON,_ c: Caller,project pid: String,agent: Bool = false) throws -> JSON {
+        // CL-420: an enrolled worker previews the exact rework it may capture.
+        if !agent { try owner(c) }
         let round = try scoped(db,try text(p,"round_id"),pid,type:"media_round")
         guard round["state"] as? String == "open",let manifestID = round["manifest_id"] as? String else { throw CoreError("MEDIA_ROUND_CLOSED","Rework is created from an Open review record.") }
         let manifest = try scoped(db,manifestID,pid,type:"media_round_manifest")
@@ -116,8 +117,9 @@ extension CommandRouter {
 
     /// Ordinary ticket capture and exact links commit together under the writer. No media
     /// decision, round, sibling item, assignee, readiness, Triage or model state changes.
-    func mediaReworkCreate(_ db: Database,_ p: JSON,_ c: Caller,project pid: String) throws -> JSON {
-        try owner(c)
+    func mediaReworkCreate(_ db: Database,_ p: JSON,_ c: Caller,project pid: String,agent: Bool = false) throws -> JSON {
+        // CL-420: the worker channel already applied the agent_rule_changes gate.
+        if !agent { try owner(c) }
         let round = try scoped(db,try text(p,"round_id"),pid,type:"media_round")
         guard round["state"] as? String == "open" else { throw CoreError("MEDIA_ROUND_CLOSED","Rework is created from an Open review record.") }
         try mediaObserve(db,p,round:round,caller:c)
@@ -165,12 +167,14 @@ extension CommandRouter {
 
     /// Direct writer path: ordinary ticket capture cannot run in the media-only preparation
     /// workspace. Selection is bounded to 200 small records; no media bytes are read.
-    func mediaReworkCreateCommand(params p: JSON,caller c: Caller,command: String,digest: String) throws -> JSON {
+    func mediaReworkCreateCommand(params p: JSON,caller c: Caller,command: String,digest: String,workerChannel: Bool = false) throws -> JSON {
         try ArchiveStorageGate.withExclusive(root:root) { _ in
             try dbQueue.writeWithoutTransaction { db in
                 var result: JSON = [:]
                 try self.withValidatedDomainTransaction(db) {
                     let pid = try self.mediaAccess(db,p,c,write:true)
+                    // CL-420: this direct writer path skips media preparation, so it applies the worker gate here.
+                    if workerChannel { try self.mediaWorkerWriteAccess(db,method:"media_rework_create",p:p,c:c,project:pid) }
                     try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:c)
                     if let row = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[c.principal,command]) {
                         guard row["digest"] as String == digest else { throw CoreError("IDEMPOTENCY_CONFLICT","This command ID has a different intent.") }
@@ -178,7 +182,7 @@ extension CommandRouter {
                         if Self.isPrunedResult(result) { throw Self.expiredCommandError(command) }
                         result["replayed"] = true;return .commit
                     }
-                    result = try self.mediaReworkCreate(db,p,c,project:pid)
+                    result = try self.mediaReworkCreate(db,p,c,project:pid,agent:workerChannel)
                     try self.event(db,caller:c,project:pid,entity:result["id"] as? String,kind:"media_rework_create")
                     try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[c.principal,command,digest,try jsonString(result)])
                     return .commit
@@ -219,8 +223,9 @@ extension CommandRouter {
     /// Explicit owner successor of an Open/Closed review record. Only included items are
     /// copied as Draft targets of exact retained candidates. A carry names the source item's
     /// current applicable decision; it applies only to an identical complete basis.
-    func mediaSuccessorRound(_ db: Database,_ p: JSON,_ c: Caller,project pid: String) throws -> JSON {
-        try owner(c)
+    func mediaSuccessorRound(_ db: Database,_ p: JSON,_ c: Caller,project pid: String,agent: Bool = false) throws -> JSON {
+        // CL-420: the worker channel already applied the agent_rule_changes gate.
+        if !agent { try owner(c) }
         let source = try scoped(db,try text(p,"source_round_id"),pid,type:"media_round")
         var observed = p;observed["round_id"] = source["id"]
         try mediaObserve(db,observed,round:source,caller:c)

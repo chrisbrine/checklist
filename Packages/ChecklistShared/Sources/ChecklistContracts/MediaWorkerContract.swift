@@ -5,6 +5,8 @@ import Foundation
 public enum MediaWorkerContract {
     public static let readMethods: Set<String> = [
         "media_type_list", "media_type_get", "media_round_get", "media_intake_get", "media_decision_list",
+        // CL-420: the read-only rework preview supplies the exact preview_digest for media_rework_create.
+        "media_rework_preview",
     ]
     public static let methods: Set<String> = readMethods.union([
         "media_round_create", "media_intake_preview", "media_intake_revise",
@@ -15,6 +17,10 @@ public enum MediaWorkerContract {
     /// `agent_rule_changes` switch is `owner_only`; the owner's app routes are unchanged.
     public static let settingMethods: Set<String> = [
         "media_type_adopt_starter", "media_type_create", "media_type_revise", "media_type_adopt", "media_type_retire", "media_round_publish",
+        // CL-420 (owner, 3 November 2026): round closure and successor, rework capture, type restore
+        // and suggestion adoption. Owner decisions (media_decide) and context approval stay owner only.
+        "media_round_cancel", "media_round_archive", "media_round_finish", "media_round_successor",
+        "media_rework_create", "media_type_restore", "media_adopt_suggestion",
     ]
 
     public struct ValidationError: Error, CustomStringConvertible, Sendable {
@@ -65,6 +71,51 @@ public enum MediaWorkerContract {
                 "item_id": text(4_000), "expected_revision": revision, "target_id": text(4_000), "review_basis_signature": digest,
             ], required: ["item_id", "expected_revision", "target_id", "review_basis_signature"])]
             required += ["round_id", "expected_revision", "observed_context_token", "items"]
+        case "media_type_restore":
+            properties["type_id"] = text(4_000); properties["expected_revision"] = revision
+            required += ["type_id", "expected_revision"]
+        case "media_round_cancel", "media_round_archive":
+            properties["round_id"] = text(4_000); properties["expected_revision"] = revision
+            required += ["round_id", "expected_revision"]
+            if method == "media_round_cancel" { properties["reason"] = text(4_000); required += ["reason"] }
+        case "media_round_finish":
+            properties["round_id"] = text(4_000); properties["expected_revision"] = revision
+            properties["observed_context_token"] = text(65_536)
+            properties["manifest_id"] = text(4_000); properties["manifest_digest"] = digest
+            required += ["round_id", "expected_revision", "observed_context_token", "manifest_id", "manifest_digest"]
+        case "media_round_successor":
+            properties["source_round_id"] = text(4_000); properties["expected_revision"] = revision
+            properties["observed_context_token"] = text(65_536)
+            properties["manifest_id"] = text(4_000); properties["manifest_digest"] = digest
+            properties["title"] = text(2_000)
+            properties["items"] = ["type": "array", "minItems": 1, "maxItems": 200, "items": object([
+                "item_id": text(4_000), "carry_decision_id": text(4_000),
+            ], required: ["item_id"])]
+            required += ["source_round_id", "expected_revision", "observed_context_token", "manifest_id", "manifest_digest", "title", "items"]
+        case "media_rework_preview":
+            properties["round_id"] = text(4_000); properties["epic_id"] = text(4_000)
+            properties["items"] = ["type": "array", "minItems": 1, "maxItems": 200, "items": object([
+                "item_id": text(4_000),
+            ], required: ["item_id"])]
+            required += ["round_id", "epic_id", "items"]
+        case "media_rework_create":
+            properties["round_id"] = text(4_000); properties["expected_revision"] = revision
+            properties["observed_context_token"] = text(65_536)
+            properties["manifest_id"] = text(4_000); properties["manifest_digest"] = digest
+            properties["epic_id"] = text(4_000); properties["preview_digest"] = text(256)
+            properties["items"] = ["type": "array", "minItems": 1, "maxItems": 200, "items": object([
+                "item_id": text(4_000), "expected_revision": revision, "decision_id": text(4_000),
+            ], required: ["item_id", "expected_revision", "decision_id"])]
+            required += ["round_id", "expected_revision", "observed_context_token", "manifest_id", "manifest_digest", "epic_id", "preview_digest", "items"]
+        case "media_adopt_suggestion":
+            properties["round_id"] = text(4_000); properties["expected_revision"] = revision
+            properties["observed_context_token"] = text(65_536)
+            properties["manifest_id"] = text(4_000); properties["manifest_digest"] = digest
+            properties["suggestion_id"] = text(4_000)
+            properties["items"] = ["type": "array", "minItems": 1, "maxItems": 1, "items": object([
+                "item_id": text(4_000), "expected_revision": revision, "target_id": text(4_000), "review_basis_signature": digest,
+            ], required: ["item_id", "expected_revision", "target_id", "review_basis_signature"])]
+            required += ["round_id", "expected_revision", "observed_context_token", "manifest_id", "manifest_digest", "suggestion_id", "items"]
         case "media_round_get", "media_decision_list":
             properties["round_id"] = text(4_000)
             properties["cursor"] = text(method == "media_round_get" ? 1_400_000 : 512)

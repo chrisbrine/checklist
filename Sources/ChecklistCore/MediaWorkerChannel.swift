@@ -15,7 +15,9 @@ extension CommandRouter {
         if !Self.mediaWorkerReads.contains(method) {
             let result = try executeMediaCommand(method:method,params:p,caller:c,workerChannel:true)
             // CL-419: a type command answers a closed projection; owner adoption records stay private.
-            return method.hasPrefix("media_type_") ? mediaWorkerTypeChange(result) : result
+            if method.hasPrefix("media_type_") { return mediaWorkerTypeChange(result) }
+            // CL-420: a round closure or successor answers a closed round projection.
+            return ["media_round_cancel","media_round_archive","media_round_finish","media_round_successor"].contains(method) ? mediaWorkerRoundChange(result) : result
         }
         // CL-320: safe worker projections read one pooled snapshot, so they answer
         // during a backup's writer lease; authority is checked inside that snapshot.
@@ -29,6 +31,8 @@ extension CommandRouter {
                 return ["types":try rows.map {try self.mediaWorkerType(db,GRDBRecordEnvelopeAdapter.decode($0,expectedType:"media_review_type").object,project:project)}]
             case "media_type_get":
                 return try self.mediaWorkerType(db,self.scoped(db,text(p,"type_id"),project,type:"media_review_type"),project:project)
+            case "media_rework_preview":
+                return try self.mediaReworkPreview(db,p,c,project:project,agent:true)
             case "media_intake_get":
                 let intake = try self.scoped(db,text(p,"intake_id"),project,type:"media_intake")
                 guard intake["author"] as? String == c.principal else {
@@ -51,6 +55,15 @@ extension CommandRouter {
         }
         if let draft = type["draft_revision"] as? JSON {
             result["draft_revision"] = ["id":draft["id"] ?? NSNull(),"schema":draft["schema"] ?? NSNull(),"rubric":draft["rubric"] ?? ""]
+        }
+        return result
+    }
+
+    private func mediaWorkerRoundChange(_ round: JSON) -> JSON {
+        var result: JSON = [:]
+        for key in ["id","project_id","type_id","title","state","revision","closure","cancellation_reason","predecessor_round_id",
+                    "predecessor_manifest_id","successor","canceled_by","archived_by","closed_by","replayed"] {
+            result[key] = round[key]
         }
         return result
     }

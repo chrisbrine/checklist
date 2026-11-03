@@ -8,7 +8,7 @@ extension CommandRouter {
     static let mediaOwnerReads = CommandMethods.mediaOwnerReads
     static let mediaOwnerPoolReads = mediaOwnerReads.subtracting(["media_original_read","media_example_read_lease","media_example_read_release"])
     static let mediaOwnerMethods = mediaOwnerReads.union([
-        "media_type_create", "media_type_revise", "media_type_adopt", "media_type_retire", "media_round_create", "media_round_cancel", "media_round_archive", "media_item_create", "media_item_update", "media_round_publish", "media_intake_preview", "media_intake_revise", "media_intake_confirm", "media_intake_capture", "media_context_approve", "media_context_reconcile", "media_decide", "media_example_read_lease", "media_example_read_release", "media_original_read",
+        "media_type_create", "media_type_revise", "media_type_adopt", "media_type_retire", "media_type_restore", "media_round_create", "media_round_cancel", "media_round_archive", "media_item_create", "media_item_update", "media_round_publish", "media_intake_preview", "media_intake_revise", "media_intake_confirm", "media_intake_capture", "media_context_approve", "media_context_reconcile", "media_decide", "media_example_read_lease", "media_example_read_release", "media_original_read",
         // CL-300: owner screens for CL-118 rework Drafts, round closure and successor rounds.
         "media_rework_create", "media_round_finish", "media_round_successor",
         // CL-318/CL-349: frozen bulk decisions and one-press suggestion adoption, owner only.

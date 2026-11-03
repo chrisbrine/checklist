@@ -40,11 +40,14 @@ struct MediaAnimationGroup: Identifiable, Equatable {
     private let saveDraft: ((MediaOwnerDraft) -> Void)?
     @Published var status = ""
     @Published var sending = false
-    let header: Record
+    /// CL-421: the simple review moves a changed round header in place; the card is kept.
+    @Published var header: Record
     nonisolated let id: String
     var target: Record { Record(values:item.object("target")) }
     var metadata: MediaValues { target.object("metadata") }
     var direction: String { metadata["direction"] as? String ?? "Direction unavailable" }
+    /// Plain words for the direction code, for example "SE" shows as "South-east" (CL-421).
+    var directionLabel: String { MediaTakeLabel.direction(metadata["direction"]) }
     var key: String { "grid:"+id+":"+target.id }
     init(item: Record,header: Record,draft: MediaOwnerDraft,saveDraft: ((MediaOwnerDraft) -> Void)? = nil) {
         self.id=item.id;self.item=item;self.header=header;self.draft=draft;self.saveDraft=saveDraft
@@ -157,35 +160,7 @@ struct MediaAnimationGroup: Identifiable, Equatable {
         catch {if token==generation {self.error=PlainError.text(error);playback.releaseAll()}}
     }
     private func prepare(_ card: MediaDirectionCard,model: MediaReviewModel,schema: MediaValues,token: UUID) async throws {
-        let project=model.projectID
-        let candidates=card.item.records("candidates"),layout=schema["layout"] as? MediaValues ?? [:]
-        guard candidates.count==1 else {throw ChecklistError("GRID_CANDIDATES","Choose among this item's candidates in item comparison.")}
-        guard let slot=candidates[0].records("slots").first(where:{$0.string("slot_id")==layout["primary_slot_id"] as? String}),
-              let original=card.item.records("originals").first(where:{$0.string("attachment_id")==slot.string("attachment_id")}),
-              MediaComparisonAvailability.resolve(slot:slot,original:original,declaredKind:"video") == .playback("video") else {
-            throw ChecklistError("MANAGED_ORIGINAL_UNAVAILABLE","No available primary video for this direction.")
-        }
-        guard playback.beginPreparation(card.key) else {throw CancellationError()}
-        defer {playback.endPreparation(card.key)}
-        card.status="Preparing exact take…"
-        let (file,copyMS)=try await MediaTakeLoader.verifiedCopy(expectedSHA256:slot.string("sha256"),maximumBytes:MediaPlaybackBudget.directionGridOriginalBytes,
-            lease:{
-                let (method,params)=MediaReviewModel.playbackLeaseRequest(roundID:card.header.id,selectedID:card.id,targetID:card.target.id,original:original,example:nil)
-                let reply=try await model.read(method,params,projectID:project),attachment=Record(values:reply["attachment"] as? MediaValues ?? [:])
-                guard let id=reply["lease_id"] as? String else {throw ChecklistError("MANAGED_ORIGINAL_UNAVAILABLE","No exact reader lease was returned.")}
-                return .init(id:id,path:attachment.string("path"),size:attachment.integer("size"),name:attachment.string("name"),attachmentID:attachment.id)
-            },release:{await model.releasePlaybackLease($0,projectID:project)})
-        let (asset,facts,probeMS)=try await MediaTakeLoader.probe(url:file.url,kind:"video")
-        let settings=MediaComparisonLabels.playbackSettings(slotID:slot.string("slot_id"),layout:layout,historical:false,metadata:card.metadata)
-        let timing=try await MediaTakeLoader.timing(asset:asset,frameRate:settings.frameRate)
-        try Task.checkCancellation();guard token==generation else {throw CancellationError()}
-        guard playback.gridAllows(bytes:original.integer("size"),facts:facts) else {
-            throw ChecklistError("GRID_BUDGET","This take exceeds the direction-grid byte, pixel or decoder budget. Use item comparison.")
-        }
-        let control=try await MediaNativeTakeControl(asset:asset,loop:true,playbackRate:timing.rate)
-        try Task.checkCancellation();guard token==generation else {control.unload();throw CancellationError()}
-        let take=MediaPreparedTake(key:card.key,label:card.direction,kind:"video",ids:["item_id":card.id,"target_id":card.target.id,"reference_id":original.string("reference_id"),"slot_id":slot.string("slot_id")],control:control,player:control.player,file:file,
-            measurement:.init(copyMilliseconds:copyMS,probeMilliseconds:probeMS,bytes:original.integer("size"),facts:facts,loop:true,timing:timing))
+        let take=try await MediaDirectionTakePreparation.prepare(card,model:model,schema:schema,playback:playback) {token==self.generation}
         guard playback.admit(take) else {throw ChecklistError("GRID_BUDGET","This take exceeds the direction-grid byte, pixel or decoder budget. Use item comparison.")}
         card.status=""
     }
@@ -214,6 +189,42 @@ struct MediaAnimationGroup: Identifiable, Equatable {
                 }
             }
         } catch {card.status=PlainError.text(error)}
+    }
+}
+
+/// One exact, verified, looping take for one direction card. The direction grid and the
+/// CL-421 simple review share it; the caller admits the returned take to its own coordinator.
+@MainActor enum MediaDirectionTakePreparation {
+    static func prepare(_ card: MediaDirectionCard,model: MediaReviewModel,schema: MediaValues,playback: MediaPlaybackCoordinator,isCurrent: @escaping @MainActor () -> Bool) async throws -> MediaPreparedTake {
+        let project=model.projectID
+        let candidates=card.item.records("candidates"),layout=schema["layout"] as? MediaValues ?? [:]
+        guard candidates.count==1 else {throw ChecklistError("GRID_CANDIDATES","Choose among this item's candidates in item comparison.")}
+        guard let slot=candidates[0].records("slots").first(where:{$0.string("slot_id")==layout["primary_slot_id"] as? String}),
+              let original=card.item.records("originals").first(where:{$0.string("attachment_id")==slot.string("attachment_id")}),
+              MediaComparisonAvailability.resolve(slot:slot,original:original,declaredKind:"video") == .playback("video") else {
+            throw ChecklistError("MANAGED_ORIGINAL_UNAVAILABLE","No available primary video for this direction.")
+        }
+        guard playback.beginPreparation(card.key) else {throw CancellationError()}
+        defer {playback.endPreparation(card.key)}
+        card.status="Preparing exact take…"
+        let (file,copyMS)=try await MediaTakeLoader.verifiedCopy(expectedSHA256:slot.string("sha256"),maximumBytes:MediaPlaybackBudget.directionGridOriginalBytes,
+            lease:{
+                let (method,params)=MediaReviewModel.playbackLeaseRequest(roundID:card.header.id,selectedID:card.id,targetID:card.target.id,original:original,example:nil)
+                let reply=try await model.read(method,params,projectID:project),attachment=Record(values:reply["attachment"] as? MediaValues ?? [:])
+                guard let id=reply["lease_id"] as? String else {throw ChecklistError("MANAGED_ORIGINAL_UNAVAILABLE","No exact reader lease was returned.")}
+                return .init(id:id,path:attachment.string("path"),size:attachment.integer("size"),name:attachment.string("name"),attachmentID:attachment.id)
+            },release:{await model.releasePlaybackLease($0,projectID:project)})
+        let (asset,facts,probeMS)=try await MediaTakeLoader.probe(url:file.url,kind:"video")
+        let settings=MediaComparisonLabels.playbackSettings(slotID:slot.string("slot_id"),layout:layout,historical:false,metadata:card.metadata)
+        let timing=try await MediaTakeLoader.timing(asset:asset,frameRate:settings.frameRate)
+        try Task.checkCancellation();guard isCurrent() else {throw CancellationError()}
+        guard playback.gridAllows(bytes:original.integer("size"),facts:facts) else {
+            throw ChecklistError("GRID_BUDGET","This take exceeds the direction-grid byte, pixel or decoder budget. Use item comparison.")
+        }
+        let control=try await MediaNativeTakeControl(asset:asset,loop:true,playbackRate:timing.rate)
+        try Task.checkCancellation();guard isCurrent() else {control.unload();throw CancellationError()}
+        return MediaPreparedTake(key:card.key,label:card.directionLabel,kind:"video",ids:["item_id":card.id,"target_id":card.target.id,"reference_id":original.string("reference_id"),"slot_id":slot.string("slot_id")],control:control,player:control.player,file:file,
+            measurement:.init(copyMilliseconds:copyMS,probeMilliseconds:probeMS,bytes:original.integer("size"),facts:facts,loop:true,timing:timing))
     }
 }
 
@@ -257,7 +268,7 @@ private struct MediaDirectionCardView: View {
     @ObservedObject var model: MediaReviewModel
     var body: some View {
         VStack(alignment:.leading,spacing:6) {
-            Text(card.direction).font(.headline).accessibilityAddTraits(.isHeader)
+            Text(card.directionLabel).font(.headline).accessibilityAddTraits(.isHeader)
             Text(MediaReviewModel.dispositionLabel(card.item.string("disposition"))).font(.caption)
             if let take=card.metadata["take"] as? String,!take.isEmpty {Text(take).font(.caption)}
             MediaDirectionPlayer(playback:grid.playback,card:card)
@@ -266,7 +277,7 @@ private struct MediaDirectionCardView: View {
                 Text((suggestion.isCurrent ? "Agent suggestion: " : "Earlier agent suggestion: ")+suggestion.source+" · "+suggestion.choice+" · "+suggestion.note).font(.caption).textSelection(.enabled)
             }
             TextField("Owner note",text:$card.draft.note,axis:.vertical).lineLimit(2...4)
-                .accessibilityLabel("Owner note for "+card.direction)
+                .accessibilityLabel("Owner note for "+card.directionLabel)
             if !card.basisMatches {
                 Button("I inspected this target and context") {card.inspectCurrentBasis()}
             }
@@ -278,7 +289,7 @@ private struct MediaDirectionCardView: View {
             }.checklistDisabled([(grid.loading || card.sending,"Wait for this group or decision to finish."),(!card.basisMatches || !card.item.bool("published") || card.header.string("state") != "open" || model.historyOnly,"Inspect a published item in an open round before deciding."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
             if !card.status.isEmpty {Text(card.status).font(.caption).textSelection(.enabled)}
         }.padding(8).background(.quaternary.opacity(0.3),in:RoundedRectangle(cornerRadius:6))
-        .accessibilityElement(children:.contain).accessibilityLabel("Direction "+card.direction)
+        .accessibilityElement(children:.contain).accessibilityLabel("Direction "+card.directionLabel)
         .accessibilityIdentifier("mediaDirection:"+card.direction)
     }
     func decide(_ disposition: String) {Task {await grid.decide(disposition,card:card,model:model)}}
@@ -290,7 +301,7 @@ private struct MediaDirectionPlayer: View {
     var body: some View {
         if let take=playback.takes[card.key],let player=take.player {
             NativePlayerAdapter(player:player,audio:false).frame(minHeight:140,maxHeight:220)
-                .accessibilityLabel("Looping "+card.direction+" take")
+                .accessibilityLabel("Looping "+card.directionLabel+" take")
             Text(MediaPlaybackLabels.playback(loop:true,frameRate:take.measurement.timing?.declaredFrameRate)).font(.caption)
         } else {Text(card.status.isEmpty ? "Take unavailable" : card.status).font(.caption)}
     }

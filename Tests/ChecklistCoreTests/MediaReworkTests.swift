@@ -59,7 +59,9 @@ final class MediaReworkTests: XCTestCase {
         XCTAssertTrue(CommandRouter.mediaOwnerReads.contains("media_rework_preview"))
         for method in ["media_rework_preview","media_rework_create","media_round_finish","media_round_successor"] {
             XCTAssertTrue(CommandRouter.mediaOwnerMethods.contains(method),method)
-            XCTAssertThrowsError(try f.router.handle(method:method,params:["project_id":f.project,"command_id":uuid()],caller:f.worker)) {XCTAssertEqual(($0 as? CoreError)?.code,"FORBIDDEN",method)}
+            // CL-420: these are also gated worker commands; an incomplete worker request refuses before any write.
+            XCTAssertTrue(CommandRouter.mediaWorkerMethods.contains(method),method)
+            XCTAssertThrowsError(try f.router.handle(method:method,params:["project_id":f.project,"command_id":uuid()],caller:f.worker),method)
         }
         let shown = try ownerCall(f,"media_rework_preview",["round_id":r["id"]!,"epic_id":epicID,"items":[["item_id":ids[1]]]])
         XCTAssertEqual((shown["items"] as! [JSON]).map {$0["action"] as? String},["create"])

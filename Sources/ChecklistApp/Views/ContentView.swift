@@ -95,7 +95,9 @@ struct ContentView: View {
         }
         .task { await store.startLiveUpdates() }
         .task(id: store.projectID) { await store.mediaReview.connect(store:store) }
-        .onChange(of: store.archivePreviewEpoch) { _, _ in Task { await store.mediaReview.refresh() } }
+        // CL-421: every store refresh changes this epoch. Media review refreshes quietly,
+        // coalesced, and changes only what changed; it never shows a loading state for it.
+        .onChange(of: store.archivePreviewEpoch) { _, _ in Task { await store.mediaReview.liveRefresh() } }
         .onAppear {
             QuickCaptureController.shared.openMainWindow = { [openWindow] in openWindow(id: "main") }
             DockBadge.apply(count: store.needsCount)

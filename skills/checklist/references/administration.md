@@ -23,4 +23,8 @@ An agent sets up Media review for a project through the MCP when asked; the owne
 - Built-in starter: `media_type_adopt_starter` with `starter` (exact ID or name: `generic`, `text`, `animation`, `video`, `animation_video` "Animation takes", `audio`) and `expected_revision` (the project revision).
 - Custom type: `media_type_create`, then `media_type_adopt` with the result's `draft_revision_id` and `observed_type_token`. Change it with `media_type_revise`, then adopt again. Retire it with `media_type_retire`.
 - Publication: read `media_round_get` and send each item's `publication_preview` target and basis to `media_round_publish`.
-- The owner keeps context approval, decisions and restoring a retired type. See [agent media changes](../../../docs/mcp-contract.md#agent-media-type-and-publication-changes-cl-419).
+- Restore a retired type with `media_type_restore` (CL-420).
+- Rounds (CL-420): cancel with `media_round_cancel` and a reason, archive a closed or canceled round with `media_round_archive`, close an Open round with `media_round_finish` and the `manifest` fence from `media_round_get`, and start a successor with `media_round_successor`.
+- Rework (CL-420): read `media_rework_preview` for exact Changes requested items and an Epic, then send its fences, items and `preview_digest` to `media_rework_create`.
+- Suggestions (CL-420): `media_adopt_suggestion` adopts one exact current suggestion as the decision.
+- The owner keeps media decisions (`media_decide`, bulk decisions) and context approval and reconciliation: these are the owner's own answers and approvals. See [agent media changes](../../../docs/mcp-contract.md#agent-media-type-and-publication-changes-cl-419) and [agent round actions](../../../docs/mcp-contract.md#agent-media-round-actions-cl-420).
