@@ -17,7 +17,7 @@ Agent references use `KEY "Title"` for tickets and `KEY "Name"` for Triages/Epic
 
 ### Native reply listener state
 
-`service_info.native_reply_listener` is what the running service process observed, separately from the build-level `native_routes` table. It has `state` (`not_started`, `listening` or `failed`), `claude_relay` (`running` or `stopped`), `codex_queue_relay` (`running` or `off`), a plain-language `message`, and `reason` when the listener failed. A failed listener stops every Claude relay until the next service start; each note stays available at the recipient's next Checklist check. The Codex queue route does not use this listener. The Claude provider card in **Settings → Message readiness** shows the same message. `running` states only that the listener exists; it is not a delivery receipt.
+`service_info.native_reply_listener` is what the running service process observed, separately from the build-level `native_routes` table. It has `state` (`not_started`, `listening` or `failed`), `claude_relay` (`running` or `stopped`), `codex_queue_relay` (`running` or `off`), a plain-language `message`, `reply_path_name` when the listener runs (`process_id` for `<service pid>.sock`, or `fallback` for `<service pid>-<8 hex>.sock`, used because a file already existed at the first name), and `reason` when the listener failed. A failed listener stops every Claude relay until the next service start; each note stays available at the recipient's next Checklist check. The Codex queue route does not use this listener. The Claude provider card in **Settings → Message readiness** shows the same message. `running` states only that the listener exists; it is not a delivery receipt.
 
 ### Native resumption recovery
 

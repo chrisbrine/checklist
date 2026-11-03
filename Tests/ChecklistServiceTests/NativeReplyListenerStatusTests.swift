@@ -32,34 +32,48 @@ final class NativeReplyListenerStatusTests: XCTestCase {
 
     func testServiceInfoReportsAFailedListenerInPlainWords() throws {
         XCTAssertEqual(try listener()["state"] as? String,"not_started")
-        let path = replies + "/\(getpid()).sock"
-        try Data("keep".utf8).write(to:URL(fileURLWithPath:path))
+        XCTAssertEqual(chmod(replies,0o777),0)
         coordinator.startNativeReplies(directory:replies)
         XCTAssertNil(coordinator.queue.sync { coordinator.nativeListener })
         let info = try listener()
         XCTAssertEqual(info["state"] as? String,"failed")
         XCTAssertEqual(info["claude_relay"] as? String,"stopped")
         XCTAssertEqual(info["codex_queue_relay"] as? String,CodexQueueRelay.enabled ? "running" : "off")
-        XCTAssertEqual(info["reason"] as? String,"Refusing to replace an existing reply path: it is not a socket.")
+        XCTAssertEqual(info["reason"] as? String,"Reply directory must be an existing same-user directory without group/world write access.")
+        XCTAssertNil(info["reply_path_name"])
         let message = try XCTUnwrap(info["message"] as? String)
         XCTAssertTrue(message.contains("does not relay notes to Claude"),message)
-        XCTAssertTrue(message.contains("it is not a socket"),message)
+        XCTAssertTrue(message.contains("Reply directory must be"),message)
         XCTAssertTrue(message.contains("Codex queue route does not use this listener and still runs"),message)
-        try FileManager.default.removeItem(atPath:path)
     }
 
-    func testAStaleSocketDoesNotStopTheListener() throws {
+    func testAFreePathReportsTheProcessIDName() throws {
+        coordinator.startNativeReplies(directory:replies)
+        XCTAssertEqual(coordinator.queue.sync { coordinator.nativeListener?.path },replies + "/\(getpid()).sock")
+        let info = try listener()
+        XCTAssertEqual(info["state"] as? String,"listening")
+        XCTAssertEqual(info["reply_path_name"] as? String,"process_id")
+        XCTAssertEqual(info["message"] as? String,"The native reply listener is running.")
+    }
+
+    func testAStaleSocketStaysAndTheServiceReportsAFallbackName() throws {
         let path = replies + "/\(getpid()).sock"
         let descriptor = socket(AF_UNIX,SOCK_STREAM,0)
         var address = sockaddr_un();address.sun_family = sa_family_t(AF_UNIX)
         withUnsafeMutableBytes(of:&address.sun_path) { $0.copyBytes(from:path.utf8) }
         let bound = withUnsafePointer(to:&address) { $0.withMemoryRebound(to:sockaddr.self,capacity:1) { Darwin.bind(descriptor,$0,socklen_t(MemoryLayout<sockaddr_un>.size)) } }
         XCTAssertEqual(bound,0);XCTAssertEqual(chmod(path,0o600),0);close(descriptor)
+        var before = stat();XCTAssertEqual(lstat(path,&before),0)
         coordinator.startNativeReplies(directory:replies)
-        XCTAssertNotNil(coordinator.queue.sync { coordinator.nativeListener })
+        let boundPath = try XCTUnwrap(coordinator.queue.sync { coordinator.nativeListener?.path })
+        XCTAssertNotEqual(boundPath,path)
+        var after = stat();XCTAssertEqual(lstat(path,&after),0)
+        XCTAssertEqual(after.st_ino,before.st_ino)
         let info = try listener()
         XCTAssertEqual(info["state"] as? String,"listening")
         XCTAssertEqual(info["claude_relay"] as? String,"running")
+        XCTAssertEqual(info["reply_path_name"] as? String,"fallback")
+        XCTAssertTrue((info["message"] as? String ?? "").contains("fallback name"))
         XCTAssertNil(info["reason"])
     }
 

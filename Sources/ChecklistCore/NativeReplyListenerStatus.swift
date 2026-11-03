@@ -7,16 +7,20 @@ public struct NativeReplyListenerStatus: Equatable, Sendable {
     public enum State: String, Sendable { case notStarted = "not_started", listening, failed }
     public let state: State
     public let reason: String?
+    public let usesFallbackName: Bool
     public let codexQueueRelayEnabled: Bool
 
-    public init(state: State, reason: String? = nil, codexQueueRelayEnabled: Bool) {
-        self.state = state; self.reason = reason; self.codexQueueRelayEnabled = codexQueueRelayEnabled
+    public init(state: State, reason: String? = nil, usesFallbackName: Bool = false, codexQueueRelayEnabled: Bool) {
+        self.state = state; self.reason = reason; self.usesFallbackName = usesFallbackName; self.codexQueueRelayEnabled = codexQueueRelayEnabled
     }
 
     var message: String {
         switch state {
         case .notStarted: return "The native reply listener did not start yet."
-        case .listening: return "The native reply listener is running."
+        case .listening:
+            return usesFallbackName
+                ? "The native reply listener is running at a fallback name, because a file already exists at its process ID name. No check has shown that Claude replies to this name."
+                : "The native reply listener is running."
         case .failed:
             let codex = codexQueueRelayEnabled ? "The Codex queue route does not use this listener and still runs." : "This build keeps the Codex queue route off."
             return "Checklist does not relay notes to Claude conversations now, because its reply listener did not start. Reason: \(reason ?? "unknown"). "
@@ -29,6 +33,7 @@ public struct NativeReplyListenerStatus: Equatable, Sendable {
                                    "claude_relay": state == .listening ? "running" : "stopped",
                                    "codex_queue_relay": codexQueueRelayEnabled ? "running" : "off"]
         if let reason { info["reason"] = reason }
+        if state == .listening { info["reply_path_name"] = usesFallbackName ? "fallback" : "process_id" }
         return info
     }
 }

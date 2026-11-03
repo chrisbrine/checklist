@@ -153,13 +153,33 @@ public enum NativeReplyRouting {
 /// A bounded same-user receipt listener. Frames are untrusted native input. The
 /// caller correlates message/recipient IDs and records actual evidence; a body
 /// containing a nonce is not automatically an acknowledgment.
+///
+/// The listener removes only a file that it created in this process. A file that already exists
+/// stays untouched: a name cannot show that a socket is dead, because a child can hold a listener
+/// after its creator exits, and Darwin refuses a connection to a live listener with a full queue.
 public final class NativeReplyListener: @unchecked Sendable {
     public let path: String
     private var descriptor: Int32
     private let createdDevice: dev_t
     private let createdInode: ino_t
     public var address: String { "uds:" + path }
+    /// False when a file already held `<pid>.sock`, so the listener bound a fallback name.
+    public var hasProcessIDName: Bool { URL(fileURLWithPath: path).lastPathComponent == "\(getpid()).sock" }
 
+    static let fallbackNameTries = 8
+
+    /// Binds `<pid>.sock` in the folder, or `<pid>-<8 hex>.sock` if any file exists at that path.
+    /// `bind` never replaces a file, so no check can go out of date before the bind.
+    public static func start(directory: String, fallbackTag: () -> String = { String(format: "%08x", UInt32.random(in: .min ... .max)) }) throws -> NativeReplyListener {
+        let processID = getpid()
+        do { return try NativeReplyListener(path: "\(directory)/\(processID).sock") } catch NativeBridgeError.system("bind", EADDRINUSE) {}
+        for _ in 0..<fallbackNameTries {
+            do { return try NativeReplyListener(path: "\(directory)/\(processID)-\(fallbackTag()).sock") } catch NativeBridgeError.system("bind", EADDRINUSE) { continue }
+        }
+        throw NativeBridgeError.invalid("Every reply socket name that this service tried already exists, after \(fallbackNameTries) fallback names. No file changed.")
+    }
+
+    /// Binds exactly this path. An existing file at the path stops the bind with EADDRINUSE and stays.
     public init(path: String) throws {
         self.path = path
         let directory = URL(fileURLWithPath: path).deletingLastPathComponent().path
@@ -167,7 +187,6 @@ public final class NativeReplyListener: @unchecked Sendable {
         guard lstat(directory, &attributes) == 0, attributes.st_mode & S_IFMT == S_IFDIR,
               attributes.st_uid == getuid(), attributes.st_mode & 0o022 == 0
         else { throw NativeBridgeError.invalid("Reply directory must be an existing same-user directory without group/world write access.") }
-        try Self.clearOwnStaleSocket(at: path)
         let socketFD = socket(AF_UNIX, SOCK_STREAM, 0)
         guard socketFD >= 0 else { throw NativeBridgeError.system("socket", errno) }
         do {
@@ -176,8 +195,15 @@ public final class NativeReplyListener: @unchecked Sendable {
                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(socketFD, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
             }
             guard result == 0 else { throw NativeBridgeError.system("bind", errno) }
-            guard chmod(path, 0o600) == 0, listen(socketFD, 8) == 0 else { throw NativeBridgeError.system("listen", errno) }
-            let created = try NativeSocketIO.checkedSocket(path)
+            var created = stat()
+            guard lstat(path, &created) == 0 else { throw NativeBridgeError.system("lstat reply path", errno) }
+            do {
+                guard chmod(path, 0o600) == 0, listen(socketFD, 8) == 0 else { throw NativeBridgeError.system("listen", errno) }
+                _ = try NativeSocketIO.checkedSocket(path)
+            } catch {
+                Self.removeFile(at: path, device: created.st_dev, inode: created.st_ino)
+                throw error
+            }
             createdDevice = created.st_dev; createdInode = created.st_ino
             descriptor = socketFD
         } catch {
@@ -194,33 +220,12 @@ public final class NativeReplyListener: @unchecked Sendable {
     /// Removes the socket file that this listener created, and never a later file at the path.
     /// The descriptor stays open, so a stop can run while the reply loop waits on it.
     public func removeSocketFile() {
-        var current = stat()
-        if lstat(path, &current) == 0, current.st_dev == createdDevice, current.st_ino == createdInode { unlink(path) }
+        Self.removeFile(at: path, device: createdDevice, inode: createdInode)
     }
 
-    /// A process names its socket with its own PID, and no other live process has this PID. So a
-    /// same-user socket at this process's own PID name that refuses a connection is stale. Every
-    /// other existing path refuses. `bind` never replaces a file, so a process that creates this
-    /// path after the removal makes `bind` fail with EADDRINUSE, and that file stays.
-    private static func clearOwnStaleSocket(at path: String) throws {
-        func refuse(_ reason: String) -> NativeBridgeError { .invalid("Refusing to replace an existing reply path: \(reason).") }
-        var found = stat()
-        guard lstat(path, &found) == 0 else {
-            if errno == ENOENT { return }
-            throw NativeBridgeError.system("lstat reply path", errno)
-        }
-        guard URL(fileURLWithPath: path).lastPathComponent == "\(getpid()).sock" else { throw refuse("it does not have this process's own socket name") }
-        guard found.st_mode & S_IFMT == S_IFSOCK else { throw refuse("it is not a socket") }
-        guard found.st_uid == getuid() else { throw refuse("it belongs to another user") }
-        switch try NativeSocketIO.connectResult(path) {
-        case 0: throw refuse("a process listens on it")
-        case ENOENT: return
-        case ECONNREFUSED: break
-        case let code: throw refuse("its connection test ended with \(String(cString: strerror(code)))")
-        }
+    private static func removeFile(at path: String, device: dev_t, inode: ino_t) {
         var current = stat()
-        guard lstat(path, &current) == 0, current.st_dev == found.st_dev, current.st_ino == found.st_ino else { throw refuse("it changed during the connection test") }
-        guard unlink(path) == 0 || errno == ENOENT else { throw NativeBridgeError.system("unlink stale reply socket", errno) }
+        if lstat(path, &current) == 0, current.st_dev == device, current.st_ino == inode { unlink(path) }
     }
 
     public func receive(timeout: TimeInterval = 5) throws -> Data {

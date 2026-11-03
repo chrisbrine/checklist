@@ -471,8 +471,9 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     private func startNativeRepliesOnQueue(directory: URL) {
         if !FileManager.default.fileExists(atPath:directory.path) { try? FileManager.default.createDirectory(at:directory,withIntermediateDirectories:false,attributes:[.posixPermissions:0o700]) }
         do {
-            nativeListener=try NativeReplyListener(path:directory.appendingPathComponent("\(getpid()).sock").path)
-            router.nativeReplyListenerStatus = .init(state:.listening,codexQueueRelayEnabled:CodexQueueRelay.enabled)
+            let started=try NativeReplyListener.start(directory:directory.path)
+            nativeListener=started
+            router.nativeReplyListenerStatus = .init(state:.listening,usesFallbackName:!started.hasProcessIDName,codexQueueRelayEnabled:CodexQueueRelay.enabled)
         } catch { // The Codex queue route needs no reply listener, so its startup pass still runs.
             fputs("Native reply listener unavailable: \(error.localizedDescription)\n",stderr)
             router.nativeReplyListenerStatus = .init(state:.failed,reason:error.localizedDescription,codexQueueRelayEnabled:CodexQueueRelay.enabled)
