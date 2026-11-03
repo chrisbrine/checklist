@@ -150,23 +150,116 @@ public enum NativeReplyRouting {
     }
 }
 
+/// A named step of a listener's start or stop. Only a test passes an observer, to swap a file at
+/// that step. A product run has no observer.
+enum NativeReplySocketStep: Sendable {
+    case afterBind, beforeIdentityCapture, beforeStopCheck, beforePrivateMove, afterPrivateMove, beforeRemoval
+}
+
+/// Sets the calling thread's working folder, or returns it to the process folder with -1. libSystem
+/// exports this symbol, and the SDK headers do not declare it. It is the route to a relative `bind`
+/// and `connect`, because this SDK has no `bindat` or `connectat`. No other thread sees the change.
+@_silgen_name("pthread_fchdir_np")
+private func setThreadWorkingFolder(_ descriptor: Int32) -> Int32
+
+/// What separates this file from every other file. The birth time stays the same across a rename.
+private struct NativeReplyFileIdentity: Equatable {
+    let device: dev_t, inode: ino_t, birthSeconds: Int, birthNanoseconds: Int
+    init(_ attributes: stat) {
+        device = attributes.st_dev; inode = attributes.st_ino
+        birthSeconds = attributes.st_birthtimespec.tv_sec; birthNanoseconds = attributes.st_birthtimespec.tv_nsec
+    }
+}
+
+/// The reply folder, opened once. Each file action names a file relative to this descriptor, so a
+/// later change to the folder's path has no effect on which folder the listener uses.
+private final class NativeReplyFolder: @unchecked Sendable {
+    let descriptor: Int32
+
+    init(path: String) throws {
+        let invalid = NativeBridgeError.invalid("Reply directory must be an existing same-user directory without group/world write access.")
+        let opened = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard opened >= 0 else { throw invalid }
+        var attributes = stat()
+        guard fstat(opened, &attributes) == 0, attributes.st_mode & S_IFMT == S_IFDIR,
+              attributes.st_uid == getuid(), attributes.st_mode & 0o022 == 0
+        else { Darwin.close(opened); throw invalid }
+        descriptor = opened
+    }
+
+    deinit { Darwin.close(descriptor) }
+
+    func status(_ name: String) -> stat? {
+        var attributes = stat()
+        return fstatat(descriptor, name, &attributes, AT_SYMLINK_NOFOLLOW) == 0 ? attributes : nil
+    }
+
+    private func inFolder<Result>(_ body: () throws -> Result) throws -> Result {
+        guard setThreadWorkingFolder(descriptor) == 0 else { throw NativeBridgeError.system("pthread_fchdir_np", errno) }
+        defer { _ = setThreadWorkingFolder(-1) }
+        return try body()
+    }
+
+    /// The umask is process-wide, and other queues can create files during this one `bind`. So the
+    /// mask removes only group and other bits: a file or folder from another queue gets at most a
+    /// narrower group and other mode, and its owner keeps every bit. No other service code sets the
+    /// umask. The socket's mode is 0700, and the owner needs only the write bit to connect.
+    func bindSocket(_ socket: Int32, name: String) throws {
+        var address = try NativeSocketIO.fileNameSocketAddress(name)
+        let (result, code): (Int32, Int32) = try inFolder {
+            let earlier = umask(0o077)
+            let result = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(socket, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+            }
+            let code = errno
+            umask(earlier)
+            return (result, code)
+        }
+        guard result == 0 else { throw NativeBridgeError.system("bind", code) }
+    }
+
+    func connectSocket(_ socket: Int32, name: String) throws {
+        var address = try NativeSocketIO.fileNameSocketAddress(name)
+        let (result, code): (Int32, Int32) = try inFolder {
+            let result = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(socket, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+            }
+            return (result, errno)
+        }
+        guard result == 0 else { throw NativeBridgeError.system("connect", code) }
+    }
+}
+
 /// A bounded same-user receipt listener. Frames are untrusted native input. The
 /// caller correlates message/recipient IDs and records actual evidence; a body
 /// containing a nonce is not automatically an acknowledgment.
 ///
-/// The listener removes only a file that it created in this process. A file that already exists
-/// stays untouched: a name cannot show that a socket is dead, because a child can hold a listener
-/// after its creator exits, and Darwin refuses a connection to a live listener with a full queue.
+/// The rule: the listener removes a file only with proof that the file is the socket that it bound,
+/// and any doubt leaves the file untouched. A file that already exists stays: a name cannot show that
+/// a socket is dead, because a child can hold a listener after its creator exits, and Darwin refuses
+/// a connection to a live listener with a full queue.
+///
+/// The proof, at start: the path has one identity before and after a connection that this process
+/// makes through the path and then receives on this listener with a random value. A start with no
+/// proof closes its socket, leaves the file and fails. No failure path removes a file.
+///
+/// The limit: a process of the same user can still defeat the proof if it puts this socket at the
+/// path for only the moment of the self-connection, or it can change the private folder of a stop.
 public final class NativeReplyListener: @unchecked Sendable {
     public let path: String
     private var descriptor: Int32
-    private let createdDevice: dev_t
-    private let createdInode: ino_t
+    private let folder: NativeReplyFolder
+    private let name: String
+    private let observer: (@Sendable (NativeReplySocketStep) -> Void)?
+    private let identityLock = NSLock()
+    /// A stop makes one attempt, so this is nil after it, and nil always means that no removal occurs.
+    private var provedIdentity: NativeReplyFileIdentity?
     public var address: String { "uds:" + path }
     /// False when a file already held `<pid>.sock`, so the listener bound a fallback name.
     public var hasProcessIDName: Bool { URL(fileURLWithPath: path).lastPathComponent == "\(getpid()).sock" }
 
     static let fallbackNameTries = 8
+    static let selfConnectionSeconds: TimeInterval = 2
 
     /// Binds `<pid>.sock` in the folder, or `<pid>-<8 hex>.sock` if any file exists at that path.
     /// `bind` never replaces a file, so no check can go out of date before the bind.
@@ -180,31 +273,24 @@ public final class NativeReplyListener: @unchecked Sendable {
     }
 
     /// Binds exactly this path. An existing file at the path stops the bind with EADDRINUSE and stays.
-    public init(path: String) throws {
+    public convenience init(path: String) throws {
+        try self.init(path: path, observer: nil)
+    }
+
+    init(path: String, observer: (@Sendable (NativeReplySocketStep) -> Void)?) throws {
         self.path = path
-        let directory = URL(fileURLWithPath: path).deletingLastPathComponent().path
-        var attributes = stat()
-        guard lstat(directory, &attributes) == 0, attributes.st_mode & S_IFMT == S_IFDIR,
-              attributes.st_uid == getuid(), attributes.st_mode & 0o022 == 0
-        else { throw NativeBridgeError.invalid("Reply directory must be an existing same-user directory without group/world write access.") }
+        self.observer = observer
+        let location = URL(fileURLWithPath: path)
+        name = location.lastPathComponent
+        _ = try NativeSocketIO.socketAddress(path) // The address limit applies to the full path that a sender uses.
+        folder = try NativeReplyFolder(path: location.deletingLastPathComponent().path)
         let socketFD = socket(AF_UNIX, SOCK_STREAM, 0)
         guard socketFD >= 0 else { throw NativeBridgeError.system("socket", errno) }
         do {
-            var address = try NativeSocketIO.socketAddress(path)
-            let result = withUnsafePointer(to: &address) { pointer in
-                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(socketFD, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
-            }
-            guard result == 0 else { throw NativeBridgeError.system("bind", errno) }
-            var created = stat()
-            guard lstat(path, &created) == 0 else { throw NativeBridgeError.system("lstat reply path", errno) }
-            do {
-                guard chmod(path, 0o600) == 0, listen(socketFD, 8) == 0 else { throw NativeBridgeError.system("listen", errno) }
-                _ = try NativeSocketIO.checkedSocket(path)
-            } catch {
-                Self.removeFile(at: path, device: created.st_dev, inode: created.st_ino)
-                throw error
-            }
-            createdDevice = created.st_dev; createdInode = created.st_ino
+            try folder.bindSocket(socketFD, name: name)
+            observer?(.afterBind)
+            guard listen(socketFD, 8) == 0 else { throw NativeBridgeError.system("listen", errno) }
+            provedIdentity = try Self.proveOwnership(listener: socketFD, folder: folder, name: name, observer: observer)
             descriptor = socketFD
         } catch {
             Darwin.close(socketFD)
@@ -217,15 +303,101 @@ public final class NativeReplyListener: @unchecked Sendable {
         removeSocketFile()
     }
 
-    /// Removes the socket file that this listener created, and never a later file at the path.
-    /// The descriptor stays open, so a stop can run while the reply loop waits on it.
-    public func removeSocketFile() {
-        Self.removeFile(at: path, device: createdDevice, inode: createdInode)
+    /// Returns the identity at the path if the path reached this listener between two equal captures.
+    /// The self-connection ends here, so the reply loop never sees it. A connection from another
+    /// process in this short time also ends here. No sender has the address until the start returns.
+    private static func proveOwnership(listener: Int32, folder: NativeReplyFolder, name: String,
+                                       observer: (@Sendable (NativeReplySocketStep) -> Void)?) throws -> NativeReplyFileIdentity {
+        observer?(.beforeIdentityCapture)
+        let unproved = "The reply socket \(name) has no proof of ownership, so the file stays and the listener did not start."
+        guard let before = folder.status(name), before.st_mode & S_IFMT == S_IFSOCK,
+              before.st_uid == getuid(), before.st_mode & 0o077 == 0
+        else { throw NativeBridgeError.invalid(unproved) }
+        do { try receiveSelfConnection(listener: listener, folder: folder, name: name) }
+        catch { throw NativeBridgeError.invalid("\(unproved) \(error.localizedDescription)") }
+        guard let after = folder.status(name), after.st_mode & S_IFMT == S_IFSOCK,
+              NativeReplyFileIdentity(after) == NativeReplyFileIdentity(before)
+        else { throw NativeBridgeError.invalid(unproved) }
+        return NativeReplyFileIdentity(before)
     }
 
-    private static func removeFile(at path: String, device: dev_t, inode: ino_t) {
-        var current = stat()
-        if lstat(path, &current) == 0, current.st_dev == device, current.st_ino == inode { unlink(path) }
+    private static func receiveSelfConnection(listener: Int32, folder: NativeReplyFolder, name: String) throws {
+        let client = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard client >= 0 else { throw NativeBridgeError.system("socket", errno) }
+        defer { Darwin.close(client) }
+        var noSignal: Int32 = 1 // The service ignores SIGPIPE only after this start.
+        guard setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size)) == 0,
+              fcntl(client, F_SETFL, O_NONBLOCK) == 0 else { throw NativeBridgeError.system("client socket", errno) }
+        try folder.connectSocket(client, name: name)
+        let value = (0..<16).map { _ in UInt8.random(in: .min ... .max) }
+        guard send(client, value, value.count, 0) == value.count else { throw NativeBridgeError.system("send", errno) }
+
+        let flags = fcntl(listener, F_GETFL)
+        guard flags >= 0, fcntl(listener, F_SETFL, flags | O_NONBLOCK) == 0 else { throw NativeBridgeError.system("fcntl", errno) }
+        defer { _ = fcntl(listener, F_SETFL, flags) }
+        let deadline = Date().addingTimeInterval(selfConnectionSeconds)
+        while true {
+            try NativeSocketIO.waitFor(listener, events: Int16(POLLIN), deadline: deadline)
+            let accepted = accept(listener, nil, nil)
+            guard accepted >= 0 else {
+                if [EAGAIN, EINTR, ECONNABORTED].contains(errno) { continue }
+                throw NativeBridgeError.system("accept", errno)
+            }
+            defer { Darwin.close(accepted) }
+            if try connection(accepted, sends: value, deadline: deadline) { return }
+        }
+    }
+
+    private static func connection(_ accepted: Int32, sends value: [UInt8], deadline: Date) throws -> Bool {
+        var received: [UInt8] = []
+        var buffer = [UInt8](repeating: 0, count: value.count)
+        while received.count < value.count {
+            try NativeSocketIO.waitFor(accepted, events: Int16(POLLIN), deadline: deadline)
+            let count = recv(accepted, &buffer, value.count - received.count, 0)
+            if count < 0, errno == EAGAIN || errno == EINTR { continue }
+            guard count > 0 else { return false }
+            received.append(contentsOf: buffer.prefix(count))
+        }
+        return received == value
+    }
+
+    /// Removes the socket file that this listener proved, and never another file. The descriptor stays
+    /// open, so a stop can run while the reply loop waits on it. The file first moves to a new private
+    /// folder, where a later file at the path cannot take its place. A file that does not match moves
+    /// back without replacing anything. If that fails, it stays in the private folder, and the log names it.
+    public func removeSocketFile() {
+        identityLock.lock(); defer { identityLock.unlock() }
+        guard let identity = provedIdentity else { return }
+        provedIdentity = nil
+
+        observer?(.beforeStopCheck)
+        guard let current = folder.status(name), NativeReplyFileIdentity(current) == identity else { return }
+        observer?(.beforePrivateMove)
+        var template = Array(".\(getpid())-stop-XXXXXXXX".utf8CString)
+        guard mkdtempat_np(folder.descriptor, &template) != nil else { return report("cannot make a private folder, so \(path) stays", code: errno) }
+        let privateName = String(cString: template)
+        let opened = openat(folder.descriptor, privateName, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard opened >= 0 else { return report("cannot open \(privateName), so \(path) stays", code: errno) }
+        defer { Darwin.close(opened) }
+        guard renameatx_np(folder.descriptor, name, opened, name, UInt32(RENAME_EXCL)) == 0 else {
+            let code = errno
+            unlinkat(folder.descriptor, privateName, AT_REMOVEDIR)
+            if code != ENOENT { report("cannot move \(path), so it stays", code: code) }
+            return
+        }
+        observer?(.afterPrivateMove)
+        var moved = stat()
+        if fstatat(opened, name, &moved, AT_SYMLINK_NOFOLLOW) == 0, moved.st_mode & S_IFMT == S_IFSOCK, NativeReplyFileIdentity(moved) == identity {
+            observer?(.beforeRemoval)
+            guard unlinkat(opened, name, 0) == 0 else { return report("cannot remove \(privateName)/\(name)", code: errno) }
+        } else if renameatx_np(opened, name, folder.descriptor, name, UInt32(RENAME_EXCL)) != 0 {
+            return report("a file that is not this socket stays at \(privateName)/\(name) in the reply folder", code: errno)
+        }
+        unlinkat(folder.descriptor, privateName, AT_REMOVEDIR)
+    }
+
+    private func report(_ text: String, code: Int32) {
+        FileHandle.standardError.write(Data("Native reply listener stop: \(text): \(String(cString: strerror(code)))\n".utf8))
     }
 
     public func receive(timeout: TimeInterval = 5) throws -> Data {
@@ -270,7 +442,8 @@ public final class NativeReplyListener: @unchecked Sendable {
 
 /// Removes the listener's socket at a normal stop, then ends the process with the signal's default
 /// action, so launchd and the install script see the same stop as before. It uses its own queue,
-/// so a busy command queue cannot delay a stop. A crash or SIGKILL still leaves the socket.
+/// so a busy command queue cannot delay a stop, and the removal stays off the POSIX signal callback.
+/// A crash or SIGKILL still leaves the socket.
 public final class NativeReplyStopHandler: @unchecked Sendable {
     private let sources: [any DispatchSourceSignal]
 

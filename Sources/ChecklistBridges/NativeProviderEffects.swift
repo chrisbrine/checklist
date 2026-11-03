@@ -107,6 +107,16 @@ public enum NativePeerTransportAdapters {
 enum NativeSocketIO {
     static func socketAddress(_ path: String) throws -> sockaddr_un {
         guard path.hasPrefix("/"), !path.utf8.contains(0) else { throw NativeBridgeError.invalid("Socket path must be absolute and contain no NUL.") }
+        return try unixAddress(path)
+    }
+
+    /// An address with one file name, for a `bind` or a `connect` that a folder descriptor resolves.
+    static func fileNameSocketAddress(_ name: String) throws -> sockaddr_un {
+        guard !name.isEmpty, !name.utf8.contains(0), !name.contains("/") else { throw NativeBridgeError.invalid("Socket name must be one file name.") }
+        return try unixAddress(name)
+    }
+
+    private static func unixAddress(_ path: String) throws -> sockaddr_un {
         var address = sockaddr_un()
         let capacity = MemoryLayout.size(ofValue: address.sun_path)
         let bytes = Array(path.utf8) + [UInt8(0)]
