@@ -9,6 +9,12 @@ import ChecklistIPC
     private func observation() -> ProviderReadinessObservation {
         ProviderSettingsObservation.observe(projectRoot: "", home: URL(fileURLWithPath: "/nonexistent-owned-fixture"), environment: [:], managedPath: "/nonexistent-owned-fixture/managed")
     }
+    func testProviderCardShowsOnlyAFailedListener() {
+        XCTAssertNil(nativeReplyListenerFailure(service: Record(values: [:])))
+        XCTAssertNil(nativeReplyListenerFailure(service: Record(values: ["native_reply_listener": ["state": "listening", "message": "running"]])))
+        XCTAssertNil(nativeReplyListenerFailure(service: Record(values: ["native_reply_listener": ["state": "not_started", "message": "waiting"]])))
+        XCTAssertEqual(nativeReplyListenerFailure(service: Record(values: ["native_reply_listener": ["state": "failed", "message": "Claude relay stopped"]])), "Claude relay stopped")
+    }
     func testContextChangesImmediatelyHideEarlierObservation() async {
         let model = ProviderReadinessModel(), first = context()
         await model.refresh(first) { _ in self.observation() }

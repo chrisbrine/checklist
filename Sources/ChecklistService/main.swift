@@ -465,14 +465,18 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         return .router(method:method,params:params,caller:caller)
     }
     func changed() { requireCommandQueue(); for callback in Array(waiters.values) { callback() } }
-    func startNativeReplies() {
-        queue.sync { startNativeRepliesOnQueue() }
+    func startNativeReplies(directory: String = "/tmp/cc-socks") {
+        queue.sync { startNativeRepliesOnQueue(directory:URL(fileURLWithPath:directory,isDirectory:true)) }
     }
-    private func startNativeRepliesOnQueue() {
-        let directory=URL(fileURLWithPath:"/tmp/cc-socks",isDirectory:true)
+    private func startNativeRepliesOnQueue(directory: URL) {
         if !FileManager.default.fileExists(atPath:directory.path) { try? FileManager.default.createDirectory(at:directory,withIntermediateDirectories:false,attributes:[.posixPermissions:0o700]) }
-        do { nativeListener=try NativeReplyListener(path:directory.appendingPathComponent("\(getpid()).sock").path) }
-        catch { fputs("Native reply listener unavailable: \(error.localizedDescription)\n",stderr) } // The Codex queue route needs no reply listener, so its startup pass still runs.
+        do {
+            nativeListener=try NativeReplyListener(path:directory.appendingPathComponent("\(getpid()).sock").path)
+            router.nativeReplyListenerStatus = .init(state:.listening,codexQueueRelayEnabled:CodexQueueRelay.enabled)
+        } catch { // The Codex queue route needs no reply listener, so its startup pass still runs.
+            fputs("Native reply listener unavailable: \(error.localizedDescription)\n",stderr)
+            router.nativeReplyListenerStatus = .init(state:.failed,reason:error.localizedDescription,codexQueueRelayEnabled:CodexQueueRelay.enabled)
+        }
         // Startup owns one pending-delivery pass; ordinary pure reads no longer
         // provide incidental dispatch after a service restart.
         queue.async { [self] in autoreleasepool {recordInterruptedCodexQueueFollowups();dispatchNative()} }
@@ -877,10 +881,12 @@ do {
     }
     let coordinator = Coordinator(router:router)
     coordinator.startNativeReplies()
+    // A top-level value, so it lasts for the process lifetime.
+    let nativeReplyStop = coordinator.queue.sync { coordinator.nativeListener }.map { NativeReplyStopHandler(listener:$0) }
     coordinator.listener.resume()
     signal(SIGPIPE,SIG_IGN)
     print("ChecklistService ready (local XPC)")
-    RunLoop.current.run()
+    withExtendedLifetime(nativeReplyStop) { RunLoop.current.run() }
 } catch {
     let recovery = StorageRecoveryServer(error:error)
     fputs("ChecklistService: storage recovery required; original data retained.\n",stderr)

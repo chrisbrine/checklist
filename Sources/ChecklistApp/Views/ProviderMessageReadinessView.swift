@@ -19,6 +19,8 @@ struct ProviderMessageReadinessView: View {
                     codexCard(observation)
                     Text("Observed \(observation.observedAt.formatted(date: .abbreviated, time: .standard)). Refresh after changing provider settings.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
                 } else {
+                    // The Claude card shows this notice once an observation exists.
+                    listenerFailure
                     Text(model.context == context && model.loading ? "Reading bounded local settings…" : "No current observation. Refresh for this project and recipient.").checklistFont(.callout)
                 }
                 Button("Refresh message readiness") { Task { await model.refresh(context) } }
@@ -32,6 +34,7 @@ struct ProviderMessageReadinessView: View {
     private func claudeCard(_ observation: ProviderReadinessObservation) -> some View {
         VStack(alignment: .leading, spacing: Spacing.small) {
             Text("Claude · version unknown").checklistFont(.calloutStrong)
+            listenerFailure
             Text(observation.claude.title).checklistFont(.callout)
             Text(ProviderReadinessObservation.versionLimitation).checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText)
             if let decision = observation.claude.observedDecision {
@@ -51,6 +54,12 @@ struct ProviderMessageReadinessView: View {
                 Text("Checklist only reads these candidates. Opening this guidance and Refresh change no provider file, permission, grant or model runtime. Automatic durable settings updates remain deferred.")
             }.checklistFont(.micro)
         }.frame(maxWidth: .infinity, alignment: .leading).checklistCard(padding: Card.padding)
+    }
+
+    @ViewBuilder private var listenerFailure: some View {
+        if let failure = nativeReplyListenerFailure(service: store.service) {
+            Label(failure, systemImage: "exclamationmark.triangle").checklistFont(.callout).textSelection(.enabled)
+        }
     }
 
     private func codexCard(_ observation: ProviderReadinessObservation) -> some View {

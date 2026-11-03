@@ -199,7 +199,7 @@ final class CodexQueueStoreTests: XCTestCase {
         try item(db,"other","00000000-0000-4000-8000-000000000999")
         XCTAssertEqual(result(root),.allowed(vscode,executable:host.executable))
         try item(db,"one",thread)
-        XCTAssertEqual(refusal(root),.queueOccupied)
+        XCTAssertEqual(result(root),.occupied(vscode,count:1))
         try db.writeWithoutTransaction { database in
             try database.execute(sql:"BEGIN EXCLUSIVE")
             XCTAssertEqual(refusal(root),.databaseLocked)

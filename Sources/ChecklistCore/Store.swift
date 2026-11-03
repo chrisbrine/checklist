@@ -13,6 +13,7 @@ import CryptoKit
 public final class CommandRouter: @unchecked Sendable {
     let epicReferenceIndex = EpicReferenceIndex()
     let readSnapshotCache = ReadSnapshotCache()
+    let nativeReplyListenerHolder = NativeReplyListenerStatusHolder()
     let dbQueue: any TransactionStorage
     /// Read-only connections for pure reads (CL-72). Nil when the store cannot open them;
     /// reads then use the writer path.

@@ -8,6 +8,10 @@ enum DeliveryLabels {
     /// acknowledgment or completion (CL-126).
     static func receipt(delivery: Record) -> String {
         if !delivery.string("reply_message_id").isEmpty || !delivery.string("replied_at").isEmpty { return receipt("replied") }
+        if ["queued","unavailable"].contains(delivery.string("state")),
+           (delivery.values["route_receipt"] as? [String:Any])?["reason_code"] as? String == "queue_occupied" {
+            return "Waiting for earlier Codex queue item"
+        }
         return receipt(delivery.string("state"))
     }
     /// The service keeps no reply field on a delivery (CL-248 correlates a reply by

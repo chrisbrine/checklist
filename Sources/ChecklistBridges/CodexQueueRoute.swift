@@ -30,6 +30,8 @@ public struct CodexHostScan: Equatable, Sendable {
 
 public enum CodexQueuePreflight: Equatable, Sendable {
     case allowed(CodexQueueObservation, executable: String)
+    /// No second item may be sent. A later note can check whether an open is safe.
+    case occupied(CodexQueueObservation, count: Int)
     case refused(CodexQueueObservation)
 }
 
@@ -94,14 +96,16 @@ public enum CodexQueueRoute {
         guard let host = first?.chosenHost else { return refused(.hostNotRunning) }
         // The role comes from a path, so the signature decides whether the service runs this binary.
         guard hostVerified(host) else { return refused(.hostSignatureInvalid) }
+        let occupied: Int?
         switch threadItems() {
-        case .empty: break
-        case .occupied: return refused(.queueOccupied)
+        case .empty: occupied = nil
+        case .occupied(let count): occupied = count
         case .failed(let reason): return refused(reason)
         }
         let last = scan()
         if let reason = holderRefusal(last) { return refused(reason) }
         guard last?.chosenHost == host else { return refused(.hostChanged) }
+        if let occupied { return .occupied(observation,count:occupied) }
         return .allowed(observation,executable:host.executable)
     }
 

@@ -13,6 +13,13 @@ struct ProviderReadinessContext: Equatable {
     let connected: Bool
 }
 
+/// The running service's own statement. It is absent unless the listener failed,
+/// so an older service or a healthy listener adds nothing to the card.
+func nativeReplyListenerFailure(service: Record) -> String? {
+    let listener = service.object("native_reply_listener")
+    return listener["state"] as? String == "failed" ? listener["message"] as? String : nil
+}
+
 /// Window-local, explicit observations. An event (including a later host hold)
 /// retires the observation rather than promoting it to a delivery receipt.
 @MainActor final class ProviderReadinessModel: ObservableObject {

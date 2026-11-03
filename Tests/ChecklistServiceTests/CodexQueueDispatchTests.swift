@@ -30,6 +30,13 @@ final class CodexQueueDispatchTests: XCTestCase {
         var onItem: (@Sendable () -> Void)?
         var proves = true
         var exec = false
+        var occupancy: Int?
+        var load = CodexThreadLoad.loaded
+        var opens: [String] = []
+        var openStatus: Int32 = 0
+        var openFailure: Error?
+        var openEnabled = true
+        var onLoad: (@Sendable () -> Void)?
     }
     private let allowed = CodexQueuePreflight.allowed(.init(host:.nativeApp,reason:.sourceVscode,source:"vscode"),executable:"/Applications/Fake.app/Contents/codex")
 
@@ -37,7 +44,9 @@ final class CodexQueueDispatchTests: XCTestCase {
         let effects = CodexQueueRouteEffects(enabled:enabled,readAppThreads:{ _ in fake.threads },
             preflight:{ [allowed] _,proven in
                 guard proven else { return .refused(.init(reason:.registrationUnproven)) }
-                return fake.preflights.isEmpty ? allowed : fake.preflights.removeFirst()
+                if !fake.preflights.isEmpty { return fake.preflights.removeFirst() }
+                if let count = fake.occupancy { return .occupied(.init(host:.nativeApp,reason:.sourceVscode,source:"vscode"),count:count) }
+                return allowed
             },
             provesRegistration:{ _ in fake.proves },
             send:{ content,registration,_,_ in
@@ -45,8 +54,11 @@ final class CodexQueueDispatchTests: XCTestCase {
                 fake.sends.append(registration.sessionID);fake.contents.append(content);return .init(exitStatus:0,byteCount:content.utf8.count,itemID:"item-\(fake.sends.count)")
             },
             followup:{ _,lane,status in
-                .init(openEnabled:true,item:{ _ in fake.onItem?();return fake.item },observe:{ .init(host:.nativeApp,reason:.sourceVscode) },load:{ .loaded },status:status,
-                    now:{ fake.clock.timeIntervalSince1970 },schedule:{ _,body in lane.async(execute:body) },open:{ _,_ in XCTFail("A loaded thread is not opened");return 0 },execHolder:{ fake.exec })
+                .init(openEnabled:fake.openEnabled,item:{ _ in fake.onItem?();return fake.item },observe:{ .init(host:.nativeApp,reason:.sourceVscode) },load:{ fake.onLoad?();return fake.load },status:status,
+                    now:{ fake.clock.timeIntervalSince1970 },schedule:{ _,body in lane.async(execute:body) },open:{ thread,timeout in
+                        XCTAssertEqual(timeout,5);fake.opens.append(thread)
+                        if let failure = fake.openFailure { throw failure };return fake.openStatus
+                    },execHolder:{ fake.exec })
             },now:{ fake.clock },readOmittedThreads:{ _,_ in fake.omittedReads += 1;return fake.omitted })
         coordinator.codexRoute = CodexQueueRouteState(markerFile:root.appendingPathComponent("codex-queue-route.json"),effects:effects)
     }
@@ -145,7 +157,7 @@ final class CodexQueueDispatchTests: XCTestCase {
     func testRefusalWritesNothingAndALaterDispatchSucceeds() throws {
         let fake = Fake();install(fake);try register(threadA)
         let n = try note(threadA)
-        for reason in [CodexQueueReason.holderExec,.hostNotRunning,.databaseLocked,.sourceExec,.sourceSubagent,.queueOccupied,.hostChanged] {
+        for reason in [CodexQueueReason.holderExec,.hostNotRunning,.databaseLocked,.sourceExec,.sourceSubagent,.hostChanged] {
             fake.preflights = [.refused(.init(reason:reason))]
             try start(n.id,threadA,n.message)
             let row = try stored(n.id)
@@ -447,13 +459,13 @@ final class CodexQueueDispatchTests: XCTestCase {
     func testOccupiedThreadKeepsTheDeliveryAndALaterDispatchSends() throws {
         let fake = Fake();install(fake);try register(threadA)
         let n = try note(threadA)
-        fake.preflights = [.refused(.init(reason:.queueOccupied))]
+        fake.occupancy = 1
         try start(n.id,threadA,n.message)
         let row = try stored(n.id)
         XCTAssertEqual(fake.sends,[]);XCTAssertEqual(row["push_state"] as? String,"unavailable");XCTAssertEqual(row["state"] as? String,n.delivery["state"] as? String)
-        XCTAssertEqual(row["revision"] as? Int,n.delivery["revision"] as? Int);XCTAssertNil(row["transport_receipt"])
+        XCTAssertEqual((row["transport_receipt"] as? [String:Any])?["reason_code"] as? String,"queue_occupied")
         XCTAssertNotNil(coordinator.codexRoute.retryAt[threadA]);XCTAssertFalse(coordinator.attemptedDeliveries.contains(n.id))
-        fake.preflights = []
+        fake.occupancy = nil
         try start(n.id,threadA,n.message)
         XCTAssertEqual(fake.sends,[threadA])
     }
@@ -468,6 +480,114 @@ final class CodexQueueDispatchTests: XCTestCase {
         XCTAssertEqual(fence(n.id),.authorizationChanged);coordinator.enrollments[e.installation]?.generation = e.generation
         XCTAssertEqual(try stored(n.id)["push_state"] as? String,"unavailable")
         XCTAssertNil(fence(n.id));XCTAssertEqual(try stored(n.id)["push_state"] as? String,"uncertain")
+    }
+    func testWaitingItemOpensOnceAndPublicReceiptKeepsLaterNoteForPickup() throws {
+        let fake = Fake();install(fake);try activate(fake.clock.addingTimeInterval(-60));try register(threadA)
+        let older = try note(threadA,"Older queued note")
+        _ = try call("delivery_record",["delivery_id":older.id,"state":"provider_accepted","receipt":["route":"codex_app_queue","queue_poll_result":"service_restarted"]],bridge)
+        let n = try note(threadA,"Later note")
+        fake.occupancy = 1;fake.load = .unloaded
+        try start(n.id,threadA,n.message)
+        XCTAssertEqual(fake.opens,[threadA]);XCTAssertTrue(fake.sends.isEmpty)
+        let row = try stored(n.id)
+        XCTAssertEqual(row["state"] as? String,n.delivery["state"] as? String);XCTAssertEqual(row["push_state"] as? String,n.delivery["push_state"] as? String)
+        XCTAssertNil(row["acknowledged_at"])
+        let listed = try call("message_delivery_list",["project_id":project!,"task_id":taskID!,"message_id":n.message["id"]!])
+        let safe = try XCTUnwrap((listed["deliveries"] as? [[String:Any]])?.first?["route_receipt"] as? [String:Any])
+        XCTAssertEqual(safe["reason_code"] as? String,"queue_occupied");XCTAssertEqual(safe["queue_poll_result"] as? String,"queue_occupied")
+        XCTAssertEqual(safe["open_result"] as? String,"exited_zero");XCTAssertEqual(safe["open_exit_status"] as? Int,0)
+        XCTAssertNil(safe["queued_item_id"],"The later note has no item of its own")
+        XCTAssertEqual((try stored(older.id)["transport_receipt"] as? [String:Any])?["queue_poll_result"] as? String,"service_restarted")
+        let worker = Caller(role:"worker",installation:"e-\(threadA)/g-\(threadA)",projectIDs:[project],sessionID:threadA,workspace:root.path)
+        XCTAssertEqual((try call("session_inbox",["project_id":project!],worker)["deliveries"] as? [[String:Any]])?.count,2)
+    }
+    func testWaitingHostHeldRunningOrStoppedThreadNeverOpensAndReceiptCanChange() throws {
+        let fake = Fake();install(fake);try activate(fake.clock.addingTimeInterval(-60));try register(threadA)
+        fake.occupancy = 1;fake.load = .loaded
+        let n = try note(threadA)
+        try start(n.id,threadA,n.message)
+        XCTAssertTrue(fake.opens.isEmpty);XCTAssertTrue(fake.sends.isEmpty)
+        XCTAssertEqual((try stored(n.id)["transport_receipt"] as? [String:Any])?["open_result"] as? String,"loaded_pending")
+        // Both running and stopped host-held turns use this same observation.
+        fake.load = .unloaded;try start(n.id,threadA,n.message)
+        XCTAssertEqual(fake.opens,[threadA])
+        XCTAssertEqual((try stored(n.id)["transport_receipt"] as? [String:Any])?["open_result"] as? String,"exited_zero","A same-reason receipt must retain its new result")
+    }
+    func testOpenLimitIncludesFirstFallbackFailuresAndServiceRestart() throws {
+        let fake = Fake();install(fake);try activate(fake.clock.addingTimeInterval(-60));try register(threadA);try register(threadB)
+        fake.item = .pending;fake.load = .unloaded;fake.openStatus = 1
+        let first = try note(threadA);try start(first.id,threadA,first.message)
+        XCTAssertEqual(fake.opens,[threadA]);XCTAssertEqual(fake.sends,[threadA])
+        fake.occupancy = 1;fake.openStatus = 0
+        // A fresh route object reads the same on-disk reservation, with no memory carried.
+        install(fake)
+        let second = try note(threadA);try start(second.id,threadA,second.message)
+        XCTAssertEqual(fake.opens,[threadA]);XCTAssertEqual((try stored(second.id)["transport_receipt"] as? [String:Any])?["open_result"] as? String,"cooldown")
+        let other = try note(threadB);try start(other.id,threadB,other.message)
+        XCTAssertEqual(fake.opens,[threadA,threadB],"The limit is per thread")
+        fake.clock = fake.clock.addingTimeInterval(CodexQueueBounds.openInterval-1)
+        try start(second.id,threadA,second.message);XCTAssertEqual(fake.opens.count,2)
+        fake.clock = fake.clock.addingTimeInterval(1);try start(second.id,threadA,second.message)
+        XCTAssertEqual(fake.opens,[threadA,threadB,threadA]);XCTAssertEqual(fake.sends,[threadA])
+        XCTAssertEqual((try stored(second.id)["transport_receipt"] as? [String:Any])?["open_result"] as? String,"exited_zero")
+    }
+    func testWaitingItemRefusesUnknownMultipleDisabledExecAndChangedChecks() throws {
+        let fake = Fake();install(fake);try activate(fake.clock.addingTimeInterval(-60));try register(threadA)
+        let n = try note(threadA)
+        fake.occupancy = 1;fake.load = .unknown;try start(n.id,threadA,n.message)
+        XCTAssertEqual((try stored(n.id)["transport_receipt"] as? [String:Any])?["open_result"] as? String,"state_unknown")
+        fake.load = .unloaded;fake.occupancy = 2;try start(n.id,threadA,n.message)
+        XCTAssertEqual((try stored(n.id)["transport_receipt"] as? [String:Any])?["open_result"] as? String,"multiple_items")
+        fake.occupancy = 1;fake.openEnabled = false;try start(n.id,threadA,n.message)
+        XCTAssertEqual((try stored(n.id)["transport_receipt"] as? [String:Any])?["open_result"] as? String,"disabled")
+        fake.openEnabled = true
+        for reason in [CodexQueueReason.holderExec,.hostSignatureInvalid,.hostNotRunning,.databaseLocked,.sourceExec,.authorizationChanged] {
+            fake.preflights = [.occupied(.init(host:.nativeApp,reason:.sourceVscode),count:1),.refused(.init(reason:reason))]
+            try start(n.id,threadA,n.message)
+            XCTAssertEqual((try stored(n.id)["transport_receipt"] as? [String:Any])?["open_result"] as? String,reason == .holderExec ? "exec_holder" : "refused")
+        }
+        XCTAssertTrue(fake.opens.isEmpty);XCTAssertTrue(fake.sends.isEmpty)
+        // After those temporary causes clear, a later dispatch can open the item.
+        try start(n.id,threadA,n.message);XCTAssertEqual(fake.opens,[threadA])
+    }
+    func testWaitingOpenTimeoutIsLimitedAndMalformedMarkerFailsClosed() throws {
+        let fake = Fake();install(fake);try activate(fake.clock.addingTimeInterval(-60));try register(threadA)
+        fake.occupancy = 1;fake.load = .unloaded;fake.openFailure = NativeBridgeError.outcomeUnknown("Synthetic timeout")
+        let n = try note(threadA);try start(n.id,threadA,n.message)
+        XCTAssertEqual((try stored(n.id)["transport_receipt"] as? [String:Any])?["open_result"] as? String,"outcome_unknown")
+        try start(n.id,threadA,n.message);XCTAssertEqual(fake.opens,[threadA])
+        try Data("malformed".utf8).write(to:root.appendingPathComponent("codex-queue-route.json"))
+        fake.clock = fake.clock.addingTimeInterval(300);try start(n.id,threadA,n.message)
+        XCTAssertEqual(fake.opens,[threadA]);XCTAssertEqual((try stored(n.id)["transport_receipt"] as? [String:Any])?["open_result"] as? String,"fence_not_recorded")
+    }
+    func testWaitingAuthorizationChangeBeforeOpenKeepsReceiptFenced() throws {
+        let fake = Fake();install(fake);try activate(fake.clock.addingTimeInterval(-60));try register(threadA)
+        fake.occupancy = 1;fake.load = .unloaded
+        let n = try note(threadA),router = coordinator.router
+        fake.onLoad = { [id = n.id] in
+            try? router.dbQueue.write { db in var d = try router.record(db,id,type:"delivery");d["owner_disconnect_ref"] = "synthetic";try router.save(db,d,type:"delivery") }
+        }
+        try start(n.id,threadA,n.message)
+        XCTAssertTrue(fake.opens.isEmpty);XCTAssertTrue(fake.sends.isEmpty);XCTAssertNil(try stored(n.id)["transport_receipt"])
+    }
+    func testWaitingItemAppearsAfterSendFenceAndGetsNoSecondQueueCall() throws {
+        let fake = Fake();install(fake);try activate(fake.clock.addingTimeInterval(-60));try register(threadA)
+        fake.occupancy = 1;fake.load = .unloaded
+        let n = try note(threadA)
+        fake.preflights = [allowed]
+        try start(n.id,threadA,n.message)
+        XCTAssertTrue(fake.sends.isEmpty);XCTAssertEqual(fake.opens,[threadA])
+        let row = try stored(n.id)
+        XCTAssertEqual(row["state"] as? String,n.delivery["state"] as? String);XCTAssertEqual(row["push_state"] as? String,"unavailable")
+        XCTAssertEqual((row["transport_receipt"] as? [String:Any])?["reason_code"] as? String,"queue_occupied")
+    }
+    func testCorruptActivationMarkerDoesNotEraseOpenLimitOnRestart() throws {
+        let fake = Fake();install(fake)
+        let marker = root.appendingPathComponent("codex-queue-route.json"),bytes = Data("malformed".utf8)
+        try bytes.write(to:marker)
+        XCTAssertNil(coordinator.codexRoute.activatedAt())
+        XCTAssertEqual(try Data(contentsOf:marker),bytes)
+        XCTAssertEqual(coordinator.codexRoute.reserveOpen(threadID:threadA),"fence_not_recorded")
     }
     /// Measures what the check sees when a file replaces the host's executable under the running process.
     func testHostFileReplacedUnderARunningProcess() throws {

@@ -167,7 +167,7 @@ public final class NativeReplyListener: @unchecked Sendable {
         guard lstat(directory, &attributes) == 0, attributes.st_mode & S_IFMT == S_IFDIR,
               attributes.st_uid == getuid(), attributes.st_mode & 0o022 == 0
         else { throw NativeBridgeError.invalid("Reply directory must be an existing same-user directory without group/world write access.") }
-        guard lstat(path, &attributes) != 0, errno == ENOENT else { throw NativeBridgeError.invalid("Refusing to replace an existing reply path.") }
+        try Self.clearOwnStaleSocket(at: path)
         let socketFD = socket(AF_UNIX, SOCK_STREAM, 0)
         guard socketFD >= 0 else { throw NativeBridgeError.system("socket", errno) }
         do {
@@ -188,8 +188,39 @@ public final class NativeReplyListener: @unchecked Sendable {
 
     deinit {
         if descriptor >= 0 { Darwin.close(descriptor) }
+        removeSocketFile()
+    }
+
+    /// Removes the socket file that this listener created, and never a later file at the path.
+    /// The descriptor stays open, so a stop can run while the reply loop waits on it.
+    public func removeSocketFile() {
         var current = stat()
         if lstat(path, &current) == 0, current.st_dev == createdDevice, current.st_ino == createdInode { unlink(path) }
+    }
+
+    /// A process names its socket with its own PID, and no other live process has this PID. So a
+    /// same-user socket at this process's own PID name that refuses a connection is stale. Every
+    /// other existing path refuses. `bind` never replaces a file, so a process that creates this
+    /// path after the removal makes `bind` fail with EADDRINUSE, and that file stays.
+    private static func clearOwnStaleSocket(at path: String) throws {
+        func refuse(_ reason: String) -> NativeBridgeError { .invalid("Refusing to replace an existing reply path: \(reason).") }
+        var found = stat()
+        guard lstat(path, &found) == 0 else {
+            if errno == ENOENT { return }
+            throw NativeBridgeError.system("lstat reply path", errno)
+        }
+        guard URL(fileURLWithPath: path).lastPathComponent == "\(getpid()).sock" else { throw refuse("it does not have this process's own socket name") }
+        guard found.st_mode & S_IFMT == S_IFSOCK else { throw refuse("it is not a socket") }
+        guard found.st_uid == getuid() else { throw refuse("it belongs to another user") }
+        switch try NativeSocketIO.connectResult(path) {
+        case 0: throw refuse("a process listens on it")
+        case ENOENT: return
+        case ECONNREFUSED: break
+        case let code: throw refuse("its connection test ended with \(String(cString: strerror(code)))")
+        }
+        var current = stat()
+        guard lstat(path, &current) == 0, current.st_dev == found.st_dev, current.st_ino == found.st_ino else { throw refuse("it changed during the connection test") }
+        guard unlink(path) == 0 || errno == ENOENT else { throw NativeBridgeError.system("unlink stale reply socket", errno) }
     }
 
     public func receive(timeout: TimeInterval = 5) throws -> Data {
@@ -230,4 +261,27 @@ public final class NativeReplyListener: @unchecked Sendable {
         }
         throw NativeBridgeError.invalid("Native reply exceeded the 256 KiB frame cap.")
     }
+}
+
+/// Removes the listener's socket at a normal stop, then ends the process with the signal's default
+/// action, so launchd and the install script see the same stop as before. It uses its own queue,
+/// so a busy command queue cannot delay a stop. A crash or SIGKILL still leaves the socket.
+public final class NativeReplyStopHandler: @unchecked Sendable {
+    private let sources: [any DispatchSourceSignal]
+
+    public init(listener: NativeReplyListener, signals: [Int32] = [SIGTERM, SIGINT],
+                finish: @escaping @Sendable (Int32) -> Void = { number in signal(number, SIG_DFL); kill(getpid(), number) }) {
+        let queue = DispatchQueue(label: "org.checklist.native-reply-stop")
+        sources = signals.map { number in
+            let source = DispatchSource.makeSignalSource(signal: number, queue: queue)
+            source.setEventHandler { listener.removeSocketFile(); finish(number) }
+            source.resume()
+            // A caught signal returns to its default action at exec, and an ignored signal does not,
+            // so child processes keep a working SIGTERM. The source still sees a caught signal.
+            signal(number) { _ in }
+            return source
+        }
+    }
+
+    deinit { sources.forEach { $0.cancel() } }
 }

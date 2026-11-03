@@ -139,7 +139,7 @@ extension CommandRouter {
             let needs = try ownerNeedsYouCounts(db)
             // Native pages need authenticated identity, not the provider/route
             // capability catalogs. Those remain available from service_info.
-            let identityKeys: Set<String> = ["session_id","caller","name","version","build_id","build_number","store_incarnation","role","project_ids","read_version"]
+            let identityKeys: Set<String> = ["session_id","caller","name","version","build_id","build_number","store_incarnation","role","project_ids","read_version","native_reply_listener"]
             let service = try dispatch(db,method:"service_info",p:[:],c:c).filter {identityKeys.contains($0.key)}
             metadata = ["projects":try projects(db,c),"service":service,"needs_you_count":needs.requests + needs.tasks,
                         "content_cursor":try cursor(db,caller:c,scope:authorizationScope(db,c),sequence:latest)]

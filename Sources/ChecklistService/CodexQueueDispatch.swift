@@ -14,6 +14,8 @@ enum CodexQueueBounds {
     static let cacheSeconds: TimeInterval = 30
     static let recentThreadSeconds: TimeInterval = 14*86400
     static let recentThreadLimit = 64
+    /// Includes failed attempts and the first item's fallback, across service restarts.
+    static let openInterval: TimeInterval = 300
 }
 
 /// The check of `NativeConnections.nativeProcess` and `bundledCLI`, for the app host that the
@@ -166,8 +168,9 @@ final class CodexQueueRouteState: @unchecked Sendable {
         lock.withLock {
             if let activated { return activated }
             let formatter = ISO8601DateFormatter()
-            if let data = try? Data(contentsOf:markerFile),let object = try? JSONSerialization.jsonObject(with:data) as? [String:Any],
-               let raw = object["activated_at"] as? String,let date = formatter.date(from:raw) {
+            if FileManager.default.fileExists(atPath:markerFile.path) {
+                guard let data = try? Data(contentsOf:markerFile),let object = try? JSONSerialization.jsonObject(with:data) as? [String:Any],
+                      let raw = object["activated_at"] as? String,let date = formatter.date(from:raw) else { return nil }
                 activated = date;return date
             }
             let date = effects.now()
@@ -176,6 +179,31 @@ final class CodexQueueRouteState: @unchecked Sendable {
             let stored = formatter.date(from:formatter.string(from:date))
             activated = stored
             return stored
+        }
+    }
+
+    /// Extend the existing activation marker, without a database migration. The
+    /// atomic write happens before open. An unreadable marker fails closed. One
+    /// service owns this file; the lock also serializes activation and reservation.
+    func reserveOpen(threadID: String) -> String? {
+        lock.withLock {
+            guard UUID(uuidString:threadID) != nil,
+                  let data = try? Data(contentsOf:markerFile),
+                  var marker = (try? JSONSerialization.jsonObject(with:data)) as? [String:Any],
+                  let activated = marker["activated_at"] as? String,ISO8601DateFormatter().date(from:activated) != nil else { return "fence_not_recorded" }
+            var attempts: [String:Double] = [:]
+            if let saved = marker["open_attempts"] {
+                guard let values = saved as? [String:Double],values.values.allSatisfy({ $0.isFinite }) else { return "fence_not_recorded" }
+                attempts = values
+            }
+            let now = effects.now().timeIntervalSince1970,key = threadID.lowercased()
+            if let previous = attempts[key],now-previous < CodexQueueBounds.openInterval { return "cooldown" }
+            attempts = attempts.filter { now-$0.value < CodexQueueBounds.openInterval }
+            attempts[key] = now
+            marker["open_attempts"] = attempts
+            guard let bytes = try? JSONSerialization.data(withJSONObject:marker),
+                  (try? bytes.write(to:markerFile,options:.atomic)) != nil else { return "fence_not_recorded" }
+            return nil
         }
     }
 }
@@ -208,7 +236,7 @@ extension Coordinator {
         let threads = route.appThreads(enrolled:Set(enrollments.values.compactMap { e -> String? in
             e.provider == "codex" && e.nativeEndpoint == nil && e.revoked != true && e.automatic == true ? (e.nativeSessionID ?? e.sessionID).lowercased() : nil
         })) { [self] in
-            queue.async { [self] in if nativeListener != nil { dispatchNative() } }
+            queue.async { [self] in dispatchNative() }
         }
         guard !threads.isEmpty else { return nil }
         let ids = enrollments.values.compactMap { e -> String? in
@@ -234,8 +262,8 @@ extension Coordinator {
         return true
     }
 
-    /// Every step runs on the route's lane. A refusal writes nothing: the delivery
-    /// keeps its label and state, and a later dispatch can try again within the bounds.
+    /// Every step runs on the route's lane. Refusals keep note state unchanged;
+    /// registration and occupied-item checks also record a safe reason receipt.
     func startCodexQueueDelivery(_ start: CodexQueueStart) {
         requireCommandQueue()
         let route = codexRoute,id = start.deliveryID,thread = start.registration.sessionID,generation = start.enrollment.generation
@@ -262,6 +290,7 @@ extension Coordinator {
             }
             let first = route.effects.preflight(start.registration,proven)
             if case .refused(let observation) = first { return refuse(observation) }
+            if case .occupied = first { return resumeCodexQueueItem(start,proven:proven) }
             let fenceFailure = queue.sync { codexQueueFence(deliveryID:id,enrollment:start.enrollment) }
             if let fenceFailure { return refuse(.init(reason:fenceFailure)) }
             // The holder can change while the fence commits, so this check is the last step before the call.
@@ -271,6 +300,7 @@ extension Coordinator {
                     _ = nativeOutcomes().record("delivery_record",params:["delivery_id":id,"state":"unavailable","release_queue_fence":true],deliveryID:id,routeGeneration:generation)
                 }
                 if case .refused(let refusal) = last { refuse(refusal) }
+                if case .occupied = last { resumeCodexQueueItem(start,proven:proven) }
                 return
             }
             let finish: @Sendable (String,Data) -> Void = { [self] state,bytes in
@@ -280,7 +310,7 @@ extension Coordinator {
                     route.open -= 1
                     changed()
                     // A second note to this thread waited for a later pass.
-                    if nativeListener != nil { dispatchNative() }
+                    dispatchNative()
                 }
             }
             do {
@@ -305,7 +335,9 @@ extension Coordinator {
                     return finish("provider_accepted",(try? JSONSerialization.data(withJSONObject:accepted)) ?? acceptedBytes)
                 }
                 let status: @Sendable () -> CodexQueueDeliveryStatus = { [self] in queue.sync { codexQueueDeliveryStatus(id:id,enrollment:start.enrollment) } }
-                CodexQueueFollowup.run(itemID:sent.itemID,registration:start.registration,environment:route.effects.followup(start.registration,route.lane,status)) { result in
+                var environment = route.effects.followup(start.registration,route.lane,status)
+                environment.reserveOpen = { route.reserveOpen(threadID:thread) }
+                CodexQueueFollowup.run(itemID:sent.itemID,registration:start.registration,environment:environment) { result in
                     var fields = (try? JSONSerialization.jsonObject(with:acceptedBytes)) as? [String:Any] ?? [:]
                     fields.merge(result.metadata) { _,new in new }
                     finish("provider_accepted",(try? JSONSerialization.data(withJSONObject:fields)) ?? acceptedBytes)
@@ -318,6 +350,56 @@ extension Coordinator {
                 finish(state,(try? JSONSerialization.data(withJSONObject:failure)) ?? Data("{}".utf8))
             }
         }
+    }
+
+    /// A dispatch-only check for a later note. Its turn belongs to the older item:
+    /// record only a refusal receipt and keep both note state and push state.
+    /// No poll, timer or second queue call is added here.
+    private func resumeCodexQueueItem(_ start: CodexQueueStart, proven: Bool) {
+        let route = codexRoute,id = start.deliveryID,thread = start.registration.sessionID
+        let status: @Sendable () -> CodexQueueDeliveryStatus = { [self] in queue.sync { codexQueueDeliveryStatus(id:id,enrollment:start.enrollment) } }
+        let environment = route.effects.followup(start.registration,route.lane,status)
+        let result: CodexQueueFollowupReceipt
+        if case .current = status() {
+            if !environment.openEnabled { result = .init(pollResult:"queue_occupied",openResult:"disabled") }
+            else {
+                // Signature, source, queue count and holder checks run again. In
+                // particular a holder seen after the first scan must block open.
+                switch route.effects.preflight(start.registration,proven) {
+                case .allowed: result = .init(pollResult:"queue_occupied",openResult:"not_needed")
+                case .refused(let observation):
+                    result = .init(pollResult:"queue_occupied",openResult:observation.reason == .holderExec ? "exec_holder" : "refused")
+                case .occupied(_,let count):
+                    if count != 1 { result = .init(pollResult:"queue_occupied",openResult:"multiple_items") }
+                    else { result = openWaitingCodexQueueItem(thread:thread,environment:environment) }
+                }
+            }
+        } else { result = .init(pollResult:"queue_occupied",openResult:"authorization_changed") }
+        queue.async { [self] in
+            var receipt: [String:Any] = ["route":"codex_app_queue","route_generation":start.enrollment.generation,"result":"refused",
+                "reason_code":"queue_occupied","observer":"codex_state_5_threads_source","source":"vscode"]
+            receipt.merge(result.metadata) { _,new in new }
+            nativeOutcomes().record("delivery_record",params:["delivery_id":id,"state":"unavailable","queue_refusal_receipt":true,"receipt":receipt],deliveryID:id,routeGeneration:start.enrollment.generation)
+            attemptedDeliveries.remove(id);route.open -= 1
+            route.retryAt[thread] = route.effects.now().addingTimeInterval(CodexQueueBounds.retrySeconds)
+            changed()
+        }
+    }
+
+    private func openWaitingCodexQueueItem(thread: String, environment e: CodexQueueFollowupEnvironment) -> CodexQueueFollowupReceipt {
+        let pending = "queue_occupied"
+        switch e.load() {
+        case .loaded: return .init(pollResult:pending,openResult:"loaded_pending")
+        case .unknown: return .init(pollResult:pending,openResult:"state_unknown")
+        case .unloaded: break
+        }
+        guard case .current = e.status() else { return .init(pollResult:pending,openResult:"authorization_changed") }
+        if e.execHolder() { return .init(pollResult:pending,openResult:"exec_holder") }
+        if let refusal = codexRoute.reserveOpen(threadID:thread) { return .init(pollResult:pending,openResult:refusal) }
+        do {
+            let status = try e.open(thread,5)
+            return .init(pollResult:pending,openResult:status == 0 ? "exited_zero" : "failed",openExitStatus:status)
+        } catch { return .init(pollResult:pending,openResult:"outcome_unknown") }
     }
 
     /// Persists an uncertainty fence BEFORE external I/O. A crash never retries this write.

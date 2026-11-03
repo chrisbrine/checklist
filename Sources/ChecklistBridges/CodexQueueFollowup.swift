@@ -28,6 +28,8 @@ public struct CodexQueueFollowupEnvironment: Sendable {
     public var open: @Sendable (String, TimeInterval) throws -> Int32
     /// An exec process holds this thread or names it. It can take the item and exit.
     public var execHolder: @Sendable () -> Bool
+    /// Commits the per-thread open limit before I/O. A result refuses the open.
+    public var reserveOpen: @Sendable () -> String? = { nil }
     public init(openEnabled: Bool, item: @escaping @Sendable (String) -> CodexQueueStore.Item, observe: @escaping @Sendable () -> CodexQueueObservation,
                 load: @escaping @Sendable () -> CodexThreadLoad, status: @escaping @Sendable () -> CodexQueueDeliveryStatus,
                 now: @escaping @Sendable () -> TimeInterval, schedule: @escaping @Sendable (TimeInterval, @escaping @Sendable () -> Void) -> Void,
@@ -108,6 +110,7 @@ public enum CodexQueueFollowup {
         // These checks take time. The item can go or the fence can come while they run.
         if let result = settled(e.item(itemID),execSeen:false,environment:e) ?? settled(e.status()) { return done(result) }
         if e.execHolder() { return done(pendingWithExec) }
+        if let refusal = e.reserveOpen() { return done(.init(pollResult:pending,openResult:refusal)) }
         do {
             let status = try e.open(thread,5)
             done(.init(pollResult:pending,openResult:status == 0 ? "exited_zero" : "failed",openExitStatus:status))

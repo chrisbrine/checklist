@@ -117,6 +117,20 @@ enum NativeSocketIO {
         return address
     }
 
+    /// The errno of one nonblocking connection test, or 0 for an accepted connection. The test
+    /// writes nothing. Darwin also returns ECONNREFUSED for a listener with a full queue.
+    static func connectResult(_ path: String) throws -> Int32 {
+        var address = try socketAddress(path)
+        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw NativeBridgeError.system("socket", errno) }
+        defer { Darwin.close(descriptor) }
+        guard fcntl(descriptor, F_SETFL, O_NONBLOCK) == 0 else { throw NativeBridgeError.system("fcntl", errno) }
+        let result = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+        }
+        return result == 0 ? 0 : errno
+    }
+
     static func checkedSocket(_ path: String) throws -> stat {
         var attributes = stat()
         guard lstat(path, &attributes) == 0 else { throw NativeBridgeError.system("lstat socket", errno) }

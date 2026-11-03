@@ -72,10 +72,10 @@ extension CoreTests {
             "source":["vscode","exec","mcp","subagent","unknown"],
             "reason_code":["source_vscode","source_exec","source_mcp","source_subagent","source_unknown","thread_missing",
                 "database_missing","database_version_unsupported","database_locked","schema_unrecognized","database_read_error",
-                "database_unsafe","recipient_invalid","route_disabled","registration_unproven","queue_command_failed","queue_outcome_unknown"],
+                "database_unsafe","recipient_invalid","route_disabled","registration_unproven","queue_command_failed","queue_outcome_unknown","queue_occupied"],
             "queue_poll_result":["not_started","item_unconfirmed","removed","removed_exec_holder","pending_after_20s","database_missing",
-                "database_version_unsupported","database_locked","schema_unrecognized","database_read_error","database_unsafe","authorization_changed","acknowledged","service_restarted"],
-            "open_result":["not_started","not_needed","loaded_pending","state_unknown","exec_holder","disabled","refused","authorization_changed","exited_zero","failed","outcome_unknown"]
+                "database_version_unsupported","database_locked","schema_unrecognized","database_read_error","database_unsafe","authorization_changed","acknowledged","service_restarted","queue_occupied"],
+            "open_result":["not_started","not_needed","loaded_pending","state_unknown","exec_holder","disabled","refused","authorization_changed","exited_zero","failed","outcome_unknown","cooldown","fence_not_recorded","multiple_items"]
         ]
         XCTAssertNil(router.codexQueueRouteReceipt(["route":"codex_app_queue","reason_code":"recipient_changed"])?["reason_code"])
         for (field,values) in vocabulary { for value in values {
