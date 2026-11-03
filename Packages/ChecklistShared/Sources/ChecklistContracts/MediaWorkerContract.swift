@@ -17,10 +17,11 @@ public enum MediaWorkerContract {
     /// `agent_rule_changes` switch is `owner_only`; the owner's app routes are unchanged.
     public static let settingMethods: Set<String> = [
         "media_type_adopt_starter", "media_type_create", "media_type_revise", "media_type_adopt", "media_type_retire", "media_round_publish",
-        // CL-420 (owner, 3 November 2026): round closure and successor, rework capture, type restore
-        // and suggestion adoption. Owner decisions (media_decide) and context approval stay owner only.
+        // CL-420 (owner, 3 November 2026): round closure and successor, rework capture and type restore.
+        // Decisions stay owner only: media_decide, suggestion adoption (it writes the item's decision)
+        // and context approval are the owner's own answers and approvals.
         "media_round_cancel", "media_round_archive", "media_round_finish", "media_round_successor",
-        "media_rework_create", "media_type_restore", "media_adopt_suggestion",
+        "media_rework_create", "media_type_restore",
     ]
 
     public struct ValidationError: Error, CustomStringConvertible, Sendable {
@@ -107,15 +108,6 @@ public enum MediaWorkerContract {
                 "item_id": text(4_000), "expected_revision": revision, "decision_id": text(4_000),
             ], required: ["item_id", "expected_revision", "decision_id"])]
             required += ["round_id", "expected_revision", "observed_context_token", "manifest_id", "manifest_digest", "epic_id", "preview_digest", "items"]
-        case "media_adopt_suggestion":
-            properties["round_id"] = text(4_000); properties["expected_revision"] = revision
-            properties["observed_context_token"] = text(65_536)
-            properties["manifest_id"] = text(4_000); properties["manifest_digest"] = digest
-            properties["suggestion_id"] = text(4_000)
-            properties["items"] = ["type": "array", "minItems": 1, "maxItems": 1, "items": object([
-                "item_id": text(4_000), "expected_revision": revision, "target_id": text(4_000), "review_basis_signature": digest,
-            ], required: ["item_id", "expected_revision", "target_id", "review_basis_signature"])]
-            required += ["round_id", "expected_revision", "observed_context_token", "manifest_id", "manifest_digest", "suggestion_id", "items"]
         case "media_round_get", "media_decision_list":
             properties["round_id"] = text(4_000)
             properties["cursor"] = text(method == "media_round_get" ? 1_400_000 : 512)

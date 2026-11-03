@@ -10,10 +10,9 @@ private struct MediaDecisionSelection {
 }
 
 extension CommandRouter {
-    func mediaDecision(_ db: Database,_ p: JSON,_ c: Caller,project pid: String,method: String,validateOnly: Bool = false,agent: Bool = false) throws -> JSON {
+    func mediaDecision(_ db: Database,_ p: JSON,_ c: Caller,project pid: String,method: String,validateOnly: Bool = false) throws -> JSON {
         if method == "media_suggest" { guard !c.isOwner else { throw CoreError("FORBIDDEN","Suggestions retain actual worker provenance.") } }
-        // CL-420: only suggestion adoption reaches here from the gated worker channel; media_decide stays owner only.
-        else if !(agent && method == "media_adopt_suggestion") { try owner(c) }
+        else { try owner(c) }
         let round = try scoped(db,try text(p,"round_id"),pid,type:"media_round")
         try mediaObserve(db,p,round:round,caller:c)
         // CL-351: a worker may suggest on exact Draft targets; no manifest exists before publication.
@@ -69,7 +68,7 @@ extension CommandRouter {
                 "revision":1],["type":"media_review_type_revision","id":(try StoredRecord(target,
                  family: "media").requiredValue("type_revision_id")),"revision":1]]
             refs += strings(target,"candidate_ids").map {["type":"media_candidate","id":$0,"revision":1]}
-            if let adopted { fields["adopted_suggestion_id"] = adopted["id"];if agent { fields["adopted_by"] = mediaAgentActor(c) };refs.append(try mediaRef("media_suggestion",adopted)) }
+            if let adopted { fields["adopted_suggestion_id"] = adopted["id"];refs.append(try mediaRef("media_suggestion",adopted)) }
             if let prior = original["last_decision_id"] as? String,method != "media_suggest" { fields["supersedes_decision_id"] = prior;
                 refs.append(["type":"media_owner_decision","id":prior,"revision":1]) }
             if let operationID = input["bulk_operation_id"] as? String {

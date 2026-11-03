@@ -416,7 +416,7 @@ extension CommandRouter {
         case "media_round_publish":
             return try mediaPublishRound(db,p,c,project:pid,resources:resources)
         case "media_context_reconcile": return try mediaReconcile(db,p,c,project:pid)
-        case "media_decide","media_suggest","media_adopt_suggestion": return try mediaDecision(db,p,c,project:pid,method:method,agent:resources.workerChannel)
+        case "media_decide","media_suggest","media_adopt_suggestion": return try mediaDecision(db,p,c,project:pid,method:method)
         case "media_follow_up_record": return try mediaFollowUpRecord(db,p,c,project:pid)
         case "media_round_finish":
             return try mediaFinishRound(db,p,c,project:pid,agent:resources.workerChannel)

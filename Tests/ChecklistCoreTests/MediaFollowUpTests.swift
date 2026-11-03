@@ -143,13 +143,14 @@ final class MediaFollowUpTests: XCTestCase {
         try rework.decide(f,r,ids[0],"changes_requested");try rework.decide(f,r,ids[1],"accepted");try rework.decide(f,r,ids[2],"needs_look")
         let next = try ticket(f),taskID = next["id"] as! String
         var good = try followUp(f,r,[ids[0]]);good["task_id"] = taskID
-        // The owner has no follow-up route and the worker has no Close route.
+        // The owner has no follow-up route. Since CL-420 the worker has a gated Close route
+        // (media_round_finish, tested in MediaAgentRoundActionTests); decisions stay owner only.
         XCTAssertFalse(CommandRouter.mediaOwnerMethods.contains("media_follow_up_record"))
         XCTAssertTrue(CommandRouter.mediaWorkerMethods.contains("media_follow_up_record"))
+        XCTAssertTrue(CommandRouter.mediaWorkerMethods.contains("media_round_finish"))
         let before = try f.allState()
         XCTAssertThrowsError(try owner(f,"media_follow_up_record",good))
         checks.checkError("FORBIDDEN") {try f.call("media_follow_up_record",good,as:f.owner)}
-        checks.checkError("FORBIDDEN") {try self.worker(f,"media_round_finish",try self.rework.finishInput(f,r))}
         checks.checkError("FORBIDDEN") {try self.worker(f,"media_decide",good)}
         // A caller cannot supply provenance or both follow-up kinds.
         var forged = good;forged["origin"] = "human_ui"

@@ -173,8 +173,6 @@ extension CommandRouter {
                 var result: JSON = [:]
                 try self.withValidatedDomainTransaction(db) {
                     let pid = try self.mediaAccess(db,p,c,write:true)
-                    // CL-420: this direct writer path skips media preparation, so it applies the worker gate here.
-                    if workerChannel { try self.mediaWorkerWriteAccess(db,method:"media_rework_create",p:p,c:c,project:pid) }
                     try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:c)
                     if let row = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[c.principal,command]) {
                         guard row["digest"] as String == digest else { throw CoreError("IDEMPOTENCY_CONFLICT","This command ID has a different intent.") }
@@ -182,6 +180,9 @@ extension CommandRouter {
                         if Self.isPrunedResult(result) { throw Self.expiredCommandError(command) }
                         result["replayed"] = true;return .commit
                     }
+                    // CL-420: this direct writer path skips media preparation, so it applies the worker gate here,
+                    // after the replay read as the other media setting commands do (a stored result replays under owner_only).
+                    if workerChannel { try self.mediaWorkerWriteAccess(db,method:"media_rework_create",p:p,c:c,project:pid) }
                     result = try self.mediaReworkCreate(db,p,c,project:pid,agent:workerChannel)
                     try self.event(db,caller:c,project:pid,entity:result["id"] as? String,kind:"media_rework_create")
                     try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[c.principal,command,digest,try jsonString(result)])

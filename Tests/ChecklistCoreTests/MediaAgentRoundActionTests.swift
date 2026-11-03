@@ -134,9 +134,19 @@ final class MediaAgentRoundActionTests: XCTestCase {
         XCTAssertEqual(replay["replayed"] as? Bool,true);XCTAssertEqual(strings(replay,"created_task_ids"),taskIDs)
         checks.checkError("IDEMPOTENCY_CONFLICT") {try self.worker(f,"media_rework_create",self.changed(input,"preview_digest","changed"),command:command)}
         XCTAssertEqual(try f.allState(),replayBefore)
+        // Review 3fec270c advice: under owner_only a stored capture replays, as the other media setting
+        // commands do, and a new capture refuses. Neither writes.
+        try types.setAgentRuleChanges(f,"owner_only")
+        let gatedBefore = try f.allState()
+        let gatedReplay = try worker(f,"media_rework_create",input,command:command)
+        XCTAssertEqual(gatedReplay["replayed"] as? Bool,true);XCTAssertEqual(strings(gatedReplay,"created_task_ids"),taskIDs)
+        checks.checkError("HUMAN_CHANNEL_REQUIRED") {try self.worker(f,"media_rework_create",input)}
+        XCTAssertEqual(try f.allState(),gatedBefore)
     }
 
-    func testAgentAdoptsSuggestionWhileDecisionsAndContextStayOwnerOnly() throws {
+    /// CL-420 review 3fec270c: adopting a suggestion writes the item's decision, so an agent cannot
+    /// adopt even its own suggestion. Decisions and context approval stay with the owner's app.
+    func testSuggestionAdoptionDecisionsAndContextStayOwnerOnly() throws {
         let f = try Fixture(),(r,_) = try published(f,1)
         let v = try view(f,r),row = (v["items"] as! [JSON])[0]
         let suggested = try worker(f,"media_suggest",channel.suggestion(v,row,disposition:"needs_look"))
@@ -144,22 +154,15 @@ final class MediaAgentRoundActionTests: XCTestCase {
         let current = try view(f,r),item = (current["items"] as! [JSON])[0]
         var input = fence(current);input["suggestion_id"] = suggestionID
         input["items"] = [["item_id":item["item_id"]!,"expected_revision":item["expected_revision"]!,"target_id":item["target_id"]!,"review_basis_signature":item["review_basis_signature"]!]]
-        let command = uuid(),adopted = try worker(f,"media_adopt_suggestion",input,command:command)
-        let decision = try XCTUnwrap((adopted["decisions"] as? [JSON])?.first)
-        XCTAssertEqual(decision["origin"] as? String,"agent");XCTAssertEqual(decision["adopted_suggestion_id"] as? String,suggestionID)
-        XCTAssertEqual(decision["disposition"] as? String,"needs_look");assertAgent(decision["adopted_by"],f)
         let before = try f.allState()
-        let replay = try worker(f,"media_adopt_suggestion",input,command:command)
-        XCTAssertEqual(replay["replayed"] as? Bool,true)
-        XCTAssertEqual((replay["decisions"] as? [JSON])?.first?["id"] as? String,decision["id"] as? String)
-        checks.checkError("IDEMPOTENCY_CONFLICT") {try self.worker(f,"media_adopt_suggestion",self.changed(input,"suggestion_id",uuid()),command:command)}
-        checks.checkError("NOT_FOUND") {try self.worker(f,"media_adopt_suggestion",self.changed(input,"suggestion_id",uuid()))}
+        XCTAssertFalse(MediaWorkerContract.methods.contains("media_adopt_suggestion"))
+        checks.checkError("FORBIDDEN") {try self.worker(f,"media_adopt_suggestion",input)}
         // The owner's own answers and approvals stay with the trusted app.
         for method in ["media_decide","media_context_approve","media_context_reconcile","media_bulk_prepare","media_bulk_apply"] {
             XCTAssertFalse(MediaWorkerContract.methods.contains(method),method)
             checks.checkError("FORBIDDEN") {try self.worker(f,method,["round_id":r["id"]!])}
         }
-        XCTAssertEqual(try f.allState(),before)
+        XCTAssertEqual(try f.allState(),before,"A refused adoption or decision writes nothing")
     }
 
     /// Rule (CL-420): a retire or restore retry with its original command_id replays the first
@@ -210,7 +213,6 @@ final class MediaAgentRoundActionTests: XCTestCase {
             "media_round_successor":successor,
             "media_rework_create":open.merging(["epic_id":epicID,"preview_digest":"x","items":[["item_id":ids[0],"expected_revision":1,"decision_id":"d"]]]) {$1},
             "media_type_restore":["type_id":t["id"]!,"expected_revision":t["revision"]!],
-            "media_adopt_suggestion":open.merging(["suggestion_id":"s","items":[["item_id":ids[0],"expected_revision":1,"target_id":"t","review_basis_signature":zero]]]) {$1},
         ]
         XCTAssertEqual(Set(inputs.keys).union(["media_type_adopt_starter","media_type_create","media_type_revise","media_type_adopt","media_type_retire","media_round_publish"]),MediaWorkerContract.settingMethods)
         for (method,input) in inputs {checks.checkError("HUMAN_CHANNEL_REQUIRED") {try self.worker(f,method,input)}}

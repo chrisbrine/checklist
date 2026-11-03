@@ -24,7 +24,7 @@ final class MediaOwnerChannelTests: XCTestCase {
             if role.role == "worker" {
                 for method in CommandRouter.mediaWorkerMethods {XCTAssertTrue(catalog.contains(method),method)}
                 // CL-419: type changes and publication are agent setting changes; decisions and context stay owner only.
-                for method in ["media_decide","media_context_approve","media_context_reconcile"] {XCTAssertFalse(catalog.contains(method),method)}
+                for method in ["media_decide","media_context_approve","media_context_reconcile","media_adopt_suggestion"] {XCTAssertFalse(catalog.contains(method),method)}
             } else {XCTAssertFalse(catalog.contains("media_"))}
         }
         for method in ["media_suggest","media_material_reference_adopt"] {
