@@ -155,7 +155,9 @@ extension CommandRouter {
                 // CL-419: a worker publication passed mediaWorkerWriteAccess above; reconcile stays owner only.
                 if !(workerChannel && method == "media_round_publish") { try self.owner(c) }
                 let round = try self.scoped(db,try text(p,"round_id"),pid,type:"media_round")
-                try self.mediaObserve(db,p,round:round,caller:c,allowAttention:method == "media_context_reconcile")
+                let automatic = c.isOwner && method == "media_round_publish" ? try self.mediaUndecidedDraftContextAttention(db,round:round) : []
+                let migrateContext = !automatic.isEmpty && automatic == strings(round,"attention_ids")
+                try self.mediaObserve(db,p,round:round,caller:c,allowAttention:method == "media_context_reconcile" || migrateContext)
                 if method == "media_round_publish" { try self.mediaValidateIntakePublication(db,round:round,selection:p["items"] as? [JSON] ?? []) }
                 let ids = Set((p["items"] as? [JSON] ?? []).compactMap {$0["item_id"] as? String})
                 var byID: [String:JSON] = [:]

@@ -193,7 +193,8 @@ struct MediaSimpleReference {
 /// ID: an unchanged row keeps its card, item and playing take; a changed row reads only that
 /// item again and updates its card in place.
 ///
-/// Take window: the views report which cards are on screen. The window is the visible cards plus
+/// Take window: the view reports the card frames, and a card is on screen (visible) when its frame
+/// meets the scroll view's visible area. The window is the visible cards plus
 /// `preloadCards` cards before and after them. Each card in the window gets a prepared take, one
 /// at a time, nearest to the visible cards first. Only visible cards play; the other prepared
 /// takes stay paused at their first frame. A take is released only when its card leaves the
@@ -221,6 +222,22 @@ struct MediaSimpleReference {
     private(set) var cards: [String: MediaDirectionCard] = [:]
     private(set) var stale = Set<String>()
     private(set) var visible = Set<String>()
+    /// The visible card IDs in play order. From the view's frames: nearest to the middle of the
+    /// visible area first. From `cardShown`: in report order.
+    private(set) var priority: [String] = []
+    /// Cards that the owner paused with the card's Pause. They stay paused after any scroll until
+    /// the owner's Play on the card or "Play all takes".
+    private(set) var ownerPaused = Set<String>()
+    /// Visible cards that the owner played with the card's Play. They play first, also with
+    /// Reduce Motion or "Pause all takes". A card leaves this set when it leaves the screen.
+    private(set) var ownerPlayed = Set<String>()
+    /// Cards paused to make room for the owner's Play. They play again last, when the budget frees.
+    private(set) var yielded = Set<String>()
+    /// The owner's "Play all takes": visible cards play also with Reduce Motion, until "Pause all takes".
+    private(set) var ownerPlaysAll = false
+    /// The last card frames (scroll view coordinates) and visible height that the view reported.
+    private var cardFrames: [String: CGRect] = [:]
+    private var viewportHeight: CGFloat = 0
     private(set) var header = Record(values: [:])
     private var rowValues: [String: NSDictionary] = [:]
     private var groupTitles: [String: String] = [:]
@@ -271,6 +288,9 @@ struct MediaSimpleReference {
     func reset() {
         pump?.cancel();pump=nil;pumpGeneration+=1;playback.releaseAll()
         cards=[:];rowValues=[:];groupTitles=[:];stale=[];visible=[];focus=nil;failedKeys=[];referenceImages=[:]
+        // The last reported frames stay: the next `sync` takes the visible cards from them, also
+        // when the view sends no new frames (its layout did not change).
+        priority=[];ownerPaused=[];ownerPlayed=[];yielded=[];ownerPlaysAll=false
         if !order.isEmpty {order=[]}
         if contextApproval != nil {contextApproval=nil}
     }
@@ -297,10 +317,11 @@ struct MediaSimpleReference {
         for id in Array(cards.keys) where !seen.contains(id) {
             if let card=cards.removeValue(forKey:id) {for key in keys(card) {playback.release(key)}}
             rowValues[id]=nil;groupTitles[id]=nil;stale.remove(id);visible.remove(id)
+            priority.removeAll {$0==id};ownerPaused.remove(id);ownerPlayed.remove(id);yielded.remove(id)
         }
         stale.formUnion(changed)
         if ids != order {order=ids}
-        schedule()
+        if !applyFrames() {schedule()}
         return changed
     }
     /// Reads each changed item, one at a time, in list order. Only that card changes.
@@ -358,21 +379,61 @@ struct MediaSimpleReference {
         guard let index,order.indices.contains(index),let card=cards[order[index]] else {return []}
         return keys(card)
     }
-    /// A card came on screen, or its take changed. The window moves to it and its take plays when it is ready.
+    /// The view reports the frame of each card that SwiftUI lays out, in the scroll view's
+    /// coordinate space (CL-421 rework). A lazy grid keeps some cells that are off screen and drops
+    /// others with no report, and a card's appear task can run after the card left. So the model
+    /// does not use appear or disappear: a card is visible when its frame meets the visible area.
+    func updateFrames(_ frames: [String: CGRect]) {cardFrames=frames;applyFrames()}
+    /// The height of the scroll view's visible area.
+    func updateViewport(height: CGFloat) {
+        guard height != viewportHeight else {return}
+        viewportHeight=height;applyFrames()
+    }
+    /// Sets the visible cards from the last reported frames. False when the view reported no
+    /// visible area yet or the visible cards did not change.
+    @discardableResult private func applyFrames() -> Bool {
+        guard viewportHeight > 0 else {return false}
+        let next=Self.visibleOrder(frames:cardFrames,viewport:viewportHeight).filter {cards[$0] != nil}
+        guard next != priority else {return false}
+        setVisible(next);return true
+    }
+    /// The cards whose frame meets the visible area (0 to `viewport`), nearest to its middle first.
+    /// Cards at the same distance go top to bottom, then left to right.
+    static func visibleOrder(frames: [String: CGRect],viewport: CGFloat) -> [String] {
+        guard viewport > 0 else {return []}
+        let middle=viewport/2
+        return frames.filter {$0.value.height > 0 && $0.value.maxY > 0 && $0.value.minY < viewport}
+            .sorted {(abs($0.value.midY-middle),$0.value.minY,$0.value.minX,$0.key) < (abs($1.value.midY-middle),$1.value.minY,$1.value.minX,$1.key)}
+            .map(\.key)
+    }
+    func setReduceMotion(_ value: Bool) {
+        guard value != reduceMotion else {return}
+        reduceMotion=value;reconcile()
+    }
+    /// Replaces the visible cards; `ordered` is their play order. A card that is not visible any
+    /// more pauses its players at their first frame; they stay prepared while it is in the window.
+    /// Then the window moves and the play budget goes to the visible cards again.
+    func setVisible(_ ordered: [String]) {
+        var seen=Set<String>()
+        let next=ordered.filter {cards[$0] != nil && seen.insert($0).inserted}
+        let left=priority.filter {!seen.contains($0)}
+        priority=next;visible=seen
+        for id in left {
+            ownerPlayed.remove(id);yielded.remove(id)
+            if let card=cards[id] {for key in keys(card) {playback.pause(key,rewind:true)}}
+        }
+        schedule()
+    }
+    /// A card came on screen (report order; tests and callers without frames).
     func cardShown(_ card: MediaDirectionCard,reduceMotion: Bool) {
         self.reduceMotion=reduceMotion
-        visible.insert(card.id)
-        schedule()
-        start(card)
+        setVisible(priority.contains(card.id) ? priority : priority+[card.id])
     }
-    /// A card left the screen. Its players pause at their first frame and stay prepared while the card is in the window.
-    func cardLeft(_ card: MediaDirectionCard) {
-        visible.remove(card.id)
-        for key in keys(card) {playback.pause(key,rewind:true)}
-        schedule()
-    }
-    /// Moves the window to the visible cards, releases each take whose card left it, and starts
-    /// the preparation of the missing takes. With no card on screen the last window stays.
+    /// A card left the screen (tests and callers without frames).
+    func cardLeft(_ card: MediaDirectionCard) {setVisible(priority.filter {$0 != card.id})}
+    /// Moves the window to the visible cards, releases each take whose card left it, gives the play
+    /// budget to the visible cards, and starts the preparation of the missing takes. With no card
+    /// on screen the last window stays.
     private func schedule() {
         let shown=order.indices.filter {visible.contains(order[$0])}
         if let low=shown.first,let high=shown.last {
@@ -381,6 +442,7 @@ struct MediaSimpleReference {
             for key in Array(playback.takes.keys) where !keep.contains(key) {playback.release(key)}
             failedKeys.formIntersection(keep)
         }
+        reconcile()
         guard pump == nil,source != nil,window != nil else {return}
         pumpGeneration+=1
         let generation=pumpGeneration
@@ -435,7 +497,7 @@ struct MediaSimpleReference {
                     continue
                 }
                 report("")
-                start(card,admitted:player)
+                reconcile()
             } catch {
                 // A failed player is not tried again until its card leaves the window and comes back.
                 guard current() else {continue}
@@ -444,45 +506,77 @@ struct MediaSimpleReference {
             }
         }
     }
-    /// A visible card plays its prepared players together (take and video reference), muted and
-    /// looped, unless Reduce Motion or the owner's Pause keeps the still first frame, and only
-    /// when all of them fit in the play budget. A video reference that becomes ready after its
-    /// take follows the take: it plays only when the take plays, and the take goes back to its
-    /// first frame so that both loops start together.
-    private func start(_ card: MediaDirectionCard,admitted: MediaSimplePlayer? = nil) {
-        guard let source,visible.contains(card.id) else {return}
-        if let admitted,admitted.isReference,playback.takes[card.key] != nil {
-            guard playback.playingKeys.contains(card.key),playback.playingKeys.count < Self.playingTakes else {return}
-            playback.rewind(card.key)
-            playback.play([admitted.key],limit:Self.playingTakes)
-            return
-        }
-        let ready=keys(card).filter {playback.takes[$0] != nil}
-        guard !ready.isEmpty,!ready.contains(where:{playback.playingKeys.contains($0)}) else {return}
-        let layout=source.schema(card)["layout"] as? MediaValues ?? [:]
-        guard MediaSimpleLayout.startsPlaying(layout:layout,reduceMotion:reduceMotion,pausedByOwner:pausedByOwner) else {return}
-        playback.play(ready,limit:Self.playingTakes)
+    /// True when a visible card plays by itself: the layout autoplays (or the owner pressed "Play
+    /// all takes"), Reduce Motion is off (or "Play all takes"), and the owner did not pause it.
+    private func autoplays(_ card: MediaDirectionCard) -> Bool {
+        guard !pausedByOwner,!ownerPaused.contains(card.id) else {return false}
+        return ownerPlaysAll || MediaSimpleLayout.startsPlaying(layout:layout(card),reduceMotion:reduceMotion,pausedByOwner:false)
     }
-    /// The card's Play or Pause. It acts on both players of the card together. At the play
-    /// budget the owner's Play pauses the cards farthest from this card until its players fit.
+    /// Gives the play budget to the visible cards, after every change of the visible cards, a
+    /// prepared or released player, an owner control or Reduce Motion. Order: the cards that the
+    /// owner played, then the cards that play by themselves in play order (nearest the middle
+    /// first), then the cards that gave way to the owner's Play. A card plays all of its prepared
+    /// players (take and video reference) or none, muted and looped, within `playingTakes`. A
+    /// visible card that does not fit keeps its still frame and its Play, and plays when the budget
+    /// frees. A video reference that becomes ready after its take joins it: the take goes back to
+    /// its first frame so that both loops start together. Players of cards that are not visible
+    /// are not changed here; they count against the budget.
+    private func reconcile() {
+        let shown=priority.compactMap {cards[$0]}
+        let shownKeys=Set(shown.flatMap {keys($0)})
+        var used=playback.playingKeys.subtracting(shownKeys).count
+        let manual=shown.filter {ownerPlayed.contains($0.id)}
+        let automatic=shown.filter {!ownerPlayed.contains($0.id) && autoplays($0)}
+        var chosen: [MediaDirectionCard] = []
+        for card in manual+automatic.filter({!yielded.contains($0.id)})+automatic.filter({yielded.contains($0.id)}) {
+            let ready=keys(card).filter {playback.takes[$0] != nil}
+            guard !ready.isEmpty,used+ready.count <= Self.playingTakes else {continue}
+            chosen.append(card);used+=ready.count
+        }
+        let chosenKeys=Set(chosen.flatMap {keys($0)})
+        for key in shownKeys where playback.playingKeys.contains(key) && !chosenKeys.contains(key) {playback.pause(key)}
+        for card in chosen {
+            let ready=keys(card).filter {playback.takes[$0] != nil}
+            let waiting=ready.filter {!playback.playingKeys.contains($0)}
+            guard !waiting.isEmpty else {continue}
+            for key in ready where playback.playingKeys.contains(key) {playback.rewind(key)}
+            playback.play(waiting,limit:Self.playingTakes)
+        }
+    }
+    /// The card's Play or Pause. It acts on both players of the card together. The owner's Pause
+    /// keeps the card still after any scroll until the owner's Play. At the play budget the
+    /// owner's Play pauses the cards farthest from this card until its players fit; those cards
+    /// play again when the budget frees.
     func toggle(_ card: MediaDirectionCard) {
         let ready=keys(card).filter {playback.takes[$0] != nil}
-        if ready.contains(where:{playback.playingKeys.contains($0)}) {for key in ready {playback.pause(key)};return}
+        yielded.remove(card.id)
+        if ready.contains(where:{playback.playingKeys.contains($0)}) {
+            ownerPaused.insert(card.id);ownerPlayed.remove(card.id)
+            for key in ready {playback.pause(key)}
+            reconcile();return
+        }
+        ownerPaused.remove(card.id)
+        if visible.contains(card.id) {ownerPlayed.insert(card.id)}
         if let index=order.firstIndex(of:card.id) {
             let positions=positions()
             let far: (String) -> Int = {positions[$0].map {abs($0-index)} ?? Int.max}
             while playback.playingKeys.count+ready.count > Self.playingTakes,let other=playback.playingKeys.max(by:{(far($0),$0) < (far($1),$1)}) {
                 for key in Set([other]+keys(at:positions[other])) {playback.pause(key)}
+                if let position=positions[other] {yielded.insert(order[position]);ownerPlayed.remove(order[position])}
             }
         }
         playback.play(ready,limit:Self.playingTakes)
+        reconcile()
     }
-    func pauseAll() {pausedByOwner=true;playback.pauseAll()}
-    /// Plays the prepared players of the visible cards, in list order, within the play budget.
-    /// A card plays both of its players or none.
+    func pauseAll() {
+        pausedByOwner=true;ownerPlaysAll=false;ownerPlayed=[];yielded=[]
+        playback.pauseAll()
+    }
+    /// Plays the prepared players of the visible cards, in play order, within the play budget,
+    /// also with Reduce Motion. It clears each card's Pause. A card plays both of its players or none.
     func playAll() {
-        pausedByOwner=false
-        for id in order where visible.contains(id) {if let card=cards[id] {playback.play(keys(card),limit:Self.playingTakes)}}
+        pausedByOwner=false;ownerPlaysAll=true;ownerPaused=[];ownerPlayed=[];yielded=[]
+        reconcile()
     }
     /// Waits until the current preparation pass ends (tests).
     func settle() async {while let task=pump {await task.value}}
@@ -572,8 +666,11 @@ struct MediaSimpleReference {
             let item=Record(values:try await model.read("media_item_get",["round_id":round,"item_id":card.id]))
             guard self.scope==scope,cards[card.id]===card else {card.sending=false;return}
             let target=Record(values:item.object("target")),lineage=target.string("published_from_target_id")
-            guard header.id==round,header.string("state")=="open",item.bool("published"),!target.id.isEmpty,
-                  target.string("review_basis_signature")==frozen?.string("review_basis_signature"),lineage.isEmpty || lineage==viewed else {
+            // A target published from the exact Draft target that the card showed is the same take. The
+            // owner's publication can migrate pending context attention (CL-422), which changes only the
+            // context part of the basis, so lineage is enough; a target without lineage must keep the basis.
+            let sameTake=lineage.isEmpty ? target.string("review_basis_signature")==frozen?.string("review_basis_signature") : lineage==viewed
+            guard header.id==round,header.string("state")=="open",item.bool("published"),!target.id.isEmpty,sameTake else {
                 throw ChecklistError("MEDIA_CONTEXT_CHANGED","The round is published, but this take changed. Look at it again before deciding.")
             }
             update(header:header);apply(item,to:card);card.inspectCurrentBasis()
@@ -611,6 +708,7 @@ struct MediaSimpleReview: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var scope: String {model.projectID+":"+model.roundID}
     var body: some View {
+        GeometryReader {viewport in
         ScrollView {
             VStack(alignment:.leading,spacing:12) {
                 HStack {
@@ -627,7 +725,7 @@ struct MediaSimpleReview: View {
                         Text(section.title).font(.title3).accessibilityAddTraits(.isHeader)
                         LazyVGrid(columns:[GridItem(.adaptive(minimum:380),alignment:.top)],alignment:.leading,spacing:12) {
                             ForEach(section.cards) {card in
-                                MediaSimpleCardView(card:card,simple:simple,playback:simple.playback,model:model,reduceMotion:reduceMotion)
+                                MediaSimpleCardView(card:card,simple:simple,playback:simple.playback,model:model)
                             }
                         }
                     }
@@ -635,6 +733,11 @@ struct MediaSimpleReview: View {
                 if model.next != nil {Button("Load more items") {Task {await model.moreRows()}}}
             }.padding(8)
         }
+        .coordinateSpace(.named(mediaSimpleScrollSpace))
+        // The visible cards come from the card frames, never from lazy-cell appear or disappear.
+        .onPreferenceChange(MediaSimpleCardFrames.self) {[review=simple] frames in MainActor.assumeIsolated {review.updateFrames(frames)}}
+        .onChange(of:viewport.size.height,initial:true) {_,height in simple.updateViewport(height:height)}
+        .onChange(of:reduceMotion,initial:true) {_,value in simple.setReduceMotion(value)}
         .accessibilityIdentifier("mediaSimpleReview")
         .onReceive(model.$header) {simple.update(header:$0)}
         .onReceive(model.$rows) {rows in sync(rows)}
@@ -644,6 +747,7 @@ struct MediaSimpleReview: View {
             Button("Cancel",role:.cancel) {simple.dismissContextApproval()}
         } message: {_ in
             Text("This project has a brief or pinned decisions that media review has not approved yet. Approve them once. Then Checklist publishes this round and records your decision.")
+        }
         }
     }
     func sync(_ rows: [Record]) {
@@ -664,13 +768,27 @@ struct MediaSimpleReview: View {
     }
 }
 
+/// The coordinate space of the simple review's scroll view. Card frames in it are relative to the
+/// visible area: 0 is its top edge.
+private let mediaSimpleScrollSpace = "mediaSimpleScroll"
+/// The frame of each laid-out card, by item ID. A lazy cell that SwiftUI dropped reports nothing.
+private struct MediaSimpleCardFrames: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect],nextValue: () -> [String: CGRect]) {value.merge(nextValue()) {$1}}
+}
+private struct MediaSimpleFrameReporter: View {
+    let id: String
+    var body: some View {
+        GeometryReader {proxy in Color.clear.preference(key:MediaSimpleCardFrames.self,value:[id:proxy.frame(in:.named(mediaSimpleScrollSpace))])}
+    }
+}
+
 private struct MediaSimpleCardView: View {
     @EnvironmentObject var store: ChecklistStore
     @ObservedObject var card: MediaDirectionCard
     let simple: MediaSimpleReviewModel
     @ObservedObject var playback: MediaSimpleTakeCache
     let model: MediaReviewModel
-    let reduceMotion: Bool
     @State private var showDetails = false
     var schema: MediaValues {card.header.object("type_revision")["schema"] as? MediaValues ?? model.schema}
     var layout: MediaValues {schema["layout"] as? MediaValues ?? [:]}
@@ -710,8 +828,7 @@ private struct MediaSimpleCardView: View {
         .padding(8).background(.quaternary.opacity(0.3),in:RoundedRectangle(cornerRadius:6))
         .accessibilityElement(children:.contain).accessibilityLabel(card.label)
         .accessibilityIdentifier("mediaSimpleCard:"+card.id)
-        .task(id:card.key) {simple.cardShown(card,reduceMotion:reduceMotion)}
-        .onDisappear {simple.cardLeft(card)}
+        .background(MediaSimpleFrameReporter(id:card.id))
     }
     @ViewBuilder var take: some View {
         if let prepared=playback.takes[card.key],let player=prepared.player {

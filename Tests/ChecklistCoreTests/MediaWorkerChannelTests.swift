@@ -319,7 +319,7 @@ final class MediaWorkerChannelTests: XCTestCase {
     func testWorkerRoundReadOmitsOwnerIdentityAndPrivateContextBodies() throws {
         let f = try Fixture(),type = try f.type(checks.schema()),created = try f.round(type)
         _ = try f.call("media_context_approve",["kind":"direction","round_id":created["id"]!,"body":"PRIVATE_OWNER_CONTEXT_BODY"])
-        _ = try f.reconcile(created)
+        XCTAssertTrue(strings(try f.get(created),"attention_ids").isEmpty)
         _ = try f.item(created);_ = try f.publish(created)
         let view = try get(f,created),encoded = try jsonString(view)
         XCTAssertEqual(view["origin"] as? String,"human_ui")

@@ -388,7 +388,8 @@ final class MediaFrozenIntakeTests: XCTestCase {
         params["items"] = f.selection(observed,publish:true)
         _ = try f.call("media_context_approve",["kind":"direction","body":"No flashing","round_id":round["id"]!])
         let attention = try f.allState();checks.checkError("MEDIA_CONTEXT_CHANGED") {try f.call("media_round_publish",params)};XCTAssertEqual(try f.allState(),attention)
-        _ = try f.reconcile(round);observed = try f.get(round);params = f.observation(observed);params["items"] = f.selection(observed,publish:true);params["command_id"] = uuid();params["project_id"] = f.project
+        observed = try f.get(round);XCTAssertTrue(strings(observed,"attention_ids").isEmpty)
+        params = f.observation(observed);params["items"] = f.selection(observed,publish:true);params["command_id"] = uuid();params["project_id"] = f.project
         let resources = try f.router.prepareMediaResources(method:"media_round_publish",params:params,caller:f.owner)
         let prepared = try XCTUnwrap(f.router.prepareMediaCommand(method:"media_round_publish",params:params,caller:f.owner,resources:resources))
         defer {try? prepared.observer.close()}

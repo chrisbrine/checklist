@@ -102,8 +102,66 @@ extension CommandRouter {
         let project = try record.string("project_id")
         let type = try record.string("type_id"), round = try record.string("round_id")
         let sources = try strings(context,"source_ids").map { try scoped(db,$0,project,type:"media_review_context") }
+        return try mediaEffectiveSourceSignature(sources,type:type,round:round,itemID:itemID)
+    }
+    private func mediaEffectiveSourceSignature(_ sources: [JSON],type: String,round: String,itemID: String) throws -> String {
         let effective = sources.filter { mediaScopeMatches($0,type:type,round:round,item:itemID) }
         return try MediaCanonical.signature(effective.compactMap {$0["signature"] as? String}.sorted())
+    }
+    /// The source replacement rules are identical for explicit and automatic migration.
+    func mediaReconciledContextSources(_ db: Database,round: JSON,context: JSON,attention: [JSON]) throws -> [JSON] {
+        let record = StoredRecord(round, family:"media_round"),pid = try record.string("project_id")
+        var sources = try strings(context,"source_ids").map {try scoped(db,$0,pid,type:"media_review_context")}
+        for a in attention where !(a["proposed_type_revision_id"] is String) {
+            let source = try scoped(db,try StoredRecord(a, family:"media_context_attention").string("source_id"),pid,type:"media_review_context")
+            sources.removeAll { old in source["kind"] as? String == "project_approval" ? old["kind"] as? String == "project_approval" : old["instruction_id"] as? String == source["instruction_id"] as? String }
+            if mediaScopeMatches(source,type:try record.string("type_id"),round:try record.string("id")) { sources.append(source) }
+        }
+        return try sources.sorted {try StoredRecord($0, family:"media_review_context").string("id") < StoredRecord($1, family:"media_review_context").string("id")}
+    }
+    func mediaReconciledType(_ db: Database,round: JSON,priorType: JSON,attention: [JSON]) throws -> JSON {
+        guard attention.contains(where:{$0["proposed_type_revision_id"] is String}) else {return priorType}
+        let record = StoredRecord(round, family:"media_round"),pid = try record.string("project_id")
+        let head = try scoped(db,try record.string("type_id"),pid,type:"media_review_type")
+        return try scoped(db,try StoredRecord(head, family:"media_review_type").string("adopted_revision_id"),pid,type:"media_review_type_revision")
+    }
+    /// Draft successors may already carry owner decisions. Protect each affected decision,
+    /// while unrelated item-scoped changes can still adopt. A failed carry has no current decision.
+    func mediaUndecidedDraftContextAttention(_ db: Database,round: JSON) throws -> [String] {
+        guard round["state"] as? String == "draft",!strings(round,"attention_ids").isEmpty else {return []}
+        let record = StoredRecord(round, family:"media_round"),pid = try record.string("project_id")
+        let (priorType,context) = try mediaRoundParts(db,round)
+        let protected = try mediaItems(db,round:round).filter {$0["last_decision_id"] != nil}
+        let attentionIDs = strings(round,"attention_ids")
+        var groups: [Data:[JSON]] = [:]
+        for id in attentionIDs {
+            let attention = try scoped(db,id,pid,type:"media_context_attention")
+            let key: String
+            if attention["proposed_type_revision_id"] is String {key = "type"}
+            else {
+                let source = try scoped(db,try StoredRecord(attention, family:"media_context_attention").string("source_id"),pid,type:"media_review_context")
+                key = source["kind"] as? String == "project_approval" ? "project" : "instruction:" + (try StoredRecord(source, family:"media_review_context").string("instruction_id"))
+            }
+            groups[Data(key.utf8),default:[]].append(attention)
+        }
+        var eligible = Set<String>()
+        // Superseding revisions migrate as one chain in original attention order. Leaving
+        // an older revision behind could otherwise restore it during a later migration.
+        for attention in groups.values {
+            let type = try mediaReconciledType(db,round:round,priorType:priorType,attention:attention)
+            var migrated = context
+            migrated["source_ids"] = try mediaReconciledContextSources(db,round:round,context:context,attention:attention).map {try StoredRecord($0, family:"media_review_context").string("id")}
+            let affectsDecision = try protected.contains { item in
+                let target = try scoped(db,try StoredRecord(item, family:"media_item").string("draft_target_id"),pid,type:"media_item_target")
+                let oldShape = try mediaCompatibleShapeForTarget(db,item:item,target:target,typeRevision:priorType,context:context)
+                let newShape = try mediaCompatibleShapeForTarget(db,item:item,target:target,typeRevision:type,context:migrated)
+                return oldShape == nil || newShape == nil || oldShape?["review_basis_signature"] as? String != newShape?["review_basis_signature"] as? String
+            }
+            if !affectsDecision {
+                for a in attention {eligible.insert(try StoredRecord(a, family:"media_context_attention").string("id"))}
+            }
+        }
+        return attentionIDs.filter {eligible.contains($0)}
     }
     /// Opaque MAC binds observation, caller scope/generation and incarnation; no event sequences.
     func mediaToken(_ db: Database,round: JSON,caller: Caller) throws -> String {
@@ -138,7 +196,15 @@ extension CommandRouter {
         try mediaWrite(db,attention,type:"media_context_attention")
         round["attention_ids"] = strings(round,"attention_ids") + [(try StoredRecord(attention, family: "media").string("id"))]
         round["record_references"] = (round["record_references"] as? [JSON] ?? []) + [try mediaRef("media_context_attention",attention)]
-        try mediaWrite(db,revised(round),type:"media_round")
+        round = revised(round);try mediaWrite(db,round,type:"media_round")
+        if caller.isOwner {
+            let automatic = try mediaUndecidedDraftContextAttention(db,round:round)
+            if !automatic.isEmpty {
+                let approval = proposedType != nil ? "review type" : source["kind"] as? String == "project_approval" ? "project context" : "context"
+                _ = try mediaApplyContextReconciliation(db,round:&round,attentionIDs:automatic,action:"migrate",
+                    reason:"Owner approved the \(approval); affected Draft items have no decisions",caller:caller)
+            }
+        }
     }
     /// Hook runs inside the existing project edit transaction. Agent edits are not approvals.
     func mediaProjectContextChanged(_ db: Database,old: JSON,updated: JSON,caller: Caller) throws {

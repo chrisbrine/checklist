@@ -357,12 +357,17 @@ final class MediaRoundTests: XCTestCase {
         checkError("MEDIA_PROJECT_CONTEXT_REQUIRED") {try f.publish(r)}
         project = try f.record(f.project,"project")
         _ = try f.call("media_context_approve",["kind":"project","expected_project_revision":project["revision"]!])
-        _ = try f.reconcile(r);_ = try f.publish(r)
+        XCTAssertTrue(strings(try f.get(r),"attention_ids").isEmpty)
+        _ = try f.publish(r)
         // A different proposal cannot give an unadopted pinned schema publication authority.
         let draftType = try f.type(schema(),adopt:false,as:f.worker),draftRound = try f.round(draftType)
         _ = try f.item(draftRound)
         var cosmetic = schema();cosmetic["name"] = "Renamed proposal"
-        _ = try revise(f,draftType,cosmetic);_ = try f.adoptType(draftType)
+        _ = try revise(f,draftType,cosmetic)
+        let workerType = try f.call("media_type_get",["type_id":draftType["id"]!],as:f.worker)
+        _ = try f.router.handle(method:"media_type_adopt",params:["project_id":f.project,"command_id":uuid(),
+            "type_id":draftType["id"]!,"type_revision_id":workerType["draft_revision_id"]!,
+            "expected_revision":workerType["revision"]!,"observed_type_token":workerType["observed_type_token"]!],caller:f.worker)
         XCTAssertFalse(strings(try f.get(draftRound),"attention_ids").isEmpty)
         _ = try f.reconcile(draftRound,action:"keep")
         checkError("MEDIA_TYPE_NOT_ADOPTED") {try f.publish(draftRound)}
@@ -389,21 +394,17 @@ final class MediaRoundTests: XCTestCase {
         XCTAssertThrowsError(try MediaCanonical.bytes(["n":Double.infinity]))
         XCTAssertNotEqual(try MediaCanonical.bytes(["b":true]),try MediaCanonical.bytes(["b":1]))
     }
-    func testSupersedingInstructionAwayFromEmptyDraftMustFenceIt() throws {
+    func testSupersedingInstructionAwayFromEmptyDraftAutomaticallyMigratesIt() throws {
         let h = MediaRoundTests(), f = try MediaRoundTests.Fixture()
         let t = try f.type(h.schema()), r = try f.round(t)
         let old = try f.call("media_context_approve",["kind":"direction","round_id":r["id"]!,"body":"Old direction"])
-        _ = try f.reconcile(r)
+        XCTAssertTrue(strings(try f.get(r),"attention_ids").isEmpty)
         let other = try f.round(t)
         _ = try f.call("media_context_approve",["kind":"direction","round_id":other["id"]!,"body":"Only the other round now","supersedes_id":old["id"]!])
         let view = try f.get(r)
-        XCTAssertFalse(strings(view,"attention_ids").isEmpty,"Removal of an applicable approved instruction must create attention even before the first Draft item")
+        XCTAssertTrue(strings(view,"attention_ids").isEmpty,"An empty Draft has no decision to protect")
+        XCTAssertTrue(strings(view["context"] as! JSON,"source_ids").isEmpty,"The former instruction scope must be removed")
         _ = try f.item(r)
-        let before = try f.allState()
-        XCTAssertThrowsError(try f.publish(r),"Publication must not silently use the superseded direction")
-        XCTAssertEqual(try f.allState(),before)
-        let reconciled = try f.reconcile(r)
-        XCTAssertTrue(strings(reconciled["context"] as! JSON,"source_ids").isEmpty)
         _ = try f.publish(r)
     }
     func testRevertedTypeAdoptionMustNotMigrateToSupersededRubric() throws {

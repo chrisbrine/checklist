@@ -547,12 +547,14 @@ extension CommandRouter {
         // CL-419: the worker channel already applied the agent_rule_changes gate; every check below is shared.
         if !resources.workerChannel { try owner(c) }
         var round = try scoped(db,try text(p,"round_id"),pid,type:"media_round")
-        try mediaObserve(db,p,round:round,caller:c)
+        let automaticAttention = c.isOwner ? try mediaUndecidedDraftContextAttention(db,round:round) : []
+        let migrateContext = !automaticAttention.isEmpty && automaticAttention == strings(round,"attention_ids")
+        try mediaObserve(db,p,round:round,caller:c,allowAttention:migrateContext)
         guard ["draft","open"].contains(round["state"] as? String ?? "") else { throw CoreError("MEDIA_ROUND_CLOSED","A closed manifest cannot be replaced.") }
         let typeHead = try scoped(db,(try StoredRecord(round, family: "media").string("type_id")),pid,type:"media_review_type")
         guard (typeHead["adoptions"] as? [JSON] ?? []).contains(where:{$0["type_revision_id"] as? String == round["type_revision_id"] as? String}) else { throw CoreError("MEDIA_TYPE_NOT_ADOPTED",
             "The owner must adopt a type before publication.") }
-        let (type,context) = try mediaRoundParts(db,round)
+        var (type,context) = try mediaRoundParts(db,round)
         let hasApprovedProjectHistory = try mediaContextSources(db,project:pid).contains {$0["kind"] as? String == "project_approval"}
         let project = try record(db,pid,type:"project")
         let globalPins = (project["pinned_decisions"] as? [JSON] ?? []).filter {$0["origin"] as? String == "human_ui" && strings($0,"task_kinds").isEmpty && strings($0,"tag_ids").isEmpty}
@@ -574,6 +576,20 @@ extension CommandRouter {
             guard bool(shape,"publication_ready"),shape["review_basis_signature"] as? String == entry["review_basis_signature"] as? String else { throw CoreError("MEDIA_BASIS_CHANGED",
                 "The exact complete target must match the publication preview.") }
             targets.append((item,shape))
+        }
+        if migrateContext {
+            // Validate the exact preview above before changing context. Only the approved
+            // context may change here; captured material and Draft lineage stay exact.
+            _ = try mediaApplyContextReconciliation(db,round:&round,attentionIDs:automaticAttention,
+                action:"migrate",reason:"Owner published a Draft round; affected items have no decisions",caller:c)
+            (type,context) = try mediaRoundParts(db,round)
+            for i in targets.indices {
+                let item = targets[i].0
+                let old = try scoped(db,try StoredRecord(item, family:"media_item").string("draft_target_id"),pid,type:"media_item_target")
+                let shape = try mediaShapeForTarget(db,item:item,target:old,typeRevision:type,context:context)
+                guard bool(shape,"publication_ready") else { throw CoreError("MEDIA_BASIS_CHANGED","The exact complete target must match the publication preview.") }
+                targets[i] = (item,shape)
+            }
         }
         for i in targets.indices {
             var item = targets[i].0
@@ -615,23 +631,19 @@ extension CommandRouter {
         try mediaObserve(db,p,round:round,caller:c,allowAttention:true)
         let attentionIDs = strings(round,"attention_ids"),action = try text(p,"action",max:32),reason = try text(p,"reason",max:4000)
         guard !attentionIDs.isEmpty,strings(p,"attention_ids") == attentionIDs,["keep","migrate"].contains(action) else { throw CoreError("MEDIA_CONTEXT_CHANGED","Reconcile the exact pending attention set with keep or migrate and a reason.") }
+        let receipt = try mediaApplyContextReconciliation(db,round:&round,attentionIDs:attentionIDs,action:action,reason:reason,caller:c)
+        var result = try mediaRoundView(db,round:round,caller:c);result["reconciliation"] = receipt;return result
+    }
+    /// Owner actions share one migration/Keep writer, including immutable provenance and
+    /// attention receipts. Automatic Draft adoption may consume only its safe context subset.
+    func mediaApplyContextReconciliation(_ db: Database,round: inout JSON,attentionIDs: [String],action: String,reason: String,caller c: Caller) throws -> JSON {
+        try owner(c)
+        let pid = try StoredRecord(round, family:"media_round").string("project_id")
         let previousManifest = round["manifest_id"] as? String
         let (priorType,priorContext) = try mediaRoundParts(db,round)
-        var type = priorType,sources = try strings(priorContext,"source_ids").map {try scoped(db,$0,pid,type:"media_review_context")}
         let attention = try attentionIDs.map {try scoped(db,$0,pid,type:"media_context_attention")}
-        if action == "migrate" {
-            if attention.contains(where:{$0["proposed_type_revision_id"] is String}) {
-                let head = try scoped(db,(try StoredRecord(round, family: "media").string("type_id")),pid,type:"media_review_type")
-                type = try scoped(db,(try StoredRecord(head, family: "media").string("adopted_revision_id")),pid,type:"media_review_type_revision")
-            }
-            for a in attention {
-                if a["proposed_type_revision_id"] is String { continue }
-                let source = try scoped(db,(try StoredRecord(a, family: "media").string("source_id")),pid,type:"media_review_context")
-                sources.removeAll { old in source["kind"] as? String == "project_approval" ? old["kind"] as? String == "project_approval" : old["instruction_id"] as? String == source["instruction_id"] as? String }
-                if mediaScopeMatches(source,type:(try StoredRecord(round, family: "media").string("type_id")),round:(try StoredRecord(round, family: "media").string("id"))) { sources.append(source) }
-            }
-        }
-        try sources.sort {((try StoredRecord($0, family: "media").string("id"))) < ((try StoredRecord($1, family: "media").string("id")))}
+        let type = try mediaReconciledType(db,round:round,priorType:priorType,attention:action == "migrate" ? attention : [])
+        let sources = try mediaReconciledContextSources(db,round:round,context:priorContext,attention:action == "migrate" ? attention : [])
         let context = try mediaSnapshot(db,round:round,typeRevision:type,sources:sources,caller:c,previous:priorContext)
         var targets: [(JSON,JSON)] = [],affected: [String] = []
         if let id = round["manifest_id"] as? String {
@@ -665,10 +677,10 @@ extension CommandRouter {
         for var a in attention { a["state"] = "reconciled";a["reconciliation_id"] = receipt["id"];
             a["record_references"] = ((try StoredRecord(a, family: "media").objects("record_references"))) + [try mediaRef("media_context_reconciliation",
             receipt)];try mediaWrite(db,revised(a),type:"media_context_attention") }
-        round["context_id"] = context["id"];round["type_revision_id"] = type["id"];round["attention_ids"] = [String]()
+        round["context_id"] = context["id"];round["type_revision_id"] = type["id"];round["attention_ids"] = strings(round,"attention_ids").filter { !attentionIDs.contains($0) }
         round["record_references"] = ((try StoredRecord(round, family: "media").objects("record_references"))) + [try mediaRef("media_review_context",
             context),try mediaRef("media_review_type_revision",type),try mediaRef("media_context_reconciliation",
             receipt)]
-        round = revised(round);try mediaWrite(db,round,type:"media_round");var result = try mediaRoundView(db,round:round,caller:c);result["reconciliation"] = receipt;return result
+        round = revised(round);try mediaWrite(db,round,type:"media_round");return receipt
     }
 }

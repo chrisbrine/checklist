@@ -417,6 +417,130 @@ import ChecklistIPC
         still.toggle(card(still,0))
         XCTAssertEqual(still.playback.playingKeys,Set(still.keys(card(still,0))))
     }
+    // MARK: Visible cards from frames (CL-421 rework 421d: autoplay after scrolling)
+
+    /// Frames of a three-column grid in the scroll view's coordinates. Row `r` starts at
+    /// `r * rowHeight - offset`. `rows` limits the cells that a lazy grid still lays out.
+    private func gridFrames(_ review: MediaSimpleReviewModel,offset: CGFloat,rowHeight: CGFloat = 300,rows: ClosedRange<Int>? = nil) -> [String: CGRect] {
+        var frames: [String: CGRect]=[:]
+        for (index,id) in review.order.enumerated() where rows?.contains(index/3) ?? true {
+            frames[id]=CGRect(x:CGFloat(index%3)*400,y:CGFloat(index/3)*rowHeight-offset,width:390,height:rowHeight-10)
+        }
+        return frames
+    }
+    private func playingCards(_ review: MediaSimpleReviewModel) -> [Int] {review.order.indices.filter {review.isPlaying(card(review,$0))}}
+    private func fullyPlaying(_ review: MediaSimpleReviewModel,_ index: Int) -> Bool {review.keys(card(review,index)).allSatisfy {review.playback.playingKeys.contains($0)}}
+
+    func testVisibleOrderUsesFramesNearestTheMiddleFirst() {
+        let frames=["a":CGRect(x:0,y:-400,width:100,height:290),"b":CGRect(x:0,y:-100,width:100,height:290),"c":CGRect(x:0,y:300,width:100,height:290),
+                    "d":CGRect(x:400,y:300,width:100,height:290),"e":CGRect(x:0,y:700,width:100,height:290),"f":CGRect(x:0,y:600,width:100,height:0)]
+        XCTAssertEqual(MediaSimpleReviewModel.visibleOrder(frames:frames,viewport:700),["c","d","b"],"Off-screen cells and empty frames are not visible; nearest the middle first, then left to right")
+        XCTAssertEqual(MediaSimpleReviewModel.visibleOrder(frames:frames,viewport:0),[])
+    }
+    /// The runner's sequence: the top row plays, then the view scrolls two pages and one page. The
+    /// lazy grid first keeps the old cells (their frames move off screen; no leave report), then
+    /// drops them (no frame at all). The budget frees and each newly visible card plays its take
+    /// and its earlier-take video reference by itself.
+    func testScrollMovesTheVisibleCardsWithoutLeaveReportsAndNewCardsPlay() async {
+        let (review,log)=await windowReview(13,make:videoItem)
+        review.updateViewport(height:300)
+        review.updateFrames(gridFrames(review,offset:0))
+        await review.settle()
+        XCTAssertEqual(review.priority,ids(0...2));XCTAssertEqual(playingCards(review),[0,1,2])
+        for index in 0...2 {XCTAssertTrue(fullyPlaying(review,index))}
+        // Two pages down. The old cells keep a frame above the visible area.
+        review.updateFrames(gridFrames(review,offset:600))
+        await review.settle()
+        XCTAssertEqual(review.priority,ids(6...8))
+        XCTAssertEqual(playingCards(review),[6,7,8],"The cards that scrolled off free the budget with no leave report")
+        for index in 6...8 {XCTAssertTrue(fullyPlaying(review,index),"Card \(index) plays its take and its video reference")}
+        XCTAssertEqual(review.playback.playingKeys.count,6)
+        XCTAssertGreaterThanOrEqual(log.controls["item-c00"]?.pauses ?? 0,1)
+        // One page down. The lazy grid dropped the cells of rows 0 and 1: they report no frame.
+        review.updateFrames(gridFrames(review,offset:900,rows:2...4))
+        await review.settle()
+        XCTAssertEqual(playingCards(review),[9,10,11])
+        for index in 9...11 {
+            XCTAssertTrue(fullyPlaying(review,index))
+            XCTAssertGreaterThanOrEqual(log.controls["item-"+name(index)+"#ref"]?.plays ?? 0,1,"The earlier take of card \(index) plays beside its take")
+        }
+        // A little more: the last row comes into view too. Four cards with references fill the budget.
+        review.updateFrames(gridFrames(review,offset:1000,rows:2...4))
+        await review.settle()
+        XCTAssertEqual(playingCards(review),[9,10,11,12]);XCTAssertEqual(review.playback.playingKeys.count,MediaSimpleReviewModel.playingTakes)
+        XCTAssertTrue(fullyPlaying(review,12))
+    }
+    /// The old model played a visible card only when it was shown or when its player became ready.
+    /// A card refused at the budget stayed still after the budget freed.
+    func testVisibleCardRefusedAtTheBudgetPlaysWhenTheBudgetFrees() async {
+        let (review,log)=await windowReview(10,make:videoItem)
+        show(review,[0,1,2,3])
+        await review.settle()
+        XCTAssertEqual(playingCards(review),[0,1,2,3])
+        // The next card comes on screen before the first one leaves (a scroll step).
+        show(review,[4])
+        await review.settle()
+        XCTAssertNotNil(review.playback.takes[card(review,4).key]);XCTAssertFalse(review.isPlaying(card(review,4)),"No budget yet: still frame with Play")
+        hide(review,[0])
+        XCTAssertEqual(playingCards(review),[1,2,3,4],"The freed budget goes to the waiting visible card")
+        XCTAssertTrue(fullyPlaying(review,4))
+        XCTAssertEqual(log.controls["item-c04"]?.plays,1);XCTAssertEqual(log.controls["item-c04#ref"]?.plays,1)
+    }
+    func testOwnerPausedCardStaysPausedAfterAScroll() async {
+        let (review,log)=await windowReview(13)
+        review.updateViewport(height:300)
+        review.updateFrames(gridFrames(review,offset:0))
+        await review.settle()
+        XCTAssertEqual(playing(review),[0,1,2])
+        review.toggle(card(review,1))
+        XCTAssertEqual(playing(review),[0,2])
+        review.updateFrames(gridFrames(review,offset:600))
+        await review.settle()
+        XCTAssertEqual(playing(review),[6,7,8])
+        review.updateFrames(gridFrames(review,offset:0))
+        await review.settle()
+        XCTAssertEqual(playing(review),[0,2],"The owner's Pause holds after the card scrolls off and back")
+        XCTAssertEqual(log.controls["item-c01"]?.plays,1)
+        review.toggle(card(review,1))
+        XCTAssertEqual(playing(review),[0,1,2])
+        // Pause all takes holds across a scroll; Play all takes plays the visible cards again.
+        review.pauseAll()
+        review.updateFrames(gridFrames(review,offset:300))
+        await review.settle()
+        XCTAssertTrue(playing(review).isEmpty)
+        review.playAll()
+        XCTAssertEqual(playing(review),[3,4,5])
+        // Reduce Motion: no card plays by itself after a scroll; the owner's Play still works.
+        let (still,_)=await windowReview(13)
+        still.setReduceMotion(true)
+        still.updateViewport(height:300)
+        still.updateFrames(gridFrames(still,offset:600))
+        await still.settle()
+        XCTAssertTrue(playing(still).isEmpty)
+        still.toggle(card(still,7))
+        XCTAssertEqual(playing(still),[7])
+        still.updateFrames(gridFrames(still,offset:900))
+        await still.settle()
+        XCTAssertTrue(playing(still).isEmpty,"Reduce Motion keeps newly visible cards still")
+    }
+    func testBudgetOverflowPlaysTheCardsNearestTheMiddle() async {
+        let (review,_)=await windowReview(15,make:videoItem)
+        // Rows 0 to 2 are visible: nine cards, eighteen players. Row 1 is in the middle, row 2 is
+        // nearer to the middle than row 0.
+        review.updateViewport(height:900)
+        review.updateFrames(gridFrames(review,offset:0))
+        await review.settle()
+        XCTAssertEqual(review.priority,ids([3,4,5,6,7,8,0,1,2]))
+        XCTAssertEqual(playingCards(review),[3,4,5,6]);XCTAssertEqual(review.playback.playingKeys.count,8)
+        for index in [0,1,2,7,8] {XCTAssertNotNil(review.playback.takes[card(review,index).key],"Card \(index) shows its still frame")}
+        // The visible area gets shorter: rows 0 and 1 stay. Row 2 leaves and frees the budget,
+        // and the nearest waiting card plays.
+        review.updateViewport(height:600)
+        await review.settle()
+        XCTAssertEqual(review.priority,ids([3,4,5,0,1,2]))
+        XCTAssertEqual(playingCards(review),[0,3,4,5])
+        for index in [0,3,4,5] {XCTAssertTrue(fullyPlaying(review,index))}
+    }
     func testReviewModelAssignsOnlyChangedLists() {
         var rows=[row("N"),row("E")]
         XCTAssertFalse(MediaReviewModel.assignIfChanged(&rows,[row("N"),row("E")]))

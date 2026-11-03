@@ -84,9 +84,10 @@ final class MediaStoredRecordTests: XCTestCase {
         XCTAssertEqual(adopted["adopted_revision_id"] as? String, proposed["draft_revision_id"] as? String)
         XCTAssertEqual(int(adopted, "revision"), int(proposed, "revision") + 1)
         let afterRound = try f.record(roundID, "media_round")
-        XCTAssertEqual(int(afterRound, "revision"), int(beforeRound, "revision") + 1)
-        XCTAssertEqual(strings(afterRound, "attention_ids").count, 1)
+        XCTAssertEqual(int(afterRound, "revision"), int(beforeRound, "revision") + 2)
+        XCTAssertTrue(strings(afterRound, "attention_ids").isEmpty)
         XCTAssertEqual(try f.rows("media_context_attention").count, 1)
+        XCTAssertEqual(try f.rows("media_context_attention").first?["state"] as? String,"reconciled")
     }
 
     func testMaterialReferenceAdoptionPropagatesMalformedApprovedTargetWithoutMutation() throws {
