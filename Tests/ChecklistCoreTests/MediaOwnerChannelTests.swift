@@ -23,7 +23,8 @@ final class MediaOwnerChannelTests: XCTestCase {
             let catalog = try jsonString(f.router.handle(method:"tool_catalog",params:[:],caller:role))
             if role.role == "worker" {
                 for method in CommandRouter.mediaWorkerMethods {XCTAssertTrue(catalog.contains(method),method)}
-                for method in ["media_round_publish","media_decide","media_type_adopt","media_context_approve"] {XCTAssertFalse(catalog.contains(method),method)}
+                // CL-419: type changes and publication are agent setting changes; decisions and context stay owner only.
+                for method in ["media_decide","media_context_approve","media_adopt_suggestion"] {XCTAssertFalse(catalog.contains(method),method)}
             } else {XCTAssertFalse(catalog.contains("media_"))}
         }
         for method in ["media_suggest","media_material_reference_adopt"] {

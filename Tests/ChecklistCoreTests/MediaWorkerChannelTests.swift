@@ -182,7 +182,7 @@ final class MediaWorkerChannelTests: XCTestCase {
         before = try f.allState()
         checks.checkError("FORBIDDEN") {try worker(f,"media_round_create",["type_id":type["id"]!,"title":"Outside grant"],as:denied)}
         checks.checkError("FORBIDDEN") {try worker(f,"media_round_get",["round_id":created["id"]!],as:denied)}
-        for method in ["media_round_publish","media_decide","media_type_adopt","media_context_approve","media_context_reconcile"] {
+        for method in ["media_decide","media_context_approve","media_context_reconcile"] {
             checks.checkError("FORBIDDEN") {try worker(f,method,["round_id":created["id"]!])}
         }
         for key in ["origin","author","author_session_id"] {

@@ -152,7 +152,8 @@ extension CommandRouter {
             // A publication must account for every included intake row, even if a
             // caller supplies a smaller selection of otherwise valid Drafts.
             let attachments: [JSON] = try dbQueue.read { db in
-                try self.owner(c)
+                // CL-419: a worker publication passed mediaWorkerWriteAccess above; reconcile stays owner only.
+                if !(workerChannel && method == "media_round_publish") { try self.owner(c) }
                 let round = try self.scoped(db,try text(p,"round_id"),pid,type:"media_round")
                 try self.mediaObserve(db,p,round:round,caller:c,allowAttention:method == "media_context_reconcile")
                 if method == "media_round_publish" { try self.mediaValidateIntakePublication(db,round:round,selection:p["items"] as? [JSON] ?? []) }

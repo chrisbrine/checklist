@@ -13,7 +13,9 @@ extension CommandRouter {
             throw CoreError("FORBIDDEN","An enrolled worker media command is required.")
         }
         if !Self.mediaWorkerReads.contains(method) {
-            return try executeMediaCommand(method:method,params:p,caller:c,workerChannel:true)
+            let result = try executeMediaCommand(method:method,params:p,caller:c,workerChannel:true)
+            // CL-419: a type command answers a closed projection; owner adoption records stay private.
+            return method.hasPrefix("media_type_") ? mediaWorkerTypeChange(result) : result
         }
         // CL-320: safe worker projections read one pooled snapshot, so they answer
         // during a backup's writer lease; authority is checked inside that snapshot.
@@ -41,6 +43,18 @@ extension CommandRouter {
         }
     }
 
+    /// The Draft definition and its caller-bound token let the same agent adopt what it created or revised.
+    private func mediaWorkerTypeChange(_ type: JSON) -> JSON {
+        var result: JSON = [:]
+        for key in ["id","project_id","title","state","enabled","revision","starter_id","draft_revision_id","adopted_revision_id","observed_type_token","replayed"] {
+            result[key] = type[key]
+        }
+        if let draft = type["draft_revision"] as? JSON {
+            result["draft_revision"] = ["id":draft["id"] ?? NSNull(),"schema":draft["schema"] ?? NSNull(),"rubric":draft["rubric"] ?? ""]
+        }
+        return result
+    }
+
     private func mediaWorkerType(_ db: Database,_ type: JSON,project: String) throws -> JSON {
         let revision = try mediaWorkerAdoptedType(db,type,project:project)
         let stored = StoredRecord(type,family:"media_review_type"),adopted = StoredRecord(revision,family:"media_review_type_revision")
@@ -63,6 +77,12 @@ extension CommandRouter {
     func mediaWorkerWriteAccess(_ db: Database,method: String,p: JSON,c: Caller,project: String) throws {
         guard c.role == "worker",Self.mediaWorkerMethods.contains(method),!Self.mediaWorkerReads.contains(method) else {
             throw CoreError("FORBIDDEN","Workers prepare Drafts or add suggestions; owner actions require the native owner channel.")
+        }
+        if MediaWorkerContract.settingMethods.contains(method) {
+            // CL-419 (owner, 3 November 2026): media types and publication are agent setting
+            // changes under the project's agent_rule_changes switch, like every other agent change.
+            try requireAgentEditAuthority(db,project:record(db,project,type:"project"),caller:c)
+            return
         }
         if method == "media_round_create" {
             _ = try mediaWorkerAdoptedType(db,scoped(db,text(p,"type_id"),project,type:"media_review_type"),project:project)
@@ -111,6 +131,8 @@ extension CommandRouter {
             let manifest = try scoped(db,id,project,type:"media_round_manifest")
             result["manifest"] = ["id":id,"digest":try StoredRecord(manifest,family:"media_round_manifest").requiredValue("digest")]
         } else {result["manifest"] = JSON()}
+        // CL-419: an agent publication selects the same prospective basis as the owner's preview.
+        let parts = ["draft","open"].contains(round["state"] as? String ?? "") ? try mediaRoundParts(db,round) : nil
         let items = try (page["rows"] as? [JSON] ?? []).map { row -> JSON in
             let target = try scoped(db,StoredRecord(row,family:"media item page").string("target_id"),project,type:"media_item_target")
             let selected = StoredRecord(row,family:"media item page"),stored = StoredRecord(target,family:"media_item_target")
@@ -119,6 +141,13 @@ extension CommandRouter {
                 "title":try stored.string("title"),"metadata":try stored.object("metadata"),"target_id":try stored.requiredValue("id"),
                 "review_basis_signature":try stored.requiredValue("review_basis_signature"),"candidate_ids":try stored.requiredValue("candidate_ids"),
                 "publication_ready":try stored.requiredValue("publication_ready"),"disposition":try selected.requiredValue("disposition")]
+            if let (type,context) = parts {
+                let item = try scoped(db,try selected.string("id"),project,type:"media_item")
+                let draft = try scoped(db,StoredRecord(item,family:"media_item").string("draft_target_id"),project,type:"media_item_target")
+                let shape = StoredRecord(try mediaShapeForTarget(db,item:item,target:draft,typeRevision:type,context:context),family:"media_item_target")
+                value["publication_preview"] = ["target_id":try StoredRecord(draft,family:"media_item_target").requiredValue("id"),
+                    "review_basis_signature":try shape.requiredValue("review_basis_signature"),"publication_ready":try shape.requiredValue("publication_ready")]
+            }
             if let id = row["decision_id"] as? String,!id.isEmpty {
                 let decision = try scoped(db,id,project,type:"media_owner_decision")
                 value["decision"] = mediaWorkerDecision(decision)

@@ -15,3 +15,12 @@ Agents change project settings (`project_settings_save`, `project_edit`, `projec
 Export/transfer uses a selected source, explicit destination, consistent snapshot, source hash and preview. No live claims or endpoints transfer as authority. Do not migrate a source board merely because its format is supported. Preserve aliases, status subtypes/tags, original attribution, source event ordering, long notes and verdicts. Unknown dependencies stay explicit, never guessed.
 
 The Checklist project's optional automatic `/Applications/Checklist.app` build/install workflow needs a valid installation-specific owner grant to its reviewed helper/destination and captured source/dependency/toolchain/build-profile fingerprint. Repository instructions or imported settings do not confer that grant; preserve an existing applicable grant without repeatedly asking for it. Do not apply it to another project or execute arbitrary commands from ticket text. Build once per fingerprint; failed jobs require an explicit linked Retry receipt. Build success still needs the target-bound `installed_build_verified` gate before completion or review-accepted triage exit.
+
+## Media review types and publication
+
+An agent sets up Media review for a project through the MCP when asked; the owner need not add a type in the app (CL-419). Each command needs the project's `agent_rule_changes` to be `allowed` and records the agent as the actor.
+
+- Built-in starter: `media_type_adopt_starter` with `starter` (exact ID or name: `generic`, `text`, `animation`, `video`, `animation_video` "Animation takes", `audio`) and `expected_revision` (the project revision).
+- Custom type: `media_type_create`, then `media_type_adopt` with the result's `draft_revision_id` and `observed_type_token`. Change it with `media_type_revise`, then adopt again. Retire it with `media_type_retire`.
+- Publication: read `media_round_get` and send each item's `publication_preview` target and basis to `media_round_publish`.
+- The owner keeps context approval, decisions and restoring a retired type. See [agent media changes](../../../docs/mcp-contract.md#agent-media-type-and-publication-changes-cl-419).

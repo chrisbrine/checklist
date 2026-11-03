@@ -7,7 +7,7 @@ final class MediaWorkerContractTests: XCTestCase {
     private let fixtureDigest = String(repeating: "a", count: 64)
 
     func testClosedWorkerCatalogAndReadClassification() throws {
-        XCTAssertEqual(MediaWorkerContract.methods.count, 12)
+        XCTAssertEqual(MediaWorkerContract.methods.count, 12 + MediaWorkerContract.settingMethods.count, "CL-419 adds the setting methods to the 12 worker methods")
         XCTAssertEqual(CommandMethods.mediaWorkerReads, MediaWorkerContract.readMethods)
         XCTAssertTrue(CommandMethods.mediaWorkerReads.isSubset(of: CommandMethods.coreReads))
         for method in MediaWorkerContract.methods {
@@ -16,7 +16,10 @@ final class MediaWorkerContractTests: XCTestCase {
             let required = try XCTUnwrap(schema["required"] as? [String])
             XCTAssertEqual(required.contains("command_id"), !MediaWorkerContract.readMethods.contains(method))
         }
-        for method in ["media_round_publish", "media_decide", "media_adopt_suggestion", "media_type_adopt", "media_item_create"] {
+        // CL-419: media type changes and publication are worker setting commands; decisions stay owner only.
+        XCTAssertTrue(MediaWorkerContract.settingMethods.isSubset(of: MediaWorkerContract.methods))
+        XCTAssertEqual(MediaWorkerContract.settingMethods, ["media_type_adopt_starter", "media_type_create", "media_type_revise", "media_type_adopt", "media_type_retire", "media_round_publish"])
+        for method in ["media_decide", "media_adopt_suggestion", "media_item_create", "media_context_approve", "media_context_reconcile"] {
             XCTAssertNil(MediaWorkerContract.inputSchema(method), method)
             XCTAssertThrowsError(try MediaWorkerContract.validate(method, parameters: write), method)
         }

@@ -9,7 +9,13 @@ public enum MediaWorkerContract {
     public static let methods: Set<String> = readMethods.union([
         "media_round_create", "media_intake_preview", "media_intake_revise",
         "media_intake_confirm", "media_intake_capture", "media_suggest", "media_follow_up_record",
-    ])
+    ]).union(settingMethods)
+    /// CL-419 (owner, 3 November 2026): media type and publication commands are agent
+    /// project setting changes. The service refuses each one while the project's
+    /// `agent_rule_changes` switch is `owner_only`; the owner's app routes are unchanged.
+    public static let settingMethods: Set<String> = [
+        "media_type_adopt_starter", "media_type_create", "media_type_revise", "media_type_adopt", "media_type_retire", "media_round_publish",
+    ]
 
     public struct ValidationError: Error, CustomStringConvertible, Sendable {
         public let description: String
@@ -32,6 +38,33 @@ public enum MediaWorkerContract {
         case "media_round_create":
             properties["type_id"] = text(4_000); properties["title"] = text(2_000)
             required += ["type_id", "title"]
+        case "media_type_adopt_starter":
+            properties["starter"] = text(256); properties["title"] = text(256)
+            properties["expected_revision"] = revision
+            required += ["starter", "expected_revision"]
+        case "media_type_create":
+            properties["title"] = text(256); properties["schema"] = ["type": "object", "maxProperties": 64]
+            properties["rubric"] = text(16_000)
+            required += ["title"]
+        case "media_type_revise":
+            properties["type_id"] = text(4_000); properties["expected_revision"] = revision
+            properties["title"] = text(256); properties["schema"] = ["type": "object", "maxProperties": 64]
+            properties["rubric"] = text(16_000)
+            required += ["type_id", "expected_revision"]
+        case "media_type_adopt":
+            properties["type_id"] = text(4_000); properties["expected_revision"] = revision
+            properties["type_revision_id"] = text(4_000); properties["observed_type_token"] = text(65_536)
+            required += ["type_id", "expected_revision", "type_revision_id", "observed_type_token"]
+        case "media_type_retire":
+            properties["type_id"] = text(4_000); properties["expected_revision"] = revision
+            required += ["type_id", "expected_revision"]
+        case "media_round_publish":
+            properties["round_id"] = text(4_000); properties["expected_revision"] = revision
+            properties["observed_context_token"] = text(65_536)
+            properties["items"] = ["type": "array", "minItems": 1, "maxItems": 200, "items": object([
+                "item_id": text(4_000), "expected_revision": revision, "target_id": text(4_000), "review_basis_signature": digest,
+            ], required: ["item_id", "expected_revision", "target_id", "review_basis_signature"])]
+            required += ["round_id", "expected_revision", "observed_context_token", "items"]
         case "media_round_get", "media_decision_list":
             properties["round_id"] = text(4_000)
             properties["cursor"] = text(method == "media_round_get" ? 1_400_000 : 512)
