@@ -1,5 +1,9 @@
 import SwiftUI
 import AppKit
+import AVFoundation
+/// Scoped imports: Combine also declares `Record`.
+import class Combine.AnyCancellable
+import protocol Combine.Publisher
 import ChecklistCore
 import ChecklistIPC
 
@@ -78,10 +82,121 @@ struct MediaSimpleSection: Identifiable {
     let cards: [MediaDirectionCard]
 }
 
+/// The prepared takes of the simple card review, kept by take key. A prepared take that does
+/// not play stays paused. At most `MediaSimpleReviewModel.preparedTakes` takes are prepared
+/// and at most `MediaSimpleReviewModel.playingTakes` play. The model decides which.
+@MainActor final class MediaSimpleTakeCache: ObservableObject, MediaTakePreparationBudget {
+    /// The byte and pixel totals are the direction-grid totals times preparedTakes / directionGridTakes (3),
+    /// so each prepared take keeps the same average share as a direction-grid take.
+    static let scale = MediaSimpleReviewModel.preparedTakes / MediaPlaybackBudget.directionGridTakes
+    static let cacheBytes = MediaPlaybackBudget.directionGridCacheBytes * scale
+    static let cachePixels = MediaPlaybackBudget.directionGridPixels * scale
+    @Published private(set) var takes: [String: MediaPreparedTake] = [:]
+    @Published private(set) var playingKeys = Set<String>()
+    private var preparing: String?
+    private var observations: [String: AnyCancellable] = [:]
+    var cachedBytes: Int {takes.values.reduce(0) {$0+$1.measurement.bytes}}
+    var cachedPixels: Int {takes.values.reduce(0) {$0+$1.measurement.facts.width*$1.measurement.facts.height}}
+    func beginPreparation(_ key: String) -> Bool {
+        guard preparing == nil || preparing == key else {return false}
+        preparing=key;return true
+    }
+    func endPreparation(_ key: String) {if preparing == key {preparing=nil}}
+    /// Checked before a native player is made, and again when the take is admitted.
+    func gridAllows(bytes: Int,facts: MediaPlaybackBudget.Facts) -> Bool {
+        guard takes.count < MediaSimpleReviewModel.preparedTakes,bytes > 0,bytes <= MediaPlaybackBudget.directionGridOriginalBytes,
+              cachedBytes+bytes <= Self.cacheBytes,facts.width > 0,facts.height > 0,facts.width <= 1024,facts.height <= 1024 else {return false}
+        return cachedPixels+facts.width*facts.height <= Self.cachePixels
+    }
+    @discardableResult func admit(_ take: MediaPreparedTake) -> Bool {
+        release(take.key)
+        guard take.kind == "video",gridAllows(bytes:take.measurement.bytes,facts:take.measurement.facts) else {take.control.unload();return false}
+        takes[take.key]=take
+        if let player=take.player {
+            // The inline native controls can start or stop a take directly.
+            observations[take.key]=player.publisher(for:\.timeControlStatus).receive(on:DispatchQueue.main).sink {[weak self,key=take.key] status in
+                MainActor.assumeIsolated {
+                    guard let self else {return}
+                    if status == .paused {self.stopped(key)} else if self.takes[key] != nil,!self.playingKeys.contains(key) {self.playingKeys.insert(key)}
+                }
+            }
+        }
+        return true
+    }
+    /// Plays a prepared take. It refuses when `limit` takes already play.
+    @discardableResult func play(_ key: String,limit: Int = MediaSimpleReviewModel.playingTakes) -> Bool {
+        guard let take=takes[key],playingKeys.contains(key) || playingKeys.count < limit else {return false}
+        if !playingKeys.contains(key) {playingKeys.insert(key)}
+        take.control.play();return true
+    }
+    /// Plays the prepared players of one card together: all of them or none. It refuses when
+    /// they do not all fit under `limit` playing players.
+    @discardableResult func play(_ keys: [String],limit: Int) -> Bool {
+        let waiting=keys.filter {takes[$0] != nil && !playingKeys.contains($0)}
+        guard !waiting.isEmpty,playingKeys.count+waiting.count <= limit else {return false}
+        for key in waiting {play(key,limit:limit)}
+        return true
+    }
+    /// Moves a prepared player back to its first frame, without a play or pause.
+    func rewind(_ key: String) {takes[key]?.player?.seek(to:.zero)}
+    /// Pauses a take. With `rewind` it goes back to its first frame.
+    func pause(_ key: String,rewind: Bool = false) {
+        guard let take=takes[key] else {return}
+        take.control.pause()
+        if rewind {take.player?.seek(to:.zero)}
+        stopped(key)
+    }
+    func pauseAll() {for key in Array(takes.keys) {pause(key)}}
+    func release(_ key: String) {
+        guard let take=takes.removeValue(forKey:key) else {return}
+        observations[key]=nil;take.control.unload();take.player?.replaceCurrentItem(with:nil)
+        stopped(key)
+    }
+    func releaseAll() {for key in Array(takes.keys) {release(key)}}
+    private func stopped(_ key: String) {if playingKeys.contains(key) {playingKeys.remove(key)}}
+}
+
+/// One native player of a card: the take (`slotID` nil, the layout's primary slot) or the
+/// card's video reference (`slotID` is that declared reference slot).
+struct MediaSimplePlayer: Equatable {
+    let key: String
+    let slotID: String?
+    var isReference: Bool {slotID != nil}
+}
+
+/// The reference shown beside a card's take. `kind` is "image" or "video".
+struct MediaSimpleReference {
+    let slot: Record
+    let original: Record
+    let kind: String
+}
+
 /// One card per item (one direction of one move). Cards and their players are kept by item
-/// ID. A refresh diffs the rows by ID: an unchanged row keeps its card, item and playing
-/// take; a changed row reads only that item again and updates its card in place.
+/// ID. A card holds one player for its take, and a second one when its reference is a video.
+/// Both players count against `preparedTakes` and `playingTakes`. A refresh diffs the rows by
+/// ID: an unchanged row keeps its card, item and playing take; a changed row reads only that
+/// item again and updates its card in place.
+///
+/// Take window: the views report which cards are on screen. The window is the visible cards plus
+/// `preloadCards` cards before and after them. Each card in the window gets a prepared take, one
+/// at a time, nearest to the visible cards first. Only visible cards play; the other prepared
+/// takes stay paused at their first frame. A take is released only when its card leaves the
+/// window (or its card or target goes). At `preparedTakes` the take farthest from the visible
+/// cards is released first, and never for a card that is farther away.
 @MainActor final class MediaSimpleReviewModel: ObservableObject {
+    /// Cards before and after the visible cards that get a take ahead of time: two rows of a
+    /// three-column grid (three rows at two columns, one and a half rows at four).
+    static let preloadCards = 6
+    /// The most prepared takes (native players) at once.
+    static let preparedTakes = 24
+    /// The most takes that play at once: the direction-grid budget.
+    static let playingTakes = MediaPlaybackBudget.directionGridTakes
+    /// How a player is made for a card: its take, or its video reference (`player.slotID`).
+    /// The view supplies the native preparation; tests supply fakes.
+    struct TakeSource {
+        var schema: @MainActor (MediaDirectionCard) -> MediaValues
+        var prepare: @MainActor (MediaDirectionCard,MediaValues,MediaSimplePlayer,@escaping @MainActor () -> Bool) async throws -> MediaPreparedTake
+    }
     @Published private(set) var order: [String] = []
     @Published var pausedByOwner = false
     private(set) var cards: [String: MediaDirectionCard] = [:]
@@ -91,10 +206,19 @@ struct MediaSimpleSection: Identifiable {
     private var rowValues: [String: NSDictionary] = [:]
     private var groupTitles: [String: String] = [:]
     private(set) var scope = ""
-    private var preparation: Task<Void,Never>?
     private var readingItems = false
     var referenceImages: [String: NSImage] = [:]
-    let playback = MediaPlaybackCoordinator(directionGrid: true)
+    let playback = MediaSimpleTakeCache()
+    var source: TakeSource?
+    var reduceMotion = false
+    /// The prepared-take bound in use. It is `preparedTakes`; a test can set a smaller one.
+    var preparedLimit = MediaSimpleReviewModel.preparedTakes
+    /// The order indices from the first to the last visible card. It stays when no card is on
+    /// screen for a moment (a scroll step or a refresh), so that no take is released then.
+    private(set) var focus: ClosedRange<Int>?
+    private var failedKeys = Set<String>()
+    private var pump: Task<Void,Never>?
+    private var pumpGeneration = 0
     var orderedCards: [MediaDirectionCard] {order.compactMap {cards[$0]}}
     var sections: [MediaSimpleSection] {
         var result: [MediaSimpleSection] = [],seen: [String: Int] = [:]
@@ -106,10 +230,28 @@ struct MediaSimpleSection: Identifiable {
         }
         return result
     }
+    /// The layout of the card's type revision.
+    func layout(_ card: MediaDirectionCard) -> MediaValues {
+        let schema=source?.schema(card) ?? (card.header.object("type_revision")["schema"] as? MediaValues) ?? [:]
+        return schema["layout"] as? MediaValues ?? [:]
+    }
+    /// The card's reference player, when its chosen reference is a video. The key holds the
+    /// reference ID, so a changed reference gets a new player.
+    func referencePlayer(_ card: MediaDirectionCard) -> MediaSimplePlayer? {
+        guard let reference=Self.reference(item:card.item,layout:layout(card)),reference.kind=="video" else {return nil}
+        return MediaSimplePlayer(key:"reference:"+card.key+":"+reference.original.string("reference_id"),slotID:reference.slot.string("slot_id"))
+    }
+    /// The card's players: the take first, then a video reference.
+    func players(_ card: MediaDirectionCard) -> [MediaSimplePlayer] {
+        [MediaSimplePlayer(key:card.key,slotID:nil)]+(referencePlayer(card).map {[$0]} ?? [])
+    }
+    func keys(_ card: MediaDirectionCard) -> [String] {players(card).map(\.key)}
+    /// True when a player of the card plays.
+    func isPlaying(_ card: MediaDirectionCard) -> Bool {keys(card).contains {playback.playingKeys.contains($0)}}
 
     func reset() {
-        preparation?.cancel();preparation=nil;playback.releaseAll()
-        cards=[:];rowValues=[:];groupTitles=[:];stale=[];visible=[];referenceImages=[:]
+        pump?.cancel();pump=nil;pumpGeneration+=1;playback.releaseAll()
+        cards=[:];rowValues=[:];groupTitles=[:];stale=[];visible=[];focus=nil;failedKeys=[];referenceImages=[:]
         if !order.isEmpty {order=[]}
     }
     /// A changed round header moves into each card in place; an unchanged one changes nothing.
@@ -133,11 +275,12 @@ struct MediaSimpleSection: Identifiable {
             rowValues[row.id]=values;changed.insert(row.id)
         }
         for id in Array(cards.keys) where !seen.contains(id) {
-            if let card=cards.removeValue(forKey:id) {playback.release(card.key)}
+            if let card=cards.removeValue(forKey:id) {for key in keys(card) {playback.release(key)}}
             rowValues[id]=nil;groupTitles[id]=nil;stale.remove(id);visible.remove(id)
         }
         stale.formUnion(changed)
         if ids != order {order=ids}
+        schedule()
         return changed
     }
     /// Reads each changed item, one at a time, in list order. Only that card changes.
@@ -156,54 +299,192 @@ struct MediaSimpleSection: Identifiable {
             catch {if scope==current {cards[id]?.status=PlainError.text(error)}}
         }
     }
-    /// Updates one card in place. The take is kept unless the reviewed target changed.
+    /// Updates one card in place. The take is kept unless the reviewed target changed; the video
+    /// reference is kept unless the target or the chosen reference changed.
     func apply(_ item: Record,to card: MediaDirectionCard) {
         guard !MediaReviewModel.sameRecord(card.item,item) else {return}
-        let previous=card.key
+        let previous=keys(card)
         card.item=item
-        if card.key != previous {playback.release(previous)}
+        let current=keys(card)
+        if current != previous {
+            for key in previous where !current.contains(key) {playback.release(key)}
+            schedule()
+        }
         if card.draft.basis.isEmpty,!card.target.id.isEmpty {card.inspectCurrentBasis()}
     }
-    /// Prepares one take at a time for a card on screen, then plays it muted and looped,
-    /// unless Reduce Motion or the owner's Pause keeps the still first frame.
-    func requestTake(_ card: MediaDirectionCard,model: MediaReviewModel,schema: MediaValues,reduceMotion: Bool) {
+
+    /// The order indices of the cards that keep a take: the visible cards and `preloadCards` on each side.
+    var window: ClosedRange<Int>? {
+        guard let focus,!order.isEmpty else {return nil}
+        let low=max(0,focus.lowerBound-Self.preloadCards),high=min(order.count-1,focus.upperBound+Self.preloadCards)
+        return low <= high ? low...high : nil
+    }
+    /// How many cards an order index is from the nearest visible card (0 for a visible card).
+    func distance(_ index: Int) -> Int {
+        guard let focus else {return Int.max}
+        return index < focus.lowerBound ? focus.lowerBound-index : index > focus.upperBound ? index-focus.upperBound : 0
+    }
+    /// The order index of each player key (take and video reference).
+    private func positions() -> [String: Int] {
+        var result: [String: Int] = [:]
+        for i in order.indices {if let card=cards[order[i]] {for key in keys(card) where result[key] == nil {result[key]=i}}}
+        return result
+    }
+    /// The player keys of the card at an order index.
+    private func keys(at index: Int?) -> [String] {
+        guard let index,order.indices.contains(index),let card=cards[order[index]] else {return []}
+        return keys(card)
+    }
+    /// A card came on screen, or its take changed. The window moves to it and its take plays when it is ready.
+    func cardShown(_ card: MediaDirectionCard,reduceMotion: Bool) {
+        self.reduceMotion=reduceMotion
         visible.insert(card.id)
-        guard !card.target.id.isEmpty,playback.takes[card.key] == nil,!model.projectID.isEmpty else {return}
-        let previous=preparation,scope=scope,key=card.key,id=card.id
-        preparation=Task { [weak self] in
-            await previous?.value
-            guard let self,!Task.isCancelled else {return}
-            let current: @MainActor () -> Bool = {[weak self] in self?.scope==scope && self?.visible.contains(id)==true && card.key==key}
-            guard current(),self.playback.takes[key] == nil else {return}
+        schedule()
+        start(card)
+    }
+    /// A card left the screen. Its players pause at their first frame and stay prepared while the card is in the window.
+    func cardLeft(_ card: MediaDirectionCard) {
+        visible.remove(card.id)
+        for key in keys(card) {playback.pause(key,rewind:true)}
+        schedule()
+    }
+    /// Moves the window to the visible cards, releases each take whose card left it, and starts
+    /// the preparation of the missing takes. With no card on screen the last window stays.
+    private func schedule() {
+        let shown=order.indices.filter {visible.contains(order[$0])}
+        if let low=shown.first,let high=shown.last {
+            focus=low...high
+            let keep=Set(window.map {$0.flatMap {keys(at:$0)}} ?? [])
+            for key in Array(playback.takes.keys) where !keep.contains(key) {playback.release(key)}
+            failedKeys.formIntersection(keep)
+        }
+        guard pump == nil,source != nil,window != nil else {return}
+        pumpGeneration+=1
+        let generation=pumpGeneration
+        pump=Task {[weak self] in await self?.prepareWindow(generation)}
+    }
+    /// The player in the window that is missing and nearest to the visible cards. A card's take
+    /// comes before its video reference.
+    private func nextPlayer() -> (card: MediaDirectionCard,index: Int,player: MediaSimplePlayer)? {
+        guard let window else {return nil}
+        var best: (card: MediaDirectionCard,index: Int,player: MediaSimplePlayer,rank: (Int,Int,Int))?
+        for i in window {
+            guard let card=cards[order[i]],!card.target.id.isEmpty else {continue}
+            for (n,player) in players(card).enumerated() where playback.takes[player.key] == nil && !failedKeys.contains(player.key) {
+                let rank=(distance(i),i,n)
+                if best == nil || rank < best!.rank {best=(card,i,player,rank)}
+            }
+        }
+        return best.map {($0.card,$0.index,$0.player)}
+    }
+    /// Releases the prepared players farthest from the visible cards until one more fits. Both
+    /// players of a card go together. It never releases a player that is as near as the waiting
+    /// card; then it returns false.
+    private func makeRoom(for index: Int) -> Bool {
+        guard playback.takes.count >= preparedLimit else {return true}
+        let positions=positions()
+        let rank: (String) -> (Int,Int) = {key in positions[key].map {(self.distance($0),$0)} ?? (Int.max,Int.max)}
+        while playback.takes.count >= preparedLimit {
+            guard let farthest=playback.takes.keys.max(by:{rank($0) < rank($1)}),rank(farthest).0 > distance(index) else {return false}
+            for key in Set([farthest]+keys(at:positions[farthest])) {playback.release(key)}
+        }
+        return true
+    }
+    /// Prepares one take at a time, nearest first, until each card in the window has one or the
+    /// bound stops it. A take that is not current any more (its card left the window, its target
+    /// changed or the round changed) is unloaded.
+    private func prepareWindow(_ generation: Int) async {
+        defer {if pumpGeneration == generation {pump=nil}}
+        while !Task.isCancelled,pumpGeneration == generation,let source,let next=nextPlayer(),makeRoom(for:next.index) {
+            let card=next.card,player=next.player,key=player.key,cardKey=card.key,id=card.id,scope=scope
+            let current: @MainActor () -> Bool = {[weak self] in
+                guard let self,self.scope == scope,card.key == cardKey,self.keys(card).contains(key),let window=self.window,let i=self.order.firstIndex(of:id) else {return false}
+                return window.contains(i)
+            }
+            let report: (String) -> Void = {text in if player.isReference {card.referenceStatus=text} else {card.status=text}}
             do {
-                let take=try await MediaDirectionTakePreparation.prepare(card,model:model,schema:schema,playback:self.playback,isCurrent:current)
-                guard current() else {take.control.unload();return}
+                let take=try await source.prepare(card,source.schema(card),player,current)
+                guard current() else {take.control.unload();continue}
                 take.player?.isMuted=true
-                guard self.playback.admit(take) else {card.status="This take is over the playback limit for cards. Open it in item comparison.";return}
-                card.status=""
-                let layout=schema["layout"] as? MediaValues ?? [:]
-                if MediaSimpleLayout.startsPlaying(layout:layout,reduceMotion:reduceMotion,pausedByOwner:self.pausedByOwner) {self.playback.play(key)}
-            } catch is CancellationError {
-            } catch {if current() {card.status=PlainError.text(error)}}
+                guard playback.admit(take) else {
+                    failedKeys.insert(key)
+                    report(player.isReference ? "This reference is over the playback limit for cards. Open it in item comparison." : "This take is over the playback limit for cards. Open it in item comparison.")
+                    continue
+                }
+                report("")
+                start(card,admitted:player)
+            } catch {
+                // A failed player is not tried again until its card leaves the window and comes back.
+                guard current() else {continue}
+                failedKeys.insert(key)
+                if !(error is CancellationError) {report(PlainError.text(error))}
+            }
         }
     }
-    func cardLeft(_ card: MediaDirectionCard) {visible.remove(card.id);playback.release(card.key)}
+    /// A visible card plays its prepared players together (take and video reference), muted and
+    /// looped, unless Reduce Motion or the owner's Pause keeps the still first frame, and only
+    /// when all of them fit in the play budget. A video reference that becomes ready after its
+    /// take follows the take: it plays only when the take plays, and the take goes back to its
+    /// first frame so that both loops start together.
+    private func start(_ card: MediaDirectionCard,admitted: MediaSimplePlayer? = nil) {
+        guard let source,visible.contains(card.id) else {return}
+        if let admitted,admitted.isReference,playback.takes[card.key] != nil {
+            guard playback.playingKeys.contains(card.key),playback.playingKeys.count < Self.playingTakes else {return}
+            playback.rewind(card.key)
+            playback.play([admitted.key],limit:Self.playingTakes)
+            return
+        }
+        let ready=keys(card).filter {playback.takes[$0] != nil}
+        guard !ready.isEmpty,!ready.contains(where:{playback.playingKeys.contains($0)}) else {return}
+        let layout=source.schema(card)["layout"] as? MediaValues ?? [:]
+        guard MediaSimpleLayout.startsPlaying(layout:layout,reduceMotion:reduceMotion,pausedByOwner:pausedByOwner) else {return}
+        playback.play(ready,limit:Self.playingTakes)
+    }
+    /// The card's Play or Pause. It acts on both players of the card together. At the play
+    /// budget the owner's Play pauses the cards farthest from this card until its players fit.
     func toggle(_ card: MediaDirectionCard) {
-        if playback.playingKeys.contains(card.key) {playback.pause(card.key)} else {playback.play(card.key)}
+        let ready=keys(card).filter {playback.takes[$0] != nil}
+        if ready.contains(where:{playback.playingKeys.contains($0)}) {for key in ready {playback.pause(key)};return}
+        if let index=order.firstIndex(of:card.id) {
+            let positions=positions()
+            let far: (String) -> Int = {positions[$0].map {abs($0-index)} ?? Int.max}
+            while playback.playingKeys.count+ready.count > Self.playingTakes,let other=playback.playingKeys.max(by:{(far($0),$0) < (far($1),$1)}) {
+                for key in Set([other]+keys(at:positions[other])) {playback.pause(key)}
+            }
+        }
+        playback.play(ready,limit:Self.playingTakes)
     }
     func pauseAll() {pausedByOwner=true;playback.pauseAll()}
-    func playAll() {pausedByOwner=false;playback.playAll()}
-    /// The first available image reference declared by the layout, in declared order.
-    static func referenceImage(item: Record,layout: MediaValues) -> (slot: Record,original: Record)? {
+    /// Plays the prepared players of the visible cards, in list order, within the play budget.
+    /// A card plays both of its players or none.
+    func playAll() {
+        pausedByOwner=false
+        for id in order where visible.contains(id) {if let card=cards[id] {playback.play(keys(card),limit:Self.playingTakes)}}
+    }
+    /// Waits until the current preparation pass ends (tests).
+    func settle() async {while let task=pump {await task.value}}
+    /// The fallback text of a card with no reference.
+    static let noReference = "No reference"
+    /// The reference shown beside the take (CL-421). Only the references that the layout declares
+    /// (`reference_slot_ids`) and that are available count, in layout order. Rule: the first
+    /// video reference (the earlier take) wins, because the owner compares takes; with no video
+    /// reference, the first image reference. A slot whose captured kind is not image or video,
+    /// or whose original is not available, is skipped. Nil means no reference ("No reference").
+    static func reference(item: Record,layout: MediaValues) -> MediaSimpleReference? {
         let ids=MediaComparisonLabels.referenceSlotIDs(layout)
         guard let candidate=item.records("candidates").first else {return nil}
         let slots=candidate.records("slots").filter {ids.contains($0.string("slot_id"))}.sorted {(ids.firstIndex(of:$0.string("slot_id")) ?? 0)<(ids.firstIndex(of:$1.string("slot_id")) ?? 0)}
+        var image: MediaSimpleReference?
         for slot in slots {
-            guard let original=item.records("originals").first(where:{$0.string("attachment_id")==slot.string("attachment_id")}),
-                  MediaComparisonAvailability.resolve(slot:slot,original:original,declaredKind:"image") == .image else {continue}
-            return (slot,original)
+            guard let original=item.records("originals").first(where:{$0.string("attachment_id")==slot.string("attachment_id")}) else {continue}
+            if MediaComparisonAvailability.resolve(slot:slot,original:original,declaredKind:"video") == .playback("video") {
+                return MediaSimpleReference(slot:slot,original:original,kind:"video")
+            }
+            if image == nil,MediaComparisonAvailability.resolve(slot:slot,original:original,declaredKind:"image") == .image {
+                image=MediaSimpleReference(slot:slot,original:original,kind:"image")
+            }
         }
-        return nil
+        return image
     }
     /// The existing owner decision route: the native command journal through `media_decide`.
     func decide(_ disposition: String,card: MediaDirectionCard,model: MediaReviewModel) async {
@@ -270,6 +551,15 @@ struct MediaSimpleReview: View {
         .onDisappear {simple.reset()}
     }
     func sync(_ rows: [Record]) {
+        if simple.source == nil {
+            let review=simple
+            simple.source = .init(
+                schema:{[weak model] card in card.header.object("type_revision")["schema"] as? MediaValues ?? model?.schema ?? [:]},
+                prepare:{[weak model,weak review] card,schema,player,current in
+                    guard let model,let review,!model.projectID.isEmpty else {throw CancellationError()}
+                    return try await MediaDirectionTakePreparation.prepare(card,model:model,schema:schema,playback:review.playback,referenceSlotID:player.slotID,key:player.key,isCurrent:current)
+                })
+        }
         let header=simple.header
         let changed=simple.sync(scope:scope,rows:rows,draft:{model.ownerDraft(for:$0,header:header)},saveDraft:{[weak model] id,value in model?.saveOwnerDraft(value,itemID:id)})
         guard !changed.isEmpty else {return}
@@ -282,7 +572,7 @@ private struct MediaSimpleCardView: View {
     @EnvironmentObject var store: ChecklistStore
     @ObservedObject var card: MediaDirectionCard
     let simple: MediaSimpleReviewModel
-    @ObservedObject var playback: MediaPlaybackCoordinator
+    @ObservedObject var playback: MediaSimpleTakeCache
     let model: MediaReviewModel
     let reduceMotion: Bool
     @State private var showDetails = false
@@ -300,7 +590,7 @@ private struct MediaSimpleCardView: View {
             }
             HStack(alignment:.top,spacing:8) {
                 take.frame(minWidth:180,maxWidth:.infinity,minHeight:160,maxHeight:220)
-                MediaSimpleReferenceView(card:card,simple:simple,model:model,layout:layout).frame(width:150)
+                MediaSimpleReferenceView(card:card,simple:simple,playback:playback,model:model,layout:layout).frame(width:150)
             }
             if let suggestion=MediaComparisonLabels.suggestions(item:card.item).first(where:\.isCurrent) {
                 Text("Agent suggests: "+suggestion.choice).font(.caption).foregroundStyle(Color.checklistSecondaryText)
@@ -322,15 +612,16 @@ private struct MediaSimpleCardView: View {
         .padding(8).background(.quaternary.opacity(0.3),in:RoundedRectangle(cornerRadius:6))
         .accessibilityElement(children:.contain).accessibilityLabel(card.label)
         .accessibilityIdentifier("mediaSimpleCard:"+card.id)
-        .task(id:card.key) {simple.requestTake(card,model:model,schema:schema,reduceMotion:reduceMotion)}
+        .task(id:card.key) {simple.cardShown(card,reduceMotion:reduceMotion)}
         .onDisappear {simple.cardLeft(card)}
     }
     @ViewBuilder var take: some View {
         if let prepared=playback.takes[card.key],let player=prepared.player {
             ZStack(alignment:.bottomTrailing) {
                 NativePlayerAdapter(player:player,audio:false).accessibilityLabel("Take, "+card.label)
-                Button(playback.playingKeys.contains(card.key) ? "Pause" : "Play") {simple.toggle(card)}
-                    .accessibilityLabel((playback.playingKeys.contains(card.key) ? "Pause " : "Play ")+card.label).padding(6)
+                // One control for both players of the card (the take and a video reference).
+                Button(simple.isPlaying(card) ? "Pause" : "Play") {simple.toggle(card)}
+                    .accessibilityLabel((simple.isPlaying(card) ? "Pause " : "Play ")+card.label).padding(6)
             }
         } else {
             Text(card.status.isEmpty || card.status.hasPrefix("Saved") ? "Preparing take…" : card.status)
@@ -352,29 +643,38 @@ private struct MediaSimpleCardView: View {
     }
 }
 
-/// The card's reference image, beside the take. A decoded image is kept by reference ID,
-/// so a refresh never reads or decodes it again.
+/// The card's reference, beside the take (rule: `MediaSimpleReviewModel.reference`). A video
+/// reference is the card's second player: the model prepares it in the take window and plays it
+/// with the take. A decoded image is kept by reference ID, so a refresh never reads or decodes
+/// it again.
 private struct MediaSimpleReferenceView: View {
     @ObservedObject var card: MediaDirectionCard
     let simple: MediaSimpleReviewModel
+    @ObservedObject var playback: MediaSimpleTakeCache
     let model: MediaReviewModel
     let layout: MediaValues
     @State private var image: NSImage?
     @State private var status = ""
-    var reference: (slot: Record,original: Record)? {MediaSimpleReviewModel.referenceImage(item:card.item,layout:layout)}
-    var key: String {reference?.original.string("reference_id") ?? ""}
+    var reference: MediaSimpleReference? {MediaSimpleReviewModel.reference(item:card.item,layout:layout)}
+    /// The image reference ID to read; empty for a video reference.
+    var key: String {reference.map {$0.kind == "image" ? $0.original.string("reference_id") : ""} ?? ""}
     var body: some View {
         VStack(alignment:.leading,spacing:2) {
             if let reference {
-                if let image {Image(nsImage:image).resizable().scaledToFit().frame(maxHeight:180).accessibilityLabel("Reference, "+MediaComparisonLabels.slot(reference.slot,definitions:model.slots))}
+                let label=MediaComparisonLabels.slot(reference.slot,definitions:model.slots)
+                if reference.kind == "video" {
+                    if let player=simple.referencePlayer(card),let prepared=playback.takes[player.key],let native=prepared.player {
+                        NativePlayerAdapter(player:native,audio:false).frame(minHeight:120,maxHeight:180).accessibilityLabel("Reference, "+label)
+                    } else {Text(card.referenceStatus.isEmpty ? "Preparing reference…" : card.referenceStatus).font(.caption).foregroundStyle(Color.checklistSecondaryText)}
+                } else if let image {Image(nsImage:image).resizable().scaledToFit().frame(maxHeight:180).accessibilityLabel("Reference, "+label)}
                 else {Text(status.isEmpty ? "Loading reference…" : status).font(.caption).foregroundStyle(Color.checklistSecondaryText)}
-                Text(MediaComparisonLabels.slot(reference.slot,definitions:model.slots)).font(.caption2).foregroundStyle(Color.checklistSecondaryText)
-            } else {Text(card.target.id.isEmpty ? "" : "No reference image").font(.caption).foregroundStyle(Color.checklistSecondaryText)}
+                Text(label).font(.caption2).foregroundStyle(Color.checklistSecondaryText)
+            } else {Text(card.target.id.isEmpty ? "" : MediaSimpleReviewModel.noReference).font(.caption).foregroundStyle(Color.checklistSecondaryText)}
         }
         .task(id:key) {await load()}
     }
     func load() async {
-        guard let reference,!key.isEmpty else {image=nil;return}
+        guard let reference,reference.kind == "image",!key.isEmpty else {image=nil;return}
         if let cached=simple.referenceImages[key] {image=cached;return}
         do {
             let value=try await model.read("media_original_read",["round_id":card.header.id,"item_id":card.id,"target_id":card.target.id,"reference_id":key])

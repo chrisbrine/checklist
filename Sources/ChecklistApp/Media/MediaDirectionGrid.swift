@@ -39,6 +39,8 @@ struct MediaAnimationGroup: Identifiable, Equatable {
     @Published var draft: MediaOwnerDraft {didSet {saveDraft?(draft)}}
     private let saveDraft: ((MediaOwnerDraft) -> Void)?
     @Published var status = ""
+    /// CL-421: the preparation or failure text of the card's video reference.
+    @Published var referenceStatus = ""
     @Published var sending = false
     /// CL-421: the simple review moves a changed round header in place; the card is kept.
     @Published var header: Record
@@ -194,19 +196,39 @@ struct MediaAnimationGroup: Identifiable, Equatable {
 
 /// One exact, verified, looping take for one direction card. The direction grid and the
 /// CL-421 simple review share it; the caller admits the returned take to its own coordinator.
+/// The take store that a direction take is prepared for: one preparation at a time, and a budget
+/// check before a native player is made. The direction grid uses its coordinator; the simple card
+/// review (CL-421) uses its own larger prepared-take cache.
+@MainActor protocol MediaTakePreparationBudget: AnyObject {
+    func beginPreparation(_ key: String) -> Bool
+    func endPreparation(_ key: String)
+    func gridAllows(bytes: Int,facts: MediaPlaybackBudget.Facts) -> Bool
+}
+extension MediaPlaybackCoordinator: MediaTakePreparationBudget {}
+
 @MainActor enum MediaDirectionTakePreparation {
-    static func prepare(_ card: MediaDirectionCard,model: MediaReviewModel,schema: MediaValues,playback: MediaPlaybackCoordinator,isCurrent: @escaping @MainActor () -> Bool) async throws -> MediaPreparedTake {
-        let project=model.projectID
+    /// The loop and rate of every player that `prepare` makes for a card, take or reference: the
+    /// primary slot's settings, that is the item's frame rate (or the layout's fixed rate).
+    static func playbackSettings(_ card: MediaDirectionCard,layout: MediaValues) -> (loop: Bool,frameRate: Double?) {
+        MediaComparisonLabels.playbackSettings(slotID:layout["primary_slot_id"] as? String ?? "",layout:layout,historical:false,metadata:card.metadata)
+    }
+    /// Prepares the layout's primary video take. CL-421: with `referenceSlotID` it prepares that
+    /// declared video reference instead, under `key`, with the same verified copy, probe, loop and
+    /// rate rule as the take: the item's frame rate (or the layout's fixed rate), so an earlier
+    /// take plays at game speed beside the new take.
+    static func prepare(_ card: MediaDirectionCard,model: MediaReviewModel,schema: MediaValues,playback: some MediaTakePreparationBudget,referenceSlotID: String? = nil,key: String? = nil,isCurrent: @escaping @MainActor () -> Bool) async throws -> MediaPreparedTake {
+        let project=model.projectID,key=key ?? card.key
         let candidates=card.item.records("candidates"),layout=schema["layout"] as? MediaValues ?? [:]
+        let primaryID=layout["primary_slot_id"] as? String ?? ""
         guard candidates.count==1 else {throw ChecklistError("GRID_CANDIDATES","Choose among this item's candidates in item comparison.")}
-        guard let slot=candidates[0].records("slots").first(where:{$0.string("slot_id")==layout["primary_slot_id"] as? String}),
+        guard let slot=candidates[0].records("slots").first(where:{$0.string("slot_id")==(referenceSlotID ?? primaryID)}),
               let original=card.item.records("originals").first(where:{$0.string("attachment_id")==slot.string("attachment_id")}),
               MediaComparisonAvailability.resolve(slot:slot,original:original,declaredKind:"video") == .playback("video") else {
-            throw ChecklistError("MANAGED_ORIGINAL_UNAVAILABLE","No available primary video for this direction.")
+            throw ChecklistError("MANAGED_ORIGINAL_UNAVAILABLE",referenceSlotID == nil ? "No available primary video for this direction." : "No available reference video for this direction.")
         }
-        guard playback.beginPreparation(card.key) else {throw CancellationError()}
-        defer {playback.endPreparation(card.key)}
-        card.status="Preparing exact take…"
+        guard playback.beginPreparation(key) else {throw CancellationError()}
+        defer {playback.endPreparation(key)}
+        if referenceSlotID == nil {card.status="Preparing exact take…"} else {card.referenceStatus="Preparing reference…"}
         let (file,copyMS)=try await MediaTakeLoader.verifiedCopy(expectedSHA256:slot.string("sha256"),maximumBytes:MediaPlaybackBudget.directionGridOriginalBytes,
             lease:{
                 let (method,params)=MediaReviewModel.playbackLeaseRequest(roundID:card.header.id,selectedID:card.id,targetID:card.target.id,original:original,example:nil)
@@ -215,7 +237,7 @@ struct MediaAnimationGroup: Identifiable, Equatable {
                 return .init(id:id,path:attachment.string("path"),size:attachment.integer("size"),name:attachment.string("name"),attachmentID:attachment.id)
             },release:{await model.releasePlaybackLease($0,projectID:project)})
         let (asset,facts,probeMS)=try await MediaTakeLoader.probe(url:file.url,kind:"video")
-        let settings=MediaComparisonLabels.playbackSettings(slotID:slot.string("slot_id"),layout:layout,historical:false,metadata:card.metadata)
+        let settings=playbackSettings(card,layout:layout)
         let timing=try await MediaTakeLoader.timing(asset:asset,frameRate:settings.frameRate)
         try Task.checkCancellation();guard isCurrent() else {throw CancellationError()}
         guard playback.gridAllows(bytes:original.integer("size"),facts:facts) else {
@@ -223,7 +245,7 @@ struct MediaAnimationGroup: Identifiable, Equatable {
         }
         let control=try await MediaNativeTakeControl(asset:asset,loop:true,playbackRate:timing.rate)
         try Task.checkCancellation();guard isCurrent() else {control.unload();throw CancellationError()}
-        return MediaPreparedTake(key:card.key,label:card.directionLabel,kind:"video",ids:["item_id":card.id,"target_id":card.target.id,"reference_id":original.string("reference_id"),"slot_id":slot.string("slot_id")],control:control,player:control.player,file:file,
+        return MediaPreparedTake(key:key,label:card.directionLabel+(referenceSlotID == nil ? "" : " reference"),kind:"video",ids:["item_id":card.id,"target_id":card.target.id,"reference_id":original.string("reference_id"),"slot_id":slot.string("slot_id")],control:control,player:control.player,file:file,
             measurement:.init(copyMilliseconds:copyMS,probeMilliseconds:probeMS,bytes:original.integer("size"),facts:facts,loop:true,timing:timing))
     }
 }
