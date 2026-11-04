@@ -21,13 +21,16 @@ extension CommandRouter {
             if p["project_id"] != nil {
                 boundProject = try scope(db, p, c)
             } else if c.role == "worker", let workspace = c.workspace {
-                let matches = try projects(db, c).filter {
+                // CL-423 review b574daee: this implicit lookup is advisory. A caller that fails the
+                // project-scope guard (stale execution domain, unregistered session, quarantine) still
+                // gets service_info, with orchestrated_triage null.
+                let matches = ((try? projects(db, c)) ?? []).filter {
                     guard let root = $0["root_path"] as? String, !root.isEmpty else { return false }
                     return containsPath(root, canonical(workspace))
                 }
-                boundProject = matches.count == 1 ? try scope(db, ["project_id": matches[0]["id"]!], c) : nil
+                boundProject = matches.count == 1 ? try? scope(db, ["project_id": matches[0]["id"]!], c) : nil
             } else { boundProject = nil }
-            if let pid = boundProject, let triage = try callerOrchestratedTriage(db, project: pid, caller: c) {
+            if let pid = boundProject, let triage = try? callerOrchestratedTriage(db, project: pid, caller: c) {
                 callerInfo["orchestrated_triage"] = ["triage_id": triage["id"] ?? NSNull(), "key": triage["key"] ?? NSNull(), "name": triage["name"] ?? NSNull()] as JSON
             }
             info["caller"] = callerInfo

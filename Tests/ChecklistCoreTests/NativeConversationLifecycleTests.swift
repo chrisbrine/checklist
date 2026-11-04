@@ -278,9 +278,11 @@ extension EvidenceAuthorityTests {
         let foreignInbox = try call("session_inbox", ["project_id": p["id"]!], other)
         XCTAssertTrue((foreignInbox["deliveries"] as! [JSON]).isEmpty)
         XCTAssertTrue((foreignInbox["native_recovery"] as! [JSON]).isEmpty)
-        // service_info now resolves the caller's workspace-bound Triage through
-        // scope, so the pre-resumption execution domain is refused on this read too.
-        assertCode("FORBIDDEN") { _ = try self.call("service_info", [:], worker) }
+        // CL-423 review b574daee: the implicit Triage lookup is advisory, so a caller that
+        // fails the scope guard still reads service_info, with orchestrated_triage null.
+        let staleInfo = try call("service_info", [:], worker)
+        XCTAssertTrue((staleInfo["native_recovery"] as! [JSON]).isEmpty)
+        XCTAssertTrue((staleInfo["caller"] as? JSON)?["orchestrated_triage"] is NSNull)
         assertCode("FORBIDDEN") { _ = try self.call("session_inbox", ["project_id": p["id"]!], worker) }
         let task = try call("task_get", ["project_id": p["id"]!, "task_id": tasks[0]["id"]!])
         let releaseReason = try XCTUnwrap(task["status_reason"] as? JSON)
