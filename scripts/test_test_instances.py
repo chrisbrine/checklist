@@ -26,7 +26,7 @@ import verify_install
 def test_directory():
     # Fixture session IDs must not inherit the caller's scratchpad binding.
     # Keep real marker writes (and their ownership checks) in marking cases.
-    return tempfile.TemporaryDirectory(dir='/private/tmp')
+    return tempfile.TemporaryDirectory(dir=os.environ.get('CHECKLIST_TEST_TMPDIR', '/private/tmp'))
 
 
 def store_fixture(path, schema=0, records=()):
@@ -72,6 +72,20 @@ def tearDownModule():
 
 
 class TestInstancesTests(unittest.TestCase):
+    def test_relay_options_require_explicit_opt_in_and_support_reset(self):
+        for command in ['create', 'start']:
+            for options, expected in [([], False if command == 'create' else None),
+                                      (['--allow-synthetic-relays'], True),
+                                      (['--no-allow-synthetic-relays'], False)]:
+                argv = ['test_instances.py', command, '--slot', '4', *options]
+                if command == 'create': argv += ['--session-id', 'actual-session']
+                with self.subTest(command=command, options=options), patch.object(sys, 'argv', argv), \
+                     patch.object(harness, 'checked'), patch.object(harness, 'locked', return_value=ExitStack()), \
+                     patch.object(harness, 'caller_session', return_value='actual-session'), \
+                     patch.object(harness, command) as action:
+                    harness.main()
+                    self.assertIs(action.call_args.args[0].allow_synthetic_relays, expected)
+
     def test_create_accepts_explicit_session_id_with_and_without_replace(self):
         for replace in [False, True]:
             argv = ['test_instances.py', 'create', '--slot', '4', '--session-id', 'actual-session']
@@ -2577,6 +2591,80 @@ class LiveRootTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'Only completed backups'): harness.snapshot_seed(custom / 'objects', Path('unused'))
 
 
+class SlotRelayTests(unittest.TestCase):
+    def test_create_persists_default_off_and_explicit_synthetic_opt_in(self):
+        for allow in [None, False, True]:
+            with self.subTest(allow=allow), test_directory() as directory, ExitStack() as stack:
+                base = Path(directory).resolve()
+                stack.enter_context(patch.object(harness, 'BASE', base / 'slots'))
+                harness.BASE.mkdir()
+                p = harness.paths(4)
+                capture = base / 'capture'
+                manifest = {'build_id': 'fixture', 'source_fingerprint': 'a' * 64, 'signing_profile': {}}
+                writes = []
+                original_save = harness.save
+                def save(paths, value):
+                    writes.append(dict(value));original_save(paths, value)
+                def run(command, **kwargs):
+                    if command[0] == 'ditto':
+                        info = p['bundle'] / 'Contents/Info.plist';info.parent.mkdir(parents=True)
+                        info.write_bytes(plistlib.dumps({'CFBundleIdentifier': 'org.checklist.app'}))
+                    else: self.assertEqual(command[0], 'codesign')
+                    return subprocess.CompletedProcess(command, 0, '', '')
+                for context in [patch.object(harness, 'caller_session', return_value='fixture'),
+                                patch.object(harness, 'requested_tickets', return_value=['CL-429']),
+                                patch.object(harness, 'stopped'), patch.object(harness, 'mark_qualification'),
+                                patch.object(harness, 'stage_selection', return_value=(capture, manifest)),
+                                patch.object(harness, 'sign_identity', return_value='-'), patch.object(harness, 'signing_teams'),
+                                patch.object(harness, 'run', side_effect=run), patch.object(harness, 'save', side_effect=save),
+                                redirect_stdout(io.StringIO())]:
+                    stack.enter_context(context)
+                arguments = SimpleNamespace(slot=4, seed='empty', replace=False)
+                if allow is not None: arguments.allow_synthetic_relays = allow
+                harness.create(arguments, p)
+                self.assertEqual(len(writes), 2)
+                self.assertTrue(all(value['allow_synthetic_relays'] is (allow is True) for value in writes))
+                self.assertIs(harness.load(p)['allow_synthetic_relays'], allow is True)
+                self.assertEqual(harness.load(p)['tickets'], ['CL-429'])
+
+    def test_status_reports_off_for_legacy_and_invalid_metadata_and_synthetic_for_opt_in(self):
+        for configured in [None, False, 'true', True]:
+            with self.subTest(configured=configured), test_directory() as directory, ExitStack() as stack:
+                base = Path(directory).resolve();stack.enter_context(patch.object(harness, 'BASE', base / 'slots'))
+                p = harness.paths(4);p['data'].mkdir(parents=True)
+                metadata = {'slot': 4}
+                if configured is not None: metadata['allow_synthetic_relays'] = configured
+                harness.save(p, metadata)
+                for context in [patch.object(harness, 'checked', return_value=p),
+                                patch.object(harness, 'launch_state', return_value={'registered': False}),
+                                patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []})]:
+                    stack.enter_context(context)
+                value = harness.status(4)
+                self.assertIs(value['allow_synthetic_relays'], configured is True)
+                self.assertEqual(value['slot_relays'], 'synthetic' if configured is True else 'off')
+
+    def test_missing_slot_status_reports_relays_off(self):
+        with test_directory() as directory, patch.object(harness, 'BASE', Path(directory) / 'slots'), \
+             patch.object(harness, 'launch_state', return_value={'registered': False}), \
+             patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}):
+            p = harness.paths(4)
+            with patch.object(harness, 'checked', return_value=p): value = harness.status(4)
+            self.assertFalse(value['created']);self.assertFalse(value['allow_synthetic_relays'])
+            self.assertEqual(value['slot_relays'], 'off')
+
+    def test_status_text_and_json_include_relay_policy(self):
+        for mode in ['off', 'synthetic']:
+            for options in [[], ['--json']]:
+                with self.subTest(mode=mode, options=options), patch.object(sys, 'argv', ['test_instances.py', 'status', '--slot', '4', *options]), \
+                     patch.object(harness, 'checked'), \
+                     patch.object(harness, 'status', return_value={'slot': 4, 'slot_relays': mode, 'allow_synthetic_relays': mode == 'synthetic'}), \
+                     redirect_stdout(io.StringIO()) as output:
+                    harness.main()
+                    value = json.loads(output.getvalue())[0] if options else json.loads(output.getvalue().removeprefix('Slot 4: '))
+                    self.assertEqual(value['slot_relays'], mode)
+                    self.assertEqual(value['allow_synthetic_relays'], mode == 'synthetic')
+
+
 class SlotStartupTests(unittest.TestCase):
     class Clock:
         def __init__(self): self.now = 0; self.sleeps = []
@@ -2624,6 +2712,42 @@ class SlotStartupTests(unittest.TestCase):
                 if appearance: expected += ['--args', '-ChecklistTestAppearance', appearance]
                 self.assertEqual([command for command in commands if command[0] == 'open'], [expected])
                 self.assertIn('Slot 4 ready (gui)', output.getvalue())
+
+    def test_start_defaults_relays_off_even_with_ambient_synthetic_opt_in(self):
+        with self.fixture([self.healthy()], environment={'CHECKLIST_SLOT_RELAYS': 'synthetic'}) as (p, clock, calls, commands, output, progress):
+            harness.start(SimpleNamespace(slot=4, gui=False), p)
+            plist = plistlib.loads((p['folder'] / 'service.plist').read_bytes())
+            self.assertEqual(plist['EnvironmentVariables'], {'CHECKLIST_SLOT_RELAYS': 'off'})
+            self.assertIs(json.loads((p['folder'] / 'slot.json').read_text())['allow_synthetic_relays'], False)
+
+    def test_start_persists_explicit_relay_opt_in_and_uses_it_on_later_starts(self):
+        for from_metadata in [False, True]:
+            with self.subTest(from_metadata=from_metadata), self.fixture([self.healthy()]) as (p, clock, calls, commands, output, progress):
+                arguments = SimpleNamespace(slot=4, gui=False)
+                if from_metadata: harness.load(p)['allow_synthetic_relays'] = True
+                else: arguments.allow_synthetic_relays = True
+                harness.start(arguments, p)
+                plist = plistlib.loads((p['folder'] / 'service.plist').read_bytes())
+                self.assertEqual(plist['EnvironmentVariables'], {'CHECKLIST_SLOT_RELAYS': 'synthetic'})
+                self.assertIs(json.loads((p['folder'] / 'slot.json').read_text())['allow_synthetic_relays'], True)
+
+    def test_start_can_explicitly_reset_persisted_relay_opt_in(self):
+        with self.fixture([self.healthy()]) as (p, clock, calls, commands, output, progress):
+            harness.load(p)['allow_synthetic_relays'] = True
+            harness.start(SimpleNamespace(slot=4, gui=False, allow_synthetic_relays=False), p)
+            plist = plistlib.loads((p['folder'] / 'service.plist').read_bytes())
+            self.assertEqual(plist['EnvironmentVariables'], {'CHECKLIST_SLOT_RELAYS': 'off'})
+            self.assertIs(json.loads((p['folder'] / 'slot.json').read_text())['allow_synthetic_relays'], False)
+
+    def test_start_refuses_relay_policy_change_for_registered_service(self):
+        for configured in [False, True]:
+            with self.subTest(configured=configured), self.fixture([], registered=True) as (p, clock, calls, commands, output, progress):
+                harness.load(p)['allow_synthetic_relays'] = configured
+                with self.assertRaisesRegex(ValueError, 'Stop this slot before changing'):
+                    harness.start(SimpleNamespace(slot=4, gui=False, allow_synthetic_relays=not configured), p)
+                self.assertEqual(commands, []);self.assertEqual(calls, [])
+                self.assertIs(harness.load(p)['allow_synthetic_relays'], configured)
+                self.assertFalse((p['folder'] / 'service.plist').exists())
 
     def test_start_timeouts_and_unavailable_then_healthy(self):
         unavailable = subprocess.CompletedProcess([], 1, '', 'Checklist: SERVICE_UNAVAILABLE: not responding')

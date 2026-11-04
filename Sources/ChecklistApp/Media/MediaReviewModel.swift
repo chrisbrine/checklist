@@ -46,6 +46,9 @@ typealias MediaValues = [String: Any]
     @Published private(set) var publishingPrepared = false
     private var publicationObservation: MediaValues = [:]
     @Published var publication: [Record] = []
+    /// CL-426: the intake publication's one plain failure line, and its press in progress.
+    @Published var publicationFailure: String?
+    @Published private(set) var publishingShown = false
     @Published var error: String?
     @Published var loading = false
     @Published var draft = MediaOwnerDraft() { didSet { saveDraft() } }
@@ -382,12 +385,40 @@ typealias MediaValues = [String: Any]
         mutate("media_context_reconcile",p) { [weak self] _ in self?.contextConflict=true }
     }
     func previewPublication() async {
+        publicationFailure=nil
         do {let result=try await read("media_publication_preview",["round_id":roundID]);header=Record(values:result["round"] as? MediaValues ?? [:]);publicationObservation=observation();publication=(result["items"] as? [MediaValues] ?? []).map(Record.init)} catch {self.error=PlainError.text(error)}
     }
-    func publish() {
-        var p=publicationObservation
-        p["items"]=publication.map {row -> MediaValues in var value=row.values;value.removeValue(forKey:"title");value.removeValue(forKey:"publication_ready");return value}
-        mutate("media_round_publish",p) { [weak self] _ in self?.publication=[];self?.roundState="open" }
+    /// The intake "Publish these N items" press (CL-426). It sends the frozen preview that the owner
+    /// saw, with its observation. On `MEDIA_PROJECT_CONTEXT_REQUIRED` the CL-422 helper approves the
+    /// project context; the model then reads the preview again and publishes it only if it holds the
+    /// same items and targets. A refusal shows one plain line in the intake view; no global alert shows.
+    func publish() {Task {await publishShownPreview()}}
+    func publishShownPreview() async {
+        guard !publication.isEmpty,!publishingShown,let store else {return}
+        let shown=publication,observed=publicationObservation,project=projectID,round=roundID,choice=roundChoiceEpoch
+        publicationFailure=nil
+        if let reason=store.writeBlockReason {publicationFailure=Self.itemsNotPublished(ChecklistError("WRITE_BLOCKED",reason));return}
+        publishingShown=true
+        defer {publishingShown=false}
+        do {
+            try await approvingProjectContext({
+                var p=observed
+                p["items"]=shown.map {row -> MediaValues in var value=row.values;value.removeValue(forKey:"title");value.removeValue(forKey:"publication_ready");return value}
+                try await self.mutateAwaiting("media_round_publish",p,quiet:true)
+                if self.projectID==project,self.roundID==round,self.roundChoiceEpoch==choice {self.publication=[];self.roundState="open"}
+            },again:{
+                _ = try await self.publishFrozenPreviewOnce(onlyReady:false,required:nil,shown:shown)
+            })
+        } catch is CancellationError {}
+        catch {if projectID==project,roundID==round,roundChoiceEpoch==choice {publicationFailure=Self.itemsNotPublished(error)}}
+    }
+    /// The intake view's one plain line for a refused publication, a failed approval included.
+    /// An unknown outcome does not claim that nothing was published.
+    static func itemsNotPublished(_ error: Error) -> String {
+        var reason=PlainError.text(error).trimmingCharacters(in:.whitespacesAndNewlines)
+        while reason.hasSuffix(".") {reason.removeLast()}
+        if ["OUTCOME_UNKNOWN","COMMAND_FAILED"].contains((error as? ChecklistError)?.code ?? "") {return "Checklist does not know if these items were published: "+reason+"."}
+        return "Could not publish these items: "+reason+". Nothing was published."
     }
     /// One owner press publishes an agent-prepared Draft through the existing exact
     /// publication boundary. No owner intake steps or mutable list selection are used.
@@ -414,14 +445,23 @@ typealias MediaValues = [String: Any]
     /// publishes once more. There is no dialog and no setup step. Each refusal comes back to the
     /// caller, which shows it; no global alert shows it.
     @discardableResult func publishFrozenPreview(onlyReady: Bool,required: (itemID: String,targetID: String)? = nil) async throws -> [Record] {
-        do {return try await publishFrozenPreviewOnce(onlyReady:onlyReady,required:required)}
+        try await approvingProjectContext {try await self.publishFrozenPreviewOnce(onlyReady:onlyReady,required:required)}
+    }
+    /// The one rule of every owner publication route (CL-422, CL-426): run `attempt`; on
+    /// `MEDIA_PROJECT_CONTEXT_REQUIRED` send the owner approval (`approveProjectContext`), wait until
+    /// the store can write, and run `again` (or `attempt`) once more. Every other refusal comes back.
+    private func approvingProjectContext<T>(_ attempt: () async throws -> T,again: (() async throws -> T)? = nil) async throws -> T {
+        do {return try await attempt()}
         catch let error as ChecklistError where error.code=="MEDIA_PROJECT_CONTEXT_REQUIRED" {
             try await approveProjectContext(quiet:true)
             await waitUntilWritable()
-            return try await publishFrozenPreviewOnce(onlyReady:onlyReady,required:required)
+            if let again {return try await again()}
+            return try await attempt()
         }
     }
-    private func publishFrozenPreviewOnce(onlyReady: Bool,required: (itemID: String,targetID: String)?) async throws -> [Record] {
+    /// `shown` (CL-426): the preview rows that the owner saw; the new preview must hold exactly
+    /// the same items and targets, or nothing is sent.
+    private func publishFrozenPreviewOnce(onlyReady: Bool,required: (itemID: String,targetID: String)?,shown: [Record]? = nil) async throws -> [Record] {
         let project=projectID,round=roundID,choice=roundChoiceEpoch
         let preview=try await read("media_publication_preview",["round_id":round])
         guard projectID==project,roundID==round,roundChoiceEpoch==choice,!Task.isCancelled else {throw CancellationError()}
@@ -433,6 +473,8 @@ typealias MediaValues = [String: Any]
         if let required,!items.contains(where:{$0.string("item_id")==required.itemID && $0.string("target_id")==required.targetID}) {
             throw ChecklistError("MEDIA_UNRESOLVED","This take is not ready for publication, or it changed. Refresh and look at it again.")
         }
+        func targets(_ rows: [Record]) -> Set<[String]> {Set(rows.map {[$0.string("item_id"),$0.string("target_id")]})}
+        if let shown,targets(items) != targets(shown) {throw ChecklistError("MEDIA_ROUND_CHANGED","The publication items changed. Preview the publication again.")}
         let params:MediaValues=["round_id":round,"expected_revision":frozen.integer("revision"),"observed_context_token":frozen.string("observed_context_token"),
             "items":items.map {row -> MediaValues in ["item_id":row.string("item_id"),"expected_revision":row.integer("expected_revision"),"target_id":row.string("target_id"),"review_basis_signature":row.string("review_basis_signature")]}]
         try await mutateAwaiting("media_round_publish",params,quiet:true)
@@ -440,14 +482,11 @@ typealias MediaValues = [String: Any]
         return items
     }
     /// The one-time project context approval (`media_context_approve`, kind project) for the
-    /// observed project revision. A failure also shows in `error`.
+    /// observed project revision. A failure also shows in `error`, unless `quiet`.
     func approveProjectContext(quiet: Bool = false) async throws {
         guard let project=store?.currentProject else {throw ChecklistError("PROJECT_REQUIRED","Select a project.")}
         try await mutateAwaiting("media_context_approve",["kind":"project","expected_project_revision":project.integer("revision")],quiet:quiet)
-        if error==Self.projectContextRequiredText {error=nil}
     }
-    /// The service text of `MEDIA_PROJECT_CONTEXT_REQUIRED`; the orange line offers the approval next to it.
-    static let projectContextRequiredText = "Approve the project context once before the first publication. No records changed."
     /// Waits (at most 10 s) until the store can accept the next change of a sequence (CL-422).
     func waitUntilWritable() async {
         for _ in 0..<40 {

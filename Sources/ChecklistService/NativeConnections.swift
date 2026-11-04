@@ -137,6 +137,7 @@ extension Coordinator {
             let token=Data(bytes).base64EncodedString()
             let label=relay ? "Personal assistant helper · \(sid.prefix(8))":"\(plugin.manifest.displayName) thread \(sid.prefix(8))"
             var enrollment=Enrollment(installation:installation,name:label,provider:provider,role:relay ? "assistant":"worker",projectIDs:projectIDs,sessionID:boundSessionID,workspace:binding,profileID:nil,tokenDigest:SHA256.hash(data:Data(token.utf8)).map{String(format:"%02x",$0)}.joined(),generation:UUID().uuidString)
+            enrollment.nativeRelayRegistrationStore=nativeRelayPolicy.registrationStore
             enrollment.nativeSessionID=sid
             enrollment.automatic=true;enrollment.revoked=false;enrollment.identityVerification=plugin.nativeHost?.identityVerification
             enrollment.nativeExecutionDomain=executionDomain
@@ -223,6 +224,8 @@ extension Coordinator {
             let token=Data(bytes).base64EncodedString()
             let plugin=ProviderPluginRegistry.bundled.plugin(native.provider,requiring:.workSession)!
             var enrollment=Enrollment(installation:boundInstallation,name:"\(plugin.manifest.displayName) thread \(native.session.prefix(8))",provider:native.provider,role:"worker",projectIDs:[pid],sessionID:native.session,workspace:native.workspace,profileID:nil,tokenDigest:SHA256.hash(data:Data(token.utf8)).map{String(format:"%02x",$0)}.joined(),generation:generation)
+            // Rebuilding an existing enrollment cannot turn a copied session into a slot-local one.
+            enrollment.nativeRelayRegistrationStore=priorEnrollment == nil ? nativeRelayPolicy.registrationStore : priorEnrollment?.nativeRelayRegistrationStore
             enrollment.nativeSessionID=native.session;enrollment.automatic=true;enrollment.revoked=false
             enrollment.codexAppHostProven=native.provider == "codex" ? codexRoute.effects.provesRegistrationDomain(session:native.session,domain:native.executionDomain) : nil
             enrollment.nativeExecutionDomain=native.executionDomain;enrollment.identityVerification=plugin.nativeHost?.identityVerification

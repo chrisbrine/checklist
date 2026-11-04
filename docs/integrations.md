@@ -24,6 +24,38 @@ On 17 October 2026, a local observation with engine 2.1.299 in Claude Desktop fo
 
 ## Claude relay reply listener
 
+### Test-slot isolation (CL-429)
+
+Every test-slot service starts with all native note relays off. It does not bind a
+Claude reply listener, write a Claude peer message, queue a Codex message or open
+a Codex thread. Notes still save for authenticated pickup. This is a runtime
+restriction in addition to the build-level qualification table below:
+`service_info.native_reply_listener` reports `state=disabled`,
+`slot_relays=off`, `claude_relay=stopped`, `codex_queue_relay=off` and explains
+that test-slot relays are off.
+
+An explicitly opted-in slot (`--allow-synthetic-relays` on create/start, persisted
+in its metadata; service environment `CHECKLIST_SLOT_RELAYS=synthetic`) permits
+only sessions first registered in that slot store. The service records an
+enrollment marker at initial verified native registration, bound to the slot
+number, canonical enrollment-store folder and Core store incarnation. Existing
+enrollments and reconnects retain their marker, including an absent marker;
+neither re-registration nor a new authorization generation upgrades a seeded
+session. A copied live session has no slot marker, and a different slot, folder
+or restored store incarnation does not match. Prepared manual pairing cannot
+mint native registration provenance. All existing native identity, delivery and
+transport checks still apply. `slot_relays=synthetic` and the listener message
+state the restriction; it does not promise a working endpoint. Use
+`--no-allow-synthetic-relays` on a stopped slot to clear consent.
+
+Before CL-429, seeded native enrollments had no instance boundary: the same live
+Claude process, private socket inode and matching registry could still pass the
+peer checks; the same Codex app registration could still pass current source,
+host signing and holder checks. Those checks identify a recipient, not the store
+that first registered it. Fake-transport tests demonstrate this eligibility and
+the new exclusion without contacting a real conversation. They do not establish
+an actual recipient acknowledgment. See the [slot recipes](monorepo-workspace.md).
+
 The service listens at `/tmp/cc-socks/<service pid>.sock`, a folder that Claude Code also uses for its own session sockets, with the same name pattern. A running service holds one file there. The rule (CL-415): the service removes a file only when it holds proof that the file is the socket it bound, and any doubt leaves the file untouched. At start it binds `<service pid>.sock` if that path is free. If any file exists at that path, the service leaves the file untouched and binds a unique name in the same folder, `<service pid>-<8 hex>.sock`, with at most 8 tries. `bind` never replaces a file, so this choice has no gap between a check and a removal. A file at the PID name can be live even if a connection is refused: a child can inherit a listener from a creator that exited, the PID can then come back to the service, and Darwin refuses a connection to a listener with a full queue. A PID name identifies a creator, not each current holder of the descriptor.
 
 The relay gives Claude the address of the path that the service actually bound. Claude's kernel peer PID still selects the recipient through the recipient's own endpoint, so no Checklist code reads the PID in the service's socket name. No check has shown that Claude Code replies to a `<service pid>-<8 hex>.sock` address. `service_info.native_reply_listener.reply_path_name` is `fallback` when the service uses such a name.
@@ -87,7 +119,7 @@ Limit: a subprocess of one Codex process can select any rollout of that process.
 
 Hook delivery is at least once: pickup is a read, the hook writes stdout, and only a later confirmation stamps the delivery. A lost output or a failed confirmation shows the note again at a later tool call, for at most 24 hours after the delivery's `created_at`. This rule is a read rule, with no write. An older note stays in the reply notice and the inbox. The confirmation has its own 1.0-second limit after stdout, so read and confirmation together take at most 2.5 seconds after executable entry, under the 3-second `timeout` below. See the [command contract](mcp-contract.md). The hook therefore lets the stdin `session_id` select only among the rollouts that the nearest native Codex process holds by kernel descriptor, so a run with subagents works. A variable or stdin claim alone is insufficient. After bootstrap verifies that observation, the hook reads the credential file of that exact installation, with no Keychain path (a slot run on 2 November 2026 showed that a hook with no credential got `SETUP_REQUIRED` on each call).
 
-The route is on: `CodexQueueRelay.enabled=true` in the source. That switch and `CodexQueueRelay.openUnloadedThreads` are compile-time constants with no per-project setting, so every Codex enrollment that passes the checks below can get the route. On build 273 (`471f195164b0981b`) in a test slot, on 2 November 2026, with the app's Codex 0.166.0-alpha.5.1: a real app thread got a Checklist note through the service relay with no owner action, and its log holds the exact marker, 27 s after the send. The same run refused a harmful request in a note, and held at most 1 queue item through 3 notes in a long turn. The unloaded-thread case is CL-417: the host held the idle thread for more than 45 minutes in that test. A Codex app thread also gets notes through replies (`pending_notes`) and the inbox. With `enabled=false`, no Codex enrollment joins native dispatch, no queue or open call runs, and no delivery changes `state` or `push_state`. The measures below remain valid. The loaded-thread check confirmed them on this source.
+The route is on: `CodexQueueRelay.enabled=true` in the source. That switch and `CodexQueueRelay.openUnloadedThreads` are compile-time constants with no per-project setting, with the additional [CL-429 test-slot restriction](#test-slot-isolation-cl-429): only eligible registrations in an explicitly opted-in slot can get the route. On build 273 (`471f195164b0981b`) in a test slot, on 2 November 2026, with the app's Codex 0.166.0-alpha.5.1: a real app thread got a Checklist note through the service relay with no owner action, and its log holds the exact marker, 27 s after the send. The same run refused a harmful request in a note, and held at most 1 queue item through 3 notes in a long turn. The unloaded-thread case is CL-417: the host held the idle thread for more than 45 minutes in that test. A Codex app thread also gets notes through replies (`pending_notes`) and the inbox. With `enabled=false`, no Codex enrollment joins native dispatch, no queue or open call runs, and no delivery changes `state` or `push_state`. The measures below remain valid. The loaded-thread check confirmed them on this source.
 
 Before queue I/O, the service resolves the actual account home from the account record, independent of caller environment, and opens only `.codex/state_5.sqlite` read-only with no SQLite busy wait. It validates the `threads` table shape and selects the exact validated thread UUID. Only `source=vscode` is an app target. `originator` cannot decide: observed exec rows can say `Codex Desktop`. Exec, mcp, subagent, missing-row, read-error, locked, unknown-schema, missing-database and unsupported-version cases each produce a stated refusal reason before any queue call. The only supported paths are `.codex/state_5.sqlite` and `.codex/queue_1.sqlite`. A newer numbered state database refuses queue submission even when the supported older file remains. A newer numbered queue database refuses the send at the preflight read of the queue. If it appears after queue acceptance, the follow-up records `queue_poll_result=database_version_unsupported` and `open_result=refused`, and the queue receipt stays. Older retained versions are allowed. A renamed or missing `state_5.sqlite` fails closed. A missing `queue_1.sqlite` under an existing Codex home does not refuse the send: the read returns no items, because the source states that Codex creates this file at its first queue call (no Checklist run measured this). The follow-up read of the exact item has no such rule, so a missing file there records `queue_poll_result=database_missing` and runs no open. Limit: if Codex renames the file to a name that is not `queue_N`, the read also returns no items, so the one-item limit has no effect. A rename to a higher `queue_N` refuses. The observer never selects the newest file. Required columns declare SQLite `TEXT`: `threads.id` is the primary key, with `source` and `originator`; queue checks require `queued_items.id` as the primary key and `thread_id`. Extra columns are allowed. An unavailable path leaves MCP pickup available.
 The implementer observed the service running as UID 501/GID 20, the state database owned by UID 501 with mode 0644, no service code-signing entitlements, and a successful read-only schema probe from that account. These observations support the inference that current Unix permissions and lack of App Sandbox allow service reads. They do not measure an exact installed-service query.

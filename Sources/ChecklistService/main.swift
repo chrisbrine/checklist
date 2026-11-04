@@ -35,6 +35,8 @@ struct Enrollment: Codable, Sendable {
     var nativeSessionID: String?
     // Codex only: set at bootstrap. True when the registered process was the app host and held this thread's rollout.
     var codexAppHostProven: Bool?
+    // Set only for a session's first registration in this slot store. Never upgraded on reconnect.
+    var nativeRelayRegistrationStore: String?
     // Prepared manual pairing remains unusable without its committed Core receipt.
     var pairingCommandID: String?
     var pairingIntentDigest: String?
@@ -79,6 +81,7 @@ final class StorageRecoveryPeer: NSObject, ChecklistRPC {
 // Invariant: after startup, mutable coordinator state is confined to queue; storage/native workers carry immutable snapshots and return mutations to queue.
 final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     let router: CommandRouter
+    let nativeRelayPolicy: SlotNativeRelayPolicy
     private let enforcesQueueIsolation: Bool
     let listener = NSXPCListener(machServiceName: ChecklistInstance.current.machServiceName)
     // Bound request envelopes, reply serialization and afterCommand bridge
@@ -98,7 +101,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     var storageWakePlanning = false
     var storageWakeReplan = false
     var attemptedDeliveries = Set<String>()
-    lazy var codexRoute = CodexQueueRouteState(markerFile:enrollmentFile.deletingLastPathComponent().appendingPathComponent("codex-queue-route.json"),effects:enforcesQueueIsolation ? .live : .unavailable)
+    lazy var codexRoute = CodexQueueRouteState(markerFile:enrollmentFile.deletingLastPathComponent().appendingPathComponent("codex-queue-route.json"),effects:enforcesQueueIsolation && nativeRelayPolicy.enabled ? .live : .unavailable)
     var nativeInFlight: [String: NativeInFlight] = [:]
     var workHealthWake: DispatchWorkItem?
     var workHealthFailures = 0
@@ -113,8 +116,9 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     /// A coordinator keeps credentials beside its enrollments. A temporary test root therefore
     /// reaches neither the live credential folder nor Keychain.
     let credentials: InstallationCredentialStore
-    init(router: CommandRouter, enrollmentFile: URL = ChecklistPaths.root.appendingPathComponent("connections.json"), startBackgroundWork: Bool = true, credentials: InstallationCredentialStore? = nil) {
+    init(router: CommandRouter, enrollmentFile: URL = ChecklistPaths.root.appendingPathComponent("connections.json"), startBackgroundWork: Bool = true, credentials: InstallationCredentialStore? = nil, instance: ChecklistInstance = .current, environment: [String:String] = ProcessInfo.processInfo.environment) {
         self.router = router
+        self.nativeRelayPolicy = SlotNativeRelayPolicy(instance:instance,storeRoot:enrollmentFile.deletingLastPathComponent(),incarnation:router.storeIncarnation,environment:environment)
         self.credentials = credentials ?? .production(root: enrollmentFile.deletingLastPathComponent())
         self.enforcesQueueIsolation = startBackgroundWork
         self.enrollmentFile = enrollmentFile
@@ -127,6 +131,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         }
         self.expectedOwnerHash=(info as? [String:Any])?[kSecCodeInfoUnique as String] as? Data
         super.init()
+        router.nativeReplyListenerStatus = relayListenerStatus(state:nativeRelayPolicy.enabled ? .notStarted : .disabled)
         // Operations only decouple the reply; each runs on its own worker as the
         // synchronous request did, never queued behind backups or maintenance.
         router.configureCommandOperations(on:commandOperationQueue) { [weak self] _,_ in
@@ -465,18 +470,28 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         return .router(method:method,params:params,caller:caller)
     }
     func changed() { requireCommandQueue(); for callback in Array(waiters.values) { callback() } }
+    private func relayListenerStatus(state: NativeReplyListenerStatus.State, reason: String? = nil, usesFallbackName: Bool = false) -> NativeReplyListenerStatus {
+        .init(state:state,reason:reason,usesFallbackName:usesFallbackName,
+              codexQueueRelayEnabled:nativeRelayPolicy.enabled && CodexQueueRelay.enabled,
+              slotRelayMode:nativeRelayPolicy.slot.map { _ in nativeRelayPolicy.enabled ? "synthetic" : "off" },
+              slotRelayMessage:nativeRelayPolicy.message)
+    }
     func startNativeReplies(directory: String = "/tmp/cc-socks") {
         queue.sync { startNativeRepliesOnQueue(directory:URL(fileURLWithPath:directory,isDirectory:true)) }
     }
     private func startNativeRepliesOnQueue(directory: URL) {
+        guard nativeRelayPolicy.enabled else {
+            router.nativeReplyListenerStatus = relayListenerStatus(state:.disabled)
+            return
+        }
         if !FileManager.default.fileExists(atPath:directory.path) { try? FileManager.default.createDirectory(at:directory,withIntermediateDirectories:false,attributes:[.posixPermissions:0o700]) }
         do {
             let started=try NativeReplyListener.start(directory:directory.path)
             nativeListener=started
-            router.nativeReplyListenerStatus = .init(state:.listening,usesFallbackName:!started.hasProcessIDName,codexQueueRelayEnabled:CodexQueueRelay.enabled)
+            router.nativeReplyListenerStatus = relayListenerStatus(state:.listening,usesFallbackName:!started.hasProcessIDName)
         } catch { // The Codex queue route needs no reply listener, so its startup pass still runs.
             fputs("Native reply listener unavailable: \(error.localizedDescription)\n",stderr)
-            router.nativeReplyListenerStatus = .init(state:.failed,reason:error.localizedDescription,codexQueueRelayEnabled:CodexQueueRelay.enabled)
+            router.nativeReplyListenerStatus = relayListenerStatus(state:.failed,reason:error.localizedDescription)
         }
         // Startup owns one pending-delivery pass; ordinary pure reads no longer
         // provide incidental dispatch after a service restart.
@@ -509,7 +524,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     func nativeDispatchDeliveries(endpointAvailable: (Enrollment)->Bool = Coordinator.nativeEndpointAvailable,
                                   load: ([String:Any]) -> [String:Any]?) -> [[String:Any]] {
         requireCommandQueue()
-        let sessions = enrollments.values.filter {$0.nativeEndpoint != nil && Self.codexQueueRegistration($0) == nil && $0.revoked != true && endpointAvailable($0)}.map { $0.sessionID }
+        let sessions = enrollments.values.filter {nativeRelayPolicy.allows($0) && $0.nativeEndpoint != nil && Self.codexQueueRegistration($0) == nil && $0.revoked != true && endpointAvailable($0)}.map { $0.sessionID }
         var pending: [[String:Any]] = []
         // Bound each internal request without imposing a new installation-wide
         // enrollment limit. An empty route set performs no outbox projection.
@@ -524,7 +539,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     }
     func dispatchNative() {
         requireCommandQueue()
-        guard router.writeAdmissionStatus["locked"] as? Bool != true else {return}
+        guard nativeRelayPolicy.enabled,router.writeAdmissionStatus["locked"] as? Bool != true else {return}
         observeNativeConversationLifecycles()
         let bridge=Caller(role:"owner",installation:"native-bridge",projectIDs:[])
         let pending = nativeDispatchDeliveries { params in
@@ -534,7 +549,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         for delivery in pending {
             guard let id=delivery["id"] as? String,!attemptedDeliveries.contains(id), delivery["push_state"] as? String == "unavailable",
                   let sid=delivery["recipient_session_id"] as? String,
-                  let enrollment=enrollments.values.first(where:{$0.sessionID==sid && $0.revoked != true && Self.nativeEndpointAvailable($0)}),
+                  let enrollment=enrollments.values.first(where:{$0.sessionID==sid && nativeRelayPolicy.allows($0) && $0.revoked != true && Self.nativeEndpointAvailable($0)}),
                   let message=delivery["message"] as? [String:Any],let mid=message["id"] as? String,let body=message["body"] as? String else { continue }
             // Owner notes, agent ticket notes and work health requests use the relay, but a work health request never uses the Codex queue branch. It always states its own
             // restricted class (prompting) and the real author; it never claims an originating agent's permission class.
@@ -571,7 +586,8 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
                 do {
                     let authorized: () -> Bool = { [self] in queue.sync { () -> Bool in
                         guard self.enrollments[enrollment.installation]?.generation == enrollment.generation,
-                              self.enrollments[enrollment.installation]?.revoked != true,
+                              let currentEnrollment = self.enrollments[enrollment.installation],
+                              self.nativeRelayPolicy.allows(currentEnrollment),currentEnrollment.revoked != true,
                               let current=try? self.router.handle(method:"delivery_pending",params:["native_session_ids":[sid]],caller:bridge),let data=current["data"] as? [String:Any],let deliveries=data["deliveries"] as? [[String:Any]] else { return false }
                         return deliveries.contains { $0["id"] as? String == id }
                     } }
@@ -617,7 +633,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         // Kernel peer identity selects one current qualified adapter before any
         // provider frame is decoded. Disabling native I/O leaves MCP pickup intact.
         let providers=Set(enrollments.values.compactMap { enrollment -> String? in
-            guard enrollment.revoked != true,let endpoint=enrollment.nativeEndpoint,
+            guard nativeRelayPolicy.allows(enrollment),enrollment.revoked != true,let endpoint=enrollment.nativeEndpoint,
                   NativeProviderTransport.endpointPID(provider:enrollment.provider,endpoint:endpoint) == frame.peerPID else { return nil }
             return enrollment.provider
         })

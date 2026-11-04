@@ -27,6 +27,8 @@ public final class CommandRouter: @unchecked Sendable {
     private let gateFiles: StorageObjectFiles
     let managedCapturePaths: [Data:String]
     let incarnation: String
+    /// Registration provenance must bind to this store lifetime, including after restore.
+    public var storeIncarnation: String { incarnation }
     let providerPlugins: ProviderPluginRegistry
     let cliCommand: String
     let serviceLease: StorageServiceLease?

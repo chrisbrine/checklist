@@ -79,6 +79,33 @@ python3 -m unittest discover -s scripts -p test_test_instances.py
 
 See [test instances](test-instances.md) for the four isolated identities, backup-seeding limits and mandatory same-build backup check before promotion. `./script/build_and_run.sh --install-stage CAPTURE_DIR` verifies and installs an existing original stage through the ordinary install path; it does not compile again. Like `--verify`, it requires the exact installed app process and healthy parsed service status before success, retaining the prior bundle on failure. The live defaults below remain unchanged; test bundles derive separate values from their own Info.plist.
 
+Every test slot starts with native relays off, including slots seeded from a live
+backup. Notes save for pickup; the Claude peer relay, Codex app queue and native
+wake routes do not contact copied conversations. `status` (text or `--json`)
+reports `slot_relays: "off"` and `allow_synthetic_relays: false`. Older slot
+metadata without the option also means off.
+
+For an explicitly authorized synthetic-session relay check, opt in at creation
+or while starting a stopped slot:
+
+```sh
+./script/test_instances.py create --slot 1 --latest-stage --ticket CL-N --allow-synthetic-relays
+./script/test_instances.py start --slot 1 --headless
+# Or opt in when starting an existing stopped slot:
+./script/test_instances.py start --slot 1 --headless --allow-synthetic-relays
+```
+
+The option persists in `slot.json`; the service launch gets
+`CHECKLIST_SLOT_RELAYS=synthetic`, and status reports `slot_relays: "synthetic"`.
+The default launch explicitly sets `CHECKLIST_SLOT_RELAYS=off`, regardless of
+the caller's environment. Synthetic mode permits only sessions first registered
+in this slot's current store, bound to its slot number, canonical registration
+store root and store incarnation. A session copied from a seed stays ineligible
+after reconnecting. Starting with `--no-allow-synthetic-relays` resets the saved
+option to off. Changing the policy requires a stopped slot; a start command
+refuses a policy change while its service is registered. This option grants no
+permission to enroll or contact a real conversation.
+
 ## Captured build lane and timing
 
 `ChecklistProducts` is a build aggregation target. It depends on `ChecklistApp`, `ChecklistService` and `ChecklistCLI`. One `swift build --target ChecklistProducts` builds and links all three shipping executables. The helper reads `--show-bin-path` once before compilation. It removes only final shipping executables and resource bundles from that output directory, retaining objects and module caches. This prevents a changed manifest or group from reusing a stale final product. It does not build the storage crash or CLI input probes for a shipping stage. SwiftPM's normal build-manifest cache stays enabled. Release remains the default configuration and retains `-O`. Release stages explicitly select `--build-system native` with `-Xswiftc -no-whole-module-optimization -Xswiftc -incremental -Xswiftc -enable-batch-mode`, so unchanged per-file objects and dependency records can be reused. The current Swift Build engine still plans whole-module dependency outputs when these compiler flags alone override release mode; that combination fails with missing dependency files. Native SwiftPM supplies the matching per-file output maps. Debug keeps the toolchain's normal defaults. Requalify this explicit engine selection when upgrading SwiftPM.

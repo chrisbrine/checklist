@@ -799,6 +799,65 @@ extension MediaSimpleReviewTests {
         XCTAssertEqual(model.roundState,"open");XCTAssertNil(model.error);XCTAssertNil(store.error)
         XCTAssertEqual((service.params("media_round_publish").last?["items"] as? [MediaValues])?.count,3)
     }
+    /// CL-426: the intake "Publish these N items" press approves the context by itself, then publishes the same items.
+    private func intakePreview(_ service: DraftService) async -> (MediaReviewModel,ChecklistStore) {
+        service.ready["SE"]=true
+        let (_,model,store)=await draftReview(service)
+        await model.previewPublication()
+        XCTAssertEqual(model.publication.count,3);service.calls=[]
+        return (model,store)
+    }
+    func testIntakePublishApprovesContextByItselfThenPublishesTheSameItems() async throws {
+        let service=DraftService()
+        let (model,store)=await intakePreview(service)
+        service.publishFailures=[Self.contextRequired()]
+        await model.publishShownPreview()
+        XCTAssertEqual(service.writes,["media_round_publish","media_context_approve","media_round_publish"])
+        XCTAssertEqual(sequence(service),["media_round_publish","media_context_approve","media_publication_preview","media_round_publish"],
+            "The first publication sends the frozen preview; the second reads it again")
+        let approve=try XCTUnwrap(service.params("media_context_approve").first)
+        XCTAssertEqual(Set(approve.keys),["kind","expected_project_revision","project_id","command_id"],"The same request as the setup button")
+        XCTAssertEqual(approve["kind"] as? String,"project");XCTAssertEqual(approve["expected_project_revision"] as? Int,4)
+        let sent=service.params("media_round_publish")
+        XCTAssertEqual(sent.first?["observed_context_token"] as? String,"draft-context")
+        for publish in sent {XCTAssertEqual((publish["items"] as? [MediaValues])?.compactMap {$0["item_id"] as? String},["item-N","item-E","item-SE"])}
+        XCTAssertEqual(model.roundState,"open");XCTAssertTrue(model.publication.isEmpty);XCTAssertNil(model.publicationFailure)
+        XCTAssertNil(store.error,"No OK-only global alert");XCTAssertNil(model.error,"No orange line");XCTAssertFalse(store.hasPendingMutation)
+    }
+    func testIntakePublishFailedApprovalShowsOneLineAndPublishesNothing() async throws {
+        let service=DraftService()
+        let (model,store)=await intakePreview(service)
+        service.publishFailures=[Self.contextRequired()]
+        service.approveFailures=[ChecklistError("REVISION_CONFLICT","The project changed. Refresh and try again.",details:["command_outcome":"rejected"])]
+        await model.publishShownPreview()
+        XCTAssertEqual(service.writes,["media_round_publish","media_context_approve"],"No second publication")
+        XCTAssertEqual(model.publicationFailure,"Could not publish these items: The project changed. Refresh and try again. Nothing was published.")
+        XCTAssertEqual(service.state,"draft");XCTAssertEqual(model.publication.count,3,"The owner still sees the items")
+        await model.waitUntilWritable();XCTAssertFalse(store.hasPendingMutation)
+        XCTAssertNil(store.error,"No global alert");XCTAssertNil(model.error)
+    }
+    func testIntakePublishRefusalShowsOneLineAndPublishesNothing() async throws {
+        let service=DraftService()
+        let (model,store)=await intakePreview(service)
+        service.publishFailures=[ChecklistError("MEDIA_BASIS_CHANGED","The exact complete target must match the publication preview.",details:["command_outcome":"rejected"])]
+        await model.publishShownPreview()
+        XCTAssertEqual(service.writes,["media_round_publish"])
+        XCTAssertEqual(model.publicationFailure,"Could not publish these items: The exact complete target must match the publication preview. Nothing was published.")
+        XCTAssertEqual(service.state,"draft");XCTAssertNil(store.error);XCTAssertNil(model.error)
+        // A new preview clears the line.
+        await model.previewPublication();XCTAssertNil(model.publicationFailure)
+    }
+    func testIntakePublishAfterApprovalSendsNothingWhenTheItemsChanged() async throws {
+        let service=DraftService()
+        let (model,store)=await intakePreview(service)
+        // The owner saw two items; the preview after the approval holds three.
+        model.publication=Array(model.publication.prefix(2))
+        service.publishFailures=[Self.contextRequired()]
+        await model.publishShownPreview()
+        XCTAssertEqual(service.writes,["media_round_publish","media_context_approve"],"No second publication")
+        XCTAssertEqual(model.publicationFailure,"Could not publish these items: The publication items changed. Preview the publication again. Nothing was published.")
+        XCTAssertEqual(service.state,"draft");XCTAssertNil(store.error);XCTAssertNil(model.error)
+    }
     /// Review 8b119aed R3: items read again before the open header arrives still take the open basis in place.
     func testOtherCardsTakeTheOpenBasisAfterPublicationWithNoReopen() async throws {
         let service=DraftService();service.ready["SE"]=true

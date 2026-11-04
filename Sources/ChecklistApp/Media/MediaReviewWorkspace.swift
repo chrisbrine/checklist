@@ -113,14 +113,8 @@ struct MediaReviewWorkspace: View {
                     TextField("New round title",text:$roundTitle)
                     Button("Add Draft round") {model.createRound(title:roundTitle) {roundTitle=""}}.checklistDisabled([(roundTitle.isEmpty,"Enter a round title."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
                 }}
-                if let error=model.error {HStack {
-                    Text(error).foregroundStyle(.orange).textSelection(.enabled)
-                    // CL-422 rework: a refusal for the project context offers the approval next to its text.
-                    if error==MediaReviewModel.projectContextRequiredText,store.currentProject != nil {
-                        Button("Approve project context") {Task {try? await model.approveProjectContext()}}
-                            .checklistDisabled([(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
-                    }
-                }}
+                // CL-426: every publication route approves the project context by itself, so this line offers no approval.
+                if let error=model.error {Text(error).foregroundStyle(.orange).textSelection(.enabled)}
                 // Shown only for data never loaded; a live refresh changes values in place (CL-421).
                 if model.loading {ProgressView("Loading media review")}
                 if !model.roundID.isEmpty && MediaSimpleLayout.usesCards(model.schema) && !itemComparison {
@@ -218,7 +212,9 @@ struct MediaReviewWorkspace: View {
                             }
                         }}.frame(maxHeight:120)
                     }
-                    Button("Publish these \(model.publication.count) items") {model.publish()}.checklistDisabled([(model.publication.contains {!$0.bool("publication_ready")},"Capture all required originals before publication."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
+                    Button("Publish these \(model.publication.count) items") {model.publish()}.checklistDisabled([(model.publication.contains {!$0.bool("publication_ready")},"Capture all required originals before publication."),(model.publishingShown,"Publishing these items."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
+                    // CL-426: one plain line for a refused publication or approval; no global alert shows it.
+                    if let failure=model.publicationFailure {Text(failure).foregroundStyle(.orange).textSelection(.enabled)}
                 }
                 DisclosureGroup("Cancel this round") {
                     TextField("Cancellation reason",text:$cancelReason)
@@ -320,22 +316,28 @@ struct MediaRoundTicketBar: View {
         }
         .onChange(of:model.roundID) {_,_ in choosing=false;search=""}
     }
+    static let visibleTicketChoices = 12
     private var picker: some View {
         VStack(alignment:.leading,spacing:4) {
             TextField("Search open tickets by key or title",text:$search).accessibilityIdentifier("mediaRoundTicketSearch")
             if model.ticketChoicesLoading && model.ticketChoices.isEmpty {ProgressView().controlSize(.small)}
-            ScrollView {
-                LazyVStack(alignment:.leading,spacing:2) {
-                    ForEach(model.ticketChoices) {task in
-                        Button(task.string("key")+" — "+task.string("title")) {model.linkTask(task.id);choosing=false}
-                            .buttonStyle(.plain).padding(.vertical,2)
-                            .accessibilityAddTraits(task.id==model.linkedTask.id ? .isSelected : [])
-                    }
-                    if !model.ticketChoicesLoading && model.ticketChoices.isEmpty {
-                        Text("No open ticket matches.").font(.caption).foregroundStyle(Color.checklistSecondaryText)
-                    }
+            // CL-427 round 93 UI check: a ScrollView with only a maximum height collapsed to zero height
+            // here, so the matches never showed. A plain list of the first matches always has its size.
+            VStack(alignment:.leading,spacing:2) {
+                ForEach(Array(model.ticketChoices.prefix(Self.visibleTicketChoices))) {task in
+                    Button(task.string("key")+" — "+task.string("title")) {model.linkTask(task.id);choosing=false}
+                        .buttonStyle(.plain).padding(.vertical,2)
+                        .accessibilityAddTraits(task.id==model.linkedTask.id ? .isSelected : [])
                 }
-            }.frame(maxHeight:140)
+                if model.ticketChoices.count > Self.visibleTicketChoices {
+                    Text("Type more of the key or title to see the other \(model.ticketChoices.count - Self.visibleTicketChoices) tickets.")
+                        .font(.caption).foregroundStyle(Color.checklistSecondaryText)
+                }
+                if !model.ticketChoicesLoading && model.ticketChoices.isEmpty {
+                    Text("No open ticket matches.").font(.caption).foregroundStyle(Color.checklistSecondaryText)
+                }
+            }
+            .fixedSize(horizontal:false,vertical:true)
             HStack {
                 if !model.linkedTask.id.isEmpty {Button("No ticket") {model.linkTask(nil);choosing=false}}
                 Button("Close") {choosing=false}

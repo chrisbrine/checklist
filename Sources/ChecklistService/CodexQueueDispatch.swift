@@ -231,16 +231,16 @@ extension Coordinator {
     /// query here reads all sessions. The note age bound narrows the store read.
     func codexQueueSelection() -> (ids:[String],createdMin:String)? {
         let route = codexRoute
-        guard route.effects.enabled,enrollments.values.contains(where:{ $0.provider == "codex" && $0.automatic == true && $0.nativeEndpoint == nil && $0.revoked != true }),
+        guard nativeRelayPolicy.enabled,route.effects.enabled,enrollments.values.contains(where:{ nativeRelayPolicy.allows($0) && $0.provider == "codex" && $0.automatic == true && $0.nativeEndpoint == nil && $0.revoked != true }),
               let activated = route.activatedAt() else { return nil }
         let threads = route.appThreads(enrolled:Set(enrollments.values.compactMap { e -> String? in
-            e.provider == "codex" && e.nativeEndpoint == nil && e.revoked != true && e.automatic == true ? (e.nativeSessionID ?? e.sessionID).lowercased() : nil
+            nativeRelayPolicy.allows(e) && e.provider == "codex" && e.nativeEndpoint == nil && e.revoked != true && e.automatic == true ? (e.nativeSessionID ?? e.sessionID).lowercased() : nil
         })) { [self] in
             queue.async { [self] in dispatchNative() }
         }
         guard !threads.isEmpty else { return nil }
         let ids = enrollments.values.compactMap { e -> String? in
-            guard e.provider == "codex",e.nativeEndpoint == nil,e.revoked != true,e.automatic == true,
+            guard nativeRelayPolicy.allows(e),e.provider == "codex",e.nativeEndpoint == nil,e.revoked != true,e.automatic == true,
                   threads.contains((e.nativeSessionID ?? e.sessionID).lowercased()),Self.codexQueueRegistration(e) != nil else { return nil }
             return e.sessionID
         }
@@ -253,7 +253,7 @@ extension Coordinator {
     func codexQueueAdmit(threadID: String, delivery: [String:Any], message: [String:Any], pass: inout CodexQueuePass) -> Bool {
         let route = codexRoute,current = route.effects.now()
         // A service timer starts no Codex turn: a work health request stays on session_inbox pickup, unchanged.
-        guard message["origin"] as? String != "system",route.effects.enabled,let activated = route.activatedAt(),pass.total < CodexQueueBounds.queueCallsPerPass,
+        guard nativeRelayPolicy.enabled,message["origin"] as? String != "system",route.effects.enabled,let activated = route.activatedAt(),pass.total < CodexQueueBounds.queueCallsPerPass,
               route.open < CodexQueueBounds.openDeliveries,!pass.threads.contains(threadID),delivery["hook_state"] == nil,
               (route.retryAt[threadID] ?? .distantPast) <= current,
               let raw = message["created_at"] as? String,let created = ISO8601DateFormatter().date(from:raw),
@@ -266,6 +266,7 @@ extension Coordinator {
     /// registration and occupied-item checks also record a safe reason receipt.
     func startCodexQueueDelivery(_ start: CodexQueueStart) {
         requireCommandQueue()
+        guard nativeRelayPolicy.allows(start.enrollment) else { return }
         let route = codexRoute,id = start.deliveryID,thread = start.registration.sessionID,generation = start.enrollment.generation
         route.open += 1
         attemptedDeliveries.insert(id)
@@ -407,7 +408,7 @@ extension Coordinator {
     func codexQueueFence(deliveryID id: String, enrollment: Enrollment) -> CodexQueueReason? {
         requireCommandQueue()
         let generation = enrollment.generation
-        guard enrollments[enrollment.installation]?.generation == generation,enrollments[enrollment.installation]?.revoked != true else { return .authorizationChanged }
+        guard let current = enrollments[enrollment.installation],nativeRelayPolicy.allows(current),current.generation == generation,current.revoked != true else { return .authorizationChanged }
         let bridge = Caller(role:"owner",installation:"native-bridge",projectIDs:[])
         let receipt: [String:Any] = ["stage":"native_send_started","route_generation":generation,"route":"codex_app_queue","result":"uncertain",
             "observer":"codex_state_5_threads_source","source":"vscode","reason_code":"queue_outcome_unknown","queue_poll_result":"not_started","open_result":"not_started"]
@@ -430,7 +431,7 @@ extension Coordinator {
     /// One exact record read. It never expands the session's open deliveries.
     func codexQueueDeliveryStatus(id: String, enrollment: Enrollment) -> CodexQueueDeliveryStatus {
         requireCommandQueue()
-        guard enrollments[enrollment.installation]?.generation == enrollment.generation,enrollments[enrollment.installation]?.revoked != true else { return .changed }
+        guard let current = enrollments[enrollment.installation],nativeRelayPolicy.allows(current),current.generation == enrollment.generation,current.revoked != true else { return .changed }
         let bridge = Caller(role:"owner",installation:"native-bridge",projectIDs:[])
         guard let result = try? router.handle(method:"delivery_pending",params:["delivery_id":id],caller:bridge),
               let data = result["data"] as? [String:Any] else { return .changed }

@@ -1288,7 +1288,8 @@ def create(arguments, p):
         mark_qualification(p['folder'], manifest['source_fingerprint'],
                            'disposable test slot ' + str(arguments.slot), session, tickets=tickets)
         metadata = {'slot': arguments.slot, 'tickets': tickets, 'build_id': manifest['build_id'], 'source_fingerprint': manifest['source_fingerprint'],
-                    'stage_path': str(capture), 'seed': {'kind': 'incomplete'}, 'created_at': now(), 'mode': 'incomplete', 'checks': None}
+                    'stage_path': str(capture), 'seed': {'kind': 'incomplete'}, 'created_at': now(), 'mode': 'incomplete', 'checks': None,
+                    'allow_synthetic_relays': getattr(arguments, 'allow_synthetic_relays', False) is True}
         save(p, metadata)
         pending = contained(p['folder'] / '.seed-data', p['folder'])
         if prepared is not None: prepared.rename(pending)
@@ -1320,8 +1321,8 @@ def create(arguments, p):
         run(['codesign', '--force', '--sign', identity, '--timestamp=none', '--identifier', p['identifier'], p['bundle']])
         run(['codesign', '--verify', '--deep', '--strict', p['bundle']])
         signing_teams(p['bundle'], manifest['signing_profile'])
-        save(p, {'slot': arguments.slot, 'build_id': manifest['build_id'], 'source_fingerprint': manifest['source_fingerprint'],
-                 'stage_path': str(capture), 'seed': seed, 'created_at': now(), 'mode': 'stopped', 'checks': None})
+        metadata.update(seed=seed, mode='stopped')
+        save(p, metadata)
         print(f'Created slot {arguments.slot}: build {manifest["build_id"]}; seed {seed["kind"]}')
 
 
@@ -1489,6 +1490,11 @@ def service_status(p, *, bound=None):
 def start(arguments, p):
     bound = start_deadline_seconds()  # Reject invalid configuration before bootstrap.
     metadata = load(p)
+    # Only this persisted opt-in controls the launch. Never inherit a relay opt-in
+    # from the caller or launchd environment, including for older slot metadata.
+    configured_relays = metadata.get('allow_synthetic_relays') is True
+    requested_relays = getattr(arguments, 'allow_synthetic_relays', None)
+    allow_synthetic_relays = configured_relays if requested_relays is None else requested_relays is True
     if metadata['seed']['kind'] not in ['empty', 'backup', 'slot', 'restored'] or metadata['mode'] in ['incomplete', 'refused', 'restaging']:
         raise ValueError('Slot creation did not complete: ' + metadata['seed'].get('reason', 'incomplete seed'))
     manifest = bundle_check(p, metadata)
@@ -1507,11 +1513,16 @@ def start(arguments, p):
     contents = {'Label': p['label'], 'MachServices': {p['label']: True},
                 'Program': str(p['bundle'] / 'Contents/MacOS/ChecklistService'), 'ProcessType': 'Interactive',
                 'RunAtLoad': False, 'KeepAlive': False,
+                'EnvironmentVariables': {'CHECKLIST_SLOT_RELAYS': 'synthetic' if allow_synthetic_relays else 'off'},
                 'StandardOutPath': str(logs / 'service.stdout.log'), 'StandardErrorPath': str(logs / 'service.stderr.log')}
     for key in ['StandardOutPath', 'StandardErrorPath']: contained(contents[key], p['folder'])
-    if not launch_state(p)['registered']:
+    registered = launch_state(p)['registered']
+    if registered and allow_synthetic_relays != configured_relays:
+        raise ValueError('Stop this slot before changing --allow-synthetic-relays; the registered service keeps its current relay policy.')
+    if not registered:
         plist.write_bytes(plistlib.dumps(contents))
         run(['launchctl', 'bootstrap', f'gui/{os.getuid()}', plist])
+    metadata['allow_synthetic_relays'] = allow_synthetic_relays
     metadata['mode'] = 'gui' if arguments.gui or processes(p)['app'] else 'headless'; save(p, metadata)
     service_status(p, bound=bound)
     if arguments.gui:
@@ -1525,10 +1536,15 @@ def start(arguments, p):
 
 def status(number):
     p = checked(number)
-    if not p['folder'].exists(): return {'slot': number, 'created': False, 'launchd': launch_state(p), 'processes': processes(p)}
+    if not p['folder'].exists():
+        return {'slot': number, 'created': False, 'allow_synthetic_relays': False, 'slot_relays': 'off',
+                'launchd': launch_state(p), 'processes': processes(p)}
     metadata = load(p)
+    allow_synthetic_relays = metadata.get('allow_synthetic_relays') is True
     size = sum(file.lstat().st_size for file in p['data'].rglob('*') if file.is_file() and not file.is_symlink())
-    return dict(metadata, created=True, launchd=launch_state(p), processes=processes(p), data_root=str(p['data']), data_bytes=size)
+    return dict(metadata, created=True, allow_synthetic_relays=allow_synthetic_relays,
+                slot_relays='synthetic' if allow_synthetic_relays else 'off',
+                launchd=launch_state(p), processes=processes(p), data_root=str(p['data']), data_bytes=size)
 
 
 def check(p):
@@ -1716,6 +1732,10 @@ def main():
         command.add_argument('--slot', type=slot_number, required=name in ['create', 'restage', 'start', 'check', 'promote'])
         if name in ['stop', 'destroy']: command.add_argument('--all', action='store_true')
         if name == 'status': command.add_argument('--json', action='store_true')
+        if name in ['create', 'start']:
+            command.add_argument('--allow-synthetic-relays', action=argparse.BooleanOptionalAction,
+                                 default=False if name == 'create' else None,
+                                 help='allow native relays only to sessions first registered in this slot store; persists in slot.json (default off)')
         if name == 'restage':
             command.add_argument('--stage', type=Path, required=True)
             command.add_argument('--session-id', help='actual owning session')
