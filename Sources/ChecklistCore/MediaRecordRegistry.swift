@@ -73,6 +73,12 @@ enum MediaRecordRegistry {
                     _ = try dependency(id,type:type,project:envelope.projectID,revision:exact)
                 }
             }
+            if envelope.type == "media_round",let raw = value["task_id"] {
+                guard let id = raw as? String,!id.isEmpty else {
+                    throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A linked media round requires an exact same-project ticket.")
+                }
+                _ = try dependency(id,type:"task",project:envelope.projectID)
+            }
             if envelope.type == "storage_job" {
                 guard let kind = value["kind"] as? String,
                       ["attachment_import","archive_cleanup_delete","archive_cleanup_cursor","ticket_object_delete","media_attachment_owner"].contains(kind) else {

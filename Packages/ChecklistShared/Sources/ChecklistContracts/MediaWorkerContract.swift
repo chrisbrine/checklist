@@ -9,7 +9,7 @@ public enum MediaWorkerContract {
         "media_rework_preview",
     ]
     public static let methods: Set<String> = readMethods.union([
-        "media_round_create", "media_intake_preview", "media_intake_revise",
+        "media_intake_preview", "media_intake_revise",
         "media_intake_confirm", "media_intake_capture", "media_suggest", "media_follow_up_record",
     ]).union(settingMethods)
     /// CL-419 (owner, 3 November 2026): media type and publication commands are agent
@@ -22,6 +22,8 @@ public enum MediaWorkerContract {
         // and context approval are the owner's own answers and approvals.
         "media_round_cancel", "media_round_archive", "media_round_finish", "media_round_successor",
         "media_rework_create", "media_type_restore",
+        // CL-427: a round may name the ticket that owns its takes; creating and linking use the same gate.
+        "media_round_create", "media_round_link_task",
     ]
 
     public struct ValidationError: Error, CustomStringConvertible, Sendable {
@@ -44,7 +46,12 @@ public enum MediaWorkerContract {
             properties["type_id"] = text(4_000); required += ["type_id"]
         case "media_round_create":
             properties["type_id"] = text(4_000); properties["title"] = text(2_000)
+            properties["task_id"] = text(4_000)
             required += ["type_id", "title"]
+        case "media_round_link_task":
+            properties["round_id"] = text(4_000); properties["expected_revision"] = revision
+            properties["task_id"] = ["oneOf": [text(4_000), ["type": "null"]]]
+            required += ["round_id", "expected_revision", "task_id"]
         case "media_type_adopt_starter":
             properties["starter"] = text(256); properties["title"] = text(256)
             properties["expected_revision"] = revision
@@ -147,6 +154,8 @@ public enum MediaWorkerContract {
             properties["observed_context_token"] = text(65_536)
             properties["manifest_id"] = text(4_000); properties["manifest_digest"] = digest
             properties["disposition"] = ["type": "string", "enum": ["accepted", "needs_look", "changes_requested", "excluded"]]
+            properties["source"] = ["type": "string", "enum": ["agent", "check"], "default": "agent",
+                "description": "agent for an agent recommendation (default); check for a suggestion produced from check evidence. Neither is an owner decision."]
             properties["winner_id"] = text(4_000); properties["none_fit"] = ["type": "boolean"]
             properties["note"] = text(4_000); properties["no_follow_up_reason"] = text(4_000)
             properties["items"] = ["type": "array", "minItems": 1, "maxItems": 200, "items": object([

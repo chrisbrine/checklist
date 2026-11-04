@@ -101,18 +101,131 @@ struct MediaSimpleDecision: Identifiable, Equatable {
     var id: String {disposition}
 }
 
+/// CL-428: the recommended decision of a card: the newest current agent suggestion of the item
+/// whose choice is one of the card's three decisions. A flag is a recommendation of "Changes
+/// requested" or "Needs look". It is advice only: it never counts as an owner decision until the
+/// owner keeps it, and it shows only while the item has no owner decision for its current target.
+struct MediaCardRecommendation: Equatable {
+    let suggestionID: String
+    let disposition: String
+    let note: String
+    let author: String
+    /// "agent" or "check" (a flag that a check produced).
+    let source: String
+    static let flagDispositions: Set<String> = ["changes_requested","needs_look"]
+    var isFlag: Bool {Self.flagDispositions.contains(disposition)}
+    var choiceTitle: String {MediaSimpleLayout.decisions.first {$0.disposition==disposition}?.title ?? MediaReviewModel.dispositionLabel(disposition)}
+    /// The plain reason on the card.
+    var reason: String {
+        guard isFlag else {return choiceTitle+" suggested by "+author+" — keep or change it"}
+        return source=="check" ? "Flagged from checks" : "Flagged by "+author
+    }
+    /// True when the owner decided the item's current target. "pending" and "stale" are no decision.
+    static func ownerDecided(_ item: Record) -> Bool {!["","pending","stale"].contains(item.string("disposition",fallback:"pending"))}
+    /// The item read's current suggestions: `agent_suggestions` when present, else the current
+    /// agent rows of `suggestions` (`stale` false). A dismissed suggestion (CL-428) is never current.
+    static func current(item: Record,dismissed: Set<String> = [],flagsDismissed: Bool = false) -> MediaCardRecommendation? {
+        guard !ownerDecided(item) else {return nil}
+        let listed=item.records("agent_suggestions").filter {!$0.id.isEmpty && $0.values["stale"] as? Bool != true}
+        let rows=listed.isEmpty ? item.records("suggestions").filter {$0.string("origin",fallback:"agent")=="agent" && $0.values["stale"] as? Bool == false} : listed
+        let cardChoices=Set(MediaSimpleLayout.decisions.map(\.disposition))
+        guard let row=rows.first(where:{!$0.id.isEmpty && !dismissed.contains($0.id) && $0.object("dismissed").isEmpty &&
+            !(flagsDismissed && flagDispositions.contains($0.string("disposition"))) && cardChoices.contains($0.string("disposition"))}) else {return nil}
+        let display=row.string("author_display").trimmingCharacters(in:.whitespacesAndNewlines)
+        let label=row.string("source_label").trimmingCharacters(in:.whitespacesAndNewlines)
+        return .init(suggestionID:row.id,disposition:row.string("disposition"),note:row.string("note"),
+                     author:!display.isEmpty ? display : !label.isEmpty ? label : "an agent",source:row.string("source")=="check" ? "check" : "agent")
+    }
+}
+
+/// CL-428: the item's `hint` field value as short plain lines above the note. The full hint is in
+/// the details popover.
+enum MediaCardHints {
+    static let shownLines = 3
+    static func lines(_ raw: Any?) -> [String] {
+        guard let text=MediaTakeLabel.value(raw) else {return []}
+        return text.split(whereSeparator:\.isNewline).map {$0.trimmingCharacters(in:.whitespaces)}.filter {!$0.isEmpty}
+    }
+    /// At most `shownLines` lines, and true when more lines exist.
+    static func shown(_ raw: Any?) -> (lines: [String],more: Bool) {
+        let all=lines(raw)
+        return (Array(all.prefix(shownLines)),all.count > shownLines)
+    }
+}
+
+/// CL-428: a "Not made" card for each direction choice of the type with no item for that
+/// character and action in the round.
+enum MediaNotMade {
+    /// The type's `direction` field choices, in schema order.
+    static func directionChoices(_ schema: MediaValues) -> [String] {
+        let field=(schema["fields"] as? [MediaValues] ?? []).first {$0["id"] as? String=="direction"}
+        return (field?["choices"] as? [Any] ?? []).compactMap {($0 as? String) ?? (($0 as? MediaValues).flatMap {($0["value"] ?? $0["id"]) as? String})}
+    }
+    /// The plain "Not made" texts by group title, in choice order. `entries` are the group title and
+    /// the label metadata of each card. A group with no character or action value gets no card.
+    static func missing(entries: [(group: String,metadata: MediaValues)],choices: [String]) -> [String: [String]] {
+        var made: [String: Set<String>] = [:],order: [String] = []
+        for entry in entries where MediaTakeLabel.value(entry.metadata["character"]) != nil && MediaTakeLabel.value(entry.metadata["animation_label"]) != nil {
+            if made[entry.group] == nil {order.append(entry.group);made[entry.group]=[]}
+            made[entry.group]!.insert(MediaTakeLabel.direction(entry.metadata["direction"]))
+        }
+        var words: [String] = []
+        for choice in choices.map(MediaTakeLabel.direction) where !words.contains(choice) {words.append(choice)}
+        var result: [String: [String]] = [:]
+        for group in order {
+            let texts=words.filter {!made[group]!.contains($0)}.map {group+" · "+$0+": Not made"}
+            if !texts.isEmpty {result[group]=texts}
+        }
+        return result
+    }
+}
+
 extension MediaDirectionCard {
     var labelMetadata: MediaValues {
         let target=target.object("metadata")
         return target.isEmpty ? item.object("metadata") : target
     }
     var label: String {MediaTakeLabel.text(labelMetadata)}
+    /// Only the current owner head whose choice applies to the displayed basis can be removed.
+    /// A carried choice can name the successor's Draft target: publication replaces that target
+    /// while preserving the basis, so the current disposition and basis establish its applicability.
+    var currentOwnerDecision: Record? {
+        let decision=Record(values:item.object("decision"))
+        let basis=decision.string("review_basis_signature")
+        let applies=decision.string("target_id")==target.id || (!basis.isEmpty && basis==target.string("review_basis_signature"))
+        guard MediaCardRecommendation.ownerDecided(item),!decision.id.isEmpty,
+              applies,decision.string("disposition")==item.string("disposition") else {return nil}
+        return decision
+    }
+    func isCurrentDecision(_ disposition: String) -> Bool {currentOwnerDecision?.string("disposition")==disposition}
+    /// CL-428: remove the exact observed owner head without making another choice or changing its note.
+    func withdrawalRequest() throws -> MediaValues {
+        var p=try decisionRequest("needs_look")
+        for key in ["disposition","note","winner_id","none_fit"] {p.removeValue(forKey:key)}
+        guard let decision=currentOwnerDecision else {throw ChecklistError("MEDIA_BASIS_CHANGED","This take no longer has the current owner decision. Inspect it again.")}
+        p["items"]=[["item_id":id,"expected_revision":item.integer("revision"),"decision_id":decision.id]]
+        return p
+    }
+    func decisionNoteHint(_ disposition: String) -> String? {
+        isCurrentDecision(disposition) ? nil : MediaSimpleLayout.noteHint(disposition,note:draft.note)
+    }
+    /// CL-428: the exact selection of `media_adopt_suggestion` for this card. It is the decision
+    /// selection with no choice: the service copies the suggestion's own choice and note.
+    func adoptionRequest(_ suggestionID: String) throws -> MediaValues {
+        // "needs_look" adds no note or winner rule, so the request holds only the checked selection.
+        var p=try decisionRequest("needs_look")
+        for key in ["disposition","note","winner_id","none_fit"] {p.removeValue(forKey:key)}
+        p["suggestion_id"]=suggestionID
+        return p
+    }
 }
 
 struct MediaSimpleSection: Identifiable {
     let id: String
     let title: String
     let cards: [MediaDirectionCard]
+    /// CL-428: the plain "Not made" texts of this group.
+    var notMade: [String] = []
 }
 
 /// The prepared takes of the simple card review, kept by take key. A prepared take that does
@@ -269,16 +382,52 @@ struct MediaSimpleReference {
     private var failedKeys = Set<String>()
     private var pump: Task<Void,Never>?
     private var pumpGeneration = 0
+    /// CL-428: the type's direction choices, for "Not made" cards. Empty: no "Not made" cards.
+    var directionChoices: [String] = []
+    /// CL-428: true when the cards are the whole round (filter "all", no further page). Only then
+    /// can a direction with no card be "Not made".
+    var listComplete = false
+    /// CL-428: flags that the owner cleared in this round. They do not come back for that take.
+    private(set) var dismissedSuggestions = Set<String>()
+    /// A later suggestion cannot flag the same item target again in this round. Accept advice
+    /// remains available, and a new target can still have its own flag.
+    private(set) var dismissedFlagTargets: [String: Set<String>] = [:]
+    /// CL-428: the suggestion whose note each card took as its draft note, by item ID.
+    private var seededNotes: [String: String] = [:]
     var orderedCards: [MediaDirectionCard] {order.compactMap {cards[$0]}}
     var sections: [MediaSimpleSection] {
         var result: [MediaSimpleSection] = [],seen: [String: Int] = [:]
+        var entries: [(group: String,metadata: MediaValues)] = []
         for card in orderedCards {
             let title=groupTitles[card.id] ?? MediaTakeLabel.group(card.labelMetadata)
+            entries.append((title,card.labelMetadata))
             if let last=result.last,last.title==title {result[result.count-1]=MediaSimpleSection(id:last.id,title:title,cards:last.cards+[card]);continue}
             let index=seen[title,default:0];seen[title]=index+1
             result.append(MediaSimpleSection(id:title+"#"+String(index),title:title,cards:[card]))
         }
+        guard listComplete,!directionChoices.isEmpty else {return result}
+        var missing=MediaNotMade.missing(entries:entries,choices:directionChoices)
+        for i in result.indices {if let texts=missing.removeValue(forKey:result[i].title) {result[i].notMade=texts}}
         return result
+    }
+    /// CL-428: the card's recommended decision, while the owner has no decision on its item.
+    func recommendation(_ card: MediaDirectionCard) -> MediaCardRecommendation? {
+        MediaCardRecommendation.current(item:card.item,dismissed:dismissedSuggestions,
+            flagsDismissed:dismissedFlagTargets[card.id]?.contains(card.target.id) == true)
+    }
+    /// The older advice line is only for choices outside the card's three buttons. Otherwise it
+    /// could show a cleared flag again as soon as its recommendation disappears.
+    func otherSuggestion(_ card: MediaDirectionCard) -> MediaSuggestionPresentation? {
+        let choices=Set(MediaSimpleLayout.decisions.map(\.disposition))
+        let ids=Set(card.item.records("suggestions").filter {!choices.contains($0.string("disposition")) &&
+            !dismissedSuggestions.contains($0.id) && $0.object("dismissed").isEmpty}.map(\.id))
+        return MediaComparisonLabels.suggestions(item:card.item).first {$0.isCurrent && ids.contains($0.id)}
+    }
+    /// CL-428: a new recommendation puts its note in an empty note box once, as an editable draft.
+    func seedRecommendationNote(_ card: MediaDirectionCard) {
+        guard let recommendation=recommendation(card),seededNotes[card.id] != recommendation.suggestionID else {return}
+        seededNotes[card.id]=recommendation.suggestionID
+        if card.draft.note.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty,!recommendation.note.isEmpty {card.draft.note=recommendation.note}
     }
     /// The layout of the card's type revision.
     func layout(_ card: MediaDirectionCard) -> MediaValues {
@@ -302,6 +451,7 @@ struct MediaSimpleReference {
     func reset() {
         pump?.cancel();pump=nil;pumpGeneration+=1;playback.releaseAll()
         cards=[:];rowValues=[:];groupTitles=[:];stale=[];visible=[];focus=nil;failedKeys=[];referenceImages=[:]
+        dismissedSuggestions=[];dismissedFlagTargets=[:];seededNotes=[:]
         // The last reported frames stay: the next `sync` takes the visible cards from them, also
         // when the view sends no new frames (its layout did not change).
         priority=[];ownerPaused=[];ownerPlayed=[];yielded=[];ownerPlaysAll=false
@@ -334,6 +484,7 @@ struct MediaSimpleReference {
             if cards[row.id] == nil {
                 let id=row.id
                 cards[id]=MediaDirectionCard(item:row,header:header,draft:draft(row),saveDraft:{saveDraft(id,$0)})
+                seedRecommendationNote(cards[id]!)
             } else if rowValues[row.id] == values {continue}
             rowValues[row.id]=values;changed.insert(row.id)
         }
@@ -378,6 +529,7 @@ struct MediaSimpleReference {
         // owner's look; the card takes the open round's basis at once.
         let lineage=card.target.string("published_from_target_id")
         if !card.target.id.isEmpty,card.draft.basis.isEmpty || (!lineage.isEmpty && lineage==card.draft.targetID) {card.inspectCurrentBasis()}
+        seedRecommendationNote(card)
     }
 
     /// The order indices of the cards that keep a take: the visible cards and `preloadCards` on each side.
@@ -626,43 +778,110 @@ struct MediaSimpleReference {
         }
         return image
     }
-    /// The existing owner decision route: the native command journal through `media_decide`.
-    func decide(_ disposition: String,card: MediaDirectionCard,model: MediaReviewModel) async {
-        guard !card.sending else {return};card.sending=true
+    /// The owner decision route uses the native command journal. A second press on the owner's
+    /// current choice sends `media_decision_withdraw`, leaving the take Pending again.
+    /// CL-428: with `keep`, a press that keeps the card's current recommendation with its own note
+    /// sends `media_adopt_suggestion` for that suggestion. A note that the owner changed makes it
+    /// the owner's own decision of that choice (`media_decide` with the owner's note).
+    func decide(_ disposition: String,card: MediaDirectionCard,model: MediaReviewModel,keep: Bool = false) async {
+        guard !card.sending else {return}
+        let withdrawnDecision=card.isCurrentDecision(disposition) ? card.currentOwnerDecision : nil
+        let kept=keep ? recommendation(card).flatMap {
+            $0.disposition==disposition && card.draft.note.trimmingCharacters(in:.whitespacesAndNewlines)==$0.note.trimmingCharacters(in:.whitespacesAndNewlines) ? $0 : nil
+        } : nil
+        if kept != nil,let hint=MediaSimpleLayout.noteHint(disposition,note:card.draft.note) {card.status=hint;return}
+        card.sending=true
         var dispatched=false
         let scope=scope
         defer {if !dispatched {card.sending=false}}
         do {
-            var params=try card.decisionRequest(disposition)
+            var params: MediaValues
+            let method: String
+            if withdrawnDecision != nil {params=try card.withdrawalRequest();method="media_decision_withdraw"}
+            else if let kept {params=try card.adoptionRequest(kept.suggestionID);method="media_adopt_suggestion"}
+            else {params=try card.decisionRequest(disposition);method="media_decide"}
             let current=Record(values:try await model.read("media_round_header",["round_id":card.header.id]))
             guard current.string("observed_context_token")==card.header.string("observed_context_token"),
                   NSDictionary(dictionary:current.object("manifest")).isEqual(to:card.header.object("manifest")),current.records("attention").isEmpty,
                   self.scope==scope else {throw ChecklistError("MEDIA_CONTEXT_CHANGED","The round context changed. Inspect this take again before deciding.")}
             params["expected_revision"]=current.integer("revision")
             dispatched=true
-            model.mutateReportingFailure("media_decide",params,onFailure:{error in card.sending=false;card.status=PlainError.text(error)}) {reply in
+            model.mutateReportingFailure(method,params,onFailure:{error in card.sending=false;card.status=PlainError.text(error)}) {reply in
                 card.sending=false
                 if let decision=(reply["decisions"] as? [MediaValues])?.first,
                    decision["item_id"] as? String==card.id,decision["target_id"] as? String==card.target.id {
-                    var values=card.item.values;values["disposition"]=disposition;values["decision"]=decision
+                    let pending=withdrawnDecision != nil && decision["disposition"] as? String=="withdrawn" &&
+                        decision["withdraws_decision_id"] as? String==withdrawnDecision?.id
+                    guard withdrawnDecision == nil || pending else {return}
+                    let saved=pending ? "pending" : disposition
+                    var values=card.item.values;values["disposition"]=saved;values["decision"]=decision
+                    if pending {values.removeValue(forKey:"follow_up")}
                     values["revision"]=card.item.integer("revision")+1;card.item=Record(values:values)
-                    card.status="Saved: "+MediaReviewModel.dispositionLabel(disposition)
+                    card.status="Saved: "+MediaReviewModel.dispositionLabel(saved)
                 }
             }
         } catch {card.status=PlainError.text(error)}
     }
     /// The card's decision press. An open round sends `media_decide`. A Draft round whose type
     /// sets `review_in_draft` publishes first (CL-422).
-    func press(_ disposition: String,card: MediaDirectionCard,model: MediaReviewModel) async {
-        if MediaSimpleLayout.decisionRoute(card,model:model) == .firstDraft {await decideFromDraft(disposition,card:card,model:model)}
-        else {await decide(disposition,card:card,model:model)}
+    func press(_ disposition: String,card: MediaDirectionCard,model: MediaReviewModel,keep: Bool = false) async {
+        if MediaSimpleLayout.decisionRoute(card,model:model) == .firstDraft {await decideFromDraft(disposition,card:card,model:model,keep:keep)}
+        else {await decide(disposition,card:card,model:model,keep:keep)}
+    }
+    /// CL-428: the card's "Keep". One press keeps the current recommendation.
+    func keep(_ card: MediaDirectionCard,model: MediaReviewModel) async {
+        guard let recommendation=recommendation(card) else {return}
+        await press(recommendation.disposition,card:card,model:model,keep:true)
+    }
+    /// CL-428: the cards whose recommendation "Keep all recommendations" keeps: a current
+    /// recommendation, no owner decision, a published item of an open round and a matching basis.
+    func keepAllCards(model: MediaReviewModel) -> [MediaDirectionCard] {
+        orderedCards.filter {recommendation($0) != nil && MediaSimpleLayout.decisionRoute($0,model:model) == .open && $0.basisMatches && !$0.sending}
+    }
+    /// CL-428: one confirmation, then one `media_adopt_suggestion` per card, one at a time.
+    func keepAllConfirmation(model: MediaReviewModel) -> PendingConfirmation? {
+        let cards=keepAllCards(model:model)
+        guard !cards.isEmpty else {return nil}
+        let count=cards.count==1 ? "1 take" : String(cards.count)+" takes"
+        return PendingConfirmation(title:"Keep all recommendations?",
+            effect:"Checklist keeps the recommended decision on "+count+" in this round, as your decision. Takes with your own decision stay as they are.",
+            confirmLabel:"Keep "+String(cards.count)+(cards.count==1 ? " recommendation" : " recommendations"),keepLabel:"Cancel") {[weak self,weak model] in
+            guard let self,let model else {return}
+            Task {await self.keepAll(cards,model:model)}
+        }
+    }
+    func keepAll(_ cards: [MediaDirectionCard],model: MediaReviewModel) async {
+        let scope=scope
+        for card in cards {
+            guard self.scope==scope,!Task.isCancelled else {return}
+            await model.waitUntilWritable()
+            guard self.cards[card.id]===card,recommendation(card) != nil else {continue}
+            await keep(card,model:model)
+        }
+    }
+    /// CL-428: "Clear flag" sends `media_suggestion_dismiss`. The card then has no recommendation,
+    /// and the flag does not come back for that take in this round. A note that is still the flag's
+    /// own note leaves the note box.
+    func clearFlag(_ card: MediaDirectionCard,model: MediaReviewModel) {
+        guard !card.sending,!model.historyOnly,let flag=recommendation(card),flag.isFlag else {return}
+        card.sending=true
+        let scope=scope,target=card.target.id
+        model.mutateReportingFailure("media_suggestion_dismiss",["round_id":card.header.id,"suggestion_id":flag.suggestionID],
+            onFailure:{error in card.sending=false;card.status=PlainError.text(error)}) {[weak self] _ in
+            card.sending=false
+            guard let self,self.scope==scope else {return}
+            self.dismissedSuggestions.insert(flag.suggestionID)
+            if !target.isEmpty {self.dismissedFlagTargets[card.id,default:[]].insert(target)}
+            if card.draft.note.trimmingCharacters(in:.whitespacesAndNewlines)==flag.note.trimmingCharacters(in:.whitespacesAndNewlines) {card.draft.note=""}
+            card.status="Flag cleared"
+        }
     }
     /// CL-422: one press publishes the Draft's publication-ready items (this card's item with the
     /// Draft target the owner saw must be one of them), reads the open round and this item again,
     /// and then records the decision through `decide`. A refused publication records no decision.
     /// On `MEDIA_PROJECT_CONTEXT_REQUIRED` the model approves the project context and publishes
     /// again (`publishFrozenPreview`); the owner's press is the approval. No dialog shows.
-    func decideFromDraft(_ disposition: String,card: MediaDirectionCard,model: MediaReviewModel) async {
+    func decideFromDraft(_ disposition: String,card: MediaDirectionCard,model: MediaReviewModel,keep: Bool = false) async {
         guard !card.sending else {return}
         if let hint=MediaSimpleLayout.noteHint(disposition,note:card.draft.note) {card.status=hint;return}
         let viewed=card.target.id,scope=scope,round=card.header.id
@@ -696,7 +915,8 @@ struct MediaSimpleReference {
         }
         await model.waitUntilWritable()
         card.sending=false
-        await decide(disposition,card:card,model:model)
+        // CL-428: Keep adopts the suggestion only while it is still current for the published item.
+        await decide(disposition,card:card,model:model,keep:keep)
     }
     /// The card's one plain line for a refused publication, an approval that failed included.
     static func notPublished(_ error: Error) -> String {
@@ -710,8 +930,10 @@ struct MediaSimpleReference {
 /// beside its reference, with a plain label and the three owner decisions.
 struct MediaSimpleReview: View {
     @ObservedObject var model: MediaReviewModel
+    @EnvironmentObject var store: ChecklistStore
     @StateObject private var simple = MediaSimpleReviewModel()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var confirmation: PendingConfirmation?
     var scope: String {model.projectID+":"+model.roundID}
     var body: some View {
         GeometryReader {viewport in
@@ -720,6 +942,11 @@ struct MediaSimpleReview: View {
                 HStack {
                     Text(MediaReviewModel.countsText(model.counts)).font(.caption).foregroundStyle(Color.checklistSecondaryText)
                     Spacer()
+                    // CL-428: one confirmed press keeps every current recommendation of the round.
+                    if !simple.keepAllCards(model:model).isEmpty {
+                        Button("Keep all recommendations…") {confirmation=simple.keepAllConfirmation(model:model)}
+                            .checklistDisabled([(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
+                    }
                     if simple.pausedByOwner || (reduceMotion && simple.playback.playingKeys.isEmpty) {
                         Button("Play all takes") {simple.playAll()}
                     } else {Button("Pause all takes") {simple.pauseAll()}}
@@ -733,6 +960,13 @@ struct MediaSimpleReview: View {
                             ForEach(section.cards) {card in
                                 MediaSimpleCardView(card:card,simple:simple,playback:simple.playback,model:model)
                             }
+                            // CL-428: a direction of the type with no take: no take and no decisions.
+                            ForEach(section.notMade,id:\.self) {text in
+                                Text(text).font(.callout).foregroundStyle(Color.checklistSecondaryText)
+                                    .frame(maxWidth:.infinity,alignment:.leading).padding(MediaSimpleLayout.cardPadding)
+                                    .background(.quaternary.opacity(0.15),in:RoundedRectangle(cornerRadius:6))
+                                    .accessibilityIdentifier("mediaSimpleNotMade:"+text)
+                            }
                         }
                     }
                 }
@@ -745,6 +979,7 @@ struct MediaSimpleReview: View {
         .onChange(of:viewport.size.height,initial:true) {_,height in simple.updateViewport(height:height)}
         .onChange(of:reduceMotion,initial:true) {_,value in simple.setReduceMotion(value)}
         .accessibilityIdentifier("mediaSimpleReview")
+        .checklistConfirmation($confirmation)
         .onReceive(model.$header) {simple.update(header:$0)}
         .onReceive(model.$rows) {rows in sync(rows)}
         .onDisappear {simple.reset()}
@@ -761,6 +996,9 @@ struct MediaSimpleReview: View {
                 })
         }
         let header=simple.header
+        // CL-428: "Not made" cards need the type's direction choices and the whole round.
+        simple.directionChoices=MediaNotMade.directionChoices(header.object("type_revision")["schema"] as? MediaValues ?? model.schema)
+        simple.listComplete=model.next == nil && model.filter == "all"
         let changed=simple.sync(scope:scope,rows:rows,draft:{model.ownerDraft(for:$0,header:header)},saveDraft:{[weak model] id,value in model?.saveOwnerDraft(value,itemID:id)})
         guard !changed.isEmpty else {return}
         let round=model.roundID
@@ -793,6 +1031,13 @@ private struct MediaSimpleCardView: View {
     var schema: MediaValues {card.header.object("type_revision")["schema"] as? MediaValues ?? model.schema}
     var layout: MediaValues {schema["layout"] as? MediaValues ?? [:]}
     var route: MediaSimpleLayout.DecisionRoute {MediaSimpleLayout.decisionRoute(card,model:model)}
+    var recommendation: MediaCardRecommendation? {simple.recommendation(card)}
+    /// The owner's own decision on the current target; empty when none.
+    var current: String {MediaCardRecommendation.ownerDecided(card.item) ? card.item.string("disposition") : ""}
+    /// A selected choice (the recommendation or the owner's decision) shows as the prominent button.
+    @ViewBuilder func choiceButton(_ title: String,selected: Bool,action: @escaping () -> Void) -> some View {
+        if selected {Button(title,action:action).buttonStyle(.borderedProminent)} else {Button(title,action:action)}
+    }
     var body: some View {
         VStack(alignment:.leading,spacing:6) {
             HStack(alignment:.firstTextBaseline) {
@@ -808,24 +1053,54 @@ private struct MediaSimpleCardView: View {
                 HStack(alignment:.top,spacing:MediaSimpleLayout.mediaSpacing) {takeColumn;referenceColumn}
                 VStack(alignment:.leading,spacing:MediaSimpleLayout.mediaSpacing) {takeColumn;referenceColumn}
             }
-            if let suggestion=MediaComparisonLabels.suggestions(item:card.item).first(where:\.isCurrent) {
+            // CL-428: the recommended decision and its plain reason. It is not an owner decision.
+            if let recommendation {
+                HStack(alignment:.firstTextBaseline,spacing:6) {
+                    Text(recommendation.reason).font(.caption).fixedSize(horizontal:false,vertical:true)
+                        .accessibilityIdentifier("mediaSimpleRecommendation:"+card.id)
+                    Spacer(minLength:4)
+                    if recommendation.isFlag {
+                        Button("Clear flag") {simple.clearFlag(card,model:model)}.controlSize(.small)
+                            .accessibilityLabel("Clear flag, "+card.label)
+                            .checklistDisabled([(card.sending,"Wait for this decision to finish."),(model.historyOnly,"This round is history only."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
+                    }
+                }
+            } else if let suggestion=simple.otherSuggestion(card) {
                 Text("Agent suggests: "+suggestion.choice).font(.caption).foregroundStyle(Color.checklistSecondaryText)
             }
-            TextField("Owner note",text:$card.draft.note,axis:.vertical).lineLimit(1...3)
+            // CL-428: the item's hint as short lines above the note; the details show all of it.
+            let hints=MediaCardHints.shown(card.labelMetadata["hint"])
+            if !hints.lines.isEmpty {
+                VStack(alignment:.leading,spacing:1) {
+                    ForEach(Array(hints.lines.enumerated()),id:\.offset) {Text($0.element)}
+                    if hints.more {Button("more") {showDetails=true}.buttonStyle(.link).accessibilityLabel("More hint lines, "+card.label)}
+                }.font(.caption).foregroundStyle(Color.checklistSecondaryText).fixedSize(horizontal:false,vertical:true)
+            }
+            // A flag opens its note at once: the note box is taller for a flagged card.
+            TextField("Owner note",text:$card.draft.note,axis:.vertical).lineLimit(recommendation?.isFlag == true ? 2...4 : 1...3)
                 .accessibilityLabel("Owner note for "+card.label)
             if !card.basisMatches,!card.target.id.isEmpty {
                 Button("I inspected this target and context") {card.inspectCurrentBasis()}
             }
             HStack {
+                if let recommendation {
+                    Button("Keep") {Task {await simple.keep(card,model:model)}}.buttonStyle(.borderedProminent)
+                        .accessibilityLabel("Keep "+recommendation.choiceTitle+", "+card.label)
+                        .help("Keep the recommended decision: "+recommendation.choiceTitle)
+                }
                 ForEach(MediaSimpleLayout.decisions) {choice in
-                    let hint=MediaSimpleLayout.noteHint(choice.disposition,note:card.draft.note)
-                    Button(choice.title) {Task {await simple.press(choice.disposition,card:card,model:model)}}
+                    let hint=card.decisionNoteHint(choice.disposition)
+                    let suggested=recommendation?.disposition==choice.disposition
+                    choiceButton(choice.title+(suggested ? " (suggested)" : ""),selected:suggested || current==choice.disposition) {
+                        Task {await simple.press(choice.disposition,card:card,model:model,keep:suggested)}
+                    }
                         .checklistDisabled([(hint != nil,hint ?? "")])
-                        .accessibilityLabel(choice.title+", "+card.label)
+                        .accessibilityLabel(choice.title+(suggested ? ", suggested" : current==choice.disposition ? ", your decision" : "")+", "+card.label)
+                        .help(card.isCurrentDecision(choice.disposition) ? "Press again to remove your decision and mark this take Pending." : hint ?? choice.title)
                 }
                 if card.sending {ProgressView().controlSize(.small).accessibilityLabel("Working on this decision")}
             }.checklistDisabled([(card.sending,"Wait for this decision to finish."),(card.target.id.isEmpty,"This item is still loading."),(route == .unavailable && card.header.string("state") == "draft","Publish this Draft round before deciding."),(!card.basisMatches || route == .unavailable,"Inspect a published item in an open round before deciding."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
-            if let hint=MediaSimpleLayout.noteHint("changes_requested",note:card.draft.note) {
+            if let hint=card.decisionNoteHint("changes_requested") {
                 Text(hint).font(.caption).foregroundStyle(Color.checklistSecondaryText).fixedSize(horizontal:false,vertical:true)
             }
             if !card.status.isEmpty {Text(card.status).font(.caption).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)}
@@ -870,7 +1145,7 @@ private struct MediaSimpleCardView: View {
         VStack(alignment:.leading,spacing:4) {
             Text(card.label).font(.headline)
             Text("Item: "+card.item.string("title")).textSelection(.enabled)
-            if let hint=card.labelMetadata["hint"] as? String,!hint.isEmpty {Text("Hint: "+hint).textSelection(.enabled)}
+            if let hint=card.labelMetadata["hint"] as? String,!hint.isEmpty {Text("Hint: "+hint).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)}
             if let prepared=playback.takes[card.key] {
                 Text(MediaPlaybackLabels.playback(loop:true,frameRate:prepared.measurement.timing?.declaredFrameRate))
                 Text(MediaPlaybackLabels.measurement(prepared.measurement)).textSelection(.enabled)

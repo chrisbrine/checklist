@@ -54,12 +54,12 @@ extension CommandRouter {
     func ticketPurgeOwnedKeys(all: [PurgeRow],pid: String,tid: String) -> Set<Data> {
         let taskKey = Data(tid.utf8)
         let containers: Set<String> = ["project","session","profile","status","tag","policy_revision","project_context_revision","taxonomy_revision","group","batch","batch_claim","relation","task"]
-        var owned = Set(all.filter {$0.project == pid && !containers.contains($0.type) && $0.type != "storage_hold" && !($0.type == "storage_job" && $0.value["kind"] as? String == Self.ticketObjectDeletionKind) && ($0.value["task_id"] as? String).map {Data($0.utf8) == taskKey} == true}.map(\.key))
+        var owned = Set(all.filter {$0.project == pid && !containers.contains($0.type) && !MediaRecordRegistry.families.contains($0.type) && $0.type != "storage_hold" && !($0.type == "storage_job" && $0.value["kind"] as? String == Self.ticketObjectDeletionKind) && ($0.value["task_id"] as? String).map {Data($0.utf8) == taskKey} == true}.map(\.key))
         owned.formUnion(all.filter {$0.project == pid && $0.type == "relation" && ($0.value["source_task_id"] as? String).map {Data($0.utf8) == taskKey} == true}.map(\.key))
         let ownerFields = ["message_id","attempt_id","parent_attempt_id","request_id","review_request_id","manifest_id","membership_id","delegation_id","conversation_id","source_capture_id"]
         // Index parent ownership once, then walk each child at most once.
         var children: [Data:[Data]] = [:]
-        for row in all where row.project == pid && !containers.contains(row.type) && row.type != "storage_hold" && !(row.type == "storage_job" && row.value["kind"] as? String == Self.ticketObjectDeletionKind) {
+        for row in all where row.project == pid && !containers.contains(row.type) && !MediaRecordRegistry.families.contains(row.type) && row.type != "storage_hold" && !(row.type == "storage_job" && row.value["kind"] as? String == Self.ticketObjectDeletionKind) {
             if let other = row.value["task_id"] as? String,Data(other.utf8) != taskKey {continue}
             for field in ownerFields {if let parent = row.value[field] as? String {children[Data(parent.utf8),default:[]].append(row.key)}}
         }
@@ -164,8 +164,12 @@ extension CommandRouter {
         // Purge's shared-history closure (for example a closed batch pointing to
         // its old manifest) must not make every own attachment a byte hold.
         let graph = all.map {row -> JSON in var value = groupValues[row.key] ?? row.value;value["record_type"] = row.type;return value}
-        let byteProtected = try doneEvidence ? ticketCleanupProtectedOwners(graph.filter {$0["id"] as? String != tid},owners:owned,tokens:references) : Set<Data>()
-        let excluded = doneEvidence ? owned.subtracting(byteProtected) : removedKeys
+        // CL-427: archived media keeps its records through ticket purge. For
+        // Done byte cleanup only, its exact handoff history relinquishes its own
+        // references; independent media references still protect that closure.
+        let byteOwners = try doneEvidence ? owned.union(mediaDoneCleanupHistory(db,task:task).map(\.key)) : owned
+        let byteProtected = try doneEvidence ? ticketCleanupProtectedOwners(graph.filter {$0["id"] as? String != tid},owners:byteOwners,tokens:references) : Set<Data>()
+        let excluded = doneEvidence ? byteOwners.subtracting(byteProtected) : removedKeys
         let remaining = all.filter {!excluded.contains($0.key) && $0.key != taskKey}.map {row -> JSON in var value = groupValues[row.key] ?? row.value;value["record_type"] = row.type;return value}
         let byteDeletion = try ticketObjectDeletionPlan(db,owned:all.filter {owned.contains($0.key)}.map {($0.type,$0.value)},remaining:remaining,referenceTokens:inventory.map {_ in references},historicalOwners:doneEvidence ? excluded : [],backupObservation:backupObservation,candidateObjects:candidateObjects,mediaAuthorityComplete:mediaAuthorityComplete)
         let impact: JSON = [

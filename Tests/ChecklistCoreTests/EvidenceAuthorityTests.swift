@@ -48,7 +48,12 @@ final class EvidenceAuthorityTests: XCTestCase {
     override func setUpWithError() throws {
         // Keep production's no-follow storage boundary intact: macOS /var
         // temporary paths traverse an alias, so use an owned physical cache root.
-        let caches = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        let caches: URL
+        if let path = ProcessInfo.processInfo.environment["CHECKLIST_TEST_STORAGE_ROOT"] {
+            caches = URL(fileURLWithPath:path,isDirectory:true)
+        } else {
+            caches = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        }
         let parent = caches.resolvingSymlinksInPath().appendingPathComponent("ChecklistQualification/CL-38", isDirectory: true)
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         directory = parent.appendingPathComponent("EvidenceAuthorityTests-" + UUID().uuidString, isDirectory: true)

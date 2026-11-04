@@ -23,6 +23,8 @@ struct PreparedMediaCommand {
     let observer: DatabaseQueue
     let dataVersion: Int64
     let project: String
+    let method: String
+    let params: JSON
     let writes: [Write]
     let result: JSON
     let encodedResult: String
@@ -35,6 +37,10 @@ struct PreparedMediaCommand {
     var readBytes = 0
 
     func commit(_ db: Database,router: CommandRouter? = nil,caller: Caller? = nil) throws {
+        if resources.workerChannel {
+            guard let router,let caller else {throw CoreError("FORBIDDEN","Prepared worker media changes require current caller authority.")}
+            try router.mediaWorkerWriteAccess(db,method:method,p:params,c:caller,project:project)
+        }
         let current = try observer.read { try Int64.fetchOne($0,sql:"PRAGMA data_version")! }
         if current != dataVersion {
             // Another connection committed: refuse only when a record this command read or
@@ -56,6 +62,20 @@ struct PreparedMediaCommand {
             try router!.validateMediaAttachmentImport(db,project:project,owner:capture.owner,prepared:capture.prepared,caller:caller!)
         }
         for original in resources.originals { _ = try router!.validatePreparedAttachment(db,project:project,prepared:original) }
+        // A ticket is outside the media observation set. Revalidate a prepared round's
+        // destination in the final writer snapshot before committing its link.
+        for write in writes where write.type == Data("media_round".utf8) {
+            let round = jsonObject(String(decoding:write.data,as:UTF8.self))
+            if let taskID = round["task_id"] as? String {
+                guard let row = try Row.fetchOne(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE id=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND type='task'",arguments:[Data(taskID.utf8),write.project]) else {
+                    throw CoreError("NOT_FOUND","The round's ticket is unavailable in this project.")
+                }
+                let task = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"task").object
+                if ["media_round_create","media_round_link_task"].contains(method),bool(task,"purged") {
+                    throw CoreError("TICKET_PURGED","A purged ticket cannot receive a new media link.")
+                }
+            }
+        }
         for write in writes {
             if let previous = write.previousRevision {
                 try db.execute(sql:"UPDATE records SET revision=?,data=CAST(? AS TEXT) WHERE id=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND type=CAST(? AS TEXT) AND revision=?",arguments:[write.revision,write.data,write.id,write.project,write.type,previous])
@@ -209,7 +229,7 @@ extension CommandRouter {
             guard MediaRecordRegistry.families.contains(envelope.type) || resources.allows(envelope) else { throw CoreError("MEDIA_CAPTURE_INCOMPLETE","Media preparation may change only registered media records.") }
             writes.append(.init(id:key,project:Data(pid.utf8),type:Data(envelope.type.utf8),revision:envelope.revision,data:data,previousRevision:original.map { $0["revision"] as Int64 }))
         }
-        var prepared = PreparedMediaCommand(observer:observer,dataVersion:version,project:pid,writes:writes,result:result,encodedResult:try jsonString(result),resources:resources)
+        var prepared = PreparedMediaCommand(observer:observer,dataVersion:version,project:pid,method:method,params:p,writes:writes,result:result,encodedResult:try jsonString(result),resources:resources)
         prepared.readRecords = reads.records;prepared.readBytes = reads.bytes
         prepared.observed = reads.observed;prepared.insertMarks = try MediaPreparationOverlay.insertMarks(db,project:pid)
         return prepared

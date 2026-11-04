@@ -213,9 +213,13 @@ extension TicketLifecycleCleanupTests {
         let other = try call("task_create",["project_id":pid,"title":"Unrelated writer"])
         try pass()
         var committed = 0
+        let unrelatedWriter = DispatchQueue(label:"checklist.cleanup-fixture.unrelated-writer")
         try router.withTicketCleanupPreparation({db in
             let prepared = try self.router.prepareTicketObjectDeletion(db)
-            _ = try self.call("message_send",["project_id":pid,"task_id":other["id"]!,"body":"Unrelated to bytes"])
+            // The command's post-commit notices use the reader pool too. Run
+            // the concurrent writer on its own dispatch context rather than
+            // recursively entering that pool from this preparation snapshot.
+            _ = try unrelatedWriter.sync {try self.call("message_send",["project_id":pid,"task_id":other["id"]!,"body":"Unrelated to bytes"])}
             return prepared
         }) {db,permit,prepared in committed += 1;try self.router.processTicketObjectDeletionIntents(db,permit:permit,prepared:prepared)}
         XCTAssertEqual(committed,1);XCTAssertFalse(FileManager.default.fileExists(atPath:a["path"] as! String))

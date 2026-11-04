@@ -131,7 +131,10 @@ extension CommandRouter {
         guard round["state"] as? String == "draft",!strings(round,"attention_ids").isEmpty else {return []}
         let record = StoredRecord(round, family:"media_round"),pid = try record.string("project_id")
         let (priorType,context) = try mediaRoundParts(db,round)
-        let protected = try mediaItems(db,round:round).filter {$0["last_decision_id"] != nil}
+        let protected = try mediaItems(db,round:round).filter {item in
+            guard let id = item["last_decision_id"] as? String else {return false}
+            return try scoped(db,id,pid,type:"media_owner_decision")["disposition"] as? String != "withdrawn"
+        }
         let attentionIDs = strings(round,"attention_ids")
         var groups: [Data:[JSON]] = [:]
         for id in attentionIDs {

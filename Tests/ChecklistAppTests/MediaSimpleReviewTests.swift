@@ -566,8 +566,15 @@ import ChecklistIPC
     var reviewInDraft: Bool? = true
     var publishFailures: [Error] = []
     var approveFailures: [Error] = []
+    var withdrawalFailures: [Error] = []
     var ready = ["N":true,"E":true,"SE":false]
-    var writes: [String] {calls.map(\.0).filter {["media_round_publish","media_context_approve","media_decide"].contains($0)}}
+    /// CL-428: the item read's suggestion rows, by direction. The fake keeps returning a dismissed
+    /// row as current, so a test proves that the card itself keeps a cleared flag gone.
+    var suggestions: [String: [MediaValues]] = [:]
+    var hints: [String: String] = [:]
+    var decisions: [String: MediaValues] = [:]
+    var itemRevisions: [String: Int] = [:]
+    var writes: [String] {calls.map(\.0).filter {["media_round_publish","media_context_approve","media_decide","media_decision_withdraw","media_adopt_suggestion","media_suggestion_dismiss"].contains($0)}}
     func params(_ method: String) -> [MediaValues] {calls.filter {$0.0==method}.map(\.1)}
     var schema: MediaValues {
         var schema=MediaTypeSettings.schema(title:"Animation",starter:"animation_video")
@@ -581,11 +588,18 @@ import ChecklistIPC
             : ["id":"round","title":"Takes","state":"open","revision":2,"observed_context_token":"open-context","manifest":["id":"manifest","digest":"digest"],"attention":[] as [MediaValues],"type_revision":["schema":schema]]
     }
     func item(_ direction: String) -> MediaValues {
-        let metadata: MediaValues=["character":"Hero","animation_label":"walk_cycle","direction":direction,"take":"1"]
+        var metadata: MediaValues=["character":"Hero","animation_label":"walk_cycle","direction":direction,"take":"1"]
+        if let hint=hints[direction] {metadata["hint"]=hint}
         let target: MediaValues=state=="draft" ? ["id":"draft-"+direction,"review_basis_signature":"draft-basis-"+direction,"metadata":metadata,"candidate_ids":["candidate-"+direction]]
             : ["id":"pub-"+direction,"review_basis_signature":"published-basis-"+direction,"published_from_target_id":"draft-"+direction,"metadata":metadata,"candidate_ids":["candidate-"+direction]]
-        return ["id":"item-"+direction,"title":"hero__walk_cycle__"+direction+".mp4","revision":state=="draft" ? 2 : 3,"published":state=="open","disposition":"pending",
-                "target":target,"candidates":[["id":"candidate-"+direction,"slots":[] as [MediaValues]]],"originals":[] as [MediaValues]]
+        var item: MediaValues=["id":"item-"+direction,"title":"hero__walk_cycle__"+direction+".mp4","revision":state=="draft" ? 2 : 3,"published":state=="open","disposition":"pending",
+                "target":target,"candidates":[["id":"candidate-"+direction,"slots":[] as [MediaValues]]],"originals":[] as [MediaValues],
+                "suggestions":suggestions[direction] ?? [] as [MediaValues]]
+        if let decision=decisions[direction] {
+            item["decision"]=decision;item["disposition"]=decision["disposition"] as? String=="withdrawn" ? "pending" : decision["disposition"]
+            item["revision"]=itemRevisions[direction]
+        }
+        return item
     }
     func request(_ method: String,_ params: MediaValues) throws -> MediaValues {
         calls.append((method,params))
@@ -605,7 +619,27 @@ import ChecklistIPC
             return ["approved":true]
         case "media_decide":
             let selection=(params["items"] as? [MediaValues])?.first ?? [:]
-            return ["decisions":[["id":"decision","item_id":selection["item_id"]!,"target_id":selection["target_id"]!,"disposition":params["disposition"]!]]]
+            let direction=String((selection["item_id"] as? String ?? "").dropFirst(5))
+            let decision: MediaValues=["id":"decision-"+direction,"item_id":selection["item_id"]!,"target_id":selection["target_id"]!,"disposition":params["disposition"]!]
+            itemRevisions[direction]=(selection["expected_revision"] as? Int ?? 0)+1
+            decisions[direction]=decision;return ["decisions":[decision]]
+        case "media_adopt_suggestion":
+            let selection=(params["items"] as? [MediaValues])?.first ?? [:]
+            let suggestion=suggestions.values.flatMap {$0}.first {$0["id"] as? String==params["suggestion_id"] as? String} ?? [:]
+            let direction=String((selection["item_id"] as? String ?? "").dropFirst(5))
+            let decision: MediaValues=["id":"adopted-"+direction,"item_id":selection["item_id"]!,"target_id":selection["target_id"]!,"disposition":suggestion["disposition"] ?? "accepted"]
+            itemRevisions[direction]=(selection["expected_revision"] as? Int ?? 0)+1
+            decisions[direction]=decision;return ["decisions":[decision]]
+        case "media_decision_withdraw":
+            if !withdrawalFailures.isEmpty {throw withdrawalFailures.removeFirst()}
+            let selection=(params["items"] as? [MediaValues])?.first ?? [:]
+            let direction=String((selection["item_id"] as? String ?? "").dropFirst(5))
+            let target=item(direction)["target"] as? MediaValues ?? [:]
+            let decision: MediaValues=["id":"withdrawal-"+direction,"item_id":selection["item_id"]!,"target_id":target["id"]!,
+                "disposition":"withdrawn","withdraws_decision_id":selection["decision_id"]!,"supersedes_decision_id":selection["decision_id"]!]
+            itemRevisions[direction]=(selection["expected_revision"] as? Int ?? 0)+1
+            decisions[direction]=decision;return ["decisions":[decision]]
+        case "media_suggestion_dismiss":return ["suggestion_id":params["suggestion_id"]!,"dismissed":["by":"owner"]]
         default:return [:]
         }
     }
@@ -807,5 +841,233 @@ extension MediaSimpleReviewTests {
         north.draft.note="Raise the arm"
         XCTAssertNil(MediaSimpleLayout.noteHint("changes_requested",note:north.draft.note),"The button enables as soon as the note has text")
         withExtendedLifetime(store) {}
+    }
+}
+
+/// CL-428: recommendations, flags, Keep, Keep all, Clear flag, hints and "Not made" cards.
+/// Fake service, rows and items only.
+extension MediaSimpleReviewTests {
+    private func suggestion(_ id: String,_ disposition: String,note: String = "",source: String = "agent",stale: Bool = false) -> MediaValues {
+        ["id":id,"origin":"agent","disposition":disposition,"note":note,"source_label":"Heir worker","author_display":"Heir worker","source":source,"stale":stale]
+    }
+    private func openReview(_ service: DraftService) async -> (MediaSimpleReviewModel,MediaReviewModel,ChecklistStore) {
+        service.state="open";return await draftReview(service)
+    }
+    func testEachRecommendationTextAndARecommendationIsNotADecision() async throws {
+        let service=DraftService()
+        service.suggestions=["N":[suggestion("s-N","accepted",note:"Looks right")],"E":[suggestion("s-E","needs_look",note:"Foot slides")],
+                             "SE":[suggestion("s-SE","changes_requested",note:"Arm clips the cape",source:"check")]]
+        let (review,model,store)=await openReview(service)
+        let north=try XCTUnwrap(review.cards["item-N"]),east=try XCTUnwrap(review.cards["item-E"]),southEast=try XCTUnwrap(review.cards["item-SE"])
+        XCTAssertEqual(review.recommendation(north)?.reason,"Accept suggested by Heir worker — keep or change it")
+        XCTAssertEqual(review.recommendation(east)?.reason,"Flagged by Heir worker")
+        XCTAssertEqual(review.recommendation(southEast)?.reason,"Flagged from checks")
+        XCTAssertEqual(review.recommendation(north)?.isFlag,false);XCTAssertEqual(review.recommendation(east)?.isFlag,true)
+        XCTAssertEqual(review.recommendation(southEast)?.choiceTitle,"Changes requested")
+        XCTAssertEqual(north.draft.note,"Looks right","The suggestion's note is an editable draft");XCTAssertEqual(southEast.draft.note,"Arm clips the cape")
+        // Advice only: nothing is sent, the item has no owner decision and the counts stay as the service sends them.
+        XCTAssertEqual(service.writes,[]);XCTAssertEqual(north.item.string("disposition"),"pending");XCTAssertTrue(model.counts.isEmpty)
+        XCTAssertFalse(MediaCardRecommendation.ownerDecided(north.item))
+        // Not current: a stale row, a dismissed row, or an item with an owner decision.
+        XCTAssertNil(MediaCardRecommendation.current(item:Record(values:["disposition":"pending","suggestions":[suggestion("old","accepted",stale:true)]])))
+        XCTAssertNil(MediaCardRecommendation.current(item:Record(values:["disposition":"pending","suggestions":[suggestion("gone","needs_look")]]),dismissed:["gone"]))
+        var dismissed=suggestion("d","needs_look");dismissed["dismissed"]=["by":"owner","at":"2026-11-03T00:00:00Z"]
+        XCTAssertNil(MediaCardRecommendation.current(item:Record(values:["disposition":"pending","suggestions":[dismissed]])))
+        XCTAssertNil(MediaCardRecommendation.current(item:Record(values:["disposition":"accepted","suggestions":[suggestion("x","needs_look")]])))
+        XCTAssertEqual(MediaCardRecommendation.current(item:Record(values:["disposition":"stale",
+            "agent_suggestions":[["id":"a","disposition":"needs_look","note":"","author_display":"Heir worker","source":"agent"]]]))?.reason,"Flagged by Heir worker",
+            "A stale owner decision is no decision for the current target; agent_suggestions rows count")
+        withExtendedLifetime(store) {}
+    }
+    func testKeepSendsAdoptSuggestionAndAnotherChoiceSendsTheDecision() async throws {
+        let service=DraftService()
+        service.suggestions=["N":[suggestion("s-N","accepted",note:"Looks right")],"E":[suggestion("s-E","accepted")]]
+        let (review,model,store)=await openReview(service)
+        let north=try XCTUnwrap(review.cards["item-N"])
+        await review.keep(north,model:model)
+        try await settle {!north.sending && service.writes.contains("media_adopt_suggestion")}
+        XCTAssertEqual(service.writes,["media_adopt_suggestion"])
+        let adopt=try XCTUnwrap(service.params("media_adopt_suggestion").first)
+        XCTAssertEqual(adopt["suggestion_id"] as? String,"s-N");XCTAssertNotNil(adopt["command_id"],"The native command journal sends it")
+        XCTAssertNil(adopt["disposition"]);XCTAssertNil(adopt["note"]);XCTAssertNil(adopt["winner_id"])
+        XCTAssertEqual(adopt["round_id"] as? String,"round");XCTAssertEqual(adopt["expected_revision"] as? Int,2)
+        XCTAssertEqual(adopt["observed_context_token"] as? String,"open-context");XCTAssertEqual(adopt["manifest_id"] as? String,"manifest")
+        let selection=try XCTUnwrap((adopt["items"] as? [MediaValues])?.first)
+        XCTAssertEqual(selection["item_id"] as? String,"item-N");XCTAssertEqual(selection["target_id"] as? String,"pub-N")
+        XCTAssertEqual(selection["review_basis_signature"] as? String,"published-basis-N");XCTAssertEqual(selection["expected_revision"] as? Int,3)
+        XCTAssertEqual(north.item.string("disposition"),"accepted");XCTAssertEqual(north.status,"Saved: Accepted")
+        XCTAssertNil(review.recommendation(north),"A kept recommendation is now the owner's decision")
+        // One press on another choice decides that choice.
+        await model.waitUntilWritable();service.calls=[]
+        let east=try XCTUnwrap(review.cards["item-E"])
+        await review.press("needs_look",card:east,model:model)
+        try await settle {!east.sending && service.writes.contains("media_decide")}
+        XCTAssertEqual(service.writes,["media_decide"]);XCTAssertEqual(service.params("media_decide").first?["disposition"] as? String,"needs_look")
+        XCTAssertEqual(east.item.string("disposition"),"needs_look")
+        withExtendedLifetime(store) {}
+    }
+    func testKeepAllKeepsEveryRecommendationAfterOneConfirmation() async throws {
+        let service=DraftService()
+        service.suggestions=["N":[suggestion("s-N","accepted")],"E":[suggestion("s-E","needs_look",note:"Foot slides")]]
+        let (review,model,store)=await openReview(service)
+        XCTAssertEqual(review.keepAllCards(model:model).map(\.id),["item-N","item-E"])
+        let confirmation=try XCTUnwrap(review.keepAllConfirmation(model:model))
+        XCTAssertEqual(confirmation.confirmLabel,"Keep 2 recommendations");XCTAssertEqual(service.writes,[],"Nothing is sent before the confirmation")
+        confirmation.perform()
+        try await settle {service.params("media_adopt_suggestion").count==2 && review.cards["item-E"]?.sending == false}
+        XCTAssertEqual(service.writes,["media_adopt_suggestion","media_adopt_suggestion"],"One adoption per item and no other write")
+        XCTAssertEqual(service.params("media_adopt_suggestion").map {$0["suggestion_id"] as? String},["s-N","s-E"])
+        XCTAssertEqual(review.cards["item-E"]?.item.string("disposition"),"needs_look");XCTAssertEqual(review.cards["item-SE"]?.item.string("disposition"),"pending")
+        XCTAssertNil(review.keepAllConfirmation(model:model),"No recommendation is left to keep")
+        withExtendedLifetime(store) {}
+    }
+    func testSecondPressOnEachOwnerChoiceWithdrawsExactHeadAndLeavesPending() async throws {
+        let service=DraftService()
+        let (review,model,store)=await openReview(service)
+        for (direction,choice) in zip(["N","E","SE"],MediaSimpleLayout.decisions) {
+            let card=try XCTUnwrap(review.cards["item-"+direction])
+            card.draft.note="Feet slide"
+            await review.press(choice.disposition,card:card,model:model)
+            try await settle {!card.sending && card.item.string("disposition")==choice.disposition}
+            let decision=try XCTUnwrap(card.currentOwnerDecision),revision=card.item.integer("revision")
+            await model.waitUntilWritable();service.calls=[]
+            card.draft.note=""
+            XCTAssertTrue(card.isCurrentDecision(choice.disposition))
+            XCTAssertNil(card.decisionNoteHint(choice.disposition),"Removing Changes requested needs no new owner note")
+            await review.press(choice.disposition,card:card,model:model)
+            try await settle {!card.sending && service.writes.contains("media_decision_withdraw")}
+            XCTAssertEqual(service.writes,["media_decision_withdraw"],"The second press removes the owner head instead of deciding again")
+            let withdraw=try XCTUnwrap(service.params("media_decision_withdraw").first)
+            XCTAssertEqual(withdraw["round_id"] as? String,"round");XCTAssertEqual(withdraw["expected_revision"] as? Int,2)
+            XCTAssertEqual(withdraw["observed_context_token"] as? String,"open-context")
+            XCTAssertEqual(withdraw["manifest_id"] as? String,"manifest");XCTAssertEqual(withdraw["manifest_digest"] as? String,"digest")
+            XCTAssertNotNil(withdraw["command_id"],"Withdrawal goes through the same native command journal as decisions")
+            for key in ["disposition","note","winner_id","none_fit","suggestion_id"] {XCTAssertNil(withdraw[key],key)}
+            let selections=try XCTUnwrap(withdraw["items"] as? [MediaValues]),selection=try XCTUnwrap(selections.first)
+            XCTAssertEqual(selections.count,1);XCTAssertEqual(Set(selection.keys),Set(["item_id","expected_revision","decision_id"]))
+            XCTAssertEqual(selection["item_id"] as? String,card.id);XCTAssertEqual(selection["expected_revision"] as? Int,revision)
+            XCTAssertEqual(selection["decision_id"] as? String,decision.id)
+            XCTAssertEqual(card.item.string("disposition"),"pending");XCTAssertEqual(card.status,"Saved: Pending")
+            XCTAssertEqual(card.item.object("decision")["withdraws_decision_id"] as? String,decision.id)
+            XCTAssertNil(card.currentOwnerDecision);XCTAssertFalse(MediaCardRecommendation.ownerDecided(card.item))
+            // A later service item read keeps the take Pending and its immutable withdrawal head.
+            review.apply(Record(values:service.item(direction)),to:card)
+            XCTAssertEqual(card.item.string("disposition"),"pending");XCTAssertNil(card.currentOwnerDecision)
+            await model.waitUntilWritable();service.calls=[]
+        }
+        withExtendedLifetime(store) {}
+    }
+    func testSecondPressWithdrawsAKeptRecommendationAndRefusalKeepsTheOwnerChoice() async throws {
+        let service=DraftService();service.suggestions=["N":[suggestion("s-N","accepted")]]
+        let (review,model,store)=await openReview(service)
+        let north=try XCTUnwrap(review.cards["item-N"])
+        await review.keep(north,model:model)
+        try await settle {!north.sending && north.currentOwnerDecision != nil}
+        let adopted=try XCTUnwrap(north.currentOwnerDecision)
+        await model.waitUntilWritable();service.calls=[]
+        service.withdrawalFailures=[ChecklistError("MEDIA_DECISION_USED","This decision already has a rework link.",details:["command_outcome":"rejected"])]
+        await review.press("accepted",card:north,model:model)
+        try await settle {!north.sending && service.writes.contains("media_decision_withdraw")}
+        XCTAssertEqual(service.writes,["media_decision_withdraw"])
+        XCTAssertEqual(north.currentOwnerDecision?.id,adopted.id);XCTAssertEqual(north.item.string("disposition"),"accepted")
+        XCTAssertTrue(north.status.contains("already has a rework link"),north.status)
+        await model.waitUntilWritable();service.calls=[]
+        await review.press("accepted",card:north,model:model)
+        try await settle {!north.sending && service.writes.contains("media_decision_withdraw")}
+        XCTAssertEqual(service.writes,["media_decision_withdraw"])
+        XCTAssertEqual((service.params("media_decision_withdraw").first?["items"] as? [MediaValues])?.first?["decision_id"] as? String,adopted.id)
+        XCTAssertEqual(north.item.string("disposition"),"pending");XCTAssertEqual(north.status,"Saved: Pending")
+        XCTAssertEqual(review.recommendation(north)?.suggestionID,"s-N","The remaining advice is separate from the removed owner choice")
+        withExtendedLifetime(store) {}
+    }
+    func testPublishedCarriedChoiceWithdrawsWhenItsBasisMatchesAcrossTargetIDs() async throws {
+        let service=DraftService()
+        service.decisions["N"]=["id":"carried-N","item_id":"item-N","target_id":"draft-N","disposition":"accepted",
+            "review_basis_signature":"published-basis-N","carried_from_decision_id":"predecessor-N"]
+        service.itemRevisions["N"]=4
+        let (review,model,store)=await openReview(service)
+        let north=try XCTUnwrap(review.cards["item-N"])
+        XCTAssertEqual(north.target.id,"pub-N");XCTAssertEqual(north.item.string("disposition"),"accepted")
+        XCTAssertEqual(north.currentOwnerDecision?.id,"carried-N","Publication changes the target ID without invalidating an unchanged carried basis")
+        // An authoritative Stale disposition must still keep an earlier choice from toggling.
+        var stale=service.item("N");stale["disposition"]="stale"
+        review.apply(Record(values:stale),to:north);XCTAssertNil(north.currentOwnerDecision)
+        review.apply(Record(values:service.item("N")),to:north)
+        await review.press("accepted",card:north,model:model)
+        try await settle {!north.sending && service.writes.contains("media_decision_withdraw")}
+        XCTAssertEqual(service.writes,["media_decision_withdraw"])
+        let selection=try XCTUnwrap((service.params("media_decision_withdraw").first?["items"] as? [MediaValues])?.first)
+        XCTAssertEqual(selection["decision_id"] as? String,"carried-N");XCTAssertEqual(selection["expected_revision"] as? Int,4)
+        XCTAssertEqual(north.item.string("disposition"),"pending");XCTAssertEqual(north.status,"Saved: Pending")
+        XCTAssertEqual(north.item.object("decision")["target_id"] as? String,"pub-N")
+        XCTAssertEqual(north.item.object("decision")["withdraws_decision_id"] as? String,"carried-N")
+        withExtendedLifetime(store) {}
+    }
+    func testClearFlagSendsDismissAndTheFlagStaysGone() async throws {
+        let service=DraftService()
+        service.suggestions=["E":[suggestion("s-E","changes_requested",note:"Foot slides")]]
+        let (review,model,store)=await openReview(service)
+        let east=try XCTUnwrap(review.cards["item-E"])
+        XCTAssertEqual(review.recommendation(east)?.isFlag,true);XCTAssertEqual(east.draft.note,"Foot slides")
+        review.clearFlag(east,model:model)
+        try await settle {!east.sending && service.writes.contains("media_suggestion_dismiss")}
+        XCTAssertEqual(service.writes,["media_suggestion_dismiss"])
+        let dismiss=try XCTUnwrap(service.params("media_suggestion_dismiss").first)
+        XCTAssertEqual(dismiss["round_id"] as? String,"round");XCTAssertEqual(dismiss["suggestion_id"] as? String,"s-E")
+        XCTAssertNil(review.recommendation(east));XCTAssertEqual(east.draft.note,"");XCTAssertEqual(east.status,"Flag cleared")
+        XCTAssertNil(review.otherSuggestion(east),"The old advice line must not show the cleared flag")
+        // A refresh reads the item again. The fake still lists the row as current; the flag stays gone.
+        await model.waitUntilWritable()
+        review.sync(scope:"project:round",rows:["N","E","SE"].map {Record(values:["id":"item-"+$0,"revision":4,"metadata":["direction":$0]])},draft:{_ in MediaOwnerDraft()},saveDraft:{_,_ in})
+        await review.readStale {id in Record(values:service.item(String(id.dropFirst(5))))}
+        XCTAssertTrue(review.cards["item-E"] === east);XCTAssertNil(review.recommendation(east))
+        XCTAssertEqual(east.draft.note,"","The cleared flag's note does not come back");XCTAssertEqual(east.item.string("disposition"),"pending")
+        XCTAssertEqual(service.writes,["media_suggestion_dismiss"],"Clearing a flag sends no decision")
+        withExtendedLifetime(store) {}
+    }
+    func testClearedFlagCoversCurrentTargetButAllowsAcceptAdviceAndNewTargetFlags() async throws {
+        let service=DraftService();service.suggestions=["E":[suggestion("first-flag","changes_requested",note:"Foot slides")]]
+        let (review,model,store)=await openReview(service)
+        let east=try XCTUnwrap(review.cards["item-E"])
+        review.clearFlag(east,model:model)
+        try await settle {!east.sending && service.writes.contains("media_suggestion_dismiss")}
+        XCTAssertEqual(review.dismissedFlagTargets[east.id],Set([east.target.id]))
+        // Different records, both flag choices and both sources, still refer to the cleared take.
+        for (choice,source) in [("changes_requested","agent"),("needs_look","check")] {
+            service.suggestions["E"]=[suggestion("new-"+choice,choice,note:"Flag returned",source:source)]
+            review.apply(Record(values:service.item("E")),to:east)
+            XCTAssertNil(review.recommendation(east));XCTAssertNil(review.otherSuggestion(east))
+            XCTAssertEqual(east.draft.note,"")
+        }
+        service.suggestions["E"]=[suggestion("new-flag","needs_look"),suggestion("new-accept","accepted",note:"Looks good")]
+        review.apply(Record(values:service.item("E")),to:east)
+        XCTAssertEqual(review.recommendation(east)?.suggestionID,"new-accept","Clearing flags never dismisses Accept advice")
+        var changed=service.item("E"),target=changed["target"] as? MediaValues ?? [:]
+        target["id"]="pub-E-new";changed["target"]=target;changed["suggestions"]=[suggestion("next-take-flag","needs_look")]
+        review.apply(Record(values:changed),to:east)
+        XCTAssertEqual(review.recommendation(east)?.suggestionID,"next-take-flag","A new target can carry a flag of its own")
+        withExtendedLifetime(store) {}
+    }
+    func testHintLinesShowAboveTheNote() async throws {
+        let hint="Feet stay planted\n\nLoop at frame 8\nCape follows\nShadow under feet"
+        let shown=MediaCardHints.shown(hint)
+        XCTAssertEqual(shown.lines,["Feet stay planted","Loop at frame 8","Cape follows"]);XCTAssertTrue(shown.more,"The rest is in the details")
+        XCTAssertEqual(MediaCardHints.shown("One line").lines,["One line"]);XCTAssertFalse(MediaCardHints.shown("One line").more)
+        XCTAssertTrue(MediaCardHints.shown(nil).lines.isEmpty);XCTAssertTrue(MediaCardHints.shown("  \n ").lines.isEmpty)
+        let service=DraftService();service.hints=["N":"Feet stay planted"]
+        let (review,_,store)=await openReview(service)
+        XCTAssertEqual(MediaCardHints.shown(try XCTUnwrap(review.cards["item-N"]).labelMetadata["hint"]).lines,["Feet stay planted"],"The card reads the item's hint field")
+        withExtendedLifetime(store) {}
+    }
+    func testNotMadeCardForADirectionWithNoTake() async throws {
+        XCTAssertEqual(MediaNotMade.directionChoices(schema()),["N","NE","E","SE","S","SW","W","NW"])
+        let (review,_)=await loadedReview()
+        XCTAssertTrue(review.sections.allSatisfy {$0.notMade.isEmpty},"No Not made card before the choices are known")
+        review.directionChoices=MediaNotMade.directionChoices(schema());review.listComplete=true
+        let section=try XCTUnwrap(review.sections.first)
+        XCTAssertEqual(section.title,"Hero · Walk cycle");XCTAssertEqual(section.cards.count,3,"A Not made card is not a take card")
+        XCTAssertEqual(section.notMade,["North-east","South","South-west","West","North-west"].map {"Hero · Walk cycle · "+$0+": Not made"})
+        review.listComplete=false
+        XCTAssertEqual(review.sections.first?.notMade,[],"A filtered or partial list shows no Not made card")
     }
 }

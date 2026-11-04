@@ -17,7 +17,7 @@ extension CommandRouter {
             // CL-419: a type command answers a closed projection; owner adoption records stay private.
             if method.hasPrefix("media_type_") { return mediaWorkerTypeChange(result) }
             // CL-420: a round closure or successor answers a closed round projection.
-            return ["media_round_cancel","media_round_archive","media_round_finish","media_round_successor"].contains(method) ? mediaWorkerRoundChange(result) : result
+            return ["media_round_cancel","media_round_archive","media_round_finish","media_round_successor","media_round_link_task"].contains(method) ? mediaWorkerRoundChange(result) : result
         }
         // CL-320: safe worker projections read one pooled snapshot, so they answer
         // during a backup's writer lease; authority is checked inside that snapshot.
@@ -62,7 +62,7 @@ extension CommandRouter {
     private func mediaWorkerRoundChange(_ round: JSON) -> JSON {
         var result: JSON = [:]
         for key in ["id","project_id","type_id","title","state","revision","closure","cancellation_reason","predecessor_round_id",
-                    "predecessor_manifest_id","successor","canceled_by","archived_by","closed_by","replayed"] {
+                    "predecessor_manifest_id","successor","canceled_by","archived_by","closed_by","task_id","task","last_result_sent","replayed"] {
             result[key] = round[key]
         }
         return result
@@ -95,10 +95,9 @@ extension CommandRouter {
             // CL-419 (owner, 3 November 2026): media types and publication are agent setting
             // changes under the project's agent_rule_changes switch, like every other agent change.
             try requireAgentEditAuthority(db,project:record(db,project,type:"project"),caller:c)
-            return
-        }
-        if method == "media_round_create" {
-            _ = try mediaWorkerAdoptedType(db,scoped(db,text(p,"type_id"),project,type:"media_review_type"),project:project)
+            if method == "media_round_create" {
+                _ = try mediaWorkerAdoptedType(db,scoped(db,text(p,"type_id"),project,type:"media_review_type"),project:project)
+            }
             return
         }
         if method == "media_suggest" || method == "media_follow_up_record" {return}
@@ -118,7 +117,7 @@ extension CommandRouter {
     /// context-source bodies and canonical owner-channel observations stay private.
     func mediaWorkerDecision(_ decision: JSON) -> JSON {
         var result: JSON = [:]
-        for key in ["id","project_id","round_id","item_id","target_id","disposition","winner_id","none_fit","note","created_at","supersedes_decision_id"] {
+        for key in ["id","project_id","round_id","item_id","target_id","disposition","winner_id","none_fit","note","created_at","supersedes_decision_id","withdraws_decision_id"] {
             result[key] = decision[key]
         }
         result["decision_id"] = decision["id"];result["decided_at"] = decision["created_at"]
@@ -132,6 +131,9 @@ extension CommandRouter {
         let page = try mediaListQuery(db,method:"media_item_page",p:query,c:c,project:project)
         var result: JSON = [:]
         for key in ["id","project_id","type_id","title","state","revision","origin","created_at"] {result[key] = round[key]}
+        result["task_id"] = round["task_id"]
+        result["task"] = try mediaRoundTask(db,round:round) ?? NSNull()
+        result["last_result_sent"] = round["last_result_sent"]
         if round["origin"] as? String == "agent" {
             result["author"] = round["author"];result["author_session_id"] = round["author_session_id"]
         }
@@ -168,6 +170,8 @@ extension CommandRouter {
                 value["decision_id"] = id;value["decided_at"] = decision["created_at"]
                 value["follow_up"] = try mediaFollowUpView(db,index:followUps,decisionID:id,project:project)
             }
+            value["agent_suggestions"] = try mediaItemSuggestions(db,project:project,itemID:try selected.string("id"),target:target,round:round)
+                .filter {!bool($0,"stale")}.map(mediaCurrentSuggestionView)
             return value
         }
         result["items"] = items;result["rows"] = items
@@ -196,19 +200,33 @@ extension CommandRouter {
     }
 
     /// Bounded owner display of actual worker suggestions, separate from decisions.
-    func mediaItemSuggestions(_ db: Database,project: String,itemID: String,target: JSON) throws -> [JSON] {
+    func mediaItemSuggestions(_ db: Database,project: String,itemID: String,target: JSON,round: JSON) throws -> [JSON] {
         try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE project_id=CAST(? AS TEXT) AND type='media_suggestion'" +
             " AND json_extract(data,'$.item_id')=CAST(? AS TEXT) COLLATE BINARY ORDER BY rowid DESC LIMIT 100",
             arguments:[Data(project.utf8),Data(itemID.utf8)]).map { row in
-                var suggestion = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"media_suggestion").object
-                if let sessionID = suggestion["author_session_id"] as? String,
-                   let session = try? scoped(db,sessionID,project,type:"session") {
-                    suggestion["source_label"] = sessionThreadLabel(session)
-                } else {suggestion["source_label"] = "Recorded worker"}
-                suggestion["display_only"] = true
-                // CL-351: `stale` covers a changed target, not only a changed basis.
-                suggestion["stale"] = !mediaSuggestionCurrent(suggestion,target:target)
-                return suggestion
+                try mediaSuggestionView(db,suggestion:GRDBRecordEnvelopeAdapter.decode(row,expectedType:"media_suggestion").object,
+                    project:project,target:target,round:round)
             }
+    }
+
+    func mediaSuggestionView(_ db: Database,suggestion original: JSON,project: String,target: JSON,round: JSON) throws -> JSON {
+        var suggestion = original
+        if let sessionID = suggestion["author_session_id"] as? String,
+           let session = try? scoped(db,sessionID,project,type:"session") {
+            suggestion["source_label"] = sessionThreadLabel(session)
+        } else {suggestion["source_label"] = "Recorded worker"}
+        suggestion["author_display"] = suggestion["source_label"]
+        suggestion["source"] = suggestion["source"] ?? "agent"
+        suggestion["dismissed"] = mediaSuggestionDismissal(suggestion,target:target,round:round)
+        suggestion["display_only"] = true
+        suggestion["stale"] = !mediaSuggestionCurrent(suggestion,target:target)
+        return suggestion
+    }
+
+    /// Current card advice never exposes the owner's identity or grants decision authority.
+    func mediaCurrentSuggestionView(_ suggestion: JSON) -> JSON {
+        ["id":suggestion["id"] ?? NSNull(),"disposition":suggestion["disposition"] ?? NSNull(),
+         "note":suggestion["note"] ?? "","author_display":suggestion["author_display"] ?? "Recorded worker",
+         "source":suggestion["source"] ?? "agent"]
     }
 }

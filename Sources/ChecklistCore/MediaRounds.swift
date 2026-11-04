@@ -43,15 +43,19 @@ extension CommandRouter {
         "media_type_revise":["type_id","expected_revision","schema","rubric","title"],
         "media_type_adopt":["type_id","expected_revision","type_revision_id","observed_type_token"],
         "media_type_adopt_starter":["starter","expected_revision","title"],
-        "media_round_create":["type_id","title"], "media_round_get":["round_id"],
+        "media_round_create":["type_id","title","task_id"], "media_round_get":["round_id"],
+        "media_round_link_task":["round_id","expected_revision","task_id"],
+        "media_round_send_result":["round_id","expected_revision"],
         "media_item_create":["round_id","title","metadata","candidates"],
         "media_item_update":["item_id","expected_revision","title","metadata","candidates"],
         "media_round_publish":["round_id","expected_revision","observed_context_token","items"],
         "media_context_approve":["kind","body","type_id","round_id","item_ids","supersedes_id","expected_project_revision"],
         "media_context_reconcile":["round_id","expected_revision","observed_context_token","action","reason","attention_ids"],
-        "media_suggest":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","items","disposition","winner_id","none_fit","note","no_follow_up_reason"],
+        "media_suggest":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","items","disposition","winner_id","none_fit","note","no_follow_up_reason","source"],
         "media_decide":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","items","disposition","winner_id","none_fit","note","no_follow_up_reason"],
+        "media_decision_withdraw":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","items"],
         "media_adopt_suggestion":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","items","suggestion_id"],
+        "media_suggestion_dismiss":["round_id","suggestion_id"],
         "media_round_finish":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest"],
         "media_follow_up_record":["round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","items","task_id","reason"],
         "media_rework_preview":["round_id","epic_id","items"],
@@ -85,7 +89,9 @@ extension CommandRouter {
         guard UUID(uuidString:command) != nil else { throw CoreError("INVALID_INPUT","command_id must be a UUID.") }
         let digest = hash(Data((method + (try jsonString(p))).utf8))
         // Rework capture writes ordinary tickets, which the media-only preparation cannot hold.
-        if method == "media_rework_create" {return try mediaReworkCreateCommand(params:p,caller:c,command:command,digest:digest,workerChannel:workerChannel)}
+        if ["media_rework_create","media_round_send_result"].contains(method) {
+            return try mediaTicketCommand(method:method,params:p,caller:c,command:command,digest:digest,workerChannel:workerChannel)
+        }
         var resources = try prepareMediaResources(method:method,params:p,caller:c,workerChannel:workerChannel)
         resources.nativeOwnerProjection = nativeOwnerProjection
         let prepared = try prepareMediaCommand(method:method,params:p,caller:c,resources:resources)
@@ -288,6 +294,7 @@ extension CommandRouter {
     }
     func mediaRoundView(_ db: Database,round: JSON,caller: Caller) throws -> JSON {
         var result = round;let (type,context) = try mediaRoundParts(db,round)
+        result["task"] = try mediaRoundTask(db,round:round) ?? NSNull()
         result["observed_context_token"] = try mediaToken(db,round:round,caller:caller);result["context"] = context
         let manifest = try (round["manifest_id"] as? String).map {try scoped(db,$0,(try StoredRecord(round, family: "media").string("project_id")),type:"media_round_manifest")}
         result["manifest"] = manifest ?? [:]
@@ -302,8 +309,9 @@ extension CommandRouter {
                     (try StoredRecord(round, family: "media").string("project_id")),type:"media_item_target")
                 if let id = item["last_decision_id"] as? String {
                     let decision = try scoped(db,id,(try StoredRecord(round, family: "media").string("project_id")),type:"media_owner_decision")
-                    let applies = decision["review_basis_signature"] as? String == entry["review_basis_signature"] as? String
-                    row["decision"] = decision;row["decision_applicable"] = applies;row["disposition"] = applies ? (try StoredRecord(decision, family: "media").requiredValue("disposition")) : "stale"
+                    let withdrawn = decision["disposition"] as? String == "withdrawn"
+                    let applies = !withdrawn && decision["review_basis_signature"] as? String == entry["review_basis_signature"] as? String
+                    row["decision"] = decision;row["decision_applicable"] = applies;row["disposition"] = withdrawn ? "pending" : applies ? (try StoredRecord(decision, family: "media").requiredValue("disposition")) : "stale"
                 } else if item["stale_predecessor_decision_id"] is String { row["disposition"] = "stale" }
             };return row
         }
@@ -338,6 +346,8 @@ extension CommandRouter {
         if method.hasPrefix("media_intake_") { return try mediaIntakeCommand(db,method:method,p:p,c:c,project:pid,resources:resources) }
         if method.hasPrefix("media_bulk_") { return try mediaBulkCommand(db,method:method,p:p,c:c,project:pid) }
         switch method {
+        case "media_round_link_task":
+            return try mediaLinkTask(db,p,c,project:pid,resources:resources)
         case "media_material_reference_adopt": return try mediaMaterialReferenceAdopt(db,p:p,c:c,project:pid)
         case "media_type_retire":
             // CL-419: the worker channel already applied the agent_rule_changes gate.
@@ -367,16 +377,9 @@ extension CommandRouter {
             // CL-420: the worker channel already applied the agent_rule_changes gate.
             if !resources.workerChannel { try owner(c) }
             var round = try scoped(db,try text(p,"round_id"),pid,type:"media_round");try mediaRevision(p,round)
-            if method == "media_round_cancel" {
-                guard ["draft","open"].contains(round["state"] as? String ?? "") else {throw CoreError("MEDIA_ROUND_CLOSED","Only a Draft or Open round can be canceled.")}
-                round["cancellation_reason"] = try text(p,"reason",max:4000);round["state"] = "canceled"
-                if resources.workerChannel { round["canceled_by"] = mediaAgentActor(c) }
-            } else {
-                guard ["closed","canceled"].contains(round["state"] as? String ?? "") else {throw CoreError("MEDIA_ROUNDS_REMAIN","Finish or explicitly cancel this round before archiving.")}
-                round["state"] = "archived"
-                if resources.workerChannel { round["archived_by"] = mediaAgentActor(c) }
-            }
-            round = revised(round);try mediaWrite(db,round,type:"media_round");return round
+            let actor = resources.workerChannel ? mediaAgentActor(c) : nil
+            if method == "media_round_cancel" { return try mediaCancelRound(db,round:round,reason:text(p,"reason",max:4000),actor:actor) }
+            return try mediaArchiveRound(db,round:round,actor:actor)
         case "media_type_create":
             return try mediaTypeView(db,type:mediaCreateType(db,p,c,project:pid),caller:c)
         case "media_type_adopt_starter":
@@ -398,6 +401,7 @@ extension CommandRouter {
                  family: "media").requiredValue("id")),"attention_ids":[String]()],project:pid,
                 caller:c,references:[try mediaRef("media_review_type",type),try mediaRef("media_review_type_revision",
                 typeRevision)])
+            try mediaSetTask(db,round:&round,input:p,project:pid)
             let sources = try mediaCurrentSources(db,project:pid,type:(try StoredRecord(type, family: "media").string("id")),round:(try StoredRecord(round, family: "media").string("id")))
             let context = try mediaSnapshot(db,round:round,typeRevision:typeRevision,sources:sources,caller:c)
             round["context_id"] = context["id"];round["record_references"] = ((try StoredRecord(round, family: "media").objects("record_references"))) + [try mediaRef("media_review_context",context)]
@@ -417,6 +421,8 @@ extension CommandRouter {
             return try mediaPublishRound(db,p,c,project:pid,resources:resources)
         case "media_context_reconcile": return try mediaReconcile(db,p,c,project:pid)
         case "media_decide","media_suggest","media_adopt_suggestion": return try mediaDecision(db,p,c,project:pid,method:method)
+        case "media_decision_withdraw": return try mediaDecisionWithdraw(db,p,c,project:pid)
+        case "media_suggestion_dismiss": return try mediaSuggestionDismiss(db,p,c,project:pid)
         case "media_follow_up_record": return try mediaFollowUpRecord(db,p,c,project:pid)
         case "media_round_finish":
             return try mediaFinishRound(db,p,c,project:pid,agent:resources.workerChannel)
@@ -609,15 +615,36 @@ extension CommandRouter {
             round:round,caller:c)
     }
 
-    private func mediaFinishRound(_ db: Database,_ p: JSON,_ c: Caller,project pid: String,agent: Bool = false) throws -> JSON {
+    func mediaFinishRound(_ db: Database,_ p: JSON,_ c: Caller,project pid: String,agent: Bool = false,systemTaskID: String? = nil) throws -> JSON {
         // CL-420: the worker channel already applied the agent_rule_changes gate; the closure checks are shared.
         if !agent { try owner(c) };var round = try scoped(db,try text(p,"round_id"),pid,type:"media_round")
-        try mediaObserve(db,p,round:round,caller:c);let manifest = try mediaObservedManifest(db,p,round:round)
+        let manifest: JSON
+        if let systemTaskID {
+            guard round["task_id"] as? String == systemTaskID,round["state"] as? String == "open",let id = round["manifest_id"] as? String else {throw CoreError("MEDIA_MANIFEST_CHANGED","Inspect the current open manifest.")}
+            manifest = try scoped(db,id,pid,type:"media_round_manifest")
+        } else {
+            try mediaObserve(db,p,round:round,caller:c);manifest = try mediaObservedManifest(db,p,round:round)
+        }
         // CL-118/CL-350: exact current dispositions; follow-up kinds counted separately.
         let (closure,links) = try mediaClosure(db,round:round,manifest:manifest,caller:c)
         round["closure"] = closure
         round["record_references"] = (try StoredRecord(round, family: "media").objects("record_references")) + (try links.map {try mediaRef("media_rework_link",$0)})
         round["state"] = "closed";if agent { round["closed_by"] = mediaAgentActor(c) }
+        if let systemTaskID {round["closed_by"] = mediaTaskDoneActor(systemTaskID)}
+        round = revised(round);try mediaWrite(db,round,type:"media_round");return round
+    }
+
+    func mediaCancelRound(_ db: Database,round original: JSON,reason: String,actor: JSON? = nil) throws -> JSON {
+        guard ["draft","open"].contains(original["state"] as? String ?? "") else {throw CoreError("MEDIA_ROUND_CLOSED","Only a Draft or Open round can be canceled.")}
+        var round = original;round["cancellation_reason"] = reason;round["state"] = "canceled"
+        if let actor {round["canceled_by"] = actor}
+        round = revised(round);try mediaWrite(db,round,type:"media_round");return round
+    }
+
+    func mediaArchiveRound(_ db: Database,round original: JSON,actor: JSON? = nil) throws -> JSON {
+        guard ["closed","canceled"].contains(original["state"] as? String ?? "") else {throw CoreError("MEDIA_ROUNDS_REMAIN","Finish or explicitly cancel this round before archiving.")}
+        var round = original;round["state"] = "archived"
+        if let actor {round["archived_by"] = actor}
         round = revised(round);try mediaWrite(db,round,type:"media_round");return round
     }
 

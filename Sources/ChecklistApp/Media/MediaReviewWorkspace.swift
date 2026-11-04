@@ -131,11 +131,13 @@ struct MediaReviewWorkspace: View {
                             .frame(maxWidth:220).onChange(of:model.filter) {_,_ in Task {await model.reloadRows()}}
                         Button("Item comparison") {itemComparison=true}.help("Show the item list, item comparison and the direction grid")
                     }
+                    MediaRoundTicketBar(model:model)
                     DisclosureGroup("Round setup and actions") {ScrollView {roundControls}.frame(maxHeight:190)}
                         .accessibilityLabel("Round setup and frozen intake")
                     MediaSimpleReview(model:model).frame(minHeight:150).layoutPriority(1)
                 } else if !model.roundID.isEmpty {
                     if MediaSimpleLayout.usesCards(model.schema) {Button("Back to cards") {model.prepareForDirectionGrid();directionGroup=nil;itemComparison=false}}
+                    MediaRoundTicketBar(model:model)
                     ScrollView {roundControls}.frame(minHeight:60,maxHeight:190).accessibilityLabel("Round setup and frozen intake")
                     HSplitView {
                         itemList.frame(minWidth:175,idealWidth:220)
@@ -283,6 +285,64 @@ struct MediaReviewWorkspace: View {
     func addFiles() {
         let panel=NSOpenPanel();panel.canChooseDirectories=false;panel.allowsMultipleSelection=true
         if panel.runModal() == .OK {model.previewIntake(["sources":panel.urls.map {["path":$0.path]}])}
+    }
+}
+
+/// CL-427: the ticket that the round is for, its picker, and the one "Send results" action.
+/// Each refusal shows as one plain line here; no global alert shows it.
+struct MediaRoundTicketBar: View {
+    @EnvironmentObject var store: ChecklistStore
+    @ObservedObject var model: MediaReviewModel
+    @State private var choosing=false
+    @State private var search=""
+    var body: some View {
+        VStack(alignment:.leading,spacing:4) {
+            HStack(spacing:8) {
+                Text(MediaReviewModel.ticketLine(model.header)).font(.subheadline).textSelection(.enabled)
+                    .accessibilityIdentifier("mediaRoundTicket")
+                if model.ticketChangeAvailable {
+                    Button(model.linkedTask.id.isEmpty ? "Choose ticket…" : "Change ticket…") {choosing.toggle()}
+                        .accessibilityLabel(model.linkedTask.id.isEmpty ? "Choose the ticket for this round" : "Change the ticket for this round")
+                }
+                Spacer()
+                if let action=model.resultAction {
+                    Button(action.label) {Task {await model.sendResults()}}
+                        .accessibilityIdentifier("mediaSendResults")
+                        .checklistDisabled([(model.resultSend.sending,"Sending results."),(action.disabledReason != nil,action.disabledReason ?? ""),
+                                            (store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
+                }
+            }
+            if let line=model.resultLine {
+                Text(line.text).font(.caption).foregroundStyle(line.refused ? Color.orange : Color.checklistSecondaryText).textSelection(.enabled)
+            }
+            if !model.ticketLinkLine.isEmpty {Text(model.ticketLinkLine).font(.caption).foregroundStyle(.orange).textSelection(.enabled)}
+            if choosing && model.ticketChangeAvailable {picker}
+        }
+        .onChange(of:model.roundID) {_,_ in choosing=false;search=""}
+    }
+    private var picker: some View {
+        VStack(alignment:.leading,spacing:4) {
+            TextField("Search open tickets by key or title",text:$search).accessibilityIdentifier("mediaRoundTicketSearch")
+            if model.ticketChoicesLoading && model.ticketChoices.isEmpty {ProgressView().controlSize(.small)}
+            ScrollView {
+                LazyVStack(alignment:.leading,spacing:2) {
+                    ForEach(model.ticketChoices) {task in
+                        Button(task.string("key")+" — "+task.string("title")) {model.linkTask(task.id);choosing=false}
+                            .buttonStyle(.plain).padding(.vertical,2)
+                            .accessibilityAddTraits(task.id==model.linkedTask.id ? .isSelected : [])
+                    }
+                    if !model.ticketChoicesLoading && model.ticketChoices.isEmpty {
+                        Text("No open ticket matches.").font(.caption).foregroundStyle(Color.checklistSecondaryText)
+                    }
+                }
+            }.frame(maxHeight:140)
+            HStack {
+                if !model.linkedTask.id.isEmpty {Button("No ticket") {model.linkTask(nil);choosing=false}}
+                Button("Close") {choosing=false}
+            }
+        }
+        .checklistDisabled([(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
+        .task(id:search) {await model.loadTicketChoices(search)}
     }
 }
 

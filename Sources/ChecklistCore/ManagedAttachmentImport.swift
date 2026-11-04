@@ -600,6 +600,7 @@ extension CommandRouter {
         guard let principal = job["parent_principal"] as? String, let command = job["parent_command_id"] as? String, let digest = job["intent_digest"] as? String, let receipt = try managedImportReceipt(db,principal:principal,command:command,digest:digest), let result = receipt["data"] as? JSON, EnvelopeStorageIdentity.equal(result["id"] as? String,aid) else { throw managedImportFailure("committed_receipt_missing") }
         var attachment = try scoped(db,aid,pid,type:"attachment")
         guard attachment["storage_job_id"] as? String == job["id"] as? String, attachment["sha256"] as? String == job["sha256"] as? String, (try? managedRelative(attachment["path"] as? String ?? "",family:"objects")) == job["object_relative_path"] as? String else { throw managedImportFailure("committed_reference_changed") }
+        if try mediaTrashIntentOwnsImportRecovery(db,attachment:attachment) {return}
         let files = try StorageObjectFiles(root:root)
         guard let original = objects.first(where: {$0["representation"] as? String == "original"}) else {
             throw managedImportFailure("original_descriptor_missing")

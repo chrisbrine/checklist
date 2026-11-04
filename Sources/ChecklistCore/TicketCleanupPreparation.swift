@@ -186,7 +186,13 @@ extension CommandRouter {
             backup?.verifyCopy(for:object,check:check)
             guard try ticketObjectDeletionHolds(db,object:object,references:references,backup:backup,mediaAuthorityComplete:mediaComplete).isEmpty,
                   object["kind"] as? String == "file",let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value else {continue}
-            do {verifications[path] = try TicketObjectRemovalVerification(root:root,relative:path,sha256:sha,size:size,check:check)} catch {failures[path] = error}
+            do {
+                verifications[path] = try TicketObjectRemovalVerification(root:root,relative:path,sha256:sha,size:size,check:check)
+                if verifications[path] == nil,object["disposal"] as? String == "trash",let trashPath = object["trash_path"] as? String {
+                    let target = URL(fileURLWithPath:trashPath)
+                    verifications[path] = try TicketObjectRemovalVerification(root:target.deletingLastPathComponent(),relative:target.lastPathComponent,sha256:sha,size:size,folderAccess:.insideTrash,check:check)
+                }
+            } catch {failures[path] = error}
         }
         return TicketCleanupPreparedDeletion(fence:fence,receipt:receipt,reactivated:reactivated,backupGenerationRow:backupGenerationRow,references:references,backup:backup,mediaAuthorityComplete:mediaComplete,candidatePaths:candidates,verifications:verifications,verificationFailures:failures)
     }

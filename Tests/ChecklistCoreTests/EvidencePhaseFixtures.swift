@@ -51,7 +51,12 @@ extension EvidenceAuthorityTests {
             func relocatePath(_ text: String) -> String {
                 // /tmp metadata and physical /private/tmp reservations describe
                 // the same source fixture. Capture both while it still exists.
-                for prefix in [original, physicalOriginal] {
+                let prefixes = [original,physicalOriginal].flatMap { path -> [String] in
+                    if path.hasPrefix("/private/tmp/") {return [path,String(path.dropFirst(8))]}
+                    if path.hasPrefix("/tmp/") {return [path,"/private" + path]}
+                    return [path]
+                }
+                for prefix in prefixes {
                     if text == prefix || text.hasPrefix(prefix + "/") { return current + text.dropFirst(prefix.count) }
                     let oldKey = prefix.lowercased()
                     if text == oldKey || text.hasPrefix(oldKey + "/") { return current + text.dropFirst(oldKey.count) }

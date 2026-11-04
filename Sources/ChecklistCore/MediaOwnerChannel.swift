@@ -12,7 +12,9 @@ extension CommandRouter {
         // CL-300: owner screens for CL-118 rework Drafts, round closure and successor rounds.
         "media_rework_create", "media_round_finish", "media_round_successor",
         // CL-318/CL-349: frozen bulk decisions and one-press suggestion adoption, owner only.
-        "media_bulk_prepare", "media_bulk_apply", "media_adopt_suggestion"
+        "media_bulk_prepare", "media_bulk_apply", "media_adopt_suggestion", "media_suggestion_dismiss", "media_decision_withdraw",
+        // CL-427: link the ticket that owns the takes; sending owner decisions stays owner only.
+        "media_round_link_task", "media_round_send_result"
     ])
     func executeMediaOwnerChannel(method: String, params p: JSON, caller c: Caller) throws -> JSON {
         try owner(c)
@@ -77,6 +79,7 @@ extension CommandRouter {
     }
     func mediaOwnerHeader(_ db: Database,_ round: JSON,_ caller: Caller) throws -> JSON {
         var result = round
+        result["task"] = try mediaRoundTask(db,round:round) ?? NSNull()
         let (type,context) = try mediaRoundParts(db,round)
         result["type_revision"] = type; result["context"] = context
         result["observed_context_token"] = try mediaToken(db,round:round,caller:caller)
@@ -104,14 +107,18 @@ extension CommandRouter {
         item["published"] = member != nil
         item["target"] = target
         item["candidates"] = try strings(target,"candidate_ids").map {try scoped(db,$0,project,type:"media_candidate")}
-        item["suggestions"] = try mediaItemSuggestions(db,project:project,itemID:itemID,target:target)
+        let suggestions = try mediaItemSuggestions(db,project:project,itemID:itemID,target:target,round:round)
+        item["suggestions"] = suggestions
+        item["agent_suggestions"] = suggestions.filter {!bool($0,"stale")}.map(mediaCurrentSuggestionView)
         item["disposition"] = "pending"
         if let id = item["last_decision_id"] as? String {
             let decision = try scoped(db,id,project,type:"media_owner_decision")
             item["decision"] = decision
-            item["disposition"] = decision["review_basis_signature"] as? String == target["review_basis_signature"] as? String ? (try StoredRecord(decision,
-                 family: "media").requiredValue("disposition")) : "stale"
-            item["follow_up"] = try mediaFollowUpView(db,index:mediaFollowUpIndex(mediaReworkLinks(db,round:round)),decisionID:id,project:project)
+            if decision["disposition"] as? String != "withdrawn" {
+                item["disposition"] = decision["review_basis_signature"] as? String == target["review_basis_signature"] as? String ? (try StoredRecord(decision,
+                     family: "media").requiredValue("disposition")) : "stale"
+                item["follow_up"] = try mediaFollowUpView(db,index:mediaFollowUpIndex(mediaReworkLinks(db,round:round)),decisionID:id,project:project)
+            }
         } else if member != nil,item["stale_predecessor_decision_id"] is String {
             // CL-118 successor with a changed basis: same Stale as the round view and item page.
             item["disposition"] = "stale"

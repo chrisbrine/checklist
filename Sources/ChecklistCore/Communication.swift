@@ -2,7 +2,7 @@ import Foundation
 import GRDB
 
 // Internal call-site purpose, never decoded from message_send JSON or a public flag.
-enum MessageWritePurpose: Equatable { case ordinaryNote, trustedHumanResponse }
+enum MessageWritePurpose: Equatable { case ordinaryNote, trustedHumanResponse, systemNote }
 
 extension CommandRouter {
     /// The fixed recipient reactions to a note: seen/OK, no, done, looking into it, needs a question.
@@ -55,9 +55,9 @@ extension CommandRouter {
         }
         return try text(recipient, "session_id", max: 4000)
     }
-    func messageWrite(_ db: Database,_ p: JSON,_ c: Caller,_ method: String,purpose: MessageWritePurpose = .ordinaryNote) throws -> JSON {
+    func messageWrite(_ db: Database,_ p: JSON,_ c: Caller,_ method: String,purpose: MessageWritePurpose = .ordinaryNote,literalBody: Bool = false) throws -> JSON {
         let pid = try scope(db,p,c,write:true)
-        if purpose == .trustedHumanResponse {
+        if purpose == .trustedHumanResponse || purpose == .systemNote {
             try owner(c)
             guard method == "message_send",p["recipient"] == nil,p["mention_target"] == nil else {
                 throw CoreError("INVALID_INPUT","Trusted human continuations retain their protected internal route.")
@@ -77,7 +77,7 @@ extension CommandRouter {
         // CL-248: audience narrows ordinary notes only and never combines with an exact recipient.
         let audience = method == "message_send" ? try ticketAudience(p) : nil
         if audience != nil, explicitSessionID != nil { throw CoreError("INVALID_INPUT","Choose audience or an exact recipient, not both. No message was saved.") }
-        if let audience, audience != .all, mentionTarget != nil || bool(p,"requires_action") || p["correction_of"] != nil || purpose != .ordinaryNote {
+        if let audience, audience != .all, mentionTarget != nil || bool(p,"requires_action") || p["correction_of"] != nil || purpose == .trustedHumanResponse {
             throw CoreError("INVALID_INPUT","Owner directions, Human Request answers, corrections and mention plans always reach both roles; audience cannot narrow them. No message was saved.")
         }
         var pickupPending = false
@@ -120,7 +120,7 @@ extension CommandRouter {
                 let participants = [sid] + (c.sessionID.map { [$0] } ?? [])
                 try save(db,["id":conversationID!,"project_id":pid,"participants":participants,"participant_authorization_generations":generations,"owner_participant":c.isOwner,"revision":1,"created_at":now()],type:"conversation")
             }
-        } else if taskID == nil, method == "message_send", c.role != "assistant", mentionTarget == nil, !bool(p,"requires_action"), purpose == .ordinaryNote, p["correction_of"] == nil {
+        } else if taskID == nil, method == "message_send", c.role != "assistant", mentionTarget == nil, !bool(p,"requires_action"), purpose != .trustedHumanResponse, p["correction_of"] == nil {
             // CL-248: a Triage note (triage_id, no task_id) or an exact-recipient project note.
             let route = try triageNoteRoute(db,params:p,project:pid,explicit:explicitSessionID,audience:audience,caller:c)
             recipientDetails = route.recipients; recipients = route.recipients.compactMap {$0["session_id"] as? String}; pickupPending = route.pickupPending
@@ -131,9 +131,18 @@ extension CommandRouter {
                 guard c.role != "assistant" else { throw CoreError("FORBIDDEN","Assistants contact named agents through scoped routes.") }
                 let session = try scoped(db,sid,pid,type:"session"); guard canReceive(session,project:pid) else { throw CoreError("FORBIDDEN","This recipient has no current message-receipt grant.") }; recipients = [sid]
             } else {
-                if !bool(p,"requires_action"),c.role != "assistant",purpose == .ordinaryNote {
-                    try validateOrdinaryMentionBody(db,project:pid,body:body,mentionTarget:mentionTarget)
-                    let route = try ordinaryMessageRoute(db,project:pid,task:task,replyTo:p["reply_to"] as? String,mentionTarget:mentionTarget,caller:c,audience:audience ?? .all)
+                if !bool(p,"requires_action"),c.role != "assistant",purpose != .trustedHumanResponse {
+                    // Service-generated media summaries quote labels/notes verbatim; their @
+                    // text never selects recipients. This internal seam is not a wire field.
+                    if !literalBody { try validateOrdinaryMentionBody(db,project:pid,body:body,mentionTarget:mentionTarget) }
+                    let route: OrdinaryMentionRoute
+                    if purpose == .systemNote,try ticketOrchestratedTriage(db,task:task).flatMap({triageOrchestratorRecipient(db,group:$0)}) == nil {
+                        // A completion warning cannot depend on an ended orchestrator's
+                        // grant, and it must not be redirected to a different role.
+                        route = .init(messageID:nil,mode:"handlers",references:[],recipients:[]);pickupPending = true
+                    } else {
+                        route = try ordinaryMessageRoute(db,project:pid,task:task,replyTo:p["reply_to"] as? String,mentionTarget:mentionTarget,caller:c,audience:audience ?? .all)
+                    }
                     ordinaryRoute = route; recipientDetails = route.recipients
                 } else {
                     recipientDetails = try relevantHandlerRecipients(db,task:task,sender:c.sessionID).filter {$0["session_id"] as? String != c.sessionID}
@@ -159,9 +168,13 @@ extension CommandRouter {
             recipients = recipientDetails.compactMap {$0["session_id"] as? String}
             ordinaryRoute = nil
         }
-        let mid = ordinaryRoute?.messageID ?? uuid(); let origin = c.isOwner ? "human_ui" : (c.role == "assistant" ? "assistant" : "agent")
+        let mid = ordinaryRoute?.messageID ?? uuid(); let origin = purpose == .systemNote ? "system" : (c.isOwner ? "human_ui" : (c.role == "assistant" ? "assistant" : "agent"))
         var m: JSON = ["id":mid,"project_id":pid,"body":body,"kind":p["kind"] ?? "note","origin":origin,"author":c.principal,"author_display":author(db,c),"author_session_id":c.sessionID ?? "human","requires_action":c.isOwner && bool(p,"requires_action"),"addressed":false,"revision":1,"created_at":now(),"profile_snapshot":profileSnapshot]
+        if purpose == .systemNote {
+            m["origin"] = "system";m["author"] = "system";m["author_display"] = "Checklist";m["author_session_id"] = "system"
+        }
         m["original_requester_session_id"] = c.sessionID ?? "human"; m["handler_session_ids_at_send"] = recipients
+        if purpose == .systemNote {m["original_requester_session_id"] = "system"}
         if let route = ordinaryRoute { m["ordinary_routing"] = route.mode; m["mentions"] = route.references }
         if pickupPending { m["pickup_pending"] = true }
         if let audience { m["audience"] = audience.rawValue }

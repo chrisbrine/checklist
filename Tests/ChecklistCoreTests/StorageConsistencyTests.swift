@@ -20,7 +20,12 @@ final class StorageFixture {
         // Keep the real storage no-follow walk intact. Foundation maps the
         // system temporary-directory alias back to /var on this macOS host;
         // qualification fixtures use the owner's physical Library/Caches root.
-        let caches = try FileManager.default.url(for:.cachesDirectory,in:.userDomainMask,appropriateFor:nil,create:true)
+        let caches: URL
+        if let path = ProcessInfo.processInfo.environment["CHECKLIST_TEST_STORAGE_ROOT"] {
+            caches = URL(fileURLWithPath:path,isDirectory:true)
+        } else {
+            caches = try FileManager.default.url(for:.cachesDirectory,in:.userDomainMask,appropriateFor:nil,create:true)
+        }
         let parent = caches.resolvingSymlinksInPath().appendingPathComponent("ChecklistQualification/CL-19",isDirectory:true)
         try FileManager.default.createDirectory(at:parent,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
         base = parent.appendingPathComponent("CL19-storage-" + id.uuidString.lowercased(),isDirectory:true)

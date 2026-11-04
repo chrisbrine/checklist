@@ -40,8 +40,8 @@ final class TicketObjectRemovalVerification {
     let size: Int64
     let descriptor: Int32
     let identity: stat
-    init?(root: URL,relative: String,sha256: String? = nil,size: Int64? = nil,backupUse: Bool = false,check: () throws -> Void = {}) throws {
-        let files = try StorageObjectFiles(root:root)
+    init?(root: URL,relative: String,sha256: String? = nil,size: Int64? = nil,backupUse: Bool = false,folderAccess: StorageFolderAccess = StorageFolderAccess(),check: () throws -> Void = {}) throws {
+        let files = try StorageObjectFiles(root:root,folderAccess:folderAccess)
         let directory: Int32,name: String
         do {(directory,name) = try files.parent(relative)} catch {if StorageFolderAccess.isMissing(error) {return nil};throw error}
         defer {Darwin.close(directory)}
@@ -89,7 +89,7 @@ extension ArchiveStoragePermit {
     /// The sole unlink path. Archive callers admit originals only; durable ticket
     /// intents also admit exact previews, capture files, sidecars and link text.
     /// No directory, followed link, external original or workspace is admitted.
-    fileprivate func removeOriginal(relative: String,sha256: String,size: Int64,capturedSource: Bool = false,sourceBuildCache: Bool = false,linkTarget: String? = nil,verified: TicketObjectRemovalVerification? = nil,requirePreverified: Bool = false) throws -> Bool {
+    fileprivate func removeOriginal(relative: String,sha256: String,size: Int64,capturedSource: Bool = false,sourceBuildCache: Bool = false,linkTarget: String? = nil,verified: TicketObjectRemovalVerification? = nil,requirePreverified: Bool = false,trashPath: String? = nil) throws -> Bool {
         try requireRoot(files.root)
         try StorageSnapshotRetention.requireNoCapture(root:files.root)
         let parts = try StorageObjectFiles.parts(relative)
@@ -100,6 +100,25 @@ extension ArchiveStoragePermit {
         let directory: Int32,name: String
         do {(directory,name) = try files.parent(relative)} catch {if StorageFolderAccess.isMissing(error) {return false};throw error}
         defer { Darwin.close(directory) }
+        var trashFiles: StorageObjectFiles?,trashName: String?
+        if let trashPath {
+            guard relative.hasPrefix("objects/"),linkTarget == nil else {throw CoreError("CLEANUP_PATH_REFUSED","Media Trash moves require a regular managed original.")}
+            let destination = URL(fileURLWithPath:trashPath),destinationFiles = try StorageObjectFiles(root:destination.deletingLastPathComponent(),folderAccess:.insideTrash)
+            var sourceEntry = stat(),destinationEntry = stat()
+            let sourceExists = fstatat(directory,name,&sourceEntry,AT_SYMLINK_NOFOLLOW) == 0
+            if !sourceExists && errno != ENOENT {throw CoreError("CLEANUP_OBJECT_UNAVAILABLE","The original could not be inspected before its Trash move.")}
+            let destinationExists = fstatat(destinationFiles.descriptor,destination.lastPathComponent,&destinationEntry,AT_SYMLINK_NOFOLLOW) == 0
+            if !destinationExists && errno != ENOENT {throw CoreError("CLEANUP_OBJECT_UNAVAILABLE","The recorded Trash destination could not be inspected.")}
+            if !sourceExists {
+                guard destinationExists else {return false}
+                var pinned = stat()
+                guard let verified,verified.root == Data(destinationFiles.root.standardizedFileURL.path.utf8),verified.relative == Data(destination.lastPathComponent.utf8),verified.sha256 == sha256,verified.size == size,
+                      fstat(verified.descriptor,&pinned) == 0,TicketObjectRemovalVerification.same(verified.identity,pinned),TicketObjectRemovalVerification.same(pinned,destinationEntry) else {throw CoreError("CLEANUP_IDENTITY_CHANGED","The prior Trash move has no current exact destination proof.")}
+                return true
+            }
+            guard !destinationExists else {throw CoreError("CLEANUP_IDENTITY_CHANGED","The recorded Trash destination is occupied; the original was retained.")}
+            trashFiles = destinationFiles;trashName = destination.lastPathComponent
+        }
         var originalFD: Int32 = -1
         defer {if originalFD >= 0 {Darwin.close(originalFD)}}
         if let linkTarget {
@@ -144,7 +163,12 @@ extension ArchiveStoragePermit {
               entry.st_mode & S_IFMT == S_IFREG,entry.st_dev == after.st_dev,entry.st_ino == after.st_ino else { throw CoreError("CLEANUP_IDENTITY_CHANGED", "Original changed during verification; bytes were retained.") }
         }
         }
-        guard unlinkat(directory,name,0) == 0,fsync(directory) == 0 else { throw CoreError("CLEANUP_IO", "Cleanup needs reconciliation before its outcome can be confirmed.") }
+        if let trashFiles,let trashName {
+            guard renameatx_np(directory,name,trashFiles.descriptor,trashName,UInt32(RENAME_EXCL)) == 0,fsync(directory) == 0 else {throw CoreError("CLEANUP_IO","The Trash move needs reconciliation before its outcome can be confirmed.")}
+            try trashFiles.synchronizePublicationDirectory()
+        } else {
+            guard unlinkat(directory,name,0) == 0,fsync(directory) == 0 else { throw CoreError("CLEANUP_IO", "Cleanup needs reconciliation before its outcome can be confirmed.") }
+        }
         return true
     }
 }
@@ -236,7 +260,8 @@ extension CommandRouter {
                             guard bool(task,"archived") else { return .commit }
                             var a = try self.scoped(db,item.original.id.text,job.projectID.text,type:"attachment")
                             guard let graph = try self.archiveCleanupExecutorGraph(db,job:job,task:task,prepared:prepared,fenced:&fenced) else { return .commit }
-                            guard try self.completeArchiveCleanupHolds(db,attachment:a,task:task,currentGraph:graph.graph,currentIndex:graph).isEmpty,
+                            guard a["media_cleanup_round_id"] == nil,
+                                  try self.completeArchiveCleanupHolds(db,attachment:a,task:task,currentGraph:graph.graph,currentIndex:graph).isEmpty,
                                   a["sha256"] as? String == item.original.sha256,try ArchiveCleanupJob.integer(a["revision"]) == item.original.attachmentRevision else { return .commit }
                             let relative = try self.archiveCleanupRelativePath(a)
                             let removed = try permit.removeOriginal(relative:relative,sha256:item.original.sha256,size:item.original.logicalBytes)
@@ -335,6 +360,8 @@ extension CommandRouter {
             receipt = revised(receipt)
             try withValidatedDomainTransaction(db) {try self.save(db,receipt,type:"storage_job");return .commit}
         }
+        receipt = try prepareMediaCleanupTrash(db,receipt:receipt)
+        objects = receipt["objects"] as? [JSON] ?? objects
         var attempted: [Int] = [],outcome = receipt
         do {
             try withValidatedDomainTransaction(db) {
@@ -362,8 +389,11 @@ extension CommandRouter {
                             guard let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value,
                                   object["kind"] as? String == "file" || object["kind"] as? String == "symlink" else {throw CoreError("CLEANUP_INTENT_INVALID","The deletion descriptor requires repair; bytes retained.")}
                             if let failure = prepared.verificationFailures[path] {throw failure}
-                            let removed = try permit.removeOriginal(relative:path,sha256:sha,size:size,capturedSource:path.hasPrefix("source-captures/"),sourceBuildCache:object["representation"] as? String == "source_build_cache",linkTarget:object["link_target"] as? String,verified:prepared.verifications[path],requirePreverified:true)
+                            let trashPath = object["disposal"] as? String == "trash" ? object["trash_path"] as? String : nil
+                            if object["disposal"] as? String == "trash",trashPath == nil {throw CoreError("CLEANUP_TRASH_INVALID","A committed Trash destination is required; originals retained.")}
+                            let removed = try permit.removeOriginal(relative:path,sha256:sha,size:size,capturedSource:path.hasPrefix("source-captures/"),sourceBuildCache:object["representation"] as? String == "source_build_cache",linkTarget:object["link_target"] as? String,verified:prepared.verifications[path],requirePreverified:true,trashPath:trashPath)
                             result["state"] = removed ? "removed" : "already_missing"
+                            if trashPath != nil {result["moved_to_trash"] = removed}
                         }
                     } catch {
                         let failures = int(object,"failures") + 1,code = (error as? CoreError)?.code ?? "CLEANUP_UNAVAILABLE"

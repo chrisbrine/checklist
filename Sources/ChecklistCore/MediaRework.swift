@@ -167,7 +167,7 @@ extension CommandRouter {
 
     /// Direct writer path: ordinary ticket capture cannot run in the media-only preparation
     /// workspace. Selection is bounded to 200 small records; no media bytes are read.
-    func mediaReworkCreateCommand(params p: JSON,caller c: Caller,command: String,digest: String,workerChannel: Bool = false) throws -> JSON {
+    func mediaTicketCommand(method: String,params p: JSON,caller c: Caller,command: String,digest: String,workerChannel: Bool = false) throws -> JSON {
         try ArchiveStorageGate.withExclusive(root:root) { _ in
             try dbQueue.writeWithoutTransaction { db in
                 var result: JSON = [:]
@@ -182,9 +182,11 @@ extension CommandRouter {
                     }
                     // CL-420: this direct writer path skips media preparation, so it applies the worker gate here,
                     // after the replay read as the other media setting commands do (a stored result replays under owner_only).
-                    if workerChannel { try self.mediaWorkerWriteAccess(db,method:"media_rework_create",p:p,c:c,project:pid) }
-                    result = try self.mediaReworkCreate(db,p,c,project:pid,agent:workerChannel)
-                    try self.event(db,caller:c,project:pid,entity:result["id"] as? String,kind:"media_rework_create")
+                    if workerChannel { try self.mediaWorkerWriteAccess(db,method:method,p:p,c:c,project:pid) }
+                    result = try method == "media_round_send_result"
+                        ? self.mediaSendResult(db,p,c,project:pid)
+                        : self.mediaReworkCreate(db,p,c,project:pid,agent:workerChannel)
+                    try self.event(db,caller:c,project:pid,entity:p["round_id"] as? String,kind:method)
                     try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[c.principal,command,digest,try jsonString(result)])
                     return .commit
                 };return result
@@ -251,7 +253,8 @@ extension CommandRouter {
             if let raw = entry["carry_decision_id"] {
                 guard let id = raw as? String,EnvelopeStorageIdentity.equal(item["last_decision_id"] as? String,id) else { throw CoreError("MEDIA_BASIS_CHANGED","A carry names the item's exact current owner decision.") }
                 let decision = try scoped(db,id,pid,type:"media_owner_decision")
-                guard decision["review_basis_signature"] as? String == member["review_basis_signature"] as? String else { throw CoreError("MEDIA_BASIS_CHANGED","A stale source decision cannot be carried.") }
+                guard decision["disposition"] as? String != "withdrawn",
+                      decision["review_basis_signature"] as? String == member["review_basis_signature"] as? String else { throw CoreError("MEDIA_BASIS_CHANGED","A stale or withdrawn source decision cannot be carried.") }
                 carry = decision
             }
             plan.append((item,target,carry))

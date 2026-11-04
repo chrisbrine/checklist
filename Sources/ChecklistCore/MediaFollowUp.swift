@@ -118,7 +118,7 @@ extension CommandRouter {
             if var row = reasons[key] {
                 row["decision_count"] = int(row,"decision_count") + 1;row["item_ids"] = strings(row,"item_ids") + [itemID];reasons[key] = row;continue
             }
-            let source = (try? scoped(db,session,project,type:"session")).map(sessionThreadLabel) ?? "Recorded worker"
+            let source = link["origin"] as? String == "system" ? "Checklist" : (try? scoped(db,session,project,type:"session")).map(sessionThreadLabel) ?? "Recorded worker"
             reasonOrder.append(key)
             reasons[key] = ["reason":reason,"source_label":source,"origin":link["origin"] ?? NSNull(),"created_at":link["created_at"] ?? NSNull(),"item_ids":[itemID],"decision_count":1]
         }
@@ -154,9 +154,29 @@ extension CommandRouter {
         return ["items":items]
     }
 
+    /// Owner dismissal suppresses flags for this take's target throughout the round.
+    /// The publication of that exact Draft target is the same take; acceptance remains advice.
+    func mediaSuggestionDismissal(_ suggestion: JSON,target: JSON,round: JSON?) -> JSON? {
+        guard ["changes_requested","needs_look"].contains(suggestion["disposition"] as? String ?? "") else {return nil}
+        if let marker = suggestion["dismissed"] as? JSON {return marker}
+        let markers = round?["dismissed_suggestions"] as? JSON ?? [:]
+        if let marker = markers[suggestion["id"] as? String ?? ""] as? JSON {return marker}
+        let exactTarget = EnvelopeStorageIdentity.equal(suggestion["target_id"] as? String,target["id"] as? String)
+        let publishedDraft = suggestion["target_phase"] as? String == "draft" && target["published_from_target_id"] is String
+            && EnvelopeStorageIdentity.equal(suggestion["target_id"] as? String,target["published_from_target_id"] as? String)
+        guard (exactTarget || publishedDraft),
+              suggestion["review_basis_signature"] as? String == target["review_basis_signature"] as? String else {return nil}
+        return markers.values.compactMap {$0 as? JSON}.first { marker in
+            guard let id = marker["target_id"] as? String else {return false}
+            return EnvelopeStorageIdentity.equal(id,target["id"] as? String)
+                || EnvelopeStorageIdentity.equal(id,target["published_from_target_id"] as? String)
+        }
+    }
+
     /// A suggestion is current on its exact target and basis, or, when recorded on a Draft
     /// target, on the target published from that exact Draft target with the same basis.
-    func mediaSuggestionCurrent(_ suggestion: JSON,target: JSON) -> Bool {
+    func mediaSuggestionCurrent(_ suggestion: JSON,target: JSON,round: JSON? = nil) -> Bool {
+        guard mediaSuggestionDismissal(suggestion,target:target,round:round) == nil else {return false}
         guard suggestion["review_basis_signature"] as? String == target["review_basis_signature"] as? String else { return false }
         if EnvelopeStorageIdentity.equal(suggestion["target_id"] as? String,target["id"] as? String) { return true }
         return suggestion["target_phase"] as? String == "draft" && target["published_from_target_id"] is String
@@ -169,8 +189,13 @@ extension CommandRouter {
     /// `MediaBulkOwnerChannelTests` holds this expression and the function above to one answer.
     static func mediaSuggestionCurrentSQL(where condition: String = "1") -> String {
         let basis = "COALESCE(json_extract(t.data,'$.review_basis_signature'),'')"
-        return "((i.id,t.id,\(basis)) IN (SELECT item_id,target_id,basis FROM suggested WHERE \(condition))"
+        func matches(_ condition: String) -> String {
+            "((i.id,t.id,\(basis)) IN (SELECT item_id,target_id,basis FROM suggested WHERE \(condition))"
             + " OR (COALESCE(json_type(t.data,'$.published_from_target_id'),'')='text'"
             + " AND (i.id,json_extract(t.data,'$.published_from_target_id'),\(basis)) IN (SELECT item_id,target_id,basis FROM suggested WHERE phase='draft' AND \(condition))))"
+        }
+        let flags = "disposition IN ('changes_requested','needs_look')"
+        let undismissed = "(t.id NOT IN (SELECT target_id FROM dismissed_targets) AND COALESCE(json_extract(t.data,'$.published_from_target_id'),'') NOT IN (SELECT target_id FROM dismissed_targets))"
+        return "(\(matches("(\(condition)) AND NOT (\(flags))")) OR (\(undismissed) AND \(matches("(\(condition)) AND (\(flags))"))))"
     }
 }

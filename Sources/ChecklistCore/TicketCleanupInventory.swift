@@ -198,7 +198,7 @@ extension CommandRouter {
             try streamTicketCleanupRows(db) {row,size in
                 guard row.project == pid else {return}
                 let direct = row.type == "relation" && row.value["source_task_id"] as? String == tid
-                let eligible = !containers.contains(row.type) && row.type != "storage_hold" && !(row.type == "storage_job" && row.value["kind"] as? String == Self.ticketObjectDeletionKind)
+                let eligible = !containers.contains(row.type) && !MediaRecordRegistry.families.contains(row.type) && row.type != "storage_hold" && !(row.type == "storage_job" && row.value["kind"] as? String == Self.ticketObjectDeletionKind)
                 let local = row.value["task_id"] == nil || row.value["task_id"] as? String == tid
                 let child = local && parents.contains {field in (row.value[field] as? String).map {owned.contains(Data($0.utf8))} ?? false}
                 if direct || eligible && (row.value["task_id"] as? String == tid || child) {
@@ -208,7 +208,8 @@ extension CommandRouter {
             if before == owned.count {break}
             guard depth < 64 else {throw CoreError("PURGE_LIMIT","Cleanup ownership depth exceeds its bound; bytes retained.")}
         }
-        result.needles = owned.union([Data(tid.utf8)])
+        for row in try mediaDoneCleanupHistory(db,task:task) {try result.add(row,bytes:jsonString(row.value).utf8.count) {row.value}}
+        result.needles = Set(result.rows.map(\.key)).union([Data(tid.utf8)])
         for row in result.rows {
             if row.type == "attachment" {
                 for key in ["path","preview_path"] {if let p = row.value[key] as? String {result.path(p,root:root)}}

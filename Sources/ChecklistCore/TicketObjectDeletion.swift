@@ -295,9 +295,10 @@ extension CommandRouter {
     func ticketObjectDeletionObjects(_ db: Database,owned: [(String,JSON)]) throws -> [JSON] {
         let files = try StorageObjectFiles(root:root)
         var objects: [String:JSON] = [:]
-        func add(path: String?, family: String, owner: String, representation: String, sha: String? = nil, size: Int64? = nil, link: String? = nil, capture: String? = nil, executable: Bool = false, reason: String? = nil) throws {
+        func add(path: String?, family: String, owner: String, representation: String, sha: String? = nil, size: Int64? = nil, link: String? = nil, capture: String? = nil, executable: Bool = false, reason: String? = nil,trash: Bool = false) throws {
             guard objects.count < 100000 else { throw CoreError("PURGE_LIMIT","The managed object inventory exceeds the safe purge limit.") }
             var item: JSON = ["owner_ids":[owner],"representation":representation,"kind":link == nil ? "file" : "symlink","executable":executable,"state":"pending","size":max(0,size ?? 0)]
+            if trash {item["disposal"] = "trash"}
             if let path {item["stored_path"] = path;item["name"] = URL(fileURLWithPath:path).lastPathComponent}
             var reasons = reason.map {[$0]} ?? []
             if let path,let relative = try? managedRelative(path,family:family) {
@@ -321,6 +322,7 @@ extension CommandRouter {
             let key = item["relative_path"] as? String ?? "unavailable:" + owner + ":" + representation
             if var prior = objects[key] {
                 prior["owner_ids"] = Array(Set((prior["owner_ids"] as? [String] ?? []) + [owner])).sorted()
+                if trash {prior["disposal"] = "trash"}
                 if prior["sha256"] as? String != item["sha256"] as? String || (prior["size"] as? NSNumber) != (item["size"] as? NSNumber) {prior["state"] = "retained";prior["reasons"] = ["ambiguous_identity"]}
                 let retained = Set((prior["reasons"] as? [String] ?? []) + (item["reasons"] as? [String] ?? []))
                 if !retained.isEmpty {prior["state"] = "retained";prior["reasons"] = retained.sorted()}
@@ -350,8 +352,9 @@ extension CommandRouter {
         for (type,value) in owned {
             let id = (try StoredRecord(value, family: "value").string("id"))
             if type == "attachment" {
-                try add(path:value["path"] as? String,family:"objects",owner:id,representation:"original",sha:value["sha256"] as? String,size:(value["size"] as? NSNumber)?.int64Value,reason:value["mode"] as? String == "managed" ? (bool(value,"keep_original") ? "keep_original" : nil) : "external_original")
-                if let path = value["preview_path"] as? String {try add(path:path,family:"objects",owner:id,representation:"preview",reason:value["mode"] as? String == "managed" ? nil : "external_original")}
+                let mediaTrash = value["media_cleanup_round_id"] is String
+                try add(path:value["path"] as? String,family:"objects",owner:id,representation:"original",sha:value["sha256"] as? String,size:(value["size"] as? NSNumber)?.int64Value,reason:value["mode"] as? String == "managed" ? (bool(value,"keep_original") ? "keep_original" : nil) : "external_original",trash:mediaTrash)
+                if let path = value["preview_path"] as? String {try add(path:path,family:"objects",owner:id,representation:"preview",reason:value["mode"] as? String == "managed" ? nil : "external_original",trash:mediaTrash)}
             } else if type == "source_capture" {try capture(value,owner:id)}
             else if type == "manifest",let evidence = value["evidence"] as? JSON,let source = evidence["source_capture"] as? JSON {try capture(source,owner:id)}
         }
@@ -386,6 +389,16 @@ extension CommandRouter {
     func ticketObjectDeletionHolds(_ db: Database, object: JSON, references: TicketObjectDeletionReferenceIndex, backup: StorageBackupRetentionIndex?,mediaAuthorityComplete: Bool) throws -> Set<String> {
         guard let relative = object["relative_path"] as? String,let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value else {return ["identity_unavailable"]}
         var holds = try sourceBuildCacheDeletionHolds(db,object:object)
+        if object["disposal"] as? String != "trash" {
+            // A pre-handoff durable intent has no Trash authority. Recheck the
+            // canonical owners at the final writer boundary as well as planning;
+            // an older descriptor must never unlink a newly marked original.
+            let owners = try jsonString(strings(object,"owner_ids"))
+            let current = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='attachment' AND id IN (SELECT value FROM json_each(?))",arguments:[owners])
+            for row in current {
+                if try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"attachment").object["media_cleanup_round_id"] is String {holds.insert("media_trash_required")}
+            }
+        }
         if !mediaAuthorityComplete {holds.insert("media_authority_unavailable")}
         let absolute = root.appendingPathComponent(relative).path
         var tokens = Set((object["owner_ids"] as? [String] ?? []).map {Data($0.utf8)})

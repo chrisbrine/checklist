@@ -31,7 +31,7 @@ private struct CleanupOwnershipGraph {
         guard !overflowed else {return}
         let containers: Set<String> = ["project","session","profile","status","tag","policy_revision","project_context_revision","taxonomy_revision","group","batch","batch_claim","relation","task"]
         let direct = row.type == "relation" && (row.value["source_task_id"] as? String).map {tasks.contains($0)} == true
-        let eligible = !containers.contains(row.type) && row.type != "storage_hold" && !(row.type == "storage_job" && row.value["kind"] as? String == CommandRouter.ticketObjectDeletionKind)
+        let eligible = !containers.contains(row.type) && !MediaRecordRegistry.families.contains(row.type) && row.type != "storage_hold" && !(row.type == "storage_job" && row.value["kind"] as? String == CommandRouter.ticketObjectDeletionKind)
         let task = row.value["task_id"] as? String
         let local = row.value["task_id"] == nil || task.map {tasks.contains($0)} == true
         let parents = ["message_id","attempt_id","parent_attempt_id","request_id","review_request_id","manifest_id","membership_id","delegation_id","conversation_id","source_capture_id"].compactMap {row.value[$0] as? String}
@@ -117,7 +117,8 @@ extension CommandRouter {
                     let row = PurgeRow(id:header.id,type:header.type,project:selected[tid]?["project_id"] as? String,value:try record(db,header.id,type:header.type))
                     try inventory.add(row,bytes:header.bytes) {row.value}
                 }
-                inventory.needles = Set((owned[tid] ?? []).map {Data($0.id.utf8)}).union([Data(tid.utf8)])
+                for row in try mediaDoneCleanupHistory(db,task:selected[tid]!) {try inventory.add(row,bytes:jsonString(row.value).utf8.count) {row.value}}
+                inventory.needles = Set(inventory.rows.map(\.key)).union([Data(tid.utf8)])
                 try ticketCleanupBatchOwnershipPaths(db,inventory:&inventory)
                 guard retainedBytes + inventory.retainedBytes <= TicketCleanupBatchInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The cleanup batch exceeds its memory bound; this ticket is deferred.")}
                 retainedBytes += inventory.retainedBytes;result.inventories[tid] = inventory

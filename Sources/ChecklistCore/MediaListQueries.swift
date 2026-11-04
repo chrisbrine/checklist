@@ -82,7 +82,7 @@ extension CommandRouter {
         return (order + ["CAST(i.id AS BLOB)"]).joined(separator:",")
     }
     private var mediaDispositionSQL: String {
-        "CASE WHEN d.id IS NULL AND i.member_item_id IS NOT NULL AND json_extract(i.data,'$.stale_predecessor_decision_id') IS NOT NULL THEN 'stale' WHEN d.id IS NULL OR i.member_item_id IS NULL THEN 'pending' WHEN json_extract(d.data,'$.review_basis_signature') IS NOT i.member_basis THEN 'stale' ELSE json_extract(d.data,'$.disposition') END"
+        "CASE WHEN json_extract(d.data,'$.disposition')='withdrawn' THEN 'pending' WHEN d.id IS NULL AND i.member_item_id IS NOT NULL AND json_extract(i.data,'$.stale_predecessor_decision_id') IS NOT NULL THEN 'stale' WHEN d.id IS NULL OR i.member_item_id IS NULL THEN 'pending' WHEN json_extract(d.data,'$.review_basis_signature') IS NOT i.member_basis THEN 'stale' ELSE json_extract(d.data,'$.disposition') END"
     }
     func mediaListIndex(_ db: Database,_ p: JSON,round: JSON,list: MediaListConfiguration,schema: MediaReviewSchema) throws -> [JSON] {
         let (sql,args) = try mediaListIndexStatement(p,round:round,list:list,schema:schema)
@@ -116,7 +116,7 @@ extension CommandRouter {
         }
         if !hidden.isEmpty {predicates.append("i.id NOT IN (SELECT value FROM json_each(:hidden))");args += ["hidden":try jsonString(hidden)]}
         if !dispositions.isEmpty {predicates.append("(\(mediaDispositionSQL)) IN (SELECT value FROM json_each(:dispositions))");args += ["dispositions":try jsonString(dispositions)]}
-        let suggestions = try mediaSuggestionPredicates(filter,arguments:&args)
+        let suggestions = try mediaSuggestionPredicates(filter,round:round,arguments:&args)
         predicates += suggestions.predicates
         let sql = """
         WITH \(suggestions.table)member AS MATERIALIZED (

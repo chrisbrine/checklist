@@ -5,12 +5,16 @@ import GRDB
 /// targets and bases; it accepts nothing, and `media_bulk_prepare` still validates every entry.
 extension CommandRouter {
     private static let mediaSuggestedTable = """
+    dismissed_targets AS MATERIALIZED (
+      SELECT json_extract(value,'$.target_id') target_id FROM json_each(:dismissed_suggestions)
+      WHERE json_type(value,'$.target_id')='text'),
     suggested AS MATERIALIZED (
       SELECT item_id,target_id,COALESCE(basis,'') basis,phase,disposition,note FROM (
         SELECT CAST(json_extract(s.data,'$.item_id') AS TEXT) item_id,json_extract(s.data,'$.target_id') target_id,
           json_extract(s.data,'$.review_basis_signature') basis,json_extract(s.data,'$.target_phase') phase,
           json_extract(s.data,'$.disposition') disposition,json_extract(s.data,'$.note') note
-        FROM records s WHERE s.type='media_suggestion' AND s.project_id=:project AND json_extract(s.data,'$.round_id')=:round)
+        FROM records s WHERE s.type='media_suggestion' AND s.project_id=:project AND json_extract(s.data,'$.round_id')=:round
+          AND s.id NOT IN (SELECT key FROM json_each(:dismissed_suggestions)))
       WHERE item_id IS NOT NULL AND target_id IS NOT NULL),
 
     """
@@ -18,7 +22,7 @@ extension CommandRouter {
     /// counts only when `mediaSuggestionCurrent` holds for the item's listed target, the same
     /// rule as the item detail, so stale advice never selects or removes an item.
     /// `note_item_ids` names items with a note that is still local to the owner's window.
-    func mediaSuggestionPredicates(_ filter: JSON,arguments args: inout StatementArguments) throws -> (table: String,predicates: [String]) {
+    func mediaSuggestionPredicates(_ filter: JSON,round: JSON,arguments args: inout StatementArguments) throws -> (table: String,predicates: [String]) {
         func flag(_ key: String) throws -> Bool? {
             guard let raw = filter[key] else {return nil}
             guard let number = raw as? NSNumber,CFGetTypeID(number) == CFBooleanGetTypeID() else {throw CoreError("INVALID_INPUT","\(key) must be Boolean.")}
@@ -30,6 +34,7 @@ extension CommandRouter {
         let noteItems = try MediaConfigurationValue.ids(filter["note_item_ids"],max:Int.max,"filter.note_item_ids").map(\.rawValue)
         guard hasNote != nil || noteItems.isEmpty else {throw CoreError("INVALID_INPUT","note_item_ids applies only to has_note.")}
         guard hasSuggestion != nil || hasNote != nil || !excludes.isEmpty else {return ("",[])}
+        args += ["dismissed_suggestions":try jsonString(round["dismissed_suggestions"] as? JSON ?? [:])]
         var predicates: [String] = []
         if let hasSuggestion {predicates.append((hasSuggestion ? "" : "NOT ") + Self.mediaSuggestionCurrentSQL())}
         if !excludes.isEmpty {
@@ -37,7 +42,7 @@ extension CommandRouter {
             args += ["suggestion_excludes":try jsonString(excludes)]
         }
         if let hasNote {
-            let noted = "(COALESCE(json_extract(d.data,'$.note'),'')<>'' OR \(Self.mediaSuggestionCurrentSQL(where:"COALESCE(note,'')<>''")) OR i.id IN (SELECT value FROM json_each(:note_items)))"
+            let noted = "((COALESCE(json_extract(d.data,'$.disposition'),'')<>'withdrawn' AND COALESCE(json_extract(d.data,'$.note'),'')<>'') OR \(Self.mediaSuggestionCurrentSQL(where:"COALESCE(note,'')<>''")) OR i.id IN (SELECT value FROM json_each(:note_items)))"
             predicates.append(hasNote ? noted : "NOT " + noted)
             args += ["note_items":try jsonString(noteItems)]
         }
@@ -50,8 +55,9 @@ extension CommandRouter {
         for row in try Row.fetchAll(db,sql:"""
         SELECT CAST(json_extract(data,'$.item_id') AS TEXT) item_id,json_extract(data,'$.target_id') target_id,json_extract(data,'$.review_basis_signature') basis,
           json_extract(data,'$.target_phase') phase,json_extract(data,'$.disposition') disposition
-        FROM records WHERE type='media_suggestion' AND project_id=? AND json_extract(data,'$.round_id')=? ORDER BY rowid
-        """,arguments:[project,try StoredRecord(round,family:"media").string("id")]) {
+        FROM records WHERE type='media_suggestion' AND project_id=? AND json_extract(data,'$.round_id')=?
+          AND id NOT IN (SELECT key FROM json_each(?)) ORDER BY rowid
+        """,arguments:[project,try StoredRecord(round,family:"media").string("id"),try jsonString(round["dismissed_suggestions"] as? JSON ?? [:])]) {
             var suggestion: JSON = ["target_id":row["target_id"] as String,"disposition":row["disposition"] as String]
             suggestion["review_basis_signature"] = String.fromDatabaseValue(row["basis"] as DatabaseValue)
             suggestion["target_phase"] = String.fromDatabaseValue(row["phase"] as DatabaseValue)
@@ -73,7 +79,7 @@ extension CommandRouter {
         for entry in entries {
             let id = Data((entry["id"] as? String ?? "").utf8)
             guard let target = targets[Data((entry["target_id"] as? String ?? "").utf8)] else {continue}
-            let current = (byItem[id] ?? []).filter {mediaSuggestionCurrent($0,target:target)}.compactMap {$0["disposition"] as? String}
+            let current = (byItem[id] ?? []).filter {mediaSuggestionCurrent($0,target:target,round:round)}.compactMap {$0["disposition"] as? String}
             if !current.isEmpty {choices[id] = current}
         }
         return choices

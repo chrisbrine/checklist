@@ -10,6 +10,112 @@ private struct MediaDecisionSelection {
 }
 
 extension CommandRouter {
+    /// Dismissal is owner metadata on the round. Suggestion content and its exact revision
+    /// remain immutable so an earlier adoption keeps a valid historical dependency.
+    func mediaSuggestionDismiss(_ db: Database,_ p: JSON,_ c: Caller,project pid: String) throws -> JSON {
+        try owner(c)
+        var round = try scoped(db,try text(p,"round_id"),pid,type:"media_round")
+        guard ["draft","open"].contains(round["state"] as? String ?? "") else {
+            throw CoreError("MEDIA_ROUND_CLOSED","Dismiss a flag in a Draft or Open round.")
+        }
+        let suggestion = try scoped(db,try text(p,"suggestion_id"),pid,type:"media_suggestion")
+        guard EnvelopeStorageIdentity.equal(suggestion["round_id"] as? String,round["id"] as? String) else {
+            throw CoreError("NOT_FOUND","This suggestion is unavailable in this round.")
+        }
+        guard ["changes_requested","needs_look"].contains(suggestion["disposition"] as? String ?? "") else {
+            throw CoreError("INVALID_INPUT","Only a Changes requested or Needs look flag can be dismissed.")
+        }
+        let item = try scoped(db,try StoredRecord(suggestion,family:"media_suggestion").string("item_id"),pid,type:"media_item")
+        guard EnvelopeStorageIdentity.equal(item["round_id"] as? String,round["id"] as? String) else {
+            throw CoreError("NOT_FOUND","This item is unavailable in this round.")
+        }
+        let manifest = try (round["manifest_id"] as? String).map {try scoped(db,$0,pid,type:"media_round_manifest")}
+        let member = (manifest?["items"] as? [JSON] ?? []).first {EnvelopeStorageIdentity.equal($0["item_id"] as? String,item["id"] as? String)}
+        let target = try scoped(db,member?["target_id"] as? String ?? StoredRecord(item,family:"media_item").string("draft_target_id"),pid,type:"media_item_target")
+        let id = try StoredRecord(suggestion,family:"media_suggestion").string("id")
+        var dismissals = round["dismissed_suggestions"] as? JSON ?? [:]
+        if dismissals[id] == nil {
+            guard mediaSuggestionCurrent(suggestion,target:target,round:round) else {
+                throw CoreError("MEDIA_BASIS_CHANGED","This flag no longer names the current item target and basis.")
+            }
+            dismissals[id] = ["at":now(),"by":"owner","target_id":try StoredRecord(target,family:"media_item_target").string("id")]
+            round["dismissed_suggestions"] = dismissals
+            round["record_references"] = (round["record_references"] as? [JSON] ?? []) + [try mediaRef("media_suggestion",suggestion)]
+            round = revised(round)
+            try mediaWrite(db,round,type:"media_round")
+        }
+        return try mediaSuggestionView(db,suggestion:suggestion,project:pid,target:target,round:round)
+    }
+
+    /// Withdrawal is an immutable owner head, not an edit to the decision it reverses.
+    /// Validate the complete selection before writing so one stale/in-use head changes nothing.
+    func mediaDecisionWithdraw(_ db: Database,_ p: JSON,_ c: Caller,project pid: String) throws -> JSON {
+        try owner(c)
+        let round = try scoped(db,try text(p,"round_id"),pid,type:"media_round")
+        guard round["state"] as? String == "open" else {
+            throw CoreError("MEDIA_ROUND_CLOSED","Withdraw a decision in an Open round.")
+        }
+        try mediaObserve(db,p,round:round,caller:c)
+        let manifest = try mediaObservedManifest(db,p,round:round)
+        guard let selected = p["items"] as? [JSON],!selected.isEmpty,selected.count <= 200 else {
+            throw CoreError("INVALID_INPUT","Select 1 to 200 distinct exact current decisions.")
+        }
+        let members = mediaManifestMembers(try StoredRecord(manifest,family:"media_round_manifest").objects("items")) {Data($0.utf8)}
+        var seen = Set<Data>(),validated: [(item:JSON,decision:JSON,target:JSON)] = []
+        for entry in selected {
+            guard Set(entry.keys) == ["item_id","expected_revision","decision_id"] else {
+                throw CoreError("INVALID_INPUT","Withdrawal needs the exact item revision and current decision ID.")
+            }
+            let item = try scoped(db,try text(entry,"item_id"),pid,type:"media_item")
+            let itemID = try StoredRecord(item,family:"media_item").string("id")
+            guard seen.insert(Data(itemID.utf8)).inserted else {throw CoreError("INVALID_INPUT","Select distinct items.")}
+            try mediaRevision(entry,item)
+            let id = try text(entry,"decision_id")
+            guard EnvelopeStorageIdentity.equal(item["round_id"] as? String,round["id"] as? String),
+                  EnvelopeStorageIdentity.equal(item["last_decision_id"] as? String,id),let member = members[Data(itemID.utf8)] else {
+                throw CoreError("MEDIA_BASIS_CHANGED","The selected decision is no longer the item's current owner decision.")
+            }
+            let decision = try scoped(db,id,pid,type:"media_owner_decision")
+            guard decision["disposition"] as? String != "withdrawn",
+                  decision["review_basis_signature"] as? String == member["review_basis_signature"] as? String else {
+                throw CoreError("MEDIA_BASIS_CHANGED","Only a current applicable owner choice can be withdrawn.")
+            }
+            let used = try Bool.fetchOne(db,sql:"""
+            SELECT EXISTS(SELECT 1 FROM records WHERE project_id=? AND
+              ((type='media_rework_link' AND json_extract(data,'$.decision_id')=?) OR
+               (type='media_owner_decision' AND json_extract(data,'$.carried_from_decision_id')=?) OR
+               (type='media_item' AND json_extract(data,'$.stale_predecessor_decision_id')=?)))
+            """,arguments:[pid,id,id,id]) ?? false
+            guard !used else {throw CoreError("MEDIA_DECISION_IN_USE","A rework link or successor carry already uses this decision.")}
+            let target = try scoped(db,try StoredRecord(member,family:"media_manifest_member").string("target_id"),pid,type:"media_item_target")
+            validated.append((item,decision,target))
+        }
+        var results: [JSON] = []
+        for entry in validated {
+            var fields: JSON = ["round_id":round["id"]!,"item_id":entry.item["id"]!,"target_id":entry.target["id"]!,
+                "manifest_id":manifest["id"]!,"manifest_digest":manifest["digest"]!,"context_id":round["context_id"]!,
+                "item_revision":entry.item["revision"]!,"disposition":"withdrawn","selection_outcome":"unselected",
+                "withdraws_decision_id":entry.decision["id"]!,"supersedes_decision_id":entry.decision["id"]!]
+            for key in ["type_revision_id","context_signature","content_signature","material_definition_signature","candidate_ids","review_basis_signature","review_basis_base64"] {
+                fields[key] = try StoredRecord(entry.target,family:"media_item_target").requiredValue(key)
+            }
+            var refs = [try mediaRef("media_round",round),try mediaRef("media_item",entry.item),
+                try mediaRef("media_item_target",entry.target),try mediaRef("media_round_manifest",manifest),
+                try mediaRef("media_owner_decision",entry.decision),
+                ["type":"media_review_context","id":round["context_id"]!,"revision":1],
+                ["type":"media_review_type_revision","id":fields["type_revision_id"]!,"revision":1]]
+            refs += strings(entry.target,"candidate_ids").map {["type":"media_candidate","id":$0,"revision":1]}
+            let withdrawal = mediaRecord(fields,project:pid,caller:c,references:refs)
+            try mediaWrite(db,withdrawal,type:"media_owner_decision")
+            var item = entry.item
+            item["last_decision_id"] = withdrawal["id"]
+            item["record_references"] = (try StoredRecord(item,family:"media_item").objects("record_references")) + [try mediaRef("media_owner_decision",withdrawal)]
+            try mediaWrite(db,revised(item),type:"media_item")
+            results.append(withdrawal)
+        }
+        return ["decisions":results]
+    }
+
     func mediaDecision(_ db: Database,_ p: JSON,_ c: Caller,project pid: String,method: String,validateOnly: Bool = false) throws -> JSON {
         if method == "media_suggest" { guard !c.isOwner else { throw CoreError("FORBIDDEN","Suggestions retain actual worker provenance.") } }
         else { try owner(c) }
@@ -24,13 +130,19 @@ extension CommandRouter {
             guard selected.count == 1 else { throw CoreError("INVALID_INPUT","Adopt one exact suggestion at a time.") }
             adopted = try scoped(db,try text(p,"suggestion_id"),pid,type:"media_suggestion")
             let adoptedTarget = try scoped(db,try text(selected[0],"target_id"),pid,type:"media_item_target")
-            guard adopted?["round_id"] as? String == round["id"] as? String,adopted?["item_id"] as? String == selected[0]["item_id"] as? String,mediaSuggestionCurrent(adopted ?? [:],target:adoptedTarget),adopted?["review_basis_signature"] as? String == selected[0]["review_basis_signature"] as? String else { throw CoreError("MEDIA_BASIS_CHANGED","A suggestion must still name this exact current target and basis.") }
+            guard adopted?["round_id"] as? String == round["id"] as? String,adopted?["item_id"] as? String == selected[0]["item_id"] as? String,mediaSuggestionCurrent(adopted ?? [:],target:adoptedTarget,round:round),adopted?["review_basis_signature"] as? String == selected[0]["review_basis_signature"] as? String else { throw CoreError("MEDIA_BASIS_CHANGED","A suggestion must still name this exact current target and basis.") }
             for key in ["disposition","winner_id","none_fit","note","no_follow_up_reason"] { input[key] = adopted?[key] }
         }
         let disposition = try text(input,"disposition",max:32)
         guard ["accepted","needs_look","changes_requested","excluded"].contains(disposition) else { throw CoreError("INVALID_INPUT","Choose an explicit media disposition.") }
         if disposition == "excluded" { _ = try text(input,"note",max:4000) }
         for key in ["note","no_follow_up_reason"] where input[key] != nil { _ = try text(input,key,max:4000) }
+        var source: String?
+        if method == "media_suggest" {
+            let value = input["source"] ?? "agent"
+            guard let value = value as? String,["agent","check"].contains(value) else {throw CoreError("INVALID_INPUT","Suggestion source must be agent or check.")}
+            source = value
+        }
         let validated = try mediaDecisionSelections(db,selected:selected,input:input,round:round,manifest:manifest,
                                                     project:pid,method:method,disposition:disposition)
         if validateOnly { return [:] }
@@ -50,6 +162,7 @@ extension CommandRouter {
                 "review_basis_signature":(try StoredRecord(target, family: "media").requiredValue("review_basis_signature")),
                 "review_basis_base64":(try StoredRecord(target, family: "media").requiredValue("review_basis_base64")),
                 "disposition":disposition]
+            if let source {fields["source"] = source}
             if draftSuggestion { fields["target_phase"] = "draft" } else {
                 fields["manifest_id"] = try StoredRecord(manifest, family: "media").requiredValue("id")
                 fields["manifest_digest"] = try StoredRecord(manifest, family: "media").requiredValue("digest")

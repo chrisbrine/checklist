@@ -2,7 +2,8 @@ import Foundation
 
 struct ArchiveStorageDraft: Equatable {
     static func holdLabel(_ value: String) -> String {
-        ["keepOriginal":"Keep original","activeWork":"active work","activeVerification":"active verification","pendingHumanInspection":"pending human inspection","currentReview":"current review","activeReader":"active reader","backupCapture":"backup capture","sharedLiveReference":"shared live reference","activeBuild":"active build","referenceGraphUnavailable":"reference graph unavailable","originalUnavailable":"original unavailable","externalOriginal":"external original","changedIdentity":"changed identity","policyNoLongerSelects":"current policy keeps it","pendingImport":"pending durable import","otherAuthoritativeHold":"other current hold"][value] ?? value
+        if value == "mediaTrashRequired" {return "media originals use Done cleanup"}
+        return ["keepOriginal":"Keep original","activeWork":"active work","activeVerification":"active verification","pendingHumanInspection":"pending human inspection","currentReview":"current review","activeReader":"active reader","backupCapture":"backup capture","sharedLiveReference":"shared live reference","activeBuild":"active build","referenceGraphUnavailable":"reference graph unavailable","originalUnavailable":"original unavailable","externalOriginal":"external original","changedIdentity":"changed identity","policyNoLongerSelects":"current policy keeps it","pendingImport":"pending durable import","otherAuthoritativeHold":"other current hold"][value] ?? value
     }
     var preset = "clean_large_managed_on_archive"
     var threshold = "20"

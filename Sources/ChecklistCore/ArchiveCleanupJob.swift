@@ -20,7 +20,7 @@ struct ArchiveCleanupJob {
     enum ItemState: String { case waiting, held, ready, suspended, canceled, removed, alreadyMissing = "already_missing" }
     enum Hold: String, CaseIterable, Hashable {
         case keepOriginal, activeWork, activeVerification, pendingHumanInspection, currentReview, activeReader, backupCapture, sharedLiveReference, activeBuild
-        case referenceGraphUnavailable, originalUnavailable, externalOriginal, changedIdentity, policyNoLongerSelects, pendingImport
+        case referenceGraphUnavailable, originalUnavailable, externalOriginal, changedIdentity, policyNoLongerSelects, pendingImport, mediaTrashRequired
     }
     enum Failure: String { case admissionUnavailable, metadataUnavailable, identityChanged }
     struct Item {

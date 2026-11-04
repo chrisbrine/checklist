@@ -454,3 +454,116 @@ import ChecklistCore
     func send(_ alert:DesktopAlert) async throws {}
     func remove(_ identifiers:[String]) {}
 }
+
+/// CL-427: the round names its ticket, the owner links it and sends the results to it.
+/// Synthetic peer replies only. No native app, service, keychain or decoder.
+extension MediaOwnerSliceTests {
+    private static let sentAt="2026-11-03T02:12:00Z"
+    private func linkedHeader(task: MediaValues?,last: MediaValues? = nil,state: String = "open") -> MediaValues {
+        var header:MediaValues=["id":"round","title":"Behemoth walk: whole paws","state":state,"revision":5,"observed_context_token":"context-1","manifest":["id":"manifest","digest":"digest"],
+            "type_revision":["schema":MediaTypeSettings.schema(title:"Animation",starter:"animation")],"attention":[],"attention_ids":[],"task":task ?? NSNull()]
+        if let last {header["last_result_sent"]=last}
+        return header
+    }
+    private static let heir130:MediaValues=["id":"task-130","key":"HEIR-130","title":"Behemoth walk","status_name":"In progress"]
+    private func decided(_ id: String,decision: String,disposition: String = "accepted") -> MediaValues {
+        ["id":id,"title":"Behemoth walk "+id,"disposition":disposition,"decision_id":decision,"metadata":["direction":"N"]]
+    }
+    private func linkedSetup(task: MediaValues?,last: MediaValues? = nil,rows: [MediaValues] = [],state: String = "open") async -> (Peer,ChecklistStore,MediaReviewModel) {
+        let (peer,store,_,_)=fixture()
+        peer.roundRecords=[linkedHeader(task:task,last:last,state:state)];peer.rows=rows
+        peer.pageCounts=rows.isEmpty ? ["pending":1] : ["accepted":rows.count]
+        let model=await setup(peer,store)
+        return (peer,store,model)
+    }
+    func testRoundHeaderNamesItsTicketInPlainWords() async {
+        XCTAssertEqual(MediaReviewModel.ticketLine(Record(values:linkedHeader(task:Self.heir130))),"For HEIR-130 — Behemoth walk")
+        XCTAssertEqual(MediaReviewModel.ticketLine(Record(values:linkedHeader(task:nil))),"No ticket")
+        XCTAssertEqual(MediaReviewModel.ticketLine(Record(values:[:])),"No ticket")
+        let (_,_,model)=await linkedSetup(task:Self.heir130)
+        XCTAssertEqual(MediaReviewModel.ticketLine(model.header),"For HEIR-130 — Behemoth walk")
+        XCTAssertEqual(model.linkedTask.string("key"),"HEIR-130")
+        XCTAssertTrue(model.ticketChangeAvailable)
+        // No ticket, or no owner decision: the send action is hidden.
+        XCTAssertNil(model.resultAction,"No owner decision yet")
+        let (_,_,unlinked)=await linkedSetup(task:nil,rows:[decided("a",decision:"d1")])
+        XCTAssertEqual(MediaReviewModel.ticketLine(unlinked.header),"No ticket");XCTAssertNil(unlinked.resultAction)
+        // A closed round keeps its ticket line but offers no ticket change.
+        let (_,_,closed)=await linkedSetup(task:Self.heir130,rows:[decided("a",decision:"d1")],state:"closed")
+        XCTAssertFalse(closed.ticketChangeAvailable);XCTAssertEqual(closed.resultAction?.label,"Send results to HEIR-130")
+    }
+    func testOwnerLinksAndRemovesTheTicketWithTheRoundRevision() async throws {
+        let (peer,store,model)=await linkedSetup(task:nil)
+        store.connected=true;peer.calls=[]
+        model.linkTask("task-130")
+        try await settle {peer.calls.contains {$0.0=="media_round_link_task"} && !store.busy}
+        let link=try XCTUnwrap(peer.calls.first {$0.0=="media_round_link_task"}?.1)
+        XCTAssertEqual(link["round_id"] as? String,"round");XCTAssertEqual(link["expected_revision"] as? Int,5)
+        XCTAssertEqual(link["task_id"] as? String,"task-130");XCTAssertEqual(link["project_id"] as? String,peer.project)
+        let removal=MediaReviewModel.linkTaskParams(header:model.header,taskID:nil)
+        XCTAssertTrue(removal["task_id"] is NSNull,"No ticket sends task_id null")
+        // A refusal shows one line beside the ticket and no global alert.
+        await model.waitUntilWritable();peer.calls=[]
+        peer.failures["media_round_link_task"]=[ChecklistError("MEDIA_ROUND_CLOSED","This round is closed. Its ticket cannot change.",details:["command_outcome":"rejected"])]
+        model.linkTask(nil)
+        try await settle {!model.ticketLinkLine.isEmpty}
+        XCTAssertTrue(model.ticketLinkLine.hasPrefix("Could not change the ticket: "),model.ticketLinkLine)
+        XCTAssertTrue(peer.calls.first {$0.0=="media_round_link_task"}?.1["task_id"] is NSNull)
+        XCTAssertNil(store.error,"No global alert");XCTAssertNil(model.error)
+        // The picker offers open tickets only, from the existing ticket list read.
+        peer.extra["task_list"]=["tasks":[["id":"task-131","key":"HEIR-131","title":"Wizard idle","status_category":"active"],["id":"task-129","key":"HEIR-129","title":"Old walk","status_category":"done"],["id":"task-130","key":"HEIR-130","title":"Behemoth walk","status_category":"queued"]]]
+        await model.loadTicketChoices("HEIR")
+        XCTAssertEqual(model.ticketChoices.map {$0.string("key")},["HEIR-130","HEIR-131"])
+        let read=try XCTUnwrap(peer.calls.last {$0.0=="task_list"}?.1)
+        XCTAssertEqual(read["text"] as? String,"HEIR");XCTAssertEqual(read["archived"] as? Bool,false)
+    }
+    func testSendShowsProgressThenReceiptAndTheChangesLabel() async throws {
+        let (peer,store,model)=await linkedSetup(task:Self.heir130,rows:[decided("a",decision:"d1"),decided("b",decision:"d2",disposition:"changes_requested")])
+        XCTAssertEqual(model.resultAction,MediaResultAction(label:"Send results to HEIR-130",disabledReason:nil))
+        peer.extra["media_round_send_result"]=["message_id":"note-1","recipients":[["session_id":"s1","display":"Codex HEIR-T1"],["session_id":"s2","display":"Claude reviewer"]],"item_count":2,"changed_only":false,"sent_at":Self.sentAt]
+        store.connected=true;peer.calls=[]
+        var progress=""
+        peer.onRequest={method in if method=="media_round_send_result" {progress=model.resultLine?.text ?? ""}}
+        await model.sendResults()
+        peer.onRequest=nil
+        XCTAssertEqual(progress,"Sending results to HEIR-130…","A progress line shows while the send runs")
+        let sent=try XCTUnwrap(peer.calls.first {$0.0=="media_round_send_result"}?.1)
+        XCTAssertEqual(sent["round_id"] as? String,"round");XCTAssertEqual(sent["expected_revision"] as? Int,5)
+        XCTAssertNotNil(sent["command_id"],"The owner command route journals the send")
+        let time=MediaReviewModel.localTime(Self.sentAt)
+        XCTAssertFalse(time.contains("T02") || time.hasSuffix("Z"),time)
+        XCTAssertEqual(model.resultLine?.text,"Sent to Codex HEIR-T1 and Claude reviewer at "+time+" · 2 items.")
+        XCTAssertEqual(model.resultLine?.refused,false);XCTAssertFalse(model.resultSend.sending)
+        XCTAssertNil(store.error);XCTAssertNil(model.error)
+        // After the send the round records what it carried: nothing new disables the action.
+        peer.roundRecords=[linkedHeader(task:Self.heir130,last:["message_id":"note-1","at":Self.sentAt,"decision_ids":["d1","d2"]])]
+        await model.refresh()
+        XCTAssertEqual(model.resultAction,MediaResultAction(label:"Send changes to HEIR-130",disabledReason:"All results sent."))
+        // A new decision since the last send enables "Send changes".
+        peer.rows=[decided("a",decision:"d3"),decided("b",decision:"d2",disposition:"changes_requested")];await model.refresh()
+        XCTAssertEqual(model.resultAction,MediaResultAction(label:"Send changes to HEIR-130",disabledReason:nil))
+        // With a filter the list is not complete, so the service decides what is new.
+        peer.rows=[decided("a",decision:"d1")];model.filter="accepted";await model.reloadRows()
+        XCTAssertNil(model.resultAction?.disabledReason)
+    }
+    func testNothingNewAndRefusalsShowOneLineWithNoGlobalAlert() async throws {
+        let (peer,store,model)=await linkedSetup(task:Self.heir130,rows:[decided("a",decision:"d1")])
+        store.connected=true
+        peer.failures["media_round_send_result"]=[ChecklistError("MEDIA_ROUND_NOTHING_NEW","No decision or note changed since the last send.",details:["command_outcome":"rejected"])]
+        await model.sendResults()
+        XCTAssertEqual(model.resultLine?.text,"Nothing new to send.");XCTAssertEqual(model.resultLine?.refused,false)
+        XCTAssertNil(store.error,"No global alert");XCTAssertNil(model.error,"No orange model line")
+        await model.waitUntilWritable()
+        peer.failures["media_round_send_result"]=[ChecklistError("MEDIA_ROUND_NO_TASK","This round names no ticket.",details:["command_outcome":"rejected"])]
+        await model.sendResults()
+        XCTAssertEqual(model.resultLine?.text,"Choose the ticket for this round first. Nothing was sent.");XCTAssertEqual(model.resultLine?.refused,true)
+        await model.waitUntilWritable()
+        peer.failures["media_round_send_result"]=[ChecklistError("MEDIA_ROUND_NO_DECISIONS","Decide an item first.",details:["command_outcome":"rejected"])]
+        await model.sendResults()
+        XCTAssertEqual(model.resultLine?.text,"Decide at least one item first. Nothing was sent.")
+        XCTAssertNil(store.error,"No global alert");XCTAssertNil(model.error);XCTAssertFalse(store.hasPendingMutation)
+        XCTAssertEqual(peer.calls.filter {$0.0=="media_round_send_result"}.count,3)
+        // Choosing another round clears the line.
+        model.chooseRound("round");XCTAssertNil(model.resultSend.line.isEmpty ? nil : model.resultSend.line)
+    }
+}

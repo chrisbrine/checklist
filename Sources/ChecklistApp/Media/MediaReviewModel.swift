@@ -11,6 +11,8 @@ typealias MediaValues = [String: Any]
     init(_ continuation: CheckedContinuation<Void,Error>) {self.continuation=continuation}
     func resume(_ result: Result<Void,Error>) {continuation?.resume(with:result);continuation=nil}
 }
+/// Holds a committed reply on the main actor; the reply dictionary is not Sendable (CL-427).
+@MainActor final class MediaReplyBox {var value: MediaValues=[:]}
 
 /// Display state is local and nonmaterial. Every decision carries the service's
 /// observed manifest/basis; refresh never retargets an unsent owner's draft.
@@ -57,6 +59,12 @@ typealias MediaValues = [String: Any]
     @Published var successorItems: [String: MediaValues] = [:]
     /// CL-318/CL-349 selection, list filters and bulk progress (MediaBulkActions.swift).
     @Published var bulk = MediaBulkState()
+    /// CL-427: the round's result send (progress, receipt or one refusal line), the ticket
+    /// choices for the round's ticket picker and the last ticket change refusal. All are local.
+    @Published var resultSend = MediaResultSend()
+    @Published var ticketChoices: [Record] = []
+    @Published var ticketChoicesLoading = false
+    @Published var ticketLinkLine = ""
     /// Audio/video takes: two verified copies, one preparation and one playing take at most.
     let playback = MediaPlaybackCoordinator()
     private(set) var projectID = ""
@@ -447,13 +455,15 @@ typealias MediaValues = [String: Any]
             try? await Task.sleep(nanoseconds:250_000_000)
         }
     }
-    /// The awaited form of `mutateReportingFailure`: it returns when the command is committed, or throws the refusal.
-    func mutateAwaiting(_ method: String,_ params: MediaValues,quiet: Bool = false) async throws {
+    /// The awaited form of `mutateReportingFailure`: it returns the committed reply, or throws the refusal.
+    @discardableResult func mutateAwaiting(_ method: String,_ params: MediaValues,quiet: Bool = false) async throws -> MediaValues {
         guard store != nil else {throw ChecklistError("WRITE_NOT_STARTED","Checklist is not connected.")}
-        return try await withCheckedThrowingContinuation {continuation in
+        let reply=MediaReplyBox()
+        try await withCheckedThrowingContinuation {continuation in
             let once=MediaResumeOnce(continuation)
-            mutateReportingFailure(method,params,quiet:quiet,onFailure:{once.resume(.failure($0))}) {_ in once.resume(.success(()))}
+            mutateReportingFailure(method,params,quiet:quiet,onFailure:{once.resume(.failure($0))}) {value in reply.value=value;once.resume(.success(()))}
         }
+        return reply.value
     }
     func previewIntake(_ params: MediaValues) {var p=params;p["round_id"]=roundID
         let isFiles=params["sources"] != nil
@@ -513,7 +523,7 @@ typealias MediaValues = [String: Any]
     var reworkAvailable: Bool { !historyOnly && header.string("state") == "open" }
     var successorAvailable: Bool { !historyOnly && ["open","closed"].contains(header.string("state")) }
     var reworkCandidates: [Record] { rows.filter { $0.string("disposition") == "changes_requested" } }
-    func clearRoundActions() { reworkSelection=[];reworkPreview=Record(values:[:]);successorItems=[:];bulk=MediaBulkState() }
+    func clearRoundActions() { reworkSelection=[];reworkPreview=Record(values:[:]);successorItems=[:];bulk=MediaBulkState();resultSend=MediaResultSend();ticketLinkLine="" }
     /// Only a listed Changes-requested item can be selected; the service checks the exact decision.
     func toggleRework(_ row: Record) {
         if reworkSelection.contains(row.id) {reworkSelection.remove(row.id)}
@@ -612,6 +622,144 @@ typealias MediaValues = [String: Any]
         return ["visible_columns":Array(ids.prefix(8)),"group_by":["character","animation_label"].filter(ids.contains),"sort":ids.contains("direction") ? [["field_id":"direction","order":((schema["fields"] as? [MediaValues])?.first {$0["id"] as? String == "direction"}?["kind"] as? String == "choice") ? "declared_choice_order" : "ascending"]] : [["key":"order","order":"ascending"]]]
     }
 }
+/// CL-427: the round names the ticket that owns its takes, and one owner press sends the
+/// owner's decisions and notes to that ticket as one ordinary ticket note.
+extension MediaReviewModel {
+    /// The round's ticket (`task: {id, key, title, status_name}` in the round read), or an empty record.
+    var linkedTask: Record { Record(values:header.object("task")) }
+    /// The header line: "For HEIR-130 — Behemoth walk", or "No ticket".
+    nonisolated static func ticketLine(_ header: Record) -> String {
+        let task=Record(values:header.object("task"))
+        guard !task.id.isEmpty else {return "No ticket"}
+        let key=task.string("key"),title=task.string("title")
+        let name=[key,title].filter {!$0.isEmpty}.joined(separator:" — ")
+        return "For "+(name.isEmpty ? "the linked ticket" : name)
+    }
+    /// The owner can choose or change the ticket while the round is Draft or Open (not closed).
+    var ticketChangeAvailable: Bool { writable && header.id == roundID }
+    /// Open tickets of this project, searched by key or title through the existing ticket list read.
+    func loadTicketChoices(_ text: String) async {
+        guard let store,!projectID.isEmpty else {return}
+        let project=projectID,round=roundID
+        func current() -> Bool {projectID==project && roundID==round}
+        ticketChoicesLoading=true
+        defer {if current() {ticketChoicesLoading=false}}
+        do {
+            guard case .loaded(let reply)=try await store.retirableRead("task_list",["project_id":project,"text":text,"archived":false,"limit":100],isCurrent:current) else {return}
+            guard current(),!Task.isCancelled else {return}
+            Self.assignIfChanged(&ticketChoices,Self.openTickets((reply["tasks"] as? [MediaValues] ?? []).map(Record.init)))
+        } catch is CancellationError {}
+        catch {if current() {ticketLinkLine="Could not search project tickets. The round's ticket did not change."}}
+    }
+    /// Done and canceled tickets are not offered; the rest are sorted by key.
+    nonisolated static func openTickets(_ rows: [Record]) -> [Record] {
+        rows.filter {!["done","canceled","cancelled"].contains($0.string("status_category"))}
+            .sorted {$0.string("key").localizedStandardCompare($1.string("key")) == .orderedAscending}
+    }
+    nonisolated static func linkTaskParams(header: Record,taskID: String?) -> MediaValues {
+        ["round_id":header.id,"expected_revision":header.integer("revision"),"task_id":taskID.map {$0 as Any} ?? NSNull()]
+    }
+    /// Sends `media_round_link_task`; `nil` removes the link. A refusal shows one line beside the ticket.
+    func linkTask(_ taskID: String?) {
+        guard ticketChangeAvailable else {return}
+        let round=roundID
+        ticketLinkLine=""
+        mutateReportingFailure("media_round_link_task",Self.linkTaskParams(header:header,taskID:taskID),quiet:true,onFailure:{[weak self] error in
+            guard let self,self.roundID==round else {return}
+            self.ticketLinkLine="Could not change the ticket: "+PlainError.text(error)
+        }) {[weak self] _ in self?.ticketLinkLine=""}
+    }
+    nonisolated static let decidedDispositions=["accepted","changes_requested","needs_look","excluded"]
+    /// The send action, or nil when it is hidden (no ticket, or no owner decision yet).
+    /// After a send it offers only changes: a listed decision that the last send did not carry.
+    /// While some items are not listed (a filter, or a page not loaded) the model cannot prove
+    /// that nothing is new, so the action stays enabled and the service answers.
+    nonisolated static func resultAction(header: Record,rows: [Record],counts: [String: Int],listComplete: Bool) -> MediaResultAction? {
+        let key=Record(values:header.object("task")).string("key",fallback:"the ticket")
+        guard !Record(values:header.object("task")).id.isEmpty else {return nil}
+        let decided=rows.filter {decidedDispositions.contains($0.string("disposition")) && !$0.string("decision_id").isEmpty}
+        guard !decided.isEmpty || decidedDispositions.contains(where:{(counts[$0] ?? 0)>0}) else {return nil}
+        let last=Record(values:header.object("last_result_sent"))
+        guard !last.values.isEmpty else {return .init(label:"Send results to "+key,disabledReason:nil)}
+        let sent=Set(last.strings("decision_ids"))
+        let changed = !listComplete || decided.contains {!sent.contains($0.string("decision_id"))}
+        return .init(label:"Send changes to "+key,disabledReason:changed ? nil : allResultsSentText)
+    }
+    nonisolated static let allResultsSentText="All results sent."
+    nonisolated static let nothingNewText="Nothing new to send."
+    var resultAction: MediaResultAction? {
+        guard !historyOnly,header.id==roundID else {return nil}
+        return Self.resultAction(header:header,rows:rows,counts:closureCounts,listComplete:filter=="all" && next==nil)
+    }
+    /// The plain line beside the send action: progress, the receipt, a refusal, or the last send.
+    var resultLine: (text: String,refused: Bool)? {
+        if resultSend.roundID==roundID,!resultSend.line.isEmpty {return (resultSend.line,resultSend.refused)}
+        let last=Record(values:header.object("last_result_sent"))
+        guard header.id==roundID,!last.values.isEmpty,let action=resultAction else {return nil}
+        if action.disabledReason != nil {return (Self.allResultsSentText,false)}
+        return ("Last sent at "+Self.localTime(last.string("at"))+". Changes since then are not sent yet.",false)
+    }
+    /// One press sends `media_round_send_result` through the owner command route and waits for its reply.
+    func sendResults() async {
+        guard let action=resultAction,action.disabledReason==nil,!resultSend.sending,let store else {return}
+        if let reason=store.writeBlockReason {store.inform(reason);return}
+        let project=projectID,round=roundID,choice=roundChoiceEpoch,key=linkedTask.string("key",fallback:"the ticket")
+        func current() -> Bool {projectID==project && roundID==round && roundChoiceEpoch==choice}
+        resultSend=MediaResultSend(roundID:round,sending:true,line:"Sending results to "+key+"…")
+        do {
+            let reply=try await mutateAwaiting("media_round_send_result",["round_id":round,"expected_revision":header.integer("revision")],quiet:true)
+            guard current() else {return}
+            resultSend=MediaResultSend(roundID:round,line:Self.receiptText(reply))
+        } catch {
+            guard current() else {return}
+            let code=(error as? ChecklistError)?.code ?? ""
+            resultSend=MediaResultSend(roundID:round,line:Self.sendRefusalText(error),refused:code != "MEDIA_ROUND_NOTHING_NEW")
+        }
+    }
+    /// "Sent to Codex HEIR-T1 and Claude reviewer at 7:12 PM · 3 items."
+    nonisolated static func receiptText(_ reply: MediaValues) -> String {
+        let names=(reply["recipients"] as? [MediaValues] ?? []).map {Record(values:$0).string("display",fallback:"an unnamed session")}
+        let count=reply["item_count"] as? Int ?? 0
+        let items=count==1 ? "1 item" : "\(count) items"
+        let who=names.isEmpty ? "" : " to "+listText(names)
+        return "Sent"+who+" at "+localTime(reply["sent_at"] as? String ?? "")+" · "+items+((reply["changed_only"] as? Bool ?? false) ? " changed since the last send." : ".")
+    }
+    nonisolated static func listText(_ names: [String]) -> String {
+        guard names.count>1 else {return names.first ?? ""}
+        return names.dropLast().joined(separator:", ")+" and "+names.last!
+    }
+    nonisolated static func sendRefusalText(_ error: Error) -> String {
+        switch (error as? ChecklistError)?.code ?? "" {
+        case "MEDIA_ROUND_NOTHING_NEW": return nothingNewText
+        case "MEDIA_ROUND_NO_TASK": return "Choose the ticket for this round first. Nothing was sent."
+        case "MEDIA_ROUND_NO_DECISIONS": return "Decide at least one item first. Nothing was sent."
+        default: return "Could not send results: "+PlainError.text(error)
+        }
+    }
+    /// A service time in the owner's local time: the time today, else the date and time.
+    nonisolated static func localTime(_ value: String,timeZone: TimeZone = .current) -> String {
+        let parser=ISO8601DateFormatter()
+        parser.formatOptions=[.withInternetDateTime,.withFractionalSeconds]
+        guard let date=parser.date(from:value) ?? ISO8601DateFormatter().date(from:value) else {return value.isEmpty ? "an unknown time" : value}
+        let formatter=DateFormatter()
+        formatter.timeZone=timeZone
+        var calendar=Calendar.current;calendar.timeZone=timeZone
+        formatter.dateStyle=calendar.isDateInToday(date) ? .none : .medium
+        formatter.timeStyle = .short
+        return formatter.string(from:date)
+    }
+}
+struct MediaResultAction: Equatable {
+    let label: String
+    let disabledReason: String?
+}
+struct MediaResultSend: Equatable {
+    var roundID=""
+    var sending=false
+    var line=""
+    var refused=false
+}
+
 struct MediaOwnerDraft: Codable,Equatable {
     var note="",winnerID="",noFollowUpReason="",reconciliationReason="",basis="",targetID="",contextToken="",manifestID="",manifestDigest=""
 }

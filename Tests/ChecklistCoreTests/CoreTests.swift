@@ -14,8 +14,13 @@ final class CoreTests: XCTestCase {
     var orchestrateBatchTriages = false
     override func setUpWithError() throws {
         // macOS /var temporary paths traverse a symlink rejected by storage admission.
-        let qualificationRoot = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-            .appendingPathComponent("ChecklistQualification/CL-20", isDirectory: true)
+        let caches: URL
+        if let path = ProcessInfo.processInfo.environment["CHECKLIST_TEST_STORAGE_ROOT"] {
+            caches = URL(fileURLWithPath:path,isDirectory:true)
+        } else {
+            caches = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        }
+        let qualificationRoot = caches.appendingPathComponent("ChecklistQualification/CL-20", isDirectory: true)
         try FileManager.default.createDirectory(at: qualificationRoot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         directory = qualificationRoot.appendingPathComponent("CoreTests-" + UUID().uuidString, isDirectory: true)
         router = try TestStore.router(root: directory)
