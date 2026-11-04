@@ -8,7 +8,7 @@ final class MediaWorkerContractTests: XCTestCase {
 
     func testClosedWorkerCatalogAndReadClassification() throws {
         XCTAssertEqual(MediaWorkerContract.methods.count, 12 + MediaWorkerContract.settingMethods.count, "CL-427 moves round creation into the setting gate and adds round linking")
-        XCTAssertEqual(MediaWorkerContract.settingMethods.count, 14)
+        XCTAssertEqual(MediaWorkerContract.settingMethods.count, 15)
         XCTAssertTrue(MediaWorkerContract.readMethods.contains("media_rework_preview"))
         XCTAssertEqual(CommandMethods.mediaWorkerReads, MediaWorkerContract.readMethods)
         XCTAssertTrue(CommandMethods.mediaWorkerReads.isSubset(of: CommandMethods.coreReads))
@@ -22,7 +22,7 @@ final class MediaWorkerContractTests: XCTestCase {
         XCTAssertTrue(MediaWorkerContract.settingMethods.isSubset(of: MediaWorkerContract.methods))
         XCTAssertEqual(MediaWorkerContract.settingMethods, ["media_type_adopt_starter", "media_type_create", "media_type_revise", "media_type_adopt", "media_type_retire", "media_round_publish",
             "media_round_cancel", "media_round_archive", "media_round_finish", "media_round_successor", "media_rework_create", "media_type_restore",
-            "media_round_create", "media_round_link_task"])
+            "media_round_create", "media_round_link_task", "media_item_link_task"])
         // CL-420: media decisions, suggestion adoption and context approval are the owner's own answers and approvals.
         for method in ["media_decide", "media_decision_withdraw", "media_adopt_suggestion", "media_suggestion_dismiss", "media_item_create", "media_context_approve", "media_context_reconcile", "media_bulk_prepare", "media_bulk_apply", "media_round_send_result"] {
             XCTAssertFalse(MediaWorkerContract.methods.contains(method), method)
@@ -68,6 +68,24 @@ final class MediaWorkerContractTests: XCTestCase {
         p["expected_revision"] = 2
         p["origin"] = "human_ui"
         XCTAssertThrowsError(try MediaWorkerContract.validate("media_round_link_task", parameters: p))
+    }
+
+    func testItemTaskLinkUsesExplicitTaskOrNullAndRequiresExactItemRevision() throws {
+        var p = write
+        p.merge(["round_id":"round","item_id":"item","expected_revision":2]) {_,new in new}
+        XCTAssertThrowsError(try MediaWorkerContract.validate("media_item_link_task",parameters:p))
+        for value: Any in ["task",NSNull()] {
+            p["task_id"] = value
+            XCTAssertNoThrow(try MediaWorkerContract.validate("media_item_link_task",parameters:p))
+        }
+        for value: Any in ["",true,4,["id":"task"]] {
+            p["task_id"] = value
+            XCTAssertThrowsError(try MediaWorkerContract.validate("media_item_link_task",parameters:p))
+        }
+        p["task_id"] = "task";p["expected_revision"] = true
+        XCTAssertThrowsError(try MediaWorkerContract.validate("media_item_link_task",parameters:p))
+        p["expected_revision"] = 2;p["item_id"] = nil
+        XCTAssertThrowsError(try MediaWorkerContract.validate("media_item_link_task",parameters:p))
     }
 
     func testThreeFileMetadataAndFiniteMapping() throws {

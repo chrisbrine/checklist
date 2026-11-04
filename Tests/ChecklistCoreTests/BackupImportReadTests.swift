@@ -158,7 +158,8 @@ final class BackupImportReadTests: XCTestCase {
         let ownIntake = try XCTUnwrap(f.router.handle(method:"media_intake_preview",params:["project_id":f.project,"command_id":uuid(),"round_id":draft["id"]!,"text":"Synthetic worker intake"],caller:f.worker)["data"] as? JSON)
         let workerRoutes: [(String,JSON)] = [
             ("media_type_list",[:]),("media_type_get",["type_id":type["id"]!]),("media_round_get",["round_id":round["id"]!]),
-            ("media_decision_list",["round_id":round["id"]!]),("media_intake_get",["intake_id":ownIntake["id"]!])]
+            ("media_decision_list",["round_id":round["id"]!]),("media_intake_get",["intake_id":ownIntake["id"]!]),
+            ("media_rework_preview",["round_id":round["id"]!,"epic_id":epic,"items":[["item_id":ids[0]]]])]
         XCTAssertEqual(Set(workerRoutes.map { $0.0 }),CommandRouter.mediaWorkerReads)
         let assistant = Caller(role:"assistant",installation:"synthetic-assistant",projectIDs:[f.project])
         let before = try f.allState()
@@ -193,6 +194,9 @@ final class BackupImportReadTests: XCTestCase {
                 case "media_type_get":XCTAssertEqual(data["id"] as? String,type["id"] as? String)
                 case "media_round_get":XCTAssertEqual((data["items"] as? [JSON])?.count,2)
                 case "media_decision_list":XCTAssertEqual((data["rows"] as? [JSON])?.count,2)
+                case "media_rework_preview":
+                    XCTAssertEqual((data["items"] as? [JSON])?.count,1)
+                    XCTAssertFalse((data["preview_digest"] as? String ?? "").isEmpty)
                 default:XCTAssertEqual(data["id"] as? String,ownIntake["id"] as? String)
                 }
                 XCTAssertThrowsError(try f.router.handle(method:method,params:params,caller:assistant)) {XCTAssertEqual(($0 as? CoreError)?.code,"FORBIDDEN",method)}

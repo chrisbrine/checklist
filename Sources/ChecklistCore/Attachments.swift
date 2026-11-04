@@ -108,6 +108,8 @@ extension CommandRouter {
                     sha256:a["sha256"] as? String,
                     failure:failure)
             }
+            // CL-404: a read of the original's bytes (also a preview with no separate file) refuses a cleaned original.
+            if representation == "original" || a["preview_path"] == nil, let refusal = Self.cleanedOriginalRefusal(a) { throw refusal }
             guard let stored = selected else { throw CoreError("ORIGINAL_CLEANED","The original is unavailable; its metadata is retained.") }
             let readsManaged = a["mode"] as? String == "managed" || representation == "preview" && a["preview_path"] != nil
             let path: String
@@ -181,19 +183,40 @@ extension CommandRouter {
         return ["attachments":attachments.map { a -> JSON in var a = a; if !c.isOwner { a.removeValue(forKey:"path"); a.removeValue(forKey:"preview_path") }; return a }]
     }
     static let attachmentChunkLimit = 8 * 1024 * 1024
+    static var cleanedOriginalError: CoreError { CoreError("ORIGINAL_CLEANED","The original is unavailable; its metadata is retained.") }
+    /// CL-404: one explicit refusal for every read of a cleaned original: a whole-file read, a range
+    /// read and an operation result. Cleanup keeps the record's path and sets availability, so the
+    /// path alone does not show it. It records nothing, because the record already says cleaned.
+    static func cleanedOriginalRefusal(_ attachment: JSON) -> CoreError? {
+        let availability = attachment["availability"] as? String
+        guard attachment["path"] == nil || ["original_cleaned","original_missing"].contains(availability ?? "") else { return nil }
+        var error = cleanedOriginalError
+        if let availability { error = CoreError(error.code,error.message,details:["availability":availability]) }
+        return error
+    }
     /// CL-397: one bounded range of a managed original. The caller joins the ranges
     /// and checks the whole-file sha256. This runs as a plain read, so no file bytes
     /// enter the command journal.
     private func attachmentChunk(_ attachment: JSON,_ p: JSON,representation: String) throws -> JSON {
         guard representation == "original",attachment["mode"] as? String == "managed" else { throw CoreError("INVALID_INPUT","offset and length read the original of a managed attachment only.") }
         guard let offset = p["offset"] as? Int,let length = p["length"] as? Int,offset >= 0,(1...Self.attachmentChunkLimit).contains(length) else { throw CoreError("INVALID_INPUT","offset must be 0 or more and length must be 1 to \(Self.attachmentChunkLimit).") }
-        guard let stored = attachment["path"] as? String else { throw CoreError("ORIGINAL_CLEANED","The original is unavailable; its metadata is retained.") }
+        // CL-404: the same explicit refusal as a whole-file read.
+        if let refusal = Self.cleanedOriginalRefusal(attachment) { throw refusal }
+        guard let stored = attachment["path"] as? String else { throw Self.cleanedOriginalError }
         let size = (attachment["size"] as? NSNumber)?.int64Value ?? 0
         guard Int64(offset) < size || (offset == 0 && size == 0) else { throw CoreError("INVALID_INPUT","offset is past the end of this \(size)-byte file.") }
+        // CL-404: a failed range read records the same availability observation as a whole-file
+        // read. The writer path marks an available original unavailable and its import job
+        // repair_required. A bad range or a cleaned original records nothing.
+        func observed(_ failure: CoreError) throws -> Error {
+            ManagedOriginalReadFailure(projectID:try StoredRecord(attachment,family:"Attachments").string("project_id"),
+                attachmentID:try StoredRecord(attachment,family:"Attachments").string("id"),revision:int(attachment,"revision"),
+                path:stored,sha256:attachment["sha256"] as? String,failure:failure)
+        }
         let bytes: Data
         do { bytes = try StorageObjectFiles(root:root).read(try managedRelative(stored,family:"objects"),offset:Int64(offset),length:length,expectedSize:size) }
-        catch StorageSnapshotFailure.sourceChanged { throw CoreError("SOURCE_CHANGED","The original no longer matches its immutable identity.") }
-        catch { throw CoreError("MANAGED_ORIGINAL_UNAVAILABLE","The managed original could not be read.",details:["reason":"original_open_or_read_failed"]) }
+        catch StorageSnapshotFailure.sourceChanged { throw try observed(CoreError("SOURCE_CHANGED","The original no longer matches its immutable identity.")) }
+        catch { throw try observed(CoreError("MANAGED_ORIGINAL_UNAVAILABLE","The managed original could not be read.",details:["reason":"original_open_or_read_failed"])) }
         var reply = attachment
         reply.removeValue(forKey:"path");reply.removeValue(forKey:"preview_path")
         reply["content_base64"] = bytes.base64EncodedString();reply["offset"] = offset;reply["length"] = bytes.count

@@ -41,7 +41,7 @@ extension TicketLifecycleCleanupTests {
             try router.withTicketCleanupPreparation({db in
                 let prepared = try self.router.prepareTicketLifecycleCleanup(db,at:clock)
                 if prepared != nil {
-                    _ = try self.call("message_send",["project_id":pid,"task_id":traffic["id"]!,"body":"Concurrent ordinary note \(step)"])
+                    try self.callBesideSnapshot("message_send",["project_id":pid,"task_id":traffic["id"]!,"body":"Concurrent ordinary note \(step)"])
                     writes += 1
                 }
                 return prepared
@@ -67,7 +67,7 @@ extension TicketLifecycleCleanupTests {
         _ = try call("backup_create",["path":directory.appendingPathComponent("conflict-backup").path])
         try router.withTicketCleanupPreparation({db in
             let prepared = try self.router.prepareTicketLifecycleCleanup(db)
-            _ = try self.call("message_send",["project_id":pid,"task_id":first["id"]!,"body":"Concurrent selected note"])
+            try self.callBesideSnapshot("message_send",["project_id":pid,"task_id":first["id"]!,"body":"Concurrent selected note"])
             return prepared
         }) {db,_,prepared in try self.router.commitTicketLifecycleCleanup(db,prepared:prepared,at:Date())}
         let items = try receipts(project).flatMap {$0["items"] as? [JSON] ?? []}

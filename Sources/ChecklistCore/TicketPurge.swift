@@ -118,6 +118,7 @@ extension CommandRouter {
     func ticketPurgePlan(_ db: Database, task: JSON, inventory: TicketCleanupInventory? = nil,doneEvidence: Bool = false,historyObservation: TicketCleanupEventObservation? = nil,backupObservation: TicketCleanupBackupObservation? = nil,candidateObjects: [JSON]? = nil,mediaAuthorityComplete: Bool? = nil,referenceGraph: TicketPurgeReferenceGraph? = nil) throws -> TicketPurgePlan {
         let pid = (try StoredRecord(task, family: "task").string("project_id")), tid = (try StoredRecord(task, family: "task").string("id")), taskKey = Data(tid.utf8)
         let rows = try inventory == nil ? Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records ORDER BY rowid LIMIT 100001") : []
+        if inventory == nil {StorageMemoryGuardSeam.observe?("whole_store_records","TicketPurge.records",rows.count)}
         guard rows.count <= 100000 else {throw CoreError("PURGE_LIMIT","The reference inventory exceeds the safe purge limit. No content was removed.")}
         let all = try inventory?.rows ?? rows.map {row -> PurgeRow in let e = try GRDBRecordEnvelopeAdapter.decode(row);return PurgeRow(id:e.id,type:e.type,project:e.projectID,value:e.object)}
         func equals(_ value: Any?, _ id: String) -> Bool {(value as? String).map {Data($0.utf8) == Data(id.utf8)} ?? false}

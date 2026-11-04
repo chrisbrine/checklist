@@ -153,7 +153,7 @@ public enum NativeReplyRouting {
 /// A named step of a listener's start or stop. Only a test passes an observer, to swap a file at
 /// that step. A product run has no observer.
 enum NativeReplySocketStep: Sendable {
-    case afterBind, beforeIdentityCapture, beforeStopCheck, beforePrivateMove, afterPrivateMove, beforeRemoval
+    case afterBind, beforeIdentityCapture, beforeStopCheck, beforeRemoval
 }
 
 /// Sets the calling thread's working folder, or returns it to the process folder with -1. libSystem
@@ -234,17 +234,18 @@ private final class NativeReplyFolder: @unchecked Sendable {
 /// caller correlates message/recipient IDs and records actual evidence; a body
 /// containing a nonce is not automatically an acknowledgment.
 ///
-/// The rule: the listener removes a file only with proof that the file is the socket that it bound,
-/// and any doubt leaves the file untouched. A file that already exists stays: a name cannot show that
-/// a socket is dead, because a child can hold a listener after its creator exits, and Darwin refuses
+/// Start and stop never remove or rename a file. A pathname identity check cannot authorize a
+/// later removal: another process of the same user can swap the file after the check. An existing
+/// file stays: a name cannot show that a socket is dead, because a child can hold a listener after its creator exits, and Darwin refuses
 /// a connection to a live listener with a full queue.
 ///
 /// The proof, at start: the path has one identity before and after a connection that this process
 /// makes through the path and then receives on this listener with a random value. A start with no
 /// proof closes its socket, leaves the file and fails. No failure path removes a file.
 ///
-/// The limit: a process of the same user can still defeat the proof if it puts this socket at the
-/// path for only the moment of the self-connection, or it can change the private folder of a stop.
+/// The limit: a process of the same user can still defeat the start observation if it puts this
+/// socket at the path for only the self-connection. That observation never authorizes file cleanup.
+/// Every successful bind may leave one socket, including after a normal stop; no folder is swept.
 public final class NativeReplyListener: @unchecked Sendable {
     public let path: String
     private var descriptor: Int32
@@ -252,8 +253,8 @@ public final class NativeReplyListener: @unchecked Sendable {
     private let name: String
     private let observer: (@Sendable (NativeReplySocketStep) -> Void)?
     private let identityLock = NSLock()
-    /// A stop makes one attempt, so this is nil after it, and nil always means that no removal occurs.
-    private var provedIdentity: NativeReplyFileIdentity?
+    /// Start observation only, never authority for a pathname mutation. Cleared on the first stop.
+    private var observedIdentity: NativeReplyFileIdentity?
     public var address: String { "uds:" + path }
     /// False when a file already held `<pid>.sock`, so the listener bound a fallback name.
     public var hasProcessIDName: Bool { URL(fileURLWithPath: path).lastPathComponent == "\(getpid()).sock" }
@@ -290,7 +291,7 @@ public final class NativeReplyListener: @unchecked Sendable {
             try folder.bindSocket(socketFD, name: name)
             observer?(.afterBind)
             guard listen(socketFD, 8) == 0 else { throw NativeBridgeError.system("listen", errno) }
-            provedIdentity = try Self.proveOwnership(listener: socketFD, folder: folder, name: name, observer: observer)
+            observedIdentity = try Self.proveOwnership(listener: socketFD, folder: folder, name: name, observer: observer)
             descriptor = socketFD
         } catch {
             Darwin.close(socketFD)
@@ -361,43 +362,19 @@ public final class NativeReplyListener: @unchecked Sendable {
         return received == value
     }
 
-    /// Removes the socket file that this listener proved, and never another file. The descriptor stays
-    /// open, so a stop can run while the reply loop waits on it. The file first moves to a new private
-    /// folder, where a later file at the path cannot take its place. A file that does not match moves
-    /// back without replacing anything. If that fails, it stays in the private folder, and the log names it.
+    /// Retains the path, including after a normal stop. Kept as the existing stop entry point for
+    /// callers. Neither a matching identity nor a move to a private folder prevents a same-user
+    /// swap before a later unlink. Darwin supplies no identity-conditional removal here, so this
+    /// method performs no filesystem mutation. The descriptor stays open for an active reply loop.
     public func removeSocketFile() {
         identityLock.lock(); defer { identityLock.unlock() }
-        guard let identity = provedIdentity else { return }
-        provedIdentity = nil
+        guard let identity = observedIdentity else { return }
+        observedIdentity = nil
 
         observer?(.beforeStopCheck)
         guard let current = folder.status(name), NativeReplyFileIdentity(current) == identity else { return }
-        observer?(.beforePrivateMove)
-        var template = Array(".\(getpid())-stop-XXXXXXXX".utf8CString)
-        guard mkdtempat_np(folder.descriptor, &template) != nil else { return report("cannot make a private folder, so \(path) stays", code: errno) }
-        let privateName = String(cString: template)
-        let opened = openat(folder.descriptor, privateName, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard opened >= 0 else { return report("cannot open \(privateName), so \(path) stays", code: errno) }
-        defer { Darwin.close(opened) }
-        guard renameatx_np(folder.descriptor, name, opened, name, UInt32(RENAME_EXCL)) == 0 else {
-            let code = errno
-            unlinkat(folder.descriptor, privateName, AT_REMOVEDIR)
-            if code != ENOENT { report("cannot move \(path), so it stays", code: code) }
-            return
-        }
-        observer?(.afterPrivateMove)
-        var moved = stat()
-        if fstatat(opened, name, &moved, AT_SYMLINK_NOFOLLOW) == 0, moved.st_mode & S_IFMT == S_IFSOCK, NativeReplyFileIdentity(moved) == identity {
-            observer?(.beforeRemoval)
-            guard unlinkat(opened, name, 0) == 0 else { return report("cannot remove \(privateName)/\(name)", code: errno) }
-        } else if renameatx_np(opened, name, folder.descriptor, name, UInt32(RENAME_EXCL)) != 0 {
-            return report("a file that is not this socket stays at \(privateName)/\(name) in the reply folder", code: errno)
-        }
-        unlinkat(folder.descriptor, privateName, AT_REMOVEDIR)
-    }
-
-    private func report(_ text: String, code: Int32) {
-        FileHandle.standardError.write(Data("Native reply listener stop: \(text): \(String(cString: strerror(code)))\n".utf8))
+        // This seam is the former check-to-removal gap. Even a file swapped here stays untouched.
+        observer?(.beforeRemoval)
     }
 
     public func receive(timeout: TimeInterval = 5) throws -> Data {
@@ -440,10 +417,9 @@ public final class NativeReplyListener: @unchecked Sendable {
     }
 }
 
-/// Removes the listener's socket at a normal stop, then ends the process with the signal's default
-/// action, so launchd and the install script see the same stop as before. It uses its own queue,
-/// so a busy command queue cannot delay a stop, and the removal stays off the POSIX signal callback.
-/// A crash or SIGKILL still leaves the socket.
+/// Runs the listener's conservative stop hook, then ends the process with the signal's default
+/// action, so launchd and the install script see the same stop as before. Its own queue keeps a
+/// busy command queue from delaying the stop. Every stop may leave the socket file (CL-418).
 public final class NativeReplyStopHandler: @unchecked Sendable {
     private let sources: [any DispatchSourceSignal]
 

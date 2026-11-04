@@ -9,13 +9,31 @@ extension CommandRouter {
         ["actor":"system","actor_kind":"system","origin":"system","at":now(),"reason":taskID,"task_id":taskID]
     }
 
+    /// Explicit links include unpublished items and the round fallback even when
+    /// every published item overrides it. Nothing releases originals early.
+    func mediaNamedTaskIDs(_ db: Database,round: JSON) throws -> Set<String> {
+        var ids = Set(try mediaItems(db,round:round).compactMap {$0["task_id"] as? String})
+        if let id = round["task_id"] as? String {ids.insert(id)}
+        return ids
+    }
+
+    func mediaAllNamedTasksDone(_ db: Database,round: JSON) throws -> Bool {
+        let pid = try StoredRecord(round,family:"media_round").string("project_id")
+        let ids = try mediaNamedTaskIDs(db,round:round)
+        return try !ids.isEmpty && ids.allSatisfy {id in
+            let task = try scoped(db,id,pid,type:"task")
+            guard let statusID = task["status_id"] as? String else {return false}
+            return try scoped(db,statusID,pid,type:"status")["category"] as? String == "done"
+        }
+    }
+
     func mediaLinkedTaskCompleted(_ db: Database,task: JSON) throws {
         let tid = try StoredRecord(task,family:"task").string("id"),pid = try StoredRecord(task,family:"task").string("project_id")
-        let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='media_round' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY ORDER BY id COLLATE BINARY",arguments:[Data(pid.utf8),Data(tid.utf8)])
+        let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='media_round' AND project_id=CAST(? AS TEXT) AND (json_extract(records.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY OR records.id IN (SELECT json_extract(i.data,'$.round_id') FROM records i WHERE i.type='media_item' AND i.project_id=CAST(? AS TEXT) AND json_extract(i.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY)) ORDER BY id COLLATE BINARY",arguments:[Data(pid.utf8),Data(tid.utf8),Data(pid.utf8),Data(tid.utf8)])
         let system = Caller(role:"owner",installation:"storage",projectIDs:[])
         for row in rows {
             var round = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"media_round").object
-            if let cleanup = round["done_task_cleanup"] as? JSON,cleanup["task_id"] as? String == tid,cleanup["state"] as? String != "deferred" {continue}
+            if let cleanup = round["done_task_cleanup"] as? JSON,cleanup["state"] as? String != "deferred" {continue}
             let state = round["state"] as? String ?? ""
             if state == "open" || state == "draft" {
                 var dispositions = try mediaRoundDispositionIndex(db,round:round)
@@ -26,16 +44,26 @@ extension CommandRouter {
                 }
                 let unresolved = dispositions.filter {!["accepted","excluded","changes_requested","needs_look"].contains($0["disposition"] as? String ?? "")}.count
                 if unresolved > 0 {
-                    if round["done_task_warning"] == nil {
+                    var warnings = round["done_task_warnings"] as? [JSON] ?? (round["done_task_warning"].map {[$0 as? JSON ?? [:]]} ?? [])
+                    var changed = false
+                    let warned = Set(warnings.compactMap {$0["task_id"] as? String})
+                    for taskID in try mediaNamedTaskIDs(db,round:round).subtracting(warned).sorted() {
                         let body = "\(round["title"] as? String ?? "Media round") has \(unresolved) undecided items; it stays open"
-                        var input: JSON = ["project_id":pid,"task_id":tid,"body":body]
-                        if let group = try ticketOrchestratedTriage(db,task:task),triageOrchestratorRecipient(db,group:group) != nil {input["audience"] = "orchestrator"}
+                        var input: JSON = ["project_id":pid,"task_id":taskID,"body":body]
+                        let namedTask = try scoped(db,taskID,pid,type:"task")
+                        if let group = try ticketOrchestratedTriage(db,task:namedTask),triageOrchestratorRecipient(db,group:group) != nil {input["audience"] = "orchestrator"}
                         let note = try messageWrite(db,input,system,"message_send",purpose:.systemNote,literalBody:true)
-                        round["done_task_warning"] = ["task_id":tid,"message_id":note["id"] ?? NSNull(),"at":now(),"undecided_count":unresolved]
-                        try mediaWrite(db,revised(round),type:"media_round")
+                        warnings.append(["task_id":taskID,"message_id":note["id"] ?? NSNull(),"at":now(),"undecided_count":unresolved])
+                        changed = true
+                    }
+                    if changed {
+                        round["done_task_warnings"] = warnings
+                        round["done_task_warning"] = warnings.first
+                        round = revised(round);try mediaWrite(db,round,type:"media_round")
                     }
                     continue
                 }
+                guard try mediaAllNamedTasksDone(db,round:round) else {continue}
                 if state == "draft" {
                     // A truly empty Draft has no published manifest to finish.
                     round = try mediaCancelRound(db,round:round,reason:"Linked task \(tid) is Done; empty Draft has no published manifest.",actor:mediaTaskDoneActor(tid))
@@ -45,6 +73,7 @@ extension CommandRouter {
                     round = try mediaFinishRound(db,["round_id":round["id"]!],system,project:pid,systemTaskID:tid)
                 }
             }
+            guard try mediaAllNamedTasksDone(db,round:round) else {continue}
             if ["closed","canceled"].contains(round["state"] as? String ?? "") {
                 round = try mediaArchiveRound(db,round:round,actor:mediaTaskDoneActor(tid))
             }
@@ -70,12 +99,13 @@ extension CommandRouter {
             guard let decisionID = item["last_decision_id"] as? String else {continue}
             let decision = try scoped(db,decisionID,pid,type:"media_owner_decision")
             guard decision["disposition"] as? String == "changes_requested",mediaFollowUpResolution(db,decision:decision,index:index,project:pid) == nil else {continue}
+            let linkedTaskID = item["task_id"] as? String ?? round["task_id"] as? String ?? taskID
             var link = mediaRecord(["round_id":round["id"]!,"item_id":item["id"]!,"decision_id":decisionID,
                 "target_id":member["target_id"]!,"review_basis_signature":member["review_basis_signature"]!,"manifest_id":manifest["id"]!,
-                "state":"worker_reason","follow_up_reason":"Linked task \(taskID) is Done.","system_task_id":taskID],project:pid,caller:caller,
+                "state":"worker_reason","follow_up_reason":"Linked task \(linkedTaskID) is Done.","system_task_id":linkedTaskID],project:pid,caller:caller,
                 references:[try mediaRef("media_round",round),try mediaRef("media_item",item),try mediaRef("media_owner_decision",decision),
-                    ["type":"media_item_target","id":member["target_id"]!,"revision":1],try mediaRef("media_round_manifest",manifest),["type":"task","id":taskID]])
-            link["origin"] = "system";link["author"] = "system";link["author_session_id"] = "system";link["actor"] = mediaTaskDoneActor(taskID)
+                    ["type":"media_item_target","id":member["target_id"]!,"revision":1],try mediaRef("media_round_manifest",manifest),["type":"task","id":linkedTaskID]])
+            link["origin"] = "system";link["author"] = "system";link["author_session_id"] = "system";link["actor"] = mediaTaskDoneActor(linkedTaskID)
             try mediaWrite(db,link,type:"media_rework_link")
         }
     }

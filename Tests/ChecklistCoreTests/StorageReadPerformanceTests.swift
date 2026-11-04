@@ -9,7 +9,12 @@ final class ReadPerformanceFixture {
     let router: CommandRouter
     let owner = Caller(role: "owner", installation: "read-performance", projectIDs: [])
     init(_ ticket: String) throws {
-        let caches = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true).resolvingSymlinksInPath()
+        let caches: URL
+        if let path = ProcessInfo.processInfo.environment["CHECKLIST_TEST_STORAGE_ROOT"] {
+            caches = URL(fileURLWithPath:path,isDirectory:true).resolvingSymlinksInPath()
+        } else {
+            caches = try FileManager.default.url(for:.cachesDirectory,in:.userDomainMask,appropriateFor:nil,create:true).resolvingSymlinksInPath()
+        }
         directory = caches.appendingPathComponent("ChecklistQualification/\(ticket)/" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         router = try TestStore.router(root: directory.appendingPathComponent("store"))

@@ -261,7 +261,7 @@ The shared CL-83 build-level catalog feeds `service_info.native_routes` and the 
 
 ### Reply listener start and stop (CL-415 source)
 
-A stale socket at the service's own PID name no longer stops every Claude relay. A stop removes the service's socket, and a listener failure shows in `service_info.native_reply_listener` and on the Claude provider card. See [Claude relay reply listener](integrations.md#claude-relay-reply-listener).
+A stale socket at the service's own PID name no longer stops every Claude relay. CL-418 conservatively retains the reply path even on a normal stop, because a pathname check cannot retain ownership through a same-user swap before removal. Every successful bind counts toward folder growth; no global cap or sweep is claimed. A listener failure shows in `service_info.native_reply_listener` and on the Claude provider card. See [Claude relay reply listener](integrations.md#claude-relay-reply-listener).
 
 ### Read-only provider message readiness (CL-37)
 

@@ -205,7 +205,7 @@ final class NativeReplyListenerStartTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: longDirectory), [String(name.dropFirst())])
     }
 
-    func testListenerEndRemovesOnlyItsBoundPath() throws {
+    func testListenerEndRetainsItsBoundPathAndTheExistingSocket() throws {
         try staleSocket(ownPath)
         let stale = inode(ownPath)
         var listener: NativeReplyListener? = try NativeReplyListener.start(directory: directory)
@@ -213,19 +213,19 @@ final class NativeReplyListenerStartTests: XCTestCase {
         XCTAssertNotNil(inode(bound))
         listener = nil
         XCTAssertNil(listener)
-        XCTAssertNil(inode(bound))
+        XCTAssertNotNil(inode(bound))
         XCTAssertEqual(inode(ownPath), stale)
     }
 
-    func testListenerEndRemovesTheProcessIDName() throws {
+    func testListenerEndRetainsTheProcessIDName() throws {
         var listener: NativeReplyListener? = try NativeReplyListener.start(directory: directory)
         XCTAssertNotNil(inode(ownPath))
         listener = nil
         XCTAssertNil(listener)
-        XCTAssertNil(inode(ownPath))
+        XCTAssertNotNil(inode(ownPath))
     }
 
-    func testStopSignalRemovesTheFallbackPathAndThenFinishes() throws {
+    func testStopSignalRetainsTheFallbackPathAndThenFinishes() throws {
         try staleSocket(ownPath)
         let stale = inode(ownPath)
         let listener = try NativeReplyListener.start(directory: directory)
@@ -236,21 +236,18 @@ final class NativeReplyListenerStartTests: XCTestCase {
             XCTAssertEqual(number, SIGUSR2)
             finished.fulfill()
         }
-        // The source registers on its own queue, and a signal before that registration has no effect.
-        for _ in 0..<50 where inode(listener.path) != nil {
-            kill(getpid(), SIGUSR2)
-            usleep(100_000)
-        }
+        usleep(100_000) // Allow source registration before the one bounded signal.
+        kill(getpid(), SIGUSR2)
         wait(for: [finished], timeout: 5)
-        XCTAssertNil(inode(listener.path))
+        XCTAssertNotNil(inode(listener.path))
         XCTAssertEqual(inode(ownPath), stale)
         withExtendedLifetime(handler) {}
     }
 
-    /// The stop removes only the file that this listener created.
+    /// The stop retains a later file without changing it.
     func testRemovalLeavesALaterFileAtThePath() throws {
         let listener = try NativeReplyListener(path: ownPath)
-        unlink(ownPath)
+        XCTAssertEqual(rename(ownPath, directory + "/bound-aside.sock"), 0)
         try Data("later".utf8).write(to: URL(fileURLWithPath: ownPath))
         listener.removeSocketFile()
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: ownPath)), Data("later".utf8))

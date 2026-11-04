@@ -1,3 +1,4 @@
+import CryptoKit
 import XCTest
 import Darwin
 import MCP
@@ -301,6 +302,59 @@ final class ChecklistMCPServerTests: XCTestCase {
             let reply = try await session.client.callTool(name:"history_list",arguments:arguments)
             XCTAssertTrue(reply.isError ?? false)
         }
+        try await assertProtocolOnly(session)
+    }
+
+    /// CL-404: one full 8 MiB range read crosses the real bridge and MCP tool route from a real
+    /// CommandRouter. The fake client replaces only the XPC hop. The test measures the reply sizes.
+    func testCL404FullRangeReadCrossesTheMCPRouteIntact() async throws {
+        let fixture = try Fixture()
+        fixture.setDiscoveries([.available(fixture.context)])
+        let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("checklist-range-read-" + UUID().uuidString)
+        let workspace = root.appendingPathComponent("workspace")
+        try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
+        let router = try CommandRouter(root:root.appendingPathComponent("store"))
+        defer { try? router.closeStore();try? FileManager.default.removeItem(at:root) }
+        let owner = Caller(role:"owner",installation:"synthetic-owner",projectIDs:[])
+        func call(_ method: String,_ params: [String:Any]) throws -> [String:Any] {
+            var params = params
+            if !CommandRouter.readMethods.contains(method) {params["command_id"] = UUID().uuidString}
+            return try router.handle(method:method,params:params,caller:owner)["data"] as! [String:Any]
+        }
+        let project = try call("project_create",["name":"Synthetic MCP range read","key_prefix":"RNG","root_path":workspace.path]),pid = project["id"] as! String
+        let epic = try call("epic_create",["project_id":pid,"name":"Synthetic files"])
+        let task = try call("task_create",["project_id":pid,"title":"Synthetic large file","epic_id":epic["id"]!])
+        _ = try call("session_register",["project_id":pid,"session_id":fixture.context.nativeSessionID,"provider":"claude","role":"worker"])
+        var generator = SystemRandomNumberGenerator()
+        let content = Data((0..<(CommandRouter.attachmentChunkLimit + 4096)).map { _ in UInt8.random(in:0...255,using:&generator) })
+        let source = workspace.appendingPathComponent("large.bin");try content.write(to:source)
+        let added = try call("attachment_add",["project_id":pid,"task_id":task["id"]!,"path":source.path,"mode":"managed_copy"])
+        let agent = Caller(role:"worker",installation:"synthetic-agent",projectIDs:[pid],sessionID:fixture.context.nativeSessionID,workspace:workspace.path)
+        fixture.requestHandler = { method,params in
+            do {return try router.handle(method:method,params:params,caller:agent)}
+            catch let error as CoreError {throw ChecklistError(error.code,error.message,details:error.details)}
+        }
+        let session = try await start(fixture)
+        let catalog = try await session.client.listTools()
+        XCTAssertTrue(catalog.tools.contains {$0.name == "attachment_read"})
+        let result = try await session.client.callTool(name:"attachment_read",arguments:["project_id":.string(pid),"attachment_id":.string(added["id"] as! String),
+            "representation":.string("original"),"offset":.int(0),"length":.int(CommandRouter.attachmentChunkLimit)])
+        XCTAssertFalse(result.isError ?? false)
+        let json = try XCTUnwrap(result.content.compactMap { if case .text(let value, _, _) = $0 { return value }; return nil }.last)
+        let envelope = try JSONSerialization.jsonObject(with:Data(json.utf8)) as! [String:Any]
+        let data = try XCTUnwrap(envelope["data"] as? [String:Any])
+        let encoded = try XCTUnwrap(data["content_base64"] as? String)
+        let bytes = try XCTUnwrap(Data(base64Encoded:encoded))
+        XCTAssertEqual(bytes,content.prefix(CommandRouter.attachmentChunkLimit))
+        XCTAssertEqual(data["length"] as? Int,CommandRouter.attachmentChunkLimit);XCTAssertEqual(data["eof"] as? Bool,false)
+        XCTAssertEqual(data["chunk_sha256"] as? String,SHA256.hash(data:bytes).map {String(format:"%02x",$0)}.joined())
+        let frames = await session.transport.frames()
+        let largest = try XCTUnwrap(frames.map(\.count).max())
+        print("CL-404 MCP range reply: content_base64 \(encoded.utf8.count) bytes, tool text \(json.utf8.count) bytes, largest JSON-RPC frame \(largest) bytes")
+        XCTAssertGreaterThan(json.utf8.count,11_000_000)
+        // The result carries the text and structuredContent, so the frame holds the range twice.
+        XCTAssertGreaterThan(largest,2 * encoded.utf8.count)
         try await assertProtocolOnly(session)
     }
 

@@ -5,7 +5,7 @@ extension CommandRouter {
     /// A live ticket summary, never a stored copy of mutable ticket authority.
     func mediaRoundTask(_ db: Database,round: JSON) throws -> JSON? {
         guard let id = round["task_id"] as? String else { return nil }
-        let pid = try StoredRecord(round,family:"media_round").string("project_id")
+        let pid = try StoredRecord(round,family:"media ticket link").string("project_id")
         let task = try scoped(db,id,pid,type:"task")
         let status = try (task["status_id"] as? String).map {try scoped(db,$0,pid,type:"status")}
         return ["id":id,"key":task["key"] ?? "","title":task["title"] ?? "",
@@ -13,7 +13,7 @@ extension CommandRouter {
     }
 
     /// Both creation and relinking validate exact same-project identities. A different
-    /// destination starts a fresh send baseline; old messages/references remain history.
+    /// destination makes only the affected items new; old messages remain history.
     func mediaSetTask(_ db: Database,round: inout JSON,input: JSON,project: String) throws {
         guard let raw = input["task_id"] else { return }
         var id: String?
@@ -23,24 +23,43 @@ extension CommandRouter {
             guard !bool(task,"purged") else {throw CoreError("TICKET_PURGED","A purged ticket cannot receive a new media link.")}
             round["record_references"] = (round["record_references"] as? [JSON] ?? []) + [try mediaRef("task",task)]
         }
-        if !EnvelopeStorageIdentity.equal(id,round["task_id"] as? String) { round["last_result_sent"] = nil }
+        if var receipt = round["last_result_sent"] as? JSON,receipt["sends"] == nil,let previous = round["task_id"] as? String {
+            receipt["sends"] = [["task_id":previous,"decision_ids":strings(receipt,"decision_ids")]]
+            round["last_result_sent"] = receipt
+        }
+        // Send baselines belong to each item and its destination, so changing a
+        // fallback never resets unrelated explicitly linked items.
         round["task_id"] = id
     }
 
-    func mediaLinkTask(_ db: Database,_ p: JSON,_ c: Caller,project: String,resources: PreparedMediaResources) throws -> JSON {
+    func mediaLinkTask(_ db: Database,_ p: JSON,_ c: Caller,project: String,resources: PreparedMediaResources,itemLink: Bool = false) throws -> JSON {
         if !resources.workerChannel { try owner(c) }
         var round = try scoped(db,try text(p,"round_id"),project,type:"media_round")
-        try mediaRevision(p,round)
+        var linked = itemLink ? try scoped(db,text(p,"item_id"),project,type:"media_item") : round
+        if itemLink,!EnvelopeStorageIdentity.equal(linked["round_id"] as? String,round["id"] as? String) {
+            throw CoreError("NOT_FOUND","This item is unavailable in this round.")
+        }
+        try mediaRevision(p,linked)
         guard ["draft","open"].contains(round["state"] as? String ?? "") else {
             throw CoreError("MEDIA_ROUND_CLOSED","A closed or archived round cannot change its ticket.")
         }
         guard p["task_id"] != nil else { throw CoreError("INVALID_INPUT","Name a ticket or explicitly clear task_id with null.") }
-        try mediaSetTask(db,round:&round,input:p,project:project)
-        round["task_linked_by"] = resources.workerChannel ? mediaAgentActor(c)
+        try mediaSetTask(db,round:&linked,input:p,project:project)
+        linked["task_linked_by"] = resources.workerChannel ? mediaAgentActor(c)
             : ["actor":c.principal,"actor_kind":"owner","origin":"human_ui","at":now()]
-        round = revised(round);try mediaWrite(db,round,type:"media_round")
-        if resources.workerChannel { return try mediaWorkerRound(db,round:round,p:[:],c:c) }
-        return try resources.nativeOwnerProjection ? mediaOwnerHeader(db,round,c) : mediaRoundView(db,round:round,caller:c)
+        linked = revised(linked)
+        try mediaWrite(db,linked,type:itemLink ? "media_item" : "media_round")
+        if itemLink {
+            // Retire old round observations and page cursors along with the item revision.
+            round = revised(round);try mediaWrite(db,round,type:"media_round")
+            if resources.nativeOwnerProjection {return try mediaOwnerItem(db,round:round,itemID:text(p,"item_id"),caller:c)}
+            var result: JSON = [:]
+            for key in ["id","round_id","revision","task_id","task_linked_by"] {result[key] = linked[key]}
+            result["task"] = try mediaRoundTask(db,round:linked) ?? NSNull()
+            return result
+        }
+        if resources.workerChannel { return try mediaWorkerRound(db,round:linked,p:[:],c:c) }
+        return try resources.nativeOwnerProjection ? mediaOwnerHeader(db,linked,c) : mediaRoundView(db,round:linked,caller:c)
     }
 
     /// Uses the ordinary ticket note writer inside the command's one transaction, so
@@ -49,53 +68,105 @@ extension CommandRouter {
         try owner(c)
         var round = try scoped(db,try text(p,"round_id"),project,type:"media_round")
         try mediaRevision(p,round)
-        guard let taskID = round["task_id"] as? String else {
-            throw CoreError("MEDIA_ROUND_NO_TASK","Link the ticket that owns this round before sending its result.")
+        guard ["draft","open"].contains(round["state"] as? String ?? "") else {
+            throw CoreError("MEDIA_ROUND_CLOSED","A closed or archived round cannot send results.")
         }
-        let task = try scoped(db,taskID,project,type:"task")
-        guard !bool(task,"purged") else {throw CoreError("TICKET_PURGED","A purged ticket cannot receive a new media result note.")}
+        let items = try mediaItems(db,round:round)
+        guard items.contains(where:{($0["task_id"] as? String ?? round["task_id"] as? String) != nil}) else {
+            throw CoreError("MEDIA_ROUND_NO_TASK","No item names a ticket, directly or through its round.")
+        }
         let manifest = try (round["manifest_id"] as? String).map {try scoped(db,$0,project,type:"media_round_manifest")}
         let members = mediaManifestMembers(manifest?["items"] as? [JSON] ?? []) {Data($0.utf8)}
-        var current: [(JSON,JSON)] = []
-        for item in try mediaItems(db,round:round) {
+        var current: [(item: JSON,target: JSON,decision: JSON)] = []
+        var withdrawn: [(item: JSON,target: JSON,decision: JSON)] = []
+        for item in items {
             guard let id = item["id"] as? String,let member = members[Data(id.utf8)],
                   let head = item["last_decision_id"] as? String else { continue }
             let decision = try scoped(db,head,project,type:"media_owner_decision")
-            guard decision["disposition"] as? String != "withdrawn",
-                  decision["review_basis_signature"] as? String == member["review_basis_signature"] as? String else { continue }
+            let isWithdrawn = decision["disposition"] as? String == "withdrawn"
+            guard isWithdrawn || decision["review_basis_signature"] as? String == member["review_basis_signature"] as? String else { continue }
             let target = try scoped(db,try StoredRecord(member,family:"media_round_manifest").string("target_id"),project,type:"media_item_target")
-            current.append((target,decision))
+            if isWithdrawn {withdrawn.append((item,target,decision))}
+            else {current.append((item,target,decision))}
         }
-        guard !current.isEmpty else { throw CoreError("MEDIA_ROUND_NO_DECISIONS","Decide at least one current published item before sending.") }
         let last = round["last_result_sent"] as? JSON
-        var previous: [Data:JSON] = [:]
-        for id in strings(last ?? [:],"decision_ids") {
-            let decision = try scoped(db,id,project,type:"media_owner_decision")
-            previous[Data(try StoredRecord(decision,family:"media_owner_decision").string("item_id").utf8)] = decision
+        // Legacy CL-427 receipts apply to the round destination they were sent to.
+        let oldSends = last?["sends"] as? [JSON] ?? (last.map {receipt -> [JSON] in
+            guard let taskID = round["task_id"] as? String else {return []}
+            var legacy = receipt;legacy["task_id"] = taskID;return [legacy]
+        } ?? [])
+        var previous: [Data:(String,JSON)] = [:]
+        for send in oldSends {
+            guard let taskID = send["task_id"] as? String else {continue}
+            for id in strings(send,"decision_ids") {
+                let decision = try scoped(db,id,project,type:"media_owner_decision")
+                previous[Data(try StoredRecord(decision,family:"media_owner_decision").string("item_id").utf8)] = (taskID,decision)
+            }
         }
-        let changed = current.filter { _,decision in
-            guard let id = decision["item_id"] as? String,let old = previous[Data(id.utf8)] else { return true }
-            return ["disposition","note","winner_id","selection_outcome","review_basis_signature","no_follow_up_reason"].contains {
-                (old[$0] as? String ?? "") != (decision[$0] as? String ?? "")
-            } || bool(old,"none_fit") != bool(decision,"none_fit")
+        var grouped: [String:[(JSON,JSON)]] = [:]
+        for (item,target,decision) in current + withdrawn {
+            guard let taskID = item["task_id"] as? String ?? round["task_id"] as? String else {continue}
+            let old = previous[Data(try StoredRecord(item,family:"media_item").string("id").utf8)]
+            if decision["disposition"] as? String == "withdrawn" {
+                // Only this item's previous recipient needs its choice retracted.
+                if EnvelopeStorageIdentity.equal(old?.0,taskID) {grouped[taskID,default:[]].append((target,decision))}
+                continue
+            }
+            let changed = old == nil || !EnvelopeStorageIdentity.equal(old?.0,taskID) ||
+                ["disposition","note","winner_id","selection_outcome","review_basis_signature","no_follow_up_reason"].contains {
+                    (old?.1[$0] as? String ?? "") != (decision[$0] as? String ?? "")
+                } || bool(old?.1 ?? [:],"none_fit") != bool(decision,"none_fit")
+            if changed {grouped[taskID,default:[]].append((target,decision))}
         }
-        guard !changed.isEmpty else { throw CoreError("MEDIA_ROUND_NOTHING_NEW","No item decision or note changed since the last send.") }
+        if current.isEmpty,grouped.isEmpty,last == nil {
+            throw CoreError("MEDIA_ROUND_NO_DECISIONS","Decide at least one current published item before sending.")
+        }
+        guard !grouped.isEmpty else { throw CoreError("MEDIA_ROUND_NOTHING_NEW","No item decision, destination or note changed since the last send.") }
         let labels = ["accepted":"Accepted","changes_requested":"Changes requested","needs_look":"Needs look","excluded":"Excluded"]
-        let lines = changed.map { target,decision in
-            "\(target["title"] as? String ?? "Media item"): \(labels[decision["disposition"] as? String ?? ""] ?? "Needs look") — \(decision["note"] as? String ?? "")"
+        var sends: [JSON] = [],references: [JSON] = []
+        var sentAt = ""
+        for taskID in grouped.keys.sorted() {
+            let task = try scoped(db,taskID,project,type:"task")
+            guard !bool(task,"purged") else {throw CoreError("TICKET_PURGED","A purged ticket cannot receive a new media result note.")}
+            let changed = grouped[taskID]!
+            let lines = changed.map { target,decision in
+                if decision["disposition"] as? String == "withdrawn" {
+                    return "\(target["title"] as? String ?? "Media item"): Pending — decision withdrawn"
+                }
+                return "\(target["title"] as? String ?? "Media item"): \(labels[decision["disposition"] as? String ?? ""] ?? "Needs look") — \(decision["note"] as? String ?? "")"
+            }
+            let body = "Media review: \(round["title"] as? String ?? "")\nRound: \(round["id"] as? String ?? "")\n\n" + lines.joined(separator:"\n")
+            let message = try messageWrite(db,["project_id":project,"task_id":taskID,"body":body],c,"message_send",literalBody:true)
+            let recipients = try (message["deliveries"] as? [JSON] ?? []).map { delivery -> JSON in
+                let id = try StoredRecord(delivery,family:"delivery").string("recipient_session_id")
+                let session = try scoped(db,id,project,type:"session")
+                return ["session_id":id,"display":session["label"] as? String ?? sessionThreadLabel(session)]
+            }
+            sends.append(["task_id":taskID,"task_key":task["key"] ?? "","message_id":try StoredRecord(message,family:"message").string("id"),
+                "recipients":recipients,"item_count":changed.count])
+            sentAt = try StoredRecord(message,family:"message").string("created_at")
+            references.append(try mediaRef("message",message))
         }
-        let body = "Media review: \(round["title"] as? String ?? "")\nRound: \(round["id"] as? String ?? "")\n\n" + lines.joined(separator:"\n")
-        let message = try messageWrite(db,["project_id":project,"task_id":taskID,"body":body],c,"message_send",literalBody:true)
-        let messageID = try StoredRecord(message,family:"message").string("id")
-        let sentAt = try StoredRecord(message,family:"message").string("created_at")
-        round["last_result_sent"] = ["message_id":messageID,"at":sentAt,"decision_ids":current.map {$0.1["id"]!}]
-        round["record_references"] = (round["record_references"] as? [JSON] ?? []) + [try mediaRef("message",message)] + (try current.map {try mediaRef("media_owner_decision",$0.1)})
+        // Keep all currently routed decisions in the baseline, including unchanged siblings.
+        let routed = current.filter {($0.item["task_id"] as? String ?? round["task_id"] as? String) != nil}
+        var baseline: [String:[String]] = [:]
+        for row in routed {
+            let taskID = row.item["task_id"] as? String ?? round["task_id"] as! String
+            baseline[taskID,default:[]].append(try StoredRecord(row.decision,family:"media_owner_decision").string("id"))
+        }
+        let previousDestinations = Set(previous.values.map {$0.0})
+        var receipt: JSON = ["at":sentAt,"decision_ids":routed.map {$0.decision["id"]!},"sends":baseline.keys.sorted().map {taskID -> JSON in
+            ["task_id":taskID,"decision_ids":baseline[taskID]!]
+        }]
+        var result: JSON = ["sends":sends,"unsent_item_count":items.filter {($0["task_id"] as? String ?? round["task_id"] as? String) == nil}.count,
+            "changed_only":Set(grouped.keys).isSubset(of:previousDestinations),"sent_at":sentAt]
+        if items.allSatisfy({$0["task_id"] == nil}),sends.count == 1 {
+            for key in ["message_id","recipients","item_count"] {result[key] = sends[0][key]}
+            receipt["message_id"] = sends[0]["message_id"]
+        }
+        round["last_result_sent"] = receipt
+        round["record_references"] = (round["record_references"] as? [JSON] ?? []) + references + (try routed.map {try mediaRef("media_owner_decision",$0.decision)})
         round = revised(round);try mediaWrite(db,round,type:"media_round")
-        let recipients = try (message["deliveries"] as? [JSON] ?? []).map { delivery -> JSON in
-            let id = try StoredRecord(delivery,family:"delivery").string("recipient_session_id")
-            let session = try scoped(db,id,project,type:"session")
-            return ["session_id":id,"display":session["label"] as? String ?? sessionThreadLabel(session)]
-        }
-        return ["message_id":messageID,"recipients":recipients,"item_count":changed.count,"changed_only":last != nil,"sent_at":sentAt]
+        return result
     }
 }

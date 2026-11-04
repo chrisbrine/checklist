@@ -189,7 +189,7 @@ extension TicketLifecycleCleanupTests {
         var committed = false
         try router.withTicketCleanupPreparation({db in
             let prepared = try self.router.prepareTicketLifecycleCleanup(db)
-            _ = try self.call("message_send",["project_id":pid,"task_id":t["id"]!,"body":"Selected ticket changed"])
+            try self.callBesideSnapshot("message_send",["project_id":pid,"task_id":t["id"]!,"body":"Selected ticket changed"])
             return prepared
         }) {db,_,prepared in
             committed = true;try self.router.commitTicketLifecycleCleanup(db,prepared:prepared,at:Date())
@@ -329,7 +329,7 @@ extension TicketLifecycleCleanupTests {
         var admitted = false
         try router.withTicketCleanupPreparation({db in
             let prepared = try self.router.prepareTicketLifecycleCleanup(db)
-            _ = try self.call("message_send",["project_id":pid,"task_id":other["id"]!,"body":a["sha256"]!])
+            try self.callBesideSnapshot("message_send",["project_id":pid,"task_id":other["id"]!,"body":a["sha256"]!])
             return prepared
         }) {db,_,prepared in admitted = true;try self.router.commitTicketLifecycleCleanup(db,prepared:prepared,at:Date())}
         XCTAssertTrue(admitted)
@@ -367,7 +367,7 @@ extension TicketLifecycleCleanupTests {
         var committed = false
         try router.withTicketCleanupPreparation({db in
             let prepared = try self.router.prepareTicketLifecycleCleanup(db)
-            _ = try self.call("task_create",["project_id":pid,"title":"Unrelated counter allocation","epic_id":counterEpic["id"]!])
+            try self.callBesideSnapshot("task_create",["project_id":pid,"title":"Unrelated counter allocation","epic_id":counterEpic["id"]!])
             return prepared
         }) {db,_,prepared in
             committed = true
@@ -410,12 +410,16 @@ extension TicketLifecycleCleanupTests {
         var committed = false
         try router.withTicketCleanupPreparation({db in
             let prepared = try self.router.prepareTicketLifecycleCleanup(db)
-            try self.router.dbQueue.writeWithoutTransaction {writer in
-                try writer.execute(sql:"WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<40000) INSERT INTO ticket_cleanup_edges SELECT CAST(i AS BLOB),0 FROM n")
-                XCTAssertLessThanOrEqual(try Int.fetchOne(writer,sql:"SELECT units FROM ticket_cleanup_budget")!,TicketCleanupChanges.rowLimit)
-                XCTAssertLessThanOrEqual(try Int.fetchOne(writer,sql:"SELECT bytes FROM ticket_cleanup_budget")!,TicketCleanupChanges.byteLimit)
+            // The command's post-commit notices use the reader pool. Run the concurrent writer on its own
+            // dispatch context rather than recursively entering that pool from this preparation snapshot.
+            try DispatchQueue(label:"checklist.cleanup-fixture.index-writer").sync {
+                try self.router.dbQueue.writeWithoutTransaction {writer in
+                    try writer.execute(sql:"WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<40000) INSERT INTO ticket_cleanup_edges SELECT CAST(i AS BLOB),0 FROM n")
+                    XCTAssertLessThanOrEqual(try Int.fetchOne(writer,sql:"SELECT units FROM ticket_cleanup_budget")!,TicketCleanupChanges.rowLimit)
+                    XCTAssertLessThanOrEqual(try Int.fetchOne(writer,sql:"SELECT bytes FROM ticket_cleanup_budget")!,TicketCleanupChanges.byteLimit)
+                }
+                _ = try self.call("task_create",["project_id":p["id"]!,"title":"Writer still commits after index limit","epic_id":counterEpic["id"]!])
             }
-            _ = try self.call("task_create",["project_id":p["id"]!,"title":"Writer still commits after index limit","epic_id":counterEpic["id"]!])
             return prepared
         }) {_,_,_ in committed = true}
         XCTAssertFalse(committed)
@@ -428,7 +432,7 @@ extension TicketLifecycleCleanupTests {
         let (p,_,a) = try fixture(),(q,_,_) = try fixture()
         try router.withTicketCleanupPreparation({db in
             let prepared = try self.router.prepareTicketLifecycleCleanup(db)
-            _ = try self.configure(p,settings:["done_evidence_enabled":false,"closed_purge_enabled":false,"closed_days":15])
+            try self.configureBesideSnapshot(p,settings:["done_evidence_enabled":false,"closed_purge_enabled":false,"closed_days":15])
             return prepared
         }) {_,_,_ in XCTFail("Changed cleanup policy must fence")}
         XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
@@ -525,12 +529,12 @@ extension TicketLifecycleCleanupTests {
                 try expireCleanupBackoff();_ = try configure(p)
                 try router.withTicketCleanupPreparation({db in
                     let prepared = try self.router.prepareTicketLifecycleCleanup(db)
-                    _ = try self.call("message_send",["project_id":pid,"task_id":t["id"]!,"body":"Deliberate unrelated-note traffic on the cleaned ticket"])
+                    try self.callBesideSnapshot("message_send",["project_id":pid,"task_id":t["id"]!,"body":"Deliberate unrelated-note traffic on the cleaned ticket"])
                     // CL-371: a ticket conflict retries only that ticket and its pass
                     // still commits (testSelectedTicketFenceRetriesOnlyThatTicketAndRetrySurvivesRestart).
                     // Only a project fence refuses the whole attempt and arms the
                     // durable backoff this soak measures.
-                    _ = try self.configure(p,settings:["done_evidence_enabled":true,"closed_purge_enabled":true,"closed_days":16 + refusals])
+                    try self.configureBesideSnapshot(p,settings:["done_evidence_enabled":true,"closed_purge_enabled":true,"closed_days":16 + refusals])
                     return prepared
                 }) {_,_,_ in XCTFail("Changed project cleanup settings cannot commit")}
                 let state = try router.dbQueue.read {try self.router.ticketCleanupPreparationState($0,project:pid)}
@@ -648,7 +652,7 @@ extension TicketLifecycleCleanupTests {
         var committed = false
         try router.withTicketCleanupPreparation({db in
             let prepared = try self.router.prepareTicketLifecycleCleanup(db)
-            _ = try self.call("task_create",["project_id":pid,"title":"Unrelated counter with existing reference","epic_id":counterEpic["id"]!])
+            try self.callBesideSnapshot("task_create",["project_id":pid,"title":"Unrelated counter with existing reference","epic_id":counterEpic["id"]!])
             return prepared
         }) {db,_,value in committed = true;try self.router.commitTicketLifecycleCleanup(db,prepared:value,at:Date())}
         XCTAssertTrue(committed)

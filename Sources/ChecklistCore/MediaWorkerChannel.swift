@@ -155,7 +155,9 @@ extension CommandRouter {
                 "revision":try selected.requiredValue("revision"),"expected_revision":try selected.requiredValue("revision"),
                 "title":try stored.string("title"),"metadata":try stored.object("metadata"),"target_id":try stored.requiredValue("id"),
                 "review_basis_signature":try stored.requiredValue("review_basis_signature"),"candidate_ids":try stored.requiredValue("candidate_ids"),
-                "publication_ready":try stored.requiredValue("publication_ready"),"disposition":try selected.requiredValue("disposition")]
+                "publication_ready":try stored.requiredValue("publication_ready"),"disposition":try selected.requiredValue("disposition"),
+                "task":row["task"] ?? NSNull()]
+            value["task_id"] = row["task_id"]
             if let (type,context) = parts {
                 let item = try scoped(db,try selected.string("id"),project,type:"media_item")
                 let draft = try scoped(db,StoredRecord(item,family:"media_item").string("draft_target_id"),project,type:"media_item_target")

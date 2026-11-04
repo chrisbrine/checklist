@@ -39,6 +39,16 @@ final class TicketLifecycleCleanupTests: XCTestCase {
         var p = p;if !CommandRouter.readMethods.contains(method) {p["command_id"] = uuid()}
         return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:owner)["data"] as! JSON
     }
+    /// A concurrent command that a fixture runs while a cleanup preparation snapshot is open. The
+    /// command's post-commit notices use the reader pool, so it runs on its own dispatch context
+    /// rather than entering that pool again from the snapshot ("Database methods are not reentrant").
+    @discardableResult func callBesideSnapshot(_ method: String,_ p: JSON) throws -> JSON {
+        try DispatchQueue(label:"checklist.cleanup-fixture.concurrent-command").sync {try call(method,p)}
+    }
+    /// `configure` sends `project_settings_save`, so it needs the same context inside a snapshot.
+    @discardableResult func configureBesideSnapshot(_ p: JSON,settings: JSON) throws -> JSON {
+        try DispatchQueue(label:"checklist.cleanup-fixture.concurrent-command").sync {try configure(p,settings:settings)}
+    }
     func write(_ body: (Database) throws -> Void) throws {
         try ArchiveStorageGate.withExclusive(root:router.root) {_ in try router.dbQueue.writeWithoutTransaction {db in try router.withValidatedDomainTransaction(db) {try body(db);return .commit}}}
     }
@@ -374,7 +384,11 @@ extension TicketLifecycleCleanupTests {
         var committed = false
         try router.withTicketCleanupPreparation({db in
             let prepared = try self.router.prepareTicketLifecycleCleanup(db)
-            _ = try self.configure(p,settings:["done_evidence_enabled":false,"closed_purge_enabled":false,"closed_days":15])
+            // The command's post-commit notices use the reader pool. Run the concurrent writer on its own
+            // dispatch context rather than recursively entering that pool from this preparation snapshot.
+            _ = try DispatchQueue(label:"checklist.cleanup-fixture.settings-writer").sync {
+                try self.configure(p,settings:["done_evidence_enabled":false,"closed_purge_enabled":false,"closed_days":15])
+            }
             return prepared
         }) {_,_,_ in committed = true}
         XCTAssertFalse(committed)

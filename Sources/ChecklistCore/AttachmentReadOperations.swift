@@ -41,7 +41,8 @@ extension CommandRouter {
         let attachment = try scoped(db,id,pid,type:"attachment")
         guard attachment["task_id"] is String else {throw CoreError("ATTACHMENT_REFERENCE_REQUIRED","Taskless originals require a current owner reference; media commands are not enabled.")}
         let selected = representation == "preview" ? (attachment["preview_path"] as? String ?? attachment["path"] as? String) : attachment["path"] as? String
-        guard let selected else {throw CoreError("ORIGINAL_CLEANED","The original is unavailable; its metadata is retained.")}
+        if representation == "original" || attachment["preview_path"] == nil, let refusal = Self.cleanedOriginalRefusal(attachment) {throw refusal}
+        guard let selected else {throw Self.cleanedOriginalError}
         let managed = attachment["mode"] as? String == "managed" || representation == "preview" && attachment["preview_path"] != nil
         let bytes: Data
         do {

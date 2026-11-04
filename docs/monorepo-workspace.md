@@ -83,7 +83,11 @@ Every test slot starts with native relays off, including slots seeded from a liv
 backup. Notes save for pickup; the Claude peer relay, Codex app queue and native
 wake routes do not contact copied conversations. `status` (text or `--json`)
 reports `slot_relays: "off"` and `allow_synthetic_relays: false`. Older slot
-metadata without the option also means off.
+metadata without the option also means off. While the slot service runs,
+`status` shows the service's own `service_info` relay state
+(`slot_relays_source: "service"`); a slot that runs a build from before CL-429
+shows `unknown` with a note, because such a build can relay whatever
+`slot.json` says (CL-431).
 
 For an explicitly authorized synthetic-session relay check, opt in at creation
 or while starting a stopped slot:

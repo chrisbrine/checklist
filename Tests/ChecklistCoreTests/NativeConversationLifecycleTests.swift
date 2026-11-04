@@ -409,6 +409,62 @@ extension EvidenceAuthorityTests {
         let list = try call("message_delivery_list", ["project_id": p["id"]!, "task_id": t["id"]!, "message_id": note["id"]!], current)["deliveries"] as! [JSON]
         XCTAssertEqual(list.filter { $0["recipient_session_id"] as? String == worker.sessionID }.count, 3)
     }
+    /// CL-405: unanswered system work health notes add no receipt at a resumption, so the
+    /// row count stays flat across repeated resumptions. An ordinary note keeps its CL-398 receipt.
+    /// Owned test store only; the real store copy is measured on a seeded slot by the orchestrator.
+    func testResumptionsAddNoReceiptForAWorkHealthNoteAndTheRowCountStaysFlat() throws {
+        let p = try project(), t = try ready(p), worker = try native(p, "health-flat", domain: "claude:150:5:0", provider: "claude")
+        _ = try claim(p, t, caller: worker)
+        let pid = p["id"] as! String, sid = worker.sessionID!
+        // 25 unanswered notes in the shape of WorkHealth.healthNote: about the per-session count of the 2 Nov backup.
+        var healthIDs: Set<String> = []
+        try router.dbQueue.writeWithoutTransaction { db in try router.withValidatedDomainTransaction(db) {
+            let generation = try router.sessionGeneration(router.scoped(db, sid, pid, type: "session"))
+            for index in 0..<25 {
+                let mid = UUID().uuidString
+                try router.save(db, ["id": mid, "project_id": pid, "task_id": t["id"]!, "kind": "work_health", "origin": "system",
+                    "body": "Work health check \(index): does work continue?", "author": "work-health-service", "author_session_id": "service",
+                    "requires_action": false, "health_request": ["id": UUID().uuidString, "state": "open"], "revision": 1,
+                    "created_at": ISO8601DateFormatter().string(from: Date())], type: "message")
+                try router.save(db, ["id": UUID().uuidString, "project_id": pid, "message_id": mid, "recipient_session_id": sid,
+                    "recipient_authorization_generation": generation, "recipient_role": "health_handler", "state": "queued",
+                    "push_state": "unavailable", "push_reason": "This work health notice waits for exact-session MCP pickup.", "revision": 1,
+                    "created_at": ISO8601DateFormatter().string(from: Date())], type: "delivery")
+                healthIDs.insert(mid)
+            }
+            return .commit
+        } }
+        let ordinary = try call("message_send", ["project_id": pid, "task_id": t["id"]!, "body": "Ordinary note"])
+        func rows() throws -> (health: Int, resumed: Int, ordinary: Int) {
+            let all = try router.dbQueue.read { db in try router.records(db, type: "delivery") }
+                .filter { $0["project_id"] as? String == pid && $0["recipient_session_id"] as? String == sid }
+            return (all.filter { healthIDs.contains($0["message_id"] as? String ?? "") }.count,
+                    all.filter { healthIDs.contains($0["message_id"] as? String ?? "") && $0["recipient_role"] as? String == "resumed_conversation" }.count,
+                    all.filter { $0["message_id"] as? String == ordinary["id"] as? String }.count)
+        }
+        let before = try rows()
+        XCTAssertEqual(before.health, 25);XCTAssertEqual(before.ordinary, 1)
+        var current = worker
+        for cycle in 1...5 {
+            current = try closeAndResume(p, current, cycle: 50 + cycle)
+            let after = try rows()
+            print("CL-405 resumption \(cycle): work health receipts \(before.health) before, \(after.health) after; resumed_conversation \(after.resumed); ordinary \(after.ordinary)")
+            XCTAssertEqual(after.health, before.health, "cycle \(cycle)");XCTAssertEqual(after.resumed, 0)
+            // Control: the ordinary note still reaches the new generation.
+            XCTAssertEqual(after.ordinary, 1 + cycle)
+            if cycle == 1 {
+                // The first recovery summary still names the fenced work health notes; no row is needed for that.
+                let recovery = try call("session_inbox", ["project_id": pid], current)["native_recovery"] as! [JSON]
+                let fenced = Set(((recovery.first?["fenced_notices"] as? [JSON]) ?? []).compactMap { $0["message_id"] as? String })
+                XCTAssertTrue(healthIDs.isSubset(of: fenced))
+            }
+            let inbox = try call("session_inbox", ["project_id": pid], current)["deliveries"] as! [JSON]
+            XCTAssertFalse(inbox.contains { healthIDs.contains($0["message_id"] as? String ?? "") })
+        }
+        XCTAssertTrue(CommandRouter.resumptionSkipsNote(["kind": "work_health", "origin": "system"]))
+        XCTAssertFalse(CommandRouter.resumptionSkipsNote(["kind": "work_health", "origin": "agent"]))
+        XCTAssertFalse(CommandRouter.resumptionSkipsNote(["origin": "system"]))
+    }
     /// F4: a queue row survives the process, so a new generation never queues this note again.
     func testUncertainCodexQueueReceiptStopsANewGeneration() throws { try assertQueueReceiptStopsANewGeneration("uncertain") }
     func testAcceptedCodexQueueReceiptNearClosureStopsANewGeneration() throws { try assertQueueReceiptStopsANewGeneration("provider_accepted") }

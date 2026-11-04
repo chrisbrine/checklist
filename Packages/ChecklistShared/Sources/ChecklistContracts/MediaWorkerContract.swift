@@ -23,7 +23,7 @@ public enum MediaWorkerContract {
         "media_round_cancel", "media_round_archive", "media_round_finish", "media_round_successor",
         "media_rework_create", "media_type_restore",
         // CL-427: a round may name the ticket that owns its takes; creating and linking use the same gate.
-        "media_round_create", "media_round_link_task",
+        "media_round_create", "media_round_link_task", "media_item_link_task",
     ]
 
     public struct ValidationError: Error, CustomStringConvertible, Sendable {
@@ -48,10 +48,11 @@ public enum MediaWorkerContract {
             properties["type_id"] = text(4_000); properties["title"] = text(2_000)
             properties["task_id"] = text(4_000)
             required += ["type_id", "title"]
-        case "media_round_link_task":
+        case "media_round_link_task", "media_item_link_task":
             properties["round_id"] = text(4_000); properties["expected_revision"] = revision
             properties["task_id"] = ["oneOf": [text(4_000), ["type": "null"]]]
             required += ["round_id", "expected_revision", "task_id"]
+            if method == "media_item_link_task" {properties["item_id"] = text(4_000);required += ["item_id"]}
         case "media_type_adopt_starter":
             properties["starter"] = text(256); properties["title"] = text(256)
             properties["expected_revision"] = revision

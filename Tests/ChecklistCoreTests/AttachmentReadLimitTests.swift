@@ -136,7 +136,8 @@ extension TicketLifecycleCleanupTests {
         XCTAssertEqual(after.0,before.0);XCTAssertEqual(after.1,before.1)
     }
 
-    func testCL397AFileWithAnotherSizeReturnsSourceChangedAndRecordsNothing() throws {
+    /// CL-404 changed the CL-397 rule: a size that differs from the record is damage, as in a whole-file read.
+    func testCL404AFileWithAnotherSizeReturnsSourceChangedAndRecordsUnavailable() throws {
         let (pid,id,_,worker) = try sparseAttachment(bytes:1024)
         let stored = try call("attachment_read",["project_id":pid,"attachment_id":id,"representation":"metadata"])["path"] as! String
         let file = try router.managedURL(stored,family:"objects")
@@ -145,7 +146,70 @@ extension TicketLifecycleCleanupTests {
         XCTAssertThrowsError(try router.handle(method:"attachment_read",params:["project_id":pid,"attachment_id":id,"representation":"original","offset":0,"length":10],caller:worker)) {
             XCTAssertEqual(($0 as? CoreError)?.code,"SOURCE_CHANGED")
         }
-        XCTAssertEqual(try record(pid,id).0,"available")
+        XCTAssertEqual(try record(pid,id).0,"unavailable")
+    }
+
+    private func setAvailability(_ id: String,_ value: String) throws {
+        try router.dbQueue.write {db in
+            var a = try self.router.record(db,id,type:"attachment");a["availability"] = value;a["cleaned_at"] = ISO8601DateFormatter().string(from:Date())
+            try self.router.save(db,self.router.revised(a),type:"attachment")
+        }
+    }
+
+    func testCL404ACleanedOriginalRefusesWholeAndRangeReadsWithOneErrorAndRecordsNothing() throws {
+        for availability in ["original_cleaned","original_missing"] {
+            let (pid,id,_,worker) = try sparseAttachment(bytes:1024)
+            let stored = try call("attachment_read",["project_id":pid,"attachment_id":id,"representation":"metadata"])["path"] as! String
+            // Cleanup keeps the path in the record and removes the file.
+            try FileManager.default.removeItem(at:try router.managedURL(stored,family:"objects"))
+            try setAvailability(id,availability)
+            let revision = try call("attachment_read",["project_id":pid,"attachment_id":id,"representation":"metadata"])["revision"] as? Int
+            var errors: [CoreError] = []
+            let reads: [(JSON,Caller?)] = [(["representation":"original"],worker),(["representation":"original"],nil),(["representation":"preview"],worker),
+                                            (["representation":"original","offset":0,"length":10],worker),(["representation":"original","offset":0,"length":10],nil)]
+            for (input,caller) in reads {
+                var params: JSON = ["project_id":pid,"attachment_id":id];params.merge(input) {$1}
+                XCTAssertThrowsError(try router.handle(method:"attachment_read",params:params,caller:caller ?? owner),"\(availability) \(input)") {
+                    if let error = $0 as? CoreError { errors.append(error) } else { XCTFail("\($0)") }
+                }
+            }
+            XCTAssertEqual(errors.count,reads.count)
+            for error in errors {
+                XCTAssertEqual(error.code,"ORIGINAL_CLEANED",availability)
+                XCTAssertEqual(error.message,errors[0].message)
+                XCTAssertEqual(error.details["availability"] as? String,availability)
+            }
+            let after = try call("attachment_read",["project_id":pid,"attachment_id":id,"representation":"metadata"])
+            XCTAssertEqual(after["availability"] as? String,availability);XCTAssertEqual(after["revision"] as? Int,revision)
+        }
+    }
+
+    /// CL-404 rule: a range read that cannot open or read the managed original records the same
+    /// observation as a whole-file read (availability unavailable, import job repair_required).
+    /// It records no operation or read receipt, as a successful range read records none.
+    func testCL404AFailedRangeReadRecordsTheSameObservationAsAWholeFileRead() throws {
+        for damage in ["missing","unreadable"] {
+            var outcomes: [String:(String?,[String],String?)] = [:]
+            for read in ["whole","range"] {
+                let (pid,id,_,worker) = try sparseAttachment(bytes:1024)
+                let stored = try call("attachment_read",["project_id":pid,"attachment_id":id,"representation":"metadata"])["path"] as! String
+                let file = try router.managedURL(stored,family:"objects")
+                if damage == "missing" { try FileManager.default.removeItem(at:file) }
+                else { try FileManager.default.setAttributes([.posixPermissions:0],ofItemAtPath:file.path) }
+                defer { if damage == "unreadable" { try? FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:file.path) } }
+                let operations = try router.dbQueue.read {try Int.fetchOne($0,sql:"SELECT COUNT(*) FROM commands")}
+                var params: JSON = ["project_id":pid,"attachment_id":id,"representation":"original"]
+                if read == "range" { params["offset"] = 0;params["length"] = 10 }
+                var code: String?
+                XCTAssertThrowsError(try router.handle(method:"attachment_read",params:params,caller:worker),"\(damage) \(read)") { code = ($0 as? CoreError)?.code }
+                let state = try record(pid,id)
+                outcomes[read] = (state.0,state.1,code)
+                if read == "range" { XCTAssertEqual(try router.dbQueue.read {try Int.fetchOne($0,sql:"SELECT COUNT(*) FROM commands")},operations) }
+            }
+            XCTAssertEqual(outcomes["range"]?.0,"unavailable",damage);XCTAssertEqual(outcomes["range"]?.0,outcomes["whole"]?.0,damage)
+            XCTAssertEqual(outcomes["range"]?.1,outcomes["whole"]?.1,damage)
+            XCTAssertEqual(outcomes["range"]?.2,"MANAGED_ORIGINAL_UNAVAILABLE",damage)
+        }
     }
 
     func testCL396UnknownRepresentationIsRefusedAndTheCatalogNamesTheValues() throws {

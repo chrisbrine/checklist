@@ -71,22 +71,33 @@ final class NativeReplyListenerOwnershipTests: XCTestCase {
             // Put the foreign file back, and the listener's own file stays aside, as a folder bound counts it.
             XCTAssertEqual(rename(path, foreign), 0)
             XCTAssertEqual(try XCTUnwrap(attributes(aside)).st_mode & S_IFMT, S_IFSOCK)
-            try FileManager.default.removeItem(atPath: aside)
+            XCTAssertEqual(rename(aside, aside + "-\(step)"), 0)
         }
     }
 
     /// Swap to a symlink: the old `chmod` followed it out of the folder and changed the target.
-    func testSymlinkSwappedInAfterBindStaysAndItsTargetKeepsItsMode() throws {
-        let target = directory + "/outside"
+    func testSymlinkSwappedInAfterBindStaysAndItsExternalTargetKeepsItsMode() throws {
+        let replies = directory + "/replies"
+        try FileManager.default.createDirectory(atPath: replies, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let target = directory + "/external-target"
         let targetInode = try makeForeignFile(target, mode: 0o644)
-        XCTAssertEqual(symlink(target, foreign), 0)
-        let linkInode = try XCTUnwrap(inode(foreign))
-        XCTAssertThrowsError(try NativeReplyListener(path: path, observer: at(.afterBind, swapIn(foreign, path)))) { assertUnproved($0) }
-        XCTAssertEqual(inode(path), linkInode)
-        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: path), target)
-        XCTAssertEqual(inode(target), targetInode)
-        XCTAssertEqual(try XCTUnwrap(attributes(target)).st_mode & 0o777, 0o644)
-        XCTAssertEqual(contents(target), Data("keep".utf8))
+        for (index, step) in [NativeReplySocketStep.afterBind, .beforeIdentityCapture].enumerated() {
+            let bound = replies + "/reply-\(index).sock", displaced = directory + "/aside-\(index)"
+            let link = directory + "/link-\(index)"
+            XCTAssertEqual(symlink(target, link), 0)
+            let linkInode = try XCTUnwrap(inode(link))
+            let observer: @Sendable (NativeReplySocketStep) -> Void = { current in
+                guard current == step else { return }
+                XCTAssertEqual(rename(bound, displaced), 0)
+                XCTAssertEqual(rename(link, bound), 0)
+            }
+            XCTAssertThrowsError(try NativeReplyListener(path: bound, observer: observer)) { assertUnproved($0) }
+            XCTAssertEqual(inode(bound), linkInode)
+            XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: bound), target)
+            XCTAssertEqual(inode(target), targetInode)
+            XCTAssertEqual(try XCTUnwrap(attributes(target)).st_mode & 0o777, 0o644)
+            XCTAssertEqual(contents(target), Data("keep".utf8))
+        }
     }
 
     /// A foreign socket with an open mode: no `chmod` runs, and the start reports a failure.
@@ -187,44 +198,22 @@ final class NativeReplyListenerOwnershipTests: XCTestCase {
         let listener = try NativeReplyListener(path: path, observer: observer)
         XCTAssertThrowsError(try listener.receiveFrame(timeout: 0.1))
         listener.removeSocketFile()
-        XCTAssertEqual(names(), [], "The proof held, so the stop removed the socket.")
+        XCTAssertEqual(names(), [URL(fileURLWithPath: path).lastPathComponent], "A start observation never authorizes pathname removal.")
     }
 
     // MARK: - Stop
 
-    func testNormalStopRemovesTheSocketAndThePrivateFolder() throws {
+    func testNormalStopRetainsOneSocketWithoutAddingAPrivateFolder() throws {
         let listener = try NativeReplyListener(path: path)
-        XCTAssertEqual(names(), [URL(fileURLWithPath: path).lastPathComponent])
-        listener.removeSocketFile()
-        XCTAssertEqual(names(), [])
-        listener.removeSocketFile()
-        XCTAssertEqual(names(), [])
-    }
-
-    /// Swap after the cleanup check, before the removal: the old code lost this file at its `unlink`.
-    func testFileSwappedInBeforeThePrivateMoveMovesBackUnchanged() throws {
-        let original = try makeForeignFile(foreign)
-        let listener = try NativeReplyListener(path: path, observer: at(.beforePrivateMove, swapIn(foreign, path)))
+        let original = try XCTUnwrap(inode(path))
+        let boundNames = names()
         listener.removeSocketFile()
         XCTAssertEqual(inode(path), original)
-        XCTAssertEqual(contents(path), Data("keep".utf8))
-        XCTAssertEqual(try XCTUnwrap(attributes(path)).st_mode & 0o777, 0o644)
-        XCTAssertEqual(names(), ["aside", URL(fileURLWithPath: path).lastPathComponent].sorted(), "The private folder is gone.")
-    }
-
-    func testSymlinkSwappedInBeforeThePrivateMoveMovesBackAndItsTargetStays() throws {
-        let target = directory + "/outside"
-        let targetInode = try makeForeignFile(target)
-        XCTAssertEqual(symlink(target, foreign), 0)
-        let linkInode = try XCTUnwrap(inode(foreign))
-        let listener = try NativeReplyListener(path: path, observer: at(.beforePrivateMove, swapIn(foreign, path)))
+        XCTAssertEqual(names(), boundNames)
         listener.removeSocketFile()
-        XCTAssertEqual(inode(path), linkInode)
-        XCTAssertEqual(inode(target), targetInode)
-        XCTAssertEqual(contents(target), Data("keep".utf8))
+        XCTAssertEqual(names(), boundNames, "Repeated cleanup adds no files or folders.")
     }
 
-    /// A file that the first check sees as foreign: no move occurs.
     func testFileSwappedInBeforeTheStopCheckIsNotMoved() throws {
         let original = try makeForeignFile(foreign)
         let listener = try NativeReplyListener(path: path, observer: at(.beforeStopCheck, swapIn(foreign, path)))
@@ -234,55 +223,91 @@ final class NativeReplyListenerOwnershipTests: XCTestCase {
         XCTAssertEqual(names(), ["aside", URL(fileURLWithPath: path).lastPathComponent].sorted())
     }
 
-    /// A file that arrives at the path after the move, or between the check and the removal, is not touched.
-    func testFileThatArrivesAfterTheMoveStays() throws {
-        for step in [NativeReplySocketStep.afterPrivateMove, .beforeRemoval] {
-            let original = try makeForeignFile(foreign)
-            let listener = try NativeReplyListener(path: path, observer: at(step, displace: false, swapIn(foreign, path)))
-            listener.removeSocketFile()
-            XCTAssertEqual(inode(path), original)
-            XCTAssertEqual(contents(path), Data("keep".utf8))
-            XCTAssertEqual(names(), [URL(fileURLWithPath: path).lastPathComponent], "The socket and the private folder are gone.")
-            try FileManager.default.removeItem(atPath: path)
-        }
-    }
-
-    /// The move back cannot replace a later file: the first file stays in the private folder.
-    func testMoveBackThatFindsALaterFileLeavesBothFiles() throws {
-        let first = try makeForeignFile(foreign, text: "first")
-        let later = directory + "/later"
-        let second = try makeForeignFile(later, text: "second")
-        let path = self.path, foreign = self.foreign, aside = self.aside
+    /// Regression at the actual removal name, including the old private-folder implementation.
+    /// The old code passed a swap at the public name but deleted a replacement at this name.
+    func testReplacementAfterTheFinalCleanupCheckStaysUnchanged() throws {
+        let original = try makeForeignFile(foreign)
+        let directory = self.directory!, path = self.path, aside = self.aside, foreign = self.foreign
+        let name = URL(fileURLWithPath: path).lastPathComponent
         let observer: @Sendable (NativeReplySocketStep) -> Void = { step in
-            if step == .beforePrivateMove {
-                XCTAssertEqual(rename(path, aside), 0)
-                XCTAssertEqual(rename(foreign, path), 0)
-            } else if step == .afterPrivateMove {
-                XCTAssertEqual(rename(later, path), 0)
-            }
+            guard step == .beforeRemoval else { return }
+            let stopFolder = try? FileManager.default.contentsOfDirectory(atPath: directory).first { $0.hasPrefix(".\(getpid())-stop-") }
+            let removalPath = stopFolder.map { directory + "/" + $0 + "/" + name } ?? path
+            XCTAssertEqual(rename(removalPath, aside), 0)
+            XCTAssertEqual(rename(foreign, removalPath), 0)
         }
         let listener = try NativeReplyListener(path: path, observer: observer)
         listener.removeSocketFile()
-        XCTAssertEqual(inode(path), second)
-        XCTAssertEqual(contents(path), Data("second".utf8))
-        let privateFolder = try XCTUnwrap(names().first { $0.hasPrefix(".\(getpid())-stop-") })
-        let kept = directory + "/" + privateFolder + "/" + URL(fileURLWithPath: path).lastPathComponent
-        XCTAssertEqual(inode(kept), first)
-        XCTAssertEqual(contents(kept), Data("first".utf8))
+        XCTAssertEqual(inode(path), original)
+        XCTAssertEqual(contents(path), Data("keep".utf8))
+        XCTAssertEqual(try XCTUnwrap(attributes(path)).st_mode & 0o777, 0o644)
+        XCTAssertEqual(names(), ["aside", name].sorted(), "Cleanup neither moves nor removes a replacement.")
     }
 
-    /// The signal route runs the same removal, and it leaves no socket and no private folder.
-    func testStopSignalRunsTheSameRemovalThenFinishes() throws {
-        let listener = try NativeReplyListener(path: path)
-        let finished = expectation(description: "finish")
-        finished.assertForOverFulfill = false
-        let handler = NativeReplyStopHandler(listener: listener, signals: [SIGUSR2]) { _ in finished.fulfill() }
-        for _ in 0..<50 where inode(listener.path) != nil {
-            kill(getpid(), SIGUSR2)
-            usleep(100_000)
+    func testSymlinkAfterTheFinalCleanupCheckAndItsExternalTargetStayUnchanged() throws {
+        let replies = directory + "/replies"
+        try FileManager.default.createDirectory(atPath: replies, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let bound = replies + "/reply.sock", target = directory + "/external-target"
+        let targetInode = try makeForeignFile(target)
+        XCTAssertEqual(symlink(target, foreign), 0)
+        let linkInode = try XCTUnwrap(inode(foreign))
+        let foreign = self.foreign, aside = self.aside
+        let observer: @Sendable (NativeReplySocketStep) -> Void = { step in
+            guard step == .beforeRemoval else { return }
+            XCTAssertEqual(rename(bound, aside), 0)
+            XCTAssertEqual(rename(foreign, bound), 0)
         }
+        let listener = try NativeReplyListener(path: bound, observer: observer)
+        listener.removeSocketFile()
+        XCTAssertEqual(inode(bound), linkInode)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: bound), target)
+        XCTAssertEqual(inode(target), targetInode)
+        XCTAssertEqual(try XCTUnwrap(attributes(target)).st_mode & 0o777, 0o644)
+        XCTAssertEqual(contents(target), Data("keep".utf8))
+    }
+
+    func testForeignSocketAfterTheFinalCleanupCheckStaysUnchanged() throws {
+        let holder = try makeForeignSocket(foreign, listening: true)
+        defer { Darwin.close(holder) }
+        let original = try XCTUnwrap(inode(foreign))
+        let listener = try NativeReplyListener(path: path, observer: at(.beforeRemoval, swapIn(foreign, path)))
+        listener.removeSocketFile()
+        XCTAssertEqual(inode(path), original)
+        XCTAssertEqual(try XCTUnwrap(attributes(path)).st_mode & 0o777, 0o600)
+    }
+
+    func testEverySuccessfulBindCountsIncludingNormalStopAndUncertainStart() throws {
+        var first: NativeReplyListener? = try NativeReplyListener(path: path)
+        let original = try XCTUnwrap(inode(path))
+        first = nil
+        XCTAssertNil(first)
+        XCTAssertEqual(inode(path), original, "Deinit leaves one socket from the successful bind.")
+        XCTAssertThrowsError(try NativeReplyListener(path: path))
+        XCTAssertEqual(names().count, 1, "A bind collision adds nothing.")
+        var fallback: NativeReplyListener? = try NativeReplyListener.start(directory: directory, fallbackTag: { "abcdef01" })
+        XCTAssertFalse(try XCTUnwrap(fallback).hasProcessIDName)
+        fallback?.removeSocketFile()
+        fallback = nil
+        XCTAssertEqual(names().count, 2, "A normal fallback stop counts as one more successful bind.")
+        let failedPath = directory + "/failed.sock"
+        XCTAssertThrowsError(try NativeReplyListener(path: failedPath, observer: { step in
+            if step == .afterBind { XCTAssertEqual(chmod(failedPath, 0o666), 0) }
+        })) { assertUnproved($0) }
+        XCTAssertEqual(names().count, 3, "An uncertain start after bind counts too.")
+        XCTAssertFalse(names().contains { $0.contains("-stop-") })
+    }
+
+    /// The signal route still finishes, and leaves the same single socket.
+    func testStopSignalRetainsTheSocketThenFinishes() throws {
+        let listener = try NativeReplyListener(path: path)
+        let original = try XCTUnwrap(inode(path))
+        let finished = expectation(description: "finish")
+        let handler = NativeReplyStopHandler(listener: listener, signals: [SIGUSR2]) { _ in finished.fulfill() }
+        usleep(100_000) // Allow the dispatch source to register before the one bounded signal.
+        kill(getpid(), SIGUSR2)
         wait(for: [finished], timeout: 5)
-        XCTAssertEqual(names(), [])
+        XCTAssertEqual(inode(path), original)
+        XCTAssertEqual(names(), [URL(fileURLWithPath: path).lastPathComponent])
         withExtendedLifetime(handler) {}
     }
 }

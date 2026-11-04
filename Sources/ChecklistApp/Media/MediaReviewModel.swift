@@ -68,6 +68,8 @@ typealias MediaValues = [String: Any]
     @Published var ticketChoices: [Record] = []
     @Published var ticketChoicesLoading = false
     @Published var ticketLinkLine = ""
+    /// CL-430: the last refusal of an item's ticket change, by item ID. Local only.
+    @Published var itemTicketLines: [String: String] = [:]
     /// Audio/video takes: two verified copies, one preparation and one playing take at most.
     let playback = MediaPlaybackCoordinator()
     private(set) var projectID = ""
@@ -562,7 +564,7 @@ typealias MediaValues = [String: Any]
     var reworkAvailable: Bool { !historyOnly && header.string("state") == "open" }
     var successorAvailable: Bool { !historyOnly && ["open","closed"].contains(header.string("state")) }
     var reworkCandidates: [Record] { rows.filter { $0.string("disposition") == "changes_requested" } }
-    func clearRoundActions() { reworkSelection=[];reworkPreview=Record(values:[:]);successorItems=[:];bulk=MediaBulkState();resultSend=MediaResultSend();ticketLinkLine="" }
+    func clearRoundActions() { reworkSelection=[];reworkPreview=Record(values:[:]);successorItems=[:];bulk=MediaBulkState();resultSend=MediaResultSend();ticketLinkLine="";itemTicketLines=[:] }
     /// Only a listed Changes-requested item can be selected; the service checks the exact decision.
     func toggleRework(_ row: Record) {
         if reworkSelection.contains(row.id) {reworkSelection.remove(row.id)}
@@ -667,12 +669,14 @@ extension MediaReviewModel {
     /// The round's ticket (`task: {id, key, title, status_name}` in the round read), or an empty record.
     var linkedTask: Record { Record(values:header.object("task")) }
     /// The header line: "For HEIR-130 — Behemoth walk", or "No ticket".
-    nonisolated static func ticketLine(_ header: Record) -> String {
-        let task=Record(values:header.object("task"))
-        guard !task.id.isEmpty else {return "No ticket"}
-        let key=task.string("key"),title=task.string("title")
-        let name=[key,title].filter {!$0.isEmpty}.joined(separator:" — ")
-        return "For "+(name.isEmpty ? "the linked ticket" : name)
+    nonisolated static func ticketLine(_ header: Record) -> String {taskLine(Record(values:header.object("task")))}
+    nonisolated static func taskLine(_ task: Record) -> String {
+        task.id.isEmpty ? "No ticket" : "For "+taskName(task)
+    }
+    /// "HEIR-130 — Behemoth walk", or "the linked ticket" when the read has neither.
+    nonisolated static func taskName(_ task: Record) -> String {
+        let name=[task.string("key"),task.string("title")].filter {!$0.isEmpty}.joined(separator:" — ")
+        return name.isEmpty ? "the linked ticket" : name
     }
     /// The owner can choose or change the ticket while the round is Draft or Open (not closed).
     var ticketChangeAvailable: Bool { writable && header.id == roundID }
@@ -713,16 +717,31 @@ extension MediaReviewModel {
     /// After a send it offers only changes: a listed decision that the last send did not carry.
     /// While some items are not listed (a filter, or a page not loaded) the model cannot prove
     /// that nothing is new, so the action stays enabled and the service answers.
+    /// CL-430: the action names "N tickets" when the decided items name more than one ticket.
     nonisolated static func resultAction(header: Record,rows: [Record],counts: [String: Int],listComplete: Bool) -> MediaResultAction? {
-        let key=Record(values:header.object("task")).string("key",fallback:"the ticket")
-        guard !Record(values:header.object("task")).id.isEmpty else {return nil}
-        let decided=rows.filter {decidedDispositions.contains($0.string("disposition")) && !$0.string("decision_id").isEmpty}
-        guard !decided.isEmpty || decidedDispositions.contains(where:{(counts[$0] ?? 0)>0}) else {return nil}
+        let decided=decidedRows(rows)
+        let withdrawn=listComplete ? withdrawnSentTickets(header:header,rows:rows) : [:]
+        guard !Record(values:header.object("task")).id.isEmpty || !itemTickets(header:header,rows:decided).isEmpty || !withdrawn.isEmpty else {return nil}
+        guard !decided.isEmpty || decidedDispositions.contains(where:{(counts[$0] ?? 0)>0}) || !withdrawn.isEmpty else {return nil}
+        let key=resultTarget(header:header,rows:rows)
         let last=Record(values:header.object("last_result_sent"))
         guard !last.values.isEmpty else {return .init(label:"Send results to "+key,disabledReason:nil)}
         let sent=Set(last.strings("decision_ids"))
-        let changed = !listComplete || decided.contains {!sent.contains($0.string("decision_id"))}
+        let changed = !listComplete || !withdrawn.isEmpty || decided.contains {!sent.contains($0.string("decision_id"))}
         return .init(label:"Send changes to "+key,disabledReason:changed ? nil : allResultsSentText)
+    }
+    /// CL-428 U1: decisions of the last send that no listed item holds any more (the owner withdrew
+    /// or replaced them), each with the ticket it went to. The next send reports a withdrawn one
+    /// as "Pending — decision withdrawn", so it is a change. Call it only with the complete list.
+    nonisolated static func withdrawnSentTickets(header: Record,rows: [Record]) -> [String: String] {
+        let last=Record(values:header.object("last_result_sent"))
+        let current=Set(rows.map {$0.string("decision_id")}.filter {!$0.isEmpty})
+        var ticketOf:[String: String]=[:]
+        for send in last.records("sends") {for id in send.strings("decision_ids") {ticketOf[id]=send.string("task_id")}}
+        let roundTask=Record(values:header.object("task")).id
+        var result:[String: String]=[:]
+        for id in last.strings("decision_ids") where !current.contains(id) {result[id]=ticketOf[id] ?? roundTask}
+        return result
     }
     nonisolated static let allResultsSentText="All results sent."
     nonisolated static let nothingNewText="Nothing new to send."
@@ -742,27 +761,51 @@ extension MediaReviewModel {
     func sendResults() async {
         guard let action=resultAction,action.disabledReason==nil,!resultSend.sending,let store else {return}
         if let reason=store.writeBlockReason {store.inform(reason);return}
-        let project=projectID,round=roundID,choice=roundChoiceEpoch,key=linkedTask.string("key",fallback:"the ticket")
+        let project=projectID,round=roundID,choice=roundChoiceEpoch,key=Self.resultTarget(header:header,rows:rows)
         func current() -> Bool {projectID==project && roundID==round && roundChoiceEpoch==choice}
         resultSend=MediaResultSend(roundID:round,sending:true,line:"Sending results to "+key+"…")
         do {
             let reply=try await mutateAwaiting("media_round_send_result",["round_id":round,"expected_revision":header.integer("revision")],quiet:true)
             guard current() else {return}
-            resultSend=MediaResultSend(roundID:round,line:Self.receiptText(reply))
+            resultSend=MediaResultSend(roundID:round,line:Self.receiptText(reply,roundTaskID:Record(values:header.object("task")).id,
+                                                                          mixed:Self.itemTickets(header:header,rows:rows).count>1))
         } catch {
             guard current() else {return}
             let code=(error as? ChecklistError)?.code ?? ""
             resultSend=MediaResultSend(roundID:round,line:Self.sendRefusalText(error),refused:code != "MEDIA_ROUND_NOTHING_NEW")
         }
     }
-    /// "Sent to Codex HEIR-T1 and Claude reviewer at 7:12 PM · 3 items."
-    nonisolated static func receiptText(_ reply: MediaValues) -> String {
-        let names=(reply["recipients"] as? [MediaValues] ?? []).map {Record(values:$0).string("display",fallback:"an unnamed session")}
-        let count=reply["item_count"] as? Int ?? 0
-        let items=count==1 ? "1 item" : "\(count) items"
-        let who=names.isEmpty ? "" : " to "+listText(names)
-        return "Sent"+who+" at "+localTime(reply["sent_at"] as? String ?? "")+" · "+items+((reply["changed_only"] as? Bool ?? false) ? " changed since the last send." : ".")
+    /// One ticket: "Sent to Codex HEIR-T1 and Claude reviewer at 7:12 PM · 3 items."
+    /// CL-430, more than one ticket: a first line, then one line per ticket of the reply's `sends`
+    /// ("HEIR-89: Codex HEIR-T1 · 1 item"), then "N items have no ticket." from `unsent_item_count`.
+    nonisolated static func receiptText(_ reply: MediaValues,roundTaskID: String? = nil,mixed: Bool = false) -> String {
+        let sends=reply["sends"] as? [MediaValues] ?? []
+        let changed=reply["changed_only"] as? Bool ?? false,time=localTime(reply["sent_at"] as? String ?? "")
+        let unsent=reply["unsent_item_count"] as? Int ?? 0
+        let unsentLine=unsent<=0 ? nil : unsent==1 ? "1 item has no ticket." : "\(unsent) items have no ticket."
+        guard sends.count>1 else {
+            // The CL-427 top-level fields of a one-ticket round, else its one `sends` entry. When that
+            // entry's ticket is not the round's ticket, or the round's items name more than one ticket,
+            // the receipt names the key (round 95 UI check: "Sent to HEIR-89: …").
+            let one=reply["recipients"] != nil || sends.isEmpty ? reply : sends[0]
+            let task=Record(values:one).string("task_id")
+            let named = reply["recipients"] == nil && !sends.isEmpty && (mixed || roundTaskID.map {task != $0} ?? false)
+            let names=recipientNames(one["recipients"])
+            let key=Record(values:one).string("task_key",fallback:"A ticket")
+            let who=named ? " to "+key+(names.isEmpty ? "" : ": "+listText(names)) : (names.isEmpty ? "" : " to "+listText(names))
+            let text="Sent"+who+" at "+time+" · "+itemsText(one["item_count"] as? Int ?? 0)+(changed ? " changed since the last send." : ".")
+            return unsentLine.map {text+" "+$0} ?? text
+        }
+        var lines=["Sent to \(sends.count) tickets at "+time+(changed ? " · only changes since the last send." : ".")]
+        for send in sends {
+            let names=recipientNames(send["recipients"]),key=Record(values:send).string("task_key",fallback:"A ticket")
+            lines.append(key+(names.isEmpty ? "" : ": "+listText(names))+" · "+itemsText(send["item_count"] as? Int ?? 0))
+        }
+        if let unsentLine {lines.append(unsentLine)}
+        return lines.joined(separator:"\n")
     }
+    nonisolated static func recipientNames(_ raw: Any?) -> [String] {(raw as? [MediaValues] ?? []).map {Record(values:$0).string("display",fallback:"an unnamed session")}}
+    nonisolated static func itemsText(_ count: Int) -> String {count==1 ? "1 item" : "\(count) items"}
     nonisolated static func listText(_ names: [String]) -> String {
         guard names.count>1 else {return names.first ?? ""}
         return names.dropLast().joined(separator:", ")+" and "+names.last!
@@ -786,6 +829,75 @@ extension MediaReviewModel {
         formatter.dateStyle=calendar.isDateInToday(date) ? .none : .medium
         formatter.timeStyle = .short
         return formatter.string(from:date)
+    }
+}
+/// CL-430: each item may name its own ticket (`task` on the item read). The item's effective
+/// ticket is its own ticket, else the round's ticket. The send posts one note per ticket.
+extension MediaReviewModel {
+    nonisolated static func effectiveTask(item: Record,header: Record) -> Record {
+        let own=Record(values:item.object("task"))
+        return own.id.isEmpty ? Record(values:header.object("task")) : own
+    }
+    nonisolated static func decidedRows(_ rows: [Record]) -> [Record] {
+        rows.filter {decidedDispositions.contains($0.string("disposition")) && !$0.string("decision_id").isEmpty}
+    }
+    /// The distinct effective tickets of these items, sorted by key. Items with no ticket are left out.
+    nonisolated static func itemTickets(header: Record,rows: [Record]) -> [Record] {
+        var seen=Set<String>(),result:[Record]=[]
+        for row in rows {
+            let task=effectiveTask(item:row,header:header)
+            if !task.id.isEmpty,seen.insert(task.id).inserted {result.append(task)}
+        }
+        return result.sorted {$0.string("key").localizedStandardCompare($1.string("key")) == .orderedAscending}
+    }
+    /// The header line: "For 5 tickets" when the listed items name more than one ticket; else the
+    /// CL-427 line of the round's ticket, or of the one ticket that the items name.
+    nonisolated static func ticketLine(_ header: Record,rows: [Record]) -> String {
+        let tickets=itemTickets(header:header,rows:rows)
+        if tickets.count>1 {return "For \(tickets.count) tickets"}
+        if Record(values:header.object("task")).id.isEmpty,let only=tickets.first {return taskLine(only)}
+        return ticketLine(header)
+    }
+    var ticketLineText: String { Self.ticketLine(header,rows:rows) }
+    /// The small card text "For HEIR-89": only when the item's ticket differs from the round's ticket
+    /// (or the round has none). A card that uses the round's ticket shows nothing.
+    nonisolated static func cardTicketLabel(item: Record,header: Record) -> String? {
+        let own=Record(values:item.object("task")),round=Record(values:header.object("task"))
+        guard !own.id.isEmpty,own.id != round.id else {return nil}
+        return "For "+own.string("key",fallback:"its own ticket")
+    }
+    /// The details popover line for the item's ticket.
+    nonisolated static func itemTicketLine(item: Record,header: Record) -> String {
+        let own=Record(values:item.object("task")),round=Record(values:header.object("task"))
+        if !own.id.isEmpty {return "Ticket: "+taskName(own)}
+        if !round.id.isEmpty {return "Ticket: "+taskName(round)+" (the round's ticket)"}
+        return "Ticket: none. Results for this item are not sent."
+    }
+    /// The send target: "HEIR-130", or "5 tickets" when the decided items name more than one ticket.
+    /// It also counts the tickets of withdrawn sent decisions, because the next send goes there too.
+    nonisolated static func resultTarget(header: Record,rows: [Record]) -> String {
+        let tickets=itemTickets(header:header,rows:decidedRows(rows))
+        let known=itemTickets(header:header,rows:rows)+[Record(values:header.object("task"))]
+        var ids=Set(tickets.map(\.id))
+        ids.formUnion(withdrawnSentTickets(header:header,rows:rows).values.filter {!$0.isEmpty})
+        if ids.count>1 {return "\(ids.count) tickets"}
+        let only=ids.first.flatMap {id in known.first {$0.id==id}}
+        return (only ?? tickets.first ?? Record(values:header.object("task"))).string("key",fallback:"the ticket")
+    }
+    /// `expected_revision` is the item's revision (CL-430 Core), not the round's.
+    nonisolated static func itemLinkTaskParams(header: Record,item: Record,taskID: String?) -> MediaValues {
+        ["round_id":header.id,"item_id":item.id,"expected_revision":item.integer("revision"),"task_id":taskID.map {$0 as Any} ?? NSNull()]
+    }
+    /// Sends `media_item_link_task`; `nil` removes the item's own ticket, so the item uses the
+    /// round's ticket again. A refusal shows one line in the card's details; no global alert.
+    func linkItemTask(_ itemID: String,_ taskID: String?) {
+        guard ticketChangeAvailable,!itemID.isEmpty,let item=rows.first(where: {$0.id==itemID}) else {return}
+        let round=roundID
+        itemTicketLines[itemID]=nil
+        mutateReportingFailure("media_item_link_task",Self.itemLinkTaskParams(header:header,item:item,taskID:taskID),quiet:true,onFailure:{[weak self] error in
+            guard let self,self.roundID==round else {return}
+            self.itemTicketLines[itemID]="Could not change this item's ticket: "+PlainError.text(error)
+        }) {[weak self] _ in self?.itemTicketLines[itemID]=nil}
     }
 }
 struct MediaResultAction: Equatable {

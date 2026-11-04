@@ -62,16 +62,16 @@ struct PreparedMediaCommand {
             try router!.validateMediaAttachmentImport(db,project:project,owner:capture.owner,prepared:capture.prepared,caller:caller!)
         }
         for original in resources.originals { _ = try router!.validatePreparedAttachment(db,project:project,prepared:original) }
-        // A ticket is outside the media observation set. Revalidate a prepared round's
+        // A ticket is outside the media observation set. Revalidate a prepared round or item's
         // destination in the final writer snapshot before committing its link.
-        for write in writes where write.type == Data("media_round".utf8) {
+        for write in writes where [Data("media_round".utf8),Data("media_item".utf8)].contains(write.type) {
             let round = jsonObject(String(decoding:write.data,as:UTF8.self))
             if let taskID = round["task_id"] as? String {
                 guard let row = try Row.fetchOne(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE id=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND type='task'",arguments:[Data(taskID.utf8),write.project]) else {
-                    throw CoreError("NOT_FOUND","The round's ticket is unavailable in this project.")
+                    throw CoreError("NOT_FOUND","The linked ticket is unavailable in this project.")
                 }
                 let task = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"task").object
-                if ["media_round_create","media_round_link_task"].contains(method),bool(task,"purged") {
+                if ["media_round_create","media_round_link_task","media_item_link_task"].contains(method),bool(task,"purged") {
                     throw CoreError("TICKET_PURGED","A purged ticket cannot receive a new media link.")
                 }
             }

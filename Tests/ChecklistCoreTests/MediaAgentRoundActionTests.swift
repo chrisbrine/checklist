@@ -214,7 +214,7 @@ final class MediaAgentRoundActionTests: XCTestCase {
             "media_rework_create":open.merging(["epic_id":epicID,"preview_digest":"x","items":[["item_id":ids[0],"expected_revision":1,"decision_id":"d"]]]) {$1},
             "media_type_restore":["type_id":t["id"]!,"expected_revision":t["revision"]!],
         ]
-        XCTAssertEqual(Set(inputs.keys).union(["media_type_adopt_starter","media_type_create","media_type_revise","media_type_adopt","media_type_retire","media_round_publish","media_round_create","media_round_link_task"]),MediaWorkerContract.settingMethods)
+        XCTAssertEqual(Set(inputs.keys).union(["media_type_adopt_starter","media_type_create","media_type_revise","media_type_adopt","media_type_retire","media_round_publish","media_round_create","media_round_link_task","media_item_link_task"]),MediaWorkerContract.settingMethods)
         for (method,input) in inputs {checks.checkError("HUMAN_CHANNEL_REQUIRED") {try self.worker(f,method,input)}}
         XCTAssertEqual(try f.allState(),before)
     }

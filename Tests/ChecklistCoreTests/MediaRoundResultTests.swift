@@ -225,9 +225,7 @@ final class MediaRoundResultTests: XCTestCase {
         }
     }
 
-    func testPurgedTicketKeepsHistoryButRefusesNewLinksAndResultNotes() throws {
-        let f = try Fixture(),t = try task(f),(r,ids) = try fixture(f)
-        _ = try link(f,r,t);try decide(f,r,ids[0],"needs_look","Retained decision")
+    func purge(_ f: Fixture,_ t: JSON) throws {
         try f.router.dbQueue.writeWithoutTransaction {db in
             try f.router.withValidatedDomainTransaction(db) {
                 let current = try f.router.record(db,t["id"] as! String,type:"task")
@@ -236,6 +234,12 @@ final class MediaRoundResultTests: XCTestCase {
                 try f.router.save(db,tombstone,type:"task");return .commit
             }
         }
+    }
+
+    func testPurgedTicketKeepsHistoryButRefusesNewLinksAndResultNotes() throws {
+        let f = try Fixture(),t = try task(f),(r,ids) = try fixture(f)
+        _ = try link(f,r,t);try decide(f,r,ids[0],"needs_look","Retained decision")
+        try purge(f,t)
         let before = try f.allState()
         checks.checkError("TICKET_PURGED") {try f.call("media_round_send_result",self.sendInput(f,r))}
         checks.checkError("TICKET_PURGED") {try self.link(f,r,t)}

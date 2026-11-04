@@ -574,7 +574,13 @@ import ChecklistIPC
     var hints: [String: String] = [:]
     var decisions: [String: MediaValues] = [:]
     var itemRevisions: [String: Int] = [:]
-    var writes: [String] {calls.map(\.0).filter {["media_round_publish","media_context_approve","media_decide","media_decision_withdraw","media_adopt_suggestion","media_suggestion_dismiss"].contains($0)}}
+    // CL-427 X1: opt-in routing/receipt refreshes with a stable inspected context.
+    var metadataRevision = 0
+    var linkedTask: MediaValues?
+    var itemTasks: [String: MediaValues] = [:]
+    var listedDirections: [String]?
+    var validateObservation = false
+    var writes: [String] {calls.map(\.0).filter {["media_round_publish","media_context_approve","media_decide","media_decision_withdraw","media_adopt_suggestion","media_suggestion_dismiss","media_round_send_result","media_round_link_task","media_item_link_task"].contains($0)}}
     func params(_ method: String) -> [MediaValues] {calls.filter {$0.0==method}.map(\.1)}
     var schema: MediaValues {
         var schema=MediaTypeSettings.schema(title:"Animation",starter:"animation_video")
@@ -584,8 +590,11 @@ import ChecklistIPC
         schema["layout"]=layout;return schema
     }
     var header: MediaValues {
-        state=="draft" ? ["id":"round","title":"Takes","state":"draft","origin":"agent","revision":1,"observed_context_token":"draft-context","manifest":[:] as MediaValues,"attention":[] as [MediaValues],"type_revision":["schema":schema]]
+        var value: MediaValues = state=="draft" ? ["id":"round","title":"Takes","state":"draft","origin":"agent","revision":1,"observed_context_token":"draft-context","manifest":[:] as MediaValues,"attention":[] as [MediaValues],"type_revision":["schema":schema]]
             : ["id":"round","title":"Takes","state":"open","revision":2,"observed_context_token":"open-context","manifest":["id":"manifest","digest":"digest"],"attention":[] as [MediaValues],"type_revision":["schema":schema]]
+        value["revision"] = (state=="draft" ? 1 : 2) + metadataRevision
+        value["task"] = linkedTask ?? NSNull()
+        return value
     }
     func item(_ direction: String) -> MediaValues {
         var metadata: MediaValues=["character":"Hero","animation_label":"walk_cycle","direction":direction,"take":"1"]
@@ -595,7 +604,10 @@ import ChecklistIPC
         var item: MediaValues=["id":"item-"+direction,"title":"hero__walk_cycle__"+direction+".mp4","revision":state=="draft" ? 2 : 3,"published":state=="open","disposition":"pending",
                 "target":target,"candidates":[["id":"candidate-"+direction,"slots":[] as [MediaValues]]],"originals":[] as [MediaValues],
                 "suggestions":suggestions[direction] ?? [] as [MediaValues]]
+        item["revision"] = itemRevisions[direction] ?? (state=="draft" ? 2 : 3)
+        item["task"] = itemTasks[direction] ?? NSNull()
         if let decision=decisions[direction] {
+            item["decision_id"]=decision["id"]
             item["decision"]=decision;item["disposition"]=decision["disposition"] as? String=="withdrawn" ? "pending" : decision["disposition"]
             item["revision"]=itemRevisions[direction]
         }
@@ -603,11 +615,15 @@ import ChecklistIPC
     }
     func request(_ method: String,_ params: MediaValues) throws -> MediaValues {
         calls.append((method,params))
+        if validateObservation,["media_decide","media_adopt_suggestion"].contains(method) {
+            guard params["expected_revision"] as? Int == header["revision"] as? Int else {throw ChecklistError("REVISION_CONFLICT","Use the refreshed header revision.")}
+            guard params["observed_context_token"] as? String == header["observed_context_token"] as? String else {throw ChecklistError("MEDIA_CONTEXT_CHANGED","The inspected context changed.")}
+        }
         switch method {
         case "media_navigation":return ["types":[["id":"type","title":"Animation","enabled":true]]]
         case "media_round_page":return ["rows":[["id":"round","title":"Takes","state":state]],"has_more":false]
         case "media_round_header":return header
-        case "media_item_page":return ["rows":[] as [MediaValues],"counts":[:] as MediaValues]
+        case "media_item_page":return ["rows":(listedDirections ?? []).map {item($0)},"counts":[:] as MediaValues]
         case "media_item_get":return item(String((params["item_id"] as? String ?? "").dropFirst(5)))
         case "media_publication_preview":
             return ["round":header,"items":["N","E","SE"].map {d -> MediaValues in ["item_id":"item-"+d,"target_id":"draft-"+d,"expected_revision":2,"review_basis_signature":"published-basis-"+d,"title":d,"publication_ready":ready[d]!]}]
@@ -639,6 +655,19 @@ import ChecklistIPC
                 "disposition":"withdrawn","withdraws_decision_id":selection["decision_id"]!,"supersedes_decision_id":selection["decision_id"]!]
             itemRevisions[direction]=(selection["expected_revision"] as? Int ?? 0)+1
             decisions[direction]=decision;return ["decisions":[decision]]
+        case "media_round_link_task":
+            metadataRevision+=1
+            linkedTask=(params["task_id"] as? String).map {["id":$0,"key":"HEIR-131","title":"Another ticket"]}
+            return header
+        case "media_item_link_task":
+            metadataRevision+=1
+            let direction=String((params["item_id"] as? String ?? "").dropFirst(5))
+            itemTasks[direction]=(params["task_id"] as? String).map {["id":$0,"key":"HEIR-132","title":"Item ticket"]}
+            itemRevisions[direction]=(item(direction)["revision"] as? Int ?? 3)+1
+            return item(direction)
+        case "media_round_send_result":
+            metadataRevision+=1
+            return ["message_id":"result-note","recipients":[] as [MediaValues],"item_count":decisions.count,"changed_only":false,"sent_at":"2026-11-04T08:00:00Z"]
         case "media_suggestion_dismiss":return ["suggestion_id":params["suggestion_id"]!,"dismissed":["by":"owner"]]
         default:return [:]
         }
@@ -920,7 +949,7 @@ extension MediaSimpleReviewTests {
         let north=try XCTUnwrap(review.cards["item-N"]),east=try XCTUnwrap(review.cards["item-E"]),southEast=try XCTUnwrap(review.cards["item-SE"])
         XCTAssertEqual(review.recommendation(north)?.reason,"Accept suggested by Heir worker — keep or change it")
         XCTAssertEqual(review.recommendation(east)?.reason,"Flagged by Heir worker")
-        XCTAssertEqual(review.recommendation(southEast)?.reason,"Flagged from checks")
+        XCTAssertEqual(review.recommendation(southEast)?.reason,"Flagged from checks by Heir worker","A check flag names the agent that posted it")
         XCTAssertEqual(review.recommendation(north)?.isFlag,false);XCTAssertEqual(review.recommendation(east)?.isFlag,true)
         XCTAssertEqual(review.recommendation(southEast)?.choiceTitle,"Changes requested")
         XCTAssertEqual(north.draft.note,"Looks right","The suggestion's note is an editable draft");XCTAssertEqual(southEast.draft.note,"Arm clips the cape")
@@ -980,6 +1009,72 @@ extension MediaSimpleReviewTests {
         XCTAssertNil(review.keepAllConfirmation(model:model),"No recommendation is left to keep")
         withExtendedLifetime(store) {}
     }
+    func testSecondCardAndKeepAllStayDecidableAfterResultSendAndTicketLinks() async throws {
+        for method in ["media_round_send_result","media_round_link_task","media_item_link_task"] {
+            let service=DraftService()
+            service.linkedTask=["id":"task-A","key":"HEIR-130","title":"Owning ticket"]
+            service.listedDirections=["N","E","SE"];service.validateObservation=true
+            service.suggestions=["E":[suggestion("s-E","accepted")],"SE":[suggestion("s-SE","accepted")]]
+            let (review,model,store)=await openReview(service)
+            await model.refresh()
+            // Mirrors MediaSimpleReview's onReceive(model.$header), including the post-write refresh.
+            let updates=model.$header.sink {review.update(header:$0)}
+            defer {updates.cancel()}
+            let north=try XCTUnwrap(review.cards["item-N"]),east=try XCTUnwrap(review.cards["item-E"])
+            let inspected=east.draft
+            await review.press("accepted",card:north,model:model)
+            try await settle {!north.sending && north.item.string("disposition")=="accepted"}
+            await model.waitUntilWritable()
+            service.calls=[]
+            switch method {
+            case "media_round_send_result":
+                XCTAssertNotNil(model.resultAction)
+                await model.sendResults()
+            case "media_round_link_task": model.linkTask("task-B")
+            default: model.linkItemTask("item-N","task-C")
+            }
+            try await settle {model.header.integer("revision")==3 && east.header.integer("revision")==3}
+            await model.waitUntilWritable()
+            XCTAssertEqual(service.params(method).count,1,method)
+            XCTAssertTrue(review.cards["item-E"]===east,"The same card keeps the owner's observation")
+            XCTAssertEqual(east.draft,inspected,"No inspection press or automatic reinspection")
+            XCTAssertTrue(east.basisMatches,method)
+            XCTAssertEqual(try east.decisionRequest("accepted")["expected_revision"] as? Int,3)
+            XCTAssertEqual(review.keepAllCards(model:model).map(\.id),["item-E","item-SE"],method)
+            await review.press("accepted",card:east,model:model)
+            try await settle {!east.sending && east.item.string("disposition")=="accepted"}
+            let decision=try XCTUnwrap(service.params("media_decide").last)
+            XCTAssertEqual(decision["expected_revision"] as? Int,3,method)
+            XCTAssertEqual(decision["observed_context_token"] as? String,inspected.contextToken,method)
+            await model.waitUntilWritable()
+            XCTAssertEqual(review.keepAllCards(model:model).map(\.id),["item-SE"])
+            let keep=try XCTUnwrap(review.keepAllConfirmation(model:model))
+            keep.perform()
+            try await settle {service.params("media_adopt_suggestion").count==1 && review.cards["item-SE"]?.sending==false}
+            XCTAssertEqual(service.params("media_adopt_suggestion").first?["expected_revision"] as? Int,3,method)
+            XCTAssertEqual(review.cards["item-SE"]?.item.string("disposition"),"accepted",method)
+            withExtendedLifetime(store) {}
+        }
+    }
+
+    func testRealContextManifestAndAttentionRefreshStillRequireInspection() async throws {
+        for kind in ["context","manifest","attention"] {
+            let service=DraftService();service.suggestions=["E":[suggestion("s-E","accepted")]]
+            let (review,model,store)=await openReview(service)
+            let east=try XCTUnwrap(review.cards["item-E"]),inspected=east.draft
+            var next=service.header;next["revision"]=3;next["observed_context_token"]="changed-"+kind
+            if kind=="manifest" {next["manifest"]=["id":"next-manifest","digest":"new-digest"]}
+            if kind=="attention" {next["attention"]=[["id":"new-attention"]]}
+            review.update(header:Record(values:next))
+            XCTAssertEqual(east.draft,inspected)
+            XCTAssertFalse(east.basisMatches,kind)
+            XCTAssertThrowsError(try east.decisionRequest("accepted"),kind)
+            XCTAssertTrue(review.keepAllCards(model:model).isEmpty,kind)
+            XCTAssertTrue(service.writes.isEmpty)
+            withExtendedLifetime(store) {}
+        }
+    }
+
     func testSecondPressOnEachOwnerChoiceWithdrawsExactHeadAndLeavesPending() async throws {
         let service=DraftService()
         let (review,model,store)=await openReview(service)

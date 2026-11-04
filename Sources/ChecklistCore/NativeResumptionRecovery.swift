@@ -26,11 +26,22 @@ extension CommandRouter {
         return message
     }
 
+    /// CL-405: a resumption gives no new receipt to a system work health note. The note
+    /// belongs to the authorization generation of its health target: queueHealthDeliveries
+    /// refuses any other generation, and the verified closure released that claim. A check
+    /// of current work makes a new note, so a copy has no reason to reach the session again.
+    /// A copy at each resumption only added a row (1,012 such rows in a backup of 2 Nov 2026).
+    /// The original receipt stays fenced in history and in the first recovery summary.
+    static func resumptionSkipsNote(_ message: JSON) -> Bool {
+        message["kind"] as? String == "work_health" && message["origin"] as? String == "system"
+    }
+
     func redeliverNativeClosureNotices(_ db: Database, session: JSON, closure: JSON) throws {
         let pid = try StoredRecord(closure, family: "native_closure").string("project_id")
         let sid = try StoredRecord(session, family: "session").string("id")
         for old in try nativeClosureNotices(db, closure: closure) {
-            guard let message = try nativeClosureNoticeMessage(db, delivery: old, project: pid) else { continue }
+            guard let message = try nativeClosureNoticeMessage(db, delivery: old, project: pid),
+                  !Self.resumptionSkipsNote(message) else { continue }
             let receipts = try queueDirectionDeliveries(db, message: message, recipients: [[
                 "session_id": sid, "recipient_role": "resumed_conversation",
                 "label": "Notice from this conversation's earlier process; its original delivery remains fenced."

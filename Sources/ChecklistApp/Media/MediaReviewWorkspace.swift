@@ -290,11 +290,11 @@ struct MediaRoundTicketBar: View {
     @EnvironmentObject var store: ChecklistStore
     @ObservedObject var model: MediaReviewModel
     @State private var choosing=false
-    @State private var search=""
     var body: some View {
         VStack(alignment:.leading,spacing:4) {
             HStack(spacing:8) {
-                Text(MediaReviewModel.ticketLine(model.header)).font(.subheadline).textSelection(.enabled)
+                // CL-430: "For 5 tickets" when the items name more than one ticket.
+                Text(model.ticketLineText).font(.subheadline).textSelection(.enabled)
                     .accessibilityIdentifier("mediaRoundTicket")
                 if model.ticketChangeAvailable {
                     Button(model.linkedTask.id.isEmpty ? "Choose ticket…" : "Change ticket…") {choosing.toggle()}
@@ -309,15 +309,38 @@ struct MediaRoundTicketBar: View {
                 }
             }
             if let line=model.resultLine {
+                // A multi-ticket receipt has one line per ticket; it grows instead of ending in "…"
+                // (round 95b UI recheck).
                 Text(line.text).font(.caption).foregroundStyle(line.refused ? Color.orange : Color.checklistSecondaryText).textSelection(.enabled)
+                    .lineLimit(nil).fixedSize(horizontal:false,vertical:true)
             }
-            if !model.ticketLinkLine.isEmpty {Text(model.ticketLinkLine).font(.caption).foregroundStyle(.orange).textSelection(.enabled)}
-            if choosing && model.ticketChangeAvailable {picker}
+            if !model.ticketLinkLine.isEmpty {
+                Text(model.ticketLinkLine).font(.caption).foregroundStyle(.orange).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
+            }
+            if choosing && model.ticketChangeAvailable {
+                MediaTicketPicker(model:model,selectedID:model.linkedTask.id,noneTitle:model.linkedTask.id.isEmpty ? nil : "No ticket",
+                                  choose:{model.linkTask($0);choosing=false},close:{choosing=false})
+            }
         }
-        .onChange(of:model.roundID) {_,_ in choosing=false;search=""}
+        .onChange(of:model.roundID) {_,_ in choosing=false}
     }
+    static let visibleTicketChoices = MediaTicketPicker.visibleTicketChoices
+}
+
+/// The CL-427 ticket picker: open tickets of the project, searched by key or title. The round's
+/// ticket bar and a card's details (CL-430, an item's own ticket) both use it.
+struct MediaTicketPicker: View {
+    @EnvironmentObject var store: ChecklistStore
+    @ObservedObject var model: MediaReviewModel
+    /// The ticket shown as selected, or "".
+    let selectedID: String
+    /// The title of the button that removes the ticket, or nil for no such button.
+    let noneTitle: String?
+    let choose: (String?) -> Void
+    let close: () -> Void
+    @State private var search=""
     static let visibleTicketChoices = 12
-    private var picker: some View {
+    var body: some View {
         VStack(alignment:.leading,spacing:4) {
             TextField("Search open tickets by key or title",text:$search).accessibilityIdentifier("mediaRoundTicketSearch")
             if model.ticketChoicesLoading && model.ticketChoices.isEmpty {ProgressView().controlSize(.small)}
@@ -325,9 +348,9 @@ struct MediaRoundTicketBar: View {
             // here, so the matches never showed. A plain list of the first matches always has its size.
             VStack(alignment:.leading,spacing:2) {
                 ForEach(Array(model.ticketChoices.prefix(Self.visibleTicketChoices))) {task in
-                    Button(task.string("key")+" — "+task.string("title")) {model.linkTask(task.id);choosing=false}
+                    Button(task.string("key")+" — "+task.string("title")) {choose(task.id)}
                         .buttonStyle(.plain).padding(.vertical,2)
-                        .accessibilityAddTraits(task.id==model.linkedTask.id ? .isSelected : [])
+                        .accessibilityAddTraits(task.id==selectedID ? .isSelected : [])
                 }
                 if model.ticketChoices.count > Self.visibleTicketChoices {
                     Text("Type more of the key or title to see the other \(model.ticketChoices.count - Self.visibleTicketChoices) tickets.")
@@ -339,12 +362,38 @@ struct MediaRoundTicketBar: View {
             }
             .fixedSize(horizontal:false,vertical:true)
             HStack {
-                if !model.linkedTask.id.isEmpty {Button("No ticket") {model.linkTask(nil);choosing=false}}
-                Button("Close") {choosing=false}
+                if let noneTitle {Button(noneTitle) {choose(nil)}}
+                Button("Close",action:close)
             }
         }
         .checklistDisabled([(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
         .task(id:search) {await model.loadTicketChoices(search)}
+    }
+}
+
+/// CL-430: an item's own ticket in the card's details, with the same picker as the round.
+/// A refusal shows as one plain line here; no global alert shows it.
+struct MediaItemTicketControl: View {
+    @ObservedObject var model: MediaReviewModel
+    let item: Record
+    @State private var choosing=false
+    var body: some View {
+        let own=Record(values:item.object("task")),round=model.linkedTask
+        VStack(alignment:.leading,spacing:4) {
+            HStack(spacing:6) {
+                Text(MediaReviewModel.itemTicketLine(item:item,header:model.header)).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
+                if model.ticketChangeAvailable && !item.id.isEmpty {
+                    Button(own.id.isEmpty ? "Choose ticket…" : "Change ticket…") {choosing.toggle()}
+                        .accessibilityLabel(own.id.isEmpty ? "Choose a ticket for this item" : "Change the ticket for this item")
+                }
+            }
+            if let line=model.itemTicketLines[item.id] {Text(line).foregroundStyle(.orange).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)}
+            if choosing && model.ticketChangeAvailable {
+                MediaTicketPicker(model:model,selectedID:own.id,noneTitle:own.id.isEmpty ? nil : round.id.isEmpty ? "No ticket" : "Use the round's ticket",
+                                  choose:{model.linkItemTask(item.id,$0);choosing=false},close:{choosing=false})
+            }
+        }
+        .accessibilityIdentifier("mediaItemTicket:"+item.id)
     }
 }
 

@@ -73,7 +73,7 @@ enum MediaRecordRegistry {
                     _ = try dependency(id,type:type,project:envelope.projectID,revision:exact)
                 }
             }
-            if envelope.type == "media_round",let raw = value["task_id"] {
+            if ["media_round","media_item"].contains(envelope.type),let raw = value["task_id"] {
                 guard let id = raw as? String,!id.isEmpty else {
                     throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A linked media round requires an exact same-project ticket.")
                 }
@@ -124,6 +124,7 @@ enum MediaRecordRegistry {
             guard result.count < limit else { throw StorageSnapshotFailure.limit }
             result.append(try GRDBRecordEnvelopeAdapter.decode(row))
         }
+        if project == nil {StorageMemoryGuardSeam.observe?("whole_store_records","MediaRecordRegistry.envelopes",result.count)}
         return result
     }
 }

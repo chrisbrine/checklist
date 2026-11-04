@@ -370,7 +370,12 @@ final class StorageObjectFiles {
                 let count = buffer.withUnsafeMutableBytes { Darwin.read(file, $0.baseAddress, $0.count) }
                 if count < 0, errno == EINTR { continue }
                 guard count >= 0 else { throw StorageSnapshotFailure.failed("read",path:path,root:root.path) }
-                if count == 0 { return result }
+                if count == 0 {
+                    if let observe = StorageMemoryGuardSeam.observe, (path as NSString).lastPathComponent == "manifest.json" {
+                        observe("whole_manifest_read",root.appendingPathComponent(path).path,result.count)
+                    }
+                    return result
+                }
                 guard result.count <= maximum - count else { throw StorageSnapshotFailure.limit }
                 result.append(contentsOf: buffer.prefix(count))
             }

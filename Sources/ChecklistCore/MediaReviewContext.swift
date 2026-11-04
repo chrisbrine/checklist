@@ -166,14 +166,17 @@ extension CommandRouter {
         }
         return attentionIDs.filter {eligible.contains($0)}
     }
-    /// Opaque MAC binds observation, caller scope/generation and incarnation; no event sequences.
+    /// Binds review context, not the round's bookkeeping revision. Routing, result receipts,
+    /// flag dismissals and Done warnings do not change what the owner inspected.
+    /// mediaObserve still checks expected_revision; exact item/target/basis and manifest
+    /// guards protect frozen Draft selections and decisions independently of this token.
     func mediaToken(_ db: Database,round: JSON,caller: Caller) throws -> String {
         let record = StoredRecord(round, family: "media_round")
         let project = try record.string("project_id")
         let type = try scoped(db,record.string("type_id"),project,type:"media_review_type")
         let state: JSON = [
             "domain":"media-observed-context-v1", "round_id":try record.requiredValue("id"),
-            "revision":try record.requiredValue("revision"), "context_id":try record.requiredValue("context_id"),
+            "context_id":try record.requiredValue("context_id"),
             "manifest_id":round["manifest_id"] ?? NSNull(), "attention_ids":strings(round,"attention_ids"),
             "type_revision_id":try record.requiredValue("type_revision_id"),
             "adopted_type_revision_id":type["adopted_revision_id"] ?? NSNull(), "principal":caller.principal,

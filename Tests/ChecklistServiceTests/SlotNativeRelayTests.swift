@@ -7,7 +7,7 @@ import ChecklistProviders
 
 /// CL-429: real temporary stores, fake endpoints and native effects only. No
 /// listener, process/registry observation, Codex store read, queue command or
-/// thread open runs. Fixtures stay beside this checkout for the bounded hand-in.
+/// thread open runs. Fixtures live under the test storage root and tearDown removes them.
 final class SlotNativeRelayTests: XCTestCase {
     private final class Fixture {
         let root: URL
@@ -44,12 +44,16 @@ final class SlotNativeRelayTests: XCTestCase {
     private var fixtures: [Fixture] = []
     private let owner = Caller(role: "owner", installation: "slot-relay-test-owner", projectIDs: [])
 
+    /// The test storage root, as the other service tests use it; never a folder beside the
+    /// source tree (CL-431: from the checkout that was ~/Documents/Work).
+    static func storageRoot(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL {
+        if let path = environment["CHECKLIST_TEST_STORAGE_ROOT"], !path.isEmpty {
+            return URL(fileURLWithPath: path, isDirectory: true).resolvingSymlinksInPath()
+        }
+        return FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+    }
     private func fixture(slot: Int? = 1, environment: [String: String] = [:]) throws -> Fixture {
-        // #filePath is inside c429/src/Tests/ChecklistServiceTests. All fixture
-        // writes remain inside the task's explicitly authorized c429 directory.
-        let taskRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
-            .deletingLastPathComponent().deletingLastPathComponent()
-        let root = taskRoot.appendingPathComponent("swift-slot-relay-fixtures").appendingPathComponent(UUID().uuidString)
+        let root = Self.storageRoot().appendingPathComponent("slot-relay-fixture-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let instance = try ChecklistInstance(slotValue: slot.map { NSNumber(value: $0) }, home: root, environment: [:])
         let router = try CommandRouter(root: root.appendingPathComponent("store"))
@@ -71,8 +75,21 @@ final class SlotNativeRelayTests: XCTestCase {
             }
             fixture.coordinator.queue.sync { fixture.coordinator.storageWake?.cancel(); fixture.coordinator.workHealthWake?.cancel() }
             try fixture.coordinator.router.closeStore()
+            // Only the folder that fixture(slot:environment:) created for this test.
+            try FileManager.default.removeItem(at: fixture.root)
         }
         fixtures = []
+    }
+    func testFixturesUseTheTestStorageRootAndNeverTheSourceTree() throws {
+        let source = URL(fileURLWithPath: #filePath).resolvingSymlinksInPath().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let made = try fixture()
+        XCTAssertTrue(made.root.path.hasPrefix(Self.storageRoot().path + "/"), made.root.path)
+        XCTAssertFalse(made.root.path.hasPrefix(source.path + "/"), "No fixture beside the source tree: \(made.root.path)")
+        let custom = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("custom-root")
+        XCTAssertEqual(Self.storageRoot(environment: ["CHECKLIST_TEST_STORAGE_ROOT": custom.path]).path, custom.path)
+        try tearDownWithError()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: made.root.path), "tearDown leaves no fixture folder")
     }
     private func call(_ fixture: Fixture, _ method: String, _ params: [String: Any], caller: Caller? = nil) throws -> [String: Any] {
         var params = params

@@ -184,8 +184,11 @@ extension CommandRouter {
         ORDER BY selected.position LIMIT :limit OFFSET :offset
         """
         let rows = try Row.fetchAll(db,sql:sql,arguments:["index":try jsonString(index),"project":project,"limit":limit,"offset":offset])
-        result["rows"] = rows.map { row -> JSON in
+        result["rows"] = try rows.map { row -> JSON in
             var value = index[row["position"] as Int];value["title"] = row["title"] as String? ?? "";value["metadata"] = jsonObject(row["metadata"] as String)
+            let item = try scoped(db,try StoredRecord(value,family:"media item page").string("id"),project,type:"media_item")
+            value["task_id"] = item["task_id"]
+            value["task"] = try mediaRoundTask(db,round:item) ?? NSNull()
             let values = (try? JSONSerialization.jsonObject(with:Data((row["group_values"] as String).utf8))) as? [Any] ?? []
             value["group_path"] = list.groupBy.enumerated().map {level,id -> JSON in ["field_id":id.rawValue,"value":values[level],"item_count":row["g\(level)"] as Int]}
             return value

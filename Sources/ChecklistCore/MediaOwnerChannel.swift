@@ -14,7 +14,7 @@ extension CommandRouter {
         // CL-318/CL-349: frozen bulk decisions and one-press suggestion adoption, owner only.
         "media_bulk_prepare", "media_bulk_apply", "media_adopt_suggestion", "media_suggestion_dismiss", "media_decision_withdraw",
         // CL-427: link the ticket that owns the takes; sending owner decisions stays owner only.
-        "media_round_link_task", "media_round_send_result"
+        "media_round_link_task", "media_item_link_task", "media_round_send_result"
     ])
     func executeMediaOwnerChannel(method: String, params p: JSON, caller c: Caller) throws -> JSON {
         try owner(c)
@@ -104,6 +104,7 @@ extension CommandRouter {
         let manifest = try (round["manifest_id"] as? String).map {try scoped(db,$0,project,type:"media_round_manifest")}
         let member = (manifest?["items"] as? [JSON] ?? []).first {EnvelopeStorageIdentity.equal($0["item_id"] as? String,itemID)}
         let target = try scoped(db,member?["target_id"] as? String ?? (try StoredRecord(item, family: "media").string("draft_target_id")),project,type:"media_item_target")
+        item["task"] = try mediaRoundTask(db,round:item) ?? NSNull()
         item["published"] = member != nil
         item["target"] = target
         item["candidates"] = try strings(target,"candidate_ids").map {try scoped(db,$0,project,type:"media_candidate")}

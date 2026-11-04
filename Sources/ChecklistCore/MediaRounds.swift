@@ -45,6 +45,7 @@ extension CommandRouter {
         "media_type_adopt_starter":["starter","expected_revision","title"],
         "media_round_create":["type_id","title","task_id"], "media_round_get":["round_id"],
         "media_round_link_task":["round_id","expected_revision","task_id"],
+        "media_item_link_task":["round_id","item_id","expected_revision","task_id"],
         "media_round_send_result":["round_id","expected_revision"],
         "media_item_create":["round_id","title","metadata","candidates"],
         "media_item_update":["item_id","expected_revision","title","metadata","candidates"],
@@ -301,6 +302,7 @@ extension CommandRouter {
         let members = mediaManifestMembers(manifest?["items"] as? [JSON] ?? []) {$0}
         result["items"] = try mediaItems(db,round:round).map { item -> JSON in
             var row = item
+            row["task"] = try mediaRoundTask(db,round:item) ?? NSNull()
             let draft = try scoped(db,(try StoredRecord(item, family: "media").string("draft_target_id")),(try StoredRecord(round, family: "media").string("project_id")),type:"media_item_target")
             row["draft_target"] = draft;row["publication_preview"] = try mediaShapeForTarget(db,item:item,target:draft,typeRevision:type,context:context)
             row["disposition"] = "pending"
@@ -346,8 +348,8 @@ extension CommandRouter {
         if method.hasPrefix("media_intake_") { return try mediaIntakeCommand(db,method:method,p:p,c:c,project:pid,resources:resources) }
         if method.hasPrefix("media_bulk_") { return try mediaBulkCommand(db,method:method,p:p,c:c,project:pid) }
         switch method {
-        case "media_round_link_task":
-            return try mediaLinkTask(db,p,c,project:pid,resources:resources)
+        case "media_round_link_task", "media_item_link_task":
+            return try mediaLinkTask(db,p,c,project:pid,resources:resources,itemLink:method == "media_item_link_task")
         case "media_material_reference_adopt": return try mediaMaterialReferenceAdopt(db,p:p,c:c,project:pid)
         case "media_type_retire":
             // CL-419: the worker channel already applied the agent_rule_changes gate.
@@ -620,7 +622,7 @@ extension CommandRouter {
         if !agent { try owner(c) };var round = try scoped(db,try text(p,"round_id"),pid,type:"media_round")
         let manifest: JSON
         if let systemTaskID {
-            guard round["task_id"] as? String == systemTaskID,round["state"] as? String == "open",let id = round["manifest_id"] as? String else {throw CoreError("MEDIA_MANIFEST_CHANGED","Inspect the current open manifest.")}
+            guard try mediaNamedTaskIDs(db,round:round).contains(systemTaskID),try mediaAllNamedTasksDone(db,round:round),round["state"] as? String == "open",let id = round["manifest_id"] as? String else {throw CoreError("MEDIA_MANIFEST_CHANGED","Inspect the current open manifest.")}
             manifest = try scoped(db,id,pid,type:"media_round_manifest")
         } else {
             try mediaObserve(db,p,round:round,caller:c);manifest = try mediaObservedManifest(db,p,round:round)

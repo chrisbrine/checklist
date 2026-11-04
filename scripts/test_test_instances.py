@@ -2652,6 +2652,36 @@ class SlotRelayTests(unittest.TestCase):
             self.assertFalse(value['created']);self.assertFalse(value['allow_synthetic_relays'])
             self.assertEqual(value['slot_relays'], 'off')
 
+    def test_status_reads_the_running_service_relay_state_and_says_when_it_cannot(self):
+        listener = lambda **fields: subprocess.CompletedProcess([], 0, stdout=json.dumps({'data': {'native_reply_listener': fields}}))
+        cases = [
+            ('stopped', [], None, 'off', 'configuration', 'not running'),
+            ('reports off', [77], listener(slot_relays='off', state='disabled'), 'off', 'service', None),
+            ('reports synthetic', [77], listener(slot_relays='synthetic'), 'synthetic', 'service', None),
+            ('older build', [77], listener(claude_relay='running', state='listening'), 'unknown', 'service', 'before CL-429'),
+            ('unreadable', [77], subprocess.CompletedProcess([], 1, stdout='not json'), 'unknown', 'service', 'no readable status'),
+            ('no reply', [77], subprocess.TimeoutExpired(['checklist'], 10), 'unknown', 'service', 'within 10 seconds')]
+        for name, pids, reply, shown, source, note in cases:
+            with self.subTest(name), test_directory() as directory, ExitStack() as stack:
+                base = Path(directory).resolve();stack.enter_context(patch.object(harness, 'BASE', base / 'slots'))
+                p = harness.paths(4);p['data'].mkdir(parents=True)
+                harness.save(p, {'slot': 4, 'allow_synthetic_relays': False})
+                calls = []
+                def run(command, timeout=60, check=True, cwd=None):
+                    calls.append(command)
+                    if isinstance(reply, BaseException): raise reply
+                    return reply
+                for context in [patch.object(harness, 'checked', return_value=p), patch.object(harness, 'run', side_effect=run),
+                                patch.object(harness, 'launch_state', return_value={'registered': bool(pids)}),
+                                patch.object(harness, 'processes', return_value={'app': [], 'service': pids, 'cli': []})]:
+                    stack.enter_context(context)
+                value = harness.status(4)
+                self.assertEqual(value['slot_relays'], shown);self.assertEqual(value['slot_relays_source'], source)
+                self.assertEqual(value['slot_relays_configured'], 'off')
+                if note is None: self.assertIsNone(value['slot_relays_note'])
+                else: self.assertIn(note, value['slot_relays_note'])
+                self.assertEqual(calls, [[p['bundle'] / 'Contents/MacOS/checklist', 'service', 'status']] if pids else [])
+
     def test_status_text_and_json_include_relay_policy(self):
         for mode in ['off', 'synthetic']:
             for options in [[], ['--json']]:

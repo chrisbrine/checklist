@@ -115,10 +115,11 @@ struct MediaCardRecommendation: Equatable {
     static let flagDispositions: Set<String> = ["changes_requested","needs_look"]
     var isFlag: Bool {Self.flagDispositions.contains(disposition)}
     var choiceTitle: String {MediaSimpleLayout.decisions.first {$0.disposition==disposition}?.title ?? MediaReviewModel.dispositionLabel(disposition)}
-    /// The plain reason on the card.
+    /// The plain reason on the card. `source:"check"` is the posting agent's claim, so a check flag
+    /// also names that agent.
     var reason: String {
         guard isFlag else {return choiceTitle+" suggested by "+author+" — keep or change it"}
-        return source=="check" ? "Flagged from checks" : "Flagged by "+author
+        return source=="check" ? "Flagged from checks by "+author : "Flagged by "+author
     }
     /// True when the owner decided the item's current target. "pending" and "stale" are no decision.
     static func ownerDecided(_ item: Record) -> Bool {!["","pending","stale"].contains(item.string("disposition",fallback:"pending"))}
@@ -1046,7 +1047,12 @@ private struct MediaSimpleCardView: View {
                 Text(MediaReviewModel.dispositionLabel(card.item.string("disposition",fallback:"pending"))).font(.caption)
                 Button {showDetails.toggle()} label: {Image(systemName:"info.circle")}.buttonStyle(.plain)
                     .accessibilityLabel("Details, "+card.label).help("Show item details")
-                    .popover(isPresented:$showDetails) {details}
+                    .popover(isPresented:$showDetails) {details.environmentObject(store)}
+            }
+            // CL-430: the item's own ticket, only when it differs from the round's ticket.
+            if let ticket=MediaReviewModel.cardTicketLabel(item:card.item,header:card.header) {
+                Text(ticket).font(.caption).foregroundStyle(Color.checklistSecondaryText).textSelection(.enabled)
+                    .accessibilityIdentifier("mediaSimpleTicket:"+card.id)
             }
             // CL-421 rework: two equal halves when the card is wide enough, else the reference under the take.
             ViewThatFits(in:.horizontal) {
@@ -1144,13 +1150,19 @@ private struct MediaSimpleCardView: View {
     var details: some View {
         VStack(alignment:.leading,spacing:4) {
             Text(card.label).font(.headline)
-            Text("Item: "+card.item.string("title")).textSelection(.enabled)
+            // Every line wraps: the popover is at most 360 points wide, and a long measurement or
+            // metadata line was cut with "…" (round 95 UI check).
+            Text("Item: "+card.item.string("title")).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
+            // CL-430: set or change this item's ticket with the round's picker.
+            MediaItemTicketControl(model:model,item:card.item)
             if let hint=card.labelMetadata["hint"] as? String,!hint.isEmpty {Text("Hint: "+hint).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)}
             if let prepared=playback.takes[card.key] {
-                Text(MediaPlaybackLabels.playback(loop:true,frameRate:prepared.measurement.timing?.declaredFrameRate))
-                Text(MediaPlaybackLabels.measurement(prepared.measurement)).textSelection(.enabled)
+                Text(MediaPlaybackLabels.playback(loop:true,frameRate:prepared.measurement.timing?.declaredFrameRate)).fixedSize(horizontal:false,vertical:true)
+                Text(MediaPlaybackLabels.measurement(prepared.measurement)).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
             }
-            ForEach(card.labelMetadata.keys.sorted(),id:\.self) {key in Text(key+": "+String(describing:card.labelMetadata[key]!)).textSelection(.enabled)}
+            ForEach(card.labelMetadata.keys.sorted(),id:\.self) {key in
+                Text(key+": "+String(describing:card.labelMetadata[key]!)).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
+            }
         }.font(.caption).padding(12).frame(maxWidth:360,alignment:.leading)
     }
 }

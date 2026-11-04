@@ -237,13 +237,18 @@ final class MediaDecisionWithdrawalTests: XCTestCase {
         XCTAssertEqual(rework.row(published,outcomes[0]["item_id"] as! String)["disposition"] as? String,"pending")
     }
 
-    func testResultSendingOmitsWithdrawnHeadAndRefusesWhenNoOwnerChoiceRemains() throws {
+    func testResultSendingOmitsNeverSentWithdrawalAndReportsPreviouslySentWithdrawal() throws {
         let (f,_,r,ids) = try rework.setup(2),task = try followUp.ticket(f,"Ticket owning the reviewed takes")
         let current = try f.get(r)
+        let neverSentLabel = rework.row(current,ids[0])["title"] as! String
+        let sentLabel = rework.row(current,ids[1])["title"] as! String
         _ = try f.call("media_round_link_task",["round_id":r["id"]!,"expected_revision":current["revision"]!,"task_id":task["id"]!])
         try rework.decide(f,r,ids[0],"accepted",["note":"Withdrawn choice must stay out of the result"])
-        try rework.decide(f,r,ids[1],"needs_look",["note":"Still current"])
         try withdraw(f,r,[ids[0]])
+        let neverSent = try f.get(r),beforeFirstSend = try f.allState()
+        checks.checkError("MEDIA_ROUND_NO_DECISIONS") {try f.call("media_round_send_result",["round_id":r["id"]!,"expected_revision":neverSent["revision"]!])}
+        XCTAssertEqual(try f.allState(),beforeFirstSend,"A never-sent withdrawal creates no note")
+        try rework.decide(f,r,ids[1],"needs_look",["note":"Still current"])
         let sentView = try f.get(r)
         let sent = try f.call("media_round_send_result",["round_id":r["id"]!,"expected_revision":sentView["revision"]!])
         XCTAssertEqual(sent["item_count"] as? Int,1)
@@ -251,8 +256,47 @@ final class MediaDecisionWithdrawalTests: XCTestCase {
         XCTAssertFalse(body.contains("Withdrawn choice"));XCTAssertFalse(body.contains(": Accepted"))
         XCTAssertTrue(body.contains(": Needs look — Still current"))
         try withdraw(f,r,[ids[1]])
-        let pending = try f.get(r),before = try f.allState()
-        checks.checkError("MEDIA_ROUND_NO_DECISIONS") {try f.call("media_round_send_result",["round_id":r["id"]!,"expected_revision":pending["revision"]!])}
-        XCTAssertEqual(try f.allState(),before)
+        let pending = try f.get(r)
+        let update = try f.call("media_round_send_result",["round_id":r["id"]!,"expected_revision":pending["revision"]!])
+        XCTAssertEqual(update["item_count"] as? Int,1)
+        let updateBody = try f.record(update["message_id"] as! String,"message")["body"] as! String
+        XCTAssertEqual(Array(updateBody.components(separatedBy:"\n\n").dropFirst()),["\(sentLabel): Pending — decision withdrawn"])
+        XCTAssertFalse(updateBody.contains(neverSentLabel + ":"),"The first choice was never sent")
+    }
+
+    func testSentAcceptedDecisionWithdrawalSendsPendingOnceAndClearsBaseline() throws {
+        let f = try Fixture(),r = try f.round(f.type(checks.schema()))
+        let item = try f.item(r,title:"Walk @literal"),id = item["id"] as! String
+        _ = try f.publish(r)
+        let task = try followUp.ticket(f,"Ticket owning the reviewed take")
+        var view = try f.get(r)
+        _ = try f.call("media_round_link_task",["round_id":r["id"]!,"expected_revision":view["revision"]!,"task_id":task["id"]!])
+        let decision = try rework.decide(f,r,id,"accepted",["note":"Use this take"])
+        view = try f.get(r)
+        let first = try f.call("media_round_send_result",["round_id":r["id"]!,"expected_revision":view["revision"]!])
+        let firstBody = try f.record(first["message_id"] as! String,"message")["body"] as! String
+        XCTAssertEqual(Array(firstBody.components(separatedBy:"\n\n").dropFirst()),["Walk @literal: Accepted — Use this take"])
+        XCTAssertEqual(first["item_count"] as? Int,1)
+        try withdraw(f,r,[id])
+        view = try f.get(r)
+        let input: JSON = ["round_id":r["id"]!,"expected_revision":view["revision"]!],command = uuid()
+        let update = try f.call("media_round_send_result",input,command:command)
+        XCTAssertEqual(update["item_count"] as? Int,1)
+        XCTAssertEqual(update["changed_only"] as? Bool,true)
+        let sends = try XCTUnwrap(update["sends"] as? [JSON])
+        XCTAssertEqual(sends.count,1);XCTAssertEqual(sends[0]["item_count"] as? Int,1)
+        XCTAssertEqual(sends[0]["task_id"] as? String,task["id"] as? String)
+        XCTAssertEqual(sends[0]["message_id"] as? String,update["message_id"] as? String)
+        let body = try f.record(update["message_id"] as! String,"message")["body"] as! String
+        XCTAssertEqual(Array(body.components(separatedBy:"\n\n").dropFirst()),["Walk @literal: Pending — decision withdrawn"])
+        let receipt = try XCTUnwrap(f.get(r)["last_result_sent"] as? JSON)
+        XCTAssertTrue(strings(receipt,"decision_ids").isEmpty)
+        XCTAssertTrue((receipt["sends"] as! [JSON]).isEmpty)
+        XCTAssertEqual(try f.record(decision["id"] as! String,"media_owner_decision")["disposition"] as? String,"accepted")
+        let before = try f.allState()
+        XCTAssertEqual(try f.call("media_round_send_result",input,command:command)["replayed"] as? Bool,true)
+        view = try f.get(r)
+        checks.checkError("MEDIA_ROUND_NOTHING_NEW") {try f.call("media_round_send_result",["round_id":r["id"]!,"expected_revision":view["revision"]!])}
+        XCTAssertEqual(try f.allState(),before,"Replay and a third send cannot repeat the withdrawal")
     }
 }

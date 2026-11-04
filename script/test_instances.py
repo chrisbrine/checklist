@@ -1534,6 +1534,23 @@ def start(arguments, p):
     print(f'Slot {arguments.slot} ready ({metadata["mode"]}).')
 
 
+def observed_slot_relays(p, service_pids):
+    """CL-431: the running slot service's own relay state from its service_info, or None with a plain reason.
+    slot.json holds only the launch configuration; a slot that runs an older build can relay with it set to off."""
+    if not service_pids:
+        return None, 'The slot service is not running; slot_relays shows the launch configuration.'
+    try: result = run([p['bundle'] / 'Contents/MacOS/checklist', 'service', 'status'], timeout=10, check=False)
+    except subprocess.TimeoutExpired:
+        return 'unknown', 'The running slot service gave no status within 10 seconds; its relay state is unknown.'
+    try: listener = json.loads(result.stdout)['data']['native_reply_listener']
+    except (ValueError, TypeError, KeyError):
+        return 'unknown', 'The running slot service gave no readable status; its relay state is unknown.'
+    value = listener.get('slot_relays') if isinstance(listener, dict) else None
+    if value in ['off', 'synthetic']: return value, None
+    return 'unknown', ('The running slot service reports no slot_relays state (a build before CL-429): '
+                       'it can relay notes to real conversations.')
+
+
 def status(number):
     p = checked(number)
     if not p['folder'].exists():
@@ -1541,10 +1558,14 @@ def status(number):
                 'launchd': launch_state(p), 'processes': processes(p)}
     metadata = load(p)
     allow_synthetic_relays = metadata.get('allow_synthetic_relays') is True
+    configured = 'synthetic' if allow_synthetic_relays else 'off'
+    found = processes(p)
+    observed, note = observed_slot_relays(p, found['service'])
     size = sum(file.lstat().st_size for file in p['data'].rglob('*') if file.is_file() and not file.is_symlink())
     return dict(metadata, created=True, allow_synthetic_relays=allow_synthetic_relays,
-                slot_relays='synthetic' if allow_synthetic_relays else 'off',
-                launchd=launch_state(p), processes=processes(p), data_root=str(p['data']), data_bytes=size)
+                slot_relays=observed or configured, slot_relays_configured=configured,
+                slot_relays_source='configuration' if observed is None else 'service', slot_relays_note=note,
+                launchd=launch_state(p), processes=found, data_root=str(p['data']), data_bytes=size)
 
 
 def check(p):

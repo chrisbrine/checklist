@@ -567,3 +567,149 @@ extension MediaOwnerSliceTests {
         model.chooseRound("round");XCTAssertNil(model.resultSend.line.isEmpty ? nil : model.resultSend.line)
     }
 }
+
+/// CL-430: each item may name its own ticket; the send posts one note per ticket.
+/// Synthetic peer replies only. No native app, service, keychain or decoder.
+extension MediaOwnerSliceTests {
+    private static let heir89:MediaValues=["id":"task-89","key":"HEIR-89","title":"Story walk north","status_name":"Queued"]
+    private static let heir90:MediaValues=["id":"task-90","key":"HEIR-90","title":"Story walk east","status_name":"Queued"]
+    private func item(_ id: String,task: MediaValues?,decision: String = "",disposition: String = "accepted") -> MediaValues {
+        var value=decided(id,decision:decision,disposition:disposition);value["task"]=task ?? NSNull()
+        if decision.isEmpty {value["disposition"]="pending";value["decision_id"]=""}
+        return value
+    }
+    func testCardShowsItsOwnTicketOnlyWhenItDiffersAndTheHeaderCountsTickets() async {
+        let round=Record(values:linkedHeader(task:Self.heir130)),none=Record(values:linkedHeader(task:nil))
+        XCTAssertEqual(MediaReviewModel.cardTicketLabel(item:Record(values:item("a",task:Self.heir89)),header:round),"For HEIR-89")
+        XCTAssertNil(MediaReviewModel.cardTicketLabel(item:Record(values:item("b",task:Self.heir130)),header:round),"Same as the round's ticket")
+        XCTAssertNil(MediaReviewModel.cardTicketLabel(item:Record(values:item("c",task:nil)),header:round),"Uses the round's ticket")
+        XCTAssertEqual(MediaReviewModel.cardTicketLabel(item:Record(values:item("a",task:Self.heir89)),header:none),"For HEIR-89")
+        XCTAssertNil(MediaReviewModel.cardTicketLabel(item:Record(values:item("c",task:nil)),header:none))
+        XCTAssertEqual(MediaReviewModel.itemTicketLine(item:Record(values:item("a",task:Self.heir89)),header:round),"Ticket: HEIR-89 — Story walk north")
+        XCTAssertEqual(MediaReviewModel.itemTicketLine(item:Record(values:item("c",task:nil)),header:round),"Ticket: HEIR-130 — Behemoth walk (the round's ticket)")
+        XCTAssertEqual(MediaReviewModel.itemTicketLine(item:Record(values:item("c",task:nil)),header:none),"Ticket: none. Results for this item are not sent.")
+        // The header counts the distinct effective tickets of the items.
+        let mixed=[item("a",task:Self.heir89),item("b",task:Self.heir90),item("c",task:nil)].map(Record.init)
+        XCTAssertEqual(MediaReviewModel.ticketLine(round,rows:mixed),"For 3 tickets")
+        XCTAssertEqual(MediaReviewModel.ticketLine(none,rows:mixed),"For 2 tickets","An item with no ticket and no round ticket names none")
+        XCTAssertEqual(MediaReviewModel.ticketLine(none,rows:[mixed[0],mixed[2]]),"For HEIR-89 — Story walk north","One item ticket and no round ticket")
+        XCTAssertEqual(MediaReviewModel.ticketLine(round,rows:[mixed[2]]),"For HEIR-130 — Behemoth walk")
+        XCTAssertEqual(MediaReviewModel.ticketLine(none,rows:[mixed[2]]),"No ticket")
+        let (_,_,model)=await linkedSetup(task:Self.heir130,rows:[item("a",task:Self.heir89),item("b",task:Self.heir90),item("c",task:nil)])
+        XCTAssertEqual(model.ticketLineText,"For 3 tickets")
+    }
+    func testOwnerSetsAndRemovesAnItemTicketWithOneRefusalLine() async throws {
+        var row=item("a",task:nil);row["revision"]=3
+        let (peer,store,model)=await linkedSetup(task:Self.heir130,rows:[row])
+        store.connected=true;peer.calls=[]
+        model.linkItemTask("a","task-89")
+        try await settle {peer.calls.contains {$0.0=="media_item_link_task"} && !store.busy}
+        let link=try XCTUnwrap(peer.calls.first {$0.0=="media_item_link_task"}?.1)
+        XCTAssertEqual(link["round_id"] as? String,"round");XCTAssertEqual(link["item_id"] as? String,"a")
+        XCTAssertEqual(link["expected_revision"] as? Int,3,"The item revision, not the round revision 5");XCTAssertEqual(link["task_id"] as? String,"task-89")
+        XCTAssertEqual(link["project_id"] as? String,peer.project);XCTAssertNotNil(link["command_id"],"The owner command route journals the change")
+        XCTAssertTrue(MediaReviewModel.itemLinkTaskParams(header:model.header,item:Record(values:row),taskID:nil)["task_id"] is NSNull,"Use the round's ticket sends task_id null")
+        await model.waitUntilWritable();peer.calls=[]
+        peer.failures["media_item_link_task"]=[ChecklistError("MEDIA_ROUND_CLOSED","This round is closed. Its tickets cannot change.",details:["command_outcome":"rejected"])]
+        model.linkItemTask("a",nil)
+        try await settle {model.itemTicketLines["a"] != nil}
+        XCTAssertTrue(model.itemTicketLines["a"]!.hasPrefix("Could not change this item's ticket: "),model.itemTicketLines["a"]!)
+        XCTAssertTrue(peer.calls.first {$0.0=="media_item_link_task"}?.1["task_id"] is NSNull)
+        XCTAssertNil(store.error,"No global alert");XCTAssertNil(model.error);XCTAssertEqual(model.ticketLinkLine,"","The round's line stays clear")
+        // A closed round offers no item ticket change and sends nothing.
+        let (closedPeer,_,closed)=await linkedSetup(task:Self.heir130,rows:[item("a",task:nil)],state:"closed")
+        closedPeer.calls=[];closed.linkItemTask("a","task-89")
+        XCTAssertFalse(closedPeer.calls.contains {$0.0=="media_item_link_task"})
+    }
+    /// Round 95 UI check: a one-ticket send from a round whose items name tickets named no key, and
+    /// after the owner withdrew a sent decision the action said "All results sent." (CL-428 U1).
+    func testOneSendOfAMixedRoundNamesItsKeyAndAWithdrawnSentDecisionCanBeSent() async throws {
+        let time=MediaReviewModel.localTime(Self.sentAt)
+        let one=MediaReviewModel.receiptText(["sends":[["task_id":"task-89","task_key":"HEIR-89","message_id":"n1",
+            "recipients":[["session_id":"s1","display":"Codex HEIR-T1"],["session_id":"s2","display":"Claude worker"]],"item_count":1]],
+            "unsent_item_count":0,"changed_only":true,"sent_at":Self.sentAt],roundTaskID:"task-130")
+        XCTAssertEqual(one,"Sent to HEIR-89: Codex HEIR-T1 and Claude worker at "+time+" · 1 item changed since the last send.")
+        // A send to the round's own ticket names the key only while the items name more than one ticket.
+        let toRound:MediaValues=["sends":[["task_id":"task-130","task_key":"HEIR-130","recipients":[["session_id":"s1","display":"Codex HEIR-T1"]],"item_count":1]],
+            "unsent_item_count":0,"changed_only":true,"sent_at":Self.sentAt]
+        XCTAssertEqual(MediaReviewModel.receiptText(toRound,roundTaskID:"task-130",mixed:true),"Sent to HEIR-130: Codex HEIR-T1 at "+time+" · 1 item changed since the last send.")
+        XCTAssertEqual(MediaReviewModel.receiptText(toRound,roundTaskID:"task-130",mixed:false),"Sent to Codex HEIR-T1 at "+time+" · 1 item changed since the last send.")
+        // The CL-427 top-level fields of a round-only send keep the receipt without a key.
+        XCTAssertEqual(MediaReviewModel.receiptText(["recipients":[["session_id":"s1","display":"Codex HEIR-T1"]],"item_count":2,"changed_only":false,"sent_at":Self.sentAt,
+            "sends":[["task_id":"task-130","task_key":"HEIR-130","recipients":[["session_id":"s1","display":"Codex HEIR-T1"]],"item_count":2]]]),
+            "Sent to Codex HEIR-T1 at "+time+" · 2 items.")
+        // The last send carried d1 (HEIR-89) and d2, d3 (HEIR-130). The owner then withdrew d1.
+        let last:MediaValues=["at":Self.sentAt,"decision_ids":["d1","d2","d3"],
+            "sends":[["task_id":"task-89","decision_ids":["d1"]],["task_id":"task-130","decision_ids":["d2","d3"]]]]
+        let withdrawn=[item("a",task:Self.heir89),item("b",task:nil,decision:"d2"),item("c",task:nil,decision:"d3")]
+        let (_,_,model)=await linkedSetup(task:Self.heir130,last:last,rows:withdrawn)
+        XCTAssertEqual(model.resultAction,MediaResultAction(label:"Send changes to 2 tickets",disabledReason:nil),"The withdrawal is a change for HEIR-89")
+        XCTAssertEqual(MediaReviewModel.withdrawnSentTickets(header:model.header,rows:withdrawn.map(Record.init)),["d1":"task-89"])
+        // Every decision withdrawn: the action still offers the send, named for both tickets.
+        let none=[item("a",task:Self.heir89),item("b",task:nil),item("c",task:nil)].map(Record.init)
+        XCTAssertEqual(MediaReviewModel.resultAction(header:model.header,rows:none,counts:[:],listComplete:true),MediaResultAction(label:"Send changes to 2 tickets",disabledReason:nil))
+        // A round-only send (CL-427 baseline, no `sends`): a withdrawal there keeps the one-ticket label.
+        let roundHeader=Record(values:linkedHeader(task:Self.heir130,last:["at":Self.sentAt,"decision_ids":["d2","d3"]]))
+        let roundRows=[item("b",task:nil),item("c",task:nil,decision:"d3")].map(Record.init)
+        XCTAssertEqual(MediaReviewModel.withdrawnSentTickets(header:roundHeader,rows:roundRows),["d2":"task-130"])
+        XCTAssertEqual(MediaReviewModel.resultAction(header:roundHeader,rows:roundRows,counts:[:],listComplete:true),MediaResultAction(label:"Send changes to HEIR-130",disabledReason:nil))
+        // Nothing withdrawn and nothing new: all results sent.
+        let same=[item("a",task:Self.heir89,decision:"d1"),item("b",task:nil,decision:"d2"),item("c",task:nil,decision:"d3")].map(Record.init)
+        XCTAssertEqual(MediaReviewModel.resultAction(header:model.header,rows:same,counts:[:],listComplete:true)?.disabledReason,MediaReviewModel.allResultsSentText)
+        // While the list is incomplete the model cannot prove anything; it stays enabled.
+        XCTAssertNil(MediaReviewModel.resultAction(header:model.header,rows:Array(same.prefix(1)),counts:[:],listComplete:false)?.disabledReason)
+    }
+    func testMixedRoundSendNamesTheTicketsAndTheReceiptListsEachTicket() async throws {
+        let rows=[item("a",task:Self.heir89,decision:"d1"),item("b",task:Self.heir90,decision:"d2",disposition:"changes_requested"),item("c",task:nil,decision:"d3"),item("d",task:Self.heir89)]
+        let (peer,store,model)=await linkedSetup(task:Self.heir130,rows:rows)
+        XCTAssertEqual(model.resultAction,MediaResultAction(label:"Send results to 3 tickets",disabledReason:nil))
+        // A pending item does not count: its ticket has no decision to send.
+        XCTAssertEqual(MediaReviewModel.resultAction(header:model.header,rows:[rows[0],rows[3]].map(Record.init),counts:[:],listComplete:true)?.label,"Send results to HEIR-89")
+        // No round ticket: an item ticket alone shows the action; no ticket at all hides it.
+        let none=Record(values:linkedHeader(task:nil))
+        XCTAssertEqual(MediaReviewModel.resultAction(header:none,rows:[Record(values:rows[0])],counts:[:],listComplete:true)?.label,"Send results to HEIR-89")
+        XCTAssertNil(MediaReviewModel.resultAction(header:none,rows:[Record(values:rows[2])],counts:[:],listComplete:true))
+        peer.extra["media_round_send_result"]=["sends":[
+            ["task_id":"task-89","task_key":"HEIR-89","message_id":"n1","recipients":[["session_id":"s1","display":"Codex HEIR-T1"]],"item_count":1],
+            ["task_id":"task-90","task_key":"HEIR-90","message_id":"n2","recipients":[["session_id":"s1","display":"Codex HEIR-T1"],["session_id":"s2","display":"Claude worker"]],"item_count":1],
+            ["task_id":"task-130","task_key":"HEIR-130","message_id":"n3","recipients":[],"item_count":1]],
+            "unsent_item_count":2,"changed_only":false,"sent_at":Self.sentAt]
+        store.connected=true;peer.calls=[]
+        var progress=""
+        peer.onRequest={method in if method=="media_round_send_result" {progress=model.resultLine?.text ?? ""}}
+        await model.sendResults()
+        peer.onRequest=nil
+        XCTAssertEqual(progress,"Sending results to 3 tickets…")
+        let sent=try XCTUnwrap(peer.calls.first {$0.0=="media_round_send_result"}?.1)
+        XCTAssertEqual(sent["round_id"] as? String,"round");XCTAssertEqual(sent["expected_revision"] as? Int,5)
+        let time=MediaReviewModel.localTime(Self.sentAt)
+        XCTAssertEqual(model.resultLine?.text,["Sent to 3 tickets at "+time+".","HEIR-89: Codex HEIR-T1 · 1 item","HEIR-90: Codex HEIR-T1 and Claude worker · 1 item","HEIR-130 · 1 item","2 items have no ticket."].joined(separator:"\n"))
+        XCTAssertEqual(model.resultLine?.refused,false);XCTAssertNil(store.error);XCTAssertNil(model.error)
+        // A repeat that sends only changes says so on its first line; one unsent item reads in the singular.
+        let repeated=MediaReviewModel.receiptText(["sends":(peer.extra["media_round_send_result"]?["sends"] as? [MediaValues] ?? []).prefix(2).map {$0},"unsent_item_count":1,"changed_only":true,"sent_at":Self.sentAt])
+        XCTAssertEqual(repeated.components(separatedBy:"\n").first,"Sent to 2 tickets at "+time+" · only changes since the last send.")
+        XCTAssertEqual(repeated.components(separatedBy:"\n").last,"1 item has no ticket.")
+        // After the send, nothing new disables the action with the multi-ticket label.
+        peer.roundRecords=[linkedHeader(task:Self.heir130,last:["message_id":"n1","at":Self.sentAt,"decision_ids":["d1","d2","d3"]])]
+        await model.refresh()
+        XCTAssertEqual(model.resultAction,MediaResultAction(label:"Send changes to 3 tickets",disabledReason:"All results sent."))
+    }
+    func testOneTicketRoundKeepsTheCL427LabelsAndReceipt() async throws {
+        let (_,_,model)=await linkedSetup(task:Self.heir130,rows:[item("a",task:nil,decision:"d1"),item("b",task:Self.heir130,decision:"d2")])
+        XCTAssertEqual(model.ticketLineText,"For HEIR-130 — Behemoth walk")
+        XCTAssertEqual(model.resultAction,MediaResultAction(label:"Send results to HEIR-130",disabledReason:nil))
+        XCTAssertEqual(MediaReviewModel.resultTarget(header:model.header,rows:model.rows),"HEIR-130")
+        let time=MediaReviewModel.localTime(Self.sentAt)
+        let recipients:[MediaValues]=[["session_id":"s1","display":"Codex HEIR-T1"]]
+        // The CL-427 top-level fields win; the one `sends` entry gives the same text.
+        let oneSend:MediaValues=["task_id":"task-130","task_key":"HEIR-130","message_id":"n1","recipients":recipients,"item_count":2]
+        let both=MediaReviewModel.receiptText(["sends":[oneSend],"message_id":"n1","recipients":recipients,"item_count":2,"unsent_item_count":0,"changed_only":false,"sent_at":Self.sentAt])
+        let sendsOnly=MediaReviewModel.receiptText(["sends":[oneSend],"unsent_item_count":0,"changed_only":false,"sent_at":Self.sentAt])
+        let legacy=MediaReviewModel.receiptText(["message_id":"n1","recipients":recipients,"item_count":2,"changed_only":false,"sent_at":Self.sentAt])
+        XCTAssertEqual(legacy,"Sent to Codex HEIR-T1 at "+time+" · 2 items.")
+        XCTAssertEqual(both,legacy);XCTAssertEqual(sendsOnly,legacy)
+        // An item with no ticket in a one-ticket send adds the unsent count.
+        XCTAssertEqual(MediaReviewModel.receiptText(["sends":[oneSend],"unsent_item_count":3,"changed_only":true,"sent_at":Self.sentAt]),
+                       "Sent to Codex HEIR-T1 at "+time+" · 2 items changed since the last send. 3 items have no ticket.")
+    }
+}
