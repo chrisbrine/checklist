@@ -3,7 +3,7 @@ import Foundation
 public struct CodexProviderPlugin: ChecklistProviderPlugin {
     public init() {}
     public let manifest = ProviderPluginManifest(pluginID: "org.checklist.codex", version: "1.0.0", providerID: "codex", displayName: "Codex",
-        capabilities: [.workSession, .pickup, .correlatedReply, .composer, .assistantRelay, .answerNotice])
+        capabilities: [.workSession, .pickup, .correlatedReply, .composer, .assistantRelay, .answerNotice, .codexAppHostRestart])
     public let nativeHost: ProviderNativeHost? = .init(executable: "codex", signingIdentifier: "codex", signingTeam: "2DC432GLL2",
         applicationBundleID: "com.openai.codex", registryDirectory: nil, identityVerification: "native_process_verified_thread_observed")
     public func observe(environment: [String:String], workspace: String, registry: [String:Any]?) -> ProviderObservedSession? {

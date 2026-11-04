@@ -172,4 +172,51 @@ final class InstallationCredentialBootstrapTests: XCTestCase {
         XCTAssertNil(try plain.credentials.read("absent"), "A temporary root has no old-store route")
         XCTAssertFalse(FileManager.default.fileExists(atPath: plain.credentials.directory.path), "No marker is written without an old store")
     }
+
+    func testCodexHostRestartNamesMissingBindingsBeforeAnyCredentialAccessOrMutation() throws {
+        // These are synthetic verified-boundary inputs, never real PID lookups.
+        // Even the queue route's positive registration hint cannot prove closure.
+        enrollment.nativeExecutionDomain = "codex:24680:5:0"
+        enrollment.codexAppHostProven = true
+        coordinator.enrollments[enrollment.installation] = enrollment
+        try coordinator.saveEnrollments()
+        let saved = try Data(contentsOf: coordinator.enrollmentFile)
+        let session = try XCTUnwrap(coordinator.router.connectionSession(sessionID: enrollment.sessionID, project: project, caller: owner))
+        old.fail(ChecklistError("UNEXPECTED_CREDENTIAL_READ", "Unsupported reconnect must stop before credentials."))
+        for (pid, domain) in [(Int32(24681), "codex:24681:6:0"), (Int32(24680), "codex:24680:6:0")] {
+            // New PID; reused PID with new start identity.
+            let replacement = Coordinator.VerifiedNativeWorkspace(provider: "codex", session: enrollment.sessionID,
+                process: pid, executionDomain: domain, workspace: root.path)
+            XCTAssertThrowsError(try coordinator.bootstrapVerifiedWorkspace([:], native: replacement,
+                readCredential: { _ in XCTFail("No transport credential read"); return nil })) { error in
+                let failure = error as? ChecklistError
+                XCTAssertEqual(failure?.code, "NATIVE_SESSION_MISMATCH")
+                XCTAssertTrue(failure?.message.contains("old thread-to-host binding") == true)
+                XCTAssertTrue(failure?.message.contains("same thread in the new host") == true)
+                XCTAssertFalse(failure?.message.contains("different native host process") == true)
+            }
+        }
+        XCTAssertEqual(old.reads, 0)
+        XCTAssertEqual(try Data(contentsOf: coordinator.enrollmentFile), saved)
+        XCTAssertEqual(coordinator.enrollments[enrollment.installation]?.generation, enrollment.generation)
+        let after = try XCTUnwrap(coordinator.router.connectionSession(sessionID: enrollment.sessionID, project: project, caller: owner))
+        XCTAssertEqual(try JSONSerialization.data(withJSONObject: after, options: .sortedKeys),
+                       try JSONSerialization.data(withJSONObject: session, options: .sortedKeys))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: coordinator.credentials.directory.path))
+    }
+
+    func testCodexHostRestartPreservesOwnerRevocationBeforeMissingEvidence() throws {
+        let session = try XCTUnwrap(coordinator.router.connectionSession(sessionID: enrollment.sessionID, project: project, caller: owner))
+        _ = try coordinator.router.handle(method: "connection_revoke", params: ["command_id": UUID().uuidString,
+            "project_id": project!, "session_id": enrollment.sessionID, "installation": session["installation"]!,
+            "expected_revision": session["revision"]!], caller: owner)
+        let replacement = Coordinator.VerifiedNativeWorkspace(provider: "codex", session: enrollment.sessionID,
+            process: 24681, executionDomain: "codex:24681:6:0", workspace: root.path)
+        refuses("CONNECTION_REVOKED") {
+            try self.coordinator.bootstrapVerifiedWorkspace([:], native: replacement,
+                readCredential: { _ in XCTFail("Revocation must precede credentials"); return nil })
+        }
+        XCTAssertEqual(old.reads, 0)
+        XCTAssertEqual(coordinator.enrollments[enrollment.installation]?.generation, enrollment.generation)
+    }
 }

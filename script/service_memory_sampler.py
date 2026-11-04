@@ -71,22 +71,24 @@ def find_processes(executable: str, runner: Runner = run_command) -> list[dict]:
     """Return each process whose executable path is exactly ``executable``.
 
     ``ps`` shows a relative command name for the service, so the sampler reads
-    the exact path of each candidate with ``proc_pidpath``.
+    the exact path of each candidate with ``proc_pidpath``. Each record also has
+    ``ppid``: the service is the launchd job (parent 1); a service child that runs
+    the same executable (seen after a backup on build 290) is a helper.
     """
-    code, out, err = runner(['ps', '-axo', 'pid=,comm='])
+    code, out, err = runner(['ps', '-axo', 'pid=,ppid=,comm='])
     if code != 0:
         raise RuntimeError(f'ps failed: {err.strip()}')
     name = os.path.basename(executable)
     found = []
     for line in out.splitlines():
-        parts = line.strip().split(None, 1)
-        if len(parts) != 2 or os.path.basename(parts[1]) != name:
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3 or os.path.basename(parts[2]) != name:
             continue
-        pid = int(parts[0])
+        pid, ppid = int(parts[0]), int(parts[1])
         if _pidpath(pid) != executable:
             continue
         code, start, _ = runner(['ps', '-o', 'lstart=', '-p', str(pid)])
-        found.append({'pid': pid, 'start_time': start.strip() if code == 0 else None})
+        found.append({'pid': pid, 'ppid': ppid, 'start_time': start.strip() if code == 0 else None})
     return found
 
 
@@ -232,15 +234,19 @@ class Sampler:
     def identify(self) -> str | None:
         """Return a stop reason when the service is gone, changed or ambiguous."""
         found = self.finder(self.args.executable)
-        if not found:
+        # The service is the launchd job (parent 1). A record without ``ppid`` counts as a root.
+        roots = [item for item in found if item.get('ppid', 1) == 1]
+        if not roots:
             return 'service_not_found'
-        if len(found) > 1:
-            return 'service_ambiguous: ' + ', '.join(str(item['pid']) for item in found)
+        if len(roots) > 1:
+            return 'service_ambiguous: ' + ', '.join(str(item['pid']) for item in roots)
+        root = roots[0]
+        self.helpers = [item['pid'] for item in found if item.get('ppid') == root['pid']]
         if self.service is None:
-            self.service = found[0]
+            self.service = root
             return None
-        if found[0]['pid'] != self.service['pid'] or found[0]['start_time'] != self.service['start_time']:
-            return f'service_pid_changed: {self.service["pid"]} -> {found[0]["pid"]}'
+        if root['pid'] != self.service['pid'] or root['start_time'] != self.service['start_time']:
+            return f'service_pid_changed: {self.service["pid"]} -> {root["pid"]}'
         return None
 
     def sample_once(self) -> str | None:
@@ -268,6 +274,14 @@ class Sampler:
                     self.highest[key] = {'bytes': footprint[key], 'mib': mib(footprint[key]), 'time': record['time']}
         except Exception as error:
             record['errors'].append(f'footprint: {error!r}')
+        helpers = []
+        for helper in getattr(self, 'helpers', []):
+            try:
+                helpers.append({'pid': helper, **self.read_footprint(helper)})
+            except Exception as error:
+                helpers.append({'pid': helper, 'error': repr(error)})
+        if helpers:
+            record['helpers'] = helpers
         try:
             record['loadavg'] = self.read_load()
         except Exception as error:

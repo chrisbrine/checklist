@@ -4,6 +4,7 @@ import Foundation
 /// proof that a particular peer/session/model is authorized or currently reachable.
 public enum ProviderCapability: String, Codable, CaseIterable, Sendable {
     case workSession = "work_session", pickup, correlatedReply = "correlated_reply", nativePeer = "native_peer"
+    case codexAppHostRestart = "codex_app_host_restart"
     case registryClosure = "registry_closure", composer, assistantRelay = "assistant_relay", answerNotice = "answer_notice", modelSelection = "model_selection"
 }
 
@@ -51,7 +52,8 @@ public struct ProviderPluginManifest: Codable, Equatable, Sendable {
               models.allSatisfy({ bounded($0.id) && bounded($0.name) && (!$0.selectable || capabilities.contains(.modelSelection)) }),
               !capabilities.contains(.workSession) || capabilities.isSuperset(of: [.pickup, .correlatedReply]),
               !capabilities.contains(.nativePeer) || capabilities.contains(.correlatedReply),
-              !capabilities.contains(.registryClosure) || capabilities.contains(.workSession) else {
+              !capabilities.contains(.registryClosure) || capabilities.contains(.workSession),
+              !capabilities.contains(.codexAppHostRestart) || (providerID == "codex" && capabilities.contains(.workSession)) else {
             throw ProviderPluginError.invalidManifest
         }
     }
@@ -130,7 +132,8 @@ public struct ProviderPluginRegistry: Sendable {
             guard registration.qualifiedCapabilities.isSubset(of: manifest.capabilities),
                   !registration.qualifiedCapabilities.contains(.workSession) || registration.qualifiedCapabilities.isSuperset(of: [.pickup, .correlatedReply]),
                   !registration.qualifiedCapabilities.contains(.nativePeer) || registration.qualifiedCapabilities.contains(.correlatedReply),
-                  !registration.qualifiedCapabilities.contains(.registryClosure) || registration.qualifiedCapabilities.contains(.workSession) else { throw ProviderPluginError.invalidManifest }
+                  !registration.qualifiedCapabilities.contains(.registryClosure) || registration.qualifiedCapabilities.contains(.workSession),
+                  !registration.qualifiedCapabilities.contains(.codexAppHostRestart) || registration.qualifiedCapabilities.contains(.workSession) else { throw ProviderPluginError.invalidManifest }
         }
         self.registrations = registrations
     }
@@ -156,7 +159,7 @@ public struct ProviderPluginRegistry: Sendable {
         // A newly declared capability is unavailable until separately qualified.
         return try! ProviderPluginRegistry([
             .init(plugin:CodexProviderPlugin(),enabled:true,
-                  qualifiedCapabilities:[.workSession,.pickup,.correlatedReply,.composer,.assistantRelay,.answerNotice]),
+                  qualifiedCapabilities:[.workSession,.pickup,.correlatedReply,.composer,.assistantRelay,.answerNotice,.codexAppHostRestart]),
             .init(plugin:ClaudeProviderPlugin(),enabled:true,
                   qualifiedCapabilities:[.workSession,.pickup,.correlatedReply,.nativePeer,.registryClosure])
         ])

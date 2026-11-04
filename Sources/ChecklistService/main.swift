@@ -92,6 +92,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     var backupDeferredCalls: [UUID: () -> Void] = [:]
     var nativeListener: NativeReplyListener?
     var nativeLifecycle = NativeLifecycleMonitor()
+    lazy var codexAppHostRestartEffects: CodexAppHostRestartEffects = enforcesQueueIsolation ? .live : .unavailable
     var storageWake: DispatchWorkItem?
     var storageWakePlan = StorageMaintenanceWakePlan()
     let storageQueue = DispatchQueue(label:"org.checklist.storage-maintenance",qos:.utility)

@@ -44,7 +44,7 @@ extension NativeSessionContext {
         return "\(info.pbi_start_tvsec):\(info.pbi_start_tvusec)"
     }
 
-    static func codexRolloutFiles(process: Int32, rootDirectory: String) -> [RolloutFile]? {
+    static func codexRolloutFiles(process: Int32, rootDirectory: String, requireComplete: Bool = false) -> [RolloutFile]? {
         // Foundation normalizes macOS /private aliases differently from the vnode
         // paths returned by libproc. POSIX realpath uses the same physical path.
         guard let physicalRoot = realpath(rootDirectory, nil) else { return nil }
@@ -59,7 +59,10 @@ extension NativeSessionContext {
         for entry in entries.prefix(Int(received) / MemoryLayout<proc_fdinfo>.size) where entry.proc_fdtype == PROX_FDTYPE_VNODE {
             var info = vnode_fdinfowithpath()
             guard entry.proc_fd <= UInt32(Int32.max),
-                  proc_pidfdinfo(process, Int32(entry.proc_fd), PROC_PIDFDVNODEPATHINFO, &info, Int32(MemoryLayout<vnode_fdinfowithpath>.size)) == MemoryLayout<vnode_fdinfowithpath>.size else { continue }
+                  proc_pidfdinfo(process, Int32(entry.proc_fd), PROC_PIDFDVNODEPATHINFO, &info, Int32(MemoryLayout<vnode_fdinfowithpath>.size)) == MemoryLayout<vnode_fdinfowithpath>.size else {
+                if requireComplete { return nil }
+                continue
+            }
             let path = withUnsafeBytes(of: &info.pvip.vip_path) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
             guard path.hasPrefix(root), URL(fileURLWithPath: path).lastPathComponent.hasPrefix("rollout-"), path.hasSuffix(".jsonl") else { continue }
             let file = RolloutFile(path: path, inode: info.pvip.vip_vi.vi_stat.vst_ino, device: Int32(bitPattern: info.pvip.vip_vi.vi_stat.vst_dev))

@@ -6,6 +6,21 @@ final class NativeSessionContextTests: XCTestCase {
     let child = "a85c9a24-fce8-49ba-a738-67594bb90a67"
     let parent = "442869b6-60df-4b59-b572-c2ac85566e2a"
 
+    func testCodexMCPThreadObservationRequiresCodexHostExactUUIDAndWorkspace() throws {
+        let value = try XCTUnwrap(NativeSessionContext.codexMCPThread(child.uppercased(), hostProvider: "codex", workspace: "/synthetic/project", environment: ["CODEX_SESSION_ID": parent]))
+        XCTAssertEqual(value.nativeSessionID, child)
+        XCTAssertEqual(value.workspacePath, "/synthetic/project")
+        for host in [nil, "claude", "unsupported"] as [String?] {
+            XCTAssertNil(NativeSessionContext.codexMCPThread(child, hostProvider: host, workspace: "/synthetic/project"))
+        }
+        XCTAssertNil(NativeSessionContext.codexMCPThread("invalid", hostProvider: "codex", workspace: "/synthetic/project"))
+        XCTAssertNil(NativeSessionContext.codexMCPThread(child, hostProvider: "codex", workspace: "relative"))
+        for exported in ["invalid", parent] {
+            XCTAssertNil(NativeSessionContext.codexMCPThread(child, hostProvider: "codex", workspace: "/synthetic/project", environment: ["CODEX_THREAD_ID": exported]))
+        }
+        XCTAssertNotNil(NativeSessionContext.codexMCPThread(child, hostProvider: "codex", workspace: "/synthetic/project", environment: ["CODEX_THREAD_ID": child.uppercased()]))
+    }
+
     func testCodexUsesActualChildExportInsteadOfParent() throws {
         let value = try XCTUnwrap(NativeSessionContext.observed(provider: "codex", environment: ["CODEX_THREAD_ID": child, "CODEX_SESSION_ID": parent], currentDirectory: "/tmp"))
         XCTAssertEqual(value.nativeSessionID, child)

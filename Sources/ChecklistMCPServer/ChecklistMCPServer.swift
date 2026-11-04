@@ -7,7 +7,7 @@ public enum ChecklistMCPServer {
     /// Calls wait for a service that does not answer yet; catalog lists answer at once.
     private static func request<T>(server: Server, bridge: Bridge, waits: Bool = true, body: () async throws -> T) async throws -> T {
         if waits, try await bridge.awaitService() { try await server.notify(ToolListChangedNotification.message()) }
-        if await bridge.retryConnection() { try await server.notify(ToolListChangedNotification.message()) }
+        if try await bridge.retryConnection() { try await server.notify(ToolListChangedNotification.message()) }
         do {
             let result = try await body()
             if await bridge.takeUpdateNotice() { try await server.notify(ToolListChangedNotification.message()) }
@@ -32,47 +32,60 @@ public enum ChecklistMCPServer {
             capabilities: .init(resources: .init(subscribe: false, listChanged: false), tools: .init(listChanged: true))
         )
         await server.withMethodHandler(ListTools.self) { parameters in
-            try await request(server: server, bridge: bridge, waits: false) {
-                guard parameters.cursor == nil else { throw MCPError.invalidParams("This catalog is a single page; no cursor is accepted.") }
-                return .init(tools: try await bridge.tools())
+            return try await Bridge.$mcpRequest.withValue(.catalog) {
+                try await request(server: server, bridge: bridge, waits: false) {
+                    guard parameters.cursor == nil else { throw MCPError.invalidParams("This catalog is a single page; no cursor is accepted.") }
+                    return .init(tools: try await bridge.tools())
+                }
             }
         }
         await server.withMethodHandler(CallTool.self) { parameters in
-            do {
-                let call: @Sendable () async throws -> Value = {
-                    try await request(server: server, bridge: bridge) {
-                        try await bridge.concurrentCall(parameters.name, .object(parameters.arguments ?? [:]))
+            return await Bridge.$mcpRequest.withValue(.tool(parameters._meta?["threadId"])) {
+                do {
+                    if try await bridge.admitMCPTool(threadID: parameters._meta?["threadId"]) {
+                        try await server.notify(ToolListChangedNotification.message())
                     }
+                    let call: @Sendable () async throws -> Value = {
+                        try await request(server: server, bridge: bridge) {
+                            try await bridge.concurrentCall(parameters.name, .object(parameters.arguments ?? [:]))
+                        }
+                    }
+                    let result = parameters.name == OperationWait.toolName ? try await OperationWait.toolCall(call) : try await call()
+                    let json = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+                    var content: [Tool.Content] = []
+                    if let envelope = try jsonObject(result) as? [String:Any],let notice = HumanAnswerNoticePresentation.text(in:envelope) { content.append(.text(text:notice,annotations:nil,_meta:nil)) }
+                    if let envelope = try jsonObject(result) as? [String:Any],let notice = PendingNoteNoticePresentation.text(in:envelope) { content.append(.text(text:notice,annotations:nil,_meta:nil)) }
+                    content.append(.text(text:json,annotations:nil,_meta:nil))
+                    return CallTool.Result(content:content, structuredContent:.some(result), isError:false)
+                } catch {
+                    var fields: [String: Value] = ["message": .string(error.localizedDescription)]
+                    if let failure = error as? ChecklistError {
+                        fields["code"] = .string(failure.code)
+                        fields["details"] = try? mcpValue(failure.details)
+                    }
+                    let errorResult: Value = .object(["error": .object(fields)])
+                    return CallTool.Result(content: [.text(text: error.localizedDescription, annotations: nil, _meta: nil)], structuredContent: .some(errorResult), isError: true)
                 }
-                let result = parameters.name == OperationWait.toolName ? try await OperationWait.toolCall(call) : try await call()
-                let json = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
-                var content: [Tool.Content] = []
-                if let envelope = try jsonObject(result) as? [String:Any],let notice = HumanAnswerNoticePresentation.text(in:envelope) { content.append(.text(text:notice,annotations:nil,_meta:nil)) }
-                if let envelope = try jsonObject(result) as? [String:Any],let notice = PendingNoteNoticePresentation.text(in:envelope) { content.append(.text(text:notice,annotations:nil,_meta:nil)) }
-                content.append(.text(text:json,annotations:nil,_meta:nil))
-                return CallTool.Result(content:content, structuredContent:.some(result), isError:false)
-            } catch {
-                var fields: [String: Value] = ["message": .string(error.localizedDescription)]
-                if let failure = error as? ChecklistError {
-                    fields["code"] = .string(failure.code)
-                    fields["details"] = try? mcpValue(failure.details)
-                }
-                let errorResult: Value = .object(["error": .object(fields)])
-                return CallTool.Result(content: [.text(text: error.localizedDescription, annotations: nil, _meta: nil)], structuredContent: .some(errorResult), isError: true)
             }
         }
         await server.withMethodHandler(ListResources.self) { parameters in
-            try await request(server: server, bridge: bridge, waits: false) {
-                guard parameters.cursor == nil else { throw MCPError.invalidParams("This resource catalog is a single page.") }
-                return .init(resources: try await bridge.resources())
+            return try await Bridge.$mcpRequest.withValue(.resource) {
+                try await bridge.requireMCPResourceIdentity()
+                return try await request(server: server, bridge: bridge, waits: false) {
+                    guard parameters.cursor == nil else { throw MCPError.invalidParams("This resource catalog is a single page.") }
+                    return .init(resources: try await bridge.resources())
+                }
             }
         }
         await server.withMethodHandler(ReadResource.self) { parameters in
-            let value = try await request(server: server, bridge: bridge) {
-                try await bridge.concurrentReadResource(parameters.uri)
+            return try await Bridge.$mcpRequest.withValue(.resource) {
+                try await bridge.requireMCPResourceIdentity()
+                let value = try await request(server: server, bridge: bridge) {
+                    try await bridge.concurrentReadResource(parameters.uri)
+                }
+                let text = String(decoding: try JSONEncoder().encode(value), as: UTF8.self)
+                return .init(contents: [.text(text, uri: parameters.uri, mimeType: "application/json")])
             }
-            let text = String(decoding: try JSONEncoder().encode(value), as: UTF8.self)
-            return .init(contents: [.text(text, uri: parameters.uri, mimeType: "application/json")])
         }
         try await server.start(transport: InitializeCompatibilityTransport(transport))
         return server

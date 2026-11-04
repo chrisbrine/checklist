@@ -622,4 +622,25 @@ extension EvidenceAuthorityTests {
             XCTAssertEqual(try router.record(db, newerAttempt["id"] as! String, type: "attempt")["state"] as? String, "active")
         }
     }
+    func testCodexRestartClosureBasisCannotBroadenToOtherProvidersOrUnknownProcess() throws {
+        let p = try project(), worker = try native(p, "codex-restart-basis", domain: "codex:123:5:0")
+        let generation = try router.dbQueue.read { try router.sessionGeneration(router.record($0, worker.sessionID!, type: "session")) }
+        func proof(provider: String = "codex", process: String = "gone", registry: String = "not_applicable", replacement: String? = "codex:200:6:0") -> VerifiedNativeClosure {
+            .init(projectID: p["id"] as! String, sessionID: worker.sessionID!, installation: worker.installation,
+                executionDomain: worker.executionDomain!, provider: provider, authorizationGeneration: generation,
+                processState: process, registryState: registry, registryDigest: nil,
+                basis: .codexAppHostRestart, replacementExecutionDomain: replacement)
+        }
+        for invalid in [proof(provider: "claude"), proof(process: "running"), proof(process: "unknown"),
+                        proof(registry: "absent"), proof(replacement: nil), proof(replacement: worker.executionDomain)] {
+            assertCode("NATIVE_CLOSURE_UNPROVEN") { _ = try self.router.reconcileVerifiedNativeClosure(invalid, caller: self.lifecycleOwner) }
+        }
+        XCTAssertEqual(try router.dbQueue.read { try router.record($0, worker.sessionID!, type: "session") }["state"] as? String, "connected")
+        _ = try router.reconcileVerifiedNativeClosure(proof(), caller: lifecycleOwner)
+        let ended = try router.dbQueue.read { try router.record($0, worker.sessionID!, type: "session") }
+        let observation = try router.dbQueue.read { try router.record($0, ended["native_closure_ref"] as! String, type: "native_closure") }
+        XCTAssertEqual(observation["evidence_basis"] as? String, "codex_app_host_restart")
+        XCTAssertEqual(observation["registry_state"] as? String, "not_applicable")
+    }
+
 }

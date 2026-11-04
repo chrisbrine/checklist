@@ -36,6 +36,9 @@ final class BridgeBlockingExecutor: SerialExecutor {
 }
 
 public actor Bridge {
+    enum MCPRequest: Sendable { case tool(Value?), resource, catalog }
+    @TaskLocal static var mcpRequest: MCPRequest?
+
     nonisolated let blockingExecutor = BridgeBlockingExecutor()
     nonisolated public var unownedExecutor: UnownedSerialExecutor {
         blockingExecutor.asUnownedSerialExecutor()
@@ -53,6 +56,11 @@ public actor Bridge {
     private var launchState = ShimLaunchState.current
     private var updateNoticePending = false
     private var bootstrapResponse: Value?
+    /// Latched only from Codex's wire metadata under an observed Codex host. It
+    /// never changes to another thread, even after bootstrap fails or waits.
+    private var codexMCPContext: NativeSessionContext?
+    private var missingNativeIdentity = false
+    private static let nativeIdentityNotice = "This MCP connection is not bound to a native thread because the host supplied no supported native identity at startup. Codex can identify each tool call with host-authored _meta.threadId; a shell connection does not bind this MCP process."
     private var setupContext: NativeSessionContext?
     private var creationNoticePending = false
     private var setupCompletionPending = false
@@ -75,12 +83,12 @@ public actor Bridge {
         }
         return startupError.map { "This conversation is not connected yet. " + $0.localizedDescription }
     }
-    var connectionNotice: String? { waitNotice ?? registryStart.notice }
-    var connectionStartupNotice: String? { waitNotice ?? registryStart.startupNotice }
+    var connectionNotice: String? { waitNotice ?? registryStart.notice ?? (missingNativeIdentity ? Self.nativeIdentityNotice : nil) }
+    var connectionStartupNotice: String? { waitNotice ?? registryStart.startupNotice ?? (missingNativeIdentity ? Self.nativeIdentityNotice : nil) }
 
     public init(configuration: BridgeConfiguration, environment: BridgeEnvironment = .init()) {
         self.environment = environment
-        client = environment.makeClient(.init(installation: configuration.installation, workspace: configuration.workspace))
+        client = environment.makeClient(.init(installation: configuration.installation, workspace: configuration.workspace, usesStoredCredential: !(configuration.automatic && configuration.command == "mcp")))
         expectedSession = configuration.expectedSession
         automatic = configuration.automatic
         requestedWorkspace = configuration.workspace
@@ -96,7 +104,10 @@ public actor Bridge {
     /// `timeBudget` caps each bootstrap attempt's reply budget; nil keeps the client's default.
     public func connect(required: Bool = false, timeBudget: TimeInterval? = nil) throws -> Value? {
         checkInstalledBuild()
-        if delegating { return nil }
+        if delegating {
+            if automatic, command == "mcp", discover().context == nil { missingNativeIdentity = true }
+            return nil
+        }
         if let bootstrapResponse { return bootstrapResponse }
         guard automatic else {
             if required { throw BridgeError("Automatic connection uses the current native conversation; omit --installation.") }
@@ -122,15 +133,83 @@ public actor Bridge {
     }
 
     private func discover() -> NativeSessionDiscovery {
-        environment.discover(assistantProject != nil)
+        if let codexMCPContext { return .available(codexMCPContext) }
+        return environment.discover(assistantProject != nil)
+    }
+
+    /// Called with protocol metadata, never tool arguments. Legacy Codex MCP
+    /// connections are private, but each identified call still proves its own
+    /// thread and a conflicting caller can never switch this connection.
+    func admitMCPTool(threadID: Value?) throws -> Bool {
+        guard command == "mcp", automatic, assistantProject == nil else { return false }
+        if let context = codexMCPContext {
+            guard case .string(let raw)? = threadID, UUID(uuidString: raw) == UUID(uuidString: context.nativeSessionID) else {
+                throw ChecklistError("NATIVE_SESSION_MISMATCH", "This Codex MCP connection requires its same host-authored _meta.threadId on every tool call. Missing or conflicting metadata cannot use an earlier thread's connection.")
+            }
+            if delegating { throw ClientUpdateRequired.error }
+            return false
+        }
+        let observed = environment.discover(false).context
+        // Claude and other existing native contexts retain their own bootstrap.
+        if let observed, observed.provider != "codex" { return false }
+        guard let threadID else { return false }
+        guard case .string(let raw) = threadID, let id = UUID(uuidString: raw) else {
+            throw ChecklistError("NATIVE_SESSION_REQUIRED", "Codex MCP _meta.threadId must be the host's native thread UUID.")
+        }
+        if let observed {
+            guard id == UUID(uuidString: observed.nativeSessionID) else {
+                throw ChecklistError("NATIVE_SESSION_MISMATCH", "Codex MCP _meta.threadId differs from this process's host-exported native thread identity.")
+            }
+            return false
+        }
+        guard let context = environment.discoverCodexMCPThread(id.uuidString.lowercased()),
+              context.provider == "codex", UUID(uuidString: context.nativeSessionID) == id else {
+            throw ChecklistError("NATIVE_HOST_REQUIRED", "MCP thread metadata can connect only from its native Codex host; client names and tool arguments cannot authenticate a thread.")
+        }
+        try verifyWorkspace(context.workspacePath)
+        if let expectedSession, UUID(uuidString: expectedSession) != id {
+            throw ChecklistError("NATIVE_SESSION_MISMATCH", "Codex MCP _meta.threadId differs from --session; that option cannot select another thread.")
+        }
+        // Retain permanent startup refusals. Metadata is no revocation/reconnect bypass.
+        if let error = startupError ?? registryStart.error { throw error }
+        codexMCPContext = context
+        if delegating { throw ClientUpdateRequired.error }
+        startConnection()
+        if delegating { throw ClientUpdateRequired.error }
+        return bootstrapResponse != nil || setupContext != nil
+    }
+
+    func requireMCPResourceIdentity() throws {
+        guard codexMCPContext != nil else { return }
+        // SDK 0.12.1 resources/read has no request metadata. Do not let a request
+        // without its own thread observation inherit tools/call authority.
+        throw ChecklistError("NATIVE_SESSION_REQUIRED", "Use a Checklist tool call with the host's _meta.threadId. Resource reads cannot identify the caller on this Codex MCP connection.")
+    }
+
+    /// Admission can suspend before execution. Recheck the request's own immutable
+    /// metadata on the actor at every service/route capture, so a pre-bind request
+    /// cannot borrow a binding established while that request was suspended.
+    private func validateMCPRequestIdentity(allowCatalog: Bool = false) throws {
+        guard let context = codexMCPContext else { return }
+        if allowCatalog, case .catalog? = Self.mcpRequest { return }
+        guard case .tool(let value)? = Self.mcpRequest,
+              case .string(let raw)? = value,
+              UUID(uuidString: raw) == UUID(uuidString: context.nativeSessionID) else {
+            throw ChecklistError("NATIVE_SESSION_MISMATCH", "This request has no matching host-authored _meta.threadId and cannot use the bound Codex thread's connection.")
+        }
     }
 
     private func bootstrap(_ observed: NativeSessionContext?, required: Bool, timeBudget: TimeInterval? = nil) throws -> Value? {
         guard let context = observed else {
             if required || assistantProject != nil { throw BridgeError("NATIVE_CONTEXT_REQUIRED: Run this command from its native local Codex or Claude conversation. Assistant relay mode requires a local Codex helper and explicit project grants.") }
+            if command == "mcp" {
+                missingNativeIdentity = true
+                client = environment.makeClient(.init(workspace: requestedWorkspace, usesStoredCredential: false))
+            }
             return nil
         }
         try verifyWorkspace(context.workspacePath)
+        missingNativeIdentity = false
         var nativeContext = context.parameters
         if let assistantProject {
             guard context.provider == "codex" else {
@@ -179,7 +258,8 @@ public actor Bridge {
         }
     }
 
-    func retryConnection() -> Bool {
+    func retryConnection() throws -> Bool {
+        try validateMCPRequestIdentity(allowCatalog: true)
         checkInstalledBuild()
         if delegating { return false }
         if setupCompletionPending,let context=setupContext {
@@ -219,6 +299,7 @@ public actor Bridge {
         do {
             _ = try connect(timeBudget: Self.startupConnectBudget)
             try verifySession(replyTimeout: max(0.5, Self.startupConnectBudget - (environment.now() - started)))
+            serviceError = nil; startupError = nil
         }
         catch { recordConnectionFailure(error) }
     }
@@ -237,6 +318,7 @@ public actor Bridge {
     /// A request that arrives during another request's wait shares that wait (one
     /// connect attempt at a time) and gets false, so the catalog notice is sent once.
     func awaitService(limit: TimeInterval = Bridge.serviceWaitLimit) async throws -> Bool {
+        try validateMCPRequestIdentity(allowCatalog: true)
         if let serviceWaitTask { _ = try await serviceWaitTask.value; return false }
         guard serviceError != nil else { return false }
         let wait = Task { try await self.waitForService(limit: limit) }
@@ -249,6 +331,9 @@ public actor Bridge {
         let started = environment.now()
         var pause: TimeInterval = 0.25, startRequested = false
         while true {
+            // A different request may have bound the connection during the yield.
+            // Refuse outside attemptService so A cannot clear B's valid binding.
+            try validateMCPRequestIdentity(allowCatalog: true)
             guard let failure = attemptService() else {
                 if registryStart.error == nil, startupError == nil { environment.stderr("Checklist: connected after waiting \(Int(((environment.now() - started) * 1000).rounded())) ms for the service.\n") }
                 return true
@@ -264,7 +349,7 @@ public actor Bridge {
                     details: ["retryable": true, "command_outcome": "not_sent", "command_executed": false, "last_code": (failure as? ChecklistError)?.code ?? "unknown"])
             }
             environment.sleep(min(pause, left)); pause = min(pause * 2, Self.serviceWaitStep)
-            await Task.yield()
+            await environment.yieldServiceWait()
         }
     }
 
@@ -432,7 +517,8 @@ public actor Bridge {
     }
 
     public func call(_ name: String, _ arguments: Value) throws -> Value {
-        try forward(current: { try localCall(name, arguments) }, delegate: { try delegateCall(name, arguments) })
+        try validateMCPRequestIdentity()
+        return try forward(current: { try localCall(name, arguments) }, delegate: { try delegateCall(name, arguments) })
     }
 
     /// What a tool call needs from actor state, captured so its blocking service
@@ -443,7 +529,8 @@ public actor Bridge {
     }
 
     /// Nil: the call needs actor state throughout (not connected, limited or setup states).
-    private func callRoute() -> CallRoute? {
+    private func callRoute() throws -> CallRoute? {
+        try validateMCPRequestIdentity()
         if delegating { return .delegate(delegateTarget()) }
         guard startupError == nil, serviceError == nil, registryStart.error == nil, registryStart.connection == nil,
               connectionNotice == nil, setupNotice == nil, setupContext == nil else { return nil }
@@ -455,8 +542,8 @@ public actor Bridge {
     /// and native context) is read on the actor; the request runs on a dispatch worker;
     /// notices are applied on the actor. The arguments, including command_id, pass unchanged.
     public nonisolated func concurrentCall(_ name: String, _ arguments: Value) async throws -> Value {
-        if name == OperationWait.toolName, await callRoute() != nil { return try await operationWaitTool(arguments) }
-        guard let route = await callRoute() else { return try await call(name, arguments) }
+        if name == OperationWait.toolName, try await callRoute() != nil { return try await operationWaitTool(arguments) }
+        guard let route = try await callRoute() else { return try await call(name, arguments) }
         let reply: Data
         do {
             switch route {
@@ -473,7 +560,7 @@ public actor Bridge {
     /// One read of a wait loop (CL-364), with its own reply budget and no catalog check.
     /// It runs on a dispatch worker, so other calls of this conversation continue.
     nonisolated func statusRead(_ name: String, _ arguments: Value, budget: TimeInterval) async throws -> Value {
-        guard case .service(let client, _)? = await callRoute() else { return try await concurrentCall(name, arguments) }
+        guard case .service(let client, _)? = try await callRoute() else { return try await concurrentCall(name, arguments) }
         do {
             let reply = try await Self.offload { () throws -> Data in
                 guard let parameters = try jsonObject(arguments) as? [String: Any] else { throw BridgeError("Tool arguments must be a JSON object.") }
@@ -555,7 +642,8 @@ public actor Bridge {
     }
 
     public func serviceInfo() throws -> Value {
-        try forward(current: { try mcpValue(withSetupNotice(client.call("service_info"))) },
+        try validateMCPRequestIdentity()
+        return try forward(current: { try mcpValue(withSetupNotice(client.call("service_info"))) },
                     delegate: { try delegateCall("service_info", .object([:])) })
     }
 
@@ -565,6 +653,7 @@ public actor Bridge {
         if serviceError != nil, let notice = connectionNotice { connection = ["connected": false, "state": "service_not_answering", "message": notice] }
         else if startupError != nil, let notice = connectionNotice { connection = ["connected": false, "state": "connection_failed", "message": notice] }
         else if let pending = registryStart.connection { connection = pending }
+        else if missingNativeIdentity { connection = ["connected": false, "state": "native_thread_identity_unavailable", "message": Self.nativeIdentityNotice] }
         else if let setupNotice { connection = ["connected":false,"state":setupCompletionPending ? "project_connection_pending":"project_setup_required","message":setupNotice] }
         else { return response }
         var response = response
@@ -574,7 +663,8 @@ public actor Bridge {
     }
 
     func resources() throws -> [Resource] {
-        try forward(current: { try resourceCatalog(localTools()) }, delegate: { try resourceCatalog(delegateTools()) })
+        try requireMCPResourceIdentity()
+        return try forward(current: { try resourceCatalog(localTools()) }, delegate: { try resourceCatalog(delegateTools()) })
     }
 
     private func resourceCatalog(_ tools: [Tool]) -> [Resource] {
@@ -626,7 +716,9 @@ public actor Bridge {
         if let expectedSession { suffix += ["--session", expectedSession] }
         if !automatic { suffix += ["--installation", installation] }
         if let assistantProject { suffix += ["--assistant", "--project", assistantProject] }
-        return DelegateTarget(update: launchState == .unavailable ? nil : environment.shimUpdate, suffix: suffix)
+        // A delegated CLI lacks this request's wire metadata. Never launch it
+        // with a fabricated environment/session argument to preserve authority.
+        return DelegateTarget(update: launchState == .unavailable || codexMCPContext != nil || missingNativeIdentity ? nil : environment.shimUpdate, suffix: suffix)
     }
 
     private func delegate(_ route: [String], input: Data? = nil, commandID: String? = nil) throws -> Data {
@@ -701,6 +793,7 @@ public actor Bridge {
     }
 
     func readResource(_ uri: String) throws -> Value {
+        try requireMCPResourceIdentity()
         switch uri {
         case "checklist://service/status": return try serviceInfo()
         case "checklist://projects": return try call("project_list", .object([:]))

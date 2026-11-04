@@ -196,7 +196,8 @@ final class OperationWaitMCPTests: XCTestCase {
             let state = count < 3 ? #"{"data":{"state":"running"}}"# : #"{"data":{"state":"succeeded","result":{"data":{"delegated":true}}}}"#
             return .init(status: 0, stdout: Data(state.utf8))
         })
-        let bridge = Bridge(configuration: .init(workspace: root.path), environment: .init(shimUpdate: update, makeClient: { [router] _ in RouterClient(router: router!, session: "unused") }, discover: { _ in .unavailable }, stderr: { _ in }))
+        // This deliberately exercises explicit legacy delegation, without a native identity.
+        let bridge = Bridge(configuration: .init(workspace: root.path, automatic: false), environment: .init(shimUpdate: update, makeClient: { [router] _ in RouterClient(router: router!, session: "unused") }, discover: { _ in .unavailable }, stderr: { _ in }))
         _ = try await bridge.connect()
         let reply = try await bridge.concurrentCall(OperationWait.toolName, .object(["operation_id": .string(id), "project_id": .string("p")]))
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(reply)) as? [String: Any])

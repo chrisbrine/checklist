@@ -56,33 +56,9 @@ extension Coordinator {
             }
             let observation = NativeLifecycleInspector.inspect(registration)
             guard observation.provesClosure else { continue }
-            // Fence even if Core/storage reconciliation fails. Dispatch and
-            // caller/automatic-bootstrap must honor this in-memory revocation.
-            if enrollments[enrollment.installation]?.generation == enrollment.generation {
-                var fenced = enrollment; fenced.revoked = true; enrollments[enrollment.installation] = fenced
-            } else { continue }
             do {
-                try saveEnrollments()
-                var pending = false
-                for project in enrollment.projectIDs {
-                    let context = try router.handle(method: "session_list", params: ["project_id": project],
-                        caller: Caller(role: "owner", installation: "native-lifecycle", projectIDs: []))
-                    let sessions = (context["data"] as? [String: Any])?["sessions"] as? [[String: Any]] ?? []
-                    guard let session = sessions.first(where: { ($0["id"] as? String)?.utf8.elementsEqual(enrollment.sessionID.utf8) == true }),
-                          let generation = session["authorization_generation"] as? String, !generation.isEmpty else {
-                        throw CoreError("RECIPIENT_CHANGED", "The exact native session authorization is unavailable.")
-                    }
-                    let proof = VerifiedNativeClosure(projectID: project, sessionID: enrollment.sessionID,
-                        installation: key, executionDomain: domain, provider: enrollment.provider,
-                        authorizationGeneration: generation,
-                        processState: observation.process.rawValue, registryState: observation.registry.rawValue,
-                        registryDigest: observation.registryDigest)
-                    guard let result = try router.withImmediateWriteAccess({try router.reconcileVerifiedNativeClosure(proof,
-                        caller: Caller(role: "owner", installation: "native-lifecycle", projectIDs: []))}) else {return}
-                    if !(result["pending_attempt_ids"] as? [String] ?? []).isEmpty { pending = true }
-                }
-                nativeLifecycle.failures.removeValue(forKey: key)
-                if !pending { nativeLifecycle.reconciled.insert(key); nativeLifecycle.watches.removeValue(forKey: key) }
+                _ = try reconcileNativeClosure(enrollment, processState: observation.process.rawValue,
+                    registryState: observation.registry.rawValue, registryDigest: observation.registryDigest)
             } catch {
                 let detail = error.localizedDescription
                 if nativeLifecycle.failures[key] != detail {
@@ -92,4 +68,39 @@ extension Coordinator {
             }
         }
     }
+
+    /// One service-owned fence/release path for registry closure and the owner's
+    /// narrow Codex app restart rule. Failures retain the fenced old generation.
+    @discardableResult
+    func reconcileNativeClosure(_ enrollment: Enrollment, processState: String, registryState: String,
+                                registryDigest: String?, basis: NativeClosureBasis = .processAndRegistry,
+                                replacementDomain: String? = nil) throws -> Bool {
+        let key = enrollment.installation + "/" + enrollment.generation
+        guard var current = enrollments[enrollment.installation], current.generation == enrollment.generation,
+              current.nativeExecutionDomain == enrollment.nativeExecutionDomain else {
+            throw CoreError("RECIPIENT_CHANGED", "The native enrollment changed before closure.")
+        }
+        current.revoked = true; enrollments[enrollment.installation] = current
+        try saveEnrollments()
+        var pending = false
+        for project in enrollment.projectIDs {
+            let caller = Caller(role: "owner", installation: "native-lifecycle", projectIDs: [])
+            guard let session = try router.connectionSession(sessionID: enrollment.sessionID, project: project, caller: caller),
+                  let generation = session["authorization_generation"] as? String, !generation.isEmpty else {
+                throw CoreError("RECIPIENT_CHANGED", "The exact native session authorization is unavailable.")
+            }
+            let proof = VerifiedNativeClosure(projectID: project, sessionID: enrollment.sessionID,
+                installation: key, executionDomain: enrollment.nativeExecutionDomain!, provider: enrollment.provider,
+                authorizationGeneration: generation, processState: processState, registryState: registryState,
+                registryDigest: registryDigest, basis: basis, replacementExecutionDomain: replacementDomain)
+            guard let result = try router.withImmediateWriteAccess({ try router.reconcileVerifiedNativeClosure(proof, caller: caller) }) else {
+                throw CoreError("NATIVE_CLOSURE_PENDING", "Closure must finish after the current storage operation before this thread can reconnect.")
+            }
+            if !(result["pending_attempt_ids"] as? [String] ?? []).isEmpty { pending = true }
+        }
+        nativeLifecycle.failures.removeValue(forKey: key)
+        if !pending { nativeLifecycle.reconciled.insert(key); nativeLifecycle.watches.removeValue(forKey: key) }
+        return !pending
+    }
+
 }

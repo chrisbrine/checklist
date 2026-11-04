@@ -54,7 +54,8 @@
           "composer",
           "assistant_relay",
           "answer_notice",
-          "model_selection"
+          "model_selection",
+          "codex_app_host_restart"
         ]
       }
     },
@@ -187,6 +188,29 @@
           "capabilities": {
             "contains": {
               "const": "model_selection"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "capabilities": {
+            "contains": {
+              "const": "codex_app_host_restart"
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "provider_id": {
+            "const": "codex"
+          },
+          "capabilities": {
+            "contains": {
+              "const": "work_session"
             }
           }
         }

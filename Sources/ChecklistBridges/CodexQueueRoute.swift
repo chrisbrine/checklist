@@ -147,33 +147,49 @@ public struct MacOSCodexProcessObserver: CodexProcessObserving {
     }
     init(sessionsRoot: String) { self.sessionsRoot = sessionsRoot }
 
-    public func scan(threadID: String) -> CodexHostScan? {
+    public func scan(threadID: String) -> CodexHostScan? { scan(threadID: threadID, requireComplete: false) }
+
+    /// Restart authority uses conservative completeness, unlike transport selection.
+    /// A live entry that cannot be classified/read must not disappear from the scan.
+    public func scan(threadID: String, requireComplete: Bool) -> CodexHostScan? {
         guard let thread = UUID(uuidString:threadID)?.uuidString.lowercased() else { return nil }
         let suffix = "-\(thread).jsonl"
         let capacity = proc_listallpids(nil,0)
         guard capacity > 0 else { return nil }
         var pids = [pid_t](repeating:0,count:Int(capacity)+64)
         let count = pids.withUnsafeMutableBytes { proc_listallpids($0.baseAddress,Int32($0.count)) }
-        guard count > 0 else { return nil }
+        guard count > 0, !requireComplete || count < pids.count else { return nil }
         var hosts: [CodexProcess] = [],holders: [CodexProcess] = [],unreadable = false,execClaim = false
         for pid in pids.prefix(Int(count)) where pid > 1 {
             var info = proc_bsdinfo()
-            guard proc_pidinfo(pid,PROC_PIDTBSDINFO,0,&info,Int32(MemoryLayout<proc_bsdinfo>.size)) == MemoryLayout<proc_bsdinfo>.size,
-                  info.pbi_uid == getuid(),let executable = Self.executable(pid) else { continue }
+            guard proc_pidinfo(pid,PROC_PIDTBSDINFO,0,&info,Int32(MemoryLayout<proc_bsdinfo>.size)) == MemoryLayout<proc_bsdinfo>.size else {
+                if requireComplete, !Self.definitelyGone(pid) { unreadable = true }
+                continue
+            }
+            guard info.pbi_uid == getuid() else { continue }
+            guard let executable = Self.executable(pid) else {
+                if requireComplete, !Self.definitelyGone(pid) { unreadable = true }
+                continue
+            }
             let codex = URL(fileURLWithPath:executable).lastPathComponent == "codex"
             let arguments = codex ? Self.arguments(pid) : nil
-            if codex,arguments == nil,kill(pid,0) == 0 { unreadable = true }
+            if codex,arguments == nil,!Self.definitelyGone(pid) { unreadable = true }
             let role = codex ? CodexQueueRoute.role(executable:executable,arguments:arguments ?? []) : .unclassified
             if codex,CodexQueueRoute.claims(role:role,arguments:arguments ?? [],threadID:thread) { execClaim = true }
             let process = CodexProcess(pid:pid,executable:executable,role:role)
             if role == .appHost { hosts.append(process) }
-            guard let held = NativeSessionContext.codexRolloutFiles(process:pid,rootDirectory:sessionsRoot) else {
-                if codex,kill(pid,0) == 0 { unreadable = true }
+            guard let held = NativeSessionContext.codexRolloutFiles(process:pid,rootDirectory:sessionsRoot,requireComplete:requireComplete) else {
+                if (codex || requireComplete),!Self.definitelyGone(pid) { unreadable = true }
                 continue
             }
             if held.contains(where:{ $0.path.hasSuffix(suffix) }) { holders.append(process) }
         }
         return .init(hosts:hosts,holders:holders,unreadable:unreadable,execClaim:execClaim)
+    }
+
+    private static func definitelyGone(_ pid: pid_t) -> Bool {
+        errno = 0
+        return kill(pid, 0) == -1 && errno == ESRCH
     }
 
     /// True only when the exact registered process is alive, is the app's host and

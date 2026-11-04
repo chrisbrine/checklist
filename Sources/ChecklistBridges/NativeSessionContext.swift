@@ -58,6 +58,23 @@ public struct NativeSessionContext: Equatable, Sendable {
                   providerRegistry: providerRegistry)
     }
 
+    /// Codex authors this UUID in tools/call params._meta.threadId. It is a host
+    /// observation like CODEX_THREAD_ID, not a credential. Bootstrap still checks
+    /// the signed host ancestry, process generation, workspace and current grants.
+    public static func discoverCodexMCPThread(_ threadID: String) -> NativeSessionContext? {
+        codexMCPThread(threadID, hostProvider: closestNativeHost(providerRegistry: .bundled)?.provider,
+                       workspace: FileManager.default.currentDirectoryPath, environment: ProcessInfo.processInfo.environment)
+    }
+
+    static func codexMCPThread(_ threadID: String, hostProvider: String?, workspace: String,
+                               environment: [String: String] = [:]) -> NativeSessionContext? {
+        guard hostProvider == "codex" else { return nil }
+        if let exported = environment["CODEX_THREAD_ID"] {
+            guard let id = UUID(uuidString: exported), id == UUID(uuidString: threadID) else { return nil }
+        }
+        return observed(provider: "codex", environment: ["CODEX_THREAD_ID": threadID], currentDirectory: workspace)
+    }
+
     static func discovery(host: (provider: String, pid: Int32)?, environment: [String: String],
                           currentDirectory: String, registryDirectory: URL?,
                           providerRegistry: ProviderPluginRegistry = .bundled) -> NativeSessionDiscovery {

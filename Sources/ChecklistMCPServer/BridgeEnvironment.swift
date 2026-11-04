@@ -47,8 +47,10 @@ public struct BridgeEnvironment: Sendable {
     public var shimUpdate: ShimUpdateEnvironment?
     public var makeClient: @Sendable (BridgeClientConfiguration) -> any BridgeClient
     public var discover: @Sendable (_ assistantRelay: Bool) -> NativeSessionDiscovery
+    public var discoverCodexMCPThread: @Sendable (String) -> NativeSessionContext?
     public var now: @Sendable () -> TimeInterval
     public var sleep: @Sendable (TimeInterval) -> Void
+    public var yieldServiceWait: @Sendable () async -> Void
     public var stderr: @Sendable (String) -> Void
     /// Nil when launchd cannot be asked.
     public var serviceJobRunning: @Sendable () -> Bool?
@@ -67,15 +69,19 @@ public struct BridgeEnvironment: Sendable {
             }
             return NativeSessionContext.discovery()
         },
+        discoverCodexMCPThread: @escaping @Sendable (String) -> NativeSessionContext? = { NativeSessionContext.discoverCodexMCPThread($0) },
         now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         sleep: @escaping @Sendable (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        yieldServiceWait: @escaping @Sendable () async -> Void = { await Task.yield() },
         stderr: @escaping @Sendable (String) -> Void = { FileHandle.standardError.write(Data($0.utf8)) },
         serviceJobRunning: @escaping @Sendable () -> Bool? = { LaunchdServiceJob.isRunning(label: ChecklistInstance.current.machServiceName) },
         startService: @escaping @Sendable () throws -> Void = { try ChecklistClient.startService(timeLimit: 8) }
     ) {
         self.shimUpdate = shimUpdate
         self.makeClient = makeClient; self.discover = discover; self.now = now
+        self.discoverCodexMCPThread = discoverCodexMCPThread
         self.sleep = sleep; self.stderr = stderr
+        self.yieldServiceWait = yieldServiceWait
         self.serviceJobRunning = serviceJobRunning; self.startService = startService
     }
 }

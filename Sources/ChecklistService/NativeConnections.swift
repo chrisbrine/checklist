@@ -107,7 +107,7 @@ extension Coordinator {
             }
             // A thread can connect before its rollout exists, and an older enrollment has no value.
             if provider == "codex",!relay,existing.codexAppHostProven != true,
-               codexRoute.effects.provesRegistrationDomain(session:existing.nativeSessionID ?? existing.sessionID,domain:executionDomain) {
+               provesCodexAppRegistration(session:existing.nativeSessionID ?? existing.sessionID,domain:executionDomain) {
                 storeCodexAppHostProof(installation:installation,generation:existing.generation)
                 existing.codexAppHostProven=true
             }
@@ -141,7 +141,7 @@ extension Coordinator {
             enrollment.nativeSessionID=sid
             enrollment.automatic=true;enrollment.revoked=false;enrollment.identityVerification=plugin.nativeHost?.identityVerification
             enrollment.nativeExecutionDomain=executionDomain
-            enrollment.codexAppHostProven=provider == "codex" && !relay ? codexRoute.effects.provesRegistrationDomain(session:sid,domain:executionDomain) : nil
+            enrollment.codexAppHostProven=provider == "codex" && !relay ? provesCodexAppRegistration(session:sid,domain:executionDomain) : nil
             enrollment.assistantRelay=relay
             if relay { enrollment.assistantGrants=grantMap;enrollment.relayPolicyRevisions=grantRevisions;enrollment.relaySelector=selector;enrollment.identityVerification="native_codex_helper_not_dot_identity" }
             if ProviderPluginRegistry.bundled.plugin(provider, requiring: .nativePeer) != nil,let endpoint=context["native_endpoint"] as? String { try bindProviderEndpoint(&enrollment,endpoint:endpoint,process:process) }
@@ -227,7 +227,7 @@ extension Coordinator {
             // Rebuilding an existing enrollment cannot turn a copied session into a slot-local one.
             enrollment.nativeRelayRegistrationStore=priorEnrollment == nil ? nativeRelayPolicy.registrationStore : priorEnrollment?.nativeRelayRegistrationStore
             enrollment.nativeSessionID=native.session;enrollment.automatic=true;enrollment.revoked=false
-            enrollment.codexAppHostProven=native.provider == "codex" ? codexRoute.effects.provesRegistrationDomain(session:native.session,domain:native.executionDomain) : nil
+            enrollment.codexAppHostProven=native.provider == "codex" ? provesCodexAppRegistration(session:native.session,domain:native.executionDomain) : nil
             enrollment.nativeExecutionDomain=native.executionDomain;enrollment.identityVerification=plugin.nativeHost?.identityVerification
             enrollment.assistantRelay=false
             if ProviderPluginRegistry.bundled.plugin(native.provider,requiring:.nativePeer) != nil,let endpoint=context["native_endpoint"] as? String { try bindProviderEndpoint(&enrollment,endpoint:endpoint,process:native.process) }
@@ -273,19 +273,51 @@ extension Coordinator {
     /// its work, the thread gets a new credential and authorization generation.
     /// Released claims and queued deliveries stay with the ended generation; an owner
     /// disconnect stays refused until the owner explicitly allows a fresh bootstrap.
-    private func reconnectNativeSession(_ existing:Enrollment,project:String,executionDomain:String,binding:String?,process:pid_t,endpoint:String?,owner:Caller,ownerAllowed:Bool = false) throws -> Enrollment {
+    private func reconnectNativeSession(_ saved:Enrollment,project:String,executionDomain:String,binding:String?,process:pid_t,endpoint:String?,owner:Caller,ownerAllowed:Bool = false) throws -> Enrollment {
+        var existing = saved
+        var codexRestart: (NativeLifecycleRegistration, NativeLifecycleRegistration)?
         let ownerDisconnected=ChecklistError("CONNECTION_REVOKED","The owner disconnected this thread in Checklist. It cannot reconnect automatically.")
         // Verified closure applies only to these enrollments; any other revocation is the owner's.
-        guard existing.automatic == true,existing.role == "worker",existing.assistantRelay != true,let plugin=ProviderPluginRegistry.bundled.plugin(existing.provider, requiring: ownerAllowed ? .workSession : .registryClosure),
+        guard existing.automatic == true,existing.role == "worker",existing.assistantRelay != true,let plugin=ProviderPluginRegistry.bundled.plugin(existing.provider, requiring: .workSession),
               existing.identityVerification == plugin.nativeHost?.identityVerification,let oldDomain=existing.nativeExecutionDomain else {
             if existing.revoked == true { throw ownerDisconnected }
-            throw ChecklistError("NATIVE_SESSION_MISMATCH","This reported thread was connected by a different native host process. Its claims and messages cannot be borrowed.")
+            throw ChecklistError("NATIVE_SESSION_MISMATCH","The saved connection has no matching verified native worker and process identity for resumption. Its claims and messages cannot be borrowed.")
         }
         if !ownerAllowed {
             guard existing.ownerRevoked != true else { throw ownerDisconnected }
-            // execute() observed native lifecycles before this request, so an unfenced
-            // enrollment means the earlier process has no verified closure yet.
-            guard existing.revoked == true else { throw ChecklistError("NATIVE_SESSION_MISMATCH","This thread's earlier process has no verified closure yet. Its claims and messages cannot be borrowed.") }
+            guard existing.workspace == binding, existing.projectIDs == [project] else {
+                throw ChecklistError("BINDING_CHANGED", "The registered workspace changed. Review this connection in Checklist before reconnecting.")
+            }
+            if existing.provider == "codex", existing.codexAppHostProven == true, codexAppHostRestartEffects.available,
+               ProviderPluginRegistry.bundled.plugin("codex", requiring: .codexAppHostRestart) != nil,
+               let old = NativeLifecycleRegistration(provider: "codex", sessionID: existing.nativeSessionID ?? existing.sessionID,
+                   executionDomain: oldDomain, registryPath: nil),
+               let new = NativeLifecycleRegistration(provider: "codex", sessionID: existing.sessionID,
+                   executionDomain: executionDomain, registryPath: nil), new.processID == process, old.sessionID == new.sessionID {
+                if let session = try router.connectionSession(sessionID: existing.sessionID, project: project, caller: owner),
+                   session["state"] as? String == "revoked" || session["owner_revoked"] as? Bool == true {
+                    throw ownerDisconnected
+                }
+                let state = try verifyCodexRestartHost(old: old, new: new)
+                let released = try reconcileNativeClosure(existing, processState: state.rawValue, registryState: "not_applicable",
+                    registryDigest: nil, basis: .codexAppHostRestart, replacementDomain: executionDomain)
+                // The rollback baseline is the fenced enrollment, never the earlier
+                // live authority. Pending source/descendant writers retain it too.
+                existing = enrollments[existing.installation]!
+                guard released else {
+                    throw CoreError("NATIVE_CLOSURE_PENDING", "Work from the earlier Codex app host must stop and return for pickup before reconnecting.")
+                }
+                _ = try verifyCodexRestartHost(old: old, new: new)
+                codexRestart = (old, new)
+            } else {
+                // Preserve part 1's precise refusal for exec, old/unproved app
+                // registrations, malformed domains and unsupported providers.
+                guard ProviderPluginRegistry.bundled.plugin(existing.provider, requiring: .registryClosure) != nil else {
+                    throw ChecklistError(existing.revoked == true ? "CONNECTION_REVOKED" : "NATIVE_SESSION_MISMATCH",
+                        "\(plugin.manifest.displayName) cannot reconnect automatically: Checklist has no verified host registry proving the old thread-to-host binding ended, or independent proof of the same thread in the new host. A host restart or observed thread ID cannot supply those proofs.")
+                }
+                guard existing.revoked == true else { throw ChecklistError("NATIVE_SESSION_MISMATCH","Checklist has not verified both the earlier process's exit (PID and start time) and an absent or replaced native registry entry. Its claims and messages cannot be borrowed.") }
+            }
             // The same live process cannot have a verified closure, so its revocation is the owner's.
             guard oldDomain != executionDomain else { throw ownerDisconnected }
         }
@@ -302,7 +334,7 @@ extension Coordinator {
         guard SecRandomCopyBytes(kSecRandomDefault,bytes.count,&bytes)==errSecSuccess else { throw ChecklistError("RANDOM_FAILURE","Could not create the thread connection.") }
         let token=Data(bytes).base64EncodedString()
         var resumed=existing
-        resumed.codexAppHostProven=existing.provider == "codex" ? codexRoute.effects.provesRegistrationDomain(session:existing.nativeSessionID ?? existing.sessionID,domain:executionDomain) : nil
+        resumed.codexAppHostProven=codexRestart != nil ? true : (existing.provider == "codex" ? provesCodexAppRegistration(session:existing.nativeSessionID ?? existing.sessionID,domain:executionDomain) : nil)
         resumed.generation=UUID().uuidString;resumed.nativeExecutionDomain=executionDomain;resumed.revoked=false;resumed.ownerRevoked=false
         resumed.tokenDigest=SHA256.hash(data:Data(token.utf8)).map{String(format:"%02x",$0)}.joined()
         resumed.nativeEndpoint=nil;resumed.nativeDevice=nil;resumed.nativeInode=nil
@@ -315,6 +347,7 @@ extension Coordinator {
             saveEnrollment: { enrollments[existing.installation] = resumed; try saveEnrollments() },
             registerSession: {
                 if ownerAllowed { return try router.reconnectOwnerAllowedSession(resumption,caller:owner) }
+                if let (old, new) = codexRestart { _ = try verifyCodexRestartHost(old: old, new: new) }
                 return try router.resumeVerifiedNativeSession(resumption, caller: owner)
             },
             rollback: { try ConnectionCommit.restore(enrollment: { enrollments[existing.installation] = existing; try saveEnrollments() }, credential: {

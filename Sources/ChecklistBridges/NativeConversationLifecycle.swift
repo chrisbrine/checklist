@@ -50,7 +50,7 @@ public enum NativeLifecycleInspector {
         return .init(process: process, registry: registry.state, detail: registry.detail, registryDigest: registry.digest)
     }
 
-    private static func processState(_ registration: NativeLifecycleRegistration) -> NativeLifecycleObservation.ProcessState {
+    public static func processState(_ registration: NativeLifecycleRegistration) -> NativeLifecycleObservation.ProcessState {
         var info = proc_bsdinfo()
         if proc_pidinfo(registration.processID, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout.size(ofValue: info))) == MemoryLayout.size(ofValue: info) {
             guard info.pbi_uid == getuid() else { return .unknown }

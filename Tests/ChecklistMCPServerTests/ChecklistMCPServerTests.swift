@@ -28,6 +28,10 @@ final class ChecklistMCPServerTests: XCTestCase {
         var requestHandler: ((String, [String:Any]) throws -> [String:Any])?
         var unregisteredWorkspace = false
         var projectCreationEnabled = false
+        var mcpMetadataHost = false
+        var metadataWorkspace: String?
+        private(set) var nativeContexts: [[String: Any]] = []
+        func recordNativeContext(_ context: [String: Any]) { locked { nativeContexts.append(context) } }
         var jobRunning: Bool? = true
         private var starts = 0
         var serviceStarts: Int { locked { starts } }
@@ -63,6 +67,9 @@ final class ChecklistMCPServerTests: XCTestCase {
                     if self.discoveries.count > 1 { return self.discoveries.removeFirst() }
                     return self.discoveries[0]
                 }
+            }, discoverCodexMCPThread: { raw in
+                NativeSessionContext.codexMCPThread(raw, hostProvider: self.mcpMetadataHost ? "codex" : nil,
+                    workspace: self.metadataWorkspace ?? self.context.workspacePath)
             }, now: { self.time }, sleep: { self.advance($0) }, stderr: { line in
                 self.locked { self.stderrLines.append(line) }
             }, serviceJobRunning: { self.locked { self.jobRunning } }, startService: { self.locked { self.starts += 1 } })
@@ -112,6 +119,7 @@ final class ChecklistMCPServerTests: XCTestCase {
         init(fixture: Fixture, index: Int) { self.fixture = fixture; self.index = index }
         func bootstrap(_ nativeContext: [String: Any], timeBudget: TimeInterval?) throws -> [String: Any] {
             XCTAssertNil(nativeContext["credential"])
+            fixture.recordNativeContext(nativeContext)
             return try fixture.bootstrap(timeBudget)
         }
         func call(_ method: String, _ params: [String: Any], replyTimeout: TimeInterval?) throws -> [String: Any] {
@@ -995,6 +1003,234 @@ final class ChecklistMCPServerTests: XCTestCase {
         XCTAssertTrue(rendered.contains("00000000-0000-0000-0000-000000000411"))
     }
 
+    private func threadMeta(_ id: String) -> Metadata {
+        .init(additionalFields: ["threadId": .string(id), "sessionId": .string("442869b6-60df-4b59-b572-c2ac85566e2a")])
+    }
+
+    func testUnboundAutomaticMCPNeverUsesStoredCredentialOrDiscoversThreadTools() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.unavailable])
+        fixture.responseData = ["caller": ["session_id": ""], "project_ids": []]
+        let session = try await start(fixture)
+        let tools = try await session.client.listTools()
+        XCTAssertEqual(tools.tools.map(\.name), ["service_info"])
+        XCTAssertTrue(fixture.calls.isEmpty, "Unbound discovery cannot consult a legacy default credential/catalog")
+        let info = try await session.client.callTool(name: "service_info")
+        XCTAssertEqual(info.isError, false)
+        XCTAssertTrue(text(info.content).contains("native_thread_identity_unavailable"))
+        XCTAssertFalse(fixture.calls.isEmpty)
+        XCTAssertTrue(fixture.calls.allSatisfy { !$0.1.usesStoredCredential && $0.1.nativeContext == nil })
+        XCTAssertTrue(fixture.attempts.isEmpty)
+        let denied = try await session.client.callTool(name: "task_list")
+        XCTAssertEqual(denied.isError, true)
+    }
+
+    func testCodexMCPWireThreadIDBootstrapsAndReturnsPendingNotesWithOneCatalogRefresh() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.unavailable]); fixture.mcpMetadataHost = true
+        fixture.requestHandler = { name, _ in
+            if name == "tool_catalog", fixture.attempts.isEmpty {
+                return ["data": ["tools": [["name": "service_info", "inputSchema": ["type": "object"]]]]]
+            }
+            if name == "tool_catalog" {
+                return ["data": ["tools": ["service_info", "task_list"].map { ["name": $0, "inputSchema": ["type": "object"]] as [String: Any] }]]
+            }
+            return ["data": ["caller": ["session_id": fixture.context.nativeSessionID], "project_ids": ["synthetic-project"],
+                "_checklist": ["pending_notes": ["schema_version": 1, "status": "pending_pickup", "has_more": false,
+                    "items": [["project_id": "00000000-0000-0000-0000-000000000410", "message_id": "00000000-0000-0000-0000-000000000411", "subject": ["kind": "ticket", "key": "SYN-1", "title": "Synthetic note"]]]]]]]
+        }
+        let session = try await start(fixture)
+        let initialTools = try await session.client.listTools()
+        XCTAssertEqual(initialTools.tools.map(\.name), ["service_info"])
+        XCTAssertTrue(fixture.attempts.isEmpty)
+        let pending = try await session.client.send(CallTool.request(.init(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))))
+        let reply = try await pending.value
+        XCTAssertEqual(reply.isError, false)
+        let envelope = try XCTUnwrap(jsonObject(XCTUnwrap(reply.structuredContent)) as? [String: Any])
+        let data = try XCTUnwrap(envelope["data"] as? [String: Any])
+        XCTAssertEqual((data["caller"] as? [String: Any])?["session_id"] as? String, fixture.context.nativeSessionID)
+        XCTAssertNotNil((data["_checklist"] as? [String: Any])?["pending_notes"])
+        XCTAssertTrue(text(reply.content).contains("Checklist has pending notes"))
+        XCTAssertEqual(fixture.nativeContexts.count, 1)
+        XCTAssertEqual(fixture.nativeContexts.first?["native_session_id"] as? String, fixture.context.nativeSessionID)
+        XCTAssertEqual(fixture.nativeContexts.first?["workspace_path"] as? String, fixture.context.workspacePath)
+        let boundTools = try await session.client.listTools()
+        XCTAssertEqual(boundTools.tools.map(\.name), ["service_info", "task_list"])
+        _ = try await session.client.callTool(name: "task_list", meta: threadMeta(fixture.context.nativeSessionID.uppercased()))
+        XCTAssertEqual(fixture.attempts.count, 1)
+        let changes = await session.notifications.count
+        XCTAssertEqual(changes, 1)
+        try await assertProtocolOnly(session)
+    }
+
+    func testCodexMCPBoundConnectionRefusesMissingConflictingAndMalformedMetadataAndResources() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.unavailable]); fixture.mcpMetadataHost = true
+        let session = try await start(fixture)
+        _ = try await session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))
+        let before = fixture.calls.count
+        for meta in [nil, threadMeta(UUID().uuidString), Metadata(additionalFields: ["threadId": .int(7)])] as [Metadata?] {
+            let reply = try await session.client.callTool(name: "service_info", meta: meta)
+            XCTAssertEqual(reply.isError, true)
+            XCTAssertTrue(text(reply.content).contains("NATIVE_SESSION_MISMATCH"))
+        }
+        do { _ = try await session.client.readResource(uri: "checklist://service/status"); XCTFail("Anonymous resource read must fail") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("NATIVE_SESSION_REQUIRED")) }
+        do { _ = try await session.client.listResources(); XCTFail("Anonymous resource list must fail") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("NATIVE_SESSION_REQUIRED")) }
+        XCTAssertEqual(fixture.calls.count, before)
+        XCTAssertEqual(fixture.attempts.count, 1)
+    }
+
+    func testRequestsAdmittedBeforeBindingCannotBorrowTheLaterThreadDuringExecution() async throws {
+        for operation in ["tool", "service_wait", "retry", "resource_list", "resource_read"] {
+            let fixture = try Fixture(provider: "codex")
+            fixture.setDiscoveries([.unavailable]); fixture.mcpMetadataHost = true
+            let bridge = Bridge(configuration: .init(workspace: fixture.context.workspacePath), environment: fixture.environment)
+            await bridge.startConnection()
+            let identity: Bridge.MCPRequest = operation.hasPrefix("resource") ? .resource : .tool(nil)
+            try await Bridge.$mcpRequest.withValue(identity) {
+                // A is admitted unbound, then suspends before capturing a client.
+                if operation.hasPrefix("resource") { try await bridge.requireMCPResourceIdentity() }
+                else { _ = try await bridge.admitMCPTool(threadID: nil) }
+                // B binds while A is suspended; resuming A retains A's own identity.
+                _ = try await Bridge.$mcpRequest.withValue(.tool(.string(fixture.context.nativeSessionID))) {
+                    try await bridge.admitMCPTool(threadID: .string(fixture.context.nativeSessionID))
+                }
+                let before = fixture.calls.count
+                do {
+                    switch operation {
+                    case "tool": _ = try await bridge.concurrentCall("service_info", .object([:]))
+                    case "service_wait": _ = try await bridge.awaitService()
+                    case "retry": _ = try await bridge.retryConnection()
+                    case "resource_list": _ = try await bridge.resources()
+                    default: _ = try await bridge.concurrentReadResource("checklist://service/status")
+                    }
+                    XCTFail("A pre-bind anonymous request borrowed B's connection: " + operation)
+                } catch let error as ChecklistError {
+                    XCTAssertTrue(["NATIVE_SESSION_REQUIRED", "NATIVE_SESSION_MISMATCH"].contains(error.code), operation)
+                }
+                XCTAssertEqual(fixture.calls.count, before, operation)
+                XCTAssertEqual(fixture.attempts.count, 1, operation)
+            }
+        }
+    }
+
+    func testConcurrentIdentifiedFirstCallsKeepOneNativeBindingAndCatalogRefresh() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.unavailable]); fixture.mcpMetadataHost = true
+        let session = try await start(fixture)
+        async let first = session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))
+        async let second = session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID.uppercased()))
+        let replies = try await [first, second]
+        XCTAssertTrue(replies.allSatisfy { $0.isError == false })
+        XCTAssertEqual(fixture.attempts.count, 1)
+        XCTAssertEqual(fixture.nativeContexts.count, 1)
+        let changes = await session.notifications.count
+        XCTAssertEqual(changes, 1)
+    }
+
+    private actor ServiceYieldGate {
+        private var paused = false
+        private var observer: CheckedContinuation<Void, Never>?
+        private var release: CheckedContinuation<Void, Never>?
+        func pause() async {
+            await withCheckedContinuation { continuation in
+                release = continuation; paused = true; observer?.resume(); observer = nil
+            }
+        }
+        func waitUntilPaused() async {
+            if paused { return }
+            await withCheckedContinuation { observer = $0 }
+        }
+        func resume() { release?.resume(); release = nil }
+    }
+
+    func testAnonymousServiceWaitRechecksAfterYieldAndCannotResetNewThreadBinding() async throws {
+        let fixture = try Fixture(provider: "codex"), gate = ServiceYieldGate()
+        fixture.setDiscoveries([.unavailable]); fixture.mcpMetadataHost = true
+        fixture.callHandler = { name in
+            if name == "service_info", fixture.nativeContexts.isEmpty {
+                throw ChecklistError("OUTCOME_UNKNOWN", "Synthetic unbound status timeout")
+            }
+        }
+        var environment = fixture.environment
+        environment.yieldServiceWait = { await gate.pause() }
+        let bridge = Bridge(configuration: .init(workspace: fixture.context.workspacePath, expectedSession: fixture.context.nativeSessionID), environment: environment)
+        await bridge.startConnection()
+        let anonymous = Task {
+            try await Bridge.$mcpRequest.withValue(.tool(nil)) { try await bridge.awaitService(limit: 20) }
+        }
+        await gate.waitUntilPaused()
+        _ = try await Bridge.$mcpRequest.withValue(.tool(.string(fixture.context.nativeSessionID))) {
+            try await bridge.admitMCPTool(threadID: .string(fixture.context.nativeSessionID))
+        }
+        let before = fixture.calls.count
+        await gate.resume()
+        do { _ = try await anonymous.value; XCTFail("An anonymous waiter accessed the later bound client") }
+        catch let error as ChecklistError { XCTAssertEqual(error.code, "NATIVE_SESSION_MISMATCH") }
+        XCTAssertEqual(fixture.calls.count, before)
+        XCTAssertEqual(fixture.attempts.count, 1)
+        _ = try await Bridge.$mcpRequest.withValue(.tool(.string(fixture.context.nativeSessionID))) {
+            try await bridge.concurrentCall("service_info", .object([:]))
+        }
+        XCTAssertEqual(fixture.calls.last?.1.nativeContext?["native_session_id"] as? String, fixture.context.nativeSessionID)
+    }
+
+    func testCodexMCPThreadIdentityCannotComeFromArgumentsSessionIDOrUnverifiedHost() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.unavailable])
+        let session = try await start(fixture)
+        _ = try await session.client.callTool(name: "service_info", arguments: ["threadId": .string(fixture.context.nativeSessionID)])
+        _ = try await session.client.callTool(name: "service_info", meta: .init(additionalFields: ["sessionId": .string(fixture.context.nativeSessionID)]))
+        XCTAssertTrue(fixture.attempts.isEmpty)
+        let before = fixture.calls.count
+        let unverified = try await session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))
+        XCTAssertTrue(text(unverified.content).contains("NATIVE_HOST_REQUIRED"))
+        let malformed = try await session.client.callTool(name: "service_info", meta: threadMeta("not-a-uuid"))
+        XCTAssertTrue(text(malformed.content).contains("NATIVE_SESSION_REQUIRED"))
+        XCTAssertTrue(fixture.attempts.isEmpty)
+        XCTAssertEqual(fixture.calls.count, before)
+    }
+
+    func testCodexMCPThreadMetadataCannotOverrideExportExpectedSessionOrWorkspace() async throws {
+        let exported = try Fixture(provider: "codex")
+        exported.setDiscoveries([.available(exported.context)])
+        let existing = try await start(exported)
+        let before = exported.calls.count
+        let refused = try await existing.client.callTool(name: "service_info", meta: threadMeta(UUID().uuidString))
+        XCTAssertTrue(text(refused.content).contains("NATIVE_SESSION_MISMATCH"))
+        XCTAssertEqual(exported.calls.count, before)
+        for wrongWorkspace in [false, true] {
+            let fixture = try Fixture(provider: "codex")
+            fixture.setDiscoveries([.unavailable]); fixture.mcpMetadataHost = true
+            if wrongWorkspace { fixture.metadataWorkspace = "/synthetic/another-project" }
+            let configuration = BridgeConfiguration(workspace: fixture.context.workspacePath,
+                expectedSession: wrongWorkspace ? nil : UUID().uuidString)
+            let session = try await start(fixture, configuration: configuration)
+            let result = try await session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))
+            XCTAssertEqual(result.isError, true)
+            XCTAssertTrue(text(result.content).contains(wrongWorkspace ? "WORKSPACE_MISMATCH" : "NATIVE_SESSION_MISMATCH"))
+            XCTAssertTrue(fixture.attempts.isEmpty)
+        }
+    }
+
+    func testCodexMCPPermanentBootstrapRefusalNeverSwitchesThreadOrRetries() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.unavailable]); fixture.mcpMetadataHost = true
+        fixture.bootstrapHandler = { _ in throw ChecklistError("CONNECTION_REVOKED", "Synthetic revoked connection") }
+        let session = try await start(fixture)
+        _ = try await session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))
+        let result = try await session.client.callTool(name: "task_list", meta: threadMeta(fixture.context.nativeSessionID))
+        XCTAssertEqual(result.isError, true)
+        XCTAssertTrue(text(result.content).contains("CONNECTION_REVOKED"))
+        let conflict = try await session.client.callTool(name: "service_info", meta: threadMeta(UUID().uuidString))
+        XCTAssertTrue(text(conflict.content).contains("NATIVE_SESSION_MISMATCH"))
+        XCTAssertEqual(fixture.attempts.count, 1)
+        let changes = await session.notifications.count
+        XCTAssertEqual(changes, 0)
+    }
+
     func testCodexAndUnregisteredWorkspaceKeepTheirStartupRules() async throws {
         let codex = try Fixture(provider: "codex")
         codex.setDiscoveries([.available(codex.context)])
@@ -1140,8 +1376,31 @@ final class ChecklistMCPServerTests: XCTestCase {
         }
     }
 
+    func testMetadataBoundMCPReplacementRequiresRestartWithoutLaunchingDelegate() async throws {
+        for replacedAtStartup in [false, true] {
+            let fixture = try Fixture(provider: "codex"), update = UpdateFixture()
+            fixture.setDiscoveries([.unavailable]); fixture.mcpMetadataHost = true
+            if replacedAtStartup { update.set(.replaced) }
+            let session = try await start(fixture, update: update.environment)
+            if !replacedAtStartup {
+                _ = try await session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))
+                update.set(.replaced)
+            }
+            let pending = try await session.client.send(CallTool.request(.init(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))))
+        let reply = try await pending.value
+            XCTAssertEqual(reply.isError, true)
+            let error = try XCTUnwrap((try jsonObject(XCTUnwrap(reply.structuredContent)) as? [String: Any])?["error"] as? [String: Any])
+            XCTAssertEqual(error["code"] as? String, ClientUpdateRequired.code)
+            let details = try XCTUnwrap(error["details"] as? [String: Any])
+            XCTAssertEqual(details["command_executed"] as? Bool, false)
+            XCTAssertEqual(details["recovery_action"] as? String, "restart_mcp_server")
+            XCTAssertTrue(update.calls.isEmpty)
+        }
+    }
+
     func testReplacedShimNativeRefusalAlsoNamesReconnectWithoutReplay() async throws {
         let fixture = try Fixture(provider:"codex"),update = UpdateFixture()
+        fixture.setDiscoveries([.available(fixture.context)])
         update.set(.replaced)
         update.result = .init(status:1,stdout:Data(),stderr:"Checklist: NATIVE_SESSION_REQUIRED: old native binding\n")
         var environment = fixture.environment;environment.shimUpdate = update.environment

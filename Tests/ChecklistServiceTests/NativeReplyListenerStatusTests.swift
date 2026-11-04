@@ -14,7 +14,7 @@ final class NativeReplyListenerStatusTests: XCTestCase {
     override func setUpWithError() throws {
         root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
-        replies = "/tmp/cl415s-\(UUID().uuidString.prefix(8).lowercased())"
+        replies = root.appendingPathComponent("replies").path
         try FileManager.default.createDirectory(atPath:replies,withIntermediateDirectories:false,attributes:[.posixPermissions:0o700])
         coordinator = Coordinator(router:try CommandRouter(root:root.appendingPathComponent("store")),enrollmentFile:root.appendingPathComponent("connections.json"),startBackgroundWork:false)
     }
@@ -22,7 +22,6 @@ final class NativeReplyListenerStatusTests: XCTestCase {
         coordinator.queue.sync {}
         coordinator.queue.sync { coordinator.nativeListener?.releaseSocketFile();coordinator.nativeListener = nil }
         try FileManager.default.removeItem(at:root)
-        try FileManager.default.removeItem(atPath:replies)
     }
     private func listener() throws -> [String:Any] {
         let result = try coordinator.router.handle(method:"service_info",params:[:],caller:owner)
@@ -30,7 +29,15 @@ final class NativeReplyListenerStatusTests: XCTestCase {
         return try XCTUnwrap(data["native_reply_listener"] as? [String:Any])
     }
 
+    private func requireSocketAddressSpace() throws {
+        // Respect a caller-selected TMPDIR. A long restricted workspace cannot
+        // provide the absolute <=103-byte sender address this transport needs.
+        try XCTSkipIf((replies + "/\(getpid())-ffffffff.sock").utf8.count >= 104,
+                      "The selected temporary root exceeds the Unix socket address limit; run this fixture in an authorized shorter root.")
+    }
+
     func testServiceInfoReportsAFailedListenerInPlainWords() throws {
+        try requireSocketAddressSpace()
         XCTAssertEqual(try listener()["state"] as? String,"not_started")
         XCTAssertEqual(chmod(replies,0o777),0)
         coordinator.startNativeReplies(directory:replies)
@@ -48,6 +55,7 @@ final class NativeReplyListenerStatusTests: XCTestCase {
     }
 
     func testAFreePathReportsTheProcessIDName() throws {
+        try requireSocketAddressSpace()
         coordinator.startNativeReplies(directory:replies)
         XCTAssertEqual(coordinator.queue.sync { coordinator.nativeListener?.path },replies + "/\(getpid()).sock")
         let info = try listener()
@@ -57,12 +65,12 @@ final class NativeReplyListenerStatusTests: XCTestCase {
     }
 
     func testAStaleSocketStaysAndTheServiceReportsAFallbackName() throws {
+        try requireSocketAddressSpace()
         let path = replies + "/\(getpid()).sock"
-        let descriptor = socket(AF_UNIX,SOCK_STREAM,0)
-        var address = sockaddr_un();address.sun_family = sa_family_t(AF_UNIX)
-        withUnsafeMutableBytes(of:&address.sun_path) { $0.copyBytes(from:path.utf8) }
-        let bound = withUnsafePointer(to:&address) { $0.withMemoryRebound(to:sockaddr.self,capacity:1) { Darwin.bind(descriptor,$0,socklen_t(MemoryLayout<sockaddr_un>.size)) } }
-        XCTAssertEqual(bound,0);XCTAssertEqual(chmod(path,0o600),0);close(descriptor)
+        // End the listener while retaining its socket file, producing a genuinely
+        // stale path without removing anything outside this fixture.
+        do { let stale = try NativeReplyListener(path:path); stale.releaseSocketFile() }
+        XCTAssertEqual(chmod(path,0o600),0)
         var before = stat();XCTAssertEqual(lstat(path,&before),0)
         coordinator.startNativeReplies(directory:replies)
         let boundPath = try XCTUnwrap(coordinator.queue.sync { coordinator.nativeListener?.path })

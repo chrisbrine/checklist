@@ -244,9 +244,20 @@ class SamplerTests(unittest.TestCase):
         self.assertEqual(summary['stop_reason'], f'max_hours: {40 / 3600}')
         self.assertTrue(summary['backups'][0]['retention']['read_early_at_stop'])
 
+    def test_launchd_root_is_the_service_and_its_child_is_a_helper(self):
+        processes = [{'pid': 56885, 'ppid': 1, 'start_time': 'Wed Nov  4 15:19:01 2026'},
+                     {'pid': 88405, 'ppid': 56885, 'start_time': 'Wed Nov  4 15:24:00 2026'}]
+        args = sampler.parse_args(['--out', '/nonexistent/samples.jsonl'])
+        run = sampler.Sampler(args, runner=lambda command, cwd=None, timeout=None: (1, '', 'unused'), finder=lambda executable: processes)
+        self.assertIsNone(run.identify())
+        self.assertEqual(run.service['pid'], 56885)
+        self.assertEqual(run.helpers, [88405])
+        processes.append({'pid': 99999, 'ppid': 1, 'start_time': 'Wed Nov  4 15:30:00 2026'})
+        self.assertEqual(run.identify(), 'service_ambiguous: 56885, 99999')
+
     def test_lookup_finds_only_the_exact_executable(self):
-        outputs = {('ps', '-axo', 'pid=,comm='): '  1 /sbin/launchd\n 56885 Contents/MacOS/ChecklistService\n 777 Contents/MacOS/ChecklistService\n'}
-        paths = {56885: sampler.DEFAULT_EXECUTABLE, 777: '/private/var/slot1/Checklist.app/Contents/MacOS/ChecklistService'}
+        outputs = {('ps', '-axo', 'pid=,ppid=,comm='): '  1 0 /sbin/launchd\n 56885 1 Contents/MacOS/ChecklistService\n 777 1 Contents/MacOS/ChecklistService\n 88405 56885 Contents/MacOS/ChecklistService\n'}
+        paths = {56885: sampler.DEFAULT_EXECUTABLE, 88405: sampler.DEFAULT_EXECUTABLE, 777: '/private/var/slot1/Checklist.app/Contents/MacOS/ChecklistService'}
 
         def runner(command, cwd=None, timeout=None):
             if command[:2] == ['ps', '-o']:
@@ -258,7 +269,7 @@ class SamplerTests(unittest.TestCase):
             found = sampler.find_processes(sampler.DEFAULT_EXECUTABLE, runner)
         finally:
             sampler._pidpath = original
-        self.assertEqual(found, [{'pid': 56885, 'start_time': 'Wed Nov  4 11:11:20 2026'}])
+        self.assertEqual(found, [{'pid': 56885, 'ppid': 1, 'start_time': 'Wed Nov  4 11:11:20 2026'}, {'pid': 88405, 'ppid': 56885, 'start_time': 'Wed Nov  4 11:11:20 2026'}])
 
 
 class ParseTests(unittest.TestCase):

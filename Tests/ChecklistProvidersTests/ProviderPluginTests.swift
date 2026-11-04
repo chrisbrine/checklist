@@ -15,6 +15,8 @@ final class ProviderPluginTests: XCTestCase {
         XCTAssertNotNil(registry.plugin("codex",requiring:.composer))
         XCTAssertNil(registry.plugin("codex",requiring:.nativePeer))
         XCTAssertNil(registry.plugin("codex",requiring:.registryClosure))
+        XCTAssertNotNil(registry.plugin("codex",requiring:.codexAppHostRestart))
+        XCTAssertNil(registry.plugin("claude",requiring:.codexAppHostRestart))
         XCTAssertNotNil(registry.plugin("claude",requiring:.nativePeer))
         XCTAssertNil(registry.plugin("claude",requiring:.composer))
         XCTAssertNil(registry.plugin("unknown",requiring:.pickup))
@@ -53,6 +55,9 @@ final class ProviderPluginTests: XCTestCase {
     func testManifestVersionAndCapabilityDependenciesValidate() throws {
         XCTAssertThrowsError(try Fixture(capabilities:[.workSession]).manifest.validate())
         XCTAssertThrowsError(try Fixture(capabilities:[.registryClosure]).manifest.validate())
+        XCTAssertThrowsError(try Fixture(provider:"codex",capabilities:[.codexAppHostRestart]).manifest.validate())
+        XCTAssertThrowsError(try Fixture(capabilities:[.workSession,.pickup,.correlatedReply,.codexAppHostRestart]).manifest.validate())
+        try Fixture(provider:"codex",capabilities:[.workSession,.pickup,.correlatedReply,.codexAppHostRestart]).manifest.validate()
         let invalid = ProviderPluginManifest(pluginID:"example.fixture",version:"latest",providerID:"fixture",displayName:"Fixture",capabilities:[])
         XCTAssertThrowsError(try invalid.validate())
         let badModel = ProviderPluginManifest(pluginID:"example.fixture",version:"1.0.0",providerID:"fixture",displayName:"Fixture",capabilities:[],models:[.init(id:"m",name:"Model",selectable:true)])

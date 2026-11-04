@@ -3,6 +3,13 @@ import GRDB
 
 /// Produced only by the bundled service's authenticated native observer. There
 /// is deliberately no public JSON command or worker-supplied closed flag.
+public enum NativeClosureBasis: String, Sendable {
+    case processAndRegistry = "process_and_registry"
+    /// Owner decision, 4 November 2026: app-host exit plus a positively held
+    /// thread in a replacement signed app host, at first-bootstrap trust only.
+    case codexAppHostRestart = "codex_app_host_restart"
+}
+
 public struct VerifiedNativeClosure: Sendable {
     public let projectID: String
     public let sessionID: String
@@ -13,12 +20,16 @@ public struct VerifiedNativeClosure: Sendable {
     public let processState: String
     public let registryState: String
     public let registryDigest: String?
+    public let basis: NativeClosureBasis
+    public let replacementExecutionDomain: String?
     public init(projectID: String, sessionID: String, installation: String, executionDomain: String,
-                provider: String, authorizationGeneration: String, processState: String, registryState: String, registryDigest: String?) {
+                provider: String, authorizationGeneration: String, processState: String, registryState: String, registryDigest: String?,
+                basis: NativeClosureBasis = .processAndRegistry, replacementExecutionDomain: String? = nil) {
         self.projectID = projectID; self.sessionID = sessionID; self.installation = installation
         self.executionDomain = executionDomain; self.provider = provider
         self.authorizationGeneration = authorizationGeneration
         self.processState = processState; self.registryState = registryState; self.registryDigest = registryDigest
+        self.basis = basis; self.replacementExecutionDomain = replacementExecutionDomain
     }
 }
 
@@ -126,10 +137,15 @@ extension CommandRouter {
 
     public func reconcileVerifiedNativeClosure(_ proof: VerifiedNativeClosure, caller: Caller) throws -> [String: Any] {
         try owner(caller)
+        let registryClosure = proof.basis == .processAndRegistry && ["absent", "replaced"].contains(proof.registryState)
+        let appRestart = proof.basis == .codexAppHostRestart && proof.provider == "codex"
+            && proof.registryState == "not_applicable"
+            && proof.replacementExecutionDomain?.hasPrefix("codex:") == true
+            && proof.replacementExecutionDomain != proof.executionDomain
         guard caller.installation == "native-lifecycle",
               !proof.authorizationGeneration.isEmpty,
-              ["gone", "replaced"].contains(proof.processState), ["absent", "replaced"].contains(proof.registryState) else {
-            throw CoreError("NATIVE_CLOSURE_UNPROVEN", "Positive native process and registry closure evidence is required.")
+              ["gone", "replaced"].contains(proof.processState), registryClosure || appRestart else {
+            throw CoreError("NATIVE_CLOSURE_UNPROVEN", "Positive native process and registry closure evidence, or the owner-approved Codex app host restart proof, is required.")
         }
         let lease = try storageAdmission.acquire(); defer { lease.finish() }
         return try ArchiveStorageGate.withExclusive(root: root) { _ in
@@ -150,9 +166,14 @@ extension CommandRouter {
                 observation = ["id": observationID, "project_id": proof.projectID, "session_id": proof.sessionID,
                     "installation": proof.installation, "execution_domain": proof.executionDomain, "provider": proof.provider,
                     "process_state": proof.processState, "registry_state": proof.registryState,
-                    "registry_digest": proof.registryDigest ?? "", "observed_at": now(), "revision": 0]
+                    "registry_digest": proof.registryDigest ?? "", "observed_at": now(), "revision": 0,
+                    "evidence_basis": proof.basis.rawValue]
+                if let domain = proof.replacementExecutionDomain { observation["replacement_execution_domain"] = domain }
             }
             let firstObservation = int(observation, "revision") == 0
+            guard (observation["evidence_basis"] as? String ?? NativeClosureBasis.processAndRegistry.rawValue) == proof.basis.rawValue else {
+                throw CoreError("RECIPIENT_CHANGED", "A different evidence basis cannot replay this native closure.")
+            }
             if firstObservation {
                 guard EnvelopeStorageIdentity.equal(sessionGeneration(session), proof.authorizationGeneration) else {
                     throw CoreError("RECIPIENT_CHANGED", "The native closure proof belongs to an older session authorization.")
@@ -200,7 +221,9 @@ extension CommandRouter {
                     var request = try scoped(db, rid, proof.projectID, type: "review_request")
                     request["state"] = "queued"; try save(db, revised(request), type: "review_request")
                 }
-                attempt["state"] = "released"; attempt["released_at"] = now(); attempt["reason"] = "Verified native process and registry closure."
+                attempt["state"] = "released"; attempt["released_at"] = now(); attempt["reason"] = proof.basis == .codexAppHostRestart
+                    ? "Verified Codex app host restart under the owner-approved process and positive-hold rule."
+                    : "Verified native process and registry closure."
                 attempt["native_closure_ref"] = observationID; attempt.removeValue(forKey: "token_hash")
                 attempt.removeValue(forKey: "native_closure_pending"); attempt.removeValue(forKey: "native_closure_blocker")
                 try save(db, revised(attempt), type: "attempt")
