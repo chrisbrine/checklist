@@ -169,6 +169,21 @@ final class MediaRoundResultTests: XCTestCase {
         XCTAssertEqual(deliveries.count,2);XCTAssertTrue(deliveries.allSatisfy {$0["state"] as? String == "queued"})
     }
 
+    func testSingleTicketReceiptReportsSavedForPickupWithoutRecipients() throws {
+        let f = try Fixture(),t = try task(f),(r,ids) = try fixture(f)
+        _ = try link(f,r,t);try decide(f,r,ids[0],"accepted","Keep")
+        let input = try sendInput(f,r),command = uuid()
+        let sent = try f.call("media_round_send_result",input,command:command)
+        XCTAssertEqual(sent["delivery_state"] as? String,"saved_for_pickup")
+        let send = try XCTUnwrap((sent["sends"] as? [JSON])?.first)
+        XCTAssertEqual(send["delivery_state"] as? String,"saved_for_pickup")
+        XCTAssertTrue((send["recipients"] as! [JSON]).isEmpty)
+        XCTAssertEqual(try f.record(send["message_id"] as! String,"message")["pickup_pending"] as? Bool,true)
+        XCTAssertTrue(try f.rows("delivery").isEmpty)
+        let replay = try f.call("media_round_send_result",input,command:command)
+        XCTAssertEqual(replay["delivery_state"] as? String,"saved_for_pickup")
+    }
+
     func testStaleDecisionsAreNotSentAndLateJournalFailureRollsBackTheWholeSend() throws {
         let f = try Fixture(),t = try task(f),(r,ids) = try fixture(f)
         _ = try link(f,r,t);try decide(f,r,ids[0],"needs_look","Current decision")

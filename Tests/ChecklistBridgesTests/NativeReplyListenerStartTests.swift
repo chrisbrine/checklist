@@ -249,7 +249,7 @@ final class NativeReplyListenerStartTests: XCTestCase {
         let listener = try NativeReplyListener(path: ownPath)
         XCTAssertEqual(rename(ownPath, directory + "/bound-aside.sock"), 0)
         try Data("later".utf8).write(to: URL(fileURLWithPath: ownPath))
-        listener.removeSocketFile()
+        listener.releaseSocketFile()
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: ownPath)), Data("later".utf8))
     }
 }

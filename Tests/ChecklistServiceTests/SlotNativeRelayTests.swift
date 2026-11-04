@@ -81,11 +81,16 @@ final class SlotNativeRelayTests: XCTestCase {
         fixtures = []
     }
     func testFixturesUseTheTestStorageRootAndNeverTheSourceTree() throws {
+        // CL-433: the source root is the folder that holds Package.swift (#filePath up 3 levels).
+        // The folder above it may hold the test storage root, so the test compares only with the
+        // source root and with the old CL-429 folder swift-slot-relay-fixtures beside it.
         let source = URL(fileURLWithPath: #filePath).resolvingSymlinksInPath().deletingLastPathComponent()
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let oldFixtures = source.deletingLastPathComponent().appendingPathComponent("swift-slot-relay-fixtures")
         let made = try fixture()
         XCTAssertTrue(made.root.path.hasPrefix(Self.storageRoot().path + "/"), made.root.path)
-        XCTAssertFalse(made.root.path.hasPrefix(source.path + "/"), "No fixture beside the source tree: \(made.root.path)")
+        XCTAssertFalse(made.root.path.hasPrefix(source.path + "/"), "No fixture in the source tree: \(made.root.path)")
+        XCTAssertFalse(made.root.path.hasPrefix(oldFixtures.path + "/"), "No fixture in the old CL-429 folder: \(made.root.path)")
         let custom = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("custom-root")
         XCTAssertEqual(Self.storageRoot(environment: ["CHECKLIST_TEST_STORAGE_ROOT": custom.path]).path, custom.path)
         try tearDownWithError()

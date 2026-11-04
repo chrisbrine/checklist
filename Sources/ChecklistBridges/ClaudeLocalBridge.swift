@@ -301,7 +301,7 @@ public final class NativeReplyListener: @unchecked Sendable {
 
     deinit {
         if descriptor >= 0 { Darwin.close(descriptor) }
-        removeSocketFile()
+        releaseSocketFile()
     }
 
     /// Returns the identity at the path if the path reached this listener between two equal captures.
@@ -362,11 +362,12 @@ public final class NativeReplyListener: @unchecked Sendable {
         return received == value
     }
 
-    /// Retains the path, including after a normal stop. Kept as the existing stop entry point for
-    /// callers. Neither a matching identity nor a move to a private folder prevents a same-user
-    /// swap before a later unlink. Darwin supplies no identity-conditional removal here, so this
-    /// method performs no filesystem mutation. The descriptor stays open for an active reply loop.
-    public func removeSocketFile() {
+    /// Releases this listener's claim on the socket file and leaves the file in place, also after a
+    /// normal stop (CL-418, CL-433). Neither a matching identity nor a move to a private folder
+    /// prevents a same-user swap before a later unlink. Darwin supplies no identity-conditional
+    /// removal here, so this method performs no filesystem mutation. The descriptor stays open for
+    /// an active reply loop.
+    public func releaseSocketFile() {
         identityLock.lock(); defer { identityLock.unlock() }
         guard let identity = observedIdentity else { return }
         observedIdentity = nil
@@ -428,7 +429,7 @@ public final class NativeReplyStopHandler: @unchecked Sendable {
         let queue = DispatchQueue(label: "org.checklist.native-reply-stop")
         sources = signals.map { number in
             let source = DispatchSource.makeSignalSource(signal: number, queue: queue)
-            source.setEventHandler { listener.removeSocketFile(); finish(number) }
+            source.setEventHandler { listener.releaseSocketFile(); finish(number) }
             source.resume()
             // A caught signal returns to its default action at exec, and an ignored signal does not,
             // so child processes keep a working SIGTERM. The source still sees a caught signal.

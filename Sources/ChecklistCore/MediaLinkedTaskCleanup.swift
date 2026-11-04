@@ -22,12 +22,69 @@ extension CommandRouter {
         let ids = try mediaNamedTaskIDs(db,round:round)
         return try !ids.isEmpty && ids.allSatisfy {id in
             let task = try scoped(db,id,pid,type:"task")
-            guard let statusID = task["status_id"] as? String else {return false}
+            guard task["disposition"] as? String != "superseded",let statusID = task["status_id"] as? String else {return false}
             return try scoped(db,statusID,pid,type:"status")["category"] as? String == "done"
         }
     }
 
-    func mediaLinkedTaskCompleted(_ db: Database,task: JSON) throws {
+    /// Retain the route before terminal status removes membership. It grants no
+    /// future authority: delivery checks the same session generation and grant.
+    private func mediaRememberOrchestrator(_ db: Database,task: JSON,round: inout JSON) throws {
+        guard let group = try ticketOrchestratedTriage(db,task:task),
+              let recipient = triageOrchestratorRecipient(db,group:group) else {return}
+        var routes = round["done_task_orchestrators"] as? [String:JSON] ?? [:]
+        let id = try StoredRecord(task,family:"task").string("id")
+        routes[id] = recipient
+        round["done_task_orchestrators"] = routes
+    }
+
+    private func mediaRetainedOrchestrator(_ db: Database,round: JSON,taskID: String) throws -> JSON? {
+        if let route = (round["done_task_orchestrators"] as? [String:JSON])?[taskID] {return route}
+        // Build-289 rounds already warned at the first Done, before this route
+        // map existed. Their exact delivery receipts retain the original fence.
+        let pid = try StoredRecord(round,family:"media_round").string("project_id")
+        let warnings = round["done_task_warnings"] as? [JSON] ?? (round["done_task_warning"].map {[$0 as? JSON ?? [:]]} ?? [])
+        for warning in warnings.reversed() where warning["task_id"] as? String == taskID {
+            guard let mid = warning["message_id"] as? String,
+                  let message = try? scoped(db,mid,pid,type:"message"),message["task_id"] as? String == taskID,
+                  message["origin"] as? String == "system" else {continue}
+            let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='delivery' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.message_id')=CAST(? AS TEXT) COLLATE BINARY AND json_extract(data,'$.recipient_role')='triage_orchestrator' ORDER BY rowid DESC LIMIT 1",arguments:[Data(pid.utf8),Data(mid.utf8)])
+            if let row = rows.first {
+                let delivery = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"delivery").object
+                var route: JSON = ["project_id":pid,"session_id":try StoredRecord(delivery,family:"delivery").string("recipient_session_id"),
+                    "authorization_generation":try StoredRecord(delivery,family:"delivery").string("recipient_authorization_generation"),
+                    "recipient_role":"triage_orchestrator"]
+                route["triage_id"] = delivery["triage_id"]
+                return route
+            }
+        }
+        return nil
+    }
+
+    /// Current orchestration takes precedence; earlier Done tickets can use the
+    /// exact route retained before leaving their Triage. Ended routes stay pickup-only.
+    private func mediaTaskWarning(_ db: Database,round: JSON,taskID: String,body: String,caller: Caller) throws -> JSON {
+        let pid = try StoredRecord(round,family:"media_round").string("project_id")
+        let task = try scoped(db,taskID,pid,type:"task")
+        var input: JSON = ["project_id":pid,"task_id":taskID,"body":body]
+        let group = try ticketOrchestratedTriage(db,task:task)
+        if let group,triageOrchestratorRecipient(db,group:group) != nil {input["audience"] = "orchestrator"}
+        let note = try messageWrite(db,input,caller,"message_send",purpose:.systemNote,literalBody:true)
+        guard group == nil,
+              let route = try mediaRetainedOrchestrator(db,round:round,taskID:taskID),
+              let sid = route["session_id"] as? String,
+              let session = try? scoped(db,sid,pid,type:"session"),session["role"] as? String == "worker",
+              canReceive(session,project:pid),sessionGeneration(session) == route["authorization_generation"] as? String else {return note}
+        // The ordinary writer has saved the system note for pickup. Attach only
+        // the revalidated retained orchestrator, never a ticket's unrelated holder.
+        var stored = try scoped(db,try StoredRecord(note,family:"message").string("id"),pid,type:"message")
+        stored["handler_session_ids_at_send"] = [sid];stored["pickup_pending"] = nil
+        try save(db,stored,type:"message")
+        _ = try queueOrdinaryDeliveries(db,message:stored,recipients:[route])
+        return stored
+    }
+
+    func mediaLinkedTaskTerminated(_ db: Database,task: JSON) throws {
         let tid = try StoredRecord(task,family:"task").string("id"),pid = try StoredRecord(task,family:"task").string("project_id")
         let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='media_round' AND project_id=CAST(? AS TEXT) AND (json_extract(records.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY OR records.id IN (SELECT json_extract(i.data,'$.round_id') FROM records i WHERE i.type='media_item' AND i.project_id=CAST(? AS TEXT) AND json_extract(i.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY)) ORDER BY id COLLATE BINARY",arguments:[Data(pid.utf8),Data(tid.utf8),Data(pid.utf8),Data(tid.utf8)])
         let system = Caller(role:"owner",installation:"storage",projectIDs:[])
@@ -36,6 +93,33 @@ extension CommandRouter {
             if let cleanup = round["done_task_cleanup"] as? JSON,cleanup["state"] as? String != "deferred" {continue}
             let state = round["state"] as? String ?? ""
             if state == "open" || state == "draft" {
+                let beforeRoutes = try jsonString(round["done_task_orchestrators"] as? JSON ?? [:])
+                try mediaRememberOrchestrator(db,task:task,round:&round)
+                let routesChanged = beforeRoutes != (try jsonString(round["done_task_orchestrators"] as? JSON ?? [:]))
+                let status = try scoped(db,try StoredRecord(task,family:"task").string("status_id"),pid,type:"status")
+                let terminalReason = task["disposition"] as? String == "superseded" ? "superseded"
+                    : status["category"] as? String == "canceled" ? "canceled" : nil
+                if let terminalReason {
+                    var notices = round["terminal_task_warnings"] as? [JSON] ?? []
+                    if !notices.contains(where:{$0["task_id"] as? String == tid}) {
+                        let body = "\(round["title"] as? String ?? "Media round") stays open because linked ticket \(task["key"] as? String ?? tid) is \(terminalReason); change its ticket links or cancel and archive the round."
+                        var messages: [String] = []
+                        for taskID in try mediaNamedTaskIDs(db,round:round).sorted() {
+                            let note = try mediaTaskWarning(db,round:round,taskID:taskID,body:body,caller:system)
+                            messages.append(try StoredRecord(note,family:"message").string("id"))
+                        }
+                        notices.append(["task_id":tid,"reason":terminalReason,"message_ids":messages,"at":now()])
+                        round["terminal_task_warnings"] = notices
+                        round = revised(round);try mediaWrite(db,round,type:"media_round")
+                    } else if routesChanged {try mediaWrite(db,revised(round),type:"media_round")}
+                    continue
+                }
+                // Earlier Dones retain routing only. Count undecided items at
+                // the last named Done, when all the ticket closure gates hold.
+                guard try mediaAllNamedTasksDone(db,round:round) else {
+                    if routesChanged {try mediaWrite(db,revised(round),type:"media_round")}
+                    continue
+                }
                 var dispositions = try mediaRoundDispositionIndex(db,round:round)
                 if state == "open",let manifestID = round["manifest_id"] as? String {
                     let manifest = try scoped(db,manifestID,pid,type:"media_round_manifest")
@@ -46,24 +130,20 @@ extension CommandRouter {
                 if unresolved > 0 {
                     var warnings = round["done_task_warnings"] as? [JSON] ?? (round["done_task_warning"].map {[$0 as? JSON ?? [:]]} ?? [])
                     var changed = false
-                    let warned = Set(warnings.compactMap {$0["task_id"] as? String})
+                    let warned = Set(warnings.filter {$0["stage"] as? String == "all_named_done"}.compactMap {$0["task_id"] as? String})
                     for taskID in try mediaNamedTaskIDs(db,round:round).subtracting(warned).sorted() {
                         let body = "\(round["title"] as? String ?? "Media round") has \(unresolved) undecided items; it stays open"
-                        var input: JSON = ["project_id":pid,"task_id":taskID,"body":body]
-                        let namedTask = try scoped(db,taskID,pid,type:"task")
-                        if let group = try ticketOrchestratedTriage(db,task:namedTask),triageOrchestratorRecipient(db,group:group) != nil {input["audience"] = "orchestrator"}
-                        let note = try messageWrite(db,input,system,"message_send",purpose:.systemNote,literalBody:true)
-                        warnings.append(["task_id":taskID,"message_id":note["id"] ?? NSNull(),"at":now(),"undecided_count":unresolved])
+                        let note = try mediaTaskWarning(db,round:round,taskID:taskID,body:body,caller:system)
+                        warnings.append(["task_id":taskID,"message_id":note["id"] ?? NSNull(),"at":now(),"undecided_count":unresolved,"stage":"all_named_done"])
                         changed = true
                     }
-                    if changed {
+                    if changed || routesChanged {
                         round["done_task_warnings"] = warnings
-                        round["done_task_warning"] = warnings.first
+                        round["done_task_warning"] = warnings.first {$0["stage"] as? String == "all_named_done"}
                         round = revised(round);try mediaWrite(db,round,type:"media_round")
                     }
                     continue
                 }
-                guard try mediaAllNamedTasksDone(db,round:round) else {continue}
                 if state == "draft" {
                     // A truly empty Draft has no published manifest to finish.
                     round = try mediaCancelRound(db,round:round,reason:"Linked task \(tid) is Done; empty Draft has no published manifest.",actor:mediaTaskDoneActor(tid))

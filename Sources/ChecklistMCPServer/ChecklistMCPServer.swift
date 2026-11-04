@@ -74,7 +74,7 @@ public enum ChecklistMCPServer {
             let text = String(decoding: try JSONEncoder().encode(value), as: UTF8.self)
             return .init(contents: [.text(text, uri: parameters.uri, mimeType: "application/json")])
         }
-        try await server.start(transport: transport)
+        try await server.start(transport: InitializeCompatibilityTransport(transport))
         return server
     }
 }

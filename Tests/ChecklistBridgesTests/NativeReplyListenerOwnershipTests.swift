@@ -197,7 +197,7 @@ final class NativeReplyListenerOwnershipTests: XCTestCase {
         }
         let listener = try NativeReplyListener(path: path, observer: observer)
         XCTAssertThrowsError(try listener.receiveFrame(timeout: 0.1))
-        listener.removeSocketFile()
+        listener.releaseSocketFile()
         XCTAssertEqual(names(), [URL(fileURLWithPath: path).lastPathComponent], "A start observation never authorizes pathname removal.")
     }
 
@@ -207,17 +207,17 @@ final class NativeReplyListenerOwnershipTests: XCTestCase {
         let listener = try NativeReplyListener(path: path)
         let original = try XCTUnwrap(inode(path))
         let boundNames = names()
-        listener.removeSocketFile()
+        listener.releaseSocketFile()
         XCTAssertEqual(inode(path), original)
         XCTAssertEqual(names(), boundNames)
-        listener.removeSocketFile()
+        listener.releaseSocketFile()
         XCTAssertEqual(names(), boundNames, "Repeated cleanup adds no files or folders.")
     }
 
     func testFileSwappedInBeforeTheStopCheckIsNotMoved() throws {
         let original = try makeForeignFile(foreign)
         let listener = try NativeReplyListener(path: path, observer: at(.beforeStopCheck, swapIn(foreign, path)))
-        listener.removeSocketFile()
+        listener.releaseSocketFile()
         XCTAssertEqual(inode(path), original)
         XCTAssertEqual(contents(path), Data("keep".utf8))
         XCTAssertEqual(names(), ["aside", URL(fileURLWithPath: path).lastPathComponent].sorted())
@@ -237,7 +237,7 @@ final class NativeReplyListenerOwnershipTests: XCTestCase {
             XCTAssertEqual(rename(foreign, removalPath), 0)
         }
         let listener = try NativeReplyListener(path: path, observer: observer)
-        listener.removeSocketFile()
+        listener.releaseSocketFile()
         XCTAssertEqual(inode(path), original)
         XCTAssertEqual(contents(path), Data("keep".utf8))
         XCTAssertEqual(try XCTUnwrap(attributes(path)).st_mode & 0o777, 0o644)
@@ -258,7 +258,7 @@ final class NativeReplyListenerOwnershipTests: XCTestCase {
             XCTAssertEqual(rename(foreign, bound), 0)
         }
         let listener = try NativeReplyListener(path: bound, observer: observer)
-        listener.removeSocketFile()
+        listener.releaseSocketFile()
         XCTAssertEqual(inode(bound), linkInode)
         XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: bound), target)
         XCTAssertEqual(inode(target), targetInode)
@@ -271,7 +271,7 @@ final class NativeReplyListenerOwnershipTests: XCTestCase {
         defer { Darwin.close(holder) }
         let original = try XCTUnwrap(inode(foreign))
         let listener = try NativeReplyListener(path: path, observer: at(.beforeRemoval, swapIn(foreign, path)))
-        listener.removeSocketFile()
+        listener.releaseSocketFile()
         XCTAssertEqual(inode(path), original)
         XCTAssertEqual(try XCTUnwrap(attributes(path)).st_mode & 0o777, 0o600)
     }
@@ -286,7 +286,7 @@ final class NativeReplyListenerOwnershipTests: XCTestCase {
         XCTAssertEqual(names().count, 1, "A bind collision adds nothing.")
         var fallback: NativeReplyListener? = try NativeReplyListener.start(directory: directory, fallbackTag: { "abcdef01" })
         XCTAssertFalse(try XCTUnwrap(fallback).hasProcessIDName)
-        fallback?.removeSocketFile()
+        fallback?.releaseSocketFile()
         fallback = nil
         XCTAssertEqual(names().count, 2, "A normal fallback stop counts as one more successful bind.")
         let failedPath = directory + "/failed.sock"

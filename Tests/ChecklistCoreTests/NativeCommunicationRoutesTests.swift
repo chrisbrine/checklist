@@ -51,10 +51,10 @@ final class NativeCommunicationRoutesTests: XCTestCase {
             }
         }
         for route in NativeCommunicationRoutes.all where !route.qualified {
-            XCTAssertEqual(route.statusLabel, route.id == "codex_idle_wake" ? "Source enabled; real test pending" : "Unavailable")
+            XCTAssertEqual(route.statusLabel, route.id == "codex_idle_wake" ? "Source enabled; qualification incomplete" : "Unavailable")
             XCTAssertEqual(route.status, route.id == "codex_idle_wake" ? "source_enabled" : "unavailable")
             XCTAssertTrue(route.qualifiedVersions.isEmpty)
-            XCTAssertTrue(route.qualificationReceipts.isEmpty)
+            if route.id != "codex_idle_wake" { XCTAssertTrue(route.qualificationReceipts.isEmpty) }
         }
         let parent = try XCTUnwrap(NativeCommunicationRoutes.all.first { $0.id == "claude_idle_wake" })
         XCTAssertEqual(parent.mode, .recordedConfiguration)
@@ -64,9 +64,29 @@ final class NativeCommunicationRoutesTests: XCTestCase {
         XCTAssertTrue(NativeCommunicationRoutes.summary.contains("Codex child closure remain unavailable"))
     }
 
+    func testCodexPartialReceiptsKeepRecoveryAndBootstrapGapsUnqualified() throws {
+        let route = try XCTUnwrap(NativeCommunicationRoutes.all.first { $0.id == "codex_idle_wake" })
+        XCTAssertTrue(route.sourceEnabled)
+        XCTAssertFalse(route.qualified)
+        XCTAssertEqual(route.status, "source_enabled")
+        XCTAssertEqual(route.statusLabel, "Source enabled; qualification incomplete")
+        XCTAssertTrue(route.qualifiedVersions.isEmpty, "Partial observations are not qualified versions")
+        XCTAssertEqual(route.qualificationReceipts, [
+            "CL-413:loaded-thread; checklist_build=273",
+            "CL-417:unloaded-thread; checklist_build=289; message_id=c54829df-7d89-40a3-9486-e6396b02aa9c"
+        ])
+        for fact in ["4 November 2026", "build 289", "pending_after_20s", "exited_zero", "open_exit_status=0", "provider_accepted", "14:05:45", "recovery case is not yet run", "MCP", "NATIVE_SESSION_MISMATCH", "not fully qualified"] {
+            XCTAssertTrue(route.reason.contains(fact), fact)
+        }
+        XCTAssertEqual(route.serviceInfo["qualification_scope"] as? String, "none")
+        XCTAssertEqual(route.serviceInfo["qualified"] as? Bool, false)
+        XCTAssertEqual(route.serviceInfo["qualification_receipts"] as? [String], route.qualificationReceipts)
+        XCTAssertTrue(NativeCommunicationRoutes.summary.contains("unloaded-thread checks passed"))
+        XCTAssertTrue(NativeCommunicationRoutes.summary.contains("recovery is not yet run"))
+    }
+
     func testServiceInfoDoesNotPromoteEnrollmentOrTransportReceipts() throws {
-        let parent = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-            .appendingPathComponent("ChecklistQualification/CL-83", isDirectory: true)
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent("ChecklistQualification/CL-83", isDirectory: true)
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
         let directory = parent.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

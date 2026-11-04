@@ -198,15 +198,184 @@ final class MediaItemTaskTests: XCTestCase {
         let oa = try results.session(f,"warning-orchestrator-a"),ob = try results.session(f,"warning-orchestrator-b")
         try results.triage(f,a,oa);try results.triage(f,b,ob)
         try cleanup.done(f,a)
+        XCTAssertTrue(try f.rows("message").isEmpty,"An earlier Done must not report a premature undecided count")
+        try results.decide(f,r,ids[0],"accepted","Decided between completions")
+        try f.reopen()
+        try cleanup.done(f,b)
         let warnings = try f.rows("message")
         XCTAssertEqual(warnings.count,2)
+        XCTAssertTrue(warnings.allSatisfy {$0["body"] as? String == "First pass has 3 undecided items; it stays open"})
         XCTAssertEqual(Set(try f.rows("delivery").compactMap {$0["recipient_session_id"] as? String}),[oa.sessionID!,ob.sessionID!])
-        try cleanup.done(f,b)
+        let before = try f.allState()
+        try cleanup.done(f,b,changeStatus:false)
+        XCTAssertEqual(try f.allState(),before)
         XCTAssertEqual(try f.rows("message").count,2)
         XCTAssertEqual(try f.get(r)["state"] as? String,"open")
         try f.acceptEach(r)
         try cleanup.done(f,b,changeStatus:false)
         XCTAssertEqual(try f.get(r)["state"] as? String,"archived")
+    }
+
+    func testEarlierDoneOrchestratorGenerationChangeKeepsFinalWarningForPickup() throws {
+        let f = try Fixture(),a = try results.task(f),b = try results.task(f),(r,ids) = try results.fixture(f)
+        _ = try link(f,r,ids[0],a);_ = try link(f,r,ids[1],b)
+        let oa = try results.session(f,"revoked-warning-a"),ob = try results.session(f,"live-warning-b")
+        try results.triage(f,a,oa);try results.triage(f,b,ob)
+        try cleanup.done(f,a)
+        try f.router.dbQueue.write {db in
+            var session = try f.router.record(db,oa.sessionID!,type:"session")
+            session["authorization_generation"] = uuid();try f.router.save(db,f.router.revised(session),type:"session")
+        }
+        try cleanup.done(f,b)
+        let saved = try XCTUnwrap(f.rows("message").first {$0["task_id"] as? String == a["id"] as? String})
+        XCTAssertEqual(saved["pickup_pending"] as? Bool,true)
+        XCTAssertEqual(Set(try f.rows("delivery").compactMap {$0["recipient_session_id"] as? String}),[ob.sessionID!])
+    }
+
+    func testLegacyPrematureWarningDoesNotSuppressTheFinalDoneCount() throws {
+        let f = try Fixture(),a = try results.task(f),b = try results.task(f),(r,ids) = try results.fixture(f)
+        _ = try results.link(f,r,a);_ = try link(f,r,ids[0],b)
+        let oa = try results.session(f,"legacy-warning-a"),ob = try results.session(f,"legacy-warning-b")
+        try results.triage(f,a,oa);try results.triage(f,b,ob)
+        // Create the actual old warning and delivery while A still has membership.
+        let old = try f.router.dbQueue.write {db in
+            try f.router.messageWrite(db,["project_id":f.project,"task_id":a["id"]!,"audience":"orchestrator",
+                "body":"First pass has 4 undecided items; it stays open"],f.owner,"message_send",purpose:.systemNote,literalBody:true)
+        }
+        try cleanup.done(f,a)
+        // Installed build-289 receipts predate done_task_orchestrators and stage.
+        try f.router.dbQueue.write {db in
+            var round = try f.router.record(db,r["id"] as! String,type:"media_round")
+            let warning: JSON = ["task_id":a["id"]!,"message_id":old["id"]!,"undecided_count":4,"at":now()]
+            round["done_task_warning"] = warning;round["done_task_warnings"] = [warning]
+            round["done_task_orchestrators"] = nil
+            try f.router.save(db,f.router.revised(round),type:"media_round")
+        }
+        try results.decide(f,r,ids[0],"accepted","Between Dones")
+        try f.reopen()
+        try cleanup.done(f,b)
+        let finalNotes = try f.rows("message").filter {$0["id"] as? String != old["id"] as? String}
+        XCTAssertEqual(finalNotes.count,2)
+        XCTAssertTrue(finalNotes.allSatisfy {$0["body"] as? String == "First pass has 3 undecided items; it stays open"})
+        let messageIDs = Set(finalNotes.compactMap {$0["id"] as? String})
+        let deliveries = try f.rows("delivery").filter {messageIDs.contains($0["message_id"] as? String ?? "")}
+        XCTAssertEqual(Set(deliveries.compactMap {$0["recipient_session_id"] as? String}),[oa.sessionID!,ob.sessionID!])
+        let stored = try f.record(r["id"] as! String,"media_round")
+        XCTAssertEqual((stored["done_task_warning"] as? JSON)?["undecided_count"] as? Int,3)
+        XCTAssertEqual((stored["done_task_warning"] as? JSON)?["stage"] as? String,"all_named_done")
+    }
+
+    func testCanceledAndSupersededNamedTicketsNotifyOnceAndRetainOriginals() throws {
+        for reason in ["canceled","superseded"] {
+            let f = try Fixture(),(a,r,attachment) = try cleanup.imageRound(f),b = try results.task(f)
+            let id = try XCTUnwrap((f.get(r)["items"] as? [JSON])?.first?["id"] as? String)
+            _ = try link(f,r,id,b)
+            let oa = try results.session(f,"terminal-a"),ob = try results.session(f,"terminal-b")
+            try results.triage(f,a,oa);try results.triage(f,b,ob)
+            try cleanup.done(f,a)
+            XCTAssertTrue(try f.rows("message").isEmpty)
+            let current = try f.record(b["id"] as! String,"task")
+            if reason == "canceled" {
+                let statusID = try f.router.dbQueue.read {try f.router.status($0,f.project,"canceled")["id"]!}
+                _ = try results.call(f,"task_transition",["task_id":b["id"]!,"expected_revision":current["revision"]!,"target_status_id":statusID,"reason":"No longer needed"])
+            } else {
+                let canonical = try results.task(f)
+                _ = try results.call(f,"task_link",["task_id":b["id"]!,"expected_revision":current["revision"]!,"action":"add","relation":"duplicate_of","target_task_id":canonical["id"]!])
+            }
+            let messages = try f.rows("message")
+            XCTAssertEqual(messages.count,2,reason)
+            XCTAssertTrue(messages.allSatisfy {($0["body"] as? String ?? "").contains("is \(reason); change its ticket links or cancel and archive the round.")})
+            XCTAssertEqual(Set(try f.rows("delivery").compactMap {$0["recipient_session_id"] as? String}),[oa.sessionID!,ob.sessionID!])
+            XCTAssertEqual(try f.get(r)["state"] as? String,"open")
+            XCTAssertNil(try f.record(r["id"] as! String,"media_round")["done_task_cleanup"])
+            let path = f.router.ownerManagedPathProjection(attachment,caller:f.owner)["path"] as! String
+            XCTAssertTrue(FileManager.default.fileExists(atPath:path))
+            XCTAssertTrue(try f.rows("storage_hold").contains {$0["kind"] as? String == "media_reference" && $0["state"] as? String == "active"})
+            let before = try f.allState()
+            try cleanup.done(f,b,changeStatus:false)
+            XCTAssertEqual(try f.allState(),before,"Repeated terminal actions must not repeat the notice")
+        }
+    }
+
+    func testCanceledNamedTicketWithoutOrchestratorSavesNoticeForPickup() throws {
+        let f = try Fixture(),a = try results.task(f),r = try f.round(f.type(checks.schema()))
+        _ = try f.item(r)
+        _ = try results.link(f,r,a)
+        let statusID = try f.router.dbQueue.read {try f.router.status($0,f.project,"canceled")["id"]!}
+        _ = try results.call(f,"task_transition",["task_id":a["id"]!,"expected_revision":a["revision"]!,"target_status_id":statusID,"reason":"No longer needed"])
+        let note = try XCTUnwrap(f.rows("message").first)
+        XCTAssertEqual(note["pickup_pending"] as? Bool,true)
+        XCTAssertTrue(try f.rows("delivery").isEmpty)
+        XCTAssertEqual(try f.get(r)["state"] as? String,"draft")
+    }
+
+    func testRelinkedItemAndRoundWithdrawalsReturnOnlyToTheirSentDestinations() throws {
+        for route in ["item","round","cleared"] {
+            let f = try Fixture(),a = try results.task(f),b = try results.task(f),(r,ids) = try results.fixture(f)
+            _ = try results.link(f,r,a)
+            try results.decide(f,r,ids[0],"accepted","Sent to A")
+            _ = try f.call("media_round_send_result",results.sendInput(f,r))
+            let baseline = try XCTUnwrap(f.get(r)["last_result_sent"] as? JSON)
+            XCTAssertEqual((baseline["sends"] as! [JSON])[0]["task_key"] as? String,a["key"] as? String)
+            if route == "item" {_ = try link(f,r,ids[0],b)}
+            else {_ = try results.link(f,r,route == "cleared" ? nil : b)}
+            let view = try f.get(r),manifest = view["manifest"] as! JSON
+            let item = (view["items"] as! [JSON]).first {$0["id"] as? String == ids[0]}!
+            var withdrawal = f.observation(view)
+            withdrawal["manifest_id"] = manifest["id"];withdrawal["manifest_digest"] = manifest["digest"]
+            withdrawal["items"] = [["item_id":ids[0],"expected_revision":item["revision"]!,"decision_id":item["last_decision_id"]!]]
+            _ = try f.call("media_decision_withdraw",withdrawal)
+            let input = try results.sendInput(f,r),command = uuid()
+            let sent = try f.call("media_round_send_result",input,command:command),sends = sent["sends"] as! [JSON]
+            XCTAssertEqual(sends.count,1,route)
+            XCTAssertEqual(sends[0]["task_id"] as? String,a["id"] as? String,route)
+            XCTAssertEqual(sends[0]["item_count"] as? Int,1)
+            let body = try f.record(sends[0]["message_id"] as! String,"message")["body"] as! String
+            XCTAssertTrue(body.hasSuffix("Walk @literal: Pending — decision withdrawn"))
+            XCTAssertTrue(((try f.get(r)["last_result_sent"] as! JSON)["sends"] as! [JSON]).isEmpty)
+            let before = try f.allState()
+            XCTAssertEqual(try f.call("media_round_send_result",input,command:command)["replayed"] as? Bool,true)
+            checks.checkError("MEDIA_ROUND_NOTHING_NEW") {try f.call("media_round_send_result",self.results.sendInput(f,r))}
+            XCTAssertEqual(try f.allState(),before)
+        }
+    }
+
+    func testUnlinkedSentChoiceSurvivesAnInterveningSendBeforeWithdrawal() throws {
+        let f = try Fixture(),a = try results.task(f),b = try results.task(f),(r,ids) = try results.fixture(f)
+        _ = try link(f,r,ids[0],a);_ = try link(f,r,ids[1],b)
+        for id in ids.prefix(2) {try results.decide(f,r,id,"accepted","Original choice")}
+        _ = try f.call("media_round_send_result",results.sendInput(f,r))
+        let original = try f.record(ids[0],"media_item")["last_decision_id"] as! String
+        _ = try link(f,r,ids[0],nil)
+        try results.decide(f,r,ids[1],"needs_look","Changed sibling")
+        let sibling = try f.call("media_round_send_result",results.sendInput(f,r))["sends"] as! [JSON]
+        XCTAssertEqual(sibling.count,1);XCTAssertEqual(sibling[0]["task_id"] as? String,b["id"] as? String)
+        XCTAssertTrue(strings(try f.get(r)["last_result_sent"] as! JSON,"decision_ids").contains(original))
+        let view = try f.get(r),manifest = view["manifest"] as! JSON
+        let item = (view["items"] as! [JSON]).first {$0["id"] as? String == ids[0]}!
+        var withdrawal = f.observation(view)
+        withdrawal["manifest_id"] = manifest["id"];withdrawal["manifest_digest"] = manifest["digest"]
+        withdrawal["items"] = [["item_id":ids[0],"expected_revision":item["revision"]!,"decision_id":original]]
+        _ = try f.call("media_decision_withdraw",withdrawal)
+        let sent = try f.call("media_round_send_result",results.sendInput(f,r))["sends"] as! [JSON]
+        XCTAssertEqual(sent.count,1);XCTAssertEqual(sent[0]["task_id"] as? String,a["id"] as? String)
+        XCTAssertTrue((try f.record(sent[0]["message_id"] as! String,"message")["body"] as! String).hasSuffix("Walk @literal: Pending — decision withdrawn"))
+        checks.checkError("MEDIA_ROUND_NOTHING_NEW") {try f.call("media_round_send_result",self.results.sendInput(f,r))}
+    }
+
+    func testMixedSendReceiptDistinguishesPickupFromQueuedRecipients() throws {
+        let f = try Fixture(),a = try results.task(f),b = try results.task(f),(r,ids) = try results.fixture(f)
+        _ = try results.link(f,r,a);_ = try link(f,r,ids[1],b)
+        let ob = try results.session(f,"receipt-orchestrator-b");try results.triage(f,b,ob)
+        for id in ids.prefix(2) {try results.decide(f,r,id,"needs_look","Review")}
+        let sent = try f.call("media_round_send_result",results.sendInput(f,r))
+        for send in sent["sends"] as! [JSON] {
+            let pickup = send["task_id"] as? String == a["id"] as? String
+            XCTAssertEqual(send["delivery_state"] as? String,pickup ? "saved_for_pickup" : "queued")
+            XCTAssertEqual((send["recipients"] as! [JSON]).isEmpty,pickup)
+            let note = try f.record(send["message_id"] as! String,"message")
+            XCTAssertEqual(bool(note,"pickup_pending"),pickup)
+        }
     }
 
     func testMixedManagedOriginalHandoffWaitsForTheLastTicket() throws {

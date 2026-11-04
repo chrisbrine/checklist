@@ -181,7 +181,7 @@ extension CommandRouter {
         if !terminal && membershipEvent == .status { return }
         let current = try currentTriages(db, project: pid, taskID: tid)
         if terminal {
-            if category == "done" {try mediaLinkedTaskCompleted(db,task:task)}
+            try mediaLinkedTaskTerminated(db,task:task)
             for group in current {
                 var extra: JSON = ["status_id": task["status_id"] ?? NSNull()]
                 if category == "done", let mid = task["current_manifest_id"] as? String, let manifest = try? scoped(db, mid, pid, type: "manifest") {

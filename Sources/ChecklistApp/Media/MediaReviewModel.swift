@@ -726,22 +726,33 @@ extension MediaReviewModel {
         let key=resultTarget(header:header,rows:rows)
         let last=Record(values:header.object("last_result_sent"))
         guard !last.values.isEmpty else {return .init(label:"Send results to "+key,disabledReason:nil)}
-        let sent=Set(last.strings("decision_ids"))
-        let changed = !listComplete || !withdrawn.isEmpty || decided.contains {!sent.contains($0.string("decision_id"))}
+        let sent=sentDecisionTickets(header:header)
+        let changed = !listComplete || !withdrawn.isEmpty || decided.contains {
+            sent[$0.string("decision_id")] != effectiveTask(item:$0,header:header).id
+        }
         return .init(label:"Send changes to "+key,disabledReason:changed ? nil : allResultsSentText)
+    }
+    /// A sent decision belongs to its recorded destination, even after the current links change.
+    /// A legacy round-only baseline is frozen into `sends` by the service before relinking.
+    nonisolated static func sentDecisionTickets(header: Record) -> [String: String] {
+        let last=Record(values:header.object("last_result_sent"))
+        var result:[String: String]=[:]
+        if last.values["sends"] != nil {
+            for send in last.records("sends") where !send.string("task_id").isEmpty {
+                for id in send.strings("decision_ids") {result[id]=send.string("task_id")}
+            }
+        } else {
+            let task=Record(values:header.object("task")).id
+            if !task.isEmpty {for id in last.strings("decision_ids") {result[id]=task}}
+        }
+        return result
     }
     /// CL-428 U1: decisions of the last send that no listed item holds any more (the owner withdrew
     /// or replaced them), each with the ticket it went to. The next send reports a withdrawn one
     /// as "Pending — decision withdrawn", so it is a change. Call it only with the complete list.
     nonisolated static func withdrawnSentTickets(header: Record,rows: [Record]) -> [String: String] {
-        let last=Record(values:header.object("last_result_sent"))
         let current=Set(rows.map {$0.string("decision_id")}.filter {!$0.isEmpty})
-        var ticketOf:[String: String]=[:]
-        for send in last.records("sends") {for id in send.strings("decision_ids") {ticketOf[id]=send.string("task_id")}}
-        let roundTask=Record(values:header.object("task")).id
-        var result:[String: String]=[:]
-        for id in last.strings("decision_ids") where !current.contains(id) {result[id]=ticketOf[id] ?? roundTask}
-        return result
+        return sentDecisionTickets(header:header).filter {!current.contains($0.key)}
     }
     nonisolated static let allResultsSentText="All results sent."
     nonisolated static let nothingNewText="Nothing new to send."
@@ -778,6 +789,7 @@ extension MediaReviewModel {
     /// One ticket: "Sent to Codex HEIR-T1 and Claude reviewer at 7:12 PM · 3 items."
     /// CL-430, more than one ticket: a first line, then one line per ticket of the reply's `sends`
     /// ("HEIR-89: Codex HEIR-T1 · 1 item"), then "N items have no ticket." from `unsent_item_count`.
+    /// A ticket with no recipients plainly says "saved for pickup, nobody was notified".
     nonisolated static func receiptText(_ reply: MediaValues,roundTaskID: String? = nil,mixed: Bool = false) -> String {
         let sends=reply["sends"] as? [MediaValues] ?? []
         let changed=reply["changed_only"] as? Bool ?? false,time=localTime(reply["sent_at"] as? String ?? "")
@@ -792,6 +804,13 @@ extension MediaReviewModel {
             let named = reply["recipients"] == nil && !sends.isEmpty && (mixed || roundTaskID.map {task != $0} ?? false)
             let names=recipientNames(one["recipients"])
             let key=Record(values:one).string("task_key",fallback:"A ticket")
+            if savedForPickup(one) {
+                // Even a round-only reply with legacy top-level fields can name its one ticket.
+                let savedKey=(one["task_key"] as? String) ?? (sends.first?["task_key"] as? String) ?? ""
+                let count=itemsText(one["item_count"] as? Int ?? 0)+(changed ? " changed since the last send." : ".")
+                let text="Saved for pickup at "+time+" · "+(savedKey.isEmpty ? "" : savedKey+" · ")+count+" Nobody was notified."
+                return unsentLine.map {text+" "+$0} ?? text
+            }
             let who=named ? " to "+key+(names.isEmpty ? "" : ": "+listText(names)) : (names.isEmpty ? "" : " to "+listText(names))
             let text="Sent"+who+" at "+time+" · "+itemsText(one["item_count"] as? Int ?? 0)+(changed ? " changed since the last send." : ".")
             return unsentLine.map {text+" "+$0} ?? text
@@ -799,10 +818,16 @@ extension MediaReviewModel {
         var lines=["Sent to \(sends.count) tickets at "+time+(changed ? " · only changes since the last send." : ".")]
         for send in sends {
             let names=recipientNames(send["recipients"]),key=Record(values:send).string("task_key",fallback:"A ticket")
-            lines.append(key+(names.isEmpty ? "" : ": "+listText(names))+" · "+itemsText(send["item_count"] as? Int ?? 0))
+            let pickup = savedForPickup(send) ? " · saved for pickup, nobody was notified" : ""
+            lines.append(key+(names.isEmpty ? "" : ": "+listText(names))+" · "+itemsText(send["item_count"] as? Int ?? 0)+pickup)
         }
         if let unsentLine {lines.append(unsentLine)}
         return lines.joined(separator:"\n")
+    }
+    /// The actual recipient list is authoritative, including replies predating `delivery_state`.
+    nonisolated static func savedForPickup(_ send: MediaValues) -> Bool {
+        if let recipients=send["recipients"] as? [MediaValues] {return recipients.isEmpty}
+        return send["delivery_state"] as? String != "queued"
     }
     nonisolated static func recipientNames(_ raw: Any?) -> [String] {(raw as? [MediaValues] ?? []).map {Record(values:$0).string("display",fallback:"an unnamed session")}}
     nonisolated static func itemsText(_ count: Int) -> String {count==1 ? "1 item" : "\(count) items"}
@@ -877,12 +902,18 @@ extension MediaReviewModel {
     /// It also counts the tickets of withdrawn sent decisions, because the next send goes there too.
     nonisolated static func resultTarget(header: Record,rows: [Record]) -> String {
         let tickets=itemTickets(header:header,rows:decidedRows(rows))
-        let known=itemTickets(header:header,rows:rows)+[Record(values:header.object("task"))]
+        let prior=Record(values:header.object("last_result_sent")).records("sends").map {
+            Record(values:["id":$0.string("task_id"),"key":$0.string("task_key")])
+        }
+        let known=itemTickets(header:header,rows:rows)+[Record(values:header.object("task"))]+prior
         var ids=Set(tickets.map(\.id))
         ids.formUnion(withdrawnSentTickets(header:header,rows:rows).values.filter {!$0.isEmpty})
         if ids.count>1 {return "\(ids.count) tickets"}
-        let only=ids.first.flatMap {id in known.first {$0.id==id}}
-        return (only ?? tickets.first ?? Record(values:header.object("task"))).string("key",fallback:"the ticket")
+        if let id=ids.first {
+            if let key=known.first(where:{$0.id==id && !$0.string("key").isEmpty})?.string("key") {return key}
+            return "the previous ticket"
+        }
+        return Record(values:header.object("task")).string("key",fallback:"the ticket")
     }
     /// `expected_revision` is the item's revision (CL-430 Core), not the round's.
     nonisolated static func itemLinkTaskParams(header: Record,item: Record,taskID: String?) -> MediaValues {

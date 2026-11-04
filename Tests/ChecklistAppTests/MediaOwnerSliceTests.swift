@@ -683,14 +683,16 @@ extension MediaOwnerSliceTests {
         let sent=try XCTUnwrap(peer.calls.first {$0.0=="media_round_send_result"}?.1)
         XCTAssertEqual(sent["round_id"] as? String,"round");XCTAssertEqual(sent["expected_revision"] as? Int,5)
         let time=MediaReviewModel.localTime(Self.sentAt)
-        XCTAssertEqual(model.resultLine?.text,["Sent to 3 tickets at "+time+".","HEIR-89: Codex HEIR-T1 · 1 item","HEIR-90: Codex HEIR-T1 and Claude worker · 1 item","HEIR-130 · 1 item","2 items have no ticket."].joined(separator:"\n"))
+        XCTAssertEqual(model.resultLine?.text,["Sent to 3 tickets at "+time+".","HEIR-89: Codex HEIR-T1 · 1 item","HEIR-90: Codex HEIR-T1 and Claude worker · 1 item","HEIR-130 · 1 item · saved for pickup, nobody was notified","2 items have no ticket."].joined(separator:"\n"))
         XCTAssertEqual(model.resultLine?.refused,false);XCTAssertNil(store.error);XCTAssertNil(model.error)
         // A repeat that sends only changes says so on its first line; one unsent item reads in the singular.
         let repeated=MediaReviewModel.receiptText(["sends":(peer.extra["media_round_send_result"]?["sends"] as? [MediaValues] ?? []).prefix(2).map {$0},"unsent_item_count":1,"changed_only":true,"sent_at":Self.sentAt])
         XCTAssertEqual(repeated.components(separatedBy:"\n").first,"Sent to 2 tickets at "+time+" · only changes since the last send.")
         XCTAssertEqual(repeated.components(separatedBy:"\n").last,"1 item has no ticket.")
         // After the send, nothing new disables the action with the multi-ticket label.
-        peer.roundRecords=[linkedHeader(task:Self.heir130,last:["message_id":"n1","at":Self.sentAt,"decision_ids":["d1","d2","d3"]])]
+        peer.roundRecords=[linkedHeader(task:Self.heir130,last:["at":Self.sentAt,"decision_ids":["d1","d2","d3"],
+            "sends":[["task_id":"task-89","decision_ids":["d1"]],["task_id":"task-90","decision_ids":["d2"]],
+                     ["task_id":"task-130","decision_ids":["d3"]]]])]
         await model.refresh()
         XCTAssertEqual(model.resultAction,MediaResultAction(label:"Send changes to 3 tickets",disabledReason:"All results sent."))
     }
@@ -711,5 +713,89 @@ extension MediaOwnerSliceTests {
         // An item with no ticket in a one-ticket send adds the unsent count.
         XCTAssertEqual(MediaReviewModel.receiptText(["sends":[oneSend],"unsent_item_count":3,"changed_only":true,"sent_at":Self.sentAt]),
                        "Sent to Codex HEIR-T1 at "+time+" · 2 items changed since the last send. 3 items have no ticket.")
+    }
+    func testPickupOnlyReceiptsSayNobodyWasNotifiedForSingleAndMixedSends() {
+        let time=MediaReviewModel.localTime(Self.sentAt)
+        let pickup:MediaValues=["task_id":"task-89","task_key":"HEIR-89","message_id":"pickup-note",
+            "recipients":[],"delivery_state":"saved_for_pickup","item_count":1]
+        let queued:MediaValues=["task_id":"task-90","task_key":"HEIR-90","message_id":"queued-note",
+            "recipients":[["session_id":"s1","display":"Codex HEIR-T1"]],"delivery_state":"queued","item_count":2]
+        let single:MediaValues=["sends":[pickup],"unsent_item_count":1,"changed_only":true,"sent_at":Self.sentAt]
+        for mixed in [false,true] {
+            XCTAssertEqual(MediaReviewModel.receiptText(single,roundTaskID:"task-130",mixed:mixed),
+                "Saved for pickup at "+time+" · HEIR-89 · 1 item changed since the last send. Nobody was notified. 1 item has no ticket.")
+        }
+        // CL-427 round-only replies also carry the one send alongside legacy top-level fields.
+        var roundOnly=single
+        for key in ["message_id","recipients","delivery_state","item_count"] {roundOnly[key]=pickup[key]}
+        XCTAssertEqual(MediaReviewModel.receiptText(roundOnly),MediaReviewModel.receiptText(single))
+        XCTAssertEqual(MediaReviewModel.receiptText(["sends":[queued,pickup],"sent_at":Self.sentAt]),[
+            "Sent to 2 tickets at "+time+".","HEIR-90: Codex HEIR-T1 · 2 items",
+            "HEIR-89 · 1 item · saved for pickup, nobody was notified"].joined(separator:"\n"))
+        // Older service replies have no delivery_state; the empty recipients still prove pickup only.
+        var legacy=pickup;legacy["delivery_state"]=nil
+        XCTAssertEqual(MediaReviewModel.receiptText(["sends":[legacy],"sent_at":Self.sentAt]),
+            "Saved for pickup at "+time+" · HEIR-89 · 1 item. Nobody was notified.")
+        XCTAssertEqual(MediaReviewModel.receiptText(["recipients":[],"item_count":2,"sent_at":Self.sentAt]),
+            "Saved for pickup at "+time+" · 2 items. Nobody was notified.")
+        var stateOnly=pickup;stateOnly["recipients"]=nil
+        XCTAssertEqual(MediaReviewModel.receiptText(["sends":[stateOnly],"sent_at":Self.sentAt]),
+            "Saved for pickup at "+time+" · HEIR-89 · 1 item. Nobody was notified.")
+        // An explicit recipient list wins over a conflicting state label, in either direction.
+        legacy["delivery_state"]="queued"
+        XCTAssertTrue(MediaReviewModel.receiptText(["sends":[legacy],"sent_at":Self.sentAt]).contains("Nobody was notified."))
+        var actualRecipients=queued;actualRecipients["delivery_state"]="saved_for_pickup"
+        XCTAssertEqual(MediaReviewModel.receiptText(["sends":[actualRecipients],"sent_at":Self.sentAt]),
+            "Sent to Codex HEIR-T1 at "+time+" · 2 items.")
+    }
+    func testWithdrawalActionKeepsEarlierDestinationAfterItemOrRoundLinksChange() {
+        let last:MediaValues=["at":Self.sentAt,"decision_ids":["d1"],
+            "sends":[["task_id":"task-89","task_key":"HEIR-89","decision_ids":["d1"]]]]
+        let cases:[(String,MediaValues?,MediaValues?)]=[
+            ("item moved",Self.heir130,Self.heir90),
+            ("item cleared to round fallback",Self.heir130,nil),
+            ("round moved",Self.heir90,nil),
+            ("every current link cleared",nil,nil)]
+        for (name,roundTask,itemTask) in cases {
+            let header=Record(values:linkedHeader(task:roundTask,last:last))
+            // Native rows retain the withdrawal head ID while its disposition becomes Pending.
+            let rows=[Record(values:item("a",task:itemTask,decision:"withdrawal-d1",disposition:"pending"))]
+            XCTAssertEqual(MediaReviewModel.withdrawnSentTickets(header:header,rows:rows),["d1":"task-89"],name)
+            XCTAssertEqual(MediaReviewModel.resultTarget(header:header,rows:rows),"HEIR-89",name)
+            XCTAssertEqual(MediaReviewModel.resultAction(header:header,rows:rows,counts:["pending":1],listComplete:true),
+                MediaResultAction(label:"Send changes to HEIR-89",disabledReason:nil),name+": the new ticket has no separate changed decision")
+            let withNewDecision=rows+[Record(values:item("b",task:Self.heir90,decision:"new-d2"))]
+            XCTAssertEqual(MediaReviewModel.resultAction(header:header,rows:withNewDecision,counts:[:],listComplete:true),
+                MediaResultAction(label:"Send changes to 2 tickets",disabledReason:nil),name+": a separate new decision also names its ticket")
+        }
+        // A frozen legacy baseline may retain only the old opaque ID. Never label it with the new key.
+        let legacy=Record(values:linkedHeader(task:Self.heir90,last:["at":Self.sentAt,"decision_ids":["d1"],
+            "sends":[["task_id":"task-89","decision_ids":["d1"]]]]))
+        let pending=[Record(values:item("a",task:nil))]
+        XCTAssertEqual(MediaReviewModel.resultAction(header:legacy,rows:pending,counts:[:],listComplete:true),
+            MediaResultAction(label:"Send changes to the previous ticket",disabledReason:nil))
+        // The same current decision must be sent again when its destination changes.
+        let moved=[Record(values:item("a",task:Self.heir90,decision:"d1"))]
+        XCTAssertTrue(MediaReviewModel.withdrawnSentTickets(header:legacy,rows:moved).isEmpty)
+        XCTAssertEqual(MediaReviewModel.resultAction(header:legacy,rows:moved,counts:[:],listComplete:true),
+            MediaResultAction(label:"Send changes to HEIR-90",disabledReason:nil))
+    }
+    func testWithdrawalOnlySendRemainsAvailableWithAllCurrentTicketLinksCleared() async throws {
+        let last:MediaValues=["at":Self.sentAt,"decision_ids":["d1"],
+            "sends":[["task_id":"task-89","task_key":"HEIR-89","decision_ids":["d1"]]]]
+        let (peer,store,model)=await linkedSetup(task:nil,last:last,
+            rows:[item("a",task:nil,decision:"withdrawal-d1",disposition:"pending")])
+        peer.extra["media_round_send_result"]=["sends":[["task_id":"task-89","task_key":"HEIR-89","message_id":"withdrawal-note",
+            "recipients":[],"delivery_state":"saved_for_pickup","item_count":1]],"changed_only":true,"sent_at":Self.sentAt]
+        store.connected=true;peer.calls=[]
+        var progress=""
+        peer.onRequest={method in if method=="media_round_send_result" {progress=model.resultLine?.text ?? ""}}
+        await model.sendResults()
+        peer.onRequest=nil
+        XCTAssertEqual(progress,"Sending results to HEIR-89…")
+        XCTAssertEqual(peer.calls.filter {$0.0=="media_round_send_result"}.count,1)
+        let expected="Saved for pickup at "+MediaReviewModel.localTime(Self.sentAt)
+        XCTAssertEqual(model.resultLine?.text,expected+" · HEIR-89 · 1 item changed since the last send. Nobody was notified.")
+        XCTAssertEqual(model.resultLine?.refused,false);XCTAssertNil(store.error);XCTAssertNil(model.error)
     }
 }

@@ -72,9 +72,6 @@ extension CommandRouter {
             throw CoreError("MEDIA_ROUND_CLOSED","A closed or archived round cannot send results.")
         }
         let items = try mediaItems(db,round:round)
-        guard items.contains(where:{($0["task_id"] as? String ?? round["task_id"] as? String) != nil}) else {
-            throw CoreError("MEDIA_ROUND_NO_TASK","No item names a ticket, directly or through its round.")
-        }
         let manifest = try (round["manifest_id"] as? String).map {try scoped(db,$0,project,type:"media_round_manifest")}
         let members = mediaManifestMembers(manifest?["items"] as? [JSON] ?? []) {Data($0.utf8)}
         var current: [(item: JSON,target: JSON,decision: JSON)] = []
@@ -105,18 +102,24 @@ extension CommandRouter {
         }
         var grouped: [String:[(JSON,JSON)]] = [:]
         for (item,target,decision) in current + withdrawn {
-            guard let taskID = item["task_id"] as? String ?? round["task_id"] as? String else {continue}
             let old = previous[Data(try StoredRecord(item,family:"media_item").string("id").utf8)]
             if decision["disposition"] as? String == "withdrawn" {
-                // Only this item's previous recipient needs its choice retracted.
-                if EnvelopeStorageIdentity.equal(old?.0,taskID) {grouped[taskID,default:[]].append((target,decision))}
+                // Retract at the sent destination, even after links move or clear.
+                // The new destination never received this decision.
+                if let old {grouped[old.0,default:[]].append((target,decision))}
                 continue
             }
+            guard let taskID = item["task_id"] as? String ?? round["task_id"] as? String else {continue}
             let changed = old == nil || !EnvelopeStorageIdentity.equal(old?.0,taskID) ||
                 ["disposition","note","winner_id","selection_outcome","review_basis_signature","no_follow_up_reason"].contains {
                     (old?.1[$0] as? String ?? "") != (decision[$0] as? String ?? "")
                 } || bool(old?.1 ?? [:],"none_fit") != bool(decision,"none_fit")
             if changed {grouped[taskID,default:[]].append((target,decision))}
+        }
+        guard !grouped.isEmpty || items.contains(where:{($0["task_id"] as? String ?? round["task_id"] as? String) != nil}) else {
+            // A retained send still permits a withdrawal-only retry after clearing links.
+            if last != nil {throw CoreError("MEDIA_ROUND_NOTHING_NEW","No item decision, destination or note changed since the last send.")}
+            throw CoreError("MEDIA_ROUND_NO_TASK","No item names a ticket, directly or through its round.")
         }
         if current.isEmpty,grouped.isEmpty,last == nil {
             throw CoreError("MEDIA_ROUND_NO_DECISIONS","Decide at least one current published item before sending.")
@@ -143,29 +146,36 @@ extension CommandRouter {
                 return ["session_id":id,"display":session["label"] as? String ?? sessionThreadLabel(session)]
             }
             sends.append(["task_id":taskID,"task_key":task["key"] ?? "","message_id":try StoredRecord(message,family:"message").string("id"),
-                "recipients":recipients,"item_count":changed.count])
+                "recipients":recipients,"delivery_state":message["delivery_status"] ?? "saved_for_pickup","item_count":changed.count])
             sentAt = try StoredRecord(message,family:"message").string("created_at")
             references.append(try mediaRef("message",message))
         }
-        // Keep all currently routed decisions in the baseline, including unchanged siblings.
+        // Keep all currently routed decisions, including unchanged siblings, and
+        // the last actually sent choice of an unlinked item. A sibling's send
+        // must not erase the destination which still needs a later withdrawal.
         let routed = current.filter {($0.item["task_id"] as? String ?? round["task_id"] as? String) != nil}
+        var baselineRows: [(taskID: String,decision: JSON)] = routed.map {row in
+            (row.item["task_id"] as? String ?? round["task_id"] as! String,row.decision)
+        }
+        for row in current where (row.item["task_id"] as? String ?? round["task_id"] as? String) == nil {
+            if let old = previous[Data(try StoredRecord(row.item,family:"media_item").string("id").utf8)] {baselineRows.append(old)}
+        }
         var baseline: [String:[String]] = [:]
-        for row in routed {
-            let taskID = row.item["task_id"] as? String ?? round["task_id"] as! String
-            baseline[taskID,default:[]].append(try StoredRecord(row.decision,family:"media_owner_decision").string("id"))
+        for row in baselineRows {
+            baseline[row.taskID,default:[]].append(try StoredRecord(row.decision,family:"media_owner_decision").string("id"))
         }
         let previousDestinations = Set(previous.values.map {$0.0})
-        var receipt: JSON = ["at":sentAt,"decision_ids":routed.map {$0.decision["id"]!},"sends":baseline.keys.sorted().map {taskID -> JSON in
-            ["task_id":taskID,"decision_ids":baseline[taskID]!]
+        var receipt: JSON = ["at":sentAt,"decision_ids":baselineRows.map {$0.decision["id"]!},"sends":try baseline.keys.sorted().map {taskID -> JSON in
+            ["task_id":taskID,"task_key":try scoped(db,taskID,project,type:"task")["key"] ?? "","decision_ids":baseline[taskID]!]
         }]
         var result: JSON = ["sends":sends,"unsent_item_count":items.filter {($0["task_id"] as? String ?? round["task_id"] as? String) == nil}.count,
             "changed_only":Set(grouped.keys).isSubset(of:previousDestinations),"sent_at":sentAt]
         if items.allSatisfy({$0["task_id"] == nil}),sends.count == 1 {
-            for key in ["message_id","recipients","item_count"] {result[key] = sends[0][key]}
+            for key in ["message_id","recipients","delivery_state","item_count"] {result[key] = sends[0][key]}
             receipt["message_id"] = sends[0]["message_id"]
         }
         round["last_result_sent"] = receipt
-        round["record_references"] = (round["record_references"] as? [JSON] ?? []) + references + (try routed.map {try mediaRef("media_owner_decision",$0.decision)})
+        round["record_references"] = (round["record_references"] as? [JSON] ?? []) + references + (try baselineRows.map {try mediaRef("media_owner_decision",$0.decision)})
         round = revised(round);try mediaWrite(db,round,type:"media_round")
         return result
     }

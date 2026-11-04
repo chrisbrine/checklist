@@ -172,3 +172,65 @@ known whole-store loaders; a new whole-store loader is caught only by the
 footprint limit, and only when its size passes the limit at this store size.
 This guard does not replace the installed measure above or owned-copy
 qualification of the actual store.
+
+
+## Installed backup sampler (CL-409)
+
+A kernel peak read after a backup gives only the lifetime value of the process.
+So CL-409 samples the installed service through each service-started backup:
+
+```
+python3 script/service_memory_sampler.py --out <evidence>/cl409-samples.jsonl
+```
+
+The sampler finds the one process whose executable is exactly
+`/Applications/Checklist.app/Contents/MacOS/ChecklistService` (`--executable`).
+`ps` shows a relative name for the service, so the sampler reads the exact path
+with `proc_pidpath`. A test slot's service has a different path and does not
+match. Each sample is one JSON line in `--out`: the time (UTC and the Mac's
+local zone, UTC-7 for the owner), `phys_footprint` and `phys_footprint_peak`
+from `footprint -p PID -f bytes`, `vm.loadavg`, and `build_id`,
+`build_number`, `backup_active`, `locked` and `reason` from
+`checklist call service_info`. After each sample the sampler waits `--interval`
+seconds (default 15), so the period is the interval plus the time of the calls
+(about 0.7 s in the smoke run). Each `checklist call` runs in `--project-dir`
+(default `~/Documents/Work/Checklist`).
+
+A backup is a period in which `backup_active` is true, or `locked` is true with
+a reason that starts with `backup`. For each backup the sampler records the
+start, the end, the duration (to one interval), the highest footprint and
+lifetime peak in the backup, the lifetime peak before and after, and the load at
+the start and the end. `--retention-delay` seconds (default 60) after the end,
+it calls `backup_retention_status` one time for `--project-id` and stores the
+raw reply in `<out>.retention-N.json`. The backup has `moved: true` when
+`last_result.occurred_at` is not earlier than the backup start and
+`last_result.moved_count` is above 0. A backup that is already active at the
+first sample is recorded with `complete: false` and does not count.
+
+When `phys_footprint` passes `--alert-bytes` (default 4 GiB), the sampler saves
+one full `footprint -p PID` report and one `sample PID 5 -file` stack next to
+`--out`, one time for each backup (or for each period between backups). It runs
+no other command on the service process.
+
+The sampler stops on the first of these conditions, and it records the reason:
+
+- `--backups` complete backups (default 3) ended and each has its retention read.
+- `--max-hours` passed (default 10). A retention read that still waits runs one time.
+- The service PID or its start time changed, the service is not found, or two
+  processes match (an install or a restart).
+- `build_id` changed.
+- SIGTERM or SIGINT.
+
+At each stop it writes `<out>.summary.json` (`--summary`): every backup, the
+highest readings, the moved-snapshot count, the stop reason and the sample
+count. An error in one sample goes into that sample's `errors` list, and the
+loop continues. The sampler is read-only: it starts no backup, reads no file
+of the service store and deletes no file.
+
+For CL-409 acceptance 1, the orchestrator starts the sampler on the installed
+build and lets the service make its own backups. The summary must show at
+least 3 complete backups on one build, and at least one with `moved: true`. If
+a reading passes 4 GiB, the alert files are the report for acceptance 2. If no
+reading passes 4 GiB, the highest values are the measured bound for
+acceptance 3. An install stops the sampler, and the count starts again on the
+new build.

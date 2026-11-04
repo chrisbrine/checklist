@@ -20,7 +20,7 @@ final class NativeReplyListenerStatusTests: XCTestCase {
     }
     override func tearDownWithError() throws {
         coordinator.queue.sync {}
-        coordinator.queue.sync { coordinator.nativeListener?.removeSocketFile();coordinator.nativeListener = nil }
+        coordinator.queue.sync { coordinator.nativeListener?.releaseSocketFile();coordinator.nativeListener = nil }
         try FileManager.default.removeItem(at:root)
         try FileManager.default.removeItem(atPath:replies)
     }
