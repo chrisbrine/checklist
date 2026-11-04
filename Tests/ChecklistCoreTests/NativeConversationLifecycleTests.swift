@@ -278,7 +278,9 @@ extension EvidenceAuthorityTests {
         let foreignInbox = try call("session_inbox", ["project_id": p["id"]!], other)
         XCTAssertTrue((foreignInbox["deliveries"] as! [JSON]).isEmpty)
         XCTAssertTrue((foreignInbox["native_recovery"] as! [JSON]).isEmpty)
-        XCTAssertTrue((try call("service_info", [:], worker)["native_recovery"] as! [JSON]).isEmpty)
+        // service_info now resolves the caller's workspace-bound Triage through
+        // scope, so the pre-resumption execution domain is refused on this read too.
+        assertCode("FORBIDDEN") { _ = try self.call("service_info", [:], worker) }
         assertCode("FORBIDDEN") { _ = try self.call("session_inbox", ["project_id": p["id"]!], worker) }
         let task = try call("task_get", ["project_id": p["id"]!, "task_id": tasks[0]["id"]!])
         let releaseReason = try XCTUnwrap(task["status_reason"] as? JSON)

@@ -262,7 +262,7 @@ extension CommandRouter {
         } else { try requireNoWritableChildren(db,attempt:a);try requireNoSourceExecutions(db,attempt:a);offer["summary"] = try text(p,"summary",max:32000) }
         try save(db,offer,type:isChild ? "delegation" : "handoff");try event(db,
         caller:c,project:pid,entity:a["task_id"] as? String,kind:method,data:["offer_id":(try StoredRecord(offer,
-         family: "WorkAuthority").requiredValue("id"))]);return offer
+         family: "WorkAuthority").requiredValue("id"))]);return try addingDispatchTriageMembership(db,reply:offer,task:task,caller:c)
     }
 }
 

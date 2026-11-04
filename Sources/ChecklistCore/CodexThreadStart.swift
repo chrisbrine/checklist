@@ -17,16 +17,31 @@ extension CommandRouter {
         return "Use Checklist for \(key): \(title). Work in \(root). Run \(cliCommand) connect --task \(taskID) from that workspace; it registers this actual thread and attaches it to the ticket. Then run \(cliCommand) call task_context '\(json)' to read the task, project rules and notes. Run checklist tools for the supported schemas. Connecting alone does not claim or assign work."
     }
 
+    func ticketThreadTriageInstruction(_ db: Database, ticket: JSON) throws -> String {
+        let stored = StoredRecord(ticket, family: "task")
+        let key = AgentReference.sanitized(try stored.string("key"), maximumCharacters: 80, maximumUTF8Bytes: 320)
+        guard let joined = try currentTriages(db, project: stored.string("project_id"), taskID: stored.string("id")).first else {
+            return "\(key) is in no Triage; ask the conversation that sent you this work to add it."
+        }
+        let reference = AgentReference.text(joined)
+        guard let orchestrator = triageOrchestratorSession(joined) else {
+            return "\(key) is in Triage \(reference), a plan with no orchestrator; your claim removes it from that plan. Ask the conversation that sent you this work to add it to its Triage. Do not call triage_orchestrate."
+        }
+        return "Your claim keeps \(key) in Triage \(reference), which conversation \(AgentReference.quoted(orchestrator)) holds. Do not call triage_orchestrate."
+    }
+
     func codexThreadStart(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         guard c.role != "assistant" else { throw CoreError("FORBIDDEN","Assistant connections cannot start ticket conversations.") }
         let pid = try scope(db,p,c,write:true),ticket = try task(db,p,pid),project = try record(db,pid,type:"project")
         let tid = ticket["id"] as? String ?? "",key = ticket["key"] as? String ?? tid,root = project["root_path"] as? String ?? ""
         let instruction = try ticketThreadInstruction(key:key,title:ticket["title"] as? String ?? "task",root:root,projectID:pid,taskID:tid)
+            + "\n" + ticketThreadTriageInstruction(db, ticket: ticket)
         var fallback: JSON = ["kind":"copy_instruction","instruction":instruction,"owner_send_required":true]
         if let url = providerPlugins.plugin("codex", requiring: .composer)?.composeURL(instruction:instruction,workspace:root) {
             fallback["kind"] = "composer_owner_send";fallback["compose_url"] = url.absoluteString
         }
         var response: JSON = ["task_id":tid,"key":key,"provider":"codex","host_route":Self.codexThreadHostRoute,"claim_acquired":false,"assignment_changed":false]
+        response = try addingDispatchTriageMembership(db, reply: response, task: ticket, caller: c)
         guard let outcome = p["host_outcome"] as? String else {
             response["state"] = "prepared";response["started"] = false;response["fallback"] = fallback
             response["host_request"] = ["tool":Self.codexThreadHostRoute,"prompt":instruction,"workspace":root]

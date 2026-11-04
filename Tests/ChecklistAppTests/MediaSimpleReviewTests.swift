@@ -1,4 +1,5 @@
 import XCTest
+import AVKit
 /// A scoped import: only the publisher protocol, because Combine also declares `Record`.
 import protocol Combine.Publisher
 import ChecklistCore
@@ -564,7 +565,8 @@ import ChecklistIPC
     var state = "draft"
     var reviewInDraft: Bool? = true
     var publishFailures: [Error] = []
-    let ready = ["N":true,"E":true,"SE":false]
+    var approveFailures: [Error] = []
+    var ready = ["N":true,"E":true,"SE":false]
     var writes: [String] {calls.map(\.0).filter {["media_round_publish","media_context_approve","media_decide"].contains($0)}}
     func params(_ method: String) -> [MediaValues] {calls.filter {$0.0==method}.map(\.1)}
     var schema: MediaValues {
@@ -598,6 +600,9 @@ import ChecklistIPC
         case "media_round_publish":
             if !publishFailures.isEmpty {throw publishFailures.removeFirst()}
             state="open";return header
+        case "media_context_approve":
+            if !approveFailures.isEmpty {throw approveFailures.removeFirst()}
+            return ["approved":true]
         case "media_decide":
             let selection=(params["items"] as? [MediaValues])?.first ?? [:]
             return ["decisions":[["id":"decision","item_id":selection["item_id"]!,"target_id":selection["target_id"]!,"disposition":params["disposition"]!]]]
@@ -696,35 +701,111 @@ extension MediaSimpleReviewTests {
         try await settle {!north.sending}
         XCTAssertEqual(service.writes,["media_round_publish"])
         await model.waitUntilWritable();XCTAssertFalse(store.hasPendingMutation,"The refusal leaves no pending command")
-        XCTAssertTrue(north.status.hasPrefix("Not published. No decision recorded."),north.status)
+        XCTAssertTrue(north.status.hasPrefix("Could not publish this round: "),north.status)
+        XCTAssertTrue(north.status.hasSuffix(". No decision was saved."),north.status)
         XCTAssertTrue(north.status.contains("publication preview"),north.status)
-        XCTAssertNil(review.contextApproval);XCTAssertEqual(north.item.string("disposition"),"pending")
+        XCTAssertEqual(north.item.string("disposition"),"pending")
+        XCTAssertNil(store.error,"The card shows the refusal; no global alert shows it");XCTAssertNil(model.error)
         // A card whose item is not publication-ready sends nothing at all.
         service.calls=[]
         let southEast=try XCTUnwrap(review.cards["item-SE"])
         await review.press("needs_look",card:southEast,model:model)
-        XCTAssertEqual(service.writes,[]);XCTAssertTrue(southEast.status.hasPrefix("Not published."),southEast.status)
+        XCTAssertEqual(service.writes,[]);XCTAssertTrue(southEast.status.hasPrefix("Could not publish this round: "),southEast.status)
         XCTAssertEqual(service.calls.map(\.0),["media_publication_preview"],"Only the preview is read");XCTAssertNotNil(model.store)
         withExtendedLifetime(store) {}
     }
-    func testProjectContextRequiredAsksForApprovalThenPublishesAndDecides() async throws {
+    private static func contextRequired() -> ChecklistError {
+        ChecklistError("MEDIA_PROJECT_CONTEXT_REQUIRED","Approve the project context once before the first publication. No records changed.",details:["command_outcome":"rejected"])
+    }
+    /// The service methods of the publication sequence, in order.
+    private func sequence(_ service: DraftService) -> [String] {
+        service.calls.map(\.0).filter {["media_publication_preview","media_round_publish","media_context_approve","media_decide"].contains($0)}
+    }
+    /// CL-422 rework (owner, 3 Nov 2026): the owner's press is the context approval. No dialog, no global alert.
+    func testProjectContextRefusalApprovesByItselfThenPublishesAndDecides() async throws {
         let service=DraftService()
-        service.publishFailures=[ChecklistError("MEDIA_PROJECT_CONTEXT_REQUIRED","Explicitly adopt the observed project context before the first publication.",details:["command_outcome":"rejected"])]
+        service.publishFailures=[Self.contextRequired()]
+        let (review,model,store)=await draftReview(service)
+        let north=try XCTUnwrap(review.cards["item-N"])
+        await review.press("accepted",card:north,model:model)
+        try await settle {!north.sending && service.writes.contains("media_decide")}
+        XCTAssertEqual(service.writes,["media_round_publish","media_context_approve","media_round_publish","media_decide"])
+        XCTAssertEqual(sequence(service),["media_publication_preview","media_round_publish","media_context_approve","media_publication_preview","media_round_publish","media_decide"],
+            "The second publication reads the preview again")
+        let approve=try XCTUnwrap(service.params("media_context_approve").first)
+        XCTAssertEqual(approve["kind"] as? String,"project");XCTAssertEqual(approve["expected_project_revision"] as? Int,4)
+        XCTAssertEqual(Set(approve.keys),["kind","expected_project_revision","project_id","command_id"],"The same request as the setup button")
+        XCTAssertEqual((service.params("media_decide").first?["items"] as? [MediaValues])?.first?["target_id"] as? String,"pub-N")
+        XCTAssertEqual(north.status,"Saved: Accepted")
+        XCTAssertNil(store.error,"No OK-only global alert");XCTAssertNil(model.error,"No orange line");XCTAssertFalse(store.hasPendingMutation)
+    }
+    func testFailedContextApprovalRecordsNoDecisionAndShowsOneCardError() async throws {
+        let service=DraftService()
+        service.publishFailures=[Self.contextRequired()]
+        service.approveFailures=[ChecklistError("REVISION_CONFLICT","The project changed. Refresh and try again.",details:["command_outcome":"rejected"])]
         let (review,model,store)=await draftReview(service)
         let north=try XCTUnwrap(review.cards["item-N"])
         await review.press("accepted",card:north,model:model)
         try await settle {!north.sending}
-        XCTAssertEqual(service.writes,["media_round_publish"],"No decision before the approval")
-        let pending=try XCTUnwrap(review.contextApproval)
-        XCTAssertEqual(pending,.init(cardID:"item-N",disposition:"accepted"))
+        XCTAssertEqual(service.writes,["media_round_publish","media_context_approve"],"No second publication and no decision")
+        XCTAssertTrue(north.status.hasPrefix("Could not publish this round: "),north.status)
+        XCTAssertTrue(north.status.hasSuffix(". No decision was saved."),north.status)
+        XCTAssertEqual(north.item.string("disposition"),"pending")
         await model.waitUntilWritable();XCTAssertFalse(store.hasPendingMutation)
-        await review.approveContextAndDecide(pending,model:model)
-        try await settle {!north.sending && service.writes.contains("media_decide")}
-        XCTAssertNil(review.contextApproval)
-        XCTAssertEqual(service.writes,["media_round_publish","media_context_approve","media_round_publish","media_decide"])
-        let approve=try XCTUnwrap(service.params("media_context_approve").first)
-        XCTAssertEqual(approve["kind"] as? String,"project");XCTAssertEqual(approve["expected_project_revision"] as? Int,4)
-        XCTAssertEqual((service.params("media_decide").first?["items"] as? [MediaValues])?.first?["target_id"] as? String,"pub-N")
-        XCTAssertEqual(north.status,"Saved: Accepted")
+        XCTAssertNil(store.error,"No global alert");XCTAssertNil(model.error)
+    }
+    func testPublishActionApprovesContextByItselfThenPublishes() async throws {
+        let service=DraftService();service.ready["SE"]=true
+        service.publishFailures=[Self.contextRequired()]
+        let (_,model,store)=await draftReview(service)
+        model.header=Record(values:service.header)
+        XCTAssertTrue(model.preparedPublicationAvailable)
+        await model.publishPreparedRound()
+        XCTAssertEqual(service.writes,["media_round_publish","media_context_approve","media_round_publish"])
+        XCTAssertEqual(model.roundState,"open");XCTAssertNil(model.error);XCTAssertNil(store.error)
+        XCTAssertEqual((service.params("media_round_publish").last?["items"] as? [MediaValues])?.count,3)
+    }
+    /// Review 8b119aed R3: items read again before the open header arrives still take the open basis in place.
+    func testOtherCardsTakeTheOpenBasisAfterPublicationWithNoReopen() async throws {
+        let service=DraftService();service.ready["SE"]=true
+        let (review,model,store)=await draftReview(service)
+        model.header=Record(values:service.header)
+        await model.publishPreparedRound()
+        XCTAssertEqual(service.writes,["media_round_publish"])
+        // The item rows arrive first, while each card still holds the Draft header.
+        review.sync(scope:"project:round",rows:["N","E","SE"].map {Record(values:["id":"item-"+$0,"revision":3,"metadata":["direction":$0]])},draft:{_ in MediaOwnerDraft()},saveDraft:{_,_ in})
+        await review.readStale {id in Record(values:service.item(String(id.dropFirst(5))))}
+        let east=try XCTUnwrap(review.cards["item-E"])
+        XCTAssertEqual(east.target.id,"pub-E");XCTAssertEqual(east.header.string("state"),"draft")
+        review.update(header:Record(values:service.header))
+        XCTAssertTrue(east.basisMatches,"No inspection press is needed")
+        await model.waitUntilWritable();service.calls=[]
+        await review.press("accepted",card:east,model:model)
+        try await settle {!east.sending && service.writes.contains("media_decide")}
+        XCTAssertEqual(service.writes,["media_decide"]);XCTAssertEqual(east.status,"Saved: Accepted")
+        withExtendedLifetime(store) {}
+    }
+    /// Review 8b119aed R2: the card player has no inline control, so no pause can bypass `ownerPaused`.
+    func testCardPlayerHasNoInlineControls() {
+        let view=AVPlayerView(),player=AVPlayer()
+        MediaSimpleCardPlayer.configure(view,player:player)
+        XCTAssertEqual(view.controlsStyle,.none);XCTAssertFalse(view.showsFullScreenToggleButton)
+        XCTAssertTrue(view.player===player);XCTAssertEqual(view.videoGravity,.resizeAspect)
+    }
+    /// CL-421 rework: "Changes requested" needs a note; the card says so and enables it with text.
+    func testChangesRequestedShowsTheNoteHintAndEnablesWithANote() async throws {
+        XCTAssertEqual(MediaSimpleLayout.changesNeedNote,"Write a note to request changes.")
+        XCTAssertEqual(MediaSimpleLayout.noteHint("changes_requested",note:""),"Write a note to request changes.")
+        XCTAssertEqual(MediaSimpleLayout.noteHint("changes_requested",note:"  \n"),"Write a note to request changes.")
+        XCTAssertNil(MediaSimpleLayout.noteHint("changes_requested",note:"Raise the arm"))
+        XCTAssertNil(MediaSimpleLayout.noteHint("accepted",note:""));XCTAssertNil(MediaSimpleLayout.noteHint("needs_look",note:""))
+        let service=DraftService()
+        let (review,model,store)=await draftReview(service)
+        let north=try XCTUnwrap(review.cards["item-N"])
+        await review.press("changes_requested",card:north,model:model)
+        XCTAssertEqual(north.status,"Write a note to request changes.");XCTAssertEqual(service.calls.count,0)
+        north.draft.note="Raise the arm"
+        XCTAssertNil(MediaSimpleLayout.noteHint("changes_requested",note:north.draft.note),"The button enables as soon as the note has text")
+        withExtendedLifetime(store) {}
     }
 }

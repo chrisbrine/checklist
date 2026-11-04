@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import AVFoundation
+import AVKit
 /// Scoped imports: Combine also declares `Record`.
 import class Combine.AnyCancellable
 import protocol Combine.Publisher
@@ -77,6 +78,22 @@ enum MediaSimpleLayout {
     @MainActor static func decisionRoute(_ card: MediaDirectionCard,model: MediaReviewModel) -> DecisionRoute {
         decisionRoute(state:card.header.string("state"),published:card.item.bool("published"),schema:schema(card,fallback:model.schema),historyOnly:model.historyOnly)
     }
+    /// CL-421 rework: the plain hint of a decision that needs a note ("Changes requested") while
+    /// the note is empty. nil when the decision can be sent. The card shows it and uses it as help.
+    static let changesNeedNote = "Write a note to request changes."
+    static func noteHint(_ disposition: String,note: String) -> String? {
+        MediaReviewModel.decisionRequiresNote(disposition) && note.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty ? changesNeedNote : nil
+    }
+    /// CL-421 rework: card media layout. The take and its reference each get one half of the card,
+    /// at least `mediaMinWidth` wide, in a fixed `mediaHeight` frame. The grid's column minimum
+    /// gives a card two halves; a narrower card puts the reference under the take.
+    static let mediaMinWidth: CGFloat = 190
+    static let mediaHeight: CGFloat = 180
+    static let mediaSpacing: CGFloat = 8
+    static let cardPadding: CGFloat = 8
+    static let cardMinWidth: CGFloat = mediaMinWidth*2+mediaSpacing+cardPadding*2+16
+    /// The video's width/height from its probe, for an aspect-fit frame with no letterbox. nil when unknown.
+    static func aspect(width: Int,height: Int) -> CGFloat? {width>0 && height>0 ? CGFloat(width)/CGFloat(height) : nil}
 }
 struct MediaSimpleDecision: Identifiable, Equatable {
     let title: String
@@ -216,9 +233,6 @@ struct MediaSimpleReference {
     }
     @Published private(set) var order: [String] = []
     @Published var pausedByOwner = false
-    /// CL-422: a first Draft decision that waits for the one-time project context approval.
-    struct ContextApproval: Equatable {let cardID: String;let disposition: String}
-    @Published var contextApproval: ContextApproval?
     private(set) var cards: [String: MediaDirectionCard] = [:]
     private(set) var stale = Set<String>()
     private(set) var visible = Set<String>()
@@ -292,13 +306,22 @@ struct MediaSimpleReference {
         // when the view sends no new frames (its layout did not change).
         priority=[];ownerPaused=[];ownerPlayed=[];yielded=[];ownerPlaysAll=false
         if !order.isEmpty {order=[]}
-        if contextApproval != nil {contextApproval=nil}
     }
     /// A changed round header moves into each card in place; an unchanged one changes nothing.
+    /// CL-422 rework (review 8b119aed R3): the publication in place moves the round from Draft to
+    /// open. A card whose item was read again before this header arrived took its published target
+    /// by lineage under the Draft header (`apply`), so its look held the Draft context token. It
+    /// takes the open round's basis here, so it needs no inspection press and no reopen.
     func update(header next: Record) {
         guard !MediaReviewModel.sameRecord(header,next) else {return}
         header=next
-        for card in cards.values where !MediaReviewModel.sameRecord(card.header,next) {card.header=next}
+        for card in cards.values where !MediaReviewModel.sameRecord(card.header,next) {
+            let published=card.header.id==next.id && card.header.string("state")=="draft" && next.string("state")=="open"
+            card.header=next
+            let target=card.target,lineage=target.string("published_from_target_id")
+            if published,!target.id.isEmpty,!lineage.isEmpty,
+               card.draft.targetID==target.id || card.draft.targetID==lineage {card.inspectCurrentBasis()}
+        }
     }
     /// Diffs the list rows by stable item ID. Returns the IDs whose item must be read.
     @discardableResult func sync(scope next: String,rows: [Record],draft: (Record) -> MediaOwnerDraft,saveDraft: @escaping (String,MediaOwnerDraft) -> Void) -> Set<String> {
@@ -631,32 +654,26 @@ struct MediaSimpleReference {
     /// The card's decision press. An open round sends `media_decide`. A Draft round whose type
     /// sets `review_in_draft` publishes first (CL-422).
     func press(_ disposition: String,card: MediaDirectionCard,model: MediaReviewModel) async {
-        if MediaSimpleLayout.decisionRoute(card,model:model) == .firstDraft {await decideFromDraft(disposition,card:card,model:model,approved:false)}
+        if MediaSimpleLayout.decisionRoute(card,model:model) == .firstDraft {await decideFromDraft(disposition,card:card,model:model)}
         else {await decide(disposition,card:card,model:model)}
     }
     /// CL-422: one press publishes the Draft's publication-ready items (this card's item with the
     /// Draft target the owner saw must be one of them), reads the open round and this item again,
     /// and then records the decision through `decide`. A refused publication records no decision.
-    /// `MEDIA_PROJECT_CONTEXT_REQUIRED` stops here and asks for the one-time approval.
-    func decideFromDraft(_ disposition: String,card: MediaDirectionCard,model: MediaReviewModel,approved: Bool) async {
+    /// On `MEDIA_PROJECT_CONTEXT_REQUIRED` the model approves the project context and publishes
+    /// again (`publishFrozenPreview`); the owner's press is the approval. No dialog shows.
+    func decideFromDraft(_ disposition: String,card: MediaDirectionCard,model: MediaReviewModel) async {
         guard !card.sending else {return}
-        if MediaReviewModel.decisionRequiresNote(disposition),card.draft.note.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty {
-            card.status="Enter what should change in the owner note.";return
-        }
+        if let hint=MediaSimpleLayout.noteHint(disposition,note:card.draft.note) {card.status=hint;return}
         let viewed=card.target.id,scope=scope,round=card.header.id
         guard !viewed.isEmpty,card.basisMatches else {card.status="Inspect this take before deciding.";return}
         card.sending=true;card.status="Publishing this round for review…"
         let published: [Record]
         do {
             published=try await model.publishFrozenPreview(onlyReady:true,required:(card.id,viewed))
-        } catch let error as ChecklistError where error.code=="MEDIA_PROJECT_CONTEXT_REQUIRED" && !approved {
-            card.sending=false
-            guard self.scope==scope else {return}
-            card.status="Approve the project context to publish this round."
-            contextApproval=ContextApproval(cardID:card.id,disposition:disposition);return
         } catch {
             card.sending=false
-            if self.scope==scope,!(error is CancellationError) {card.status="Not published. No decision recorded. "+PlainError.text(error)}
+            if self.scope==scope,!(error is CancellationError) {card.status=Self.notPublished(error)}
             return
         }
         card.status="Saving decision…"
@@ -681,22 +698,11 @@ struct MediaSimpleReference {
         card.sending=false
         await decide(disposition,card:card,model:model)
     }
-    /// The owner approved the project context: approve it once, then publish and decide.
-    func approveContextAndDecide(_ pending: ContextApproval,model: MediaReviewModel) async {
-        if contextApproval==pending {contextApproval=nil}
-        guard let card=cards[pending.cardID],!card.sending else {return}
-        card.sending=true;card.status="Approving the project context…"
-        do {try await model.approveProjectContext()}
-        catch {card.sending=false;card.status="Not approved. No decision recorded. "+PlainError.text(error);return}
-        await model.waitUntilWritable()
-        card.sending=false
-        await decideFromDraft(pending.disposition,card:card,model:model,approved:true)
-    }
-    /// The owner closed the approval without approving.
-    func dismissContextApproval() {
-        guard let pending=contextApproval else {return}
-        contextApproval=nil
-        if let card=cards[pending.cardID],!card.sending {card.status="Not published. No decision recorded."}
+    /// The card's one plain line for a refused publication, an approval that failed included.
+    static func notPublished(_ error: Error) -> String {
+        var reason=PlainError.text(error).trimmingCharacters(in:.whitespacesAndNewlines)
+        while reason.hasSuffix(".") {reason.removeLast()}
+        return "Could not publish this round: "+reason+". No decision was saved."
     }
 }
 
@@ -723,7 +729,7 @@ struct MediaSimpleReview: View {
                 LazyVStack(alignment:.leading,spacing:14) {
                     ForEach(simple.sections) {section in
                         Text(section.title).font(.title3).accessibilityAddTraits(.isHeader)
-                        LazyVGrid(columns:[GridItem(.adaptive(minimum:380),alignment:.top)],alignment:.leading,spacing:12) {
+                        LazyVGrid(columns:[GridItem(.adaptive(minimum:MediaSimpleLayout.cardMinWidth),alignment:.top)],alignment:.leading,spacing:12) {
                             ForEach(section.cards) {card in
                                 MediaSimpleCardView(card:card,simple:simple,playback:simple.playback,model:model)
                             }
@@ -742,12 +748,6 @@ struct MediaSimpleReview: View {
         .onReceive(model.$header) {simple.update(header:$0)}
         .onReceive(model.$rows) {rows in sync(rows)}
         .onDisappear {simple.reset()}
-        .confirmationDialog("Approve the project context for media review?",isPresented:Binding(get:{simple.contextApproval != nil},set:{if !$0 {simple.dismissContextApproval()}}),titleVisibility:.visible,presenting:simple.contextApproval) {pending in
-            Button("Approve current project context for media review") {Task {await simple.approveContextAndDecide(pending,model:model)}}
-            Button("Cancel",role:.cancel) {simple.dismissContextApproval()}
-        } message: {_ in
-            Text("This project has a brief or pinned decisions that media review has not approved yet. Approve them once. Then Checklist publishes this round and records your decision.")
-        }
         }
     }
     func sync(_ rows: [Record]) {
@@ -803,9 +803,10 @@ private struct MediaSimpleCardView: View {
                     .accessibilityLabel("Details, "+card.label).help("Show item details")
                     .popover(isPresented:$showDetails) {details}
             }
-            HStack(alignment:.top,spacing:8) {
-                take.frame(minWidth:180,maxWidth:.infinity,minHeight:160,maxHeight:220)
-                MediaSimpleReferenceView(card:card,simple:simple,playback:playback,model:model,layout:layout).frame(width:150)
+            // CL-421 rework: two equal halves when the card is wide enough, else the reference under the take.
+            ViewThatFits(in:.horizontal) {
+                HStack(alignment:.top,spacing:MediaSimpleLayout.mediaSpacing) {takeColumn;referenceColumn}
+                VStack(alignment:.leading,spacing:MediaSimpleLayout.mediaSpacing) {takeColumn;referenceColumn}
             }
             if let suggestion=MediaComparisonLabels.suggestions(item:card.item).first(where:\.isCurrent) {
                 Text("Agent suggests: "+suggestion.choice).font(.caption).foregroundStyle(Color.checklistSecondaryText)
@@ -817,27 +818,48 @@ private struct MediaSimpleCardView: View {
             }
             HStack {
                 ForEach(MediaSimpleLayout.decisions) {choice in
+                    let hint=MediaSimpleLayout.noteHint(choice.disposition,note:card.draft.note)
                     Button(choice.title) {Task {await simple.press(choice.disposition,card:card,model:model)}}
-                        .checklistDisabled([(MediaReviewModel.decisionRequiresNote(choice.disposition) && card.draft.note.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty,"Enter what should change in the owner note.")])
+                        .checklistDisabled([(hint != nil,hint ?? "")])
                         .accessibilityLabel(choice.title+", "+card.label)
                 }
                 if card.sending {ProgressView().controlSize(.small).accessibilityLabel("Working on this decision")}
             }.checklistDisabled([(card.sending,"Wait for this decision to finish."),(card.target.id.isEmpty,"This item is still loading."),(route == .unavailable && card.header.string("state") == "draft","Publish this Draft round before deciding."),(!card.basisMatches || route == .unavailable,"Inspect a published item in an open round before deciding."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
-            if !card.status.isEmpty {Text(card.status).font(.caption).textSelection(.enabled)}
+            if let hint=MediaSimpleLayout.noteHint("changes_requested",note:card.draft.note) {
+                Text(hint).font(.caption).foregroundStyle(Color.checklistSecondaryText).fixedSize(horizontal:false,vertical:true)
+            }
+            if !card.status.isEmpty {Text(card.status).font(.caption).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)}
         }
-        .padding(8).background(.quaternary.opacity(0.3),in:RoundedRectangle(cornerRadius:6))
+        .padding(MediaSimpleLayout.cardPadding).background(.quaternary.opacity(0.3),in:RoundedRectangle(cornerRadius:6))
+        .clipShape(RoundedRectangle(cornerRadius:6))
         .accessibilityElement(children:.contain).accessibilityLabel(card.label)
         .accessibilityIdentifier("mediaSimpleCard:"+card.id)
         .background(MediaSimpleFrameReporter(id:card.id))
     }
+    /// The take half: the take in its fixed frame, then its label and the card's Play/Pause.
+    var takeColumn: some View {
+        VStack(alignment:.leading,spacing:2) {
+            take.mediaSimpleHalf()
+            HStack(alignment:.firstTextBaseline,spacing:4) {
+                Text("Take").font(.caption2).foregroundStyle(Color.checklistSecondaryText)
+                Spacer(minLength:4)
+                if playback.takes[card.key]?.player != nil {
+                    // One control for both players of the card (the take and a video reference).
+                    Button(simple.isPlaying(card) ? "Pause" : "Play") {simple.toggle(card)}
+                        .controlSize(.small).fixedSize()
+                        .accessibilityLabel((simple.isPlaying(card) ? "Pause " : "Play ")+card.label)
+                }
+            }
+        }.frame(minWidth:MediaSimpleLayout.mediaMinWidth,idealWidth:MediaSimpleLayout.mediaMinWidth,maxWidth:.infinity,alignment:.leading)
+    }
+    var referenceColumn: some View {
+        MediaSimpleReferenceView(card:card,simple:simple,playback:playback,model:model,layout:layout)
+            .frame(minWidth:MediaSimpleLayout.mediaMinWidth,idealWidth:MediaSimpleLayout.mediaMinWidth,maxWidth:.infinity,alignment:.leading)
+    }
     @ViewBuilder var take: some View {
         if let prepared=playback.takes[card.key],let player=prepared.player {
-            ZStack(alignment:.bottomTrailing) {
-                NativePlayerAdapter(player:player,audio:false).accessibilityLabel("Take, "+card.label)
-                // One control for both players of the card (the take and a video reference).
-                Button(simple.isPlaying(card) ? "Pause" : "Play") {simple.toggle(card)}
-                    .accessibilityLabel((simple.isPlaying(card) ? "Pause " : "Play ")+card.label).padding(6)
-            }
+            MediaSimpleCardPlayer(player:player,aspect:MediaSimpleLayout.aspect(width:prepared.measurement.facts.width,height:prepared.measurement.facts.height))
+                .accessibilityLabel("Take, "+card.label)
         } else {
             Text(card.status.isEmpty || card.status.hasPrefix("Saved") ? "Preparing take…" : card.status)
                 .font(.caption).foregroundStyle(Color.checklistSecondaryText).frame(maxWidth:.infinity,maxHeight:.infinity)
@@ -879,12 +901,13 @@ private struct MediaSimpleReferenceView: View {
                 let label=MediaComparisonLabels.slot(reference.slot,definitions:model.slots)
                 if reference.kind == "video" {
                     if let player=simple.referencePlayer(card),let prepared=playback.takes[player.key],let native=prepared.player {
-                        NativePlayerAdapter(player:native,audio:false).frame(minHeight:120,maxHeight:180).accessibilityLabel("Reference, "+label)
-                    } else {Text(card.referenceStatus.isEmpty ? "Preparing reference…" : card.referenceStatus).font(.caption).foregroundStyle(Color.checklistSecondaryText)}
-                } else if let image {Image(nsImage:image).resizable().scaledToFit().frame(maxHeight:180).accessibilityLabel("Reference, "+label)}
-                else {Text(status.isEmpty ? "Loading reference…" : status).font(.caption).foregroundStyle(Color.checklistSecondaryText)}
-                Text(label).font(.caption2).foregroundStyle(Color.checklistSecondaryText)
-            } else {Text(card.target.id.isEmpty ? "" : MediaSimpleReviewModel.noReference).font(.caption).foregroundStyle(Color.checklistSecondaryText)}
+                        MediaSimpleCardPlayer(player:native,aspect:MediaSimpleLayout.aspect(width:prepared.measurement.facts.width,height:prepared.measurement.facts.height))
+                            .accessibilityLabel("Reference, "+label).mediaSimpleHalf()
+                    } else {Text(card.referenceStatus.isEmpty ? "Preparing reference…" : card.referenceStatus).font(.caption).foregroundStyle(Color.checklistSecondaryText).mediaSimpleHalf()}
+                } else if let image {Image(nsImage:image).resizable().scaledToFit().accessibilityLabel("Reference, "+label).mediaSimpleHalf()}
+                else {Text(status.isEmpty ? "Loading reference…" : status).font(.caption).foregroundStyle(Color.checklistSecondaryText).mediaSimpleHalf()}
+                Text(label).font(.caption2).foregroundStyle(Color.checklistSecondaryText).fixedSize(horizontal:false,vertical:true)
+            } else {Text(card.target.id.isEmpty ? "" : MediaSimpleReviewModel.noReference).font(.caption).foregroundStyle(Color.checklistSecondaryText).fixedSize(horizontal:false,vertical:true)}
         }
         .task(id:key) {await load()}
     }
@@ -899,5 +922,55 @@ private struct MediaSimpleReferenceView: View {
             simple.referenceImages[key]=decoded;image=decoded
         } catch is CancellationError {
         } catch {status="Reference unavailable: "+PlainError.text(error)}
+    }
+}
+
+/// CL-421 rework: one half of a card's media. A fixed-height frame as wide as its half, with the
+/// content centred and clipped to it, so a take or reference never draws past its half.
+private extension View {
+    func mediaSimpleHalf() -> some View {
+        frame(maxWidth:.infinity,maxHeight:.infinity).frame(height:MediaSimpleLayout.mediaHeight).clipped()
+    }
+}
+
+/// CL-421 rework: a card player. `NativePlayerAdapter` keeps AVPlayerView's own size: its inline
+/// controls need more width than half a card, so the reference drew past its 150-point frame
+/// into the next card, and its black background showed as a band beside an aspect-fit video.
+/// This view takes exactly the size it is offered, has no controls of its own (the card's
+/// Play/Pause plays both players together), a clear background, and an aspect-fit frame of the
+/// probed video size, so no letterbox band shows.
+struct MediaSimpleCardPlayer: View {
+    let player: AVPlayer
+    let aspect: CGFloat?
+    var body: some View {
+        if let aspect {Surface(player:player).aspectRatio(aspect,contentMode:.fit)}
+        else {Surface(player:player)}
+    }
+    /// No inline controls (review 8b119aed R2): an inline pause was not recorded as the owner's
+    /// pause, so the next budget pass played the take again. The card's visible Play/Pause is the
+    /// only control, and it records `ownerPaused`.
+    static func configure(_ view: AVPlayerView,player: AVPlayer) {
+        view.controlsStyle = .none
+        view.showsFullScreenToggleButton=false
+        view.videoGravity = .resizeAspect
+        view.wantsLayer=true;view.layer?.backgroundColor=NSColor.clear.cgColor
+        view.player=player
+        view.setAccessibilityLabel("Video")
+    }
+    private struct Surface: NSViewRepresentable {
+        let player: AVPlayer
+        func makeNSView(context: Context) -> AVPlayerView {
+            let view=AVPlayerView()
+            MediaSimpleCardPlayer.configure(view,player:player)
+            return view
+        }
+        func updateNSView(_ view: AVPlayerView,context: Context) {
+            if view.player !== player {view.player?.pause();view.player=player}
+        }
+        /// The offered size, never the view's own: an unspecified dimension is zero.
+        func sizeThatFits(_ proposal: ProposedViewSize,nsView: AVPlayerView,context: Context) -> CGSize? {
+            proposal.replacingUnspecifiedDimensions(by:.zero)
+        }
+        static func dismantleNSView(_ view: AVPlayerView,coordinator: ()) {view.player?.pause();view.player=nil}
     }
 }

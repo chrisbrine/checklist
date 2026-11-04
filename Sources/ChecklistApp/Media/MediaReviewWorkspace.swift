@@ -113,7 +113,14 @@ struct MediaReviewWorkspace: View {
                     TextField("New round title",text:$roundTitle)
                     Button("Add Draft round") {model.createRound(title:roundTitle) {roundTitle=""}}.checklistDisabled([(roundTitle.isEmpty,"Enter a round title."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
                 }}
-                if let error=model.error {Text(error).foregroundStyle(.orange).textSelection(.enabled)}
+                if let error=model.error {HStack {
+                    Text(error).foregroundStyle(.orange).textSelection(.enabled)
+                    // CL-422 rework: a refusal for the project context offers the approval next to its text.
+                    if error==MediaReviewModel.projectContextRequiredText,store.currentProject != nil {
+                        Button("Approve project context") {Task {try? await model.approveProjectContext()}}
+                            .checklistDisabled([(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
+                    }
+                }}
                 // Shown only for data never loaded; a live refresh changes values in place (CL-421).
                 if model.loading {ProgressView("Loading media review")}
                 if !model.roundID.isEmpty && MediaSimpleLayout.usesCards(model.schema) && !itemComparison {

@@ -121,7 +121,9 @@ final class ChecklistStore: ObservableObject {
     @Published var hasPendingMutation = false
     var pendingCommandID: String? { pendingMutation?.command.params["command_id"] as? String }
     var pendingMutationQueued: Bool { pendingCommandID.map(queuedCommandIDs.contains) ?? false }
-    private var pendingMutation: (command: PendingCommandRecovery, success: String?, completion: (([String: Any]) -> Void)?, failure: ((Error) -> Void)?)?
+    /// `alertsOnRefusal` false: the caller shows a refusal itself, so the store sets no global `error` (alert) for it.
+    /// An unknown outcome always sets `error`.
+    private var pendingMutation: (command: PendingCommandRecovery, success: String?, completion: (([String: Any]) -> Void)?, failure: ((Error) -> Void)?, alertsOnRefusal: Bool)?
     private var recoveredCommand: (command: PendingCommandRecovery, marker: String)?
     @Published var notice: String? { didSet { if !informing { noticeIsWarning = false } } }
     private var informing = false
@@ -1920,7 +1922,7 @@ final class ChecklistStore: ObservableObject {
                 ignoreSavedCommand(marker: recovered.marker, message: Self.foreignRecoveryNotice)
                 return
             }
-            pendingMutation = (recovered.command, "Last change checked", nil, nil)
+            pendingMutation = (recovered.command, "Last change checked", nil, nil, true)
             hasPendingMutation = true
         } else if let pending = pendingMutation,
                   !pending.command.matches(storeIncarnation: storeIncarnation, serviceIdentity: pendingCommandServiceIdentity) {
@@ -1935,7 +1937,7 @@ final class ChecklistStore: ObservableObject {
         inform(message)
     }
 
-    func run(_ method: String, _ params: [String: Any] = [:], success: String? = nil, failure: ((Error) -> Void)? = nil, completion: (([String: Any]) -> Void)? = nil) {
+    func run(_ method: String, _ params: [String: Any] = [:], success: String? = nil, failure: ((Error) -> Void)? = nil, alertsOnRefusal: Bool = true, completion: (([String: Any]) -> Void)? = nil) {
         // CL-315: every early return reaches the caller's failure path, so a caller that shows
         // progress (a busy flag, a capture sequence) never waits for a command that was not sent.
         let refuse = { (reason: String, details: [String: Any]) in failure?(ChecklistError("WRITE_NOT_STARTED", reason, details: details)) }
@@ -1943,7 +1945,7 @@ final class ChecklistStore: ObservableObject {
         var command = params
         if command["command_id"] == nil { command["command_id"] = UUID().uuidString }
         let recovery = PendingCommandRecovery(method: method, params: command, storeIncarnation: storeIncarnation, serviceIdentity: pendingCommandServiceIdentity)
-        pendingMutation = (recovery, success, completion, failure)
+        pendingMutation = (recovery, success, completion, failure, alertsOnRefusal)
         do {
             try pendingCommandPersistence.save(recovery.encoded(),pendingCommandKey)
             preferences.removeObject(forKey: ignoredRecoveryPreferenceKey)
@@ -2043,7 +2045,8 @@ final class ChecklistStore: ObservableObject {
                     self.error = "The service may already have saved this change. Use Check the last change before you make another change."
                 } else {
                     pendingMutation = nil; hasPendingMutation = false; pendingCommandPersistence.remove(pendingCommandKey)
-                    self.error = PlainError.text(error)
+                    // CL-422 rework: a caller that shows the refusal itself (a media card) gets no second, global alert.
+                    if pending.alertsOnRefusal { self.error = PlainError.text(error) }
                 }
             }
         }

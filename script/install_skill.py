@@ -10,13 +10,16 @@ Rules for each target folder:
 - A receipt whose files still match it: replace (or `current` when the files
   already equal the source).
 - A receipt whose files differ: the user changed the copy; skip and report.
-- No receipt: replace only when `SKILL.md` front matter says `name: checklist`.
+- No receipt and `SKILL.md` front matter says `name: checklist`: replace,
+  even if the copy was changed; the old copy goes to the Trash. The changed
+  copy is kept rule applies once a receipt exists.
 - An old folder moves to the Trash with a unique name; nothing is deleted.
   A read-only old folder gives a read-only new copy.
 
 `--preview` reads only. `--apply` changes the targets. One JSON line per
-target. Exit 0 when no target failed, 1 when a target failed, 2 for a bad
-source or usage.
+target. Each skipped target warns on stderr. Leftover incoming folders are
+reported on each preview/apply run, even if the source is refused, and kept.
+Exit 0 when no target failed, 1 when a target failed, 2 for a bad source or usage.
 """
 import argparse
 import datetime
@@ -259,8 +262,17 @@ def apply_target(row, source, source_files, build, home):
                 trashed_to=str(trashed) if trashed else None, source_build=build)
 
 
+def report_leftover_incoming(host, target):
+    incoming = [str(path) for path in sorted(target.parent.glob('.checklist-incoming-*'))
+                if path.is_dir()]
+    for path in incoming:
+        print(f'Checklist skill for {host} has a leftover incoming folder; kept at {path}',
+              file=sys.stderr, flush=True)
+    return incoming
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--preview', action='store_true', help='read only; print the plan')
     mode.add_argument('--apply', action='store_true', help='install or replace the targets')
@@ -276,6 +288,8 @@ def main(argv=None):
             raise SkillError('the source SKILL.md does not name the checklist skill: ' + str(source))
         source_files = tree_files(source)
     except (OSError, SkillError) as error:
+        for host, relative in HOSTS:
+            report_leftover_incoming(host, home / relative)
         print(json.dumps({'action': 'refused', 'source': str(source), 'reason': str(error)}), flush=True)
         return 2
     build = source_build(source)
@@ -286,6 +300,12 @@ def main(argv=None):
         if arguments.apply and row['action'] in ('install', 'replace'):
             row = apply_target(row, source, source_files, build, home)
             row['applied'] = row['action'] != 'failed'
+        if row['action'] == 'skip':
+            print(f"Checklist skill for {host} not updated: {row['reason']}; {row['path']}",
+                  file=sys.stderr, flush=True)
+        incoming = report_leftover_incoming(host, home / relative)
+        if incoming:
+            row['leftover_incoming'] = incoming
         failed = failed or row['action'] == 'failed'
         print(json.dumps(row, sort_keys=True), flush=True)
     return 1 if failed else 0

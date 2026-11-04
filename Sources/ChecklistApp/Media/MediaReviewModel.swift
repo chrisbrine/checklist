@@ -101,7 +101,9 @@ typealias MediaValues = [String: Any]
     func mutate(_ method: String,_ params: MediaValues,then: @escaping (MediaValues) throws -> Void = {_ in}) {
         mutateReportingFailure(method,params,onFailure:nil,then:then)
     }
-    func mutateReportingFailure(_ method: String,_ params: MediaValues,onFailure: ((Error) -> Void)?,then: @escaping (MediaValues) throws -> Void) {
+    /// `quiet`: the caller shows a refusal itself, so neither `error` (the orange line) nor the
+    /// store's global alert shows it (CL-422 rework). An unknown outcome still shows in the store.
+    func mutateReportingFailure(_ method: String,_ params: MediaValues,quiet: Bool = false,onFailure: ((Error) -> Void)?,then: @escaping (MediaValues) throws -> Void) {
         guard let store else {return}
         var params=params;params["project_id"]=projectID
         let project = projectID
@@ -109,9 +111,9 @@ typealias MediaValues = [String: Any]
             onFailure?(error)
             guard let self,self.projectID == project else {return}
             self.capturing=false
-            self.error=PlainError.text(error)
+            if !quiet {self.error=PlainError.text(error)}
             if ["MEDIA_CONTEXT_CHANGED","MEDIA_CONTEXT_ATTENTION","MEDIA_BASIS_CHANGED","REVISION_CONFLICT"].contains((error as? ChecklistError)?.code ?? "") {self.contextConflict=true}
-        }) { [weak self] result in
+        },alertsOnRefusal:!quiet) { [weak self] result in
             guard let self,self.projectID == project else {
                 // The command was committed, but its project is no longer shown: no follow-up step runs.
                 onFailure?(ChecklistError("MEDIA_PROJECT_CHANGED","The project changed. Checklist saved the change but did not continue."));return
@@ -397,7 +399,21 @@ typealias MediaValues = [String: Any]
     /// Publish action). With `onlyReady` it publishes the ready items, and `required` (CL-422)
     /// must be one of them with the Draft target that the owner saw; otherwise nothing is sent.
     /// It returns the preview rows that it published.
+    ///
+    /// CL-422 rework (owner, 3 Nov 2026): the owner's own press in the trusted app is the project
+    /// context approval. On `MEDIA_PROJECT_CONTEXT_REQUIRED` the model sends the same
+    /// `media_context_approve` request as the setup button, then reads the preview again and
+    /// publishes once more. There is no dialog and no setup step. Each refusal comes back to the
+    /// caller, which shows it; no global alert shows it.
     @discardableResult func publishFrozenPreview(onlyReady: Bool,required: (itemID: String,targetID: String)? = nil) async throws -> [Record] {
+        do {return try await publishFrozenPreviewOnce(onlyReady:onlyReady,required:required)}
+        catch let error as ChecklistError where error.code=="MEDIA_PROJECT_CONTEXT_REQUIRED" {
+            try await approveProjectContext(quiet:true)
+            await waitUntilWritable()
+            return try await publishFrozenPreviewOnce(onlyReady:onlyReady,required:required)
+        }
+    }
+    private func publishFrozenPreviewOnce(onlyReady: Bool,required: (itemID: String,targetID: String)?) async throws -> [Record] {
         let project=projectID,round=roundID,choice=roundChoiceEpoch
         let preview=try await read("media_publication_preview",["round_id":round])
         guard projectID==project,roundID==round,roundChoiceEpoch==choice,!Task.isCancelled else {throw CancellationError()}
@@ -411,16 +427,19 @@ typealias MediaValues = [String: Any]
         }
         let params:MediaValues=["round_id":round,"expected_revision":frozen.integer("revision"),"observed_context_token":frozen.string("observed_context_token"),
             "items":items.map {row -> MediaValues in ["item_id":row.string("item_id"),"expected_revision":row.integer("expected_revision"),"target_id":row.string("target_id"),"review_basis_signature":row.string("review_basis_signature")]}]
-        try await mutateAwaiting("media_round_publish",params)
+        try await mutateAwaiting("media_round_publish",params,quiet:true)
         if projectID==project,roundID==round,roundChoiceEpoch==choice {publication=[];roundState="open"}
         return items
     }
     /// The one-time project context approval (`media_context_approve`, kind project) for the
     /// observed project revision. A failure also shows in `error`.
-    func approveProjectContext() async throws {
+    func approveProjectContext(quiet: Bool = false) async throws {
         guard let project=store?.currentProject else {throw ChecklistError("PROJECT_REQUIRED","Select a project.")}
-        try await mutateAwaiting("media_context_approve",["kind":"project","expected_project_revision":project.integer("revision")])
+        try await mutateAwaiting("media_context_approve",["kind":"project","expected_project_revision":project.integer("revision")],quiet:quiet)
+        if error==Self.projectContextRequiredText {error=nil}
     }
+    /// The service text of `MEDIA_PROJECT_CONTEXT_REQUIRED`; the orange line offers the approval next to it.
+    static let projectContextRequiredText = "Approve the project context once before the first publication. No records changed."
     /// Waits (at most 10 s) until the store can accept the next change of a sequence (CL-422).
     func waitUntilWritable() async {
         for _ in 0..<40 {
@@ -429,11 +448,11 @@ typealias MediaValues = [String: Any]
         }
     }
     /// The awaited form of `mutateReportingFailure`: it returns when the command is committed, or throws the refusal.
-    func mutateAwaiting(_ method: String,_ params: MediaValues) async throws {
+    func mutateAwaiting(_ method: String,_ params: MediaValues,quiet: Bool = false) async throws {
         guard store != nil else {throw ChecklistError("WRITE_NOT_STARTED","Checklist is not connected.")}
         return try await withCheckedThrowingContinuation {continuation in
             let once=MediaResumeOnce(continuation)
-            mutateReportingFailure(method,params,onFailure:{once.resume(.failure($0))}) {_ in once.resume(.success(()))}
+            mutateReportingFailure(method,params,quiet:quiet,onFailure:{once.resume(.failure($0))}) {_ in once.resume(.success(()))}
         }
     }
     func previewIntake(_ params: MediaValues) {var p=params;p["round_id"]=roundID

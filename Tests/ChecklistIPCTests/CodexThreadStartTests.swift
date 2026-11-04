@@ -77,6 +77,7 @@ final class CodexThreadStartTests: XCTestCase {
         let request = prepared["host_request"] as! [String: Any]
         XCTAssertEqual(request["tool"] as? String, "codex_app.create_thread"); XCTAssertEqual(request["workspace"] as? String, root.path)
         let expected = try ChecklistHandoff.instruction(key: task["key"] as! String, title: "Synthetic thread start", root: root.path, projectID: pid, taskID: tid, cliCommand: router.cliCommand)
+            + "\n\(task["key"]!) is in no Triage; ask the conversation that sent you this work to add it."
         XCTAssertEqual(request["prompt"] as? String, expected)
         let fallback = prepared["fallback"] as! [String: Any]
         XCTAssertEqual(fallback["kind"] as? String, "composer_owner_send"); XCTAssertEqual(fallback["owner_send_required"] as? Bool, true)

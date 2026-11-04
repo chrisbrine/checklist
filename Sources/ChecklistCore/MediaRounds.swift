@@ -559,7 +559,7 @@ extension CommandRouter {
         let project = try record(db,pid,type:"project")
         let globalPins = (project["pinned_decisions"] as? [JSON] ?? []).filter {$0["origin"] as? String == "human_ui" && strings($0,"task_kinds").isEmpty && strings($0,"tag_ids").isEmpty}
         guard hasApprovedProjectHistory || (project["brief"] as? String ?? "").isEmpty && globalPins.isEmpty else { throw CoreError("MEDIA_PROJECT_CONTEXT_REQUIRED",
-            "Explicitly adopt the observed project context before the first publication; historical text cannot mint approval.") }
+            "Approve the project context once before the first publication. No records changed.") }
         guard let selected = p["items"] as? [JSON],!selected.isEmpty,
             Set(selected.compactMap {$0["item_id"] as? String}).count == selected.count else { throw CoreError("INVALID_INPUT",
             "Select one or more distinct exact Draft targets.") }

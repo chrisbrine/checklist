@@ -107,6 +107,20 @@ extension CommandRouter {
         return result
     }
 
+    /// Dispatch observes the current membership, before the recipient claims. Unlike
+    /// a claim, dispatch never moves a ticket into the caller's Triage automatically.
+    func addingDispatchTriageMembership(_ db: Database, reply: JSON, task: JSON, caller: Caller) throws -> JSON {
+        let stored = StoredRecord(task, family: "task")
+        let joined = try currentTriages(db, project: stored.string("project_id"), taskID: stored.string("id")).first
+        if let mine = try callerOrchestratedTriage(db, project: stored.string("project_id"), caller: caller),
+           mine["id"] as? String != joined?["id"] as? String {
+            var result = reply
+            result["triage_membership"] = try taskCreateTriageMembership(db, task: task, joined: joined, caller: caller)
+            return result
+        }
+        return try addingClaimTriageMembership(db, reply: reply, task: task, caller: caller)
+    }
+
     func currentTriages(_ db: Database, project pid: String, taskID tid: String) throws -> [JSON] {
         try records(db, type: "group", project: pid).filter { $0["kind"] as? String == "triage" && triageMemberIDs($0).contains(tid) }
     }

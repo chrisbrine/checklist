@@ -115,6 +115,8 @@ class InstallSkillTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(rows['claude']['action'], 'skip');self.assertFalse(rows['claude']['applied'])
         self.assertIn('user change', rows['claude']['reason'])
+        self.assertEqual(result.stderr.splitlines(), [
+            f"Checklist skill for claude not updated: {rows['claude']['reason']}; {self.claude}"])
         self.assertEqual(rows['claude']['difference'], {'added': ['mine.md'], 'changed': ['references/work.md'],
                                                         'missing': []})
         self.assertEqual((self.claude / 'references/work.md').read_text(), 'my local change\n')
@@ -146,8 +148,63 @@ class InstallSkillTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(rows['claude']['action'], 'skip');self.assertIn("'other-skill'", rows['claude']['reason'])
         self.assertEqual(rows['codex']['action'], 'skip');self.assertIn('link', rows['codex']['reason'])
+        self.assertEqual(result.stderr.splitlines(), [
+            f"Checklist skill for {host} not updated: {rows[host]['reason']}; {target}"
+            for host, target in [('claude', self.claude), ('codex', self.codex)]])
         self.assertIn('not ours', (self.claude / 'SKILL.md').read_text())
         self.assertEqual(self.trash_entries(), [])
+
+    def test_failed_trash_move_leftover_is_reported_on_every_run_and_kept(self):
+        self.old_copy(self.claude)
+        blocked_trash = self.home / 'blocked-trash'
+        blocked_trash.write_text('a file prevents the fixture Trash folder from being created\n')
+        self.environment['CHECKLIST_TRASH_DIR'] = str(blocked_trash)
+        result, rows = self.run_script('--apply')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(rows['claude']['action'], 'failed')
+        leftovers = list(self.claude.parent.glob('.checklist-incoming-*'))
+        self.assertEqual(len(leftovers), 1)
+        leftover = leftovers[0]
+        kept = files_of(leftover)
+        self.assertEqual(kept['SKILL.md'], SKILL + 'new rule\n')
+        warning = f'Checklist skill for claude has a leftover incoming folder; kept at {leftover}'
+        self.assertEqual(rows['claude']['leftover_incoming'], [str(leftover)])
+        self.assertEqual(result.stderr.splitlines(), [warning])
+        self.environment['CHECKLIST_TRASH_DIR'] = str(self.home / '.Trash')
+        for mode in ('--preview', '--apply'):
+            with self.subTest(mode=mode):
+                result, rows = self.run_script(mode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(rows['claude']['leftover_incoming'], [str(leftover)])
+                self.assertEqual(result.stderr.splitlines(), [warning])
+                self.assertEqual(files_of(leftover), kept, 'leftover contents are kept')
+
+    def test_help_explains_replacement_without_receipt_and_changed_copy_protection(self):
+        result = subprocess.run([sys.executable, str(SCRIPT), '--help'], env=self.environment,
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('No receipt and `SKILL.md` front matter says `name: checklist`: replace', result.stdout)
+        self.assertIn('even if the copy was changed; the old copy goes to the Trash', result.stdout)
+        self.assertIn('copy is kept rule applies once a receipt exists', result.stdout)
+
+    def test_invalid_source_still_reports_existing_leftovers_without_changing_them(self):
+        warnings = []
+        for host, target in [('claude', self.claude), ('codex', self.codex)]:
+            incoming = target.parent / '.checklist-incoming-fixture'
+            self.old_copy(incoming)
+            warnings.append(f'Checklist skill for {host} has a leftover incoming folder; kept at {incoming}')
+        kept = files_of(self.home)
+        other = self.root / 'other';other.mkdir()
+        (other / 'SKILL.md').write_text('---\nname: other\n---\n')
+        for mode in ('--preview', '--apply'):
+            for source in (self.root / 'missing-source', other):
+                with self.subTest(mode=mode, source=source):
+                    result, rows = self.run_script(mode, source=source)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(rows[None]['action'], 'refused')
+                    self.assertEqual(result.stderr.splitlines(), warnings)
+                    self.assertEqual(files_of(self.home), kept)
+                    self.assertFalse(self.claude.exists());self.assertFalse(self.codex.exists())
 
     def test_unreadable_receipt_is_skipped(self):
         self.old_copy(self.claude)
@@ -173,6 +230,41 @@ class InstallSkillTests(unittest.TestCase):
         self.assertGreater(call, script.index('case "$MODE" in --stage|--rebuild-stage|--clean-stage) echo "Staged'))
         line = script[script.rindex('\n', 0, call):script.index('\n', call)]
         self.assertIn('--apply', line);self.assertIn('skill-install.jsonl', line);self.assertIn('||', line)
+
+    def test_install_hook_forwards_skip_warnings_without_failing(self):
+        self.old_copy(self.claude, skill='---\nname: other-skill\n---\nnot ours\n')
+        result = self.run_install_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self.root / 'capture/skill-install.jsonl'
+        rows = {row['host']: row for row in map(json.loads, report.read_text().splitlines())}
+        self.assertEqual(rows['claude']['action'], 'skip')
+        self.assertEqual(result.stderr.splitlines(), [
+            f"Checklist skill for claude not updated: {rows['claude']['reason']}; {self.claude}"])
+        self.assertEqual((self.root / 'capture/skill-install.stderr').read_text(), result.stderr)
+        self.assertIn('Skill install report: ' + str(report), result.stdout)
+
+    def test_install_hook_does_not_fail_when_skill_install_fails(self):
+        self.old_copy(self.claude)
+        blocked_trash = self.home / 'blocked-trash'
+        blocked_trash.write_text('not a folder\n')
+        self.environment['CHECKLIST_TRASH_DIR'] = str(blocked_trash)
+        result = self.run_install_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self.root / 'capture/skill-install.jsonl'
+        rows = {row['host']: row for row in map(json.loads, report.read_text().splitlines())}
+        self.assertEqual(rows['claude']['action'], 'failed')
+        self.assertIn('Warning: the Checklist skill copies were not all installed; report: ' + str(report),
+                      result.stderr)
+        self.assertIn(rows['claude']['leftover_incoming'][0], result.stderr)
+
+    def run_install_hook(self):
+        script = (REPO / 'script/build_and_run.sh').read_text()
+        hook = script[script.index('# CL-423:'):script.index('if ! python3 "$ROOT_DIR/script/retire_old_bundles.py"')]
+        capture = self.root / 'capture';capture.mkdir()
+        environment = dict(self.environment, ROOT_DIR=str(REPO),
+                           DEST=str(self.source.parents[3]), CAPTURE_DIR=str(capture))
+        return subprocess.run(['/bin/bash', '-e', '-c', hook], env=environment,
+                              capture_output=True, text=True, timeout=60)
 
 
 if __name__ == '__main__':

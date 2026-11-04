@@ -1370,6 +1370,22 @@ class SeedIsolationTests(unittest.TestCase):
                     harness.require_local_paths(database, base / 'data')
                 self.assertNotIn('/outside/file', str(raised.exception))
 
+    def test_media_values_named_path_are_text(self):
+        # CL-425: a person's media field, item metadata or intake column named "path" is text.
+        with test_directory() as directory:
+            base = Path(directory).resolve();live = base / 'Checklist';live.mkdir();slots = base / 'slots'
+            with patch.object(harness, 'LIVE', live), patch.object(harness, 'DEFAULT_LIVE', live), patch.object(harness, 'BASE', slots):
+                counts = self.inspect(base, [
+                    ('media_item', {'id': 'item', 'metadata': {'path': '/Volumes/Art/takes/walk', 'direction': 'N'}}),
+                    ('media_intake_row', {'id': 'row', 'path': str(base / 'project/walk.mp4'), 'columns': {'path': 'walk/north'}}),
+                    ('media_intake_plan', {'id': 'plan', 'rows': [{'path': str(base / 'project/walk.mp4'), 'columns': {'path': '../walk'}}]})])
+                self.assertEqual(counts['external_project_path_occurrences'], 2)
+                # A real file field keeps its rule: an intake source path into the live root still refuses.
+                database = base / 'bad.sqlite'
+                store_fixture(database, 3, [('media_intake_row', {'id': 'row', 'path': str(live / 'objects/file'), 'columns': {'path': 'x'}})])
+                with self.assertRaises(ValueError):
+                    harness.require_local_paths(database, base / 'data')
+
     def test_retained_recovery_references_are_inert_not_file_authority(self):
         values = ['/outside/evidence/', '/usr/bin/trash --stopOnError printed success', '/outside/../evidence']
         for kind in ['attempt', 'source_execution']:

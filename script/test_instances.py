@@ -523,6 +523,11 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
                 return ('captured', None)
             if record_kind == 'request' and '.files[]' in location: return ('binding', None)
             if parent.get('kind') == 'workspace_file': return ('binding', None)
+            # CL-425: a media field value, item metadata value or intake source column that a person
+            # named "path" is text, not a file path; the seed never resolves it.
+            if record_kind is not None and record_kind.startswith('media_') and any(
+                    '.' + name + '.' in location + '.' or '.' + name + '[]' in location for name in ('metadata', 'columns', 'values', 'field_values')):
+                return ('text', None)
             # CL-424: media intake records (intake, plan, row) keep each worker-selected source
             # file as an external reference; capture copies the bytes into managed originals.
             # The slot never opens or follows this path. Managed modes are decided above.
