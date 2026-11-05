@@ -624,9 +624,10 @@ extension EvidenceAuthorityTests {
     }
     func testCodexRestartScanMetadataCannotBroadenResumptionAuthority() throws {
         let p = try project()
-        for (provider, basis, count) in [("codex", NativeClosureBasis.codexAppHostRestart, -1),
-                                         ("codex", .processAndRegistry, 2), ("claude", .processAndRegistry, 2)] {
-            let worker = try native(p, "scan-metadata-\(provider)-\(basis.rawValue)", domain: "\(provider):123:5:0", provider: provider)
+        for (provider, basis, first, last) in [("codex", NativeClosureBasis.codexAppHostRestart, -1, 2),
+                                               ("codex", .codexAppHostRestart, 2, -1),
+                                               ("codex", .processAndRegistry, 2, 3), ("claude", .processAndRegistry, 2, 3)] {
+            let worker = try native(p, "scan-metadata-\(provider)-\(basis.rawValue)-\(first)-\(last)", domain: "\(provider):123:5:0", provider: provider)
             let generation = try router.dbQueue.read { try router.sessionGeneration(router.record($0, worker.sessionID!, type: "session")) }
             let proof = VerifiedNativeClosure(projectID: p["id"] as! String, sessionID: worker.sessionID!,
                 installation: worker.installation, executionDomain: worker.executionDomain!, provider: provider,
@@ -637,7 +638,7 @@ extension EvidenceAuthorityTests {
                 oldInstallation: worker.installation, oldExecutionDomain: worker.executionDomain!,
                 newInstallation: worker.installation + "/new", newExecutionDomain: "\(provider):200:6:0")
             assertCode("NATIVE_SESSION_MISMATCH") {
-                _ = try self.router.resumeVerifiedNativeSession(resume, caller: self.bootstrapOwner, codexRestartIncompleteNonCodex: count)
+                _ = try self.router.resumeVerifiedNativeSession(resume, caller: self.bootstrapOwner, codexRestartScanCounts: .init(first: first, last: last))
             }
             XCTAssertEqual(try router.dbQueue.read { try router.record($0, worker.sessionID!, type: "session") }["state"] as? String, "ended")
         }

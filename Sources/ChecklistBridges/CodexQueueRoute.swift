@@ -58,6 +58,12 @@ public struct CodexHostScan: Equatable, Sendable {
         self.incompleteNonCodex = incompleteNonCodex
         self.blockers = blockers
     }
+    /// Restart agreement excludes diagnostic counts of identified non-Codex processes.
+    /// Keep all host, holder, argument-claim and unknown-candidate facts in agreement.
+    public func agreesOnCodexSafety(with other: Self) -> Bool {
+        hosts == other.hosts && holders == other.holders && execClaim == other.execClaim
+            && unreadable == other.unreadable && blockers == other.blockers
+    }
     public var execActive: Bool { execClaim || holders.contains { $0.role == .exec } }
     /// The process that the service would run.
     public var chosenHost: CodexProcess? { holders.first ?? hosts.first }

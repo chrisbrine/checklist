@@ -52,6 +52,14 @@ public struct NativeSessionResumption: Sendable {
     }
 }
 
+/// Diagnostic evidence from the final successful paired restart observation.
+/// These counts never establish process or conversation authority.
+public struct CodexRestartScanCounts: Sendable {
+    public let first: Int
+    public let last: Int
+    public init(first: Int, last: Int) { self.first = first; self.last = last }
+}
+
 extension CommandRouter {
     /// Reconnects a conversation whose earlier process had a verified closure. The
     /// session gets a new authorization generation; released attempts, history and
@@ -59,7 +67,7 @@ extension CommandRouter {
     /// notices get distinct receipts addressed only to this resumed generation.
     /// An owner disconnect (`revoked`) or a closure with work still stopping refuses.
     public func resumeVerifiedNativeSession(_ resumption: NativeSessionResumption, caller: Caller,
-                                           codexRestartIncompleteNonCodex: Int? = nil) throws -> [String: Any] {
+                                           codexRestartScanCounts: CodexRestartScanCounts? = nil) throws -> [String: Any] {
         try owner(caller)
         guard caller.installation == "native-thread-bootstrap" else {
             throw CoreError("FORBIDDEN", "Only the bundled native connection service can resume a closed conversation.")
@@ -96,8 +104,8 @@ extension CommandRouter {
             guard observation["state"] as? String == "released" else {
                 throw CoreError("NATIVE_CLOSURE_PENDING", "Work from the earlier process must stop and return for pickup before this thread can reconnect.")
             }
-            if let count = codexRestartIncompleteNonCodex {
-                guard count >= 0, resumption.provider == "codex",
+            if let counts = codexRestartScanCounts {
+                guard counts.first >= 0, counts.last >= 0, resumption.provider == "codex",
                       observation["evidence_basis"] as? String == NativeClosureBasis.codexAppHostRestart.rawValue else {
                     throw CoreError("NATIVE_SESSION_MISMATCH", "Restart scan evidence requires an owner-approved Codex app closure.")
                 }
@@ -111,7 +119,10 @@ extension CommandRouter {
             session = revised(session); try save(db, session, type: "session")
             try redeliverNativeClosureNotices(db, session: session, closure: observation)
             var evidence: JSON = ["observation_ref": observationID, "ended_authorization_generation": endedGeneration]
-            if let count = codexRestartIncompleteNonCodex { evidence["incomplete_non_codex"] = count }
+            if let counts = codexRestartScanCounts {
+                evidence["incomplete_non_codex_first"] = counts.first
+                evidence["incomplete_non_codex"] = counts.last
+            }
             try event(db, caller: caller, project: resumption.projectID, entity: resumption.sessionID,
                       kind: "native_session_resumed", data: evidence)
             result = session

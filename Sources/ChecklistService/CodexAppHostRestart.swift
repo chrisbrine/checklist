@@ -12,6 +12,8 @@ struct CodexAppHostRestartEffects: Sendable {
     var scan: @Sendable (String) -> CodexHostScan?
     var signed: @Sendable (CodexProcess) -> Bool
     var holds: @Sendable (NativeLifecycleRegistration) -> Bool
+    /// Bounded, request-local retry only; fixtures inject a nonblocking fake.
+    var pauseBeforeRetry: @Sendable () -> Void = { Thread.sleep(forTimeInterval: 1) }
 
     static var unavailable: Self {
         .init(available: false, process: { _ in .unknown }, source: { _ in .init(reason: .registrationUnproven) },
@@ -28,7 +30,7 @@ struct CodexAppHostRestartEffects: Sendable {
 
 struct CodexAppHostRestartEvidence {
     let process: NativeLifecycleObservation.ProcessState
-    let incompleteNonCodex: Int
+    let counts: CodexRestartScanCounts
 }
 
 extension Coordinator {
@@ -41,6 +43,28 @@ extension Coordinator {
         let observation = effects.source(registration)
         return observation.host == .nativeApp && observation.reason == .sourceVscode && observation.source == "vscode"
             && effects.process(registration) == .running && effects.holds(registration)
+    }
+
+    /// Closure already ended the old authority. Retry only transient verifier
+    /// evidence, at most three full paired observations per stage of this request.
+    /// Permanent errors and owner revocation leave immediately, without waiting.
+    func verifyCodexRestartAfterClosure(old: NativeLifecycleRegistration, new: NativeLifecycleRegistration,
+                                       checkOwner: () throws -> Void) throws -> CodexAppHostRestartEvidence {
+        var retriesRemaining = 2
+        while true {
+            try checkOwner()
+            let evidence: CodexAppHostRestartEvidence
+            do { evidence = try verifyCodexRestartHost(old: old, new: new) }
+            catch {
+                try checkOwner()
+                guard retriesRemaining > 0, CodexRestartRefusal.applies(error) else { throw error }
+                retriesRemaining -= 1
+                codexAppHostRestartEffects.pauseBeforeRetry()
+                continue
+            }
+            try checkOwner()
+            return evidence
+        }
     }
 
     /// The owner accepted first-bootstrap thread trust, not an exclusive registry
@@ -97,12 +121,12 @@ extension Coordinator {
                 scan: first.scan, extra: [.init(process: first.process, reason: .newHostUnverified)])
         }
         let last = try host(effects.scan(new.sessionID))
-        guard last.scan == first.scan, effects.source(new) == source else {
+        guard last.scan.agreesOnCodexSafety(with: first.scan), effects.source(new) == source else {
             let changed = (first.scan.hosts + last.scan.hosts).filter { !first.scan.hosts.contains($0) || !last.scan.hosts.contains($0) }
             throw refusal("The Codex app host, holder scan or thread source changed during the restart observation."
                 + " (incompleteNonCodex first=\(first.scan.incompleteNonCodex), last=\(last.scan.incompleteNonCodex))",
                 scan: last.scan, extra: (changed + [last.process]).map { .init(process: $0, reason: .observationChanged) })
         }
-        return .init(process: state, incompleteNonCodex: last.scan.incompleteNonCodex)
+        return .init(process: state, counts: .init(first: first.scan.incompleteNonCodex, last: last.scan.incompleteNonCodex))
     }
 }

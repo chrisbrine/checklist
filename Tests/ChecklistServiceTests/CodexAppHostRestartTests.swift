@@ -24,6 +24,8 @@ final class CodexAppHostRestartTests: XCTestCase {
         var scans = 0, processReads = 0
         var onScan: (() throws -> Void)?
         var scanFailure: Error?
+        var pauses = 0
+        var onPause: (() throws -> Void)?
     }
     private let evidence = Evidence()
     private var root: URL!, coordinator: Coordinator!, enrollment: Enrollment!, project: String!
@@ -66,7 +68,10 @@ final class CodexAppHostRestartTests: XCTestCase {
             if evidence.scanUnavailable { return nil }
             return .init(hosts: [evidence.host] + evidence.extraHosts, holders: (evidence.holds ? [evidence.host] : []) + evidence.extra,
                          unreadable: evidence.unreadable, execClaim: evidence.execClaim, incompleteNonCodex: evidence.incompleteNonCodex, blockers: evidence.blockers)
-        }, signed: { [evidence] _ in evidence.signed }, holds: { [evidence] _ in evidence.holds })
+        }, signed: { [evidence] _ in evidence.signed }, holds: { [evidence] _ in evidence.holds }, pauseBeforeRetry: { [evidence] in
+            evidence.pauses += 1
+            do { try evidence.onPause?() } catch { evidence.scanFailure = error }
+        })
     }
     override func tearDownWithError() throws {
         for _ in 0..<2 { coordinator?.storageQueue.sync {}; coordinator?.queue.sync {} }
@@ -277,14 +282,21 @@ final class CodexAppHostRestartTests: XCTestCase {
             sql: "SELECT data FROM events WHERE kind='native_session_resumed' AND entity_id=? ORDER BY seq DESC LIMIT 1",
             arguments: [enrollment.sessionID]) })
         let event = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(data.utf8)) as? JSON)
-        XCTAssertEqual(event["incomplete_non_codex"] as? Int, 7, "Success records the final sample, not the pre-closure count")
+        XCTAssertEqual(event["incomplete_non_codex_first"] as? Int, 7)
+        XCTAssertEqual(event["incomplete_non_codex"] as? Int, 7, "Success records the final pair, not the pre-closure count")
     }
 
-    func testRestartRefusesWhenIncompleteNonCodexCountChangesBetweenScans() throws {
-        evidence.incompleteNonCodex = 2
-        evidence.onScan = { [evidence] in if evidence.scans == 2 { evidence.incompleteNonCodex = 3 } }
-        refuses(contains: "incompleteNonCodex first=2, last=3")
-        XCTAssertEqual(try session()["state"] as? String, "connected")
+    func testCountDriftAlonePassesEveryStageAndRecordsBothFinalSamples() throws {
+        evidence.onScan = { [evidence] in evidence.incompleteNonCodex = evidence.scans }
+        XCTAssertTrue(try bootstrap().changed)
+        XCTAssertEqual(evidence.scans, 6, "All three stages compare pairs despite count drift")
+        XCTAssertEqual(evidence.pauses, 0)
+        let data = try XCTUnwrap(router.dbQueue.read { try String.fetchOne($0,
+            sql: "SELECT data FROM events WHERE kind='native_session_resumed' AND entity_id=? ORDER BY seq DESC LIMIT 1",
+            arguments: [enrollment.sessionID]) })
+        let event = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(data.utf8)) as? JSON)
+        XCTAssertEqual(event["incomplete_non_codex_first"] as? Int, 5)
+        XCTAssertEqual(event["incomplete_non_codex"] as? Int, 6)
     }
 
     func testRestartRefusesWhenHostSetChangesBetweenScans() throws {
@@ -310,7 +322,7 @@ final class CodexAppHostRestartTests: XCTestCase {
             evidence.oldState = .gone; evidence.newState = .running
             evidence.source = .init(host: .nativeApp, reason: .sourceVscode, source: "vscode")
             evidence.scanUnavailable = false; evidence.unreadable = false; evidence.execClaim = false
-            evidence.holds = true; evidence.signed = true; evidence.extra = []; evidence.scans = 0; evidence.onScan = nil
+            evidence.holds = true; evidence.signed = true; evidence.extra = []; evidence.extraHosts = []; evidence.scans = 0; evidence.onScan = nil
             evidence.incompleteNonCodex = 7
             switch scenario {
             case "running": evidence.oldState = .running
@@ -324,7 +336,9 @@ final class CodexAppHostRestartTests: XCTestCase {
             case "no_hold": evidence.holds = false
             case "signature": evidence.signed = false
             case "new_identity": evidence.newState = .unknown
-            case "changed_scan": evidence.onScan = { [evidence] in if evidence.scans == 2 { evidence.incompleteNonCodex = 8 } }
+            case "changed_scan": evidence.onScan = { [evidence] in
+                if evidence.scans == 2 { evidence.extraHosts = [.init(pid: 999, executable: "codex", role: .appHost)] }
+            }
             default: evidence.onScan = { [evidence] in if evidence.scans == 2 { evidence.source = .init(host: .exec, reason: .sourceExec, source: "exec") } }
             }
             XCTAssertThrowsError(try coordinator.verifyCodexRestartHost(old: old, new: new), scenario) { error in
@@ -362,6 +376,129 @@ final class CodexAppHostRestartTests: XCTestCase {
         coordinator.enrollments[enrollment.installation]?.workspace = root.path
         coordinator.enrollments[enrollment.installation]?.ownerRevoked = true
         XCTAssertThrowsError(try bootstrap()) { XCTAssertFalse(CodexRestartRefusal.applies($0)) }
+        XCTAssertEqual(evidence.pauses, 0)
+    }
+
+    func testHolderClaimAndBlockerDriftStillRefuseBeforeClosure() throws {
+        for kind in ["holder", "claim", "blocker"] {
+            evidence.scans = 0; evidence.extra = []; evidence.execClaim = false; evidence.blockers = []
+            evidence.onScan = { [evidence] in
+                guard evidence.scans == 2 else { return }
+                let process = CodexProcess(pid: 30000, executable: "/synthetic/other", role: .unclassified)
+                if kind == "holder" { evidence.extra = [process] }
+                if kind == "claim" { evidence.execClaim = true }
+                if kind == "blocker" { evidence.blockers = [.init(process: process, reason: .namesThread)] }
+            }
+            XCTAssertThrowsError(try bootstrap()) { XCTAssertTrue(CodexRestartRefusal.applies($0), kind) }
+            XCTAssertEqual(try session()["state"] as? String, "connected")
+            XCTAssertEqual(evidence.pauses, 0)
+        }
+    }
+
+    func testTransientPostClosureFailureRecoversOnThirdAttemptWithOldAuthorityFenced() throws {
+        let (task, attempt) = try claimedTask()
+        let note = try call("message_send", ["project_id": project!, "task_id": task["id"]!, "body": "Before retry"])
+        let delivery = try XCTUnwrap((note["deliveries"] as? [JSON])?.first)
+        evidence.onScan = { [evidence] in evidence.unreadable = (3...4).contains(evidence.scans) }
+        evidence.onPause = { [self] in
+            XCTAssertEqual(try session()["state"] as? String, "ended")
+            XCTAssertEqual(try coordinator.credentials.read(enrollment.installation), token)
+            XCTAssertTrue(coordinator.enrollments[enrollment.installation]?.revoked == true)
+            try router.dbQueue.read { db in
+                let released = try router.record(db, attempt["id"] as! String, type: "attempt")
+                XCTAssertEqual(released["state"] as? String, "released"); XCTAssertNil(released["token_hash"])
+                let receipt = try router.deliveryReceiptProjection(db, router.record(db, delivery["id"] as! String, type: "delivery"))
+                XCTAssertEqual(receipt["state"] as? String, "fenced")
+                XCTAssertEqual(receipt["native_closure_ref"] as? String, released["native_closure_ref"] as? String)
+            }
+        }
+        XCTAssertTrue(try bootstrap().changed)
+        XCTAssertNil(evidence.scanFailure); XCTAssertEqual(evidence.pauses, 2); XCTAssertEqual(evidence.scans, 8)
+        XCTAssertEqual(try session()["state"] as? String, "connected")
+        let resumed = try XCTUnwrap(coordinator.enrollments[enrollment.installation])
+        refuses("STALE_CLAIM", contains: "claim") {
+            _ = try self.call("work_checkpoint", ["project_id": self.project!, "attempt_id": attempt["id"]!,
+                "claim_token": attempt["claim_token"]!, "progress": "Old token"], self.worker(resumed))
+        }
+        let receipts = try call("message_delivery_list", ["project_id": project!, "task_id": task["id"]!, "message_id": note["id"]!])["deliveries"] as! [JSON]
+        XCTAssertEqual(receipts.first { $0["id"] as? String == delivery["id"] as? String }?["state"] as? String, "fenced")
+    }
+
+    func testTransientCommitEvidenceFailureRecoversWithoutRestoringOldAuthority() throws {
+        evidence.onScan = { [evidence] in evidence.unreadable = evidence.scans == 5 }
+        evidence.onPause = { [self] in
+            XCTAssertEqual(try session()["state"] as? String, "ended")
+            XCTAssertNotEqual(try coordinator.credentials.read(enrollment.installation), token)
+            XCTAssertNotEqual(coordinator.enrollments[enrollment.installation]?.generation, enrollment.generation)
+        }
+        XCTAssertTrue(try bootstrap().changed)
+        XCTAssertNil(evidence.scanFailure); XCTAssertEqual(evidence.pauses, 1); XCTAssertEqual(evidence.scans, 7)
+        XCTAssertEqual(try session()["state"] as? String, "connected")
+    }
+
+    func testPersistentPostClosureEvidenceFailureStopsAfterThreeAttempts() throws {
+        evidence.onScan = { [evidence] in if evidence.scans >= 3 { evidence.unreadable = true } }
+        XCTAssertThrowsError(try bootstrap()) { XCTAssertTrue(CodexRestartRefusal.applies($0)) }
+        XCTAssertEqual(evidence.pauses, 2); XCTAssertEqual(evidence.scans, 5)
+        XCTAssertEqual(try session()["state"] as? String, "ended")
+        XCTAssertTrue(coordinator.enrollments[enrollment.installation]?.revoked == true)
+        XCTAssertEqual(try coordinator.credentials.read(enrollment.installation), token)
+    }
+
+    private func revokeDuringRetry() throws {
+        // Fake a canonical owner-revocation race in this owned store. The public
+        // ticket disconnect action deliberately rejects an already-ended session.
+        try router.dbQueue.write { db in
+            var current = try router.record(db, enrollment.sessionID, type: "session")
+            current["state"] = "revoked"; current["owner_revoked"] = true
+            current["authorization_generation"] = UUID().uuidString
+            try router.save(db, router.revised(current), type: "session")
+        }
+    }
+
+    func testOwnerRevocationDuringPostClosureRetryStopsBeforeAnotherSample() throws {
+        evidence.onScan = { [evidence] in evidence.unreadable = evidence.scans == 3 }
+        evidence.onPause = { [self] in try revokeDuringRetry() }
+        refuses("CONNECTION_REVOKED", contains: "owner")
+        XCTAssertNil(evidence.scanFailure); XCTAssertEqual(evidence.pauses, 1); XCTAssertEqual(evidence.scans, 3)
+        XCTAssertEqual(try session()["owner_revoked"] as? Bool, true)
+        XCTAssertEqual(try coordinator.credentials.read(enrollment.installation), token)
+        XCTAssertThrowsError(try bootstrap()) { XCTAssertFalse(CodexRestartRefusal.applies($0)) }
+    }
+
+    func testOwnerRevocationDuringCommitRetryRollsBackToFencedEnrollment() throws {
+        evidence.onScan = { [evidence] in evidence.unreadable = evidence.scans == 5 }
+        evidence.onPause = { [self] in try revokeDuringRetry() }
+        refuses("CONNECTION_REVOKED", contains: "owner")
+        XCTAssertNil(evidence.scanFailure); XCTAssertEqual(evidence.pauses, 1); XCTAssertEqual(evidence.scans, 5)
+        XCTAssertEqual(try session()["owner_revoked"] as? Bool, true)
+        XCTAssertTrue(coordinator.enrollments[enrollment.installation]?.revoked == true)
+        XCTAssertEqual(try coordinator.credentials.read(enrollment.installation), token)
+    }
+
+    func testOwnerRevocationDuringSuccessfulFinalSamplePreventsCommit() throws {
+        evidence.onScan = { [self] in if evidence.scans == 6 { try revokeDuringRetry() } }
+        refuses("CONNECTION_REVOKED", contains: "owner")
+        XCTAssertNil(evidence.scanFailure); XCTAssertEqual(evidence.pauses, 0)
+        XCTAssertEqual(try session()["owner_revoked"] as? Bool, true)
+        XCTAssertTrue(coordinator.enrollments[enrollment.installation]?.revoked == true)
+        XCTAssertEqual(try coordinator.credentials.read(enrollment.installation), token)
+    }
+
+    func testLocalOwnerRevocationDuringCommitRetrySurvivesRollback() throws {
+        evidence.onScan = { [evidence] in evidence.unreadable = evidence.scans == 5 }
+        evidence.onPause = { [self] in
+            coordinator.enrollments[enrollment.installation]?.ownerRevoked = true
+            coordinator.enrollments[enrollment.installation]?.revoked = true
+        }
+        refuses("CONNECTION_REVOKED", contains: "owner")
+        XCTAssertEqual(evidence.pauses, 1); XCTAssertEqual(evidence.scans, 5)
+        XCTAssertTrue(coordinator.enrollments[enrollment.installation]?.ownerRevoked == true)
+        XCTAssertTrue(coordinator.enrollments[enrollment.installation]?.revoked == true)
+        XCTAssertEqual(try coordinator.credentials.read(enrollment.installation), token)
+        XCTAssertEqual(try session()["state"] as? String, "ended")
+        XCTAssertThrowsError(try bootstrap()) { XCTAssertFalse(CodexRestartRefusal.applies($0)) }
+        XCTAssertEqual(evidence.scans, 5, "Later bootstrap cannot erase the owner's refusal")
     }
 
 }

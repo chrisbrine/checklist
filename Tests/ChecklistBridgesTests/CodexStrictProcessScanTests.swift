@@ -2,6 +2,25 @@ import XCTest
 @testable import ChecklistBridges
 
 final class CodexStrictProcessScanTests: XCTestCase {
+
+    func testRestartAgreementExcludesOnlyIncompleteNonCodexCount() {
+        let host = CodexProcess(pid: 1, executable: "/synthetic/codex", role: .appHost)
+        let other = CodexProcess(pid: 2, executable: "/synthetic/other", role: .unclassified)
+        let baseline = CodexHostScan(hosts: [host], holders: [host], incompleteNonCodex: 7)
+        let drift = CodexHostScan(hosts: [host], holders: [host], incompleteNonCodex: 8)
+        XCTAssertNotEqual(baseline, drift, "Full observations still retain diagnostic evidence")
+        XCTAssertTrue(baseline.agreesOnCodexSafety(with: drift))
+        XCTAssertTrue(drift.agreesOnCodexSafety(with: baseline))
+        for changed in [CodexHostScan(hosts: [host, other], holders: [host]),
+                        CodexHostScan(hosts: [host], holders: [host, other]),
+                        CodexHostScan(hosts: [host], holders: [host], execClaim: true),
+                        CodexHostScan(hosts: [host], holders: [host], unreadable: true),
+                        CodexHostScan(hosts: [host], holders: [host], blockers: [.init(process: other, reason: .namesThread)])] {
+            XCTAssertFalse(baseline.agreesOnCodexSafety(with: changed))
+            XCTAssertFalse(changed.agreesOnCodexSafety(with: baseline))
+        }
+    }
+
     private let thread = "00000000-0000-4000-8000-000000000434"
     private let app = "/Applications/Synthetic.app/Contents/MacOS/codex"
     private struct Entry: Sendable {

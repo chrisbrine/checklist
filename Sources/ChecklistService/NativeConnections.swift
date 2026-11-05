@@ -277,6 +277,19 @@ extension Coordinator {
         var existing = saved
         var codexRestart: (NativeLifecycleRegistration, NativeLifecycleRegistration)?
         let ownerDisconnected=ChecklistError("CONNECTION_REVOKED","The owner disconnected this thread in Checklist. It cannot reconnect automatically.")
+        func checkOwnerRevocation() throws {
+            // At commit the local enrollment is staged, while Core still owns the
+            // ended generation. Revocation in either record takes precedence.
+            if enrollments[saved.installation]?.ownerRevoked == true {
+                // Keep newly observed owner intent in the fenced rollback baseline.
+                existing.ownerRevoked = true; existing.revoked = true
+                throw ownerDisconnected
+            }
+            if let session = try router.connectionSession(sessionID: saved.sessionID, project: project, caller: owner),
+               session["state"] as? String == "revoked" || session["owner_revoked"] as? Bool == true {
+                throw ownerDisconnected
+            }
+        }
         // Verified closure applies only to these enrollments; any other revocation is the owner's.
         guard existing.automatic == true,existing.role == "worker",existing.assistantRelay != true,let plugin=ProviderPluginRegistry.bundled.plugin(existing.provider, requiring: .workSession),
               existing.identityVerification == plugin.nativeHost?.identityVerification,let oldDomain=existing.nativeExecutionDomain else {
@@ -307,7 +320,7 @@ extension Coordinator {
                 guard released else {
                     throw CoreError("NATIVE_CLOSURE_PENDING", "Work from the earlier Codex app host must stop and return for pickup before reconnecting.")
                 }
-                _ = try verifyCodexRestartHost(old: old, new: new)
+                _ = try verifyCodexRestartAfterClosure(old: old, new: new, checkOwner: checkOwnerRevocation)
                 codexRestart = (old, new)
             } else {
                 // Preserve part 1's precise refusal for exec, old/unproved app
@@ -347,9 +360,11 @@ extension Coordinator {
             saveEnrollment: { enrollments[existing.installation] = resumed; try saveEnrollments() },
             registerSession: {
                 if ownerAllowed { return try router.reconnectOwnerAllowedSession(resumption,caller:owner) }
-                let evidence = try codexRestart.map { try verifyCodexRestartHost(old: $0.0, new: $0.1) }
+                let evidence = try codexRestart.map {
+                    try verifyCodexRestartAfterClosure(old: $0.0, new: $0.1, checkOwner: checkOwnerRevocation)
+                }
                 return try router.resumeVerifiedNativeSession(resumption, caller: owner,
-                    codexRestartIncompleteNonCodex: evidence?.incompleteNonCodex)
+                    codexRestartScanCounts: evidence?.counts)
             },
             rollback: { try ConnectionCommit.restore(enrollment: { enrollments[existing.installation] = existing; try saveEnrollments() }, credential: {
                 if let priorCredential { try credentials.write(existing.installation, priorCredential) }
