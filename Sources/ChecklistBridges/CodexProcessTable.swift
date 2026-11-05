@@ -31,10 +31,15 @@ extension MacOSCodexProcessObserver {
     func strictScan(threadID: String, accountID: uid_t, table: any CodexProcessTableReading) -> CodexHostScan? {
         guard let thread = UUID(uuidString: threadID)?.uuidString.lowercased(), let pids = table.processIDs() else { return nil }
         var hosts: [CodexProcess] = [], holders: [CodexProcess] = []
+        var blockers: [CodexProcessBlocker] = []
         var unreadable = false, execClaim = false, incompleteNonCodex = 0
+        func unknown(_ pid: pid_t, executable: String = "unknown", role: CodexProcessRole = .unclassified) {
+            unreadable = true
+            blockers.append(.init(process: .init(pid: pid, executable: executable, role: role), reason: .unreadableCandidate))
+        }
         for pid in pids where pid > 1 {
             guard let account = table.bsdAccount(pid) ?? table.kernelAccount(pid) else {
-                if !table.definitelyGone(pid) { unreadable = true }
+                if !table.definitelyGone(pid) { unknown(pid) }
                 continue
             }
             guard account.belongs(to: accountID) else { continue }
@@ -45,7 +50,7 @@ extension MacOSCodexProcessObserver {
             guard let identity, identity.belongs(to: accountID), path != nil || !identity.command.isEmpty,
                   let arguments = table.arguments(pid),
                   let argv0 = arguments.first, !argv0.isEmpty else {
-                if !table.definitelyGone(pid) { unreadable = true }
+                if !table.definitelyGone(pid) { unknown(pid, executable: path ?? account.command) }
                 continue
             }
             let executable = path ?? argv0
@@ -53,8 +58,13 @@ extension MacOSCodexProcessObserver {
                 || URL(fileURLWithPath: argv0).lastPathComponent == "codex" || identity.command == "codex"
             let candidate = codex || CodexQueueRoute.execClaims(arguments: arguments, threadID: thread)
             let role = candidate ? CodexQueueRoute.role(executable: executable, arguments: arguments) : .unclassified
-            if candidate, CodexQueueRoute.claims(role: role, arguments: arguments, threadID: thread) { execClaim = true }
-            let process = CodexProcess(pid: pid, executable: executable, role: role)
+            let process = CodexProcess(pid: pid, executable: executable, role: role,
+                diagnosticExecutable: path == nil ? identity.command : nil)
+            if candidate, CodexQueueRoute.claims(role: role, arguments: arguments, threadID: thread) {
+                execClaim = true
+                if arguments.contains("--last") { blockers.append(.init(process: process, reason: .namesLast)) }
+                if arguments.contains(where: { $0.lowercased().contains(thread) }) { blockers.append(.init(process: process, reason: .namesThread)) }
+            }
             if role == .appHost { hosts.append(process) }
             let descriptors = table.descriptors(pid)
             // No filesystem open/realpath: match all rollout filenames for this
@@ -64,13 +74,14 @@ extension MacOSCodexProcessObserver {
                 URL(fileURLWithPath: $0).lastPathComponent.hasPrefix("rollout-") && $0.hasSuffix("-\(thread).jsonl")
             }) { holders.append(process) }
             if !descriptors.complete, !table.definitelyGone(pid) {
-                if candidate { unreadable = true } else { incompleteNonCodex += 1 }
+                if candidate { unknown(pid, executable: path ?? identity.command, role: role) } else { incompleteNonCodex += 1 }
             }
         }
         // Kernel enumeration order carries no authority; both samples compare
         // the same sorted safety facts and the incomplete-non-Codex count.
         return .init(hosts: hosts.sorted { $0.pid < $1.pid }, holders: holders.sorted { $0.pid < $1.pid },
-                     unreadable: unreadable, execClaim: execClaim, incompleteNonCodex: incompleteNonCodex)
+                     unreadable: unreadable, execClaim: execClaim, incompleteNonCodex: incompleteNonCodex,
+                     blockers: blockers.sorted { $0.pid == $1.pid ? $0.reason.rawValue < $1.reason.rawValue : $0.pid < $1.pid })
     }
 }
 

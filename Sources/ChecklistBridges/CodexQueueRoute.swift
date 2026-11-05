@@ -10,7 +10,36 @@ public struct CodexProcess: Equatable, Sendable {
     public let pid: Int32
     public let executable: String
     public let role: CodexProcessRole
-    public init(pid: Int32, executable: String, role: CodexProcessRole) { self.pid = pid; self.executable = executable; self.role = role }
+    /// Kernel command name when the executable path is unavailable. argv[0]
+    /// may classify a candidate internally but must never become error text.
+    public let diagnosticExecutable: String?
+    public init(pid: Int32, executable: String, role: CodexProcessRole, diagnosticExecutable: String? = nil) {
+        self.pid = pid; self.executable = executable; self.role = role; self.diagnosticExecutable = diagnosticExecutable
+    }
+}
+
+public enum CodexProcessBlockReason: String, Sendable {
+    case namesThread = "names_thread", namesLast = "names_last", execHolder = "exec_holder"
+    case secondHolder = "second_holder", unreadableCandidate = "unreadable_candidate"
+    case oldHostRunning = "old_host_running", unsignedHost = "unsigned_host"
+    case newHostUnverified = "new_host_unverified", observationChanged = "observation_changed"
+}
+
+/// Privacy-bounded facts only: no argv, prompt or complete executable path is
+/// retained in a blocker. Unknown identity remains explicitly unclassified.
+public struct CodexProcessBlocker: Equatable, Sendable {
+    public let pid: Int32
+    public let executable: String
+    public let role: CodexProcessRole
+    public let reason: CodexProcessBlockReason
+    public init(process: CodexProcess, reason: CodexProcessBlockReason) {
+        pid = process.pid; role = process.role; self.reason = reason
+        let identity = process.diagnosticExecutable ?? process.executable
+        let name = identity.isEmpty ? "unknown" : URL(fileURLWithPath: identity).lastPathComponent
+        executable = String(name.unicodeScalars.prefix(160).map { CharacterSet.controlCharacters.contains($0) ? "?" : String($0) }.joined())
+    }
+    public var summary: String { "PID \(pid) executable=\(executable) role=\(role.rawValue) reason=\(reason.rawValue)" }
+    public var diagnostic: [String: Any] { ["pid": pid, "executable": executable, "role": role.rawValue, "reason": reason.rawValue] }
 }
 
 public struct CodexHostScan: Equatable, Sendable {
@@ -22,10 +51,12 @@ public struct CodexHostScan: Equatable, Sendable {
     public let execClaim: Bool
     /// Identified non-Codex processes with incomplete descriptor observations.
     public let incompleteNonCodex: Int
+    public let blockers: [CodexProcessBlocker]
     public init(hosts: [CodexProcess], holders: [CodexProcess], unreadable: Bool = false, execClaim: Bool = false,
-                incompleteNonCodex: Int = 0) {
+                incompleteNonCodex: Int = 0, blockers: [CodexProcessBlocker] = []) {
         self.hosts = hosts; self.holders = holders; self.unreadable = unreadable; self.execClaim = execClaim
         self.incompleteNonCodex = incompleteNonCodex
+        self.blockers = blockers
     }
     public var execActive: Bool { execClaim || holders.contains { $0.role == .exec } }
     /// The process that the service would run.

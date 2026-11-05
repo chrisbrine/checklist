@@ -56,8 +56,8 @@ public actor Bridge {
     private var launchState = ShimLaunchState.current
     private var updateNoticePending = false
     private var bootstrapResponse: Value?
-    /// Latched only from Codex's wire metadata under an observed Codex host. It
-    /// never changes to another thread, even after bootstrap fails or waits.
+    /// Selected by Codex wire metadata or the native context of a restart-refused
+    /// bootstrap. It never changes, and later calls must identify this same thread.
     private var codexMCPContext: NativeSessionContext?
     private var missingNativeIdentity = false
     private static let nativeIdentityNotice = "This MCP connection is not bound to a native thread because the host supplied no supported native identity at startup. Codex can identify each tool call with host-authored _meta.threadId; a shell connection does not bind this MCP process."
@@ -70,6 +70,12 @@ public actor Bridge {
     private var serviceError: Error?
     /// A hard MCP startup error outside bootstrap; reported as a tool error, never retried.
     private var startupError: Error?
+    /// A native evidence refusal has no authority. Only a later identified tool
+    /// call may retry it; catalog/resource requests never start a retry or timer.
+    private var codexRestartError: ChecklistError?
+    private var codexRestartBootstrapRefused = false
+    private var codexRestartRetryAt: TimeInterval = 0
+    static let codexRestartRetryInterval: TimeInterval = 5
     /// The service wait in progress; concurrent requests share it instead of repeating it.
     private var serviceWaitTask: Task<Bool, Error>?
     public static let serviceWaitLimit: TimeInterval = 60
@@ -80,6 +86,10 @@ public actor Bridge {
     private var waitNotice: String? {
         if let serviceError {
             return "This conversation is not connected yet. The Checklist service did not answer (\(serviceError.localizedDescription)) Each request waits for the service and connects by itself; no reconnect is needed."
+        }
+        if let codexRestartError {
+            return "This conversation is not connected yet. " + codexRestartError.localizedDescription
+                + " A later tool call with this same _meta.threadId retries the evidence, at most once per 5 s."
         }
         return startupError.map { "This conversation is not connected yet. " + $0.localizedDescription }
     }
@@ -146,7 +156,18 @@ public actor Bridge {
             guard case .string(let raw)? = threadID, UUID(uuidString: raw) == UUID(uuidString: context.nativeSessionID) else {
                 throw ChecklistError("NATIVE_SESSION_MISMATCH", "This Codex MCP connection requires its same host-authored _meta.threadId on every tool call. Missing or conflicting metadata cannot use an earlier thread's connection.")
             }
+            try verifyWorkspace(context.workspacePath)
+            if let expectedSession, UUID(uuidString: expectedSession) != UUID(uuidString: context.nativeSessionID) {
+                throw ChecklistError("NATIVE_SESSION_MISMATCH", "The bound Codex thread differs from --session; retry cannot select another thread.")
+            }
             if delegating { throw ClientUpdateRequired.error }
+            if codexRestartError != nil, environment.now() >= codexRestartRetryAt {
+                // Actor isolation plus reservation before synchronous bootstrap
+                // bounds concurrent calls too. The service rechecks every guard.
+                codexRestartRetryAt = environment.now() + Self.codexRestartRetryInterval
+                startConnection()
+                return bootstrapResponse != nil || setupContext != nil
+            }
             return false
         }
         let observed = environment.discover(false).context
@@ -220,6 +241,14 @@ public actor Bridge {
         }
         let response: [String: Any]
         do { response = try client.bootstrap(nativeContext, timeBudget: timeBudget) }
+        catch let error as ChecklistError where CodexRestartRefusal.applies(error) && context.provider == "codex"
+            && automatic && command == "mcp" && assistantProject == nil {
+            // Retain identity, never credentials/authority. Anonymous or another
+            // thread's next request must not trigger this bootstrap again.
+            codexMCPContext = context
+            codexRestartBootstrapRefused = true
+            throw error
+        }
         catch let error as ChecklistError where error.code == ClientUpdateRequired.code && environment.shimUpdate != nil {
             checkInstalledBuild(force: true, refused: true)
             return nil
@@ -295,18 +324,31 @@ public actor Bridge {
     /// The attempt is bounded by `startupConnectBudget`; a reply timeout is a service
     /// wait, so the first request connects lazily with the full wait.
     public func startConnection() {
+        codexRestartBootstrapRefused = false
         let started = environment.now()
         do {
             _ = try connect(timeBudget: Self.startupConnectBudget)
             try verifySession(replyTimeout: max(0.5, Self.startupConnectBudget - (environment.now() - started)))
-            serviceError = nil; startupError = nil
+            serviceError = nil; startupError = nil; codexRestartError = nil
         }
         catch { recordConnectionFailure(error) }
     }
 
     private func recordConnectionFailure(_ error: Error) {
+        defer { codexRestartBootstrapRefused = false }
         bootstrapResponse = nil
         client = environment.makeClient(.init(workspace: requestedWorkspace, usesStoredCredential: false))
+        if codexRestartBootstrapRefused, CodexRestartRefusal.applies(error), codexMCPContext?.provider == "codex",
+           automatic, command == "mcp", assistantProject == nil {
+            codexRestartError = error as? ChecklistError
+            codexRestartRetryAt = environment.now() + Self.codexRestartRetryInterval
+            // ClaudeRegistryStart also retains bootstrap errors, so clearing only
+            // startupError would still latch this Codex evidence failure.
+            registryStart = ClaudeRegistryStart()
+            serviceError = nil; startupError = nil
+            return
+        }
+        codexRestartError = nil
         serviceError = ServiceWait.applies(error) ? error : nil
         startupError = serviceError == nil && registryStart.error == nil ? error : nil
     }
@@ -335,7 +377,7 @@ public actor Bridge {
             // Refuse outside attemptService so A cannot clear B's valid binding.
             try validateMCPRequestIdentity(allowCatalog: true)
             guard let failure = attemptService() else {
-                if registryStart.error == nil, startupError == nil { environment.stderr("Checklist: connected after waiting \(Int(((environment.now() - started) * 1000).rounded())) ms for the service.\n") }
+                if registryStart.error == nil, startupError == nil, codexRestartError == nil { environment.stderr("Checklist: connected after waiting \(Int(((environment.now() - started) * 1000).rounded())) ms for the service.\n") }
                 return true
             }
             if !startRequested, ServiceWait.notRunning(failure), environment.serviceJobRunning() == false {
@@ -355,9 +397,10 @@ public actor Bridge {
 
     /// One full startup connection attempt. Nil unless the service still does not answer.
     private func attemptService() -> Error? {
+        codexRestartBootstrapRefused = false
         do { _ = try connect(); try verifySession() }
         catch { recordConnectionFailure(error); return serviceError }
-        serviceError = nil; startupError = nil
+        serviceError = nil; startupError = nil; codexRestartError = nil
         return nil
     }
 
@@ -532,7 +575,7 @@ public actor Bridge {
     private func callRoute() throws -> CallRoute? {
         try validateMCPRequestIdentity()
         if delegating { return .delegate(delegateTarget()) }
-        guard startupError == nil, serviceError == nil, registryStart.error == nil, registryStart.connection == nil,
+        guard startupError == nil, serviceError == nil, codexRestartError == nil, registryStart.error == nil, registryStart.connection == nil,
               connectionNotice == nil, setupNotice == nil, setupContext == nil else { return nil }
         return .service(client, checksCatalog: command != "call")
     }
@@ -611,7 +654,7 @@ public actor Bridge {
 
     private func localCall(_ name: String, _ arguments: Value) throws -> Value {
         try Self.refuseHookOnly(name)
-        if let error = startupError ?? serviceError ?? registryStart.error, !ClaudeRegistryStart.limitedToolNames.contains(name) { throw error }
+        if let error = startupError ?? serviceError ?? codexRestartError ?? registryStart.error, !ClaudeRegistryStart.limitedToolNames.contains(name) { throw error }
         // Direct CLI calls already bootstrap/verify. The service checks its current
         // caller, catalog/schema and grants for the actual command. Fetching and
         // decoding the entire catalog here adds a serialized round trip per call.
@@ -651,6 +694,11 @@ public actor Bridge {
     private func withSetupNotice(_ response: [String: Any]) -> [String: Any] {
         let connection: [String: Any]
         if serviceError != nil, let notice = connectionNotice { connection = ["connected": false, "state": "service_not_answering", "message": notice] }
+        else if let error = codexRestartError, let notice = connectionNotice {
+            connection = ["connected": false, "state": "connection_failed", "message": notice,
+                "retryable": true, "reason": CodexRestartRefusal.reason,
+                "retry_after_seconds": max(0, codexRestartRetryAt - environment.now()), "details": error.details]
+        }
         else if startupError != nil, let notice = connectionNotice { connection = ["connected": false, "state": "connection_failed", "message": notice] }
         else if let pending = registryStart.connection { connection = pending }
         else if missingNativeIdentity { connection = ["connected": false, "state": "native_thread_identity_unavailable", "message": Self.nativeIdentityNotice] }

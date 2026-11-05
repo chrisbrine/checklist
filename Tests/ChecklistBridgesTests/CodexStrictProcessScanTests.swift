@@ -114,6 +114,43 @@ final class CodexStrictProcessScanTests: XCTestCase {
         bytes.append(0); XCTAssertEqual(MacOSCodexProcessObserver.parseArguments(bytes, requireComplete: true), ["agent"])
         bytes[bytes.count - 2] = 0xff; XCTAssertNil(MacOSCodexProcessObserver.parseArguments(bytes, requireComplete: true))
     }
+    func testStrictBlockersNameProcessesWithoutPrivateArgumentsOrFullPaths() throws {
+        var script = Entry(); script.path = "/private/secret-folder/wait.py"
+        script.argv = ["wait.py", thread, "--last", "private-prompt-marker"]
+        var codex = Entry(); codex.path = "/private/secret-folder/codex"; codex.argv = nil
+        let result = try scan([10: script, 11: codex])
+        XCTAssertTrue(result.unreadable); XCTAssertTrue(result.execClaim)
+        XCTAssertEqual(result.blockers.map(\.pid), [10, 10, 11])
+        XCTAssertEqual(Set(result.blockers.map { $0.reason.rawValue }), ["names_last", "names_thread", "unreadable_candidate"])
+        let encoded = try JSONSerialization.data(withJSONObject: result.blockers.map(\.diagnostic), options: [.sortedKeys])
+        let text = String(decoding: encoded, as: UTF8.self)
+        XCTAssertTrue(text.contains("wait.py")); XCTAssertTrue(text.contains("codex"))
+        for secret in ["secret-folder", "private-prompt-marker", thread] { XCTAssertFalse(text.contains(secret)) }
+        XCTAssertTrue(result.blockers[0].summary.contains("PID 10 executable=wait.py role=unclassified"))
+    }
+
+    func testNoPathDiagnosticsUseKernelNameInsteadOfCustomArgvZero() throws {
+        var entry = Entry(); entry.path = nil; entry.argv = ["private-prompt-as-argv-zero", thread]
+        entry.descriptors = .init(paths: [rollout], complete: false)
+        let result = try scan([10: entry])
+        XCTAssertTrue(result.unreadable)
+        XCTAssertEqual(result.blockers.map(\.executable), ["agent", "agent"])
+        let holder = try XCTUnwrap(result.holders.first)
+        let serviceBlocker = CodexProcessBlocker(process: holder, reason: .secondHolder)
+        XCTAssertEqual(serviceBlocker.executable, "agent")
+        let encoded = try JSONSerialization.data(withJSONObject: (result.blockers + [serviceBlocker]).map(\.diagnostic))
+        XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("private-prompt"))
+    }
+
+    func testBlockerBasenamesBoundAndSanitizeControlCharacters() {
+        let process = CodexProcess(pid: 10, executable: "/private/folder/\n" + String(repeating: "n", count: 200), role: .exec)
+        let blocker = CodexProcessBlocker(process: process, reason: .execHolder)
+        XCTAssertEqual(blocker.executable.count, 160)
+        XCTAssertTrue(blocker.executable.hasPrefix("?")); XCTAssertFalse(blocker.summary.contains("\n"))
+        XCTAssertFalse(blocker.summary.contains("private/folder"))
+        XCTAssertEqual(CodexProcessBlocker(process: .init(pid: 11, executable: "", role: .unclassified), reason: .unreadableCandidate).executable, "unknown")
+    }
+
 }
 
 final class CodexLiveProcessScanTests: XCTestCase {

@@ -1215,6 +1215,155 @@ final class ChecklistMCPServerTests: XCTestCase {
         }
     }
 
+    func testCodexRestartEvidenceRetriesSameWireThreadAfterCooldown() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.unavailable]); fixture.mcpMetadataHost = true
+        fixture.bootstrapHandler = { _ in
+            if fixture.attempts.count == 1 { throw CodexRestartRefusal.error("Synthetic transient holder") }
+        }
+        let session = try await start(fixture)
+        let request = try await session.client.send(CallTool.request(.init(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))))
+        let first = try await request.value
+        let envelope = try XCTUnwrap(jsonObject(XCTUnwrap(first.structuredContent)) as? [String: Any])
+        let connection = try XCTUnwrap((envelope["data"] as? [String: Any])?["connection"] as? [String: Any])
+        XCTAssertEqual(connection["retryable"] as? Bool, true)
+        XCTAssertEqual(connection["reason"] as? String, CodexRestartRefusal.reason)
+        fixture.advance(5)
+        let next = try await session.client.callTool(name: "task_list", meta: threadMeta(fixture.context.nativeSessionID))
+        XCTAssertEqual(next.isError, false)
+        XCTAssertEqual(fixture.attempts.map { $0.0 }, [0, 5])
+        XCTAssertTrue(fixture.nativeContexts.allSatisfy { $0["native_session_id"] as? String == fixture.context.nativeSessionID })
+        _ = try await session.client.callTool(name: "task_list", meta: threadMeta(fixture.context.nativeSessionID))
+        XCTAssertEqual(fixture.attempts.count, 2)
+        let changes = await session.notifications.count
+        XCTAssertEqual(changes, 1)
+    }
+
+    func testServiceWaitTransitionToRestartEvidenceNeverReportsConnected() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.unavailable]); fixture.mcpMetadataHost = true
+        fixture.bootstrapHandler = { _ in
+            if fixture.attempts.count == 1 { throw ChecklistError("SERVICE_UNAVAILABLE", "Synthetic service wait") }
+            if fixture.attempts.count == 2 { throw CodexRestartRefusal.error("Synthetic pending evidence") }
+        }
+        let session = try await start(fixture)
+        let pending = try await session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))
+        XCTAssertTrue(text(pending.content).contains("Synthetic pending evidence"))
+        XCTAssertEqual(fixture.attempts.count, 2)
+        XCTAssertFalse(fixture.stderr.joined().contains("connected after waiting"))
+        fixture.advance(5)
+        let recovered = try await session.client.callTool(name: "task_list", meta: threadMeta(fixture.context.nativeSessionID))
+        XCTAssertEqual(recovered.isError, false); XCTAssertEqual(fixture.attempts.count, 3)
+    }
+
+    func testCodexRestartRetryBoundStartsWhenFailureCompletes() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.unavailable]); fixture.mcpMetadataHost = true
+        fixture.bootstrapHandler = { _ in fixture.advance(2); throw CodexRestartRefusal.error("Synthetic slow evidence") }
+        let session = try await start(fixture)
+        _ = try await session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))
+        fixture.advance(4.5)
+        _ = try await session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))
+        XCTAssertEqual(fixture.attempts.count, 1)
+        fixture.advance(0.5)
+        _ = try await session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))
+        for _ in 0..<3 { _ = try await session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID)) }
+        XCTAssertEqual(fixture.attempts.map { $0.0 }, [0, 7])
+        XCTAssertEqual(fixture.time, 9)
+    }
+
+    func testPendingCodexRestartNeverRetriesCatalogAnonymousConflictingOrResourceRequests() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.unavailable]); fixture.mcpMetadataHost = true
+        fixture.bootstrapHandler = { _ in throw CodexRestartRefusal.error("Synthetic pending evidence") }
+        let session = try await start(fixture)
+        _ = try await session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))
+        fixture.advance(10)
+        let tools = try await session.client.listTools()
+        XCTAssertEqual(tools.tools.map(\.name), ["service_info"])
+        for meta in [nil, threadMeta(UUID().uuidString), threadMeta("invalid"), Metadata(additionalFields: ["threadId": .int(7)])] as [Metadata?] {
+            let refused = try await session.client.callTool(name: "service_info", meta: meta)
+            XCTAssertEqual(refused.isError, true)
+            XCTAssertTrue(text(refused.content).contains("NATIVE_SESSION_MISMATCH"))
+        }
+        do { _ = try await session.client.readResource(uri: "checklist://service/status"); XCTFail("Anonymous resource read retried") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("NATIVE_SESSION_REQUIRED")) }
+        do { _ = try await session.client.listResources(); XCTFail("Anonymous resource catalog retried") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("NATIVE_SESSION_REQUIRED")) }
+        XCTAssertEqual(fixture.attempts.count, 1)
+    }
+
+    func testCodexRestartRetryStopsPermanentlyAfterOwnerRefusal() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.unavailable]); fixture.mcpMetadataHost = true
+        fixture.bootstrapHandler = { _ in
+            if fixture.attempts.count == 1 { throw CodexRestartRefusal.error("Synthetic evidence") }
+            throw ChecklistError("CONNECTION_REVOKED", "Synthetic owner revocation")
+        }
+        let session = try await start(fixture)
+        _ = try await session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))
+        fixture.advance(5)
+        _ = try await session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))
+        fixture.advance(10)
+        let refused = try await session.client.callTool(name: "task_list", meta: threadMeta(fixture.context.nativeSessionID))
+        XCTAssertEqual(refused.isError, true)
+        XCTAssertTrue(text(refused.content).contains("CONNECTION_REVOKED"))
+        XCTAssertEqual(fixture.attempts.count, 2)
+    }
+
+    func testExportedCodexStartupEvidenceNeedsIdentifiedCallToRetry() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        fixture.bootstrapHandler = { _ in
+            if fixture.attempts.count == 1 { throw CodexRestartRefusal.error("Synthetic startup evidence") }
+        }
+        let session = try await start(fixture)
+        fixture.advance(5)
+        let anonymous = try await session.client.callTool(name: "service_info")
+        XCTAssertEqual(anonymous.isError, true); XCTAssertEqual(fixture.attempts.count, 1)
+        let recovered = try await session.client.callTool(name: "task_list", meta: threadMeta(fixture.context.nativeSessionID))
+        XCTAssertEqual(recovered.isError, false); XCTAssertEqual(fixture.attempts.count, 2)
+    }
+
+    func testCodexRestartRetryCannotOverrideExpectedSession() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        fixture.bootstrapHandler = { _ in throw CodexRestartRefusal.error("Synthetic startup evidence") }
+        let session = try await start(fixture, configuration: .init(workspace: fixture.context.workspacePath, expectedSession: UUID().uuidString))
+        fixture.advance(10)
+        let refused = try await session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))
+        XCTAssertEqual(refused.isError, true); XCTAssertTrue(text(refused.content).contains("--session"))
+        XCTAssertEqual(fixture.attempts.count, 1)
+    }
+
+    func testRestartMarkerOutsideCodexBootstrapCannotEnableRetries() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.unavailable]); fixture.mcpMetadataHost = true
+        fixture.callHandler = { name in if name == "service_info", !fixture.nativeContexts.isEmpty { throw CodexRestartRefusal.error("Synthetic non-bootstrap error") } }
+        let session = try await start(fixture, configuration: .init(workspace: fixture.context.workspacePath, expectedSession: fixture.context.nativeSessionID))
+        _ = try await session.client.callTool(name: "service_info", meta: threadMeta(fixture.context.nativeSessionID))
+        fixture.advance(10)
+        _ = try await session.client.callTool(name: "task_list", meta: threadMeta(fixture.context.nativeSessionID))
+        XCTAssertEqual(fixture.attempts.count, 1)
+    }
+
+    func testGenericRetryableWrongCodeReasonOrProviderStayPermanent() async throws {
+        let variants: [(String, ChecklistError)] = [
+            ("codex", ChecklistError("CONNECTION_REVOKED", "Synthetic owner refusal", details: ["retryable": true, "reason": CodexRestartRefusal.reason])),
+            ("codex", ChecklistError("NATIVE_SESSION_MISMATCH", "Synthetic other retry", details: ["retryable": true, "reason": "other"])),
+            ("codex", ChecklistError("NATIVE_SESSION_MISMATCH", "Synthetic provenance refusal")),
+            ("claude", CodexRestartRefusal.error("Synthetic wrong provider"))]
+        for (provider, error) in variants {
+            let fixture = try Fixture(provider: provider)
+            fixture.setDiscoveries([.available(fixture.context)])
+            fixture.bootstrapHandler = { _ in throw error }
+            let session = try await start(fixture)
+            fixture.advance(10)
+            _ = try await session.client.callTool(name: "task_list", meta: threadMeta(fixture.context.nativeSessionID))
+            XCTAssertEqual(fixture.attempts.count, 1)
+        }
+    }
+
     func testCodexMCPPermanentBootstrapRefusalNeverSwitchesThreadOrRetries() async throws {
         let fixture = try Fixture(provider: "codex")
         fixture.setDiscoveries([.unavailable]); fixture.mcpMetadataHost = true

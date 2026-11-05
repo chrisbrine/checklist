@@ -75,23 +75,39 @@ final class NativeCommunicationRoutesTests: XCTestCase {
             "CL-413:loaded-thread; checklist_build=273",
             "CL-417:unloaded-thread; checklist_build=289; message_id=c54829df-7d89-40a3-9486-e6396b02aa9c",
             "CL-417:unloaded-thread; checklist_build=291; message_id=445ded0f-bf72-427d-96fb-30d5422e1d50",
-            "CL-417:later-note-recovery; checklist_build=291; message_id=321dfa67-caac-4e1f-9d40-b50f66ffeca5"
+            "CL-417:later-note-recovery; checklist_build=291; message_id=321dfa67-caac-4e1f-9d40-b50f66ffeca5",
+            "CL-417:unloaded-thread; checklist_build=292; message_id=ebe09471-90db-4385-9b3b-33f791fe5223",
+            "CL-417:later-note-recovery; checklist_build=292; message_id=0ca0ee01-6cd9-49c0-817b-eaed7d9718d8"
         ])
         for fact in ["4 November 2026", "build 289", "14:05:45", "build 291 (91b23bf52628646c)", "16:46:29 PDT", "16:46:52",
                      "pending_after_20s", "exited_zero", "open_exit_status=0", "provider_accepted",
                      "16:55:35 PDT", "queue_poll_result=queue_occupied", "reason_code=queue_occupied", "result=refused (no second item)", "16:55:38",
                      "ChatGPT 26.1029.61003", "codex-cli 0.166.0-alpha.6", "0.166.0-alpha.5.1",
-                     "no recheck on these versions", "current enrollment generation", "NATIVE_SESSION_MISMATCH", "CL-434", "not fully qualified"] {
+                     "no recheck on these versions", "current enrollment generation", "NATIVE_SESSION_MISMATCH", "CL-434", "not fully qualified",
+                     "while the waiting item existed", "relayed the later note as its own queue item", "16:56:33 PDT", "queue_poll_result=removed",
+                     "open_result=not_needed", "16:56:30-16:56:38", "wrote the note's marker", "On build 292, a non-contributor check runner",
+                     "17:50:18 PDT", "17:51:05 PDT", "CL-440", Self.build291RecoverySnapshotSHA256, Self.build292RecoverySnapshotSHA256,
+                     "The CL-434 reconnect has no passing installed run yet"] {
             XCTAssertTrue(route.reason.contains(fact), fact)
         }
         XCTAssertFalse(route.reason.contains("not yet run"), "The recovery case has run")
+        for stale in Self.staleRecoveryClaims { XCTAssertFalse(route.reason.contains(stale), stale) }
+        XCTAssertFalse(route.reason.contains("reconnect refused there"))
         XCTAssertEqual(route.serviceInfo["qualification_scope"] as? String, "none")
         XCTAssertEqual(route.serviceInfo["qualified"] as? Bool, false)
         XCTAssertEqual(route.serviceInfo["qualification_receipts"] as? [String], route.qualificationReceipts)
         XCTAssertTrue(NativeCommunicationRoutes.summary.contains("later-note recovery checks passed"))
         XCTAssertTrue(NativeCommunicationRoutes.summary.contains("stays unqualified"))
         XCTAssertFalse(NativeCommunicationRoutes.summary.contains("not yet run"))
+        XCTAssertTrue(NativeCommunicationRoutes.summary.contains("after an app restart. The CL-434 reconnect has no passing installed run yet; docs/codex-host-restart.md records its results. Autonomous child push/wake"))
+        let joined = try NSRegularExpression(pattern: "[a-z)]\\.[A-Z]")
+        let summary = NativeCommunicationRoutes.summary
+        XCTAssertEqual(joined.numberOfMatches(in: summary, range: NSRange(summary.startIndex..., in: summary)), 0, "Every sentence of native_push_status starts after a space")
     }
+
+    static let build291RecoverySnapshotSHA256 = "9d63f15bcd091ea9eecc849466b6430fd60ed8d4c02eed6380263b3b5d63b380"
+    static let build292RecoverySnapshotSHA256 = "3aa32159dee6cfbaaf995147995577c3bc1b5ef024c495cd6ce8db58679266e0"
+    static let staleRecoveryClaims = ["later note stayed in the inbox", "later note stays in the inbox", "stays in the inbox because the turn belongs to the older item", "later note's marker did not appear"]
 
     func testPublishedCodexRouteDocsStateTheRecoveryResult() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -101,6 +117,21 @@ final class NativeCommunicationRoutesTests: XCTestCase {
         for fact in ["445ded0f-bf72-427d-96fb-30d5422e1d50", "321dfa67-caac-4e1f-9d40-b50f66ffeca5", "queue_occupied", "result=refused", "0.166.0-alpha.6", "NATIVE_SESSION_MISMATCH"] {
             XCTAssertTrue(row.contains(fact), fact)
             XCTAssertTrue(status.contains(fact), fact)
+        }
+        for fact in ["0ca0ee01-6cd9-49c0-817b-eaed7d9718d8", "ebe09471-90db-4385-9b3b-33f791fe5223", "relayed the later note as its own queue item",
+                     "`queue_poll_result=removed`", "`open_result=not_needed`", "16:56:33 PDT", "CL-440", Self.build291RecoverySnapshotSHA256, Self.build292RecoverySnapshotSHA256] {
+            XCTAssertTrue(row.contains(fact), fact)
+            XCTAssertTrue(status.contains(fact), fact)
+        }
+        let openLimit = try XCTUnwrap(integrations.components(separatedBy: "\n").first { $0.hasPrefix("Open limit (CL-416).") })
+        for fact in ["gets a `refused` receipt", "relays the later note as its own queue item", "relayed the later note as its own item", "Build 292 repeated this relay"] {
+            XCTAssertTrue(openLimit.contains(fact), fact)
+        }
+        XCTAssertTrue(integrations.contains("3. **Build 292 recheck, pass.**"))
+        XCTAssertTrue(integrations.contains("retains its six partial qualification receipts"))
+        XCTAssertTrue(status.contains("now hold six partial receipts"))
+        for document in [integrations, status, row, openLimit] {
+            for stale in Self.staleRecoveryClaims { XCTAssertFalse(document.contains(stale), stale) }
         }
         for document in [integrations, status] {
             XCTAssertFalse(document.contains("recovery case is not yet run"))

@@ -47,42 +47,61 @@ extension Coordinator {
     /// lease. Check again after closure and inside the credential commit boundary.
     func verifyCodexRestartHost(old: NativeLifecycleRegistration, new: NativeLifecycleRegistration) throws -> CodexAppHostRestartEvidence {
         let effects = codexAppHostRestartEffects
+        func refusal(_ message: String, scan: CodexHostScan? = nil, extra: [CodexProcessBlocker] = []) -> ChecklistError {
+            var blockers = scan?.blockers ?? []
+            for process in scan?.holders ?? [] where process.pid != new.processID || process.role != .appHost {
+                blockers.append(.init(process: process, reason: process.role == .exec ? .execHolder : .secondHolder))
+            }
+            blockers += extra
+            var unique: [CodexProcessBlocker] = []
+            for blocker in blockers where !unique.contains(blocker) { unique.append(blocker) }
+            unique.sort { $0.pid == $1.pid ? $0.reason.rawValue < $1.reason.rawValue : $0.pid < $1.pid }
+            let count = scan.map { String($0.incompleteNonCodex) } ?? "unknown"
+            let identities = unique.isEmpty ? "" : " Blocking processes: " + unique.map(\.summary).joined(separator: "; ") + "."
+            return CodexRestartRefusal.error(message + " (incompleteNonCodex=\(count))" + identities,
+                blockingProcesses: unique.map(\.diagnostic))
+        }
         let state = effects.process(old)
         guard state == .gone || state == .replaced else {
-            throw ChecklistError("NATIVE_SESSION_MISMATCH", state == .running
+            let process = CodexProcess(pid: old.processID, executable: state == .running ? "codex" : "unknown",
+                role: state == .running ? .appHost : .unclassified)
+            throw refusal(state == .running
                 ? "The earlier Codex app host PID and start time still identify a running process. Its connection cannot close for restart."
-                : "Checklist cannot verify that the earlier Codex app host ended: its PID/start identity lookup is unreadable or incomplete.")
+                : "Checklist cannot verify that the earlier Codex app host ended: its PID/start identity lookup is unreadable or incomplete.",
+                extra: [.init(process: process, reason: state == .running ? .oldHostRunning : .unreadableCandidate)])
         }
         let source = effects.source(new)
         guard source.host == .nativeApp, source.reason == .sourceVscode, source.source == "vscode" else {
-            throw ChecklistError("NATIVE_SESSION_MISMATCH", "Codex app restart requires the exact thread's source=vscode record. " + source.reason.explanation)
+            throw refusal("Codex app restart requires the exact thread's source=vscode record. " + source.reason.explanation)
         }
         func host(_ scan: CodexHostScan?) throws -> (process: CodexProcess, scan: CodexHostScan) {
-            let evidence = " (incompleteNonCodex=\(scan.map { String($0.incompleteNonCodex) } ?? "unknown"))"
             guard let scan, !scan.unreadable else {
-                throw ChecklistError("NATIVE_SESSION_MISMATCH", "The Codex process/holder observation is unreadable or incomplete; another holder cannot be excluded." + evidence)
+                throw refusal("The Codex process/holder observation is unreadable or incomplete; another holder cannot be excluded.", scan: scan)
             }
             guard !scan.execActive else {
-                throw ChecklistError("NATIVE_SESSION_MISMATCH", "Another Codex process holds this conversation or names its thread or --last. Restart reconnect is refused." + evidence)
+                throw refusal("Another Codex process holds this conversation or names its thread or --last. Restart reconnect is refused.", scan: scan)
             }
             guard scan.holders.count == 1, let holder = scan.holders.first,
                   holder.pid == new.processID, holder.role == .appHost, scan.hosts.contains(holder) else {
-                throw ChecklistError("NATIVE_SESSION_MISMATCH", "The new Codex app host must positively hold this thread's rollout, with no other process holding it." + evidence)
+                throw refusal("The new Codex app host must positively hold this thread's rollout, with no other process holding it.", scan: scan)
             }
             return (holder, scan)
         }
         let first = try host(effects.scan(new.sessionID))
-        let evidence = " (incompleteNonCodex=\(first.scan.incompleteNonCodex))"
         guard effects.signed(first.process) else {
-            throw ChecklistError("NATIVE_SESSION_MISMATCH", "The new Codex app host's running signature or executable identity could not be verified; an upgrade may still be in progress." + evidence)
+            throw refusal("The new Codex app host's running signature or executable identity could not be verified; an upgrade may still be in progress.",
+                scan: first.scan, extra: [.init(process: first.process, reason: .unsignedHost)])
         }
         guard effects.holds(new), effects.process(new) == .running else {
-            throw ChecklistError("NATIVE_SESSION_MISMATCH", "The new Codex app host's PID/start identity and positive hold on this thread could not be verified." + evidence)
+            throw refusal("The new Codex app host's PID/start identity and positive hold on this thread could not be verified.",
+                scan: first.scan, extra: [.init(process: first.process, reason: .newHostUnverified)])
         }
         let last = try host(effects.scan(new.sessionID))
         guard last.scan == first.scan, effects.source(new) == source else {
-            throw ChecklistError("NATIVE_SESSION_MISMATCH", "The Codex app host, holder scan or thread source changed during the restart observation."
-                + " (incompleteNonCodex first=\(first.scan.incompleteNonCodex), last=\(last.scan.incompleteNonCodex))")
+            let changed = (first.scan.hosts + last.scan.hosts).filter { !first.scan.hosts.contains($0) || !last.scan.hosts.contains($0) }
+            throw refusal("The Codex app host, holder scan or thread source changed during the restart observation."
+                + " (incompleteNonCodex first=\(first.scan.incompleteNonCodex), last=\(last.scan.incompleteNonCodex))",
+                scan: last.scan, extra: (changed + [last.process]).map { .init(process: $0, reason: .observationChanged) })
         }
         return .init(process: state, incompleteNonCodex: last.scan.incompleteNonCodex)
     }

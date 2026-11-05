@@ -17,6 +17,8 @@ final class CodexAppHostRestartTests: XCTestCase {
         var host = CodexProcess(pid: 24681, executable: "/Applications/Synthetic.app/Contents/MacOS/codex", role: .appHost)
         var extra: [CodexProcess] = []
         var extraHosts: [CodexProcess] = []
+        var blockers: [CodexProcessBlocker] = []
+        var scanUnavailable = false
         var incompleteNonCodex = 0
         var holds = true, signed = true, unreadable = false, execClaim = false
         var scans = 0, processReads = 0
@@ -61,8 +63,9 @@ final class CodexAppHostRestartTests: XCTestCase {
         }, source: { [evidence] _ in evidence.source }, scan: { [evidence] _ in
             evidence.scans += 1
             do { try evidence.onScan?() } catch { evidence.scanFailure = error; return nil }
+            if evidence.scanUnavailable { return nil }
             return .init(hosts: [evidence.host] + evidence.extraHosts, holders: (evidence.holds ? [evidence.host] : []) + evidence.extra,
-                         unreadable: evidence.unreadable, execClaim: evidence.execClaim, incompleteNonCodex: evidence.incompleteNonCodex)
+                         unreadable: evidence.unreadable, execClaim: evidence.execClaim, incompleteNonCodex: evidence.incompleteNonCodex, blockers: evidence.blockers)
         }, signed: { [evidence] _ in evidence.signed }, holds: { [evidence] _ in evidence.holds })
     }
     override func tearDownWithError() throws {
@@ -295,6 +298,70 @@ final class CodexAppHostRestartTests: XCTestCase {
     func testUnreadableRefusalReportsIncompleteNonCodexCount() throws {
         evidence.unreadable = true; evidence.incompleteNonCodex = 4
         refuses(contains: "incompleteNonCodex=4")
+    }
+
+    func testEveryVerifierEvidenceRefusalCarriesScopedRetryMarker() throws {
+        let old = try XCTUnwrap(NativeLifecycleRegistration(provider: "codex", sessionID: enrollment.sessionID,
+            executionDomain: "codex:24680:5:0", registryPath: nil))
+        let new = try XCTUnwrap(NativeLifecycleRegistration(provider: "codex", sessionID: enrollment.sessionID,
+            executionDomain: "codex:24681:6:0", registryPath: nil))
+        for scenario in ["running", "unknown", "source", "nil_scan", "unreadable", "exec_claim", "exec_holder", "other_holder",
+                         "no_hold", "signature", "new_identity", "changed_scan", "changed_source"] {
+            evidence.oldState = .gone; evidence.newState = .running
+            evidence.source = .init(host: .nativeApp, reason: .sourceVscode, source: "vscode")
+            evidence.scanUnavailable = false; evidence.unreadable = false; evidence.execClaim = false
+            evidence.holds = true; evidence.signed = true; evidence.extra = []; evidence.scans = 0; evidence.onScan = nil
+            evidence.incompleteNonCodex = 7
+            switch scenario {
+            case "running": evidence.oldState = .running
+            case "unknown": evidence.oldState = .unknown
+            case "source": evidence.source = .init(host: .exec, reason: .sourceExec, source: "exec")
+            case "nil_scan": evidence.scanUnavailable = true
+            case "unreadable": evidence.unreadable = true
+            case "exec_claim": evidence.execClaim = true
+            case "exec_holder": evidence.extra = [.init(pid: 30000, executable: "/synthetic/codex", role: .exec)]
+            case "other_holder": evidence.extra = [.init(pid: 30000, executable: "/synthetic/other", role: .unclassified)]
+            case "no_hold": evidence.holds = false
+            case "signature": evidence.signed = false
+            case "new_identity": evidence.newState = .unknown
+            case "changed_scan": evidence.onScan = { [evidence] in if evidence.scans == 2 { evidence.incompleteNonCodex = 8 } }
+            default: evidence.onScan = { [evidence] in if evidence.scans == 2 { evidence.source = .init(host: .exec, reason: .sourceExec, source: "exec") } }
+            }
+            XCTAssertThrowsError(try coordinator.verifyCodexRestartHost(old: old, new: new), scenario) { error in
+                XCTAssertTrue(CodexRestartRefusal.applies(error), "\(scenario): \(error)")
+                XCTAssertTrue(error.localizedDescription.contains("incompleteNonCodex="))
+            }
+        }
+    }
+
+    func testBlockerRefusalNamesEveryProcessWithoutPathsArgumentsOrPrompt() throws {
+        let script = CodexProcess(pid: 30001, executable: "/private/secret-folder/wait.py", role: .unclassified)
+        let exec = CodexProcess(pid: 30002, executable: "/private/secret-folder/codex", role: .exec)
+        let noPath = CodexProcess(pid: 30003, executable: "private-prompt-as-argv-zero", role: .unclassified, diagnosticExecutable: "kernel-helper")
+        evidence.incompleteNonCodex = 7; evidence.execClaim = true; evidence.extra = [exec, noPath]
+        evidence.blockers = [.init(process: script, reason: .namesThread), .init(process: exec, reason: .namesLast)]
+        XCTAssertThrowsError(try bootstrap()) { error in
+            let failure = error as? ChecklistError
+            XCTAssertTrue(CodexRestartRefusal.applies(error))
+            let text = error.localizedDescription
+            for value in ["PID 30001", "executable=wait.py", "role=unclassified", "reason=names_thread", "PID 30002",
+                          "executable=codex", "role=exec", "reason=names_last", "reason=exec_holder", "PID 30003", "executable=kernel-helper", "reason=second_holder", "incompleteNonCodex=7"] {
+                XCTAssertTrue(text.contains(value), text)
+            }
+            XCTAssertFalse(text.contains("secret-folder")); XCTAssertFalse(text.contains("private-prompt"))
+            XCTAssertEqual((failure?.details["blocking_processes"] as? [[String: Any]])?.count, 4)
+        }
+    }
+
+    func testPermanentBindingFailuresKeepNoRestartRetryMarker() throws {
+        coordinator.enrollments[enrollment.installation]?.codexAppHostProven = false
+        XCTAssertThrowsError(try bootstrap()) { XCTAssertFalse(CodexRestartRefusal.applies($0)) }
+        coordinator.enrollments[enrollment.installation]?.codexAppHostProven = true
+        coordinator.enrollments[enrollment.installation]?.workspace = root.appendingPathComponent("other").path
+        XCTAssertThrowsError(try bootstrap()) { XCTAssertFalse(CodexRestartRefusal.applies($0)) }
+        coordinator.enrollments[enrollment.installation]?.workspace = root.path
+        coordinator.enrollments[enrollment.installation]?.ownerRevoked = true
+        XCTAssertThrowsError(try bootstrap()) { XCTAssertFalse(CodexRestartRefusal.applies($0)) }
     }
 
 }
