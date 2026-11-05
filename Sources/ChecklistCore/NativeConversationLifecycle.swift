@@ -58,7 +58,8 @@ extension CommandRouter {
     /// deliveries queued for the ended generation stay fenced. Unacknowledged
     /// notices get distinct receipts addressed only to this resumed generation.
     /// An owner disconnect (`revoked`) or a closure with work still stopping refuses.
-    public func resumeVerifiedNativeSession(_ resumption: NativeSessionResumption, caller: Caller) throws -> [String: Any] {
+    public func resumeVerifiedNativeSession(_ resumption: NativeSessionResumption, caller: Caller,
+                                           codexRestartIncompleteNonCodex: Int? = nil) throws -> [String: Any] {
         try owner(caller)
         guard caller.installation == "native-thread-bootstrap" else {
             throw CoreError("FORBIDDEN", "Only the bundled native connection service can resume a closed conversation.")
@@ -95,6 +96,12 @@ extension CommandRouter {
             guard observation["state"] as? String == "released" else {
                 throw CoreError("NATIVE_CLOSURE_PENDING", "Work from the earlier process must stop and return for pickup before this thread can reconnect.")
             }
+            if let count = codexRestartIncompleteNonCodex {
+                guard count >= 0, resumption.provider == "codex",
+                      observation["evidence_basis"] as? String == NativeClosureBasis.codexAppHostRestart.rawValue else {
+                    throw CoreError("NATIVE_SESSION_MISMATCH", "Restart scan evidence requires an owner-approved Codex app closure.")
+                }
+            }
             let endedGeneration = sessionGeneration(session)
             session["state"] = "connected"; session["installation"] = resumption.newInstallation
             session["execution_domain"] = resumption.newExecutionDomain; session["authorization_generation"] = uuid()
@@ -103,8 +110,10 @@ extension CommandRouter {
             session["resumed_at"] = now(); session["last_seen"] = now()
             session = revised(session); try save(db, session, type: "session")
             try redeliverNativeClosureNotices(db, session: session, closure: observation)
+            var evidence: JSON = ["observation_ref": observationID, "ended_authorization_generation": endedGeneration]
+            if let count = codexRestartIncompleteNonCodex { evidence["incomplete_non_codex"] = count }
             try event(db, caller: caller, project: resumption.projectID, entity: resumption.sessionID,
-                      kind: "native_session_resumed", data: ["observation_ref": observationID, "ended_authorization_generation": endedGeneration])
+                      kind: "native_session_resumed", data: evidence)
             result = session
             return .commit
             }

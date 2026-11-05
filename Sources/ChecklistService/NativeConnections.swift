@@ -299,7 +299,7 @@ extension Coordinator {
                     throw ownerDisconnected
                 }
                 let state = try verifyCodexRestartHost(old: old, new: new)
-                let released = try reconcileNativeClosure(existing, processState: state.rawValue, registryState: "not_applicable",
+                let released = try reconcileNativeClosure(existing, processState: state.process.rawValue, registryState: "not_applicable",
                     registryDigest: nil, basis: .codexAppHostRestart, replacementDomain: executionDomain)
                 // The rollback baseline is the fenced enrollment, never the earlier
                 // live authority. Pending source/descendant writers retain it too.
@@ -347,8 +347,9 @@ extension Coordinator {
             saveEnrollment: { enrollments[existing.installation] = resumed; try saveEnrollments() },
             registerSession: {
                 if ownerAllowed { return try router.reconnectOwnerAllowedSession(resumption,caller:owner) }
-                if let (old, new) = codexRestart { _ = try verifyCodexRestartHost(old: old, new: new) }
-                return try router.resumeVerifiedNativeSession(resumption, caller: owner)
+                let evidence = try codexRestart.map { try verifyCodexRestartHost(old: $0.0, new: $0.1) }
+                return try router.resumeVerifiedNativeSession(resumption, caller: owner,
+                    codexRestartIncompleteNonCodex: evidence?.incompleteNonCodex)
             },
             rollback: { try ConnectionCommit.restore(enrollment: { enrollments[existing.installation] = existing; try saveEnrollments() }, credential: {
                 if let priorCredential { try credentials.write(existing.installation, priorCredential) }

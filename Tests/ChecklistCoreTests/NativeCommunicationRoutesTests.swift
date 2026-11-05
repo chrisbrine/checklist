@@ -73,16 +73,40 @@ final class NativeCommunicationRoutesTests: XCTestCase {
         XCTAssertTrue(route.qualifiedVersions.isEmpty, "Partial observations are not qualified versions")
         XCTAssertEqual(route.qualificationReceipts, [
             "CL-413:loaded-thread; checklist_build=273",
-            "CL-417:unloaded-thread; checklist_build=289; message_id=c54829df-7d89-40a3-9486-e6396b02aa9c"
+            "CL-417:unloaded-thread; checklist_build=289; message_id=c54829df-7d89-40a3-9486-e6396b02aa9c",
+            "CL-417:unloaded-thread; checklist_build=291; message_id=445ded0f-bf72-427d-96fb-30d5422e1d50",
+            "CL-417:later-note-recovery; checklist_build=291; message_id=321dfa67-caac-4e1f-9d40-b50f66ffeca5"
         ])
-        for fact in ["4 November 2026", "build 289", "pending_after_20s", "exited_zero", "open_exit_status=0", "provider_accepted", "14:05:45", "recovery case is not yet run", "MCP", "NATIVE_SESSION_MISMATCH", "not fully qualified"] {
+        for fact in ["4 November 2026", "build 289", "14:05:45", "build 291 (91b23bf52628646c)", "16:46:29 PDT", "16:46:52",
+                     "pending_after_20s", "exited_zero", "open_exit_status=0", "provider_accepted",
+                     "16:55:35 PDT", "queue_poll_result=queue_occupied", "reason_code=queue_occupied", "result=refused (no second item)", "16:55:38",
+                     "ChatGPT 26.1029.61003", "codex-cli 0.166.0-alpha.6", "0.166.0-alpha.5.1",
+                     "no recheck on these versions", "current enrollment generation", "NATIVE_SESSION_MISMATCH", "CL-434", "not fully qualified"] {
             XCTAssertTrue(route.reason.contains(fact), fact)
         }
+        XCTAssertFalse(route.reason.contains("not yet run"), "The recovery case has run")
         XCTAssertEqual(route.serviceInfo["qualification_scope"] as? String, "none")
         XCTAssertEqual(route.serviceInfo["qualified"] as? Bool, false)
         XCTAssertEqual(route.serviceInfo["qualification_receipts"] as? [String], route.qualificationReceipts)
-        XCTAssertTrue(NativeCommunicationRoutes.summary.contains("unloaded-thread checks passed"))
-        XCTAssertTrue(NativeCommunicationRoutes.summary.contains("recovery is not yet run"))
+        XCTAssertTrue(NativeCommunicationRoutes.summary.contains("later-note recovery checks passed"))
+        XCTAssertTrue(NativeCommunicationRoutes.summary.contains("stays unqualified"))
+        XCTAssertFalse(NativeCommunicationRoutes.summary.contains("not yet run"))
+    }
+
+    func testPublishedCodexRouteDocsStateTheRecoveryResult() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let integrations = try String(contentsOf: root.appendingPathComponent("docs/integrations.md"), encoding: .utf8)
+        let status = try String(contentsOf: root.appendingPathComponent("docs/implementation-status.md"), encoding: .utf8)
+        let row = try XCTUnwrap(integrations.components(separatedBy: "\n").first { $0.hasPrefix("| `codex_idle_wake` |") })
+        for fact in ["445ded0f-bf72-427d-96fb-30d5422e1d50", "321dfa67-caac-4e1f-9d40-b50f66ffeca5", "queue_occupied", "result=refused", "0.166.0-alpha.6", "NATIVE_SESSION_MISMATCH"] {
+            XCTAssertTrue(row.contains(fact), fact)
+            XCTAssertTrue(status.contains(fact), fact)
+        }
+        for document in [integrations, status] {
+            XCTAssertFalse(document.contains("recovery case is not yet run"))
+            XCTAssertFalse(document.contains("later-note recovery case is not yet run"))
+            XCTAssertFalse(document.contains("is **not yet run**"))
+        }
     }
 
     func testServiceInfoDoesNotPromoteEnrollmentOrTransportReceipts() throws {

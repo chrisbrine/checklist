@@ -16,12 +16,16 @@ public struct CodexProcess: Equatable, Sendable {
 public struct CodexHostScan: Equatable, Sendable {
     public let hosts: [CodexProcess]
     public let holders: [CodexProcess]
-    /// A running codex process whose descriptors could not be read. It may hold the rollout.
+    /// A live process cannot be excluded as a Codex candidate or its descriptors are incomplete.
     public let unreadable: Bool
     /// A codex process other than the app host names this thread or `--last`, and may not have opened the rollout yet.
     public let execClaim: Bool
-    public init(hosts: [CodexProcess], holders: [CodexProcess], unreadable: Bool = false, execClaim: Bool = false) {
+    /// Identified non-Codex processes with incomplete descriptor observations.
+    public let incompleteNonCodex: Int
+    public init(hosts: [CodexProcess], holders: [CodexProcess], unreadable: Bool = false, execClaim: Bool = false,
+                incompleteNonCodex: Int = 0) {
         self.hosts = hosts; self.holders = holders; self.unreadable = unreadable; self.execClaim = execClaim
+        self.incompleteNonCodex = incompleteNonCodex
     }
     public var execActive: Bool { execClaim || holders.contains { $0.role == .exec } }
     /// The process that the service would run.
@@ -141,34 +145,42 @@ public protocol CodexProcessObserving: Sendable {
 /// A process of another account cannot be read and is not counted.
 public struct MacOSCodexProcessObserver: CodexProcessObserving {
     let sessionsRoot: String
+    private let table: any CodexProcessTableReading
+    private let accountID: uid_t
     public init() {
         let home = getpwuid(getuid())?.pointee.pw_dir.map { String(cString:$0) } ?? NSHomeDirectory()
         sessionsRoot = URL(fileURLWithPath:home).appendingPathComponent(".codex/sessions").path
+        table = MacOSCodexProcessTableReader(); accountID = getuid()
     }
-    init(sessionsRoot: String) { self.sessionsRoot = sessionsRoot }
+    init(sessionsRoot: String) { self.sessionsRoot = sessionsRoot; table = MacOSCodexProcessTableReader(); accountID = getuid() }
+    init(sessionsRoot: String, accountID: uid_t, table: any CodexProcessTableReading) {
+        self.sessionsRoot = sessionsRoot; self.accountID = accountID; self.table = table
+    }
 
     public func scan(threadID: String) -> CodexHostScan? { scan(threadID: threadID, requireComplete: false) }
 
-    /// Restart authority uses conservative completeness, unlike transport selection.
-    /// A live entry that cannot be classified/read must not disappear from the scan.
+    /// Strict restart classification is independent of the legacy transport scan.
     public func scan(threadID: String, requireComplete: Bool) -> CodexHostScan? {
+        if requireComplete { return strictScan(threadID: threadID, accountID: accountID, table: table) }
+        return transportScan(threadID: threadID)
+    }
+
+    private func transportScan(threadID: String) -> CodexHostScan? {
         guard let thread = UUID(uuidString:threadID)?.uuidString.lowercased() else { return nil }
         let suffix = "-\(thread).jsonl"
         let capacity = proc_listallpids(nil,0)
         guard capacity > 0 else { return nil }
         var pids = [pid_t](repeating:0,count:Int(capacity)+64)
         let count = pids.withUnsafeMutableBytes { proc_listallpids($0.baseAddress,Int32($0.count)) }
-        guard count > 0, !requireComplete || count < pids.count else { return nil }
+        guard count > 0 else { return nil }
         var hosts: [CodexProcess] = [],holders: [CodexProcess] = [],unreadable = false,execClaim = false
         for pid in pids.prefix(Int(count)) where pid > 1 {
             var info = proc_bsdinfo()
             guard proc_pidinfo(pid,PROC_PIDTBSDINFO,0,&info,Int32(MemoryLayout<proc_bsdinfo>.size)) == MemoryLayout<proc_bsdinfo>.size else {
-                if requireComplete, !Self.definitelyGone(pid) { unreadable = true }
                 continue
             }
             guard info.pbi_uid == getuid() else { continue }
             guard let executable = Self.executable(pid) else {
-                if requireComplete, !Self.definitelyGone(pid) { unreadable = true }
                 continue
             }
             let codex = URL(fileURLWithPath:executable).lastPathComponent == "codex"
@@ -178,8 +190,8 @@ public struct MacOSCodexProcessObserver: CodexProcessObserving {
             if codex,CodexQueueRoute.claims(role:role,arguments:arguments ?? [],threadID:thread) { execClaim = true }
             let process = CodexProcess(pid:pid,executable:executable,role:role)
             if role == .appHost { hosts.append(process) }
-            guard let held = NativeSessionContext.codexRolloutFiles(process:pid,rootDirectory:sessionsRoot,requireComplete:requireComplete) else {
-                if (codex || requireComplete),!Self.definitelyGone(pid) { unreadable = true }
+            guard let held = NativeSessionContext.codexRolloutFiles(process:pid,rootDirectory:sessionsRoot) else {
+                if codex,!Self.definitelyGone(pid) { unreadable = true }
                 continue
             }
             if held.contains(where:{ $0.path.hasSuffix(suffix) }) { holders.append(process) }
@@ -211,17 +223,17 @@ public struct MacOSCodexProcessObserver: CodexProcessObserving {
         return String(decoding:path.prefix { $0 != 0 }.map { UInt8(bitPattern:$0) },as:UTF8.self)
     }
 
-    static func arguments(_ pid: pid_t) -> [String]? {
+    static func arguments(_ pid: pid_t, requireComplete: Bool = false) -> [String]? {
         var name: [Int32] = [CTL_KERN,KERN_PROCARGS2,pid]
         var size = 0
         guard sysctl(&name,3,nil,&size,nil,0) == 0,size > MemoryLayout<Int32>.size,size <= 4*1024*1024 else { return nil }
         var bytes = [UInt8](repeating:0,count:size)
         guard sysctl(&name,3,&bytes,&size,nil,0) == 0,size > MemoryLayout<Int32>.size else { return nil }
-        return parseArguments(Array(bytes.prefix(size)))
+        return parseArguments(Array(bytes.prefix(size)), requireComplete: requireComplete)
     }
 
     /// KERN_PROCARGS2: argc, the executable path, NUL padding, then argc strings.
-    static func parseArguments(_ bytes: [UInt8]) -> [String]? {
+    static func parseArguments(_ bytes: [UInt8], requireComplete: Bool = false) -> [String]? {
         guard bytes.count > 4 else { return nil }
         let argc = bytes.prefix(4).enumerated().reduce(0) { $0 + Int($1.element) << (8*$1.offset) }
         guard argc > 0,argc <= 4096 else { return nil }
@@ -232,7 +244,10 @@ public struct MacOSCodexProcessObserver: CodexProcessObserving {
         while index < bytes.count,result.count < argc {
             let start = index
             while index < bytes.count,bytes[index] != 0 { index += 1 }
-            result.append(String(decoding:bytes[start..<index],as:UTF8.self))
+            if requireComplete {
+                guard index < bytes.count, let argument = String(bytes: bytes[start..<index], encoding: .utf8) else { return nil }
+                result.append(argument)
+            } else { result.append(String(decoding:bytes[start..<index],as:UTF8.self)) }
             index += 1
         }
         return result.count == argc ? result : nil

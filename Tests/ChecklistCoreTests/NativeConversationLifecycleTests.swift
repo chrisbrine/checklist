@@ -622,6 +622,27 @@ extension EvidenceAuthorityTests {
             XCTAssertEqual(try router.record(db, newerAttempt["id"] as! String, type: "attempt")["state"] as? String, "active")
         }
     }
+    func testCodexRestartScanMetadataCannotBroadenResumptionAuthority() throws {
+        let p = try project()
+        for (provider, basis, count) in [("codex", NativeClosureBasis.codexAppHostRestart, -1),
+                                         ("codex", .processAndRegistry, 2), ("claude", .processAndRegistry, 2)] {
+            let worker = try native(p, "scan-metadata-\(provider)-\(basis.rawValue)", domain: "\(provider):123:5:0", provider: provider)
+            let generation = try router.dbQueue.read { try router.sessionGeneration(router.record($0, worker.sessionID!, type: "session")) }
+            let proof = VerifiedNativeClosure(projectID: p["id"] as! String, sessionID: worker.sessionID!,
+                installation: worker.installation, executionDomain: worker.executionDomain!, provider: provider,
+                authorizationGeneration: generation, processState: "gone", registryState: basis == .codexAppHostRestart ? "not_applicable" : "absent",
+                registryDigest: nil, basis: basis, replacementExecutionDomain: "\(provider):200:6:0")
+            _ = try router.reconcileVerifiedNativeClosure(proof, caller: lifecycleOwner)
+            let resume = NativeSessionResumption(projectID: p["id"] as! String, sessionID: worker.sessionID!, provider: provider,
+                oldInstallation: worker.installation, oldExecutionDomain: worker.executionDomain!,
+                newInstallation: worker.installation + "/new", newExecutionDomain: "\(provider):200:6:0")
+            assertCode("NATIVE_SESSION_MISMATCH") {
+                _ = try self.router.resumeVerifiedNativeSession(resume, caller: self.bootstrapOwner, codexRestartIncompleteNonCodex: count)
+            }
+            XCTAssertEqual(try router.dbQueue.read { try router.record($0, worker.sessionID!, type: "session") }["state"] as? String, "ended")
+        }
+    }
+
     func testCodexRestartClosureBasisCannotBroadenToOtherProvidersOrUnknownProcess() throws {
         let p = try project(), worker = try native(p, "codex-restart-basis", domain: "codex:123:5:0")
         let generation = try router.dbQueue.read { try router.sessionGeneration(router.record($0, worker.sessionID!, type: "session")) }

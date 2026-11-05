@@ -3,6 +3,7 @@ import CryptoKit
 import ChecklistProviders
 import ChecklistBridges
 import ChecklistIPC
+import GRDB
 @testable import ChecklistCore
 @testable import ChecklistService
 
@@ -15,6 +16,8 @@ final class CodexAppHostRestartTests: XCTestCase {
         var source = CodexQueueObservation(host: .nativeApp, reason: .sourceVscode, source: "vscode")
         var host = CodexProcess(pid: 24681, executable: "/Applications/Synthetic.app/Contents/MacOS/codex", role: .appHost)
         var extra: [CodexProcess] = []
+        var extraHosts: [CodexProcess] = []
+        var incompleteNonCodex = 0
         var holds = true, signed = true, unreadable = false, execClaim = false
         var scans = 0, processReads = 0
         var onScan: (() throws -> Void)?
@@ -58,8 +61,8 @@ final class CodexAppHostRestartTests: XCTestCase {
         }, source: { [evidence] _ in evidence.source }, scan: { [evidence] _ in
             evidence.scans += 1
             do { try evidence.onScan?() } catch { evidence.scanFailure = error; return nil }
-            return .init(hosts: [evidence.host], holders: (evidence.holds ? [evidence.host] : []) + evidence.extra,
-                         unreadable: evidence.unreadable, execClaim: evidence.execClaim)
+            return .init(hosts: [evidence.host] + evidence.extraHosts, holders: (evidence.holds ? [evidence.host] : []) + evidence.extra,
+                         unreadable: evidence.unreadable, execClaim: evidence.execClaim, incompleteNonCodex: evidence.incompleteNonCodex)
         }, signed: { [evidence] _ in evidence.signed }, holds: { [evidence] _ in evidence.holds })
     }
     override func tearDownWithError() throws {
@@ -261,6 +264,37 @@ final class CodexAppHostRestartTests: XCTestCase {
         XCTAssertTrue(coordinator.provesCodexAppRegistration(session: enrollment.sessionID, domain: "codex:24681:6:0"))
         evidence.source = .init(host: .exec, reason: .sourceExec, source: "exec")
         XCTAssertFalse(coordinator.provesCodexAppRegistration(session: enrollment.sessionID, domain: "codex:24681:6:0"))
+    }
+
+    func testRestartRecordsFinalIncompleteNonCodexCount() throws {
+        evidence.incompleteNonCodex = 2
+        evidence.onScan = { [evidence] in if evidence.scans == 5 { evidence.incompleteNonCodex = 7 } }
+        XCTAssertTrue(try bootstrap().changed)
+        let data = try XCTUnwrap(router.dbQueue.read { try String.fetchOne($0,
+            sql: "SELECT data FROM events WHERE kind='native_session_resumed' AND entity_id=? ORDER BY seq DESC LIMIT 1",
+            arguments: [enrollment.sessionID]) })
+        let event = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(data.utf8)) as? JSON)
+        XCTAssertEqual(event["incomplete_non_codex"] as? Int, 7, "Success records the final sample, not the pre-closure count")
+    }
+
+    func testRestartRefusesWhenIncompleteNonCodexCountChangesBetweenScans() throws {
+        evidence.incompleteNonCodex = 2
+        evidence.onScan = { [evidence] in if evidence.scans == 2 { evidence.incompleteNonCodex = 3 } }
+        refuses(contains: "incompleteNonCodex first=2, last=3")
+        XCTAssertEqual(try session()["state"] as? String, "connected")
+    }
+
+    func testRestartRefusesWhenHostSetChangesBetweenScans() throws {
+        evidence.onScan = { [evidence] in
+            if evidence.scans == 2 { evidence.extraHosts = [.init(pid: 999, executable: evidence.host.executable, role: .appHost)] }
+        }
+        refuses(contains: "holder scan or thread source changed")
+        XCTAssertEqual(try session()["state"] as? String, "connected")
+    }
+
+    func testUnreadableRefusalReportsIncompleteNonCodexCount() throws {
+        evidence.unreadable = true; evidence.incompleteNonCodex = 4
+        refuses(contains: "incompleteNonCodex=4")
     }
 
 }

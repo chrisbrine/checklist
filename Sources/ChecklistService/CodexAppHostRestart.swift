@@ -26,6 +26,11 @@ struct CodexAppHostRestartEffects: Sendable {
     }
 }
 
+struct CodexAppHostRestartEvidence {
+    let process: NativeLifecycleObservation.ProcessState
+    let incompleteNonCodex: Int
+}
+
 extension Coordinator {
     /// Registration provenance is read-only and independent of relay consent.
     /// Synthetic coordinators retain the existing injected queue proof seam.
@@ -40,7 +45,7 @@ extension Coordinator {
 
     /// The owner accepted first-bootstrap thread trust, not an exclusive registry
     /// lease. Check again after closure and inside the credential commit boundary.
-    func verifyCodexRestartHost(old: NativeLifecycleRegistration, new: NativeLifecycleRegistration) throws -> NativeLifecycleObservation.ProcessState {
+    func verifyCodexRestartHost(old: NativeLifecycleRegistration, new: NativeLifecycleRegistration) throws -> CodexAppHostRestartEvidence {
         let effects = codexAppHostRestartEffects
         let state = effects.process(old)
         guard state == .gone || state == .replaced else {
@@ -52,29 +57,33 @@ extension Coordinator {
         guard source.host == .nativeApp, source.reason == .sourceVscode, source.source == "vscode" else {
             throw ChecklistError("NATIVE_SESSION_MISMATCH", "Codex app restart requires the exact thread's source=vscode record. " + source.reason.explanation)
         }
-        func host(_ scan: CodexHostScan?) throws -> CodexProcess {
+        func host(_ scan: CodexHostScan?) throws -> (process: CodexProcess, scan: CodexHostScan) {
+            let evidence = " (incompleteNonCodex=\(scan.map { String($0.incompleteNonCodex) } ?? "unknown"))"
             guard let scan, !scan.unreadable else {
-                throw ChecklistError("NATIVE_SESSION_MISMATCH", "The Codex process/holder observation is unreadable or incomplete; another holder cannot be excluded.")
+                throw ChecklistError("NATIVE_SESSION_MISMATCH", "The Codex process/holder observation is unreadable or incomplete; another holder cannot be excluded." + evidence)
             }
             guard !scan.execActive else {
-                throw ChecklistError("NATIVE_SESSION_MISMATCH", "Another Codex process holds this conversation or names its thread or --last. Restart reconnect is refused.")
+                throw ChecklistError("NATIVE_SESSION_MISMATCH", "Another Codex process holds this conversation or names its thread or --last. Restart reconnect is refused." + evidence)
             }
             guard scan.holders.count == 1, let holder = scan.holders.first,
                   holder.pid == new.processID, holder.role == .appHost, scan.hosts.contains(holder) else {
-                throw ChecklistError("NATIVE_SESSION_MISMATCH", "The new Codex app host must positively hold this thread's rollout, with no other process holding it.")
+                throw ChecklistError("NATIVE_SESSION_MISMATCH", "The new Codex app host must positively hold this thread's rollout, with no other process holding it." + evidence)
             }
-            return holder
+            return (holder, scan)
         }
         let first = try host(effects.scan(new.sessionID))
-        guard effects.signed(first) else {
-            throw ChecklistError("NATIVE_SESSION_MISMATCH", "The new Codex app host's running signature or executable identity could not be verified; an upgrade may still be in progress.")
+        let evidence = " (incompleteNonCodex=\(first.scan.incompleteNonCodex))"
+        guard effects.signed(first.process) else {
+            throw ChecklistError("NATIVE_SESSION_MISMATCH", "The new Codex app host's running signature or executable identity could not be verified; an upgrade may still be in progress." + evidence)
         }
         guard effects.holds(new), effects.process(new) == .running else {
-            throw ChecklistError("NATIVE_SESSION_MISMATCH", "The new Codex app host's PID/start identity and positive hold on this thread could not be verified.")
+            throw ChecklistError("NATIVE_SESSION_MISMATCH", "The new Codex app host's PID/start identity and positive hold on this thread could not be verified." + evidence)
         }
-        guard try host(effects.scan(new.sessionID)) == first, effects.source(new) == source else {
-            throw ChecklistError("NATIVE_SESSION_MISMATCH", "The Codex app host or thread source changed during the restart observation.")
+        let last = try host(effects.scan(new.sessionID))
+        guard last.scan == first.scan, effects.source(new) == source else {
+            throw ChecklistError("NATIVE_SESSION_MISMATCH", "The Codex app host, holder scan or thread source changed during the restart observation."
+                + " (incompleteNonCodex first=\(first.scan.incompleteNonCodex), last=\(last.scan.incompleteNonCodex))")
         }
-        return state
+        return .init(process: state, incompleteNonCodex: last.scan.incompleteNonCodex)
     }
 }
