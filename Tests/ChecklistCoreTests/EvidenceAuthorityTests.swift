@@ -4,6 +4,7 @@ import GRDB
 @testable import ChecklistCore
 
 final class EvidenceAuthorityTests: XCTestCase {
+    override class func setUp() { super.setUp(); TestFixtureTimings.start() }
     private static let prepared = TestStore.Template(name: "EvidenceAuthorityTests") { router, workspace in
         let owner = Caller(role:"owner",installation:"evidence-owner",projectIDs:[])
         let project = try router.handle(method:"project_create",params:["command_id":uuid(),"name":"Evidence fixture","key_prefix":"E","root_path":workspace.path],caller:owner)["data"] as! JSON
@@ -110,7 +111,7 @@ final class EvidenceAuthorityTests: XCTestCase {
     func clearPreparedProject() { preparedProject = nil }
     var directory: URL!,workspace: URL!,router: CommandRouter!
     let owner = Caller(role:"owner",installation:"evidence-owner",projectIDs:[])
-    override func setUpWithError() throws {
+    override func setUpWithError() throws { try TestFixtureTimings.measure("case.setup") {
         // Keep production's no-follow storage boundary intact: macOS /var
         // temporary paths traverse an alias, so use an owned physical cache root.
         let caches: URL
@@ -130,14 +131,14 @@ final class EvidenceAuthorityTests: XCTestCase {
             project["root_path"] = workspace.resolvingSymlinksInPath().path
             return project
         }
-    }
-    override func tearDownWithError() throws { try router?.closeStore();router = nil;try? FileManager.default.removeItem(at:directory) }
+    } }
+    override func tearDownWithError() throws { try TestFixtureTimings.measure("case.teardown") { try TestFixtureTimings.measure("teardown.close") { try router?.closeStore();router = nil };try? TestFixtureTimings.measure("teardown.files") { try FileManager.default.removeItem(at:directory) } } }
     @discardableResult func call(_ method: String,_ input: JSON,_ caller: Caller? = nil,command: String? = nil) throws -> JSON {
         var p = input
         if method == "work_submit" { p = try fixtureAcceptanceEvidence(router,input:p) }
         if method == "batch_submit",let members = p["members"] as? [JSON] { p["members"] = try members.map {try fixtureAcceptanceEvidence(router,input:$0)} }
         if !CommandRouter.readMethods.contains(method) {p["command_id"] = command ?? UUID().uuidString}
-        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:caller ?? owner)["data"] as! JSON
+        return try TestFixtureTimings.measure("body.command." + method) { try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:caller ?? owner)["data"] as! JSON }
     }
     func project() throws -> JSON {
         if var preparedProject {

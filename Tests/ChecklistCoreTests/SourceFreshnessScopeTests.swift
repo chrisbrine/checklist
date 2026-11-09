@@ -26,7 +26,7 @@ final class SubmissionEvidenceFixture {
         var p = method == "review_context" ? input.filter {["task_id","review_request_id","target_manifest_id","gate","evidence_refs"].contains($0.key)} : input
         p["project_id"] = project["id"]
         if !CommandRouter.readMethods.contains(method) { p["command_id"] = UUID().uuidString }
-        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:caller ?? storage.owner)["data"] as! JSON
+        return try TestFixtureTimings.measure("body.command." + method) { try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:caller ?? storage.owner)["data"] as! JSON }
     }
     func record(_ id: Any,_ type: String) throws -> JSON { try router.dbQueue.read { try router.record($0,id as! String,type:type) } }
     func worker(_ label: String) throws -> Caller {
@@ -57,6 +57,7 @@ final class SubmissionEvidenceFixture {
 }
 
 final class SourceFreshnessScopeTests: XCTestCase {
+    override class func setUp() { super.setUp(); TestFixtureTimings.start() }
     // Only commands preceding the behavior under test are prepared. Sessions,
     // claims, scope adjustment, captures and freshness checks stay live on each
     // private workspace, including its real parent symlink.
@@ -64,7 +65,7 @@ final class SourceFreshnessScopeTests: XCTestCase {
         let owner = Caller(role:"owner",installation:"read-performance",projectIDs:[])
         func call(_ method:String,_ input:JSON) throws -> JSON {
             var value = input;value["command_id"] = UUID().uuidString
-            return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:value),caller:owner)["data"] as! JSON
+            return try TestFixtureTimings.measure("body.command." + method) { try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:value),caller:owner)["data"] as! JSON }
         }
         let project = try call("project_create",["name":"Synthetic submission evidence","key_prefix":"SE","root_path":workspace.path])
         for _ in 0..<2 {

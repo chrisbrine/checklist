@@ -61,6 +61,7 @@ public enum TestStore {
                               automaticBackupRetentionTrashRoot: URL? = nil,
                               durable: Bool = ProcessInfo.processInfo.environment["CHECKLIST_QUALIFICATION"] == "1",
                               template: Template? = nil, workspace: URL? = nil,
+                              trackEpicReferences: Bool = false,
                               sourceGitMemo: Bool = ProcessInfo.processInfo.environment["CHECKLIST_QUALIFICATION"] != "1") throws -> CommandRouter {
         SourceGitFixtureMemo.configure(enabled: sourceGitMemo)
         let anchored = root.resolvingSymlinksInPath()
@@ -70,8 +71,15 @@ public enum TestStore {
             try StoreDirectory(root: anchored).requireFreshScaffoldingOnly()
             try TestFixtureTimings.measure("store.seed") { try seed(anchored, template: template, workspace: workspace) }
         }
-        let router = try TestFixtureTimings.measure("store.open") { try CommandRouter(root: root, serviceLease: serviceLease, cliCommand: cliCommand, providerPlugins: providerPlugins, automaticBackupRetentionTrashRoot: automaticBackupRetentionTrashRoot) }
+        let router = try TestFixtureTimings.measure("store.open") { try TestFixtureTimings.startup { try CommandRouter(root: root, serviceLease: serviceLease, cliCommand: cliCommand, providerPlugins: providerPlugins, automaticBackupRetentionTrashRoot: automaticBackupRetentionTrashRoot, fixtureTrackEpicReferences: durable || trackEpicReferences || ProcessInfo.processInfo.environment["CHECKLIST_QUALIFICATION"] == "1") } }
         if !durable {
+            ValidationCatalogFixture.configure(router)
+            router.fixtureStoreRows = { db, sql, arguments in
+                try Row.fetchAll(db.cachedStatement(sql: sql), arguments: arguments)
+            }
+            router.fixtureStoreStatement = { db, sql, arguments in
+                try db.cachedStatement(sql: sql).execute(arguments: arguments)
+            }
             // Disposable unit fixtures need transaction/reopen semantics, not a
             // power-loss durability barrier on every command. Qualification and
             // direct CommandRouter storage/crash fixtures retain production FULL.
@@ -168,7 +176,7 @@ public enum TestStore {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let database = root.appendingPathComponent("checklist.sqlite")
         let original = source.appendingPathComponent("checklist.sqlite")
-        try clone(original, to: database)
+        try TestFixtureTimings.measure("seed.database-copy") { try clone(original, to: database) }
         let identity = StoreIdentityReceipt(format_version: 1, logical_store_id: UUID().uuidString.lowercased(),
                                           incarnation: UUID().uuidString.lowercased(), database_generation: 1,
                                           schema_revision: SchemaMigrations.currentSchema, state: "ready")
@@ -179,9 +187,9 @@ public enum TestStore {
             // reopens with production FULL; only unit fixtures then select NORMAL.
             try $0.execute(sql: "PRAGMA synchronous=OFF")
         }
-        let queue = try DatabaseQueue(path: database.path, configuration: configuration)
+        let queue = try TestFixtureTimings.measure("seed.sqlite-open") { try DatabaseQueue(path: database.path, configuration: configuration) }
         do {
-            try queue.write { db in
+            try TestFixtureTimings.measure("seed.identity-and-relocation") { try queue.write { db in
                 if template != nil, let workspace {
                     let oldWorkspace = try String.fetchOne(db, sql: "SELECT value FROM metadata WHERE key=?", arguments: [workspaceKey]) ?? ""
                     let oldIncarnation = try String.fetchOne(db, sql: "SELECT value FROM metadata WHERE key='incarnation'")
@@ -209,10 +217,11 @@ public enum TestStore {
                 // avoiding a durable metadata write on the production reopen.
                 _ = try SealedCursor.storeKey(db)
             }
-            try queue.close()
+            }
+            try TestFixtureTimings.measure("seed.sqlite-close") { try queue.close() }
         } catch { try? queue.close(); throw error }
         let receipt = root.appendingPathComponent(StoreIdentityReceipt.fileName)
-        try identity.encoded().write(to: receipt, options: .atomic)
+        try TestFixtureTimings.measure("seed.receipt-file") { try identity.encoded().write(to: receipt, options: .atomic) }
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: receipt.path)
     }
 }

@@ -1,20 +1,70 @@
+import ChecklistTestSupport
 import XCTest
 import GRDB
 @testable import ChecklistCore
 @testable import ChecklistBridges
 
 final class HumanAnswerNoticeTests: XCTestCase {
+    override class func setUp() { super.setUp(); TestFixtureTimings.start() }
+    private static let fixtureKey = "test-human-answer-notice-fixture"
+    private static let prepared = TestStore.Template(name:"HumanAnswerNoticeTests.claimed-handler") { router,workspace in
+        let fixture = HumanAnswerNoticeTests()
+        fixture.root = workspace.deletingLastPathComponent();fixture.router = router
+        let value = try fixture.makeFixture()
+        try router.dbQueue.write { db in
+            try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:[HumanAnswerNoticeTests.fixtureKey,try jsonString([
+                "project":value.project,"task":value.task,"requester":value.requester.sessionID!,
+                "handler":value.handler.sessionID!,"other":value.other.sessionID!
+            ])])
+        }
+    }
     var root: URL!
     var router: CommandRouter!
     let owner = Caller(role:"owner",installation:"notice-owner",projectIDs:[])
-    override func setUpWithError() throws {root = FileManager.default.temporaryDirectory.appendingPathComponent(uuid());try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true);router = try CommandRouter(root:root.appendingPathComponent("store"))}
-    override func tearDownWithError() throws {router = nil;try? FileManager.default.removeItem(at:root)}
+    // Every case enters through fixture(), which selects the prepared default
+    // or real custom-key construction before opening its one private router.
+    override func setUpWithError() throws { try TestFixtureTimings.measure("case.setup") {root = FileManager.default.temporaryDirectory.appendingPathComponent(uuid());try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)} }
+    override func tearDownWithError() throws { try TestFixtureTimings.measure("case.teardown") {TestFixtureTimings.measure("teardown.close") { router = nil };try? TestFixtureTimings.measure("teardown.files") { try FileManager.default.removeItem(at:root) }} }
     func envelope(_ method: String,_ params: JSON = [:],_ caller: Caller? = nil, command: String? = nil) throws -> JSON {
         var input = params;if !CommandRouter.readMethods.contains(method) {input["command_id"] = command ?? uuid()}
-        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:input),caller:caller ?? owner)
+        return try TestFixtureTimings.measure("body.command." + method) { try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:input),caller:caller ?? owner) }
     }
     @discardableResult func call(_ method: String,_ params: JSON = [:],_ caller: Caller? = nil, command: String? = nil) throws -> JSON {try envelope(method,params,caller,command:command)["data"] as! JSON}
     func fixture(key: String? = nil) throws -> (project:JSON,task:JSON,requester:Caller,handler:Caller,other:Caller) {
+        if router != nil { return try makeFixture(key:key) }
+        if let key {
+            // The custom key remains an actual task_create input, including its
+            // path/newline bytes. It is not a patched copy of the default task.
+            router = try TestFixtureTimings.measure("fixture.open") { try TestStore.router(root:root.appendingPathComponent("store")) }
+            return try makeFixture(key:key)
+        }
+        let workspace = root.appendingPathComponent("workspace")
+        router = try TestFixtureTimings.measure("fixture.open") {
+            try TestStore.router(root:root.appendingPathComponent("store"),template:Self.prepared,workspace:workspace)
+        }
+        return try TestFixtureTimings.measure("fixture.rebind") { try router.dbQueue.write { db in
+            let value = jsonObject(try XCTUnwrap(String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[Self.fixtureKey])))
+            func worker(_ name: String) throws -> Caller {
+                let id = try XCTUnwrap(value[name] as? String)
+                var session = try router.record(db,id,type:"session")
+                session["workspace"] = workspace.path
+                try router.save(db,session,type:"session")
+                // Reconstruct the connection only. Every notice, hook and role
+                // check still reads current authority through the real router.
+                return Caller(role:session["role"] as! String,installation:session["installation"] as! String,
+                              projectIDs:strings(session,"project_ids"),sessionID:id,workspace:workspace.path)
+            }
+            let requester = try worker("requester"),handler = try worker("handler"),other = try worker("other")
+            for var attempt in try router.records(db,type:"attempt") {
+                attempt["incarnation"] = router.incarnation
+                try router.save(db,attempt,type:"attempt")
+            }
+            var project = value["project"] as! JSON
+            project["root_path"] = workspace.resolvingSymlinksInPath().path
+            return (project,value["task"] as! JSON,requester,handler,other)
+        } }
+    }
+    private func makeFixture(key: String? = nil) throws -> (project:JSON,task:JSON,requester:Caller,handler:Caller,other:Caller) {
         let workspace = root.appendingPathComponent("workspace");try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
         let project = try call("project_create",["name":"Notices","key_prefix":"NT","root_path":workspace.path])
         var taskInput: JSON = ["project_id":project["id"]!,"title":"Answer delivery","brief":"Continue only from the actual owner response"]

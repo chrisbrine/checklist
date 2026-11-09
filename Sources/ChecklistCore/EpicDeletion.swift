@@ -3,6 +3,9 @@ import GRDB
 
 extension CommandRouter {
     func epicDelete(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
+        guard !fixtureOmitsEpicReferenceIndex else {
+            throw CoreError("FIXTURE_EPIC_INDEX_DISABLED", "This unit fixture omits the Epic deletion proof. Use TestStore.router(trackEpicReferences: true) to test deletion.")
+        }
         try worker(c)
         let pid = try scope(db,p,c,write:true)
         try requireAgentEditAuthority(db,project:record(db,pid,type:"project"),caller:c)

@@ -303,7 +303,11 @@ extension CommandRouter {
         if method == "message_send" { _ = try explicitMessageRecipient(p); _ = try ticketAudience(p) }
         if c.isOwner { return }
         if method == "tool_catalog" { guard p.isEmpty else { throw CoreError("INVALID_INPUT","tool_catalog takes no arguments.") }; return }
-        guard let tool = toolCatalog(c,includingHookOnly:CommandMethods.codexHookOnly.contains(method)).first(where: {$0["name"] as? String == method}),let schema = tool["inputSchema"] as? JSON,let properties = schema["properties"] as? JSON else { throw CoreError("FORBIDDEN","This command is not available to this connection role.") }
+        let includingHookOnly = CommandMethods.codexHookOnly.contains(method)
+        // Disposable worker fixtures may share these immutable schemas. The
+        // production default and grant-dependent assistant catalogs stay real.
+        let catalog = c.role == "worker" ? fixtureValidationCatalog?(c,includingHookOnly) ?? toolCatalog(c,includingHookOnly:includingHookOnly) : toolCatalog(c,includingHookOnly:includingHookOnly)
+        guard let tool = catalog.first(where: {$0["name"] as? String == method}),let schema = tool["inputSchema"] as? JSON,let properties = schema["properties"] as? JSON else { throw CoreError("FORBIDDEN","This command is not available to this connection role.") }
         guard Set(p.keys).isSubset(of:Set(properties.keys)) else { throw CoreError("INVALID_INPUT","Unknown fields are not accepted by this command.") }
         for key in strings(schema,"required") where !(method == "task_create" && key == "epic_id") { guard p[key] != nil else { throw CoreError("INVALID_INPUT","\(key) is required.") } }
         for (key,value) in p {

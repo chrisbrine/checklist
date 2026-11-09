@@ -4,11 +4,12 @@ import GRDB
 @testable import ChecklistCore
 
 final class TicketLifecycleCleanupTests: XCTestCase {
+    override class func setUp() { super.setUp(); TestFixtureTimings.start() }
     private static let prepared = TestStore.Template(name: "TicketLifecycleCleanupTests") { router, workspace in
         let owner = Caller(role:"owner",installation:"lifecycle-fixture",projectIDs:[])
         func call(_ method: String,_ input: JSON) throws -> JSON {
             var input = input; input["command_id"] = uuid()
-            return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:input),caller:owner)["data"] as! JSON
+            return try TestFixtureTimings.measure("body.command." + method) { try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:input),caller:owner)["data"] as! JSON }
         }
         let project = try call("project_create",["name":"Synthetic lifecycle","key_prefix":"LC","root_path":workspace.path])
         let task = try call("task_create",["project_id":project["id"]!,"title":"Synthetic closed work"])
@@ -22,10 +23,10 @@ final class TicketLifecycleCleanupTests: XCTestCase {
     var router: CommandRouter!
     let owner = Caller(role:"owner",installation:"lifecycle-fixture",projectIDs:[])
     let defaults: JSON = ["done_evidence_enabled":true,"closed_purge_enabled":true,"closed_days":15]
-    override func setUpWithError() throws {
+    override func setUpWithError() throws { try TestFixtureTimings.measure("case.setup") {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("checklist-lifecycle-" + uuid())
         try openPreparedFixture()
-    }
+    } }
     private func openPreparedFixture() throws {
         let suffix = uuid(),workspace = directory.appendingPathComponent("workspace-prepared-" + suffix)
         router = try TestStore.router(root:directory.appendingPathComponent("store-" + suffix),template:Self.prepared,workspace:workspace)
@@ -37,10 +38,10 @@ final class TicketLifecycleCleanupTests: XCTestCase {
             return (project,task,router.ownerManagedPathProjection(attachment,caller:owner))
         }
     }
-    override func tearDownWithError() throws {try router?.closeStore();router = nil;try? FileManager.default.removeItem(at:directory)}
+    override func tearDownWithError() throws { try TestFixtureTimings.measure("case.teardown") {try TestFixtureTimings.measure("teardown.close") { try router?.closeStore();router = nil };try? TestFixtureTimings.measure("teardown.files") { try FileManager.default.removeItem(at:directory) }} }
     func call(_ method: String,_ p: JSON) throws -> JSON {
         var p = p;if !CommandRouter.readMethods.contains(method) {p["command_id"] = uuid()}
-        return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:owner)["data"] as! JSON
+        return try TestFixtureTimings.measure("body.command." + method) { try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:p),caller:owner)["data"] as! JSON }
     }
     /// A concurrent command that a fixture runs while a cleanup preparation snapshot is open. The
     /// command's post-commit notices use the reader pool, so it runs on its own dispatch context

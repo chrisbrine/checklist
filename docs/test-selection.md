@@ -430,7 +430,20 @@ rebound. Refusals, a workspace overlapping a protected root and a tree it cannot
 fixtures, `sourceGitMemo: false` and `CHECKLIST_QUALIFICATION=1` keep real Git. `TestStoreTests` checks this separation against a
 fresh production Router. The setup benchmark measures the actual unit helper
 with `durable: false` against fresh production setup. Reopening
-an existing fixture preserves its data. Fresh storage, migration, crash and
+an existing fixture preserves its data. Disposable unit routers also prepare
+worker validation catalogs once per test image and reuse GRDB statements on each
+connection for canonical record lookups and writes. These fixture seams reuse
+only schema metadata and compiled SQL. Every request still executes validation,
+current authority checks, the original SQL, triggers and transactions. Public
+`tool_catalog` replies and assistant validation use the real catalog. Production
+and durable routers leave these seams unset; the fixture tests check defaults,
+validation parity, changed bindings, trigger failures, rollback and reopen.
+Disposable fixtures omit the TEMP reference index used only by `epic_delete`.
+Core deletion cases explicitly request `trackEpicReferences: true`, including
+reopens. Production, durable fixtures and qualification always install it.
+Deletion on an omitted-index fixture fails with `FIXTURE_EPIC_INDEX_DISABLED`;
+it cannot return a simulated pass. Other canonical domain validators stay real.
+Fresh storage, migration, crash and
 failure qualifiers keep their original bootstrap path. `TestStoreTests` checks
 isolation, concurrent copies, reopen preservation and paired setup medians.
 
@@ -450,7 +463,13 @@ authority before reuse. The retention-answer ordering test supplies persisted
 answer times around the real owner settings command instead of sleeping for a
 clock tick (CL-363). `CHECKLIST_TEST_PROFILE=1` emits per-case
 `CHECKLIST_FIXTURE_TIMING` JSON for `store.seed`, `store.open`, `git.key`,
-`git.real` and cold `template.open/prepare/close` components. Set
+`git.real` and cold `template.open/prepare/close` components. The five largest
+Core classes also report case setup, handler calls, store close and filesystem
+cleanup. Startup attribution separates schema preflight, writer opening,
+directory work, recovery and construction. Seed attribution separates the
+database copy, identity relocation and receipt publication. Human-answer notices
+select their private claimed-handler template before opening a router; custom
+keys still run through actual creation. Set
 `CHECKLIST_TEST_PROFILE_DIRECTORY` to retain per-process JSONL without mixing
 with XCTest output. These nested components are already included in XCTest method times.
 This profiling is test-support code and is off by default.

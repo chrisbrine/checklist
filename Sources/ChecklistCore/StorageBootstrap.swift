@@ -7,6 +7,13 @@ import Darwin
 enum StorageBootstrap {
     /// Internal owned-copy qualification only; production installs no callback.
     nonisolated(unsafe) static var qualificationObserve: ((String,TimeInterval) -> Void)?
+    /// Opt-in component attribution; the default executes the original operation.
+    private static func measured<T>(_ phase: String, _ body: () throws -> T) rethrows -> T {
+        guard let observe = qualificationObserve else { return try body() }
+        let start = ProcessInfo.processInfo.systemUptime
+        defer { observe(phase, ProcessInfo.processInfo.systemUptime - start) }
+        return try body()
+    }
     enum Boundary { case upgradeBeforeCommit, upgradeCommitted }
     struct Opened { let queue: DatabaseQueue; let incarnation: String; var completedProtectedBackupOperation: String? = nil }
     static func writableURI(_ database: URL) throws -> String {
@@ -17,7 +24,7 @@ enum StorageBootstrap {
     static func open(root: URL, serviceLease: StorageServiceLease? = nil, prepareDatabase: @escaping @Sendable (Database)throws->Void = { _ in }, observe: (Boundary)->Void = { _ in }) throws -> Opened {
         let root = StoreDirectory.anchoredRoot(root)
         defer {StorageUpgradeProgress.clear(root:root)}
-        let directory = try StoreDirectory(root:root)
+        let directory = try measured("filesystem.directory") { try StoreDirectory(root:root) }
         if let serviceLease { try serviceLease.requireRoot(root) }
         return try ArchiveStorageGate.withExclusive(root:root) { permit in
             let database = root.appendingPathComponent("checklist.sqlite")
@@ -30,7 +37,7 @@ enum StorageBootstrap {
                 if let external,external.schema_revision < SchemaMigrations.currentSchema {
                     StorageUpgradeProgress.update(root:root,stage:"preparation_validation",seconds:90)
                 }
-                switch try readOnlyPreflight(database) {
+                switch try measured("schema.preflight", { try readOnlyPreflight(database) }) {
                 case .legacy(let incarnation):
                     guard serviceLease != nil else { throw StoreRecovery.required("upgrade_requires_exclusive_service") }
                     if let external {
@@ -60,7 +67,7 @@ enum StorageBootstrap {
                 try db.execute(sql:"PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000")
             }
             let queue: DatabaseQueue
-            do { queue = try DatabaseQueue(path:writableURI(database),configuration:configuration) }
+            do { queue = try measured("sqlite.writer-open") { try DatabaseQueue(path:writableURI(database),configuration:configuration) } }
             catch { throw StoreRecovery.required("writable_database_unavailable") }
             do {
                 var protectedOperation: String?
@@ -71,7 +78,7 @@ enum StorageBootstrap {
                 try queue.writeWithoutTransaction { db in
                     guard try String.fetchOne(db,sql:"PRAGMA journal_mode=WAL")?.lowercased() == "wal" else { throw StoreRecovery.required("wal_configuration_failed") }
                 }
-                try directory.ensureObjectsDirectory()
+                try measured("filesystem.objects") { try directory.ensureObjectsDirectory() }
                 if version < SchemaMigrations.currentSchema {
                     let protected: JSON
                     if fresh {
@@ -103,11 +110,11 @@ enum StorageBootstrap {
                     }
                     observe(.upgradeCommitted)
                 }
-                try StorageBackupReceiptMigration.finishCompaction(queue)
+                try measured("schema.compaction") { try StorageBackupReceiptMigration.finishCompaction(queue) }
                 // Derived membership data is warmed before any maintenance turn.
                 // Missing historical backup bytes refuse accounting/cleanup, not
                 // access to the restored store's unrelated tickets.
-                do {try queue.read {try StorageBackupManifestIndex.warm($0,root:root)}}
+                do {try measured("schema.backup-index") { try queue.read {try StorageBackupManifestIndex.warm($0,root:root)} }}
                 catch {fputs("Backup membership indexes unavailable; cleanup will retain bytes.\n",stderr)}
                 let ready = identity.withSchema(SchemaMigrations.currentSchema).withState("ready")
                 // A crash after SQL COMMIT finishes pending compaction/publication.
@@ -117,7 +124,7 @@ enum StorageBootstrap {
                 }
                 // Group labels are an independent additive backfill. Protocol 3
                 // still fences earlier binaries from the managed-path representation.
-                try queue.write { try GroupKeys.backfill($0) }
+                try measured("schema.backfill") { try queue.write { try GroupKeys.backfill($0) } }
                 return Opened(queue:queue,incarnation:identity.incarnation,completedProtectedBackupOperation:protectedOperation)
             } catch let error as CoreError { try? queue.close();throw error }
             catch { try? queue.close();throw StoreRecovery.required("compatible_bootstrap_transaction_failed") }

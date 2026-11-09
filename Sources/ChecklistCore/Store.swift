@@ -12,8 +12,14 @@ import CryptoKit
 /// Command lifecycle callbacks belong to the service coordinator, not this object.
 public final class CommandRouter: @unchecked Sendable {
     let epicReferenceIndex = EpicReferenceIndex()
+    let fixtureOmitsEpicReferenceIndex: Bool
     let readSnapshotCache = ReadSnapshotCache()
     let nativeReplyListenerHolder = NativeReplyListenerStatusHolder()
+    /// Component fixtures may prepare immutable validation metadata and SQL.
+    /// Nil keeps the production catalog and statement execution paths.
+    var fixtureValidationCatalog: ((Caller, Bool) -> [JSON])?
+    var fixtureStoreStatement: ((Database, String, StatementArguments) throws -> Void)?
+    var fixtureStoreRows: ((Database, String, StatementArguments) throws -> [Row])?
     let dbQueue: any TransactionStorage
     /// Read-only connections for pure reads (CL-72). Nil when the store cannot open them;
     /// reads then use the writer path.
@@ -92,7 +98,15 @@ public final class CommandRouter: @unchecked Sendable {
     var exportPublications: [ExportPublication] = []
     /// Internal phase observer for explicit owned-copy memory qualification.
     nonisolated(unsafe) static var qualificationStartupObserve: ((String) -> Void)?
-    public init(root: URL, serviceLease: StorageServiceLease? = nil, cliCommand: String = "/Applications/Checklist.app/Contents/MacOS/checklist", providerPlugins: ProviderPluginRegistry = .bundled, automaticBackupRetentionTrashRoot: URL? = nil) throws {
+    public convenience init(root: URL, serviceLease: StorageServiceLease? = nil, cliCommand: String = "/Applications/Checklist.app/Contents/MacOS/checklist", providerPlugins: ProviderPluginRegistry = .bundled, automaticBackupRetentionTrashRoot: URL? = nil) throws {
+        try self.init(root:root,serviceLease:serviceLease,cliCommand:cliCommand,providerPlugins:providerPlugins,
+                      automaticBackupRetentionTrashRoot:automaticBackupRetentionTrashRoot,fixtureTrackEpicReferences:true)
+    }
+    /// Disposable component fixtures may omit the derived deletion proof only.
+    /// Production, storage, durability and deletion tests keep the public default.
+    init(root: URL, serviceLease: StorageServiceLease?, cliCommand: String, providerPlugins: ProviderPluginRegistry,
+         automaticBackupRetentionTrashRoot: URL?, fixtureTrackEpicReferences: Bool) throws {
+        self.fixtureOmitsEpicReferenceIndex = !fixtureTrackEpicReferences
         let root = StoreDirectory.anchoredRoot(root)
         self.root = root
         self.serviceLease = serviceLease
@@ -152,7 +166,7 @@ public final class CommandRouter: @unchecked Sendable {
             storageMaintenanceFallbackFailures = 2
             storageMaintenanceRetryAt = Date().addingTimeInterval(60)
         }
-        try dbQueue.writeWithoutTransaction { try epicReferenceIndex.install($0) }
+        if fixtureTrackEpicReferences { try dbQueue.writeWithoutTransaction { try epicReferenceIndex.install($0) } }
         try backupWrites.restore(root:root,incarnation:incarnation,admission:storageAdmission)
         backupWrites.resume(router:self)
         // The bootstrap gate and any protected capture are released before
@@ -172,7 +186,7 @@ public final class CommandRouter: @unchecked Sendable {
     func record(_ db: Database, _ id: String, type: String? = nil) throws -> JSON {
         let query = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE id = CAST(? AS TEXT)" + (type == nil ? "" : " AND type = CAST(? AS TEXT)")
         let arguments = type.map { StatementArguments([Data(id.utf8), Data($0.utf8)]) } ?? StatementArguments([Data(id.utf8)])
-        let values = try readSnapshotCache.records(db,key:["record",id,type]) {try Row.fetchAll(db,sql:query,arguments:arguments)}
+        let values = try readSnapshotCache.records(db,key:["record",id,type]) {try self.fetchStoreRows(db,sql:query,arguments:arguments)}
         guard let value = values.first else { throw CoreError("NOT_FOUND", "This record is not available.") }
         return value
     }
@@ -190,7 +204,7 @@ public final class CommandRouter: @unchecked Sendable {
             else { query += " AND project_id = CAST(? AS TEXT)"; arguments.append(Data(project.utf8)) }
         }
         return try readSnapshotCache.records(db,key:["records",type,project]) {
-            try Row.fetchAll(db,sql:query + " ORDER BY rowid",arguments:StatementArguments(arguments))
+            try self.fetchStoreRows(db,sql:query + " ORDER BY rowid",arguments:StatementArguments(arguments))
         }
     }
     /// A pure read runs on a read-only connection; a write there asks for the writer path.
@@ -214,7 +228,7 @@ public final class CommandRouter: @unchecked Sendable {
                 try db.execute(sql:"UPDATE records SET project_id=CAST(? AS TEXT),type=CAST(? AS TEXT),revision=?,data=CAST(? AS TEXT) WHERE id=CAST(? AS TEXT)",arguments:[envelope.projectID.map { Data($0.utf8) },Data(envelope.type.utf8),envelope.revision,Data(raw.utf8),Data(envelope.id.utf8)])
             }
         } else {
-            try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),?,CAST(? AS TEXT)) ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,type=excluded.type,revision=excluded.revision,data=excluded.data",arguments:[Data(envelope.id.utf8),envelope.projectID.map { Data($0.utf8) },Data(envelope.type.utf8),envelope.revision,Data(raw.utf8)])
+            try executeStoreStatement(db,sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),?,CAST(? AS TEXT)) ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,type=excluded.type,revision=excluded.revision,data=excluded.data",arguments:[Data(envelope.id.utf8),envelope.projectID.map { Data($0.utf8) },Data(envelope.type.utf8),envelope.revision,Data(raw.utf8)])
         }
         invalidateTaskRecordSelection(db,type:type)
         if let previousType = previous?["type"] as String?,previousType != type {invalidateTaskRecordSelection(db,type:previousType)}
@@ -232,6 +246,16 @@ public final class CommandRouter: @unchecked Sendable {
             try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-next:" + pid,String(min(previous,clock.timeIntervalSince1970))])
         }
     }
+    func fetchStoreRows(_ db: Database, sql: String, arguments: StatementArguments) throws -> [Row] {
+        if let fixtureStoreRows { return try fixtureStoreRows(db, sql, arguments) }
+        return try Row.fetchAll(db, sql: sql, arguments: arguments)
+    }
+    /// The fixture seam changes preparation only. SQLite still executes the exact
+    /// statement, arguments and triggers inside the original transaction.
+    func executeStoreStatement(_ db: Database, sql: String, arguments: StatementArguments) throws {
+        if let fixtureStoreStatement { try fixtureStoreStatement(db, sql, arguments) }
+        else { try db.execute(sql: sql, arguments: arguments) }
+    }
     func event(_ db: Database, caller: Caller, project: String?, entity: String?, kind: String, data: JSON = [:]) throws {
         try requireWriter(db)
         var data = data
@@ -246,7 +270,7 @@ public final class CommandRouter: @unchecked Sendable {
         for field in ["triage_id","epic_id","from_epic_id","to_epic_id"] {
             if let id = data[field] as? String,let group = try? record(db,id,type:"group") { data[String(field.dropLast(3)) + "_key"] = group["key"] ?? "";data[String(field.dropLast(3)) + "_name"] = group["name"] ?? "" }
         }
-        try db.execute(sql:"INSERT INTO events(id,project_id,entity_id,actor,kind,occurred_at,data) VALUES (CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),?, ?,CAST(? AS TEXT))",arguments:[Data(uuid().utf8),project.map {Data($0.utf8)},entity.map {Data($0.utf8)},Data(caller.principal.utf8),kind,now(),Data((try jsonString(data)).utf8)])
+        try executeStoreStatement(db,sql:"INSERT INTO events(id,project_id,entity_id,actor,kind,occurred_at,data) VALUES (CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),?, ?,CAST(? AS TEXT))",arguments:[Data(uuid().utf8),project.map {Data($0.utf8)},entity.map {Data($0.utf8)},Data(caller.principal.utf8),kind,now(),Data((try jsonString(data)).utf8)])
     }
     func revised(_ record: JSON) -> JSON { var r = record; r["revision"] = int(r,"revision") + 1; r["updated_at"] = now(); return r }
     func revision(_ p: JSON, _ r: JSON) throws {
@@ -282,7 +306,7 @@ public final class CommandRouter: @unchecked Sendable {
         var arguments: [DatabaseValueConvertible] = [Data(id.utf8),Data(type.utf8)]
         if type == "session" { query += Self.sessionProjectCandidate; arguments += [Data(project.utf8),Data(project.utf8)] }
         else { query += "project_id = CAST(? AS TEXT)"; arguments.append(Data(project.utf8)) }
-        let values = try readSnapshotCache.records(db,key:["scoped",id,project,type]) {try Row.fetchAll(db,sql:query,arguments:StatementArguments(arguments))}
+        let values = try readSnapshotCache.records(db,key:["scoped",id,project,type]) {try self.fetchStoreRows(db,sql:query,arguments:StatementArguments(arguments))}
         guard let value = values.first else { throw CoreError("NOT_FOUND", "This record is not available in this project.") }
         return value
     }
@@ -290,7 +314,7 @@ public final class CommandRouter: @unchecked Sendable {
         if let id = p["task_id"] as? String ?? p["id"] as? String { return try scoped(db,id,pid,type:"task") }
         if let key = p["key"] as? String {
             let matches = try readSnapshotCache.records(db,key:["task-key",pid,key]) {
-                try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='task' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.key')=CAST(? AS TEXT) COLLATE BINARY ORDER BY rowid LIMIT 2",arguments:[Data(pid.utf8),Data(key.utf8)])
+                try self.fetchStoreRows(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='task' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.key')=CAST(? AS TEXT) COLLATE BINARY ORDER BY rowid LIMIT 2",arguments:[Data(pid.utf8),Data(key.utf8)])
             }
             guard matches.count <= 1 else {throw CoreError("AMBIGUOUS_TASK","More than one ticket uses this display key. Select its stable internal ID.")}
             if let match = matches.first {return match}
@@ -549,7 +573,7 @@ public final class CommandRouter: @unchecked Sendable {
                     output["command_id"] = command
                     var durable = output
                     if var d = durable["data"] as? JSON { d.removeValue(forKey:"claim_token"); durable["data"] = self.redactBatchClaims(d) }
-                    try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[caller.principal,command,digest,try jsonString(durable)])
+                    try self.executeStoreStatement(db,sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[caller.principal,command,digest,try jsonString(durable)])
                 }
                 return .commit
             } } catch {

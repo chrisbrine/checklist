@@ -204,7 +204,7 @@ extension CoreTests {
                 }
             }
             try router.closeStore()
-            router = try TestStore.router(root:directory)
+            router = try TestStore.router(root:directory,trackEpicReferences:true)
             let before = try deletionFingerprint()
             // Clear pending without a request-path scan: exercise the very same
             // finite page worker directly, bounded by this tiny fixture's rows.
@@ -232,7 +232,7 @@ extension CoreTests {
     func testEpicDeletePendingAndUnavailableIndexRefuseWithoutDurableChanges() throws {
         let p = try project(),pid = p["id"] as! String
         let epic = try call("epic_create",["project_id":pid,"name":"Pending"]),gid = epic["id"] as! String
-        try router.closeStore();router = try TestStore.router(root:directory)
+        try router.closeStore();router = try TestStore.router(root:directory,trackEpicReferences:true)
         let before = try deletionFingerprint()
         do {_ = try call("epic_delete",["project_id":pid,"epic_id":gid,"expected_revision":1]);XCTFail("Legacy proof must refuse while pending")}
         catch let error as CoreError {XCTAssertEqual(error.code,"EPIC_HISTORY_UNPROVEN");XCTAssertEqual(error.details["reason"] as? String,"reference_index_pending")}
@@ -315,7 +315,7 @@ extension CoreTests {
             try db.execute(sql:"INSERT INTO records(rowid,id,project_id,type,revision,data) VALUES (-1,'large-proof-record',?,'message',1,?)",arguments:[pid,payload])
             try db.execute(sql:"INSERT INTO events(id,project_id,entity_id,actor,kind,occurred_at,data) VALUES ('large-proof-event',?,?,'fixture','padding','2026-10-22',?)",arguments:[pid,pid,payload])
         }
-        try router.closeStore();router = try TestStore.router(root:directory)
+        try router.closeStore();router = try TestStore.router(root:directory,trackEpicReferences:true)
         let before = try deletionFingerprint(),start = ProcessInfo.processInfo.systemUptime
         // The first legacy row is large-proof-record (rowid -1). A zero
         // slice budget simulates a host descheduled past its deadline, even for
@@ -353,7 +353,7 @@ extension CoreTests {
         try router.dbQueue.write { db in
             try db.execute(sql:"INSERT INTO records(rowid,id,project_id,type,revision,data) VALUES (-1,'slice-source',?,'message',1,?)",arguments:[pid,try jsonString(["links":[gid,"stale-target"]])])
         }
-        try router.closeStore();router = try TestStore.router(root:directory)
+        try router.closeStore();router = try TestStore.router(root:directory,trackEpicReferences:true)
         XCTAssertTrue(try router.epicReferenceIndex.buildPage(router,seconds:0))
         // Same revision, and repeated replacement/deletion, must still fence a
         // parsed source. A revision-only comparison would resurrect stale links.

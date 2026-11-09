@@ -7,12 +7,13 @@ import UniformTypeIdentifiers
 @testable import ChecklistCore
 
 final class CoreTests: XCTestCase {
+    override class func setUp() { super.setUp(); TestFixtureTimings.start() }
     var directory: URL!
     var router: CommandRouter!
     let owner = Caller(role:"owner",installation:"test-owner",projectIDs:[])
     /// CL-125: batch fixtures that keep tickets through claims prepare from an orchestrated Triage (rule 6).
     var orchestrateBatchTriages = false
-    override func setUpWithError() throws {
+    override func setUpWithError() throws { try TestFixtureTimings.measure("case.setup") {
         // macOS /var temporary paths traverse a symlink rejected by storage admission.
         let caches: URL
         if let path = ProcessInfo.processInfo.environment["CHECKLIST_TEST_STORAGE_ROOT"] {
@@ -23,9 +24,11 @@ final class CoreTests: XCTestCase {
         let qualificationRoot = caches.appendingPathComponent("ChecklistQualification/CL-20", isDirectory: true)
         try FileManager.default.createDirectory(at: qualificationRoot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         directory = qualificationRoot.appendingPathComponent("CoreTests-" + UUID().uuidString, isDirectory: true)
-        router = try TestStore.router(root: directory)
-    }
-    override func tearDownWithError() throws { try router?.closeStore();router = nil; try? FileManager.default.removeItem(at:directory) }
+        // Epic deletion owns the derived-reference proof tests. Other cases
+        // still run real command validation and canonical transaction guards.
+        router = try TestStore.router(root: directory, trackEpicReferences: name.contains("testEpicDelete"))
+    } }
+    override func tearDownWithError() throws { try TestFixtureTimings.measure("case.teardown") { try TestFixtureTimings.measure("teardown.close") { try router?.closeStore();router = nil }; try? TestFixtureTimings.measure("teardown.files") { try FileManager.default.removeItem(at:directory) } } }
     @discardableResult func call(_ method: String,_ p: JSON = [:],_ caller: Caller? = nil,_ command: String? = nil) throws -> JSON {
         var p = p
         if method == "work_submit" { p = try fixtureAcceptanceEvidence(router,input:p) }
@@ -35,7 +38,7 @@ final class CoreTests: XCTestCase {
         if method == "review_record" {p = try addingSyntheticReviewEvidence(p,actor:caller ?? owner)}
         if method == "batch_review_record",let members = p["members"] as? [JSON] {p["members"] = try members.map {try addingSyntheticReviewEvidence($0,actor:caller ?? owner)}}
         if !CommandRouter.readMethods.contains(method) { p["command_id"] = command ?? UUID().uuidString }
-        return try router.handle(method:method,params:(caller?.role == "assistant" ? p : try fixtureTaskInput(router,method:method,input:p)),caller:caller ?? owner)["data"] as! JSON
+        return try TestFixtureTimings.measure("body.command." + method) { try router.handle(method:method,params:(caller?.role == "assistant" ? p : try fixtureTaskInput(router,method:method,input:p)),caller:caller ?? owner)["data"] as! JSON }
     }
     func addingSyntheticReviewEvidence(_ input: JSON,actor: Caller) throws -> JSON {
         var p = input

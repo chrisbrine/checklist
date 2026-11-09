@@ -20,7 +20,7 @@ final class ReadPerformanceFixture {
         router = try TestStore.router(root: directory.appendingPathComponent("store"), template: template,
                                      workspace: template == nil ? nil : directory.appendingPathComponent("workspace"))
     }
-    deinit { try? router.closeStore(); try? FileManager.default.removeItem(at: directory) }
+    deinit { try? TestFixtureTimings.measure("teardown.close") { try router.closeStore() }; try? TestFixtureTimings.measure("teardown.files") { try FileManager.default.removeItem(at: directory) } }
     func call(_ method: String, _ input: JSON = [:]) throws -> JSON {
         var p = input
         if !CommandRouter.readMethods.contains(method) { p["command_id"] = UUID().uuidString }
