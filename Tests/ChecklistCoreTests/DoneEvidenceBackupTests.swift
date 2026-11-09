@@ -63,9 +63,18 @@ extension TicketLifecycleCleanupTests {
     func testCL393RecentBackupAndFailedAttemptEachHoldTheNextOneForTheInterval() throws {
         try confirmRetention()
         _ = try fixture()
-        _ = try call("backup_create",["path":directory.appendingPathComponent("cl393-recent").path])
-        let backupTime = Date()
-        Thread.sleep(forTimeInterval:1.1)
+        let backup = try call("backup_create",["path":directory.appendingPathComponent("cl393-recent").path])
+        // The deadline reads the persisted capture time. Keep the real backup,
+        // and place that clock just before the waiting job instead of sleeping.
+        let backupTime = Date().addingTimeInterval(-2)
+        try router.dbQueue.write { db in
+            let key = "backup-generation:" + (backup["operation_id"] as! String)
+            var generation = jsonObject(try XCTUnwrap(String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[key])))
+            var summary = generation["summary"] as! JSON
+            summary["captured_at"] = ISO8601DateFormatter().string(from:backupTime)
+            generation["summary"] = summary
+            try db.execute(sql:"UPDATE metadata SET value=? WHERE key=?",arguments:[try jsonString(generation),key])
+        }
         _ = try waitingFile()
         let due = try XCTUnwrap(try deadline())
         XCTAssertEqual(due.timeIntervalSince(backupTime),CommandRouter.doneEvidenceBackupInterval,accuracy:60)

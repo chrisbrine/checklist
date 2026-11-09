@@ -194,6 +194,35 @@ def run(command, timeout=60, check=True, cwd=None):
     return result
 
 
+class PhaseTimings:
+    """Sequential wall phases; emit the real elapsed values without estimates."""
+    def __init__(self, operation):
+        self.operation = operation
+        self.started = self.boundary = time.monotonic()
+        self.current = None
+        self.phases = {}
+
+    def start(self, name):
+        boundary = time.monotonic()
+        if self.current is not None:
+            self.phases[self.current] = self.phases.get(self.current, 0) + boundary - self.boundary
+            print('Slot phase event: ' + json.dumps({'operation': self.operation, 'phase': self.current,
+                  'seconds': boundary - self.boundary, 'elapsed_seconds': boundary - self.started}, sort_keys=True), flush=True)
+        self.current, self.boundary = name, boundary
+
+    def finish(self):
+        self.start(None)
+        result = {'operation': self.operation, 'wall_seconds': self.boundary - self.started,
+                  'phases_seconds': self.phases}
+        print('Slot phase timing: ' + json.dumps(result, sort_keys=True), flush=True)
+        return result
+
+
+def host_load():
+    try: return subprocess.check_output(['sysctl', '-n', 'vm.loadavg'], text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.SubprocessError): return None
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -380,6 +409,61 @@ class ManagedPathMapping:
         return None
 
 
+class ExternalBindingOverlapCache:
+    """Reuse only external binding guards; recheck every named identity at release."""
+    def __init__(self, maximum_entries=2048, maximum_bytes=1_048_576):
+        self.maximum_entries, self.maximum_bytes = maximum_entries, maximum_bytes
+        self.entries = {}
+        self.payload_bytes = self.hits = self.filesystem_checks = 0
+
+    @staticmethod
+    def named_identity(path):
+        path = Path(path).absolute()
+        anchor, tail, identity = _canonical_path(path)
+        digest = hashlib.sha256(json.dumps([str(anchor), tail, identity]).encode())
+        # A moved leaf may keep its inode and spelling while an ancestor changes.
+        # Bind lexical links and canonical ancestry too, without reading file bytes.
+        names = {path, *path.parents, anchor, *anchor.parents}
+        for named in sorted(names, key=str):
+            try:
+                info = named.lstat()
+                value = [str(named), info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)]
+            except (FileNotFoundError, NotADirectoryError): value = [str(named), None]
+            digest.update(json.dumps(value, separators=(',', ':')).encode())
+        return digest.digest()
+
+    def full_overlap(self, path):
+        self.filesystem_checks += 1
+        return checklist_root_overlap(path) or paths_overlap(path, DEFAULT_LIVE)
+
+    def overlap(self, path, location):
+        key = str(path)
+        if key in self.entries:
+            self.hits += 1
+            return False
+        cost = len(os.fsencode(key)) + len(location.encode()) + 32
+        if len(key) > 4096 or len(self.entries) >= self.maximum_entries or self.payload_bytes + cost > self.maximum_bytes:
+            return self.full_overlap(path)
+        before = self.named_identity(path)
+        result = self.full_overlap(path)
+        if result: return result
+        if self.named_identity(path) != before:
+            raise ValueError('External binding named ancestry changed during inspection.')
+        self.entries[key] = (before, location)
+        self.payload_bytes += cost
+        return False
+
+    def revalidate(self):
+        for key, (identity, location) in self.entries.items():
+            path = Path(key)
+            if self.named_identity(path) != identity:
+                raise ValueError('External binding named ancestry changed during inspection (' + location + ').')
+            if self.full_overlap(path):
+                raise ValueError('External binding now overlaps a Checklist data root (' + location + ').')
+            if self.named_identity(path) != identity:
+                raise ValueError('External binding named ancestry changed during release (' + location + ').')
+
+
 # Core reads source bytes or selects attachment bytes through these manifest fields.
 # Keep this inventory with docs/test-instances.md when adding a Core consumer.
 MANIFEST_FILE_EVIDENCE_FIELDS = frozenset({'source_capture', 'artifact_refs', 'playtest_bundle', 'acceptance_evidence'})
@@ -404,6 +488,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
                            'relative_capture_paths', 'relative_evidence_paths', 'inert_history_path_occurrences', 'inert_metadata_path_occurrences',
                            'capture_git_provenance'], 0)
     mapping = ManagedPathMapping()
+    external_bindings = ExternalBindingOverlapCache()
     summary_source_root = Path(summary_source_root) if summary_source_root is not None else None
     source_summaries = {}
     non_json = set()
@@ -430,6 +515,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
         # directory metadata; an outside file leaf is never filesystem authority.
         candidate = path.parent if managed else path
         try:
+            if not managed: return external_bindings.overlap(candidate, location)
             return checklist_root_overlap(candidate) or paths_overlap(candidate, DEFAULT_LIVE)
         except (OSError, RuntimeError, ValueError):
             refuse(location, 'a path whose filesystem ancestry cannot be safely compared')
@@ -713,11 +799,18 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
                         # CL-424: name the record kind, never the value, so that a refusal shows its cause.
                         if table != 'records' or record_kind is None: raise
                         raise ValueError(f'{error} Record kind: {record_kind}.') from error
+        try: external_bindings.revalidate()
+        except (OSError, RuntimeError, ValueError) as error:
+            refuse('external binding release', str(error))
     except (UnicodeError, RecursionError) as error:
         raise ValueError('Seed values cannot be safely inspected. ' + RELOCATION_REQUIRED) from error
     finally:
         connection.close()
     if source_summaries: counts['source_summary_paths'] = source_summaries
+    counts.update(external_overlap_cache_entries=len(external_bindings.entries),
+                  external_overlap_cache_hits=external_bindings.hits,
+                  external_overlap_filesystem_checks=external_bindings.filesystem_checks,
+                  external_overlap_cache_payload_bytes=external_bindings.payload_bytes)
     return counts
 
 
@@ -935,6 +1028,8 @@ def copy_snapshot_files(source, destination, entries):
 def snapshot_seed(source, destination, destination_root=None, current_schema=None):
     """current_schema is the staged build's (create passes it); the default reads this source tree."""
     if current_schema is None: current_schema = storage_schema(REPO / SCHEMA_SOURCE)
+    timing = PhaseTimings('snapshot_seed')
+    timing.start('manifest_and_membership')
     source = source.expanduser().absolute()
     # Live access is confined to published backups, never its open database or connections.
     for live in {LIVE, DEFAULT_LIVE}:
@@ -1007,7 +1102,9 @@ def snapshot_seed(source, destination, destination_root=None, current_schema=Non
             if name in visited or len(visited) >= 32: raise ValueError('Captured link cycle.')
             visited.add(name); name = links[name]
         if name not in expected: raise ValueError('Captured link target is absent.')
+    timing.start('verify_payload')
     verify_snapshot_files(source, regular)
+    timing.start('database_integrity_and_counts')
     observation = database_observation(source / 'database.sqlite')
     if observation['quick_check'] != 'ok' or observation['schema'] != manifest['schema']:
         raise ValueError('Snapshot database integrity/schema mismatch.')
@@ -1017,12 +1114,14 @@ def snapshot_seed(source, destination, destination_root=None, current_schema=Non
             raise ValueError('Snapshot canonical family counts mismatch.')
     if 'tableRows' in manifest and manifest['tableRows'] != observation['table_rows']:
         raise ValueError('Snapshot table counts mismatch.')
+    timing.start('source_path_inspection')
     live_snapshot = is_live_snapshot(source, manifest['sourceRoot'])
     summary_source_root = manifest['sourceRoot'] if live_snapshot else None
     inspection = require_local_paths(source / 'database.sqlite', destination_root or destination,
                                      source_root=manifest['sourceRoot'], summary_source_root=summary_source_root)
     source_summary_paths = inspection.pop('source_summary_paths', {})
     # Verification finishes before any source byte is used in the new store.
+    timing.start('materialization_and_verification')
     copy_snapshot_files(source, destination, regular)
     for name, digest, size, descriptor in entries[1:]:
         if descriptor['kind'] != 'symlink': continue
@@ -1031,6 +1130,7 @@ def snapshot_seed(source, destination, destination_root=None, current_schema=Non
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if descriptor['kind'] == 'symlink':
             target.symlink_to(descriptor['linkTarget'])
+    timing.start('destination_path_inspection')
     require_local_paths(destination / 'checklist.sqlite', destination_root or destination,
                         source_root=manifest['sourceRoot'], summary_source_root=summary_source_root,
                         summary_source_paths=source_summary_paths)
@@ -1045,7 +1145,7 @@ def snapshot_seed(source, destination, destination_root=None, current_schema=Non
     return {'kind': 'backup', 'source': str(source), 'source_hash': hashlib.sha256(raw).hexdigest(),
             'age_seconds_at_create': age, 'source_root': manifest['sourceRoot'], 'before_start': observation,
             'live_snapshot': live_snapshot, 'path_inspection': inspection, 'source_summary_paths': source_summary_paths,
-            'current_schema_no_migration': observation['schema'] == current_schema}
+            'current_schema_no_migration': observation['schema'] == current_schema, 'timing': timing.finish()}
 
 
 def restored_inventory(root):
@@ -1264,6 +1364,8 @@ def trash(folder, root=None):
 
 
 def create(arguments, p):
+    timing = PhaseTimings('test_slot_create')
+    timing.start('preflight')
     session = caller_session(getattr(arguments, 'session_id', None))
     # CL-359: a slot store copy is registered with its tickets before anything changes.
     tickets = requested_tickets(getattr(arguments, 'tickets', None))
@@ -1289,12 +1391,13 @@ def create(arguments, p):
                            'disposable test slot ' + str(arguments.slot), session, tickets=tickets)
         metadata = {'slot': arguments.slot, 'tickets': tickets, 'build_id': manifest['build_id'], 'source_fingerprint': manifest['source_fingerprint'],
                     'stage_path': str(capture), 'seed': {'kind': 'incomplete'}, 'created_at': now(), 'mode': 'incomplete', 'checks': None,
-                    'allow_synthetic_relays': getattr(arguments, 'allow_synthetic_relays', False) is True}
+                    'allow_synthetic_relays': getattr(arguments, 'allow_synthetic_relays', False) is True, 'first_start_pending': True}
         save(p, metadata)
         pending = contained(p['folder'] / '.seed-data', p['folder'])
         if prepared is not None: prepared.rename(pending)
         else: pending.mkdir(mode=0o700)
         try:
+            timing.start('seed')
             if arguments.seed != 'empty': current_schema = require_managed_path_support(capture, manifest)
             seed = {'kind': 'empty', 'source_hash': None, 'age_seconds_at_create': 0}
             if prepared is not None:
@@ -1311,6 +1414,7 @@ def create(arguments, p):
             save(p, metadata)
             raise
         # Neither the service root nor an executable app is published for a refused seed.
+        timing.start('bundle_copy_and_sign')
         pending.rename(p['data'])
         run(['ditto', capture / 'Checklist.app', p['bundle']])
         info_file = p['bundle'] / 'Contents/Info.plist'
@@ -1321,7 +1425,7 @@ def create(arguments, p):
         run(['codesign', '--force', '--sign', identity, '--timestamp=none', '--identifier', p['identifier'], p['bundle']])
         run(['codesign', '--verify', '--deep', '--strict', p['bundle']])
         signing_teams(p['bundle'], manifest['signing_profile'])
-        metadata.update(seed=seed, mode='stopped')
+        metadata.update(seed=seed, mode='stopped', create_timing=timing.finish())
         save(p, metadata)
         print(f'Created slot {arguments.slot}: build {manifest["build_id"]}; seed {seed["kind"]}')
 
@@ -1488,6 +1592,8 @@ def service_status(p, *, bound=None):
 
 
 def start(arguments, p):
+    timing = PhaseTimings('test_slot_start')
+    timing.start('preflight')
     bound = start_deadline_seconds()  # Reject invalid configuration before bootstrap.
     metadata = load(p)
     # Only this persisted opt-in controls the launch. Never inherit a relay opt-in
@@ -1516,15 +1622,41 @@ def start(arguments, p):
                 'EnvironmentVariables': {'CHECKLIST_SLOT_RELAYS': 'synthetic' if allow_synthetic_relays else 'off'},
                 'StandardOutPath': str(logs / 'service.stdout.log'), 'StandardErrorPath': str(logs / 'service.stderr.log')}
     for key in ['StandardOutPath', 'StandardErrorPath']: contained(contents[key], p['folder'])
+    timing.start('service_registration')
     registered = launch_state(p)['registered']
     if registered and allow_synthetic_relays != configured_relays:
         raise ValueError('Stop this slot before changing --allow-synthetic-relays; the registered service keeps its current relay policy.')
+    first_start = metadata.get('first_start_pending') is True and not registered
+    load_start = host_load()
+    launch_started = time.monotonic()
+    metadata['first_start_pending'] = False
+    metadata['startup_attempted_at'] = now()
+    save(p, metadata)
     if not registered:
         plist.write_bytes(plistlib.dumps(contents))
         run(['launchctl', 'bootstrap', f'gui/{os.getuid()}', plist])
     metadata['allow_synthetic_relays'] = allow_synthetic_relays
     metadata['mode'] = 'gui' if arguments.gui or processes(p)['app'] else 'headless'; save(p, metadata)
+    timing.start('launch_to_healthy')
     service_status(p, bound=bound)
+    launch_seconds = time.monotonic() - launch_started
+    metadata['start_timing'] = timing.finish()
+    if first_start and metadata['seed'].get('kind') == 'backup' and metadata['seed'].get('live_snapshot') is True:
+        seed = metadata['seed'];before = seed['before_start']
+        measurement = {'format': 1, 'kind': 'checklist-owned-copy-startup', 'first_start': True, 'live_snapshot': True,
+                       'source_fingerprint': manifest['source_fingerprint'],
+                       'service_sha256': sha(Path(metadata['stage_path']) / 'Checklist.app/Contents/MacOS/ChecklistService'),
+                       'source_root': seed['source_root'], 'source_schema': before['schema'],
+                       'logical_store_id': (before.get('identity') or {}).get('logical_store_id'),
+                       'target_schema': storage_schema(Path(metadata['stage_path']) / 'source' / SCHEMA_SOURCE),
+                       'seed_manifest_sha256': seed['source_hash'], 'measured_at_unix': time.time(),
+                       'measured_at': now(), 'launch_to_healthy_seconds': launch_seconds,
+                       'load_start': load_start, 'load_end': host_load(), 'timing': metadata['start_timing']}
+        measurement_file = contained(p['folder'] / 'offline-measurement.json', p['folder'])
+        measurement_file.write_text(json.dumps(measurement, indent=2) + '\n');measurement_file.chmod(0o600)
+        metadata['offline_measurement'] = str(measurement_file)
+        print('Owned-copy startup measurement: ' + json.dumps(measurement, sort_keys=True), flush=True)
+    save(p, metadata)
     if arguments.gui:
         print(f'Opening Checklist Test {arguments.slot}: synthetic/test data only.')
         command = ['open', '-n', p['bundle']]
@@ -1731,6 +1863,10 @@ def promote(arguments, p):
     gates = promotion_gates(selected, slots)
     for gate, passed in gates.items(): print(f'{gate}: {"PASS" if passed else "FAIL"}', flush=True)
     command = [str(REPO / 'script/build_and_run.sh'), '--install-stage', selected['stage_path']]
+    measurement = next((value.get('offline_measurement') for value in slots
+                        if value.get('build_id') == selected['build_id'] and value.get('source_fingerprint') == selected['source_fingerprint']
+                        and value.get('offline_measurement')), None)
+    if measurement: command += ['--offline-measurement', measurement]
     print('Planned action: ' + json.dumps(command), flush=True)
     if not gates['live_snapshot_check_same_build']:
         print('Missing live-backup qualification: run a same-build live-backup-seeded slot check.')

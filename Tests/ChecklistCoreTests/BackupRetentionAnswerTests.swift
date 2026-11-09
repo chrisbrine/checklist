@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import Foundation
 import GRDB
@@ -7,9 +8,9 @@ import GRDB
 final class BackupRetentionAnswerTests: XCTestCase {
     private let label = "Newest 3, plus one per day for 3 days (about 6 snapshots, 15 GB)"
     private func fixture() throws -> StorageFixture {
-        let f = try StorageFixture(open:false);try f.close()
+        let f = try StorageFixture(open:false,fast:true)
         let lease = try StorageServiceLease(root:f.root)
-        f.router = try CommandRouter(root:f.root,serviceLease:lease,automaticBackupRetentionTrashRoot:f.workspace);f.lease = lease
+        f.router = try TestStore.router(root:f.root,serviceLease:lease,automaticBackupRetentionTrashRoot:f.workspace);f.lease = lease
         return f
     }
     private func worker(_ f: StorageFixture,_ project: JSON,workspace: URL? = nil) throws -> Caller {
@@ -198,9 +199,21 @@ final class BackupRetentionAnswerTests: XCTestCase {
     func testOwnerSaveReplacesRuleAndAnOlderAnswerCannotComeBack() throws {
         let f = try fixture(),p = try f.project(),c = try worker(f,p)
         let first = try request(f,p,c,labels:[label]),firstResponse = try answer(f,first)
+        // The behavior compares persisted answer times, not elapsed wall time.
+        // Keep real owner answers and place their timestamps explicitly around
+        // the authenticated settings command, without sleeping for a clock tick.
+        func dateAnswer(_ request: JSON, _ responseID: String, _ timestamp: String) throws {
+            try editRequest(f,request) { stored in
+                var responses = stored["responses"] as! [JSON]
+                let index = responses.firstIndex { $0["id"] as? String == responseID }!
+                responses[index]["created_at"] = timestamp
+                stored["responses"] = responses
+            }
+        }
+        try dateAnswer(first,firstResponse,"2000-01-01T00:00:00Z")
         _ = try apply(f,p,c,request:first["id"] as! String,response:firstResponse)
         let unused = try request(f,p,c,labels:["Newest 9, plus one per day for 9 days"]),unusedResponse = try answer(f,unused)
-        Thread.sleep(forTimeInterval:1.1)
+        try dateAnswer(unused,unusedResponse,"2000-01-02T00:00:00Z")
         _ = try f.call("backup_retention_set",["newest_count":7,"daily_days":2])
         var current = try settings(f)
         XCTAssertEqual(current["newest_count"] as? Int,7)
@@ -209,8 +222,11 @@ final class BackupRetentionAnswerTests: XCTestCase {
         refused("newer_rule_exists") {_ = try self.apply(f,p,c,request:unused["id"] as! String,response:unusedResponse)}
         current = try settings(f);XCTAssertEqual(current["newest_count"] as? Int,7)
         // A later answer is the owner's newest decision.
-        Thread.sleep(forTimeInterval:1.1)
+        let confirmed = try XCTUnwrap((current["owner_confirmation"] as? JSON)?["confirmed_at"] as? String)
+        let formatter = ISO8601DateFormatter()
+        let laterTime = try XCTUnwrap(formatter.date(from:confirmed)).addingTimeInterval(1)
         let later = try request(f,p,c,labels:["Other"]),laterResponse = try answer(f,later,option:nil,custom:"Newest 4, plus one per day for 2 days")
+        try dateAnswer(later,laterResponse,formatter.string(from:laterTime))
         _ = try apply(f,p,c,request:later["id"] as! String,response:laterResponse)
         current = try settings(f)
         XCTAssertEqual(current["newest_count"] as? Int,4);XCTAssertEqual(current["daily_days"] as? Int,2)

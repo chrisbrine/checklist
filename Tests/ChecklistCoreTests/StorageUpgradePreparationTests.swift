@@ -188,6 +188,10 @@ final class StorageUpgradePreparationTests: XCTestCase {
         let f = try StorageFixture()
         let prepared = try StorageUpgradePreparation.prepare(root:f.root)
         XCTAssertEqual(prepared["needs_upgrade"] as? Bool,false)
+        XCTAssertEqual(prepared["source_root"] as? String, f.root.path)
+        XCTAssertEqual(prepared["source_schema"] as? Int, SchemaMigrations.currentSchema)
+        XCTAssertEqual(prepared["target_schema"] as? Int, SchemaMigrations.currentSchema)
+        XCTAssertNotNil(prepared["logical_store_id"] as? String)
         XCTAssertFalse(FileManager.default.fileExists(atPath:f.root.appendingPathComponent(StorageUpgradePreparation.receiptName).path))
     }
 }

@@ -7,8 +7,12 @@ import GRDB
 func fixtureTaskInput(_ router: CommandRouter,method: String,input: JSON) throws -> JSON {
     guard method == "task_create",input["epic_id"] == nil,let project=input["project_id"] as? String else {return input}
     let owner=Caller(role:"owner",installation:"required-epic-fixture",projectIDs:[])
-    let groups=try router.handle(method:"epic_list",params:["project_id":project],caller:owner)["data"] as! JSON
-    let current=(groups["groups"] as? [JSON] ?? []).first {!bool($0,"archived")}
+    // Preparation needs only an existing Epic ID. Avoid projecting the full
+    // Epic list and every member ticket before each unrelated task_create.
+    // Re-read current rows so archived/deleted Epics cannot leak across cases.
+    let current=try router.dbQueue.read {db in
+        try router.records(db,type:"group",project:project).first {$0["kind"] as? String == "epic" && !bool($0,"archived")}
+    }
     let epic: JSON
     if let current {epic=current}
     else {epic=try router.handle(method:"epic_create",params:["command_id":uuid(),"project_id":project,"name":"Fixture tickets"],caller:owner)["data"] as! JSON}

@@ -16,13 +16,41 @@ final class MediaRoundTests: XCTestCase {
         let owner: Caller
         var worker: Caller
         let project: String
-        init() throws {
-            storage = try StorageFixture(fast:true)
-            base = storage.base;workspace = storage.workspace;root = storage.root
-            router = storage.router!;owner = storage.owner
-            project = try storage.project()["id"] as! String
-            let session = try router.handle(method:"session_register",params:["command_id":uuid(),"project_id":project,"provider":"codex","label":"Actual fixture worker","session_id":"media-fixture-worker","workspace":workspace.path],caller:owner)["data"] as! JSON
-            worker = Caller(role:"worker",installation:"media-owned-worker",projectIDs:[project],sessionID:session["id"] as? String ?? "media-fixture-worker",workspace:workspace.path)
+        init(template: TestStore.Template? = nil) throws {
+            storage = try StorageFixture(open:template == nil,fast:true)
+            base = storage.base;workspace = storage.workspace;root = storage.root;owner = storage.owner
+            if let template {
+                // The owned harness retains the lease and teardown. Only disposable
+                // prerequisite bytes come from the immutable prepared phase.
+                try FileManager.default.removeItem(at:workspace)
+                let lease = try StorageServiceLease(root:root)
+                storage.lease = lease
+                let prepared = try TestStore.router(root:root,serviceLease:lease,template:template,workspace:workspace)
+                router = prepared;storage.router = prepared
+                project = try prepared.dbQueue.read {try XCTUnwrap(prepared.records($0,type:"project").first?["id"] as? String)}
+                let workspacePath = workspace.path
+                try prepared.dbQueue.write {db in
+                    var session = try prepared.record(db,"media-fixture-worker",type:"session")
+                    session["workspace"] = workspacePath
+                    try prepared.save(db,session,type:"session")
+                }
+            } else {
+                router = storage.router!
+                project = try storage.project()["id"] as! String
+                _ = try router.handle(method:"session_register",params:["command_id":uuid(),"project_id":project,"provider":"codex","label":"Actual fixture worker","session_id":"media-fixture-worker","workspace":workspace.path],caller:owner)
+            }
+            worker = Caller(role:"worker",installation:"media-owned-worker",projectIDs:[project],sessionID:"media-fixture-worker",workspace:workspace.path)
+        }
+        /// A template builder borrows its router; TestStore owns checkpoint/close.
+        /// The unopened harness supplies the same owner and eventual cleanup only.
+        init(router: CommandRouter,workspace: URL) throws {
+            storage = try StorageFixture(open:false,fast:true)
+            self.router = router;self.workspace = workspace;root = router.root;base = root.deletingLastPathComponent();owner = storage.owner
+            let value = try router.handle(method:"project_create",params:["command_id":uuid(),"name":"Storage fixture","key_prefix":"SF","root_path":workspace.path],caller:owner)["data"] as! JSON
+            project = value["id"] as! String
+            _ = try router.handle(method:"epic_create",params:["command_id":uuid(),"project_id":project,"name":"Storage fixture tickets"],caller:owner)
+            _ = try router.handle(method:"session_register",params:["command_id":uuid(),"project_id":project,"provider":"codex","label":"Actual fixture worker","session_id":"media-fixture-worker","workspace":workspace.path],caller:owner)
+            worker = Caller(role:"worker",installation:"media-owned-worker",projectIDs:[project],sessionID:"media-fixture-worker",workspace:workspace.path)
         }
         func call(_ method: String,_ p: JSON = [:],as caller: Caller? = nil,command: String? = nil) throws -> JSON {
             var p = p;p["project_id"] = p["project_id"] ?? project

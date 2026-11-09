@@ -20,7 +20,7 @@ extension CoreTests {
         XCTAssertNotNil(submitted["manifest_id"])
     }
     func testReviewGroupReopenKeepsTheTicketInItsTriage() throws {
-        let value = try submittedArtifact(),p = value.project,first = try triage(p,"Review first",phase:"review")
+        let value = try preparedSubmittedArtifact(),p = value.project,first = try triage(p,"Review first",phase:"review")
         try addTriage(p,first,value.task)
         let result = try call("triage_transition",triageInput(p,first,["action":"reopen"]))
         // CL-125 rule 8: returning to Queued is a status action and keeps membership.

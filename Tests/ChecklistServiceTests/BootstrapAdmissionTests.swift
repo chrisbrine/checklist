@@ -56,6 +56,17 @@ final class BootstrapAdmissionTests: XCTestCase {
         }
     }
 
+    func testNewEnrollmentStillRejectsCanonicalSessionWhenLocalEnrollmentIsMissing() throws {
+        let original = try coordinator.router.connectionSession(sessionID:enrollment.sessionID,project:project,caller:owner)
+        coordinator.enrollments.removeValue(forKey:enrollment.installation)
+        refuses("SESSION_ID_CONFLICT") { try self.bootstrap() }
+        XCTAssertTrue(coordinator.enrollments.isEmpty)
+        XCTAssertEqual(try coordinator.router.connectionSession(sessionID:enrollment.sessionID,project:project,caller:owner)?["installation"] as? String,original?["installation"] as? String)
+        let fresh = try bootstrap(native(session:UUID().uuidString))
+        XCTAssertTrue(fresh.changed)
+        XCTAssertEqual(coordinator.enrollments.count,1)
+    }
+
     func testNewUnverifiedConnectionIsRejectedBeforeWriterAdmission() throws {
         try coordinator.router.backupWrites.beginCapture()
         let connection = NSXPCConnection(machServiceName: "org.checklist.synthetic.unconnected")

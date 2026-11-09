@@ -8,7 +8,7 @@ final class ReadPerformanceFixture {
     let directory: URL
     let router: CommandRouter
     let owner = Caller(role: "owner", installation: "read-performance", projectIDs: [])
-    init(_ ticket: String) throws {
+    init(_ ticket: String, template: TestStore.Template? = nil) throws {
         let caches: URL
         if let path = ProcessInfo.processInfo.environment["CHECKLIST_TEST_STORAGE_ROOT"] {
             caches = URL(fileURLWithPath:path,isDirectory:true).resolvingSymlinksInPath()
@@ -17,7 +17,8 @@ final class ReadPerformanceFixture {
         }
         directory = caches.appendingPathComponent("ChecklistQualification/\(ticket)/" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        router = try TestStore.router(root: directory.appendingPathComponent("store"))
+        router = try TestStore.router(root: directory.appendingPathComponent("store"), template: template,
+                                     workspace: template == nil ? nil : directory.appendingPathComponent("workspace"))
     }
     deinit { try? router.closeStore(); try? FileManager.default.removeItem(at: directory) }
     func call(_ method: String, _ input: JSON = [:]) throws -> JSON {
@@ -113,12 +114,12 @@ final class StorageReadPerformanceTests: XCTestCase {
         let patterns = [column + #"\s+COLLATE\s+BINARY\s*(?:=|IS|IN)"#,
                         column + #"\s*(?:=|IS|IN)\s*"# + operand + #"\s+COLLATE\s+BINARY"#,
                         operand + #"\s+COLLATE\s+BINARY\s*=\s*"# + column]
+        let expressions = try patterns.map { try NSRegularExpression(pattern:$0,options:.caseInsensitive) }
         for url in try FileManager.default.contentsOfDirectory(at:sources,includingPropertiesForKeys:nil) where url.pathExtension == "swift" {
             let source = try String(contentsOf:url,encoding:.utf8)
             // CL-363: every pattern needs this literal; most files need no regex scan.
             guard source.range(of:"COLLATE",options:.caseInsensitive) != nil else {continue}
-            for pattern in patterns {
-                let regex = try NSRegularExpression(pattern:pattern,options:.caseInsensitive)
+            for regex in expressions {
                 XCTAssertNil(regex.firstMatch(in:source,range:NSRange(source.startIndex...,in:source)),url.lastPathComponent + " overrides indexed identity collation")
             }
         }

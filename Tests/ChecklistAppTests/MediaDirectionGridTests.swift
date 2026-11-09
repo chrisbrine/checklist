@@ -1,4 +1,6 @@
 import XCTest
+import SwiftUI
+import AVKit
 import ChecklistCore
 import ChecklistIPC
 @testable import ChecklistApp
@@ -28,7 +30,7 @@ import ChecklistIPC
     }
     private func item(_ direction: String) -> Record {
         Record(values:["id":"item-"+direction,"revision":2,"published":true,"disposition":"pending",
-            "target":["id":"target-"+direction,"review_basis_signature":"basis-"+direction,"metadata":["character":"Hero","animation_label":"walk","direction":direction,"hint":"Exact hint"],"candidate_ids":["candidate-"+direction]],
+            "target":["id":"target-"+direction,"review_basis_signature":"basis-"+direction,"metadata":["character":"Hero","animation_label":"walk","direction":direction,"take":"12 fps","hint":"Synthetic 512 by 512; eight frames."],"candidate_ids":["candidate-"+direction]],
             "candidates":[["id":"candidate-"+direction,"slots":[]]],"originals":[]])
     }
     private func card(_ direction: String) -> MediaDirectionCard {
@@ -72,6 +74,45 @@ import ChecklistIPC
         grid.releaseAll()
         for direction in directions {XCTAssertTrue(grid.admit(take(direction,bytes:MediaPlaybackBudget.directionGridOriginalBytes,width:512,height:512)))}
         XCTAssertEqual(grid.cachedBytes,MediaPlaybackBudget.directionGridCacheBytes)
+    }
+    func testCompactTilesShowEightDirectionsAndEveryDecisionInTwoRows() async throws {
+        let defaults=isolatedDefaults("CompactDirections")
+        let directory=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer {try? FileManager.default.removeItem(at:directory)}
+        let store=ChecklistStore(draftJournal:LocalDraftJournal(directory:directory),preferences:defaults.preferences,
+            restorePendingCommand:false,desktopAlerts:DesktopAlertCoordinator(sink:GridNoAlerts()),
+            requestTransport:{_,_ in ["data":[:]]},navigationMemory:DetailItemNavigationMemory(),
+            pendingCommandPersistence:PendingCommandPersistence(read:{_ in nil},save:{_,_ in},remove:{_ in}))
+        let grid=MediaDirectionGridModel(),cards=directions.map {card($0)}
+        for card in cards {
+            card.draft.note="Keep feet planted"
+            let sample=MediaPreparedTake(key:card.key,label:card.direction,kind:"video",ids:[:],control:GridTake(),player:AVPlayer(),
+                measurement:.init(copyMilliseconds:0,probeMilliseconds:0,bytes:1024,
+                    facts:.init(durationSeconds:1,width:512,height:512,frames:8,hasVideo:true,hasAudio:false)))
+            XCTAssertTrue(grid.playback.admit(sample))
+        }
+        defer {grid.close()}
+        let restore=AXProbe.enableEnhancedUserInterface();defer {restore()}
+        // The review area remaining beside the app sidebar in a 1240-point window.
+        let window=NSWindow(contentRect:NSRect(x:-10000,y:-10000,width:900,height:740),styleMask:[.titled],backing:.buffered,defer:false)
+        window.isReleasedWhenClosed=false
+        defer {window.contentView=nil;window.close()}
+        let host=NSHostingView(rootView:ScrollView {
+            MediaDirectionTiles(cards:cards,grid:grid,model:store.mediaReview).padding(8)
+        }.environmentObject(store).frame(width:900,height:740))
+        window.contentView=host
+        host.layoutSubtreeIfNeeded()
+        try await AXProbe.until {AXProbe.button(host,"Needs look for North-west") != nil}
+        var rows=Set<Int>()
+        for card in cards {
+            let accept=try XCTUnwrap(AXProbe.button(host,"Accept "+card.directionLabel))
+            let frame=try XCTUnwrap(AXProbe.frame(accept));rows.insert(Int(frame.midY.rounded()))
+            for label in ["Accept "+card.directionLabel,"Changes requested for "+card.directionLabel,"Needs look for "+card.directionLabel] {
+                let button=try XCTUnwrap(AXProbe.button(host,label))
+                XCTAssertTrue(AXProbe.visible(button,in:window),label+" must be fully visible without scrolling")
+            }
+        }
+        XCTAssertEqual(rows.count,2,"Eight directions fit in four columns and two rows")
     }
     func testGroupResolvesWholeCharacterActionBeyondListPageAndKeepsOpaqueValues() throws {
         let schema=MediaTypeSettings.schema(title:"Animation",starter:"animation_video")

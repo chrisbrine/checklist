@@ -19,10 +19,13 @@ final class ClientConnectionAdmissionTests: XCTestCase {
             super.init(); listener.delegate = self; listener.resume()
         }
         func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
-            let accepted = admission.accept(connection) {
+            let accepted = admission.accept(connection, timedPeer: { timing in
+                XCTAssertLessThanOrEqual(timing.listenerUptime, timing.identityStartedUptime)
+                XCTAssertLessThanOrEqual(timing.identityStartedUptime, timing.identityFinishedUptime)
+                XCTAssertLessThanOrEqual(timing.identityFinishedUptime, timing.admittedUptime)
                 self.lock.lock(); self.factories += 1; self.lock.unlock()
                 return Spy { self.lock.lock(); self.dispatched += 1; self.lock.unlock() }
-            }
+            })
             if accepted { lock.lock(); connections.append(connection); lock.unlock() }
             return accepted
         }

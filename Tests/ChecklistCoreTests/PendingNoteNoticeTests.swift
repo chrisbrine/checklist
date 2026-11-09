@@ -253,6 +253,7 @@ extension HumanAnswerNoticeTests {
     /// Core read path only: no process start, no XPC and no native discovery. The row count matches
     /// the largest project in the newest backup (4,072 delivery rows).
     func testHookPickupTimeOnALargeDeliveryTable() throws {
+        try QualificationSuite.requireEnabled()
         let f = try fixture();for _ in 0..<8 { _ = try sendNote(f) }
         try router.dbQueue.write { db in
             let template = try XCTUnwrap(String.fetchOne(db,sql:"SELECT id FROM records WHERE type='delivery' ORDER BY rowid LIMIT 1"))
@@ -330,7 +331,20 @@ extension HumanAnswerNoticeTests {
 
     func testRowsPastTheScanBoundReportHasMore() throws {
         let f = try fixture(),old = try sendNote(f,body:"older good note")
-        for index in 0..<(CommandRouter.pendingNoteScanRows + 1) { _ = try sendNote(f,body:"dropped \(index)") }
+        // Fixture rows exercise the full scan bound. Only one send is needed
+        // to obtain the real message/delivery envelopes; pickup is the subject.
+        let seed = try sendNote(f,body:"dropped 0")
+        try router.dbQueue.write { db in
+            let message = try router.record(db,seed["id"] as! String,type:"message")
+            let delivery = try router.record(db,(seed["deliveries"] as! [JSON])[0]["id"] as! String,type:"delivery")
+            for index in 1..<(CommandRouter.pendingNoteScanRows + 1) {
+                var nextMessage = message;nextMessage["id"] = uuid();nextMessage["body"] = "dropped \(index)"
+                try router.save(db,nextMessage,type:"message")
+                var nextDelivery = delivery;nextDelivery["id"] = uuid();nextDelivery["message_id"] = nextMessage["id"]!
+                try router.save(db,nextDelivery,type:"delivery")
+                try router.event(db,caller:owner,project:f.project["id"] as? String,entity:f.task["id"] as? String,kind:"message_saved",data:["message_id":nextMessage["id"]!,"origin":nextMessage["origin"]!])
+            }
+        }
         try detachDeliveries(keeping:[(old["deliveries"] as! [JSON])[0]["id"] as! String])
         let picked = try pickup(f.requester)
         XCTAssertTrue((picked["items"] as! [JSON]).isEmpty);XCTAssertEqual(picked["has_more"] as? Bool,true);XCTAssertEqual(picked["status"] as? String,"pending_pickup")

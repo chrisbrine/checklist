@@ -95,27 +95,33 @@ struct StorageBackupRetentionPolicy {
 }
 
 extension CommandRouter {
-    static let storageBackupPruningMethods: Set<String> = ["backup_retention_get","backup_retention_set","backup_pin","backup_prune_preview","backup_prune"]
+    static let storageBackupPruningMethods: Set<String> = ["backup_retention_get","backup_retention_set","backup_pin","backup_prune_preview","backup_prune","backup_incomplete_preview","backup_incomplete_retire"]
     /// Test seam is an explicit owned directory, never the user's Trash. Production
     /// uses the filesystem's appropriate Trash and atomic same-volume rename only.
     /// macOS privacy refuses open(2) and listing of ~/.Trash for a process with no
     /// grant, but allows a path-based mkdir and open of a child, so no code here may
     /// open or list the Trash root (CL-360).
     func executeStorageBackupPruning(method: String,params: JSON,caller: Caller,trashRoot: URL? = nil,automaticTrigger: String? = nil,observe: (String) throws -> Void = {_ in}) throws -> JSON {
+        let incompleteOnly = Self.storageIncompleteBackupMethods.contains(method)
+        let authorityGeneration: String?
         if automaticTrigger != nil {
             guard method == "backup_prune",caller.principal == Self.automaticBackupRetentionCaller.principal else {throw CoreError("FORBIDDEN","Automatic backup retention is an internal service operation.")}
-        } else {try owner(caller)}
+            authorityGeneration = nil
+        } else if incompleteOnly {authorityGeneration = try requireIncompleteBackupAuthority(params:params,caller:caller)}
+        else {try owner(caller);authorityGeneration = nil}
         if method == "backup_retention_get" {return ["data":try dbQueue.read {db -> JSON in
             var settings = try backupRetentionSettings(db)
             if let last = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='backup-automatic-prune-last'") {settings["last_automatic_prune"] = jsonObject(last)}
             settings["automatic_prune_history"] = try automaticBackupRetentionHistory(db)
             return settings
         }]}
-        if method == "backup_prune_preview" {return ["data":try backupPrunePreview(includeUnrecorded:bool(params,"include_unrecorded"))]}
+        if method == "backup_prune_preview" || method == "backup_incomplete_preview" {return ["data":try backupPrunePreview(includeUnrecorded:incompleteOnly || bool(params,"include_unrecorded"),incompleteOnly:incompleteOnly)]}
         let command = try text(params,"command_id",max:100)
         guard UUID(uuidString:command) != nil else {throw CoreError("INVALID_INPUT","command_id must be a UUID.")}
         let digest = hash(Data((method + (try jsonString(params))).utf8))
         do {return try ArchiveStorageGate.withExclusive(root:root) { _ in
+            // Authority can change while waiting for the filesystem gate.
+            if incompleteOnly {try requireIncompleteBackupAuthority(params:params,caller:caller,expectedGeneration:authorityGeneration)}
             if let replay = try dbQueue.read({try backupPruneReplay($0,command:command,digest:digest,caller:caller)}) {return replay}
             if method == "backup_retention_set" || method == "backup_pin" {
                 return try dbQueue.write {db in
@@ -170,12 +176,13 @@ extension CommandRouter {
                 guard let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[journalKey]) else {return nil}
                 let value = jsonObject(raw)
                 guard value["digest"] as? String == digest else {throw CoreError("IDEMPOTENCY_CONFLICT","This prune command belongs to another intent.")}
+                if incompleteOnly,value["authorization_generation"] as? String != authorityGeneration {throw CoreError("CONNECTION_REVOKED","The retained incomplete backup retirement belongs to an earlier session authorization generation.")}
                 return value
             }
             if journal == nil {
-                let preview = try backupPrunePreview(includeUnrecorded:bool(params,"include_unrecorded"),retainingOperation:automaticTrigger)
+                let preview = try backupPrunePreview(includeUnrecorded:incompleteOnly || bool(params,"include_unrecorded"),incompleteOnly:incompleteOnly,retainingOperation:automaticTrigger)
                 guard try text(params,"preview_sha256",max:64) == preview["preview_sha256"] as? String else {throw CoreError("BACKUP_PRUNE_PREVIEW_CHANGED","Review a fresh backup prune preview before applying it.")}
-                guard bool(preview,"owner_confirmed") else {throw CoreError("BACKUP_RETENTION_UNCONFIRMED","The owner must confirm the retention setting before pruning.")}
+                guard incompleteOnly || bool(preview,"owner_confirmed") else {throw CoreError("BACKUP_RETENTION_UNCONFIRMED","The owner must confirm the retention setting before pruning.")}
                 let candidates = (preview["snapshots"] as? [JSON] ?? []).filter {bool($0,"prune")}
                 var entries: [JSON] = []
                 let trash: URL?
@@ -200,7 +207,8 @@ extension CommandRouter {
                         entries.append(entry)
                     }
                 }
-                journal = ["digest":digest,"entries":entries,"created_at":now()]
+                journal = ["digest":digest,"entries":entries,"retained_entries":(preview["snapshots"] as? [JSON] ?? []).filter {!bool($0,"prune")},"created_at":now()]
+                if incompleteOnly {journal?["authorization_generation"] = authorityGeneration as Any? ?? NSNull()}
                 try dbQueue.write {db in
                     try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
                     try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:[journalKey,try jsonString(journal!)])
@@ -214,11 +222,13 @@ extension CommandRouter {
                 try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
                 try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[pendingKey,try jsonString(["kind":"backup_prune","intent_digest":digest,"state":"pending"])])
             }
-            var moved: [JSON] = [],retained: [JSON] = []
+            var moved: [JSON] = [],retained: [JSON] = incompleteOnly ? (journal?["retained_entries"] as? [JSON] ?? []).map {entry in
+                var kept = entry;kept["reason"] = (entry["keep_reasons"] as? [String])?.first ?? "no_current_prune_authority";return kept
+            } : []
             // A crash releases the object gate. Pins, upgrade protection and the
             // owner's rule may change before original retry. Recheck every source
             // still present; already moved exact inodes must finish reconciliation.
-            let current = try backupPrunePreview(includeUnrecorded:bool(params,"include_unrecorded"),retainingOperation:automaticTrigger)
+            let current = try backupPrunePreview(includeUnrecorded:incompleteOnly || bool(params,"include_unrecorded"),incompleteOnly:incompleteOnly,retainingOperation:automaticTrigger)
             let decisions = Dictionary(uniqueKeysWithValues:(current["snapshots"] as? [JSON] ?? []).map {($0["path"] as! String,$0)})
             for entry in journal!["entries"] as? [JSON] ?? [] {
                 let path = entry["path"] as! String
@@ -230,6 +240,7 @@ extension CommandRouter {
                 }
                 do {try moveBackupToTrash(entry);try moveBackupIndexToTrash(entry);moved.append(entry);try observe("prune_snapshot_moved")}
                 catch let error as CoreError where error.code == "BACKUP_IN_USE" {var kept = entry;kept["reason"] = "in_use";retained.append(kept)}
+                catch let error as CoreError where incompleteOnly && error.code == "BACKUP_PRUNE_SOURCE_CHANGED" {var kept = entry;kept["reason"] = "source_changed";kept["keep_reasons"] = ["source_changed"];retained.append(kept)}
             }
             return try dbQueue.write {db in
                 try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
@@ -239,7 +250,7 @@ extension CommandRouter {
                         // Do not retire a replacement record under an old plan.
                         if let raw = try String.fetchOne(db,sql:"SELECT json_object('manifest',json_extract(value,'$.manifest_sha256'),'path',json_extract(value,'$.summary.path')) FROM metadata WHERE key=?",arguments:[key]) {
                             let actual = jsonObject(raw)
-                            guard actual["manifest"] as? String == entry["manifest_sha256"] as? String,actual["path"] as? String == entry["path"] as? String else {throw CoreError("BACKUP_PRUNE_RECORD_CHANGED","The moved snapshot's receipt changed; preserve this prune command for reconciliation.")}
+                            guard actual["manifest"] as? String == (entry["recorded_manifest_sha256"] ?? entry["manifest_sha256"]) as? String,actual["path"] as? String == (entry["recorded_path"] ?? entry["path"]) as? String else {throw CoreError("BACKUP_PRUNE_RECORD_CHANGED","The moved snapshot's receipt changed; preserve this prune command for reconciliation.")}
                             try db.execute(sql:"DELETE FROM metadata WHERE key=?",arguments:[key])
                         }
                         if let operation = entry["operation_id"] as? String {
@@ -249,6 +260,7 @@ extension CommandRouter {
                     }
                 }
                 var data: JSON = ["status":"complete","moved_to_trash":moved,"retained_in_use":retained.filter {$0["reason"] as? String == "in_use"},"retained_snapshots":retained,"moved_count":moved.count,"physical_space_freed":NSNull(),"trash_requires_owner_emptying":true]
+                if incompleteOnly {data["scope"] = "incomplete_backup_folders";data["retained_count"] = retained.count;data["folders"] = moved.map {$0.merging(["action":"moved_to_trash"]) {_,new in new}} + retained.map {$0.merging(["action":"kept"]) {_,new in new}}}
                 if let automaticTrigger {
                     data["origin"] = "automatic_backup_retention"
                     data["trigger_operation_id"] = automaticTrigger
@@ -262,7 +274,7 @@ extension CommandRouter {
                 return try backupPruneFinish(db,command:command,digest:digest,caller:caller,data:data)
             }
         }} catch {
-            if method == "backup_prune" {
+            if method == "backup_prune" || method == "backup_incomplete_retire" {
                 let key = "backup-prune-intent:" + hash(Data((caller.principal + command).utf8))
                 let pending = (try? dbQueue.read {db in
                     guard let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[key]) else {return false}
@@ -304,7 +316,7 @@ extension CommandRouter {
         }
         return StorageBackupRetentionPolicy.proposed.json.merging(["pins":[] as [JSON],"owner_confirmed":false]) {_,new in new}
     }
-    private func requireManagedBackupPath(_ path: URL) throws {
+    func requireManagedBackupPath(_ path: URL) throws {
         let prefix = root.appendingPathComponent("backups").path + "/"
         guard path.path.hasPrefix(prefix) else {throw CoreError("BACKUP_PRUNE_PATH_REFUSED","Only snapshots inside this installation's backups folder can be pruned.")}
         let parts = String(path.path.dropFirst(prefix.count)).split(separator:"/").map(String.init)
@@ -313,10 +325,10 @@ extension CommandRouter {
         let snapshot = name.hasPrefix("snapshot-") || [".snapshot-failed-",".snapshot-incomplete-",".snapshot-staging-"].contains {name.hasPrefix($0)}
         guard direct,snapshot else {throw CoreError("BACKUP_PRUNE_PATH_REFUSED","Only named snapshot folders directly in backups or its qualification folder can be pruned.")}
     }
-    func backupPrunePreview(includeUnrecorded: Bool = false,at date: Date = Date(),retainingOperation: String? = nil) throws -> JSON {
-        let (settings,receipts,protected,historical) = try dbQueue.read {db -> (JSON,[JSON],Set<String>,Set<String>) in
+    func backupPrunePreview(includeUnrecorded: Bool = false,incompleteOnly: Bool = false,at date: Date = Date(),retainingOperation: String? = nil) throws -> JSON {
+        let (settings,receipts,protected,historical) = try readForPreparation {db -> (JSON,[JSON],Set<String>,Set<String>) in
             let settings = try backupRetentionSettings(db)
-            let rows = try Row.fetchAll(db,sql:"SELECT key,json_object('operation_id',json_extract(value,'$.operation_id'),'state',json_extract(value,'$.state'),'manifest_sha256',json_extract(value,'$.manifest_sha256'),'summary',json_extract(value,'$.summary'),'historical_catalog',json_extract(value,'$.historical_catalog')) AS header FROM metadata WHERE key GLOB 'backup-generation:*'")
+            let receipts = try backupCompletionReceipts(db)
             var protected = Set<String>(),historical = Set<String>()
             for key in ["preupgrade_snapshot","backup-protected-history"] {
                 if let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[key]) {
@@ -340,14 +352,14 @@ extension CommandRouter {
                     }
                 }
             }
-            return (settings,rows.map {var value = jsonObject($0["header"]);value["generation_key"] = $0["key"] as String;return value},protected,historical)
+            return (settings,receipts,protected,historical)
         }
         let policy = try StorageBackupRetentionPolicy.parse(settings)
         var snapshots: [String:JSON] = [:]
         for receipt in receipts {
             guard let summary = receipt["summary"] as? JSON,let path = summary["path"] as? String else {continue}
-            let complete = !(receipt["historical_catalog"] is JSON) && !URL(fileURLWithPath:path,isDirectory:true).lastPathComponent.hasPrefix(".") && receipt["state"] as? String == "complete" && summary["verification"] as? String == "manifest_database_managed_files" && summary["manifest_sha256"] as? String == receipt["manifest_sha256"] as? String
-            snapshots[path] = ["path":path,"state":complete ? "complete" : "incomplete","manifest_sha256":receipt["manifest_sha256"] ?? NSNull(),"operation_id":receipt["operation_id"] ?? "","generation_key":receipt["generation_key"]!,"captured_at":summary["captured_at"] ?? NSNull(),"usage":summary["usage"] ?? NSNull()]
+            let completionPath = backupCompletionPath(receipt),selectedPath = completionPath ?? path
+            snapshots[selectedPath] = ["path":selectedPath,"recorded_path":path,"state":completionPath == nil ? "incomplete" : "complete","manifest_sha256":receipt["manifest_sha256"] ?? NSNull(),"recorded_manifest_sha256":receipt["manifest_sha256"] ?? NSNull(),"operation_id":receipt["operation_id"] ?? "","generation_key":receipt["generation_key"]!,"captured_at":summary["captured_at"] ?? NSNull(),"usage":summary["usage"] ?? NSNull()]
         }
         let parent = root.appendingPathComponent("backups")
         if FileManager.default.fileExists(atPath:parent.path) {
@@ -359,7 +371,7 @@ extension CommandRouter {
                     guard lstat(url.path,&info) == 0,info.st_mode & S_IFMT == S_IFDIR else {continue}
                     if url.lastPathComponent.hasPrefix("qualification-"),depth == 0 {try scan(url,1);continue}
                     guard url.lastPathComponent.hasPrefix("snapshot-") || url.lastPathComponent.hasPrefix(".snapshot-") else {continue}
-                    if snapshots[url.path] == nil {snapshots[url.path] = ["path":url.path,"state":"unrecorded_or_incomplete","generation_key":"","operation_id":"","captured_at":NSNull(),"manifest_sha256":NSNull()]}
+                    if snapshots[url.path] == nil {snapshots[url.path] = ["path":url.path,"state":"incomplete","incomplete_reason":"no_complete_receipt","folder_kind":url.lastPathComponent.hasPrefix(".snapshot-staging-") ? "staging" : "snapshot","generation_key":"","operation_id":"","captured_at":NSNull(),"manifest_sha256":NSNull()]}
                 }
             }
             try files.requireNamedRoot(parent);try scan(parent,0);try files.requireNamedRoot(parent)
@@ -390,6 +402,7 @@ extension CommandRouter {
             if !managed {reasons.append("outside_managed_backups")}
             if protected.contains(path) || bool(snapshot,"upgrade_prepared") {reasons.append("protected_upgrade")}
             if pinnedPaths.contains(path) {reasons.append("owner_pinned")}
+            if incompleteOnly,snapshot["state"] as? String == "complete" {reasons.append("complete_receipt")}
             if snapshot["state"] as? String != "complete",!includeUnrecorded {reasons.append("unrecorded_or_incomplete")}
             if snapshot["state"] as? String == "complete",snapshot["captured_at"] is NSNull {reasons.append("unknown_capture_time")}
             // Historical/foreign paths are display provenance, never I/O authority.
@@ -397,16 +410,23 @@ extension CommandRouter {
                 var info = stat()
                 if lstat(path,&info) != 0 || info.st_mode & S_IFMT != S_IFDIR {reasons.append("missing_or_changed")}
                 else {snapshot["device"] = Int64(info.st_dev);snapshot["inode"] = UInt64(info.st_ino)}
-                // Missing manifests cannot receive a use lease or become candidates.
+                // Incomplete folders can predate manifest publication. A pinned
+                // directory and the capture barrier protect their atomic move.
                 if let lease = try? StorageBackupUseLease(root:URL(fileURLWithPath:path,isDirectory:true)),let sha = try? lease.manifestSHA256() {
                     if let expected = snapshot["manifest_sha256"] as? String,expected != sha {reasons.append("manifest_changed")}
                     snapshot["manifest_sha256"] = sha
+                } else if snapshot["state"] as? String != "complete",let files = try? StorageObjectFiles(root:URL(fileURLWithPath:path,isDirectory:true),pinRootForGates:true),
+                          (try? files.regularOrLinkExists("manifest.json")) == false {
+                    snapshot["manifest_absent"] = true
+                    snapshot["directory_mode"] = UInt32(info.st_mode)
+                    snapshot["directory_mtime_seconds"] = Int64(info.st_mtimespec.tv_sec);snapshot["directory_mtime_nanoseconds"] = Int64(info.st_mtimespec.tv_nsec)
+                    snapshot["directory_ctime_seconds"] = Int64(info.st_ctimespec.tv_sec);snapshot["directory_ctime_nanoseconds"] = Int64(info.st_ctimespec.tv_nsec)
                 } else {reasons.append("manifest_unavailable_or_in_use")}
             }
             snapshot["keep_reasons"] = reasons;snapshot["prune"] = reasons.isEmpty
             output.append(snapshot)
         }
-        let body: JSON = ["settings":settings,"owner_confirmed":bool(settings,"owner_confirmed"),"include_unrecorded":includeUnrecorded,"snapshots":output,"snapshot_count":output.count,"prune_count":output.filter {bool($0,"prune")}.count,"retained_count":output.filter {!bool($0,"prune")}.count,"physical_space_freed":NSNull()]
+        let body: JSON = ["settings":settings,"owner_confirmed":bool(settings,"owner_confirmed"),"include_unrecorded":includeUnrecorded,"incomplete_only":incompleteOnly,"snapshots":output,"snapshot_count":output.count,"complete_count":output.filter {$0["state"] as? String == "complete"}.count,"incomplete_count":output.filter {$0["state"] as? String != "complete"}.count,"prune_count":output.filter {bool($0,"prune")}.count,"retained_count":output.filter {!bool($0,"prune")}.count,"physical_space_freed":NSNull()]
         return body.merging(["preview_sha256":hash(Data((try jsonString(body)).utf8))]) {_,new in new}
     }
     private func protectedInsert(_ path: String,into snapshots: inout [String:JSON]) {
@@ -428,6 +448,7 @@ extension CommandRouter {
         try trash.synchronizePublicationDirectory()
     }
     private func moveBackupToTrash(_ entry: JSON) throws {
+        if bool(entry,"manifest_absent") {try moveIncompleteBackupWithoutManifest(entry);return}
         let source = URL(fileURLWithPath:entry["path"] as! String),destination = URL(fileURLWithPath:entry["trash_path"] as! String)
         try requireManagedBackupPath(source)
         var sourceInfo = stat()

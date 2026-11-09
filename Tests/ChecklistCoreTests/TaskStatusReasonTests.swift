@@ -57,14 +57,18 @@ extension CoreTests {
     }
 
     func testStatusReasonReviewReleaseHasAttributionAndClearsOnReclaim() throws {
-        let p = try project(), tasks = try [ready(p,task(p)),ready(p,task(p))], group = try triage(p)
-        for task in tasks {try addTriage(p,group,task)}
-        let batch = try prepareImplementationBatch(p,group,tasks), claims = try claimFixedBatch(p,batch)["claims"] as! [JSON]
-        _ = try call("batch_submit",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":1,"members":try claims.map {try batchArtifactInput(p,$0)}])
-        let reviewGroup = try triage(p,phase:"review")
-        for task in tasks {try addTriage(p,reviewGroup,task)}
+        let fixture = try preparedCorePhase("status-reason-review-claims") { [self] in
+            let p = try project(), (group,tasks) = try coreFixtureTasksAndTriage(p,count:2)
+            let batch = try prepareImplementationBatch(p,group,tasks),claims = try claimFixedBatch(p,batch)["claims"] as! [JSON]
+            _ = try call("batch_submit",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":1,"members":try claims.map {try batchArtifactInput(p,$0)}])
+            let reviewGroup = try triage(p,phase:"review")
+            for task in tasks {try addTriage(p,reviewGroup,task)}
+            let reviewer = Caller(role:"owner",installation:"status-reason-reviewer",projectIDs:[])
+            let prepared = try prepareReviewBatch(p,reviewGroup,tasks,reviewer),reviews = try claimFixedBatch(p,prepared,reviewer)["claims"] as! [JSON]
+            return ["project":p,"tasks":tasks,"reviews":reviews]
+        }
+        let p = fixture["project"] as! JSON,tasks = fixture["tasks"] as! [JSON],reviews = fixture["reviews"] as! [JSON]
         let reviewer = Caller(role:"owner",installation:"status-reason-reviewer",projectIDs:[])
-        let prepared = try prepareReviewBatch(p,reviewGroup,tasks,reviewer), reviews = try claimFixedBatch(p,prepared,reviewer)["claims"] as! [JSON]
         let release = try call("work_release",["project_id":p["id"]!,"attempt_id":reviews[0]["id"]!,"claim_token":reviews[0]["claim_token"]!,"reason":"Another reviewer should check the native build"],reviewer)
         XCTAssertEqual(release["status_category"] as? String,"review")
         let reason = try XCTUnwrap(release["status_reason"] as? JSON)

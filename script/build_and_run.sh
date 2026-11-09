@@ -14,10 +14,12 @@ export CHECKLIST_BUILD_SCOPE="$BUILD_SCOPE"
 # (--ticket KEY, repeatable, or CHECKLIST_TICKETS=CL-1,CL-2) and refuses without.
 # Install modes record keys when given; --install-stage takes no keys.
 TICKET_ARGS=()
+OFFLINE_MEASUREMENT="${CHECKLIST_OFFLINE_MEASUREMENT:-}"
 if [ "$MODE" != --install-stage ] && [ "$#" -gt 0 ]; then
   shift
   while [ "$#" -gt 0 ]; do
     case "$1" in
+      --offline-measurement) if [ "$#" -lt 2 ]; then echo "--offline-measurement needs a qualification receipt" >&2; exit 2; fi; OFFLINE_MEASUREMENT="$2"; shift 2;;
       --ticket) if [ "$#" -lt 2 ]; then echo "--ticket needs a key such as CL-10" >&2; exit 2; fi; TICKET_ARGS+=(--ticket "$2"); shift 2;;
       *) echo "Unknown argument: $1" >&2; exit 2;;
     esac
@@ -110,7 +112,8 @@ else
 fi
 export CHECKLIST_SIGN_IDENTITY="$SIGN_IDENTITY"
 if [ "$MODE" = --install-stage ]; then
-  if [ "$#" != 2 ]; then echo "usage: $0 --install-stage CAPTURE_DIR" >&2; exit 2; fi
+  if [ "$#" = 4 ] && [ "$3" = --offline-measurement ]; then OFFLINE_MEASUREMENT="$4";
+  elif [ "$#" != 2 ]; then echo "usage: $0 --install-stage CAPTURE_DIR [--offline-measurement FILE]" >&2; exit 2; fi
   CAPTURE_DIR="$(python3 - "$ROOT_DIR/script" "$2" <<'PYVERIFY'
 import sys
 sys.path.insert(0,sys.argv[1])
@@ -377,17 +380,7 @@ codesign --verify --deep --strict "$INCOMING"
 # Complete the protected copy and rehearsal while the old service still serves.
 # Startup revalidates this preparation after the old writer has stopped.
 UPGRADE_PREPARATION="$("$INCOMING/Contents/MacOS/ChecklistService" --prepare-upgrade)"
-python3 - "$UPGRADE_PREPARATION" <<'PYUPGRADE'
-import json,math,sys
-value=json.loads(sys.argv[1]);seconds=value.get('expected_offline_seconds')
-if (type(value.get('needs_upgrade')) is not bool or type(value.get('prepared')) is not bool
-    or type(seconds) not in [int,float] or not math.isfinite(seconds) or seconds<=0):
- raise SystemExit('Invalid store-upgrade preparation receipt; the installed app is untouched.')
-print('Store upgrade preparation: '+json.dumps(value,sort_keys=True),flush=True)
-print(f'Expected service offline window: about {seconds:g} s; '+
-      ('the prepared store must still match at the swap. A changed store uses the full protected startup and reports its reason.'
-       if value['needs_upgrade'] and value['prepared'] else 'protected startup estimate.'),flush=True)
-PYUPGRADE
+python3 "$SOURCE/script/upgrade_offline.py" "$UPGRADE_PREPARATION" "$CAPTURE_DIR" "$INCOMING/Contents/MacOS/ChecklistService" "$OFFLINE_MEASUREMENT"
 # Quiesce only this UI and the process holding this installation's service lock.
 # Data remains in Application Support. This does not claim or create a database backup.
 OFFLINE_STARTED="$(date +%s)"

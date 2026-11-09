@@ -22,7 +22,45 @@ final class MediaListScaleTests: XCTestCase {
     /// Seeds `count` items, publishes the first `count - unpublished` in one manifest and adds
     /// owner decisions (some on an older basis) and stale-predecessor marks per `expected`.
     func publish(_ f: Fixture,_ round: inout JSON,count: Int,unpublished: Int = 0) throws {
-        try lists.seed(f,round,count:count)
+        // This is a read/query corpus, not a save/envelope test. Build the same
+        // canonical shapes and references once, then insert fixture rows without
+        // reparsing them through per-record compareSave/reference-write guards.
+        try f.router.dbQueue.write {db in
+            let (type,context) = try f.router.mediaRoundParts(db,round)
+            var shapePrototype: JSON?
+            for index in 0..<count {
+                var item = f.router.mediaRecord(["round_id":round["id"]!,"title":"Item \(index)","state":"draft","order":index],
+                    project:f.project,caller:f.worker,references:[try f.router.mediaRef("media_round",round)])
+                item["id"] = String(format:"item-%04d",index)
+                let metadata: JSON = ["character":index < count/2 ? "hero":"villain","animation_label":"walk","direction":["E","N","NE"][index%3],"number":index,"flag":index%2 == 0]
+                if shapePrototype == nil {
+                    shapePrototype = try f.router.mediaTargetShape(db,item:item,title:"Item \(index)",metadata:metadata,candidates:[],typeRevision:type,context:context)
+                }
+                // All five declared fields are material, with identical schema,
+                // empty candidate set and instruction context. Reuse that fixed
+                // definition while retaining each row's exact canonical values.
+                var shape = shapePrototype!
+                shape["item_id"] = item["id"];shape["title"] = item["title"];shape["metadata"] = metadata
+                let content = try MediaCanonical.bytes(["candidate_set":[] as [JSON],"material_metadata":metadata])
+                shape["content_signature"] = ChecklistCore.hash(content);shape["content_basis_base64"] = content.base64EncodedString()
+                let basis: JSON = ["content_signature":shape["content_signature"]!,"material_definition_signature":shape["material_definition_signature"]!,
+                    "context_signature":shape["context_signature"]!,"rubric":type["rubric"] ?? "","selection_rule":"single-explicit-winner-v1","material_valid":false]
+                shape["review_basis_signature"] = try MediaCanonical.signature(basis)
+                shape["review_basis_base64"] = try MediaCanonical.bytes(basis).base64EncodedString()
+                if index < 6 || index == count - 1 {
+                    let canonical = try f.router.mediaTargetShape(db,item:item,title:"Item \(index)",metadata:metadata,candidates:[],typeRevision:type,context:context)
+                    XCTAssertEqual(try jsonString(shape),try jsonString(canonical),"Prepared parity corpus must retain canonical target bytes")
+                }
+                let target = f.router.mediaRecord(shape,project:f.project,caller:f.worker,references:[
+                    try f.router.mediaRef("media_item",item),
+                    ["type":"media_review_type_revision","id":shape["type_revision_id"]!,"revision":1],
+                    ["type":"media_review_context","id":shape["context_id"]!,"revision":1]])
+                try fixtureInsert(db,target,type:"media_item_target")
+                item["draft_target_id"] = target["id"]
+                item["record_references"] = (item["record_references"] as! [JSON]) + [try f.router.mediaRef("media_item_target",target)]
+                try fixtureInsert(db,item,type:"media_item")
+            }
+        }
         round = try f.router.dbQueue.write {db -> JSON in
             let (type,context) = try f.router.mediaRoundParts(db,round)
             let items = try f.router.mediaItems(db,round:round),published = count - unpublished
@@ -38,7 +76,7 @@ final class MediaListScaleTests: XCTestCase {
                     let basis = index % 11 == 0 ? "older-basis" : target["review_basis_signature"] as! String
                     let decision = f.router.mediaRecord(["item_id":item["id"]!,"target_id":target["id"]!,"disposition":disposition,
                         "review_basis_signature":basis,"origin":"human_ui"],project:f.project,caller:f.owner)
-                    try f.router.mediaWrite(db,decision,type:"media_owner_decision")
+                    try fixtureInsert(db,decision,type:"media_owner_decision")
                     next["last_decision_id"] = decision["id"]
                 } else if index % 13 == 0 {
                     next["stale_predecessor_decision_id"] = "older-decision"
@@ -47,6 +85,9 @@ final class MediaListScaleTests: XCTestCase {
             }
             return current
         }
+    }
+    private func fixtureInsert(_ db: Database,_ value: JSON,type: String) throws {
+        try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (?,?,?,?,?)",arguments:[value["id"] as! String,value["project_id"] as! String,type,value["revision"] as! Int,try jsonString(value)])
     }
     func pageAll(_ f: Fixture,_ round: JSON,filter: JSON? = nil) throws -> [JSON] {
         var rows: [JSON] = [],cursor: String? = nil
@@ -78,7 +119,10 @@ final class MediaListScaleTests: XCTestCase {
     }
 
     func testListIndexMatchesFormerManifestJoinOnSmallRound() throws {
-        let f = try Fixture(),type = try f.type(lists.schema());var round = try f.round(type)
+        // The parity corpus is consumed once. Seed it on the prepared empty
+        // store instead of paying another migration/open/clone for one use.
+        let f = try Fixture(),type = try f.type(lists.schema())
+        var round = try f.round(type)
         try publish(f,&round,count:80,unpublished:6)
         let old = try oldIndex(f,round)
         XCTAssertEqual(Set(old.map {$0[5]}),["pending","accepted","changes_requested","excluded","stale"])

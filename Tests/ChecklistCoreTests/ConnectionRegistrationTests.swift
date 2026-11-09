@@ -59,6 +59,29 @@ final class ConnectionRegistrationTests: XCTestCase {
         try router.cancelStorageDrain(drain,caller:owner)
     }
 
+    func testGlobalConnectionSessionCollisionKeepsFreshStateOwnerAndStorageAdmission() throws {
+        let f = try fixture()
+        XCTAssertTrue(try router.connectionSessionExists(sessionID:f.sid,caller:owner))
+        XCTAssertFalse(try router.connectionSessionExists(sessionID:uuid(),caller:owner))
+        XCTAssertThrowsError(try router.connectionSessionExists(sessionID:f.sid,caller:Caller(role:"worker",installation:"foreign",projectIDs:[f.pid]))) { error in
+            XCTAssertEqual((error as? CoreError)?.code,"HUMAN_CHANNEL_REQUIRED")
+        }
+        // A second project cannot hide this global collision; terminal sessions
+        // still belong to their original registration and cannot be replaced.
+        _ = try call("project_create",["name":"Other collision scope","key_prefix":"OC"])
+        for state in ["ended","revoked"] {
+            let current = try session(f.sid)
+            _ = try call("session_update",["project_id":f.pid,"session_id":f.sid,"expected_revision":current["revision"]!,"state":state])
+            XCTAssertTrue(try router.connectionSessionExists(sessionID:f.sid,caller:owner))
+        }
+        let drain = try router.beginStorageDrain(caller:owner)
+        XCTAssertTrue(try router.waitForStorageDrain(drain,timeout:1,caller:owner))
+        XCTAssertThrowsError(try router.connectionSessionExists(sessionID:f.sid,caller:owner)) { error in
+            XCTAssertEqual((error as? CoreError)?.code,"STORAGE_DRAINING")
+        }
+        try router.cancelStorageDrain(drain,caller:owner)
+    }
+
     func testOriginalIntentReplaySkipsEveryPreparationAndKeepsExactSemanticReceipt() throws {
         let f = try fixture(), original = intent(f.pid)
         var preparations = 0, rotations = 0
@@ -144,13 +167,31 @@ final class ConnectionRegistrationTests: XCTestCase {
             let inputs: JSON = ["intent": original, "project_id": f.pid, "session_id": f.sid]
             try Data((try jsonString(inputs)).utf8).write(to: root.appendingPathComponent("crash-inputs.json"))
             let bundle = Bundle(for: ConnectionRegistrationTests.self).bundleURL
-            let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-            process.arguments = ["xctest", "-XCTest", "ChecklistCoreTests.ConnectionRegistrationTests/testOnlyDisposableCrashChild", bundle.path]
+            let process = Process()
+            let selector = ["-XCTest", "ChecklistCoreTests.ConnectionRegistrationTests/testOnlyDisposableCrashChild", bundle.path]
+            // The active XCTest host already identifies the selected developer
+            // toolchain. Avoid launching xcrun again for every crash boundary.
+            if let host = Bundle.main.executableURL, host.lastPathComponent == "xctest" {
+                process.executableURL = host; process.arguments = selector
+            } else {
+                process.executableURL = URL(fileURLWithPath:"/usr/bin/xcrun")
+                process.arguments = ["xctest"] + selector
+            }
             var environment = ProcessInfo.processInfo.environment
             environment["CL82_CHILD_MODE"] = mode; environment["CL82_CHILD_ROOT"] = root.path; process.environment = environment
             let output = Pipe(); process.standardOutput = output; process.standardError = output
+            let exited = DispatchSemaphore(value:0)
+            process.terminationHandler = { _ in exited.signal() }
             router = nil
-            try process.run(); process.waitUntilExit()
+            try process.run()
+            let completed = exited.wait(timeout:.now() + 30)
+            if completed != .success, process.isRunning {
+                _ = Darwin.kill(process.processIdentifier,SIGKILL)
+                XCTAssertEqual(exited.wait(timeout:.now() + 5),.success,"Disposable crash child did not stop")
+            }
+            XCTAssertEqual(completed,.success,"Disposable crash child exceeded its finite bound")
+            guard !process.isRunning else { return }
+            process.waitUntilExit()
             let diagnostics = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
             XCTAssertEqual(process.terminationReason, .uncaughtSignal, diagnostics); XCTAssertEqual(process.terminationStatus, SIGKILL, diagnostics)
             router = try TestStore.router(root: root)

@@ -171,8 +171,9 @@ final class CommandOperationTests: XCTestCase {
         let invalidSource = f.base.appendingPathComponent("invalid-source")
         try Data([0]).write(to:invalidSource)
         let methods = CommandRouter.alwaysOperationMethods.union(CommandRouter.operationEvidenceMethods).union(["task_archive","attachment_add","attachment_read","work_submit","batch_submit","project_edit","project_settings_save"])
+        var interrupted: [(method: String, command: String, input: JSON, accepted: JSON, id: String)] = []
         for method in methods.sorted() {
-            if method == "backup_prune_preview" {
+            if ["backup_prune_preview","backup_incomplete_preview"].contains(method) {
                 try f.router!.dbQueue.write {db in try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('backup-retention-settings','{}') ON CONFLICT(key) DO UPDATE SET value=excluded.value")}
             }
             let lane = HeldLane(f.router!);defer {lane.finish()}
@@ -198,17 +199,31 @@ final class CommandOperationTests: XCTestCase {
                 record["state"] = "running";record.removeValue(forKey:"error");record.removeValue(forKey:"finished_at")
                 try f.router!.saveOperation(db,record)
             }
-            try f.reopen()
+            interrupted.append((method,command,input,accepted,id))
+            if ["backup_prune_preview","backup_incomplete_preview"].contains(method) {
+                try f.router!.dbQueue.write {db in try db.execute(sql:"DELETE FROM metadata WHERE key='backup-retention-settings'")}
+            }
+        }
+        // Every admitted method has an independent durable running record. One
+        // real startup recovers the entire set, just as a process restart does.
+        try f.reopen()
+        for (method,command,input,accepted,id) in interrupted {
+            if ["backup_prune_preview","backup_incomplete_preview"].contains(method) {
+                try f.router!.dbQueue.write {db in try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('backup-retention-settings','{}') ON CONFLICT(key) DO UPDATE SET value=excluded.value")}
+            }
             let recovered = try read(f,accepted,project:pid)
             XCTAssertEqual(recovered["state"] as? String,"failed",method)
             XCTAssertEqual((recovered["error"] as? JSON)?["code"] as? String,"OPERATION_INTERRUPTED",method)
             let retryLane = HeldLane(f.router!);defer {retryLane.finish()}
             let retry = try f.call(method,input,command:command)
             XCTAssertEqual(try data(retry)["operation_id"] as? String,id,method)
-            XCTAssertEqual(try data(retry)["state"] as? String,"queued",method)
+            XCTAssertEqual(try data(retry)["state"] as? String,method == "backup_create" ? "failed" : "queued",method)
+            if method == "backup_create" {
+                XCTAssertEqual((try data(retry)["error"] as? JSON)?["code"] as? String,"OPERATION_INTERRUPTED")
+            }
             retryLane.finish()
             XCTAssertEqual(try read(f,accepted,project:pid)["state"] as? String,"failed",method)
-            if method == "backup_prune_preview" {
+            if ["backup_prune_preview","backup_incomplete_preview"].contains(method) {
                 try f.router!.dbQueue.write {db in try db.execute(sql:"DELETE FROM metadata WHERE key='backup-retention-settings'")}
             }
         }

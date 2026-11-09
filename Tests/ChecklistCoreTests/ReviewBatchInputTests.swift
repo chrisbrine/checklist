@@ -9,9 +9,8 @@ extension CoreTests {
         }
         return (fixture["project"] as! JSON,fixture["group"] as! JSON,fixture["tasks"] as! [JSON],Caller(role:"owner",installation:"review-input-reader",projectIDs:[]))
     }
-    private func buildReviewBatchInputsFixture() throws -> (project: JSON,group: JSON,tasks: [JSON],reviewer: Caller) {
-        let p = try project(),tasks = try [ready(p,task(p,"Open request")),ready(p,task(p,"No open request")),ready(p,task(p,"Revision changes"))],implementation = try triage(p)
-        for task in tasks {try addTriage(p,implementation,task)}
+    func buildReviewBatchInputsFixture() throws -> (project: JSON,group: JSON,tasks: [JSON],reviewer: Caller) {
+        let p = try project(), (implementation,tasks) = try coreFixtureTasksAndTriage(p,count:3,titles:["Open request","No open request","Revision changes"])
         let batch = try prepareImplementationBatch(p,implementation,tasks),claims = try claimFixedBatch(p,batch)["claims"] as! [JSON]
         _ = try call("batch_submit",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":1,"members":try claims.map {try batchArtifactInput(p,$0)}])
         // A completed/superseded request leaves no open review request for this member.

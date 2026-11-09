@@ -25,6 +25,7 @@ A check of operation scheduling needs a call that really becomes an operation. T
 | `attachment_read` | input | Each call with `representation` `preview` or `original`. The default `metadata` stays synchronous. Use this read first: it needs only an existing attachment. |
 | `attachment_cleanup_preview` | always | Agent call with the task. |
 | `backup_prune_preview` | always | Owner channel only: an agent cannot call it. |
+| `backup_incomplete_preview` | always | List incomplete/staging backup folders and exact keep reasons. Apply only the final preview digest through `backup_incomplete_retire`. |
 | `import_preview` | always | Agent call with an authorized source. |
 | `policy_preview` | always | Agent call with a policy. |
 | `restore_preview` | always | Owner channel only. An agent gets `STORAGE_BOUNDARY_REQUIRED`. |

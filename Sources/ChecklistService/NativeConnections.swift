@@ -129,9 +129,7 @@ extension Coordinator {
             return BootstrapResult(reply:connectionResult(existing, project:pid),changed:false)
         }
         return try bootstrapWrite {
-            let snapshot=try router.handle(method:"snapshot",params:[:],caller:owner)
-            let records=(snapshot["data"] as? [String:Any] ?? snapshot)["sessions"] as? [[String:Any]] ?? []
-            guard !records.contains(where:{$0["id"] as? String == boundSessionID}) else { throw ChecklistError("SESSION_ID_CONFLICT","This reported session identifier already belongs to another connection. It cannot replace that connection.") }
+            guard try !router.connectionSessionExists(sessionID:boundSessionID,caller:owner) else { throw ChecklistError("SESSION_ID_CONFLICT","This reported session identifier already belongs to another connection. It cannot replace that connection.") }
             var bytes=[UInt8](repeating:0,count:32)
             guard SecRandomCopyBytes(kSecRandomDefault,bytes.count,&bytes)==errSecSuccess else { throw ChecklistError("RANDOM_FAILURE","Could not create the thread connection.") }
             let token=Data(bytes).base64EncodedString()

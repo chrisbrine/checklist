@@ -75,7 +75,7 @@ extension CoreTests {
     }
 
     func testDuplicatePreservesContextAndFindingsRequiresExplicitReopen() throws {
-        let value = try submittedArtifact(), p = value.project
+        let value = try preparedSubmittedArtifact(), p = value.project
         let reviewer = Caller(role: "owner", installation: "independent-relation-review", projectIDs: [])
         let rid = strings(value.submission, "review_request_ids")[0]
         let claim = try call("work_claim", ["project_id": p["id"]!, "task_id": value.task["id"]!, "expected_revision": value.task["revision"]!, "phase": "review", "review_request_id": rid, "target_manifest_id": value.submission["manifest_id"]!, "gate": "review"], reviewer)

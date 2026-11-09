@@ -235,8 +235,17 @@ final class StorageMigrationTests: XCTestCase {
         XCTAssertEqual(try f.router!.dbQueue.read {try Int.fetchOne($0,sql:"PRAGMA user_version")},SchemaMigrations.currentSchema)
     }
     func testMigrationDeathBeforeAndAfterCommitRepairsForwardWithoutReplacingUserData() throws {
+        let f = try StorageFixture(open:false),project = try f.seedReleased(),pid = project["id"] as! String
+        // The released subprocess has exited: keep its entire closed legacy
+        // store as immutable input to both genuine migration/death boundaries.
+        let released = f.base.appendingPathComponent("released-template")
+        try FileManager.default.copyItem(at:f.root,to:released)
         for mode in ["migration-before-commit","migration-committed"] {
-            let f = try StorageFixture(open:false),project = try f.seedReleased(),pid = project["id"] as! String
+            if mode == "migration-committed" {
+                try f.close()
+                try FileManager.default.moveItem(at:f.root,to:f.base.appendingPathComponent("recovered-before-commit"))
+                try FileManager.default.copyItem(at:released,to:f.root)
+            }
             let child = try f.spawn(mode);try f.finish(child,seconds:30)
             XCTAssertEqual(child.terminationReason,.uncaughtSignal);XCTAssertEqual(child.terminationStatus,SIGKILL)
             XCTAssertEqual(try String(contentsOf:f.base.appendingPathComponent("ready"),encoding:.utf8),mode)

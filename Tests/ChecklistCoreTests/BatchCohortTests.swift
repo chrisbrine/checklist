@@ -15,8 +15,7 @@ extension CoreTests {
         return Caller(role:"worker",installation:name,projectIDs:[p["id"] as! String],sessionID:sid,workspace:p["root_path"] as? String,executionDomain:"synthetic:"+name)
     }
     func sharedBatch(_ p: JSON,_ worker: Caller,paths: [String] = ["src/shared.swift","src/shared.swift"]) throws -> JSON {
-        let group = try triage(p),tasks = try paths.map {_ in try ready(p,task(p))}
-        for task in tasks { try addTriage(p,group,task) }
+        let (group,tasks) = try coreFixtureTasksAndTriage(p,count:paths.count)
         return try prepareImplementationBatch(p,group,tasks,worker,scopes:paths.map {[["path":$0,"access":"write"]]})
     }
     func cohortAuth(_ p: JSON,_ claim: JSON) -> JSON { ["project_id":p["id"]!,"attempt_id":claim["id"]!,"claim_token":claim["claim_token"]!] }
@@ -51,9 +50,14 @@ extension CoreTests {
         XCTAssertEqual(Set(claims.map {($0["file_scopes"] as! [JSON])[0]["canonical_key"] as! String}).count,1)
     }
     func testSharedBatchExternalUnionSurvivesPartialReleaseAndIndividualSubmission() throws {
+        try assertSharedBatchExternalUnion(submit:false)
+    }
+    func testSharedBatchExternalUnionSurvivesIndividualSubmission() throws {
+        try assertSharedBatchExternalUnion(submit:true)
+    }
+    private func assertSharedBatchExternalUnion(submit: Bool) throws {
         orchestrateBatchTriages = true // CL-125 rule 6: claims keep tickets in an orchestrated Triage.
-        for submit in [false,true] {
-            let p = try cohortProject(),worker = try cohortWorker(p),other = try cohortWorker(p),batch = try sharedBatch(p,worker),claims = try claimFixedBatch(p,batch,worker)["claims"] as! [JSON]
+            let f = try preparedCohortWorkers(),p = f.project,worker = f.worker,other = f.other,batch = try sharedBatch(p,worker),claims = try claimFixedBatch(p,batch,worker)["claims"] as! [JSON]
             let outside = try ready(p,task(p))
             // Same session in a different batch, and another session, cannot join this cohort.
             for caller in [worker,other] {
@@ -76,10 +80,9 @@ extension CoreTests {
             assertCode("SCOPE_CONFLICT") {_ = try self.outsiderClaim(p,outside,other)}
             _ = try call("batch_release",["project_id":p["id"]!,"batch_id":batch["id"]!,"members":[["attempt_id":claims[1]["id"]!,"claim_token":claims[1]["claim_token"]!]],"reason":"Last owner release"],worker)
             _ = try outsiderClaim(p,outside,other)
-        }
     }
     func testSharedBatchPreexistingWriterAndLateMemberConflictRollbackWithTicketDiagnostics() throws {
-        let p = try cohortProject(),worker = try cohortWorker(p),other = try cohortWorker(p),outside = try ready(p,task(p)),batch = try sharedBatch(p,worker,paths:["safe.swift","src/shared.swift"])
+        let f = try preparedCohortWorkers(),p = f.project,worker = f.worker,other = f.other,outside = try ready(p,task(p)),batch = try sharedBatch(p,worker,paths:["safe.swift","src/shared.swift"])
         _ = try outsiderClaim(p,outside,other)
         let before = try batchClaimState(p,batch)
         XCTAssertThrowsError(try claimFixedBatch(p,batch,worker)) { error in
@@ -105,7 +108,7 @@ extension CoreTests {
         _ = try call("work_scope_adjust",input,worker)
     }
     func testSharedBatchCopiedCohortCannotTransferThroughChildHandoffOrTakeover() throws {
-        let p = try cohortProject(),worker = try cohortWorker(p),other = try cohortWorker(p),batch = try sharedBatch(p,worker),claims = try claimFixedBatch(p,batch,worker)["claims"] as! [JSON]
+        let f = try preparedCohortWorkers(),p = f.project,worker = f.worker,other = f.other,batch = try sharedBatch(p,worker),claims = try claimFixedBatch(p,batch,worker)["claims"] as! [JSON]
         var delegate = cohortAuth(p,claims[0]);delegate["child_session_id"] = other.sessionID!;delegate["file_scopes"] = [["path":"src/shared.swift","access":"write"]]
         let offer = try call("work_delegate",delegate,worker),before = try batchClaimState(p,batch)
         assertCode("SCOPE_CONFLICT") {_ = try self.call("work_child_accept",["project_id":p["id"]!,"delegation_id":offer["id"]!],other)}

@@ -143,3 +143,31 @@ extension ServiceQueueTimingTests {
         coordinator.queue.sync {XCTAssertEqual(coordinator.storageWakePlan.deadline,fresh)}
     }
 }
+
+extension ServiceQueueTimingTests {
+    func testTenCleanupMetadataRepliesLeaveForegroundReadsFreeOfMutationHooks() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let router = try CommandRouter(root:root)
+        defer {try? router.closeStore();try? FileManager.default.removeItem(at:root)}
+        let coordinator = Coordinator(router:router,enrollmentFile:root.appendingPathComponent("connections.json"),startBackgroundWork:false)
+        coordinator.workHealthFailures = 2
+        let connection = NSXPCConnection(machServiceName:"org.checklist.synthetic.unconnected")
+        defer {connection.invalidate()}
+        let peer = Peer(coordinator:coordinator,connection:connection)
+        var hooks = 0, replies = 0
+        coordinator.queue.sync {
+            coordinator.waiters[UUID()] = {hooks += 1}
+            for method in Array(repeating:"cleanup_job_list",count:10) + ["cleanup_job_get","service_info","task_get"] {
+                XCTAssertTrue(CommandRouter.runsOutsideSerialQueue(method),method)
+                peer.finish(["data":[:]],runHooks:Peer.requiresAfterCommand(method),method:method) {_ in replies += 1}
+            }
+            XCTAssertEqual(replies,13)
+            XCTAssertEqual(hooks,0,"Metadata reads must not queue mutation/change/native/storage scans ahead of foreground admission")
+            for method in ["cleanup_job_cancel","cleanup_job_retry","task_archive","message_send","attachment_read","attachment_cleanup_preview"] {
+                XCTAssertTrue(Peer.requiresAfterCommand(method),method)
+            }
+        }
+        coordinator.storageQueue.sync {}
+        coordinator.queue.sync {coordinator.storageWake?.cancel()}
+    }
+}

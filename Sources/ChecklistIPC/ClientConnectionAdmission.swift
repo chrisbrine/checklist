@@ -35,6 +35,20 @@ public struct ClientExecutableKey: Hashable, Sendable {
     }
 }
 
+/// Connection boundary stamps; exported only on an explicitly timed request.
+public struct ClientAdmissionTiming: Sendable {
+    public let listenerUptime: TimeInterval
+    public let identityStartedUptime: TimeInterval
+    public let identityFinishedUptime: TimeInterval
+    public let admittedUptime: TimeInterval
+    public let cacheHit: Bool
+
+    public var fields: [String: Any] {
+        ["listener_uptime_s": listenerUptime, "identity_started_uptime_s": identityStartedUptime,
+         "identity_finished_uptime_s": identityFinishedUptime, "admitted_uptime_s": admittedUptime, "cache_hit": cacheHit]
+    }
+}
+
 /// A PID check selects the peer. XPC still checks the exact hash on every command message.
 /// The signature of each executable is read once; later clients of the same unchanged
 /// executable reuse that identity. A first read runs off the listener's serial queue.
@@ -70,29 +84,40 @@ public struct ClientConnectionAdmission {
     /// A cached executable is classified at once. Otherwise the connection is held unresumed
     /// while a concurrent queue reads its signature; a refused peer is then invalidated.
     public func accept(_ connection: NSXPCConnection, peer: @escaping () -> any ChecklistRPC) -> Bool {
+        accept(connection, timedPeer: { _ in peer() })
+    }
+
+    /// Admission precedes the request's diagnostic switch. Retain four monotonic
+    /// stamps per connection, and expose them only on explicitly timed replies.
+    public func accept(_ connection: NSXPCConnection, timedPeer: @escaping (ClientAdmissionTiming) -> any ChecklistRPC) -> Bool {
+        let listener = ProcessInfo.processInfo.systemUptime
         guard requirement != nil else { return false }
         let key = keySource(connection)
         if let key, let identity = cache.identity(for: key) {
-            return admit(connection, identity, peer: peer)
+            let checked = ProcessInfo.processInfo.systemUptime
+            return admit(connection, identity, listener: listener, started: listener, finished: checked, cacheHit: true, peer: timedPeer)
         }
         let check = Deferred { [self] in
+            let started = ProcessInfo.processInfo.systemUptime
             let identity = identitySource(connection)
+            let finished = ProcessInfo.processInfo.systemUptime
             // Cache only when the executable did not change during the read.
             if let key, let identity, keySource(connection) == key { cache.store(identity, for: key) }
             // A refused peer gets no exported object; resuming before invalidation tells
             // the client at once instead of leaving its first message unanswered.
-            if !admit(connection, identity, peer: peer) { connection.resume(); connection.invalidate() }
+            if !admit(connection, identity, listener: listener, started: started, finished: finished, cacheHit: false, peer: timedPeer) { connection.resume(); connection.invalidate() }
         }
         Self.checks.async { check.run() }
         return true
     }
 
-    private func admit(_ connection: NSXPCConnection, _ identity: ClientBuildIdentity?, peer: () -> any ChecklistRPC) -> Bool {
+    private func admit(_ connection: NSXPCConnection, _ identity: ClientBuildIdentity?, listener: TimeInterval, started: TimeInterval, finished: TimeInterval, cacheHit: Bool, peer: (ClientAdmissionTiming) -> any ChecklistRPC) -> Bool {
         switch ClientBuildAdmission.classify(identity, currentHashes: currentHashes, checklistIdentifiers: identifiers) {
         case .current:
             guard let requirement else { return false }
             connection.setCodeSigningRequirement(requirement)
-            connection.exportedObject = peer()
+            connection.exportedObject = peer(.init(listenerUptime: listener, identityStartedUptime: started,
+                identityFinishedUptime: finished, admittedUptime: ProcessInfo.processInfo.systemUptime, cacheHit: cacheHit))
         case .outdated:
             connection.exportedObject = OutdatedClientPeer()
         case .refused:

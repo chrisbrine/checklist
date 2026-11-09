@@ -30,6 +30,18 @@ extension CommandRouter {
         }
     }
 
+    /// Internal owner-only global collision check for a new native enrollment.
+    /// Read only the selected canonical session; never project the owner snapshot
+    /// or scope away an ended/revoked session belonging to another project.
+    public func connectionSessionExists(sessionID: String, caller: Caller) throws -> Bool {
+        try owner(caller)
+        let lease = try storageAdmission.acquire(); defer { lease.finish() }
+        return try readConnectionAuthority { db in
+            do { _ = try self.record(db,sessionID,type:"session"); return true }
+            catch let error as CoreError where error.code == "NOT_FOUND" { return false }
+        }
+    }
+
     private func readConnectionAuthority<T>(_ body: (Database) throws -> T) throws -> T {
         if readers != nil {return try readForPreparation(body)}
         guard let result = try withImmediateWriteAccess({try dbQueue.read(body)}) else {

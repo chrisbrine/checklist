@@ -232,6 +232,7 @@ extension EvidenceAuthorityTests {
     // Rule 10 through review_record: a reject moves the ticket back to its return Triage; a pass without Done stays;
     // a return Triage without an orchestrator sends the ticket to no Triage.
     func testRejectThroughReviewRecordMovesTicketToReturnTriage() throws {
+        useReviewGitFixture()
         try sourceFixture()
         var p = try project()
         p = try call("policy_apply",["project_id":p["id"]!,"expected_revision":p["revision"]!,"policy":["required_gates":["review"],"review_batch_policy":"hold_passing_for_batch"]])
@@ -268,6 +269,7 @@ extension EvidenceAuthorityTests {
 
     // Rule 10 through batch_review_record: the reviewer's explicit add keeps the return Triage, and a reject moves each ticket back.
     func testRejectThroughBatchReviewRecordMovesTicketsToReturnTriage() throws {
+        useReviewGitFixture()
         try sourceFixture()
         let p = try project(), a = try native(p,"batch-implementing",domain:"codex:cl125-batch-a"), b = try native(p,"batch-reviewing",domain:"claude:cl125-batch-b",provider:"claude")
         let triageA = try startOwn(p,a), triageB = try startOwn(p,b)

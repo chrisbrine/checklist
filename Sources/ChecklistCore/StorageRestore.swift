@@ -9,6 +9,9 @@ extension CommandRouter {
 
     func executeStorageRestore(method: String,params: JSON,caller: Caller,budget: StorageSnapshotBudget = .production()) throws -> JSON {
         try owner(caller)
+        budget.beginTiming(operation: method, command: params["command_id"] as? String)
+        var timingOutcome = "failed"
+        defer { budget.finishTiming(outcome: timingOutcome) }
         if method == "restore_create",let command = params["command_id"] as? String {
             let digest = hash(Data((method + (try jsonString(params))).utf8))
             if let replay = try dbQueue.read({db -> JSON? in
@@ -17,10 +20,11 @@ extension CommandRouter {
                 let result = jsonObject(row["result"])
                 if Self.isPrunedResult(result) {throw Self.expiredCommandError(command)}
                 return result.merging(["replayed":true]) {_,new in new}
-            }) {return replay}
+            }) {timingOutcome = "replayed";return replay}
         }
         let source = URL(fileURLWithPath:try text(params,"path"),isDirectory:true).standardizedFileURL
         do {
+            try requireCompletedBackupForRestore(source)
             let useLease = try StorageBackupUseLease(root:source)
             let files = useLease.files
             defer {withExtendedLifetime(useLease) {}}
@@ -31,6 +35,7 @@ extension CommandRouter {
             guard let operation = UUID(uuidString:manifest.operationID) else {throw StorageSnapshotFailure.incomplete}
             let digest = try autoreleasepool {try StorageSnapshot.verify(files,operation:operation,budget:budget)}
             guard digest == manifestDigest else {throw StorageSnapshotFailure.sourceChanged}
+            try requireCompletedBackupForRestore(source, manifestSHA256: digest)
             // Older schemas need the separately protected migration path before
             // restore. Never apply an unqualified schema rewrite during restore.
             guard manifest.schema == SchemaMigrations.currentSchema else {throw CoreError("RESTORE_SCHEMA_UNSUPPORTED","Restore requires a current-format backup. Qualify an upgrade on a separate copy first.")}
@@ -45,12 +50,15 @@ extension CommandRouter {
                 let families: [String:Int]
                 if let captured = manifest.recordFamilies {families = captured}
                 else {families = try database.read {try StorageSnapshot.recordFamilyCounts($0)}}
-                return ["data":["manifest_sha256":digest,"path":source.path,"schema":manifest.schema,"store_id":manifest.storeID,"source_root":manifest.sourceRoot,"captured_at":manifest.capturedAt as Any? ?? NSNull(),"verified_at":now(),"record_families":families,"projects":Array(projects.prefix(200)),"project_count":projects.count,"managed_files":manifest.objects.count,"managed_bytes":manifest.objects.reduce(Int64(0)) {$0 + $1.size},"unavailable":manifest.unavailable.map {["authority":$0.authority,"reason":$0.reason]},"external_references":manifest.externalReferences,"destination_parent":root.appendingPathComponent("restore").path,"existing_store_preserved":true,"authority":"new_incarnation_recovery_required"]]
+                timingOutcome = "complete"
+                return ["data":["state":"complete","manifest_sha256":digest,"path":source.path,"schema":manifest.schema,"store_id":manifest.storeID,"source_root":manifest.sourceRoot,"captured_at":manifest.capturedAt as Any? ?? NSNull(),"verified_at":now(),"record_families":families,"projects":Array(projects.prefix(200)),"project_count":projects.count,"managed_files":manifest.objects.count,"managed_bytes":manifest.objects.reduce(Int64(0)) {$0 + $1.size},"unavailable":manifest.unavailable.map {["authority":$0.authority,"reason":$0.reason]},"external_references":manifest.externalReferences,"destination_parent":root.appendingPathComponent("restore").path,"existing_store_preserved":true,"authority":"new_incarnation_recovery_required"]]
             }
             guard try text(params,"manifest_sha256",max:64) == digest else {throw CoreError("RESTORE_PREVIEW_CHANGED","The backup changed after preview. Preview it again before restoring.")}
-            return try StorageSnapshotRetention.withCapture(root:root) { _ in
+            let result = try StorageSnapshotRetention.withCapture(root:root) { _ in
                 try createRestoredCopy(params:params,caller:caller,source:files,manifest:manifest,manifestSHA:digest,budget:budget)
             }
+            timingOutcome = "complete"
+            return result
         } catch let error as DatabaseError {
             if let command = params["command_id"] as? String {throw storageOutcomeFailure(error,command:command)}
             throw error
@@ -113,21 +121,25 @@ extension CommandRouter {
             try StorageSnapshotWork.restoreObjects(manifest.objects,source:source,destination:stage,budget:budget,logicalBytesBeforeCopy:manifest.databaseSize)
             try budget.notify("restore_objects_finished")
             try stage.synchronizeCopiedDirectories(budget:budget)
+            try budget.notify("restore_fencing_started")
             receipt = try fenceRestoredAuthority(stage:stage,params:params,caller:caller,manifest:manifest,manifestSHA:manifestSHA,intent:intent,budget:budget)
+            try budget.notify("restore_fencing_finished")
             try stage.writeNew(receiptName,bytes:Data((try jsonString(receipt)).utf8))
             try stage.synchronizeOwnedFile("checklist.sqlite")
             try budget.check()
-            try budget.observe("restore_before_publish")
-            do {try parent.publish(stageName,as:name) {try budget.observe("restore_published_before_flush")}}
+            try budget.notify("restore_before_publish")
+            do {try parent.publish(stageName,as:name) {try budget.notify("restore_published_before_flush")}}
             catch {throw CoreError("OUTCOME_UNKNOWN","Restore publication is uncertain. Preserve the original command and check its result before retrying.",details:["command_id":command,"command_outcome":"unknown"])}
         }
         let summary: JSON
         do {
+            try budget.notify("restore_usage_started")
             let files = try StorageObjectFiles(root:destination)
             let usage = try StorageCopyUsage.measure(files,paths:["checklist.sqlite",StoreIdentityReceipt.fileName,receiptName] + manifest.objects.map {$0.descriptor.relativePath},budget:budget)
             summary = ["kind":"restore_copy","operation_id":command,"path":destination.path,"source_root":manifest.sourceRoot,
                 "store_id":manifest.storeID,"captured_at":manifest.capturedAt as Any? ?? NSNull(),"verified_at":now(),
                 "manifest_sha256":manifestSHA,"verification":"copy_integrity_and_authority_fencing","native_startup_verified":false,"usage":usage]
+            try budget.notify("restore_usage_finished")
         } catch {
             throw CoreError("OUTCOME_UNKNOWN","The restored copy was published but its usage receipt needs reconciliation. Preserve the original command.",details:["command_id":command,"command_outcome":"unknown"])
         }

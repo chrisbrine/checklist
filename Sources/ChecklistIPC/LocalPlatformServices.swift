@@ -106,11 +106,13 @@ public struct MacOSLocalCommandTransport: LocalCommandTransport {
         let connection = suppliedConnection ?? NSXPCConnection(machServiceName: ChecklistInstance.current.machServiceName, options: [])
         connection.remoteObjectInterface = NSXPCInterface(with: ChecklistRPC.self)
         let semaphore = DispatchSemaphore(value: 0)
-        let outcome = OSAllocatedUnfairLock(initialState: (finished: false, response: Optional<Data>.none, error: Optional<Error>.none))
+        let outcome = OSAllocatedUnfairLock(initialState: (finished: false, response: Optional<Data>.none, error: Optional<Error>.none, receivedAt: Optional<TimeInterval>.none))
+        let timed = request?["diagnostics_timing"] as? Bool == true
         let complete: @Sendable (Data?, Error?) -> Void = { value, error in
+            let receivedAt = timed ? ProcessInfo.processInfo.systemUptime : nil
             let accepted = outcome.withLock { state in
                 guard !state.finished else { return false }
-                state.finished = true; state.response = value; state.error = error
+                state.finished = true; state.response = value; state.error = error; state.receivedAt = receivedAt
                 return true
             }
             if accepted { semaphore.signal() }
@@ -130,7 +132,13 @@ public struct MacOSLocalCommandTransport: LocalCommandTransport {
             if let upgrade = upgradeStatus() { throw upgrade.error(commandID: commandID, outcomeUnknown: true, transportReason: "reply_timeout") }
             throw CommandReply.unknown(commandID: commandID, reason: "reply_timeout")
         }
-        let (received, failure) = outcome.withLock { ($0.response, $0.error) }
+        let resumed = timed ? ProcessInfo.processInfo.systemUptime : 0
+        let (received, failure, receivedAt) = outcome.withLock { ($0.response, $0.error, $0.receivedAt) }
+        if timed {
+            diagnostic["sent_uptime_s"] = sent
+            diagnostic["reply_received_uptime_s"] = receivedAt
+            diagnostic["waiter_resumed_uptime_s"] = resumed
+        }
         guard let received else {
             // execute was already invoked; a proxy failure cannot prove noncommit.
             if let upgrade = upgradeStatus() { throw upgrade.error(commandID: commandID, outcomeUnknown: true, transportReason: failure == nil ? "connection_ended" : "transport_error_after_send") }

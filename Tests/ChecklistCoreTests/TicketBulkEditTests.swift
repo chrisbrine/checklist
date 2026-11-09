@@ -190,7 +190,10 @@ final class TicketBulkEditTests: XCTestCase {
     }
 
     func testBulkStatusRequiresReasonBeforeRowsAndRecordsItForEveryTicket() throws {
-        let (p,t) = try fixture()
+        let (p,created) = try fixture()
+        // Compare the same public read projection before and after refusals,
+        // including derived Triage membership. Keep the full equality assertion.
+        let t = try created.map {try current(p,$0)}
         for preview in [true,false] {
             for action in ["cancel","reopen"] {
                 XCTAssertThrowsError(try edit(p,t,["kind":"status","action":action],preview:preview)) { error in

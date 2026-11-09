@@ -122,11 +122,18 @@ final class ScopedTaskRecordsTests:XCTestCase {
     }
     func testHistoricalWorkerRosterDoesNotBlockCurrentAuthorityButCurrentOverflowDoes()throws {
         try write {db in
-            for i in 0..<221 {
-                let sid="ended-session-\(i)"
-                try router.save(db,["id":sid,"project_id":pid,"project_ids":[pid],"role":"worker","provider":"codex","state":"ended","authorization_generation":"old","revision":1],type:"session")
-                try router.save(db,["id":"old-link-\(i)","project_id":pid,"task_id":tid,"session_id":sid,"session_authorization_generation":"old","state":"linked","revision":1],type:"task_session")
-                try router.save(db,["id":"old-alias-\(i)","project_id":pid,"task_id":tid,"state":"retired","revision":1],type:"task_alias")
+            // This read fixture needs the complete 221-row historical roster,
+            // not 663 independent envelope compare/save operations. Canonical
+            // SQL envelopes keep the same IDs, generations and task links.
+            let sequence = "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<220) "
+            let families: [(String,String,JSON)] = [
+                ("session","ended-session-",["project_id":pid,"project_ids":[pid],"role":"worker","provider":"codex","state":"ended","authorization_generation":"old","revision":1]),
+                ("task_session","old-link-",["project_id":pid,"task_id":tid,"session_authorization_generation":"old","state":"linked","revision":1]),
+                ("task_alias","old-alias-",["project_id":pid,"task_id":tid,"state":"retired","revision":1])
+            ]
+            for (type,prefix,fields) in families {
+                let value = type == "task_session" ? "json_set(?,'$.id',?||i,'$.session_id','ended-session-'||i)" : "json_set(?,'$.id',?||i)"
+                try db.execute(sql:sequence + "INSERT INTO records(id,project_id,type,revision,data) SELECT ?||i,?,?,1," + value + " FROM n",arguments:[prefix,pid,type,try jsonString(fields),prefix])
             }
             try router.save(db,["id":"current-worker","project_id":pid,"project_ids":[pid],"role":"worker","provider":"codex","state":"active","authorization_generation":"current","execution_domain":"actual-fixture","revision":1],type:"session")
             try router.save(db,["id":"current-link","project_id":pid,"task_id":tid,"session_id":"current-worker","session_authorization_generation":"current","execution_domain":"actual-fixture","state":"linked","revision":1],type:"task_session")
@@ -141,7 +148,9 @@ final class ScopedTaskRecordsTests:XCTestCase {
         XCTAssertEqual((current["history_counts"] as! JSON)["task_sessions"] as? Int,222)
         let roster=try call("workspace_page",["project_id":pid,"surface":"worker_sessions","include_archived":true])
         XCTAssertEqual(roster["total"] as? Int,221);XCTAssertEqual((roster["rows"] as! [JSON]).count,50);XCTAssertNotNil(roster["next_cursor"] as? String)
-        try write {db in for i in 0..<201 {try router.save(db,["id":"current-finding-\(i)","project_id":pid,"task_id":tid,"state":"open","revision":1],type:"finding")}}
+        try write {db in
+            try db.execute(sql:"WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<200) INSERT INTO records(id,project_id,type,revision,data) SELECT 'current-finding-'||i,?,'finding',1,json_set(?,'$.id','current-finding-'||i) FROM n",arguments:[pid,try jsonString(["project_id":pid,"task_id":tid,"state":"open","revision":1])])
+        }
         let fresh=try call("task_context",["task_id":tid,"detail_level":"ui"])
         let excessive=try call("task_context",["task_id":tid,"detail_level":"ui_records","selected_context_cursor":fresh["context_cursor"]!])
         XCTAssertEqual(excessive["complete"] as? Bool,false,"A genuinely excessive current gate set remains fail-closed")

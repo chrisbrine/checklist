@@ -24,8 +24,11 @@ final class TicketLifecycleCleanupTests: XCTestCase {
     let defaults: JSON = ["done_evidence_enabled":true,"closed_purge_enabled":true,"closed_days":15]
     override func setUpWithError() throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("checklist-lifecycle-" + uuid())
-        let workspace = directory.appendingPathComponent("workspace-prepared")
-        router = try TestStore.router(root:directory.appendingPathComponent("store"),template:Self.prepared,workspace:workspace)
+        try openPreparedFixture()
+    }
+    private func openPreparedFixture() throws {
+        let suffix = uuid(),workspace = directory.appendingPathComponent("workspace-prepared-" + suffix)
+        router = try TestStore.router(root:directory.appendingPathComponent("store-" + suffix),template:Self.prepared,workspace:workspace)
         preparedFixture = try router.dbQueue.read {db in
             var project = jsonObject(try XCTUnwrap(String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='test-lifecycle-project'")))
             project["root_path"] = workspace.resolvingSymlinksInPath().path
@@ -70,6 +73,17 @@ final class TicketLifecycleCleanupTests: XCTestCase {
             try ticketCleanupBackupTemplate(router,objects:[["relative_path":relative,"sha256":a["sha256"]!,"size":a["size"]!,"kind":"file"]])
         }
         return (p,try read(t),a)
+    }
+    /// Matrix rows exercise independent lifecycle decisions. Reuse the populated
+    /// phase through private store/workspace copies instead of replaying project,
+    /// task and managed-attachment intake for every row. Related fixtures within
+    /// a row still use `fixture` and share the current store.
+    func independentFixture(category: String = "done",age: Int = 0,backed: Bool = true) throws -> (JSON,JSON,JSON) {
+        if preparedFixture == nil {
+            try router.closeStore()
+            try openPreparedFixture()
+        }
+        return try fixture(category:category,age:age,backed:backed)
     }
     func read(_ task: JSON) throws -> JSON {try router.dbQueue.read {try router.record($0,task["id"] as! String,type:"task")}}
     func mark(_ p: JSON,_ t: JSON,category: String,age: Int = 0) throws {
@@ -156,14 +170,14 @@ final class TicketLifecycleCleanupTests: XCTestCase {
     }
     func testOnlyAgedClosedTicketsPurgeOpenAndRecentlyChangedTicketsStay() throws {
         for category in ["queued","active","review","blocked","parked","done","canceled"] {
-            let (p,t,a) = try fixture(category:category,age:20)
+            let (p,t,a) = try independentFixture(category:category,age:20)
             let settings: JSON = ["done_evidence_enabled":false,"closed_purge_enabled":true,"closed_days":15]
             _ = try configure(p,settings:settings);try pass();try finish()
             let closed = ["done","canceled"].contains(category)
             XCTAssertEqual(bool(try read(t),"purged"),closed,category)
             XCTAssertEqual(FileManager.default.fileExists(atPath:a["path"] as! String),!closed,category)
         }
-        let (p,t,_) = try fixture(category:"canceled",age:20)
+        let (p,t,_) = try independentFixture(category:"canceled",age:20)
         _ = try call("message_send",["project_id":p["id"]!,"task_id":t["id"]!,"body":"A recent note resets age"])
         _ = try configure(p);try pass();XCTAssertFalse(bool(try read(t),"purged"))
     }
@@ -180,7 +194,7 @@ final class TicketLifecycleCleanupTests: XCTestCase {
     }
     func testReopenAndNewKeepOriginalOrReaderHoldWinAtFinalUnlinkAfterRestart() throws {
         for protection in ["reopen","keep","reader","foreign"] {
-            let (p,t,a) = try fixture();_ = try configure(p);try pass()
+            let (p,t,a) = try independentFixture();_ = try configure(p);try pass()
             try write {db in
                 switch protection {
                 case "reopen":var task = try self.router.record(db,t["id"] as! String,type:"task");task["status_id"] = try self.router.status(db,p["id"] as! String,"queued")["id"]!;try self.router.save(db,self.router.revised(task),type:"task")
@@ -271,13 +285,18 @@ extension TicketLifecycleCleanupTests {
     }
     func testExternalSharedAndDisabledRulesRetainBytesWhileCompletedBackupPermitsUnlink() throws {
         for protection in ["external","shared","backup","disable"] {
-            let (p,t,a) = try fixture()
+            let (p,t,a) = try independentFixture()
             if protection == "external" {
                 try write {db in var value = try self.router.record(db,a["id"] as! String,type:"attachment");value["mode"] = "external_reference";try self.router.save(db,self.router.revised(value),type:"attachment")}
             } else if protection == "shared" {
                 let (other,ot,_) = try fixture(category:"queued")
                 try write {db in var value = try self.router.record(db,a["id"] as! String,type:"attachment");value["id"] = uuid();value["project_id"] = other["id"]!;value["task_id"] = ot["id"]!;try self.router.save(db,value,type:"attachment")}
-            } else if protection == "backup" {_ = try call("backup_create",["path":directory.appendingPathComponent("protected-" + uuid()).path])}
+            } else if protection == "backup" {
+                // This row needs completed-backup deletion authority. The full
+                // snapshot/restore route has its own exact-byte regression case.
+                let relative = try XCTUnwrap(ManagedPaths.relative(a["path"] as! String,family:"objects",root:router.root))
+                try ticketCleanupBackupTemplate(router,objects:[["relative_path":relative,"sha256":a["sha256"]!,"size":a["size"]!,"kind":"file"]])
+            }
             let project = try configure(p);try pass();if protection == "shared" {try pass()}
             if protection == "disable" {_ = try call("project_settings_save",["project_id":p["id"]!,"expected_revision":project["revision"]!,"ticket_cleanup":["done_evidence_enabled":false,"closed_purge_enabled":false,"closed_days":15]])}
             try finish();XCTAssertEqual(FileManager.default.fileExists(atPath:a["path"] as! String),protection != "backup",protection);XCTAssertFalse(bool(try read(t),"purged"))
@@ -669,7 +688,7 @@ extension TicketLifecycleCleanupTests {
 
     func testCacheNewOwnerAndChangedExecutionFingerprintPreventUnlink() throws {
         for newOwner in [false,true] {
-            let (p,t,_) = try fixture(),(execution,path) = try cacheExecution(p,t,sourceSHA:ChecklistCore.hash(Data(uuid().utf8)))
+            let (p,t,_) = try independentFixture(),(execution,path) = try cacheExecution(p,t,sourceSHA:ChecklistCore.hash(Data(uuid().utf8)))
             let files = try StorageObjectFiles(root:router.root)
             try files.writeNew(path + "/file",bytes:Data("held".utf8))
             try pass()
@@ -707,7 +726,7 @@ extension TicketLifecycleCleanupTests {
 
     func testCacheReaderBackupAndUnsupportedLinkHoldsRetainBytes() throws {
         for hold in ["reader","backup","link"] {
-            let (p,t,_) = try fixture(),(execution,path) = try cacheExecution(p,t,sourceSHA:ChecklistCore.hash(Data(uuid().utf8)))
+            let (p,t,_) = try independentFixture(),(execution,path) = try cacheExecution(p,t,sourceSHA:ChecklistCore.hash(Data(uuid().utf8)))
             let files = try StorageObjectFiles(root:router.root),bytes = Data("protected cache".utf8)
             try files.writeNew(path + "/target",bytes:bytes)
             if hold == "link" {
@@ -811,7 +830,7 @@ extension TicketLifecycleCleanupTests {
 extension TicketLifecycleCleanupTests {
     func testCacheAliasChainsConvergenceAndCyclesHaveBoundedSafeOutcomes() throws {
         for kind in ["chain","convergent","cycle","directory_cycle"] {
-            let (p,t,_) = try fixture(),(_,path) = try cacheExecution(p,t,sourceSHA:ChecklistCore.hash(Data(uuid().utf8)))
+            let (p,t,_) = try independentFixture(),(_,path) = try cacheExecution(p,t,sourceSHA:ChecklistCore.hash(Data(uuid().utf8)))
             let files = try StorageObjectFiles(root:router.root)
             try files.writeNew(path + "/arch/debug/product",bytes:Data("cache product".utf8))
             if kind == "cycle" {

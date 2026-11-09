@@ -24,7 +24,7 @@ FRESH_COPY_PATHS = (
     'Sources/ChecklistIPC/StorageUpgradeStatus.swift', 'Sources/ChecklistApp/*App.swift',
     'Sources/ChecklistCLI/*', 'Packages/*', 'Package.swift', 'Package.resolved',
     'Resources/*.plist', 'script/build_and_run.sh', 'script/verify_install.py',
-    'script/verify_stage.py', 'script/build_input_inventory.py', 'script/build_support.py',
+    'script/verify_stage.py', 'script/build_input_inventory.py', 'script/build_support.py', 'script/upgrade_offline.py',
 )
 FRESH_COPY = 'Fresh real-size live-backup copy required; create a new seeded slot and qualify startup/protected backup.'
 MAX_SEED_AGE_HOURS = 72

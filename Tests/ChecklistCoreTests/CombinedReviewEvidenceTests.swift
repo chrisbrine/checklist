@@ -1,8 +1,32 @@
+import ChecklistTestSupport
 import XCTest
+import GRDB
 @testable import ChecklistCore
 
 /// Exercise the shared verdict entry points with both image and playtest inputs.
 extension PlaytestBundleTests {
+    private static let combinedSubmissionPhase = TestStore.Template(name:"combined-review-submission") { router,workspace in
+        let fixture = PlaytestBundleTests()
+        fixture.router = router;fixture.directory = workspace
+        let project = try fixture.combinedProject(),submission = try fixture.combinedSubmission(project)
+        try router.dbQueue.write {db in
+            try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('test-combined-review',?)",arguments:[try jsonString(["project":project,"submission":submission.submission,"screenshot":submission.screenshot])])
+        }
+    }
+    /// All verdict entry points start at the identical immutable submitted
+    /// bundle. Each gets private managed bytes and its own reviewer/claim.
+    func preparedCombinedSubmission() throws -> (project: JSON,submission: JSON,screenshot: JSON) {
+        try router.closeStore()
+        let workspace = directory.appendingPathComponent("combined-workspace")
+        router = try TestStore.router(root:directory.appendingPathComponent("combined-store"),template:Self.combinedSubmissionPhase,workspace:workspace)
+        return try router.dbQueue.read { db in
+            let value = jsonObject(try XCTUnwrap(String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='test-combined-review'")))
+            let project = try router.record(db,(value["project"] as! JSON)["id"] as! String,type:"project")
+            let screenshot = router.ownerManagedPathProjection(try router.record(db,(value["screenshot"] as! JSON)["id"] as! String,type:"attachment"),caller:owner)
+            return (project,value["submission"] as! JSON,screenshot)
+        }
+    }
+
     func combinedProject() throws -> JSON {
         try call("project_create", ["name":"Synthetic combined evidence", "key_prefix":"CE", "root_path":directory.path])
     }
@@ -22,8 +46,8 @@ extension PlaytestBundleTests {
 
     func combinedReviewer(_ project: JSON) throws -> Caller {
         let sid = UUID().uuidString, installation = "synthetic-combined-critic", domain = "synthetic-combined-review-host"
-        _ = try call("session_register", ["project_id":project["id"]!, "session_id":sid, "installation":installation, "provider":"codex", "role":"worker", "workspace":directory.path, "execution_domain":domain])
-        return Caller(role:"worker", installation:installation, projectIDs:[project["id"] as! String], sessionID:sid, workspace:directory.path, executionDomain:domain)
+        _ = try call("session_register", ["project_id":project["id"]!, "session_id":sid, "installation":installation, "provider":"codex", "role":"worker", "workspace":project["root_path"]!, "execution_domain":domain])
+        return Caller(role:"worker", installation:installation, projectIDs:[project["id"] as! String], sessionID:sid, workspace:project["root_path"] as? String, executionDomain:domain)
     }
 
     func combinedClaim(_ project: JSON, _ submission: JSON, _ reviewer: Caller) throws -> JSON {
@@ -59,7 +83,7 @@ extension PlaytestBundleTests {
     }
 
     func testCombinedAgentVerdictEnforcesBothGuardsBeforeRetainingFiles() throws {
-        let project = try combinedProject(), fixture = try combinedSubmission(project), reviewer = try combinedReviewer(project)
+        let prepared = try preparedCombinedSubmission(),project = prepared.project,fixture = (submission:prepared.submission,screenshot:prepared.screenshot),reviewer = try combinedReviewer(project)
         let attempt = try combinedClaim(project, fixture.submission, reviewer)
         let input = try combinedVerdictInput(project, attempt, fixture.screenshot, reviewer)
         var missingMarks = input; missingMarks.removeValue(forKey:"inspected_images")
@@ -74,7 +98,7 @@ extension PlaytestBundleTests {
     }
 
     func testCombinedSavedDraftRollsBackRetentionAndSubmitsAllFields() throws {
-        let project = try combinedProject(), fixture = try combinedSubmission(project), reviewer = try combinedReviewer(project)
+        let prepared = try preparedCombinedSubmission(),project = prepared.project,fixture = (submission:prepared.submission,screenshot:prepared.screenshot),reviewer = try combinedReviewer(project)
         let attempt = try combinedClaim(project, fixture.submission, reviewer), input = try combinedVerdictInput(project, attempt, fixture.screenshot, reviewer)
         let saved = try call("review_draft_save", input, reviewer), params = (saved["draft_verdict"] as! JSON)["params"] as! JSON
         for key in ["inspected_images", "review_assessment"] { XCTAssertEqual(try jsonString(params[key]!), try jsonString(input[key]!)) }
@@ -88,7 +112,7 @@ extension PlaytestBundleTests {
     }
 
     func testCombinedBatchMembersRetainTheirOwnMarksAssessmentAndCitations() throws {
-        let project = try combinedProject(), first = try combinedSubmission(project), second = try combinedSubmission(project), reviewer = try combinedReviewer(project)
+        let prepared = try preparedCombinedSubmission(),project = prepared.project,first = (submission:prepared.submission,screenshot:prepared.screenshot),second = try combinedSubmission(project),reviewer = try combinedReviewer(project)
         var group = try call("triage_create", ["project_id":project["id"]!, "name":"Synthetic combined review", "phase":"review"])
         for fixture in [first, second] {
             _ = try call("group_membership", ["project_id":project["id"]!, "group_id":group["id"]!, "expected_revision":group["revision"]!, "task_id":(fixture.submission["task"] as! JSON)["id"]!, "action":"add"])

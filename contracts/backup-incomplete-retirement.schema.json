@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Checklist incomplete backup retirement commands v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "preview", "retire"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "preview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "params"],
+      "properties": {
+        "method": {"const": "backup_incomplete_preview"},
+        "params": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["project_id"],
+          "properties": {
+            "project_id": {"type": "string", "format": "uuid"},
+            "command_id": {"type": "string", "format": "uuid"}
+          }
+        }
+      }
+    },
+    "retire": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "params"],
+      "properties": {
+        "method": {"const": "backup_incomplete_retire"},
+        "params": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["project_id", "command_id", "preview_sha256"],
+          "properties": {
+            "project_id": {"type": "string", "format": "uuid"},
+            "command_id": {"type": "string", "format": "uuid"},
+            "preview_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        }
+      }
+    }
+  }
+}

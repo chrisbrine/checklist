@@ -132,22 +132,25 @@ struct MediaReviewWorkspace: View {
                 } else if !model.roundID.isEmpty {
                     if MediaSimpleLayout.usesCards(model.schema) {Button("Back to cards") {model.prepareForDirectionGrid();directionGroup=nil;itemComparison=false}}
                     MediaRoundTicketBar(model:model)
-                    ScrollView {roundControls}.frame(minHeight:60,maxHeight:190).accessibilityLabel("Round setup and frozen intake")
-                    HSplitView {
-                        itemList.frame(minWidth:175,idealWidth:220)
+                    if let group=directionGroup {
                         ScrollView {
-                            if let group=directionGroup {
-                                MediaDirectionGrid(model:model,group:group,close:{directionGroup=nil}).id(model.projectID+":"+model.roundID+":"+group.id).padding(8)
-                            } else {
+                            MediaDirectionGrid(model:model,group:group,close:{directionGroup=nil})
+                                .id(model.projectID+":"+model.roundID+":"+group.id).padding(8)
+                        }.layoutPriority(1)
+                    } else {
+                        ScrollView {roundControls}.frame(minHeight:60,maxHeight:190).accessibilityLabel("Round setup and frozen intake")
+                        HSplitView {
+                            itemList.frame(minWidth:175,idealWidth:220)
+                            ScrollView {
                                 VStack(alignment:.leading) {
                                     if let group=MediaAnimationGroup(metadata:model.item.object("target")["metadata"] as? MediaValues ?? [:],schema:model.schema) {
                                         Button("Open direction grid") {model.prepareForDirectionGrid();directionGroup=group}
                                     }
                                     MediaOwnerComparison(model:model)
                                 }.frame(maxWidth:.infinity,alignment:.leading).padding(8)
-                            }
-                        }.frame(minWidth:280)
-                    }.frame(minHeight:150).layoutPriority(1)
+                            }.frame(minWidth:280)
+                        }.frame(minHeight:150).layoutPriority(1)
+                    }
                 } else {Text("Choose a round, or capture a title-only Draft round.").foregroundStyle(Color.checklistSecondaryText);Spacer()}
             } else {Spacer()} // No onboarding imposed on a project without enabled types.
         }.padding(12)

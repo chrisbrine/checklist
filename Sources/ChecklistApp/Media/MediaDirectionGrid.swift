@@ -243,7 +243,7 @@ extension MediaPlaybackCoordinator: MediaTakePreparationBudget {}
         guard playback.gridAllows(bytes:original.integer("size"),facts:facts) else {
             throw ChecklistError("GRID_BUDGET","This take exceeds the direction-grid byte, pixel or decoder budget. Use item comparison.")
         }
-        let control=try await MediaNativeTakeControl(asset:asset,loop:true,playbackRate:timing.rate)
+        let control=try await MediaNativeTakeControl(asset:asset,loop:true,playbackRate:timing.rate,traceLabel:key+":"+card.direction)
         try Task.checkCancellation();guard isCurrent() else {control.unload();throw CancellationError()}
         return MediaPreparedTake(key:key,label:card.directionLabel+(referenceSlotID == nil ? "" : " reference"),kind:"video",ids:["item_id":card.id,"target_id":card.target.id,"reference_id":original.string("reference_id"),"slot_id":slot.string("slot_id")],control:control,player:control.player,file:file,
             measurement:.init(copyMilliseconds:copyMS,probeMilliseconds:probeMS,bytes:original.integer("size"),facts:facts,loop:true,timing:timing))
@@ -272,14 +272,25 @@ struct MediaDirectionGrid: View {
             if grid.loading {ProgressView("Preparing direction grid")}
             if let error=grid.error {Text(error).foregroundStyle(.orange).textSelection(.enabled)}
             if !grid.loading,grid.cards.isEmpty,grid.error==nil {Text("No directions in this group.")}
-            LazyVGrid(columns:[GridItem(.adaptive(minimum:210),alignment:.top)],alignment:.leading,spacing:12) {
-                ForEach(grid.cards) {card in MediaDirectionCardView(card:card,grid:grid,model:model)}
-            }
+            MediaDirectionTiles(cards:grid.cards,grid:grid,model:model)
             MediaTakeDetails(playback:grid.playback)
         }
         .accessibilityIdentifier("mediaDirectionGrid")
         .task(id:scope) {await grid.open(group:group,model:model)}
         .onDisappear {grid.close()}
+    }
+}
+
+/// The opened group uses the whole review width. Four compact columns fit eight
+/// directions in two rows at the qualification window's available review width.
+struct MediaDirectionTiles: View {
+    let cards: [MediaDirectionCard]
+    @ObservedObject var grid: MediaDirectionGridModel
+    @ObservedObject var model: MediaReviewModel
+    var body: some View {
+        LazyVGrid(columns:[GridItem(.adaptive(minimum:200),alignment:.top)],alignment:.leading,spacing:10) {
+            ForEach(cards) {card in MediaDirectionCardView(card:card,grid:grid,model:model)}
+        }
     }
 }
 
@@ -292,22 +303,31 @@ private struct MediaDirectionCardView: View {
         VStack(alignment:.leading,spacing:6) {
             Text(card.directionLabel).font(.headline).accessibilityAddTraits(.isHeader)
             Text(MediaReviewModel.dispositionLabel(card.item.string("disposition"))).font(.caption)
-            if let take=card.metadata["take"] as? String,!take.isEmpty {Text(take).font(.caption)}
+            if let take=card.metadata["take"] as? String,!take.isEmpty {Text(take).font(.caption).lineLimit(1).help(take)}
             MediaDirectionPlayer(playback:grid.playback,card:card)
-            if let hint=card.metadata["hint"] as? String,!hint.isEmpty {Text(hint).font(.caption).textSelection(.enabled)}
-            ForEach(MediaComparisonLabels.suggestions(item:card.item)) {suggestion in
-                Text((suggestion.isCurrent ? "Agent suggestion: " : "Earlier agent suggestion: ")+suggestion.source+" · "+suggestion.choice+" · "+suggestion.note).font(.caption).textSelection(.enabled)
+            if let hint=card.metadata["hint"] as? String,!hint.isEmpty {Text(hint).font(.caption).lineLimit(2).help(hint).textSelection(.enabled)}
+            if !MediaComparisonLabels.suggestions(item:card.item).isEmpty {
+                DisclosureGroup("Suggestions") {
+                    ForEach(MediaComparisonLabels.suggestions(item:card.item)) {suggestion in
+                        Text((suggestion.isCurrent ? "Agent suggestion: " : "Earlier agent suggestion: ")+suggestion.source+" · "+suggestion.choice+" · "+suggestion.note).font(.caption).textSelection(.enabled)
+                    }
+                }
             }
-            TextField("Owner note",text:$card.draft.note,axis:.vertical).lineLimit(2...4)
+            TextField("Owner note",text:$card.draft.note,axis:.vertical).lineLimit(1...2)
                 .accessibilityLabel("Owner note for "+card.directionLabel)
             if !card.basisMatches {
                 Button("I inspected this target and context") {card.inspectCurrentBasis()}
             }
-            VStack(alignment:.leading) {
-                Button("Accept") {decide("accepted")}
+            VStack(alignment:.leading,spacing:4) {
+                HStack {
+                    Button("Accept") {decide("accepted")}
+                        .accessibilityLabel("Accept "+card.directionLabel)
+                    Button("Needs look") {decide("needs_look")}
+                        .accessibilityLabel("Needs look for "+card.directionLabel)
+                }
                 Button("Changes requested") {decide("changes_requested")}
+                    .accessibilityLabel("Changes requested for "+card.directionLabel)
                     .checklistDisabled([(card.draft.note.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty,"Enter what should change in the owner note.")])
-                Button("Needs look") {decide("needs_look")}
             }.checklistDisabled([(grid.loading || card.sending,"Wait for this group or decision to finish."),(!card.basisMatches || !card.item.bool("published") || card.header.string("state") != "open" || model.historyOnly,"Inspect a published item in an open round before deciding."),(store.writeBlockReason != nil,store.writeBlockReason ?? DisabledReasons.saving)])
             if !card.status.isEmpty {Text(card.status).font(.caption).textSelection(.enabled)}
         }.padding(8).background(.quaternary.opacity(0.3),in:RoundedRectangle(cornerRadius:6))
@@ -322,7 +342,8 @@ private struct MediaDirectionPlayer: View {
     @ObservedObject var card: MediaDirectionCard
     var body: some View {
         if let take=playback.takes[card.key],let player=take.player {
-            NativePlayerAdapter(player:player,audio:false).frame(minHeight:140,maxHeight:220)
+            MediaSimpleCardPlayer(player:player,aspect:CGFloat(take.measurement.facts.width)/CGFloat(max(1,take.measurement.facts.height)))
+                .frame(height:140).frame(maxWidth:.infinity).clipped()
                 .accessibilityLabel("Looping "+card.directionLabel+" take")
             Text(MediaPlaybackLabels.playback(loop:true,frameRate:take.measurement.timing?.declaredFrameRate)).font(.caption)
         } else {Text(card.status.isEmpty ? "Take unavailable" : card.status).font(.caption)}

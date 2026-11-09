@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import XCTest
 import Foundation
 @testable import ChecklistCore
@@ -40,8 +41,8 @@ final class MediaGroupJoinTests: XCTestCase {
         XCTAssertTrue(strings(intake, "remaining_row_ids").isEmpty)
         return rows
     }
-    func draftCandidates(_ f: MediaFrozenIntakeTests.Fixture) throws -> [JSON] {
-        let items = try f.rows("media_item"); XCTAssertEqual(items.count, 1)
+    func draftCandidates(_ f: MediaFrozenIntakeTests.Fixture,round: JSON? = nil) throws -> [JSON] {
+        let items = try f.rows("media_item").filter {round == nil || $0["round_id"] as? String == round?["id"] as? String}; XCTAssertEqual(items.count, 1)
         let target = try f.record(items[0]["draft_target_id"] as! String, "media_item_target")
         return try strings(target, "candidate_ids").map { try f.record($0, "media_candidate") }
     }
@@ -52,14 +53,25 @@ final class MediaGroupJoinTests: XCTestCase {
                       MediaPlaybackOriginalTests.movie(seconds: 1, tracks: [MediaPlaybackOriginalTests.track(width: 64, height: 48, frames: 12)])]
         let cases: [(String, [Data], [String])] = [("video", movies, ["r42b-ref-80x60-24f.mp4", "r42b-take-64x48-12f.mp4"]),
                                                    ("audio", [wav(seconds: 2), wav(seconds: 1)], ["tone-660hz-2s.wav", "tone-440hz-1s.wav"])]
+        let f = try MediaFrozenIntakeTests.Fixture()
         for (kind, data, names) in cases {
+            let type = try f.type(starter(kind))
+            // Independent rounds share only project/session/type prerequisites.
             // Each capture order (Reference first, Take first) gives the same single candidate.
             for captureOrder in [[0, 1], [1, 0]] {
-                let f = try MediaFrozenIntakeTests.Fixture(), round = try f.round(f.type(starter(kind)))
+                let round = try f.round(type)
+                // Sharing prerequisite authority must retain the original fresh-
+                // fixture whole-store checks: no extra items or intake rows,
+                // and no changes to any earlier case's records. Candidate history
+                // legitimately keeps the first partial capture as provenance.
+                let families = ["media_item","media_candidate","media_intake_row"]
+                let prior = try Dictionary(uniqueKeysWithValues:families.map {family in
+                    (family,try Dictionary(uniqueKeysWithValues:f.rows(family).map {($0["id"] as! String,try jsonString($0))}))
+                })
                 let sources = try zip(names, data).map { try write(f, $0, $1) }
                 let rows = try groupAndCapture(f, round, sources, slots: ["reference", "take"], captureOrder: captureOrder)
                 XCTAssertEqual(rows.map { $0["media_kind"] as? String }, [kind, kind])
-                let candidates = try draftCandidates(f)
+                let candidates = try draftCandidates(f,round:round)
                 XCTAssertEqual(candidates.count, 1, "\(kind) \(captureOrder)")
                 XCTAssertEqual(slotIDs(candidates[0]), ["reference", "take"], "\(kind) \(captureOrder)")
                 let bySlot = Dictionary(uniqueKeysWithValues: (candidates[0]["slots"] as! [JSON]).map { ($0["slot_id"] as! String, $0) })
@@ -67,7 +79,9 @@ final class MediaGroupJoinTests: XCTestCase {
                 XCTAssertEqual(bySlot["take"]?["sha256"] as? String, rows[1]["sha256"] as? String)
                 XCTAssertEqual(candidates[0]["source_name"] as? String, rows[0]["name"] as? String, "The group's earliest row names the candidate")
                 // Every committed row of the group names the joined candidate.
-                let committed = try f.rows("media_intake_row").filter { $0["capture_state"] as? String == "committed" }
+                let rowIDs = Set(rows.map {$0["id"] as! String})
+                let committed = try f.rows("media_intake_row").filter {rowIDs.contains($0["id"] as? String ?? "") && $0["capture_state"] as? String == "committed"}
+                XCTAssertEqual(committed.count,rows.count)
                 XCTAssertEqual(Set(committed.compactMap { $0["candidate_id"] as? String }), [candidates[0]["id"] as! String])
                 // Publication preview: no incomplete item; publish succeeds with one item.
                 let observed = try f.get(round), items = observed["items"] as! [JSON]
@@ -80,6 +94,16 @@ final class MediaGroupJoinTests: XCTestCase {
                 XCTAssertEqual(((published["manifest"] as! JSON)["items"] as! [JSON]).count, 1)
                 let after = ((try f.get(round))["items"] as! [JSON])[0]
                 XCTAssertEqual(strings(after["published_target"] as! JSON, "candidate_ids"), [candidates[0]["id"] as! String])
+                let newIDs: [String:Set<String>] = ["media_item":[after["id"] as! String],"media_intake_row":rowIDs]
+                for family in families {
+                    let inventory = try Dictionary(uniqueKeysWithValues:f.rows(family).map {($0["id"] as! String,try jsonString($0))})
+                    if let expectedNew = newIDs[family] {
+                        XCTAssertEqual(Set(inventory.keys),Set(prior[family]!.keys).union(expectedNew),family)
+                    }
+                    for (id,value) in prior[family]! {
+                        XCTAssertEqual(inventory[id],value,"A later capture order must not change prior \(family) \(id)")
+                    }
+                }
             }
         }
     }

@@ -1,5 +1,6 @@
 import XCTest
 import Darwin
+import ChecklistTestSupport
 @testable import ChecklistCore
 
 /// Real subprocess probes use only owned temporary repositories and protected roots.
@@ -24,14 +25,17 @@ final class SourceGitConfinementTests: XCTestCase {
             try Data(value.utf8).write(to: path)
         }
         @discardableResult func fixtureGit(_ args: [String], at path: URL? = nil, environment override: [String: String]? = nil) throws -> Data {
-            let process = Process(), out = Pipe(), err = Pipe()
+            let process = Process(), out = Pipe(), err = Pipe(), exited = DispatchSemaphore(value: 0)
             process.executableURL = URL(fileURLWithPath: git)
             process.arguments = ["-C", (path ?? repo).path] + args
             process.environment = override ?? environment
             process.standardOutput = out; process.standardError = err; process.standardInput = FileHandle.nullDevice
+            // A termination callback avoids Foundation's polling wait for each
+            // tiny native setup/positive-control command. Git still runs afresh.
+            process.terminationHandler = { _ in exited.signal() }
             try process.run()
             let bytes = out.fileHandleForReading.readDataToEndOfFile(), errors = err.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
+            exited.wait()
             guard process.terminationReason == .exit, process.terminationStatus == 0 else {
                 throw CoreError("FIXTURE_GIT_FAILED", String(decoding: errors, as: UTF8.self))
             }
@@ -113,7 +117,7 @@ final class SourceGitConfinementTests: XCTestCase {
     func testDirectNestedAndActiveConditionalIncludesTerminateInventoryAndCapture() throws {
         for mode in ["direct", "nested", "conditional"] {
             let f = try Fixture(), sentinel = f.store.appendingPathComponent("sentinel-config")
-            let router = try CommandRouter(root: f.store)
+            let router = try TestStore.router(root: f.store, sourceGitMemo: false)
             defer { try? router.closeStore() }
             try f.write(sentinel, "[probe]\nsecret = PROTECTED_SENTINEL\n")
             if mode == "nested" {
@@ -227,7 +231,7 @@ final class SourceGitConfinementTests: XCTestCase {
     }
 
     func testNormalUnbornInitializedAndExternalWorktreeFingerprintsMatchGit() throws {
-        let f = try Fixture(), router = try CommandRouter(root: f.store)
+        let f = try Fixture(), router = try TestStore.router(root: f.store, sourceGitMemo: false)
         defer { try? router.closeStore() }
         try f.write(f.repo.appendingPathComponent(".gitignore"), "ignored.txt\n")
         try f.write(f.repo.appendingPathComponent("ignored.txt"), "explicit ignored source")

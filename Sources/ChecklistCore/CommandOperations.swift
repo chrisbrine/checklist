@@ -95,6 +95,7 @@ final class CommandOperations: @unchecked Sendable {
         } catch {StoreRecovery.recordFailure(root:root,error:error)}
     }
     private var probe: ((String) -> Void)?
+    private var backupProbe: ((String) throws -> Void)?
     let contextKey = "ChecklistCommandOperation-" + UUID().uuidString
 
     /// Serialize only matching caller/UUID admissions across the SQLite and
@@ -131,6 +132,12 @@ final class CommandOperations: @unchecked Sendable {
     var executionProbe: ((String) -> Void)? {
         get {lock.withLock {probe}}
         set {lock.withLock {probe = newValue}}
+    }
+    /// Test seam only: observes real backup boundaries, including after writer
+    /// admission opens. The service never installs it.
+    var backupExecutionProbe: ((String) throws -> Void)? {
+        get {lock.withLock {backupProbe}}
+        set {lock.withLock {backupProbe = newValue}}
     }
     func recordRecoveryRequired(_ id: String) {lock.withLock {_ = recoveryRequired.insert(id)}}
     func needsRecovery(_ id: String) -> Bool {lock.withLock {recoveryRequired.contains(id)}}
@@ -177,7 +184,7 @@ extension CommandRouter {
         return try readForPreparation {try self.operationRecord($0,id:id) != nil}
     }
     static let alwaysOperationMethods: Set<String> = [
-        "backup_create","restore_create","restore_preview","backup_prune_preview","backup_prune","attachment_cleanup_preview",
+        "backup_create","restore_create","restore_preview","backup_prune_preview","backup_prune","backup_incomplete_preview","backup_incomplete_retire","attachment_cleanup_preview",
         "import_preview","import_commit","import_rollback","export_project",
         "media_intake_preview","media_intake_capture","media_intake_confirm","media_round_publish","media_context_reconcile","project_icon_import",
         "task_purge_preview","task_purge","epic_delete",
@@ -351,7 +358,8 @@ extension CommandRouter {
         if Self.readMethods.contains(method),params["command_id"] == nil {params["command_id"] = uuid()}
         let command = try text(params,"command_id",max:100)
         guard UUID(uuidString:command) != nil else {throw CoreError("INVALID_INPUT","command_id must be a UUID.")}
-        if Self.storageRestoreMethods.contains(method) || Self.storageBackupPruningMethods.contains(method) {try owner(caller)}
+        if Self.storageRestoreMethods.contains(method) || Self.storageBackupPruningMethods.subtracting(Self.storageIncompleteBackupMethods).contains(method) {try owner(caller)}
+        if Self.storageIncompleteBackupMethods.contains(method) {try requireIncompleteBackupAuthority(params:params,caller:caller)}
         let generation = try backupWriteAuthorization(params:params,caller:caller)
         let id = Self.commandOperationID(principal:caller.principal,command:command)
         let digest = hash(Data((method + (try jsonString(params))).utf8))
@@ -360,17 +368,31 @@ extension CommandRouter {
         defer {if !retained {lease.finish()}}
         var schedule = false
         // Completed/pending replay is a pooled point read, independent of a
-        // currently busy writer. Only explicit interrupted recovery writes again.
+        // currently busy writer. Explicit interrupted recovery may write again
+        // for other methods; a backup keeps its first terminal outcome.
         if let previous = try readForPreparation({try self.operationRecord($0,id:id)}) {
             try readForPreparation {db in try self.authorizeOperation(db,previous,params:params,caller:caller)}
             guard previous["digest"] as? String == digest else {throw CoreError("IDEMPOTENCY_CONFLICT","This command ID was already accepted with different input.")}
+            if previous["method"] as? String == "backup_create" {
+                // A backup's terminal outcome belongs to its first attempt. A
+                // replay must not replace an interruption/uncertainty with a
+                // second attempt against the first attempt's retained folder.
+                if ["succeeded","failed"].contains(previous["state"] as? String ?? "") {
+                    let payload = try readForPreparation {db in
+                        try self.authorizeOperation(db,previous,params:params,caller:caller)
+                        return try self.operationPayload(db,previous,caller:caller)
+                    }
+                    return ["command_id":command,"command_outcome":"accepted","data":payload]
+                }
+                return operationAcknowledgment(previous)
+            }
             if previous["state"] as? String != "failed" || !bool(previous,"recoverable") {return operationAcknowledgment(previous)}
         }
         func accept(_ db: Database,persist: Bool) throws -> JSON {
                 if var previous = try self.operationRecord(db,id:id) {
                     try self.authorizeOperation(db,previous,params:params,caller:caller)
                     guard previous["digest"] as? String == digest else {throw CoreError("IDEMPOTENCY_CONFLICT","This command ID was already accepted with different input.")}
-                    if previous["state"] as? String == "failed",bool(previous,"recoverable") {
+                    if previous["method"] as? String != "backup_create",previous["state"] as? String == "failed",bool(previous,"recoverable") {
                         previous["state"] = "queued";previous["updated_at"] = now();previous.removeValue(forKey:"error");previous.removeValue(forKey:"finished_at")
                         previous["recoverable"] = false
                         if persist {try self.saveOperation(db,previous)};schedule = true
@@ -409,7 +431,7 @@ extension CommandRouter {
             retained = true;commandOperations.add(job,router:self)
         }
         // Acceptance always identifies the same operation, including on replay.
-        // Result bytes are read only through the status route.
+        // Terminal backup replay above reads the same canonical status payload.
         return operationAcknowledgment(operation)
     }
     func operationAcknowledgment(_ operation: JSON) -> JSON {
@@ -512,6 +534,11 @@ extension CommandRouter {
         try commandOperations.withAdmission(principal:job.caller.principal,command:command) {
         try dbQueue.write {db in
                 guard var value = try self.operationRecord(db,id:job.id) else {throw CoreError("OPERATION_MISSING","The accepted operation record is missing.")}
+                let committedBackup = job.method == "backup_create" && output == nil
+                    ? try Row.fetchOne(db,sql:"SELECT digest FROM commands WHERE principal=? AND command_id=?",arguments:[job.caller.principal,command]) : nil
+                if let committedBackup {
+                    guard committedBackup["digest"] as String == value["digest"] as? String else {throw CoreError("IDEMPOTENCY_CONFLICT","The backup receipt no longer matches its accepted intent.")}
+                }
                 if let output {
                     // Successful replies have one privacy/retention owner. The
                     // final transaction publishes both reply and terminal state.
@@ -539,6 +566,10 @@ extension CommandRouter {
                     }
                     value["reply_write_admission"] = output["write_admission"]
                     value["state"] = "succeeded";value.removeValue(forKey:"outcome_unknown");value.removeValue(forKey:"error")
+                } else if committedBackup != nil {
+                    // The complete backup receipt precedes retention/advisory
+                    // work. A later failure cannot replace that proven outcome.
+                    value["state"] = "succeeded";value.removeValue(forKey:"outcome_unknown");value.removeValue(forKey:"error")
                 } else if let failure {
                     let uncertain = bool(value,"outcome_unknown") || failure.code == "OUTCOME_UNKNOWN" || failure.details["command_outcome"] as? String == "unknown"
                     var error = PublicErrorText.payload(failure)
@@ -555,7 +586,7 @@ extension CommandRouter {
                     let receipt: JSON = expired ? jsonObject(Self.prunedResult) : ["command_id":value["command_id"]!,"error":error]
                     try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?) ON CONFLICT(principal,command_id) DO UPDATE SET result=excluded.result",arguments:[job.caller.principal,errorCommand,errorDigest,try jsonString(receipt)])
                     value["state"] = "failed";value["error_result_command_id"] = errorCommand;value.removeValue(forKey:"error")
-                    value["recoverable"] = uncertain;value["outcome_unknown"] = uncertain
+                    value["recoverable"] = uncertain && job.method != "backup_create";value["outcome_unknown"] = uncertain
                 }
                 if value["started_at"] == nil {value["started_at"] = outcome.startedAt}
                 value["finished_at"] = now();value["updated_at"] = now();try self.saveOperation(db,value)
@@ -565,7 +596,8 @@ extension CommandRouter {
     }
     /// Runs before admission opens. Completed semantic transactions win over a
     /// lost operation acknowledgment. Other interrupted attempts fail explicitly;
-    /// only exact original-intent replay can schedule reconciliation.
+    /// only exact original-intent replay can schedule reconciliation for methods
+    /// other than backup_create. Backups keep their first terminal outcome.
     func recoverCommandOperations(_ db: Database) throws {
         // The accepted metadata was flushed independently of SQLite during a
         // capture. Import it before applying the existing interruption rules.
@@ -578,16 +610,26 @@ extension CommandRouter {
             var value = jsonObject(row["value"])
             let key: String = row["key"]
             try validateOperationRecord(value,id:String(key.dropFirst("command-operation:".count)))
-            guard ["queued","running"].contains(value["state"] as? String ?? "") else {continue}
+            let interrupted = ["queued","running"].contains(value["state"] as? String ?? "")
+            let failedBackup = value["state"] as? String == "failed" && value["method"] as? String == "backup_create"
+            guard interrupted || failedBackup else {continue}
             guard let principal = value["principal"] as? String,let command = value["command_id"] as? String,let digest = value["digest"] as? String else {throw StoreRecovery.required("command_operation_invalid")}
             let restored = value["incarnation"] as? String != incarnation
             if !restored,let receipt = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[principal,command]),receipt["digest"] as String == digest {
                 value["state"] = "succeeded";value.removeValue(forKey:"outcome_unknown");value.removeValue(forKey:"error")
             } else {
+                // Preserve an earlier terminal backup error byte-for-byte when
+                // no committed receipt supplies a more conclusive outcome.
+                if failedBackup {continue}
                 let running = value["state"] as? String == "running" || bool(value,"outcome_unknown")
-                value["state"] = "failed";value["recoverable"] = !restored;value["outcome_unknown"] = running
+                let backup = value["method"] as? String == "backup_create"
+                value["state"] = "failed";value["recoverable"] = !restored && !backup;value["outcome_unknown"] = running
+                let message: String
+                if restored {message = "The operation was captured in another store incarnation; it cannot resume in this restored copy."}
+                else if backup {message = "The service restarted before a final backup reply was recorded. This command ID keeps its interrupted outcome. Keep retained backup folders for inspection and use a new command ID for a new backup."}
+                else {message = "The service restarted before a final operation reply was recorded. Replay only the exact original command and UUID to reconcile."}
                 value["error"] = CoreError(restored ? "OPERATION_RESTORED" : "OPERATION_INTERRUPTED",
-                    restored ? "The operation was captured in another store incarnation; it cannot resume in this restored copy." : "The service restarted before a final operation reply was recorded. Replay only the exact original command and UUID to reconcile.",
+                    message,
                     details:["command_id":command,"reason":restored ? "store_incarnation_changed" : "service_restarted","command_outcome":running ? "unknown" : "rejected"]).dictionary
             }
             value["finished_at"] = now();value["updated_at"] = now();try saveOperation(db,value)

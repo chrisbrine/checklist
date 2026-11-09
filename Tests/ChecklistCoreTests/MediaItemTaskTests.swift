@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import Foundation
 import XCTest
 import GRDB
@@ -267,7 +268,7 @@ final class MediaItemTaskTests: XCTestCase {
 
     func testCanceledAndSupersededNamedTicketsNotifyOnceAndRetainOriginals() throws {
         for reason in ["canceled","superseded"] {
-            let f = try Fixture(),(a,r,attachment) = try cleanup.imageRound(f),b = try results.task(f)
+            let (f,a,r,attachment) = try cleanup.imageFixture(),b = try results.task(f)
             let id = try XCTUnwrap((f.get(r)["items"] as? [JSON])?.first?["id"] as? String)
             _ = try link(f,r,id,b)
             let oa = try results.session(f,"terminal-a"),ob = try results.session(f,"terminal-b")
@@ -309,12 +310,21 @@ final class MediaItemTaskTests: XCTestCase {
         XCTAssertEqual(try f.get(r)["state"] as? String,"draft")
     }
 
+    private static let sentWithdrawalPhase = TestStore.Template(name:"media-item-task-sent-withdrawal") {router,workspace in
+        let checks = MediaItemTaskTests(),f = try Fixture(router:router,workspace:workspace)
+        let a = try checks.results.task(f),b = try checks.results.task(f),(r,ids) = try checks.results.fixture(f)
+        _ = try checks.results.link(f,r,a)
+        try checks.results.decide(f,r,ids[0],"accepted","Sent to A")
+        _ = try f.call("media_round_send_result",checks.results.sendInput(f,r))
+        try router.dbQueue.write {try $0.execute(sql:"INSERT INTO metadata(key,value) VALUES ('test-media-withdrawal',?)",arguments:[try jsonString(["a":a["id"]!,"b":b["id"]!,"items":ids])])}
+    }
+
     func testRelinkedItemAndRoundWithdrawalsReturnOnlyToTheirSentDestinations() throws {
         for route in ["item","round","cleared"] {
-            let f = try Fixture(),a = try results.task(f),b = try results.task(f),(r,ids) = try results.fixture(f)
-            _ = try results.link(f,r,a)
-            try results.decide(f,r,ids[0],"accepted","Sent to A")
-            _ = try f.call("media_round_send_result",results.sendInput(f,r))
+            let f = try Fixture(template:Self.sentWithdrawalPhase)
+            let phase = try f.router.dbQueue.read {try jsonObject(XCTUnwrap(String.fetchOne($0,sql:"SELECT value FROM metadata WHERE key='test-media-withdrawal'")))}
+            let a = try f.record(phase["a"] as! String,"task"),b = try f.record(phase["b"] as! String,"task")
+            let r = try XCTUnwrap(f.rows("media_round").first),ids = strings(phase,"items")
             let baseline = try XCTUnwrap(f.get(r)["last_result_sent"] as? JSON)
             XCTAssertEqual((baseline["sends"] as! [JSON])[0]["task_key"] as? String,a["key"] as? String)
             if route == "item" {_ = try link(f,r,ids[0],b)}
@@ -379,7 +389,7 @@ final class MediaItemTaskTests: XCTestCase {
     }
 
     func testMixedManagedOriginalHandoffWaitsForTheLastTicket() throws {
-        let f = try Fixture(),(a,r,attachment) = try cleanup.imageRound(f),b = try results.task(f)
+        let (f,a,r,attachment) = try cleanup.imageFixture(),b = try results.task(f)
         let item = try XCTUnwrap((f.get(r)["items"] as? [JSON])?.first)
         _ = try link(f,r,item["id"] as! String,b)
         let path = f.router.ownerManagedPathProjection(attachment,caller:f.owner)["path"] as! String

@@ -17,11 +17,19 @@ public enum CallTimingLog {
 public final class ServiceCallTiming: Sendable {
     public let requestID = UUID().uuidString.lowercased()
     private let received: TimeInterval
+    private let admission: ClientAdmissionTiming?
     private let durations = OSAllocatedUnfairLock(initialState: ["queue_wait_ms": 0.0, "bootstrap_verification_ms": 0.0, "execution_ms": 0.0])
 
-    public init(received: TimeInterval = ProcessInfo.processInfo.systemUptime) { self.received = received }
-    public func queued(since start: TimeInterval) {
-        durations.withLock { $0["queue_wait_ms", default: 0] += (ProcessInfo.processInfo.systemUptime - start) * 1000 }
+    public init(received: TimeInterval = ProcessInfo.processInfo.systemUptime, admission: ClientAdmissionTiming? = nil) {
+        self.received = received; self.admission = admission
+    }
+    public func queued(since start: TimeInterval, until now: TimeInterval = ProcessInfo.processInfo.systemUptime, phase: String = "coordinator_queue_wait_ms") {
+        durations.withLock {
+            let elapsed = (now - start) * 1000
+            $0["queue_wait_ms", default: 0] += elapsed
+            $0[phase, default: 0] += elapsed
+            if phase == "coordinator_queue_wait_ms" { $0["coordinator_dequeued_uptime_s"] = now }
+        }
     }
     public func measure<T>(_ phase: String, _ body: () throws -> T) rethrows -> T {
         let start = ProcessInfo.processInfo.systemUptime
@@ -43,7 +51,11 @@ public final class ServiceCallTiming: Sendable {
         var fields: [String:Any] = durations.withLock { $0 }
         fields["request_id"] = requestID
         fields["encoding_ms"] = (ProcessInfo.processInfo.systemUptime - start) * 1000
-        fields["total_ms"] = (ProcessInfo.processInfo.systemUptime - received) * 1000
+        let ready = ProcessInfo.processInfo.systemUptime
+        fields["received_uptime_s"] = received
+        fields["reply_ready_uptime_s"] = ready
+        fields["total_ms"] = (ready - received) * 1000
+        if let admission { fields["admission"] = admission.fields }
         let trailer = try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])
         bytes.removeLast()
         if !result.isEmpty { bytes.append(0x2c) }

@@ -134,17 +134,27 @@ final class CoreTests: XCTestCase {
         t = try call("task_get",["project_id":p["id"]!,"task_id":t["id"]!]);let done = try call("task_complete",["project_id":p["id"]!,"task_id":t["id"]!,"expected_revision":t["revision"]!]);XCTAssertEqual(done["status_category"] as? String,"done")
     }
     func testStatusProtectionAndPagedHistory() throws {
-        let p = try project();let taxonomy = try call("taxonomy_get",["project_id":p["id"]!]);let queued = (taxonomy["statuses"] as! [JSON]).first {$0["category"] as? String == "queued"}!
-        assertCode("STATUS_REQUIRED") { _ = try self.call("status_retire",["project_id":p["id"]!,"status_id":queued["id"]!,"expected_revision":1]) }
-        let t = try task(p)
-        // Pagination needs 210 canonical notes/events, not 210 independent
-        // command journals and maintenance boundaries. Message routing itself
-        // remains covered by the communication tests in this class.
-        try fixtureDomainTransaction { db in
-            for n in 0..<210 {
-                _ = try router.messageWrite(db,["project_id":p["id"]!,"task_id":t["id"]!,"body":"Note \(n)"],owner,"message_send")
+        let fixture = try preparedCorePhase("status-paged-history") { [self] in
+            let p = try project(),t = try task(p)
+            // Pagination needs 210 canonical notes/events, not 210 independent
+            // command journals and maintenance boundaries. Message routing itself
+            // remains covered by the communication tests in this class.
+            try fixtureDomainTransaction { db in
+                let first = try router.messageWrite(db,["project_id":p["id"]!,"task_id":t["id"]!,"body":"Note 0"],owner,"message_send")
+                let message = try router.record(db,first["id"] as! String,type:"message")
+                let event = try XCTUnwrap(Row.fetchOne(db,sql:"SELECT * FROM events WHERE entity_id=? AND kind='message_saved' ORDER BY seq DESC LIMIT 1",arguments:[t["id"] as! String]))
+                // Copy the canonical record/event shapes, varying every identity
+                // and note body. Pagination still sees all 210 real notes and
+                // events, without rerunning handler discovery 210 times.
+                let sequence = "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<209) "
+                try db.execute(sql:sequence + "INSERT INTO records(id,project_id,type,revision,data) SELECT 'history-note-'||i,?,'message',1,json_set(?,'$.id','history-note-'||i,'$.body','Note '||i) FROM n",arguments:[p["id"] as! String,try jsonString(message)])
+                try db.execute(sql:sequence + "INSERT INTO events(id,project_id,entity_id,actor,kind,occurred_at,data) SELECT 'history-note-event-'||i,?,?,?,'message_saved',?,json_set(?,'$.message_id','history-note-'||i) FROM n",arguments:[p["id"] as! String,t["id"] as! String,event["actor"] as String,event["occurred_at"] as String,event["data"] as String])
             }
+            return ["project":p,"task":t]
         }
+        let p = fixture["project"] as! JSON,t = fixture["task"] as! JSON
+        let taxonomy = try call("taxonomy_get",["project_id":p["id"]!]);let queued = (taxonomy["statuses"] as! [JSON]).first {$0["category"] as? String == "queued"}!
+        assertCode("STATUS_REQUIRED") { _ = try self.call("status_retire",["project_id":p["id"]!,"status_id":queued["id"]!,"expected_revision":1]) }
         let first = try call("history_list",["project_id":p["id"]!,"task_id":t["id"]!]);let second = try call("history_list",["project_id":p["id"]!,"task_id":t["id"]!,"cursor":first["next_cursor"]!]);XCTAssertEqual((first["events"] as! [JSON]).count,200);XCTAssertEqual((second["events"] as! [JSON]).count,11)
     }
     func testConcurrentClaimsAndRestart() throws {
@@ -223,7 +233,7 @@ final class CoreTests: XCTestCase {
         try call("human_request_create",["project_id":value.project["id"]!,"task_id":value.task["id"]!,"target_attachment_id":value.artifact["id"]!,"questions":[["id":"approve","type":"approval","prompt":"Inspect this exact original","required":true]]])
     }
     func testHumanApprovalPassIsExactAndCannotPassOtherGate() throws {
-        let value = try submittedArtifact(gates:["human_approval","review"]);let p = value.project;var request = try humanApproval(value)
+        let value = try preparedSubmittedArtifact(gates:["human_approval","review"]);let p = value.project;var request = try humanApproval(value)
         XCTAssertEqual(request["gate"] as? String,"human_approval");XCTAssertEqual(request["target_manifest_id"] as? String,value.submission["manifest_id"] as? String)
         assertCode("TARGET_CHANGED") { _ = try self.call("human_request_answer",try self.observedGateAnswer(["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":1,"target_sha256":"wrong","answers":[["question_id":"approve","value":"approved"]]], task:value.task)) }
         request = try call("human_request_answer",try observedGateAnswer(["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":1,"target_sha256":value.artifact["sha256"]!,"response":"clarification","explanation":"I have not checked this target","answers":[["question_id":"approve","value":"not_checked"]]], task:value.task))
@@ -239,7 +249,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(reviews.count,1);XCTAssertEqual(reviews[0]["gate"] as? String,"human_approval");XCTAssertEqual(reviews[0]["origin"] as? String,"human_ui");XCTAssertEqual(reviews[0]["target_sha256"] as? String,value.artifact["sha256"] as? String)
     }
     func testHumanApprovalRejectAndCancelNeverPass() throws {
-        let value = try submittedArtifact(gates:["human_approval"]);let p = value.project;var request = try humanApproval(value)
+        let value = try preparedSubmittedArtifact(gates:["human_approval"]);let p = value.project;var request = try humanApproval(value)
         _ = try call("human_request_cancel",["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":1]);let current = try call("task_get",["project_id":p["id"]!,"task_id":value.task["id"]!]);XCTAssertNil(current["active_verification_request_id"])
         request = try humanApproval(value)
         let answered = try call("human_request_answer",try observedGateAnswer(["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":1,"target_sha256":value.artifact["sha256"]!,"answers":[["question_id":"approve","value":"changes_requested"]]], task:value.task))
@@ -247,16 +257,16 @@ final class CoreTests: XCTestCase {
         assertCode("EVIDENCE_STALE") { _ = try self.call("task_complete",["project_id":p["id"]!,"task_id":task["id"]!,"expected_revision":task["revision"]!]) }
     }
     func testHumanApprovalChangedAcceptanceOrOriginalCannotPass() throws {
-        let value = try submittedArtifact(gates:["human_approval"]);let p = value.project;let request = try humanApproval(value);var t = try call("task_get",["project_id":p["id"]!,"task_id":value.task["id"]!])
+        let value = try preparedSubmittedArtifact(gates:["human_approval"]);let p = value.project;let request = try humanApproval(value);var t = try call("task_get",["project_id":p["id"]!,"task_id":value.task["id"]!])
         t = try call("task_edit",["project_id":p["id"]!,"task_id":t["id"]!,"expected_revision":t["revision"]!,"patch":["brief":"Changed acceptance context"]])
         assertCode("REVIEW_TARGET_MISMATCH") { _ = try self.call("human_request_answer",try self.observedGateAnswer(["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":1,"target_sha256":value.artifact["sha256"]!,"answers":[["question_id":"approve","value":"approved"]]], task:value.task)) }
         XCTAssertTrue((try call("snapshot")["reviews"] as! [JSON]).isEmpty)
-        let value2 = try submittedArtifact(gates:["human_approval"]);let request2 = try humanApproval(value2);try Data("tampered original".utf8).write(to:URL(fileURLWithPath:value2.artifact["path"] as! String))
+        let value2 = try preparedSubmittedArtifact(gates:["human_approval"]);let request2 = try humanApproval(value2);try Data("tampered original".utf8).write(to:URL(fileURLWithPath:value2.artifact["path"] as! String))
         assertCode("EVIDENCE_STALE") { _ = try self.call("human_request_answer",try self.observedGateAnswer(["project_id":value2.project["id"]!,"request_id":request2["id"]!,"expected_revision":1,"target_sha256":value2.artifact["sha256"]!,"answers":[["question_id":"approve","value":"approved"]]], task:value2.task)) }
         XCTAssertTrue((try call("snapshot")["reviews"] as! [JSON]).isEmpty)
     }
     func testFindingsSurviveFixRoundsAndRequireExplicitEvidenceDisposition() throws {
-        let value = try submittedArtifact();let p = value.project;let reviewer = Caller(role:"owner",installation:"independent-reviewer",projectIDs:[])
+        let value = try preparedSubmittedArtifact();let p = value.project;let reviewer = Caller(role:"owner",installation:"independent-reviewer",projectIDs:[])
         let rid = (value.submission["review_request_ids"] as! [String])[0];let review = try call("work_claim",["project_id":p["id"]!,"task_id":value.task["id"]!,"expected_revision":value.task["revision"]!,"phase":"review","review_request_id":rid,"target_manifest_id":value.submission["manifest_id"]!,"gate":"review"],reviewer)
         let rejected = try call("review_record",["project_id":p["id"]!,"attempt_id":review["id"]!,"claim_token":review["claim_token"]!,"review_request_id":rid,"target_manifest_id":value.submission["manifest_id"]!,"gate":"review","verdict":"reject","findings":[["client_ref":"input-1","severity":"high","description":"The input is delayed"]]],reviewer)
         let finding = (rejected["findings"] as! [JSON])[0]
@@ -275,7 +285,7 @@ final class CoreTests: XCTestCase {
     }
 
     func testNewReviewRoundCannotReusePriorPassAndWaiverIsSeparate() throws {
-        let value = try submittedArtifact();let p = value.project;let reviewer = Caller(role:"owner",installation:"review-round",projectIDs:[]);let rid = (value.submission["review_request_ids"] as! [String])[0]
+        let value = try preparedSubmittedArtifact();let p = value.project;let reviewer = Caller(role:"owner",installation:"review-round",projectIDs:[]);let rid = (value.submission["review_request_ids"] as! [String])[0]
         let a = try call("work_claim",["project_id":p["id"]!,"task_id":value.task["id"]!,"expected_revision":value.task["revision"]!,"phase":"review","review_request_id":rid,"target_manifest_id":value.submission["manifest_id"]!,"gate":"review"],reviewer)
         let first = try call("review_record",["project_id":p["id"]!,"attempt_id":a["id"]!,"claim_token":a["claim_token"]!,"review_request_id":rid,"target_manifest_id":value.submission["manifest_id"]!,"gate":"review","verdict":"pass"],reviewer)
         var task = try call("task_get",["project_id":p["id"]!,"task_id":value.task["id"]!]);let request = try call("review_request",["project_id":p["id"]!,"task_id":task["id"]!,"expected_revision":task["revision"]!,"target_manifest_id":value.submission["manifest_id"]!,"gate":"review","supersedes_request_id":rid,"reason":"Recheck an additional scenario"])
@@ -301,7 +311,7 @@ final class CoreTests: XCTestCase {
         assertCode("REVIEW_INDEPENDENCE") { _ = try self.call("work_claim",["project_id":p["id"]!,"task_id":task["id"]!,"expected_revision":current["revision"]!,"phase":"review","review_request_id":(submission["review_request_ids"] as! [String])[0],"target_manifest_id":submission["manifest_id"]!,"gate":"review"],alias) }
     }
     func testHumanAssignedTaskCanReceiveIndependentAgentReview() throws {
-        let value = try submittedArtifact();let p = value.project;let workspace = directory.appendingPathComponent("human-work");try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
+        let value = try preparedSubmittedArtifact();let p = value.project;let workspace = directory.appendingPathComponent("human-work");try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
         _ = try call("project_edit",["project_id":p["id"]!,"expected_revision":p["revision"]!,"root_path":workspace.path])
         let task = try call("task_edit",["project_id":p["id"]!,"task_id":value.task["id"]!,"expected_revision":value.task["revision"]!,"patch":["planned_assignee":"human"]]);let sid = UUID().uuidString
         _ = try call("session_register",["project_id":p["id"]!,"session_id":sid,"role":"worker","provider":"claude","installation":"independent-agent"])

@@ -215,8 +215,11 @@ final class AuthorityTests: XCTestCase {
         let first = try peerReply(input)
         XCTAssertNotNil(first["data"],String(describing:first))
         let timing = try XCTUnwrap(first["_checklist_timing"] as? [String:Any])
-        XCTAssertEqual(Set(timing.keys),["queue_wait_ms","bootstrap_verification_ms","execution_ms","encoding_ms","total_ms","request_id","route_lifecycle_ms","route_current_session_ms"])
+        XCTAssertEqual(Set(timing.keys),["queue_wait_ms","bootstrap_verification_ms","execution_ms","encoding_ms","total_ms","request_id","route_lifecycle_ms","route_current_session_ms","coordinator_queue_wait_ms","worker_queue_wait_ms","received_uptime_s","coordinator_dequeued_uptime_s","reply_ready_uptime_s"])
         XCTAssertTrue(timing.filter {$0.key != "request_id"}.values.allSatisfy {($0 as? Double).map {$0.isFinite && $0 >= 0} == true})
+        XCTAssertLessThanOrEqual(timing["received_uptime_s"] as! Double,timing["coordinator_dequeued_uptime_s"] as! Double)
+        XCTAssertLessThanOrEqual(timing["coordinator_dequeued_uptime_s"] as! Double,timing["reply_ready_uptime_s"] as! Double)
+        XCTAssertEqual(timing["queue_wait_ms"] as! Double,(timing["coordinator_queue_wait_ms"] as! Double) + (timing["worker_queue_wait_ms"] as! Double),accuracy:0.001)
         XCTAssertGreaterThan(timing["bootstrap_verification_ms"] as! Double,0)
         XCTAssertGreaterThan(timing["execution_ms"] as! Double,0)
         input["owner_channel"] = true

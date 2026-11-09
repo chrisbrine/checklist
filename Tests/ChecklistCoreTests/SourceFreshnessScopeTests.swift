@@ -1,17 +1,26 @@
 import XCTest
+import ChecklistTestSupport
 @testable import ChecklistCore
 
 /// Synthetic command fixture; no installed application or native observation is claimed.
 final class SubmissionEvidenceFixture {
     let storage: ReadPerformanceFixture, workspace: URL, project: JSON
     var router: CommandRouter { storage.router }
-    init(_ ticket: String,symlinkedParent: Bool = false) throws {
-        storage = try ReadPerformanceFixture(ticket)
+    init(_ ticket: String,symlinkedParent: Bool = false,template: TestStore.Template? = nil) throws {
+        storage = try ReadPerformanceFixture(ticket,template:template)
         let parent = storage.directory.appendingPathComponent("root-alias")
         if symlinkedParent { try FileManager.default.createSymbolicLink(atPath:parent.path,withDestinationPath:storage.directory.path) }
         workspace = (symlinkedParent ? parent : storage.directory).appendingPathComponent("workspace")
         try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
-        project = try storage.call("project_create",["name":"Synthetic submission evidence","key_prefix":"SE","root_path":workspace.path])
+        if template == nil {
+            project = try storage.call("project_create",["name":"Synthetic submission evidence","key_prefix":"SE","root_path":workspace.path])
+        } else {
+            let router = storage.router
+            project = try router.dbQueue.read {db in
+                guard let value = try router.records(db,type:"project").first else {throw CoreError("FIXTURE_PROJECT_MISSING","The prepared submission phase has no project.")}
+                return value
+            }
+        }
     }
     func call(_ method: String,_ input: JSON,_ caller: Caller? = nil) throws -> JSON {
         var p = method == "review_context" ? input.filter {["task_id","review_request_id","target_manifest_id","gate","evidence_refs"].contains($0.key)} : input
@@ -48,6 +57,21 @@ final class SubmissionEvidenceFixture {
 }
 
 final class SourceFreshnessScopeTests: XCTestCase {
+    // Only commands preceding the behavior under test are prepared. Sessions,
+    // claims, scope adjustment, captures and freshness checks stay live on each
+    // private workspace, including its real parent symlink.
+    private static let symlinkPrerequisites = TestStore.Template(name:"SourceFreshnessScopeTests-symlink-prerequisites") {router,workspace in
+        let owner = Caller(role:"owner",installation:"read-performance",projectIDs:[])
+        func call(_ method:String,_ input:JSON) throws -> JSON {
+            var value = input;value["command_id"] = UUID().uuidString
+            return try router.handle(method:method,params:fixtureTaskInput(router,method:method,input:value),caller:owner)["data"] as! JSON
+        }
+        let project = try call("project_create",["name":"Synthetic submission evidence","key_prefix":"SE","root_path":workspace.path])
+        for _ in 0..<2 {
+            let task = try call("task_create",["project_id":project["id"]!,"title":"Synthetic evidence","brief":"A bounded observable result","acceptance":[]])
+            _ = try call("task_edit",["project_id":project["id"]!,"task_id":task["id"]!,"expected_revision":task["revision"]!,"patch":["readiness":"ready"]])
+        }
+    }
     func submitted(_ scopes: [JSON] = [["path":"src","access":"write"],["path":"dependency.txt","access":"read"]]) throws -> (SubmissionEvidenceFixture,JSON,Caller) {
         let f = try SubmissionEvidenceFixture("CL-141")
         try f.write("src/file.swift");try f.write("dependency.txt");try f.write("other.txt");try f.write("AGENTS.md")
@@ -78,9 +102,16 @@ final class SourceFreshnessScopeTests: XCTestCase {
         stale({_ = try f.call("review_record",verdict,r)},path:"src/file.swift")
     }
     func testReadScopeAndInstructionsAreRelevant() throws {
+        let (f,s,r) = try submitted()
         for path in ["dependency.txt","AGENTS.md","nested/CLAUDE.md","new/AGENTS.md"] {
-            let (f,s,r) = try submitted();try f.write(path,"changed")
+            let url = f.workspace.appendingPathComponent(path)
+            let original = try? Data(contentsOf:url)
+            try f.write(path,"changed")
             stale({_ = try f.call("review_context",f.selectors(s),r)},path:path)
+            if let original { try original.write(to:url) }
+            else { try FileManager.default.removeItem(at:url) }
+            // Each mutation starts from the same independently verified capture.
+            _ = try f.call("review_context",f.selectors(s),r)
         }
     }
     func testNewAndMissingDirectoryEntriesAreRelevant() throws {
@@ -165,10 +196,24 @@ final class SourceFreshnessScopeTests: XCTestCase {
         }
     }
     func testScopedSymlinkChainsRetainResolvedIdentityAndAliasDiagnostics() throws {
-        let inputs: [(String,String?)] = [("AGENTS.md",nil),("nested/CLAUDE.md",nil),("dependency.txt","read"),("write-dependency.txt","write"),("src/dependency.txt",nil)]
-        for (alias,access) in inputs {
-            let f = try SubmissionEvidenceFixture("CL-141",symlinkedParent:true)
-            try f.write("src/file.swift");try f.write("one.txt","same bytes");try f.write("two.txt","same bytes");try f.write("links/unrelated.txt")
+        try scopedSymlinkChains([("AGENTS.md",nil),("nested/CLAUDE.md",nil)])
+    }
+    func testDeclaredReadAndWriteSymlinkChainsRetainIdentityAndAliasDiagnostics() throws {
+        try scopedSymlinkChains([("dependency.txt","read"),("write-dependency.txt","write")])
+    }
+    func testNestedScopeSymlinkChainRetainsIdentityAndAliasDiagnostics() throws {
+        try scopedSymlinkChains([("src/dependency.txt",nil)])
+    }
+    private func scopedSymlinkChains(_ inputs: [(String,String?)]) throws {
+        // Alias variants share only project/session prerequisites. Each still
+        // claims and submits its own ready task and captures its actual tree.
+        let f = try SubmissionEvidenceFixture("CL-141",symlinkedParent:true,template:Self.symlinkPrerequisites)
+        try f.write("src/file.swift");try f.write("one.txt","same bytes");try f.write("two.txt","same bytes")
+        let author = try f.worker("author"),r = try f.worker("reviewer")
+        let tasks = try f.router.dbQueue.read {try f.router.records($0,type:"task",project:f.project["id"] as! String)}
+        for (index,value) in inputs.enumerated() {
+            let (alias,access) = value
+            try f.write("links/unrelated.txt")
             let middle = f.workspace.appendingPathComponent("links/middle.txt"),link = f.workspace.appendingPathComponent(alias)
             try FileManager.default.createDirectory(at:link.deletingLastPathComponent(),withIntermediateDirectories:true)
             try FileManager.default.createSymbolicLink(atPath:middle.path,withDestinationPath:"../one.txt")
@@ -176,10 +221,10 @@ final class SourceFreshnessScopeTests: XCTestCase {
             try FileManager.default.createSymbolicLink(atPath:link.path,withDestinationPath:target)
             var scopes: [JSON] = [["path":"src","access":"write"]]
             if let access {scopes.append(["path":link.path,"access":access])}
-            let author = try f.worker("author"),task = try f.ready(),claimed = try f.claim(task,author,scopes:scopes)
+            let claimed = try f.claim(tasks[index],author,scopes:scopes)
             // A lane-only scope adjustment must also retain the declared file aliases.
             _ = try f.call("work_scope_adjust",["attempt_id":claimed["id"]!,"claim_token":claimed["claim_token"]!,"lane_scopes":[]],author)
-            let s = try f.call("work_submit",f.submissionInput(claimed,author),author),r = try f.worker("reviewer")
+            let s = try f.call("work_submit",f.submissionInput(claimed,author),author)
             let context = try f.call("review_context",f.selectors(s),r),relevance = try XCTUnwrap(context["source_relevance"] as? JSON)
             let input = try XCTUnwrap((relevance["symlink_inputs"] as? [JSON])?.first {$0["path"] as? String == alias})
             XCTAssertEqual(input["resolved_path"] as? String,"one.txt");XCTAssertEqual(input["sha256"] as? String,ChecklistCore.hash(Data("same bytes".utf8)))
@@ -194,6 +239,10 @@ final class SourceFreshnessScopeTests: XCTestCase {
                 stale({_ = try f.call("review_context",f.selectors(s),r)},path:alias)
                 stale({_ = try f.call("work_claim",f.selectors(s),r)},path:alias)
             }
+            // The next branch creates both links from their exact original
+            // bytes and requires its own positive context before mutating them.
+            try FileManager.default.removeItem(at:link)
+            try FileManager.default.removeItem(at:middle)
         }
     }
     func testBatchClaimKeepsDeclaredSymlinkScopeAlias() throws {

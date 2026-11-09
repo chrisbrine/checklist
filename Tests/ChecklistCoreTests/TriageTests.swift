@@ -143,7 +143,7 @@ extension CoreTests {
     }
     func testHumanApprovalVerdictLeavesTriagesButUnfinishedAnswerRetainsThem() throws {
         for verdict in ["approved","changes_requested","declined"] {
-            let value = try submittedArtifact(gates:["human_approval"]);let p = value.project;let group = try triage(p,phase:"review");try addTriage(p,group,value.task)
+            let value = try preparedSubmittedArtifact(gates:["human_approval"]);let p = value.project;let group = try triage(p,phase:"review");try addTriage(p,group,value.task)
             var request = try humanApproval(value)
             request = try call("human_request_answer",try observedGateAnswer(["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":request["revision"]!,"target_sha256":value.artifact["sha256"]!,"response":"clarification","explanation":"I have not checked this target","answers":[["question_id":"approve","value":"not_checked"]]], task:value.task))
             XCTAssertEqual(strings(try currentTriage(p,group),"task_ids"),[value.task["id"] as! String])
@@ -152,7 +152,7 @@ extension CoreTests {
     }
     func testTriageDoneHonorsGatesAndRemovesAllTriagesOnlyAfterAtomicSuccess() throws {
         // The project hold override keeps approved tickets in Review for this Triage completion (CL-137).
-        let value = try submittedArtifact(gates:["human_approval"],holdPassing:true);let p = value.project;let first = value.task;let second = try ready(p,task(p,"Other completion target"));let claim = try call("work_claim",["project_id":p["id"]!,"task_id":second["id"]!,"expected_revision":second["revision"]!]);_ = try submitTriageArtifact(p,second,claim)
+        let value = try preparedSubmittedArtifact(gates:["human_approval"],holdPassing:true);let p = value.project;let first = value.task;let second = try ready(p,task(p,"Other completion target"));let claim = try call("work_claim",["project_id":p["id"]!,"task_id":second["id"]!,"expected_revision":second["revision"]!]);_ = try submitTriageArtifact(p,second,claim)
         let request = try humanApproval(value);_ = try call("human_request_answer",try observedGateAnswer(["project_id":p["id"]!,"request_id":request["id"]!,"expected_revision":request["revision"]!,"target_sha256":value.artifact["sha256"]!,"answers":[["question_id":"approve","value":"approved"]]], task:value.task))
         let group = try triage(p,phase:"review");try addTriage(p,group,first);try addTriage(p,group,second)
         let epic = (try call("epic_list",["project_id":p["id"]!])["groups"] as! [JSON]).first {$0["id"] as? String == first["epic_id"] as? String}!

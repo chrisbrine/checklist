@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "preview": {
+    "method": "backup_incomplete_preview",
+    "params": {
+      "project_id": "00000000-0000-0000-0000-000000000377",
+      "command_id": "b21b07da-8829-4daa-a460-2201b42a5051"
+    }
+  },
+  "retire": {
+    "method": "backup_incomplete_retire",
+    "params": {
+      "project_id": "00000000-0000-0000-0000-000000000377",
+      "command_id": "0f6f3bca-2b93-43bc-a0a5-b7998c20ebec",
+      "preview_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  }
+}

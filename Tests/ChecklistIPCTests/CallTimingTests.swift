@@ -12,7 +12,7 @@ final class CallTimingTests: XCTestCase {
         let decoded = try CommandReply.decode(timing.encode(result),method:"task_edit",commandID:id)
         XCTAssertEqual(try JSONSerialization.data(withJSONObject:decoded["data"]!,options:[.sortedKeys]),try JSONSerialization.data(withJSONObject:result["data"]!,options:[.sortedKeys]))
         let fields = try XCTUnwrap(decoded["_checklist_timing"] as? [String:Any])
-        XCTAssertEqual(Set(fields.keys),["queue_wait_ms","bootstrap_verification_ms","execution_ms","encoding_ms","total_ms","request_id"])
+        XCTAssertEqual(Set(fields.keys),["queue_wait_ms","bootstrap_verification_ms","execution_ms","encoding_ms","total_ms","request_id","coordinator_queue_wait_ms","coordinator_dequeued_uptime_s","received_uptime_s","reply_ready_uptime_s"])
         XCTAssertNotNil((fields["request_id"] as? String).flatMap(UUID.init(uuidString:)))
         XCTAssertGreaterThanOrEqual((fields["queue_wait_ms"] as! Double),10)
         XCTAssertGreaterThanOrEqual((fields["bootstrap_verification_ms"] as! Double),5)
@@ -34,6 +34,35 @@ final class CallTimingTests: XCTestCase {
             XCTAssertEqual((error as? ChecklistError)?.code,"CONNECTION_REVOKED")
         }
     }
+    func testAdmissionAndQueueBoundariesAreSeparateFromServiceWork() throws {
+        let now = ProcessInfo.processInfo.systemUptime
+        let admission = ClientAdmissionTiming(listenerUptime: now - 0.05, identityStartedUptime: now - 0.04,
+            identityFinishedUptime: now - 0.03, admittedUptime: now - 0.02, cacheHit: false)
+        let timing = ServiceCallTiming(received: now - 0.01, admission: admission)
+        timing.queued(since: now - 0.01)
+        timing.queued(since: now - 0.005, phase: "worker_queue_wait_ms")
+        let reply = try JSONSerialization.jsonObject(with: timing.encode(["data":[:]])) as! [String:Any]
+        let fields = reply["_checklist_timing"] as! [String:Any]
+        let coordinator = fields["coordinator_queue_wait_ms"] as! Double
+        let worker = fields["worker_queue_wait_ms"] as! Double
+        XCTAssertEqual(fields["queue_wait_ms"] as! Double, coordinator + worker, accuracy: 0.001)
+        XCTAssertEqual(fields["received_uptime_s"] as! Double, now - 0.01)
+        let observed = fields["admission"] as! [String:Any]
+        XCTAssertEqual(observed["listener_uptime_s"] as! Double, now - 0.05)
+        XCTAssertEqual(observed["cache_hit"] as? Bool, false)
+    }
+
+    func testQueueWaitEndsAtDequeueBeforeRequestDecodeAndTimingAllocation() throws {
+        let now = ProcessInfo.processInfo.systemUptime
+        let timing = ServiceCallTiming(received: now - 0.1)
+        timing.queued(since: now - 0.1, until: now - 0.08)
+        let reply = try JSONSerialization.jsonObject(with: timing.encode(["data":[:]])) as! [String:Any]
+        let fields = reply["_checklist_timing"] as! [String:Any]
+        XCTAssertEqual(fields["coordinator_queue_wait_ms"] as! Double, 20, accuracy: 0.001)
+        XCTAssertEqual(fields["coordinator_dequeued_uptime_s"] as! Double, now - 0.08)
+        XCTAssertGreaterThanOrEqual(fields["total_ms"] as! Double, 100)
+    }
+
     private final class TimingPeer: NSObject, NSXPCListenerDelegate, ChecklistRPC {
         let listener = NSXPCListener.anonymous()
         var connections: [NSXPCConnection] = []
@@ -63,7 +92,13 @@ final class CallTimingTests: XCTestCase {
         let setup = try XCTUnwrap(fields["connection_setup_ms"] as? Double),send = try XCTUnwrap(fields["send_to_reply_ms"] as? Double)
         XCTAssertGreaterThanOrEqual(setup,0);XCTAssertGreaterThanOrEqual(send,0)
         XCTAssertEqual(setup+send,fields["round_trip_ms"] as! Double,accuracy:1)
-        XCTAssertNotNil(fields["service"] as? [String:Any])
+        let service = try XCTUnwrap(fields["service"] as? [String:Any])
+        let sent = try XCTUnwrap(fields["sent_uptime_s"] as? Double)
+        let received = try XCTUnwrap(fields["reply_received_uptime_s"] as? Double)
+        let resumed = try XCTUnwrap(fields["waiter_resumed_uptime_s"] as? Double)
+        XCTAssertLessThanOrEqual(sent, service["received_uptime_s"] as! Double)
+        XCTAssertLessThanOrEqual(service["reply_ready_uptime_s"] as! Double, received)
+        XCTAssertLessThanOrEqual(received, resumed)
     }
 
     func testDiagnosticLogIsOneJSONLineWithoutProtocolStdout() throws {

@@ -164,24 +164,30 @@ extension CommandRouter {
     /// Admitted by handle, but never occupies its serial writer during copying.
     /// An explicit budget is an internal fixture seam, not a service callback.
     func executeStorageBackup(params: JSON, caller: Caller, budget: StorageSnapshotBudget = .production()) throws -> JSON {
+        budget.beginTiming(operation: "backup_create", command: params["command_id"] as? String)
+        var timingOutcome = "failed"
+        defer { budget.finishTiming(outcome: timingOutcome) }
         do {
             try dbQueue.read { try authorizeStorageBackup($0,params:params,caller:caller) }
             try backupWrites.beginCapture()
             defer {backupWrites.endBackup(router:self)}
             var budget = budget
             let observe = budget.observe
+            let executionProbe = commandOperations.backupExecutionProbe
             budget.observe = { event in
                 if event == "capture_released" {self.backupWrites.endCapture(router:self)}
                 try observe(event)
+                try executionProbe?(event)
             }
             var result = try StorageSnapshotRetention.withCapture(root:root) { retention in
                 try createStorageBackup(params:params,caller:caller,budget:budget,retention:retention)
             }
             if let data = result["data"] as? JSON,let operation = data["operation_id"] as? String {
-                try budget.observe("retention_begin")
-                result["backup_retention"] = applyAutomaticBackupRetention(after:operation,observe:{try budget.observe("retention_" + $0)})
-                try budget.observe("retention_end")
+                try budget.notify("retention_begin")
+                result["backup_retention"] = applyAutomaticBackupRetention(after:operation,observe:{try budget.notify("retention_" + $0)})
+                try budget.notify("retention_end")
             }
+            timingOutcome = "complete"
             return result
         } catch {
             let reported = budget.reporting(error)
@@ -254,9 +260,9 @@ extension CommandRouter {
               !destination.path.hasPrefix(root.standardizedFileURL.path + "/source-captures/") else { throw CoreError("INVALID_INPUT","Choose a separate backup destination.") }
         let parent = destination.deletingLastPathComponent(), name = destination.lastPathComponent
         func commitBackup(_ receipt: StorageSnapshotReceipt) throws -> JSON {
-            try budget.observe("receipt_prepare_begin")
+            try budget.notify("receipt_prepare_begin")
             let prepared = try prepareStorageBackupReceipt(destination:destination,receipt:receipt,identity:identity,budget:budget)
-            try budget.observe("receipt_prepare_end")
+            try budget.notify("receipt_prepare_end")
             return try ArchiveStorageGate.withExclusive(root:root) { permit in
                 try dbQueue.writeWithoutTransaction { db in
                     try self.commitStorageBackupReceipt(db,params:params,caller:caller,permit:permit,command:command,digest:digest,key:key,destination:destination,receipt:receipt,identity:identity,generation:prepared.generation,summary:prepared.summary,projectIDs:prepared.projectIDs)
@@ -327,12 +333,12 @@ extension CommandRouter {
             }
             try copy.close()
         } catch {try? copy.close();throw error}
-        try budget.observe("receipt_manifest_loaded")
+        try budget.notify("receipt_manifest_loaded")
         let manifestIndex = try StorageBackupManifestIndex.prepare(root:root,manifest:manifest,manifestSHA256:receipt.manifestSHA256)
-        try budget.observe("receipt_index_prepared")
+        try budget.notify("receipt_index_prepared")
         let files = try StorageObjectFiles(root:destination)
         let usage = try StorageCopyUsage.measure(files,paths:["database.sqlite","manifest.json","intent.json"] + manifest.objects.map {"managed/" + $0.descriptor.relativePath},budget:budget)
-        try budget.observe("receipt_usage_measured")
+        try budget.notify("receipt_usage_measured")
         let summary: JSON = ["kind":"backup","operation_id":receipt.operationID.uuidString.lowercased(),"path":destination.path,
             "source_root":manifest.sourceRoot,"store_id":manifest.storeID,"captured_at":manifest.capturedAt as Any? ?? NSNull(),
             "verified_at":now(),"verification":"manifest_database_managed_files","manifest_sha256":receipt.manifestSHA256,"usage":usage,

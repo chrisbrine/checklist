@@ -4,15 +4,18 @@ import GRDB
 
 extension CoreTests {
     private func reviewRequestTriageFixture(_ verdict: String) throws -> (project: JSON, task: JSON, groups: [JSON], request: JSON, reviewer: Caller) {
-        let f = try reviewBatchInputsFixture(), p = f.project, task = f.tasks[0]
-        // CL-125 rule 4: the ticket is in this one review Triage.
-        let batch = try prepareReviewBatch(p,f.group,[task,f.tasks[2]],f.reviewer)
-        let claims = try claimFixedBatch(p,batch,f.reviewer)["claims"] as! [JSON]
-        let inputs: [JSON] = claims.map { claim in
-            let input: JSON = ["attempt_id":claim["id"]!,"claim_token":claim["claim_token"]!,"review_request_id":claim["review_request_id"]!,"target_manifest_id":claim["manifest_id"]!,"gate":"review","verdict":"blocked"]
-            return input
+        let fixture = try preparedCorePhase(orchestrateBatchTriages ? "review-request-blocked-orchestrated" : "review-request-blocked-plan") { [self] in
+            let f = try buildReviewBatchInputsFixture(), p = f.project, task = f.tasks[0]
+            // CL-125 rule 4: the ticket is in this one review Triage.
+            let batch = try prepareReviewBatch(p,f.group,[task,f.tasks[2]],f.reviewer)
+            let claims = try claimFixedBatch(p,batch,f.reviewer)["claims"] as! [JSON]
+            let inputs: [JSON] = claims.map { claim in
+                ["attempt_id":claim["id"]!,"claim_token":claim["claim_token"]!,"review_request_id":claim["review_request_id"]!,"target_manifest_id":claim["manifest_id"]!,"gate":"review","verdict":"blocked"]
+            }
+            _ = try call("batch_review_record",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":1,"members":inputs],f.reviewer)
+            return ["project":p,"task":task,"group":f.group,"claims":claims]
         }
-        _ = try call("batch_review_record",["project_id":p["id"]!,"batch_id":batch["id"]!,"expected_revision":1,"members":inputs],f.reviewer)
+        let p = fixture["project"] as! JSON, task = fixture["task"] as! JSON, claims = fixture["claims"] as! [JSON]
         // Historical CL-41 requests are retained unchanged by CL-216; current verdicts no longer create them.
         if verdict != "blocked" {
             try reviewFixtureWrite { db in
@@ -26,7 +29,7 @@ extension CoreTests {
         }
         let claim = claims.first { $0["task_id"] as? String == task["id"] as? String }!
         let request = try router.dbQueue.read { try router.record($0,claim["review_request_id"] as! String,type:"review_request") }
-        return (p,task,[f.group],request,f.reviewer)
+        return (p,task,[fixture["group"] as! JSON],request,Caller(role:"owner",installation:"review-input-reader",projectIDs:[]))
     }
     private func requestAgain(_ p: JSON,_ task: JSON,_ request: JSON) throws -> JSON {
         let current = try call("task_get",["project_id":p["id"]!,"task_id":task["id"]!])

@@ -33,6 +33,7 @@ extension EvidenceAuthorityTests {
 
     // CL-41
     func testLegacyEvidenceMissingReturnsTheSameTargetForMoreEvidence() throws {
+        useReviewGitFixture()
         let (p,t,submitted,review,author,first) = try nativeSourceReviewPhase()
         let second = Caller(role: "owner", installation: "em-second", projectIDs: [])
         var missing = reviewInput(p, review, verdict: "evidence_missing")
@@ -94,6 +95,7 @@ extension EvidenceAuthorityTests {
 
     // CL-42
     func testAdviceFindingsStayVisibleAndDoNotBlockCompletion() throws {
+        useReviewGitFixture()
         let (p,t,submitted,review,author,reviewer) = try nativeSourceReviewPhase()
         let other = try native(p, "adv-other", domain: "claude:4203:1:0", provider: "claude")
         var reject = reviewInput(p, review, verdict: "reject"); reject["findings"] = [finding("polish", try sourceRef(submitted))]
@@ -125,20 +127,62 @@ extension EvidenceAuthorityTests {
         XCTAssertEqual(open.count, 2); XCTAssertTrue(open.allSatisfy { $0["severity"] as? String == "advice" })
     }
 
-    // CL-43
-    func testRepeatedCauseWarnsTheTicketAndItsCoordinator() throws {
-        try sourceFixture()
-        let p = try project(), author = try native(p, "rep-author", domain: "codex:4301:1:0"), reviewer = try native(p, "rep-reviewer", domain: "claude:4302:1:0", provider: "claude")
-        let t = try ready(p)
-        var previous: String?
-        for round in 1...3 {
-            let submitted = try submit(p, t, author), review = try reviewClaim(p, submitted, reviewer)
-            var reject = reviewInput(p, review, verdict: "reject"); reject["findings"] = [finding("timing-\(round)", try sourceRef(submitted), sameCause: previous)]
-            previous = ((try call("review_record", reject, reviewer)["findings"] as! [JSON])[0])["id"] as? String
-            let summary = try call("task_context", ["project_id": p["id"]!, "task_id": t["id"]!])["review_summary"] as! JSON
-            XCTAssertEqual((summary["rounds"] as! [JSON]).first?["failed_rounds"] as? Int, round)
-            XCTAssertEqual((summary["warnings"] as! [JSON]).count, round == 3 ? 1 : 0, "warn only when the cause returns for the second time")
+    // CL-43: each round's rejection remains an executed command. Earlier
+    // completed rounds are immutable preparation for that round's observation.
+    private func repeatedCauseReviewPhase(priorRounds: Int) throws -> JSON {
+        if priorRounds == 0 {
+            let (p,t,submitted,review,author,reviewer) = try nativeSourceReviewPhase()
+            return ["project":p,"task":t,"submitted":submitted,"review":review,"author":author.sessionID!,"reviewer":reviewer.sessionID!]
         }
+        return try preparedPhase("repeated-cause-before-\(priorRounds + 1)") { fixture in
+            try fixture.sourceFixture()
+            let p = try fixture.project(), author = try fixture.native(p,"rep-author",domain:"codex:4301:1:0")
+            let reviewer = try fixture.native(p,"rep-reviewer",domain:"claude:4302:1:0",provider:"claude"), t = try fixture.ready(p)
+            var previous: String?
+            for index in 0..<priorRounds {
+                let submitted = try fixture.submit(p,t,author), review = try fixture.reviewClaim(p,submitted,reviewer)
+                var reject = fixture.reviewInput(p,review,verdict:"reject")
+                reject["findings"] = [fixture.finding("timing-\(index + 1)",try fixture.sourceRef(submitted),sameCause:previous)]
+                previous = ((try fixture.call("review_record",reject,reviewer)["findings"] as! [JSON])[0])["id"] as? String
+            }
+            let submitted = try fixture.submit(p,t,author), review = try fixture.reviewClaim(p,submitted,reviewer)
+            var payload: JSON = ["project":p,"task":t,"submitted":submitted,"review":review,"author":author.sessionID!,"reviewer":reviewer.sessionID!]
+            if let previous { payload["previous"] = previous }
+            if priorRounds == 2 {
+                let otherTicket = try fixture.ready(p), otherSubmitted = try fixture.submit(p,otherTicket,author)
+                payload["otherSubmitted"] = otherSubmitted
+                payload["otherReview"] = try fixture.reviewClaim(p,otherSubmitted,reviewer)
+            }
+            return payload
+        }
+    }
+
+    private func assertRepeatedCauseRound(_ phase: JSON, round: Int) throws -> (p: JSON,t: JSON,reviewer: Caller,previous: String?) {
+        let p = phase["project"] as! JSON, t = phase["task"] as! JSON
+        let submitted = phase["submitted"] as! JSON, review = phase["review"] as! JSON
+        let reviewer = try phaseCaller(phase["reviewer"]!)
+        var reject = reviewInput(p,review,verdict:"reject")
+        reject["findings"] = [finding("timing-\(round)",try sourceRef(submitted),sameCause:phase["previous"] as? String)]
+        let previous = ((try call("review_record",reject,reviewer)["findings"] as! [JSON])[0])["id"] as? String
+        let summary = try call("task_context",["project_id":p["id"]!,"task_id":t["id"]!])["review_summary"] as! JSON
+        XCTAssertEqual((summary["rounds"] as! [JSON]).first?["failed_rounds"] as? Int,round)
+        XCTAssertEqual((summary["warnings"] as! [JSON]).count,round == 3 ? 1 : 0,"warn only when the cause returns for the second time")
+        return (p,t,reviewer,previous)
+    }
+
+    func testFirstCauseHasNoRepeatedCauseWarning() throws {
+        _ = try assertRepeatedCauseRound(repeatedCauseReviewPhase(priorRounds:0),round:1)
+    }
+
+    func testFirstRecurrenceHasNoRepeatedCauseWarning() throws {
+        useReviewGitFixture()
+        _ = try assertRepeatedCauseRound(repeatedCauseReviewPhase(priorRounds:1),round:2)
+    }
+
+    func testRepeatedCauseWarnsTheTicketAndItsCoordinator() throws {
+        useReviewGitFixture()
+        let phase = try repeatedCauseReviewPhase(priorRounds:2)
+        let (p,t,reviewer,previous) = try assertRepeatedCauseRound(phase,round:3)
         let warning = ((try call("task_context", ["project_id": p["id"]!, "task_id": t["id"]!])["review_summary"] as! JSON)["warnings"] as! [JSON])[0]
         XCTAssertEqual(warning["occurrences"] as? Int, 3); XCTAssertEqual((warning["finding_ids"] as? [String])?.count, 3)
         let ticket = try current(p, t)
@@ -148,7 +192,7 @@ extension EvidenceAuthorityTests {
         let group = (try call("triage_list", ["project_id": p["id"]!])["groups"] as! [JSON]).first { $0["id"] as? String == triage["id"] as? String }!
         XCTAssertEqual((group["member_warnings"] as? [JSON])?.first?["cause_id"] as? String, warning["cause_id"] as? String)
         // same_cause_as names a finding of this ticket only.
-        let otherTicket = try ready(p), otherSubmitted = try submit(p, otherTicket, author), otherReview = try reviewClaim(p, otherSubmitted, reviewer)
+        let otherSubmitted = phase["otherSubmitted"] as! JSON, otherReview = phase["otherReview"] as! JSON
         var foreign = reviewInput(p, otherReview, verdict: "reject"); foreign["findings"] = [finding("foreign", try sourceRef(otherSubmitted), sameCause: previous)]
         assertCode("REVIEW_TARGET_MISMATCH") { _ = try self.call("review_record", foreign, reviewer) }
     }
@@ -266,25 +310,42 @@ extension EvidenceAuthorityTests {
     }
 
     // CL-45
-    func testReleaseSetHoldsNeedThePolicyAndCompleteTheSetTogether() throws {
-        try sourceFixture()
-        let reviewer = Caller(role: "owner", installation: "release-reviewer", projectIDs: [])
-        // Without the policy a pass cannot hold, and passing tickets complete independently.
-        var p = try project()
-        let plainSubmitted = try submitSource(p, try claim(p, try ready(p))), plainReview = try reviewClaim(p, plainSubmitted, reviewer)
-        var held = reviewInput(p, plainReview, verdict: "pass"); held["review_assessment"] = try ownReviewAssessment(p, plainReview, reviewer); held["release_set"] = "1.0"; held["hold_reason"] = "Ships with the save format"
-        assertCode("POLICY_DENIED") { _ = try self.call("review_record", held, reviewer) }
+    func testReleaseSetHoldRequiresPolicy() throws {
+        let (p,_,plainReview,reviewer) = try ownerSourceReviewPhase()
+        var held = reviewInput(p,plainReview,verdict:"pass")
+        held["review_assessment"] = try ownReviewAssessment(p,plainReview,reviewer)
+        held["release_set"] = "1.0"; held["hold_reason"] = "Ships with the save format"
+        assertCode("POLICY_DENIED") { _ = try self.call("review_record",held,reviewer) }
+    }
 
-        p = try record(p["id"], "project")
-        p = try call("policy_apply", ["project_id": p["id"]!, "expected_revision": p["revision"]!, "policy": ["required_gates": ["review"], "release_set_holds": true]])
+    private func releaseSetReviewPhase() throws -> JSON {
+        try preparedPhase("release-set-reviews") { fixture in
+            try fixture.sourceFixture()
+            var p = try fixture.project()
+            p = try fixture.call("policy_apply",["project_id":p["id"]!,"expected_revision":p["revision"]!,"policy":["required_gates":["review"],"release_set_holds":true]])
+            let reviewer = Caller(role:"owner",installation:"release-reviewer",projectIDs:[])
+            var candidates: [JSON] = []
+            for _ in 0..<2 {
+                let task = try fixture.ready(p), submitted = try fixture.submitSource(p,fixture.claim(p,task))
+                let review = try fixture.reviewClaim(p,submitted,reviewer)
+                candidates.append(["task":task,"review":review,"assessment":try fixture.ownReviewAssessment(p,review,reviewer)])
+            }
+            return ["project":p,"candidates":candidates]
+        }
+    }
+
+    func testReleaseSetHoldsNeedThePolicyAndCompleteTheSetTogether() throws {
+        useReviewGitFixture()
+        let phase = try releaseSetReviewPhase(), p = phase["project"] as! JSON
+        let reviewer = Caller(role:"owner",installation:"release-reviewer",projectIDs:[])
         var tasks: [JSON] = []
-        for index in 0..<2 {
-            let t = try ready(p), submitted = try submitSource(p, try claim(p, t)), review = try reviewClaim(p, submitted, reviewer)
-            var pass = reviewInput(p, review, verdict: "pass"); pass["review_assessment"] = try ownReviewAssessment(p, review, reviewer)
+        for (index,candidate) in (phase["candidates"] as! [JSON]).enumerated() {
+            let t = candidate["task"] as! JSON, review = candidate["review"] as! JSON
+            var pass = reviewInput(p,review,verdict:"pass"); pass["review_assessment"] = candidate["assessment"]!
             pass["release_set"] = "1.0"; pass["hold_reason"] = "Committed alone it fails the save-format tests (\(index))"
-            let completion = try call("review_record", pass, reviewer)["completion"] as! JSON
-            XCTAssertEqual(completion["waiting_for"] as? String, "RELEASE_SET"); XCTAssertEqual(completion["release_set"] as? String, "1.0")
-            tasks.append(try current(p, t))
+            let completion = try call("review_record",pass,reviewer)["completion"] as! JSON
+            XCTAssertEqual(completion["waiting_for"] as? String,"RELEASE_SET"); XCTAssertEqual(completion["release_set"] as? String,"1.0")
+            tasks.append(try current(p,t))
         }
         for t in tasks {
             XCTAssertEqual(t["status_category"] as? String, "review"); XCTAssertEqual((t["release_hold"] as? JSON)?["release_set"] as? String, "1.0")

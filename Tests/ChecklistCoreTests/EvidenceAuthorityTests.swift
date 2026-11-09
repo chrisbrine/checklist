@@ -28,7 +28,9 @@ final class EvidenceAuthorityTests: XCTestCase {
             process.arguments = ["-C", workspace.path] + args
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
-            try process.run(); process.waitUntilExit()
+            let exited = DispatchSemaphore(value:0)
+            process.terminationHandler = { _ in exited.signal() }
+            try process.run(); exited.wait()
             guard process.terminationReason == .exit, process.terminationStatus == 0 else {
                 throw CoreError("FIXTURE_GIT_FAILED", "Preparing the private source fixture failed")
             }
@@ -40,6 +42,69 @@ final class EvidenceAuthorityTests: XCTestCase {
         try git(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture"])
         try write("tracked.txt", "dirty"); try write("untracked.txt", "new")
         try write("private/receipt.txt", "never captured")
+        // Review-routing tests mock only Git's inventory subprocess. Preserve
+        // actual answers from this exact prepared repository; capture still
+        // reads and hashes every source byte from each private workspace.
+        var answers: JSON = [:]
+        for args in [["--version"], ["rev-parse", "--verify", "--quiet", "HEAD"], ["ls-files", "--stage", "-z"], ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]] {
+            // This prepares synthetic mock input alongside init/add/commit;
+            // native confinement is exercised by the ordinary source tests.
+            let process = Process(), output = Pipe(), exited = DispatchSemaphore(value:0)
+            process.executableURL = URL(fileURLWithPath:try SourceGit.resolve())
+            process.arguments = ["-c","core.fsmonitor=false","-C",workspace.path] + args
+            process.environment = SourceGit.environment(ProcessInfo.processInfo.environment)
+            process.standardOutput = output;process.standardError = FileHandle.nullDevice
+            process.terminationHandler = { _ in exited.signal() }
+            try process.run()
+            let bytes = output.fileHandleForReading.readDataToEndOfFile();exited.wait()
+            guard process.terminationReason == .exit,process.terminationStatus == 0 else {
+                throw CoreError("FIXTURE_GIT_FAILED", "Preparing review inventory failed")
+            }
+            answers[args.joined(separator: " ")] = bytes.base64EncodedString()
+        }
+        try Data((try jsonString(answers)).utf8).write(to: workspace.appendingPathComponent(".git/checklist-review-responses.json"))
+    }
+    var usesReviewGitFixture = false
+    /// Explicitly scoped to review outcome/routing tests. Native Git and
+    /// source-freshness/confinement tests retain the normal adapter.
+    func useReviewGitFixture() {
+        usesReviewGitFixture = true
+        SourceGit.fixtureProcessAdapter.withLockUnchecked { $0 = ReviewSourceGitFixture() }
+    }
+    private final class ReviewSourceGitFixture: SourceGitProcessAdapter {
+        func run(_ request: SourceGitProcessRequest) throws -> Data {
+            let arguments = request.arguments
+            guard arguments.count >= 7, arguments[5] == "-C" else {
+                throw CoreError("FIXTURE_GIT_INPUT", "Unexpected review Git request")
+            }
+            let workspace = URL(fileURLWithPath: arguments[6]), command = Array(arguments.dropFirst(7))
+            // Refuse unexpected fixture inputs instead of returning a plausible
+            // inventory that would silently omit newly introduced source files.
+            let expected: Set<String> = [".gitignore", "tracked.txt", "untracked.txt", "scripts/validate-plan.py"]
+            var actual = Set<String>()
+            let root = workspace.resolvingSymlinksInPath().path
+            guard let entries = FileManager.default.enumerator(at: workspace, includingPropertiesForKeys: [.isDirectoryKey]) else {
+                throw CoreError("FIXTURE_GIT_INPUT", "Review source is unavailable")
+            }
+            for case let entry as URL in entries {
+                let path = entry.resolvingSymlinksInPath().path
+                guard path.hasPrefix(root + "/") else {
+                    throw CoreError("FIXTURE_GIT_INPUT", "Review source escaped its workspace",details:["root":root,"entry":path])
+                }
+                let relative = String(path.dropFirst(root.count + 1))
+                if relative == ".git" || relative == "private" { entries.skipDescendants(); continue }
+                if try entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory != true { actual.insert(relative) }
+            }
+            guard actual == expected else {
+                throw CoreError("FIXTURE_GIT_INPUT", "Review source inventory changed",details:["root":root,"actual":actual.sorted(),"expected":expected.sorted()])
+            }
+            if command == ["rev-parse", "--show-toplevel"] { return Data((workspace.path + "\n").utf8) }
+            let answers = jsonObject(try String(contentsOf: workspace.appendingPathComponent(".git/checklist-review-responses.json"), encoding: .utf8))
+            guard let encoded = answers[command.joined(separator: " ")] as? String, let answer = Data(base64Encoded: encoded) else {
+                throw CoreError("FIXTURE_GIT_INPUT", "Unexpected review Git command")
+            }
+            return answer
+        }
     }
     private var preparedProject: JSON?
     func clearPreparedProject() { preparedProject = nil }
@@ -104,7 +169,13 @@ final class EvidenceAuthorityTests: XCTestCase {
         return Caller(role:"worker",installation:installation,projectIDs:[p["id"] as! String],sessionID:id,workspace:workspace.path,executionDomain:domain)
     }
     func write(_ path: String,_ content: String) throws { let target = workspace.appendingPathComponent(path);try FileManager.default.createDirectory(at:target.deletingLastPathComponent(),withIntermediateDirectories:true);try Data(content.utf8).write(to:target) }
-    func git(_ args: [String]) throws { let p = Process();p.executableURL = URL(fileURLWithPath:"/usr/bin/git");p.arguments = ["-C",workspace.path]+args;p.standardOutput = FileHandle.nullDevice;p.standardError = FileHandle.nullDevice;try p.run();p.waitUntilExit();XCTAssertEqual(p.terminationStatus,0) }
+    func git(_ args: [String]) throws {
+        let p = Process(),exited = DispatchSemaphore(value:0)
+        p.executableURL = URL(fileURLWithPath:"/usr/bin/git");p.arguments = ["-C",workspace.path]+args
+        p.standardOutput = FileHandle.nullDevice;p.standardError = FileHandle.nullDevice
+        p.terminationHandler = { _ in exited.signal() }
+        try p.run();exited.wait();XCTAssertEqual(p.terminationStatus,0)
+    }
     func sourceFixture() throws {
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         if try FileManager.default.contentsOfDirectory(atPath: workspace.path).isEmpty {
@@ -262,7 +333,7 @@ final class EvidenceAuthorityTests: XCTestCase {
         assertCode("EVIDENCE_STALE") { _ = try self.router.dbQueue.read {try self.router.validateManifestTarget($0,task:edited,manifestID:submission["manifest_id"] as! String)} }
     }
     func testSourceReviewUsesOwnAssessmentWithoutMandatoryExecution() throws {
-        try sourceFixture();let p = try project(),a = try claim(p,ready(p)),submission = try submitSource(p,a),reviewer = Caller(role:"owner",installation:"source-reviewer",projectIDs:[]),review = try reviewClaim(p,submission,reviewer)
+        let (p,submission,review,reviewer) = try ownerSourceReviewPhase()
         assertCode("REVIEW_ASSESSMENT_REQUIRED") { _ = try self.call("review_record",self.reviewInput(p,review,verdict:"pass"),reviewer) }
         var input = reviewInput(p,review,verdict:"pass");input["review_assessment"] = try ownReviewAssessment(p,review,reviewer)
         _ = try call("review_record",input,reviewer)
@@ -271,7 +342,7 @@ final class EvidenceAuthorityTests: XCTestCase {
         let done = try call("task_complete",["project_id":p["id"]!,"task_id":t["id"]!,"expected_revision":t["revision"]!]);XCTAssertEqual(done["status_category"] as? String,"done")
     }
     func testStableSourceFindingRequiresCurrentTargetResolutionEvidence() throws {
-        try sourceFixture();let p = try project(),author = try claim(p,ready(p)),submitted = try submitSource(p,author),reviewer = Caller(role:"owner",installation:"finding-reviewer",projectIDs:[]),review = try reviewClaim(p,submitted,reviewer)
+        let (p,submitted,review,reviewer) = try ownerSourceReviewPhase()
         let firstManifest = try router.dbQueue.read {try router.record($0,submitted["manifest_id"] as! String,type:"manifest")},firstSource = (firstManifest["evidence"] as! JSON)["source_capture"] as! JSON
         let oldRef: JSON = ["source_capture_id":firstSource["id"]!,"sha256":firstSource["sha256"]!]
         var reject = reviewInput(p,review,verdict:"reject");reject["findings"] = [["client_ref":"missing-marker","description":"Expected marker absent","severity":"normal","evidence_refs":[oldRef]]]
@@ -289,7 +360,7 @@ final class EvidenceAuthorityTests: XCTestCase {
         XCTAssertEqual(resolved["state"] as? String,"resolved");XCTAssertEqual(resolved["resolved_on_manifest_id"] as? String,fixed["manifest_id"] as? String)
     }
     func testInterruptedSourceProcessRetainsReservationsUntilExplicitRecovery() throws {
-        try sourceFixture();let p = try project(),a = try claim(p,ready(p)),submission = try submitSource(p,a),reviewer = Caller(role:"owner",installation:"interrupted-reviewer",projectIDs:[]),review = try reviewClaim(p,submission,reviewer),job = UUID().uuidString
+        let (p,_,review,reviewer) = try ownerSourceReviewPhase(),job = UUID().uuidString
         try router.dbQueue.write { db in try router.save(db,["id":job,"project_id":p["id"]!,"task_id":review["task_id"]!,"attempt_id":review["id"]!,"state":"interrupted","revision":1],type:"source_execution") }
         var release = auth(p,review);release["reason"] = "Cannot silently release an unknown process"
         assertCode("SOURCE_EXECUTION_ACTIVE") { _ = try self.call("work_release",release,reviewer) }
@@ -307,7 +378,7 @@ final class EvidenceAuthorityTests: XCTestCase {
         assertCode("STALE_CLAIM") { _ = try self.call("work_checkpoint",checkpoint,reviewer) }
     }
     func testUnverifiedStopFlagRetainsAuthorityAcrossDescriptiveFailureStates() throws {
-        try sourceFixture();let p = try project(),a = try claim(p,ready(p)),submission = try submitSource(p,a),reviewer = Caller(role:"owner",installation:"unverified-stop-reviewer",projectIDs:[]),review = try reviewClaim(p,submission,reviewer)
+        let (p,_,review,reviewer) = try ownerSourceReviewPhase()
         let ids = [UUID().uuidString,UUID().uuidString]
         try router.dbQueue.write { db in
             for (index,state) in ["stale","failed"].enumerated() { try router.save(db,["id":ids[index],"project_id":p["id"]!,"task_id":review["task_id"]!,"attempt_id":review["id"]!,"state":state,"process_stop_unverified":true,"revision":1],type:"source_execution") }
@@ -321,7 +392,7 @@ final class EvidenceAuthorityTests: XCTestCase {
         for id in ids { let stopped = try call("source_execution_get",["project_id":p["id"]!,"execution_id":id],reviewer);XCTAssertEqual(stopped["state"] as? String,"stopped");XCTAssertFalse(bool(stopped,"process_stop_unverified")) }
     }
     func testDisabledRunnerDoesNotCreateAQueuedOrRunningProcess() throws {
-        try sourceFixture();let p = try project(),a = try claim(p,ready(p)),submission = try submitSource(p,a),reviewer = Caller(role:"owner",installation:"disabled-runner-reviewer",projectIDs:[]),review = try reviewClaim(p,submission,reviewer)
+        let (p,_,review,reviewer) = try ownerSourceReviewPhase()
         var run = auth(p,review);run["tool"] = "swift_test";run["args"] = []
         assertCode("UNSUPPORTED_CAPABILITY") { _ = try self.call("source_review_execute",run,reviewer) }
         let jobs = try router.dbQueue.read {try router.records($0,type:"source_execution",project:p["id"] as? String)};XCTAssertTrue(jobs.isEmpty)

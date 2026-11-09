@@ -34,6 +34,7 @@ public enum CommandMethods {
         "restore_preview",
         "backup_retention_get",
         "backup_prune_preview",
+        "backup_incomplete_preview",
         "ticket_cleanup_receipts",
         "work_health_get",
         "cleanup_job_get",

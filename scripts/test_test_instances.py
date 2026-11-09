@@ -663,6 +663,81 @@ class DestroyCleanupTests(unittest.TestCase):
                                     for domain in state.domains))
 
 
+class ExternalBindingOverlapCacheTests(unittest.TestCase):
+    @contextmanager
+    def fixture(self):
+        with test_directory() as directory:
+            base = Path(directory).resolve();external = base / 'projects/workspace';external.mkdir(parents=True)
+            with patch.object(harness, 'LIVE', base / 'live'), patch.object(harness, 'DEFAULT_LIVE', base / 'live'), \
+                 patch.object(harness, 'BASE', base / 'slots'):
+                yield base, external
+
+    def test_repeated_bindings_keep_occurrence_counts_and_recheck_at_release(self):
+        with self.fixture() as (base, external):
+            database = base / 'database.sqlite'
+            records = [('project', {'id': 'project-' + str(i), 'root_path': str(external)}) for i in range(5)]
+            store_fixture(database, records=records)
+            with patch.object(harness, 'checklist_root_overlap', wraps=harness.checklist_root_overlap) as check:
+                counts = harness.require_local_paths(database, base / 'destination')
+            self.assertEqual(counts['external_project_path_occurrences'], 5)
+            self.assertEqual(counts['external_overlap_cache_hits'], 4)
+            self.assertEqual(counts['external_overlap_cache_entries'], 1)
+            self.assertEqual(counts['external_overlap_filesystem_checks'], 2)
+            self.assertEqual(check.call_count, 2)
+
+    def test_late_binding_replacement_refuses_and_new_invocation_has_no_cache(self):
+        with self.fixture() as (base, external):
+            cached = harness.ExternalBindingOverlapCache();self.assertFalse(cached.overlap(external, 'fixture'))
+            external.rename(external.with_name('previous'));external.mkdir()
+            self.assertFalse(cached.overlap(external, 'fixture'))
+            with self.assertRaisesRegex(ValueError, 'named ancestry changed'): cached.revalidate()
+            fresh = harness.ExternalBindingOverlapCache()
+            self.assertFalse(fresh.overlap(external, 'new invocation'));fresh.revalidate()
+            self.assertEqual(fresh.filesystem_checks, 2)
+
+    def test_late_ancestor_replacement_refuses_even_when_leaf_inode_is_preserved(self):
+        with self.fixture() as (base, external):
+            cached = harness.ExternalBindingOverlapCache();cached.overlap(external, 'fixture')
+            leaf_identity = external.stat().st_ino
+            parent = external.parent;previous = parent.with_name('previous-projects')
+            parent.rename(previous);parent.mkdir();(previous / external.name).rename(external)
+            self.assertEqual(external.stat().st_ino, leaf_identity)
+            with self.assertRaisesRegex(ValueError, 'named ancestry changed'): cached.revalidate()
+
+    def test_changed_checklist_roots_are_rechecked_at_release_and_in_new_invocations(self):
+        with self.fixture() as (base, external):
+            cached = harness.ExternalBindingOverlapCache();cached.overlap(external, 'fixture')
+            cached.overlap(external, 'fixture')
+            with patch.object(harness, 'LIVE', external):
+                with self.assertRaisesRegex(ValueError, 'now overlaps'): cached.revalidate()
+                fresh = harness.ExternalBindingOverlapCache()
+                self.assertEqual(fresh.overlap(external, 'new invocation'), 'live')
+                self.assertEqual(len(fresh.entries), 0)
+
+    def test_entry_and_byte_bounds_fall_back_to_original_guards(self):
+        with self.fixture() as (base, external):
+            second = base / 'another';second.mkdir()
+            cached = harness.ExternalBindingOverlapCache(maximum_entries=1)
+            for path in [external, second, second, external]: self.assertFalse(cached.overlap(path, 'fixture'))
+            cached.revalidate()
+            self.assertEqual(len(cached.entries), 1);self.assertEqual(cached.hits, 1)
+            self.assertEqual(cached.filesystem_checks, 4)
+            uncached = harness.ExternalBindingOverlapCache(maximum_bytes=0)
+            for _ in range(2): self.assertFalse(uncached.overlap(external, 'fixture'))
+            uncached.revalidate()
+            self.assertEqual(uncached.filesystem_checks, 2);self.assertEqual(uncached.entries, {})
+
+    def test_managed_descriptors_never_use_the_external_binding_cache(self):
+        with self.fixture() as (base, external):
+            database = base / 'database.sqlite'
+            first = attachment(external / 'objects/item');second = dict(first, id='second')
+            store_fixture(database, records=[('attachment', first), ('attachment', second)])
+            with patch.object(harness.ExternalBindingOverlapCache, 'overlap', side_effect=AssertionError('managed path cached')):
+                counts = harness.require_local_paths(database, base / 'destination')
+            self.assertEqual(counts['managed_unavailable_absolute'], 2)
+            self.assertEqual(counts['external_overlap_cache_entries'], 0)
+
+
 class SnapshotLogicTests(unittest.TestCase):
     def fixture(self, base, schema=0, records=()):
         source = base / 'snapshot-fixture'; source.mkdir()
@@ -2879,6 +2954,34 @@ class SlotStartupTests(unittest.TestCase):
             self.assertFalse((p['folder'] / 'service.plist').exists())
             self.assertIn('Slot 4 ready (headless)', output.getvalue())
 
+    def test_only_first_fresh_live_copy_start_publishes_bound_measurement(self):
+        with self.fixture(['timeout', self.healthy(), self.healthy()]) as (p, clock, calls, commands, output, progress):
+            metadata = harness.load(p)
+            metadata['first_start_pending'] = True
+            metadata['seed'].update(live_snapshot=True, source_hash='manifest-digest',
+                                    before_start={'schema': 3, 'identity': {'logical_store_id': 'store'}})
+            with patch.object(harness, 'bundle_check', return_value={'source_fingerprint': 'fingerprint'}), \
+                 patch.object(harness, 'sha', return_value='service-digest'), patch.object(harness, 'storage_schema', return_value=4), \
+                 patch.object(harness, 'host_load', return_value='{ 1 2 3 }'):
+                harness.start(SimpleNamespace(slot=4, gui=False), p)
+                measurement = json.loads((p['folder'] / 'offline-measurement.json').read_text())
+                harness.start(SimpleNamespace(slot=4, gui=False), p)
+            self.assertEqual(measurement['launch_to_healthy_seconds'], 35)
+            self.assertEqual(measurement['service_sha256'], 'service-digest')
+            self.assertEqual(measurement['source_schema'], 3)
+            self.assertEqual(measurement['target_schema'], 4)
+            self.assertEqual(measurement['load_start'], '{ 1 2 3 }')
+            self.assertEqual(json.loads((p['folder'] / 'offline-measurement.json').read_text()), measurement)
+            self.assertFalse(metadata['first_start_pending'])
+
+    def test_start_records_real_phase_times(self):
+        with self.fixture(['timeout', self.healthy()]) as (p, clock, calls, commands, output, progress):
+            harness.start(SimpleNamespace(slot=4, gui=False), p)
+            saved = json.loads((p['folder'] / 'slot.json').read_text())
+            self.assertEqual(saved['start_timing']['phases_seconds']['launch_to_healthy'], 35)
+            self.assertEqual(saved['start_timing']['wall_seconds'], 35)
+            self.assertNotIn('offline_measurement', saved)
+
     def test_check_waits_before_smoke_and_keeps_other_command_bounds(self):
         with self.fixture(['timeout'] * 3 + [self.healthy()]) as (p, clock, calls, commands, output, progress):
             waiting_run = harness.run;other_calls = []
@@ -2921,13 +3024,13 @@ print(os.environ['UPGRADE_RECEIPT'])
 raise SystemExit(int(os.environ.get('UPGRADE_EXIT','0')))
 """)
             service.chmod(0o755);trace = base / 'trace'
-            good = {'needs_upgrade': True, 'prepared': True, 'expected_offline_seconds': 90}
+            good = {'needs_upgrade': False, 'prepared': False, 'expected_offline_seconds': 90}
             for receipt, code, succeeds in [(good, 0, True), (good, 1, False),
                                              (dict(good, expected_offline_seconds='90'), 0, False),
                                              (dict(good, prepared=1), 0, False)]:
                 with self.subTest(receipt=receipt, code=code):
                     trace.write_text('')
-                    environment = dict(os.environ, INCOMING=str(incoming), UPGRADE_TRACE=str(trace),
+                    environment = dict(os.environ, INCOMING=str(incoming), SOURCE=str(harness.REPO), CAPTURE_DIR=str(base), OFFLINE_MEASUREMENT='', UPGRADE_TRACE=str(trace),
                                        UPGRADE_RECEIPT=json.dumps(receipt), UPGRADE_EXIT=str(code))
                     result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block + '\nprintf "stop\\n" >> "$UPGRADE_TRACE"'],
                                             env=environment, text=True, capture_output=True)
@@ -2935,7 +3038,34 @@ raise SystemExit(int(os.environ.get('UPGRADE_EXIT','0')))
                     self.assertEqual(trace.read_text().splitlines(), ['prepare', 'stop'] if succeeds else ['prepare'])
                     if succeeds:
                         self.assertIn('Expected service offline window: about 90 s', result.stdout)
-                        self.assertIn('changed store uses the full protected startup', result.stdout)
+                        self.assertIn('no store upgrade is required (startup estimate)', result.stdout)
+
+    def test_upgrade_measurement_is_printed_before_stop_and_missing_measurement_refuses(self):
+        script = (harness.REPO / 'script/build_and_run.sh').read_text()
+        start = script.index('# Complete the protected copy and rehearsal')
+        block = script[start:script.index('# Quiesce only this UI', start)]
+        with test_directory() as directory:
+            base = Path(directory).resolve();service = base / 'incoming.app/Contents/MacOS/ChecklistService'
+            service.parent.mkdir(parents=True)
+            service.write_text('#!' + sys.executable + '\nimport os\nprint(os.environ["UPGRADE_RECEIPT"])\n')
+            service.chmod(0o755)
+            (base / 'capture-manifest.json').write_text(json.dumps({'source_fingerprint': 'fingerprint'}))
+            receipt = {'needs_upgrade': True, 'prepared': True, 'expected_offline_seconds': 90,
+                       'source_schema': 3, 'target_schema': 4, 'source_root': '/live', 'logical_store_id': 'store'}
+            measurement = dict(receipt, format=1, kind='checklist-owned-copy-startup', first_start=True, live_snapshot=True,
+                               source_fingerprint='fingerprint', service_sha256=harness.sha(service),
+                               launch_to_healthy_seconds=32, measured_at_unix=harness.time.time(), load_start='{ 4 5 6 }')
+            path = base / 'measurement.json';path.write_text(json.dumps(measurement))
+            for supplied in ['', str(path)]:
+                environment = dict(os.environ, INCOMING=str(service.parents[2]), SOURCE=str(harness.REPO), CAPTURE_DIR=str(base),
+                                   OFFLINE_MEASUREMENT=supplied, UPGRADE_RECEIPT=json.dumps(receipt))
+                result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block + '\necho stop'],
+                                        env=environment, text=True, capture_output=True)
+                self.assertEqual(result.returncode == 0, bool(supplied), result.stderr)
+                if supplied:
+                    self.assertLess(result.stdout.index('measured copy first startup 32.000 s'), result.stdout.index('\nstop'))
+                    self.assertIn('about 50 s', result.stdout)
+                else: self.assertNotIn('\nstop', result.stdout)
 
     def test_install_measurement_names_healthy_answer_and_failure_is_only_lower_bound(self):
         script = (harness.REPO / 'script/build_and_run.sh').read_text()

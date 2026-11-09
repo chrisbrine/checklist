@@ -71,6 +71,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testCL392LimitRefusalDoublesToOneHourAndADoneWakeStartsAgain() throws {
+        try QualificationSuite.requireEnabled()
         var count = 0
         for expected in [60.0,120,240,480,960,1920,3600,3600] {
             let time = Date(timeIntervalSince1970:1000)
@@ -149,6 +150,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testCL392OutcomeRowsOfOtherTicketsDoNotCountAgainstTheHistoryLimit() throws {
+        try QualificationSuite.requireEnabled()
         let (project,task,_) = try fixture(),pid = project["id"] as! String
         let foreign = "{\"origin\":\"automatic_cleanup\",\"receipt_id\":\"\(uuid())\",\"removed_bytes\":1,\"state\":\"removed\",\"task_id\":\"\(uuid())\"}"
         try addEvents(pid,count:100001,kind:"ticket_evidence_cleanup_outcome",entity:pid,data:foreign)

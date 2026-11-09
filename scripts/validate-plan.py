@@ -182,6 +182,17 @@ def check() -> dict:
         for field in fields:
             bad = copy.deepcopy(examples[name]); bad.pop(field)
             reject(name, bad, 'missing ' + field)
+    for section, field, value in [('preview', 'path', '/synthetic/outside-backups'),
+                                  ('retire', 'include_unrecorded', True),
+                                  ('retire', 'preview_sha256', 'not-an-exact-preview'),
+                                  ('retire', 'command_id', 'not-a-uuid')]:
+        bad = copy.deepcopy(examples['backup-incomplete-retirement'])
+        bad[section]['params'][field] = value
+        reject('backup-incomplete-retirement', bad, section + ' ' + field)
+    for section in ('preview', 'retire'):
+        bad = copy.deepcopy(examples['backup-incomplete-retirement'])
+        bad[section]['params'].pop('project_id')
+        reject('backup-incomplete-retirement', bad, section + ' missing worker project')
     for kind, key in [('triage', 'DEMO-E1'), ('epic', 'DEMO-T1'), ('triage', 'DEMO-T0')]:
         bad = copy.deepcopy(examples['group-reference']); bad.update(kind=kind, key=key)
         reject('group-reference', bad, 'wrong group key kind or number')

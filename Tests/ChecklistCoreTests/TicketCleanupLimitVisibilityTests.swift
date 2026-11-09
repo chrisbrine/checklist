@@ -24,6 +24,7 @@ extension TicketLifecycleCleanupTests {
         XCTAssertEqual((maintenance["preparation"] as? JSON)?["state"] as? String,"committed","Writer completion remains separate from selection refusal")
     }
     func testCL394HistoryRowLimitIsVisibleAndRepeatedRefusalAddsNoHistory() throws {
+        try QualificationSuite.requireEnabled()
         let (project,_,_) = try fixture(),pid = project["id"] as! String
         try cl394History(project,count:100001)
         let time = Date()
@@ -50,6 +51,7 @@ extension TicketLifecycleCleanupTests {
         print("CL394_REPEAT_NOOP new_events=0 new_receipts=0 repeated_passes=1")
     }
     func testCL394HistoryTokenLimitIsVisible() throws {
+        try QualificationSuite.requireEnabled()
         let (project,_,_) = try fixture()
         // 1000 rows, each with >2000 traversal nodes: exceed the aggregate
         // token budget without the event-row or per-payload bound.
@@ -59,6 +61,7 @@ extension TicketLifecycleCleanupTests {
         try cl394AssertLimit(project,name:"history_tokens",maximum:2000000)
     }
     func testCL394CommandRowLimitIsVisible() throws {
+        try QualificationSuite.requireEnabled()
         let (project,_,_) = try fixture(category:"canceled",age:20)
         try router.dbQueue.write {db in
             try db.execute(sql:"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<100001) INSERT INTO commands(principal,command_id,digest,result) SELECT 'fixture',?||i,'fixture','{}' FROM n",arguments:[uuid() + "-"])

@@ -36,23 +36,38 @@ extension EvidenceAuthorityTests {
         return (f["project"] as! JSON,f["triage"] as! JSON,f["task"] as! JSON,try phaseCaller(f["orchestrator"]!),try phaseCaller(f["holder"]!),try phaseCaller(f["child"]!),try phaseCaller(f["peer"]!))
     }
 
-    private func savedNotePhase(count: Int, ownNotes: Bool) throws -> JSON {
-        try preparedPhase("saved-triage-notes-\(count)-\(ownNotes)") { fixture in
+    /// One real send supplies the canonical pending-note shape. The remaining
+    /// distinct notes are fixture input, prepared in one transaction; every
+    /// bounded delivery, replay and pickup command still executes normally.
+    private func savedNotes(_ p: JSON, triage: JSON, author: Caller, count: Int) throws -> [String] {
+        precondition(count > 0)
+        let first = try routeNote(p,nil,author,["triage_id":triage["id"]!])
+        XCTAssertEqual(first["delivery_status"] as? String,"saved_for_pickup")
+        XCTAssertTrue((first["deliveries"] as! [JSON]).isEmpty)
+        return try router.dbQueue.write { db in
+            let prototype = try router.record(db,first["id"] as! String,type:"message")
+            XCTAssertEqual(prototype["pickup_pending"] as? Bool,true)
+            var ids = [first["id"] as! String]
+            for _ in 1..<count {
+                var message = prototype; message["id"] = UUID().uuidString
+                try router.save(db,message,type:"message")
+                try router.event(db,caller:author,project:p["id"] as? String,entity:triage["id"] as? String,kind:"message_saved",data:["message_id":message["id"]!,"origin":message["origin"]!])
+                ids.append(message["id"] as! String)
+            }
+            return ids
+        }
+    }
+
+    private func savedNotePhase() throws -> JSON {
+        try preparedPhase("saved-triage-notes-52-and-50-own") { fixture in
             let p = try fixture.project(), o = try fixture.native(p,"orchestrator",domain:"host-o"), peer = try fixture.native(p,"peer",domain:"host-p")
             let plan = try fixture.call("triage_create",["project_id":p["id"]!,"name":"Long plan"])
-            if !ownNotes {
-                let parked = try fixture.ready(p)
-                try fixture.routeAdd(p,plan["id"]!,parked,peer)
-            }
-            var saved: [String] = []
-            for _ in 0..<count { saved.append(try fixture.routeNote(p,nil,peer,["triage_id":plan["id"]!])["id"] as! String) }
+            let saved = try fixture.savedNotes(p,triage:plan,author:peer,count:52)
             var result: JSON = ["project":p,"orchestrator":o.sessionID!,"peer":peer.sessionID!,"plan":plan,"saved":saved]
-            if ownNotes {
-                let second = try fixture.call("triage_create",["project_id":p["id"]!,"name":"Own notes plan"])
-                for _ in 0..<50 { _ = try fixture.routeNote(p,nil,o,["triage_id":second["id"]!]) }
-                result["second"] = second
-                result["foreign"] = try fixture.routeNote(p,nil,peer,["triage_id":second["id"]!])["id"]!
-            }
+            let second = try fixture.call("triage_create",["project_id":p["id"]!,"name":"Own notes plan"])
+            _ = try fixture.savedNotes(p,triage:second,author:o,count:50)
+            result["second"] = second
+            result["foreign"] = try fixture.routeNote(p,nil,peer,["triage_id":second["id"]!])["id"]!
             return result
         }
     }
@@ -168,9 +183,13 @@ extension EvidenceAuthorityTests {
         let late = try call("message_delivery_list",["project_id":p["id"]!,"task_id":lone["id"]!,"message_id":early["id"]!],peer)["deliveries"] as! [JSON]
         XCTAssertEqual(late.compactMap {$0["recipient_session_id"] as? String},[h.sessionID!])
         // At most 50 saved notes per pickup; the rest are advertised.
-        let crowdedFixture = try savedNotePhase(count:51,ownNotes:false), cp = crowdedFixture["project"] as! JSON, crowded = crowdedFixture["plan"] as! JSON
-        let helper = try native(cp,"second-orchestrator",domain:"host-x")
-        let joined = try call("triage_orchestrate",["project_id":cp["id"]!,"triage_id":crowded["id"]!,"expected_revision":try routeTriage(crowded["id"]!)["revision"]!,"action":"start"],helper)
+        // Reuse the enrolled project and peer from the earlier pickup checks;
+        // this independent plan has no orchestrator or holder of its own.
+        let crowded = try call("triage_create",["project_id":p["id"]!,"name":"Long plan"]), parked = try ready(p)
+        try routeAdd(p,crowded["id"]!,parked,peer)
+        _ = try savedNotes(p,triage:crowded,author:peer,count:51)
+        let helper = try native(p,"second-orchestrator",domain:"host-x")
+        let joined = try call("triage_orchestrate",["project_id":p["id"]!,"triage_id":crowded["id"]!,"expected_revision":try routeTriage(crowded["id"]!)["revision"]!,"action":"start"],helper)
         XCTAssertEqual(joined["saved_notes_delivered"] as? Int,50);XCTAssertEqual(joined["saved_note_delivery_has_more"] as? Bool,true)
     }
 
@@ -194,7 +213,7 @@ extension EvidenceAuthorityTests {
     }
 
     func testCheckpointContinuesSavedTriageNotePickupFiftyAtATime() throws {
-        let f = try savedNotePhase(count:52,ownNotes:true), p = f["project"] as! JSON, o = try phaseCaller(f["orchestrator"]!)
+        let f = try savedNotePhase(), p = f["project"] as! JSON, o = try phaseCaller(f["orchestrator"]!)
         let plan = f["plan"] as! JSON
         var saved = f["saved"] as! [String]
         func orchestrate(_ action: String,command: String = UUID().uuidString) throws -> JSON {

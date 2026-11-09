@@ -114,14 +114,26 @@ final class StorageRestoreTests: XCTestCase {
         XCTAssertEqual(replay["replayed"] as? Bool,true)
     }
     func testCorruptChecksumUnsupportedSchemaAndChangedPreviewNeverPublish() throws {
+        // Backup creation is prerequisite setup here; every refusal consumes
+        // pristine bytes from one real completed snapshot, restored after each
+        // mutation. The object-corruption branch keeps its distinct input store.
+        let plain = try StorageFixture(fast:true),project = try plain.project();_ = try plain.task(project)
+        let plainURL = try backup(plain),plainPreview = try preview(plain,plainURL)
         for scenario in ["checksum","schema","preview","missing","object","family","table"] {
-            let f = try StorageFixture(),p = try f.project();_ = try f.task(p)
+            let f = scenario == "object" ? try StorageFixture(fast:true) : plain
+            let p = scenario == "object" ? try f.project() : project
+            if scenario == "object" { _ = try f.task(p) }
             if scenario == "object" {
                 let source = f.workspace.appendingPathComponent("original");try Data([4,5,6]).write(to:source)
                 let t = try f.task(p)
                 _ = try f.call("attachment_add",["project_id":p["id"]!,"task_id":t["id"]!,"path":source.path])
             }
-            let url = try backup(f),preview = try preview(f,url),rootHash = try f.router!.dbQueue.read {try SchemaMigrations.contentFingerprint($0)}
+            let url = scenario == "object" ? try backup(f) : plainURL
+            let preview = scenario == "object" ? try preview(f,url) : plainPreview
+            let rootHash = try f.router!.dbQueue.read {try SchemaMigrations.contentFingerprint($0)}
+            let manifestURL = url.appendingPathComponent("manifest.json"),databaseURL = url.appendingPathComponent("database.sqlite")
+            let manifestBefore = try Data(contentsOf:manifestURL)
+            let databaseBefore = scenario == "checksum" ? try Data(contentsOf:databaseURL) : nil
             if scenario == "object" {
                 let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self,from:Data(contentsOf:url.appendingPathComponent("manifest.json")))
                 try Data([0]).write(to:url.appendingPathComponent("managed/" + manifest.objects[0].descriptor.relativePath))
@@ -137,10 +149,15 @@ final class StorageRestoreTests: XCTestCase {
                 let file = url.appendingPathComponent("manifest.json");var manifest = try JSONSerialization.jsonObject(with:Data(contentsOf:file)) as! JSON
                 manifest["schema"] = 99;try JSONSerialization.data(withJSONObject:manifest).write(to:file)
             }
-            if scenario == "missing" {try FileManager.default.removeItem(at:url.appendingPathComponent("intent.json"))}
+            let intent = url.appendingPathComponent("intent.json"),preservedIntent = f.base.appendingPathComponent("preserved-intent.json")
+            if scenario == "missing" {try FileManager.default.moveItem(at:intent,to:preservedIntent)}
             XCTAssertThrowsError(try f.call("restore_create",["path":url.path,"manifest_sha256":scenario == "preview" ? String(repeating:"0",count:64) : preview["manifest_sha256"]!]))
             XCTAssertFalse(FileManager.default.fileExists(atPath:f.root.appendingPathComponent("restore").path))
             XCTAssertEqual(try f.router!.dbQueue.read {try SchemaMigrations.contentFingerprint($0)},rootHash)
+            if ["schema","family","table"].contains(scenario) {try manifestBefore.write(to:manifestURL)}
+            if let databaseBefore {try databaseBefore.write(to:databaseURL)}
+            if scenario == "missing" {try FileManager.default.moveItem(at:preservedIntent,to:intent)}
+            XCTAssertEqual(try Data(contentsOf:manifestURL),manifestBefore)
         }
     }
     func testInterruptedCandidateRetryAndUncertainPublicationReconcileOriginalIntent() throws {

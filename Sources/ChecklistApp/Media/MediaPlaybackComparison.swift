@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import AVKit
 import Combine
+import QuartzCore
 import ChecklistCore
 
 /// Native take control. AVPlayer is the production adapter; tests use small fakes.
@@ -25,8 +26,10 @@ extension AVPlayer: MediaTakeControl {}
     private var unloaded = false
     private var rewindGeneration = 0
     private var rewindPending = false
+    private var trace: MediaPlaybackTrace?
 
-    init(asset: AVURLAsset, loop: Bool, playbackRate: Float) async throws {
+    init(asset: AVURLAsset, loop: Bool, playbackRate: Float, traceLabel: String? = nil,
+         traceDirectory: URL? = MediaPlaybackTrace.configuredDirectory) async throws {
         let playbackAsset: AVAsset = loop ? try await Self.loopTimeline(asset: asset, playbackRate: playbackRate) : asset
         try Task.checkCancellation()
         self.playbackRate = playbackRate; loops = loop
@@ -35,6 +38,14 @@ extension AVPlayer: MediaTakeControl {}
         let item = AVPlayerItem(asset: playbackAsset)
         player.actionAtItemEnd = loop ? .none : .pause
         player.insert(item, after: nil)
+        // No extra output, display link, metadata probe or file exists unless the
+        // qualification switch was explicitly supplied at launch.
+        if let traceDirectory {
+            do {
+                trace = try await MediaPlaybackTrace.make(directory: traceDirectory, item: item, source: asset,
+                    rate: playbackRate, label: traceLabel ?? asset.url.lastPathComponent)
+            } catch { NSLog("Checklist playback trace unavailable: %@", error.localizedDescription) }
+        }
         // Native AVKit controls may change rate directly rather than call play().
         // Keep the declared game speed, but never turn a native Pause into Play.
         rateObservation = player.publisher(for: \.rate).receive(on: DispatchQueue.main).sink { [weak self] _ in
@@ -85,12 +96,14 @@ extension AVPlayer: MediaTakeControl {}
     }
     func play() {
         guard !unloaded else { return }
+        trace?.event("play")
         _ = rewindAtEnd()
         // Start now and let AVFoundation preserve the requested rate during seek.
         // A later native Pause can never be overridden by a seek completion.
         player.play()
     }
     func pause() {
+        trace?.event("pause")
         rewindGeneration += 1; rewindPending = false
         player.pause(); player.currentItem?.cancelPendingSeeks()
     }
@@ -101,9 +114,18 @@ extension AVPlayer: MediaTakeControl {}
         guard !rewindPending else { return true }
         rewindPending = true; rewindGeneration += 1
         let generation = rewindGeneration
-        player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+        let rewindStarted = trace == nil ? nil : CACurrentMediaTime()
+        trace?.event("rewind_begin", fields: ["item_seconds": time, "timeline_duration_seconds": duration, "generation": generation])
+        player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+            let callbackHost = rewindStarted == nil ? nil : CACurrentMediaTime()
             Task { @MainActor [weak self] in
-                guard let self, !self.unloaded, self.rewindGeneration == generation else { return }
+                guard let self else { return }
+                if let rewindStarted, let callbackHost {
+                    self.trace?.event("rewind_complete", fields: ["elapsed_ms": (callbackHost - rewindStarted) * 1000,
+                        "callback_host_seconds": callbackHost, "main_actor_delay_ms": (CACurrentMediaTime() - callbackHost) * 1000,
+                        "finished": finished, "generation": generation, "current_generation": self.rewindGeneration])
+                }
+                guard !self.unloaded, self.rewindGeneration == generation else { return }
                 self.rewindPending = false
             }
         }
@@ -112,6 +134,9 @@ extension AVPlayer: MediaTakeControl {}
     func unload() {
         guard !unloaded else { return }
         unloaded = true; rateObservation = nil; endObservation = nil; pause()
+        trace?.event("unload")
+        if let trace { if let item = player.currentItem { item.remove(trace.output) }; trace.stop() }
+        trace = nil
         player.removeAllItems()
     }
     isolated deinit { unload() }
@@ -408,7 +433,7 @@ struct MediaPlaybackSlotView: View {
             let (asset, facts, probeMilliseconds) = try await MediaTakeLoader.probe(url: file.url, kind: kind)
             let timing = try await MediaTakeLoader.timing(asset: asset, frameRate: frameRate)
             try Task.checkCancellation()
-            let control = try await MediaNativeTakeControl(asset: asset, loop: loop, playbackRate: timing.rate)
+            let control = try await MediaNativeTakeControl(asset: asset, loop: loop, playbackRate: timing.rate, traceLabel: key + ":" + label)
             try Task.checkCancellation()
             var ids = ["slot_id": slot.string("slot_id"), "reference_id": original.string("reference_id"), "attachment_id": original.string("attachment_id"), "sha256": slot.string("sha256")]
             if let example { ids["target_id"] = example.string("target_id"); ids["decision_id"] = example.string("decision_id") }

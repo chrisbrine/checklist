@@ -114,7 +114,7 @@ final class StorageBackupPruningTests: XCTestCase {
         try FileManager.default.createDirectory(at:failed,withIntermediateDirectories:true)
         try Data("failed manifest".utf8).write(to:failed.appendingPathComponent("manifest.json"))
         let plan = try preview(f),entries = plan["snapshots"] as! [JSON],entry = entries.first {$0["path"] as? String == failed.path}!
-        XCTAssertEqual(plan["snapshot_count"] as? Int,2);XCTAssertEqual(entry["state"] as? String,"unrecorded_or_incomplete");XCTAssertFalse(bool(entry,"prune"))
+        XCTAssertEqual(plan["snapshot_count"] as? Int,2);XCTAssertEqual(entry["state"] as? String,"incomplete");XCTAssertFalse(bool(entry,"prune"))
         let explicit = try preview(f,["include_unrecorded":true]);XCTAssertEqual(explicit["prune_count"] as? Int,1)
         XCTAssertEqual((try apply(f,explicit)["data"] as! JSON)["moved_count"] as? Int,1)
     }

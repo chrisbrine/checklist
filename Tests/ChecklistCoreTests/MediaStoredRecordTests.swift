@@ -45,19 +45,31 @@ final class MediaStoredRecordTests: XCTestCase {
     }
 
     func testTypeAdoptionRejectsMissingOrWrongMandatoryTargetFields() throws {
+        let f = try MediaRoundTests.Fixture(template:Self.revisedTargetPhase)
+        let item = try XCTUnwrap(f.rows("media_item").first)
+        let target = try f.record(XCTUnwrap(item["draft_target_id"] as? String),"media_item_target")
         for field in ["title", "metadata"] {
             let malformed: [Any?] = field == "title" ? [nil, NSNull(), true, 7, [:]] : [nil, true, 7, "metadata", []]
             for value in malformed {
-                try assertTypeAdoptionRejectsMalformedTarget(field: field, value: value)
+                try assertTypeAdoptionRejectsMalformedTarget(field: field, value: value,fixture:f,target:target)
             }
         }
     }
 
-    private func assertTypeAdoptionRejectsMalformedTarget(field: String, value: Any?) throws {
-        let checks = MediaRoundTests(), f = try MediaRoundTests.Fixture()
-        let type = try f.type(checks.schema()), round = try f.round(type), item = try f.item(round)
-        _ = try checks.revise(f, type, checks.schema(), rubric: "Changed rubric")
-        let target = try XCTUnwrap(item["draft_target"] as? JSON)
+    private static let revisedTargetPhase = TestStore.Template(name:"media-stored-record-revised-target") {router,workspace in
+        let checks = MediaRoundTests(),f = try MediaRoundTests.Fixture(router:router,workspace:workspace)
+        let type = try f.type(checks.schema()),round = try f.round(type)
+        _ = try f.item(round)
+        _ = try checks.revise(f,type,checks.schema(),rubric:"Changed rubric")
+    }
+
+    private func assertTypeAdoptionRejectsMalformedTarget(field: String, value: Any?,fixture: MediaRoundTests.Fixture? = nil,target pristineTarget: JSON? = nil) throws {
+        let checks = MediaRoundTests(), f = try fixture ?? MediaRoundTests.Fixture(template:Self.revisedTargetPhase)
+        let type = try XCTUnwrap(f.rows("media_review_type").first),round = try XCTUnwrap(f.rows("media_round").first)
+        let item = try XCTUnwrap(f.rows("media_item").first)
+        let target = try pristineTarget ?? f.record(XCTUnwrap(item["draft_target_id"] as? String),"media_item_target")
+        // Failed adoption leaves the phase unchanged. Every matrix branch starts
+        // from the pristine target instead of reopening an identical store.
         try replaceTargetField(f, target: target, field: field, value: value)
         let typeID = try XCTUnwrap(type["id"] as? String), roundID = try XCTUnwrap(round["id"] as? String)
         let beforeType = try f.record(typeID, "media_review_type"), beforeRound = try f.record(roundID, "media_round")

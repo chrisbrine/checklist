@@ -6,6 +6,7 @@ import GRDB
 /// Owned projection fixtures include historical mixed-phase membership; current
 /// membership commands still enforce separate Implementation and Review Triages.
 final class ActiveSectionTests: XCTestCase {
+    private var directory: URL!
     private var root: URL!
     private var router: CommandRouter!
     private var pid = ""
@@ -13,9 +14,18 @@ final class ActiveSectionTests: XCTestCase {
     private var worker: Caller { Caller(role: "worker", installation: "active-section-worker", projectIDs: [pid], workspace: root.path) }
     private let members = ["queued", "draft", "review", "active", "blocked", "parked", "done"]
 
+    private static let phase = TestStore.Template(name:"ActiveSectionTests.mixed-members") { router,workspace in
+        let fixture = ActiveSectionTests()
+        fixture.router = router; fixture.root = workspace
+        try fixture.prepareMembers()
+    }
     override func setUpWithError() throws {
-        root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("active-section-" + UUID().uuidString)
-        router = try TestStore.router(root: root)
+        directory = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("active-section-" + UUID().uuidString)
+        root = directory.appendingPathComponent("workspace")
+        router = try TestStore.router(root:directory.appendingPathComponent("store"),template:Self.phase,workspace:root)
+        pid = try router.dbQueue.read {try XCTUnwrap(router.records($0,type:"project").first?["id"] as? String)}
+    }
+    private func prepareMembers() throws {
         pid = try call("project_create", ["name": "Active section fixture", "key_prefix": "AS", "root_path": root.path])["id"] as! String
         try write { db in
             for category in self.members where category != "draft" {
@@ -35,7 +45,7 @@ final class ActiveSectionTests: XCTestCase {
                                      "name": "Historical mixed Triage", "purpose": "Projection coverage", "archived": false, "task_ids": self.members], type: "group")
         }
     }
-    override func tearDownWithError() throws { router = nil; try? FileManager.default.removeItem(at: root) }
+    override func tearDownWithError() throws { try router?.closeStore();router = nil; try? FileManager.default.removeItem(at: directory) }
     private func call(_ method: String, _ input: JSON, _ caller: Caller? = nil) throws -> JSON {
         var input = input
         if !CommandRouter.readMethods.contains(method) { input["command_id"] = UUID().uuidString }
@@ -62,7 +72,12 @@ final class ActiveSectionTests: XCTestCase {
     private func ids(_ reply: JSON) -> Set<String> { Set((reply["tasks"] as! [JSON]).compactMap { $0["id"] as? String }) }
 
     func testOrchestratedAndUnorchestratedActivePagesCountsAndSidebar() throws {
-        for orchestrated in [false, true] {
+        try assertActivePages(orchestrated:false)
+    }
+    func testOrchestratedActivePagesCountsAndSidebar() throws {
+        try assertActivePages(orchestrated:true)
+    }
+    private func assertActivePages(orchestrated: Bool) throws {
             try orchestration(orchestrated)
             let active = try page("active")
             XCTAssertEqual(ids(active), ["active"])
@@ -93,7 +108,6 @@ final class ActiveSectionTests: XCTestCase {
             let member = try page("active", limit: 1, cursor: header["next_cursor"])
             XCTAssertEqual(ids(member), ["active"])
             XCTAssertEqual(member["matched_count"] as? Int, 1)
-        }
     }
 
     func testAgentReadsKeepExactStatusSelectionAndAdvisoryAttention() throws {

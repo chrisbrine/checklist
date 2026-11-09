@@ -18,6 +18,7 @@ extension EvidenceAuthorityTests {
                 let fixture = EvidenceAuthorityTests()
                 fixture.router = router; fixture.workspace = workspace
                 fixture.directory = workspace.deletingLastPathComponent()
+                if self.usesReviewGitFixture { fixture.useReviewGitFixture() }
                 let payload = try prepare(fixture)
                 try router.dbQueue.write { db in
                     var manifests: JSON = [:], captures: JSON = [:]
@@ -40,6 +41,7 @@ extension EvidenceAuthorityTests {
         workspace = phase.appendingPathComponent("workspace", isDirectory: true)
         router = try TestStore.router(root: phase.appendingPathComponent("store"), template: template, workspace: workspace)
         clearPreparedProject()
+        if usesReviewGitFixture { useReviewGitFixture() }
         return try router.dbQueue.write { db in
             let saved = jsonObject(try XCTUnwrap(String.fetchOne(db, sql: "SELECT value FROM metadata WHERE key=?", arguments: [Self.phaseKey])))
             let original = try XCTUnwrap(saved["workspace"] as? String)
@@ -122,6 +124,21 @@ extension EvidenceAuthorityTests {
         return Caller(role: session["role"] as! String, installation: session["installation"] as! String,
                       projectIDs: strings(session, "project_ids"), sessionID: session["id"] as? String,
                       workspace: session["workspace"] as? String, executionDomain: session["execution_domain"] as? String)
+    }
+
+    /// These cases start after an owner-authored source target has been
+    /// claimed for review. Capture construction has its own direct tests.
+    func ownerSourceReviewPhase() throws -> (JSON, JSON, JSON, Caller) {
+        let f = try preparedPhase("owner-source-review") { fixture in
+            try fixture.sourceFixture()
+            let p = try fixture.project(), attempt = try fixture.claim(p, fixture.ready(p))
+            let submitted = try fixture.submitSource(p, attempt)
+            let reviewer = Caller(role: "owner", installation: "phase-owner-reviewer", projectIDs: [])
+            let review = try fixture.reviewClaim(p, submitted, reviewer)
+            return ["project": p, "submitted": submitted, "review": review]
+        }
+        return (f["project"] as! JSON, f["submitted"] as! JSON, f["review"] as! JSON,
+                Caller(role: "owner", installation: "phase-owner-reviewer", projectIDs: []))
     }
 
     func nativeSourceReviewPhase() throws -> (JSON, JSON, JSON, JSON, Caller, Caller) {

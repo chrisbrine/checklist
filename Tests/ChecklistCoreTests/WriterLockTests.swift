@@ -124,18 +124,41 @@ extension EvidenceAuthorityTests {
     func testPreparedCaptureObservationRejectsChangesBeforeTheWriter() throws {
         try sourceFixture()
         let p = try project()
+        // Every writer invocation rolls back. Reuse its submitted target and
+        // restore only the mutated snapshot between cases, rather than creating
+        // ten equivalent source captures and enrolled sessions.
+        let task = try ready(p), author = try claim(p, task), submission = try submitSource(p, author)
+        let reviewer = try native(p, "observation-reviewer", domain: "observation-reviewer")
+        let target = submission["task"] as! JSON
+        let manifest = try router.dbQueue.read { try router.record($0, submission["manifest_id"] as! String, type: "manifest") }
+        let capture = (manifest["evidence"] as! JSON)["source_capture"] as! JSON, id = capture["id"] as! String
+        let snapshot = try router.managedURL(capture["snapshot_path"] as! String, family: "source-captures"), tracked = snapshot.appendingPathComponent("tracked.txt")
+        let original = try Data(contentsOf: tracked), mode = (try FileManager.default.attributesOfItem(atPath: tracked.path)[.posixPermissions] as! NSNumber).intValue
+        let folderMode = (try FileManager.default.attributesOfItem(atPath: snapshot.path)[.posixPermissions] as! NSNumber).intValue
+        func authoritySnapshot() throws -> String {
+            try router.dbQueue.read { db in
+                try jsonString([
+                    "task": router.record(db, target["id"] as! String, type: "task"),
+                    "attempt": router.record(db, author["id"] as! String, type: "attempt"),
+                    "request": router.record(db, (submission["review_request_ids"] as! [String])[0], type: "review_request")
+                ])
+            }
+        }
+        let authority = try authoritySnapshot()
         for mutation in ["none", "modify", "add", "remove", "chmod", "write-permission", "unreadable", "same-bytes", "changed-before", "folder-unreadable-before"] {
-            let task = try ready(p), author = try claim(p, task), submission = try submitSource(p, author)
-            let reviewer = try native(p, "observation-" + mutation, domain: "observation-" + mutation)
-            let target = submission["task"] as! JSON
             let input: JSON = ["command_id": UUID().uuidString, "project_id": p["id"]!, "task_id": target["id"]!, "expected_revision": target["revision"]!, "phase": "review", "review_request_id": (submission["review_request_ids"] as! [String])[0], "target_manifest_id": submission["manifest_id"]!, "gate": "review"]
-            let manifest = try router.dbQueue.read { try router.record($0, submission["manifest_id"] as! String, type: "manifest") }
-            let capture = (manifest["evidence"] as! JSON)["source_capture"] as! JSON, id = capture["id"] as! String
-            let snapshot = try router.managedURL(capture["snapshot_path"] as! String, family: "source-captures"), tracked = snapshot.appendingPathComponent("tracked.txt")
-            let original = try Data(contentsOf: tracked), mode = (try FileManager.default.attributesOfItem(atPath: tracked.path)[.posixPermissions] as! NSNumber).intValue
+            let displaced = directory.appendingPathComponent("observation-displaced-" + UUID().uuidString)
+            let extra = snapshot.appendingPathComponent("extra.txt")
+            defer {
+                try? FileManager.default.setAttributes([.posixPermissions: folderMode], ofItemAtPath: snapshot.path)
+                if FileManager.default.fileExists(atPath: displaced.path) { try? FileManager.default.moveItem(at: displaced, to: tracked) }
+                if FileManager.default.fileExists(atPath: extra.path) { try? FileManager.default.moveItem(at: extra, to: directory.appendingPathComponent("observation-extra-" + UUID().uuidString)) }
+                try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: tracked.path)
+                if ["modify", "same-bytes", "changed-before"].contains(mutation) { try? original.write(to: tracked) }
+                try? FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: tracked.path)
+            }
             if mutation == "changed-before" { try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: tracked.path); try Data("dirtx".utf8).write(to: tracked) }
             // Finding 4485fafb: a capture that preparation could not read fails in the writer although it is readable again.
-            let folderMode = (try FileManager.default.attributesOfItem(atPath: snapshot.path)[.posixPermissions] as! NSNumber).intValue
             if mutation == "folder-unreadable-before" { try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: snapshot.path) }
             let preparation = try router.prepareCommandFiles(method: "work_claim", params: input, caller: reviewer)
             if mutation == "folder-unreadable-before" { try FileManager.default.setAttributes([.posixPermissions: folderMode], ofItemAtPath: snapshot.path) }
@@ -144,7 +167,7 @@ extension EvidenceAuthorityTests {
             switch mutation {
             case "modify": try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: tracked.path); try Data("dirtx".utf8).write(to: tracked)
             case "add": try Data("unexpected member".utf8).write(to: snapshot.appendingPathComponent("extra.txt"))
-            case "remove": try FileManager.default.removeItem(at: tracked)
+            case "remove": try FileManager.default.moveItem(at: tracked, to: displaced)
             case "chmod": try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: tracked.path)
             case "write-permission": try FileManager.default.setAttributes([.posixPermissions: mode ^ 0o200], ofItemAtPath: tracked.path)
             // A read inside the writer would fail; only the observation can accept this file.
@@ -153,7 +176,6 @@ extension EvidenceAuthorityTests {
             case "same-bytes": try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: tracked.path); try original.write(to: tracked)
             default: break
             }
-            defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: tracked.path) }
             var outcome: Result<String?, Error> = .success(nil)
             do {
                 try ArchiveStorageGate.withExclusive(root: storeRoot) { _ in
@@ -173,6 +195,7 @@ extension EvidenceAuthorityTests {
             case (_, .failure(let error)): XCTAssertEqual((error as? CoreError)?.code, "EVIDENCE_STALE", mutation)
             default: XCTFail("a changed capture became an active review claim: \(mutation)")
             }
+            XCTAssertEqual(try authoritySnapshot(), authority, "Each observation case rolls back its claim authority: \(mutation)")
         }
     }
 

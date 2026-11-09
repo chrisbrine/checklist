@@ -284,7 +284,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
 
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
         guard connection.effectiveUserIdentifier == getuid() else { return false }
-        return clientIdentity.accept(connection) { Peer(coordinator: self, connection: connection) }
+        return clientIdentity.accept(connection, timedPeer: { Peer(coordinator: self, connection: connection, admission: $0) })
     }
     func saveEnrollments() throws {
         requireCommandQueue()
@@ -712,7 +712,10 @@ private final class DeferredConnection: @unchecked Sendable {
 final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
     let coordinator: Coordinator
     private weak var connection: NSXPCConnection?
-    init(coordinator: Coordinator, connection: NSXPCConnection) { self.coordinator=coordinator;self.connection=connection }
+    private let admission: ClientAdmissionTiming?
+    init(coordinator: Coordinator, connection: NSXPCConnection, admission: ClientAdmissionTiming? = nil) {
+        self.coordinator=coordinator;self.connection=connection;self.admission=admission
+    }
     func execute(_ request: Data, withReply callback: @escaping (Data) -> Void) {
         let replyOwner = ServiceReply(callback)
         let reply: @Sendable (Data) -> Void = { replyOwner.send($0) }
@@ -720,10 +723,12 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
         // Drain caller-thread JSON/serialization and hook temporaries for each
         // request, including off-queue reads and deferred change replies.
         let received = ProcessInfo.processInfo.systemUptime
-        coordinator.queue.async { [self] in autoreleasepool {
+        coordinator.queue.async { [self] in
+            let dequeued = ProcessInfo.processInfo.systemUptime
+            autoreleasepool {
             let object = (try? JSONSerialization.jsonObject(with:request)) as? [String:Any]
-            let timing = object?["diagnostics_timing"] as? Bool == true ? ServiceCallTiming(received:received) : nil
-            timing?.queued(since: received)
+            let timing = object?["diagnostics_timing"] as? Bool == true ? ServiceCallTiming(received:received, admission:admission) : nil
+            timing?.queued(since: received, until: dequeued)
             if let timing { coordinator.timingDiagnosticsEnabled = true;CallTimingLog.write(["scope":"service_admission","request_id":timing.requestID,"method":object?["method"] as? String ?? "","received_uptime_s":received,"start_uptime_s":ProcessInfo.processInfo.systemUptime]) }
             if let object, object["method"] as? String == "changes_wait", let connection {
                 let id = UUID()
@@ -780,7 +785,7 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
                 catch { finish(["error":Self.publicError(error)],timing:timing,method:method,reply:reply); return }
                 let queued = ProcessInfo.processInfo.systemUptime
                 DispatchQueue.global(qos:.userInitiated).async { [self] in autoreleasepool {
-                    timing?.queued(since:queued)
+                    timing?.queued(since:queued, phase:"worker_queue_wait_ms")
                     let result: [String:Any]
                     do {
                         let params = try JSONSerialization.jsonObject(with:paramsBytes) as? [String:Any] ?? [:]
@@ -799,9 +804,11 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
         }}
     }
     /// These paths do not prepare managed reads/leases or repair availability.
+    /// Cleanup metadata uses pooled reads and the asynchronous accounting cache;
+    /// it creates no change, native delivery or storage deadline to announce.
     /// Keep hooks on other reads that can fall back to the writer.
     static func requiresAfterCommand(_ method:String) -> Bool {
-        !["service_info","tool_catalog","operation_get","command_status","task_get","session_list","project_list","project_resolve","workspace_page","task_list","triage_list","epic_list"].contains(method)
+        !["service_info","tool_catalog","operation_get","command_status","task_get","session_list","project_list","project_resolve","workspace_page","task_list","triage_list","epic_list","cleanup_job_list","cleanup_job_get"].contains(method)
     }
     /// On the serial queue.
     func finish(_ result:[String:Any],timing:ServiceCallTiming? = nil,runHooks:Bool = true,method:String = "",reply:(Data)->Void) {

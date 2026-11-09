@@ -72,6 +72,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testOversizedJobObservationDefersActualDoneSelectionAndSchedulesRetry() throws {
+        try QualificationSuite.requireEnabled()
         let (project,task,attachment) = try fixture(),tid = task["id"] as! String
         var oversized = cleanupObservedJob(task)
         oversized["body"] = String(repeating:"x",count:4 * 1024 * 1024 + 1)
@@ -87,6 +88,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testAgedPurgeSkipsDoneJobObservationWithOversizedAccountingHistory() throws {
+        try QualificationSuite.requireEnabled()
         let (project,task,_) = try fixture(age:20),tid = task["id"] as! String
         var unrelated = cleanupObservedJob(selectedJobTicket(project:project["id"] as! String))
         unrelated["body"] = String(repeating:"x",count:4 * 1024 * 1024 + 1)

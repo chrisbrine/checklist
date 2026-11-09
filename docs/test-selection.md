@@ -275,6 +275,21 @@ default method or the 180-second default Core budget; `--strict` makes either a
 failure. `guarded_default_commands` names those executable wrappers; the existing
 `swift_commands` and `default_swift_commands` remain raw argv for inspection.
 Qualification and isolated timing commands retain their own intended budgets.
+For the serial Core budget, use the same warm scratch path and the shared build
+wrapper, with `CHECKLIST_QUALIFICATION` unset. The command selects every default
+Core case and leaves the real-Trash proof outside the run:
+
+```sh
+python3 script/check_test_timings.py run --log <evidence>/core-default-serial.log -- env CHECKLIST_STORAGE_PROBE="$PWD/../.build/debug/StorageCrashProbe" swift test --skip-build --skip-update --scratch-path ../.build --skip HumanClaimsKeychainTests --skip 'StorageAutomaticBackupRetentionTests.testRealTrashProofRunOnly' --filter '^ChecklistCoreTests\.'
+```
+
+Take the shared build slot before starting the timing guard so queue wait stays
+separate from execution time. Record the start/end load and both command wall
+and native target time. Per-class invocation sums explain fixture cost; they do
+not replace class or target wall time. Keep cold phase publication inside the
+first measured run and label later reuse. Do not move functional tests to
+qualification merely because a loaded host makes them slow.
+
 Some SwiftPM parallel XML omits skip metadata. In that case the guard reports
 invocations with execution/skip counts unknown and labels durations as runner
 process time; it never treats an empty XML case as proof that assertions ran.
@@ -426,7 +441,14 @@ private database, managed-object and workspace bytes. Store and workspace roots
 remain siblings. Canonical workspace authority is rebound to the private copy;
 literal event/command history and source content stay unchanged. Tested commands
 and assertions run on each copy. The first run pays phase publication; later
-warm runs reuse it. `CHECKLIST_TEST_PROFILE=1` emits per-case
+warm runs reuse it. Core review claims, blocked review requests and submitted
+artifacts also share prepared phases. Media adoption, typed joins, accepted
+candidate sets and small list-index comparisons reuse their exact prerequisites.
+Independent lifecycle matrix rows copy the populated phase instead of accumulating
+unrelated projects. Rollback matrices restore mutated inputs and verify unchanged
+authority before reuse. The retention-answer ordering test supplies persisted
+answer times around the real owner settings command instead of sleeping for a
+clock tick (CL-363). `CHECKLIST_TEST_PROFILE=1` emits per-case
 `CHECKLIST_FIXTURE_TIMING` JSON for `store.seed`, `store.open`, `git.key`,
 `git.real` and cold `template.open/prepare/close` components. Set
 `CHECKLIST_TEST_PROFILE_DIRECTORY` to retain per-process JSONL without mixing
@@ -443,6 +465,17 @@ file-descriptor exhaustion/retry observations also run in qualification. Their
 large inputs, actual process limits, fixed retry conditions and assertions are
 unchanged. Small bulk/filter/adoption, worker follow-up and error-text/errno
 mapping correctness cases remain default.
+
+The CL-363 continuation keeps the 500 MiB attachment read (63 ranges), the
+100,001-row foreign-outcome and cleanup-retry probes, the 100,001-row history
+and command limit probes, and the two-million-token history limit in
+qualification. The two large shared-history admission cases (six 3 MB rows)
+and the two over-4-MiB job-history cases use that group too. Every original
+input and assertion remains. The 4,072-delivery hook pickup timing case also
+runs in qualification, with its original 1.5-second maximum. Small range, retry arithmetic, history matching,
+job-observation and configurable-limit cases stay default. Populated phase
+publication now clones the empty current-schema seed before opening through
+production admission; the empty seed alone performs fresh migration.
 
 Logic-only cancellation and offline recovery tests use protocol-shaped replies
 through the existing page parser and request transport. Separate App/Core route

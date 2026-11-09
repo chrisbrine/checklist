@@ -38,6 +38,25 @@ extension EvidenceAuthorityTests {
         else { XCTAssertTrue(try vnMembers(s.ta["id"]!).contains(tid),"A reviewer with no Triage leaves the ticket in TA.") }
         return (task,review)
     }
+    /// Return notices vary only by verdict. Clone their submitted, claimed
+    /// target rather than repeating enrollment, orchestration and capture.
+    private func vnReviewedPhase(reviewerOrchestrates: Bool) throws -> (setup: VNSetup, task: JSON, review: JSON) {
+        let phase = try preparedPhase("verdict-notice-\(reviewerOrchestrates)") { fixture in
+            let setup = try fixture.vnSetup(reviewerOrchestrates: reviewerOrchestrates)
+            let (task, review) = try fixture.vnReviewed(setup)
+            var payload: JSON = ["project":setup.p,"ta":setup.ta,"oa":setup.oa.sessionID!,"holder":setup.h.sessionID!,"reviewer":setup.b.sessionID!,"task":task,"review":review]
+            if let tb = setup.tb { payload["tb"] = tb }
+            return payload
+        }
+        let setup: VNSetup = (phase["project"] as! JSON, phase["ta"] as! JSON, phase["tb"] as? JSON,
+                              try phaseCaller(phase["oa"]!), try phaseCaller(phase["holder"]!), try phaseCaller(phase["reviewer"]!))
+        let task = phase["task"] as! JSON, review = phase["review"] as! JSON, tid = task["id"] as! String
+        // Assert the actual private copy's pre-verdict membership on every use.
+        if let tb = setup.tb { XCTAssertTrue(try vnMembers(tb["id"]!).contains(tid),"The review claim moves the ticket to B's Triage.") }
+        else { XCTAssertTrue(try vnMembers(setup.ta["id"]!).contains(tid),"A reviewer with no Triage leaves the ticket in TA.") }
+        return (setup, task, review)
+    }
+
     private func vnVerdict(_ p: JSON,_ review: JSON,_ kind: String) throws -> JSON {
         var input = reviewInput(p,review,verdict:kind == "implementation_blocked" ? "blocked" : kind)
         if kind != "reject" { input["reason"] = "The implementing session must supply the recorded device check." }
@@ -50,8 +69,8 @@ extension EvidenceAuthorityTests {
         }
         return input
     }
-    private func vnAssertReturnNotice(_ f: VNSetup,_ kind: String) throws {
-        let (task,review) = try vnReviewed(f)
+    private func vnAssertReturnNotice(_ kind: String, reviewerOrchestrates: Bool = true) throws {
+        let (f,task,review) = try vnReviewedPhase(reviewerOrchestrates: reviewerOrchestrates)
         let result = try call("review_record",try vnVerdict(f.p,review,kind),f.b)
         let routing = try XCTUnwrap(result["implementation_return"] as? JSON,kind)
         XCTAssertEqual(routing["state"] as? String,"active",kind)
@@ -69,18 +88,24 @@ extension EvidenceAuthorityTests {
 
     // R42C: the reviewer orchestrates another Triage, so the ticket sits in TB when the verdict is recorded.
     func testVerdictReturnNoticeReachesHolderAndReturnTriageOrchestrator() throws {
-        let s = try vnSetup(reviewerOrchestrates: true)
-        for kind in ["evidence_missing","not_run","implementation_blocked"] { try vnAssertReturnNotice(s,kind) }
+        try vnAssertReturnNotice("evidence_missing")
+    }
+
+    func testNotRunVerdictReturnNoticeReachesHolderAndReturnTriageOrchestrator() throws {
+        try vnAssertReturnNotice("not_run")
+    }
+
+    func testImplementationBlockedVerdictReturnNoticeReachesHolderAndReturnTriageOrchestrator() throws {
+        try vnAssertReturnNotice("implementation_blocked")
     }
 
     func testVerdictReturnNoticeWhenReviewerOrchestratesNoTriage() throws {
-        try vnAssertReturnNotice(try vnSetup(reviewerOrchestrates: false),"evidence_missing")
+        try vnAssertReturnNotice("evidence_missing", reviewerOrchestrates: false)
     }
 
     // A reject queues the ticket with no holder; its notice reaches the return Triage's orchestrator, never the reviewer.
     func testRejectNoticeReachesReturnTriageOrchestrator() throws {
-        let s = try vnSetup(reviewerOrchestrates: true)
-        let (task,review) = try vnReviewed(s)
+        let (s,task,review) = try vnReviewedPhase(reviewerOrchestrates: true)
         let result = try call("review_record",try vnVerdict(s.p,review,"reject"),s.b)
         XCTAssertNil(result["implementation_return"])
         XCTAssertTrue(try vnMembers(s.ta["id"]!).contains(task["id"] as! String))

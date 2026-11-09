@@ -10,7 +10,9 @@ For an installer-driven upgrade (CL-305), the staged `ChecklistService --prepare
 
 After the old service exits and the new service holds its lifetime lease and object gate, startup compares the full source database fingerprint and all bound file identities. An unchanged preparation skips durable copying and rehearsal and runs the fingerprint-checked upgrade transaction. Schema 3→4 does not compute an unused managed-path relocation plan. A write, changed/missing file, incompatible target, invalid receipt or absent preparation requires a fresh protected snapshot and rehearsal of the stopped store; it never silently uses the earlier backup. The backup pointer committed by the migration therefore represents the store at the swap. A current-schema restart requires no upgrade preparation. Unenrolled installer preparation is a local executable operation, not a new MCP method or agent grant.
 
-Only offline startup publishes the advisory `upgrade-progress.json` marker, with its live PID, stage, estimate and fallback reason. CLI/app clients show **upgrading** for preparation validation, protected snapshot, rehearsal and final migration; they preserve ambiguous command IDs and never turn a transport timeout into a rejected write. A normal completion or handled failure removes the marker; clients reject a dead/stale publisher. Estimates are advisory (90 seconds for reusable preparation, about 15 minutes for fallback), not a deadline or a measured result. Install/promote prints the estimate before stopping the old service and measures through the first healthy answer. The qualification gate must measure launch-to-first-answer separately.
+Only offline startup publishes the advisory `upgrade-progress.json` marker, with its live PID, stage, estimate and fallback reason. CLI/app clients show **upgrading** for preparation validation, protected snapshot, rehearsal and final migration; they preserve ambiguous command IDs and never turn a transport timeout into a rejected write. A normal completion or handled failure removes the marker; clients reject a dead/stale publisher. Runtime progress estimates are advisory (90 seconds for reusable preparation, about 15 minutes for fallback), not a deadline or a measured result.
+
+For a store upgrade, install/promote requires a successful first-start measurement on a fresh owned live-backup copy before stopping the service. The measurement binds the exact staged source fingerprint and service executable SHA-256, source root/store identity and schema, target schema, seed manifest, time and host load. It expires after 72 hours. The installer prints that measured launch-to-first-healthy duration with a stated 25% plus 10-second margin before the stop. A missing, stale or mismatched measurement refuses before the stop. The first-start sample includes protected copying and rehearsal when that schema needs them; online preparation time cannot substitute for an offline sample. The installer also measures the actual stop-request-to-first-healthy window. A current-schema restart retains its explicitly labeled startup estimate.
 
 Qualification must use the exact staged code on an owned consistent copy of the existing store, including retained record families and required managed files. Exercise the complete online preparation, durable protected publication and verification, exact target rehearsal, stopped-store revalidation and first answered call; verify the protected generation matches the source at the swap. Exercise a post-preparation write and changed/missing source or backup object, crash before/after migration commit, invalid preparation and the visible upgrading/fallback estimates. Record load, preparation time, unavailable window, launch-to-answer and the final backup manifest/fingerprint; a SQL-only rehearsal or synthetic fixture does not replace this gate.
 
@@ -449,6 +451,12 @@ Byte-maintenance scheduling stores an internal project rotation and per-project 
 
 `backup_create` now admits enrolled workers when the selected project permits agent rule changes. Agent destinations are fixed beneath `backups/`, optionally in a validated `qualification-<name>` subfolder; arbitrary agent paths and assistant calls refuse. The native owner path remains available. Capture and completion recheck project/session authority and write an attributed agent event. Workers read project-scoped completion receipts using `history_list(project_id, entity:"backup")`; owner receipts record trusted `human_ui` provenance and membership from the captured database, not the live project list at completion. Only those captured projects can see an unscoped owner receipt. Assistants are refused, and the read omits paths and other project identities. Command ID, operation ID, manifest digest, capture/verification times and event time are historical evidence; older agent events recover missing fields from retained receipts where available. Legacy unscoped owner events without captured-project evidence stay excluded. See the [backup read contract](mcp-contract.md#agent-backup-and-owner-restore-cl-258--cl-6). Both routes retain the protected SQLite capture, root retention barrier, durable publication, original-command reconciliation and 1,800-second / free-space-bounded logical-byte / 500,000-object production bounds.
 
+Accepted backups belong to the service. A returned call, completed turn, MCP disconnect, XPC invalidation or reply timeout does not cancel an accepted owner or agent backup. A confirmed native conversation closure ends the agent's authorization. The running backup still checks current project/session authority before recording its completed receipt; revoked authority leaves the original operation failed with the actual error and no complete receipt. Physical copying may already have finished. A manifest-bearing folder without a completed receipt remains incomplete. An owner backup has no agent session generation and continues after its caller disconnects.
+
+A backup command UUID identifies one accepted attempt for one authenticated principal and exact input. Terminal replay returns that same operation, timestamps and canonical result or error, including `OUTCOME_UNKNOWN` and startup `OPERATION_INTERRUPTED`. It never starts another backup attempt under that UUID. A matching committed semantic receipt establishes success even if later retention/advisory work failed; startup also repairs earlier failed operation metadata from that receipt. Without one, the first interrupted outcome remains visible: unknown after running, rejected if it never started and carries no earlier uncertainty. Keep incomplete folders for inspection and use a new UUID for a new backup. Other long-command reconciliation rules stay unchanged. Current authority, store incarnation, result expiry and purge fences still apply. A changed caller principal or authorization generation does not inherit the old operation's authority.
+
+The retained 30 October evidence observes command `5aca4aec-aa28-4aa1-91cb-bb601c576b54` running through 19:55:48Z (984 seconds). The saved acceptance and terminal result describe only the later 19:59:48Z attempt and its `BACKUP_INCOMPLETE` result at 19:59:53Z. The first terminal outcome and matching service log are unavailable. A current fixture reproduces receipt authorization failure after confirmed native closure, but does not prove the historical cause. That cause remains unproven.
+
 Manifests add `recordFamilies` (every registered canonical family, including zero counts) and `tableRows` (metadata, records, commands, events and cursors). The complete database SHA-256 covers every table and historical record; every required managed object retains its descriptor/hash/size and exact membership verification. Counts are checked against that same database. Earlier format-1 manifests remain verifiable by deriving the inventory from their database; no backup schema migration is introduced.
 
 The trusted native app verifies a selected backup before showing a restore confirmation. Only snapshots at the build's current schema (5 since CL-360) can be restored by this implementation; an older snapshot refuses with `RESTORE_SCHEMA_UNSUPPORTED` until an upgrade is qualified on a separate copy. The accepted digest is checked again on Create. The service copies the database and every managed file/link into an unpublished owned directory under `restore/`, preserving executable modes and confined capture links. It validates the complete relocated inventory and integrity before atomically publishing a **separate disposable data root**. Existing data and the backup are never replaced or edited. Unpublished interrupted stages are retained; an uncertain publish must reconcile the original command, never silently start a competing restore. A receipt identifies the source manifest and new incarnation. This is candidate restoration, not an in-place production replacement or automatic rollback switch.
@@ -633,6 +641,20 @@ not run pruning again. Trash moves do not free physical disk space until the
 owner empties Trash, and APFS shared extents prevent inferring physical savings
 from logical lengths. No live prune is part of source qualification.
 
+### Incomplete backup reporting and retirement (CL-377)
+
+A managed folder is complete only when it has a matching complete backup-generation receipt or a verified protected/prepared upgrade receipt. A manifest alone proves no completed publication. `backup_prune_preview` and `backup_incomplete_preview` list other named snapshot folders and leftover staging folders with `state=incomplete`, a reason, and separate `complete_count` and `incomplete_count`. Relocated compact receipts resolve through the existing safe local snapshot-name rule. Minimal protection records retain bytes without asserting completion.
+
+`restore_preview` rejects an unpublished local folder or a managed folder without a completed receipt with `BACKUP_INCOMPLETE`, `details.state=incomplete`, its path and reason. It checks the receipt again against the fully verified manifest digest. Successful previews report `state=complete`. External normal backup folders retain independent full verification.
+
+An enrolled worker calls `backup_incomplete_preview {project_id}`, waits for its final preview, then sends `backup_incomplete_retire {project_id,command_id,preview_sha256}`. Current scope, session and `agent_rule_changes=allowed` apply, as for agent backup creation. No owner step is needed. The owner can use the same route without `project_id`. Assistants cannot call either command. This route changes no retention rule and never retires a complete backup.
+
+The object gate, capture refusal, pins, upgrade protection, managed-path rules, no-follow ancestry pins and same-volume exclusive Trash rename still apply. Agent authority is checked before and after waiting for the gate; the durable intent binds its original authorization generation across retries. Supported lifecycle and policy changes take that same gate. A manifest-bearing folder retains the manifest-use lease and exact manifest digest. A pre-manifest folder takes an exclusive directory lease and binds device, inode, mode, modification/change times and continued manifest absence before rename. A changed preview refuses before intent publication. Retry rechecks current protection and keeps a replaced or changed directory. No original store file moves, and no route empties Trash.
+
+Each final result reports folders with `action=moved_to_trash` and `trash_path`, or `action=kept`, `reason` and `keep_reasons`. It also returns moved and retained lists and counts. The durable prune intent reconciles interruption after intent commit or rename with the original command UUID. Pre-manifest reconciliation checks the exact moved inode and continued manifest absence; rename itself changes directory change time. Uncertain flush/IO outcomes preserve the intent and report `OUTCOME_UNKNOWN`. Successful replay moves nothing again. A Trash move does not reclaim physical space until Trash is emptied.
+
+The retained 30 October folders need a post-install agent preview and apply with its exact digest. Source fixtures and owned test-slot retirement do not establish a live retirement result.
+
 ### Compact backup receipts and schema 5 (CL-360/CL-369)
 
 Each completed backup keeps its full object descriptors in its immutable, SHA-256-bound `manifest.json`. The database stores only its path, manifest digest, verification/usage summary, object count and logical byte count. A derived sorted 32-byte membership-key index under `backups/.indexes/` has its own digest in the receipt. This index accelerates historical accounting and cleanup selection; it never grants deletion authority. Final deletion still verifies the exact manifest and independent payload through pinned descriptors. Missing indexes can be rebuilt from the bound manifest; missing or changed manifests retain bytes and report unavailable authority. Initial rebuilding/validation is a separate cost from repeated lookups. Shared cached index bytes are dropped when receipts disappear, and prune moves unused generation indexes beside snapshots in the Trash.
@@ -652,6 +674,8 @@ Current-schema copies and restores also resolve compact receipt manifests and cl
 Historical path parsing is lexical and rejects parent traversal before creating a local snapshot URL. Foreign provenance URLs explicitly specify directory semantics, avoiding Foundation's directory-type filesystem inference. Cleanup tries compact independent generations in reverse receipt insertion order so a fresh complete payload is considered before missing historical copies; every candidate still requires the same pinned manifest and payload checks, with older copies available as fallback.
 
 ### Snapshot work and measured costs (CL-356)
+
+Backup, restore preview, restore creation and online upgrade preparation emit `storage_phase_timing` JSON lines in the service's standard error and unified log (`subsystem=org.checklist.coordination`, `category=storage-phase`). Each line names the operation, original command UUID when present, preceding phase, next phase, monotonic phase and total seconds, UTC time and three host load averages. Major boundaries include database capture, inventory, object materialization, manifest/synchronization, both independent verification passes, receipt/index/usage work, retention, restore authority fencing and publication. Per-file progress emits no timing lines. A terminal `complete`, `replayed` or `failed` boundary accounts for the last interval, including failed attempts. These observations change no timeout or integrity check. Slot create, seed and first-start phase records use the harness's corresponding timing output.
 
 Object materialization is serial and admits each actual file size against one
 running logical-byte total; independent verification uses at most four joined
@@ -804,3 +828,117 @@ before decoding, streaming canonical backup validation and retaining only unique
 removed-evidence matching facts. The [memory qualification procedure](service-memory.md)
 records phase footprints, allocator versus mapped pages, fixture limits and the
 required exact-stage installation gate. No schema migration or deletion rule changes.
+
+### Package A real-size measurements (CL-383)
+
+On 9 November 2026, owned slot 3 used captured source
+88da7fa363a9553d9fd4ed87f34fb42fd27673ad6c6bd099d46c77a2df1cd1d9.
+The supported harness seeded it from the newest complete live backup selected
+at that time, snapshot-823b815e-8d9c-4ffe-bee7-ae9c6ad428ff, manifest
+56ad13e259c5efcdc902c06a45f960ba6364aff16346f9906ff3b702af8350a2.
+Final create/start used unchanged native identity and no session override.
+Earlier observations with an obsolete override are excluded from qualification.
+The host ran its ordinary concurrent load; no run waited for lower load.
+
+The pre-start copy held 3,677,906,312 logical bytes in 40,173 regular files:
+2,484,502,731 database/identity bytes and 1,193,403,581 managed bytes in
+40,171 regular managed files. Managed bytes comprised 429,039,202 objects,
+763,530,323 captures, 422,286 executions and 411,770 icons. SQLite quick_check
+returned ok at schema 5, with 73,133 records, 449,002 events, 48,599 command
+rows and 15,969 metadata rows. This corpus is smaller than the historical 9 GB;
+these observations do not establish a one-minute result for 9 GB.
+
+| Operation | Measured seconds | Major phases, seconds | sysctl vm.loadavg start → end |
+| --- | ---: | --- | --- |
+| Slot create, fresh backup copy | 705.645 wall | manifest/membership 2.065; source hash 5.065; DB checks 1.166; source path inspection 355.230; materialization and independent destination verification 12.334; destination path inspection 325.719 | 131.69/130.52/144.40 → 62.36/67.70/99.67 |
+| First headless slot start | 344.399 wall | preflight 328.412; registration 0.100; launch to first healthy answer 15.710 | 62.25/67.59/99.44 → 50.96/63.31/87.52 |
+| Agent backup_create | 247.546 CLI wall; 234.834 core | DB copy 4.598; inventory 58.725; object copy 31.813; directory sync 5.694; manifest 0.019; independent verification 62.953 and 63.214; receipt preparation 3.285 | 66.68/65.72/87.28 → 100.46/78.39/86.55 |
+| Native owner restore preview | 75.000 durable operation; 72.083 core | manifest 2.106; DB hash 2.093; inventory 63.236; object verification 1.874; namespace closure 0.820 | { 76.30 70.12 80.23 } → { 60.64 70.60 78.73 } |
+| Native owner restore_create | 209.000 durable operation; 208.554 core | See complete phase sequence below | { 62.35 70.79 78.75 } → { 68.92 65.76 74.01 } |
+
+Core phase lines carry their own UTC, monotonic interval/total, command ID and
+getloadavg values. Shell bookends use sysctl. Native UI bookends include the
+time until the implementer observes the completed UI, so durable operation
+timestamps and core intervals are reported separately. The preview bookend was
+276.499 s; it includes delayed review-sheet observation after the operation
+finished. These are not interchangeable latency measures.
+
+Complete restore-create intervals:
+
+| Interval | Seconds |
+| --- | ---: |
+| started → verify_started | 1.364 |
+| verify_started → verify_manifest_loaded | 1.690 |
+| verify_manifest_loaded → verify_database_hashed | 1.397 |
+| verify_database_hashed → verify_inventory_finished | 57.241 |
+| verify_inventory_finished → verify_objects_finished | 1.896 |
+| verify_objects_finished → verify_finished | 0.861 |
+| verify_finished → restore_objects_started | 3.095 |
+| restore_objects_started → restore_objects_finished | 25.040 |
+| restore_objects_finished → restore_fencing_started | 0.000 |
+| restore_fencing_started → restore_fencing_finished | 114.113 |
+| restore_fencing_finished → restore_before_publish | 0.008 |
+| restore_before_publish → restore_published_before_flush | 0.000 |
+| restore_published_before_flush → restore_usage_started | 0.000 |
+| restore_usage_started → restore_usage_finished | 1.654 |
+| restore_usage_finished → complete | 0.195 |
+
+
+Create and total first start exceed five minutes. The two create path
+inspections take 680.949 s, 96.5% of wall time. Start preflight takes 328.412 s;
+service launch takes 15.710 s. Each inspection retains 1,304,192 managed-relative
+occurrences, 159 managed-origin-absolute paths, 12,790 external bindings,
+774,740 capture paths, 1,637,270 inert-history paths, 512 inert-metadata paths
+and 864 Git provenance values.
+
+The bounded invocation-local external overlap cache holds at most 2,048 entries
+and 1 MiB of accounted path/location/observation payload. This sample held
+2,041 entries and 342,171 payload bytes, reused 10,749 checks and still ran
+4,082 full first/release guards. Every occurrence keeps lexical, field-policy
+and count checks. First and release guards bind lexical and canonical ancestor
+identity and current Checklist-root overlap; a replaced ancestor or late leaf
+refuses. Overflow uses the original per-occurrence guard. Managed containment
+still runs per occurrence. Source, destination and startup use separate caches.
+The optimization opens no external file bytes and removes no managed check.
+
+Backup, restore preview and restore creation finish within five minutes in this sample.
+The restore fencing interval includes copied-session revocation, delivery
+quarantine, SQLite integrity and the candidate's full managed-file inventory.
+A bounded two-second service stack sample during this interval found 481 of
+485 sampled restore stacks in candidate inventory, mainly descriptor-relative
+regularOrLinkExists/parent/openat checks for captured paths. This identifies
+active validation work rather than a stalled UI; it does not assign that sample
+fraction to the whole operation. These checks remain.
+
+The first-start receipt records 15.7945655 s including registration overhead,
+at schema 5 → 5. It does not qualify an actual schema-upgrade offline window.
+An upgrade install requires a fresh exact-stage backup-copy startup that
+crossed the actual schema step. The measurement binds the service hash, source
+fingerprint, source store/root/schema, target schema and time. Before stopping
+the old service, the installer validates that receipt and prints measured
+launch-to-healthy plus a 25% and 10-second margin. Missing, mismatched, stale,
+warm or current-schema proof refuses. Online preparation is not an offline
+sample. No installed upgrade or live stop ran in this qualification.
+
+The final backup snapshot-2233fb2f-d3db-45c1-b8dd-2d2580987d23 has manifest
+a62f7d3daf5c2c01a97384291618b4760e29ded1ede09f7f1eb257c58874396a.
+It contains 40,174 regular files, 3,723,975,850 logical bytes and
+2,937,524,224 allocated file bytes after runtime metadata changes. This is a
+different observation from the pre-start corpus. Allocated bytes deduplicate
+inodes within the copy; shared APFS extents are not measured as exclusive bytes.
+Its complete result separately reports retention unconfirmed, moved 0 and
+maintenance held for backup_capture. Completed capture does not confirm
+automatic retention. Exact same-command replay took 0.074 s, preserved the
+durable operation, canonical result and timestamps, and left snapshot names
+and all 33 phase lines unchanged. It started no second capture.
+
+The two independent backup verification inventories took 57.303 and 57.408 s,
+alongside the initial 58.725 s inventory. They dominate the backup result and
+remain independent. Full hashes, namespace closure, descriptor safety,
+durability barriers, authority fences, limits and cooperative deadlines remain.
+Focused negative-path/concurrency tests and a real soft+hard 256-descriptor run
+with 98 descriptors already held supplement these real-size observations.
+
+Exact commands, timeouts, UTC, loads and raw phase lines are retained in the
+package hand-in and measurements. Earlier source snapshots and host loads
+differ, so excluded diagnostic baselines do not establish a strict cache A/B.

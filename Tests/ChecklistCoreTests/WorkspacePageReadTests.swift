@@ -107,14 +107,20 @@ extension CoreTests {
         XCTAssertEqual((second["rows"] as! [JSON]).count,50)
         XCTAssertThrowsError(try call("workspace_page",["project_id":foreign["id"]!,"surface":"activity","cursor":first["next_cursor"]!]))
     }
+    private func preparedWorkspaceEpic() throws -> (project: JSON,task: JSON,epic: JSON) {
+        let f = try preparedCorePhase("workspace-epic-membership") { [self] in
+            let p=try call("project_create",["name":"Scoped Epic","key_prefix":"EP","root_path":directory.path]),t=try task(p)
+            let pid=p["id"] as! String,tid=t["id"] as! String
+            let epic=try call("epic_create",["project_id":pid,"name":"Scoped Epic"])
+            try fixtureDomainTransaction {db in
+                var task=try router.record(db,tid,type:"task");task["epic_id"]=epic["id"];task=router.revised(task);try router.save(db,task,type:"task")
+            }
+            return ["project":p,"task":t,"epic":epic]
+        }
+        return (f["project"] as! JSON,f["task"] as! JSON,f["epic"] as! JSON)
+    }
     func testWorkspaceEpicRowsHaveTruthfulCountsAndExplicitMembershipPages()throws {
-        let p=try call("project_create",["name":"Scoped Epic","key_prefix":"EP","root_path":directory.path]),t=try task(p)
-        let pid=p["id"] as! String,tid=t["id"] as! String
-        let epic=try call("epic_create",["project_id":pid,"name":"Scoped Epic"])
-        try router.dbQueue.writeWithoutTransaction {db in try router.withValidatedDomainTransaction(db) {
-            var task=try router.record(db,tid,type:"task");task["epic_id"]=epic["id"];task=router.revised(task);try router.save(db,task,type:"task")
-            return .commit
-        }}
+        let f=try preparedWorkspaceEpic(),p=f.project,epic=f.epic,pid=p["id"] as! String,tid=f.task["id"] as! String
         let list=try call("workspace_page",["project_id":pid,"surface":"epics"])
         XCTAssertEqual((list["rows"] as! [JSON]).first {$0["id"] as? String == epic["id"] as? String}?["ticket_count"] as? Int,1)
         let members=try call("workspace_page",["project_id":pid,"surface":"epic_tasks","record_id":epic["id"]!])
@@ -125,7 +131,22 @@ extension CoreTests {
         // ambiguous. Exercise real SQL for every owner grouping/order and the
         // default worker page, with finite continuation and no omitted rows.
         let other=try task(p),otherID=other["id"] as! String
-        for grouping in ["none","status","epic"] {
+        try assertWorkspaceEpicOrdering(p,tid:tid,otherID:otherID,grouping:"none")
+        let worker=Caller(role:"worker",installation:"workspace-order-worker",projectIDs:[pid],workspace:p["root_path"] as? String)
+        let first=try call("task_list",["project_id":pid,"limit":1],worker)
+        let second=try call("task_list",["project_id":pid,"limit":1,"cursor":first["next_cursor"]!],worker)
+        XCTAssertEqual(Set(((first["tasks"] as! [JSON])+(second["tasks"] as! [JSON])).compactMap {$0["id"] as? String}),Set([tid,otherID]))
+    }
+    func testWorkspaceEpicMembershipPagesRetainEveryStatusOrdering() throws {
+        let f=try preparedWorkspaceEpic(),other=try task(f.project)
+        try assertWorkspaceEpicOrdering(f.project,tid:f.task["id"] as! String,otherID:other["id"] as! String,grouping:"status")
+    }
+    func testWorkspaceEpicMembershipPagesRetainEveryEpicOrdering() throws {
+        let f=try preparedWorkspaceEpic(),other=try task(f.project)
+        try assertWorkspaceEpicOrdering(f.project,tid:f.task["id"] as! String,otherID:other["id"] as! String,grouping:"epic")
+    }
+    private func assertWorkspaceEpicOrdering(_ p: JSON,tid: String,otherID: String,grouping: String) throws {
+        let pid=p["id"] as! String
             for ordering in ["manual","priority","updated_desc"] {
                 var cursor:String?,ids:[String]=[],pages=0
                 repeat {
@@ -139,10 +160,5 @@ extension CoreTests {
                 } while cursor != nil && pages<3
                 XCTAssertEqual(Set(ids),Set([tid,otherID]));XCTAssertEqual(ids.count,2)
             }
-        }
-        let worker=Caller(role:"worker",installation:"workspace-order-worker",projectIDs:[pid],workspace:directory.path)
-        let first=try call("task_list",["project_id":pid,"limit":1],worker)
-        let second=try call("task_list",["project_id":pid,"limit":1,"cursor":first["next_cursor"]!],worker)
-        XCTAssertEqual(Set(((first["tasks"] as! [JSON])+(second["tasks"] as! [JSON])).compactMap {$0["id"] as? String}),Set([tid,otherID]))
     }
 }

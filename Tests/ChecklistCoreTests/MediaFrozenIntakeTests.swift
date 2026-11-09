@@ -41,7 +41,7 @@ final class MediaFrozenIntakeTests: XCTestCase {
         }
         /// Template construction borrows the router which TestStore closes and
         /// checkpoints before publishing. This adapter never owns or reopens it.
-        fileprivate init(router: CommandRouter,workspace: URL) throws {
+        init(router: CommandRouter,workspace: URL) throws {
             storage = nil;self.router = router;self.workspace = workspace
             root = router.root;base = root.deletingLastPathComponent()
             owner = Caller(role:"owner",installation:"storage-fixture",projectIDs:[])
@@ -139,8 +139,22 @@ final class MediaFrozenIntakeTests: XCTestCase {
         var p: JSON = ["intake_id":intake["id"]!,"expected_revision":intake["revision"]!,"resolutions":resolutions];p["mapping"] = mapping
         return try f.call("media_intake_revise",p,as:f.worker)
     }
+    private static let explicitIntakeRoundsPhase = TestStore.Template(name:"media-frozen-explicit-intake-rounds") {router,workspace in
+        let checks = MediaFrozenIntakeTests(),f = try Fixture(router:router,workspace:workspace)
+        let image = try f.round(f.type(checks.imageSchema(twoSlots:true)))
+        let text = try f.round(f.type(checks.checks.schema()))
+        let tsv = try f.round(f.type(checks.checks.schema()))
+        try router.dbQueue.write {try $0.execute(sql:"INSERT INTO metadata(key,value) VALUES ('test-explicit-intake-rounds',?)",arguments:[try jsonString(["image":image["id"]!,"text":text["id"]!,"tsv":tsv["id"]!])])}
+    }
+    private func explicitRound(_ f: Fixture,_ kind: String) throws -> JSON {
+        let ids = try f.router.dbQueue.read {try jsonObject(XCTUnwrap(String.fetchOne($0,sql:"SELECT value FROM metadata WHERE key='test-explicit-intake-rounds'")))}
+        return try f.record(XCTUnwrap(ids[kind] as? String),"media_round")
+    }
     func testCandidateSetRetainedInDifferentOrderKeepsAcceptedBasis() throws {
-        let f = try Fixture(),round = try f.round(f.type(imageSchema()))
+        // This phase has one consumer: build it on the shared empty-store seed,
+        // avoiding a second router startup and clone for an unused cached copy.
+        let f = try Fixture()
+        let round = try f.round(f.type(imageSchema()))
         var intake = try preview(f,round,(0..<8).map {try source(f,"take-\($0).png",$0)})
         intake = try resolve(f,intake,(intake["rows"] as! [JSON]).map {["row_id":$0["id"]!,"disposition":"include","group_id":"one-item"]})
         intake = try confirm(f,intake)
@@ -285,7 +299,7 @@ final class MediaFrozenIntakeTests: XCTestCase {
         XCTAssertEqual(try f.rows("attachment").count,2)
     }
     func testExplicitSlotsDuplicateGroupingAndPastedExactLinesAndTSV() throws {
-        let f = try Fixture(),round = try f.round(f.type(imageSchema(twoSlots:true)))
+        let f = try Fixture(template:Self.explicitIntakeRoundsPhase),round = try explicitRound(f,"image")
         let one = try source(f,"same-1.png",1),two = try source(f,"same-2.png",1)
         var intake = try preview(f,round,[one,two]),rows = intake["rows"] as! [JSON]
         XCTAssertTrue(rows.allSatisfy {$0["disposition"] as? String == "unresolved"})
@@ -301,48 +315,30 @@ final class MediaFrozenIntakeTests: XCTestCase {
         XCTAssertEqual(strings(target,"candidate_ids").count,2)
         XCTAssertEqual(item["title"] as? String,groups[0]["title"] as? String);XCTAssertEqual(int(item,"order"),int(groups[0],"order"))
         let published = try f.publish(round);XCTAssertEqual(((published["manifest"] as! JSON)["items"] as! [JSON]).count,1)
-        let textRound = try f.round(f.type(checks.schema()))
+        let textRound = try explicitRound(f,"text")
         var pasted = try f.call("media_intake_preview",["round_id":textRound["id"]!,"text":" e\u{301}\r\n\n=literal\n"],as:f.worker)
         pasted = try capture(f,confirm(f,pasted));XCTAssertEqual(strings(pasted,"committed_row_ids").count,2)
         let candidateTexts = try f.rows("media_candidate").flatMap {$0["slots"] as! [JSON]}.compactMap {$0["text"] as? String}
         XCTAssertTrue(candidateTexts.contains(" e\u{301}\r"));XCTAssertTrue(candidateTexts.contains("=literal"))
-        let tsvRound = try f.round(f.type(checks.schema()))
+        let tsvRound = try explicitRound(f,"tsv")
         let tsv = try f.call("media_intake_preview",["round_id":tsvRound["id"]!,"tsv":"title\ttext\tgroup\nStory\ttake one\tg\nStory\ttake two\tg\n"],as:f.worker)
         _ = try capture(f,confirm(f,tsv));XCTAssertEqual(((try f.get(tsvRound))["items"] as! [JSON]).count,1)
     }
-    private static func publicationPhase(published: Bool) -> TestStore.Template {
-        TestStore.Template(name:"media-frozen-publication-" + (published ? "published" : "captured")) {router,workspace in
-            let checks = MediaFrozenIntakeTests(),f = try Fixture(router:router,workspace:workspace)
-            let round = try f.round(f.type(checks.imageSchema()))
-            let intake = try checks.capture(f,checks.confirm(f,checks.preview(f,round,[checks.source(f,"original.png",1)])))
-            if published { _ = try f.publish(round) }
-            try router.dbQueue.write {db in
-                try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('test-media-publication-intake',?)",arguments:[try jsonString(intake)])
-            }
-        }
-    }
-    private static let capturedPublicationPhase = publicationPhase(published:false)
-    private static let publishedPublicationPhase = publicationPhase(published:true)
-
     func testPublicationRollsBackAtEveryHandoverManifestAndReceiptStep() throws {
         let points = [
+            ("UPDATE","records","NEW.type='storage_hold' AND json_extract(NEW.data,'$.state')='released'"),
             ("INSERT","records","NEW.type='storage_job' AND json_extract(NEW.data,'$.owner_kind')='media_target'"),
             ("INSERT","records","NEW.type='storage_hold'"),
-            ("UPDATE","records","NEW.type='storage_hold' AND json_extract(NEW.data,'$.state')='released'"),
             ("INSERT","records","NEW.type='media_item_target'"),
             ("INSERT","records","NEW.type='media_round_manifest'"),
             ("UPDATE","records","NEW.type='media_round'"),
             ("INSERT","events","1"),("INSERT","commands","1")
         ]
+        let f = try Fixture(),round = try f.round(f.type(imageSchema()))
+        let intake = try capture(f,confirm(f,preview(f,round,[source(f,"original.png",1)])))
         for (operation,table,condition) in points {
-            // The released-hold trigger needs prepublication; every other point
-            // starts from an earlier publication, as before. Only setup is cloned.
-            let unpublished = operation == "UPDATE" && condition.contains("storage_hold")
-            let f = try Fixture(template:unpublished ? Self.capturedPublicationPhase : Self.publishedPublicationPhase)
-            let round = try XCTUnwrap(f.rows("media_round").first)
-            let intake = try f.router.dbQueue.read {db in
-                try jsonObject(XCTUnwrap(String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='test-media-publication-intake'")))
-            }
+            // The released-hold failure runs first on captured inputs. Its real
+            // successful retry prepares the published phase for all later points.
             XCTAssertEqual(strings(intake,"committed_row_ids").count,1)
             let observed = try f.get(round),before = try f.allState()
             try f.router.dbQueue.write {try $0.execute(sql:"CREATE TRIGGER media_fail BEFORE \(operation) ON \(table) WHEN \(condition) BEGIN SELECT RAISE(ABORT,'publication interruption'); END")}

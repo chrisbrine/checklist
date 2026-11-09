@@ -1,3 +1,5 @@
+import ChecklistTestSupport
+import GRDB
 import Foundation
 import XCTest
 @testable import ChecklistCore
@@ -9,13 +11,24 @@ final class MediaObservationTokenTests: XCTestCase {
     let results = MediaRoundResultTests()
     let itemTasks = MediaItemTaskTests()
 
+    private static let inspectedTokenPhase = TestStore.Template(name:"media-observation-inspected-token") {router,workspace in
+        let checks = MediaObservationTokenTests(),f = try MediaFrozenIntakeTests.Fixture(router:router,workspace:workspace)
+        let r = try f.round(f.type(checks.checks.schema()))
+        let ids = try (0..<2).map {try f.item(r,title:"Take \($0)")["id"] as! String}
+        _ = try f.publish(r)
+        _ = try checks.results.link(f,r,checks.results.task(f))
+        let flag = try checks.recommendations.suggest(f,r,ids[0])
+        try router.dbQueue.write {try $0.execute(sql:"INSERT INTO metadata(key,value) VALUES ('test-media-observation',?)",arguments:[try jsonString(["items":ids,"flag":flag["id"]!])])}
+    }
+
     func testSecondItemAcceptsInspectedTokenAfterSendRoundLinkItemLinkAndFlagDismissal() throws {
         for (method,worker) in [("media_round_send_result",false),("media_round_link_task",false),
                                 ("media_round_link_task",true),("media_item_link_task",false),
                                 ("media_item_link_task",true),("media_suggestion_dismiss",false)] {
-            let (f,r,ids) = try recommendations.setup(2)
-            _ = try results.link(f,r,results.task(f))
-            let flag = try recommendations.suggest(f,r,ids[0])
+            let f = try MediaFrozenIntakeTests.Fixture(template:Self.inspectedTokenPhase)
+            let phase = try f.router.dbQueue.read {try jsonObject(XCTUnwrap(String.fetchOne($0,sql:"SELECT value FROM metadata WHERE key='test-media-observation'")))}
+            let r = try XCTUnwrap(f.rows("media_round").first),ids = strings(phase,"items")
+            let flag = try f.record(phase["flag"] as! String,"media_suggestion")
             let observed = try f.get(r),token = observed["observed_context_token"] as? String
             var second = f.decisionParams(observed,ids:[ids[1]])
             _ = try f.call("media_decide",f.decisionParams(observed,ids:[ids[0]]))

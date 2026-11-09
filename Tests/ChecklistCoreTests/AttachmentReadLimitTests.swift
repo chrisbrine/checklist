@@ -98,6 +98,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testCL397AgentReadsALargeFileInRangesAndTheBytesMatch() throws {
+        try QualificationSuite.requireEnabled()
         let size: UInt64 = 500 * 1024 * 1024
         let (pid,id,sha,worker) = try sparseAttachment(bytes:size)
         var hasher = SHA256(),offset = 0,ranges = 0,done = false

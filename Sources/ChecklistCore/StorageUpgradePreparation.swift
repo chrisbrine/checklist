@@ -44,16 +44,23 @@ public enum StorageUpgradePreparation {
         let source = try DatabaseQueue(path:root.appendingPathComponent("checklist.sqlite").path,configuration:config)
         defer {try? source.close()}
         let state = try source.read { try SchemaMigrations.inspect($0) }
+        let sourceSchema = try source.read { try Int.fetchOne($0, sql: "PRAGMA user_version") ?? 0 }
         guard case .current(let identity) = state else {
-            return ["needs_upgrade":true,"prepared":false,"expected_offline_seconds":900,"reason":"legacy_store_requires_offline_preparation"]
+            return ["needs_upgrade":true,"prepared":false,"expected_offline_seconds":900,"reason":"legacy_store_requires_offline_preparation",
+                    "source_root":root.path,"source_schema":sourceSchema,"target_schema":SchemaMigrations.currentSchema,"logical_store_id":NSNull()]
         }
+        let provenance: JSON = ["source_root":root.path,"source_schema":identity.schema_revision,
+            "target_schema":SchemaMigrations.currentSchema,"logical_store_id":identity.logical_store_id]
         guard !requiringUpgrade || identity.schema_revision < SchemaMigrations.currentSchema else {
-            return ["needs_upgrade":false,"prepared":false,"expected_offline_seconds":30]
+            return provenance.merging(["needs_upgrade":false,"prepared":false,"expected_offline_seconds":30]) { _, new in new }
         }
         let external = try StoreIdentityReceipt.decode(files.read(StoreIdentityReceipt.fileName,maximum:4096))
         guard external == identity else { throw StoreRecovery.required("external_database_identity_mismatch") }
         return try StorageSnapshotRetention.withCapture(root:root) { retention in
             let operation = UUID(), budget = qualificationBudget ?? StorageSnapshotBudget.production()
+            budget.beginTiming(operation: "upgrade_preparation", command: operation.uuidString.lowercased())
+            var timingOutcome = "failed"
+            defer { budget.finishTiming(outcome: timingOutcome) }
             let (fd,_) = try files.parent("backups/.preupgrade",create:true);Darwin.close(fd)
             let parent = root.appendingPathComponent("backups")
             let started = ProcessInfo.processInfo.systemUptime
@@ -71,9 +78,10 @@ public enum StorageUpgradePreparation {
                 targetChecksum:SchemaMigrations.backupReceiptChecksum,executableSHA256:try executableSHA256(),fileIdentities:identities)
             try publish(try StorageSnapshot.encoded(receipt),name:receiptName,root:root)
             let unchanged = try source.read { try SchemaMigrations.contentFingerprint($0) == receipt.sourceFingerprint }
-            return ["needs_upgrade":true,"prepared":true,"expected_offline_seconds":unchanged ? 90 : 900,
+            timingOutcome = "complete"
+            return provenance.merging(["needs_upgrade":true,"prepared":true,"expected_offline_seconds":unchanged ? 90 : 900,
                     "reason":unchanged ? "prepared_snapshot_and_rehearsal" : "source_changed_after_preparation",
-                    "protected_backup":generation.path,"preparation_seconds":ProcessInfo.processInfo.systemUptime-started]
+                    "protected_backup":generation.path,"preparation_seconds":ProcessInfo.processInfo.systemUptime-started]) { _, new in new }
         }
     }
 

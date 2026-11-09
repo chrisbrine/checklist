@@ -15,6 +15,7 @@ enum StorageSnapshotFailure: Error {
 final class StorageSnapshotMeasurement {
     let checkLock = NSLock()
     let observerLock = NSLock()
+    var phaseTiming: StoragePhaseTiming?
     var bytes: Int64 = 0
     var metadataBytes: Int64 = 0
     var objects: Int = 0
@@ -96,6 +97,7 @@ struct StorageSnapshotBudget {
 
     func notify(_ event: String) throws {
         measurement.observerLock.lock(); defer { measurement.observerLock.unlock() }
+        measurement.phaseTiming?.record(event)
         try observe(event)
     }
 

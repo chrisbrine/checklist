@@ -14,6 +14,19 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 QUALIFICATION_TESTS = (
+    'ChecklistCoreTests.HumanAnswerNoticeTests/testHookPickupTimeOnALargeDeliveryTable',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testCL403InventoryRefusedNewestWindowRunsTheOlderQueueWithoutRetry',
+    # CL-363 continuation: unchanged attachment/history scale boundaries.
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testCL397AgentReadsALargeFileInRangesAndTheBytesMatch',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testCL392LimitRefusalDoublesToOneHourAndADoneWakeStartsAgain',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testCL392OutcomeRowsOfOtherTicketsDoNotCountAgainstTheHistoryLimit',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testCL394HistoryRowLimitIsVisibleAndRepeatedRefusalAddsNoHistory',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testCL394HistoryTokenLimitIsVisible',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testCL394CommandRowLimitIsVisible',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testP321SharedHistoryBoundsRefuseOnlyOversizedTicket',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testP321ExactHistoryAdmissionDoesNotStarveTicketWithLargeForeignProtectedHistory',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testOversizedJobObservationDefersActualDoneSelectionAndSchedulesRetry',
+    'ChecklistCoreTests.TicketLifecycleCleanupTests/testAgedPurgeSkipsDoneJobObservationWithOversizedAccountingHistory',
     # CL-363: 201/242/250-item workflows and actual descriptor-exhaustion retries.
     'ChecklistCoreTests.MediaBulkOwnerChannelTests/test250ItemRoundIsAcceptedInOneActionWithOwnerDecisionPerItem',
     'ChecklistCoreTests.MediaBulkOwnerChannelTests/test250ItemRoundWithCurrentSuggestionsKeepsFilterAndActionTime',
@@ -126,6 +139,10 @@ QUALIFICATION_TESTS = (
 # scripts/test_affected_tests.py fails when wall_clock_budget_cases finds an
 # ungated case missing here or in QUALIFICATION_TESTS.
 TIMING_TESTS = (
+    'ChecklistBridgesTests.CodexQueueEffectsTests/testBoundedCommandDoesNotWaitForDescendantPipeEOF',
+    'ChecklistBridgesTests.CodexQueueEffectsTests/testBoundedCommandTimesOutWithoutRetry',
+    'ChecklistBridgesTests.NativeReplyListenerOwnershipTests/testLiveForeignListenerSwappedInStaysAndNoProofExists',
+    'ChecklistCLITests.CodexPostToolHookTests/testStalledStdinHasABound',
     'ChecklistServiceTests.BootstrapAdmissionTests/testFreshBootstrapReadsAndTwoQueuedWritesFinishWhileActualWriterIsHeld',
     'ChecklistAppTests.ApplicationTerminationTests/testOpenFloatingCaptureQuitsAndRestoresBlankTextAndFiles',
     'ChecklistAppTests.CachedScreenReturnTests/testTemplateCatalogOverviewReturnNeedsNoReadOrCatalogReplay',
@@ -197,6 +214,7 @@ VALIDATION_ONLY_GLOBS = (
 # Repository files read at runtime, not represented by SwiftPM dependencies.
 # RepositoryDependencyTests audits Swift and Python repository input reads.
 FILE_TEST_CONSUMERS = {
+    'docs/implementation-status.md': ('ChecklistCoreTests',),
     'Sources/ChecklistLegacyKeychain/ChecklistLegacyKeychain.c': ('ChecklistIPCTests',),
     'Sources/ChecklistLegacyKeychain/include/ChecklistLegacyKeychain.h': ('ChecklistIPCTests',),
     'docs/database-storage.md': ('ChecklistAppTests',),

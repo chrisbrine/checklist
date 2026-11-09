@@ -220,7 +220,16 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
     }
     func testPermanentLateHoldsExhaustBoundedCursorAndDoNotPollForever() throws {
         let f = try fixture(count:9),job = try archive(f)
-        for a in f.files { _ = try call("attachment_update",["project_id":f.project["id"]!,"attachment_id":a["id"]!,"expected_revision":a["revision"]!,"action":"keep_original"]) }
+        // Late holds are input to the cursor executor, independent of the
+        // attachment-update command. Prepare the same nine durable hold flags
+        // together, after archive selection and before either real pump.
+        try transaction {db in
+            for a in f.files {
+                var held = try router.record(db,a["id"] as! String,type:"attachment")
+                held["keep_original"] = true
+                try router.save(db,router.revised(held),type:"attachment")
+            }
+        }
         try makeDue(job);try router.runStorageMaintenance()
         let first = try ArchiveCleanupJob(record:record(job["id"] as! String,"cleanup_job"))
         XCTAssertEqual(first.state,.held);XCTAssertEqual(first.items.filter {$0.state == .waiting}.count,1)

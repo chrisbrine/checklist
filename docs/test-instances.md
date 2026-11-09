@@ -41,6 +41,17 @@ Ignored files stay until a later save replaces them. Deleting one does not undo 
 
 The harness resolves the live root from nonempty `CHECKLIST_DATA_ROOT`, otherwise `~/Library/Application Support/Checklist`, for backup lookup, read restrictions and provenance. Test roots remain fixed. Every slot command refuses if that effective live root canonically equals, contains or lies inside the slot folder or data root; all involved slots are admitted before any action, including replacement, slot-copy seeds and promotion evidence. Comparisons resolve symlinks and use whole path components, so sibling names remain distinct. The runtime also refuses test startup when its data root overlaps the effective live root, and refuses a live `CHECKLIST_DATA_ROOT` that equals, contains or lies inside the reserved test tree. Default live values remain unchanged. Only verified snapshots in that live root’s published `backups/` directory count toward promotion.
 
+A single seed/start path-inspection pass may reuse an exact external binding's
+successful filesystem-overlap check. Every occurrence still runs its lexical and
+field-policy checks and increments its original count. The cache holds at most
+2,048 entries and 1 MiB of encoded path/location/digest payload; larger inputs
+use the original guard. Python entry overhead is separately bounded by the entry
+limit. Before returning, the pass rechecks each cached path's named device/inode,
+file type and lexical/canonical ancestor identities, repeats both full overlap
+guards against the current Checklist roots, and rechecks identity again. A named
+path or ancestor change refuses the pass. Managed paths and file checks are never
+cached this way. Source, destination and later startup each use a separate cache.
+
 The shared Python helpers are `paths_overlap(a, b) -> bool` and `checklist_root_overlap(path, exclude=()) -> str | None`. Root lookup checks `live`, each `slot-N` data root and folder in numerical order, then `test-base`, returning the first non-excluded label. Slot admission excludes its own label and `test-base`; a live or another-slot overlap refuses. Swift uses the same path rule: existing equal/ancestor paths are identified by `(st_dev, st_ino)`; remaining comparisons use the deepest existing ancestor's canonical on-disk spelling (`F_GETPATH` on macOS), with symlinks resolved even for missing tails. Components are NFD-normalized and case-folded, treating every volume as case-insensitive to fail closed. Comparisons never use string prefixes. The shared vectors in `Tests/Fixtures/path-overlap-vectors.json` cover filesystem aliases and missing paths in both languages.
 
 Snapshot seeding is a qualification copy, not a production restore or authority reactivation. Nonempty seeds require a verified stage with the schema-3 managed-path migration (schema 3 or later); the same verified captured file supplies the stage's current schema. The harness checks the immutable captured implementation before publication and again before startup, so an older staged binary cannot use these relaxed inspection rules.
@@ -234,6 +245,27 @@ the minutes target or replace native/installed qualification.
 Every promotion requires a passing check for the selected build and a passing check of that same fingerprint in a slot seeded from a snapshot of the live store. A restaged live-backup slot qualifies only under the reuse rule above, revalidated at promotion; storage/startup changes still require a fresh real-size copy. Stale, failed and other-build checks do not qualify. The original stage and slot payload/signature are verified again. Dry run prints every gate and the exact planned install command without changing slot state or installing anything. Without passing live-backup qualification, it names the missing same-build live-backup slot check; there is no bypass. Accepted legacy paths alone do not qualify startup, durable protected copying, migration time or native behavior.
 
 Promotion installs the original live stage through `script/build_and_run.sh --install-stage CAPTURE_DIR`; it never installs the renamed test bundle or transfers test data. That mode re-verifies the original capture and signatures before entering the existing install path. Before stopping the old service, it invokes the incoming service's `--prepare-upgrade`: an older schema receives a verified protected snapshot and rehearsal while the old service still serves. Preparation failures abort before the stop. The installer prints the expected offline window before the swap and the measured stop-request-to-first-healthy-answer window afterward; promotion forwards both. If no healthy answer is observed, the installer reports elapsed time rather than claiming recovery. Startup accepts preparation only if the stopped database and required managed files still match; otherwise a fresh protected snapshot and rehearsal preserve the swap-time store, with a reported upgrading stage, estimate and reason.
+
+CL-383 records measured phases in `slot.json`: `create_timing`, the backup
+seed's `timing`, and `start_timing`. A newly created live-backup seed records
+its first launch through the first healthy service answer in
+`offline-measurement.json`. The receipt binds the captured source fingerprint,
+exact service executable hash, source store/root/schema, target schema, seed
+manifest hash, time and host load. Later starts cannot replace that first-start
+measurement. A failed first start supplies no successful measurement.
+
+Promotion forwards this file to the original installer. A direct installer can
+use `--install-stage CAPTURE_DIR --offline-measurement FILE`, or
+`--verify --offline-measurement FILE` (`CHECKLIST_OFFLINE_MEASUREMENT` also
+selects it). If preparation reports a store upgrade, installation requires a
+matching first-start measurement no older than 72 hours, taken through that
+schema upgrade on an owned live-backup copy. It refuses before stopping the
+service when that proof is missing or differs. The printed window uses measured
+copy startup plus 25% and 10 seconds. Online preparation time is never used as
+an offline sample. A current-schema copy cannot qualify a schema upgrade.
+No-upgrade installs label their existing startup estimate explicitly.
+The installer uses the helper captured with the incoming build. Captures made
+before that helper existed refuse before service stop; create a new stage.
 
 Both `--install-stage` and `--verify` require the exact installed app process and a healthy service status. Shell mode dispatch makes verification mandatory even if its Python interpreter or helper cannot run. Verification polls status with calls bounded to 30 seconds for up to 45 minutes; `CHECKLIST_VERIFY_DEADLINE_SECONDS` overrides the total bound with a minimum of 60 seconds. Timeouts, unavailable/starting replies and a call with no answer keep waiting, with progress about every minute. No answer means empty stdout with no code or a startup code on stderr (`OUTCOME_UNKNOWN`, `SERVICE_UNAVAILABLE`, `UNAVAILABLE`, `STORAGE_UPGRADING`, `STORAGE_NOT_READY`, `STORAGE_DRAINING`, `STORE_BUSY`); `service status` has a 10-second reply limit and reports `OUTCOME_UNKNOWN` when it ends or when no service job is registered. A deadline failure names the last call's exit status, stdout and stderr. Structured `STORAGE_UPGRADING` replies also keep waiting and print the stage, remaining estimate and any fallback reason when they change; recovery, definite errors (including any other stderr code), malformed replies or a missing exact app process fail immediately and name the real output. Slot `start` uses the same upgrading progress. On failure the installed bundle, store and previous bundle are kept. Check `checklist service status` and the service log. If the first start upgraded the store, rollback requires restoring its protected pre-upgrade generation, not the previous bundle; diagnostics name the newest completed `backups/snapshot-*` created since install began when one exists. Promotion distinguishes an install that ran but failed installed verification and reports success only after verification passes.
 

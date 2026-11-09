@@ -36,7 +36,10 @@ public enum TestStore {
                 try TestStore.publishTemplate(name: name) { pending in
                     let workspace = pending.appendingPathComponent("workspace", isDirectory: true)
                     try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
-                    let router = try TestFixtureTimings.measure("template.open") { try CommandRouter(root: pending.appendingPathComponent("store")) }
+                    // Populated phases start from the same current-schema seed
+                    // as unit fixtures. The empty seed alone pays fresh migration;
+                    // each phase still opens through production admission/recovery.
+                    let router = try TestFixtureTimings.measure("template.open") { try TestStore.router(root: pending.appendingPathComponent("store"), durable: false) }
                     do {
                         try router.dbQueue.writeWithoutTransaction { try $0.execute(sql: "PRAGMA synchronous=NORMAL") }
                         try TestFixtureTimings.measure("template.prepare") { try prepare(router, workspace) }
@@ -55,6 +58,7 @@ public enum TestStore {
     public static func router(root: URL, serviceLease: StorageServiceLease? = nil,
                               cliCommand: String = "/Applications/Checklist.app/Contents/MacOS/checklist",
                               providerPlugins: ProviderPluginRegistry = .bundled,
+                              automaticBackupRetentionTrashRoot: URL? = nil,
                               durable: Bool = ProcessInfo.processInfo.environment["CHECKLIST_QUALIFICATION"] == "1",
                               template: Template? = nil, workspace: URL? = nil,
                               sourceGitMemo: Bool = ProcessInfo.processInfo.environment["CHECKLIST_QUALIFICATION"] != "1") throws -> CommandRouter {
@@ -66,7 +70,7 @@ public enum TestStore {
             try StoreDirectory(root: anchored).requireFreshScaffoldingOnly()
             try TestFixtureTimings.measure("store.seed") { try seed(anchored, template: template, workspace: workspace) }
         }
-        let router = try TestFixtureTimings.measure("store.open") { try CommandRouter(root: root, serviceLease: serviceLease, cliCommand: cliCommand, providerPlugins: providerPlugins) }
+        let router = try TestFixtureTimings.measure("store.open") { try CommandRouter(root: root, serviceLease: serviceLease, cliCommand: cliCommand, providerPlugins: providerPlugins, automaticBackupRetentionTrashRoot: automaticBackupRetentionTrashRoot) }
         if !durable {
             // Disposable unit fixtures need transaction/reopen semantics, not a
             // power-loss durability barrier on every command. Qualification and

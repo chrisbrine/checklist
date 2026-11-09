@@ -36,13 +36,16 @@ extension CoreTests {
         XCTAssertEqual(try jsonString(after["attempts"]!),try jsonString(call("snapshot")["attempts"]!))
     }
     func testDiscardReviewPreparationAndClaimedEverRefusalsIncludingReleasedAndCompleted() throws {
-        let value = try submittedArtifact(),p = value.project,group = try triage(p,phase:"review"),reviewer = Caller(role:"owner",installation:"discard-reviewer",projectIDs:[])
+        let value = try preparedSubmittedArtifact(),p = value.project,group = try triage(p,phase:"review"),reviewer = Caller(role:"owner",installation:"discard-reviewer",projectIDs:[])
         try addTriage(p,group,value.task)
         let reviewBatch = try prepareReviewBatch(p,group,[value.task],reviewer)
         XCTAssertEqual(try discardBatch(p,reviewBatch,reviewer)["lifecycle"] as? String,"discarded")
         assertCode("BATCH_DISCARDED") {_ = try self.claimFixedBatch(p,reviewBatch,reviewer)}
-        for complete in [false,true] {
-            let p = try cohortProject(),worker = try cohortWorker(p)
+    }
+    func testDiscardClaimedEverRefusesAfterRelease() throws { try assertDiscardClaimedEver(complete:false) }
+    func testDiscardClaimedEverRefusesAfterCompletion() throws { try assertDiscardClaimedEver(complete:true) }
+    private func assertDiscardClaimedEver(complete: Bool) throws {
+            let f = try preparedCohortWorkers(),p = f.project,worker = f.worker
             _ = try call("policy_apply",["project_id":p["id"]!,"expected_revision":p["revision"]!,"policy":["required_gates":[]]])
             let batch = try sharedBatch(p,worker),claims = try claimFixedBatch(p,batch,worker)["claims"] as! [JSON]
             XCTAssertEqual(try call("batch_get",["project_id":p["id"]!,"batch_id":batch["id"]!])["lifecycle"] as? String,"claimed")
@@ -60,7 +63,6 @@ extension CoreTests {
             // A historical attempt is sufficient even if its dispatch receipt is absent.
             try router.dbQueue.write {try $0.execute(sql:"DELETE FROM records WHERE type='batch_claim' AND project_id=?",arguments:[p["id"] as! String])}
             assertCode("BATCH_ALREADY_CLAIMED") {_ = try self.discardBatch(p,batch,worker)}
-        }
     }
     func testDiscardInputAuthorityAndRevisionRefusalsHaveNoEffects() throws {
         let p = try cohortProject(),foreign = try cohortProject(),worker = try cohortWorker(p),batch = try sharedBatch(p,worker),before = try batchClaimState(p,batch)

@@ -1,3 +1,4 @@
+import ChecklistTestSupport
 import Foundation
 import XCTest
 import GRDB
@@ -146,6 +147,19 @@ final class MediaLinkedTaskCleanupTests: XCTestCase {
         _ = try results.link(f,round,task)
         return (task,round,try XCTUnwrap(f.rows("attachment").first))
     }
+    private static let imageRoundPhase = TestStore.Template(name:"media-linked-task-image-round") {router,workspace in
+        let f = try Fixture(router:router,workspace:workspace)
+        _ = try MediaLinkedTaskCleanupTests().imageRound(f)
+    }
+    /// Immutable accepted-image prerequisites serve cleanup and link matrices.
+    /// Each caller keeps private managed bytes and its own Trash destination.
+    func imageFixture() throws -> (Fixture,JSON,JSON,JSON) {
+        let f = try Fixture(template:Self.imageRoundPhase)
+        let trash = f.base.appendingPathComponent("owned-media-trash",isDirectory:true)
+        try FileManager.default.createDirectory(at:trash,withIntermediateDirectories:true)
+        f.router.ticketCleanupTrashRoot = trash
+        return (f,try XCTUnwrap(f.rows("task").first),try XCTUnwrap(f.rows("media_round").first),try XCTUnwrap(f.rows("attachment").first))
+    }
     func cleanupPlan(_ f: Fixture,_ task: JSON) throws -> TicketPurgePlan {
         try f.router.dbQueue.read {db in
             let current = try f.router.record(db,task["id"] as! String,type:"task")
@@ -154,7 +168,7 @@ final class MediaLinkedTaskCleanupTests: XCTestCase {
     }
 
     func testManagedOriginalHandoffUsesExistingBackupProtectedDoneCleanupAndKeepsHistory() throws {
-        let f = try Fixture(),(task,round,attachment) = try imageRound(f)
+        let (f,task,round,attachment) = try imageFixture()
         let original = f.router.ownerManagedPathProjection(attachment,caller:f.owner)["path"] as! String
         let decisions = try f.rows("media_owner_decision").map {try jsonString($0)}
         try done(f,task)
@@ -186,7 +200,7 @@ final class MediaLinkedTaskCleanupTests: XCTestCase {
     }
 
     func testSharedSuccessorAndReaderLeaseKeepOriginalAfterLinkedTaskDone() throws {
-        let f = try Fixture(),(task,round,attachment) = try imageRound(f)
+        let (f,task,round,attachment) = try imageFixture()
         let view = try f.get(round),item = try XCTUnwrap((view["items"] as? [JSON])?.first)
         var successor = f.observation(view);successor["source_round_id"] = successor.removeValue(forKey:"round_id")
         successor["manifest_id"] = (view["manifest"] as! JSON)["id"]!;successor["manifest_digest"] = (view["manifest"] as! JSON)["digest"]!
@@ -209,7 +223,7 @@ final class MediaLinkedTaskCleanupTests: XCTestCase {
     }
 
     func testMediaTrashIntentReconcilesAlreadyMovedDestinationAfterRestart() throws {
-        let f = try Fixture(),(task,_,attachment) = try imageRound(f)
+        let (f,task,_,attachment) = try imageFixture()
         let trash = try XCTUnwrap(f.router.ticketCleanupTrashRoot)
         try done(f,task)
         try ticketCleanupBackupTemplate(f.router,objects:cleanupPlan(f,task).byteDeletion.objects)
@@ -243,7 +257,7 @@ final class MediaLinkedTaskCleanupTests: XCTestCase {
     }
 
     func testSharedOriginalBecomesTrashEligibleWhenBothLinkedTasksAreDone() throws {
-        let f = try Fixture(),(firstTask,round,attachment) = try imageRound(f)
+        let (f,firstTask,round,attachment) = try imageFixture()
         let path = try XCTUnwrap(ManagedPaths.resolve(try XCTUnwrap(attachment["path"] as? String),family:"objects",root:f.root)).path
         let view = try f.get(round),item = (view["items"] as! [JSON])[0]
         var p = f.observation(view);p["source_round_id"] = p.removeValue(forKey:"round_id")
@@ -264,7 +278,7 @@ final class MediaLinkedTaskCleanupTests: XCTestCase {
 
     func testUncommittedTrashFolderWithMissingOrCorruptMarkerIsRetainedAndRetryUsesFreshFolder() throws {
         for corruptMarker in [false,true] {
-            let f = try Fixture(),(task,_,attachment) = try imageRound(f)
+            let (f,task,_,attachment) = try imageFixture()
             try done(f,task)
             try ticketCleanupBackupTemplate(f.router,objects:cleanupPlan(f,task).byteDeletion.objects)
             try f.router.runTicketLifecycleCleanup()
@@ -326,7 +340,7 @@ final class MediaLinkedTaskCleanupTests: XCTestCase {
     }
 
     func testPreHandoffNonTrashTicketIntentCannotUnlinkCurrentMarkedMediaOwner() throws {
-        let f = try Fixture(),(task,_,attachment) = try imageRound(f)
+        let (f,task,_,attachment) = try imageFixture()
         try done(f,task)
         try ticketCleanupBackupTemplate(f.router,objects:cleanupPlan(f,task).byteDeletion.objects)
         try f.router.runTicketLifecycleCleanup()

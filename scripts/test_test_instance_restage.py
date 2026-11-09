@@ -101,6 +101,7 @@ class RestageTests(unittest.TestCase):
                      'Sources/ChecklistIPC/LocalPlatformServices.swift', 'Sources/ChecklistCLI/ChecklistCommand.swift', 'Sources/ChecklistCore/GroupKeys.swift',
                      'Sources/ChecklistCore/GRDBRecordEnvelopeAdapter.swift', 'Sources/ChecklistCore/RecordEnvelope.swift']:
             self.assertTrue(policy.sensitive_paths([path]), path)
+        self.assertTrue(policy.sensitive_paths(['script/upgrade_offline.py']))
         self.assertEqual(policy.sensitive_paths(['Sources/ChecklistApp/Views/View.swift']), [])
         for path in ['Sources/ChecklistCore/StorageBootstrap.swift', 'Sources/ChecklistCore/SchemaMigrations.swift']:
             file = self.target / 'source' / path

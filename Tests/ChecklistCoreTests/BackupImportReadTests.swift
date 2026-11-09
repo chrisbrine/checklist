@@ -87,8 +87,11 @@ final class BackupImportReadTests: XCTestCase {
     }
 
     func testImportReadAuthorizationRechecksCurrentSessionAndPolicyDuringCapture() throws {
+        let (f,p,preview,receipt) = try fixture(),caller = try worker(f,p),router = f.router!
+        let original = try router.dbQueue.read {db in
+            (try router.record(db,p["id"] as! String,type:"project"),try router.record(db,caller.sessionID!,type:"session"))
+        }
         for scenario in ["revoked","ended","role","quarantined","domain","policy","missing"] {
-            let (f,p,preview,receipt) = try fixture(),caller = try worker(f,p),router = f.router!
             _ = try f.call("import_preview",preview,caller:caller)
             _ = try f.call("import_receipt_get",receipt,caller:caller)
             try router.dbQueue.write {db in
@@ -111,6 +114,17 @@ final class BackupImportReadTests: XCTestCase {
                 for (method,params) in [("import_preview",preview),("import_receipt_get",receipt)] {
                     XCTAssertThrowsError(try f.call(method,params,caller:caller)) {XCTAssertEqual(($0 as? CoreError)?.code,code,scenario)}
                 }
+            }
+            // Each refusal starts from the same real committed import/session.
+            // Restore exact authority bytes, including a deleted session, before
+            // the next scenario's successful public reads warm the read path.
+            try router.dbQueue.write {db in
+                try router.save(db,original.0,type:"project")
+                try router.save(db,original.1,type:"session")
+            }
+            try router.dbQueue.read {db in
+                XCTAssertEqual(try jsonString(router.record(db,p["id"] as! String,type:"project")),try jsonString(original.0))
+                XCTAssertEqual(try jsonString(router.record(db,caller.sessionID!,type:"session")),try jsonString(original.1))
             }
         }
     }

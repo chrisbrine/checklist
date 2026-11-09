@@ -9,11 +9,29 @@ final class MediaReworkTests: XCTestCase {
     typealias Fixture = MediaRoundTests.Fixture
     let checks = MediaRoundTests()
 
+    private static func publishedPhase(_ count: Int) -> TestStore.Template {
+        TestStore.Template(name:"media-rework-published-\(count)") {router,workspace in
+            let checks = MediaRoundTests(),f = try Fixture(router:router,workspace:workspace)
+            let t = try f.type(checks.schema()),r = try f.round(t)
+            for index in 0..<count { _ = try f.item(r,title:"Item \(index)",texts:["Exact \(index)\r\n"]) }
+            _ = try f.publish(r)
+        }
+    }
+    private static let publishedTwo = publishedPhase(2)
+    private static let publishedThree = publishedPhase(3)
+    private static let publishedFive = publishedPhase(5)
+
     func setup(_ count: Int) throws -> (Fixture,JSON,JSON,[String]) {
-        let f = try Fixture(),t = try f.type(checks.schema()),r = try f.round(t)
-        for index in 0..<count { _ = try f.item(r,title:"Item \(index)",texts:["Exact \(index)\r\n"]) }
-        let published = try f.publish(r)
-        return (f,t,published,(published["items"] as! [JSON]).map {$0["id"] as! String})
+        let phase: TestStore.Template
+        switch count {
+        case 2: phase = Self.publishedTwo
+        case 3: phase = Self.publishedThree
+        case 5: phase = Self.publishedFive
+        default: phase = Self.publishedPhase(count)
+        }
+        let f = try Fixture(template:phase),t = try XCTUnwrap(f.rows("media_review_type").first)
+        let r = try f.get(XCTUnwrap(f.rows("media_round").first))
+        return (f,t,r,(r["items"] as! [JSON]).map {$0["id"] as! String})
     }
     func epic(_ f: Fixture,_ name: String = "Media rework") throws -> String {
         (try f.storage.call("epic_create",["project_id":f.project,"name":name])["data"] as! JSON)["id"] as! String

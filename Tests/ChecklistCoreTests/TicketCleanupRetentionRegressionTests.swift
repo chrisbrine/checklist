@@ -7,7 +7,8 @@ import Darwin
 /// A completed-backup template for deletion-engine tests. Its managed payloads
 /// are independent immutable entries, so the real no-follow verifier still
 /// checks every selected byte. Full snapshot/restore uses the real route below.
-func ticketCleanupBackupTemplate(_ router: CommandRouter,objects: [JSON]) throws {
+@discardableResult
+func ticketCleanupBackupTemplate(_ router: CommandRouter,objects: [JSON]) throws -> URL {
     let directory = router.root.appendingPathComponent("backups/template-" + uuid())
     try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true)
     let source = try StorageObjectFiles(root:router.root),copy = try StorageObjectFiles(root:directory,batchSynchronization:true)
@@ -38,6 +39,7 @@ func ticketCleanupBackupTemplate(_ router: CommandRouter,objects: [JSON]) throws
     try write("manifest.json",manifestBytes)
     let generation: JSON = ["state":"complete","objects":entries,"manifest_sha256":manifest,"summary":["path":directory.path,"manifest_sha256":manifest,"verification":"manifest_database_managed_files"]]
     try router.dbQueue.write {try $0.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["backup-generation:" + uuid(),try jsonString(generation)])}
+    return directory
 }
 
 extension PurgeByteDeletionTests {
@@ -166,11 +168,12 @@ extension TicketLifecycleCleanupTests {
 
     func testP321MissingAndChangedBackupPayloadsRetainTheLiveOriginal() throws {
         for failure in ["payload_missing","payload_changed","manifest_missing","manifest_changed"] {
-            let (project,_,attachment) = try fixture(backed:false)
-            let backup = directory.appendingPathComponent("p321-unavailable-" + uuid())
-            _ = try call("backup_create",["path":backup.path])
-            _ = try configure(project);try router.runTicketLifecycleCleanup()
+            let (project,_,attachment) = try independentFixture(backed:false)
             let relative = try XCTUnwrap(ManagedPaths.relative(attachment["path"] as! String,family:"objects",root:router.root))
+            // Corrupt a genuine independent payload/manifest after lifecycle
+            // preparation, without rebuilding a full snapshot for each row.
+            let backup = try ticketCleanupBackupTemplate(router,objects:[["relative_path":relative,"sha256":attachment["sha256"]!,"size":attachment["size"]!,"kind":"file"]])
+            _ = try configure(project);try router.runTicketLifecycleCleanup()
             let retained = backup.appendingPathComponent(failure.hasPrefix("manifest") ? "manifest.json" : "managed/" + relative)
             if failure.hasSuffix("changed") {try Data("wrong evidence".utf8).write(to:retained)}
             else {try FileManager.default.removeItem(at:retained)}

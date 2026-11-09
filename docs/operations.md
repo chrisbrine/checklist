@@ -125,3 +125,54 @@ After the ticket records are permanently removed, Checklist cleans up managed or
 ## CLI JSON results
 
 Every successful `checklist call` result is one RFC 8259 JSON value followed by a newline. Literal U+0000–U+001F inside string keys or values are escaped at the CLI output boundary; existing escapes and formatting whitespace outside strings are preserved. Standard strict JSON parsers can consume the output. MCP tool/resource JSON and SDK protocol frames have separate control-character regression coverage.
+
+## Diagnose new CLI process latency (CL-375)
+
+Run an exact executable from the caller's actual workspace with
+`CHECKLIST_TIMING=1`. Diagnostics go to stderr as `ChecklistTiming` JSON lines.
+The semantic command reply stays on stdout. No credential or workspace is added
+to the timing fields. Without the switch, replies carry no timing trailer.
+
+The launcher records its monotonic spawn time. `cli_setup.main_entered_uptime_s`
+marks CLI entry. Each `ipc` diagnostic records `sent_uptime_s`, the reply callback's
+`reply_received_uptime_s` and `waiter_resumed_uptime_s`. The nested service timing
+records `received_uptime_s`, `coordinator_dequeued_uptime_s` and
+`reply_ready_uptime_s`. `coordinator_queue_wait_ms` and `worker_queue_wait_ms`
+separate the two queues; `queue_wait_ms` remains their sum.
+
+The service's `admission` object records listener entry, identity-check start and
+finish, admission to the peer, and whether the executable identity cache hit.
+Admission precedes the first request's switch, so it retains four monotonic
+stamps per connection even for untimed clients. A request also takes one dequeue stamp before decoding its opt-in switch.
+The new client callback stamps and the timing trailer are opt-in. The exact code-sign requirement remains enforced
+on each XPC message. A cache hit does not bypass that requirement.
+
+Use these boundaries to split send-to-receipt delivery around listener admission.
+A connection can be admitted before send; intersect its admission interval with
+the send-to-receipt interval before subtracting it. The remaining delivery time
+includes XPC's per-message signature enforcement and OS scheduling. The identity
+reader's wall interval includes scheduling too; it is not isolated signing CPU.
+Reply delivery runs from `reply_ready_uptime_s` to the client's reply callback,
+including the small timing-trailer encoding. Callback-to-waiter time is separate.
+Do not add nested execution or route durations to the enclosing service interval.
+
+`script/measure_cli_latency.py` starts at least 50 fresh CLI processes and saves
+complete replies, timing lines, process lifetimes and host load outside the source
+checkout. It never starts a backup or changes a ticket. Its `calls` mode can
+require an already-running authorized backup at both series boundaries. Its
+`burst` mode runs ten task-scoped `cleanup_job_list` calls beside `service_info`
+and `task_get`. A refused cleanup list is a failed check. Process overlap and
+service-request overlap are separate observations. See `--help` for exact flags.
+
+Cleanup-job metadata already runs on pooled read connections. `cleanup_job_list`
+and `cleanup_job_get` now skip the serial post-command mutation hooks: these reads
+create no change, delivery or storage deadline. Cancellation, retry, archive,
+writes and managed read/preview paths retain their hooks. This removes redundant
+change-wait, native-dispatch, storage-planning and health work from the coordinator
+queue ahead of later calls. It does not move mutable coordinator state to workers.
+
+First enrollment also uses a fresh owner-only lookup of the selected canonical
+session ID. It previously built the full owner snapshot on the coordinator just
+to detect an existing session, blocking every other bootstrap behind task/context
+projection. The selected lookup keeps the global collision check, including
+ended/revoked sessions and other projects, and retains storage admission.

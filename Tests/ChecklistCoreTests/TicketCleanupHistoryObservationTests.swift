@@ -79,6 +79,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testP321SharedHistoryBoundsRefuseOnlyOversizedTicket() throws {
+        try QualificationSuite.requireEnabled()
         let (project,first,_) = try fixture(),pid = project["id"] as! String,tid = first["id"] as! String
         let second = try call("task_create",["project_id":pid,"title":"Unaffected history owner"]),other = second["id"] as! String
         let padding = String(repeating:"x",count:3_000_000)
@@ -107,6 +108,7 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testP321ExactHistoryAdmissionDoesNotStarveTicketWithLargeForeignProtectedHistory() throws {
+        try QualificationSuite.requireEnabled()
         let (project,first,_) = try fixture(category:"canceled",age:20),pid = project["id"] as! String,tid = first["id"] as! String
         let second = try call("task_create",["project_id":pid,"title":"Foreign protection owner"]),shared = uuid()
         let padding = String(repeating:"x",count:3_000_000)

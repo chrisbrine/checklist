@@ -23,6 +23,6 @@ final class StorageBackupIncompletePublicationTests: XCTestCase {
         XCTAssertEqual(marker?["state"] as? String,"failed")
         XCTAssertThrowsError(try f.router!.handle(method:"restore_preview",params:["path":failed.path],caller:f.owner))
         let preview = try f.router!.backupPrunePreview()
-        XCTAssertTrue((preview["snapshots"] as? [JSON] ?? []).contains {$0["path"] as? String == failed.path && $0["state"] as? String == "unrecorded_or_incomplete"})
+        XCTAssertTrue((preview["snapshots"] as? [JSON] ?? []).contains {$0["path"] as? String == failed.path && $0["state"] as? String == "incomplete"})
     }
 }
