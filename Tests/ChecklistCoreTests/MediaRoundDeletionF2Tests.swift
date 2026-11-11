@@ -204,7 +204,7 @@ extension MediaRoundDeletionTests {
         try f.router.dbQueue.writeWithoutTransaction {db in
             let changes = MediaRoundDeletionChanges(),version = try changes.install(db)
             defer {try? changes.remove(db)}
-            let fence = try MediaRoundDeletionFence(db,ids:[],events:[],commands:[],needles:[Data("00000000-0000-0000-0000-000000000453".utf8)],holdDigests:[],filePaths:[])
+            let fence = try MediaRoundDeletionFence(db,ids:[],events:[],commands:[],needles:[Data("00000000-0000-0000-0000-000000000453".utf8)],pendingRequestTasks:[],holdDigests:[],filePaths:[])
             let recordID = uuid(),eventID = uuid(),commandID = uuid()
             try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES(?,?,'message',1,?)",arguments:[recordID,f.project,try jsonString(["id":recordID,"project_id":f.project,"revision":1,"body":"Unrelated fixture payload"])])
             try db.execute(sql:"INSERT INTO events(id,project_id,entity_id,actor,kind,occurred_at,data) VALUES(?,?,NULL,'fixture','message_saved',?,?)",arguments:[eventID,f.project,now(),try jsonString(["message_id":recordID])])
@@ -239,7 +239,7 @@ extension MediaRoundDeletionTests {
             try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES(CAST(? AS TEXT),?,'message',1,?)",arguments:[Data(oldID.utf8),f.project,try jsonString(["id":oldID,"project_id":f.project,"revision":1,"references":[target]])])
             let changes = MediaRoundDeletionChanges(),version = try changes.install(db)
             defer {try? changes.remove(db)}
-            let fence = try MediaRoundDeletionFence(db,ids:[],events:[],commands:[],needles:[Data(target.utf8)],holdDigests:[],filePaths:[])
+            let fence = try MediaRoundDeletionFence(db,ids:[],events:[],commands:[],needles:[Data(target.utf8)],pendingRequestTasks:[],holdDigests:[],filePaths:[])
             try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES(CAST(? AS TEXT),?,'message',1,?)",arguments:[Data(changedID.utf8),f.project,try jsonString(["id":changedID,"project_id":f.project,"revision":1,"body":"An unrelated changed neighbor"])])
             XCTAssertNoThrow(try fence.validate(db,changes:changes,writerVersion:version),"A byte-distinct unchanged neighbor must not become a new reference")
         }

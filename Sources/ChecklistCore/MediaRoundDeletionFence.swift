@@ -44,11 +44,12 @@ struct MediaRoundDeletionFence {
     let events: [Data:Data]
     let commands: [(String,Data,Data)]
     let needles: Set<Data>
+    let pendingRequestTasks: Set<Data>
     let holdDigests: Set<Data>
     let filePaths: [String]
     let workspaceProtections: Set<Data>
 
-    init(_ db: Database,ids: Set<Data>,events: [String],commands: [(String,String)],needles: Set<Data>,holdDigests: Set<Data>,filePaths: [String]) throws {
+    init(_ db: Database,ids: Set<Data>,events: [String],commands: [(String,String)],needles: Set<Data>,pendingRequestTasks: Set<Data>,holdDigests: Set<Data>,filePaths: [String]) throws {
         var records: [Data:Record] = [:],history: [Data:Data] = [:],receipts: [(String,Data,Data)] = []
         for id in ids {
             guard let row = try Row.fetchOne(db,sql:"SELECT revision,CAST(data AS BLOB) data,CAST(type AS BLOB) type,CAST(project_id AS BLOB) project FROM records WHERE id=CAST(? AS TEXT)",arguments:[id]) else {throw Self.changed("planned_record_missing",type:"record",id:id)}
@@ -65,6 +66,7 @@ struct MediaRoundDeletionFence {
             receipts.append((principal,id,MediaPreparationOverlay.digest(data)))
         }
         self.records = records;self.events = history;self.commands = receipts;self.needles = needles;self.holdDigests = holdDigests
+        self.pendingRequestTasks = pendingRequestTasks
         self.filePaths = filePaths;workspaceProtections = try Self.workspaceProtections(db,paths:filePaths)
     }
     static func changed(_ check: String,type: String,id: Data) -> CoreError {
@@ -111,20 +113,24 @@ struct MediaRoundDeletionFence {
             guard let data = try Data.fetchOne(db,sql:"SELECT CAST(json_array(digest,result) AS BLOB) FROM commands WHERE principal=? AND command_id=CAST(? AS TEXT)",arguments:[principal,id]),MediaPreparationOverlay.digest(data) == digest else {throw Self.changed("planned_command_changed",type:"command",id:id)}
         }
         let tokens = try jsonString(needles.map {String(decoding:$0,as:UTF8.self)}),digests = try jsonString(holdDigests.map {String(decoding:$0,as:UTF8.self)})
+        let tasks = try jsonString(pendingRequestTasks.map {String(decoding:$0,as:UTF8.self)})
         // Match complete text atoms AND dictionary keys as in the preparation
         // stream. SQL keeps even a large unrelated changed row out of Swift.
         for (table,kind,key,payload) in [("records",0,"id","data"),("events",1,"id","data"),("commands",2,"command_id","result")] {
             let principal = kind == 2 ? " AND r.principal=c.principal" : ""
             let holds = kind == 0 ? " OR (r.type='storage_hold' AND CAST(token AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?)))" : ""
+            // Linked tickets only gate pending owner requests in preparation.
+            // Their ordinary notes, events and receipts are not media references.
+            let pending = kind == 0 ? " OR (r.type='request' AND json_extract(r.data,'$.state')='pending' AND CAST(json_extract(r.data,'$.task_id') AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?)))" : ""
             let entity = kind == 1 ? " OR CAST(r.entity_id AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))" : ""
             var arguments: [DatabaseValueConvertible] = [tokens]
-            if kind == 0 {arguments.append(digests)}
+            if kind == 0 {arguments.append(digests);arguments.append(tasks)}
             if kind == 1 {arguments.append(tokens)}
             let sql = """
                 SELECT CAST(r.\(key) AS BLOB) id,\(kind == 0 ? "r.type" : kind == 1 ? "'event'" : "'command'") type FROM \(changes.name) c JOIN \(table) r ON r.\(key)=CAST(c.id AS TEXT)\(principal)
                 WHERE c.kind=\(kind) AND (NOT json_valid(r.\(payload)) OR EXISTS(
                     SELECT 1 FROM (SELECT j.atom token FROM json_tree(r.\(payload)) j WHERE j.type='text' UNION ALL SELECT j.key FROM json_tree(r.\(payload)) j WHERE typeof(j.key)='text')
-                    WHERE CAST(token AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))\(holds))\(entity)) LIMIT 1
+                    WHERE CAST(token AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))\(holds))\(pending)\(entity)) LIMIT 1
                 """
             if let row = try Row.fetchOne(db,sql:sql,arguments:StatementArguments(arguments)) {throw Self.changed("changed_reference",type:row["type"],id:row["id"])}
         }

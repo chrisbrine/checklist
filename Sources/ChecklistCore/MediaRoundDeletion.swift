@@ -365,7 +365,7 @@ extension CommandRouter {
         }
         let counts = removed.reduce(into:[String:Int]()) {$0[$1.type,default:0] += 1}
         observedIDs.formUnion(owned)
-        let fence = try MediaRoundDeletionFence(db,ids:observedIDs,events:events,commands:commands,needles:needles.union(tasks).union(attachmentIDs),holdDigests:holdDigests,filePaths:objects.compactMap {($0["relative_path"] as? String).map {root.appendingPathComponent($0).path}})
+        let fence = try MediaRoundDeletionFence(db,ids:observedIDs,events:events,commands:commands,needles:needles,pendingRequestTasks:tasks,holdDigests:holdDigests,filePaths:objects.compactMap {($0["relative_path"] as? String).map {root.appendingPathComponent($0).path}})
         let historyFinished = ProcessInfo.processInfo.systemUptime
         let audit: JSON = ["deleted":true,"round_id":rid,"project_id":project,"actor":c.principal,"actor_kind":c.isOwner ? "owner" : "agent","reason":reason,"counts":counts,"kept_attachments":keptAudit,
             "preparation_seconds":historyFinished-started,"preparation_timings":["graph_seconds":graphFinished-started,"references_seconds":referencesFinished-graphFinished,"cleanup_seconds":cleanupFinished-referencesFinished,"history_seconds":historyFinished-cleanupFinished]]
