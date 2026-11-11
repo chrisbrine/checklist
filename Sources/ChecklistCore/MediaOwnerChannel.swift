@@ -14,7 +14,7 @@ extension CommandRouter {
         // CL-318/CL-349: frozen bulk decisions and one-press suggestion adoption, owner only.
         "media_bulk_prepare", "media_bulk_apply", "media_adopt_suggestion", "media_suggestion_dismiss", "media_decision_withdraw",
         // CL-427: link the ticket that owns the takes; sending owner decisions stays owner only.
-        "media_round_link_task", "media_item_link_task", "media_round_send_result"
+        "media_round_link_task", "media_item_link_task", "media_round_send_result", "media_round_delete"
     ])
     func executeMediaOwnerChannel(method: String, params p: JSON, caller c: Caller) throws -> JSON {
         try owner(c)

@@ -25,7 +25,7 @@ final class StorageDeadlineReadTests: XCTestCase {
         let readers = try XCTUnwrap(router.readers)
         let statements = LockedTestState<[String]>([])
         try readers.read { db in
-            db.trace { if case .statement(let statement) = $0 { statements.withLock { $0.append(statement.sql) } } }
+            db.trace { if case .statement(let statement) = $0 { statements.withLock { $0.append(statement.expandedSQL) } } }
         }
         _ = try router.nextArchiveCleanupDeadline()
         try readers.read { $0.trace(options:[]) }
@@ -33,7 +33,7 @@ final class StorageDeadlineReadTests: XCTestCase {
         XCTAssertEqual(metadata.count,4)
         try readers.read { db in
             for sql in metadata {
-                let plan = try Row.fetchAll(db,sql:"EXPLAIN QUERY PLAN " + sql,arguments:sql.contains("expires_at") ? [Date().timeIntervalSince1970] : [])
+                let plan = try Row.fetchAll(db,sql:"EXPLAIN QUERY PLAN " + sql)
                 XCTAssertTrue(plan.contains { ($0["detail"] as String).contains("COVERING INDEX records_scope") })
                 XCTAssertTrue(plan.contains { ($0["detail"] as String).contains("INTEGER PRIMARY KEY") })
             }

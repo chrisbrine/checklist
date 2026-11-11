@@ -5,6 +5,7 @@ import Foundation
 public enum MediaWorkerContract {
     public static let readMethods: Set<String> = [
         "media_type_list", "media_type_get", "media_round_get", "media_intake_get", "media_decision_list",
+        "media_round_deletion_get",
         // CL-420: the read-only rework preview supplies the exact preview_digest for media_rework_create.
         "media_rework_preview",
     ]
@@ -24,6 +25,8 @@ public enum MediaWorkerContract {
         "media_rework_create", "media_type_restore",
         // CL-427: a round may name the ticket that owns its takes; creating and linking use the same gate.
         "media_round_create", "media_round_link_task", "media_item_link_task",
+        // CL-446: permanent closed-round record deletion uses the same project setting gate.
+        "media_round_delete",
     ]
 
     public struct ValidationError: Error, CustomStringConvertible, Sendable {
@@ -83,10 +86,10 @@ public enum MediaWorkerContract {
         case "media_type_restore":
             properties["type_id"] = text(4_000); properties["expected_revision"] = revision
             required += ["type_id", "expected_revision"]
-        case "media_round_cancel", "media_round_archive":
+        case "media_round_cancel", "media_round_archive", "media_round_delete":
             properties["round_id"] = text(4_000); properties["expected_revision"] = revision
             required += ["round_id", "expected_revision"]
-            if method == "media_round_cancel" { properties["reason"] = text(4_000); required += ["reason"] }
+            if method != "media_round_archive" { properties["reason"] = text(4_000); required += ["reason"] }
         case "media_round_finish":
             properties["round_id"] = text(4_000); properties["expected_revision"] = revision
             properties["observed_context_token"] = text(65_536)
@@ -116,6 +119,8 @@ public enum MediaWorkerContract {
                 "item_id": text(4_000), "expected_revision": revision, "decision_id": text(4_000),
             ], required: ["item_id", "expected_revision", "decision_id"])]
             required += ["round_id", "expected_revision", "observed_context_token", "manifest_id", "manifest_digest", "epic_id", "preview_digest", "items"]
+        case "media_round_deletion_get":
+            properties["round_id"] = text(4_000); required += ["round_id"]
         case "media_round_get", "media_decision_list":
             properties["round_id"] = text(4_000)
             properties["cursor"] = text(method == "media_round_get" ? 1_400_000 : 512)

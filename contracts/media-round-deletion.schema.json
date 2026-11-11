@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://checklist.local/contracts/media-round-deletion.schema.json",
+  "title": "Guarded media round deletion and content-free cleanup outcome (CL-446)",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "delete": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "const": "media_round_delete"
+        },
+        "params": {
+          "$ref": "#/$defs/delete"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ]
+    },
+    "read": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "const": "media_round_deletion_get"
+        },
+        "params": {
+          "$ref": "#/$defs/read"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ]
+    },
+    "result": {
+      "$ref": "#/$defs/summary"
+    }
+  },
+  "required": [
+    "delete",
+    "read",
+    "result"
+  ],
+  "$defs": {
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000,
+      "pattern": "\\S"
+    },
+    "delete": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "$ref": "#/$defs/text"
+        },
+        "round_id": {
+          "$ref": "#/$defs/text"
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "reason": {
+          "$ref": "#/$defs/text"
+        },
+        "command_id": {
+          "type": "string",
+          "format": "uuid",
+          "minLength": 1,
+          "maxLength": 100
+        }
+      },
+      "required": [
+        "project_id",
+        "round_id",
+        "expected_revision",
+        "reason",
+        "command_id"
+      ]
+    },
+    "read": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "$ref": "#/$defs/text"
+        },
+        "round_id": {
+          "$ref": "#/$defs/text"
+        }
+      },
+      "required": [
+        "project_id",
+        "round_id"
+      ]
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "relative_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))\\S"
+        },
+        "representation": {
+          "$ref": "#/$defs/text"
+        },
+        "status": {
+          "enum": [
+            "moved",
+            "held",
+            "kept"
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/text"
+        },
+        "reasons": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/text"
+          }
+        }
+      },
+      "required": [
+        "representation",
+        "status",
+        "reason",
+        "reasons"
+      ]
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Content-free semantic result shared by media_round_delete and media_round_deletion_get. The later read reports current cleanup outcomes.",
+      "properties": {
+        "deleted": {
+          "const": true
+        },
+        "project_id": {
+          "$ref": "#/$defs/text"
+        },
+        "round_id": {
+          "$ref": "#/$defs/text"
+        },
+        "actor": {
+          "$ref": "#/$defs/text"
+        },
+        "actor_kind": {
+          "enum": [
+            "agent",
+            "owner"
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/text"
+        },
+        "counts": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "description": "Counts of removed records by registered family, including the round."
+        },
+        "byte_deletion_receipt_id": {
+          "$ref": "#/$defs/text"
+        },
+        "cleanup_state": {
+          "$ref": "#/$defs/text"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/file"
+          }
+        }
+      },
+      "required": [
+        "deleted",
+        "project_id",
+        "round_id",
+        "actor",
+        "actor_kind",
+        "reason",
+        "counts",
+        "byte_deletion_receipt_id",
+        "cleanup_state",
+        "files"
+      ]
+    }
+  }
+}

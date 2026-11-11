@@ -114,18 +114,18 @@ extension CommandRouter {
     static let ticketObjectDeletionReadySQL = """
         json_valid(records.data) AND json_extract(records.data,'$.kind')='ticket_object_delete' AND (
             json_extract(records.data,'$.state')='pending' OR (
-                json_extract(records.data,'$.state')='completed' AND json_extract(records.data,'$.cause') IN ('task_purge','done_evidence')
+                json_extract(records.data,'$.state')='completed' AND json_extract(records.data,'$.cause') IN ('task_purge','done_evidence','media_round_delete')
                 AND EXISTS(SELECT 1 FROM json_each(records.data,'$.objects') object WHERE json_extract(object.value,'$.state')='retained'
                     AND json_type(object.value,'$.reasons')='array' AND json_array_length(object.value,'$.reasons')>0
                     AND NOT EXISTS(SELECT 1 FROM json_each(object.value,'$.reasons') reason WHERE reason.type!='text' OR (reason.value NOT IN ('backup_authority','remaining_record','backup_required','backup_copy_unavailable','backup_authority_unavailable') AND reason.value NOT GLOB 'backup_index_error:*' AND reason.value NOT GLOB 'backup_copy_unverified:*'))
                     AND (
-                        (json_extract(records.data,'$.cause')='task_purge' AND (COALESCE(json_extract(records.data,'$.cleanup_policy_version'),0)<2 OR COALESCE((SELECT CAST(value AS INTEGER) FROM metadata WHERE key='ticket-cleanup-backup-seen:'||records.id),-1)<COALESCE((SELECT MAX(rowid) FROM metadata WHERE key GLOB 'backup-generation:*' AND json_valid(value) AND json_extract(value,'$.state')='complete'),0)))
+                        (json_extract(records.data,'$.cause') IN ('task_purge','media_round_delete') AND (COALESCE(json_extract(records.data,'$.cleanup_policy_version'),0)<2 OR COALESCE((SELECT CAST(value AS INTEGER) FROM metadata WHERE key='ticket-cleanup-backup-seen:'||records.id),-1)<COALESCE((SELECT MAX(rowid) FROM metadata WHERE key GLOB 'backup-generation:*' AND json_valid(value) AND json_extract(value,'$.state')='complete'),0)))
                         OR (COALESCE(json_extract(records.data,'$.cleanup_policy_version'),0)>=2
                             AND NOT EXISTS(SELECT 1 FROM metadata WHERE key='ticket-cleanup-copy-retry-seen:'||records.id)
                             AND EXISTS(SELECT 1 FROM json_each(object.value,'$.reasons') reason WHERE reason.value='backup_copy_unavailable'))
                         OR EXISTS(SELECT 1 FROM json_each(object.value,'$.reasons') reason WHERE reason.value IN ('backup_copy_unverified:POSIX_24','backup_copy_unverified:POSIX_23','backup_copy_unverified:POSIX_4','backup_copy_unverified:deadline'))
                     ))
-            ))
+            ) OR (\(mediaRoundDeletionReaderReadySQL)))
         """
     func rearmTicketObjectCopyFailures(_ db: Database,receipt: inout JSON,backupGenerationRow: Int64? = nil) throws {
         guard let id = receipt["id"] as? String else {return}
@@ -135,7 +135,7 @@ extension CommandRouter {
         // continue. Recheck its retryable holds once per completed generation;
         // older jobs without a marker get one check against existing backups.
         let pendingDone = policy >= 2 && receipt["state"] as? String == "pending" && receipt["cause"] as? String == "done_evidence"
-        if pendingDone || receipt["state"] as? String == "completed" && receipt["cause"] as? String == "task_purge" {
+        if pendingDone || receipt["state"] as? String == "completed" && ["task_purge","media_round_delete"].contains(receipt["cause"] as? String ?? "") {
             let seen = try Int64.fetchOne(db,sql:"SELECT CAST(value AS INTEGER) FROM metadata WHERE key=?",arguments:["ticket-cleanup-backup-seen:" + id]) ?? -1
             let generation = try backupGenerationRow ?? ticketCleanupBackupGenerationRow(db)
             generationRetry = policy < 2 || seen < generation
@@ -146,6 +146,10 @@ extension CommandRouter {
         var objects = receipt["objects"] as? [JSON] ?? []
         for i in objects.indices where objects[i]["state"] as? String == "retained" {
             let reasons = Set(objects[i]["reasons"] as? [String] ?? [])
+            if receipt["cause"] as? String == "media_round_delete",reasons.contains("reader_lease"),
+               try mediaRoundDeletionReaderCanResume(db,receipt:id,object:objects[i]) {
+                objects[i]["state"] = "pending";objects[i].removeValue(forKey:"reasons");continue
+            }
             if Self.ticketObjectDeletionReasonsRetryable(reasons),
                (generationRetry || legacy && reasons.contains("backup_copy_unavailable") || reasons.contains(where:TicketCleanupCopyFailure.isTransient)) {
                 objects[i]["state"] = "pending";objects[i].removeValue(forKey:"reasons")
@@ -450,7 +454,7 @@ extension CommandRouter {
         let generation = try ticketCleanupBackupGenerationRow(db)
         let receipt: JSON = ["id":id,"project_id":project,"task_id":task,"kind":Self.ticketObjectDeletionKind,"cause":cause,"state":plan.objects.contains {$0["state"] as? String == "pending"} ? "pending" : "completed","revision":1,"created_at":now(),"objects":plan.objects,"summary":plan.summary,"cleanup_policy_version":2]
         try save(db,receipt,type:"storage_job")
-        if cause == "task_purge" || cause == "done_evidence" {try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-backup-seen:" + id,String(generation)])}
+        if ["task_purge","done_evidence","media_round_delete"].contains(cause) {try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-backup-seen:" + id,String(generation)])}
         return receipt
     }
 

@@ -192,15 +192,23 @@ extension CommandRouter {
 
     /// Structural ownership only. References to a predecessor, approved example
     /// or another round do not bring that independent history into this handoff.
-    private func mediaRoundOwnedHistory(_ db: Database,round: JSON) throws -> [JSON] {
+    func mediaRoundOwnedHistory(_ db: Database,round: JSON,visit: ((JSON) throws -> Void)? = nil) throws -> [JSON] {
         let pid = try StoredRecord(round,family:"media_round").string("project_id"),rid = try StoredRecord(round,family:"media_round").string("id")
         let families = MediaRecordRegistry.families.sorted().map {"'" + $0 + "'"}.joined(separator:",")
         // Materialize structural edges once; a large round must not rescan the
         // project's record corpus for each item in the recursive walk.
-        let sql = "WITH RECURSIVE edges(parent,child) AS MATERIALIZED (SELECT CAST(j.value AS TEXT),r.id FROM records r,json_each(json_array(json_extract(r.data,'$.round_id'),json_extract(r.data,'$.item_id'),json_extract(r.data,'$.intake_id'),json_extract(r.data,'$.operation_id'))) j WHERE r.type IN (" + families + ") AND r.project_id=CAST(? AS TEXT) AND j.type='text'),media_history(id) AS (SELECT CAST(? AS TEXT) UNION SELECT e.child FROM media_history p JOIN edges e ON e.parent=p.id COLLATE BINARY) SELECT " + Self.canonicalRecordColumns + " FROM records WHERE id IN (SELECT id FROM media_history) ORDER BY id COLLATE BINARY LIMIT 100001"
-        let rows = try Row.fetchAll(db,sql:sql,arguments:[Data(pid.utf8),Data(rid.utf8)])
-        guard rows.count <= 100000 else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The media handoff exceeds its bounded history inventory; originals retained.")}
-        return try rows.map {var value = try GRDBRecordEnvelopeAdapter.decode($0).object;value["record_type"] = $0["type"] as String;return value}
+        let sql = "WITH RECURSIVE edges(parent,child) AS MATERIALIZED (SELECT CAST(j.value AS TEXT),r.id FROM records r,json_each(json_array(json_extract(r.data,'$.round_id'),json_extract(r.data,'$.item_id'),json_extract(r.data,'$.intake_id'),json_extract(r.data,'$.plan_id'),json_extract(r.data,'$.operation_id'))) j WHERE r.type IN (" + families + ") AND r.project_id=CAST(? AS TEXT) AND j.type='text'),media_history(id) AS (SELECT CAST(? AS TEXT) UNION SELECT e.child FROM media_history p JOIN edges e ON e.parent=p.id COLLATE BINARY) SELECT " + Self.canonicalRecordColumns + " FROM records WHERE id IN (SELECT id FROM media_history) ORDER BY id COLLATE BINARY LIMIT 100001"
+        let rows = try Row.fetchCursor(db,sql:sql,arguments:[Data(pid.utf8),Data(rid.utf8)])
+        var result: [JSON] = [],count = 0
+        while let raw = try rows.next() {
+            count += 1
+            guard count <= 100000 else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The media handoff exceeds its bounded history inventory; originals retained.")}
+            try autoreleasepool {
+                var value = try GRDBRecordEnvelopeAdapter.decode(raw).object;value["record_type"] = raw["type"] as String
+                if let visit {try visit(value)} else {result.append(value)}
+            }
+        }
+        return result
     }
 
     private func mediaHandOffDoneOriginals(_ db: Database,round original: JSON,taskID: String) throws {

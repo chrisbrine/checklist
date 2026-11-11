@@ -159,6 +159,9 @@ final class BackupImportReadTests: XCTestCase {
         let bulkRound = try f.publish(bulkDraft),bulkFilter: JSON = ["dispositions":["pending"]]
         let selection = try bulk.owner(f,"media_bulk_selection",["round_id":bulkRound["id"]!,"filter":bulkFilter])
         let bulkOperation = try bulk.owner(f,"media_bulk_prepare",bulk.prepareParams(selection))
+        let deletedDraft = try f.round(type)
+        let canceled = try f.call("media_round_cancel",["round_id":deletedDraft["id"]!,"expected_revision":deletedDraft["revision"]!,"reason":"Synthetic receipt read"])
+        _ = try f.call("media_round_delete",["round_id":deletedDraft["id"]!,"expected_revision":canceled["revision"]!,"reason":"Synthetic receipt read"])
         let routes: [(String,JSON)] = [
             ("media_navigation",[:]),("media_round_page",["type_id":type["id"]!,"state":"open"]),
             ("media_round_header",["round_id":round["id"]!]),("media_item_get",["round_id":round["id"]!,"item_id":ids[0]]),
@@ -166,14 +169,16 @@ final class BackupImportReadTests: XCTestCase {
             ("media_intake_get",["intake_id":intake["id"]!]),("media_item_page",["round_id":round["id"]!]),
             ("media_item_counts",["round_id":round["id"]!]),("media_approved_examples",["round_id":draft["id"]!,"item_id":draftItem["id"]!,"expanded":true,"examples":["enabled":true]]),
             ("media_rework_preview",["round_id":round["id"]!,"epic_id":epic,"items":[["item_id":ids[0]]]]),
-            ("media_bulk_selection",["round_id":bulkRound["id"]!,"filter":bulkFilter]),("media_bulk_get",["operation_id":bulkOperation["id"]!])]
+            ("media_bulk_selection",["round_id":bulkRound["id"]!,"filter":bulkFilter]),("media_bulk_get",["operation_id":bulkOperation["id"]!]),
+            ("media_round_deletion_get",["round_id":deletedDraft["id"]!])]
         XCTAssertEqual(Set(routes.map { $0.0 }),CommandRouter.mediaOwnerPoolReads)
         // CL-331/333 worker reads (PM1) use the same pooled snapshot with current worker authority.
         let ownIntake = try XCTUnwrap(f.router.handle(method:"media_intake_preview",params:["project_id":f.project,"command_id":uuid(),"round_id":draft["id"]!,"text":"Synthetic worker intake"],caller:f.worker)["data"] as? JSON)
         let workerRoutes: [(String,JSON)] = [
             ("media_type_list",[:]),("media_type_get",["type_id":type["id"]!]),("media_round_get",["round_id":round["id"]!]),
             ("media_decision_list",["round_id":round["id"]!]),("media_intake_get",["intake_id":ownIntake["id"]!]),
-            ("media_rework_preview",["round_id":round["id"]!,"epic_id":epic,"items":[["item_id":ids[0]]]])]
+            ("media_rework_preview",["round_id":round["id"]!,"epic_id":epic,"items":[["item_id":ids[0]]]]),
+            ("media_round_deletion_get",["round_id":deletedDraft["id"]!])]
         XCTAssertEqual(Set(workerRoutes.map { $0.0 }),CommandRouter.mediaWorkerReads)
         let assistant = Caller(role:"assistant",installation:"synthetic-assistant",projectIDs:[f.project])
         let before = try f.allState()
@@ -208,6 +213,7 @@ final class BackupImportReadTests: XCTestCase {
                 case "media_type_get":XCTAssertEqual(data["id"] as? String,type["id"] as? String)
                 case "media_round_get":XCTAssertEqual((data["items"] as? [JSON])?.count,2)
                 case "media_decision_list":XCTAssertEqual((data["rows"] as? [JSON])?.count,2)
+                case "media_round_deletion_get":XCTAssertEqual(data["round_id"] as? String,deletedDraft["id"] as? String)
                 case "media_rework_preview":
                     XCTAssertEqual((data["items"] as? [JSON])?.count,1)
                     XCTAssertFalse((data["preview_digest"] as? String ?? "").isEmpty)

@@ -4,6 +4,7 @@ public enum CommandMethods {
     /// Internal media dispatcher reads. Owner projection and lease routes have their own classification.
     public static let mediaInternalReads: Set<String> = [
         "media_type_get", "media_round_get", "media_intake_get", "media_bulk_get",
+        "media_round_deletion_get",
         "media_item_page", "media_item_counts", "media_approved_examples",
     ]
     public static let mediaWorkerReads: Set<String> = MediaWorkerContract.readMethods
@@ -11,6 +12,7 @@ public enum CommandMethods {
         "media_navigation",
         "media_round_page",
         "media_round_header",
+        "media_round_deletion_get",
         "media_item_get",
         "media_publication_preview",
         "media_type_get",

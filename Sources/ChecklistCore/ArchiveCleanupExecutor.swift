@@ -322,7 +322,7 @@ extension CommandRouter {
             let evidenceBackup = try self.doneEvidenceBackupWake(db).map {max(Int64($0.timeIntervalSince1970 * 1000),nowMS + 50)}
             let retry = [self.ticketCleanupRetryAt,self.ticketCleanupYieldAt].compactMap {$0}.max().map {Int64($0.timeIntervalSince1970 * 1000)}
             let routineRetry = self.storageMaintenanceRetryAt.map {Int64($0.timeIntervalSince1970 * 1000)}
-            let next = [evidenceBackup,lifecycle.map { max(Int64($0.timeIntervalSince1970 * 1000),retry ?? 0,nowMS + 50) },deletionDeadline.map {max($0,retry ?? 0)},deadline.map { max($0,routineRetry ?? 0,nowMS + 50) },expiry.map { Int64($0 * 1000) },more ? max(routineRetry ?? 0,nowMS + 1000) : nil,routineRetry].compactMap {$0}.min()
+            let next = [evidenceBackup,lifecycle.map { max(Int64($0.timeIntervalSince1970 * 1000),retry ?? 0,nowMS + 50) },deletionDeadline.map {max($0,retry ?? 0)},deadline.map { max($0,routineRetry ?? 0,nowMS + 50) },expiry.map { Int64(($0 + 0.01) * 1000) },more ? max(routineRetry ?? 0,nowMS + 1000) : nil,routineRetry].compactMap {$0}.min()
             return next.map { Date(timeIntervalSince1970:Double($0)/1000) }
         }
     }
@@ -427,7 +427,13 @@ extension CommandRouter {
     }
 
     private func saveTicketObjectDeletionOutcome(_ db: Database,receipt: JSON,objects: [JSON],backupGenerationRow: Int64) throws -> JSON {
-        var receipt = receipt;receipt["objects"] = objects
+        var receipt = receipt,objects = objects
+        if receipt["cause"] as? String == "media_round_delete" {
+            for index in objects.indices where strings(objects[index],"reasons").contains("reader_lease") {
+                objects[index]["reader_hold_ids"] = try mediaRoundDeletionReaderHoldIDs(db,object:objects[index])
+            }
+        }
+        receipt["objects"] = objects
         receipt["summary"] = Self.ticketObjectDeletionSummary(objects)
         receipt["state"] = objects.contains {$0["state"] as? String == "pending"} ? "pending" : "completed"
         receipt["checked_at"] = now()
@@ -436,7 +442,7 @@ extension CommandRouter {
         if let id = receipt["id"] as? String {
             try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?, '1')",arguments:["ticket-cleanup-copy-retry-seen:" + id])
         }
-        if ["task_purge","done_evidence"].contains(receipt["cause"] as? String ?? ""),let id = receipt["id"] as? String {
+        if ["task_purge","done_evidence","media_round_delete"].contains(receipt["cause"] as? String ?? ""),let id = receipt["id"] as? String {
             try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-backup-seen:" + id,String(backupGenerationRow)])
         }
         if receipt["cause"] as? String == "done_evidence",receipt["state"] as? String == "completed",int(receipt,"cleanup_policy_version") < 2,let project = receipt["project_id"] as? String,let task = receipt["task_id"] as? String {

@@ -7,8 +7,8 @@ final class MediaWorkerContractTests: XCTestCase {
     private let fixtureDigest = String(repeating: "a", count: 64)
 
     func testClosedWorkerCatalogAndReadClassification() throws {
-        XCTAssertEqual(MediaWorkerContract.methods.count, 12 + MediaWorkerContract.settingMethods.count, "CL-427 moves round creation into the setting gate and adds round linking")
-        XCTAssertEqual(MediaWorkerContract.settingMethods.count, 15)
+        XCTAssertEqual(MediaWorkerContract.methods.count, 13 + MediaWorkerContract.settingMethods.count, "CL-446 adds the content-free deletion read")
+        XCTAssertEqual(MediaWorkerContract.settingMethods.count, 16)
         XCTAssertTrue(MediaWorkerContract.readMethods.contains("media_rework_preview"))
         XCTAssertEqual(CommandMethods.mediaWorkerReads, MediaWorkerContract.readMethods)
         XCTAssertTrue(CommandMethods.mediaWorkerReads.isSubset(of: CommandMethods.coreReads))
@@ -22,7 +22,7 @@ final class MediaWorkerContractTests: XCTestCase {
         XCTAssertTrue(MediaWorkerContract.settingMethods.isSubset(of: MediaWorkerContract.methods))
         XCTAssertEqual(MediaWorkerContract.settingMethods, ["media_type_adopt_starter", "media_type_create", "media_type_revise", "media_type_adopt", "media_type_retire", "media_round_publish",
             "media_round_cancel", "media_round_archive", "media_round_finish", "media_round_successor", "media_rework_create", "media_type_restore",
-            "media_round_create", "media_round_link_task", "media_item_link_task"])
+            "media_round_create", "media_round_link_task", "media_item_link_task", "media_round_delete"])
         // CL-420: media decisions, suggestion adoption and context approval are the owner's own answers and approvals.
         for method in ["media_decide", "media_decision_withdraw", "media_adopt_suggestion", "media_suggestion_dismiss", "media_item_create", "media_context_approve", "media_context_reconcile", "media_bulk_prepare", "media_bulk_apply", "media_round_send_result"] {
             XCTAssertFalse(MediaWorkerContract.methods.contains(method), method)
@@ -31,6 +31,40 @@ final class MediaWorkerContractTests: XCTestCase {
         }
         XCTAssertNoThrow(try MediaWorkerContract.validate("media_type_list", parameters: ["project_id": "project"]))
         XCTAssertThrowsError(try MediaWorkerContract.validate("media_type_list", parameters: ["project_id": "project", "include_draft": true]))
+    }
+
+    func testRoundDeletionRequiresReasonRevisionAndFreshCommandEnvelope() throws {
+        let valid = write.merging(["round_id": "round", "expected_revision": 2, "reason": "The canceled pass is no longer needed."]) { _, new in new }
+        XCTAssertNoThrow(try MediaWorkerContract.validate("media_round_delete", parameters: valid))
+        for field in ["project_id", "round_id", "expected_revision", "reason", "command_id"] {
+            var missing = valid; missing.removeValue(forKey: field)
+            XCTAssertThrowsError(try MediaWorkerContract.validate("media_round_delete", parameters: missing), field)
+        }
+        for value: Any in ["", " \n\t", true, 1, NSNull()] {
+            var bad = valid; bad["reason"] = value
+            XCTAssertThrowsError(try MediaWorkerContract.validate("media_round_delete", parameters: bad))
+        }
+        for value: Any in [true, 0, 1.5, "2"] {
+            var bad = valid; bad["expected_revision"] = value
+            XCTAssertThrowsError(try MediaWorkerContract.validate("media_round_delete", parameters: bad))
+        }
+        for field in ["origin", "principal", "session_id"] {
+            var bad = valid; bad[field] = "owner"
+            XCTAssertThrowsError(try MediaWorkerContract.validate("media_round_delete", parameters: bad), field)
+        }
+        var badCommand = valid; badCommand["command_id"] = "not-a-uuid"
+        XCTAssertThrowsError(try MediaWorkerContract.validate("media_round_delete", parameters: badCommand))
+    }
+
+    func testRoundDeletionReadHasOnlyProjectAndRoundAndNoCommandID() throws {
+        let valid: [String: Any] = ["project_id": "project", "round_id": "round"]
+        XCTAssertNoThrow(try MediaWorkerContract.validate("media_round_deletion_get", parameters: valid))
+        XCTAssertTrue(MediaWorkerContract.readMethods.contains("media_round_deletion_get"))
+        XCTAssertFalse(MediaWorkerContract.settingMethods.contains("media_round_deletion_get"))
+        for field in ["command_id", "expected_revision", "reason", "limit", "cursor", "principal"] {
+            var bad = valid; bad[field] = "unsupported"
+            XCTAssertThrowsError(try MediaWorkerContract.validate("media_round_deletion_get", parameters: bad), field)
+        }
     }
 
     func testRoundCreationAcceptsOptionalOwningTaskAndRejectsInvalidTaskValues() throws {

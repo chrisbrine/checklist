@@ -18,6 +18,7 @@ final class CommandMethodsTests: XCTestCase {
     func testInternalMediaReadClassificationRetainsItsDistinctDispatchSet() {
         XCTAssertEqual(CommandMethods.mediaInternalReads, [
             "media_type_get", "media_round_get", "media_intake_get", "media_bulk_get",
+            "media_round_deletion_get",
             "media_item_page", "media_item_counts", "media_approved_examples",
         ])
         XCTAssertEqual(CommandMethods.mediaInternalReads.subtracting(CommandMethods.mediaOwnerReads),
@@ -35,5 +36,15 @@ final class CommandMethodsTests: XCTestCase {
         }
         XCTAssertFalse(CommandMethods.coreReads.contains("connection_list"))
         XCTAssertFalse(CommandMethods.coreReads.contains("task_handoff_prepare"))
+    }
+
+    func testRoundDeletionReadIsAvailableToWorkersAndOwnerWhileDeleteIsMutation() {
+        XCTAssertTrue(CommandMethods.mediaWorkerReads.contains("media_round_deletion_get"))
+        XCTAssertTrue(CommandMethods.mediaOwnerReads.contains("media_round_deletion_get"))
+        XCTAssertTrue(CommandMethods.mediaInternalReads.contains("media_round_deletion_get"))
+        for reads in [CommandMethods.coreReads, CommandMethods.serviceReads] {
+            XCTAssertTrue(reads.contains("media_round_deletion_get"))
+            XCTAssertFalse(reads.contains("media_round_delete"))
+        }
     }
 }

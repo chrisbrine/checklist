@@ -193,6 +193,33 @@ def check() -> dict:
         bad = copy.deepcopy(examples['backup-incomplete-retirement'])
         bad[section]['params'].pop('project_id')
         reject('backup-incomplete-retirement', bad, section + ' missing worker project')
+    for field in ('project_id', 'round_id', 'expected_revision', 'reason', 'command_id'):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['delete']['params'].pop(field)
+        reject('media-round-deletion', bad, 'delete missing ' + field)
+    for field, value in (('reason', ' \n\t'), ('expected_revision', 0),
+                         ('expected_revision', True), ('command_id', 'not-a-uuid'),
+                         ('origin', 'human_ui')):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['delete']['params'][field] = value
+        reject('media-round-deletion', bad, 'delete invalid ' + field)
+    for section, field, value in (('read', 'command_id', '00000000-0000-4000-8000-000000000903'),
+                                   ('read', 'limit', 100)):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad[section]['params'][field] = value
+        reject('media-round-deletion', bad, section + ' unsupported ' + field)
+    for field, value in (('content_base64', 'c3ludGhldGlj'), ('title', 'Original round title')):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['result'][field] = value
+        reject('media-round-deletion', bad, 'content-bearing result ' + field)
+    for field, value in (('status', 'deleted'), ('relative_path', '/synthetic/outside-store'),
+                         ('relative_path', 'objects/../outside-store')):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['result']['files'][0][field] = value
+        reject('media-round-deletion', bad, 'file invalid ' + field)
+    bad = copy.deepcopy(examples['media-round-deletion'])
+    bad['result']['counts']['media_item'] = -1
+    reject('media-round-deletion', bad, 'negative record count')
     for kind, key in [('triage', 'DEMO-E1'), ('epic', 'DEMO-T1'), ('triage', 'DEMO-T0')]:
         bad = copy.deepcopy(examples['group-reference']); bad.update(kind=kind, key=key)
         reject('group-reference', bad, 'wrong group key kind or number')

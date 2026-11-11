@@ -1,0 +1,67 @@
+{
+  "delete": {
+    "method": "media_round_delete",
+    "params": {
+      "project_id": "00000000-0000-0000-0000-000000000901",
+      "round_id": "00000000-0000-0000-0000-000000000902",
+      "expected_revision": 4,
+      "reason": "The canceled synthetic pass is no longer needed.",
+      "command_id": "00000000-0000-4000-8000-000000000903"
+    }
+  },
+  "read": {
+    "method": "media_round_deletion_get",
+    "params": {
+      "project_id": "00000000-0000-0000-0000-000000000901",
+      "round_id": "00000000-0000-0000-0000-000000000902"
+    }
+  },
+  "result": {
+    "project_id": "00000000-0000-0000-0000-000000000901",
+    "round_id": "00000000-0000-0000-0000-000000000902",
+    "deleted": true,
+    "actor": "worker:synthetic-session",
+    "actor_kind": "agent",
+    "reason": "The canceled synthetic pass is no longer needed.",
+    "counts": {
+      "media_round": 1,
+      "media_item": 1,
+      "media_item_target": 1,
+      "media_candidate": 1,
+      "media_intake": 1,
+      "media_intake_plan": 1,
+      "media_intake_row": 1,
+      "media_intake_chunk": 1
+    },
+    "byte_deletion_receipt_id": "00000000-0000-0000-0000-000000000904",
+    "cleanup_state": "pending",
+    "files": [
+      {
+        "relative_path": "objects/synthetic/take.wav",
+        "representation": "original",
+        "status": "held",
+        "reason": "backup_required",
+        "reasons": [
+          "backup_required"
+        ]
+      },
+      {
+        "relative_path": "objects/synthetic/preview.png",
+        "representation": "preview",
+        "status": "moved",
+        "reason": "moved_to_trash",
+        "reasons": [
+          "moved_to_trash"
+        ]
+      },
+      {
+        "representation": "original",
+        "status": "kept",
+        "reason": "external_original",
+        "reasons": [
+          "external_original"
+        ]
+      }
+    ]
+  }
+}

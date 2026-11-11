@@ -209,6 +209,7 @@ final class MediaAgentRoundActionTests: XCTestCase {
         let inputs: [String:JSON] = [
             "media_round_cancel":["round_id":r["id"]!,"expected_revision":v["revision"]!,"reason":"Stop"],
             "media_round_archive":["round_id":r["id"]!,"expected_revision":v["revision"]!],
+            "media_round_delete":["round_id":r["id"]!,"expected_revision":v["revision"]!,"reason":"Retire this closed round"],
             "media_round_finish":open,
             "media_round_successor":successor,
             "media_rework_create":open.merging(["epic_id":epicID,"preview_digest":"x","items":[["item_id":ids[0],"expected_revision":1,"decision_id":"d"]]]) {$1},

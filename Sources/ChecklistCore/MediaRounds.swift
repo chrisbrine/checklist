@@ -39,6 +39,8 @@ extension CommandRouter {
         "media_type_restore":["type_id","expected_revision"],
         "media_round_cancel":["round_id","expected_revision","reason"],
         "media_round_archive":["round_id","expected_revision"],
+        "media_round_delete":["round_id","expected_revision","reason"],
+        "media_round_deletion_get":["round_id"],
         "media_type_create":["title","schema","rubric"], "media_type_get":["type_id"],
         "media_type_revise":["type_id","expected_revision","schema","rubric","title"],
         "media_type_adopt":["type_id","expected_revision","type_revision_id","observed_type_token"],
@@ -75,6 +77,7 @@ extension CommandRouter {
         if reads.contains(method) {
             return try readForPreparation { db in
                 let pid = try self.mediaAccess(db,p,c)
+                if method == "media_round_deletion_get" {return try self.mediaRoundDeletionGet(db,p,project:pid)}
                 if method == "media_item_page" || method == "media_item_counts" {return try self.mediaListQuery(db,method:method,p:p,c:c,project:pid)}
                 if method == "media_approved_examples" {return try self.mediaExampleQuery(db,p:p,c:c,project:pid)}
                 if method == "media_bulk_get" { return try self.mediaBulkView(db,operation:self.scoped(db,try text(p,"operation_id"),pid,type:"media_bulk_operation")) }
@@ -89,6 +92,7 @@ extension CommandRouter {
         let command = try text(p,"command_id",max:100)
         guard UUID(uuidString:command) != nil else { throw CoreError("INVALID_INPUT","command_id must be a UUID.") }
         let digest = hash(Data((method + (try jsonString(p))).utf8))
+        if method == "media_round_delete" {return try executeMediaRoundDelete(p,c,command:command,digest:digest)}
         // Rework capture writes ordinary tickets, which the media-only preparation cannot hold.
         if ["media_rework_create","media_round_send_result"].contains(method) {
             return try mediaTicketCommand(method:method,params:p,caller:c,command:command,digest:digest,workerChannel:workerChannel)

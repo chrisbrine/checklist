@@ -68,6 +68,10 @@ The default location is `~/Library/Application Support/Checklist/`. Settings →
 
 This document complements [architecture](architecture.md), [domain semantics](domain.md), the [MCP contract](mcp-contract.md), [attachments](attachments.md), [later transfer](migration.md) and [self-building](self-hosting.md). Those contracts still determine authority and task behavior.
 
+## Deleted media rounds (CL-446)
+
+`media_round_delete` removes the round and its owned records in one transaction. It keeps one content-free history event and a durable file cleanup receipt. Managed originals and previews use the existing verified Trash engine. Files without a completed independent backup stay held with `backup_required`; a later backup can capture those receipt-owned files without recreating the round. A later export, backup and restore preview omit the removed round records. Earlier backups keep their copy until retention removes it. The command does not rewrite earlier backups or exports.
+
 ## Store ownership and layout
 
 Ship SQLite inside the native app's storage layer, using the pinned Swift wrapper selected during the packaging spike. Only `ChecklistService` opens the authoritative database for mutation. UI windows, MCP shims, the diagnostic executable and retained assistant components use authenticated service commands. They never coordinate by editing a shared JSON or Markdown file.

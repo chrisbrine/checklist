@@ -24,6 +24,7 @@ extension CommandRouter {
         let admission = try storageAdmission.acquire();defer {admission.finish()}
         return try readForPreparation { db in
             let project = try self.mediaAccess(db,p,c)
+            if method == "media_round_deletion_get" {return try self.mediaRoundDeletionGet(db,p,project:project)}
             switch method {
             case "media_type_list":
                 let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE project_id=CAST(? AS TEXT) AND type='media_review_type' AND json_extract(data,'$.enabled')=1 ORDER BY id COLLATE BINARY LIMIT 9",arguments:[Data(project.utf8)])
