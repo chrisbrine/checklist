@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://checklist.local/contracts/media-round-deletion.schema.json",
-  "title": "Guarded media round deletion and content-free cleanup outcome (CL-446)",
+  "title": "Guarded media round deletion, command operation and content-free cleanup outcome (CL-446, CL-448\u2013450)",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -39,12 +39,105 @@
     },
     "result": {
       "$ref": "#/$defs/summary"
+    },
+    "accepted": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "command_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "command_outcome": {
+          "const": "accepted"
+        },
+        "data": {
+          "$ref": "#/$defs/operation"
+        },
+        "write_admission": {
+          "$ref": "#/$defs/writeAdmission"
+        }
+      },
+      "required": [
+        "command_id",
+        "command_outcome",
+        "data"
+      ]
+    },
+    "operation_get": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "const": "operation_get"
+        },
+        "params": {
+          "$ref": "#/$defs/operationParameters"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ]
+    },
+    "operation_wait": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "const": "operation_wait"
+        },
+        "params": {
+          "$ref": "#/$defs/waitParameters"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ]
+    },
+    "operation_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/completedOperation"
+        },
+        "write_admission": {
+          "$ref": "#/$defs/writeAdmission"
+        }
+      },
+      "required": [
+        "data"
+      ]
+    },
+    "operation_failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional current failed-operation example. Its diagnostic requirements do not rewrite historical errors returned by exact-original replay.",
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/failedOperation"
+        },
+        "write_admission": {
+          "$ref": "#/$defs/writeAdmission"
+        }
+      },
+      "required": [
+        "data"
+      ]
+    },
+    "retained_capture_history": {
+      "$ref": "#/$defs/captureHistory"
     }
   },
   "required": [
     "delete",
     "read",
-    "result"
+    "result",
+    "accepted",
+    "operation_get",
+    "operation_wait",
+    "operation_result"
   ],
   "$defs": {
     "text": {
@@ -184,6 +277,46 @@
           "items": {
             "$ref": "#/$defs/file"
           }
+        },
+        "kept_attachments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/keptAttachment"
+          },
+          "description": "Done/Canceled ticket attachments excluded from the round byte-deletion cohort and kept with their tickets. Present even when empty."
+        },
+        "preparation_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Measured wall seconds spent preparing this deletion before the record commit. Legacy receipts omit both preparation fields rather than inventing a measurement."
+        },
+        "preparation_timings": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "graph_seconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "references_seconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "cleanup_seconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "history_seconds": {
+              "type": "number",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "graph_seconds",
+            "references_seconds",
+            "cleanup_seconds",
+            "history_seconds"
+          ]
         }
       },
       "required": [
@@ -196,7 +329,432 @@
         "counts",
         "byte_deletion_receipt_id",
         "cleanup_state",
-        "files"
+        "files",
+        "kept_attachments"
+      ],
+      "dependentRequired": {
+        "preparation_seconds": [
+          "preparation_timings"
+        ],
+        "preparation_timings": [
+          "preparation_seconds"
+        ]
+      }
+    },
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "operationParameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "$ref": "#/$defs/text"
+        },
+        "operation_id": {
+          "$ref": "#/$defs/uuid"
+        }
+      },
+      "required": [
+        "project_id",
+        "operation_id"
+      ]
+    },
+    "waitParameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "$ref": "#/$defs/text"
+        },
+        "operation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "wait_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 45
+        }
+      },
+      "required": [
+        "project_id",
+        "operation_id"
+      ]
+    },
+    "completedOperation": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/operation"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "const": "succeeded"
+            }
+          },
+          "required": [
+            "finished_at",
+            "result"
+          ]
+        }
+      ]
+    },
+    "failedOperation": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/operation"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "const": "failed"
+            },
+            "error": {
+              "$ref": "#/$defs/diagnosticOperationError"
+            }
+          },
+          "required": [
+            "finished_at",
+            "error"
+          ]
+        }
+      ]
+    },
+    "diagnosticOperationError": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/operationError"
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "MEDIA_CONTEXT_CHANGED"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "details": {
+                "$ref": "#/$defs/deletionContextChangedDetails"
+              }
+            },
+            "required": [
+              "details"
+            ]
+          }
+        }
+      ]
+    },
+    "deletionContextChangedDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Content-free refusal identity. The check name is an extensible nonblank string. Record IDs can name an infrastructure observation, such as metadata data_version or a temporary journal ID. No payload, path, title or body is returned. Timings are present together after preparation completes; earlier failures omit both.",
+      "properties": {
+        "check": {
+          "$ref": "#/$defs/text"
+        },
+        "record_type": {
+          "$ref": "#/$defs/text"
+        },
+        "record_id": {
+          "$ref": "#/$defs/text"
+        },
+        "preparation_seconds": {
+          "$ref": "#/$defs/summary/properties/preparation_seconds"
+        },
+        "preparation_timings": {
+          "$ref": "#/$defs/summary/properties/preparation_timings"
+        }
+      },
+      "required": [
+        "check",
+        "record_type",
+        "record_id"
+      ],
+      "dependentRequired": {
+        "preparation_seconds": [
+          "preparation_timings"
+        ],
+        "preparation_timings": [
+          "preparation_seconds"
+        ]
+      }
+    },
+    "keptAttachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "attachment_id": {
+          "$ref": "#/$defs/text"
+        },
+        "task_id": {
+          "$ref": "#/$defs/text"
+        },
+        "task_key": {
+          "$ref": "#/$defs/text"
+        },
+        "status": {
+          "const": "kept"
+        },
+        "reason": {
+          "const": "kept_with_ticket"
+        }
+      },
+      "required": [
+        "attachment_id",
+        "task_id",
+        "task_key",
+        "status",
+        "reason"
+      ]
+    },
+    "captureHistory": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "const": 1
+        },
+        "state": {
+          "const": "round_deleted"
+        },
+        "round_id": {
+          "$ref": "#/$defs/text"
+        },
+        "owner_id": {
+          "$ref": "#/$defs/text"
+        },
+        "owner_kind": {
+          "enum": [
+            "media_intake",
+            "media_draft_item",
+            "media_target"
+          ]
+        },
+        "import_job_id": {
+          "$ref": "#/$defs/text"
+        }
+      },
+      "required": [
+        "format",
+        "state",
+        "round_id"
+      ],
+      "description": "Optional attachment.media_capture_history after round deletion. Historical IDs preserve provenance and resolve no current dependency; active ownership/import-job pointers to removed records are detached. state=round_deleted retains originals and previews through ordinary archive and Done-evidence cleanup until task_purge admits verified Trash disposal under its current guards.",
+      "dependentRequired": {
+        "owner_id": [
+          "owner_kind"
+        ],
+        "owner_kind": [
+          "owner_id"
+        ]
+      }
+    },
+    "finalReply": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "command_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "data": {
+          "$ref": "#/$defs/summary"
+        },
+        "write_admission": {
+          "$ref": "#/$defs/writeAdmission"
+        }
+      },
+      "required": [
+        "command_id",
+        "data"
+      ]
+    },
+    "operationError": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/text"
+        },
+        "message": {
+          "$ref": "#/$defs/text"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "details": {
+          "type": "object"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/text"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ]
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "command_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "project_id": {
+          "$ref": "#/$defs/text"
+        },
+        "method": {
+          "const": "media_round_delete"
+        },
+        "state": {
+          "enum": [
+            "queued",
+            "running",
+            "succeeded",
+            "failed"
+          ]
+        },
+        "status_method": {
+          "const": "operation_get"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "finished_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "result": {
+          "$ref": "#/$defs/finalReply"
+        },
+        "error": {
+          "$ref": "#/$defs/operationError"
+        }
+      },
+      "required": [
+        "operation_id",
+        "command_id",
+        "method",
+        "state",
+        "created_at",
+        "status_method"
+      ],
+      "description": "The first acknowledgment is queued. Exact-original replay identifies the same operation and may include its first terminal result or error; pending work has neither.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "queued",
+                  "running"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "result": false,
+              "error": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "succeeded"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "error": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "failed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "result": false
+            }
+          }
+        }
+      ]
+    },
+    "writeAdmission": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Standard service write-admission observation on a reply envelope, not deletion authority or completion.",
+      "properties": {
+        "backup_active": {
+          "type": "boolean"
+        },
+        "locked": {
+          "type": "boolean"
+        },
+        "queued": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "estimated_remaining_seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "generation": {
+          "$ref": "#/$defs/uuid"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "backup_active",
+        "locked",
+        "queued",
+        "reason",
+        "message",
+        "estimated_remaining_seconds",
+        "generation",
+        "revision"
       ]
     }
   }

@@ -260,7 +260,7 @@ extension CommandRouter {
                             guard bool(task,"archived") else { return .commit }
                             var a = try self.scoped(db,item.original.id.text,job.projectID.text,type:"attachment")
                             guard let graph = try self.archiveCleanupExecutorGraph(db,job:job,task:task,prepared:prepared,fenced:&fenced) else { return .commit }
-                            guard a["media_cleanup_round_id"] == nil,
+                            guard a["media_cleanup_round_id"] == nil,!Self.isKeptMediaRoundAttachment(a),
                                   try self.completeArchiveCleanupHolds(db,attachment:a,task:task,currentGraph:graph.graph,currentIndex:graph).isEmpty,
                                   a["sha256"] as? String == item.original.sha256,try ArchiveCleanupJob.integer(a["revision"]) == item.original.attachmentRevision else { return .commit }
                             let relative = try self.archiveCleanupRelativePath(a)
@@ -371,7 +371,7 @@ extension CommandRouter {
                 }
                 let references = prepared.references,mediaAuthorityComplete = prepared.mediaAuthorityComplete,backup = prepared.backup
                 for i in objects.indices where objects[i]["state"] as? String == "pending" && objects[i]["kind"] as? String == "symlink" {
-                    let holds = try self.ticketObjectDeletionHolds(db,object:objects[i],references:references,backup:backup,mediaAuthorityComplete:mediaAuthorityComplete)
+                    let holds = try self.ticketObjectDeletionHolds(db,object:objects[i],references:references,backup:backup,mediaAuthorityComplete:mediaAuthorityComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge")
                     if !holds.isEmpty {objects[i]["state"] = "retained";objects[i]["reasons"] = holds.sorted()}
                 }
                 var pendingTargets = Self.retainTicketObjectDeletionLinkTargets(&objects)
@@ -383,7 +383,7 @@ extension CommandRouter {
                     let object = objects[index]
                     var result = object
                     do {
-                        let holds = try self.ticketObjectDeletionHolds(db,object:object,references:references,backup:backup,mediaAuthorityComplete:mediaAuthorityComplete)
+                        let holds = try self.ticketObjectDeletionHolds(db,object:object,references:references,backup:backup,mediaAuthorityComplete:mediaAuthorityComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge")
                         if !holds.isEmpty {result["state"] = "retained";result["reasons"] = holds.sorted()}
                         else {
                             guard let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value,

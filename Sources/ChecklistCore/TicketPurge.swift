@@ -172,7 +172,7 @@ extension CommandRouter {
         let byteProtected = try doneEvidence ? ticketCleanupProtectedOwners(graph.filter {$0["id"] as? String != tid},owners:byteOwners,tokens:references) : Set<Data>()
         let excluded = doneEvidence ? byteOwners.subtracting(byteProtected) : removedKeys
         let remaining = all.filter {!excluded.contains($0.key) && $0.key != taskKey}.map {row -> JSON in var value = groupValues[row.key] ?? row.value;value["record_type"] = row.type;return value}
-        let byteDeletion = try ticketObjectDeletionPlan(db,owned:all.filter {owned.contains($0.key)}.map {($0.type,$0.value)},remaining:remaining,referenceTokens:inventory.map {_ in references},historicalOwners:doneEvidence ? excluded : [],backupObservation:backupObservation,candidateObjects:candidateObjects,mediaAuthorityComplete:mediaAuthorityComplete)
+        let byteDeletion = try ticketObjectDeletionPlan(db,owned:all.filter {owned.contains($0.key)}.map {($0.type,$0.value)},remaining:remaining,referenceTokens:inventory.map {_ in references},historicalOwners:doneEvidence ? excluded : [],backupObservation:backupObservation,candidateObjects:candidateObjects,mediaAuthorityComplete:mediaAuthorityComplete,preserveTicketMedia:doneEvidence)
         let impact: JSON = [
             "task_id": tid, "project_id": pid, "expected_revision": (try StoredRecord(task, family: "task").requiredValue("revision")), "record_counts": counts,
             "removed_record_count": removed.count, "shared_record_count": shared.count, "history_events": events.count, "preserved_relation_count": relationCount,

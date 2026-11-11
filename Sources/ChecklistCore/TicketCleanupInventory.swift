@@ -283,6 +283,7 @@ extension CommandRouter {
                         pending += [envelope.object["owner_id"] as? String,envelope.object["attachment_id"] as? String].compactMap {$0}
                     }
                     if envelope.type == "storage_job",let id = envelope.object["attachment_owner_id"] as? String {pending.append(id)}
+                    if envelope.type == "attachment",Self.isKeptMediaRoundAttachment(envelope.object),let id = envelope.object["task_id"] as? String {pending.append(id)}
                 }
                 try add(root)
                 while let id = pending.popLast() {

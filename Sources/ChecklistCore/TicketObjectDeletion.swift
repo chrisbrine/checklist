@@ -103,6 +103,9 @@ struct TicketObjectDeletionPlan {
 }
 
 extension CommandRouter {
+    static func isKeptMediaRoundAttachment(_ value: JSON) -> Bool {
+        (value["media_capture_history"] as? JSON)?["state"] as? String == "round_deleted"
+    }
     static let ticketObjectDeletionKind = "ticket_object_delete"
     static let ticketObjectDeletionRetryReasons: Set<String> = ["backup_authority","remaining_record","backup_required","backup_copy_unavailable","backup_authority_unavailable"]
     static func ticketObjectDeletionReasonsRetryable(_ reasons: Set<String>) -> Bool {
@@ -356,7 +359,7 @@ extension CommandRouter {
         for (type,value) in owned {
             let id = (try StoredRecord(value, family: "value").string("id"))
             if type == "attachment" {
-                let mediaTrash = value["media_cleanup_round_id"] is String
+                let mediaTrash = value["media_cleanup_round_id"] is String || Self.isKeptMediaRoundAttachment(value)
                 try add(path:value["path"] as? String,family:"objects",owner:id,representation:"original",sha:value["sha256"] as? String,size:(value["size"] as? NSNumber)?.int64Value,reason:value["mode"] as? String == "managed" ? (bool(value,"keep_original") ? "keep_original" : nil) : "external_original",trash:mediaTrash)
                 if let path = value["preview_path"] as? String {try add(path:path,family:"objects",owner:id,representation:"preview",reason:value["mode"] as? String == "managed" ? nil : "external_original",trash:mediaTrash)}
             } else if type == "source_capture" {try capture(value,owner:id)}
@@ -368,7 +371,7 @@ extension CommandRouter {
         return Array(objects.values)
     }
 
-    func ticketObjectDeletionPlan(_ db: Database, owned: [(String,JSON)], remaining: [JSON], referenceTokens: [Data:Set<Data>]? = nil,historicalOwners: Set<Data> = [],backupObservation: TicketCleanupBackupObservation? = nil,candidateObjects: [JSON]? = nil,mediaAuthorityComplete: Bool? = nil) throws -> TicketObjectDeletionPlan {
+    func ticketObjectDeletionPlan(_ db: Database, owned: [(String,JSON)], remaining: [JSON], referenceTokens: [Data:Set<Data>]? = nil,historicalOwners: Set<Data> = [],backupObservation: TicketCleanupBackupObservation? = nil,candidateObjects: [JSON]? = nil,mediaAuthorityComplete: Bool? = nil,preserveTicketMedia: Bool = false) throws -> TicketObjectDeletionPlan {
         let objects = try candidateObjects ?? ticketObjectDeletionObjects(db,owned:owned)
         let backup: StorageBackupRetentionIndex?
         if let backupObservation {backup = backupObservation.index}
@@ -378,7 +381,7 @@ extension CommandRouter {
         var result: [JSON] = []
         for var item in objects {
             if item["state"] as? String == "pending" {
-                let holds = try ticketObjectDeletionHolds(db,object:item,references:references,backup:backup,mediaAuthorityComplete:mediaComplete)
+                let holds = try ticketObjectDeletionHolds(db,object:item,references:references,backup:backup,mediaAuthorityComplete:mediaComplete,preserveTicketMedia:preserveTicketMedia)
                 if !holds.isEmpty {item["state"] = "retained";item["reasons"] = holds.sorted()}
             }
             result.append(item)
@@ -390,9 +393,16 @@ extension CommandRouter {
         return .init(objects:result)
     }
 
-    func ticketObjectDeletionHolds(_ db: Database, object: JSON, references: TicketObjectDeletionReferenceIndex, backup: StorageBackupRetentionIndex?,mediaAuthorityComplete: Bool) throws -> Set<String> {
+    func ticketObjectDeletionHolds(_ db: Database, object: JSON, references: TicketObjectDeletionReferenceIndex, backup: StorageBackupRetentionIndex?,mediaAuthorityComplete: Bool,preserveTicketMedia: Bool = false) throws -> Set<String> {
         guard let relative = object["relative_path"] as? String,let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value else {return ["identity_unavailable"]}
         var holds = try sourceBuildCacheDeletionHolds(db,object:object)
+        if preserveTicketMedia {
+            let owners = try jsonString(strings(object,"owner_ids"))
+            let current = try Row.fetchCursor(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='attachment' AND id IN (SELECT value FROM json_each(?))",arguments:[owners])
+            while let row = try current.next() {
+                if try Self.isKeptMediaRoundAttachment(GRDBRecordEnvelopeAdapter.decode(row,expectedType:"attachment").object) {holds.insert("kept_with_ticket")}
+            }
+        }
         if object["disposal"] as? String != "trash" {
             // A pre-handoff durable intent has no Trash authority. Recheck the
             // canonical owners at the final writer boundary as well as planning;
@@ -400,7 +410,8 @@ extension CommandRouter {
             let owners = try jsonString(strings(object,"owner_ids"))
             let current = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='attachment' AND id IN (SELECT value FROM json_each(?))",arguments:[owners])
             for row in current {
-                if try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"attachment").object["media_cleanup_round_id"] is String {holds.insert("media_trash_required")}
+                let attachment = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"attachment").object
+                if attachment["media_cleanup_round_id"] is String || Self.isKeptMediaRoundAttachment(attachment) {holds.insert("media_trash_required")}
             }
         }
         if !mediaAuthorityComplete {holds.insert("media_authority_unavailable")}

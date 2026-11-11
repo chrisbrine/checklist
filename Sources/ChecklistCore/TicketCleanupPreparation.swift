@@ -165,7 +165,7 @@ extension CommandRouter {
         }
         var objects = receipt["objects"] as? [JSON] ?? []
         for i in objects.indices where objects[i]["state"] as? String == "pending" && objects[i]["kind"] as? String == "symlink" {
-            let holds = try ticketObjectDeletionHolds(db,object:objects[i],references:references,backup:backup,mediaAuthorityComplete:mediaComplete)
+            let holds = try ticketObjectDeletionHolds(db,object:objects[i],references:references,backup:backup,mediaAuthorityComplete:mediaComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge")
             if !holds.isEmpty {objects[i]["state"] = "retained";objects[i]["reasons"] = holds.sorted()}
         }
         let targets = Self.retainTicketObjectDeletionLinkTargets(&objects)
@@ -180,11 +180,11 @@ extension CommandRouter {
             if candidates.count >= 256 || !candidates.isEmpty && ProcessInfo.processInfo.systemUptime-started >= 1 {break}
             guard let path = object["relative_path"] as? String else {continue}
             candidates.insert(path)
-            guard try ticketObjectDeletionHolds(db,object:object,references:references,backup:backup,mediaAuthorityComplete:mediaComplete).isEmpty else {continue}
+            guard try ticketObjectDeletionHolds(db,object:object,references:references,backup:backup,mediaAuthorityComplete:mediaComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge").isEmpty else {continue}
             let deadline = ProcessInfo.processInfo.systemUptime + 60
             let check = {guard ProcessInfo.processInfo.systemUptime < deadline else {throw StorageSnapshotFailure.deadline}}
             backup?.verifyCopy(for:object,check:check)
-            guard try ticketObjectDeletionHolds(db,object:object,references:references,backup:backup,mediaAuthorityComplete:mediaComplete).isEmpty,
+            guard try ticketObjectDeletionHolds(db,object:object,references:references,backup:backup,mediaAuthorityComplete:mediaComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge").isEmpty,
                   object["kind"] as? String == "file",let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value else {continue}
             do {
                 verifications[path] = try TicketObjectRemovalVerification(root:root,relative:path,sha256:sha,size:size,check:check)

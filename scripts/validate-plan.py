@@ -220,6 +220,152 @@ def check() -> dict:
     bad = copy.deepcopy(examples['media-round-deletion'])
     bad['result']['counts']['media_item'] = -1
     reject('media-round-deletion', bad, 'negative record count')
+    for section in ('accepted', 'operation_get', 'operation_wait', 'operation_result'):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad.pop(section)
+        reject('media-round-deletion', bad, 'missing operation example ' + section)
+    for section, field, value in (
+            ('accepted', 'command_outcome', 'completed'),
+            ('operation_get', 'method', 'media_round_delete'),
+            ('operation_wait', 'method', 'operation_get')):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad[section][field] = value
+        reject('media-round-deletion', bad, section + ' invalid ' + field)
+    for section in ('operation_get', 'operation_wait'):
+        for field, value in (('operation_id', 'not-a-uuid'), ('command_id', '00000000-0000-4000-8000-000000000903')):
+            bad = copy.deepcopy(examples['media-round-deletion'])
+            bad[section]['params'][field] = value
+            reject('media-round-deletion', bad, section + ' invalid ' + field)
+    for value in (-1, 46, True):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['operation_wait']['params']['wait_seconds'] = value
+        reject('media-round-deletion', bad, 'invalid operation wait duration')
+    bad = copy.deepcopy(examples['media-round-deletion'])
+    bad['operation_result']['data']['state'] = 'running'
+    reject('media-round-deletion', bad, 'completion claim for running operation')
+    bad = copy.deepcopy(examples['media-round-deletion'])
+    bad['accepted']['data']['result'] = copy.deepcopy(bad['operation_result']['data']['result'])
+    reject('media-round-deletion', bad, 'fabricated result for queued operation')
+    for section in ('accepted', 'operation_result'):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad[section]['write_admission']['locked'] = 'false'
+        reject('media-round-deletion', bad, section + ' invalid write-admission Boolean')
+    bad = copy.deepcopy(examples['media-round-deletion'])
+    bad['operation_result']['data']['result']['write_admission']['revision'] = -1
+    reject('media-round-deletion', bad, 'negative terminal write-admission revision')
+    bad = copy.deepcopy(examples['media-round-deletion'])
+    bad['operation_result']['data']['result']['write_admission']['permission_token'] = 'not authority'
+    reject('media-round-deletion', bad, 'unknown terminal write-admission authority field')
+    for field in ('attachment_id', 'task_id', 'task_key', 'status', 'reason'):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['result']['kept_attachments'][0].pop(field)
+        reject('media-round-deletion', bad, 'kept attachment missing ' + field)
+    for field, value in (('status', 'moved'), ('reason', 'moved_to_trash'), ('title', 'Private ticket title')):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['result']['kept_attachments'][0][field] = value
+        reject('media-round-deletion', bad, 'invalid kept attachment ' + field)
+    for field in ('kept_attachments', 'preparation_seconds', 'preparation_timings'):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['result'].pop(field)
+        reject('media-round-deletion', bad, 'summary missing ' + field)
+    bad = copy.deepcopy(examples['media-round-deletion'])
+    bad['result']['preparation_seconds'] = -1
+    reject('media-round-deletion', bad, 'negative preparation duration')
+    for field in ('graph_seconds', 'references_seconds', 'cleanup_seconds', 'history_seconds'):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['result']['preparation_timings'][field] = -1
+        reject('media-round-deletion', bad, 'negative preparation phase ' + field)
+    for field in ('error', 'finished_at'):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['operation_failure']['data'].pop(field)
+        reject('media-round-deletion', bad, 'failed operation missing ' + field)
+    bad = copy.deepcopy(examples['media-round-deletion'])
+    bad['operation_failure']['data']['state'] = 'succeeded'
+    reject('media-round-deletion', bad, 'failed operation claims success')
+    bad = copy.deepcopy(examples['media-round-deletion'])
+    bad['operation_failure']['data']['error'].pop('details')
+    reject('media-round-deletion', bad, 'context refusal missing details')
+    for field in ('check', 'record_type', 'record_id'):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['operation_failure']['data']['error']['details'].pop(field)
+        reject('media-round-deletion', bad, 'context refusal missing ' + field)
+        for value in ('', ' \n\t', 0):
+            bad = copy.deepcopy(examples['media-round-deletion'])
+            bad['operation_failure']['data']['error']['details'][field] = value
+            reject('media-round-deletion', bad, 'context refusal invalid ' + field)
+    for field in ('payload', 'path', 'title', 'body'):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['operation_failure']['data']['error']['details'][field] = 'synthetic content'
+        reject('media-round-deletion', bad, 'content-bearing refusal ' + field)
+    for field in ('preparation_seconds', 'preparation_timings'):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['operation_failure']['data']['error']['details'].pop(field)
+        reject('media-round-deletion', bad, 'unpaired refusal timing ' + field)
+    for value in (-1, True):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['operation_failure']['data']['error']['details']['preparation_seconds'] = value
+        reject('media-round-deletion', bad, 'invalid refusal preparation duration')
+    for field in ('graph_seconds', 'references_seconds', 'cleanup_seconds', 'history_seconds'):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['operation_failure']['data']['error']['details']['preparation_timings'].pop(field)
+        reject('media-round-deletion', bad, 'refusal missing preparation phase ' + field)
+        for value in (-1, True):
+            bad = copy.deepcopy(examples['media-round-deletion'])
+            bad['operation_failure']['data']['error']['details']['preparation_timings'][field] = value
+            reject('media-round-deletion', bad, 'invalid refusal preparation phase ' + field)
+    bad = copy.deepcopy(examples['media-round-deletion'])
+    bad['operation_failure']['data']['error']['details']['preparation_timings']['unknown_phase'] = 0
+    reject('media-round-deletion', bad, 'unknown refusal preparation phase')
+    for field, value in (('format', 2), ('state', 'active'), ('owner_kind', 'task'),
+                         ('attachment_owner_id', '00000000-0000-0000-0000-000000000908')):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['retained_capture_history'][field] = value
+        reject('media-round-deletion', bad, 'invalid capture history ' + field)
+    for field in ('format', 'state', 'round_id', 'owner_id', 'owner_kind'):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['retained_capture_history'].pop(field)
+        reject('media-round-deletion', bad, 'capture history missing ' + field)
+    for label, transform in (
+            ('no kept ticket attachments', lambda value: value['result'].update(kept_attachments=[])),
+            ('zero wait duration', lambda value: value['operation_wait']['params'].update(wait_seconds=0)),
+            ('minimal capture history', lambda value: value.update(retained_capture_history={
+                'format': 1, 'state': 'round_deleted', 'round_id': value['result']['round_id']})),
+            ('terminal replay', lambda value: value['accepted'].update(data=copy.deepcopy(value['operation_result']['data'])))):
+        valid = copy.deepcopy(examples['media-round-deletion'])
+        transform(valid)
+        if not validators['media-round-deletion'].is_valid(valid):
+            errors.append('media-round-deletion: valid ' + label + ' was rejected')
+    legacy = copy.deepcopy(examples['media-round-deletion'])
+    for summary in (legacy['result'], legacy['operation_result']['data']['result']['data']):
+        summary['kept_attachments'] = []
+        summary.pop('preparation_seconds')
+        summary.pop('preparation_timings')
+    if not validators['media-round-deletion'].is_valid(legacy):
+        errors.append('media-round-deletion: valid legacy receipt without invented timings was rejected')
+    for label, details in (
+            ('metadata observation', {'check': 'untracked_writer', 'record_type': 'metadata', 'record_id': 'data_version'}),
+            ('temporary journal', {'check': 'change_journal_overflow', 'record_type': 'journal', 'record_id': 'media_delete_synthetic'}),
+            ('future check name', {'check': 'future_dependency_check', 'record_type': 'record', 'record_id': 'synthetic-record'})):
+        valid = copy.deepcopy(examples['media-round-deletion'])
+        valid['operation_failure']['data']['error']['details'].update(details)
+        if not validators['media-round-deletion'].is_valid(valid):
+            errors.append('media-round-deletion: valid ' + label + ' was rejected')
+    early = copy.deepcopy(examples['media-round-deletion'])
+    details = early['operation_failure']['data']['error']['details']
+    details['check'] = 'planned_record_missing'
+    details.pop('preparation_seconds')
+    details.pop('preparation_timings')
+    if not validators['media-round-deletion'].is_valid(early):
+        errors.append('media-round-deletion: valid early refusal without invented timings was rejected')
+    other_error = copy.deepcopy(examples['media-round-deletion'])
+    other_error['operation_failure']['data']['error'] = {'code': 'MEDIA_ROUND_NOT_CLOSED', 'message': 'The synthetic round is open.'}
+    if not validators['media-round-deletion'].is_valid(other_error):
+        errors.append('media-round-deletion: another refusal incorrectly requires context diagnostics')
+    legacy_failure = copy.deepcopy(examples['media-round-deletion'])
+    legacy_failure['accepted']['data'] = legacy_failure.pop('operation_failure')['data']
+    legacy_failure['accepted']['data']['error']['details'] = {}
+    if not validators['media-round-deletion'].is_valid(legacy_failure):
+        errors.append('media-round-deletion: exact replay of a legacy failed operation was rejected')
     for kind, key in [('triage', 'DEMO-E1'), ('epic', 'DEMO-T1'), ('triage', 'DEMO-T0')]:
         bad = copy.deepcopy(examples['group-reference']); bad.update(kind=kind, key=key)
         reject('group-reference', bad, 'wrong group key kind or number')

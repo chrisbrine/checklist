@@ -12,6 +12,8 @@ private struct MediaRoundDeletionPlan {
     let commands: [(String,String)]
     let bytes: TicketObjectDeletionPlan
     let audit: JSON
+    let keptAttachments: [JSON]
+    let fence: MediaRoundDeletionFence
 }
 
 extension CommandRouter {
@@ -54,6 +56,9 @@ extension CommandRouter {
         }
         result["byte_deletion_receipt_id"] = receipt["id"]
         result["cleanup_state"] = receipt["state"]
+        // Earlier CL-446 receipts predate ticket-preserving deletion. Their
+        // empty kept set is known; no unrecorded timing is invented.
+        if result["kept_attachments"] == nil {result["kept_attachments"] = [JSON]()}
         result["files"] = (receipt["objects"] as? [JSON] ?? []).map { object -> JSON in
             let state = object["state"] as? String ?? "retained"
             var reasons = strings(object,"reasons"),status = "kept"
@@ -78,13 +83,27 @@ extension CommandRouter {
     }
 
     /// All graph work and preview hashing happen on a separate read-only
-    /// snapshot. A strict data_version fence admits no intervening write, even
-    /// an eventless/same-revision edit or a new foreign-project reference.
+    /// snapshot. A narrow changed-row fence preserves unrelated service writes,
+    /// including eventless/same-revision edits outside the deletion graph.
     func executeMediaRoundDelete(_ p: JSON,_ c: Caller,command: String,digest: String) throws -> JSON {
         var configuration = Configuration();configuration.readonly = true
         configuration.prepareDatabase {try SchemaMigrations.installStorageCollation($0)}
         let observer = try DatabaseQueue(path:root.appendingPathComponent("checklist.sqlite").path,configuration:configuration)
         defer {try? observer.close()}
+        let changes = MediaRoundDeletionChanges()
+        let (writerVersion,preparationProject) = try dbQueue.writeWithoutTransaction {db in
+            let project = try self.mediaAccess(db,p,c,write:true)
+            let version = try changes.install(db),key = Data(project.utf8)
+            self.mediaRoundDeletionPreparations[key,default:[]].insert(changes.name)
+            return (version,key)
+        }
+        defer {
+            try? dbQueue.writeWithoutTransaction {db in
+                self.mediaRoundDeletionPreparations[preparationProject]?.remove(changes.name)
+                if self.mediaRoundDeletionPreparations[preparationProject]?.isEmpty == true {self.mediaRoundDeletionPreparations.removeValue(forKey:preparationProject)}
+                try changes.remove(db)
+            }
+        }
         var plan: MediaRoundDeletionPlan?,replay: JSON?
         try observer.read {db in
             let project = try self.mediaAccess(db,p,c,write:true)
@@ -97,10 +116,11 @@ extension CommandRouter {
             }
             try self.requireAgentEditAuthority(db,project:self.record(db,project,type:"project"),caller:c)
             plan = try self.prepareMediaRoundDeletion(db,p,c,project:project)
+            try self.mediaRoundDeletionPreparationProbe?()
         }
         if let replay {return replay}
-        guard let plan else {throw CoreError("MEDIA_CONTEXT_CHANGED","Read the round again before deleting it.")}
-        return try ArchiveStorageGate.withExclusive(root:root) {_ in
+        guard let plan else {throw MediaRoundDeletionFence.changed("plan_unavailable",type:"media_round",id:Data((try text(p,"round_id")).utf8))}
+        do {return try ArchiveStorageGate.withExclusive(root:root) {_ in
             try dbQueue.writeWithoutTransaction {db in
                 var result: JSON = [:]
                 try self.withValidatedDomainTransaction(db) {
@@ -113,8 +133,9 @@ extension CommandRouter {
                         result["replayed"] = true;return .commit
                     }
                     try self.requireAgentEditAuthority(db,project:self.record(db,project,type:"project"),caller:c)
-                    guard EnvelopeStorageIdentity.equal(project,plan.project),try observer.read({try Int64.fetchOne($0,sql:"PRAGMA data_version")!}) == plan.version else {
-                        throw CoreError("MEDIA_CONTEXT_CHANGED","The store changed during deletion preparation. Refresh and retry; no records changed.")
+                    guard EnvelopeStorageIdentity.equal(project,plan.project) else {throw MediaRoundDeletionFence.changed("project_scope",type:"project",id:Data(plan.project.utf8))}
+                    if try observer.read({try Int64.fetchOne($0,sql:"PRAGMA data_version")!}) != plan.version {
+                        try plan.fence.validate(db,changes:changes,writerVersion:writerVersion)
                     }
                     var receipt = try self.enqueueTicketObjectDeletion(db,project:project,task:plan.round,cause:"media_round_delete",plan:plan.bytes)
                     receipt["round_id"] = plan.round;receipt["deletion"] = plan.audit
@@ -122,9 +143,10 @@ extension CommandRouter {
                     // this durable receipt exists, under ordinary pruning rules.
                     receipt["parent_principal"] = c.principal;receipt["parent_command_id"] = command;receipt["intent_digest"] = digest
                     try self.save(db,receipt,type:"storage_job")
+                    for attachment in plan.keptAttachments {try self.save(db,attachment,type:"attachment")}
                     for row in plan.records {
                         try db.execute(sql:"DELETE FROM records WHERE id=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND type=CAST(? AS TEXT)",arguments:[Data(row.id.utf8),Data(project.utf8),Data(row.type.utf8)])
-                        guard db.changesCount == 1 else {throw CoreError("MEDIA_CONTEXT_CHANGED","A round-owned record changed. No records changed.")}
+                        guard db.changesCount == 1 else {throw MediaRoundDeletionFence.changed("owned_record_delete",type:row.type,id:Data(row.id.utf8))}
                     }
                     for id in plan.events {try db.execute(sql:"DELETE FROM events WHERE id=CAST(? AS TEXT)",arguments:[Data(id.utf8)])}
                     for (principal,id) in plan.commands {
@@ -138,10 +160,16 @@ extension CommandRouter {
                 }
                 return result
             }
+        }} catch let error as CoreError where error.code == "MEDIA_CONTEXT_CHANGED" {
+            var details = error.details
+            details["preparation_seconds"] = plan.audit["preparation_seconds"]
+            details["preparation_timings"] = plan.audit["preparation_timings"]
+            throw CoreError(error.code,error.message,details:details)
         }
     }
 
     private func prepareMediaRoundDeletion(_ db: Database,_ p: JSON,_ c: Caller,project: String) throws -> MediaRoundDeletionPlan {
+        let started = ProcessInfo.processInfo.systemUptime
         let version = try Int64.fetchOne(db,sql:"PRAGMA data_version")!
         let rid = try text(p,"round_id"),round = try scoped(db,rid,project,type:"media_round")
         try mediaRevision(p,round)
@@ -204,21 +232,62 @@ extension CommandRouter {
             if e.type == "storage_job",let id = e.object["attachment_id"] as? String,
                try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE id=CAST(? AS TEXT) AND type='attachment')",arguments:[Data(id.utf8)]) == true {attachmentIDs.insert(Data(id.utf8))}
         }
+        var keptAttachments: [JSON] = [],keptAudit: [JSON] = [],observedIDs = Set<Data>()
         for rawID in attachmentIDs.sorted(by:{$0.lexicographicallyPrecedes($1)}) {
             let id = String(decoding:rawID,as:UTF8.self)
             let attachment = try scoped(db,id,project,type:"attachment")
-            guard attachment["task_id"] == nil else {throw CoreError("MEDIA_ROUND_REFERENCED","A ticket still owns a captured attachment; nothing was removed.",details:["record_id":id,"record_type":"attachment"])}
+            if attachment["task_id"] != nil {
+                guard let taskID = attachment["task_id"] as? String,!taskID.isEmpty else {throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A captured attachment has malformed ticket ownership; nothing was removed.")}
+                let task = try scoped(db,taskID,project,type:"task")
+                let status = try scoped(db,try StoredRecord(task,family:"task").string("status_id"),project,type:"status")
+                guard ["done","canceled"].contains(status["category"] as? String ?? "") else {
+                    throw CoreError("MEDIA_ROUND_REFERENCED","An open ticket still owns a captured attachment; nothing was removed.",details:["record_id":id,"record_type":"attachment","task_id":taskID])
+                }
+                observedIDs.formUnion([rawID,Data(taskID.utf8),Data((try StoredRecord(status,family:"status").string("id")).utf8)])
+                keptAttachments.append(attachment)
+                keptAudit.append(["attachment_id":id,"task_id":taskID,"task_key":try StoredRecord(task,family:"task").string("key"),"status":"kept","reason":"kept_with_ticket"])
+                continue
+            }
             try add(attachment,type:"attachment")
         }
         let removed = selected.values.sorted {$0.key.lexicographicallyPrecedes($1.key)},owned = Set(selected.keys)
+        // Active capture anchors/import jobs leave with the round. Preserve
+        // their IDs as explicitly historical provenance on the ticket attachment,
+        // rather than keeping dangling live ownership references.
+        for index in keptAttachments.indices {
+            var attachment = keptAttachments[index]
+            var history: JSON = ["format":1,"state":"round_deleted","round_id":rid]
+            var detached = false,captureDetached = false
+            for (field,historical) in [("attachment_owner_id","owner_id"),("storage_job_id","import_job_id"),("media_cleanup_round_id","round_id")] {
+                guard let id = attachment[field] as? String,owned.contains(Data(id.utf8)) else {continue}
+                detached = true;history[historical] = id;attachment.removeValue(forKey:field)
+                if field != "media_cleanup_round_id" {captureDetached = true}
+                if field == "attachment_owner_id",let owner = selected[Data(id.utf8)] {history["owner_kind"] = owner.value["owner_kind"]}
+            }
+            // A later adopting round must not overwrite the original capture's
+            // already detached provenance with its own use of that attachment.
+            let needsHistory = attachment["media_capture_history"] == nil
+            if captureDetached || needsHistory {attachment["media_capture_history"] = history}
+            if detached || needsHistory {attachment = revised(attachment)}
+            keptAttachments[index] = attachment
+        }
         let keys = owned
         var tasks = Set(removed.filter {$0.type == "media_item"}.compactMap {$0.value["task_id"] as? String}.map {Data($0.utf8)})
         if let task = round["task_id"] as? String {tasks.insert(Data(task.utf8))}
+        tasks.formUnion(keptAttachments.compactMap {$0["task_id"] as? String}.map {Data($0.utf8)})
         let attachments = removed.filter {$0.type == "attachment"}.map {row -> (String,JSON) in
             var value = row.value;value["media_cleanup_round_id"] = rid;return (row.type,value)
         }
-        let importObjects = try mediaRoundDeletionImportObjects(db,jobs:removed.filter {$0.type == "storage_job" && $0.value["kind"] as? String == "attachment_import"}.map(\.value))
-        var objects = try ticketObjectDeletionObjects(db,owned:attachments)
+        let keptObjects = try ticketObjectDeletionObjects(db,owned:keptAttachments.map {("attachment",$0)})
+        let keptPaths = Set(keptObjects.compactMap {$0["relative_path"] as? String}.map {Data($0.utf8)})
+        let importObjects = try mediaRoundDeletionImportObjects(db,jobs:removed.filter {$0.type == "storage_job" && $0.value["kind"] as? String == "attachment_import"}.map(\.value)).filter {object in
+            guard let path = object["relative_path"] as? String else {return true}
+            return !keptPaths.contains(Data(path.utf8))
+        }
+        var objects = try ticketObjectDeletionObjects(db,owned:attachments).filter {object in
+            guard let path = object["relative_path"] as? String else {return true}
+            return !keptPaths.contains(Data(path.utf8))
+        }
         var positions: [Data:Int] = [:]
         for (index,object) in objects.enumerated() {if let path = object["relative_path"] as? String {positions[Data(path.utf8)] = index}}
         for object in importObjects {
@@ -237,9 +306,19 @@ extension CommandRouter {
         let paths = Set(objects.flatMap {[$0["relative_path"] as? String,$0["stored_path"] as? String,($0["relative_path"] as? String).map {root.appendingPathComponent($0).path}].compactMap {$0}}.map {Data($0.utf8)})
         let needles = keys.union(paths)
         let holdDigests = Set(objects.compactMap {$0["sha256"] as? String}.map {Data($0.utf8)})
-        var remaining: [JSON] = [],remainingBytes = 0
-        try streamTicketCleanupRows(db,needles:needles.union(tasks),holdDigests:holdDigests,fullPayloads:true) {row,size in
+        let graphFinished = ProcessInfo.processInfo.systemUptime
+        var remaining = keptAttachments.map {attachment -> JSON in var value = attachment;value["record_type"] = "attachment";return value},remainingBytes = 0
+        // The shared stream validates complete unrelated envelopes but returns
+        // only headers above 16 KiB. Exact SQL matching admits relevant payloads
+        // below the same safe bound; unrelated prose needs no second traversal.
+        try streamTicketCleanupRows(db,needles:needles.union(tasks),holdDigests:holdDigests) {projected,size in
+            var row = projected
+            if size > TicketCleanupInventory.projectionByteLimit,(row.type == "project" || bool(row.value,"_cleanup_large_match")) {
+                guard size <= TicketCleanupInventory.rowByteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A selected deletion reference exceeds its safe bound; nothing was removed.")}
+                row = .init(id:row.id,type:row.type,project:row.project,value:try self.record(db,row.id,type:row.type))
+            }
             if owned.contains(row.key) {return}
+            if keptAttachments.contains(where:{Data(($0["id"] as? String ?? "").utf8) == row.key}) {return}
             let refs = try tokens(row.value),large = bool(row.value,"_cleanup_large_match")
             if row.type == "request",row.value["state"] as? String == "pending",
                tasks.contains(Data((row.value["task_id"] as? String ?? "").utf8)) || !refs.isDisjoint(with:keys) || large {
@@ -255,28 +334,41 @@ extension CommandRouter {
                 remainingBytes += size
                 guard size <= TicketCleanupInventory.rowByteLimit,remainingBytes <= TicketCleanupInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","Selected deletion holds exceed their safe bound; nothing was removed.")}
                 var value = row.value;value["record_type"] = row.type;remaining.append(value)
+                if row.type != "project" {observedIDs.insert(row.key)}
             }
         }
+        let referencesFinished = ProcessInfo.processInfo.systemUptime
         var cleanup = try ticketObjectDeletionPlan(db,owned:attachments,remaining:remaining,candidateObjects:objects)
         for index in cleanup.objects.indices where strings(cleanup.objects[index],"reasons").contains("reader_lease") {
             cleanup.objects[index]["reader_hold_ids"] = try mediaRoundDeletionReaderHoldIDs(db,object:cleanup.objects[index])
         }
+        let cleanupFinished = ProcessInfo.processInfo.systemUptime
         var events: [String] = [],commands: [(String,String)] = []
-        let history = try Row.fetchCursor(db,sql:"SELECT id,entity_id,kind,data FROM events WHERE project_id=CAST(? AS TEXT)",arguments:[Data(project.utf8)])
+        let historyTokens = try jsonString(keys.map {String(decoding:$0,as:UTF8.self)})
+        // History needs exact text atoms and dictionary keys, not a Foundation
+        // object graph for every unrelated receipt. SQLite streams the complete
+        // JSON; only matching identities cross this read-lane boundary.
+        func historyMatch(_ payload: String) -> String {
+            "EXISTS(SELECT 1 FROM json_tree(CASE WHEN json_valid(\(payload)) THEN CASE WHEN json_type(\(payload))='object' THEN \(payload) ELSE '{}' END ELSE '{}' END) j WHERE (j.type='text' AND CAST(j.atom AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))) OR (typeof(j.key)='text' AND CAST(j.key AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))))"
+        }
+        let history = try Row.fetchCursor(db,sql:"SELECT id,entity_id,CASE WHEN kind GLOB 'media_*' THEN " + historyMatch("data") + " ELSE 0 END AS media_reference FROM events WHERE project_id=CAST(? AS TEXT)",arguments:[historyTokens,historyTokens,Data(project.utf8)])
         var historyCount = 0
         while let row = try history.next() {
             historyCount += 1;guard historyCount <= 100_000 else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The deletion history exceeds its safe bound.")}
-            let mediaReference = try (row["kind"] as String).hasPrefix("media_") ? !tokens(jsonObject(row["data"])).isDisjoint(with:keys) : false
-            if owned.contains(Data((row["entity_id"] as String? ?? "").utf8)) || mediaReference {events.append(row["id"])}
+            if owned.contains(Data((row["entity_id"] as String? ?? "").utf8)) || row["media_reference"] as Bool {events.append(row["id"])}
         }
-        let receipts = try Row.fetchCursor(db,sql:"SELECT principal,command_id,result FROM commands")
+        let receipts = try Row.fetchCursor(db,sql:"SELECT principal,command_id," + historyMatch("result") + " AS media_reference FROM commands",arguments:[historyTokens,historyTokens])
         var receiptCount = 0
         while let row = try receipts.next() {
             receiptCount += 1;guard receiptCount <= 100_000 else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The deletion command history exceeds its safe bound.")}
-            if !(try tokens(jsonObject(row["result"]))).isDisjoint(with:keys) {commands.append((row["principal"],row["command_id"]))}
+            if row["media_reference"] as Bool {commands.append((row["principal"],row["command_id"]))}
         }
         let counts = removed.reduce(into:[String:Int]()) {$0[$1.type,default:0] += 1}
-        let audit: JSON = ["deleted":true,"round_id":rid,"project_id":project,"actor":c.principal,"actor_kind":c.isOwner ? "owner" : "agent","reason":reason,"counts":counts]
-        return .init(version:version,project:project,round:rid,records:removed,events:events,commands:commands,bytes:cleanup,audit:audit)
+        observedIDs.formUnion(owned)
+        let fence = try MediaRoundDeletionFence(db,ids:observedIDs,events:events,commands:commands,needles:needles.union(tasks).union(attachmentIDs),holdDigests:holdDigests,filePaths:objects.compactMap {($0["relative_path"] as? String).map {root.appendingPathComponent($0).path}})
+        let historyFinished = ProcessInfo.processInfo.systemUptime
+        let audit: JSON = ["deleted":true,"round_id":rid,"project_id":project,"actor":c.principal,"actor_kind":c.isOwner ? "owner" : "agent","reason":reason,"counts":counts,"kept_attachments":keptAudit,
+            "preparation_seconds":historyFinished-started,"preparation_timings":["graph_seconds":graphFinished-started,"references_seconds":referencesFinished-graphFinished,"cleanup_seconds":cleanupFinished-referencesFinished,"history_seconds":historyFinished-cleanupFinished]]
+        return .init(version:version,project:project,round:rid,records:removed,events:events,commands:commands,bytes:cleanup,audit:audit,keptAttachments:keptAttachments,fence:fence)
     }
 }

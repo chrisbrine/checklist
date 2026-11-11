@@ -577,6 +577,14 @@ extension CommandRouter {
             if managedImportRecoveryFailures[key,default:0] >= 2 { warning = .suspended; continue }
             do {
                 let job = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"storage_job").object
+                // An unrelated note can reach this maintenance tail. Settling a
+                // media import changes its round-owned job and staging bytes;
+                // defer that housekeeping while a deletion snapshot is pinned.
+                // The final deletion fence still rejects every domain change.
+                if job["kind"] as? String == "attachment_import",job["attachment_owner_id"] is String,
+                   let project = job["project_id"] as? String,self.mediaRoundDeletionPreparations[Data(project.utf8)] != nil {
+                    warning = warning ?? .retryPending;continue
+                }
                 try reconcileManagedAttachmentImport(db,job:job)
                 managedImportRecoveryFailures.removeValue(forKey:key)
             } catch {

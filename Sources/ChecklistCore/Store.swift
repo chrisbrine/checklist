@@ -44,6 +44,11 @@ public final class CommandRouter: @unchecked Sendable {
     var qualificationBackupPruneListedURL: ((URL,URL) -> URL)? // Test-only URL spelling seam; nil keeps filesystem enumeration.
     var automaticBackupRetentionTrashRoot: URL? // Owned fixture directory only; nil uses the production Trash.
     var ticketCleanupTrashRoot: URL? // Owned fixture seam; nil uses the same-volume production Trash.
+    /// Owned-test seam after the read-only deletion plan, before writer acquisition.
+    var mediaRoundDeletionPreparationProbe: (@Sendable () throws -> Void)?
+    /// Writer-confined, command-local preparation ownership. Import housekeeping
+    /// waits until these snapshots finish; ordinary domain writes remain fenced.
+    var mediaRoundDeletionPreparations: [Data:Set<String>] = [:]
     let commandOperations = CommandOperations()
     // Per-command/transaction state, accessed only on the sole writer connection.
     var taskReferenceFrame: TaskReferenceFrame?

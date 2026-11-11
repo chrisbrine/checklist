@@ -49,7 +49,7 @@ extension CommandRouter {
     func completeArchiveCleanupHolds(_ db: Database,attachment a: JSON,task: JSON,considerArchiving: Bool = false,currentGraph: [JSON]? = nil, currentIndex: ArchiveCleanupReferenceIndex? = nil) throws -> Set<ArchiveCleanupJob.Hold> {
         let aid = (try StoredRecord(a, family: "a").string("id")), tid = (try StoredRecord(task, family: "task").string("id"))
         var holds = Set<ArchiveCleanupJob.Hold>()
-        if a["media_cleanup_round_id"] is String {holds.insert(.mediaTrashRequired)}
+        if a["media_cleanup_round_id"] is String || Self.isKeptMediaRoundAttachment(a) {holds.insert(.mediaTrashRequired)}
         if try StorageSnapshotRetention.isActive(root:root) {holds.insert(.backupCapture)}
         if a["mode"] as? String != "managed" { holds.insert(.externalOriginal) }
         if bool(a,"keep_original") { holds.insert(.keepOriginal) }

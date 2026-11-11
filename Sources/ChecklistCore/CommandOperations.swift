@@ -187,7 +187,7 @@ extension CommandRouter {
         "backup_create","restore_create","restore_preview","backup_prune_preview","backup_prune","backup_incomplete_preview","backup_incomplete_retire","attachment_cleanup_preview",
         "import_preview","import_commit","import_rollback","export_project",
         "media_intake_preview","media_intake_capture","media_intake_confirm","media_round_publish","media_context_reconcile","project_icon_import",
-        "task_purge_preview","task_purge","epic_delete",
+        "task_purge_preview","task_purge","epic_delete","media_round_delete",
         "policy_preview","policy_propose","policy_apply","status_retire","relation_import",
         "media_publication_preview","media_type_adopt","media_type_retire","media_context_approve","media_round_finish","media_round_successor"
     ]
@@ -369,14 +369,14 @@ extension CommandRouter {
         var schedule = false
         // Completed/pending replay is a pooled point read, independent of a
         // currently busy writer. Explicit interrupted recovery may write again
-        // for other methods; a backup keeps its first terminal outcome.
+        // for other methods; backup and media deletion keep their first terminal outcome.
         if let previous = try readForPreparation({try self.operationRecord($0,id:id)}) {
             try readForPreparation {db in try self.authorizeOperation(db,previous,params:params,caller:caller)}
             guard previous["digest"] as? String == digest else {throw CoreError("IDEMPOTENCY_CONFLICT","This command ID was already accepted with different input.")}
-            if previous["method"] as? String == "backup_create" {
-                // A backup's terminal outcome belongs to its first attempt. A
-                // replay must not replace an interruption/uncertainty with a
-                // second attempt against the first attempt's retained folder.
+            if ["backup_create","media_round_delete"].contains(previous["method"] as? String ?? "") {
+                // Destructive deletion and backup keep their first terminal outcome.
+                // Replay cannot replace an interruption or uncertainty with
+                // another attempt against changed records or retained files.
                 if ["succeeded","failed"].contains(previous["state"] as? String ?? "") {
                     let payload = try readForPreparation {db in
                         try self.authorizeOperation(db,previous,params:params,caller:caller)
@@ -392,7 +392,7 @@ extension CommandRouter {
                 if var previous = try self.operationRecord(db,id:id) {
                     try self.authorizeOperation(db,previous,params:params,caller:caller)
                     guard previous["digest"] as? String == digest else {throw CoreError("IDEMPOTENCY_CONFLICT","This command ID was already accepted with different input.")}
-                    if previous["method"] as? String != "backup_create",previous["state"] as? String == "failed",bool(previous,"recoverable") {
+                    if !["backup_create","media_round_delete"].contains(previous["method"] as? String ?? ""),previous["state"] as? String == "failed",bool(previous,"recoverable") {
                         previous["state"] = "queued";previous["updated_at"] = now();previous.removeValue(forKey:"error");previous.removeValue(forKey:"finished_at")
                         previous["recoverable"] = false
                         if persist {try self.saveOperation(db,previous)};schedule = true
@@ -555,7 +555,9 @@ extension CommandRouter {
                     // Never resurrect a reply scrubbed by a concurrent purge.
                     // Read-only operations have no semantic journal yet: retire
                     // their private snapshot if any purge crossed execution.
-                    let expired = existing.map {Self.isPrunedResult(jsonObject($0["result"]))} == true || (job.method != "task_purge" && currentPurgeEpoch != purgeEpoch)
+                    // Purge/deletion advance this epoch themselves; their durable
+                    // semantic receipts still expose any concurrent scrubbing.
+                    let expired = existing.map {Self.isPrunedResult(jsonObject($0["result"]))} == true || (!["task_purge","media_round_delete"].contains(job.method) && currentPurgeEpoch != purgeEpoch)
                     if expired {durable = jsonObject(Self.prunedResult)}
                     let media = Self.mediaOwnerMethods.contains(job.method) || Self.mediaWorkerMethods.contains(job.method)
                     if !media || existing == nil {
@@ -586,7 +588,7 @@ extension CommandRouter {
                     let receipt: JSON = expired ? jsonObject(Self.prunedResult) : ["command_id":value["command_id"]!,"error":error]
                     try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?) ON CONFLICT(principal,command_id) DO UPDATE SET result=excluded.result",arguments:[job.caller.principal,errorCommand,errorDigest,try jsonString(receipt)])
                     value["state"] = "failed";value["error_result_command_id"] = errorCommand;value.removeValue(forKey:"error")
-                    value["recoverable"] = uncertain && job.method != "backup_create";value["outcome_unknown"] = uncertain
+                    value["recoverable"] = uncertain && !["backup_create","media_round_delete"].contains(job.method);value["outcome_unknown"] = uncertain
                 }
                 if value["started_at"] == nil {value["started_at"] = outcome.startedAt}
                 value["finished_at"] = now();value["updated_at"] = now();try self.saveOperation(db,value)
@@ -597,7 +599,7 @@ extension CommandRouter {
     /// Runs before admission opens. Completed semantic transactions win over a
     /// lost operation acknowledgment. Other interrupted attempts fail explicitly;
     /// only exact original-intent replay can schedule reconciliation for methods
-    /// other than backup_create. Backups keep their first terminal outcome.
+    /// other than backup_create and media_round_delete. Both keep their first outcome.
     func recoverCommandOperations(_ db: Database) throws {
         // The accepted metadata was flushed independently of SQLite during a
         // capture. Import it before applying the existing interruption rules.
@@ -623,10 +625,12 @@ extension CommandRouter {
                 if failedBackup {continue}
                 let running = value["state"] as? String == "running" || bool(value,"outcome_unknown")
                 let backup = value["method"] as? String == "backup_create"
-                value["state"] = "failed";value["recoverable"] = !restored && !backup;value["outcome_unknown"] = running
+                let deletion = value["method"] as? String == "media_round_delete"
+                value["state"] = "failed";value["recoverable"] = !restored && !backup && !deletion;value["outcome_unknown"] = running
                 let message: String
                 if restored {message = "The operation was captured in another store incarnation; it cannot resume in this restored copy."}
                 else if backup {message = "The service restarted before a final backup reply was recorded. This command ID keeps its interrupted outcome. Keep retained backup folders for inspection and use a new command ID for a new backup."}
+                else if deletion {message = "The service restarted before a final media deletion reply was recorded. This command ID keeps its interrupted outcome. Read the round and deletion receipt to reconcile; use a new command ID for a new deletion."}
                 else {message = "The service restarted before a final operation reply was recorded. Replay only the exact original command and UUID to reconcile."}
                 value["error"] = CoreError(restored ? "OPERATION_RESTORED" : "OPERATION_INTERRUPTED",
                     message,

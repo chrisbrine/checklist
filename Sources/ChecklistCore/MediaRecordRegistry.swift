@@ -49,6 +49,25 @@ enum MediaRecordRegistry {
         }
         for envelope in envelopes {
             let value = envelope.object
+            // A deleted round's ticket attachment owns its bytes independently.
+            // These IDs are a historical capture account, not live dependencies.
+            if envelope.type == "attachment",let raw = value["media_capture_history"] {
+                guard let history = raw as? JSON,history["format"] as? Int == 1,
+                      history["state"] as? String == "round_deleted",
+                      let round = history["round_id"] as? String,!round.isEmpty,
+                      let task = value["task_id"] as? String,!task.isEmpty,
+                      Set(history.keys).isSubset(of:["format","state","round_id","owner_id","owner_kind","import_job_id"]) else {
+                    throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A retained ticket attachment has incomplete historical capture provenance.")
+                }
+                if let owner = history["owner_id"] {
+                    guard let id = owner as? String,!id.isEmpty,
+                          let kind = history["owner_kind"] as? String,MediaAttachmentOwnerKind(rawValue:kind) != nil else {
+                        throw CoreError("MEDIA_CAPTURE_INCOMPLETE","Historical media capture ownership is incomplete.")
+                    }
+                } else if history["owner_kind"] != nil {throw CoreError("MEDIA_CAPTURE_INCOMPLETE","Historical media capture ownership is incomplete.")}
+                if let raw = history["import_job_id"] {guard let id = raw as? String,!id.isEmpty else {throw CoreError("MEDIA_CAPTURE_INCOMPLETE","Historical media import identity is incomplete.")}}
+                _ = try dependency(task,type:"task",project:envelope.projectID)
+            }
             if families.contains(envelope.type) {
                 guard let references = value["record_references"] as? [JSON] else {
                     throw CoreError("MEDIA_CAPTURE_INCOMPLETE", "Media history must declare its exact record dependencies.")

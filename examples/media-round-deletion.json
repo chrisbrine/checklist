@@ -62,6 +62,198 @@
           "external_original"
         ]
       }
-    ]
+    ],
+    "kept_attachments": [
+      {
+        "attachment_id": "00000000-0000-0000-0000-000000000905",
+        "task_id": "00000000-0000-0000-0000-000000000906",
+        "task_key": "SYN-7",
+        "status": "kept",
+        "reason": "kept_with_ticket"
+      }
+    ],
+    "preparation_seconds": 0.125,
+    "preparation_timings": {
+      "graph_seconds": 0.025,
+      "references_seconds": 0.05,
+      "cleanup_seconds": 0.025,
+      "history_seconds": 0.025
+    }
+  },
+  "accepted": {
+    "command_id": "00000000-0000-4000-8000-000000000903",
+    "command_outcome": "accepted",
+    "data": {
+      "operation_id": "00000000-0000-4000-8000-000000000907",
+      "command_id": "00000000-0000-4000-8000-000000000903",
+      "method": "media_round_delete",
+      "state": "queued",
+      "status_method": "operation_get",
+      "project_id": "00000000-0000-0000-0000-000000000901",
+      "created_at": "2026-11-01T12:00:00Z"
+    },
+    "write_admission": {
+      "backup_active": false,
+      "locked": false,
+      "queued": false,
+      "reason": "",
+      "message": "",
+      "estimated_remaining_seconds": null,
+      "generation": "00000000-0000-0000-0000-000000000910",
+      "revision": 0
+    }
+  },
+  "operation_get": {
+    "method": "operation_get",
+    "params": {
+      "project_id": "00000000-0000-0000-0000-000000000901",
+      "operation_id": "00000000-0000-4000-8000-000000000907"
+    }
+  },
+  "operation_wait": {
+    "method": "operation_wait",
+    "params": {
+      "project_id": "00000000-0000-0000-0000-000000000901",
+      "operation_id": "00000000-0000-4000-8000-000000000907",
+      "wait_seconds": 45
+    }
+  },
+  "operation_result": {
+    "data": {
+      "operation_id": "00000000-0000-4000-8000-000000000907",
+      "command_id": "00000000-0000-4000-8000-000000000903",
+      "method": "media_round_delete",
+      "state": "succeeded",
+      "status_method": "operation_get",
+      "project_id": "00000000-0000-0000-0000-000000000901",
+      "created_at": "2026-11-01T12:00:00Z",
+      "started_at": "2026-11-01T12:00:00Z",
+      "finished_at": "2026-11-01T12:00:01Z",
+      "result": {
+        "command_id": "00000000-0000-4000-8000-000000000903",
+        "data": {
+          "project_id": "00000000-0000-0000-0000-000000000901",
+          "round_id": "00000000-0000-0000-0000-000000000902",
+          "deleted": true,
+          "actor": "worker:synthetic-session",
+          "actor_kind": "agent",
+          "reason": "The canceled synthetic pass is no longer needed.",
+          "counts": {
+            "media_round": 1,
+            "media_item": 1,
+            "media_item_target": 1,
+            "media_candidate": 1,
+            "media_intake": 1,
+            "media_intake_plan": 1,
+            "media_intake_row": 1,
+            "media_intake_chunk": 1
+          },
+          "byte_deletion_receipt_id": "00000000-0000-0000-0000-000000000904",
+          "cleanup_state": "pending",
+          "files": [
+            {
+              "relative_path": "objects/synthetic/take.wav",
+              "representation": "original",
+              "status": "held",
+              "reason": "backup_required",
+              "reasons": [
+                "backup_required"
+              ]
+            },
+            {
+              "relative_path": "objects/synthetic/preview.png",
+              "representation": "preview",
+              "status": "moved",
+              "reason": "moved_to_trash",
+              "reasons": [
+                "moved_to_trash"
+              ]
+            },
+            {
+              "representation": "original",
+              "status": "kept",
+              "reason": "external_original",
+              "reasons": [
+                "external_original"
+              ]
+            }
+          ],
+          "kept_attachments": [
+            {
+              "attachment_id": "00000000-0000-0000-0000-000000000905",
+              "task_id": "00000000-0000-0000-0000-000000000906",
+              "task_key": "SYN-7",
+              "status": "kept",
+              "reason": "kept_with_ticket"
+            }
+          ],
+          "preparation_seconds": 0.125,
+          "preparation_timings": {
+            "graph_seconds": 0.025,
+            "references_seconds": 0.05,
+            "cleanup_seconds": 0.025,
+            "history_seconds": 0.025
+          }
+        },
+        "write_admission": {
+          "backup_active": false,
+          "locked": false,
+          "queued": false,
+          "reason": "",
+          "message": "",
+          "estimated_remaining_seconds": null,
+          "generation": "00000000-0000-0000-0000-000000000910",
+          "revision": 0
+        }
+      }
+    },
+    "write_admission": {
+      "backup_active": false,
+      "locked": false,
+      "queued": false,
+      "reason": "",
+      "message": "",
+      "estimated_remaining_seconds": null,
+      "generation": "00000000-0000-0000-0000-000000000910",
+      "revision": 0
+    }
+  },
+  "operation_failure": {
+    "data": {
+      "operation_id": "00000000-0000-4000-8000-000000000911",
+      "command_id": "00000000-0000-4000-8000-000000000912",
+      "method": "media_round_delete",
+      "state": "failed",
+      "status_method": "operation_get",
+      "project_id": "00000000-0000-0000-0000-000000000901",
+      "created_at": "2026-11-01T12:00:02Z",
+      "started_at": "2026-11-01T12:00:02Z",
+      "finished_at": "2026-11-01T12:00:03Z",
+      "error": {
+        "code": "MEDIA_CONTEXT_CHANGED",
+        "message": "A round record, deletion-plan row or relevant reference changed during preparation; no records changed.",
+        "retryable": false,
+        "details": {
+          "check": "planned_record_changed",
+          "record_type": "media_round",
+          "record_id": "00000000-0000-0000-0000-000000000913",
+          "preparation_seconds": 0.125,
+          "preparation_timings": {
+            "graph_seconds": 0.025,
+            "references_seconds": 0.05,
+            "cleanup_seconds": 0.025,
+            "history_seconds": 0.025
+          }
+        }
+      }
+    }
+  },
+  "retained_capture_history": {
+    "format": 1,
+    "state": "round_deleted",
+    "round_id": "00000000-0000-0000-0000-000000000902",
+    "owner_id": "00000000-0000-0000-0000-000000000908",
+    "owner_kind": "media_intake",
+    "import_job_id": "00000000-0000-0000-0000-000000000909"
   }
 }

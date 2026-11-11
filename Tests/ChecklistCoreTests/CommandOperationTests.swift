@@ -67,6 +67,75 @@ final class CommandOperationTests: XCTestCase {
         return result
     }
 
+    /// CL-450: pause the actual read-only deletion preparation. Every request
+    /// below must finish while that operation is still paused, including a write.
+    func testMediaRoundDeleteAcceptsBeforePreparationAndKeepsReadAndWriteRequestsFree() throws {
+        let checks = MediaRoundDeletionTests(),f = try MediaFrozenIntakeTests.Fixture()
+        let round = try checks.cancel(f,f.round(f.type(MediaRoundTests().schema())))
+        let project = try f.router.dbQueue.read {try f.router.record($0,f.project,type:"project")}
+        let task = try f.storage!.task(project),router = f.router!
+        let registration = try f.record(f.worker.sessionID!,"session")
+        let worker = Caller(role:"worker",installation:try XCTUnwrap(registration["installation"] as? String),projectIDs:[f.project],sessionID:f.worker.sessionID,workspace:f.workspace.path)
+        let lane = HeldLane(router)
+        let entered = DispatchSemaphore(value:0),release = DispatchSemaphore(value:0)
+        router.mediaRoundDeletionPreparationProbe = {
+            entered.signal()
+            guard release.wait(timeout:.now()+20) == .success else {throw CoreError("TEST_TIMEOUT","Paused deletion was not released.")}
+        }
+        defer {release.signal();lane.finish();router.mediaRoundDeletionPreparationProbe = nil}
+        let command = uuid()
+        var input = try checks.input(f,round);input["project_id"] = f.project;input["command_id"] = command
+        let began = Date()
+        let accepted = try router.handle(method:"media_round_delete",params:input,caller:worker)
+        XCTAssertLessThan(Date().timeIntervalSince(began),1)
+        let id = try XCTUnwrap(data(accepted)["operation_id"] as? String)
+        XCTAssertEqual(accepted["command_outcome"] as? String,"accepted")
+        XCTAssertEqual(try data(accepted)["state"] as? String,"queued")
+        XCTAssertEqual(entered.wait(timeout:.now()+0.02),.timedOut,"Acceptance must not run preparation on the request lane")
+        lane.release()
+        XCTAssertEqual(entered.wait(timeout:.now()+5),.success)
+        let calls: [(String,JSON)] = [
+            ("service_info",["project_id":f.project]),
+            ("task_get",["project_id":f.project,"task_id":task["id"]!]),
+            ("message_send",["project_id":f.project,"task_id":task["id"]!,"kind":"note","body":"Unrelated synthetic write during media deletion","command_id":uuid()])]
+        for (method,params) in calls {
+            let before = Date()
+            _ = try router.handle(method:method,params:params,caller:worker)
+            XCTAssertLessThan(Date().timeIntervalSince(before),1,method)
+        }
+        let running = try router.handle(method:"operation_get",params:["project_id":f.project,"operation_id":id],caller:worker)
+        XCTAssertEqual(try data(running)["state"] as? String,"running")
+        release.signal();lane.finish()
+        let complete = try router.handle(method:"operation_get",params:["project_id":f.project,"operation_id":id],caller:worker)
+        XCTAssertEqual(try data(complete)["state"] as? String,"succeeded")
+        let result = try XCTUnwrap(data(complete)["result"] as? JSON)
+        XCTAssertEqual(try data(result)["deleted"] as? Bool,true)
+        let replay = try router.handle(method:"media_round_delete",params:input,caller:worker)
+        XCTAssertEqual(try data(replay)["operation_id"] as? String,id)
+        let again = try router.handle(method:"operation_get",params:["project_id":f.project,"operation_id":id],caller:worker)
+        XCTAssertEqual(try jsonString(data(again)["result"]!),try jsonString(result))
+    }
+
+    func testMediaRoundDeleteReplayKeepsFirstInterruptedOutcome() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),pid = project["id"] as! String,router = f.router!
+        let lane = HeldLane(router);defer {lane.finish()}
+        let command = uuid(),input: JSON = ["command_id":command,"project_id":pid,"round_id":uuid(),"expected_revision":1,"reason":"Synthetic interruption"]
+        let accepted = try f.call("media_round_delete",input,command:command)
+        let id = try XCTUnwrap(data(accepted)["operation_id"] as? String)
+        lane.finish()
+        try router.dbQueue.write { db in
+            var operation = try XCTUnwrap(router.operationRecord(db,id:id))
+            operation["state"] = "failed";operation["recoverable"] = true
+            operation["error"] = ["code":"OPERATION_INTERRUPTED","message":"Synthetic first interrupted outcome"]
+            try router.saveOperation(db,operation)
+        }
+        _ = try f.call("media_round_delete",input,command:command)
+        lane.finish()
+        let replay = try read(f,accepted,project:pid)
+        XCTAssertEqual(replay["state"] as? String,"failed")
+        XCTAssertEqual((replay["error"] as? JSON)?["code"] as? String,"OPERATION_INTERRUPTED")
+    }
+
     func testBackupAndRestoreReturnBeforeLaneRunsThenExposeOriginalReplies() throws {
         let f = try StorageFixture(fast:true);_ = try f.project()
         let destination = f.base.appendingPathComponent("operation-backup"),command = uuid(),input: JSON = ["path":destination.path]
@@ -214,11 +283,15 @@ final class CommandOperationTests: XCTestCase {
             let recovered = try read(f,accepted,project:pid)
             XCTAssertEqual(recovered["state"] as? String,"failed",method)
             XCTAssertEqual((recovered["error"] as? JSON)?["code"] as? String,"OPERATION_INTERRUPTED",method)
+            if method == "media_round_delete" {
+                XCTAssertTrue(((recovered["error"] as? JSON)?["message"] as? String ?? "").contains("keeps its interrupted outcome"))
+                XCTAssertEqual(try f.router!.dbQueue.read {try f.router!.operationRecord($0,id:id)?["recoverable"] as? Bool},false)
+            }
             let retryLane = HeldLane(f.router!);defer {retryLane.finish()}
             let retry = try f.call(method,input,command:command)
             XCTAssertEqual(try data(retry)["operation_id"] as? String,id,method)
-            XCTAssertEqual(try data(retry)["state"] as? String,method == "backup_create" ? "failed" : "queued",method)
-            if method == "backup_create" {
+            XCTAssertEqual(try data(retry)["state"] as? String,["backup_create","media_round_delete"].contains(method) ? "failed" : "queued",method)
+            if ["backup_create","media_round_delete"].contains(method) {
                 XCTAssertEqual((try data(retry)["error"] as? JSON)?["code"] as? String,"OPERATION_INTERRUPTED")
             }
             retryLane.finish()
