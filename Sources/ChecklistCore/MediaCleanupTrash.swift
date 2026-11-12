@@ -3,6 +3,32 @@ import GRDB
 import Darwin
 
 extension CommandRouter {
+    /// Pure receipt validation, before any retained Trash pathname is opened.
+    /// A copy keeps its incarnation, so that alone cannot authorize a destination.
+    /// Legacy destinations without a root binding stay unavailable; never adopt
+    /// them by stamping the copy's current root onto historical authority.
+    func mediaCleanupTrashBindingFailure(_ receipt: JSON) -> String? {
+        let objects = receipt["objects"] as? [JSON] ?? []
+        let pending = objects.filter {$0["disposal"] as? String == "trash" && $0["state"] as? String == "pending"}
+        guard !pending.isEmpty else {return nil}
+        guard receipt["media_trash_directory"] != nil || objects.contains(where:{$0["trash_path"] != nil}) else {return nil}
+        guard let source = receipt["media_trash_source_root"] as? String,Data(source.utf8) == Data(root.path.utf8) else {return "trash_source_root_unproven"}
+        guard let stored = receipt["media_trash_directory"] as? String,stored.hasPrefix("/"),
+              (try? StorageObjectFiles.parts(stored,absolute:true)) != nil,
+              let id = receipt["id"] as? String else {return "trash_intent_invalid"}
+        let directory = URL(fileURLWithPath:stored,isDirectory:true)
+        let folder = "Checklist-media-" + hash(Data((incarnation + ":" + id).utf8)),name = directory.lastPathComponent
+        guard name == folder || name.hasPrefix(folder + "-") && UUID(uuidString:String(name.dropFirst(folder.count + 1))) != nil else {return "trash_intent_invalid"}
+        for object in pending {
+            guard let path = object["relative_path"] as? String,path.hasPrefix("objects/"),
+                  (try? StorageObjectFiles.parts(path)) != nil,object["kind"] as? String == "file",
+                  let target = object["trash_path"] as? String else {return "trash_intent_invalid"}
+            let expected = directory.appendingPathComponent(hash(Data(path.utf8)) + "-" + URL(fileURLWithPath:path).lastPathComponent).path
+            guard Data(target.utf8) == Data(expected.utf8) else {return "trash_intent_invalid"}
+        }
+        return nil
+    }
+
     /// A durable media Trash intent owns reconciliation of this exact original.
     /// Its source may already have moved before the SQL outcome commits. Import
     /// recovery must not turn that deliberate absence into a new repair owner;
@@ -33,6 +59,7 @@ extension CommandRouter {
     func prepareMediaCleanupTrash(_ db: Database,receipt original: JSON) throws -> JSON {
         var receipt = original,objects = receipt["objects"] as? [JSON] ?? []
         guard objects.contains(where:{$0["disposal"] as? String == "trash" && $0["state"] as? String == "pending"}) else {return receipt}
+        if let reason = mediaCleanupTrashBindingFailure(receipt) {throw CoreError("CLEANUP_TRASH_INVALID","The retained Trash intent has no current instance authority; originals retained.",details:["reason":reason])}
         let id = try StoredRecord(receipt,family:"storage_job").string("id")
         let folderName = "Checklist-media-" + hash(Data((incarnation + ":" + id).utf8))
         let marker: JSON = ["receipt_id":id,"source_root":root.path,"incarnation":incarnation]
@@ -77,7 +104,8 @@ extension CommandRouter {
             else {objects[index]["trash_path"] = target;changed = true}
         }
         if changed {
-            receipt["media_trash_directory"] = directory.path;receipt["objects"] = objects;receipt = revised(receipt)
+            receipt["media_trash_directory"] = directory.path;receipt["media_trash_source_root"] = root.path
+            receipt["objects"] = objects;receipt = revised(receipt)
             try withValidatedDomainTransaction(db) {try self.save(db,receipt,type:"storage_job");return .commit}
         }
         return receipt

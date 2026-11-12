@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, ExitStack, closing
 import ctypes
 from datetime import datetime, timezone
+import errno
 import fcntl
 import hashlib
 import json
@@ -305,6 +306,25 @@ def require_managed_path_support(capture, manifest):
     return storage_schema(migration)
 
 
+def require_receipt_path_support(capture, manifest, inspection):
+    """Origin receipt metadata needs the audited instance-local byte executor."""
+    if not any(inspection.get(key, 0) for key in ['receipt_origin_absolute', 'receipt_unavailable_absolute', 'receipt_nonlocal_trash_absolute']): return
+    required = {'Sources/ChecklistCore/TicketObjectDeletion.swift',
+                'Sources/ChecklistCore/TicketCleanupPreparation.swift',
+                'Sources/ChecklistCore/ArchiveCleanupExecutor.swift',
+                'Sources/ChecklistCore/MediaCleanupTrash.swift'}
+    inputs = {entry['path']: entry for entry in manifest.get('inputs', [])}
+    if not required <= inputs.keys():
+        raise ValueError('Stage predates instance-local deletion receipts; rebuild before seeding a slot.')
+    for name in required:
+        file = Path(capture) / 'source' / name
+        if sha(file) != inputs[name]['sha256']:
+            raise ValueError('Stage has no verified instance-local deletion executor; rebuild before seeding a slot.')
+    source = (Path(capture) / 'source/Sources/ChecklistCore/TicketObjectDeletion.swift').read_text()
+    if not re.search(r'^    static let ticketObjectDeletionLocalPathVersion = 2$', source, re.M):
+        raise ValueError('Stage predates instance-local deletion receipts; rebuild before seeding a slot.')
+
+
 def supported_schema(schema, current_schema, kind):
     # A seed may be older (the stage migrates it at first start) but never newer than the stage.
     if type(schema) is not int or schema < 0:
@@ -484,6 +504,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
     destination = Path(os.path.normpath(destination)).absolute()
     source_root = Path(os.path.normpath(source_root)).absolute() if source_root is not None else None
     counts = dict.fromkeys(['managed_relative', 'managed_local_absolute', 'managed_origin_absolute',
+                           'receipt_origin_absolute', 'receipt_unavailable_absolute', 'receipt_nonlocal_trash_absolute', 'receipt_opaque_trash_absolute',
                            'managed_unavailable_absolute', 'external_project_path_occurrences',
                            'relative_capture_paths', 'relative_evidence_paths', 'inert_history_path_occurrences', 'inert_metadata_path_occurrences',
                            'capture_git_provenance'], 0)
@@ -492,6 +513,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
     summary_source_root = Path(summary_source_root) if summary_source_root is not None else None
     source_summaries = {}
     non_json = set()
+    refused_value = None
 
     def decoded_json(value):
         # Most database leaves are field names, hashes and ordinary prose. Avoid
@@ -502,8 +524,23 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
             if len(value) <= 512 and len(non_json) < 4096: non_json.add(value)
             return value
 
-    def refuse(location, cause):
-        raise ValueError(f'Seed contains {cause} ({location}). ' + RELOCATION_REQUIRED)
+    def refuse(location, cause, value=None):
+        nonlocal refused_value
+        refused_value = value
+        # Diagnose the descriptor's family, never its path or record content.
+        family = 'not_classified'
+        if isinstance(value, str):
+            if value.startswith('/'):
+                path = PurePosixPath(value)
+                if source_root is not None and path.is_relative_to(source_root):
+                    parts = path.relative_to(source_root).parts
+                    family = parts[0] if parts and parts[0] in {'objects', 'source-captures', 'staging', 'icons', 'source-executions', 'source-build-cache'} else 'other_source_family'
+                else:
+                    managed = next((part for part in path.parts if part in {'objects', 'source-captures', 'staging', 'icons', 'source-executions', 'source-build-cache'}), 'unclassified')
+                    family = 'outside_source_root/' + managed
+            else: family = 'relative_or_url'
+        diagnostic = f' Source path family: {family}.' if value is not None else ''
+        raise ValueError(f'Seed contains {cause} ({location}).{diagnostic} ' + RELOCATION_REQUIRED)
 
     def relative_to(path, root, location):
         try: return mapping.relative(path, root)
@@ -517,8 +554,9 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
         try:
             if not managed: return external_bindings.overlap(candidate, location)
             return checklist_root_overlap(candidate) or paths_overlap(candidate, DEFAULT_LIVE)
-        except (OSError, RuntimeError, ValueError):
-            refuse(location, 'a path whose filesystem ancestry cannot be safely compared')
+        except (OSError, RuntimeError, ValueError) as error:
+            detail = f' [filesystem errno {error.errno}]' if isinstance(error, OSError) else ''
+            refuse(location, 'a path whose filesystem ancestry cannot be safely compared' + detail, str(path))
 
     def check_absolute(value, location):
         if not value.startswith('/') or '\0' in value or any(x in ['', '.', '..'] for x in value.split('/')[1:]):
@@ -533,8 +571,60 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
 
     def check_slot_absolute(value, location):
         path = check_absolute(value, location)
-        if not path.is_relative_to(destination): refuse(location, 'a stored absolute path outside the destination slot root')
+        if not path.is_relative_to(destination): refuse(location, 'a stored absolute path outside the destination slot root', value)
         check_local(path.relative_to(destination), location)
+
+    def check_receipt_stored(value, location):
+        # This exact field is provenance/reference text. The byte executor uses
+        # relative_path only, through its current root's descriptor-relative gate.
+        # Reuse canonical managed safety, including origin aliases, no-follow
+        # copy checks and refusal of other Checklist roots. Unproved outside
+        # spellings (including external originals) stay unavailable metadata.
+        category = check_managed(value, None, location)
+        if category == 'managed_origin_absolute': counts['receipt_origin_absolute'] += 1
+        elif category == 'managed_unavailable_absolute': counts['receipt_unavailable_absolute'] += 1
+
+    def check_receipt_trash(value, location):
+        path = check_absolute(value, location)
+        if path.is_relative_to(destination): check_local(path.relative_to(destination), location)
+        else:
+            # Core anchors its root by resolving only the owned parent directory.
+            anchored_destination = destination.parent.resolve() / destination.name
+            unbound = record_body.get('media_trash_source_root') != str(anchored_destination)
+            def components(value):
+                return tuple(unicodedata.normalize('NFD', unicodedata.normalize('NFD', part).casefold()) for part in value.parts)
+            parts = components(path)
+            roots = [LIVE, DEFAULT_LIVE, BASE]
+            for number in range(1, 5):
+                roots.extend([paths(number)['folder'], paths(number)['data']])
+            for root in roots:
+                other = components(root)
+                if parts[:len(other)] == other or other[:len(parts)] == parts:
+                    refuse(location, 'a Trash destination into a different Checklist data root', value)
+            opaque = False
+            for entry in reversed([path, *path.parents]):
+                try: mode = entry.lstat().st_mode
+                except (FileNotFoundError, NotADirectoryError): continue
+                except OSError as error:
+                    if unbound and error.errno in {errno.EPERM, errno.EACCES}:
+                        opaque = True; break
+                    refuse(location, 'a Trash destination whose ancestry cannot be inspected', value)
+                if stat.S_ISLNK(mode): refuse(location, 'a Trash destination through a symlink', value)
+            if not opaque:
+                try:
+                    overlap = checklist_root_overlap(path.parent) or paths_overlap(path.parent, DEFAULT_LIVE)
+                except OSError as error:
+                    if unbound and error.errno in {errno.EPERM, errno.EACCES}: opaque = True
+                    else: refuse(location, 'a Trash destination whose ancestry cannot be safely compared', value)
+                except (RuntimeError, ValueError):
+                    refuse(location, 'a Trash destination whose ancestry cannot be safely compared', value)
+                else:
+                    if overlap: refuse(location, 'a Trash destination into a different Checklist data root', value)
+            # Denied ancestry is unknown history, not a passed physical guard.
+            # The v2 executor repeats this root mismatch before old-target access.
+            # Current-root-bound authority still fails closed.
+            if opaque: counts['receipt_opaque_trash_absolute'] += 1
+            counts['receipt_nonlocal_trash_absolute'] += 1
 
     def check_managed(value, family, location):
         if not value.startswith('/'):
@@ -544,7 +634,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
                 refuse(location, 'a managed path in the wrong family')
             check_local(relative, location)
             counts['managed_relative'] += 1
-            return
+            return 'managed_relative'
         path = check_absolute(value, location)
         for root, category in [(destination, 'managed_local_absolute'), (source_root, 'managed_origin_absolute')]:
             if root is None: continue
@@ -567,7 +657,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
             # absolute path is data; local content proof belongs to Core.
             check_local(relative, location)
             counts[category] += 1
-            return
+            return category
         if unsafe_checklist_root(path, location, managed=True):
             refuse(location, 'a managed path into a different Checklist data root')
         # Core makes an unproved outside descriptor unavailable without reading
@@ -575,6 +665,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
         if family is not None and family not in path.parts[1:-1]:
             refuse(location, 'a managed path in the wrong family')
         counts['managed_unavailable_absolute'] += 1
+        return 'managed_unavailable_absolute'
 
     def check_binding(value, location, optional=False):
         if optional and not value: return
@@ -588,6 +679,12 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
 
     def policy(key, parent, location, record_kind):
         capture = capture_context(location, record_kind)
+        if record_kind == 'storage_job' and record_body.get('kind') == 'ticket_object_delete':
+            if location == 'records.data.objects[]' and key == 'stored_path': return ('receipt_stored', None)
+            if location == 'records.data' and key == 'media_trash_source_root': return ('catalog_provenance', None)
+            if (location == 'records.data.objects[]' and key == 'trash_path'
+                    or location == 'records.data' and key == 'media_trash_directory'):
+                return ('receipt_trash', None)
         if record_kind == 'capture_bindings':
             if key == 'stored': return ('lookup', 'source-captures')
             if key == 'relative': return ('managed', 'source-captures')
@@ -717,6 +814,8 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
                     source_summaries.setdefault(metadata_key, {})[field] = value
                 counts['inert_metadata_path_occurrences'] += 1
             elif kind == 'managed': check_managed(value, family, location)
+            elif kind == 'receipt_stored': check_receipt_stored(value, location)
+            elif kind == 'receipt_trash': check_receipt_trash(value, location)
             elif kind == 'backup_catalog':
                 try: relative = relative_path(value)
                 except ValueError: refuse(location, 'a malformed root-relative backup catalog path')
@@ -781,6 +880,9 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
             columns = [column[0] for column in cursor.description]
             for row in cursor:
                 record_kind = row[columns.index('type')] if table == 'records' and 'type' in columns else None
+                record_data = decoded_json(row[columns.index('data')]) if table == 'records' and 'data' in columns else None
+                record_body = record_data if isinstance(record_data, dict) else {}
+                refused_value = None
                 metadata_key = row[columns.index('key')] if table == 'metadata' and 'key' in columns else None
                 if metadata_key == 'managed-capture-paths-v3': record_kind = 'capture_bindings'
                 if metadata_key is not None and metadata_key.startswith('backup-historical-catalog:'):
@@ -791,6 +893,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
                 if metadata_key is not None and metadata_key.startswith('storage-last-verified-'):
                     record_kind = 'storage_summary'
                 for column, value in zip(columns, row):
+                    if table == 'records' and column == 'data': value = record_data
                     inert = (table == 'commands' and column == 'result') or (table == 'events' and column == 'data')
                     if column == 'value' and metadata_key is not None and (metadata_key in {'preupgrade_snapshot', 'backup-protected-history', 'backup-automatic-prune-last'} or metadata_key.startswith(('backup-pruned:', 'backup-generation:', 'backup-automatic-prune-fenced:'))):
                         inert = 'metadata'
@@ -798,7 +901,30 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
                     except ValueError as error:
                         # CL-424: name the record kind, never the value, so that a refusal shows its cause.
                         if table != 'records' or record_kind is None: raise
-                        raise ValueError(f'{error} Record kind: {record_kind}.') from error
+                        def identifier(value):
+                            return value if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}', value) else '<invalid_identifier>'
+                        diagnostic = {'record_id': identifier(row[columns.index('id')]) if 'id' in columns else None,
+                                      'record_type': identifier(record_kind), 'kind': identifier(record_body.get('kind'))}
+                        # Receipt timing and enum metadata identify the writer's
+                        # lifecycle without exposing names, paths or ticket text.
+                        if record_kind == 'storage_job' and record_body.get('kind') == 'ticket_object_delete':
+                            for key in ['cause', 'state']:
+                                if isinstance(record_body.get(key), str) and record_body[key] in {'task_purge', 'done_evidence', 'media_round_delete', 'pending', 'completed'}:
+                                    diagnostic[key] = record_body[key]
+                            for key in ['created_at', 'checked_at']:
+                                if isinstance(record_body.get(key), str) and re.fullmatch(r'[0-9T:.Z+-]{20,35}', record_body[key]):
+                                    diagnostic[key] = record_body[key]
+                            raw_objects = record_body.get('objects')
+                            for obj in raw_objects if isinstance(raw_objects, list) else []:
+                                if isinstance(obj, dict) and obj.get('stored_path') == refused_value and refused_value is not None:
+                                    diagnostic['has_relative_path'] = isinstance(obj.get('relative_path'), str)
+                                    state = obj.get('state')
+                                    diagnostic['object_state'] = state if isinstance(state, str) and state in {'pending', 'retained', 'removed', 'already_missing'} else None
+                                    reasons = obj.get('reasons') if isinstance(obj.get('reasons'), list) else []
+                                    diagnostic['outside_managed_store'] = 'outside_managed_store' in reasons
+                                    diagnostic['external_original'] = 'external_original' in reasons
+                                    break
+                        raise ValueError(f'{error} Record kind: {identifier(record_kind)}. Record: {json.dumps(diagnostic, sort_keys=True)}.') from error
         try: external_bindings.revalidate()
         except (OSError, RuntimeError, ValueError) as error:
             refuse('external binding release', str(error))
@@ -1409,6 +1535,7 @@ def create(arguments, p):
             elif arguments.seed.startswith('slot:'):
                 seed = slot_seed(checked(slot_number(arguments.seed[5:])), pending, p['data'])
             elif arguments.seed != 'empty': raise ValueError('Seed must be empty, latest-backup, backup:PATH, restored:PATH or slot:M.')
+            require_receipt_path_support(capture, manifest, seed.get('path_inspection', {}))
         except (ValueError, OSError, sqlite3.Error) as error:
             metadata.update(mode='refused', seed={'kind': 'refused', 'reason': str(error)})
             save(p, metadata)
@@ -1459,6 +1586,7 @@ def restage(arguments, p):
     bundle_check(p, metadata)
     capture, manifest = stage_selection(arguments)
     require_managed_path_support(capture, manifest)
+    require_receipt_path_support(capture, manifest, metadata['seed'].get('path_inspection', {}))
     reply = getattr(arguments, 'backup_reply', None)
     proof = restage_qualification(metadata, capture, manifest, getattr(arguments, 'seeded_commit', None), reply)
     identity = sign_identity(manifest)
@@ -1612,8 +1740,9 @@ def start(arguments, p):
             seed['kind'] == 'restored' and seed.get('source_manifest') is not None
             and is_live_snapshot(Path(seed['source_manifest']).parent, seed.get('source_root')))
         summary_source_root = seed.get('source_root') if source_summaries else None
-        require_local_paths(p['data'] / 'checklist.sqlite', p['data'], immutable=False, source_root=seed.get('source_root'),
-                            summary_source_root=summary_source_root, summary_source_paths=seed.get('source_summary_paths', {}))
+        inspection = require_local_paths(p['data'] / 'checklist.sqlite', p['data'], immutable=False, source_root=seed.get('source_root'),
+                                         summary_source_root=summary_source_root, summary_source_paths=seed.get('source_summary_paths', {}))
+        require_receipt_path_support(Path(metadata['stage_path']), manifest, inspection)
     logs = contained(p['folder'] / 'logs', p['folder']); logs.mkdir(mode=0o700, exist_ok=True)
     plist = contained(p['folder'] / 'service.plist', p['folder'])
     contents = {'Label': p['label'], 'MachServices': {p['label']: True},

@@ -28,6 +28,9 @@ public final class CommandRouter: @unchecked Sendable {
     // Writer connection only, including startup and maintenance callbacks.
     var lastRoutinePrune: Date?
     var workHealthScanPosition: Int64 = 0
+    let workHealthPreparationLock = NSLock()
+    /// Owned-test seam at the expensive work-health read boundary.
+    var workHealthPreparationProbe: (@Sendable () throws -> Void)?
     private let preparationLock = NSLock()
     let root: URL
     private let gateFiles: StorageObjectFiles

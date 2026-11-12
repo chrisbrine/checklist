@@ -172,10 +172,12 @@ extension CommandRouter {
         var candidates = Set<String>(),verifications: [String:TicketObjectRemovalVerification] = [:],failures: [String:Error] = [:]
         let started = ProcessInfo.processInfo.systemUptime
         let descriptorReserve = backup?.descriptorAdmissionReserve ?? 108
+        let trashUnavailable = mediaCleanupTrashBindingFailure(receipt) != nil
         // Amortize the immutable reference/backup observation across a bounded
         // batch. Stop admitting after one second; a single large object's
         // cooperative verification retains the existing sixty-second ceiling.
         for object in objects where object["state"] as? String == "pending" && !targets.contains(object["relative_path"] as? String ?? "") {
+            if trashUnavailable && object["disposal"] as? String == "trash" {continue}
             if !candidates.isEmpty,backup?.hasDescriptorBudget(reserving:descriptorReserve) == false {break}
             if candidates.count >= 256 || !candidates.isEmpty && ProcessInfo.processInfo.systemUptime-started >= 1 {break}
             guard let path = object["relative_path"] as? String else {continue}

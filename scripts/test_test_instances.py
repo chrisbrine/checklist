@@ -1,6 +1,7 @@
 """Pure-logic checks for bounded test slots; no installed app or service is touched."""
 import importlib.util
 import io
+import errno
 from contextlib import redirect_stdout, redirect_stderr, closing, ExitStack, contextmanager
 import itertools
 import os
@@ -219,6 +220,49 @@ class TestInstancesTests(unittest.TestCase):
             with self.assertRaises(ValueError): harness.load(p)
 
 class AdditionalGuardsTests(unittest.TestCase):
+    def test_origin_receipts_require_hash_bound_instance_local_executor_capability(self):
+        with test_directory() as directory:
+            base = Path(directory).resolve()
+            names = ['TicketObjectDeletion.swift', 'TicketCleanupPreparation.swift', 'ArchiveCleanupExecutor.swift', 'MediaCleanupTrash.swift']
+            inputs = []
+            for name in names:
+                relative = 'Sources/ChecklistCore/' + name
+                file = base / 'source' / relative;file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text('    static let ticketObjectDeletionLocalPathVersion = 2\n' if name == names[0] else 'audited consumer')
+                inputs.append({'path': relative, 'sha256': harness.sha(file)})
+            manifest = {'inputs': inputs};counts = {'receipt_origin_absolute': 1}
+            harness.require_receipt_path_support(base, manifest, counts)
+            harness.require_receipt_path_support(base, manifest, {'receipt_unavailable_absolute': 1})
+            harness.require_receipt_path_support(base, manifest, {'receipt_nonlocal_trash_absolute': 1})
+            with self.assertRaisesRegex(ValueError, 'predates'):
+                harness.require_receipt_path_support(base, {'inputs': []}, {'receipt_unavailable_absolute': 1})
+            harness.require_receipt_path_support(base, {'inputs': []}, {})
+            for index in range(len(inputs)):
+                with self.subTest(missing=names[index]), self.assertRaisesRegex(ValueError, 'predates'):
+                    harness.require_receipt_path_support(base, {'inputs': inputs[:index] + inputs[index + 1:]}, counts)
+                file = base / 'source' / inputs[index]['path'];original = file.read_text();file.write_text('changed')
+                with self.subTest(changed=names[index]), self.assertRaisesRegex(ValueError, 'no verified'):
+                    harness.require_receipt_path_support(base, manifest, counts)
+                file.write_text(original)
+            file = base / 'source' / inputs[0]['path'];file.write_text('old executor')
+            inputs[0]['sha256'] = harness.sha(file)
+            with self.assertRaisesRegex(ValueError, 'predates'):
+                harness.require_receipt_path_support(base, manifest, counts)
+            file.write_text('    static let ticketObjectDeletionLocalPathVersion = 1\n')
+            inputs[0]['sha256'] = harness.sha(file)
+            with self.assertRaisesRegex(ValueError, 'predates'):
+                harness.require_receipt_path_support(base, manifest, {'receipt_nonlocal_trash_absolute': 1})
+
+    def test_origin_receipt_cannot_start_an_old_stage_before_launch(self):
+        p = harness.paths(2)
+        metadata = {'seed': {'kind': 'backup', 'source_root': '/owned/source'}, 'mode': 'stopped', 'stage_path': '/unused-stage'}
+        with patch.object(harness, 'load', return_value=metadata), patch.object(harness, 'bundle_check', return_value={'inputs': []}), \
+             patch.object(harness, 'require_managed_path_support', return_value=5), \
+             patch.object(harness, 'require_local_paths', return_value={'receipt_origin_absolute': 1}), patch.object(harness, 'run') as run:
+            with self.assertRaisesRegex(ValueError, 'predates instance-local deletion receipts'):
+                harness.start(SimpleNamespace(slot=2, gui=False), p)
+            run.assert_not_called()
+
     def test_old_stages_cannot_produce_test_bundles(self):
         with self.assertRaises(ValueError): harness.require_instance_support({'inputs': []})
         harness.require_instance_support({'inputs': [{'path': 'Sources/ChecklistIPC/ChecklistInstance.swift'}]})
@@ -1330,6 +1374,163 @@ class RestoredSeedTests(unittest.TestCase):
 
 class SeedIsolationTests(unittest.TestCase):
     fixture = SnapshotLogicTests.fixture
+
+    def test_pending_deletion_receipt_origin_stored_path_seeds_without_rewriting(self):
+        record = {'id': '00000000-0000-0000-0000-000000000452', 'kind': 'ticket_object_delete',
+                  'cause': 'task_purge', 'state': 'pending', 'objects': [
+                      {'stored_path': '/owned/source/objects/file', 'relative_path': 'objects/file',
+                       'kind': 'file', 'state': 'pending', 'sha256': 'a' * 64, 'size': 7}]}
+        with test_directory() as directory:
+            source, destination, manifest = self.fixture(Path(directory).resolve(), 3, [('storage_job', record)])
+            seed = harness.snapshot_seed(source, destination)
+            self.assertEqual(seed['path_inspection']['receipt_origin_absolute'], 1)
+            self.assertEqual(harness.sha(source / 'database.sqlite'), manifest['databaseSHA256'])
+            self.assertEqual(harness.sha(destination / 'checklist.sqlite'), manifest['databaseSHA256'])
+            # Startup repeats the policy against the published copy, including its WAL.
+            counts = harness.require_local_paths(destination / 'checklist.sqlite', destination,
+                                                  immutable=False, source_root='/owned/source')
+            self.assertEqual(counts['receipt_origin_absolute'], 1)
+
+    def test_deletion_receipt_stored_path_exception_has_exact_record_scope(self):
+        for kind, body in [
+                ('task', {'kind': 'ticket_object_delete', 'objects': [{'stored_path': '/owned/source/objects/file'}]}),
+                ('storage_job', {'kind': 'attachment_import', 'objects': [{'stored_path': '/owned/source/objects/file'}]}),
+                ('storage_job', {'kind': 'ticket_object_delete', 'nested': {'objects': [{'stored_path': '/owned/source/objects/file'}]}})]:
+            with self.subTest(kind=kind, body=body), test_directory() as directory:
+                with self.assertRaises(ValueError):
+                    self.inspect(Path(directory).resolve(), [(kind, dict(body, id='00000000-0000-0000-0000-000000000452'))], '/owned/source')
+
+    def test_deletion_receipt_paths_keep_url_traversal_family_and_root_refusals(self):
+        for value in ['file:///owned/source/objects/file', '../objects/file', 'objects/../file',
+                      '/owned/source/objects/../file', '/owned/source/other/file',
+                      '/owned/source/objects//file',
+                      str(harness.paths(4)['data'] / 'objects/file')]:
+            with self.subTest(value=value), test_directory() as directory:
+                record = {'id': '00000000-0000-0000-0000-000000000452', 'kind': 'ticket_object_delete',
+                          'objects': [{'stored_path': value}]}
+                with self.assertRaises(ValueError) as raised:
+                    self.inspect(Path(directory).resolve(), [('storage_job', record)], '/owned/source')
+                self.assertNotIn(value, str(raised.exception))
+        # An external original is retained history, never a source-file fallback.
+        with test_directory() as directory:
+            result = self.inspect(Path(directory).resolve(), [('storage_job', {
+                'id': 'receipt', 'kind': 'ticket_object_delete', 'objects': [
+                    {'stored_path': '/outside/external-original.txt', 'kind': 'file',
+                     'state': 'retained', 'reasons': ['external_original']}]})], '/owned/source')
+            self.assertEqual(result['receipt_unavailable_absolute'], 1)
+
+    def test_deletion_receipt_paths_refuse_local_copy_symlinks_and_unsafe_trash(self):
+        for immutable in [True, False]:
+            with self.subTest(immutable=immutable), test_directory() as directory:
+                base = Path(directory).resolve();copy = base / '.seed-data';copy.mkdir()
+                (copy / 'objects').symlink_to(base / 'outside')
+                database = copy / 'checklist.sqlite'
+                store_fixture(database, 3, [('storage_job', {'id': 'receipt', 'kind': 'ticket_object_delete',
+                    'objects': [{'stored_path': '/owned/source/objects/file'}]})])
+                with self.assertRaisesRegex(ValueError, 'symlink'):
+                    harness.require_local_paths(database, base / 'data', immutable=immutable, source_root='/owned/source')
+        for body in [{'objects': [{'trash_path': 'file:///outside/trash/file'}]}, {'media_trash_directory': '/outside/../trash'},
+                     {'media_trash_directory': str(harness.LIVE / 'objects/trash')},
+                     {'objects': [{'trash_path': str(harness.paths(4)['data'] / 'objects/file')}]}]:
+            with self.subTest(body=body), test_directory() as directory:
+                with self.assertRaises(ValueError):
+                    self.inspect(Path(directory).resolve(), [('storage_job', dict(body, id='receipt', kind='ticket_object_delete'))], '/owned/source')
+
+    def test_copied_legacy_and_bound_trash_destinations_are_data_with_a_new_executor(self):
+        for binding in [None, '/owned/source']:
+            with self.subTest(binding=binding), test_directory() as directory:
+                record = {'id': 'receipt', 'kind': 'ticket_object_delete', 'state': 'pending',
+                          'media_trash_directory': '/outside/Trash/retained',
+                          'objects': [{'trash_path': '/outside/Trash/retained/file', 'relative_path': 'objects/file'}]}
+                if binding is not None: record['media_trash_source_root'] = binding
+                result = self.inspect(Path(directory).resolve(), [('storage_job', record)], '/owned/source')
+                self.assertEqual(result['receipt_nonlocal_trash_absolute'], 2)
+
+    def test_receipt_trash_inspection_never_opens_foreign_file_leaf(self):
+        with test_directory() as directory:
+            base = Path(directory).resolve();outside = base / 'foreign-trash';outside.mkdir()
+            leaf = outside / 'sentinel';leaf.write_bytes(b'foreign bytes must not be opened')
+            original_open = os.open;opened = []
+            def guarded_open(path, *args, **kwargs):
+                opened.append(str(path))
+                self.assertNotEqual(str(path), str(leaf), 'An inert foreign Trash file must never be opened')
+                return original_open(path, *args, **kwargs)
+            record = {'id': 'receipt', 'kind': 'ticket_object_delete', 'state': 'pending',
+                      'media_trash_directory': str(outside), 'objects': [{'trash_path': str(leaf)}]}
+            with patch.object(harness.os, 'open', side_effect=guarded_open):
+                result = self.inspect(base, [('storage_job', record)], '/owned/source')
+            self.assertEqual(result['receipt_nonlocal_trash_absolute'], 2)
+            self.assertNotIn(str(leaf), opened)
+        with test_directory() as directory:
+            base = Path(directory).resolve();alias = base / 'trash-link';alias.symlink_to(base / 'outside')
+            with self.assertRaisesRegex(ValueError, 'symlink'):
+                self.inspect(base, [('storage_job', {'id': 'receipt', 'kind': 'ticket_object_delete',
+                    'media_trash_directory': str(alias)})], '/owned/source')
+
+    def test_denied_trash_ancestry_is_opaque_only_for_unbound_history(self):
+        for code in [errno.EPERM, errno.EACCES, errno.EIO]:
+            for binding in [None, 'foreign', 'current']:
+                with self.subTest(code=code, binding=binding), test_directory() as directory:
+                    base = Path(directory).resolve(); outside = base / 'foreign-trash';outside.mkdir()
+                    record = {'id': 'receipt', 'kind': 'ticket_object_delete', 'state': 'pending',
+                              'media_trash_directory': str(outside), 'objects': [{'trash_path': str(outside / 'file')}]}
+                    if binding is not None: record['media_trash_source_root'] = str(base / 'data') if binding == 'current' else '/owned/source'
+                    original = harness._canonical_path
+                    def denied(path):
+                        if Path(path) == outside or Path(path) == outside.parent:
+                            raise OSError(code, 'private pathname must not escape')
+                        return original(path)
+                    with patch.object(harness, '_canonical_path', side_effect=denied):
+                        if code in [errno.EPERM, errno.EACCES] and binding != 'current':
+                            result = self.inspect(base, [('storage_job', record)], '/owned/source')
+                            self.assertEqual(result['receipt_opaque_trash_absolute'], 2)
+                            self.assertEqual(result['receipt_nonlocal_trash_absolute'], 2)
+                        else:
+                            with self.assertRaises(ValueError) as raised:
+                                self.inspect(base, [('storage_job', record)], '/owned/source')
+                            self.assertNotIn('private pathname', str(raised.exception))
+
+    def test_opaque_trash_keeps_lexical_root_and_reachable_symlink_refusals(self):
+        for root in [harness.LIVE, harness.paths(4)['data']]:
+            with self.subTest(root=root), test_directory() as directory:
+                base = Path(directory).resolve()
+                with patch.object(harness, '_canonical_path', side_effect=PermissionError(errno.EPERM, 'denied')):
+                    with self.assertRaisesRegex(ValueError, 'different Checklist'):
+                        self.inspect(base, [('storage_job', {'id': 'receipt', 'kind': 'ticket_object_delete',
+                            'media_trash_directory': str(root / 'hidden')})], '/owned/source')
+        with test_directory() as directory:
+            base = Path(directory).resolve();outside=base/'foreign';outside.mkdir()
+            alias=base/'trash-parent';alias.symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, 'symlink'):
+                self.inspect(base, [('storage_job', {'id': 'receipt', 'kind': 'ticket_object_delete',
+                    'media_trash_directory': str(alias/'hidden')})], '/owned/source')
+
+    def test_refusal_diagnostics_redact_invalid_kind_and_malformed_receipt_enums(self):
+        for kind in [{'body': 'private note'}, ['private note'], '/private/name', 'private note']:
+            with self.subTest(kind=kind), test_directory() as directory:
+                with self.assertRaises(ValueError) as raised:
+                    self.inspect(Path(directory).resolve(), [('storage_job', {
+                        'id': 'receipt', 'kind': kind, 'objects': [{'stored_path': '/private/name'}]})])
+                self.assertIn('<invalid_identifier>', str(raised.exception))
+                self.assertNotIn('private', str(raised.exception))
+        with test_directory() as directory, self.assertRaises(ValueError):
+            self.inspect(Path(directory).resolve(), [('storage_job', {'id': 'receipt', 'kind': 'ticket_object_delete',
+                'cause': [], 'state': {}, 'objects': None, 'details': {'path': '/private/name'}})])
+        with test_directory() as directory, self.assertRaises(ValueError):
+            self.inspect(Path(directory).resolve(), [('storage_job', {'id': 'receipt', 'kind': 'ticket_object_delete',
+                'media_trash_directory': str(harness.LIVE), 'objects': [{'stored_path': str(harness.LIVE), 'state': {}}]})])
+
+    def test_seed_refusal_names_structural_record_fields_without_content(self):
+        with test_directory() as directory:
+            record = {'id': '00000000-0000-0000-0000-000000000452', 'kind': 'unknown_delete',
+                      'body': 'private ticket body', 'objects': [{'stored_path': '/owned/source/objects/private-name'}]}
+            with self.assertRaises(ValueError) as raised:
+                self.inspect(Path(directory).resolve(), [('storage_job', record)], '/owned/source')
+            message = str(raised.exception)
+            for value in [record['id'], 'storage_job', 'unknown_delete', 'records.data.objects[].stored_path', 'Source path family: objects']:
+                self.assertIn(value, message)
+            for value in ['private ticket body', 'private-name', '/owned/source']:
+                self.assertNotIn(value, message)
 
     def inspect(self, base, records, source_root=None):
         database = base / 'fixture.sqlite'
@@ -2801,7 +3002,7 @@ class SlotStartupTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, json.dumps(response), '')
             for context in [patch.dict(os.environ, environment or {}, clear=True),
                             patch.object(harness, 'load', return_value=metadata), patch.object(harness, 'bundle_check', return_value={}),
-                            patch.object(harness, 'require_managed_path_support', return_value=4), patch.object(harness, 'require_local_paths'),
+                            patch.object(harness, 'require_managed_path_support', return_value=4), patch.object(harness, 'require_local_paths', return_value={}),
                             patch.object(harness, 'launch_state', return_value={'registered': registered}),
                             patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}),
                             patch.object(harness, 'run', side_effect=run), patch.object(harness.time, 'monotonic', clock.monotonic),

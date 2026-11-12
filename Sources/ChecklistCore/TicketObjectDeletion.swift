@@ -107,6 +107,11 @@ extension CommandRouter {
         (value["media_capture_history"] as? JSON)?["state"] as? String == "round_deleted"
     }
     static let ticketObjectDeletionKind = "ticket_object_delete"
+    /// Seed capability: stored_path is provenance only. Preparation and the
+    /// byte executor use relative_path beneath this router's root, never an
+    /// absolute stored_path from a retained receipt's original installation.
+    /// Version 2 also fences retained Trash destinations by their exact source root.
+    static let ticketObjectDeletionLocalPathVersion = 2
     static let ticketObjectDeletionRetryReasons: Set<String> = ["backup_authority","remaining_record","backup_required","backup_copy_unavailable","backup_authority_unavailable"]
     static func ticketObjectDeletionReasonsRetryable(_ reasons: Set<String>) -> Bool {
         !reasons.isEmpty && reasons.allSatisfy {ticketObjectDeletionRetryReasons.contains($0) || $0.hasPrefix("backup_index_error:") || $0.hasPrefix("backup_copy_unverified:")}

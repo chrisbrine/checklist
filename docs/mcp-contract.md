@@ -856,6 +856,12 @@ An undecided Draft stays open too; an empty Draft is canceled and archived becau
 
 Marked media entries carry `disposal: "trash"` in the existing byte-cleanup receipt and retain exact `trash_path` destinations plus `moved_to_trash` outcomes. Archive cleanup holds marked originals with `mediaTrashRequired`; an older non-Trash ticket intent is held with `media_trash_required`. A resumed move verifies the recorded destination rather than granting permanent deletion, and an incomplete pre-intent Trash folder is retained while a new exclusive destination is prepared. No flow empties Trash.
 
+Retained Trash intents also require the current store root's exact persisted
+binding before destination access. Copied or legacy unbound pending moves remain
+`retained` with `trash_source_root_unproven`; an inconsistent target uses
+`trash_intent_invalid`. These holds preserve prior outcomes and grant no access
+to the original installation's files. See [cleanup receipt authority](archive-cleanup.md).
+
 `last_result_sent.decision_ids` is the baseline of all current decisions at that send, including unchanged items. An otherwise identical decision with a new ID is unchanged; a different selected candidate, none-fit choice, review basis or follow-up reason counts as a change. Changing an effective destination resends that item to its new ticket without resetting unrelated items. An unlinked item retains its last actually sent choice and destination across unrelated sends, until a withdrawal or a current decision sent to a new destination replaces it. Legacy CL-427 single-ticket baselines remain usable. If an item in the last sent baseline now has a withdrawn head, the earlier sent ticket's note includes `<plain label>: Pending — decision withdrawn`, counted in `item_count`, even after the item or round moves to another ticket or its link is cleared. The new ticket gets no withdrawal line; separate changed current decisions still go to their own effective destinations. A send whose only changes are withdrawals is allowed even when no current decision remains. After sending, the baseline excludes withdrawn items, so another send does not repeat them. An item withdrawn before it was ever sent sends nothing. Result notes otherwise include only current published decisions, quote literal labels/notes without interpreting `@` mentions, and retain the ordinary note-size bound and atomic refusal.
 
 ### Agent media type and publication changes (CL-419)

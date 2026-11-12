@@ -60,6 +60,38 @@ Seed inspection and start preflight accept the managed families `objects`, `sour
 
 Before publication, the harness inspects all database values read-only. It accepts validated root-relative managed descriptors and legacy absolute descriptors under the verified snapshot `sourceRoot` or stopped source slot root. Core resolves them only inside the new root. Schema 0, 1 and 2 enter the normal protected migration: the complete pre-upgrade snapshot finishes before one atomic path rewrite. An outside descriptor without local proof stays unavailable. The harness never rewrites database records. A descriptor into a different Checklist data root still refuses the seed; the verified origin exception applies only to canonical managed fields with the right family layout. Managed descriptors through a symlink in the corresponding copy also refuse. See [the storage contract](database-storage.md) for proof and rollback rules.
 
+Retained `storage_job` records with `kind:ticket_object_delete` also keep
+`objects[].stored_path` as provenance and reference text. For this exact field,
+the harness accepts a valid managed descriptor under the destination or verified
+source root, or a managed relative descriptor. It checks the corresponding copy
+for symlinks and never opens the source path. A different Checklist root, file
+URL, traversal or invalid local family refuses. An unproved
+outside spelling, including an external original, remains unavailable history.
+`relative_path` keeps its managed-path
+checks and is the byte executor's only source-file authority. Startup does not
+rewrite receipt history. `receipt_origin_absolute` counts origin spellings and
+`receipt_unavailable_absolute` counts unproved outside spellings.
+
+Before publishing or starting a copy with these nonlocal receipt paths, the harness
+requires the staged `ticketObjectDeletionLocalPathVersion = 2` capability and
+hash-verified captured deletion writer, preparation, executor and Trash sources. Restage
+checks this capability too. Older stages without it refuse even if they support
+schema-3 managed paths. Receipt `trash_path` and `media_trash_directory` must be
+well-formed absolute paths outside other Checklist roots, or local no-follow
+paths. `receipt_nonlocal_trash_absolute` counts outside destinations. Core checks
+the persisted `media_trash_source_root` byte-for-byte against its current root
+before any retained Trash access. Legacy or copied destinations without that
+proof stay unavailable and pending moves settle as retained; completed outcomes
+remain history. The harness never backfills a binding or opens a Trash target.
+For root-unbound history only, `EPERM` or `EACCES` while inspecting ancestry
+records `receipt_opaque_trash_absolute`. Lexical Checklist-root overlaps and
+reachable symlinks still refuse. An inaccessible boundary leaves physical aliases
+and links below it unknown; it grants no authority. Core's repeated root-binding
+check keeps that history inert. Current-root-bound destinations and other
+filesystem errors still refuse when ancestry cannot be proved.
+A refusal names the record ID, type, `kind`,
+field and source path family, without printing its path or ticket content.
+
 Project/workspace roots, file scopes, external attachment references and owner-selected project files are accepted outside every Checklist data root. Their occurrence count is recorded as `path_inspection.external_project_path_occurrences`. Source-capture `additional_paths` remain relative to their recorded project root. Every binding uses the shared CL-169 overlap rule: it can neither lie inside nor contain the live/default roots or the whole test-instance base, including every slot. Comparisons use existing ancestor device/inode identities, resolve symlink spellings, and compare path components in Unicode NFD with case folding on every volume. This also covers normalized spellings and case-folded lock keys. Core source inventory separately refuses overlap with its current store before traversal and rejects selected entries that resolve into it. These folders are references; they are not copied or relocated. The slot's signed owner channel or an actually enrolled scoped session may read them later when an authorized attachment, source-capture or live-source check permits it. A copied path grants no new access and starts no work. Use synthetic projects in a disposable slot when a check must avoid existing project files. Create them only with `project_create` through that slot’s CLI from its actual authorized workspace, after verifying the slot/build identity; never use the live CLI for synthetic project creation. After evidence capture, close the slot GUI and run `./script/test_instances.py destroy --slot N` for the owned slot. Archiving a project retains it and is not cleanup. Record the destroy receipt or incomplete cleanup; leave no synthetic project or enrollment in the live installation.
 
 Manifest evidence uses an explicit file-consumer inventory (CL-402):

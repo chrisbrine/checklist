@@ -2,8 +2,9 @@ import Foundation
 import GRDB
 import Darwin
 import CryptoKit
+import os
 
-/// All supported routers take this gate before entering the SQL writer. Reader
+/// Managed-file authority commits take this gate before the SQL writer. Reader
 /// grants, links, backup holds and the final unlink therefore share one order.
 final class ArchiveStoragePermit {
     fileprivate let files: StorageObjectFiles
@@ -14,7 +15,8 @@ final class ArchiveStoragePermit {
     }
 }
 enum ArchiveStorageGate {
-    static func withExclusive<T>(root: URL,files pinned: StorageObjectFiles? = nil,_ body: (ArchiveStoragePermit) throws -> T) throws -> T {
+    private static let logger = Logger(subsystem:"org.checklist.coordination",category:"archive-storage-gate")
+    static func withExclusive<T>(root: URL,files pinned: StorageObjectFiles? = nil,file: StaticString = #fileID,line: UInt = #line,caller: StaticString = #function,_ body: (ArchiveStoragePermit) throws -> T) throws -> T {
         let files: StorageObjectFiles
         if let pinned { try pinned.requireNamedRoot(root);files = pinned }
         else { files = try StorageObjectFiles(root:root) }
@@ -23,9 +25,21 @@ enum ArchiveStorageGate {
         defer { Darwin.close(fd) }
         var info = stat()
         guard fstat(fd,&info) == 0,info.st_mode & S_IFMT == S_IFREG,info.st_nlink == 1 else { throw CoreError("STORAGE_GATE_UNAVAILABLE", "The managed object gate is not a private regular file.") }
+        let started = ProcessInfo.processInfo.systemUptime
         while flock(fd,LOCK_EX) != 0 { if errno != EINTR { throw CoreError("STORAGE_GATE_UNAVAILABLE", "The managed object gate could not be acquired.") } }
+        let acquired = ProcessInfo.processInfo.systemUptime
+        let thread = pthread_mach_thread_np(pthread_self())
+        logger.debug("acquired file=\(String(describing:file),privacy:.public) line=\(line) caller=\(String(describing:caller),privacy:.public) thread=\(thread) acquired_uptime=\(acquired) wait_ms=\((acquired-started)*1000)")
         let permit = ArchiveStoragePermit(files)
-        defer { permit.active = false;_ = flock(fd,LOCK_UN) }
+        defer {
+            permit.active = false;_ = flock(fd,LOCK_UN)
+            let released = ProcessInfo.processInfo.systemUptime
+            if acquired-started >= 0.1 || released-acquired >= 0.1 {
+                logger.notice("released file=\(String(describing:file),privacy:.public) line=\(line) caller=\(String(describing:caller),privacy:.public) thread=\(thread) acquired_uptime=\(acquired) released_uptime=\(released) wait_ms=\((acquired-started)*1000) hold_ms=\((released-acquired)*1000)")
+            } else {
+                logger.debug("released file=\(String(describing:file),privacy:.public) line=\(line) caller=\(String(describing:caller),privacy:.public) thread=\(thread) acquired_uptime=\(acquired) released_uptime=\(released) wait_ms=\((acquired-started)*1000) hold_ms=\((released-acquired)*1000)")
+            }
+        }
         return try body(permit)
     }
 }
@@ -340,6 +354,19 @@ extension CommandRouter {
         guard try !StorageSnapshotRetention.isActive(root:root) else {return prepared.receipt}
         var receipt = prepared.receipt
         guard var objects = receipt["objects"] as? [JSON],objects.count <= 100000,objects.contains(where: {$0["state"] as? String == "pending"}) else {throw CoreError("CLEANUP_INTENT_INVALID","The deletion intent requires repair; bytes retained.")}
+        if let reason = mediaCleanupTrashBindingFailure(receipt) {
+            // A copied or unbound legacy destination is history, never a file
+            // authority. Settle its pending moves without opening that folder.
+            for i in objects.indices where objects[i]["state"] as? String == "pending" && objects[i]["disposal"] as? String == "trash" {
+                objects[i]["state"] = "retained";objects[i]["reasons"] = [reason]
+            }
+            var outcome = receipt
+            try withValidatedDomainTransaction(db) {
+                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow)
+                return .commit
+            }
+            return outcome
+        }
         if Self.isLegacyDoneEvidenceDeletion(receipt) {
             // No old ownership fingerprint gains unlink authority. Keep every
             // byte, preserve all earlier outcomes, and request a fresh policy-v2

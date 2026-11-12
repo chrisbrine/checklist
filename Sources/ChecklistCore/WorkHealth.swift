@@ -303,19 +303,70 @@ extension CommandRouter {
         }
     }
 
-    /// Runs one bounded page on the service queue. Restarting resets only the scan
-    /// position; all requests/deadlines/outcomes survive in the domain transaction.
+    /// Prepare the page and progress clocks without the object gate or writer.
+    /// Restarting resets only the scan position; durable requests stay in SQL.
     public func runWorkHealthChecks(at date: Date = Date()) throws -> [String: Any] {
         let lease = try storageAdmission.acquire(); defer { lease.finish() }
+        workHealthPreparationLock.lock();defer {workHealthPreparationLock.unlock()}
+        var configuration = Configuration();configuration.readonly = true
+        configuration.prepareDatabase {db in
+            try SchemaMigrations.installStorageCollation(db);Self.installTicketSearchFunctions(db)
+        }
+        // Never fall back to a long read on the writer if the ordinary pool is
+        // unavailable or occupied by a cleanup deadline scan.
+        let observer = try DatabaseQueue(path:root.appendingPathComponent("checklist.sqlite").path,configuration:configuration)
+        defer {try? observer.close()}
+        let fence = WorkHealthPreparationChanges()
+        let (position,version) = try dbQueue.writeWithoutTransaction {db in
+            var version: Int64 = 0
+            try db.inSavepoint {version = try fence.install(db);return .commit}
+            return (workHealthScanPosition,version)
+        }
+        defer {try? dbQueue.writeWithoutTransaction {try fence.remove($0)}}
+        let page = try observer.read {db in try autoreleasepool {
+            let result = try prepareWorkHealthPage(db,after:position)
+            try workHealthPreparationProbe?()
+            return result
+        }}
         return try ArchiveStorageGate.withExclusive(root: root) { _ in
             try dbQueue.writeWithoutTransaction { db in
-                var result: JSON = [:]
-                var nextPosition: Int64 = 0
-                // Yield the writer/coordinator between bounded ticket pages;
-                // one advisory sweep must not consume a foreground command's budget.
-                let pageLimit = 10
+                var result: JSON = [:],advance = false
                 try withValidatedDomainTransaction(db) {
-                let rows = try Row.fetchAll(db, sql: """
+                    guard let changes = try fence.read(db,version:version) else {
+                        // Keep the cursor and use the ordinary 30-second health
+                        // wake, rather than rescanning immediately under traffic.
+                        result = ["scanned":0,"inspected":0,"changed":0,"has_more":false,"enabled":true,"deferred":true]
+                        return .commit
+                    }
+                    var inspected = 0,changed = 0,processed = 0,refused = 0
+                    for item in page.items {
+                        guard try workHealthPreparationIsCurrent(db,changes:changes,dependencies:item.dependencies) else {refused += 1;continue}
+                        processed += 1
+                        switch item.action {
+                        case .unheld(let category):
+                            if try endUnheldWorkHealth(db,task:item.task,category:category) {changed += 1}
+                        case .inspect(let progress):
+                            if try checkWorkHealth(db,task:item.task,at:date,prepared:progress) {changed += 1}
+                            inspected += 1
+                        case .skip:break
+                        }
+                    }
+                    // A known stale item is revisited on the next sweep. Even
+                    // a full stale page must yield to quiet tickets after it.
+                    advance = true
+                    result = ["scanned":page.items.count,"inspected":inspected,"changed":changed,"has_more":page.hasMore,"enabled":page.enabled,"deferred_count":refused]
+                    if processed == 0 && refused > 0 {result["deferred"] = true}
+                    return .commit
+                }
+                if advance {workHealthScanPosition = page.nextPosition}
+                return result
+            }
+        }
+    }
+
+    private func prepareWorkHealthPage(_ db: Database,after position: Int64) throws -> WorkHealthPreparedPage {
+        let pageLimit = 10
+        let rows = try Row.fetchAll(db, sql: """
                     WITH triage_members AS MATERIALIZED (
                         SELECT g.project_id,
                                CASE WHEN m.type='object' THEN json_extract(m.value,'$.task_id') ELSE m.value END AS task_id
@@ -333,34 +384,63 @@ extension CommandRouter {
                          OR EXISTS (SELECT 1 FROM triage_members m WHERE m.project_id=r.project_id AND m.task_id=r.id)
                          OR (json_extract(r.data,'$.work_health.request_id') IS NOT NULL AND EXISTS (SELECT 1 FROM records s WHERE s.id=json_extract(r.data,'$.status_id') AND s.type='status' AND s.project_id=r.project_id AND json_extract(s.data,'$.category') IN ('queued','parked','blocked'))))
                     ORDER BY r.rowid LIMIT ?
-                    """, arguments: [workHealthScanPosition,pageLimit])
-                var inspected = 0, changed = 0
-                for row in rows {
-                    let task = try GRDBRecordEnvelopeAdapter.decode(row).object
-                    if let category = try healthUnheldCategory(db,task:task) {
-                        if try endUnheldWorkHealth(db,task:task,category:category) { changed += 1 }
-                    // Advisory attention retains orchestration/sibling handling; it is not the Active filter.
-                    } else if try selectedTaskActiveAttention(db,task:task) {
-                        if try checkWorkHealth(db, task: task, at: date) { changed += 1 }; inspected += 1
-                    }
-                }
-                nextPosition = rows.count < pageLimit ? 0 : (rows.last?["position"] as Int64? ?? 0)
-                let enabled = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='project') AND COALESCE(json_extract(data,'$.archived'),0)=0 AND COALESCE(json_extract(data,'$.work_health_settings.enabled'),1)=1") ?? 0
-                result = ["scanned": rows.count, "inspected": inspected, "changed":changed, "has_more": rows.count == pageLimit, "enabled": enabled > 0]
-                return .commit
-                }
-                workHealthScanPosition = nextPosition
-                return result
-            }
+                    """, arguments: [position,pageLimit])
+        var dependencyRows = 0,dependencyBytes = 0
+        let items = try rows.map {row -> WorkHealthPreparedPage.Item in
+            let task = try GRDBRecordEnvelopeAdapter.decode(row).object
+            let action: WorkHealthPreparedPage.Action
+            if let category = try healthUnheldCategory(db,task:task) {action = .unheld(category)}
+            // Advisory attention retains orchestration/sibling handling.
+            else if try selectedTaskActiveAttention(db,task:task) {
+                let target = try workHealthTarget(db,task:task)
+                action = .inspect(WorkHealthPreparedProgress(target:target,
+                    reading:try healthProgressReading(db,task:task,target:target),
+                    token:try healthProgressToken(db,task:task,target:target)))
+            } else {action = .skip}
+            var dependencies = try prepareWorkHealthDependencies(db,task:task,action:action)
+            if dependencyRows + dependencies.ids.count > 32768 || dependencyBytes + dependencies.bytes > 4*1024*1024 {
+                dependencies.refuse()
+            } else {dependencyRows += dependencies.ids.count;dependencyBytes += dependencies.bytes}
+            return .init(task:task,action:action,dependencies:dependencies)
         }
+        let enabled = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='project') AND COALESCE(json_extract(data,'$.archived'),0)=0 AND COALESCE(json_extract(data,'$.work_health_settings.enabled'),1)=1") ?? 0
+        return .init(items:items,nextPosition:rows.count < pageLimit ? 0 : (rows.last?["position"] as Int64? ?? 0),hasMore:rows.count == pageLimit,enabled:enabled > 0)
     }
-    func checkWorkHealth(_ db: Database, task original: JSON, at date: Date) throws -> Bool {
+
+    private func prepareWorkHealthDependencies(_ db: Database,task: JSON,action: WorkHealthPreparedPage.Action) throws -> WorkHealthPreparationDependencies {
+        var dependencies = WorkHealthPreparationDependencies()
+        let pid = try StoredRecord(task,family:"task").string("project_id"),tid = try StoredRecord(task,family:"task").string("id")
+        dependencies.include(tid);dependencies.include(task["status_id"] as? String);dependencies.include(task["active_attempt_id"] as? String)
+        dependencies.selectedTasks.insert(.init(project:Data(pid.utf8),id:Data(tid.utf8)))
+        dependencies.includeProject(pid,facts:try workHealthPreparationProjectFacts(record(db,pid,type:"project")))
+        if case .inspect(let progress) = action {
+            dependencies.attemptTasks.insert(.init(project:Data(pid.utf8),id:Data(tid.utf8)))
+            if progress.target["kind"] as? String == "attempt" {dependencies.include(progress.target["id"] as? String)}
+        }
+        // Triage attention may depend on a sibling's status/active attempt.
+        // Keep those exact identities without retaining their payloads.
+        for group in try scopedTaskGroups(db,task:task) where !bool(group,"archived") {
+            let groupID = try StoredRecord(group,family:"group").string("id")
+            dependencies.include(groupID)
+            try visitWorkHealthPreparationMembers(db,group:Data(groupID.utf8),project:Data(pid.utf8)) {member in
+                dependencies.include(member)
+                guard dependencies.complete else {return false}
+                if let sibling = try? scoped(db,String(decoding:member,as:UTF8.self),pid,type:"task") {
+                    dependencies.include(sibling["status_id"] as? String)
+                }
+                return dependencies.complete
+            }
+            if !dependencies.complete {break}
+        }
+        return dependencies
+    }
+    func checkWorkHealth(_ db: Database, task original: JSON, at date: Date, prepared: WorkHealthPreparedProgress? = nil) throws -> Bool {
         var task = original
         let project = try record(db, (try StoredRecord(task, family: "task").string("project_id")), type: "project"), settings = workHealthSettings(project)
         guard bool(settings, "enabled") else { return false }
-        let target = try workHealthTarget(db, task: task), stamp = healthStamp(date)
-        let reading = try healthProgressReading(db, task: task, target: target), progress = reading.at
-        let progressToken = try healthProgressToken(db, task: task, target: target)
+        let target = try prepared?.target ?? workHealthTarget(db, task: task), stamp = healthStamp(date)
+        let reading = try prepared?.reading ?? healthProgressReading(db, task: task, target: target), progress = reading.at
+        let progressToken = try prepared?.token ?? healthProgressToken(db, task: task, target: target)
         var health = task["work_health"] as? JSON ?? [:]
         let previous = health
         if let old = health["target"] as? JSON, !sameHealthTarget(old, target) { health = [:] }
