@@ -176,3 +176,98 @@ session ID. It previously built the full owner snapshot on the coordinator just
 to detect an existing session, blocking every other bootstrap behind task/context
 projection. The selected lookup keeps the global collision check, including
 ended/revoked sessions and other projects, and retains storage admission.
+
+## New CLI process time on a saturated CPU (CL-444)
+
+A new `checklist` process is not always below 1 s when every CPU is busy. Two
+things cause this. macOS scheduling is outside Checklist. The CPU time that the
+CLI and the service use for a call is inside Checklist.
+
+**Measured limit.** Runner R3 (9 November 2026, build 305, 10 CPUs) made 50 new
+`checklist call service_info` processes while a slot backup ran beside 160
+`nice -n 20` CPU workers. The 1-minute load was 126 to 229. The calls took a
+median of 509 ms and a 95th percentile of 981 ms. Two calls took 1.017 s and
+1.058 s. At load 28 to 30 the same 50 calls took a median of 96 ms and at most
+329 ms.
+
+**Cause outside Checklist.** A process waits for a free CPU at each step: exec,
+each new or woken thread, each period of its own CPU work, each reply from
+another process, exit, and the wake-up of the parent that reaps it. In the R3
+run the launcher also started `sysctl -n vm.loadavg` 100 times as a new process.
+That program is not Checklist and uses about 2 ms of CPU. It took a median of
+40 ms, a 95th percentile of 239 ms and a maximum of 457 ms. At load 28 to 30 it
+took 4.6 ms, 6.5 ms and 7.8 ms. The largest intervals of the two slow CLI calls
+(launcher to main 454 ms, last reply to process end 363 ms and 274 ms) are of
+that size.
+
+The wait grows faster than the CPU time that a process needs. On 12 November
+2026 (5-minute load 868 to 950) a C program with a plain loop ran 50 times for
+each CPU need, in turn:
+
+| CPU need of the loop | Process time: median / 95th percentile / maximum |
+| ---: | ---: |
+| 0 ms | 12 / 37 / 168 ms |
+| 5 ms | 20 / 92 / 169 ms |
+| 10 ms | 37 / 232 / 267 ms |
+| 25 ms | 165 / 749 / 809 ms |
+| 50 ms | 697 / 1398 / 2145 ms |
+| 100 ms | 1677 / 2767 / 3526 ms |
+
+`script/measure_process_launch.py` starts the installed CLI in turn with
+programs that are not Checklist, 50 times each. Result of 12 November 2026
+(build 321, 5-minute load 989 to 992, milliseconds as median / 95th percentile /
+maximum):
+
+| New process | Total | Launcher to main | In main, no request | Request delivery | Last stamp to reaped | CPU used |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `checklist call service_info` (184 KB reply) | 540 / 1750 / 1929 | 16 / 29 / 40 | 381 / 877 / 1661 | 14 / 50 / 51 | 4.8 / 34 / 86 | 113 |
+| `checklist version` | 34 / 173 / 185 | 16 / 32 / 55 | 15 / 123 / 148 | - | 1.4 / 8.0 / 11 | 15 |
+| Swift program with Foundation | 23 / 42 / 55 | 12 / 20 / 21 | 8.8 / 25 / 35 | - | 1.2 / 4.6 / 9.1 | 8.2 |
+| C program | 5.5 / 14 / 17 | 5.0 / 13 / 17 | 0 | - | 0.6 / 2.2 / 3.8 | 2.3 |
+| C program, 2 socket round trips | 6.4 / 18 / 23 | 5.0 / 11 / 15 | 0.1 | 0.2 / 4.9 / 6.4 | 0.7 / 2.4 / 6.7 | 2.5 |
+| C program, 100 ms CPU loop | 473 / 1041 / 1843 | 4.9 / 15 / 41 | 467 / 1030 / 1833 | - | 0.9 / 14 / 35 | 103 |
+| `/usr/bin/true` | 4.1 / 10 / 30 | - | - | - | - | 1.7 |
+
+The CLI's launch and exit times were of the size of the Swift program's
+(medians 16 against 12 ms, and 4.8 against 1.2 ms). Its time in main was that of
+the C loop with the same CPU need.
+Six of the 50 calls took above 1 s. Three of them spent 0.8 to 1.5 s in main
+after the reply arrived. The other three waited 0.65 to 0.91 s for the service's
+bootstrap reply. This load is 4 to 8 times the load of the R3 run. The kernel's
+1-minute load value fell to below 1 when it passed about 1024, so these runs
+give the 5-minute value.
+
+**Cause inside Checklist, changed (CL-444).** The CLI and the MCP connection
+converted each reply to the MCP value type through a second JSON text pass and
+the MCP SDK decoder. That decoder tries each value type in turn and tests every
+string with a new regular expression. For a 184 KB `service_info` reply that
+conversion used 76 to 79 ms of CPU. The whole reply step (parse, convert, print)
+used 101 ms of CPU in each new process, and 15 ms for a 19 KB reply. The reply
+is now converted directly (`JSONValueConversion`). The reply step uses 8.5 ms
+and 2.0 ms and writes the same bytes. As a new process at 5-minute load 953 to
+989, the reply step took a median of 1279 ms before and 13 ms after for the
+184 KB reply, and 48 ms before and 2.7 ms after for the 19 KB reply. These
+numbers are for the reply step alone. A whole call of the changed CLI is not
+measured here.
+
+**Not changed.** A CLI process still uses about 15 ms of CPU before its first
+request. The service took a median of 91 ms between receipt and reply for the
+two requests of a call (95th percentile 1012 ms). Both wait for a CPU on a
+saturated host.
+
+**What an operator can do.**
+
+- Keep one process. An agent's `checklist mcp` connection starts no process for
+  a call.
+- Use `checklist call --wait METHOD` for a long command. One process reads to the
+  final reply. A loop of `operation_get` processes pays the process start each time.
+- Start fewer processes. Do not poll with `checklist call` in a loop. Do not
+  start many calls at one time on a busy host.
+- Set the caller's time limit well above 1 s for a new process when the load is
+  above the CPU count. A slow call is not a failed call. Keep the same
+  `command_id` when you send a mutation again.
+- Measure the host:
+  `python3 script/measure_process_launch.py --cli /Applications/Checklist.app/Contents/MacOS/checklist --cwd WORKSPACE --output NEW_FOLDER_OUTSIDE_THE_CHECKOUT`.
+  It starts no backup, no write command and no load. It writes `summary.md` with
+  these intervals for each kind of process. When the control programs are slow
+  too, the cause is the host load.

@@ -277,6 +277,84 @@ class CleanupTests(unittest.TestCase):
         self.assertTrue(all(r['action'] == 'kept' for r in reports))
         self.assertTrue((p/'source').exists()); self.assertEqual(self.moves, [])
 
+    # CL-447: a destroyed slot bundle in the Trash that lost build-info.json, or is gone.
+    def stale_main(self, mode, processes):
+        """Run main() for the build pass with the Trash and the process paths of the fixture."""
+        cleaner = clean.Cleaner
+        def make(*args, **kwargs):
+            return cleaner(*args, process_reader=lambda: processes, mover=self.move,
+                           batch_mover=self.move_batch, **kwargs)
+        output = io.StringIO()
+        with patch.object(clean, 'trash_root', return_value=self.trash), patch.object(clean, 'Cleaner', make), \
+             patch.object(sys, 'argv', ['clean_builds.py', mode, '--only', 'builds', '--repo', str(self.repo),
+                                        '--installed-app', str(self.installed)]), \
+             patch.object(clean, 'storage_report'), patch.object(clean, 'background_sizes', return_value=None), \
+             contextlib.redirect_stdout(output):
+            status = clean.main()
+        return status, [json.loads(line) for line in output.getvalue().splitlines()]
+
+    def test_trash_slot_bundle_without_build_info_or_gone_is_stale_and_exits_zero(self):
+        cases = [(state, mode) for state in ['no build-info', 'bundle gone'] for mode in ['--preview', '--apply']]
+        for index, (state, mode) in enumerate(cases):
+            with self.subTest(state=state, mode=mode):
+                capture = self.capture(str(index + 1) * 64)
+                folder = self.trash / ('slot-1-Checklist-' + str(index) * 32)
+                bundle = folder / 'Checklist Test 1.app'
+                if state == 'no build-info': (bundle / 'Contents/MacOS').mkdir(parents=True)
+                else: folder.mkdir()
+                status, reports = self.stale_main(mode, [bundle / 'Contents/MacOS/ChecklistService'])
+                self.assertEqual(status, 0)
+                stale = [r for r in reports if r['action'] == 'stale_trash_reference']
+                self.assertEqual([(r['path'], r['kind'], r['bytes']) for r in stale],
+                                 [(str(bundle), 'running_bundle', None)])
+                self.assertIn('no build-info.json' if state == 'no build-info' else 'is gone', stale[0]['reason'])
+                self.assertFalse(any(r['action'] == 'kept_error' for r in reports))
+                # The pass still decides the other items.
+                wanted = 'trashed' if mode == '--apply' else 'eligible'
+                outputs = [r for r in reports if r.get('kind') == 'build_output' and Path(r['path']).parent == capture]
+                self.assertEqual(len(outputs), 4)
+                self.assertEqual({r['action'] for r in outputs}, {wanted})
+                self.assertEqual((capture / 'source').exists(), mode == '--preview')
+                self.assertTrue((capture / 'capture-manifest.json').exists())
+
+    def test_other_bundle_read_errors_still_exit_non_zero(self):
+        capture = self.capture(self.ids[2])
+        def bundle(index, trashed):
+            parent = self.trash / ('slot-2-Checklist-' + str(index) * 32) if trashed else self.base / f'slot-{index}'
+            return parent / 'Checklist Test 2.app'
+        cases = [('trash invalid json', True, '{'),
+                 ('trash invalid fingerprint', True, json.dumps({'source_fingerprint': 'invalid'})),
+                 ('trash build-info is a folder', True, 'folder'),
+                 ('outside trash no build-info', False, 'missing'),
+                 ('outside trash bundle gone', False, 'absent')]
+        index = 0
+        for name, trashed, content in cases:
+            for mode in ['--preview', '--apply']:
+                index += 1
+                with self.subTest(case=name, mode=mode):
+                    path = bundle(index, trashed)
+                    info = path / 'Contents/Resources/build-info.json'
+                    if content != 'absent': (path / 'Contents/MacOS').mkdir(parents=True)
+                    if content == 'folder': info.mkdir(parents=True)
+                    elif content not in ('missing', 'absent'):
+                        info.parent.mkdir(parents=True); info.write_text(content)
+                    status, reports = self.stale_main(mode, [path / 'Contents/MacOS/ChecklistService'])
+                    self.assertEqual(status, 1)
+                    self.assertEqual([r['action'] for r in reports if r['action'] != 'summary'], ['kept_error'])
+                    self.assertTrue((capture / 'source').exists()); self.assertEqual(self.moves, [])
+
+    def test_stale_trash_reference_appearing_before_the_batch_is_reported_once(self):
+        capture = self.capture(self.ids[2])
+        bundle = self.trash / ('slot-1-Checklist-' + 'd4' * 16) / 'Checklist Test 1.app'
+        (bundle / 'Contents').mkdir(parents=True)
+        path = bundle / 'Contents/MacOS/ChecklistApp'
+        with patch.object(clean, 'trash_root', return_value=self.trash), \
+             patch.object(self.cleaner, 'process_reader', side_effect=[[path], [path]]):
+            reports = self.run_clean(self.cleaner.builds, True)
+        self.assertEqual([r['path'] for r in reports if r['action'] == 'stale_trash_reference'], [str(bundle)])
+        self.assertFalse(self.cleaner.failed)
+        self.assertFalse((capture / 'source').exists())
+
     def test_unreadable_running_bundle_identity_retains_every_build(self):
         self.capture(self.ids[2])
         bundle = self.apps/'Renamed Qualification.app'; bundle.mkdir()

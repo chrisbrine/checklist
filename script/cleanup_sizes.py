@@ -10,7 +10,11 @@ import threading
 from pathlib import Path
 
 
-def background_sizes(groups, targets=(), *, size_reader, workers=8, chunk=16):
+# A wider folder below a target stays one du job: no job per file of a huge flat folder.
+TARGET_SPLIT_WIDTH = 64
+
+
+def background_sizes(groups, targets=(), *, size_reader, workers=8, chunk=16, target_split=0):
     """Return a cached ``sizer(paths)`` backed by bounded background du calls.
 
     Split group roots two levels deep for parallelism (stopping at target
@@ -18,6 +22,11 @@ def background_sizes(groups, targets=(), *, size_reader, workers=8, chunk=16):
     ``size_reader`` exactly once. Ancestor sizes sum those same leaf results and
     the allocated blocks of partition directories; no ancestor du scan repeats
     a descendant's work. Directory symlinks are leaves, never traversed.
+
+    ``target_split`` (CL-376) also splits each target that many levels deep, so
+    one large held workspace is sized by parallel du jobs, not by one serial du.
+    A folder below a target with more than ``TARGET_SPLIT_WIDTH`` entries stays
+    one job. The sums are the same allocated blocks (same hard-link caveat).
 
     As with cleanup's previous parallel du implementation, hard links shared
     across du batches can count twice. Missing roots are absent from results.
@@ -32,7 +41,7 @@ def background_sizes(groups, targets=(), *, size_reader, workers=8, chunk=16):
     # A plan is either a leaf (None), or (own allocated bytes, child paths).
     plans = {}
 
-    def partition(path, split_depth=0):
+    def partition(path, split_depth=0, below_target=False):
         descendants = [target for target in existing if path in target.parents]
         if split_depth or descendants:
             try:
@@ -43,20 +52,25 @@ def background_sizes(groups, targets=(), *, size_reader, workers=8, chunk=16):
             except OSError:
                 plans[path] = None
                 return
+            if target_split and below_target and not descendants and len(parts) > TARGET_SPLIT_WIDTH:
+                plans[path] = None
+                return
             plans[path] = (own, parts)
             for child in parts:
-                child_depth = max(0, split_depth - 1) if child not in existing else 0
+                is_target = child in existing and child not in roots
+                child_depth = (target_split if is_target else
+                               max(0, split_depth - 1) if child not in existing else 0)
                 if child in roots:
                     child_depth = max(1, child_depth)
                 if child_depth or any(child in target.parents for target in descendants):
-                    partition(child, child_depth)
+                    partition(child, child_depth, is_target or (below_target and child not in existing))
                 else:
                     plans[child] = None
         else:
             plans[path] = None
 
     for root in forest:
-        partition(root, split_depth=2 if root in roots else 1)
+        partition(root, split_depth=2 if root in roots else max(1, target_split), below_target=root not in roots)
     leaves = [path for path, plan in plans.items() if plan is None]
     # Directory scans get independent jobs: one slow directory cannot serialize
     # fifteen others inside a single du call. Batch only files and symlinks.

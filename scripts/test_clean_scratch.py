@@ -1503,6 +1503,81 @@ print(json.dumps({"data": data}))
             self.assertTrue(report['over_budget'])
             self.assertIn('CLEANUP BUDGET EXCEEDED', errors.getvalue())
 
+    # CL-376: faster helpers give the same values as the code they replace.
+    def test_command_arguments_match_shlex_split(self):
+        import shlex
+        lines = ['/usr/bin/swift build --scratch-path=/a/.build', '  /bin/sh\t-c   run  ', '',
+                 '/a/b "space file" --x=/c', "/a 'single quoted' /b", '/a\\ b /c', '/a "unmatched /b',
+                 '/a\x0bb /c', '/a\rb\n/c', '/Applications/Some App.app/Contents/MacOS/Some App --flag',
+                 '/a #not-a-comment /b', 'caf\u00e9\u00a0/x /y']
+        for line in lines:
+            with self.subTest(line=line):
+                try: expected = shlex.split(line)
+                except ValueError: expected = line.split()
+                self.assertEqual(cleanup.command_arguments(line), expected)
+
+    def test_used_items_match_the_parent_walk(self):
+        item = self.item()
+        roots = [item, item / '.build', Path(str(item) + '-other'), item / 'sub/deep', item.parent, Path('/')]
+        paths = [item, item / '.build', item / '.build/a/b', item / '.buildx/a', Path(str(item) + '-other/file'),
+                 Path(str(item) + '-other2'), item / 'sub', item / 'sub/deep/x', item.parent.parent, Path('/elsewhere/x')]
+        for selected in [roots, roots[:3], roots[3:4], []]:
+            for observed in [paths, paths[3:6], paths[-1:], []]:
+                expected = {parent for path in observed for parent in (path, *path.parents) if parent in set(selected)}
+                self.assertEqual(cleanup.used_items(observed, selected), expected)
+                self.assertEqual(cleanup.used_items(observed, iter(selected)), expected)
+
+    def test_tree_summary_matches_inventory(self):
+        root = self.item('unknown', qualification=True)
+        self.write(root, 'store/checklist.sqlite', b'unknown-store')
+        self.write(root, 'a/b/c/file', b'x' * 3000)
+        (root / 'empty/dir').mkdir(parents=True)
+        outside = self.root / 'outside'; outside.mkdir(); self.write(outside, 'file', b'not counted' * 100)
+        (root / 'link').symlink_to(outside)
+        os.utime(root / 'a/b/c/file', (time.time() + 500, time.time() + 500))
+        for path in [root, root / 'a/b/c/file', root / 'link', root / 'empty']:
+            observed = cleanup.inventory(path)
+            self.assertEqual(cleanup.tree_summary(path),
+                             (max(max(entry[4], entry[5]) for entry in observed.values()),
+                              sum(entry[3] for entry in observed.values() if not stat.S_ISDIR(entry[2]))))
+        with self.assertRaises(OSError): cleanup.tree_summary(root / 'missing')
+
+    def test_plan_reads_relative_parts_like_pathlib(self):
+        # An item named like a build folder, and Git metadata below an item (CL-376 string parts).
+        item = self.item('.build'); self.write(item, 'object', b'1'); self.write(item, 'deep/.git/config', b'2')
+        decision = self.plan(item)
+        self.assertEqual(decision['moves'], [item / 'object'])
+        self.assertEqual(decision['reasons'], {'rebuildable build output/cache': 1,
+                                               'Git metadata retained; checkout retirement belongs to CL-194': 1})
+        self.assertEqual(decision, self.plan(item, exhaustive=True))
+
+    def test_preview_splits_held_targets_for_sizing(self):
+        held = self.item('held'); self.mark(held)
+        for name in ['a/x/1', 'a/y/2', 'b/3', 'top']:
+            self.write(held, name, b'z' * 20000)
+        calls, reader = [], cleanup.du_sizes
+        def read(paths):
+            calls.extend(paths)
+            return reader(paths)
+        output = io.StringIO()
+        with patch.object(sys, 'argv', ['clean_scratch.py', '--session-id', 'session', '--sessions-root', str(self.sessions),
+                                        '--qualification-root', str(self.qualification), '--repo', str(self.repo),
+                                        '--installed-info', str(self.installed), '--preview']), \
+             redirect_stdout(output), patch('sys.stderr', io.StringIO()), \
+             patch.object(cleanup, 'running_paths', return_value=[]), \
+             patch.object(cleanup, 'git_objects', return_value=self.objects), \
+             patch.object(cleanup, 'du_sizes', side_effect=read):
+            self.assertEqual(cleanup.main(), 0)
+        rows = [json.loads(line) for line in output.getvalue().splitlines()]
+        row = next(r for r in rows if r.get('path') == str(held))
+        self.assertEqual(row['total_bytes'], reader([held])[held])
+        self.assertEqual(rows[-1]['groups']['scratch'], reader([self.sessions / '-Users-Checklist/session/scratchpad'])[
+            self.sessions / '-Users-Checklist/session/scratchpad'])
+        # The held root is sized by jobs two levels down, never by one du of the whole root.
+        self.assertNotIn(held, calls)
+        self.assertLessEqual({held / 'a/x', held / 'a/y', held / 'b/3', held / 'top'}, set(calls))
+        self.assertEqual(len(calls), len(set(calls)))
+
     def test_background_du_starts_after_process_inspection(self):
         # Its own du arguments must never read as a process using an item.
         item = self.item('copy');self.write(item, '.build/o', b'1')

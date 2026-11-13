@@ -8,7 +8,13 @@ func jsonData(_ value: Any, pretty: Bool = false) throws -> Data {
     try JSONSerialization.data(withJSONObject: value, options: pretty ? [.prettyPrinted, .sortedKeys, .fragmentsAllowed] : [.sortedKeys, .fragmentsAllowed])
 }
 
+/// The direct walk covers JSON object trees; other input takes the decoder (CL-444).
 func mcpValue(_ value: Any) throws -> Value {
+    if let converted = JSONValueConversion.value(value) { return converted }
+    return try mcpValueByDecoding(value)
+}
+
+func mcpValueByDecoding(_ value: Any) throws -> Value {
     try JSONDecoder().decode(Value.self, from: jsonData(value))
 }
 

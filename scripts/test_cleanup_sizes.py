@@ -82,6 +82,39 @@ class CleanupSizeTests(unittest.TestCase):
         self.assertNotIn(package, calls)
         self.assertIn(source, calls)
 
+    def test_target_split_sizes_a_held_target_with_parallel_jobs(self):
+        # CL-376: one large held workspace is not one serial du.
+        for name in ['a/x/1', 'a/y/2', 'b/z/3', 'top']:
+            self.write('scratch/held/' + name)
+        for index in range(70):
+            self.write(f'scratch/held/wide/{index}')
+        self.write('scratch/other/file')
+        scratch = self.root / 'scratch'
+        held = scratch / 'held'
+        (held / 'link').symlink_to(self.root, target_is_directory=True)
+        calls = []
+        lock = threading.Lock()
+
+        def read(paths):
+            with lock:
+                calls.extend(paths)
+            return self.du(paths)
+
+        sizer = background_sizes({'scratch': [scratch]}, [held], size_reader=read, target_split=2)
+        self.assertEqual(sizer([held, scratch]), {path: self.du([path])[path] for path in (held, scratch)})
+        self.assertEqual(len(calls), len(set(calls)))
+        self.assertTrue(all(not any(a in b.parents for b in calls) for a in calls))
+        self.assertNotIn(held, calls)
+        self.assertLessEqual({held / 'a/x', held / 'a/y', held / 'b/z', held / 'top', held / 'link'}, set(calls))
+        # A folder wider than the bound stays one job; a link is never traversed.
+        self.assertIn(held / 'wide', calls)
+        self.assertFalse(any(held / 'wide' in path.parents or held / 'link' in path.parents for path in calls))
+        # The default keeps a target as one job.
+        calls.clear()
+        sizer = background_sizes({'scratch': [scratch]}, [held], size_reader=read)
+        self.assertEqual(sizer([held]), self.du([held]))
+        self.assertIn(held, calls)
+
     def test_symlink_target_is_not_traversed(self):
         self.write('outside/private/file')
         self.write('scratch/retained/file')

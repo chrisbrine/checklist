@@ -253,7 +253,8 @@ final class BackupRetentionAnswerTests: XCTestCase {
         }
         let tools = f.router!.toolCatalog(c),names = Set(tools.compactMap {$0["name"] as? String})
         XCTAssertTrue(names.contains("backup_retention_apply_answer"))
-        XCTAssertTrue(names.isDisjoint(with:CommandRouter.storageBackupPruningMethods))
+        // CL-377: an agent sees exactly the two incomplete-backup commands of the pruning set. Every other member stays owner-only.
+        XCTAssertEqual(names.intersection(CommandRouter.storageBackupPruningMethods),["backup_incomplete_preview","backup_incomplete_retire"])
         let entry = try XCTUnwrap(tools.first {$0["name"] as? String == "backup_retention_apply_answer"}),schema = entry["inputSchema"] as! JSON
         XCTAssertEqual(Set(schema["required"] as! [String]),["project_id","command_id","request_id","response_id"])
         XCTAssertNil((schema["properties"] as! JSON)["newest_count"]);XCTAssertNil((schema["properties"] as! JSON)["daily_days"])

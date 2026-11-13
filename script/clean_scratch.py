@@ -137,6 +137,29 @@ def inventory(root):
     return result
 
 
+def tree_summary(root):
+    """(newest mtime/ctime in ns, logical bytes of non-directories) of a whole tree.
+
+    The same values as from inventory(), without one path object and one dictionary
+    row per entry (CL-376 speed). Links are never followed.
+    """
+    metadata = os.lstat(root)
+    newest = max(metadata.st_mtime_ns, metadata.st_ctime_ns)
+    if not stat.S_ISDIR(metadata.st_mode):
+        return newest, metadata.st_size
+    size, pending = 0, [os.fspath(root)]
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                metadata = entry.stat(follow_symlinks=False)
+                newest = max(newest, metadata.st_mtime_ns, metadata.st_ctime_ns)
+                if stat.S_ISDIR(metadata.st_mode):
+                    pending.append(entry.path)
+                else:
+                    size += metadata.st_size
+    return newest, size
+
+
 def running_paths():
     """Observe executable, cwd, open-file and absolute command argument paths.
 
@@ -151,24 +174,52 @@ def running_paths():
     # distinct path once; duplicates carry no extra use/protection information.
     paths = {line[1:] for line in result.stdout.splitlines() if line.startswith('n/')}
     commands = subprocess.check_output(['/bin/ps', '-axo', 'command='], text=True)
-    for line in commands.splitlines():
-        try:
-            arguments = shlex.split(line)
-        except ValueError:
-            # An unmatched quote is possible in a process title; lsof still
-            # supplies cwd/executable/open files. Preserve absolute fragments.
-            arguments = line.split()
-        for argument in arguments:
+    # Each distinct command line is parsed once (CL-376: many processes share one).
+    for line in set(commands.splitlines()):
+        for argument in command_arguments(line):
             value = argument.split('=', 1)[-1] if argument.startswith('-') else argument
             if value.startswith('/'):
                 paths.add(value)
     return [Path(path).resolve() for path in sorted(paths)]
 
 
+_SHELL_SYNTAX = re.compile(r'[\'"\\]')
+_SHELL_SPACE = re.compile(r'[ \t\r\n]+')
+
+
+def command_arguments(line):
+    """The words of one ps command line, as shlex.split gives them.
+
+    A line with no quote and no backslash splits at shlex's own whitespace set;
+    the result is the same and needs no per-character parse (CL-376 speed).
+    """
+    if not _SHELL_SYNTAX.search(line):
+        return [word for word in _SHELL_SPACE.split(line) if word]
+    try:
+        return shlex.split(line)
+    except ValueError:
+        # An unmatched quote is possible in a process title; lsof still
+        # supplies cwd/executable/open files. Preserve absolute fragments.
+        return line.split()
+
+
 def used_items(processes, items):
-    """Match observed paths to candidate roots once, rather than paths × items."""
-    roots = set(items)
-    return {parent for path in processes for parent in (path, *path.parents) if parent in roots}
+    """The candidate roots that hold an observed path (the root itself or a path below it).
+
+    One prefix test per observed path, in C (CL-376 speed): no pathlib parent
+    objects for each of many thousand paths.
+    """
+    roots = {os.fspath(item): item for item in items}
+    prefixes = {root: root.rstrip('/') + '/' for root in roots}
+    below_any = tuple(prefixes.values())
+    used = set()
+    for path in processes:
+        text = os.fspath(path)
+        if text in roots:
+            used.add(roots[text])
+        if text.startswith(below_any):
+            used.update(item for root, item in roots.items() if text.startswith(prefixes[root]))
+    return used
 
 
 def children(path):
@@ -459,10 +510,11 @@ def du_sizes(paths):
     return sizes
 
 
-def background_sizes(groups, workers=16, chunk=16, targets=()):
+def background_sizes(groups, workers=16, chunk=16, targets=(), target_split=0):
     """Share one allocated-size scan between held rows and the size report."""
     from cleanup_sizes import background_sizes as shared_sizes
-    return shared_sizes(groups, targets, size_reader=du_sizes, workers=workers, chunk=chunk)
+    return shared_sizes(groups, targets, size_reader=du_sizes, workers=workers, chunk=chunk,
+                        target_split=target_split)
 
 
 def storage_groups(sessions, qualification, repo):
@@ -630,6 +682,13 @@ def installed_fingerprint(path):
 def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaustive=False):
     """exhaustive=True skips the item-wide-hold shortcut (tests prove both agree)."""
     before = inventory(item)
+    below_item = os.fspath(item).rstrip('/') + '/'
+    def relative_parts(path):
+        """path.relative_to(item).parts from the path text (CL-376 speed: no pathlib parse per file)."""
+        text = os.fspath(path)
+        if text.startswith(below_item):
+            return tuple(text[len(below_item):].split('/'))
+        return path.relative_to(item).parts
     legacy = legacy_workspaces(before)
     files = {path: entry for path, entry in before.items() if not stat.S_ISDIR(entry[2])}
     size = sum(entry[3] for entry in files.values())
@@ -679,7 +738,7 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
     retire_run = kind == 'qualification' and bool((read_marker(item) or {}).get('source_fingerprint'))
     whole = retire_run or released_retire
     if retire_run and not ticket_retire and not reason and any(
-            not stat.S_ISREG(entry[2]) or '.git' in path.relative_to(item).parts
+            not stat.S_ISREG(entry[2]) or '.git' in relative_parts(path)
             for path, entry in files.items()):
         reason = 'qualification run contains links, special files or Git metadata; retained'
     counts = Counter(build_bytes=0, git_redundant_source_bytes=0, qualification_bytes=0, kept_bytes=0)
@@ -712,7 +771,7 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
     reasons = Counter()
     removable = set()
     for path, entry in files.items():
-        parts = path.relative_to(item).parts
+        parts = relative_parts(path)
         # Include the item's own name for an item that is itself a build folder.
         components = (item.name,) + parts
         why = reason
@@ -754,7 +813,7 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
         # Empty folders can accompany an eligible tree, but never override an
         # item-wide hold or remove even empty Git metadata.
         removable_tree[path] = (not reason and not any(within(path, root) for root in legacy)
-                                 and (whole or '.git' not in (item.name,) + path.relative_to(item).parts)
+                                 and (whole or '.git' not in (item.name,) + relative_parts(path))
                                  and all(removable_tree[p] for p in children_by_parent.get(path, []))
                                ) if stat.S_ISDIR(entry[2]) else path in removable
     def select(path):
@@ -1031,10 +1090,9 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
         try:
             if read_marker(item) is not None:
                 continue
-            observed = inventory(item)
-            changed = max(max(entry[4], entry[5]) / 1e9 for entry in observed.values())
+            newest, size = tree_summary(item)
+            changed = newest / 1e9
             if clock() - changed >= UNMARKED_AGE_SECONDS:
-                size = sum(entry[3] for entry in observed.values() if not stat.S_ISDIR(entry[2]))
                 print(json.dumps({'path': str(item), 'kind': 'qualification',
                                   'action': 'unmarked_qualification', 'total_bytes': size,
                                   'age_seconds': clock() - changed, 'eligible_paths': [],
@@ -1168,7 +1226,7 @@ def main():
         # walks their parent and then walks each held child again.
         targets = [item for item, _ in candidates(sessions.resolve(), qualification.resolve(),
                                                   args.session_id, args.include_released)]
-        sizers.append(background_sizes(groups, targets=targets))
+        sizers.append(background_sizes(groups, targets=targets, target_split=2))
         return sizers[-1]
     result = clean(args.sessions_root.expanduser().resolve(), args.qualification_root.expanduser().resolve(),
                    args.repo.expanduser().resolve(), args.installed_info.expanduser(),

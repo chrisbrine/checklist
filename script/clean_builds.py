@@ -97,7 +97,31 @@ def installation(build, installed):
     return retained, bundles
 
 
-def running_bundle_builds(processes):
+def trash_root():
+    """The user Trash, where `test_instances.py destroy` moves a slot folder."""
+    return (Path.home() / '.Trash').resolve()
+
+
+def stale_trash_reference(bundle):
+    """CL-447: the reason when a bundle in the Trash, or its build-info.json, is gone.
+
+    A process path can name a destroyed slot bundle after the Trash lost it. Such a
+    bundle has no identity to protect. Every other read error still refuses.
+    """
+    if not within(bundle, trash_root()): return None
+    try:
+        if not stat.S_ISDIR(bundle.lstat().st_mode): return None
+    except FileNotFoundError:
+        return 'bundle in the Trash is gone; reference ignored'
+    try:
+        (bundle / 'Contents/Resources/build-info.json').lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return 'bundle in the Trash has no build-info.json; reference ignored'
+    return None
+
+
+def running_bundle_builds(processes, stale=None):
+    """Fingerprints of the observed app bundles; `stale` collects (bundle, reason) rows."""
     retained = set()
     for bundle in processes:
         if bundle.suffix != '.app': continue
@@ -106,6 +130,9 @@ def running_bundle_builds(processes):
                  or any(bundle/'Contents/MacOS'/name in processes
                         for name in ['ChecklistApp', 'ChecklistService', 'checklist']))
         if known or (bundle / 'Contents/MacOS/ChecklistApp').is_file():
+            if why := stale_trash_reference(bundle):
+                if stale is not None: stale.append((bundle, why))
+                continue
             retained.add(fingerprint(read_json(bundle / 'Contents/Resources/build-info.json')))
     return retained
 
@@ -320,11 +347,22 @@ class Cleaner:
         self.protected_cache = None
         retained, _ = installation(self.build, self.installed)
         processes = self.processes()
-        running = running_bundle_builds(processes)
+        reported = set()
+        def observed(paths):
+            # CL-447: a stale Trash reference is one report line, never a failure.
+            stale = []
+            result = running_bundle_builds(paths, stale)
+            for bundle, why in sorted(stale):
+                if bundle in reported: continue
+                reported.add(bundle)
+                print(json.dumps({'path': str(bundle), 'kind': 'running_bundle', 'bytes': None,
+                                  'action': 'stale_trash_reference', 'reason': why}, sort_keys=True))
+            return result
+        running = observed(processes)
         def refresh(paths):
             nonlocal processes, running
             processes = paths
-            running = running_bundle_builds(processes)
+            running = observed(processes)
         def unchanged_install(folder=None):
             if installation(self.build, self.installed)[0] != retained:
                 return 'installation changed; retain build'

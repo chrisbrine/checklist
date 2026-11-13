@@ -370,6 +370,17 @@ Alternatively, supply `--project-id ID --status-file PATH` with an explicit
 `{"project_id":"ID","tasks":[{"key":"CL-10","status_category":"done"}]}`
 list. This is an operator-supplied status snapshot; refresh it before applying.
 
+Stale Trash references (CL-447): the build pass reads `build-info.json` of each
+app bundle that a process path names, to keep that bundle's capture. `test_instances.py
+destroy` moves a slot folder to `~/.Trash`, and a process path can name that
+bundle after the Trash lost the bundle or its `build-info.json`. The pass reports
+each such bundle as one line and continues:
+`{"action": "stale_trash_reference", "kind": "running_bundle", "path": "<bundle>", "bytes": null, "reason": "..."}`.
+The reason says whether the bundle or only its `build-info.json` is gone. The
+line does not change the exit code of `--preview` or `--apply`. Every other read
+error still gives `kept_error` and exit code 1: a bundle outside the Trash without
+`build-info.json`, and a Trash bundle whose `build-info.json` is unreadable or invalid.
+
 Evidence notes (CL-359): `--evidence-notes PATH` writes one JSON line per owning
 ticket for each evidence folder that retires. The note gives the folder name, file
 count, logical bytes, the SHA-256 of each `notes.md` and `report.md`, the
@@ -394,14 +405,43 @@ stay on disk until the owner empties the Trash.
 In a preview of either command, the `du` calls run in the background while the folders are
 inspected: each group root is sized as its own block plus parallel `du -sk` calls of up to
 16 children (a hard link shared by two calls counts twice). An apply sizes the folders
-after its moves. The `clean_scratch.py --preview` must finish in under 1 minute on the real
-scratch root (CL-359); it plans items in parallel threads and prints them in item order.
+after its moves. The `clean_scratch.py --preview` plans items in 8 parallel processes and
+prints them in item order. It also splits each candidate item two levels deep for `du`
+(CL-376), so one large held workspace is sized by parallel calls. A folder with more than
+64 entries below an item stays one call.
+
+Preview time limit (CL-376, measured 12 November 2026, 10 CPUs, load from other projects).
+The 1-minute target of CL-359 was met on the 62.6 GB real scratch and not on 117 GB.
+From 100 GB to 180 GB, expect up to 80 seconds at a 1-minute load of 400 to 970:
+
+| Scratch (size report) | Files | Load (1 min) | Preview time, 2 or 3 runs |
+| --- | --- | --- | --- |
+| Real scratch, 62.6 GB, one 50 GB held workspace | not counted | 850 to 960 | 54.3 s, 56.2 s |
+| Synthetic scratch, 117.3 GB, 20 item lines | 0.83 million | 405 to 420 | 73.3 s, 74.0 s, 70.3 s |
+| Synthetic scratch, 177.9 GB, 29 item lines | 1.30 million | 730 to 810 | 76.9 s, 72.1 s |
+
+The synthetic scratch holds APFS clones of one 5.4 GB build folder: held, released,
+ticket-released, unmarked, legacy, spare and qualification items. The measured cost is
+0.40 to 0.63 seconds per GB, or 5.5 to 8.9 seconds per 100,000 files. The time did not
+grow with the load in this range. These parts bound it:
+
+- Each file of an item that has no marker hold needs one `lstat` and one plan row.
+  All 23 such items (1.06 million files) took 36 s in the 8 processes.
+- Each byte outside a build folder and outside Git metadata is hashed (SHA-1) to compare
+  it with Git. One 5.4 GB item of such bytes took 27 s in one process.
+- The `du` pass took 26 s for 177.9 GB when it ran alone.
+- Process inspection (`lsof`, `ps`) took 5 to 10 s.
+
+In October 2026 the preview took 64 to 253 s on several hundred GB at load 147 to 172.
+To stay below 1 minute, keep the scratch below the 50 GB budget: run `--release-done` and
+apply cleanup at each round boundary.
 
 Preview is read-only and apply computes new decisions, inventories and process
 observations. Preview caches one process snapshot for the pass; build apply
 refreshes it once before the batch, then rechecks inventories and installation
 identity under the build lease. Process paths are deduplicated before resolution
-and indexed by ancestors once, rather than resolved/scanned for every item.
+and matched to candidate roots by one prefix test for each path, rather than
+resolved/scanned for every item. Each distinct `ps` command line is parsed once.
 Evidence apply takes one initial process snapshot for eligible items and one
 fresh snapshot before its Trash batch, rechecking only selected trees, markers
 and current ticket statuses. Retained containers and policy refusals need no
