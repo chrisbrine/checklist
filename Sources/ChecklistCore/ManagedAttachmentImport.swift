@@ -53,10 +53,16 @@ extension CommandRouter {
             allowed = caller.projectIDs.isEmpty ? " AND 0" : " AND project_id IN (" + caller.projectIDs.map {_ in "CAST(? AS TEXT)"}.joined(separator:",") + ")"
             arguments += caller.projectIDs.map { Data($0.utf8) as DatabaseValueConvertible }
         }
-        guard let row = try Row.fetchOne(db,sql:"SELECT " + Self.canonicalRecordColumns + base + allowed,arguments:StatementArguments(arguments)) else {
+        // CL-363: this read runs in every write command. A caller with at most 8 project grants has one of
+        // 10 fixed texts, which the connection keeps prepared; a longer grant list is prepared for each call.
+        let sql = "SELECT " + Self.canonicalRecordColumns + base + allowed
+        let pending = try (caller.isOwner || caller.projectIDs.count <= 8
+            ? storeRow(db,sql:sql,arguments:StatementArguments(arguments))
+            : Row.fetchOne(db,sql:sql,arguments:StatementArguments(arguments)))
+        guard let row = pending else {
             // An out-of-grant parent cannot become a free UUID. Observe only
             // existence, not its payload, digest, project or error contents.
-            if try Int.fetchOne(db,sql:"SELECT COUNT(*)" + base,arguments:[Data(key.utf8)]) != 0 { throw CoreError("FORBIDDEN", "The pending command is outside the current grant.") }
+            if try storeInt(db,sql:"SELECT COUNT(*)" + base,arguments:[Data(key.utf8)]) != 0 { throw CoreError("FORBIDDEN", "The pending command is outside the current grant.") }
             return
         }
         let job = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"storage_job").object
@@ -569,7 +575,7 @@ extension CommandRouter {
     /// a finalized original. Referenced objects and uncertain jobs are retained.
     func reconcileManagedAttachmentImports(_ db: Database) throws -> StorageMaintenanceWarning? {
         guard try ensureManagedImportRecoveryIndex(db) else {return nil}
-        let rows = try Row.fetchAll(db,sql:"SELECT r.rowid AS maintenance_position," + Self.canonicalColumns(alias:"r") + " FROM temp.checklist_import_recovery i CROSS JOIN main.records r ON r.rowid=i.record_rowid AND CAST(r.id AS BLOB)=i.source_id WHERE i.record_rowid>? AND r.type='storage_job' ORDER BY i.record_rowid LIMIT 32",arguments:[managedImportMaintenanceAfterRow])
+        let rows = try self.fetchStoreRows(db,sql:"SELECT r.rowid AS maintenance_position," + Self.canonicalColumns(alias:"r") + " FROM temp.checklist_import_recovery i CROSS JOIN main.records r ON r.rowid=i.record_rowid AND CAST(r.id AS BLOB)=i.source_id WHERE i.record_rowid>? AND r.type='storage_job' ORDER BY i.record_rowid LIMIT 32",arguments:[managedImportMaintenanceAfterRow])
         managedImportMaintenanceAfterRow = rows.count == 32 ? (rows.last!["maintenance_position"] as Int64) : 0
         var warning: StorageMaintenanceWarning?
         for row in rows {

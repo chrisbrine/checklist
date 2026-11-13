@@ -138,7 +138,7 @@ struct ResolvedReviewRequirement {
         append(requirement.rejectBar)
         let types = ReviewRequirementEvidenceType.allCases.filter { requirement.requiredEvidenceTypes.contains($0) }
         append(String(types.count)); types.forEach { append($0.rawValue) }
-        return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        return lowercaseHex(SHA256.hash(data: bytes))
     }
 }
 

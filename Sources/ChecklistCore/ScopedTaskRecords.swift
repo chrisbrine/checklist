@@ -18,7 +18,8 @@ extension CommandRouter {
         var args: [DatabaseValueConvertible] = try selected.map {[try jsonString($0)]} ?? []
         args += [type,Data(record.projectID.utf8),Data(record.id.utf8)]+arguments
         if let limit {sql += " LIMIT ?";args.append(limit)}
-        return try Row.fetchAll(db,sql:sql,arguments:StatementArguments(args)).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
+        // CL-363: each caller passes a constant predicate, so this text has a small fixed set of forms.
+        return try fetchStoreRows(db,sql:sql,arguments:StatementArguments(args)).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
     }
     func scopedTaskCount(_ db: Database, type: String, task: JSON, predicate: String = "1") throws -> Int {
         let record = try StoredTaskRecord(task)
@@ -29,12 +30,12 @@ extension CommandRouter {
         let sql = "SELECT COUNT(*) FROM records WHERE "+selection
             + "type=? AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND ("
             + predicate+")"
-        return try Int.fetchOne(db,sql:sql,arguments:StatementArguments(arguments)) ?? 0
+        return try Int.fetchOne(storeStatement(db,sql),arguments:StatementArguments(arguments)) ?? 0
     }
     func scopedTaskGroups(_ db: Database, task: JSON) throws -> [JSON] {
         let record = try StoredTaskRecord(task)
         let pid = record.projectID,tid = record.id
-        return try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns +
+        return try fetchStoreRows(db,sql:"SELECT "+Self.canonicalRecordColumns +
             " FROM records g WHERE type='group' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.kind')='triage' AND EXISTS " +
             "(SELECT 1 FROM json_each(CASE WHEN json_array_length(json_extract(g.data,'$.members'))>0 THEN " +
             "json_extract(g.data,'$.members') ELSE json_extract(g.data,'$.task_ids') END) m WHERE (CASE WHEN m.type='object' THEN " +

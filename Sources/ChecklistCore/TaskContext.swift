@@ -76,7 +76,7 @@ extension CommandRouter {
         // Restore creation order within the bounded newest-note window before timestamp sorting.
         let messages = chronologicalMessages(try scopedTaskRows(db,type:"message",task:task,limit:11,descending:true).reversed().map {$0})
         let directionIDs = try jsonString(directions.compactMap {$0["id"] as? String})
-        let deliveries = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='delivery' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.message_id') IN (SELECT value FROM json_each(?)) ORDER BY rowid DESC LIMIT 51",arguments:[Data(pid.utf8),directionIDs]).reversed().map {try GRDBRecordEnvelopeAdapter.decode($0).object}
+        let deliveries = try self.fetchStoreRows(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='delivery' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.message_id') IN (SELECT value FROM json_each(?)) ORDER BY rowid DESC LIMIT 51",arguments:[Data(pid.utf8),directionIDs]).reversed().map {try GRDBRecordEnvelopeAdapter.decode($0).object}
         let next: String
         if !directions.isEmpty { next = "address_owner_directions" }
         else if try scopedTaskCount(db,type:"request",task:task,predicate:"json_extract(data,'$.state')='pending' AND json_extract(data,'$.blocking')=1") > 0 { next = "await_human_answer" }
@@ -116,7 +116,7 @@ extension CommandRouter {
         counts["blocking_findings"]=try scopedTaskCount(db,type:"finding",task:task,predicate:"json_extract(data,'$.state')='open' AND COALESCE(json_extract(data,'$.severity'),'')<>'advice'")
         counts["messages"]=messages.count<11 ? messages.count : try scopedTaskCount(db,type:"message",task:task)
         counts["attempts"]=attempts.count<limit+1 ? attempts.count : try scopedTaskCount(db,type:"attempt",task:task)
-        counts["direction_deliveries"]=try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records d JOIN records m ON m.type='message' AND m.project_id=d.project_id AND m.id=json_extract(d.data,'$.message_id') WHERE d.type='delivery' AND m.project_id=CAST(? AS TEXT) AND json_extract(m.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND json_extract(m.data,'$.origin')='human_ui' AND json_extract(m.data,'$.requires_action')=1 AND COALESCE(json_extract(m.data,'$.addressed'),0)=0 AND \(Self.unretractedDirectionSQL("m"))",arguments:[Data(pid.utf8),Data(tid.utf8)]) ?? 0
+        counts["direction_deliveries"]=try self.storeInt(db,sql:"SELECT COUNT(*) FROM records d JOIN records m ON m.type='message' AND m.project_id=d.project_id AND m.id=json_extract(d.data,'$.message_id') WHERE d.type='delivery' AND m.project_id=CAST(? AS TEXT) AND json_extract(m.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND json_extract(m.data,'$.origin')='human_ui' AND json_extract(m.data,'$.requires_action')=1 AND COALESCE(json_extract(m.data,'$.addressed'),0)=0 AND \(Self.unretractedDirectionSQL("m"))",arguments:[Data(pid.utf8),Data(tid.utf8)]) ?? 0
         result["counts"]=counts
         let truncatedSections: [Bool] = [directions.count > limit,findings.count > limit,requests.count > limit,reviews.count > limit,messages.count > 10,deliveries.count > 50]
         result["truncated"] = truncatedSections.contains(true)
@@ -129,7 +129,7 @@ extension CommandRouter {
         result["prior_handler"] = attempts.last(where: {$0["id"] as? String != task["active_attempt_id"] as? String}).map {contextRecord($0,type:"attempt",caller:caller)} ?? NSNull()
         result["handler_recipients"] = try relevantHandlerRecipients(db,task:task)
         result["relation_context"] = try scopedRelationContext(db,task:task)
-        let batches = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='batch' AND project_id=CAST(? AS TEXT) AND EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.members')) WHERE json_extract(value,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY) ORDER BY rowid DESC LIMIT 11",arguments:[Data(pid.utf8),Data(tid.utf8)]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
+        let batches = try self.fetchStoreRows(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='batch' AND project_id=CAST(? AS TEXT) AND EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.members')) WHERE json_extract(value,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY) ORDER BY rowid DESC LIMIT 11",arguments:[Data(pid.utf8),Data(tid.utf8)]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
         result["batches"] = try batches.prefix(10).reversed().map {batch -> JSON in
             var reference:JSON=[:]
             for key in ["id","project_id","triage_id","triage_key","triage_name","phase","revision","created_at","digest"] {reference[key]=batch[key]}
@@ -145,7 +145,7 @@ extension CommandRouter {
             reference["snapshot_ref"]=["method":"batch_get","project_id":pid,"batch_id":(try StoredRecord(batch, family: "record").requiredValue("id"))]
             return reference
         }
-        result["batch_count"] = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type='batch' AND project_id=CAST(? AS TEXT) AND EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.members')) WHERE json_extract(value,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY)",arguments:[Data(pid.utf8),Data(tid.utf8)]) ?? 0
+        result["batch_count"] = try self.storeInt(db,sql:"SELECT COUNT(*) FROM records WHERE type='batch' AND project_id=CAST(? AS TEXT) AND EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.members')) WHERE json_extract(value,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY)",arguments:[Data(pid.utf8),Data(tid.utf8)]) ?? 0
         result["batches_ref"] = ["method":"task_context","project_id":pid,"task_id":tid,"detail_level":"full"]
         if batches.count > 10 { result["truncated"] = true }
         result["task_sessions"] = try scopedTaskRows(db,type:"task_session",task:task,limit:25,descending:true).map {try taskSessionProjection(db,$0)}

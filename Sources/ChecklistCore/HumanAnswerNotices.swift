@@ -28,7 +28,7 @@ extension CommandRouter {
                   providerPlugins.plugin(session["provider"] as? String ?? "", requiring: .answerNotice) != nil,session["role"] as? String == "worker",
                   canReceive(session,project:pid) else { continue }
             let generation = sessionGeneration(session)
-            let rows = try Row.fetchAll(db,sql:"""
+            let rows = try self.fetchStoreRows(db,sql:"""
                 SELECT d.id AS id,d.project_id AS project_id,d.type AS type,d.revision AS revision,d.data AS data,
                        CAST(d.id AS BLOB) AS _envelope_id_bytes,CAST(d.project_id AS BLOB) AS _envelope_project_id_bytes,
                        CAST(d.type AS BLOB) AS _envelope_type_bytes,CAST(d.data AS BLOB) AS _envelope_data_bytes

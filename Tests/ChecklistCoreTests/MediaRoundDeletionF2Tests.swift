@@ -270,6 +270,7 @@ extension MediaRoundDeletionTests {
     /// Casting each indexed record ID to BLOB made the old final fence scan this
     /// corpus once per journal entry while holding the service's sole writer.
     func testF2EveryReadAndWriteRequestStaysWithinOneSecondThroughPreparationAndCommit() throws {
+        try QualificationSuite.requireEnabled() // CL-363: 65,536 seeded records, 540 requests and a wall-clock maximum for each request.
         let f = try Fixture(),round = try cancel(f,f.round(f.type(checks.schema())))
         let task = try results.task(f),writer = try results.session(f,"f2-latency-writer")
         let seedTask = try results.task(f)

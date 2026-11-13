@@ -109,7 +109,7 @@ enum MediaPreparationOverlay {
     }
 
     private static func literal(_ value: String) -> String {
-        "CAST(x'" + Data(value.utf8).map { String(format:"%02x",$0) }.joined() + "' AS TEXT)"
+        "CAST(x'" + lowercaseHex(value.utf8) + "' AS TEXT)"
     }
     static func install(_ db: Database,project: String,session: String,reads: Reads) throws {
         db.add(function:DatabaseFunction("checklist_media_prepared_read",argumentCount:4,pure:true) { values in

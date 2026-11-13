@@ -206,7 +206,7 @@ public struct RichContentEnvelope: @unchecked Sendable {
     public static func digest(text: String, content: [String: Any]?) -> String {
         var pair: [String: Any] = ["text": text]
         if let content { pair["content"] = content }
-        return SHA256.hash(data: canonical(pair)).map { String(format: "%02x", $0) }.joined()
+        return lowercaseHex(SHA256.hash(data: canonical(pair)))
     }
 
     static func isBool(_ number: NSNumber) -> Bool { CFGetTypeID(number) == CFBooleanGetTypeID() }

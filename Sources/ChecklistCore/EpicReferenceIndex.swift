@@ -96,7 +96,7 @@ final class EpicReferenceIndex: Sendable {
         }
         if let row = try Row.fetchOne(db,sql:"SELECT source_kind,source_id,reason FROM epic_guard_invalid ORDER BY source_kind,source_id LIMIT 1") {
             let id: Data = row["source_id"],kind: Int = row["source_kind"]
-            let name = String(data:id,encoding:.utf8) ?? id.map {String(format:"%02x",$0)}.joined()
+            let name = String(data:id,encoding:.utf8) ?? lowercaseHex(id)
             throw CoreError("EPIC_HISTORY_UNPROVEN","Retained \(kind == 0 ? "record" : "event") \(name) has an invalid or over-2-MB payload. Nothing was removed; repair the named source through an authorized command.",details:["reason":"reference_index_unavailable","source_kind":kind == 0 ? "record" : "event","source_id":name,"payload_reason":row["reason"] as String])
         }
     }

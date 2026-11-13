@@ -26,9 +26,9 @@ extension CommandRouter {
         return value
     }
     private func healthTime(_ value: Any?) -> Date? {
-        (value as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
+        (value as? String).flatMap { StoredClock.shared.date(from: $0) }
     }
-    private func healthStamp(_ date: Date) -> String { ISO8601DateFormatter().string(from: date) }
+    private func healthStamp(_ date: Date) -> String { StoredClock.shared.string(from: date) }
 
     /// Only changed substantive checkpoint text advances this clock. Reads,
     /// session heartbeats, repeated checkpoint text and scope edits do not.
@@ -97,7 +97,7 @@ extension CommandRouter {
                   WHERE a.type='attempt' AND a.project_id=? AND CASE WHEN json_valid(a.data) THEN json_extract(a.data,'$.task_id') END=?
                 ) SELECT data FROM tree
                 """
-            let latest = try Double.fetchOne(db,
+            let latest = try storeDouble(db,
                 sql: "SELECT MAX(checklist_timestamp(COALESCE(json_extract(data,'$.health_progress_at'),json_extract(data,'$.last_checkpoint'),json_extract(data,'$.started_at')))) FROM (" + sql +
                     ")", arguments: [pid, (try StoredRecord(target, family: "health_target").string("id")), pid, (try StoredRecord(task, family: "task").string("id"))])
             return (latest.map { Date(timeIntervalSince1970: $0) }, "ticket_attempt")
@@ -107,7 +107,7 @@ extension CommandRouter {
             let triage = healthTime(orchestration["health_progress_at"] ?? orchestration["started_at"])
             // Every attempt of this ticket, whatever its state. The same clock fields as above, so a repeated checkpoint does not advance it.
             // json_valid guard: one malformed attempt record cannot roll back the health page.
-            let own = try Double.fetchOne(db,
+            let own = try storeDouble(db,
                 sql: "SELECT MAX(checklist_timestamp(COALESCE(json_extract(data,'$.health_progress_at'),json_extract(data,'$.last_checkpoint'),json_extract(data,'$.started_at')))) FROM records WHERE type='attempt' AND project_id=? AND CASE WHEN json_valid(data) THEN json_extract(data,'$.task_id') END=?",
                 arguments: [pid, (try StoredRecord(task, family: "task").string("id"))]).map { Date(timeIntervalSince1970: $0) }
             if let own, own >= triage ?? .distantPast { return (own, "ticket_attempt") }

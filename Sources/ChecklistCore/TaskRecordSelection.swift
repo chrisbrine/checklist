@@ -58,7 +58,7 @@ extension CommandRouter {
         if frame.unavailable.contains(family) {return nil}
         guard frame.families.count + frame.unavailable.count < 64 else {return nil}
         let remaining = 4096-frame.rowCount
-        let rows = try Row.fetchAll(db,sql:"""
+        let rows = try self.fetchStoreRows(db,sql:"""
             SELECT rowid AS selection_rowid, CAST(json_extract(data,'$.task_id') AS BLOB) AS selection_task
             FROM records INDEXED BY records_scope
             WHERE project_id=CAST(? AS TEXT) AND type=CAST(? AS TEXT)

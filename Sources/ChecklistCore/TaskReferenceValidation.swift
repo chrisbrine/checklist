@@ -130,13 +130,13 @@ extension CommandRouter {
             }
             for ids in referenceChunks(referenceOrder(work.tasks)) {
                 let sql = "SELECT rowid AS _reference_position," + Self.canonicalRecordColumns + " FROM records WHERE type='task' AND project_id=CAST(? AS TEXT) AND id IN (" + referencePlaceholders(ids.count) + ") ORDER BY rowid"
-                try consume(Row.fetchAll(db, sql: sql, arguments: referenceArguments(work.project, ids)))
+                try consume(referenceRows(db, sql: sql, arguments: referenceArguments(work.project, ids), count: ids.count))
             }
             for type in ["status", "tag", "group"] {
                 for ids in referenceChunks(referenceOrder(work.targets[type] ?? [:])) {
                     let candidate = inboundReferenceCandidate(type, placeholders: referencePlaceholders(ids.count))
                     let sql = "SELECT rowid AS _reference_position," + Self.canonicalRecordColumns + " FROM records WHERE type='task' AND project_id=CAST(? AS TEXT) AND (" + candidate + ") ORDER BY rowid"
-                    try consume(Row.fetchAll(db, sql: sql, arguments: referenceArguments(work.project, ids)))
+                    try consume(referenceRows(db, sql: sql, arguments: referenceArguments(work.project, ids), count: ids.count))
                 }
             }
             for id in work.tasks.keys {
@@ -160,7 +160,7 @@ extension CommandRouter {
                 var values: [DatabaseValueConvertible] = [group.project, Data(group.type.utf8)]
                 values += chunk.map { Data($0.utf8) as DatabaseValueConvertible }
                 let sql = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE project_id=CAST(? AS TEXT) AND type=CAST(? AS TEXT) AND id IN (" + referencePlaceholders(chunk.count) + ") ORDER BY rowid"
-                for row in try Row.fetchAll(db, sql: sql, arguments: StatementArguments(values)) {
+                for row in try referenceRows(db, sql: sql, arguments: StatementArguments(values), count: chunk.count) {
                     let target = try GRDBRecordEnvelopeAdapter.decode(row, expectedType: group.type)
                     let project = try StoredRecord(target.object, family: "reference_target").string("project_id")
                     targets[.init(project: Data(project.utf8), type: target.type, id: Data(target.id.utf8))] = target
@@ -211,6 +211,12 @@ extension CommandRouter {
         return "CASE WHEN json_valid(data) THEN CASE WHEN json_type(data)='object' THEN (" + field + ") ELSE 1 END ELSE 1 END"
     }
 
+    /// CL-363: this validation runs at the commit of every domain write, mostly for 1 to 3 identities.
+    /// A list of at most 8 identities has a small fixed set of texts, which the connection keeps
+    /// prepared. A longer list is prepared for the call, so the statement cache stays bounded.
+    private func referenceRows(_ db: Database, sql: String, arguments: StatementArguments, count: Int) throws -> [Row] {
+        try (count <= 8 ? fetchStoreRows(db, sql: sql, arguments: arguments) : Row.fetchAll(db, sql: sql, arguments: arguments))
+    }
     private func referenceOrder(_ values: [Data: String]) -> [String] {
         values.sorted(by: { $0.key.lexicographicallyPrecedes($1.key) }).map(\.value)
     }

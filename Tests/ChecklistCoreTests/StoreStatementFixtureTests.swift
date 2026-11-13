@@ -1,6 +1,7 @@
 import ChecklistTestSupport
 import XCTest
 import GRDB
+import SQLite3
 @testable import ChecklistCore
 
 /// Prepared SQL changes compilation cost, not the canonical write or its guards.
@@ -21,11 +22,15 @@ final class StoreStatementFixtureTests: XCTestCase {
         XCTAssertEqual(try durable.dbQueue.read { try Int.fetchOne($0, sql: "PRAGMA synchronous") }, 2)
     }
 
-    func testPreparedReadsKeepBindingsAndCurrentRowsReal() throws {
+    func testPreparedReadsKeepBindingsAndCurrentRowsReal() throws { try preparedReadsKeepBindingsAndCurrentRowsReal(durable: false) }
+    /// CL-363: without the fixture seam, the product keeps this SQL prepared on each connection.
+    func testProductPreparedReadsKeepBindingsAndCurrentRowsReal() throws { try preparedReadsKeepBindingsAndCurrentRowsReal(durable: true) }
+    private func preparedReadsKeepBindingsAndCurrentRowsReal(durable: Bool) throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("statement-reads-" + uuid())
         defer { _ = try? FileManager.default.trashItem(at: root, resultingItemURL: nil) }
-        let router = try TestStore.router(root: root, durable: false)
+        let router = try TestStore.router(root: root, durable: durable)
         defer { try? router.closeStore() }
+        XCTAssertEqual(router.fixtureStoreRows == nil, durable)
         let owner = Caller(role: "owner", installation: "statement-reads", projectIDs: [])
         func create(_ name: String) throws -> JSON {
             try router.handle(method: "project_create", params: ["name": name, "key_prefix": "SR", "command_id": uuid()], caller: owner)["data"] as! JSON
@@ -42,12 +47,16 @@ final class StoreStatementFixtureTests: XCTestCase {
         XCTAssertThrowsError(try router.dbQueue.read { try router.record($0, uuid(), type: "project") })
     }
 
-    func testPreparedWritesKeepTriggersRollbackAndSchemaChangesReal() throws {
+    func testPreparedWritesKeepTriggersRollbackAndSchemaChangesReal() throws { try preparedWritesKeepTriggersRollbackAndSchemaChangesReal(durable: false) }
+    /// CL-363: the product's kept statements see a new trigger, its removal, a rollback and a reopen.
+    func testProductPreparedWritesKeepTriggersRollbackAndSchemaChangesReal() throws { try preparedWritesKeepTriggersRollbackAndSchemaChangesReal(durable: true) }
+    private func preparedWritesKeepTriggersRollbackAndSchemaChangesReal(durable: Bool) throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("statement-effects-" + uuid())
         defer { _ = try? FileManager.default.trashItem(at: root, resultingItemURL: nil) }
         let owner = Caller(role: "owner", installation: "statement-fixture", projectIDs: [])
-        let router = try TestStore.router(root: root, durable: false)
+        let router = try TestStore.router(root: root, durable: durable)
         defer { try? router.closeStore() }
+        XCTAssertEqual(router.fixtureStoreStatement == nil, durable)
         func call(_ title: String, command: String = uuid()) throws -> JSON {
             try router.handle(method: "project_create", params: ["name": title, "key_prefix": "SC", "command_id": command], caller: owner)["data"] as! JSON
         }
@@ -77,5 +86,47 @@ final class StoreStatementFixtureTests: XCTestCase {
         let saved = try reopened.dbQueue.read { try reopened.record($0, updated["id"] as! String, type: "project") }
         XCTAssertEqual(saved["name"] as? String, "Updated")
         XCTAssertEqual(saved["revision"] as? Int, 2)
+    }
+
+
+    /// CL-363: the product path (no fixture seam) runs one kept statement for each repeated read
+    /// and write of a record, on the writer and on a read-only connection.
+    func testProductKeepsOnePreparedStatementForRepeatedRecordReadsAndSaves() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("statement-product-" + uuid())
+        defer { _ = try? FileManager.default.trashItem(at: root, resultingItemURL: nil) }
+        let router = try CommandRouter(root: root)
+        defer { try? router.closeStore() }
+        XCTAssertNil(router.fixtureStoreRows); XCTAssertNil(router.fixtureStoreStatement)
+        let owner = Caller(role: "owner", installation: "statement-product", projectIDs: [])
+        func create(_ name: String) throws -> JSON {
+            try router.handle(method: "project_create", params: ["name": name, "key_prefix": "SP", "command_id": uuid()], caller: owner)["data"] as! JSON
+        }
+        let first = try create("First"), id = first["id"] as! String
+        let read = "SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE id = CAST(? AS TEXT) AND type = CAST(? AS TEXT)"
+        func runs(_ db: Database, _ sql: String) throws -> Int32 {
+            sqlite3_stmt_status(try db.cachedStatement(sql: sql).sqliteStatement, SQLITE_STMTSTATUS_RUN, 0)
+        }
+        try router.dbQueue.read { db in
+            XCTAssertTrue(try db.cachedStatement(sql: read) === router.storeStatement(db, read))
+            let before = try runs(db, read)
+            for _ in 0..<3 { XCTAssertEqual(try router.record(db, id, type: "project")["id"] as? String, id) }
+            XCTAssertEqual(try runs(db, read) - before, 3)
+        }
+        let readers = try XCTUnwrap(router.readers)
+        try readers.read { db in
+            let before = try runs(db, read)
+            for _ in 0..<2 { XCTAssertEqual(try router.record(db, id, type: "project")["name"] as? String, "First") }
+            XCTAssertEqual(try runs(db, read) - before, 2)
+        }
+        // Each save reads the previous row with one kept statement and writes with another.
+        let previous = "SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE id = CAST(? AS TEXT)"
+        let readsBefore = try router.dbQueue.read { try runs($0, previous) }
+        var revision = first["revision"]!
+        for name in ["Second", "Third"] {
+            let edited = try router.handle(method: "project_edit", params: ["project_id": id, "expected_revision": revision, "name": name, "command_id": uuid()], caller: owner)["data"] as! JSON
+            revision = edited["revision"]!
+        }
+        XCTAssertGreaterThanOrEqual(try router.dbQueue.read { try runs($0, previous) } - readsBefore, 2)
+        XCTAssertEqual(try router.dbQueue.read { try router.record($0, id, type: "project")["name"] as? String }, "Third")
     }
 }

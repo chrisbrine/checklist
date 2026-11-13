@@ -75,7 +75,7 @@ extension CommandRouter {
         let limit = min(max(int(p,"limit",default:200),1),200)
         // Separate project-prefix ranges allow the existing covering events_scope
         // index to serve this private cursor generation; no new persisted index.
-        let latest = try Int.fetchOne(db,sql:"""
+        let latest = try self.storeInt(db,sql:"""
         SELECT COALESCE(MAX(latest),0) FROM (
           SELECT MAX(seq) latest FROM events WHERE project_id IS NULL
           UNION ALL
@@ -110,7 +110,8 @@ extension CommandRouter {
         let pageOrder = unitOrder + groupOrder + ticketRowOrder(view:view,prefix:"matching.")
         // One materialization supplies the window, truthful distinct task counts,
         // and selected Triage summaries. Empty pages still return their totals.
-        let result = try Row.fetchAll(db,sql:ticketWindowSQL(selection:sql,ownerView:view != nil,ordering:pageOrder),arguments:arguments)
+        // CL-363: the text depends only on the view's surface, grouping and ordering (a small fixed set), never on a request value.
+        let result = try fetchStoreRows(db,sql:ticketWindowSQL(selection:sql,ownerView:view != nil,ordering:pageOrder),arguments:arguments)
         let count = (result.first?["matched_total"] as Int?) ?? 0
         let fetched = result.filter { ($0["page_present"] as Int?) != nil }
         let selected = Array(fetched.prefix(limit))
@@ -134,10 +135,10 @@ extension CommandRouter {
         // Owner sidebar lists all owned projects even when one Tickets project is selected.
         page["projects"] = try projects(db,c)
         for (name,type) in [("statuses","status"),("tags","tag")] {
-            page[name] = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type=? AND project_id IN (SELECT value FROM json_each(?)) ORDER BY rowid",arguments:[type,projectJSON]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
+            page[name] = try self.fetchStoreRows(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type=? AND project_id IN (SELECT value FROM json_each(?)) ORDER BY rowid",arguments:[type,projectJSON]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
         }
-        page["epics"] = try Row.fetchAll(db,sql:"SELECT id,project_id,json_extract(data,'$.name') name,json_extract(data,'$.key') key FROM records WHERE type='group' AND json_extract(data,'$.kind')='epic' AND project_id IN (SELECT value FROM json_each(?)) ORDER BY rowid",arguments:[projectJSON]).map {["id":$0["id"] as String,"project_id":$0["project_id"] as String,"key":$0["key"] as String? ?? "","name":$0["name"] as String? ?? ""]}
-        page["filter_triages"] = try Row.fetchAll(db,sql:"SELECT id,project_id,json_extract(data,'$.name') name,json_extract(data,'$.key') key FROM records WHERE type='group' AND json_extract(data,'$.kind')='triage' AND project_id IN (SELECT value FROM json_each(?)) ORDER BY rowid",arguments:[projectJSON]).map {["id":$0["id"] as String,"project_id":$0["project_id"] as String,"key":$0["key"] as String? ?? "","name":$0["name"] as String? ?? ""]}
+        page["epics"] = try self.fetchStoreRows(db,sql:"SELECT id,project_id,json_extract(data,'$.name') name,json_extract(data,'$.key') key FROM records WHERE type='group' AND json_extract(data,'$.kind')='epic' AND project_id IN (SELECT value FROM json_each(?)) ORDER BY rowid",arguments:[projectJSON]).map {["id":$0["id"] as String,"project_id":$0["project_id"] as String,"key":$0["key"] as String? ?? "","name":$0["name"] as String? ?? ""]}
+        page["filter_triages"] = try self.fetchStoreRows(db,sql:"SELECT id,project_id,json_extract(data,'$.name') name,json_extract(data,'$.key') key FROM records WHERE type='group' AND json_extract(data,'$.kind')='triage' AND project_id IN (SELECT value FROM json_each(?)) ORDER BY rowid",arguments:[projectJSON]).map {["id":$0["id"] as String,"project_id":$0["project_id"] as String,"key":$0["key"] as String? ?? "","name":$0["name"] as String? ?? ""]}
         // Global sidebar badges do not force the full requests/tasks corpus into memory.
         let needs = try ownerNeedsYouCounts(db)
         page["outstanding_request_count"] = needs.requests
@@ -457,14 +458,16 @@ private struct TicketPageLookupKey: Hashable {
 /// Foundation formatters and cached values when called from a Sendable closure.
 private final class TicketTimestampCache: @unchecked Sendable {
     private let lock = NSLock()
-    private let fractional = ISO8601DateFormatter()
-    private let standard = ISO8601DateFormatter()
+    // CL-363: each connection installs one cache. Most never see a stamp outside the
+    // canonical form, so the two formatters are made at their first use, under `lock`.
+    private lazy var fractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    private lazy var standard = ISO8601DateFormatter()
     private let wholeSecondUTC = Date.ISO8601FormatStyle()
     private var timestamps: [String:Double] = [:]
-
-    init() {
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    }
 
     func timestamp(_ value: String) -> Double {
         lock.lock(); defer { lock.unlock() }

@@ -110,10 +110,25 @@ public final class CommandRouter: @unchecked Sendable {
         try self.init(root:root,serviceLease:serviceLease,cliCommand:cliCommand,providerPlugins:providerPlugins,
                       automaticBackupRetentionTrashRoot:automaticBackupRetentionTrashRoot,fixtureTrackEpicReferences:true)
     }
+    /// CL-363: a test-support statement about a store that the caller cloned from a published
+    /// template a moment ago, into a folder that had fresh scaffolding only. No product code
+    /// makes one. The startup then leaves out work that changes nothing for such a store:
+    /// the read-only schema preflight (the caller wrote `identity` to the database and to the
+    /// receipt file), and, for a clone that the caller found `empty` (no row in `records`,
+    /// `commands` or `cursors`, and no managed file or staging folder), the three sweeps of
+    /// pending captures, exports and imports (they find nothing) and the statements of the
+    /// routine pruning pass that can match no row. The retention mark of that pass is written
+    /// as always, so the write-ahead log has its first frame as after a complete startup.
+    /// The first storage maintenance pass, recovery of sources and operations, admission and
+    /// the reader pool are unchanged. A clone that is not `empty` keeps the complete pass.
+    struct FixtureFreshStore {
+        let identity: StoreIdentityReceipt
+        let empty: Bool
+    }
     /// Disposable component fixtures may omit the derived deletion proof only.
     /// Production, storage, durability and deletion tests keep the public default.
     init(root: URL, serviceLease: StorageServiceLease?, cliCommand: String, providerPlugins: ProviderPluginRegistry,
-         automaticBackupRetentionTrashRoot: URL?, fixtureTrackEpicReferences: Bool) throws {
+         automaticBackupRetentionTrashRoot: URL?, fixtureTrackEpicReferences: Bool, fixtureFreshStore: FixtureFreshStore? = nil) throws {
         self.fixtureOmitsEpicReferenceIndex = !fixtureTrackEpicReferences
         let root = StoreDirectory.anchoredRoot(root)
         self.root = root
@@ -122,7 +137,7 @@ public final class CommandRouter: @unchecked Sendable {
         self.providerPlugins = providerPlugins
         self.automaticBackupRetentionTrashRoot = automaticBackupRetentionTrashRoot
         let opened: StorageBootstrap.Opened
-        do { opened = try StorageBootstrap.open(root:root,serviceLease:serviceLease,prepareDatabase:{ Self.installTicketSearchFunctions($0) }) }
+        do { opened = try StorageBootstrap.open(root:root,serviceLease:serviceLease,knownCurrentIdentity:fixtureFreshStore?.identity,prepareDatabase:{ Self.installTicketSearchFunctions($0) }) }
         catch { StoreRecovery.recordFailure(root:root,error:error);throw error }
         Self.qualificationStartupObserve?("bootstrap_end")
         let gateFiles = try StorageObjectFiles(root:root,pinRootForGates:true)
@@ -159,15 +174,22 @@ public final class CommandRouter: @unchecked Sendable {
             defer { startupLease.finish() }
             try ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { permit in
                 dbQueue.writeWithoutTransaction { db in
-                    // CL-70: files left by commands that never committed, before any new command.
-                    try? self.sweepPendingSourceCaptures(db)
-                    try? self.sweepPendingExports(db)
+                    if fixtureFreshStore?.empty != true {
+                        // CL-70: files left by commands that never committed, before any new command.
+                        try? self.sweepPendingSourceCaptures(db)
+                        try? self.sweepPendingExports(db)
+                    }
                     Self.qualificationStartupObserve?("pending_files_end")
-                    try? self.sweepAbandonedManagedImports(db)
+                    if fixtureFreshStore?.empty != true { try? self.sweepAbandonedManagedImports(db) }
                     Self.qualificationStartupObserve?("abandoned_imports_end")
                     _ = self.performStorageMaintenance(db, permit: permit)
                     Self.qualificationStartupObserve?("storage_maintenance_end")
-                    _ = self.pruneRoutineRecordsIfDue(db)
+                    if fixtureFreshStore?.empty == true {
+                        // With no cursor, command or record row, the pruning pass is its mark write alone.
+                        let now = Date()
+                        self.lastRoutinePrune = now
+                        try? db.inTransaction { _ = try self.commandRetentionCutoff(db, now: now.timeIntervalSince1970); return .commit }
+                    } else { _ = self.pruneRoutineRecordsIfDue(db) }
                 }
             }
         } catch {
@@ -224,7 +246,8 @@ public final class CommandRouter: @unchecked Sendable {
         try requireWriter(db)
         let incoming = try GRDBRecordEnvelopeAdapter.incoming(value,type:type)
         guard case .text(let id) = incoming.id else { throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.jsonIdentity)) }
-        let previous = try Row.fetchOne(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE id = CAST(? AS TEXT)",arguments:[Data(id.utf8)])
+        // `id` is the primary key, so the first row is the only row (the former fetchOne).
+        let previous = try fetchStoreRows(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE id = CAST(? AS TEXT)",arguments:[Data(id.utf8)]).first
         let envelope = try GRDBRecordEnvelopeAdapter.compareSave(incoming:incoming,previous:previous)
         guard case .text(let raw) = incoming.data else { throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.sqlData)) }
         let referenceWrite = try prepareTaskReferenceWrite(db,previous:previous,next:envelope)
@@ -254,15 +277,46 @@ public final class CommandRouter: @unchecked Sendable {
             try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-next:" + pid,String(min(previous,clock.timeIntervalSince1970))])
         }
     }
-    func fetchStoreRows(_ db: Database, sql: String, arguments: StatementArguments) throws -> [Row] {
+    /// CL-363: SQL that runs in every command is prepared one time for each connection,
+    /// not one time for each call. Preparation only changes: SQLite executes the exact
+    /// statement and arguments, with its triggers, inside the caller's transaction.
+    ///
+    /// Use these two functions only for constant SQL text, or text with a small fixed set
+    /// of forms. Text that contains a request value or a list of any length would grow the
+    /// connection's statement cache without a limit.
+    ///
+    /// Thread safety: GRDB keeps the cache in the connection and uses a connection on one
+    /// serial queue only. Each call ends with the statement reset (all rows are copied), so
+    /// a later call with the same text, also from a nested read, finds it free. SQLite
+    /// prepares a cached statement again by itself after a schema change.
+    func fetchStoreRows(_ db: Database, sql: String, arguments: StatementArguments = StatementArguments()) throws -> [Row] {
         if let fixtureStoreRows { return try fixtureStoreRows(db, sql, arguments) }
-        return try Row.fetchAll(db, sql: sql, arguments: arguments)
+        return try Row.fetchAll(db.cachedStatement(sql: sql), arguments: arguments)
     }
-    /// The fixture seam changes preparation only. SQLite still executes the exact
-    /// statement, arguments and triggers inside the original transaction.
     func executeStoreStatement(_ db: Database, sql: String, arguments: StatementArguments) throws {
         if let fixtureStoreStatement { try fixtureStoreStatement(db, sql, arguments) }
-        else { try db.execute(sql: sql, arguments: arguments) }
+        else { try db.cachedStatement(sql: sql).execute(arguments: arguments) }
+    }
+    /// The connection's kept statement for this exact text, for GRDB's typed fetches
+    /// (`Int.fetchOne(statement)` decodes as `Int.fetchOne(db, sql:)` does). The rules above
+    /// apply: constant text only, and each use ends (fetchOne, fetchAll, execute) before the
+    /// next use starts. Never keep a cursor of this statement open across another call.
+    func storeStatement(_ db: Database, _ sql: String) throws -> Statement { try db.cachedStatement(sql: sql) }
+    // Each function below decodes as GRDB's `fetchOne(db, sql:)` / `fetchAll(db, sql:)` of the same type.
+    func storeRow(_ db: Database, sql: String, arguments: StatementArguments = StatementArguments()) throws -> Row? {
+        try Row.fetchOne(storeStatement(db, sql), arguments: arguments)
+    }
+    func storeInt(_ db: Database, sql: String, arguments: StatementArguments = StatementArguments()) throws -> Int? {
+        try Int.fetchOne(storeStatement(db, sql), arguments: arguments)
+    }
+    func storeDouble(_ db: Database, sql: String, arguments: StatementArguments = StatementArguments()) throws -> Double? {
+        try Double.fetchOne(storeStatement(db, sql), arguments: arguments)
+    }
+    func storeString(_ db: Database, sql: String, arguments: StatementArguments = StatementArguments()) throws -> String? {
+        try String.fetchOne(storeStatement(db, sql), arguments: arguments)
+    }
+    func storeStrings(_ db: Database, sql: String, arguments: StatementArguments = StatementArguments()) throws -> [String] {
+        try String.fetchAll(storeStatement(db, sql), arguments: arguments)
     }
     func event(_ db: Database, caller: Caller, project: String?, entity: String?, kind: String, data: JSON = [:]) throws {
         try requireWriter(db)
@@ -336,7 +390,7 @@ public final class CommandRouter: @unchecked Sendable {
     }
     /// CL-72: a sealed cursor needs no stored row, so no method grows the cursors table.
     func cursor(_ db: Database, caller: Caller, scope: String, sequence specifiedSequence: Int? = nil) throws -> String {
-        let sequence = try specifiedSequence ?? Int.fetchOne(db,sql:"SELECT COALESCE(MAX(seq),0) FROM events") ?? 0
+        let sequence = try specifiedSequence ?? Int.fetchOne(storeStatement(db,"SELECT COALESCE(MAX(seq),0) FROM events")) ?? 0
         return try SealedCursor.seal(sequence:sequence,created:Date().timeIntervalSince1970,binding:SealedCursor.binding(principal:caller.principal,scope:scope,incarnation:incarnation),key:cursorKey)
     }
     func cursorSequence(_ db: Database, _ p: JSON, caller: Caller, scope: String) throws -> Int {
@@ -498,11 +552,17 @@ public final class CommandRouter: @unchecked Sendable {
         defer {if writerRead {backupWrites.finishWrite()}}
         // A crash-left export reserves its intent before any command's file preparation.
         // The shared transaction guard checks it again under the object gate.
+        // CL-363: the digest of (method, params) is computed here, at its original place under the
+        // gate, and used again by the transaction guard below. The inputs do not change in between.
+        var firstDigest: String?
         if !Self.readMethods.contains(method),let command = params["command_id"] as? String {
             try ArchiveStorageGate.withExclusive(root:root,files:gateFiles) { _ in
-                try requirePendingExportIntent(command:command,digest:hash(Data((method + (try jsonString(params))).utf8)),caller:caller)
+                let digest = hash(Data((method + (try jsonString(params))).utf8))
+                firstDigest = digest
+                try requirePendingExportIntent(command:command,digest:digest,caller:caller)
             }
         }
+        let commandDigest = firstDigest
         if method == "backup_create" {
             do { return try executeStorageBackup(params:params,caller:caller) }
             catch let error as DatabaseError {
@@ -558,9 +618,10 @@ public final class CommandRouter: @unchecked Sendable {
                 if writes {
                     command = try text(params,"command_id",max:100)
                     guard UUID(uuidString:command) != nil else { throw CoreError("INVALID_INPUT", "command_id must be a UUID.") }
-                    digest = hash(Data((method + (try jsonString(params))).utf8))
+                    digest = try commandDigest ?? hash(Data((method + (try jsonString(params))).utf8))
                     try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
-                    if let row = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[caller.principal,command]) {
+                    // (principal, command_id) is the primary key, so the first row is the only row.
+                    if let row = try self.fetchStoreRows(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[caller.principal,command]).first {
                         guard (row["digest"] as String) == digest else { throw CoreError("IDEMPOTENCY_CONFLICT", "This command ID was already used with different input.") }
                         output = jsonObject(row["result"])
                         if Self.isPrunedResult(output) { throw Self.expiredCommandError(command) }

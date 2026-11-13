@@ -249,7 +249,7 @@ extension CommandRouter {
     }
     static func commandOperationKey(_ id: String) -> String {"command-operation:" + id.lowercased()}
     func operationRecord(_ db: Database,id: String) throws -> JSON? {
-        let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[Self.commandOperationKey(id)])
+        let raw = try self.storeString(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[Self.commandOperationKey(id)])
         guard let value = commandOperations.stagedAdmission(id,canonical:raw) ?? raw.map(jsonObject) else {return nil}
         try validateOperationRecord(value,id:id)
         return value

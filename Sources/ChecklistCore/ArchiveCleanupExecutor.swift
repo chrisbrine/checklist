@@ -84,7 +84,7 @@ final class TicketObjectRemovalVerification {
                 guard counted <= (size ?? before.st_size) else {throw CoreError("CLEANUP_IDENTITY_CHANGED","Original size changed; bytes retained.")}
                 hasher.update(data:Data(buffer.prefix(count)))
             }
-            let digest = hasher.finalize().map {String(format:"%02x",$0)}.joined()
+            let digest = lowercaseHex(hasher.finalize())
             guard fstat(fd,&after) == 0 else {throw CoreError("CLEANUP_OBJECT_UNAVAILABLE","The original could not be rechecked.",details:["posix_errno":errno])}
             guard counted == (size ?? before.st_size),(sha256 == nil || digest == sha256),Self.same(before,after) else {throw CoreError("CLEANUP_IDENTITY_CHANGED","Original changed during verification; bytes retained.")}
             self.root = Data(root.standardizedFileURL.path.utf8);self.relative = Data(relative.utf8)
@@ -169,7 +169,7 @@ extension ArchiveStoragePermit {
             counted += Int64(n);guard counted <= size else { throw CoreError("CLEANUP_IDENTITY_CHANGED", "Original size changed; bytes were retained.") }
             hasher.update(data:Data(buffer.prefix(n)))
         }
-        let digest = hasher.finalize().map { String(format:"%02x",$0) }.joined()
+        let digest = lowercaseHex(hasher.finalize())
         var after = stat(),entry = stat()
         guard counted == size,digest == sha256,fstat(fd,&after) == 0,fstatat(directory,name,&entry,AT_SYMLINK_NOFOLLOW) == 0,
               before.st_dev == after.st_dev,before.st_ino == after.st_ino,before.st_size == after.st_size,
@@ -198,7 +198,7 @@ extension CommandRouter {
     /// one exact original per call. The service schedules a one-shot continuation.
     /// Persisted job, cursor and deletion intent survive router/process restart.
     func dueArchiveCleanupJobIDs(_ db: Database,nowMS: Int64) throws -> [String] {
-        try String.fetchAll(db,sql:"""
+        try self.storeStrings(db,sql:"""
             SELECT j.id FROM records j LEFT JOIN records c ON c.id=('archive-cleanup-cursor:' || j.id) AND c.type='storage_job'
             WHERE j.rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='cleanup_job') AND CASE WHEN json_valid(j.data) THEN COALESCE(json_extract(j.data,'$.not_before_ms') <= ?,1) ELSE 1 END AND CASE WHEN json_valid(j.data) THEN json_extract(j.data,'$.state') NOT IN ('completed','canceled','suspended') ELSE 1 END
             ORDER BY CASE WHEN json_valid(c.data) THEN COALESCE(json_extract(c.data,'$.checked_at_ms'),0) ELSE 0 END,j.rowid LIMIT 8
@@ -218,10 +218,16 @@ extension CommandRouter {
         fenced = true
         return try prepared.index ?? ArchiveCleanupReferenceIndex(prepared.rows)
     }
-    func processArchiveCleanupJobs(_ db: Database,permit: ArchiveStoragePermit,nowMS: Int64,prepared: PreparedArchiveCleanupScan? = nil) throws {
+    /// `noCaptureUnderPermit` (CL-363): the caller read "no backup capture" for this root earlier in
+    /// the same call that holds this permit. A permit never becomes active again, so a permit that
+    /// passes `requireRoot` below was active at that read. A capture takes its hold inside the
+    /// object gate (`StorageSnapshotRetention.withCapture`), so no hold can start while the permit
+    /// is active, and a second read cannot find one. Each unlink still reads the hold again
+    /// (`removeOriginal`). Every other caller keeps the read here.
+    func processArchiveCleanupJobs(_ db: Database,permit: ArchiveStoragePermit,nowMS: Int64,prepared: PreparedArchiveCleanupScan? = nil,noCaptureUnderPermit: Bool = false) throws {
         try permit.requireRoot(root)
         guard !db.isInsideTransaction else { throw CoreError("CLEANUP_TRANSACTION_REQUIRED", "Run cleanup after the semantic transaction commits.") }
-        guard try !StorageSnapshotRetention.isActive(root:root) else {return}
+        if !noCaptureUnderPermit { guard try !StorageSnapshotRetention.isActive(root:root) else {return} }
         let ids = try dueArchiveCleanupJobIDs(db,nowMS:nowMS)
         var admissions = 0,fenced = false
         jobs: for id in ids {

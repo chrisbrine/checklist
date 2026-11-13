@@ -110,7 +110,7 @@ extension CommandRouter {
     /// command can no longer be retried with the same ID to reuse the staged bytes.
     func sweepAbandonedManagedImports(_ db: Database, now current: Date = Date()) throws {
         let files = try StorageObjectFiles(root: root)
-        let formatter = ISO8601DateFormatter()
+        let formatter = StoredClock.shared
         // Cleanup receipts can contain hundreds of MB of unrelated object history.
         // Select import jobs before canonical decoding and drain each row's
         // Foundation temporaries rather than retaining the whole job corpus.
@@ -134,7 +134,7 @@ extension CommandRouter {
         }
     }
 
-    private func sweepAbandonedManagedImport(_ db: Database,files: StorageObjectFiles,formatter: ISO8601DateFormatter,current: Date,job: inout JSON) throws {
+    private func sweepAbandonedManagedImport(_ db: Database,files: StorageObjectFiles,formatter: StoredClock,current: Date,job: inout JSON) throws {
         if job["settled_reason"] as? String == "canceled_media_staging" {
             // Cancellation already committed its fence. Retry only its own
             // incomplete staging cleanup, without the abandonment grace period.

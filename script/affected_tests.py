@@ -131,6 +131,8 @@ QUALIFICATION_TESTS = (
     'ChecklistCoreTests.TicketLifecycleCleanupTests/testBatchInventoryOversizedForeignReferenceRefusesOnlyItsTarget',
     'ChecklistCoreTests.TicketLifecycleCleanupTests/testBatchInventoryAdmitsThirtyTwoIndependentTickets',
     'ChecklistCoreTests.ArchiveCleanupScanFenceTests/testScaledExecutorWriteHoldBeforeAndAfter',
+    # CL-363: 65,536 seeded records, 540 requests and the CL-450 one-second maximum for each request.
+    'ChecklistCoreTests.MediaRoundDeletionTests/testF2EveryReadAndWriteRequestStaysWithinOneSecondThroughPreparationAndCommit',
 )
 # Methods that assert a wall-clock budget, regardless of its size.
 # They keep their assertions unchanged but leave the parallel default pass and run in

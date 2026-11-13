@@ -62,7 +62,8 @@ final class ReadSnapshotCache {
             // DatabasePool.read pins a transaction before this pragma. data_version
             // belongs to this exact connection and changes on every external commit,
             // including maintenance, deletes and writes that emit no domain event.
-            let version = try Int.fetchOne(db,sql:"PRAGMA data_version") ?? -1
+            // CL-363: every pure read asks this; the connection keeps the statement prepared.
+            let version = try Int.fetchOne(db.cachedStatement(sql:"PRAGMA data_version")) ?? -1
             let namespace = Data(try jsonString(["role":caller.role,"installation":caller.installation,
                 "projects":caller.projectIDs,"session":caller.sessionID ?? NSNull(),"workspace":caller.workspace ?? NSNull(),
                 "grants":caller.assistantGrants,"domain":caller.executionDomain ?? NSNull(),"locale":Locale.current.identifier]).utf8)

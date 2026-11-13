@@ -35,7 +35,7 @@ extension CommandRouter {
             guard let session = try pendingNoteRecord(db,sid,pid,type:"session"), session["provider"] as? String == "codex",
                   session["role"] as? String == "worker", canReceive(session,project:pid) else { continue }
             // CASE, not AND: SQLite does not guarantee term order. A malformed row cannot name a recipient, so it matches nobody.
-            let rows = try Row.fetchAll(db,sql:"""
+            let rows = try self.fetchStoreRows(db,sql:"""
                 SELECT \(Self.canonicalRecordColumns),rowid AS _pending_rowid FROM records
                 WHERE type='delivery' AND project_id=CAST(? AS TEXT)
                   AND CASE WHEN json_valid(data) THEN CASE WHEN json_type(data)='object' THEN

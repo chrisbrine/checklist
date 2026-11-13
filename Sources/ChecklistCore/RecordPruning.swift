@@ -102,7 +102,7 @@ extension CommandRouter {
             return .commit
         }
         try db.inTransaction {
-            let cutoff = ISO8601DateFormatter().string(from: now.addingTimeInterval(-Self.cleanupPreviewRetention))
+            let cutoff = StoredClock.shared.string(from: now.addingTimeInterval(-Self.cleanupPreviewRetention))
             try db.execute(sql: """
                 DELETE FROM records WHERE rowid IN (SELECT p.rowid FROM records p LEFT JOIN records t ON t.type='task' AND t.id=CASE WHEN json_valid(p.data) THEN json_extract(p.data,'$.task_id') END
                   WHERE p.type='cleanup_preview' AND json_valid(p.data)

@@ -20,7 +20,7 @@ extension CommandRouter {
             // The live accepted tree is task-scoped before any canonical row is
             // decoded. Historical attempts in this project are not context work.
             let sql="WITH RECURSIVE tree(id) AS (SELECT id FROM records WHERE type='attempt' AND project_id=CAST(? AS TEXT) AND id=CAST(? AS TEXT) AND json_extract(data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND json_extract(data,'$.state')='active' UNION SELECT a.id FROM records a JOIN tree ON json_extract(a.data,'$.parent_attempt_id')=tree.id WHERE a.type='attempt' AND a.project_id=CAST(? AS TEXT) AND json_extract(a.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND json_extract(a.data,'$.state')='active') SELECT "+Self.canonicalColumns(alias:"r")+" FROM records r JOIN tree ON r.id=tree.id LIMIT 34"
-            let rows=try Row.fetchAll(db,sql:sql,arguments:[Data(pid.utf8),Data(((try StoredRecord(root, family: "attempt").string("id"))).utf8),Data(tid.utf8),Data(pid.utf8),Data(tid.utf8)])
+            let rows=try self.fetchStoreRows(db,sql:sql,arguments:[Data(pid.utf8),Data(((try StoredRecord(root, family: "attempt").string("id"))).utf8),Data(tid.utf8),Data(pid.utf8),Data(tid.utf8)])
             guard rows.count<=33 else {throw CoreError("CAPACITY_EXCEEDED","The live task delegation tree exceeds its declared capacity.")}
             attempts=try rows.map {try GRDBRecordEnvelopeAdapter.decode($0,expectedType:"attempt").object}
         } else { attempts = [] }
@@ -106,7 +106,7 @@ extension CommandRouter {
         // Each authenticated pickup processes at most50 missing notes; further
         // work is advertised, never hidden in a polling loop or huge allocation.
         let sql="SELECT "+Self.canonicalColumns(alias:"m")+" FROM records m WHERE m.type='message' AND m.project_id=CAST(? AS TEXT) AND json_extract(m.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND (json_extract(m.data,'$.origin')='human_ui' OR json_extract(m.data,'$.pickup_pending')=1) AND (COALESCE(json_extract(m.data,'$.requires_action'),0)=0 OR \(Self.unretractedDirectionSQL("m"))) AND (NOT EXISTS (SELECT 1 FROM records d WHERE d.type='delivery' AND d.project_id=m.project_id AND json_extract(d.data,'$.message_id')=m.id) OR (json_extract(m.data,'$.requires_action')=1 AND COALESCE(json_extract(m.data,'$.addressed'),0)=0 AND EXISTS (SELECT 1 FROM json_each(?) target WHERE NOT EXISTS (SELECT 1 FROM records d WHERE d.type='delivery' AND d.project_id=m.project_id AND json_extract(d.data,'$.message_id')=m.id AND json_extract(d.data,'$.recipient_session_id')=json_extract(target.value,'$.session') COLLATE BINARY AND json_extract(d.data,'$.recipient_authorization_generation')=json_extract(target.value,'$.generation') COLLATE BINARY)))) ORDER BY m.rowid LIMIT 51"
-        let rows=try Row.fetchAll(db,sql:sql,arguments:[Data(((try StoredRecord(task, family: "task").string("project_id"))).utf8),Data(((try StoredRecord(task,
+        let rows=try self.fetchStoreRows(db,sql:sql,arguments:[Data(((try StoredRecord(task, family: "task").string("project_id"))).utf8),Data(((try StoredRecord(task,
             family: "task").string("id"))).utf8),try jsonString(pairs)])
         for row in rows.prefix(50) {
             let message=try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"message").object
@@ -115,7 +115,7 @@ extension CommandRouter {
                 " AND json_extract(data,'$.message_id')=CAST(? AS TEXT) COLLATE BINARY ORDER BY rowid"
             let projectID = try StoredRecord(task, family: "task").string("project_id")
             let messageID = try StoredRecord(message, family: "message").string("id")
-            let existing = try Row.fetchAll(db, sql: deliverySQL, arguments: [Data(projectID.utf8), Data(messageID.utf8)])
+            let existing = try self.fetchStoreRows(db,sql: deliverySQL, arguments: [Data(projectID.utf8), Data(messageID.utf8)])
                 .map {try GRDBRecordEnvelopeAdapter.decode($0,expectedType:"delivery").object}
             if bool(message,"requires_action") || message["human_request_id"] != nil {
                 if existing.isEmpty || (bool(message,"requires_action") && !bool(message,"addressed")) {_=try queueDirectionDeliveries(db,message:message,recipients:recipients)}

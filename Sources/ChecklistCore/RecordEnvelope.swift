@@ -278,7 +278,16 @@ private enum EnvelopeJSONFields {
             whitespace(); guard index < bytes.count else { throw EnvelopeFailure(.jsonObject) }
             if bytes[index] == 125 { return result }
             let start = index; try stringEnd()
-            guard let key = try? JSONSerialization.jsonObject(with: Data(bytes[start..<index]), options: [.fragmentsAllowed]) as? String else { throw EnvelopeFailure(.jsonObject) }
+            // CL-363: JSONSerialization accepted the whole object before this pass, so each key token is a
+            // valid JSON string. A token with no backslash has no escape: the bytes between its quotes are
+            // the key. Only an escaped spelling needs the parser to give the key that it names.
+            let key: String
+            if bytes[start..<index].contains(92) {
+                guard let decoded = try? JSONSerialization.jsonObject(with: Data(bytes[start..<index]), options: [.fragmentsAllowed]) as? String else { throw EnvelopeFailure(.jsonObject) }
+                key = decoded
+            } else {
+                key = String(decoding: bytes[(start + 1)..<(index - 1)], as: UTF8.self)
+            }
             whitespace(); guard index < bytes.count, bytes[index] == 58 else { throw EnvelopeFailure(.jsonObject) }; index += 1
             whitespace(); let valueStart = index; try valueEnd()
             if ["id", "project_id", "revision"].contains(key) {

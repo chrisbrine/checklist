@@ -135,7 +135,7 @@ extension CommandRouter {
     }
     func requirePendingStorageCommand(_ db: Database, command: String, digest: String, caller: Caller) throws {
         let key = try pendingStorageCommandKey(principal:caller.principal,command:command)
-        if let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[key]) {
+        if let raw = try self.storeString(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[key]) {
             guard let pending = try JSONSerialization.jsonObject(with:Data(raw.utf8)) as? JSON,
                   pending["intent_digest"] as? String == digest else { throw CoreError("IDEMPOTENCY_CONFLICT","This original command ID already belongs to another storage operation.") }
         }

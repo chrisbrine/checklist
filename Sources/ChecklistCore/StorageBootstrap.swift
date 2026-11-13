@@ -21,7 +21,11 @@ enum StorageBootstrap {
         value.queryItems = [URLQueryItem(name:"mode",value:"rw")]
         guard let uri = value.string else { throw StoreRecovery.required("database_location_unavailable") };return uri
     }
-    static func open(root: URL, serviceLease: StorageServiceLease? = nil, prepareDatabase: @escaping @Sendable (Database)throws->Void = { _ in }, observe: (Boundary)->Void = { _ in }) throws -> Opened {
+    /// `knownCurrentIdentity` is a test-support statement (CL-363): the caller cloned this database
+    /// from a published template a moment ago and wrote this identity to it and to its receipt
+    /// file. The read-only preflight would read that identity again, so it does not run. Nil
+    /// (every product caller) keeps the preflight. Every later check of this function is unchanged.
+    static func open(root: URL, serviceLease: StorageServiceLease? = nil, knownCurrentIdentity: StoreIdentityReceipt? = nil, prepareDatabase: @escaping @Sendable (Database)throws->Void = { _ in }, observe: (Boundary)->Void = { _ in }) throws -> Opened {
         let root = StoreDirectory.anchoredRoot(root)
         defer {StorageUpgradeProgress.clear(root:root)}
         let directory = try measured("filesystem.directory") { try StoreDirectory(root:root) }
@@ -37,7 +41,10 @@ enum StorageBootstrap {
                 if let external,external.schema_revision < SchemaMigrations.currentSchema {
                     StorageUpgradeProgress.update(root:root,stage:"preparation_validation",seconds:90)
                 }
-                switch try measured("schema.preflight", { try readOnlyPreflight(database) }) {
+                let state: SchemaMigrations.State
+                if let knownCurrentIdentity { state = .current(knownCurrentIdentity) }
+                else { state = try measured("schema.preflight", { try readOnlyPreflight(database) }) }
+                switch state {
                 case .legacy(let incarnation):
                     guard serviceLease != nil else { throw StoreRecovery.required("upgrade_requires_exclusive_service") }
                     if let external {

@@ -48,7 +48,7 @@ extension CommandRouter {
         }
         return offset
     }
-    private func mediaSQLBytes(_ value: String) -> String { "X'" + Data(value.utf8).map {String(format:"%02x",$0)}.joined() + "'" }
+    private func mediaSQLBytes(_ value: String) -> String { "X'" + lowercaseHex(value.utf8) + "'" }
     private func mediaFieldSQL(_ id: MediaReviewID,alias: String = "t") -> String {
         "(SELECT value FROM json_each(\(alias).data,'$.metadata') WHERE CAST(key AS BLOB)=\(mediaSQLBytes(id.rawValue)))"
     }

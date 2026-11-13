@@ -18,7 +18,7 @@ extension CommandRouter {
         // The existing events_scope index selects this exact ticket. Only the
         // latest status event is decoded; notes and other project history are not.
         let arguments: [DatabaseValueConvertible] = [Data(pid.utf8), Data(tid.utf8)] + Self.ticketStatusEventKinds
-        guard let row = try Row.fetchOne(db, sql: "SELECT actor,kind,occurred_at,data FROM events WHERE project_id=CAST(? AS TEXT) AND entity_id=CAST(? AS TEXT) AND kind IN (" + kinds + ") ORDER BY seq DESC LIMIT 1", arguments: StatementArguments(arguments)) else { return nil }
+        guard let row = try self.storeRow(db,sql: "SELECT actor,kind,occurred_at,data FROM events WHERE project_id=CAST(? AS TEXT) AND entity_id=CAST(? AS TEXT) AND kind IN (" + kinds + ") ORDER BY seq DESC LIMIT 1", arguments: StatementArguments(arguments)) else { return nil }
         let data = jsonObject(row["data"]), kind: String = row["kind"]
         guard let reason = data["reason"] as? String, !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         if let target = data["to_status_id"] as? String {

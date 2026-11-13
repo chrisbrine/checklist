@@ -86,7 +86,7 @@ extension CommandRouter {
 
     /// A checkpoint names the shared resource it waits for, or ends an earlier wait (CL-47).
     func recordResourceWait(_ p: JSON, attempt a: inout JSON) throws {
-        let formatter = ISO8601DateFormatter()
+        let formatter = StoredClock.shared
         if p["waiting_for_resource"] != nil {
             let resource = try text(p, "waiting_for_resource", max: 200)
             if a["waiting_for_resource"] as? String != resource {
@@ -103,11 +103,10 @@ extension CommandRouter {
     /// waiting does not count toward the quiet warning (CL-47).
     static func checkpointHealth(_ attempt: JSON, now current: Date = Date()) -> JSON? {
         guard attempt["state"] as? String == "active" else { return nil }
-        let formatter = ISO8601DateFormatter()
         if let resource = attempt["waiting_for_resource"] as? String {
             return ["state": "waiting_for_resource", "resource": resource, "since": attempt["waiting_since"] ?? NSNull()]
         }
-        guard let last = (attempt["last_checkpoint"] as? String ?? attempt["started_at"] as? String).flatMap(formatter.date(from:)) else { return ["state": "current"] }
+        guard let last = (attempt["last_checkpoint"] as? String ?? attempt["started_at"] as? String).flatMap(StoredClock.shared.date(from:)) else { return ["state": "current"] }
         let quiet = max(0, Int(current.timeIntervalSince(last)))
         return quiet >= Int(quietCheckpointSeconds) ? ["state": "quiet", "quiet_seconds": quiet] : ["state": "current", "quiet_seconds": quiet]
     }

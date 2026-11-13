@@ -50,7 +50,15 @@ public enum TestFixtureTimings {
     private final class Observer: NSObject, XCTestObservation, @unchecked Sendable {
         private let lock = NSLock()
         private var started: TimeInterval?
+        private var startedCPU: (user: Double, system: Double)?
         private var components: [String: (count: Int, seconds: Double)] = [:]
+        /// CL-363: CPU time of this process. Under host load the elapsed time of a case is mostly a
+        /// wait for a CPU; the CPU time of a serial run is the cost of the case itself.
+        private static func processCPU() -> (user: Double, system: Double) {
+            var usage = rusage()
+            getrusage(RUSAGE_SELF, &usage)
+            return (Double(usage.ru_utime.tv_sec) + Double(usage.ru_utime.tv_usec) / 1e6, Double(usage.ru_stime.tv_sec) + Double(usage.ru_stime.tv_usec) / 1e6)
+        }
         private let output: FileHandle? = {
             guard let directory = ProcessInfo.processInfo.environment["CHECKLIST_TEST_PROFILE_DIRECTORY"] else { return nil }
             let root = URL(fileURLWithPath: directory, isDirectory: true)
@@ -69,11 +77,17 @@ public enum TestFixtureTimings {
             lock.lock(); defer { lock.unlock() }
             components = [:]
             started = ProcessInfo.processInfo.systemUptime
+            startedCPU = Self.processCPU()
         }
         func testCaseDidFinish(_ testCase: XCTestCase) {
             lock.lock()
-            let values: [String: Any] = ["test": testCase.name, "case_seconds": started.map { ProcessInfo.processInfo.systemUptime - $0 } as Any, "components": components.mapValues { ["count": $0.count, "seconds": $0.seconds] as [String: Any] }]
-            components = [:]
+            var values: [String: Any] = ["test": testCase.name, "case_seconds": started.map { ProcessInfo.processInfo.systemUptime - $0 } as Any, "components": components.mapValues { ["count": $0.count, "seconds": $0.seconds] as [String: Any] }]
+            if let startedCPU {
+                let current = Self.processCPU()
+                values["case_user_seconds"] = current.user - startedCPU.user
+                values["case_system_seconds"] = current.system - startedCPU.system
+            }
+            components = [:]; started = nil; startedCPU = nil
             lock.unlock()
             if let data = try? JSONSerialization.data(withJSONObject: values, options: [.sortedKeys]), let line = String(data: data, encoding: .utf8) {
                 if let output {

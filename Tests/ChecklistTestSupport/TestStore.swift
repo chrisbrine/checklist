@@ -3,6 +3,7 @@ import XCTest
 import Darwin
 import CryptoKit
 import GRDB
+import SQLite3
 import ChecklistProviders
 @testable import ChecklistCore
 
@@ -66,12 +67,18 @@ public enum TestStore {
         SourceGitFixtureMemo.configure(enabled: sourceGitMemo)
         let anchored = root.resolvingSymlinksInPath()
         // Reopen existing fixtures through production admission; never replace data.
+        var fresh: CommandRouter.FixtureFreshStore?
         if !FileManager.default.fileExists(atPath: anchored.appendingPathComponent("checklist.sqlite").path),
            !FileManager.default.fileExists(atPath: anchored.appendingPathComponent(StoreIdentityReceipt.fileName).path) {
             try StoreDirectory(root: anchored).requireFreshScaffoldingOnly()
-            try TestFixtureTimings.measure("store.seed") { try seed(anchored, template: template, workspace: workspace) }
+            let seeded = try TestFixtureTimings.measure("store.seed") { try seed(anchored, template: template, workspace: workspace) }
+            // CL-363: a disposable unit fixture states what it just cloned, so the startup leaves
+            // out the preflight and, for a clone with no row and no managed file, the sweeps and
+            // pruning statements that can find nothing. Durable and qualification fixtures, a
+            // reopened store and every direct CommandRouter keep the complete production startup.
+            if !durable { fresh = .init(identity: seeded.identity, empty: seeded.empty) }
         }
-        let router = try TestFixtureTimings.measure("store.open") { try TestFixtureTimings.startup { try CommandRouter(root: root, serviceLease: serviceLease, cliCommand: cliCommand, providerPlugins: providerPlugins, automaticBackupRetentionTrashRoot: automaticBackupRetentionTrashRoot, fixtureTrackEpicReferences: durable || trackEpicReferences || ProcessInfo.processInfo.environment["CHECKLIST_QUALIFICATION"] == "1") } }
+        let router = try TestFixtureTimings.measure("store.open") { try TestFixtureTimings.startup { try CommandRouter(root: root, serviceLease: serviceLease, cliCommand: cliCommand, providerPlugins: providerPlugins, automaticBackupRetentionTrashRoot: automaticBackupRetentionTrashRoot, fixtureTrackEpicReferences: durable || trackEpicReferences || ProcessInfo.processInfo.environment["CHECKLIST_QUALIFICATION"] == "1", fixtureFreshStore: fresh) } }
         if !durable {
             ValidationCatalogFixture.configure(router)
             router.fixtureStoreRows = { db, sql, arguments in
@@ -156,7 +163,9 @@ public enum TestStore {
         } else { throw CocoaError(.fileReadUnsupportedScheme) }
     }
 
-    private static func seed(_ root: URL, template: Template?, workspace: URL?) throws {
+    /// `empty`: the clone of the database alone (no managed file or staging folder), with no row
+    /// in `records`, `commands` or `cursors`, counted in the clone itself.
+    private static func seed(_ root: URL, template: Template?, workspace: URL?) throws -> (identity: StoreIdentityReceipt, empty: Bool) {
         let source: URL
         if let template {
             guard let workspace else { throw CocoaError(.fileNoSuchFile) }
@@ -180,6 +189,15 @@ public enum TestStore {
         let identity = StoreIdentityReceipt(format_version: 1, logical_store_id: UUID().uuidString.lowercased(),
                                           incarnation: UUID().uuidString.lowercased(), database_generation: 1,
                                           schema_revision: SchemaMigrations.currentSchema, state: "ready")
+        let receipt = root.appendingPathComponent(StoreIdentityReceipt.fileName)
+        if template == nil {
+            // CL-363: the clone of the empty template needs four metadata rows only. SQLite writes
+            // the same rows as the GRDB path below, without the setup of a GRDB connection.
+            let empty = try TestFixtureTimings.measure("seed.identity-and-relocation") { try writeIdentity(identity, database: database) }
+            try TestFixtureTimings.measure("seed.receipt-file") { try identity.encoded().write(to: receipt, options: .atomic) }
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: receipt.path)
+            return (identity, empty)
+        }
         var configuration = Configuration()
         configuration.prepareDatabase {
             try SchemaMigrations.installStorageCollation($0)
@@ -220,9 +238,60 @@ public enum TestStore {
             }
             try TestFixtureTimings.measure("seed.sqlite-close") { try queue.close() }
         } catch { try? queue.close(); throw error }
-        let receipt = root.appendingPathComponent(StoreIdentityReceipt.fileName)
         try TestFixtureTimings.measure("seed.receipt-file") { try identity.encoded().write(to: receipt, options: .atomic) }
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: receipt.path)
+        return (identity, false)
+    }
+
+    /// The identity, incarnation and a new cursor seal key of one private clone, in one
+    /// transaction with relaxed synchronization (disposable seed preparation only).
+    /// Returns true when the clone has no row in `records`, `commands` or `cursors`.
+    private static func writeIdentity(_ identity: StoreIdentityReceipt, database: URL) throws -> Bool {
+        var connection: OpaquePointer?
+        guard sqlite3_open_v2(database.path, &connection, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK, let connection else {
+            sqlite3_close(connection)
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        defer { sqlite3_close(connection) }
+        // The metadata key uses the storage collation. This is the comparison of
+        // `SchemaMigrations.installStorageCollation`: raw bytes first, then the length.
+        guard sqlite3_create_collation_v2(connection, SchemaMigrations.storageCollation, SQLITE_UTF8, nil, { _, an, ap, bn, bp in
+            let n = min(an, bn)
+            if n > 0, let ap, let bp {
+                let order = memcmp(ap, bp, Int(n))
+                if order != 0 { return order < 0 ? -1 : 1 }
+            }
+            return an == bn ? 0 : (an < bn ? -1 : 1)
+        }, nil) == SQLITE_OK else { throw CocoaError(.fileWriteUnknown) }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        @discardableResult func run(_ sql: String, _ values: [String] = []) throws -> Int64? {
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(connection, sql, -1, &statement, nil) == SQLITE_OK else { throw CocoaError(.fileWriteUnknown) }
+            defer { sqlite3_finalize(statement) }
+            for (index, value) in values.enumerated() {
+                guard sqlite3_bind_text(statement, Int32(index + 1), value, -1, transient) == SQLITE_OK else { throw CocoaError(.fileWriteUnknown) }
+            }
+            var first: Int64?
+            var code = sqlite3_step(statement)
+            while code == SQLITE_ROW {
+                if first == nil { first = sqlite3_column_int64(statement, 0) }
+                code = sqlite3_step(statement)
+            }
+            guard code == SQLITE_DONE else { throw CocoaError(.fileWriteUnknown) }
+            return first
+        }
+        try run("PRAGMA synchronous=OFF")
+        try run("BEGIN IMMEDIATE")
+        do {
+            try run("UPDATE metadata SET value=? WHERE key='incarnation'", [identity.incarnation])
+            try run("UPDATE metadata SET value=? WHERE key='store_identity'", [String(decoding: try identity.encoded(), as: UTF8.self)])
+            try run("DELETE FROM metadata WHERE key='cursor_seal_key'")
+            let key = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0).base64EncodedString() }
+            try run("INSERT OR REPLACE INTO metadata(key,value) VALUES ('cursor_seal_key',?)", [key])
+            let rows = try run("SELECT (SELECT COUNT(*) FROM records) + (SELECT COUNT(*) FROM commands) + (SELECT COUNT(*) FROM cursors)")
+            try run("COMMIT")
+            return rows == 0
+        } catch { try? run("ROLLBACK"); throw error }
     }
 }
 

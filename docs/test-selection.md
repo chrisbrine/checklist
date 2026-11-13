@@ -92,6 +92,9 @@ All Core timing methods are now environment-gated qualification (CL-358), includ
 `testThousandItemPublishedRoundListIsFast` and
 `testFiveThousandItemPublishedRoundListIsFast`, plus
 `MediaPreparationScaleTests/testLargeProjectPreparationReadsTouchedRecordsAndHoldsAtomicityReplayAndFencing`.
+`MediaRoundDeletionTests/testF2EveryReadAndWriteRequestStaysWithinOneSecondThroughPreparationAndCommit`
+is gated the same way (CL-363). It seeds 65,536 records, sends 540 requests and
+asserts the CL-450 one-second maximum for each request; the other F2 cases stay default.
 The owned-copy preview/screen measurements also stay opt-in and keep their
 explicit private-input gates. Two cleanup-deadline checks are conservatively
 isolated because they compare a deadline with the real current time; injected
@@ -417,7 +420,17 @@ an APFS copy-on-write clone (ordinary copy fallback), fresh logical-store and
 incarnation IDs, and a fresh cursor seal key generated during private seed
 preparation so reopening does not need another durable key write. Only disposable seed preparation
 uses relaxed SQLite synchronization. The Router still opens through production
-admission, pools and startup recovery. Disposable unit fixtures then select
+admission, pools and startup recovery. A disposable unit fixture states to the Router
+that its store is a fresh clone with a known identity (`FixtureFreshStore`, CL-363).
+The startup then leaves out the read-only schema preflight. For a clone in which the
+seed counted no row in `records`, `commands` or `cursors`, and which has no managed
+file, it also leaves out the three sweeps of pending captures, exports and imports and
+the pruning statements that can match no row. The first storage maintenance pass and
+the retention mark write of the pruning pass stay, so the files, the rows and the
+first write-ahead log frame are those of the complete startup. A clone with rows keeps
+the complete pruning pass and the sweeps. A reopened store, a durable or qualification
+fixture and a direct `CommandRouter` keep the complete startup;
+`FixtureFreshStoreTests` compares the two. Disposable unit fixtures then select
 SQLite `NORMAL` synchronization on their own writer, preserving WAL, foreign
 keys, transaction visibility and reopen behavior without a disk durability
 barrier per command. Qualification fixtures retain `FULL` (the helper's `durable`
@@ -472,6 +485,9 @@ select their private claimed-handler template before opening a router; custom
 keys still run through actual creation. Set
 `CHECKLIST_TEST_PROFILE_DIRECTORY` to retain per-process JSONL without mixing
 with XCTest output. These nested components are already included in XCTest method times.
+Each case line also has `case_user_seconds` and `case_system_seconds`, the CPU time of
+the test process during that case (CL-363). Under host load the elapsed time of a case is
+mostly a wait for a CPU, so use the CPU time of a serial run to rate the cost of a case.
 This profiling is test-support code and is off by default.
 
 The two 1,000-operation `StorageFolderAccessTests` probes and the two lifecycle
@@ -513,6 +529,26 @@ module closure. `default_swift_commands` is the ordinary component and
 final-round coverage refresh as described above. Changes to the observation
 environment other than the test files and named runtime inputs above require a
 refresh or conservative fallback.
+
+### Core cost in the test build (CL-363)
+
+Debug builds keep the normal compiler defaults of the toolchain for every target. One
+measured option is not applied: `-O` for the `ChecklistCore` target in debug builds
+(`unsafeFlags` in `Package.swift`). In one measured window the default serial Core run
+needed 198.5 CPU seconds with that flag and 256.1 without it. A fresh full build needed
+909 compiler CPU seconds with the flag against 571 without it, and a build that only
+compiled Core again needed 494 to 562. `assert()` in optimized `ChecklistCore` code is
+not evaluated in the tests. The flag saves about 55 CPU seconds in one full serial Core
+run and adds about 340 CPU seconds to each build that compiles most of Core, so it stays
+off. A decision to apply it belongs to CL-363. GRDB and the test targets are unoptimized
+in each case.
+
+SQL with constant text that runs in each command uses the statement cache of its
+connection (`CommandRouter.fetchStoreRows`, `executeStoreStatement`, `storeStatement`).
+Do not pass text that contains a request value or a list of any length to these
+functions: the cache has no limit. `now()` uses one shared ISO 8601 formatter
+(`StoredClock`). The first full run after a build also publishes the phase templates,
+so it needs more CPU time than the next run.
 
 ## Persistent build slots and installed checks
 

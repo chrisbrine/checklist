@@ -30,7 +30,7 @@ extension CommandRouter {
             + " AND json_extract(data,'$.orchestration.state')='active'"
             + " AND (EXISTS (SELECT 1 FROM json_each(data,'$.task_ids') WHERE value=CAST(? AS TEXT))"
             + " OR EXISTS (SELECT 1 FROM json_each(data,'$.members') WHERE json_extract(value,'$.task_id')=CAST(? AS TEXT))) ORDER BY rowid"
-        let rows = try Row.fetchAll(db, sql: sql, arguments: [Data(stored.projectID.utf8), Data(stored.id.utf8), Data(stored.id.utf8)])
+        let rows = try self.fetchStoreRows(db,sql: sql, arguments: [Data(stored.projectID.utf8), Data(stored.id.utf8), Data(stored.id.utf8)])
         return try rows.map { try GRDBRecordEnvelopeAdapter.decode($0, expectedType: "group").object }
             .first { !bool($0, "archived") && triageMemberIDs($0).contains(stored.id) && triageOrchestratorSession($0) != nil }
     }

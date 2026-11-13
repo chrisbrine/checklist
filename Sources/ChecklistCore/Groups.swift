@@ -278,7 +278,7 @@ extension CommandRouter {
     private func groupRelatedRecords(_ db: Database,_ group: JSON,type: String,field: String) throws -> [JSON] {
         let pid = (try StoredRecord(group, family: "group").string("project_id")), gid = (try StoredRecord(group, family: "group").string("id"))
         return try readSnapshotCache.records(db,key:["group-related",pid,gid,type,field]) {
-            try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND json_extract(data,'$."+field+"')=CAST(? AS TEXT) COLLATE BINARY ORDER BY rowid",arguments:[Data(type.utf8),Data(pid.utf8),Data(gid.utf8)])
+            try self.fetchStoreRows(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND json_extract(data,'$."+field+"')=CAST(? AS TEXT) COLLATE BINARY ORDER BY rowid",arguments:[Data(type.utf8),Data(pid.utf8),Data(gid.utf8)])
         }
     }
     // A creator may reuse the canonical tasks it just read in this writer transaction.

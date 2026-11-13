@@ -20,10 +20,12 @@ extension CommandRouter {
     /// suspension still requires the existing explicit retry authority.
     func performStorageMaintenance(_ db: Database, permit: ArchiveStoragePermit, archiveScan: PreparedArchiveCleanupScan? = nil) -> StorageMaintenanceWarning? {
         do {
+            // CL-363: the cleanup pass below does not read the hold a second time. It accepts this
+            // read only after `permit.requireRoot`: a permit that is active there was active here.
             if try StorageSnapshotRetention.isActive(root:root) {return .backupCapture}
             if let retry = storageMaintenanceRetryAt,retry > Date() {return .retryPending}
             let importWarning = try reconcileManagedAttachmentImports(db)
-            try processArchiveCleanupJobs(db, permit: permit, nowMS: Int64(Date().timeIntervalSince1970 * 1000), prepared: archiveScan)
+            try processArchiveCleanupJobs(db, permit: permit, nowMS: Int64(Date().timeIntervalSince1970 * 1000), prepared: archiveScan, noCaptureUnderPermit: true)
             storageMaintenanceFallbackFailures = 0
             storageMaintenanceRetryAt = nil
             return importWarning
