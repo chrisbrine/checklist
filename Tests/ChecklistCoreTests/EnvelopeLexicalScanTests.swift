@@ -32,6 +32,39 @@ final class EnvelopeLexicalScanTests: XCTestCase {
         XCTAssertEqual(value.revision, 1)
     }
 
+    // CL-457 finding bcaf55f0: the parser drops a U+FEFF at the start of a key, so a key written as a raw
+    // U+FEFF before `id`, `project_id` or `revision` is that envelope key in the complete parse. The
+    // lexical pass must read the same key, as it did before the CL-363 byte copy.
+    func testEnvelopeKeysWithALeadingByteOrderMarkStillDetectDuplicates() {
+        let m = "\u{FEFF}"
+        let duplicates = [
+            #"{"id":"record",""# + m + #"id":"record","project_id":"p","revision":1}"#,
+            #"{"id":"record",""# + m + #"id":"other","project_id":"p","revision":1}"#,
+            #"{""# + m + #"id":"other","id":"record","project_id":"p","revision":1}"#,
+            #"{"id":"record","project_id":"p",""# + m + #"project_id":"q","revision":1}"#,
+            #"{"id":"record","project_id":"p","revision":1,""# + m + #"revision":2}"#,
+            #"{"id":"record","project_id":"p","revision":1,""# + m + #"revision":1}"#
+        ]
+        for raw in duplicates {
+            XCTAssertTrue(raw.unicodeScalars.contains("\u{FEFF}"))
+            refuses(raw, reason: .duplicateEnvelopeField)
+        }
+    }
+
+    func testEnvelopeKeysWithALeadingByteOrderMarkDecodeAsTheCompleteParseReadsThem() throws {
+        let m = "\u{FEFF}"
+        let first = try decode(#"{""# + m + #"id":"record","project_id":"p","revision":1}"#)
+        XCTAssertEqual(first.id, "record"); XCTAssertEqual(first.projectID, "p"); XCTAssertEqual(first.revision, 1)
+        let second = try decode(#"{"id":"record","project_id":"p",""# + m + #"revision":1}"#)
+        XCTAssertEqual(second.id, "record"); XCTAssertEqual(second.projectID, "p"); XCTAssertEqual(second.revision, 1)
+    }
+
+    func testUnrelatedNonASCIIKeysRemainAllowed() throws {
+        let value = try decode(#"{"id":"record","project_id":"p","revision":1,"é":1,"🍎":"x","idé":"other"}"#)
+        XCTAssertEqual(value.id, "record"); XCTAssertEqual(value.projectID, "p"); XCTAssertEqual(value.revision, 1)
+        XCTAssertEqual(value.object["idé"] as? String, "other")
+    }
+
     func testNestedContainersAndEscapedQuotesDoNotHideFollowingEnvelopeFields() throws {
         let raw = #"{"nested":[{"body":"quotes: \" and slash: \\ and brackets: } ] { [","nested":[null,false,1.5,{"id":"nested","project_id":"other","revision":2}]}],"body":"é 🍎 \u0000","id":"record","project_id":"p","revision":1}"#
         let value = try decode(raw)

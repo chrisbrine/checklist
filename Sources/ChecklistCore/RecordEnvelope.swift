@@ -279,10 +279,12 @@ private enum EnvelopeJSONFields {
             if bytes[index] == 125 { return result }
             let start = index; try stringEnd()
             // CL-363: JSONSerialization accepted the whole object before this pass, so each key token is a
-            // valid JSON string. A token with no backslash has no escape: the bytes between its quotes are
-            // the key. Only an escaped spelling needs the parser to give the key that it names.
+            // valid JSON string. A token of ASCII bytes with no backslash has no escape and no character
+            // that the parser changes: the bytes between its quotes are the key. Each other token goes to
+            // the parser, which gives the key that the complete parse reads. CL-457 finding bcaf55f0: the
+            // parser drops a U+FEFF at the start of a string, so a byte copy of such a key is another key.
             let key: String
-            if bytes[start..<index].contains(92) {
+            if bytes[start..<index].contains(where: { $0 == 92 || $0 >= 0x80 }) {
                 guard let decoded = try? JSONSerialization.jsonObject(with: Data(bytes[start..<index]), options: [.fragmentsAllowed]) as? String else { throw EnvelopeFailure(.jsonObject) }
                 key = decoded
             } else {
