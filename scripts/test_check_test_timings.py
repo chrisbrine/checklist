@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,23 @@ def serial(cases=(('testFast', 0.25, 'passed'),), total=0.25, finish=True):
     return '\n'.join(lines) + '\n'
 
 
+CORE_TESTS = Path(__file__).resolve().parents[1] / 'Tests' / 'ChecklistCoreTests'
+KNOWN = 'ChecklistCoreTests.FixtureTests/testKnownSlow'
+
+
+def stale_registry_names(names, root=CORE_TESTS):
+    """Registry names that are no longer a test method of their class in the Core test sources."""
+    sources = [path.read_text(errors='replace') for path in sorted(root.rglob('*.swift'))]
+    stale = []
+    for name in names:
+        match = re.fullmatch(r'ChecklistCoreTests\.(\w+)/(test\w+)', name)
+        if not match or not any(
+                re.search(r'\b(?:class|extension)\s+' + match[1] + r'\b', text) and
+                re.search(r'\bfunc\s+' + match[2] + r'\s*\(', text) for text in sources):
+            stale.append(name)
+    return stale
+
+
 class TimingGuardTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -30,6 +48,8 @@ class TimingGuardTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
 
     def assess(self, text, **options):
+        # A known CPU time by default, so each case states only what it tests.
+        options.setdefault('cpu_seconds', 1.0)
         return guard.assess(*guard.parse_log(text), **options)
 
     def xml(self, cases, *, count=None):
@@ -70,17 +90,102 @@ class TimingGuardTests(unittest.TestCase):
         self.assertIsNone(result['per_test_budget_seconds'])
         self.assertEqual(result['tests'][0]['seconds'], 200)
 
-    def test_core_default_budget_is_180_and_boundary_is_inclusive(self):
+    def test_core_wall_level_is_180_inclusive_and_is_a_warning_that_does_not_fail_strict(self):
         self.assertEqual(self.assess(serial(total=180))['status'], 'pass')
-        result = self.assess(serial(total=180.001))
+        result = self.assess(serial(total=180.001), cpu_seconds=250, load_start=[21.5, 20, 19], load_end=120.25)
         self.assertEqual(result['budget_seconds'], 180)
-        self.assertIn('Default run: 180.001s > 180.000s', result['warnings'][0])
+        self.assertEqual(result['budget_enforced'], 'cpu')
+        self.assertEqual(result['status'], 'warning')
+        self.assertIn('Default Core run wall time: 180.001s > 180.000s', result['warnings'][0])
+        self.assertIn('1-minute load 21.50 at the start, 120.25 at the end', result['warnings'][0])
+        self.assertEqual(result['advisories'], result['warnings'])
+        self.assertEqual(result['strict_failures'], [])
 
     def test_explicit_wall_measurement_includes_overhead_and_overrides_serial_summary(self):
         result = self.assess(serial(total=0.25), elapsed=181)
         self.assertEqual(result['elapsed_seconds'], 181)
         self.assertEqual(result['elapsed_source'], 'measured command wall time')
-        self.assertIn('Default run:', result['warnings'][0])
+        self.assertIn('Default Core run wall time:', result['warnings'][0])
+
+    def test_core_cpu_budget_is_280_inclusive_and_above_fails_strict(self):
+        under = self.assess(serial(), cpu_seconds=280)
+        self.assertEqual(under['status'], 'pass')
+        self.assertEqual(under['cpu_budget_seconds'], 280)
+        self.assertEqual(under['cpu_seconds'], 280)
+        over = self.assess(serial(), cpu_seconds=280.001)
+        self.assertIn('Default Core run CPU time: 280.001s > 280.000s', over['strict_failures'][0])
+        self.assertEqual(over['advisories'], [])
+        self.assertEqual(self.assess(serial(), cpu_seconds=100, core_cpu_budget=99)['cpu_budget_seconds'], 99)
+        self.assertEqual(len(self.assess(serial(), cpu_seconds=100, core_cpu_budget=99)['strict_failures']), 1)
+
+    def test_cpu_fields_sum_user_and_system_time(self):
+        result = self.assess(serial(), cpu_seconds=None, cpu_user_seconds=200.5, cpu_system_seconds=31.25)
+        self.assertEqual(result['cpu_user_seconds'], 200.5)
+        self.assertEqual(result['cpu_system_seconds'], 31.25)
+        self.assertEqual(result['cpu_seconds'], 231.75)
+        self.assertEqual(result['status'], 'pass')
+
+    def test_core_run_without_cpu_time_warns_and_does_not_fail_strict(self):
+        result = self.assess(serial(), cpu_seconds=None)
+        self.assertEqual(result['status'], 'warning')
+        self.assertIn('Missing CPU time; default Core CPU budget is unverified', result['warnings'][0])
+        self.assertEqual(result['strict_failures'], [])
+        self.assertIsNone(result['cpu_seconds'])
+
+    def test_explicit_budget_qualification_and_noncore_runs_have_no_cpu_budget(self):
+        explicit = self.assess(serial(), elapsed=61, budget=60, cpu_seconds=900)
+        self.assertIsNone(explicit['cpu_budget_seconds'])
+        self.assertEqual(explicit['budget_enforced'], 'wall')
+        self.assertIn('Default run: 61.000s > 60.000s', explicit['strict_failures'][0])
+        self.assertEqual(len(explicit['strict_failures']), 1)
+        qualification = self.assess(serial(total=500), qualification=True, cpu_seconds=None)
+        self.assertEqual((qualification['status'], qualification['cpu_budget_seconds']), ('pass', None))
+        other = self.assess(serial().replace('ChecklistCoreTests', 'ChecklistAppTests'), elapsed=500, cpu_seconds=None)
+        self.assertEqual((other['status'], other['cpu_budget_seconds'], other['budget_enforced']), ('pass', None, None))
+
+    def test_registered_slow_case_has_its_reason_and_does_not_fail_strict(self):
+        result = self.assess(serial((('testKnownSlow', 3.5, 'passed'), ('testFast', 0.1, 'passed')), total=3.6),
+                             known_slow={KNOWN: 'Starts a real child process.'})
+        self.assertEqual([test['id'] for test in result['slow_tests']], [KNOWN])
+        self.assertEqual(result['slow_tests'][0]['registered'], True)
+        self.assertEqual(result['registered_slow_tests'][0]['reason'], 'Starts a real child process.')
+        self.assertEqual(result['unregistered_slow_tests'], [])
+        self.assertEqual((result['status'], result['warnings'], result['strict_failures']), ('pass', [], []))
+        self.assertNotIn('reason', result['tests'][0])
+
+    def test_unregistered_slow_case_is_listed_apart_and_fails_strict(self):
+        result = self.assess(serial((('testKnownSlow', 3.5, 'passed'), ('testNewSlow', 1.2, 'passed')), total=4.7),
+                             known_slow={KNOWN: 'Starts a real child process.'})
+        self.assertEqual([test['id'] for test in result['registered_slow_tests']], [KNOWN])
+        self.assertEqual([test['id'] for test in result['unregistered_slow_tests']],
+                         ['ChecklistCoreTests.FixtureTests/testNewSlow'])
+        self.assertNotIn('registered', result['unregistered_slow_tests'][0])
+        self.assertEqual(len(result['strict_failures']), 1)
+        self.assertIn('testNewSlow: 1.200s > 1.000s', result['strict_failures'][0])
+        output, errors = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            guard.report(result)
+        text = errors.getvalue()
+        self.assertIn('CPU time: 1.00 s (within) against the Core CPU budget of 280 CPU s.', text)
+        self.assertIn('Wall time: 4.70 s', text)
+        self.assertIn('Registered slow cases (1, known reason, not a failure):', text)
+        self.assertIn('testKnownSlow: 3.500s. Starts a real child process.', text)
+        self.assertIn('Unregistered slow cases: 1', text)
+        self.assertIn('1 finding(s) fail a --strict run; 0 recorded only.', text)
+
+    def test_registry_has_the_8_known_cases_with_reasons_and_each_is_a_core_test_method(self):
+        self.assertEqual(len(guard.KNOWN_SLOW_TESTS), 8)
+        self.assertTrue(all(reason.strip() for reason in guard.KNOWN_SLOW_TESTS.values()))
+        self.assertTrue(CORE_TESTS.is_dir())
+        self.assertEqual(stale_registry_names(guard.KNOWN_SLOW_TESTS), [])
+
+    def test_stale_registry_name_is_found(self):
+        real = next(iter(guard.KNOWN_SLOW_TESTS))
+        renamed = real + 'Renamed'
+        wrong_class = real.replace('.ConnectionRegistrationTests/', '.NoSuchClassTests/')
+        self.assertNotEqual(real, wrong_class)
+        self.assertEqual(stale_registry_names([real, renamed, wrong_class, 'OtherTests.X/testY']),
+                         [renamed, wrong_class, 'OtherTests.X/testY'])
 
     def test_noncore_only_applies_total_budget_when_explicit(self):
         text = serial().replace('ChecklistCoreTests', 'ChecklistAppTests')
@@ -92,14 +197,19 @@ class TimingGuardTests(unittest.TestCase):
         tests, summaries, problems = guard.parse_xunit(path)
         result = guard.assess(tests, summaries, problems, elapsed=0.9, budget=1)
         self.assertEqual(result['status'], 'pass')
+        self.assertEqual(result['budget_enforced'], 'wall')
         self.assertEqual(result['class_seconds']['ChecklistCoreTests.FixtureTests'], 1.6)
         self.assertEqual(result['elapsed_seconds'], 0.9)
         unmeasured = guard.assess(tests, summaries, problems)
         self.assertIn('Missing measured wall time', unmeasured['warnings'][0])
+        self.assertIn('Missing CPU time', unmeasured['warnings'][1])
+        self.assertEqual(unmeasured['strict_failures'], [])
+        self.assertIn('Missing measured wall time',
+                      guard.assess(tests, summaries, problems, budget=1)['strict_failures'][0])
 
     def test_parallel_xunit_without_skip_metadata_retains_invocations_with_unknown_counts(self):
         path = self.xml([('testUnit', 0.1, ''), ('testGated', 0.1, '')])
-        result = guard.assess(*guard.parse_xunit(path), elapsed=0.2)
+        result = guard.assess(*guard.parse_xunit(path), elapsed=0.2, cpu_seconds=0.3)
         self.assertEqual(result['status'], 'pass')
         self.assertEqual(result['warnings'], [])
         self.assertEqual(result['invocation_count'], 2)
@@ -115,6 +225,7 @@ class TimingGuardTests(unittest.TestCase):
             guard.report(result)
         self.assertIn('execution/skip counts unknown', output.getvalue())
         self.assertIn('TEST TIMING GUARD LIMITATION', errors.getvalue())
+        self.assertIn('CPU time: 0.30 s (within)', errors.getvalue())
 
     def test_xunit_explicit_zero_skips_attests_executed_count(self):
         path = self.xml([('testUnit', 0.1, '')])
@@ -273,6 +384,10 @@ class TimingGuardTests(unittest.TestCase):
         self.assertEqual(len(receipt['load_start']), 3)
         self.assertEqual(len(receipt['load_end']), 3)
         self.assertGreater(receipt['elapsed_seconds'], 0)
+        self.assertGreaterEqual(receipt['cpu_user_seconds'], 0)
+        self.assertGreaterEqual(receipt['cpu_system_seconds'], 0)
+        self.assertAlmostEqual(receipt['cpu_seconds'], receipt['cpu_user_seconds'] + receipt['cpu_system_seconds'])
+        self.assertEqual(receipt['cpu_budget_seconds'], 280)
         self.assertEqual(len(receipt['log_sha256']), 64)
         self.assertIn("Test Case '-[ChecklistCoreTests", (self.root / 'command.log').read_text())
 
@@ -286,6 +401,45 @@ class TimingGuardTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertTrue((self.root / 'command-1.log.json').is_file())
         self.assertEqual((self.root / 'command.log').read_text(), (self.root / 'command-1.log').read_text())
+
+    def test_wrapper_measures_child_cpu_time_and_rates_it_against_the_core_cpu_budget(self):
+        command = self.command()
+        executable = Path(command[0])
+        burn = ('import time\nstop = time.process_time() + 0.3\n'
+                'while time.process_time() < stop:\n    pass\n')
+        executable.write_text(executable.read_text().replace('import pathlib,sys\n', 'import pathlib,sys\n' + burn))
+        log = self.root / 'cpu.log'
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            status = guard.main(['run', '--log', str(log), '--strict', '--core-cpu-budget', '0.2', '--'] + command)
+        receipt = json.loads(log.with_suffix('.log.json').read_text())
+        self.assertEqual(status, 1)
+        self.assertGreaterEqual(receipt['cpu_seconds'], 0.3)
+        self.assertEqual(receipt['cpu_budget_seconds'], 0.2)
+        self.assertIn('Default Core run CPU time:', receipt['strict_failures'][0])
+        status, receipt = self.run_guard(command, strict=True, log=self.root / 'cpu-default.log')
+        self.assertEqual((status, receipt['status'], receipt['strict_failures']), (0, 'pass', []))
+
+    def test_strict_core_run_passes_with_wall_above_180_when_cpu_is_within_budget(self):
+        log = self.root / 'existing.log'
+        log.write_text(serial(total=400))
+        output, errors = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            status = guard.main(['check', '--log', str(log), '--elapsed', '505.47', '--cpu-seconds', '251.71',
+                                 '--load-start', '120', '--load-end', '80', '--strict', '--json'])
+        receipt = json.loads(output.getvalue())
+        self.assertEqual(status, 0)
+        self.assertEqual(receipt['status'], 'warning')
+        self.assertEqual(receipt['cpu_seconds'], 251.71)
+        self.assertIsNone(receipt['cpu_user_seconds'])
+        self.assertEqual(receipt['strict_failures'], [])
+        self.assertIn('Default Core run wall time: 505.470s > 180.000s', receipt['warnings'][0])
+        self.assertIn('load 120.00 at the start, 80.00 at the end', receipt['warnings'][0])
+        self.assertIn('CPU time: 251.71 s (within) against the Core CPU budget of 280 CPU s.', errors.getvalue())
+        self.assertIn('(recorded only) Default Core run wall time', errors.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(guard.main(['check', '--log', str(log), '--elapsed', '505.47', '--cpu-seconds', '280.5',
+                                         '--strict']), 1)
+            self.assertEqual(guard.main(['check', '--log', str(log), '--elapsed', '505.47', '--strict']), 0)
 
     def test_swift_wrapper_requests_xunit_and_uses_its_parallel_case_time(self):
         status, receipt = self.run_guard(self.command('[1/1] Testing Fixture/testSlow', fake_swift=True))

@@ -272,12 +272,35 @@ retention exemption is added. The independent scratch cache survives source-only
 workspace synchronization.
 
 `commands` wraps each default Swift/native invocation with
-`script/check_test_timings.py run`, which retains a log, load/wall timing receipt
+`script/check_test_timings.py run`, which retains a log, load/wall/CPU timing receipt
 and SwiftPM per-case XML where applicable. It warns loudly above one second per
-default method or the 180-second default Core budget; `--strict` makes either a
+default method or above the default Core CPU budget; `--strict` makes either a
 failure. `guarded_default_commands` names those executable wrappers; the existing
 `swift_commands` and `default_swift_commands` remain raw argv for inspection.
 Qualification and isolated timing commands retain their own intended budgets.
+
+The budget of the default serial Core run is 280 CPU seconds (`--core-cpu-budget`,
+CL-363): the user plus system time of the guarded command and its child processes.
+The receipt has `cpu_user_seconds`, `cpu_system_seconds` and `cpu_seconds`. The guard
+also records the wall time and the load at the start and the end. A wall time above
+180 seconds (`--core-budget`) is a warning in the receipt with the wall time and both
+load values; it never fails a `--strict` run by itself. Reason: the wall time follows
+the load of the other projects on the host. The same code needed 258 seconds of wall
+time at a load of 21 and 505 seconds at a load of 120, and 231.46 and 251.71 CPU
+seconds in two measured runs. A Core run with no known CPU time has a warning and
+does not fail. An explicit `--budget`, a qualification run and a run without Core
+cases keep their wall-time rules.
+
+`KNOWN_SLOW_TESTS` in the guard names 8 default Core cases that need more than one
+second by design, each with its reason: they start real child processes (the crash
+probe or Git), or sleep as their assertion needs. The receipt lists them in
+`registered_slow_tests` with the reason; they do not fail a `--strict` run. Each
+other case above one second is in `unregistered_slow_tests` and fails a `--strict`
+run. `strict_failures` holds the findings that fail; `advisories` holds the findings
+that are recorded only. Add a case to the registry only with a reason that is not a
+scale or timing measurement; `scripts/test_check_test_timings.py` fails when a
+registered name is no longer a test method in `Tests/ChecklistCoreTests`.
+
 For the serial Core budget, use the same warm scratch path and the shared build
 wrapper, with `CHECKLIST_QUALIFICATION` unset. The command selects every default
 Core case and leaves the real-Trash proof outside the run:
@@ -540,7 +563,7 @@ needed 198.5 CPU seconds with that flag and 256.1 without it. A fresh full build
 compiled Core again needed 494 to 562. `assert()` in optimized `ChecklistCore` code is
 not evaluated in the tests. The flag saves about 55 CPU seconds in one full serial Core
 run and adds about 340 CPU seconds to each build that compiles most of Core, so it stays
-off. A decision to apply it belongs to CL-363. GRDB and the test targets are unoptimized
+off. The owner left this choice to the agents on 12 November 2026, and the flag stays off. GRDB and the test targets are unoptimized
 in each case.
 
 SQL with constant text that runs in each command uses the statement cache of its
